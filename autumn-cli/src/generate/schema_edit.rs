@@ -1298,14 +1298,33 @@ fn split_top_level_commas(s: &str) -> Vec<&str> {
 /// `key = value` pairs, joined back into a single `key = value, ...`
 /// fragment. Returns `None` when none of `pairs` sets a source key (e.g. a
 /// plain `{ version = "...", features = [...] }` table).
+///
+/// `registry` is special-cased: unlike `workspace`/`path`/`git`, a registry
+/// alone doesn't pin a resolvable dependency -- Cargo still requires an
+/// explicit `version` alongside it (confirmed via `cargo metadata --offline`:
+/// dropping `version` from a registry dep reports "was specified without
+/// a path, git repository, version, or workspace dependency"), so `version`
+/// is mirrored too whenever `registry` is present.
 fn extract_source_keys<'a>(pairs: impl Iterator<Item = &'a str>) -> Option<String> {
-    let found: Vec<String> = pairs
+    let items: Vec<(&str, &str)> = pairs
         .filter_map(|part| {
             let (key, value) = part.split_once('=')?;
-            let key = key.trim();
-            is_source_key(key).then(|| format!("{key} = {}", value.trim()))
+            Some((key.trim(), value.trim()))
         })
         .collect();
+
+    let mut found: Vec<String> = items
+        .iter()
+        .filter(|(key, _)| is_source_key(key))
+        .map(|(key, value)| format!("{key} = {value}"))
+        .collect();
+
+    if found.iter().any(|f| f.starts_with("registry"))
+        && let Some((_, value)) = items.iter().find(|(key, _)| *key == "version")
+    {
+        found.insert(0, format!("version = {value}"));
+    }
+
     if found.is_empty() {
         None
     } else {
@@ -4293,6 +4312,26 @@ pub struct Comment {
         assert!(
             updated.contains("autumn-web = { version = \"0.6\", features = [\"test-support\"] }"),
             "must fall back to an explicit version when [dependencies] has no source keys: {updated}"
+        );
+    }
+
+    #[test]
+    fn dev_dependency_test_support_mirrors_registry_with_version() {
+        // Regression test (Codex review, issue #1023): `registry = "..."`
+        // alone doesn't pin a resolvable dependency the way `workspace`/
+        // `path`/`git` do -- Cargo still requires an explicit `version`
+        // alongside it (confirmed via `cargo metadata --offline`: a dep with
+        // neither path/git/version/workspace fails with "specified without
+        // providing a local path, Git repository, version, or workspace
+        // dependency to use"). Dropping `version` when mirroring `registry`
+        // would produce the same failure.
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = { version = \"0.6\", registry = \"private\" }\n";
+        let updated = ensure_dev_dependency_test_support(cargo, "0.6");
+        assert!(
+            updated.contains(
+                "autumn-web = { version = \"0.6\", registry = \"private\", features = [\"test-support\"] }"
+            ),
+            "must mirror both version and registry together: {updated}"
         );
     }
 
