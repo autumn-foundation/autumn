@@ -1739,8 +1739,10 @@ fn detect_dependencies_autumn_web_source(existing: &str) -> Option<String> {
             continue;
         };
         // Dotted form: autumn_web.package = "autumn-web" /
-        // autumn_web.path = "../autumn" / etc.
-        if sub == "package" && val_code.trim_matches('"') == "autumn-web" {
+        // autumn_web.path = "../autumn" / etc. Trim both TOML quote forms
+        // -- Cargo accepts `package = 'autumn-web'` identically to a
+        // double-quoted value.
+        if sub == "package" && val_code.trim_matches(['"', '\'']) == "autumn-web" {
             alias_confirmed = true;
         }
         alias_dotted_pairs.push(format!("{sub} = {val_code}"));
@@ -4880,6 +4882,24 @@ pub struct Comment {
             updated
                 .contains("autumn-web = { path = \"../autumn\", features = [\"test-support\"] }"),
             "must mirror the dotted-aliased dep's path source: {updated}"
+        );
+        assert!(!updated.contains("version = \"0.6\""));
+    }
+
+    #[test]
+    fn dev_dependency_test_support_mirrors_dotted_aliased_path_source_single_quoted() {
+        // Regression test (Codex review, issue #1023): the dotted-alias
+        // confirmation check (`sub == "package" && val_code.trim_matches...`)
+        // still trimmed only double quotes even after the inline-table and
+        // subtable single-quote fixes, so `autumn_web.package =
+        // 'autumn-web'` (valid Cargo.toml, same as the double-quoted form)
+        // never confirmed the alias and fell through to a mismatched
+        // crates.io version.
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nautumn_web.package = 'autumn-web'\nautumn_web.path = '../autumn'\n";
+        let updated = ensure_dev_dependency_test_support(cargo, "0.6");
+        assert!(
+            updated.contains("autumn-web = { path = '../autumn', features = [\"test-support\"] }"),
+            "must mirror the single-quoted dotted-aliased dep's path source: {updated}"
         );
         assert!(!updated.contains("version = \"0.6\""));
     }
