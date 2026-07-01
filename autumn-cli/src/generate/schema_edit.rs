@@ -1830,14 +1830,25 @@ fn rewrite_dep_with_feature(line: &str, dep_name: &str, feature: &str) -> String
         }
     }
 
+    // Everything below only considers the code portion of the line -- a
+    // trailing `# comment` containing TOML-looking text (e.g. an example
+    // `# features = []`) must never be mistaken for a real key. Otherwise
+    // the feature gets spliced into the comment while the actual
+    // dependency value is untouched, and the caller reports success even
+    // though nothing real changed (confirmed: `tokio = { version = "1" } #
+    // features = []` would otherwise "succeed" without adding the feature).
+    let (code, comment) = line
+        .split_once('#')
+        .map_or((line, String::new()), |(c, rest)| (c, format!("#{rest}")));
+
     // Form 2/3: <dep_name> = { ... features = [...] ... }
-    if let Some(open) = line.find("features")
-        && let Some(bracket_start) = line[open..].find('[')
+    if let Some(open) = code.find("features")
+        && let Some(bracket_start) = code[open..].find('[')
     {
         let abs_start = open + bracket_start;
-        if let Some(bracket_end_rel) = line[abs_start..].find(']') {
+        if let Some(bracket_end_rel) = code[abs_start..].find(']') {
             let abs_end = abs_start + bracket_end_rel;
-            let body = &line[abs_start + 1..abs_end];
+            let body = &code[abs_start + 1..abs_end];
             let body_trimmed = body.trim();
             let separator = if body_trimmed.is_empty() {
                 ""
@@ -1847,21 +1858,22 @@ fn rewrite_dep_with_feature(line: &str, dep_name: &str, feature: &str) -> String
                 ", "
             };
             return format!(
-                "{}{}{}{}",
-                &line[..abs_end],
+                "{}{}{}{}{}",
+                &code[..abs_end],
                 separator,
                 feature_quoted,
-                &line[abs_end..]
+                &code[abs_end..],
+                comment
             );
         }
     }
 
     // Form 2b: <dep_name> = { version = "x.y.z" } — no features key yet.
     // Insert features before the closing `}`.
-    if let Some(close) = line.rfind('}') {
-        let before = line[..close].trim_end();
-        let after = &line[close..];
-        return format!("{before}, features = [{feature_quoted}]{after}");
+    if let Some(close) = code.rfind('}') {
+        let before = code[..close].trim_end();
+        let after = &code[close..];
+        return format!("{before}, features = [{feature_quoted}]{after}{comment}");
     }
 
     line.to_owned()
@@ -4826,6 +4838,29 @@ pub struct Comment {
         assert!(
             features_line.contains("\"rt\"") && features_line.contains("\"macros\""),
             "the real tokio dep must get both features despite the tokio-util decoy: {features_line}"
+        );
+    }
+
+    #[test]
+    fn tokio_test_features_not_spliced_into_trailing_comment() {
+        // Regression test (Codex review, issue #1023): rewrite_dep_with_feature
+        // searched for "features"/"[...]" in the raw line, including any
+        // trailing `# comment`. A comment that happens to contain
+        // TOML-looking text (e.g. a `# features = []` example) got the
+        // feature spliced into the comment instead of the real dependency
+        // value, while the caller still reported success -- leaving the
+        // generated `#[tokio::test]` smoke test unable to compile because
+        // the actual tokio entry never gained rt/macros.
+        let cargo = "[package]\nname=\"x\"\n\n[dev-dependencies]\ntokio = { version = \"1\" } # features = []\n";
+        let updated = ensure_dev_dependency_tokio_test_features(cargo);
+        let tokio_line = updated
+            .lines()
+            .find(|l| l.trim_start().starts_with("tokio"))
+            .unwrap_or_else(|| panic!("no tokio line in: {updated}"));
+        let code = tokio_line.split_once('#').map_or(tokio_line, |(c, _)| c);
+        assert!(
+            code.contains("\"rt\"") && code.contains("\"macros\""),
+            "features must be added to the real dependency value, not the trailing comment: {tokio_line}"
         );
     }
 
