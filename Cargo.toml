@@ -1,5 +1,5 @@
 [workspace]
-members = ["autumn", "autumn-macros", "autumn-cli", "autumn-admin-plugin", "autumn-storage-s3", "autumn-cache-redis", "examples/hello", "examples/todo-app", "examples/blog", "examples/bookmarks", "examples/bookmarks-distributed", "examples/bookmarks-sharded", "examples/wiki", "examples/reddit-clone", "examples/saas", "benchmarks/runtime/gate"]
+members = ["autumn", "autumn-macros", "autumn-cli", "autumn-admin-plugin", "autumn-storage-s3", "autumn-cache-redis", "examples/hello", "examples/todo-app", "examples/blog", "examples/bookmarks", "examples/bookmarks-distributed", "examples/bookmarks-sharded", "examples/wiki", "examples/reddit-clone", "examples/saas", "benchmarks/runtime/gate", "example-e2e"]
 resolver = "3"
 
 # `cargo test --workspace` builds every example, plugin, integration test, and

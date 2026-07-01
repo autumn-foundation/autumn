@@ -40,9 +40,17 @@ tempfile = "3"
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
 tracing-subscriber = "0.3"
+example-e2e = { path = "../../example-e2e" }
 
 [lints.rust]
 unsafe_code = "forbid"
 
 [features]
 embed-assets = ["autumn-web/embed-assets"]
+# Enable the headless-browser system smoke. Requires Chromium on the host.
+#   cargo test -p reddit-clone --features system-tests --test smoke -- --include-ignored
+system-tests = ["autumn-web/system-tests"]
+
+[[test]]
+name = "smoke"
+path = "tests/system/smoke.rs"

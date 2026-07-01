@@ -19,6 +19,16 @@ validator = { version = "0.20", features = ["derive"] }
 [dev-dependencies]
 autumn-web = { path = "../../autumn", features = ["test-support"] }
 tokio = { version = "1", features = ["rt", "macros"] }
+example-e2e = { path = "../../example-e2e" }
+
+[features]
+# Enable the headless-browser system smoke. Requires Chromium on the host.
+#   cargo test -p saas --features system-tests --test smoke -- --include-ignored
+system-tests = ["autumn-web/system-tests"]
+
+[[test]]
+name = "smoke"
+path = "tests/system/smoke.rs"
 
 [lints.rust]
 unsafe_code = "forbid"

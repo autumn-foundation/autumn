@@ -203,3 +203,155 @@ async fn expect_hx_settle_waits_for_htmx() {
     page.expect_hx_settle().await.expect("settle");
     page.expect_text("Swapped!").await.expect("assert swap");
 }
+
+// ── attach(): browser-only mode against an already-running server ─────────
+//
+// Issue #1192: the fan-out example harness spawns each example's real
+// binary as a subprocess (so `main.rs`'s actual routes, migrations, and
+// builder chain run unmodified) and only needs the browser half of
+// `SystemTest`. `attach(base_url)` must launch managed Chromium and target
+// an externally-supplied base URL instead of booting an in-process router.
+
+/// `attach()` must launch a browser and successfully visit a page served by
+/// an independently-running server. We stand up that server via a normal
+/// `SystemTest::build()` (which owns its own in-process axum server) purely
+/// to get *something* listening on an ephemeral port, then discard that
+/// runner's browser/page and instead attach a **second**, independent
+/// `SystemTest::attach()` runner at the same `base_url()` — exercising the
+/// exact shape the fan-out harness uses: browser half only, server owned
+/// elsewhere (there, a spawned subprocess; here, the first runner's server).
+#[tokio::test]
+#[ignore = "requires Chromium — set AUTUMN_CHROMIUM or install chromium-browser"]
+async fn attach_visits_externally_running_server() {
+    use autumn_web::prelude::*;
+
+    #[get("/")]
+    async fn index() -> &'static str {
+        "<html><body><h1>Externally booted</h1></body></html>"
+    }
+
+    let server = SystemTest::new()
+        .routes(routes![index])
+        .build()
+        .await
+        .expect("boot stand-in server");
+    let base_url = server.base_url().to_string();
+
+    let runner = SystemTest::attach(base_url)
+        .await
+        .expect("attach to running server");
+
+    let page = runner.page().await.expect("open page");
+    page.visit("/").await.expect("visit");
+    page.expect_text("Externally booted")
+        .await
+        .expect("text assertion failed");
+}
+
+// ── Console-error capture ──────────────────────────────────────────────────
+//
+// AC3 requires every baseline smoke to assert "no uncaught console errors".
+// `Page` must accumulate console/runtime errors as they occur so a smoke can
+// fail loudly on a broken page instead of only checking rendered text.
+
+/// A page that throws an uncaught JS error must fail
+/// `expect_no_console_errors()`.
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn expect_no_console_errors_fails_on_uncaught_exception() {
+    use autumn_web::prelude::*;
+
+    #[get("/")]
+    async fn index() -> &'static str {
+        "<html><body><h1>Page loads fine</h1></body></html>"
+    }
+
+    let runner = SystemTest::new()
+        .routes(routes![index])
+        .build()
+        .await
+        .expect("start runner");
+
+    let page = runner.page().await.expect("open page");
+    page.visit("/").await.expect("visit");
+
+    // Autumn's default CSP (`script-src 'self'`) blocks inline `<script>`
+    // tags in served HTML, so an inline-script fixture would never actually
+    // run and this test would trivially pass for the wrong reason. Trigger
+    // the exception via CDP `Runtime.evaluate` instead (`Page::evaluate`),
+    // which — like the DevTools console itself — is not subject to the
+    // page's CSP, so it reliably reaches V8 as an uncaught exception.
+    let _ = page
+        .evaluate("setTimeout(() => { throw new Error('boom'); }, 0)")
+        .await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let result = page.expect_no_console_errors().await;
+    assert!(
+        result.is_err(),
+        "a page that throws an uncaught exception must fail the console-error assertion"
+    );
+}
+
+/// A clean page (no console errors) must pass `expect_no_console_errors()`.
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn expect_no_console_errors_passes_on_clean_page() {
+    use autumn_web::prelude::*;
+
+    #[get("/")]
+    async fn index() -> &'static str {
+        "<html><body><h1>All good</h1></body></html>"
+    }
+
+    let runner = SystemTest::new()
+        .routes(routes![index])
+        .build()
+        .await
+        .expect("start runner");
+
+    let page = runner.page().await.expect("open page");
+    page.visit("/").await.expect("visit");
+    page.expect_text("All good").await.expect("text");
+
+    page.expect_no_console_errors()
+        .await
+        .expect("clean page must not report console errors");
+}
+
+/// `console_errors()` must return the accumulated messages for inspection
+/// (not just a boolean), so a failing smoke's CI output is actionable.
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn console_errors_returns_accumulated_messages() {
+    use autumn_web::prelude::*;
+
+    #[get("/")]
+    async fn index() -> &'static str {
+        "<html><body><h1>Page loads fine</h1></body></html>"
+    }
+
+    let runner = SystemTest::new()
+        .routes(routes![index])
+        .build()
+        .await
+        .expect("start runner");
+
+    let page = runner.page().await.expect("open page");
+    page.visit("/").await.expect("visit");
+
+    // Autumn's default CSP (`script-src 'self'`) blocks inline `<script>`
+    // tags, so trigger the console call via CDP `Runtime.evaluate`
+    // (`Page::evaluate`) instead — it is not subject to page CSP, same as
+    // the DevTools console.
+    let _ = page.evaluate("console.error('bad thing happened')").await;
+
+    // Give the CDP event a moment to be delivered and recorded.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let errors = page.console_errors();
+    assert!(
+        errors.iter().any(|e| e.contains("bad thing happened")),
+        "expected captured console.error message; got: {errors:?}"
+    );
+}

@@ -34,3 +34,8 @@ slots = ["8192-16383"]
 enabled = true
 source = "header"
 header_name = "x-tenant-id"
+# The browser auto-requests /favicon.ico for any page load; without this it's
+# rejected by the same header check as every other route (400, not the 404 a
+# missing route would give), which the browser's headless smoke test reports
+# as a real console error.
+public_paths = ["/favicon.ico"]

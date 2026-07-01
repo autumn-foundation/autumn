@@ -15,7 +15,7 @@ pub fn layout(title: &str, signed_in: bool, content: Markup) -> Markup {
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { (title) " · {{project_name}}" }
                 link rel="stylesheet" href="/static/css/app.css";
-                (javascript_include_tag("htmx"))
+                script src="/static/js/htmx.min.js" {}
             }
             body class="bg-gray-50 text-gray-900" {
                 header class="border-b bg-white" {
