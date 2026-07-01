@@ -1388,7 +1388,27 @@ fn detect_dependencies_autumn_web_source(existing: &str) -> Option<String> {
         }
         let after_ws = line.trim_start();
         let Some(rest) = after_ws.strip_prefix("autumn-web") else {
-            continue;
+            // Not the literal `autumn-web` key -- check for a renamed dep,
+            // e.g. `aw = { package = "autumn-web", path = "../autumn" }`.
+            // `ensure_autumn_web_feature_status_in_section` already mirrors
+            // this shape for `[dependencies]` (Pass 1) and dev-dependencies
+            // reuse it; the source-detection path needs the same coverage,
+            // else it silently drops the alias's path/git/workspace source
+            // and falls back to a mismatched crates.io version.
+            let Some((key, val)) = after_ws.split_once('=') else {
+                continue;
+            };
+            let alias = key.trim();
+            if alias.replace('-', "_") != "autumn_web" {
+                continue;
+            }
+            let val_code = val.split('#').next().unwrap_or(val);
+            if !val_code.contains(r#"package = "autumn-web""#)
+                && !val_code.contains(r#"package="autumn-web""#)
+            {
+                continue;
+            }
+            return extract_source_from_inline_table(line);
         };
         if let Some(dotted) = rest.strip_prefix('.') {
             // autumn-web.workspace = true / autumn-web.path = "..." / etc.
@@ -4359,6 +4379,28 @@ pub struct Comment {
             dep_line.contains("version = \"0.6\"") && dep_line.contains("registry = \"private\""),
             "must mirror both dotted version and registry together: {dep_line}"
         );
+    }
+
+    #[test]
+    fn dev_dependency_test_support_mirrors_aliased_path_source() {
+        // Regression test (Codex review, issue #1023): a renamed dep, e.g.
+        // `autumn_web = { package = "autumn-web", path = "../autumn" }`,
+        // wasn't recognized at all -- the detector only matched the literal
+        // `autumn-web` key, so it fell back to a mismatched crates.io
+        // version. Confirmed via `cargo metadata --offline` that Cargo
+        // unifies dependency sources by *package name* (here "autumn-web"),
+        // not by the local alias key, so an unaliased `autumn-web = { path
+        // = "../autumn", ... }` dev-dependency (mirroring just the source,
+        // not the alias) resolves to the identical node as the aliased
+        // `[dependencies]` entry.
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nautumn_web = { package = \"autumn-web\", path = \"../autumn\" }\n";
+        let updated = ensure_dev_dependency_test_support(cargo, "0.6");
+        assert!(
+            updated
+                .contains("autumn-web = { path = \"../autumn\", features = [\"test-support\"] }"),
+            "must mirror the aliased dep's path source: {updated}"
+        );
+        assert!(!updated.contains("version = \"0.6\""));
     }
 
     // ── IdType-aware variants (issue #1400) ────────────────────────────────
