@@ -1365,6 +1365,12 @@ fn extract_source_from_subtable_lines(lines: &[&str]) -> Option<String> {
 fn detect_dependencies_autumn_web_source(existing: &str) -> Option<String> {
     let lines: Vec<&str> = existing.lines().collect();
     let mut in_section = false;
+    // Every `autumn-web.<key> = <value>` dotted line, collected across the
+    // whole section before filtering -- a dep can spread `version` and
+    // `registry` (or any other source key) across separate dotted lines in
+    // any order, and extract_source_keys needs to see all of them at once to
+    // apply the "registry needs version too" rule.
+    let mut dotted_pairs: Vec<String> = Vec::new();
 
     // Pass 1: inline or dotted-key form directly under `[dependencies]`.
     for &line in &lines {
@@ -1386,13 +1392,9 @@ fn detect_dependencies_autumn_web_source(existing: &str) -> Option<String> {
         };
         if let Some(dotted) = rest.strip_prefix('.') {
             // autumn-web.workspace = true / autumn-web.path = "..." / etc.
-            let Some((key, value)) = dotted.split_once('=') else {
-                continue;
-            };
-            let key = key.trim();
-            if is_source_key(key) {
-                let value = value.split('#').next().unwrap_or("").trim();
-                return Some(format!("{key} = {value}"));
+            let code = dotted.split_once('#').map_or(dotted, |(before, _)| before);
+            if let Some((key, value)) = code.split_once('=') {
+                dotted_pairs.push(format!("{} = {}", key.trim(), value.trim()));
             }
             continue;
         }
@@ -1404,6 +1406,10 @@ fn detect_dependencies_autumn_web_source(existing: &str) -> Option<String> {
         // a plain string version (no source keys -- `None`) or an inline
         // table that may carry `workspace`/`path`/`git`.
         return extract_source_from_inline_table(line);
+    }
+
+    if !dotted_pairs.is_empty() {
+        return extract_source_keys(dotted_pairs.iter().map(String::as_str));
     }
 
     // Pass 2: multiline `[dependencies.autumn-web]` subtable form.
@@ -4332,6 +4338,26 @@ pub struct Comment {
                 "autumn-web = { version = \"0.6\", registry = \"private\", features = [\"test-support\"] }"
             ),
             "must mirror both version and registry together: {updated}"
+        );
+    }
+
+    #[test]
+    fn dev_dependency_test_support_mirrors_dotted_registry_with_version() {
+        // Regression test (Codex review, issue #1023): the dotted-key form
+        // can spread `version` and `registry` across separate
+        // `autumn-web.<key> = <value>` lines. The scan used to return as
+        // soon as it saw the first source key (`registry`), dropping the
+        // sibling `autumn-web.version` line entirely -- same underlying bug
+        // as the inline-table case, just in the dotted-key branch.
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web.version = \"0.6\"\nautumn-web.registry = \"private\"\n";
+        let updated = ensure_dev_dependency_test_support(cargo, "0.6");
+        let dep_line = updated
+            .lines()
+            .find(|l| l.starts_with("autumn-web =") && l.contains("test-support"))
+            .unwrap_or_else(|| panic!("no dev-dependency autumn-web line in: {updated}"));
+        assert!(
+            dep_line.contains("version = \"0.6\"") && dep_line.contains("registry = \"private\""),
+            "must mirror both dotted version and registry together: {dep_line}"
         );
     }
 
