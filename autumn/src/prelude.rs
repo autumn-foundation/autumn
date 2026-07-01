@@ -57,6 +57,8 @@ pub use crate::canary::CanaryRoute;
 /// Database connection extractor.
 #[cfg(feature = "db")]
 pub use crate::db::Db;
+/// Current request path extractor, for path-aware view helpers like `nav_link`.
+pub use crate::extract::CurrentPath;
 /// Typed domain event bus publisher extractor. The `Event` trait it works with
 /// lives at [`crate::events::Event`] (kept out of the prelude to avoid clashing
 /// with [`crate::sse::Event`]).
@@ -176,10 +178,10 @@ pub use crate::form::{Changeset, ChangesetForm, IntoChangeset};
 #[cfg(feature = "maud")]
 pub use crate::widgets::{
     ActiveSearchConfig, AutocompleteConfig, CardConfig, Column, Crumb, Cta, CtaStyle,
-    DataTableConfig, HeadingLevel, HeroConfig, SearchMethod, SortDir, active_search,
+    DataTableConfig, HeadingLevel, HeroConfig, NavLinkMatch, SearchMethod, SortDir, active_search,
     active_search_empty_state, active_search_input, active_search_results,
     autocomplete_empty_state, autocomplete_input, autocomplete_option, breadcrumb, card,
-    data_table, hero, property_list, stat_card,
+    data_table, hero, nav_link, nav_link_matched, property_list, stat_card,
 };
 
 // ── Hooks ───────────────────────────────────────────────────────

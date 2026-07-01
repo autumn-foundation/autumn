@@ -14,6 +14,7 @@
 //! | `data_table` | Column-driven, sortable `<table>` |
 //! | `breadcrumb` | Accessible `<nav>` breadcrumb trail |
 //! | `hero` | Landing-page banner: headline, optional subtitle, and CTAs |
+//! | `nav_link` | Navigation anchor, auto-marked active + `aria-current` |
 //!
 //! # Interactive / search widgets
 //!
@@ -1105,6 +1106,47 @@ pub fn breadcrumb(crumbs: &[Crumb<'_>]) -> maud::Markup {
                 }
             }
         }
+    }
+}
+
+// ── nav_link ────────────────────────────────────────────────────────────────
+
+/// Match mode for [`nav_link_matched`] — how the current request path is
+/// compared against a link's `href` to decide the active state.
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NavLinkMatch {
+    /// Active only when the current path equals `href` exactly (default).
+    #[default]
+    Exact,
+    /// Active when the current path equals `href`, or starts with `href`
+    /// followed by a `/` segment boundary — so `/admin/posts/3/edit`
+    /// activates an `/admin/posts` link, but `/admin/postsX` does not.
+    Prefix,
+}
+
+/// Render a navigation anchor, marked active when `href` equals `current_path`.
+///
+/// Uses [`NavLinkMatch::Exact`]; see [`nav_link_matched`] for prefix matching.
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn nav_link(current_path: &str, href: &str, label: &str) -> maud::Markup {
+    nav_link_matched(current_path, href, label, NavLinkMatch::Exact)
+}
+
+/// Render a navigation anchor with an explicit [`NavLinkMatch`] mode.
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn nav_link_matched(
+    current_path: &str,
+    href: &str,
+    label: &str,
+    mode: NavLinkMatch,
+) -> maud::Markup {
+    // Red-phase stub: renders the anchor without any active-state handling.
+    let _ = (current_path, mode);
+    maud::html! {
+        a href=(href) { (label) }
     }
 }
 
@@ -2328,6 +2370,75 @@ mod tests {
         );
         // Only the last item carries aria-current
         assert_eq!(html.matches(r#"aria-current="page""#).count(), 1, "{html}");
+    }
+
+    // ── nav_link ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn nav_link_exact_match_is_active() {
+        let html = nav_link("/admin/posts", "/admin/posts", "Posts").into_string();
+        assert!(html.contains(r#"class="active""#), "{html}");
+        assert!(html.contains(r#"aria-current="page""#), "{html}");
+    }
+
+    #[test]
+    fn nav_link_no_match_is_inactive() {
+        let html = nav_link("/admin/jobs", "/admin/posts", "Posts").into_string();
+        assert!(!html.contains("active"), "{html}");
+        assert!(!html.contains("aria-current"), "{html}");
+    }
+
+    #[test]
+    fn nav_link_exact_mode_rejects_sub_paths() {
+        let html = nav_link("/admin/posts/3", "/admin/posts", "Posts").into_string();
+        assert!(!html.contains("active"), "{html}");
+        assert!(!html.contains("aria-current"), "{html}");
+    }
+
+    #[test]
+    fn nav_link_prefix_match_is_active() {
+        let html = nav_link_matched(
+            "/admin/posts/3/edit",
+            "/admin/posts",
+            "Posts",
+            NavLinkMatch::Prefix,
+        )
+        .into_string();
+        assert!(html.contains(r#"class="active""#), "{html}");
+        assert!(html.contains(r#"aria-current="page""#), "{html}");
+    }
+
+    #[test]
+    fn nav_link_prefix_mode_rejects_false_positive() {
+        // "/admin/postsX" must NOT match "/admin/posts" as a prefix.
+        let html = nav_link_matched(
+            "/admin/postsX",
+            "/admin/posts",
+            "Posts",
+            NavLinkMatch::Prefix,
+        )
+        .into_string();
+        assert!(!html.contains("active"), "{html}");
+        assert!(!html.contains("aria-current"), "{html}");
+    }
+
+    #[test]
+    fn nav_link_prefix_mode_exact_path_is_active() {
+        let html = nav_link_matched(
+            "/admin/posts",
+            "/admin/posts",
+            "Posts",
+            NavLinkMatch::Prefix,
+        )
+        .into_string();
+        assert!(html.contains(r#"class="active""#), "{html}");
+    }
+
+    #[test]
+    fn nav_link_renders_label_and_href() {
+        let html = nav_link("/somewhere/else", "/admin/posts", "Posts").into_string();
+        assert!(html.contains(r#"href="/admin/posts""#), "{html}");
+        assert!(html.contains(">Posts<"), "{html}");
     }
 
     // ── property_list ──────────────────────────────────────────────────
