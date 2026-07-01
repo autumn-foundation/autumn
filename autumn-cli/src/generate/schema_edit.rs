@@ -1308,6 +1308,16 @@ fn ensure_dep_feature_status_in_section(
 /// dev-dependency leaves an otherwise-valid project unable to compile its
 /// test targets at all.
 ///
+/// If there's no existing `tokio` dev-dependency, the new entry mirrors
+/// whatever `[dependencies]` declares for `tokio` (crates.io version,
+/// `workspace = true`, `path`, `git`, etc.) via [`detect_dependencies_source`],
+/// for the same reason [`ensure_dev_dependency_test_support`] mirrors
+/// `autumn-web`'s source: Cargo requires every declaration of a dependency
+/// to unify to one source across build targets, so defaulting to a
+/// crates.io version unconditionally would break `cargo` entirely for any
+/// project that sources `tokio` from the workspace or a local path/git
+/// checkout in `[dependencies]`.
+///
 /// Idempotent: a second call is a no-op once both features are present.
 #[must_use]
 pub fn ensure_dev_dependency_tokio_test_features(existing: &str) -> String {
@@ -1323,7 +1333,9 @@ pub fn ensure_dev_dependency_tokio_test_features(existing: &str) -> String {
     // features. (If it existed but was missing one of the features, the two
     // ensure_dep_feature_status_in_section calls above already added it.)
     let lines: Vec<&str> = existing.lines().collect();
-    let new_dep_line = "tokio = { version = \"1\", features = [\"rt\", \"macros\"] }";
+    let source = detect_dependencies_source(existing, "tokio")
+        .unwrap_or_else(|| "version = \"1\"".to_string());
+    let new_dep_line = format!("tokio = {{ {source}, features = [\"rt\", \"macros\"] }}");
 
     let Some(header_idx) = lines
         .iter()
@@ -1542,45 +1554,34 @@ fn extract_source_from_subtable_lines(lines: &[&str]) -> Option<String> {
     )
 }
 
-/// Extract the version literal from a plain-string `autumn-web = "x.y.z"`
+/// Extract the version literal from a plain-string `<dep_name> = "x.y.z"`
 /// declaration (no inline table), so it can be mirrored the same way an
 /// explicit `version = "..."` key is.
-fn extract_plain_string_version(line: &str) -> Option<String> {
-    let rest = line.trim().strip_prefix("autumn-web")?.trim_start();
+fn extract_plain_string_version(line: &str, dep_name: &str) -> Option<String> {
+    let rest = line.trim().strip_prefix(dep_name)?.trim_start();
     let rest = rest.strip_prefix('=')?.trim_start();
     let rest = rest.split('#').next().unwrap_or(rest).trim();
     (rest.starts_with('"') && rest.ends_with('"') && rest.len() >= 2)
         .then(|| format!("version = {rest}"))
 }
 
-/// Detect the source (`workspace = true`, `path = "..."`, `git = "..."`,
-/// `version = "..."`, etc.) that `[dependencies]` declares for `autumn-web`,
-/// so a freshly inserted `[dev-dependencies]` entry can mirror it instead of
-/// defaulting to the CLI's own `version = ...`. See [`SOURCE_KEYS`] for why
-/// mismatched sources break the build, and [`extract_source_keys`] for why
-/// even a plain crates.io version needs mirroring (not just workspace/path/
-/// git/registry): a stale or pinned `[dependencies]` requirement that
-/// doesn't overlap the CLI's version makes Cargo's resolver fail too.
+/// Like [`detect_dependencies_autumn_web_source`], but for an arbitrary
+/// dependency name instead of always `autumn-web`. Doesn't handle a
+/// renamed/aliased dependency -- see [`ensure_dep_feature_status_in_section`]
+/// for why that stays specific to `autumn-web`.
 ///
-/// Returns `None` only when `[dependencies]` has no `autumn-web` entry at
-/// all, in which case the caller should fall back to an explicit
-/// `version = ...`.
-fn detect_dependencies_autumn_web_source(existing: &str) -> Option<String> {
+/// Returns `None` when `[dependencies]` has no `<dep_name>` entry at all, or
+/// declares it as a plain crates.io dependency with no other source keys and
+/// no explicit `version` either (i.e. nothing at all to mirror).
+fn detect_dependencies_source(existing: &str, dep_name: &str) -> Option<String> {
     let lines: Vec<&str> = existing.lines().collect();
     let mut in_section = false;
-    // Every `autumn-web.<key> = <value>` dotted line, collected across the
+    // Every `<dep_name>.<key> = <value>` dotted line, collected across the
     // whole section before filtering -- a dep can spread `version` and
     // `registry` (or any other source key) across separate dotted lines in
     // any order, and extract_source_keys needs to see all of them at once to
     // apply the "registry needs version too" rule.
     let mut dotted_pairs: Vec<String> = Vec::new();
-    // Same idea for a renamed dep's dotted form, e.g. `autumn_web.package =
-    // "autumn-web"` plus `autumn_web.path = "../autumn"` -- only trusted as
-    // the autumn-web alias once a sibling `.package = "autumn-web"` line
-    // confirms it (an alias importable as `autumn_web` could coincidentally
-    // exist for an unrelated crate otherwise).
-    let mut alias_dotted_pairs: Vec<String> = Vec::new();
-    let mut alias_confirmed = false;
 
     // Pass 1: inline or dotted-key form directly under `[dependencies]`.
     for &line in &lines {
@@ -1597,45 +1598,11 @@ fn detect_dependencies_autumn_web_source(existing: &str) -> Option<String> {
             continue;
         }
         let after_ws = line.trim_start();
-        let Some(rest) = after_ws.strip_prefix("autumn-web") else {
-            // Not the literal `autumn-web` key -- check for a renamed dep,
-            // e.g. `aw = { package = "autumn-web", path = "../autumn" }` or
-            // its dotted-key equivalent `aw.package = "autumn-web"` /
-            // `aw.path = "../autumn"`. `ensure_autumn_web_feature_status_in_section`
-            // already mirrors both shapes for `[dependencies]`; the
-            // source-detection path needs the same coverage, else it
-            // silently drops the alias's path/git/workspace source and
-            // falls back to a mismatched crates.io version.
-            let Some((key, val)) = after_ws.split_once('=') else {
-                continue;
-            };
-            let key = key.trim();
-            let (alias, dotted_sub) = key
-                .split_once('.')
-                .map_or((key, None), |(b, r)| (b, Some(r)));
-            if alias.replace('-', "_") != "autumn_web" {
-                continue;
-            }
-            let val_code = val.split('#').next().unwrap_or(val).trim();
-            let Some(sub) = dotted_sub else {
-                // Inline form: autumn_web = { package = "autumn-web", ... }.
-                if val_code.contains(r#"package = "autumn-web""#)
-                    || val_code.contains(r#"package="autumn-web""#)
-                {
-                    return extract_source_from_inline_table(line);
-                }
-                continue;
-            };
-            // Dotted form: autumn_web.package = "autumn-web" /
-            // autumn_web.path = "../autumn" / etc.
-            if sub == "package" && val_code.trim_matches('"') == "autumn-web" {
-                alias_confirmed = true;
-            }
-            alias_dotted_pairs.push(format!("{sub} = {val_code}"));
+        let Some(rest) = after_ws.strip_prefix(dep_name) else {
             continue;
         };
         if let Some(dotted) = rest.strip_prefix('.') {
-            // autumn-web.workspace = true / autumn-web.path = "..." / etc.
+            // <dep_name>.workspace = true / <dep_name>.path = "..." / etc.
             let code = dotted.split_once('#').map_or(dotted, |(before, _)| before);
             if let Some((key, value)) = code.split_once('=') {
                 dotted_pairs.push(format!("{} = {}", key.trim(), value.trim()));
@@ -1643,46 +1610,126 @@ fn detect_dependencies_autumn_web_source(existing: &str) -> Option<String> {
             continue;
         }
         if rest.starts_with(|c: char| c != '=' && !c.is_whitespace()) {
-            // A different dependency (e.g. `autumn-web2`) -- keep scanning.
+            // A different dependency sharing this prefix -- keep scanning.
             continue;
         }
-        // The single `autumn-web = ...` declaration for this section: a
+        // The single `<dep_name> = ...` declaration for this section: a
         // plain string version, or an inline table that may carry
         // `workspace`/`path`/`git`/`version`.
-        if let Some(version) = extract_plain_string_version(line) {
+        if let Some(version) = extract_plain_string_version(line, dep_name) {
             return Some(version);
         }
         return extract_source_from_inline_table(line);
-    }
-
-    if alias_confirmed {
-        return extract_source_keys(alias_dotted_pairs.iter().map(String::as_str));
     }
 
     if !dotted_pairs.is_empty() {
         return extract_source_keys(dotted_pairs.iter().map(String::as_str));
     }
 
-    // Pass 2: multiline `[dependencies.autumn-web]` subtable form.
-    let subtable_key = "[dependencies.autumn-web]";
-    if let Some(section_start) = lines
+    // Pass 2: multiline `[dependencies.<dep_name>]` subtable form.
+    let subtable_key = format!("[dependencies.{dep_name}]");
+    let section_start = lines
         .iter()
         .position(|l| l.trim().split('#').next().unwrap_or("").trim() == subtable_key)
-        .map(|p| p + 1)
-    {
-        let section_end = lines[section_start..]
-            .iter()
-            .position(|l| {
-                let t = l.trim();
-                t.starts_with('[') && !t.is_empty()
-            })
-            .map_or(lines.len(), |p| section_start + p);
-        return extract_source_from_subtable_lines(&lines[section_start..section_end]);
+        .map(|p| p + 1)?;
+    let section_end = lines[section_start..]
+        .iter()
+        .position(|l| {
+            let t = l.trim();
+            t.starts_with('[') && !t.is_empty()
+        })
+        .map_or(lines.len(), |p| section_start + p);
+    extract_source_from_subtable_lines(&lines[section_start..section_end])
+}
+
+/// Detect the source (`workspace = true`, `path = "..."`, `git = "..."`,
+/// `version = "..."`, etc.) that `[dependencies]` declares for `autumn-web`,
+/// so a freshly inserted `[dev-dependencies]` entry can mirror it instead of
+/// defaulting to the CLI's own `version = ...`. See [`SOURCE_KEYS`] for why
+/// mismatched sources break the build, and [`extract_source_keys`] for why
+/// even a plain crates.io version needs mirroring (not just workspace/path/
+/// git/registry): a stale or pinned `[dependencies]` requirement that
+/// doesn't overlap the CLI's version makes Cargo's resolver fail too.
+///
+/// Returns `None` only when `[dependencies]` has no `autumn-web` entry at
+/// all, in which case the caller should fall back to an explicit
+/// `version = ...`.
+fn detect_dependencies_autumn_web_source(existing: &str) -> Option<String> {
+    if let Some(source) = detect_dependencies_source(existing, "autumn-web") {
+        return Some(source);
     }
 
-    // Pass 2c: `[dependencies.autumn_web]` subtable whose body declares
-    // `package = "autumn-web"` -- the table-key form of a renamed dep
-    // (mirrors `ensure_autumn_web_feature_status_in_section`'s Pass 2b).
+    // Not found under the literal key -- check for a renamed dep, e.g.
+    // `aw = { package = "autumn-web", path = "../autumn" }` or its
+    // dotted-key equivalent `aw.package = "autumn-web"` / `aw.path =
+    // "../autumn"`. `ensure_autumn_web_feature_status_in_section` already
+    // mirrors both shapes for `[dependencies]`; the source-detection path
+    // needs the same coverage, else it silently drops the alias's
+    // path/git/workspace source and falls back to a mismatched crates.io
+    // version.
+    let lines: Vec<&str> = existing.lines().collect();
+    let mut in_section = false;
+    // Every `autumn_web.<key> = <value>` dotted line, collected across the
+    // whole section -- only trusted as the autumn-web alias once a sibling
+    // `.package = "autumn-web"` line confirms it (an alias importable as
+    // `autumn_web` could coincidentally exist for an unrelated crate
+    // otherwise).
+    let mut alias_dotted_pairs: Vec<String> = Vec::new();
+    let mut alias_confirmed = false;
+
+    for &line in &lines {
+        let trimmed = line.trim();
+        if is_section_header(trimmed, "dependencies") {
+            in_section = true;
+            continue;
+        }
+        if in_section && is_section_boundary(trimmed, "dependencies") {
+            in_section = false;
+            continue;
+        }
+        if !in_section || trimmed.starts_with('#') {
+            continue;
+        }
+        let after_ws = line.trim_start();
+        if after_ws.strip_prefix("autumn-web").is_some() {
+            // The literal key -- already covered by detect_dependencies_source above.
+            continue;
+        }
+        let Some((key, val)) = after_ws.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        let (alias, dotted_sub) = key
+            .split_once('.')
+            .map_or((key, None), |(b, r)| (b, Some(r)));
+        if alias.replace('-', "_") != "autumn_web" {
+            continue;
+        }
+        let val_code = val.split('#').next().unwrap_or(val).trim();
+        let Some(sub) = dotted_sub else {
+            // Inline form: autumn_web = { package = "autumn-web", ... }.
+            if val_code.contains(r#"package = "autumn-web""#)
+                || val_code.contains(r#"package="autumn-web""#)
+            {
+                return extract_source_from_inline_table(line);
+            }
+            continue;
+        };
+        // Dotted form: autumn_web.package = "autumn-web" /
+        // autumn_web.path = "../autumn" / etc.
+        if sub == "package" && val_code.trim_matches('"') == "autumn-web" {
+            alias_confirmed = true;
+        }
+        alias_dotted_pairs.push(format!("{sub} = {val_code}"));
+    }
+
+    if alias_confirmed {
+        return extract_source_keys(alias_dotted_pairs.iter().map(String::as_str));
+    }
+
+    // `[dependencies.autumn_web]` subtable whose body declares `package =
+    // "autumn-web"` -- the table-key form of a renamed dep (mirrors
+    // `ensure_autumn_web_feature_status_in_section`'s Pass 2b).
     let section_start =
         find_section_start_with_autumn_web_package(&lines, "[dependencies.autumn_web]")?;
     let section_end = lines[section_start..]
@@ -4876,6 +4923,45 @@ pub struct Comment {
             updated.matches("tokio").count(),
             1,
             "must not insert a duplicate tokio entry: {updated}"
+        );
+    }
+
+    #[test]
+    fn tokio_test_features_mirrors_path_source() {
+        // Regression test (Codex review, issue #1023): the same
+        // source-mismatch bug that motivated the whole autumn-web
+        // source-mirroring saga also applies to tokio -- if [dependencies]
+        // sources tokio from a path/workspace/git override (e.g. an
+        // internal fork), inserting a crates.io `version = "1"` dev entry
+        // makes Cargo reject the manifest ("Dependency 'tokio' has
+        // different source paths depending on the build target"; confirmed
+        // via a hand-built `cargo metadata --offline` reproduction). The
+        // new entry must mirror the existing path source instead.
+        let cargo =
+            "[package]\nname=\"x\"\n\n[dependencies]\ntokio = { path = \"../fake-tokio\" }\n";
+        let updated = ensure_dev_dependency_tokio_test_features(cargo);
+        let tokio_dev_line = updated
+            .lines()
+            .find(|l| l.trim_start().starts_with("tokio") && l.contains("rt"))
+            .unwrap_or_else(|| panic!("no tokio dev-dependency line in: {updated}"));
+        assert!(
+            tokio_dev_line.contains("path = \"../fake-tokio\""),
+            "must mirror the path source instead of defaulting to a crates.io version: {tokio_dev_line}"
+        );
+        assert!(!tokio_dev_line.contains("version"));
+    }
+
+    #[test]
+    fn tokio_test_features_falls_back_to_version_for_plain_crates_io_dep() {
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\ntokio = \"1\"\n";
+        let updated = ensure_dev_dependency_tokio_test_features(cargo);
+        let tokio_dev_line = updated
+            .lines()
+            .find(|l| l.trim_start().starts_with("tokio") && l.contains("rt"))
+            .unwrap_or_else(|| panic!("no tokio dev-dependency line in: {updated}"));
+        assert!(
+            tokio_dev_line.contains("version = \"1\""),
+            "must fall back to an explicit version when [dependencies] has no source keys: {tokio_dev_line}"
         );
     }
 
