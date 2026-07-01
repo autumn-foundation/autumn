@@ -22,7 +22,7 @@ no extra imports are needed beyond the usual `use autumn_web::prelude::*;`.
 | `pluralize_with(count, "octopus", "octopi")` | `1 octopus` / `2 octopi` |
 | `truncate(text, 30)` | `The quick brown fox jumps ov…` |
 | `truncate_words(text, 5)` | `The quick brown fox jumps…` |
-| `time_ago_in_words(dt, &clock)` | `3 minutes ago` / `in 2 days` |
+| `time_ago_in_words(dt, clock.now())` | `3 minutes ago` / `in 2 days` |
 | `format_datetime(dt, "%Y-%m-%d")` | `2026-06-07` |
 
 `number_to_currency` takes a [`rust_decimal::Decimal`](https://docs.rs/rust_decimal)

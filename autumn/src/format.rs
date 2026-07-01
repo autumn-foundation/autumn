@@ -39,7 +39,7 @@ use rust_decimal::Decimal;
 /// Configuration for [`CurrencyOptions::format`] — symbol, precision, and
 /// thousands/decimal separators.
 #[cfg(feature = "maud")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 pub struct CurrencyOptions<'a> {
     symbol: &'a str,
     precision: u32,
@@ -121,23 +121,20 @@ fn format_currency(value: Decimal, options: &CurrencyOptions<'_>) -> String {
         rust_decimal::RoundingStrategy::MidpointAwayFromZero,
     );
     let negative = rounded.is_sign_negative() && !rounded.is_zero();
-    let abs = rounded.abs();
-    let digits = format!("{:.prec$}", abs, prec = options.precision as usize);
+    let digits = format!(
+        "{:.prec$}",
+        rounded.abs(),
+        prec = options.precision as usize
+    );
     let (int_part, frac_part) = split_decimal_string(&digits);
-    let grouped_int = group_thousands(int_part, options.thousands_separator);
-
-    let mut out =
-        String::with_capacity(options.symbol.len() + grouped_int.len() + frac_part.len() + 2);
-    if negative {
-        out.push('-');
-    }
-    out.push_str(options.symbol);
-    out.push_str(&grouped_int);
-    if options.precision > 0 {
-        out.push(options.decimal_separator);
-        out.push_str(frac_part);
-    }
-    out
+    assemble_signed_grouped(
+        negative,
+        int_part,
+        frac_part,
+        options.thousands_separator,
+        options.decimal_separator,
+        options.symbol,
+    )
 }
 
 // ── Delimited numbers ────────────────────────────────────────────────────────
@@ -151,20 +148,9 @@ fn format_currency(value: Decimal, options: &CurrencyOptions<'_>) -> String {
 pub fn number_with_delimiter<T: Into<Decimal>>(value: T) -> maud::Markup {
     let value: Decimal = value.into();
     let negative = value.is_sign_negative() && !value.is_zero();
-    let abs = value.abs();
-    let digits = abs.to_string();
+    let digits = value.abs().to_string();
     let (int_part, frac_part) = split_decimal_string(&digits);
-    let grouped_int = group_thousands(int_part, ',');
-
-    let mut out = String::with_capacity(grouped_int.len() + frac_part.len() + 2);
-    if negative {
-        out.push('-');
-    }
-    out.push_str(&grouped_int);
-    if !frac_part.is_empty() {
-        out.push('.');
-        out.push_str(frac_part);
-    }
+    let out = assemble_signed_grouped(negative, int_part, frac_part, ',', '.', "");
     maud::html! { (out) }
 }
 
@@ -172,6 +158,32 @@ pub fn number_with_delimiter<T: Into<Decimal>>(value: T) -> maud::Markup {
 /// and fractional parts (without the separating dot).
 fn split_decimal_string(s: &str) -> (&str, &str) {
     s.split_once('.').unwrap_or((s, ""))
+}
+
+/// Assemble a signed, thousands-grouped decimal string:
+/// `[-][symbol]grouped-int[decimal_sep+frac]`. Shared by [`format_currency`]
+/// and [`number_with_delimiter`], which differ only in `symbol` and
+/// separators.
+fn assemble_signed_grouped(
+    negative: bool,
+    int_part: &str,
+    frac_part: &str,
+    thousands_separator: char,
+    decimal_separator: char,
+    symbol: &str,
+) -> String {
+    let grouped_int = group_thousands(int_part, thousands_separator);
+    let mut out = String::with_capacity(symbol.len() + grouped_int.len() + frac_part.len() + 2);
+    if negative {
+        out.push('-');
+    }
+    out.push_str(symbol);
+    out.push_str(&grouped_int);
+    if !frac_part.is_empty() {
+        out.push(decimal_separator);
+        out.push_str(frac_part);
+    }
+    out
 }
 
 /// Group the ASCII digits of `int_digits` into threes, joined by `separator`.
@@ -215,10 +227,15 @@ pub fn pluralize_with(count: i64, singular: &str, plural: &str) -> maud::Markup 
     maud::html! { (count) " " (word) }
 }
 
-/// Naive English pluraliser for display words. Mirrors the identifier
-/// pluraliser in `autumn-cli`'s naming helpers, minus the `snake_case`
-/// segment-splitting (display words are whole words, not identifiers).
-fn pluralize_word(word: &str) -> String {
+/// Naive English pluraliser for a single word: irregulars, sibilant endings
+/// (`+es`), consonant+`y` (`y` → `ies`), otherwise `+s`.
+///
+/// Shared with `autumn-cli`'s identifier pluraliser
+/// ([`autumn_web::format::pluralize_word`] wrapped with `snake_case`
+/// segment-splitting there), so both the CLI-generated names and the
+/// rendered page text agree on the same rules.
+#[must_use]
+pub fn pluralize_word(word: &str) -> String {
     if word.is_empty() {
         return String::new();
     }
@@ -270,7 +287,13 @@ pub fn truncate_with(text: &str, len: usize, omission: &str) -> maud::Markup {
         return maud::html! { (text) };
     }
     let omission_len = omission.chars().count();
-    let keep = len.saturating_sub(omission_len);
+    if omission_len >= len {
+        // Even the omission marker doesn't fit `len` on its own; clip it so
+        // the total output still honors the caller's length cap.
+        let clipped: String = omission.chars().take(len).collect();
+        return maud::html! { (clipped) };
+    }
+    let keep = len - omission_len;
     let truncated: String = text.chars().take(keep).collect();
     maud::html! { (truncated) (omission) }
 }
@@ -310,7 +333,9 @@ pub fn time_ago_in_words(dt: DateTime<Utc>, now: DateTime<Utc>) -> maud::Markup 
     maud::html! { (text) }
 }
 
-fn relative_time_words(dt: DateTime<Utc>, now: DateTime<Utc>) -> String {
+/// Render the relative-time phrase shared with [`crate::time_zone::time_ago`]
+/// (which additionally wraps it in a localized `<time>` element).
+pub(crate) fn relative_time_words(dt: DateTime<Utc>, now: DateTime<Utc>) -> String {
     let secs = now.signed_duration_since(dt).num_seconds();
     if secs < 0 {
         format!("in {}", duration_words(secs.unsigned_abs()))
@@ -531,6 +556,15 @@ mod tests {
         assert_eq!(
             truncate_with("The quick brown fox", 16, " [more]").into_string(),
             "The quick [more]"
+        );
+    }
+
+    #[test]
+    fn truncate_with_omission_longer_than_len_is_clipped() {
+        // The omission marker itself must not push the total past `len`.
+        assert_eq!(
+            truncate_with("The quick brown fox", 2, " [read more]").into_string(),
+            " ["
         );
     }
 
