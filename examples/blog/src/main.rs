@@ -163,4 +163,31 @@ mod tests {
         assert!(html.contains("Autumn Blog"), "html: {html}");
         assert!(!html.contains("nav.brand"), "html: {html}");
     }
+
+    #[tokio::test]
+    async fn home_hero_i18n_keys_resolve_in_both_locales() {
+        let bundle = autumn_web::i18n::Bundle::load_from_dir(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("i18n"),
+            &autumn_web::i18n::I18nConfig {
+                supported_locales: vec!["en".to_owned(), "es".to_owned()],
+                ..Default::default()
+            },
+        )
+        .expect("blog i18n bundle");
+        let bundle = std::sync::Arc::new(bundle);
+
+        let en = autumn_web::i18n::Locale::new("en").with_bundle(bundle.clone());
+        assert_eq!(en.t("home.hero.title"), "Welcome to the Blog");
+        assert_eq!(
+            en.t("home.hero.subtitle"),
+            "Thoughts, tutorials, and stories — powered by Autumn."
+        );
+
+        let es = autumn_web::i18n::Locale::new("es").with_bundle(bundle);
+        assert_eq!(es.t("home.hero.title"), "Bienvenido al Blog");
+        assert_eq!(
+            es.t("home.hero.subtitle"),
+            "Reflexiones, tutoriales e historias — con la potencia de Autumn."
+        );
+    }
 }

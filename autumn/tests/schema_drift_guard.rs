@@ -33,11 +33,33 @@
 //! UPDATE_SCHEMA_SNAPSHOT=1 cargo test -p autumn-web schema_keys_snapshot_guard
 //! ```
 //!
-//! This test is pinned to the features compiled in the workspace default feature
-//! set.  Run `cargo test --all-features` when the feature set changes.
+//! The snapshot is generated with every optional root section compiled in
+//! (`cargo test --all-features`), so it always contains `i18n`/`mail`/
+//! `storage`/`http`/`reporting` alongside the always-on sections. A handful of
+//! `AutumnConfig` root fields are gated behind an optional cargo feature (see
+//! [`FEATURE_GATED_ROOTS`]); when this test binary is compiled without one of
+//! those features (e.g. `cargo test -p autumn-web --features maud`, which
+//! carries only the crate's own default features), that root section is
+//! legitimately absent from `schema_leaf_paths()` — not a real removal — so
+//! the guard below excludes it rather than failing.
 
 use autumn_web::config::{AutumnConfig, deprecated_config_keys};
 use std::collections::BTreeSet;
+
+/// Pairs of (is this optional feature enabled in this build, its
+/// `AutumnConfig` root section) for every field in `config.rs` gated behind
+/// `#[cfg(feature = "...")]`. Keep in sync with `config.rs`'s `AutumnConfig`
+/// struct — [`feature_gated_roots_mapping_matches_config_when_enabled`] below
+/// self-checks this list whenever a listed feature happens to be enabled.
+const fn feature_gated_roots() -> [(bool, &'static str); 5] {
+    [
+        (cfg!(feature = "i18n"), "i18n"),
+        (cfg!(feature = "mail"), "mail"),
+        (cfg!(feature = "storage"), "storage"),
+        (cfg!(feature = "http-client"), "http"),
+        (cfg!(feature = "reporting"), "reporting"),
+    ]
+}
 
 const SNAPSHOT_PATH: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -85,12 +107,20 @@ fn schema_keys_snapshot_guard() {
 
     let snapshot = load_snapshot();
     let registry: BTreeSet<&str> = deprecated_config_keys().iter().map(|d| d.path).collect();
+    let disabled_roots: BTreeSet<&str> = feature_gated_roots()
+        .into_iter()
+        .filter(|(enabled, _)| !enabled)
+        .map(|(_, root)| root)
+        .collect();
 
-    // Keys in snapshot but absent from current schema without a registry entry.
+    // Keys in snapshot but absent from current schema without a registry
+    // entry, excluding root sections whose gating feature isn't compiled
+    // into this test binary (see module docs).
     let removed_without_deprecation: Vec<&str> = snapshot
         .iter()
         .filter(|k| !current.contains(k.as_str()))
         .filter(|k| !registry.contains(k.as_str()))
+        .filter(|k| !disabled_roots.contains(k.split('.').next().unwrap_or(k.as_str())))
         .map(String::as_str)
         .collect();
 
@@ -139,6 +169,30 @@ fn every_registered_deprecated_key_has_a_known_root_section() {
         orphaned.is_empty(),
         "DEPRECATED_CONFIG_KEYS entries reference unknown root sections \
          (the section was renamed or removed): {orphaned:?}\nKnown roots: {roots:?}",
+    );
+}
+
+/// Self-check for [`feature_gated_roots`]: whenever a listed feature happens
+/// to be enabled in this build (e.g. via workspace feature unification with
+/// `cargo test --workspace`, or `--all-features`), its mapped root section
+/// must actually appear in the compiled schema. Catches the mapping going
+/// stale (a feature renamed, or a root field renamed/removed) instead of
+/// silently letting a real removal slip past the guard above as "expected".
+#[test]
+fn feature_gated_roots_mapping_matches_config_when_enabled() {
+    let current = AutumnConfig::schema_leaf_paths();
+    let stale: Vec<&str> = feature_gated_roots()
+        .into_iter()
+        .filter(|(enabled, _)| *enabled)
+        .map(|(_, root)| root)
+        .filter(|root| !current.iter().any(|k| k.split('.').next() == Some(*root)))
+        .collect();
+
+    assert!(
+        stale.is_empty(),
+        "feature_gated_roots() in this file is stale: these features are enabled in this \
+         build but their mapped root section is missing from the compiled schema: {stale:?}\n\
+         Update the mapping to match config.rs's current #[cfg(feature = \"...\")] fields.",
     );
 }
 

@@ -16,6 +16,10 @@ nav.locale.es = Español
 
 footer.tagline = Built with Autumn
 
+# ── Home page ─────────────────────────────────────────────────
+home.hero.title = Welcome to the Blog
+home.hero.subtitle = Thoughts, tutorials, and stories — powered by Autumn.
+
 # ── Greet page (demonstrates t! macro) ───────────────────────
 greet.title = Welcome to the Autumn Blog
 greet.greeting = Hello, { $name }! You are viewing this page in English.

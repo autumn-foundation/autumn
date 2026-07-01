@@ -8,7 +8,7 @@ use autumn_web::cache::cache_fragment_global;
 use autumn_web::extract::{Form, Path};
 use autumn_web::i18n::Locale;
 use autumn_web::seo::SeoMeta;
-use autumn_web::widgets::{Crumb, breadcrumb};
+use autumn_web::widgets::{Crumb, HeroConfig, breadcrumb, hero};
 use autumn_web::{AutumnError, AutumnResult, Db, Markup, Redirect, delete, get, html, post, t};
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
@@ -246,14 +246,10 @@ pub async fn index(locale: Locale, mut db: Db) -> AutumnResult<Markup> {
         &locale,
         "Autumn Blog",
         html! {
-            header class="mb-10" {
-                h1 class="text-3xl font-bold tracking-tight text-stone-900 mb-2" {
-                    "Welcome to the Blog"
-                }
-                p class="text-stone-600" {
-                    "Thoughts, tutorials, and stories — powered by Autumn."
-                }
-            }
+            (hero(
+                &HeroConfig::new(&t!(locale, "home.hero.title"))
+                    .subtitle(&t!(locale, "home.hero.subtitle"))
+            ))
 
             @if published_posts.is_empty() {
                 div class="text-center py-20" {
