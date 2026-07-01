@@ -1296,8 +1296,8 @@ fn split_top_level_commas(s: &str) -> Vec<&str> {
 
 /// Pull the source-defining keys (see [`SOURCE_KEYS`]) out of a run of
 /// `key = value` pairs, joined back into a single `key = value, ...`
-/// fragment. Returns `None` when none of `pairs` sets a source key (e.g. a
-/// plain `{ version = "...", features = [...] }` table).
+/// fragment. Returns `None` only when `pairs` has no `version` and no
+/// source key at all (i.e. the dependency can't be found).
 ///
 /// `registry` is special-cased: unlike `workspace`/`path`/`git`, a registry
 /// alone doesn't pin a resolvable dependency -- Cargo still requires an
@@ -1305,6 +1305,14 @@ fn split_top_level_commas(s: &str) -> Vec<&str> {
 /// dropping `version` from a registry dep reports "was specified without
 /// a path, git repository, version, or workspace dependency"), so `version`
 /// is mirrored too whenever `registry` is present.
+///
+/// When there's no source key at all (a plain `{ version = "...", features
+/// = [...] }` table), the existing `version` requirement is mirrored on its
+/// own rather than returning `None` -- a caller that fell back to its own
+/// version instead would produce two different requirements for the same
+/// crate (e.g. an existing `autumn-web = "0.5"` pin vs. the CLI's current
+/// `0.6`), which Cargo's resolver rejects outright when the ranges don't
+/// overlap (confirmed via `cargo metadata`: "failed to select a version").
 fn extract_source_keys<'a>(pairs: impl Iterator<Item = &'a str>) -> Option<String> {
     let items: Vec<(&str, &str)> = pairs
         .filter_map(|part| {
@@ -1319,17 +1327,18 @@ fn extract_source_keys<'a>(pairs: impl Iterator<Item = &'a str>) -> Option<Strin
         .map(|(key, value)| format!("{key} = {value}"))
         .collect();
 
+    let version = items.iter().find(|(key, _)| *key == "version");
+
     if found.iter().any(|f| f.starts_with("registry"))
-        && let Some((_, value)) = items.iter().find(|(key, _)| *key == "version")
+        && let Some((_, value)) = version
     {
         found.insert(0, format!("version = {value}"));
     }
 
     if found.is_empty() {
-        None
-    } else {
-        Some(found.join(", "))
+        return version.map(|(_, value)| format!("version = {value}"));
     }
+    Some(found.join(", "))
 }
 
 /// Extract the source keys from an inline-table `autumn-web = { ... }` line.
@@ -1353,15 +1362,29 @@ fn extract_source_from_subtable_lines(lines: &[&str]) -> Option<String> {
     )
 }
 
+/// Extract the version literal from a plain-string `autumn-web = "x.y.z"`
+/// declaration (no inline table), so it can be mirrored the same way an
+/// explicit `version = "..."` key is.
+fn extract_plain_string_version(line: &str) -> Option<String> {
+    let rest = line.trim().strip_prefix("autumn-web")?.trim_start();
+    let rest = rest.strip_prefix('=')?.trim_start();
+    let rest = rest.split('#').next().unwrap_or(rest).trim();
+    (rest.starts_with('"') && rest.ends_with('"') && rest.len() >= 2)
+        .then(|| format!("version = {rest}"))
+}
+
 /// Detect the source (`workspace = true`, `path = "..."`, `git = "..."`,
-/// etc.) that `[dependencies]` declares for `autumn-web`, so a freshly
-/// inserted `[dev-dependencies]` entry can mirror it instead of defaulting
-/// to a crates.io `version = ...`. See [`SOURCE_KEYS`] for why mismatched
-/// sources break the build.
+/// `version = "..."`, etc.) that `[dependencies]` declares for `autumn-web`,
+/// so a freshly inserted `[dev-dependencies]` entry can mirror it instead of
+/// defaulting to the CLI's own `version = ...`. See [`SOURCE_KEYS`] for why
+/// mismatched sources break the build, and [`extract_source_keys`] for why
+/// even a plain crates.io version needs mirroring (not just workspace/path/
+/// git/registry): a stale or pinned `[dependencies]` requirement that
+/// doesn't overlap the CLI's version makes Cargo's resolver fail too.
 ///
-/// Returns `None` when `[dependencies]` declares `autumn-web` as a plain
-/// crates.io dependency (or the entry can't be found at all), in which case
-/// the caller should fall back to an explicit `version = ...`.
+/// Returns `None` only when `[dependencies]` has no `autumn-web` entry at
+/// all, in which case the caller should fall back to an explicit
+/// `version = ...`.
 fn detect_dependencies_autumn_web_source(existing: &str) -> Option<String> {
     let lines: Vec<&str> = existing.lines().collect();
     let mut in_section = false;
@@ -1422,9 +1445,12 @@ fn detect_dependencies_autumn_web_source(existing: &str) -> Option<String> {
             // A different dependency (e.g. `autumn-web2`) -- keep scanning.
             continue;
         }
-        // The single `autumn-web = ...` declaration for this section: either
-        // a plain string version (no source keys -- `None`) or an inline
-        // table that may carry `workspace`/`path`/`git`.
+        // The single `autumn-web = ...` declaration for this section: a
+        // plain string version, or an inline table that may carry
+        // `workspace`/`path`/`git`/`version`.
+        if let Some(version) = extract_plain_string_version(line) {
+            return Some(version);
+        }
         return extract_source_from_inline_table(line);
     }
 
@@ -1434,10 +1460,26 @@ fn detect_dependencies_autumn_web_source(existing: &str) -> Option<String> {
 
     // Pass 2: multiline `[dependencies.autumn-web]` subtable form.
     let subtable_key = "[dependencies.autumn-web]";
-    let section_start = lines
+    if let Some(section_start) = lines
         .iter()
-        .position(|l| l.trim().split('#').next().unwrap_or("").trim() == subtable_key)?
-        + 1;
+        .position(|l| l.trim().split('#').next().unwrap_or("").trim() == subtable_key)
+        .map(|p| p + 1)
+    {
+        let section_end = lines[section_start..]
+            .iter()
+            .position(|l| {
+                let t = l.trim();
+                t.starts_with('[') && !t.is_empty()
+            })
+            .map_or(lines.len(), |p| section_start + p);
+        return extract_source_from_subtable_lines(&lines[section_start..section_end]);
+    }
+
+    // Pass 2c: `[dependencies.autumn_web]` subtable whose body declares
+    // `package = "autumn-web"` -- the table-key form of a renamed dep
+    // (mirrors `ensure_autumn_web_feature_status_in_section`'s Pass 2b).
+    let section_start =
+        find_section_start_with_autumn_web_package(&lines, "[dependencies.autumn_web]")?;
     let section_end = lines[section_start..]
         .iter()
         .position(|l| {
@@ -4399,6 +4441,56 @@ pub struct Comment {
             updated
                 .contains("autumn-web = { path = \"../autumn\", features = [\"test-support\"] }"),
             "must mirror the aliased dep's path source: {updated}"
+        );
+        assert!(!updated.contains("version = \"0.6\""));
+    }
+
+    #[test]
+    fn dev_dependency_test_support_mirrors_existing_pinned_version_not_cli_version() {
+        // Regression test (Codex review, issue #1023): the fallback used to
+        // insert `version = "<CLI's own CARGO_PKG_VERSION>"` unconditionally,
+        // ignoring whatever `[dependencies]` actually pins. When the two
+        // differ (e.g. a project pinned to an older `autumn-web = "0.5"`
+        // while the CLI itself is `0.6`), Cargo's resolver can reject the
+        // manifest outright if the two version requirements don't overlap
+        // (confirmed via `cargo metadata`: "failed to select a version").
+        // The dev-dependency entry must mirror the *existing* requirement,
+        // not the CLI's.
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = \"0.5\"\n";
+        let updated = ensure_dev_dependency_test_support(cargo, "0.6");
+        assert!(
+            updated.contains("autumn-web = { version = \"0.5\", features = [\"test-support\"] }"),
+            "must mirror the existing pinned version, not the CLI's: {updated}"
+        );
+        assert!(!updated.contains("version = \"0.6\""));
+    }
+
+    #[test]
+    fn dev_dependency_test_support_mirrors_version_from_inline_table() {
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = { version = \"0.5\" }\n";
+        let updated = ensure_dev_dependency_test_support(cargo, "0.6");
+        assert!(
+            updated.contains("autumn-web = { version = \"0.5\", features = [\"test-support\"] }"),
+            "must mirror the existing pinned version from an inline table: {updated}"
+        );
+    }
+
+    #[test]
+    fn dev_dependency_test_support_mirrors_aliased_subtable_path_source() {
+        // Regression test (Codex review, issue #1023): the renamed-dep fix
+        // only covered the inline-table alias form (`autumn_web = {
+        // package = "autumn-web", ... }`); the multiline subtable form
+        // (`[dependencies.autumn_web]` with a `package = "autumn-web"`
+        // body) went undetected the same way the unaliased subtable case
+        // did before that fix, silently falling back to a crates.io
+        // version that conflicts with the aliased dep's real path/git/
+        // workspace source.
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies.autumn_web]\npackage = \"autumn-web\"\npath = \"../autumn\"\n";
+        let updated = ensure_dev_dependency_test_support(cargo, "0.6");
+        assert!(
+            updated
+                .contains("autumn-web = { path = \"../autumn\", features = [\"test-support\"] }"),
+            "must mirror the aliased subtable's path source: {updated}"
         );
         assert!(!updated.contains("version = \"0.6\""));
     }
