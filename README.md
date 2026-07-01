@@ -196,6 +196,7 @@ See [EXAMPLES.md](EXAMPLES.md) for the full catalog with personas, journeys, pre
 - [Operating Background Jobs](docs/guide/operating-background-jobs.md) - admin dashboard and recovery actions for `#[job]`
 - [Exposing Your API as MCP Tools](docs/guide/mcp.md) — project typed endpoints into a Model Context Protocol server with `#[api_doc(mcp)]` + `mount_mcp`
 - [Mail Guide](docs/guide/mail.md)
+- [View Formatting Helpers](docs/guide/format-helpers.md) — `number_to_currency`, `pluralize`, `truncate`, `time_ago_in_words`, and friends for Maud templates
 - [Cloud-Native Guide](docs/guide/cloud-native.md)
 - [Logging & PII](docs/guide/logging-pii.md)
 - [Todo Tutorial](docs/guide/tutorial/index.md)

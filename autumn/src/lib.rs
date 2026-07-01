@@ -91,6 +91,11 @@ pub mod error;
 #[cfg(feature = "maud")]
 pub mod error_pages;
 pub mod extract;
+/// View-layer value formatting helpers (currency, delimited numbers,
+/// pluralize, truncate, relative/absolute dates) for Maud templates.
+///
+/// See [`mod@format`] for the full API.
+pub mod format;
 pub mod health;
 #[cfg(feature = "db")]
 pub mod hooks;
@@ -1158,6 +1163,7 @@ pub mod reexports {
     pub use inventory;
     #[cfg(feature = "mail")]
     pub use lettre;
+    pub use rust_decimal;
     #[cfg(feature = "db")]
     pub use scoped_futures;
     pub use serde;
