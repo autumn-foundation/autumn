@@ -105,12 +105,48 @@ impl BookmarkRepository {
         }
     }
 
+    /// Resolve the pool `operation` should actually use, honoring
+    /// `database.read_your_writes`.
+    ///
+    /// This repository predates the `#[repository(...)]` macro (it hand-rolls
+    /// pool selection for finer-grained shard-lease control), so it doesn't
+    /// get RYWW's generated-code wiring for free — it opts in explicitly via
+    /// the same public `is_pinned` call the macro emits. A replica-eligible
+    /// read is redirected to primary while the current request (or session,
+    /// depending on `read_your_writes` mode) is pinned; `role_for`'s answer
+    /// is otherwise final. Split out from [`Self::conn`] so this decision is
+    /// testable without a live pool.
+    fn effective_role(operation: BookmarkOperation) -> PoolRole {
+        let role = Self::role_for(operation);
+        if role == PoolRole::Replica && autumn_web::read_your_writes::is_pinned() {
+            autumn_web::read_your_writes::note_pin_redirect();
+            PoolRole::Primary
+        } else {
+            role
+        }
+    }
+
+    /// Acquire a connection for `operation` from the pool [`Self::effective_role`]
+    /// selects. Only genuine writes call `mark_write()` — mirroring the
+    /// macro's "mark only after a successful primary acquire" behavior —
+    /// not every pin-redirected read.
     async fn conn(
-        role: PoolRole,
+        operation: BookmarkOperation,
     ) -> AutumnResult<diesel_async::pooled_connection::deadpool::Object<AsyncPgConnection>> {
+        let role = Self::effective_role(operation);
         let state = Self::distributed_state()?;
         let pool = Self::pool(&state, role);
-        pool.get().await.map_err(AutumnError::from)
+        let conn = pool.get().await.map_err(AutumnError::from)?;
+        if matches!(
+            operation,
+            BookmarkOperation::Save
+                | BookmarkOperation::Update
+                | BookmarkOperation::DeleteById
+                | BookmarkOperation::MarkDead
+        ) {
+            autumn_web::read_your_writes::mark_write();
+        }
+        Ok(conn)
     }
 
     fn missing_bookmark_error(operation: &'static str, id: i64) -> AutumnError {
@@ -141,7 +177,7 @@ impl BookmarkRepository {
     }
 
     async fn try_acquire_shard_lease(shard: u32) -> AutumnResult<Option<ShardLease>> {
-        let mut conn = Self::conn(Self::role_for(BookmarkOperation::MarkDead)).await?;
+        let mut conn = Self::conn(BookmarkOperation::MarkDead).await?;
         let (namespace, shard_key) = Self::link_checker_lock_key(shard);
         let result = diesel::sql_query("SELECT pg_try_advisory_lock($1, $2) AS acquired")
             .bind::<Integer, _>(namespace)
@@ -184,7 +220,7 @@ impl BookmarkRepository {
     }
 
     pub async fn find_all(&self) -> AutumnResult<Vec<Bookmark>> {
-        let mut conn = Self::conn(Self::role_for(BookmarkOperation::FindAll)).await?;
+        let mut conn = Self::conn(BookmarkOperation::FindAll).await?;
         bookmarks::table
             .load::<Bookmark>(&mut conn)
             .await
@@ -192,7 +228,7 @@ impl BookmarkRepository {
     }
 
     pub async fn find_alive_in_shard(&self, shard: u32) -> AutumnResult<Vec<(i64, String)>> {
-        let mut conn = Self::conn(Self::role_for(BookmarkOperation::FindAliveInShard)).await?;
+        let mut conn = Self::conn(BookmarkOperation::FindAliveInShard).await?;
         diesel::sql_query(
             "SELECT id, url FROM bookmarks WHERE alive = true AND (id % $1) = $2 ORDER BY id",
         )
@@ -205,7 +241,7 @@ impl BookmarkRepository {
     }
 
     pub async fn find_by_tag(&self, tag: String) -> AutumnResult<Vec<Bookmark>> {
-        let mut conn = Self::conn(Self::role_for(BookmarkOperation::FindByTag)).await?;
+        let mut conn = Self::conn(BookmarkOperation::FindByTag).await?;
         bookmarks::table
             .filter(bookmarks::tag.eq(tag))
             .load::<Bookmark>(&mut conn)
@@ -214,7 +250,7 @@ impl BookmarkRepository {
     }
 
     pub async fn find_by_id(&self, id: i64) -> AutumnResult<Option<Bookmark>> {
-        let mut conn = Self::conn(Self::role_for(BookmarkOperation::FindById)).await?;
+        let mut conn = Self::conn(BookmarkOperation::FindById).await?;
         bookmarks::table
             .find(id)
             .first::<Bookmark>(&mut conn)
@@ -224,7 +260,7 @@ impl BookmarkRepository {
     }
 
     pub async fn save(&self, new: &NewBookmark) -> AutumnResult<Bookmark> {
-        let mut conn = Self::conn(Self::role_for(BookmarkOperation::Save)).await?;
+        let mut conn = Self::conn(BookmarkOperation::Save).await?;
         diesel::insert_into(bookmarks::table)
             .values(new)
             .get_result::<Bookmark>(&mut conn)
@@ -233,7 +269,7 @@ impl BookmarkRepository {
     }
 
     pub async fn update(&self, id: i64, changes: &UpdateBookmark) -> AutumnResult<Bookmark> {
-        let mut conn = Self::conn(Self::role_for(BookmarkOperation::Update)).await?;
+        let mut conn = Self::conn(BookmarkOperation::Update).await?;
         let changeset = changes.__to_changeset();
         let result = diesel::update(bookmarks::table.find(id))
             .set(&changeset)
@@ -243,7 +279,7 @@ impl BookmarkRepository {
     }
 
     pub async fn delete_by_id(&self, id: i64) -> AutumnResult<()> {
-        let mut conn = Self::conn(Self::role_for(BookmarkOperation::DeleteById)).await?;
+        let mut conn = Self::conn(BookmarkOperation::DeleteById).await?;
         let affected = diesel::delete(bookmarks::table.find(id))
             .execute(&mut conn)
             .await
@@ -255,7 +291,7 @@ impl BookmarkRepository {
     }
 
     pub async fn mark_dead(&self, id: i64) -> AutumnResult<bool> {
-        let mut conn = Self::conn(Self::role_for(BookmarkOperation::MarkDead)).await?;
+        let mut conn = Self::conn(BookmarkOperation::MarkDead).await?;
         let affected = diesel::update(bookmarks::table.find(id))
             .set(bookmarks::alive.eq(false))
             .execute(&mut conn)
@@ -273,7 +309,7 @@ impl BookmarkRepository {
     }
 
     pub async fn count_all(&self) -> AutumnResult<i64> {
-        let mut conn = Self::conn(Self::role_for(BookmarkOperation::FindAll)).await?;
+        let mut conn = Self::conn(BookmarkOperation::FindAll).await?;
         bookmarks::table
             .count()
             .get_result::<i64>(&mut conn)
@@ -349,6 +385,8 @@ mod tests {
     use crate::config::DistributedConfig;
     use crate::db::create_dual_pools;
     use crate::state::DistributedState;
+    use autumn_web::config::ReadYourWrites;
+    use autumn_web::read_your_writes::{RequestPin, mark_write, scope};
     use autumn_web::test::TestDb;
     use diesel::result::Error as DieselError;
     use std::sync::Arc;
@@ -387,6 +425,88 @@ mod tests {
             BookmarkRepository::role_for(BookmarkOperation::MarkDead),
             PoolRole::Primary
         );
+    }
+
+    // ── RYWW wiring (BookmarkRepository::effective_role) ────────────────────
+    //
+    // This repository predates the `#[repository(...)]` macro, so it doesn't
+    // get RYWW's pin-checking for free — it opts in explicitly in `conn()`.
+    // These tests exercise that opt-in against the same public `is_pinned`
+    // task-local the framework's own generated code and RYW middleware use
+    // (see `autumn/src/read_your_writes.rs`), without needing a live pool —
+    // the full write-then-read path is covered by
+    // `tests/system/smoke.rs::bookmarks_distributed_read_your_own_write_after_create`.
+
+    #[tokio::test]
+    async fn effective_role_replica_reads_stay_on_replica_with_no_pin() {
+        assert_eq!(
+            BookmarkRepository::effective_role(BookmarkOperation::FindAll),
+            PoolRole::Replica,
+            "outside any RYWW scope, reads must keep going to the replica"
+        );
+    }
+
+    #[tokio::test]
+    async fn effective_role_replica_reads_stay_on_replica_before_a_write() {
+        let pin = RequestPin::new(ReadYourWrites::Request);
+        scope(pin, async {
+            assert_eq!(
+                BookmarkRepository::effective_role(BookmarkOperation::FindAll),
+                PoolRole::Replica,
+                "a pin scope alone (no write yet) must not redirect reads"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn effective_role_redirects_replica_reads_to_primary_after_a_write() {
+        let pin = RequestPin::new(ReadYourWrites::Request);
+        scope(pin, async {
+            mark_write();
+            assert_eq!(
+                BookmarkRepository::effective_role(BookmarkOperation::FindAll),
+                PoolRole::Primary,
+                "a replica-eligible read after a write must redirect to primary"
+            );
+            assert_eq!(
+                BookmarkRepository::effective_role(BookmarkOperation::FindByTag),
+                PoolRole::Primary
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn effective_role_ignores_the_pin_when_read_your_writes_is_off() {
+        let pin = RequestPin::new(ReadYourWrites::Off);
+        scope(pin, async {
+            mark_write();
+            assert_eq!(
+                BookmarkRepository::effective_role(BookmarkOperation::FindAll),
+                PoolRole::Replica,
+                "off mode must never redirect, even after a write"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn effective_role_writes_always_target_primary_regardless_of_pin_state() {
+        assert_eq!(
+            BookmarkRepository::effective_role(BookmarkOperation::Save),
+            PoolRole::Primary,
+            "writes are already Primary via role_for, pin or not"
+        );
+        let pin = RequestPin::new(ReadYourWrites::Request);
+        scope(pin, async {
+            mark_write();
+            assert_eq!(
+                BookmarkRepository::effective_role(BookmarkOperation::Save),
+                PoolRole::Primary
+            );
+        })
+        .await;
     }
 
     #[test]

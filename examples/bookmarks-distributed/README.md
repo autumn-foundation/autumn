@@ -15,6 +15,7 @@ runtime seams pulled into the open instead of hidden behind happy-path defaults.
 | **Profiles** | `autumn.toml` + `autumn-dev.toml` + `autumn-docker.toml` | Local dev and Docker deployment use canonical `[database]` primary/replica wiring without touching framework internals |
 | **`#[model]`** | `models.rs` | Generates `Bookmark`, `NewBookmark`, `UpdateBookmark` from one struct |
 | **Explicit repository** | `repositories.rs` | Routes reads to replica, writes to primary, and defines `/api/bookmarks` handlers by hand |
+| **Read-your-own-writes** | `autumn.toml` `[database]` + `repositories.rs` | `read_your_writes = "session"` pins a client's reads to the primary for `pin_after_write_secs` after any write; since this repository predates the `#[repository(...)]` macro it opts in explicitly via the public `read_your_writes::is_pinned`/`mark_write` calls |
 | **Partitioned scheduled task** | `tasks.rs` | `#[scheduled(every = "1h")]` link checker partitions work into fixed shards and uses Postgres advisory locks for ownership |
 | **Explicit migrator** | `src/bin/migrate.rs` | Runs embedded migrations once against the primary before web replicas start |
 | **Compose deployment** | `docker-compose.yml` + `docker/` | Primary + streaming replica + one-shot migrator + 2 web replicas + nginx |
@@ -181,6 +182,15 @@ page), regardless of which replica handles it.
   split wanted an explicit repository seam almost immediately.
 - Scheduled tasks are process-local by default, so distributed safety required
   explicit shard ownership and advisory-lock coordination in application code.
+- Splitting reads to the replica for real also means a client can create a
+  bookmark and then, on the very next page load, not see it — the classic
+  read-your-own-writes gap whenever replication lag (or, as here, a second
+  independent database standing in for one) sits between the write and the
+  next read. `read_your_writes = "session"` closes this for the common
+  create-then-redirect flow, but because this repository predates the
+  `#[repository(...)]` macro it doesn't get that wiring automatically —
+  `BookmarkRepository::conn()` opts in by hand via the same public
+  `is_pinned`/`mark_write` calls the macro emits.
   Use `#[scheduled]` for light in-process work like this demo; move durable or
   coordinated multi-step work to Harvest.
 - Non-dev deployment needed an explicit migration runner because

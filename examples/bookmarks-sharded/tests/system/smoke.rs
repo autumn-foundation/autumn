@@ -5,7 +5,9 @@
 //! headless-Chromium browser against the cross-shard `/api/stats`
 //! fan-out endpoint, and asserts both shards answer with no uncaught
 //! console errors — the direct regression guard for the framework's
-//! `[[database.shards]]` shard-routing feature.
+//! `[[database.shards]]` shard-routing feature. A second test proves
+//! read-your-own-writes shard consistency: a tenant's create and their very
+//! next list read must always land on the same shard.
 //!
 //! `bookmarks-sharded` uses the framework's own `AutumnConfig`, so unlike
 //! `bookmarks-distributed`'s bespoke loader, standard
@@ -25,9 +27,14 @@
 
 #![cfg(feature = "system-tests")]
 
-#[tokio::test]
-#[ignore = "requires Chromium + Docker — set AUTUMN_CHROMIUM or install chromium-browser"]
-async fn bookmarks_sharded_boots_and_fans_out_across_shards() {
+/// Spawn `bookmarks-sharded` against a fresh 3-container topology (control +
+/// shard0 + shard1), using the same fixed slot split every test in this file
+/// relies on.
+///
+/// Returns the [`PgTopology`](example_e2e::PgTopology) alongside the spawned
+/// process: dropping it tears the containers down, so callers must keep it
+/// bound for as long as `ExampleProcess` is in use.
+async fn spawn() -> (example_e2e::ExampleProcess, example_e2e::PgTopology) {
     let db = example_e2e::provision_postgres(3).await;
     let control_url = &db.urls()[0];
     let shard0_url = &db.urls()[1];
@@ -55,6 +62,14 @@ async fn bookmarks_sharded_boots_and_fans_out_across_shards() {
     )
     .await
     .expect("spawn bookmarks-sharded example — is it built?");
+
+    (app, db)
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium + Docker — set AUTUMN_CHROMIUM or install chromium-browser"]
+async fn bookmarks_sharded_boots_and_fans_out_across_shards() {
+    let (app, _db) = spawn().await;
 
     let runner = app
         .attach_browser()
@@ -91,4 +106,56 @@ async fn bookmarks_sharded_boots_and_fans_out_across_shards() {
     page.expect_no_console_errors()
         .await
         .expect("no console errors on /api/stats");
+}
+
+/// Regression guard for `[[database.shards]]` routing consistency: a tenant
+/// who just created a bookmark must see it on the very next list read.
+///
+/// `ShardedDb` hashes the tenant id onto a shard the same way for every
+/// request — no cache, no staleness — so the create and the list below
+/// should always land on the same shard by construction (see
+/// `autumn/src/sharding.rs`'s `HashShardRouter`). This is a deterministic
+/// pass/fail, not a timing race: shard0 and shard1 here are two wholly
+/// independent testcontainer databases, so if routing were ever
+/// inconsistent for the same tenant, the created bookmark would never
+/// appear — it would be sitting in the other shard's database instead.
+#[tokio::test]
+#[ignore = "requires Chromium + Docker — set AUTUMN_CHROMIUM or install chromium-browser"]
+async fn bookmarks_sharded_read_your_own_write_after_create() {
+    let (app, _db) = spawn().await;
+
+    let runner = app
+        .attach_browser()
+        .await
+        .expect("attach browser — is Chromium installed?");
+    let page = runner.page().await.expect("open page");
+
+    // See the fan-out test above for why /health is visited first: every
+    // route requires X-Tenant-Id, and a plain navigation can't set headers.
+    page.visit("/health").await.expect("visit /health");
+    page.evaluate(
+        "fetch('/api/bookmarks', { \
+           method: 'POST', \
+           headers: { 'X-Tenant-Id': 'acme', 'Content-Type': 'application/json' }, \
+           body: JSON.stringify({ \
+             url: 'https://example.com/ryow', \
+             title: 'RYOW shard bookmark', \
+             tag: 'ryow' \
+           }) \
+         }) \
+         .then(r => r.text()) \
+         .then(() => fetch('/api/bookmarks', { headers: { 'X-Tenant-Id': 'acme' } })) \
+         .then(r => r.text()) \
+         .then(t => { document.body.textContent = t; })",
+    )
+    .await
+    .expect("evaluate create-then-list fetch chain");
+
+    page.expect_text("RYOW shard bookmark").await.expect(
+        "bookmark created for tenant \"acme\" must appear on the very next list read for \
+         the same tenant — the create and the list must have routed to the same shard",
+    );
+    page.expect_no_console_errors()
+        .await
+        .expect("no console errors across the create -> list flow");
 }
