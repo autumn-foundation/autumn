@@ -321,6 +321,7 @@ pub mod feature_flags;
 pub mod form;
 pub mod gdpr;
 pub mod job;
+pub mod job_tracking;
 pub mod runtime_config;
 #[cfg(feature = "seed")]
 pub mod seed;
