@@ -204,6 +204,56 @@ async fn expect_hx_settle_waits_for_htmx() {
     page.expect_text("Swapped!").await.expect("assert swap");
 }
 
+/// A plain (non-htmx) form submit triggers a full-page navigation, which
+/// briefly destroys the JS execution context an in-flight `evaluate()` call
+/// (inside `click()`'s implicit settle wait, or a subsequent `expect_*`
+/// poll) may still be targeting. That must not surface as a hard CDP error —
+/// see `is_transient_navigation_error` in `system_test.rs`.
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn click_triggering_full_page_navigation_does_not_break_polling() {
+    use autumn_web::prelude::*;
+
+    #[get("/")]
+    async fn form_page() -> Markup {
+        maud::html! {
+            html {
+                body {
+                    form action="/submit" method="post" {
+                        button type="submit" { "Go" }
+                    }
+                }
+            }
+        }
+    }
+
+    #[post("/submit")]
+    async fn submit() -> Redirect {
+        Redirect::to("/done")
+    }
+
+    #[get("/done")]
+    async fn done() -> &'static str {
+        "Navigated successfully"
+    }
+
+    let runner = SystemTest::new()
+        .routes(routes![form_page, submit, done])
+        .build()
+        .await
+        .expect("start");
+
+    let page = runner.page().await.expect("page");
+    page.visit("/").await.expect("visit");
+    page.click("button[type=submit]")
+        .await
+        .expect("submit form — triggers a full-page redirect");
+    page.expect_text("Navigated successfully").await.expect(
+        "text on the post-redirect page must be visible without the poll \
+         aborting on a transient destroyed-execution-context error",
+    );
+}
+
 // ── attach(): browser-only mode against an already-running server ─────────
 //
 // Issue #1192: the fan-out example harness spawns each example's real
