@@ -306,7 +306,7 @@ pub use crate::format::pluralize;
 #[cfg(feature = "maud")]
 pub use crate::format::pluralize_with;
 /// Render `"3 minutes ago"` / `"in 2 days"` relative to `now` (pass `clock.now()`
-/// from the [`Clock`](crate::time::Clock) extractor, or a [`crate::time::ClockSource`]
+/// from the [`Clock`] extractor, or a [`crate::time::ClockSource`]
 /// like [`crate::time::FixedClock`] in tests).
 #[cfg(feature = "maud")]
 pub use crate::format::time_ago_in_words;

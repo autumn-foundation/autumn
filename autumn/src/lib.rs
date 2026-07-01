@@ -94,7 +94,7 @@ pub mod extract;
 /// View-layer value formatting helpers (currency, delimited numbers,
 /// pluralize, truncate, relative/absolute dates) for Maud templates.
 ///
-/// See [`format`] for the full API.
+/// See [`mod@format`] for the full API.
 pub mod format;
 pub mod health;
 #[cfg(feature = "db")]
