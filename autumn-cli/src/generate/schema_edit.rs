@@ -1165,8 +1165,7 @@ fn ensure_autumn_web_feature_status_in_section(
     // Pass 2b: `[<section>.autumn_web]` table section whose body declares
     // `package = "autumn-web"` — Cargo's table-key form of a renamed dep.
     let renamed_subtable_key = format!("[{section}.autumn_web]");
-    if let Some(start) = find_section_start_with_autumn_web_package(&lines, &renamed_subtable_key)
-    {
+    if let Some(start) = find_section_start_with_autumn_web_package(&lines, &renamed_subtable_key) {
         return (
             add_feature_to_deps_section(&lines, start, existing, feature, &feature_quoted),
             true,
@@ -4000,7 +3999,8 @@ pub struct Comment {
 
     #[test]
     fn dev_dependency_test_support_adds_feature_to_existing_dev_entry() {
-        let cargo = "[package]\nname=\"x\"\n\n[dev-dependencies]\nautumn-web = { version = \"0.6\" }\n";
+        let cargo =
+            "[package]\nname=\"x\"\n\n[dev-dependencies]\nautumn-web = { version = \"0.6\" }\n";
         let updated = ensure_dev_dependency_test_support(cargo, "0.6");
         assert!(
             updated.contains("\"test-support\""),
@@ -4049,8 +4049,7 @@ pub struct Comment {
         // Regression test (code review, issue #1023): a `[dev-dependencies.autumn-web]`
         // subtable used to go unrecognized, causing a second, conflicting
         // `autumn-web = {...}` line to be inserted (a duplicate-key Cargo.toml).
-        let cargo =
-            "[package]\nname=\"x\"\n\n[dev-dependencies.autumn-web]\nversion = \"0.6\"\n";
+        let cargo = "[package]\nname=\"x\"\n\n[dev-dependencies.autumn-web]\nversion = \"0.6\"\n";
         let updated = ensure_dev_dependency_test_support(cargo, "0.6");
         assert!(
             updated.contains("test-support"),
@@ -4075,8 +4074,10 @@ pub struct Comment {
             "dev-dependencies",
         );
         assert!(found);
-        let via_public =
-            ensure_dev_dependency_test_support("[package]\nname=\"x\"\n\n[dev-dependencies]\nautumn-web = \"0.6\"\n", "0.6");
+        let via_public = ensure_dev_dependency_test_support(
+            "[package]\nname=\"x\"\n\n[dev-dependencies]\nautumn-web = \"0.6\"\n",
+            "0.6",
+        );
         assert_eq!(via_shared, via_public);
     }
 
