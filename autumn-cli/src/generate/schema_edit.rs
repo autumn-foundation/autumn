@@ -970,15 +970,16 @@ fn add_feature_to_multiline_inline_table(
     Some(out)
 }
 
-/// Handle the dotted key form `autumn-web.* = ...` inside a dependency section
-/// (`[dependencies]` or `[dev-dependencies]`, per `section`).
+/// Handle the dotted key form `<dep_name>.* = ...` inside a dependency
+/// section (`[dependencies]` or `[dev-dependencies]`, per `section`).
 ///
-/// Looks for an existing `autumn-web.features` key in the section to splice into;
-/// if none is found, inserts one immediately after `dep_line_idx`.
+/// Looks for an existing `<dep_name>.features` key in the section to splice
+/// into; if none is found, inserts one immediately after `dep_line_idx`.
 fn patch_dotted_dep(
     lines: &[&str],
     dep_line_idx: usize,
     existing: &str,
+    dep_name: &str,
     feature: &str,
     feature_quoted: &str,
     section: &str,
@@ -990,13 +991,14 @@ fn patch_dotted_dep(
 
     if lines[dep_line_idx..section_end].iter().any(|l| {
         let line_code = l.split_once('#').map_or(*l, |(before, _)| before);
-        line_code.trim_start().starts_with("autumn-web") && line_code.contains(feature_quoted)
+        line_code.trim_start().starts_with(dep_name) && line_code.contains(feature_quoted)
     }) {
         return existing.to_owned();
     }
 
+    let features_key = format!("{dep_name}.features");
     for (j, &sec_line) in lines[dep_line_idx..section_end].iter().enumerate() {
-        if sec_line.trim_start().starts_with("autumn-web.features") {
+        if sec_line.trim_start().starts_with(&features_key) {
             let new_line = rewrite_features_line(sec_line, feature);
             let mut out = String::with_capacity(existing.len() + 32);
             for (k, &l) in lines.iter().enumerate() {
@@ -1010,7 +1012,7 @@ fn patch_dotted_dep(
         }
     }
 
-    let new_feat = format!("autumn-web.features = [{feature_quoted}]");
+    let new_feat = format!("{features_key} = [{feature_quoted}]");
     let mut out = String::with_capacity(existing.len() + new_feat.len() + 2);
     for (k, &l) in lines.iter().enumerate() {
         out.push_str(l);
@@ -1089,17 +1091,26 @@ fn ensure_autumn_web_feature_status_in_section(
         }
         // Match either the exact `autumn-web` key or a renamed dep with `package = "autumn-web"`.
         let after_ws = line.trim_start();
-        if let Some(rest) = after_ws.strip_prefix("autumn-web") {
+        let dep_prefix = if let Some(rest) = after_ws.strip_prefix("autumn-web") {
             if rest.starts_with('.') {
                 // Dotted key form: autumn-web.workspace = true, autumn-web.features = [...], etc.
                 return (
-                    patch_dotted_dep(&lines, i, existing, feature, &feature_quoted, section),
+                    patch_dotted_dep(
+                        &lines,
+                        i,
+                        existing,
+                        "autumn-web",
+                        feature,
+                        &feature_quoted,
+                        section,
+                    ),
                     true,
                 );
             }
             if rest.starts_with(|c: char| c != '=' && !c.is_whitespace()) {
                 continue;
             }
+            "autumn-web"
         } else {
             // Check for a renamed dep: `aw = { package = "autumn-web", ... }`.
             let val = after_ws.split_once('=').map_or("", |x| x.1);
@@ -1115,7 +1126,8 @@ fn ensure_autumn_web_feature_status_in_section(
             if alias.replace('-', "_") != "autumn_web" {
                 continue;
             }
-        }
+            alias
+        };
         // Idempotency check: strip any trailing TOML comment so that a line such as
         //   autumn-web = { version = "0.6" } # add "inbound-mailgun" later
         // does not falsely appear to already have the feature enabled.
@@ -1123,7 +1135,7 @@ fn ensure_autumn_web_feature_status_in_section(
         if line_code.contains(&feature_quoted) {
             return (existing.to_owned(), true);
         }
-        let new_line = rewrite_dep_with_feature(line, feature);
+        let new_line = rewrite_dep_with_feature(line, dep_prefix, feature);
         if new_line == line {
             // Multiline inline table — delegate to helper.
             match add_feature_to_multiline_inline_table(
@@ -1173,6 +1185,165 @@ fn ensure_autumn_web_feature_status_in_section(
     }
 
     (existing.to_owned(), false)
+}
+
+/// Like [`ensure_autumn_web_feature_status_in_section`], but for an
+/// arbitrary dependency name instead of always `autumn-web`.
+///
+/// Handles the literal-key inline form, the dotted-key form, and the
+/// multiline `[<section>.<dep_name>]` subtable form -- but *not* a
+/// renamed/aliased dependency (`x = { package = "<dep_name>", ... }`).
+/// `autumn-web` is the one dependency projects realistically rename (to
+/// dodge the hyphen); nothing else in a generated project's `Cargo.toml`
+/// needs that, so the extra alias-detection complexity stays specific to
+/// [`ensure_autumn_web_feature_status_in_section`] instead of being carried
+/// here for every caller.
+fn ensure_dep_feature_status_in_section(
+    existing: &str,
+    dep_name: &str,
+    feature: &str,
+    section: &str,
+) -> (String, bool) {
+    let feature_quoted = format!("\"{feature}\"");
+    let lines: Vec<&str> = existing.lines().collect();
+    let mut in_section = false;
+
+    // Pass 1: literal-key inline or dotted-key form.
+    for (i, &line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if is_section_header(trimmed, section) {
+            in_section = true;
+            continue;
+        }
+        if in_section && is_section_boundary(trimmed, section) {
+            in_section = false;
+            continue;
+        }
+        if !in_section || trimmed.starts_with('#') {
+            continue;
+        }
+        let after_ws = line.trim_start();
+        let Some(rest) = after_ws.strip_prefix(dep_name) else {
+            continue;
+        };
+        if rest.starts_with('.') {
+            return (
+                patch_dotted_dep(
+                    &lines,
+                    i,
+                    existing,
+                    dep_name,
+                    feature,
+                    &feature_quoted,
+                    section,
+                ),
+                true,
+            );
+        }
+        if rest.starts_with(|c: char| c != '=' && !c.is_whitespace()) {
+            // A different dependency sharing this prefix -- keep scanning.
+            continue;
+        }
+        let line_code = line.split_once('#').map_or(line, |(before, _)| before);
+        if line_code.contains(&feature_quoted) {
+            return (existing.to_owned(), true);
+        }
+        let new_line = rewrite_dep_with_feature(line, dep_name, feature);
+        if new_line == line {
+            match add_feature_to_multiline_inline_table(
+                &lines,
+                i,
+                existing,
+                feature,
+                &feature_quoted,
+            ) {
+                None => continue,
+                Some(result) => return (result, true),
+            }
+        }
+        let mut out = String::with_capacity(existing.len() + 32);
+        for (j, &l) in lines.iter().enumerate() {
+            out.push_str(if j == i { &new_line } else { l });
+            out.push('\n');
+        }
+        if !existing.ends_with('\n') {
+            out.pop();
+        }
+        return (out, true);
+    }
+
+    // Pass 2: multiline `[<section>.<dep_name>]` subtable form.
+    let subtable_key = format!("[{section}.{dep_name}]");
+    for (i, &line) in lines.iter().enumerate() {
+        let key_part = line.trim().split('#').next().unwrap_or("").trim();
+        if key_part != subtable_key {
+            continue;
+        }
+        return (
+            add_feature_to_deps_section(&lines, i + 1, existing, feature, &feature_quoted),
+            true,
+        );
+    }
+
+    (existing.to_owned(), false)
+}
+
+/// Ensure `[dev-dependencies]` carries a `tokio` entry with the `rt` and
+/// `macros` features that a generated `#[tokio::test]` smoke test needs to
+/// compile.
+///
+/// Every `autumn new` project template already declares this (see
+/// `templates/Cargo.toml.tmpl`), but a hand-rolled project -- or one where
+/// the entry was edited down -- might not. `cargo test --tests` still
+/// compiles `#[ignore]`d tests, so a missing (or feature-incomplete) `tokio`
+/// dev-dependency leaves an otherwise-valid project unable to compile its
+/// test targets at all.
+///
+/// Idempotent: a second call is a no-op once both features are present.
+#[must_use]
+pub fn ensure_dev_dependency_tokio_test_features(existing: &str) -> String {
+    let (updated, found_rt) =
+        ensure_dep_feature_status_in_section(existing, "tokio", "rt", "dev-dependencies");
+    let (updated, found_macros) =
+        ensure_dep_feature_status_in_section(&updated, "tokio", "macros", "dev-dependencies");
+    if found_rt && found_macros {
+        return updated;
+    }
+
+    // No existing `tokio` dev-dependency at all -- insert one with both
+    // features. (If it existed but was missing one of the features, the two
+    // ensure_dep_feature_status_in_section calls above already added it.)
+    let lines: Vec<&str> = existing.lines().collect();
+    let new_dep_line = "tokio = { version = \"1\", features = [\"rt\", \"macros\"] }";
+
+    let Some(header_idx) = lines
+        .iter()
+        .position(|l| is_section_header(l.trim(), "dev-dependencies"))
+    else {
+        let mut out = existing.to_owned();
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        if !out.is_empty() && !out.ends_with("\n\n") {
+            out.push('\n');
+        }
+        out.push_str("[dev-dependencies]\n");
+        let _ = writeln!(out, "{new_dep_line}");
+        return out;
+    };
+
+    let mut out = String::with_capacity(existing.len() + 96);
+    for (j, &l) in lines.iter().enumerate() {
+        out.push_str(l);
+        out.push('\n');
+        if j == header_idx {
+            let _ = writeln!(out, "{new_dep_line}");
+        }
+    }
+    if !existing.ends_with('\n') {
+        out.pop();
+    }
+    out
 }
 
 /// Ensure `[dev-dependencies]` carries an `autumn-web` entry with the
@@ -1627,12 +1798,12 @@ fn rewrite_features_line(line: &str, feature: &str) -> String {
 }
 
 /// Rewrite a single `autumn-web = …` TOML line to include `feature`.
-fn rewrite_dep_with_feature(line: &str, feature: &str) -> String {
+fn rewrite_dep_with_feature(line: &str, dep_name: &str, feature: &str) -> String {
     let feature_quoted = format!("\"{feature}\"");
     let trimmed = line.trim();
 
-    // Form 1: autumn-web = "x.y.z"  (optional trailing TOML comment)
-    if let Some(rest) = trimmed.strip_prefix("autumn-web") {
+    // Form 1: <dep_name> = "x.y.z"  (optional trailing TOML comment)
+    if let Some(rest) = trimmed.strip_prefix(dep_name) {
         let rest = rest.trim_start_matches([' ', '=', '\t']);
         if rest.starts_with('"') {
             // Strip any trailing `# comment` before matching the closing quote.
@@ -1644,13 +1815,13 @@ fn rewrite_dep_with_feature(line: &str, feature: &str) -> String {
                 let indent_len = line.len() - line.trim_start().len();
                 let indent = &line[..indent_len];
                 return format!(
-                    "{indent}autumn-web = {{ version = \"{version}\", features = [{feature_quoted}] }}"
+                    "{indent}{dep_name} = {{ version = \"{version}\", features = [{feature_quoted}] }}"
                 );
             }
         }
     }
 
-    // Form 2/3: autumn-web = { ... features = [...] ... }
+    // Form 2/3: <dep_name> = { ... features = [...] ... }
     if let Some(open) = line.find("features")
         && let Some(bracket_start) = line[open..].find('[')
     {
@@ -1676,7 +1847,7 @@ fn rewrite_dep_with_feature(line: &str, feature: &str) -> String {
         }
     }
 
-    // Form 2b: autumn-web = { version = "x.y.z" } — no features key yet.
+    // Form 2b: <dep_name> = { version = "x.y.z" } — no features key yet.
     // Insert features before the closing `}`.
     if let Some(close) = line.rfind('}') {
         let before = line[..close].trim_end();
@@ -4541,6 +4712,105 @@ pub struct Comment {
             "must mirror the dotted-aliased dep's path source: {updated}"
         );
         assert!(!updated.contains("version = \"0.6\""));
+    }
+
+    // ── ensure_dev_dependency_tokio_test_features (issue #1023) ────────────
+
+    #[test]
+    fn tokio_test_features_inserts_when_dev_dependencies_absent() {
+        // Regression test (Codex review, issue #1023): a project not
+        // created from `autumn new` (or one where the tokio dev-dependency
+        // was removed) has no `tokio` entry to add `rt`/`macros` to, so the
+        // generated `#[tokio::test]` smoke test fails to compile. `cargo
+        // test --tests` still compiles `#[ignore]`d tests, so this broke an
+        // otherwise-valid project's test build entirely.
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = \"0.6\"\n";
+        let updated = ensure_dev_dependency_tokio_test_features(cargo);
+        assert!(
+            updated.contains("tokio = { version = \"1\", features = [\"rt\", \"macros\"] }"),
+            "must insert a tokio dev-dependency with rt and macros: {updated}"
+        );
+    }
+
+    #[test]
+    fn tokio_test_features_inserts_when_dev_dependencies_section_exists_without_tokio() {
+        let cargo =
+            "[package]\nname=\"x\"\n\n[dev-dependencies]\nautumn-web = { version = \"0.6\" }\n";
+        let updated = ensure_dev_dependency_tokio_test_features(cargo);
+        assert!(
+            updated.contains("tokio = { version = \"1\", features = [\"rt\", \"macros\"] }"),
+            "must insert tokio into the existing dev-dependencies section: {updated}"
+        );
+        assert!(updated.contains("autumn-web"));
+    }
+
+    #[test]
+    fn tokio_test_features_adds_missing_features_to_existing_tokio() {
+        let cargo = "[package]\nname=\"x\"\n\n[dev-dependencies]\ntokio = { version = \"1\" }\n";
+        let updated = ensure_dev_dependency_tokio_test_features(cargo);
+        let dep_line = updated
+            .lines()
+            .find(|l| l.trim_start().starts_with("tokio"))
+            .unwrap_or_else(|| panic!("no tokio line in: {updated}"));
+        assert!(
+            dep_line.contains("\"rt\"") && dep_line.contains("\"macros\""),
+            "must add both missing features to the existing tokio entry: {dep_line}"
+        );
+        assert_eq!(
+            updated.matches("tokio").count(),
+            1,
+            "must not duplicate the tokio dev-dependency: {updated}"
+        );
+    }
+
+    #[test]
+    fn tokio_test_features_adds_only_the_missing_feature() {
+        let cargo = "[package]\nname=\"x\"\n\n[dev-dependencies]\ntokio = { version = \"1\", features = [\"macros\"] }\n";
+        let updated = ensure_dev_dependency_tokio_test_features(cargo);
+        let dep_line = updated
+            .lines()
+            .find(|l| l.trim_start().starts_with("tokio"))
+            .unwrap_or_else(|| panic!("no tokio line in: {updated}"));
+        assert!(dep_line.contains("\"rt\"") && dep_line.contains("\"macros\""));
+        assert_eq!(
+            dep_line.matches("\"macros\"").count(),
+            1,
+            "must not duplicate an already-present feature: {dep_line}"
+        );
+    }
+
+    #[test]
+    fn tokio_test_features_is_idempotent() {
+        let cargo = "[package]\nname=\"x\"\n\n[dev-dependencies]\ntokio = { version = \"1\", features = [\"rt\", \"macros\"] }\n";
+        let once = ensure_dev_dependency_tokio_test_features(cargo);
+        let twice = ensure_dev_dependency_tokio_test_features(&once);
+        assert_eq!(once, twice, "a second call must be a no-op");
+    }
+
+    #[test]
+    fn tokio_test_features_handles_dotted_key_form() {
+        let cargo = "[package]\nname=\"x\"\n\n[dev-dependencies]\ntokio.version = \"1\"\n";
+        let updated = ensure_dev_dependency_tokio_test_features(cargo);
+        let features_line = updated
+            .lines()
+            .find(|l| l.trim_start().starts_with("tokio.features"))
+            .unwrap_or_else(|| panic!("no tokio.features line in: {updated}"));
+        assert!(features_line.contains("\"rt\"") && features_line.contains("\"macros\""));
+    }
+
+    #[test]
+    fn tokio_test_features_handles_subtable_form() {
+        let cargo = "[package]\nname=\"x\"\n\n[dev-dependencies.tokio]\nversion = \"1\"\n";
+        let updated = ensure_dev_dependency_tokio_test_features(cargo);
+        assert!(
+            updated.contains("\"rt\"") && updated.contains("\"macros\""),
+            "must add both features to a subtable tokio entry: {updated}"
+        );
+        assert_eq!(
+            updated.matches("tokio").count(),
+            1,
+            "must not insert a duplicate tokio entry: {updated}"
+        );
     }
 
     // ── IdType-aware variants (issue #1400) ────────────────────────────────

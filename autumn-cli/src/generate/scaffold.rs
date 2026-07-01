@@ -21,7 +21,7 @@ use super::model::{
 use super::naming::{pascal, pluralize, snake};
 use super::schema_edit::{
     add_mod_declaration, create_table_sql_with_metadata_and_id, ensure_autumn_web_feature,
-    ensure_dev_dependency_test_support, update_main_rs,
+    ensure_dev_dependency_test_support, ensure_dev_dependency_tokio_test_features, update_main_rs,
 };
 use super::{Flags, GenerateError, ensure_project_root, read_or_empty, timestamp_now};
 
@@ -297,6 +297,30 @@ pub fn plan_scaffold_with_options(
             })
             .unwrap_or_else(|| read_or_empty(&cargo_path));
         let updated = ensure_dev_dependency_test_support(&base, env!("CARGO_PKG_VERSION"));
+        if updated != base {
+            plan.actions.retain(|a| a.path() != cargo_path);
+            plan.modify(cargo_path, updated);
+        }
+    }
+
+    // The generated smoke test also uses `#[tokio::test]`, which needs the
+    // `rt` and `macros` tokio features to compile. Every `autumn new`
+    // project already has these (see `templates/Cargo.toml.tmpl`), but a
+    // hand-rolled or edited-down Cargo.toml might not -- and `cargo test
+    // --tests` still compiles `#[ignore]`d tests, so a missing dev-dependency
+    // here would leave the project unable to compile its test targets.
+    {
+        let cargo_path = project_root.join("Cargo.toml");
+        let base = plan
+            .actions
+            .iter()
+            .rev()
+            .find_map(|a| match a {
+                Action::Modify { path, contents } if path == &cargo_path => Some(contents.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| read_or_empty(&cargo_path));
+        let updated = ensure_dev_dependency_tokio_test_features(&base);
         if updated != base {
             plan.actions.retain(|a| a.path() != cargo_path);
             plan.modify(cargo_path, updated);
@@ -2300,6 +2324,29 @@ async fn main() {
         assert!(
             !deps_section.contains("test-support"),
             "test-support must stay out of [dependencies]: {cargo}"
+        );
+    }
+
+    #[test]
+    fn smoke_test_wires_dev_dependency_tokio_test_features() {
+        // Regression test (Codex review, issue #1023): the generated smoke
+        // test uses `#[tokio::test]`, which needs the `rt` and `macros`
+        // tokio features to compile. A project not created from `autumn
+        // new` -- like this test's bare Cargo.toml -- has no tokio
+        // dev-dependency at all, so without this wiring the generated test
+        // target would fail to compile (cargo test --tests still compiles
+        // #[ignore]d tests).
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(tmp.path(), "Post", &[], "20260427000000").unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let cargo = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+        let tokio_line = cargo
+            .lines()
+            .find(|l| l.trim_start().starts_with("tokio"))
+            .unwrap_or_else(|| panic!("Cargo.toml must have a tokio dev-dependency: {cargo}"));
+        assert!(
+            tokio_line.contains("\"rt\"") && tokio_line.contains("\"macros\""),
+            "tokio dev-dependency must enable rt and macros for #[tokio::test]: {tokio_line}"
         );
     }
 
