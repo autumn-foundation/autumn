@@ -1361,9 +1361,18 @@ enum ReleaseCommands {
 enum GenerateCommands {
     /// Generate a `#[model]` struct, Diesel migration, and schema entry.
     ///
-    /// Example:
+    /// Field types: String, Text, i32, i64, bool, f32, f64, Uuid, `NaiveDateTime`,
+    /// `DateTime`, Vec<u8>/Bytea, Attachment, references, Option<...>.
+    ///
+    /// `field:references` scaffolds a foreign key: a `field_id BIGINT` column
+    /// with a `REFERENCES <table>(id)` constraint and an index, where `<table>`
+    /// is the pluralised form of `field`. Append `?` for a nullable FK
+    /// (`post:references?` -> `post_id: Option<i64>`).
+    ///
+    /// Examples:
     ///
     ///   autumn generate model Post title:String body:Text published:bool
+    ///   autumn generate model Comment body:Text post:references
     #[command(verbatim_doc_comment)]
     Model {
         /// Resource name (`PascalCase` or `snake_case`, e.g. `Post`).
@@ -1708,6 +1717,13 @@ enum GenerateCommands {
     },
     /// Generate model, migration, repository, HTML routes, smoke test, and
     /// register the new routes in `src/main.rs`.
+    ///
+    /// Field types: String, Text, i32, i64, bool, f32, f64, Uuid, `NaiveDateTime`,
+    /// `DateTime`, Vec<u8>/Bytea, Attachment, references, Option<...>.
+    ///
+    /// `field:references` scaffolds a foreign key (`field_id BIGINT
+    /// REFERENCES <table>(id)` plus an index), e.g.
+    /// `autumn generate scaffold Comment body:Text post:references`.
     Scaffold {
         /// Resource name (`PascalCase` or `snake_case`, e.g. `Post`).
         name: String,

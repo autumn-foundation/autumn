@@ -50,6 +50,10 @@ pub struct Plan {
     pub project_root: PathBuf,
     /// The actions this plan will perform when executed.
     pub actions: Vec<Action>,
+    /// Advisory messages surfaced to the user on [`Plan::execute`] (both
+    /// `--dry-run` and a real run), without failing the generator — e.g. a
+    /// `references` field whose target model doesn't exist yet.
+    pub warnings: Vec<String>,
 }
 
 impl Plan {
@@ -59,7 +63,14 @@ impl Plan {
         Self {
             project_root: project_root.into(),
             actions: Vec::new(),
+            warnings: Vec::new(),
         }
+    }
+
+    /// Record an advisory message, printed by [`Plan::execute`] but never
+    /// fatal to the plan.
+    pub fn warn(&mut self, message: impl Into<String>) {
+        self.warnings.push(message.into());
     }
 
     /// Push a [`Action::Create`] action.
@@ -122,6 +133,10 @@ impl Plan {
     /// an existing file and `--force` was not passed; or [`GenerateError::Io`]
     /// for filesystem failures during emission.
     pub fn execute(&self, flags: Flags) -> Result<(), GenerateError> {
+        for warning in &self.warnings {
+            eprintln!("Warning: {warning}");
+        }
+
         if flags.dry_run {
             self.print_dry_run();
             return Ok(());
@@ -227,6 +242,21 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let plan = Plan::new(tmp.path());
         (tmp, plan)
+    }
+
+    #[test]
+    fn new_plan_has_no_warnings() {
+        let (_tmp, plan) = fixture();
+        assert!(plan.warnings.is_empty());
+    }
+
+    #[test]
+    fn warn_records_message_and_execute_does_not_fail() {
+        let (_tmp, mut plan) = fixture();
+        plan.warn("referenced table 'posts' is assumed to exist");
+        assert_eq!(plan.warnings.len(), 1);
+        // A warning never fails the plan — it's advisory only.
+        plan.execute(Flags::default()).unwrap();
     }
 
     #[test]

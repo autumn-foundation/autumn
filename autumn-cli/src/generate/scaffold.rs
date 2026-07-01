@@ -1829,13 +1829,43 @@ fn render_api_smoke_test(plural: &str, id_schema_type: &str, setup_calls: &str) 
     )
 }
 
+/// Emit `CREATE TABLE IF NOT EXISTS <target> (id BIGSERIAL PRIMARY KEY);` for
+/// every distinct table a `references` field points at.
+///
+/// `TestDb::shared()` starts one Postgres testcontainer per `tests/*.rs`
+/// binary (a process-global `OnceLock`), so a scaffold's own smoke test can't
+/// assume some *other* scaffolded resource's smoke test already created the
+/// referenced table — `CREATE TABLE comments (... REFERENCES posts(id) ...)`
+/// would otherwise fail with "relation posts does not exist" whenever
+/// `Comment` is scaffolded without also scaffolding `Post` in the same run.
+/// A minimal stand-in table (just the `id` column the FK constraint checks
+/// against) is enough to satisfy Postgres without duplicating the target's
+/// full schema.
+fn render_reference_stub_tables_sql(fields: &[Field]) -> String {
+    let mut out = String::new();
+    let mut seen = BTreeSet::new();
+    for f in fields {
+        if let Some(target) = f.reference_table()
+            && seen.insert(target.clone())
+        {
+            let _ = writeln!(
+                out,
+                "CREATE TABLE IF NOT EXISTS {target} (id BIGSERIAL PRIMARY KEY);"
+            );
+        }
+    }
+    out
+}
+
 /// Render the `tests/<snake>.rs` smoke test.
 ///
 /// Delegates to [`render_index_smoke_test`] or [`render_api_smoke_test`]
 /// depending on `api`, after computing the exact `CREATE TABLE`/`CREATE
 /// INDEX` SQL the generated migration also emits (see
 /// [`create_table_sql_with_metadata_and_id`]), so the throwaway table the
-/// test creates in `TestDb` matches the real schema.
+/// test creates in `TestDb` matches the real schema. Any `references` field
+/// also gets a stub target table created first — see
+/// [`render_reference_stub_tables_sql`].
 fn render_smoke_test(
     pascal_name: &str,
     plural: &str,
@@ -1845,9 +1875,11 @@ fn render_smoke_test(
     indexes: &BTreeSet<String>,
     defaults: &BTreeMap<String, String>,
 ) -> String {
+    let stub_tables_sql = render_reference_stub_tables_sql(fields);
     let create_table_sql =
         create_table_sql_with_metadata_and_id(plural, fields, indexes, defaults, id_type);
-    let setup_calls = render_execute_sql_calls(&create_table_sql);
+    let mut setup_calls = render_execute_sql_calls(&stub_tables_sql);
+    setup_calls.push_str(&render_execute_sql_calls(&create_table_sql));
     let id_schema_type = id_type.schema_type();
 
     if api {
@@ -3205,6 +3237,119 @@ async fn main() {
             test.matches("CREATE TABLE").count(),
             1,
             "CREATE TABLE must appear in a single execute_sql call, not split across two: {test}"
+        );
+    }
+
+    // ── references field: scaffold + smoke-test wiring (issue #1026) ───────
+
+    #[test]
+    fn scaffold_references_field_emits_fk_column_constraint_and_index() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Comment",
+            &["body:Text".into(), "post:references".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let up = fs::read_to_string(
+            tmp.path()
+                .join("migrations/20260427000000_create_comments/up.sql"),
+        )
+        .unwrap();
+        assert!(
+            up.contains("post_id BIGINT NOT NULL REFERENCES posts(id)"),
+            "up.sql: {up}"
+        );
+        assert!(
+            up.contains("CREATE INDEX idx_comments_post_id ON comments (post_id);"),
+            "up.sql: {up}"
+        );
+    }
+
+    #[test]
+    fn scaffold_references_field_warns_when_target_model_missing() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Comment",
+            &["post:references".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        assert_eq!(plan.warnings.len(), 1, "warnings: {:?}", plan.warnings);
+        assert!(plan.warnings[0].contains("posts"));
+    }
+
+    #[test]
+    fn scaffold_smoke_test_creates_a_stub_referenced_table_before_the_real_one() {
+        // The generated smoke test runs in its own throwaway `TestDb` (one
+        // Postgres testcontainer per `tests/*.rs` binary, per-process — see
+        // `TestDb::shared()`), so it can't rely on some *other* scaffolded
+        // resource's smoke test having already created the referenced table.
+        // A `CREATE TABLE comments (... REFERENCES posts(id) ...)` would fail
+        // with "relation posts does not exist" unless the comments smoke test
+        // creates a minimal stand-in `posts` table itself first.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Comment",
+            &["body:Text".into(), "post:references".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let test = fs::read_to_string(tmp.path().join("tests/comment.rs")).unwrap();
+        let stub_pos = test
+            .find("CREATE TABLE IF NOT EXISTS posts")
+            .unwrap_or_else(|| panic!("expected a stub `posts` table in the smoke test: {test}"));
+        let real_pos = test.find("CREATE TABLE comments").unwrap_or_else(|| {
+            panic!("expected the real `comments` table in the smoke test: {test}")
+        });
+        assert!(
+            stub_pos < real_pos,
+            "the stub referenced table must be created before the table under test: {test}"
+        );
+    }
+
+    #[test]
+    fn scaffold_smoke_test_emits_one_stub_per_distinct_reference_target() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Follow",
+            &["follower:references".into(), "followee:references".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let test = fs::read_to_string(tmp.path().join("tests/follow.rs")).unwrap();
+        assert!(test.contains("CREATE TABLE IF NOT EXISTS followers"));
+        assert!(test.contains("CREATE TABLE IF NOT EXISTS followees"));
+    }
+
+    #[test]
+    fn render_reference_stub_tables_sql_dedupes_identical_targets() {
+        // Two references whose base names happen to pluralise to the same
+        // table must only emit one `CREATE TABLE IF NOT EXISTS` for it.
+        let fields = super::super::dsl::parse_fields(&[
+            "person:references".into(),
+            "people:references".into(),
+        ])
+        .unwrap();
+        let sql = render_reference_stub_tables_sql(&fields);
+        assert_eq!(
+            sql.matches("CREATE TABLE IF NOT EXISTS").count(),
+            fields
+                .iter()
+                .filter_map(Field::reference_table)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            "stub tables must be de-duplicated by target name: {sql}"
         );
     }
 }

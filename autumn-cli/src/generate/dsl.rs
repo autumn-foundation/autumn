@@ -5,6 +5,7 @@
 //! Rust type (for the `#[model]` struct) and its SQL type (for the migration).
 
 use super::GenerateError;
+use super::naming;
 
 /// A single field parsed from the command line.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,6 +52,20 @@ impl Field {
     pub const fn sql_nullability(&self) -> &'static str {
         if self.nullable { "NULL" } else { "NOT NULL" }
     }
+
+    /// For a [`FieldKind::References`] field, the referenced table name —
+    /// the `_id` suffix is stripped from the column name and the remainder
+    /// is pluralised via [`naming::pluralize`] (`post_id` -> `posts`).
+    ///
+    /// Returns `None` for every other field kind.
+    #[must_use]
+    pub fn reference_table(&self) -> Option<String> {
+        if !self.kind.is_reference() {
+            return None;
+        }
+        let base = self.name.strip_suffix("_id").unwrap_or(&self.name);
+        Some(naming::pluralize(base))
+    }
 }
 
 /// The supported field types. Mirrors the documented public surface in the
@@ -90,6 +105,12 @@ pub enum FieldKind {
     /// be explicit, or leave as `Attachment` (equivalent: nullable is the default
     /// and safe choice for file fields).
     Attachment,
+    /// `references` — a foreign-key column (`i64`/`BIGINT`), matching the
+    /// default `i64` primary-key convention. The DSL rewrites the declared
+    /// field name to end in `_id` (`post:references` -> `post_id`) and the
+    /// referenced table is derived from the base name via [`naming::pluralize`]
+    /// (`post` -> `posts`). See [`Field::reference_table`].
+    References,
 }
 
 impl FieldKind {
@@ -102,7 +123,8 @@ impl FieldKind {
         match self {
             Self::String | Self::Text => "String",
             Self::I32 => "i32",
-            Self::I64 => "i64",
+            // `References` is always `i64`, matching the default `i64` PK convention.
+            Self::I64 | Self::References => "i64",
             Self::Bool => "bool",
             Self::F32 => "f32",
             Self::F64 => "f64",
@@ -120,7 +142,7 @@ impl FieldKind {
         match self {
             Self::String | Self::Text => "Text",
             Self::I32 => "Int4",
-            Self::I64 => "Int8",
+            Self::I64 | Self::References => "Int8",
             Self::Bool => "Bool",
             Self::F32 => "Float4",
             Self::F64 => "Float8",
@@ -138,7 +160,7 @@ impl FieldKind {
         match self {
             Self::String | Self::Text => "TEXT",
             Self::I32 => "INTEGER",
-            Self::I64 => "BIGINT",
+            Self::I64 | Self::References => "BIGINT",
             Self::Bool => "BOOLEAN",
             Self::F32 => "REAL",
             Self::F64 => "DOUBLE PRECISION",
@@ -157,6 +179,12 @@ impl FieldKind {
     #[must_use]
     pub const fn is_attachment(self) -> bool {
         matches!(self, Self::Attachment)
+    }
+
+    /// Returns `true` for a foreign-key `references` field.
+    #[must_use]
+    pub const fn is_reference(self) -> bool {
+        matches!(self, Self::References)
     }
 }
 
@@ -237,7 +265,7 @@ impl IdType {
 
 /// Comma-separated list of supported types, for error messages and `--help`.
 pub const SUPPORTED_TYPES: &str = "String, Text, i32, i64, bool, f32, f64, \
-    Uuid, NaiveDateTime, DateTime, Vec<u8>, Bytea, Attachment, Option<…>";
+    Uuid, NaiveDateTime, DateTime, Vec<u8>, Bytea, Attachment, references, Option<…>";
 
 /// Comma-separated list of supported Postgres column types (`udt_name`), for
 /// the `db pull` introspection error message.
@@ -320,8 +348,17 @@ pub fn parse_field(token: &str) -> Result<Field, GenerateError> {
         reason: format!("unsupported type '{ty}'. Supported: {SUPPORTED_TYPES}"),
     })?;
 
+    // `references` fields always end in `_id` — `post:references` resolves to
+    // the column `post_id`. Tolerate an already-suffixed name (`post_id:references`)
+    // rather than doubling the suffix.
+    let name = if kind == FieldKind::References && !name.ends_with("_id") {
+        format!("{name}_id")
+    } else {
+        name.to_owned()
+    };
+
     Ok(Field {
-        name: name.to_owned(),
+        name,
         kind,
         nullable,
     })
@@ -353,6 +390,13 @@ pub fn parse_fields(tokens: &[String]) -> Result<Vec<Field>, GenerateError> {
 }
 
 fn parse_type(ty: &str) -> Option<(FieldKind, bool)> {
+    // A trailing `?` is a terser nullable marker than `Option<…>` — chiefly
+    // used for `references` fields (`post:references?`), but accepted for any
+    // atomic type.
+    if let Some(inner) = ty.strip_suffix('?') {
+        let kind = atomic_type(inner.trim())?;
+        return Some((kind, true));
+    }
     if let Some(inner) = strip_wrapper(ty, "Option") {
         let kind = atomic_type(inner.trim())?;
         Some((kind, true))
@@ -384,6 +428,9 @@ fn atomic_type(ty: &str) -> Option<FieldKind> {
         // Accept both casing variants so `cover_image:Attachment` and
         // `cover_image:attachment` both work.
         "Attachment" | "attachment" => Some(FieldKind::Attachment),
+        // References / references: foreign-key column, resolved to `_id` and
+        // `BIGINT REFERENCES <table>(id)` by the callers that emit SQL.
+        "References" | "references" => Some(FieldKind::References),
         _ => {
             // Allow `Vec<u8>` as a synonym for `Bytea`.
             strip_wrapper(ty, "Vec").and_then(|inner| {
@@ -814,6 +861,91 @@ mod tests {
                 "'{token}' should parse to BigSerial"
             );
         }
+    }
+
+    // ── references field kind (issue #1026) ────────────────────────────────
+
+    #[test]
+    fn parse_references_resolves_column_name_to_id() {
+        let f = parse_field("post:references").unwrap();
+        assert_eq!(f.name, "post_id");
+        assert_eq!(f.kind, FieldKind::References);
+        assert!(!f.nullable);
+    }
+
+    #[test]
+    fn parse_references_pascal_case_also_accepted() {
+        let f = parse_field("post:References").unwrap();
+        assert_eq!(f.name, "post_id");
+        assert_eq!(f.kind, FieldKind::References);
+    }
+
+    #[test]
+    fn parse_references_does_not_double_suffix_already_named_column() {
+        let f = parse_field("post_id:references").unwrap();
+        assert_eq!(f.name, "post_id");
+    }
+
+    #[test]
+    fn parse_references_multi_word_base_name() {
+        let f = parse_field("blog_post:references").unwrap();
+        assert_eq!(f.name, "blog_post_id");
+        assert_eq!(f.reference_table().as_deref(), Some("blog_posts"));
+    }
+
+    #[test]
+    fn references_rust_type_is_i64() {
+        let f = parse_field("post:references").unwrap();
+        assert_eq!(f.rust_type(), "i64");
+    }
+
+    #[test]
+    fn references_sql_type_is_bigint() {
+        let f = parse_field("post:references").unwrap();
+        assert_eq!(f.sql_type(), "BIGINT");
+        assert_eq!(f.sql_nullability(), "NOT NULL");
+    }
+
+    #[test]
+    fn references_schema_type_is_int8() {
+        let f = parse_field("post:references").unwrap();
+        assert_eq!(f.schema_type(), "Int8");
+    }
+
+    #[test]
+    fn references_target_table_derived_via_pluralize() {
+        let f = parse_field("post:references").unwrap();
+        assert_eq!(f.reference_table().as_deref(), Some("posts"));
+    }
+
+    #[test]
+    fn references_nullable_form_with_question_mark() {
+        let f = parse_field("post:references?").unwrap();
+        assert_eq!(f.name, "post_id");
+        assert!(f.nullable);
+        assert_eq!(f.rust_type(), "Option<i64>");
+        assert_eq!(f.schema_type(), "Nullable<Int8>");
+        assert_eq!(f.sql_nullability(), "NULL");
+    }
+
+    #[test]
+    fn references_is_reference_predicate() {
+        assert!(FieldKind::References.is_reference());
+        assert!(!FieldKind::I64.is_reference());
+    }
+
+    #[test]
+    fn non_reference_field_has_no_reference_table() {
+        let f = parse_field("title:String").unwrap();
+        assert_eq!(f.reference_table(), None);
+    }
+
+    #[test]
+    fn references_appears_in_supported_types_constant() {
+        assert!(
+            SUPPORTED_TYPES.contains("references"),
+            "SUPPORTED_TYPES must list references"
+        );
     }
 
     #[test]

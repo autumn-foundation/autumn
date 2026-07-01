@@ -114,6 +114,7 @@ pub fn plan_model_with_options(
     let schema_fields = augment_fields_for_soft_delete(&fields, options.soft_delete)?;
 
     let mut plan = Plan::new(project_root);
+    warn_about_unknown_references(&mut plan, project_root, &fields);
 
     // (a) `src/models/<snake>.rs` + `src/models/mod.rs`
     let models_dir = project_root.join("src").join("models");
@@ -183,6 +184,38 @@ pub fn plan_model_with_options(
     plan_cargo_deps(&mut plan, project_root, &deps);
 
     Ok(plan)
+}
+
+/// Warn on every `references` field whose target model file doesn't exist in
+/// this project yet (AC8, issue #1026). The generator still scaffolds the FK
+/// column, constraint, and index — the referenced table is simply assumed to
+/// already exist (e.g. it's created by an out-of-band migration, or the
+/// referenced model will be generated in a later command).
+pub(super) fn warn_about_unknown_references(
+    plan: &mut Plan,
+    project_root: &Path,
+    fields: &[Field],
+) {
+    for f in fields {
+        if !f.kind.is_reference() {
+            continue;
+        }
+        let Some(table) = f.reference_table() else {
+            continue;
+        };
+        let base = f.name.strip_suffix("_id").unwrap_or(&f.name);
+        let model_path = project_root
+            .join("src")
+            .join("models")
+            .join(format!("{base}.rs"));
+        if !model_path.exists() {
+            plan.warn(format!(
+                "'{}' references model '{base}', but src/models/{base}.rs was not found — \
+                 assuming table '{table}' already exists.",
+                f.name
+            ));
+        }
+    }
 }
 
 /// Append the virtual `deleted_at` column that `--soft-delete` models add to
@@ -669,7 +702,8 @@ fn sql_default_literal(field: &Field, value: &str) -> Result<String, String> {
         | FieldKind::NaiveDateTime
         | FieldKind::DateTime
         | FieldKind::Bytea
-        | FieldKind::Attachment => Err(format!(
+        | FieldKind::Attachment
+        | FieldKind::References => Err(format!(
             "defaults for {} fields are not supported by `autumn generate` yet",
             field.rust_type()
         )),
@@ -1605,5 +1639,134 @@ autumn-web = \"0.3\"\n";
             up.contains("author_id UUID NOT NULL"),
             "FK Uuid migration: {up}"
         );
+    }
+
+    // ── references field type (issue #1026) ────────────────────────────────
+
+    #[test]
+    fn references_field_emits_i64_struct_field_fk_constraint_and_index() {
+        let tmp = project();
+        let plan = plan_model(
+            tmp.path(),
+            "Comment",
+            &["body:Text".into(), "post:references".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let model = fs::read_to_string(tmp.path().join("src/models/comment.rs")).unwrap();
+        assert!(
+            model.contains("pub post_id: i64,"),
+            "references field must render as i64: {model}"
+        );
+
+        let up = fs::read_to_string(
+            tmp.path()
+                .join("migrations/20260427000000_create_comments/up.sql"),
+        )
+        .unwrap();
+        assert!(
+            up.contains("post_id BIGINT NOT NULL REFERENCES posts(id)"),
+            "up.sql must emit the FK column + constraint: {up}"
+        );
+        assert!(
+            up.contains("CREATE INDEX idx_comments_post_id ON comments (post_id);"),
+            "up.sql must emit an automatic FK index: {up}"
+        );
+
+        let down = fs::read_to_string(
+            tmp.path()
+                .join("migrations/20260427000000_create_comments/down.sql"),
+        )
+        .unwrap();
+        assert!(
+            down.contains("DROP TABLE comments"),
+            "down.sql drops the whole table, cleanly reversing the FK/index/column: {down}"
+        );
+
+        let schema = fs::read_to_string(tmp.path().join("src/schema.rs")).unwrap();
+        assert!(
+            schema.contains("post_id -> Int8,"),
+            "schema.rs must use Int8 for the FK column: {schema}"
+        );
+    }
+
+    #[test]
+    fn nullable_references_field_emits_option_i64() {
+        let tmp = project();
+        let plan = plan_model(
+            tmp.path(),
+            "Comment",
+            &["post:references?".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let model = fs::read_to_string(tmp.path().join("src/models/comment.rs")).unwrap();
+        assert!(
+            model.contains("pub post_id: Option<i64>,"),
+            "nullable references field must render as Option<i64>: {model}"
+        );
+
+        let up = fs::read_to_string(
+            tmp.path()
+                .join("migrations/20260427000000_create_comments/up.sql"),
+        )
+        .unwrap();
+        assert!(
+            up.contains("post_id BIGINT NULL REFERENCES posts(id)"),
+            "{up}"
+        );
+    }
+
+    #[test]
+    fn references_field_warns_when_target_model_is_missing() {
+        let tmp = project();
+        let plan = plan_model(
+            tmp.path(),
+            "Comment",
+            &["post:references".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        assert_eq!(plan.warnings.len(), 1, "warnings: {:?}", plan.warnings);
+        assert!(plan.warnings[0].contains("post"));
+        assert!(plan.warnings[0].contains("posts"));
+    }
+
+    #[test]
+    fn references_field_no_warning_when_target_model_exists() {
+        let tmp = project();
+        let models_dir = tmp.path().join("src/models");
+        fs::create_dir_all(&models_dir).unwrap();
+        fs::write(models_dir.join("post.rs"), "// existing Post model\n").unwrap();
+
+        let plan = plan_model(
+            tmp.path(),
+            "Comment",
+            &["post:references".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        assert!(
+            plan.warnings.is_empty(),
+            "no warning expected once src/models/post.rs exists: {:?}",
+            plan.warnings
+        );
+    }
+
+    #[test]
+    fn no_references_field_means_no_warnings() {
+        let tmp = project();
+        let plan = plan_model(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        assert!(plan.warnings.is_empty());
     }
 }
