@@ -3121,4 +3121,43 @@ async fn main() {
             "show must include defaulted field 'views': {routes}"
         );
     }
+
+    #[test]
+    fn smoke_test_default_value_containing_semicolon_does_not_corrupt_sql() {
+        // Regression test (PR review, issue #1023): `create_table_sql_with_metadata_and_id`
+        // emits `DEFAULT '...'` verbatim for a String/Text `--default`, so a
+        // value containing a semicolon (e.g. a bio with "; " in it) must not
+        // be split into two broken `db.execute_sql(...)` calls.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+            &ScaffoldOptions {
+                model: ModelOptions {
+                    defaults: vec!["title=hello;world".to_string()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let test = fs::read_to_string(tmp.path().join("tests/post.rs")).unwrap();
+        assert!(
+            test.contains("DEFAULT 'hello;world'"),
+            "generated default literal must survive intact: {test}"
+        );
+        // Every db.execute_sql(...) call's string literal argument must itself
+        // be balanced/complete SQL -- i.e. the CREATE TABLE statement was not
+        // split mid-literal. Count occurrences of "CREATE TABLE" (must be
+        // exactly one, not spread across two calls).
+        assert_eq!(
+            test.matches("CREATE TABLE").count(),
+            1,
+            "CREATE TABLE must appear in a single execute_sql call, not split across two: {test}"
+        );
+    }
 }
