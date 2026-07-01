@@ -345,6 +345,13 @@ pub async fn cached_bookmark_count() -> AutumnResult<i64> {
 
 #[get("/api/bookmarks/count")]
 pub async fn bookmark_api_count() -> AutumnResult<Json<i64>> {
+    // `cached_bookmark_count()`'s TTL cache is global (unkeyed by session),
+    // so it would silently defeat RYWW: a client pinned to primary after a
+    // write must see a live count, not whatever was cached — possibly from
+    // the replica, possibly from before the write — up to 30s ago.
+    if autumn_web::read_your_writes::is_pinned() {
+        return Ok(Json(BookmarkRepository.count_all().await?));
+    }
     Ok(Json(cached_bookmark_count().await?))
 }
 

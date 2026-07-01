@@ -232,5 +232,21 @@ secret = "{TEST_SIGNING_SECRET}"
         .await
         .expect("no console errors across the create -> redirect -> list flow");
 
+    // `/api/bookmarks/count` sits behind a 30s process-wide cache
+    // (`cached_bookmark_count()`), unkeyed by session — bypassed while RYWW-
+    // pinned so this still reflects the just-created bookmark rather than a
+    // stale (here: zero) cached count. See BookmarkRepository::bookmark_api_count.
+    page.evaluate(
+        "fetch('/api/bookmarks/count')\
+         .then(r => r.text())\
+         .then(t => { document.body.textContent = 'count:' + t; })",
+    )
+    .await
+    .expect("evaluate count fetch");
+    page.expect_text("count:1").await.expect(
+        "the cached /api/bookmarks/count endpoint must also see the just-created bookmark \
+         while RYWW-pinned, not the 30s-stale cached count",
+    );
+
     let _ = std::fs::remove_dir_all(&scratch_dir);
 }
