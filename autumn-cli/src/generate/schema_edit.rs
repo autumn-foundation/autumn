@@ -1123,9 +1123,7 @@ fn ensure_autumn_web_feature_status_in_section(
         } else {
             // Check for a renamed dep: `aw = { package = "autumn-web", ... }`.
             let val = after_ws.split_once('=').map_or("", |x| x.1);
-            if !val.contains(r#"package = "autumn-web""#)
-                && !val.contains(r#"package="autumn-web""#)
-            {
+            if !declares_package(val, "autumn-web") {
                 continue;
             }
             // The alias must be importable as `autumn_web`; an alias such as
@@ -1486,6 +1484,26 @@ fn split_top_level_commas(s: &str) -> Vec<&str> {
     parts
 }
 
+/// True iff `text` declares `package = "<target>"` -- either as one field
+/// of a `{ ... }` inline table (e.g. `aw = { package = "autumn-web", ... }`)
+/// or as a bare `key = value` line (the multiline subtable form, e.g. a
+/// `[dependencies.aw]` body's `package = "autumn-web"` line).
+///
+/// Tolerant of any amount of TOML whitespace around `=` on either side --
+/// TOML permits none, one, or many spaces there, so a literal substring
+/// check for one specific spacing (`package = "..."` or `package="..."`)
+/// silently misses forms like `package= "..."` or `package ="..."`.
+fn declares_package(text: &str, target: &str) -> bool {
+    let body = match (text.find('{'), text.rfind('}')) {
+        (Some(open), Some(close)) if close > open => &text[open + 1..close],
+        _ => text,
+    };
+    split_top_level_commas(body).into_iter().any(|part| {
+        part.split_once('=')
+            .is_some_and(|(k, v)| k.trim() == "package" && v.trim().trim_matches('"') == target)
+    })
+}
+
 /// Pull the source-defining keys (see [`SOURCE_KEYS`]) out of a run of
 /// `key = value` pairs, joined back into a single `key = value, ...`
 /// fragment. Returns `None` only when `pairs` has no `version` and no
@@ -1708,9 +1726,7 @@ fn detect_dependencies_autumn_web_source(existing: &str) -> Option<String> {
         let val_code = val.split('#').next().unwrap_or(val).trim();
         let Some(sub) = dotted_sub else {
             // Inline form: autumn_web = { package = "autumn-web", ... }.
-            if val_code.contains(r#"package = "autumn-web""#)
-                || val_code.contains(r#"package="autumn-web""#)
-            {
+            if declares_package(val_code, "autumn-web") {
                 return extract_source_from_inline_table(line);
             }
             continue;
@@ -1761,7 +1777,7 @@ fn find_section_start_with_autumn_web_package(lines: &[&str], key: &str) -> Opti
             .map_or(lines.len(), |p| section_start + p);
         let has_pkg = lines[section_start..section_end].iter().any(|l| {
             let code = l.split_once('#').map_or(*l, |(b, _)| b);
-            code.contains(r#"package = "autumn-web""#) || code.contains(r#"package="autumn-web""#)
+            declares_package(code, "autumn-web")
         });
         if has_pkg {
             return Some(section_start);
@@ -4705,6 +4721,25 @@ pub struct Comment {
             updated
                 .contains("autumn-web = { path = \"../autumn\", features = [\"test-support\"] }"),
             "must mirror the aliased dep's path source: {updated}"
+        );
+        assert!(!updated.contains("version = \"0.6\""));
+    }
+
+    #[test]
+    fn dev_dependency_test_support_mirrors_aliased_path_source_odd_spacing() {
+        // Regression test (Codex review, issue #1023): the alias detector
+        // matched `package = "autumn-web"` or `package="autumn-web"` as
+        // literal substrings, missing other TOML-legal spacings like
+        // `package= "autumn-web"` (space after `=` only) -- confirmed valid
+        // via `cargo metadata --offline --no-deps`. That silently dropped
+        // the alias's path/workspace/git source and fell back to a
+        // mismatched crates.io version.
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nautumn_web = { package= \"autumn-web\", path = \"../autumn\" }\n";
+        let updated = ensure_dev_dependency_test_support(cargo, "0.6");
+        assert!(
+            updated
+                .contains("autumn-web = { path = \"../autumn\", features = [\"test-support\"] }"),
+            "must mirror the aliased dep's path source despite odd spacing around package=: {updated}"
         );
         assert!(!updated.contains("version = \"0.6\""));
     }
