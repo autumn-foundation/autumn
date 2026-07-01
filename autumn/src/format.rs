@@ -9,7 +9,7 @@
 //!
 //! # Quick example
 //!
-//! ```rust,ignore
+//! ```rust
 //! use autumn_web::format::{number_to_currency, pluralize, time_ago_in_words};
 //! use autumn_web::time::FixedClock;
 //! use chrono::{TimeZone, Utc};
@@ -92,9 +92,9 @@ impl<'a> CurrencyOptions<'a> {
 
     /// Format `value` per this configuration, returning HTML-escaped [`maud::Markup`].
     #[must_use]
-    pub fn format(&self, _value: Decimal) -> maud::Markup {
-        // TODO(red): not implemented yet.
-        maud::html! { "" }
+    pub fn format(&self, value: Decimal) -> maud::Markup {
+        let text = format_currency(value, self);
+        maud::html! { (text) }
     }
 }
 
@@ -112,33 +112,144 @@ pub fn number_to_currency(value: Decimal) -> maud::Markup {
     CurrencyOptions::new().format(value)
 }
 
+#[cfg(feature = "maud")]
+fn format_currency(value: Decimal, options: &CurrencyOptions<'_>) -> String {
+    // `round_dp` rounds but does not pad trailing zeros onto a shorter scale
+    // (e.g. 1234.5 stays scale=1), so the digit string is built by rounding
+    // first, then formatting with an explicit precision to force zero-padding.
+    let rounded = value.round_dp_with_strategy(
+        options.precision,
+        rust_decimal::RoundingStrategy::MidpointAwayFromZero,
+    );
+    let negative = rounded.is_sign_negative() && !rounded.is_zero();
+    let abs = rounded.abs();
+    let digits = format!("{:.prec$}", abs, prec = options.precision as usize);
+    let (int_part, frac_part) = split_decimal_string(&digits);
+    let grouped_int = group_thousands(int_part, options.thousands_separator);
+
+    let mut out =
+        String::with_capacity(options.symbol.len() + grouped_int.len() + frac_part.len() + 2);
+    if negative {
+        out.push('-');
+    }
+    out.push_str(options.symbol);
+    out.push_str(&grouped_int);
+    if options.precision > 0 {
+        out.push(options.decimal_separator);
+        out.push_str(frac_part);
+    }
+    out
+}
+
 // ── Delimited numbers ────────────────────────────────────────────────────────
 
 /// Render an integer or decimal with grouped thousands (`1,234,567`).
+///
+/// Accepts any type that converts into [`rust_decimal::Decimal`] (the common
+/// Rust integer types, plus `Decimal` itself).
 #[cfg(feature = "maud")]
 #[must_use]
-pub fn number_with_delimiter<T: Into<Decimal>>(_value: T) -> maud::Markup {
-    // TODO(red): not implemented yet.
-    maud::html! { "" }
+pub fn number_with_delimiter<T: Into<Decimal>>(value: T) -> maud::Markup {
+    let value: Decimal = value.into();
+    let negative = value.is_sign_negative() && !value.is_zero();
+    let abs = value.abs();
+    let digits = abs.to_string();
+    let (int_part, frac_part) = split_decimal_string(&digits);
+    let grouped_int = group_thousands(int_part, ',');
+
+    let mut out = String::with_capacity(grouped_int.len() + frac_part.len() + 2);
+    if negative {
+        out.push('-');
+    }
+    out.push_str(&grouped_int);
+    if !frac_part.is_empty() {
+        out.push('.');
+        out.push_str(frac_part);
+    }
+    maud::html! { (out) }
+}
+
+/// Split a plain decimal string (`"1234.50"` or `"1234"`) into its integer
+/// and fractional parts (without the separating dot).
+fn split_decimal_string(s: &str) -> (&str, &str) {
+    s.split_once('.').unwrap_or((s, ""))
+}
+
+/// Group the ASCII digits of `int_digits` into threes, joined by `separator`.
+fn group_thousands(int_digits: &str, separator: char) -> String {
+    let len = int_digits.len();
+    let mut out = String::with_capacity(len + len / 3);
+    for (i, ch) in int_digits.chars().enumerate() {
+        if i > 0 && (len - i).is_multiple_of(3) {
+            out.push(separator);
+        }
+        out.push(ch);
+    }
+    out
 }
 
 // ── Pluralize ────────────────────────────────────────────────────────────────
 
 /// Render `"{count} {word}"`, pluralizing `singular` with a simple
 /// irregular-aware English rule when `count != 1`.
+///
+/// Use [`pluralize_with`] to supply an explicit plural for irregulars this
+/// rule misses.
 #[cfg(feature = "maud")]
 #[must_use]
-pub fn pluralize(_count: i64, _singular: &str) -> maud::Markup {
-    // TODO(red): not implemented yet.
-    maud::html! { "" }
+pub fn pluralize(count: i64, singular: &str) -> maud::Markup {
+    let word = if count == 1 {
+        singular.to_owned()
+    } else {
+        pluralize_word(singular)
+    };
+    maud::html! { (count) " " (word) }
 }
 
-/// Render `"{count} {word}"`, choosing between `singular` and an explicit `plural`.
+/// Render `"{count} {word}"`, choosing between `singular` and an explicit
+/// `plural` — the escape hatch for irregulars [`pluralize`]'s built-in rule
+/// misses.
 #[cfg(feature = "maud")]
 #[must_use]
-pub fn pluralize_with(_count: i64, _singular: &str, _plural: &str) -> maud::Markup {
-    // TODO(red): not implemented yet.
-    maud::html! { "" }
+pub fn pluralize_with(count: i64, singular: &str, plural: &str) -> maud::Markup {
+    let word = if count == 1 { singular } else { plural };
+    maud::html! { (count) " " (word) }
+}
+
+/// Naive English pluraliser for display words. Mirrors the identifier
+/// pluraliser in `autumn-cli`'s naming helpers, minus the `snake_case`
+/// segment-splitting (display words are whole words, not identifiers).
+fn pluralize_word(word: &str) -> String {
+    if word.is_empty() {
+        return String::new();
+    }
+    match word {
+        "person" => return "people".to_owned(),
+        "child" => return "children".to_owned(),
+        "man" => return "men".to_owned(),
+        "woman" => return "women".to_owned(),
+        "mouse" => return "mice".to_owned(),
+        "goose" => return "geese".to_owned(),
+        _ => {}
+    }
+    let lower = word.to_ascii_lowercase();
+    if lower.ends_with("ss")
+        || lower.ends_with('x')
+        || lower.ends_with('z')
+        || lower.ends_with("ch")
+        || lower.ends_with("sh")
+    {
+        return format!("{word}es");
+    }
+    if lower.ends_with('y') {
+        let prev = word.chars().rev().nth(1);
+        if prev.is_some_and(|c| !"aeiouAEIOU".contains(c)) {
+            let mut out: String = word.chars().take(word.chars().count() - 1).collect();
+            out.push_str("ies");
+            return out;
+        }
+    }
+    format!("{word}s")
 }
 
 // ── Truncation ────────────────────────────────────────────────────────────────
@@ -154,9 +265,15 @@ pub fn truncate(text: &str, len: usize) -> maud::Markup {
 /// Like [`truncate`], with a caller-supplied omission marker instead of `"…"`.
 #[cfg(feature = "maud")]
 #[must_use]
-pub fn truncate_with(_text: &str, _len: usize, _omission: &str) -> maud::Markup {
-    // TODO(red): not implemented yet.
-    maud::html! { "" }
+pub fn truncate_with(text: &str, len: usize, omission: &str) -> maud::Markup {
+    let char_count = text.chars().count();
+    if char_count <= len {
+        return maud::html! { (text) };
+    }
+    let omission_len = omission.chars().count();
+    let keep = len.saturating_sub(omission_len);
+    let truncated: String = text.chars().take(keep).collect();
+    maud::html! { (truncated) (omission) }
 }
 
 /// Shorten `text` to at most `n` whitespace-delimited words.
@@ -169,28 +286,67 @@ pub fn truncate_words(text: &str, n: usize) -> maud::Markup {
 /// Like [`truncate_words`], with a caller-supplied omission marker instead of `"…"`.
 #[cfg(feature = "maud")]
 #[must_use]
-pub fn truncate_words_with(_text: &str, _n: usize, _omission: &str) -> maud::Markup {
-    // TODO(red): not implemented yet.
-    maud::html! { "" }
+pub fn truncate_words_with(text: &str, n: usize, omission: &str) -> maud::Markup {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    if words.len() <= n {
+        return maud::html! { (text) };
+    }
+    let truncated = words[..n].join(" ");
+    maud::html! { (truncated) (omission) }
 }
 
 // ── Dates & times ────────────────────────────────────────────────────────────
 
 /// Render a human-readable relative time (`"3 minutes ago"`, `"in 2 days"`)
 /// between `dt` and the current instant of `clock`.
+///
+/// Pass a [`crate::time::FixedClock`] or [`crate::time::TickingClock`] in
+/// tests for deterministic output.
 #[cfg(feature = "maud")]
 #[must_use]
-pub fn time_ago_in_words(_dt: DateTime<Utc>, _clock: &dyn ClockSource) -> maud::Markup {
-    // TODO(red): not implemented yet.
-    maud::html! { "" }
+pub fn time_ago_in_words(dt: DateTime<Utc>, clock: &dyn ClockSource) -> maud::Markup {
+    let text = relative_time_words(dt, clock.now());
+    maud::html! { (text) }
+}
+
+fn relative_time_words(dt: DateTime<Utc>, now: DateTime<Utc>) -> String {
+    let secs = now.signed_duration_since(dt).num_seconds();
+    if secs < 0 {
+        format!("in {}", duration_words(secs.unsigned_abs()))
+    } else {
+        format!("{} ago", duration_words(secs.unsigned_abs()))
+    }
+}
+
+/// Render a whole-unit duration as `"{n} {second,minute,hour,day}(s)"`.
+fn duration_words(secs: u64) -> String {
+    let (n, singular, plural) = if secs < 60 {
+        (secs, "second", "seconds")
+    } else if secs < 3600 {
+        (secs / 60, "minute", "minutes")
+    } else if secs < 86_400 {
+        (secs / 3600, "hour", "hours")
+    } else {
+        (secs / 86_400, "day", "days")
+    };
+    let word = if n == 1 { singular } else { plural };
+    format!("{n} {word}")
 }
 
 /// Render `dt` (UTC) using a `chrono` strftime-style absolute format string.
+///
+/// ```rust
+/// use autumn_web::format::format_datetime;
+/// use chrono::{TimeZone, Utc};
+///
+/// let dt = Utc.with_ymd_and_hms(2026, 6, 7, 14, 32, 1).unwrap();
+/// assert_eq!(format_datetime(dt, "%Y-%m-%d").into_string(), "2026-06-07");
+/// ```
 #[cfg(feature = "maud")]
 #[must_use]
-pub fn format_datetime(_dt: DateTime<Utc>, _fmt: &str) -> maud::Markup {
-    // TODO(red): not implemented yet.
-    maud::html! { "" }
+pub fn format_datetime(dt: DateTime<Utc>, fmt: &str) -> maud::Markup {
+    let text = dt.format(fmt).to_string();
+    maud::html! { (text) }
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────
@@ -209,10 +365,7 @@ mod tests {
 
     #[test]
     fn currency_formats_with_default_options() {
-        assert_eq!(
-            number_to_currency(dec("1234.5")).into_string(),
-            "$1,234.50"
-        );
+        assert_eq!(number_to_currency(dec("1234.5")).into_string(), "$1,234.50");
     }
 
     #[test]
@@ -222,10 +375,7 @@ mod tests {
 
     #[test]
     fn currency_formats_negative() {
-        assert_eq!(
-            number_to_currency(dec("-42.5")).into_string(),
-            "-$42.50"
-        );
+        assert_eq!(number_to_currency(dec("-42.5")).into_string(), "-$42.50");
     }
 
     #[test]
@@ -375,8 +525,10 @@ mod tests {
 
     #[test]
     fn truncate_with_custom_omission() {
+        // len (16) caps the *total* output, including the omission marker:
+        // "The quick" (9 chars) + " [more]" (7 chars) = 16.
         assert_eq!(
-            truncate_with("The quick brown fox", 12, " [more]").into_string(),
+            truncate_with("The quick brown fox", 16, " [more]").into_string(),
             "The quick [more]"
         );
     }
@@ -430,10 +582,7 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2026, 1, 1, 12, 3, 0).unwrap();
         let dt = Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
         let clock = FixedClock::at(now);
-        assert_eq!(
-            time_ago_in_words(dt, &clock).into_string(),
-            "3 minutes ago"
-        );
+        assert_eq!(time_ago_in_words(dt, &clock).into_string(), "3 minutes ago");
     }
 
     #[test]
