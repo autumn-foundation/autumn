@@ -285,6 +285,39 @@ pub use crate::i18n::Locale;
 #[cfg(feature = "i18n")]
 pub use crate::i18n::t;
 
+// ── Formatting ───────────────────────────────────────────────────
+/// Currency, delimited-number, precision/separator configuration for
+/// [`number_to_currency`]. See [`crate::format`] for the full API.
+#[cfg(feature = "maud")]
+pub use crate::format::CurrencyOptions;
+/// Format a `chrono` UTC timestamp with a strftime-style absolute format string.
+#[cfg(feature = "maud")]
+pub use crate::format::format_datetime;
+/// Format a [`rust_decimal::Decimal`] as currency (`$1,234.50`) using sane defaults.
+#[cfg(feature = "maud")]
+pub use crate::format::number_to_currency;
+/// Render an integer or decimal with grouped thousands (`1,234,567`).
+#[cfg(feature = "maud")]
+pub use crate::format::number_with_delimiter;
+/// Render `"{count} {word}"`, pluralizing with a simple irregular-aware rule.
+#[cfg(feature = "maud")]
+pub use crate::format::pluralize;
+/// Render `"{count} {word}"`, choosing between an explicit singular and plural.
+#[cfg(feature = "maud")]
+pub use crate::format::pluralize_with;
+/// Render `"3 minutes ago"` / `"in 2 days"` relative to a [`crate::time::ClockSource`].
+#[cfg(feature = "maud")]
+pub use crate::format::time_ago_in_words;
+/// Shorten text to at most `len` characters without splitting a UTF-8 character mid-byte.
+#[cfg(feature = "maud")]
+pub use crate::format::{truncate, truncate_with};
+/// Shorten text to at most `n` whitespace-delimited words.
+#[cfg(feature = "maud")]
+pub use crate::format::{truncate_words, truncate_words_with};
+/// Exact-precision decimal type accepted by [`number_to_currency`] and
+/// [`number_with_delimiter`].
+pub use rust_decimal::Decimal;
+
 // ── Time zones ────────────────────────────────────────────────────
 /// Request-scoped time zone extractor (resolves from user extension,
 /// session, cookie, and query parameter — see [`crate::time_zone`]).
@@ -392,5 +425,13 @@ mod tests {
     fn maud_types_work_through_prelude() {
         let markup: Markup = html! { "hello" };
         assert!(markup.into_string().contains("hello"));
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn format_helpers_work_through_prelude() {
+        let price: Decimal = "9.5".parse().unwrap();
+        assert_eq!(number_to_currency(price).into_string(), "$9.50");
+        assert_eq!(pluralize(1, "comment").into_string(), "1 comment");
     }
 }

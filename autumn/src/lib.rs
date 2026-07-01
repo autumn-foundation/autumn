@@ -1163,6 +1163,7 @@ pub mod reexports {
     pub use inventory;
     #[cfg(feature = "mail")]
     pub use lettre;
+    pub use rust_decimal;
     #[cfg(feature = "db")]
     pub use scoped_futures;
     pub use serde;
