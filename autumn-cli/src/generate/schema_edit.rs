@@ -1492,15 +1492,18 @@ fn split_top_level_commas(s: &str) -> Vec<&str> {
 /// Tolerant of any amount of TOML whitespace around `=` on either side --
 /// TOML permits none, one, or many spaces there, so a literal substring
 /// check for one specific spacing (`package = "..."` or `package="..."`)
-/// silently misses forms like `package= "..."` or `package ="..."`.
+/// silently misses forms like `package= "..."` or `package ="..."`. Also
+/// tolerant of TOML's single-quoted literal-string form (`package =
+/// 'autumn-web'`), which Cargo accepts identically to a double-quoted one.
 fn declares_package(text: &str, target: &str) -> bool {
     let body = match (text.find('{'), text.rfind('}')) {
         (Some(open), Some(close)) if close > open => &text[open + 1..close],
         _ => text,
     };
     split_top_level_commas(body).into_iter().any(|part| {
-        part.split_once('=')
-            .is_some_and(|(k, v)| k.trim() == "package" && v.trim().trim_matches('"') == target)
+        part.split_once('=').is_some_and(|(k, v)| {
+            k.trim() == "package" && v.trim().trim_matches(['"', '\'']) == target
+        })
     })
 }
 
@@ -1574,13 +1577,17 @@ fn extract_source_from_subtable_lines(lines: &[&str]) -> Option<String> {
 
 /// Extract the version literal from a plain-string `<dep_name> = "x.y.z"`
 /// declaration (no inline table), so it can be mirrored the same way an
-/// explicit `version = "..."` key is.
+/// explicit `version = "..."` key is. Recognizes both of TOML's string
+/// forms -- double-quoted (`"x.y.z"`) and single-quoted literal
+/// (`'x.y.z'`) -- since Cargo accepts either.
 fn extract_plain_string_version(line: &str, dep_name: &str) -> Option<String> {
     let rest = line.trim().strip_prefix(dep_name)?.trim_start();
     let rest = rest.strip_prefix('=')?.trim_start();
     let rest = rest.split('#').next().unwrap_or(rest).trim();
-    (rest.starts_with('"') && rest.ends_with('"') && rest.len() >= 2)
-        .then(|| format!("version = {rest}"))
+    let is_quoted = rest.len() >= 2
+        && ((rest.starts_with('"') && rest.ends_with('"'))
+            || (rest.starts_with('\'') && rest.ends_with('\'')));
+    is_quoted.then(|| format!("version = {rest}"))
 }
 
 /// Like [`detect_dependencies_autumn_web_source`], but for an arbitrary
@@ -4740,6 +4747,41 @@ pub struct Comment {
             updated
                 .contains("autumn-web = { path = \"../autumn\", features = [\"test-support\"] }"),
             "must mirror the aliased dep's path source despite odd spacing around package=: {updated}"
+        );
+        assert!(!updated.contains("version = \"0.6\""));
+    }
+
+    #[test]
+    fn dev_dependency_test_support_mirrors_aliased_path_source_single_quoted() {
+        // Regression test (Codex review, issue #1023): TOML's single-quoted
+        // literal-string form (`package = 'autumn-web'`) is accepted by
+        // Cargo identically to a double-quoted one (confirmed via `cargo
+        // metadata --offline --no-deps`), but the alias detector only
+        // stripped double quotes from the package value, so it missed this
+        // form and fell back to a mismatched crates.io version.
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nautumn_web = { package = 'autumn-web', path = '../autumn' }\n";
+        let updated = ensure_dev_dependency_test_support(cargo, "0.6");
+        assert!(
+            updated.contains("autumn-web = { path = '../autumn', features = [\"test-support\"] }"),
+            "must mirror the aliased dep's single-quoted path source: {updated}"
+        );
+        assert!(!updated.contains("version = \"0.6\""));
+    }
+
+    #[test]
+    fn dev_dependency_test_support_mirrors_single_quoted_version() {
+        // Regression test (Codex review, issue #1023): a plain single-quoted
+        // version (`autumn-web = '0.5'`) is valid Cargo.toml (confirmed via
+        // `cargo metadata --offline --no-deps`), but extract_plain_string_version
+        // only recognized double-quoted strings, so it fell back to the
+        // CLI's own version instead of mirroring the project's pin --
+        // exactly the same failure mode the double-quoted version-mirroring
+        // fix addressed.
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = '0.5'\n";
+        let updated = ensure_dev_dependency_test_support(cargo, "0.6");
+        assert!(
+            updated.contains("autumn-web = { version = '0.5', features = [\"test-support\"] }"),
+            "must mirror the existing single-quoted pinned version, not the CLI's: {updated}"
         );
         assert!(!updated.contains("version = \"0.6\""));
     }
