@@ -385,10 +385,14 @@ Everything `model` produces, plus:
 - `src/routes/<plural>.rs` — Maud HTML handlers for `index`, `show`, `new_form`,
   `create`, `edit_form`, and `update`. (Skipped if `--api` is set).
 - `src/routes/mod.rs` — module aggregator. (Skipped if `--api` is set).
-- `tests/<snake>.rs` — a smoke test that hits `GET /<plural>` against
-  a running server and asserts a 2xx response (skipped unless
-  `AUTUMN_TEST_BASE_URL` is set). For `--api` scaffolds, this performs a JSON-based
-  CRUD round-trip.
+- `tests/<snake>.rs` — a real, in-process smoke test built on
+  `autumn_web::test::{TestApp, TestClient, TestDb}`: it boots a throwaway
+  Postgres database, fires a request at a stand-in for the scaffolded index
+  route, and asserts a real response — no running server, no env var, no
+  silent skip. `cargo test` reports it as `ignored` with an explicit reason
+  (Docker isn't assumed to be available); run `cargo test -- --ignored` to
+  execute it for real. `--api` scaffolds get the JSON equivalent, asserting
+  against `GET /api/<plural>`.
 - `src/main.rs` — the `mod` declarations plus `routes![…]` entries get
   added in place. Existing entries are preserved; rerunning the generator
   with the same arguments is a no-op. By default, the scaffold registers only

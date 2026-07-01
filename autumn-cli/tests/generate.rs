@@ -367,12 +367,16 @@ fn generate_scaffold_full_e2e_post() {
         assert!(routes.contains(needle), "routes file missing: {needle}");
     }
 
-    // Smoke test.
+    // Smoke test: real, in-process, DB-backed index/read test (issue #1023) --
+    // no raw TcpStream, no AUTUMN_TEST_BASE_URL, no silent env-gated skip.
     let test = fs::read_to_string(project.join("tests/post.rs")).unwrap();
-    assert!(test.contains("posts_index_returns_200_when_server_is_running"));
-    assert!(test.contains("AUTUMN_TEST_BASE_URL"));
+    assert!(test.contains("posts_index_renders_scaffolded_rows"));
+    assert!(test.contains("autumn_web::test::{TestApp, TestClient, TestDb}"));
+    assert!(!test.contains("TcpStream"));
+    assert!(!test.contains("AUTUMN_TEST_BASE_URL"));
     assert!(!test.contains("AUTUMN_TEST_SESSION_COOKIE"));
     assert!(!test.contains("Cookie: {session_cookie}"));
+    assert!(test.contains("#[ignore = \"requires Docker"));
 
     // `routes![]` registration.
     let main = fs::read_to_string(project.join("src/main.rs")).unwrap();
@@ -438,12 +442,14 @@ fn generate_scaffold_api_only() {
     // No HTML routes file
     assert!(!project.join("src/routes/posts.rs").is_file());
 
-    // Smoke test.
+    // Smoke test: real, in-process, DB-backed read test (issue #1023).
     let test = fs::read_to_string(project.join("tests/post.rs")).unwrap();
-    assert!(test.contains("posts_api_json_crud_round_trip_when_server_is_running"));
-    assert!(test.contains("AUTUMN_TEST_BASE_URL"));
-    assert!(test.contains("POST"));
-    assert!(test.contains("DELETE"));
+    assert!(test.contains("posts_api_list_returns_ok_against_a_real_database"));
+    assert!(test.contains("autumn_web::test::{TestApp, TestClient, TestDb}"));
+    assert!(!test.contains("TcpStream"));
+    assert!(!test.contains("AUTUMN_TEST_BASE_URL"));
+    assert!(test.contains("#[ignore = \"requires Docker"));
+    assert!(test.contains("/api/posts"));
 
     // `routes![]` registration.
     let main = fs::read_to_string(project.join("src/main.rs")).unwrap();
@@ -3756,6 +3762,47 @@ fn generated_sharded_scaffold_cargo_checks() {
     assert!(
         check.status.success(),
         "cargo check on generated sharded scaffold failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr),
+    );
+}
+
+/// Slow end-to-end check: scaffold a `--soft-delete` project, patch Cargo.toml
+/// to the local autumn-web, and `cargo check --tests` the result. Regression
+/// coverage for a bug where the generated model's `deleted_at` field lacked
+/// `#[default]` (so `NewX`/`UpdateX` required it, but no handler populated
+/// it) and was declared in the wrong position relative to `created_at`
+/// (mismatching the migration/schema.rs column order the `#[repository]`
+/// macro's positional insert-`RETURNING` query relies on).
+///
+/// Run with: `cargo test -p autumn-cli -- --ignored generated_soft_delete_scaffold_cargo_checks`
+#[test]
+#[ignore = "slow: cargo-checks a fresh soft-delete scaffold — run with `cargo test -p autumn-cli -- --ignored`"]
+fn generated_soft_delete_scaffold_cargo_checks() {
+    let (_tmp, project) = fresh_project("soft-delete-build");
+
+    patch_generated_cargo_toml(&project);
+
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Post",
+            "title:String",
+            "body:Text",
+            "--soft-delete",
+        ],
+    );
+
+    let check = Command::new("cargo")
+        .args(["check", "--tests"])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "cargo check on generated soft-delete scaffold failed:\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&check.stdout),
         String::from_utf8_lossy(&check.stderr),
     );
