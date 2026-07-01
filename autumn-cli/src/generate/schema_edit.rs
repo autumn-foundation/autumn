@@ -1881,20 +1881,25 @@ fn rewrite_dep_with_feature(line: &str, dep_name: &str, feature: &str) -> String
     let feature_quoted = format!("\"{feature}\"");
     let trimmed = line.trim();
 
-    // Form 1: <dep_name> = "x.y.z"  (optional trailing TOML comment)
+    // Form 1: <dep_name> = "x.y.z"  (optional trailing TOML comment).
+    // Recognizes both of TOML's string forms -- double-quoted and
+    // single-quoted literal (`<dep_name> = 'x.y.z'`) -- since Cargo accepts
+    // either; a version-only check here for `"` alone left a single-quoted
+    // dep unrecognized, so the caller treated it as absent and inserted a
+    // duplicate key.
     if let Some(rest) = trimmed.strip_prefix(dep_name) {
         let rest = rest.trim_start_matches([' ', '=', '\t']);
-        if rest.starts_with('"') {
+        if let Some(quote) = rest.chars().next().filter(|&c| c == '"' || c == '\'') {
             // Strip any trailing `# comment` before matching the closing quote.
             let value_str = rest.split('#').next().unwrap_or(rest).trim_end();
             if let Some(version) = value_str
-                .strip_prefix('"')
-                .and_then(|r| r.strip_suffix('"'))
+                .strip_prefix(quote)
+                .and_then(|r| r.strip_suffix(quote))
             {
                 let indent_len = line.len() - line.trim_start().len();
                 let indent = &line[..indent_len];
                 return format!(
-                    "{indent}{dep_name} = {{ version = \"{version}\", features = [{feature_quoted}] }}"
+                    "{indent}{dep_name} = {{ version = {quote}{version}{quote}, features = [{feature_quoted}] }}"
                 );
             }
         }
@@ -4547,6 +4552,26 @@ pub struct Comment {
     }
 
     #[test]
+    fn dev_dependency_test_support_rewrites_single_quoted_plain_version() {
+        // Regression test (Codex review, issue #1023): same gap as the
+        // tokio case -- rewrite_dep_with_feature's Form 1 only recognized
+        // double-quoted plain-string versions, so a valid single-quoted
+        // existing `autumn-web = '0.6'` dev-dependency was treated as
+        // absent and duplicated instead of getting test-support added.
+        let cargo = "[package]\nname=\"x\"\n\n[dev-dependencies]\nautumn-web = '0.6'\n";
+        let updated = ensure_dev_dependency_test_support(cargo, "0.6");
+        assert_eq!(
+            updated.matches("autumn-web").count(),
+            1,
+            "must rewrite the existing single-quoted autumn-web dep in place, not duplicate it: {updated}"
+        );
+        assert!(
+            updated.contains("\"test-support\""),
+            "must add test-support to the single-quoted dev entry: {updated}"
+        );
+    }
+
+    #[test]
     fn dev_dependency_test_support_creates_section_when_absent() {
         let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = \"0.6\"\n";
         let updated = ensure_dev_dependency_test_support(cargo, "0.6");
@@ -4985,6 +5010,32 @@ pub struct Comment {
         assert!(
             code.contains("\"rt\"") && code.contains("\"macros\""),
             "features must be added to the real dependency value, not the trailing comment: {tokio_line}"
+        );
+    }
+
+    #[test]
+    fn tokio_test_features_rewrites_single_quoted_plain_version() {
+        // Regression test (Codex review, issue #1023): rewrite_dep_with_feature's
+        // Form 1 only recognized a double-quoted plain-string version
+        // (`tokio = "1"`). A valid single-quoted one (`tokio = '1'`,
+        // confirmed accepted by `cargo metadata --offline --no-deps`) fell
+        // through unrecognized, so the caller treated the dependency as
+        // absent and inserted a *second*, duplicate `tokio` key -- which
+        // Cargo rejects outright, making the manifest unusable.
+        let cargo = "[package]\nname=\"x\"\n\n[dev-dependencies]\ntokio = '1'\n";
+        let updated = ensure_dev_dependency_tokio_test_features(cargo);
+        assert_eq!(
+            updated.matches("tokio").count(),
+            1,
+            "must rewrite the existing single-quoted tokio dep in place, not duplicate it: {updated}"
+        );
+        let tokio_line = updated
+            .lines()
+            .find(|l| l.trim_start().starts_with("tokio"))
+            .unwrap_or_else(|| panic!("no tokio line in: {updated}"));
+        assert!(
+            tokio_line.contains("\"rt\"") && tokio_line.contains("\"macros\""),
+            "must add both features to the single-quoted tokio dep: {tokio_line}"
         );
     }
 
