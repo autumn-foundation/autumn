@@ -161,6 +161,7 @@ validator.workspace = true
 uuid = { version = "1", features = ["v4"] }
 chrono = { workspace = true }
 chrono-tz.workspace = true
+rust_decimal.workspace = true
 croner = "3.0.1"
 testcontainers = { workspace = true, optional = true }
 testcontainers-modules = { workspace = true, optional = true }
