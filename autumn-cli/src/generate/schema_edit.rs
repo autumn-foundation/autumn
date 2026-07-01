@@ -1194,7 +1194,13 @@ fn ensure_autumn_web_feature_status_in_section(
 /// less-capable reimplementation. Only the "no `autumn-web` entry yet" case is
 /// bespoke: unlike `[dependencies]` (which every `autumn new` project already
 /// declares `autumn-web` in), a fresh project's `[dev-dependencies]` has no
-/// `autumn-web` line at all, so this inserts one with an explicit version.
+/// `autumn-web` line at all, so this inserts one. Its source mirrors whatever
+/// `[dependencies]` uses (crates.io version, `workspace = true`, `path`, or
+/// `git`) via [`detect_dependencies_autumn_web_source`] -- Cargo requires
+/// every declaration of a dependency to unify to one source across build
+/// targets, so defaulting to a crates.io version unconditionally would break
+/// `cargo` entirely for any project that inherits `autumn-web` from the
+/// workspace or a local path/git checkout.
 ///
 /// Idempotent: a second call is a no-op once the feature is present.
 #[must_use]
@@ -1206,8 +1212,9 @@ pub fn ensure_dev_dependency_test_support(existing: &str, autumn_version: &str) 
     }
 
     let feature_quoted = "\"test-support\"";
-    let new_dep_line =
-        format!("autumn-web = {{ version = \"{autumn_version}\", features = [{feature_quoted}] }}");
+    let source = detect_dependencies_autumn_web_source(existing)
+        .unwrap_or_else(|| format!("version = \"{autumn_version}\""));
+    let new_dep_line = format!("autumn-web = {{ {source}, features = [{feature_quoted}] }}");
     let lines: Vec<&str> = existing.lines().collect();
 
     let Some(header_idx) = lines
@@ -1243,6 +1250,157 @@ pub fn ensure_dev_dependency_test_support(existing: &str, autumn_version: &str) 
         out.pop();
     }
     out
+}
+
+/// TOML keys that determine *where* a dependency resolves from. Cargo
+/// unifies every declaration of a given dependency name to a single source
+/// across build targets, so if `[dependencies]` and `[dev-dependencies]`
+/// disagree on any of these, `cargo` refuses to build at all ("Dependency
+/// 'autumn-web' has different source paths depending on the build target").
+const SOURCE_KEYS: &[&str] = &[
+    "workspace",
+    "path",
+    "git",
+    "branch",
+    "tag",
+    "rev",
+    "registry",
+];
+
+fn is_source_key(key: &str) -> bool {
+    SOURCE_KEYS.contains(&key)
+}
+
+/// Split `s` on top-level commas, ignoring commas nested inside a quoted
+/// string or a `[...]`/`{...}` value (e.g. a `features = [...]` list).
+fn split_top_level_commas(s: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut depth = 0i32;
+    let mut in_str = false;
+    for (i, c) in s.char_indices() {
+        match c {
+            '"' => in_str = !in_str,
+            '[' | '{' if !in_str => depth += 1,
+            ']' | '}' if !in_str => depth -= 1,
+            ',' if !in_str && depth == 0 => {
+                parts.push(&s[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&s[start..]);
+    parts
+}
+
+/// Pull the source-defining keys (see [`SOURCE_KEYS`]) out of a run of
+/// `key = value` pairs, joined back into a single `key = value, ...`
+/// fragment. Returns `None` when none of `pairs` sets a source key (e.g. a
+/// plain `{ version = "...", features = [...] }` table).
+fn extract_source_keys<'a>(pairs: impl Iterator<Item = &'a str>) -> Option<String> {
+    let found: Vec<String> = pairs
+        .filter_map(|part| {
+            let (key, value) = part.split_once('=')?;
+            let key = key.trim();
+            is_source_key(key).then(|| format!("{key} = {}", value.trim()))
+        })
+        .collect();
+    if found.is_empty() {
+        None
+    } else {
+        Some(found.join(", "))
+    }
+}
+
+/// Extract the source keys from an inline-table `autumn-web = { ... }` line.
+fn extract_source_from_inline_table(line: &str) -> Option<String> {
+    let open = line.find('{')?;
+    let close = line.rfind('}')?;
+    if close <= open {
+        return None;
+    }
+    extract_source_keys(split_top_level_commas(&line[open + 1..close]).into_iter())
+}
+
+/// Extract the source keys from the body lines of a `[dependencies.autumn-web]`
+/// multiline subtable.
+fn extract_source_from_subtable_lines(lines: &[&str]) -> Option<String> {
+    extract_source_keys(
+        lines
+            .iter()
+            .map(|l| l.split_once('#').map_or(*l, |(code, _)| code).trim())
+            .filter(|l| !l.is_empty()),
+    )
+}
+
+/// Detect the source (`workspace = true`, `path = "..."`, `git = "..."`,
+/// etc.) that `[dependencies]` declares for `autumn-web`, so a freshly
+/// inserted `[dev-dependencies]` entry can mirror it instead of defaulting
+/// to a crates.io `version = ...`. See [`SOURCE_KEYS`] for why mismatched
+/// sources break the build.
+///
+/// Returns `None` when `[dependencies]` declares `autumn-web` as a plain
+/// crates.io dependency (or the entry can't be found at all), in which case
+/// the caller should fall back to an explicit `version = ...`.
+fn detect_dependencies_autumn_web_source(existing: &str) -> Option<String> {
+    let lines: Vec<&str> = existing.lines().collect();
+    let mut in_section = false;
+
+    // Pass 1: inline or dotted-key form directly under `[dependencies]`.
+    for &line in &lines {
+        let trimmed = line.trim();
+        if is_section_header(trimmed, "dependencies") {
+            in_section = true;
+            continue;
+        }
+        if in_section && is_section_boundary(trimmed, "dependencies") {
+            in_section = false;
+            continue;
+        }
+        if !in_section || trimmed.starts_with('#') {
+            continue;
+        }
+        let after_ws = line.trim_start();
+        let Some(rest) = after_ws.strip_prefix("autumn-web") else {
+            continue;
+        };
+        if let Some(dotted) = rest.strip_prefix('.') {
+            // autumn-web.workspace = true / autumn-web.path = "..." / etc.
+            let Some((key, value)) = dotted.split_once('=') else {
+                continue;
+            };
+            let key = key.trim();
+            if is_source_key(key) {
+                let value = value.split('#').next().unwrap_or("").trim();
+                return Some(format!("{key} = {value}"));
+            }
+            continue;
+        }
+        if rest.starts_with(|c: char| c != '=' && !c.is_whitespace()) {
+            // A different dependency (e.g. `autumn-web2`) -- keep scanning.
+            continue;
+        }
+        // The single `autumn-web = ...` declaration for this section: either
+        // a plain string version (no source keys -- `None`) or an inline
+        // table that may carry `workspace`/`path`/`git`.
+        return extract_source_from_inline_table(line);
+    }
+
+    // Pass 2: multiline `[dependencies.autumn-web]` subtable form.
+    let subtable_key = "[dependencies.autumn-web]";
+    let section_start = lines
+        .iter()
+        .position(|l| l.trim().split('#').next().unwrap_or("").trim() == subtable_key)?
+        + 1;
+    let section_end = lines[section_start..]
+        .iter()
+        .position(|l| {
+            let t = l.trim();
+            t.starts_with('[') && !t.is_empty()
+        })
+        .map_or(lines.len(), |p| section_start + p);
+    extract_source_from_subtable_lines(&lines[section_start..section_end])
 }
 
 /// Scan `lines` for a section header matching `key` (after stripping inline TOML comments)
@@ -4079,6 +4237,63 @@ pub struct Comment {
             "0.6",
         );
         assert_eq!(via_shared, via_public);
+    }
+
+    #[test]
+    fn dev_dependency_test_support_mirrors_workspace_source() {
+        // Regression test (Codex review, issue #1023): when `[dependencies]`
+        // inherits `autumn-web` from the workspace and there's no existing
+        // `[dev-dependencies]` entry, inserting a crates.io `version = ...`
+        // entry makes Cargo refuse to build at all -- confirmed via a
+        // hand-built `cargo metadata` reproduction ("Dependency 'autumn-web'
+        // has different source paths depending on the build target"). The
+        // new dev-dependency entry must mirror `workspace = true` instead.
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web.workspace = true\n\n[dev-dependencies]\ntokio = { version = \"1\" }\n";
+        let updated = ensure_dev_dependency_test_support(cargo, "0.6");
+        assert!(
+            updated.contains("autumn-web = { workspace = true, features = [\"test-support\"] }"),
+            "must mirror the workspace source instead of defaulting to a crates.io version: {updated}"
+        );
+        assert!(!updated.contains("version = \"0.6\""));
+    }
+
+    #[test]
+    fn dev_dependency_test_support_mirrors_path_source() {
+        // Same failure mode as the workspace case, but for a direct `path`
+        // source (the pattern this monorepo's own `examples/*` projects use).
+        let cargo =
+            "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = { path = \"../autumn\" }\n";
+        let updated = ensure_dev_dependency_test_support(cargo, "0.6");
+        assert!(
+            updated
+                .contains("autumn-web = { path = \"../autumn\", features = [\"test-support\"] }"),
+            "must mirror the path source instead of defaulting to a crates.io version: {updated}"
+        );
+        assert!(!updated.contains("version = \"0.6\""));
+    }
+
+    #[test]
+    fn dev_dependency_test_support_mirrors_subtable_path_source() {
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies.autumn-web]\npath = \"../autumn\"\n";
+        let updated = ensure_dev_dependency_test_support(cargo, "0.6");
+        assert!(
+            updated
+                .contains("autumn-web = { path = \"../autumn\", features = [\"test-support\"] }"),
+            "must mirror a subtable-declared path source: {updated}"
+        );
+        assert!(!updated.contains("version = \"0.6\""));
+    }
+
+    #[test]
+    fn dev_dependency_test_support_falls_back_to_version_for_plain_crates_io_dep() {
+        // Baseline: a plain crates.io version in `[dependencies]` must still
+        // produce the pre-existing `version = ...` fallback.
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = \"0.6\"\n";
+        let updated = ensure_dev_dependency_test_support(cargo, "0.6");
+        assert!(
+            updated.contains("autumn-web = { version = \"0.6\", features = [\"test-support\"] }"),
+            "must fall back to an explicit version when [dependencies] has no source keys: {updated}"
+        );
     }
 
     // ── IdType-aware variants (issue #1400) ────────────────────────────────
