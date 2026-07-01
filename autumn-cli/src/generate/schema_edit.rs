@@ -991,7 +991,16 @@ fn patch_dotted_dep(
 
     if lines[dep_line_idx..section_end].iter().any(|l| {
         let line_code = l.split_once('#').map_or(*l, |(before, _)| before);
-        line_code.trim_start().starts_with(dep_name) && line_code.contains(feature_quoted)
+        // Require an exact dotted match (`<dep_name>.` ...) rather than a
+        // bare prefix, so an unrelated dependency sharing the prefix (e.g.
+        // `tokio-util = { features = ["rt"] }` when `dep_name` is "tokio")
+        // can't be mistaken for evidence that `<dep_name>` already has the
+        // feature -- that would skip actually adding it to the real dep.
+        line_code
+            .trim_start()
+            .strip_prefix(dep_name)
+            .is_some_and(|rest| rest.starts_with('.'))
+            && line_code.contains(feature_quoted)
     }) {
         return existing.to_owned();
     }
@@ -4796,6 +4805,28 @@ pub struct Comment {
             .find(|l| l.trim_start().starts_with("tokio.features"))
             .unwrap_or_else(|| panic!("no tokio.features line in: {updated}"));
         assert!(features_line.contains("\"rt\"") && features_line.contains("\"macros\""));
+    }
+
+    #[test]
+    fn tokio_test_features_dotted_form_not_shadowed_by_prefixed_dep() {
+        // Regression test (Codex review, issue #1023): patch_dotted_dep's
+        // idempotency check used a bare `starts_with(dep_name)`, so a later
+        // unrelated dependency sharing the prefix (e.g. `tokio-util`, a real
+        // crate that can plausibly coexist with `tokio` in the same
+        // project) whose value happened to contain `"rt"` was mistaken for
+        // proof that the real `tokio` dotted dep already had the feature --
+        // skipping the actual `tokio.features` splice and leaving the
+        // generated `#[tokio::test]` smoke test unable to compile.
+        let cargo = "[package]\nname=\"x\"\n\n[dev-dependencies]\ntokio.version = \"1\"\ntokio-util = { features = [\"rt\"] }\n";
+        let updated = ensure_dev_dependency_tokio_test_features(cargo);
+        let features_line = updated
+            .lines()
+            .find(|l| l.trim_start().starts_with("tokio.features"))
+            .unwrap_or_else(|| panic!("no tokio.features line in: {updated}"));
+        assert!(
+            features_line.contains("\"rt\"") && features_line.contains("\"macros\""),
+            "the real tokio dep must get both features despite the tokio-util decoy: {features_line}"
+        );
     }
 
     #[test]
