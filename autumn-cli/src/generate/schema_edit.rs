@@ -1394,6 +1394,13 @@ fn detect_dependencies_autumn_web_source(existing: &str) -> Option<String> {
     // any order, and extract_source_keys needs to see all of them at once to
     // apply the "registry needs version too" rule.
     let mut dotted_pairs: Vec<String> = Vec::new();
+    // Same idea for a renamed dep's dotted form, e.g. `autumn_web.package =
+    // "autumn-web"` plus `autumn_web.path = "../autumn"` -- only trusted as
+    // the autumn-web alias once a sibling `.package = "autumn-web"` line
+    // confirms it (an alias importable as `autumn_web` could coincidentally
+    // exist for an unrelated crate otherwise).
+    let mut alias_dotted_pairs: Vec<String> = Vec::new();
+    let mut alias_confirmed = false;
 
     // Pass 1: inline or dotted-key form directly under `[dependencies]`.
     for &line in &lines {
@@ -1412,26 +1419,40 @@ fn detect_dependencies_autumn_web_source(existing: &str) -> Option<String> {
         let after_ws = line.trim_start();
         let Some(rest) = after_ws.strip_prefix("autumn-web") else {
             // Not the literal `autumn-web` key -- check for a renamed dep,
-            // e.g. `aw = { package = "autumn-web", path = "../autumn" }`.
-            // `ensure_autumn_web_feature_status_in_section` already mirrors
-            // this shape for `[dependencies]` (Pass 1) and dev-dependencies
-            // reuse it; the source-detection path needs the same coverage,
-            // else it silently drops the alias's path/git/workspace source
-            // and falls back to a mismatched crates.io version.
+            // e.g. `aw = { package = "autumn-web", path = "../autumn" }` or
+            // its dotted-key equivalent `aw.package = "autumn-web"` /
+            // `aw.path = "../autumn"`. `ensure_autumn_web_feature_status_in_section`
+            // already mirrors both shapes for `[dependencies]`; the
+            // source-detection path needs the same coverage, else it
+            // silently drops the alias's path/git/workspace source and
+            // falls back to a mismatched crates.io version.
             let Some((key, val)) = after_ws.split_once('=') else {
                 continue;
             };
-            let alias = key.trim();
+            let key = key.trim();
+            let (alias, dotted_sub) = key
+                .split_once('.')
+                .map_or((key, None), |(b, r)| (b, Some(r)));
             if alias.replace('-', "_") != "autumn_web" {
                 continue;
             }
-            let val_code = val.split('#').next().unwrap_or(val);
-            if !val_code.contains(r#"package = "autumn-web""#)
-                && !val_code.contains(r#"package="autumn-web""#)
-            {
+            let val_code = val.split('#').next().unwrap_or(val).trim();
+            let Some(sub) = dotted_sub else {
+                // Inline form: autumn_web = { package = "autumn-web", ... }.
+                if val_code.contains(r#"package = "autumn-web""#)
+                    || val_code.contains(r#"package="autumn-web""#)
+                {
+                    return extract_source_from_inline_table(line);
+                }
                 continue;
+            };
+            // Dotted form: autumn_web.package = "autumn-web" /
+            // autumn_web.path = "../autumn" / etc.
+            if sub == "package" && val_code.trim_matches('"') == "autumn-web" {
+                alias_confirmed = true;
             }
-            return extract_source_from_inline_table(line);
+            alias_dotted_pairs.push(format!("{sub} = {val_code}"));
+            continue;
         };
         if let Some(dotted) = rest.strip_prefix('.') {
             // autumn-web.workspace = true / autumn-web.path = "..." / etc.
@@ -1452,6 +1473,10 @@ fn detect_dependencies_autumn_web_source(existing: &str) -> Option<String> {
             return Some(version);
         }
         return extract_source_from_inline_table(line);
+    }
+
+    if alias_confirmed {
+        return extract_source_keys(alias_dotted_pairs.iter().map(String::as_str));
     }
 
     if !dotted_pairs.is_empty() {
@@ -4491,6 +4516,29 @@ pub struct Comment {
             updated
                 .contains("autumn-web = { path = \"../autumn\", features = [\"test-support\"] }"),
             "must mirror the aliased subtable's path source: {updated}"
+        );
+        assert!(!updated.contains("version = \"0.6\""));
+    }
+
+    #[test]
+    fn dev_dependency_test_support_mirrors_dotted_aliased_path_source() {
+        // Regression test (Codex review, issue #1023): the renamed-dep fixes
+        // covered the inline-table (`autumn_web = { package = "autumn-web",
+        // ... }`) and subtable (`[dependencies.autumn_web]`) alias shapes,
+        // but not Cargo's dotted renamed-dependency form
+        // (`autumn_web.package = "autumn-web"` plus `autumn_web.path =
+        // "../autumn"` on separate lines). The alias-detection branch split
+        // on the key's dot and compared the whole `autumn_web.package`
+        // string against `autumn_web`, so it never matched and fell through
+        // to a mismatched crates.io version. Confirmed via `cargo metadata
+        // --offline` that two different paths for the same package name
+        // conflict, same as the other alias forms.
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nautumn_web.package = \"autumn-web\"\nautumn_web.path = \"../autumn\"\n";
+        let updated = ensure_dev_dependency_test_support(cargo, "0.6");
+        assert!(
+            updated
+                .contains("autumn-web = { path = \"../autumn\", features = [\"test-support\"] }"),
+            "must mirror the dotted-aliased dep's path source: {updated}"
         );
         assert!(!updated.contains("version = \"0.6\""));
     }
