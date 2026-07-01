@@ -34,6 +34,10 @@ pub enum BookmarkOperation {
     Update,
     DeleteById,
     MarkDead,
+    /// Acquiring the link checker's per-shard advisory lock — needs a
+    /// primary connection like a write does, but isn't itself a write, so
+    /// it's kept out of `conn()`'s `mark_write()` set.
+    AcquireShardLease,
 }
 
 pub(crate) const LINK_CHECKER_SHARD_COUNT: u32 = 16;
@@ -75,7 +79,8 @@ impl BookmarkRepository {
             BookmarkOperation::Save
             | BookmarkOperation::Update
             | BookmarkOperation::DeleteById
-            | BookmarkOperation::MarkDead => PoolRole::Primary,
+            | BookmarkOperation::MarkDead
+            | BookmarkOperation::AcquireShardLease => PoolRole::Primary,
         }
     }
 
@@ -126,6 +131,22 @@ impl BookmarkRepository {
         }
     }
 
+    /// Whether `operation` is a genuine write that should call `mark_write()`.
+    ///
+    /// `AcquireShardLease` also targets the primary (see [`Self::role_for`])
+    /// but taking an advisory lock isn't a write, so it's deliberately
+    /// excluded — split out from [`Self::conn`] so that's testable without a
+    /// live pool.
+    const fn is_write(operation: BookmarkOperation) -> bool {
+        matches!(
+            operation,
+            BookmarkOperation::Save
+                | BookmarkOperation::Update
+                | BookmarkOperation::DeleteById
+                | BookmarkOperation::MarkDead
+        )
+    }
+
     /// Acquire a connection for `operation` from the pool [`Self::effective_role`]
     /// selects. Only genuine writes call `mark_write()` — mirroring the
     /// macro's "mark only after a successful primary acquire" behavior —
@@ -137,13 +158,7 @@ impl BookmarkRepository {
         let state = Self::distributed_state()?;
         let pool = Self::pool(&state, role);
         let conn = pool.get().await.map_err(AutumnError::from)?;
-        if matches!(
-            operation,
-            BookmarkOperation::Save
-                | BookmarkOperation::Update
-                | BookmarkOperation::DeleteById
-                | BookmarkOperation::MarkDead
-        ) {
+        if Self::is_write(operation) {
             autumn_web::read_your_writes::mark_write();
         }
         Ok(conn)
@@ -177,7 +192,7 @@ impl BookmarkRepository {
     }
 
     async fn try_acquire_shard_lease(shard: u32) -> AutumnResult<Option<ShardLease>> {
-        let mut conn = Self::conn(BookmarkOperation::MarkDead).await?;
+        let mut conn = Self::conn(BookmarkOperation::AcquireShardLease).await?;
         let (namespace, shard_key) = Self::link_checker_lock_key(shard);
         let result = diesel::sql_query("SELECT pg_try_advisory_lock($1, $2) AS acquired")
             .bind::<Integer, _>(namespace)
@@ -425,6 +440,31 @@ mod tests {
             BookmarkRepository::role_for(BookmarkOperation::MarkDead),
             PoolRole::Primary
         );
+        assert_eq!(
+            BookmarkRepository::role_for(BookmarkOperation::AcquireShardLease),
+            PoolRole::Primary
+        );
+    }
+
+    #[test]
+    fn acquire_shard_lease_targets_primary_but_is_not_a_write() {
+        assert!(
+            !BookmarkRepository::is_write(BookmarkOperation::AcquireShardLease),
+            "taking an advisory lock must not call mark_write(), even though it \
+             needs a primary connection like a write does"
+        );
+    }
+
+    #[test]
+    fn writes_are_all_marked() {
+        for op in [
+            BookmarkOperation::Save,
+            BookmarkOperation::Update,
+            BookmarkOperation::DeleteById,
+            BookmarkOperation::MarkDead,
+        ] {
+            assert!(BookmarkRepository::is_write(op), "{op:?} must mark a write");
+        }
     }
 
     // ── RYWW wiring (BookmarkRepository::effective_role) ────────────────────

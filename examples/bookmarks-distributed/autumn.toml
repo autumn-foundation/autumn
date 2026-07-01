@@ -25,5 +25,13 @@ auto_migrate_in_production = false
 # spans two separate requests. See BookmarkRepository::conn() in
 # src/repositories.rs — this repository predates the #[repository(...)]
 # macro, so it opts into RYWW explicitly rather than getting it for free.
+#
+# The autumn.ryw cookie needs a configured signing secret to actually be
+# issued (see docs/guide/signing-secrets.md) — without one, dev's zero-config
+# ephemeral per-process key is deliberately NOT used for it, so this setting
+# quietly does nothing across the create -> redirect -> list flow. `docker
+# compose` already requires AUTUMN_SECURITY__SIGNING_SECRET (see
+# docker-compose.yml); for a plain `cargo run`, set the same env var to see
+# session pinning actually take effect.
 read_your_writes = "session"
 pin_after_write_secs = 10

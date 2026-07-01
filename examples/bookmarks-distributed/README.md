@@ -190,7 +190,13 @@ page), regardless of which replica handles it.
   create-then-redirect flow, but because this repository predates the
   `#[repository(...)]` macro it doesn't get that wiring automatically —
   `BookmarkRepository::conn()` opts in by hand via the same public
-  `is_pinned`/`mark_write` calls the macro emits.
+  `is_pinned`/`mark_write` calls the macro emits. Session-mode pinning
+  itself needs a configured signing secret to issue its `autumn.ryw` cookie
+  (see `docs/guide/signing-secrets.md`) — dev's zero-config ephemeral key is
+  deliberately not used for it, so a plain `cargo run` with no
+  `AUTUMN_SECURITY__SIGNING_SECRET` set will quietly keep missing the
+  just-created bookmark. `docker compose` already requires that variable
+  (see below); for a plain `cargo run`, set it yourself to see pinning work.
   Use `#[scheduled]` for light in-process work like this demo; move durable or
   coordinated multi-step work to Harvest.
 - Non-dev deployment needed an explicit migration runner because

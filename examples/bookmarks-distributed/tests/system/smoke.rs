@@ -65,6 +65,10 @@ fn setup_scratch_dir(
     replica_url: &str,
     extra_toml: &str,
 ) {
+    // A prior run that panicked before its own cleanup (or a reused PID)
+    // could leave this scratch dir behind; without clearing it first, the
+    // `static` symlink below would fail with `AlreadyExists`.
+    let _ = std::fs::remove_dir_all(dir);
     std::fs::create_dir_all(dir).expect("create scratch config dir");
     std::fs::write(
         dir.join("autumn.toml"),

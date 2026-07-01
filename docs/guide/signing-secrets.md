@@ -34,6 +34,7 @@ key** at startup. You do not need to set anything.
 | Process restart | All existing sessions are invalidated immediately |
 | Signed URLs from a previous process | Return `403 Forbidden` — the signature cannot be verified |
 | Multiple dev replicas | Sessions started on one replica are not readable by another |
+| `database.read_your_writes = "session"` | The ephemeral key is deliberately **not** threaded into the RYW middleware (see `router.rs`), so the `autumn.ryw` cookie is never issued — cross-request pinning silently does nothing until a secret is configured. A warning is logged at startup. `request` mode is unaffected (it needs no cookie). |
 
 This is intentional: ephemeral keys keep local development zero-config and
 ensure you never accidentally use a development secret in production. The
