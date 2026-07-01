@@ -188,10 +188,10 @@ fn assemble_signed_grouped(
 
 /// Group the ASCII digits of `int_digits` into threes, joined by `separator`.
 fn group_thousands(int_digits: &str, separator: char) -> String {
-    let len = int_digits.len();
-    let mut out = String::with_capacity(len + len / 3);
+    let char_count = int_digits.chars().count();
+    let mut out = String::with_capacity(char_count + char_count / 3);
     for (i, ch) in int_digits.chars().enumerate() {
-        if i > 0 && (len - i).is_multiple_of(3) {
+        if i > 0 && (char_count - i).is_multiple_of(3) {
             out.push(separator);
         }
         out.push(ch);
@@ -209,12 +209,11 @@ fn group_thousands(int_digits: &str, separator: char) -> String {
 #[cfg(feature = "maud")]
 #[must_use]
 pub fn pluralize(count: i64, singular: &str) -> maud::Markup {
-    let word = if count == 1 {
-        singular.to_owned()
+    if count == 1 {
+        maud::html! { (count) " " (singular) }
     } else {
-        pluralize_word(singular)
-    };
-    maud::html! { (count) " " (word) }
+        maud::html! { (count) " " (pluralize_word(singular)) }
+    }
 }
 
 /// Render `"{count} {word}"`, choosing between `singular` and an explicit
@@ -258,11 +257,12 @@ pub fn pluralize_word(word: &str) -> String {
         return format!("{word}es");
     }
     if lower.ends_with('y') {
-        let prev = word.chars().rev().nth(1);
-        if prev.is_some_and(|c| !"aeiouAEIOU".contains(c)) {
-            let mut out: String = word.chars().take(word.chars().count() - 1).collect();
-            out.push_str("ies");
-            return out;
+        // 'y' is 1-byte ASCII, so slicing off the last byte stays on a char boundary.
+        let prefix = &word[..word.len() - 1];
+        if let Some(prev) = prefix.chars().next_back()
+            && !"aeiouAEIOU".contains(prev)
+        {
+            return format!("{prefix}ies");
         }
     }
     format!("{word}s")
@@ -290,12 +290,18 @@ pub fn truncate_with(text: &str, len: usize, omission: &str) -> maud::Markup {
     if omission_len >= len {
         // Even the omission marker doesn't fit `len` on its own; clip it so
         // the total output still honors the caller's length cap.
-        let clipped: String = omission.chars().take(len).collect();
-        return maud::html! { (clipped) };
+        let byte_idx = omission
+            .char_indices()
+            .nth(len)
+            .map_or(omission.len(), |(idx, _)| idx);
+        return maud::html! { (&omission[..byte_idx]) };
     }
     let keep = len - omission_len;
-    let truncated: String = text.chars().take(keep).collect();
-    maud::html! { (truncated) (omission) }
+    let byte_idx = text
+        .char_indices()
+        .nth(keep)
+        .map_or(text.len(), |(idx, _)| idx);
+    maud::html! { (&text[..byte_idx]) (omission) }
 }
 
 /// Shorten `text` to at most `n` whitespace-delimited words.
@@ -313,8 +319,13 @@ pub fn truncate_words_with(text: &str, n: usize, omission: &str) -> maud::Markup
     if words.len() <= n {
         return maud::html! { (text) };
     }
-    let truncated = words[..n].join(" ");
-    maud::html! { (truncated) (omission) }
+    maud::html! {
+        @for (i, word) in words[..n].iter().enumerate() {
+            @if i > 0 { " " }
+            (word)
+        }
+        (omission)
+    }
 }
 
 // ── Dates & times ────────────────────────────────────────────────────────────
