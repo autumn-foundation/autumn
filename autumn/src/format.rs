@@ -11,27 +11,26 @@
 //!
 //! ```rust
 //! use autumn_web::format::{number_to_currency, pluralize, time_ago_in_words};
-//! use autumn_web::time::FixedClock;
+//! use autumn_web::time::{ClockSource, FixedClock};
 //! use chrono::{TimeZone, Utc};
 //! use maud::html;
 //! use rust_decimal::Decimal;
 //!
 //! let price: Decimal = "1234.5".parse().unwrap();
 //! let posted_at = Utc.with_ymd_and_hms(2026, 1, 1, 11, 58, 0).unwrap();
-//! let clock = FixedClock::at(Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap());
+//! let now = FixedClock::at(Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap()).now();
 //!
 //! let markup = html! {
 //!     (number_to_currency(price))
 //!     " — "
 //!     (pluralize(3, "comment"))
 //!     " — "
-//!     (time_ago_in_words(posted_at, &clock))
+//!     (time_ago_in_words(posted_at, now))
 //! };
 //!
 //! assert_eq!(markup.into_string(), "$1,234.50 — 3 comments — 2 minutes ago");
 //! ```
 
-use crate::time::ClockSource;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 
@@ -298,14 +297,16 @@ pub fn truncate_words_with(text: &str, n: usize, omission: &str) -> maud::Markup
 // ── Dates & times ────────────────────────────────────────────────────────────
 
 /// Render a human-readable relative time (`"3 minutes ago"`, `"in 2 days"`)
-/// between `dt` and the current instant of `clock`.
+/// between `dt` and `now`.
 ///
-/// Pass a [`crate::time::FixedClock`] or [`crate::time::TickingClock`] in
-/// tests for deterministic output.
+/// Pass `now` from the [`crate::time::Clock`] extractor (`clock.now()`) in
+/// handlers, or from a [`crate::time::ClockSource`] like
+/// [`crate::time::FixedClock`] (`clock.now()`) in tests for deterministic
+/// output.
 #[cfg(feature = "maud")]
 #[must_use]
-pub fn time_ago_in_words(dt: DateTime<Utc>, clock: &dyn ClockSource) -> maud::Markup {
-    let text = relative_time_words(dt, clock.now());
+pub fn time_ago_in_words(dt: DateTime<Utc>, now: DateTime<Utc>) -> maud::Markup {
+    let text = relative_time_words(dt, now);
     maud::html! { (text) }
 }
 
@@ -354,7 +355,7 @@ pub fn format_datetime(dt: DateTime<Utc>, fmt: &str) -> maud::Markup {
 #[cfg(all(test, feature = "maud"))]
 mod tests {
     use super::*;
-    use crate::time::FixedClock;
+    use crate::time::{ClockSource, FixedClock};
     use chrono::TimeZone;
 
     fn dec(s: &str) -> Decimal {
@@ -564,7 +565,7 @@ mod tests {
         let dt = Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
         let clock = FixedClock::at(now);
         assert_eq!(
-            time_ago_in_words(dt, &clock).into_string(),
+            time_ago_in_words(dt, clock.now()).into_string(),
             "30 seconds ago"
         );
     }
@@ -574,7 +575,10 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2026, 1, 1, 12, 1, 0).unwrap();
         let dt = Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
         let clock = FixedClock::at(now);
-        assert_eq!(time_ago_in_words(dt, &clock).into_string(), "1 minute ago");
+        assert_eq!(
+            time_ago_in_words(dt, clock.now()).into_string(),
+            "1 minute ago"
+        );
     }
 
     #[test]
@@ -582,7 +586,10 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2026, 1, 1, 12, 3, 0).unwrap();
         let dt = Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
         let clock = FixedClock::at(now);
-        assert_eq!(time_ago_in_words(dt, &clock).into_string(), "3 minutes ago");
+        assert_eq!(
+            time_ago_in_words(dt, clock.now()).into_string(),
+            "3 minutes ago"
+        );
     }
 
     #[test]
@@ -590,7 +597,10 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2026, 1, 1, 14, 0, 0).unwrap();
         let dt = Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
         let clock = FixedClock::at(now);
-        assert_eq!(time_ago_in_words(dt, &clock).into_string(), "2 hours ago");
+        assert_eq!(
+            time_ago_in_words(dt, clock.now()).into_string(),
+            "2 hours ago"
+        );
     }
 
     #[test]
@@ -598,7 +608,10 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2026, 1, 3, 12, 0, 0).unwrap();
         let dt = Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
         let clock = FixedClock::at(now);
-        assert_eq!(time_ago_in_words(dt, &clock).into_string(), "2 days ago");
+        assert_eq!(
+            time_ago_in_words(dt, clock.now()).into_string(),
+            "2 days ago"
+        );
     }
 
     #[test]
@@ -606,7 +619,10 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
         let dt = Utc.with_ymd_and_hms(2026, 1, 3, 12, 0, 0).unwrap();
         let clock = FixedClock::at(now);
-        assert_eq!(time_ago_in_words(dt, &clock).into_string(), "in 2 days");
+        assert_eq!(
+            time_ago_in_words(dt, clock.now()).into_string(),
+            "in 2 days"
+        );
     }
 
     // ── format_datetime ─────────────────────────────────────────────────────

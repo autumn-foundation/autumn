@@ -48,7 +48,7 @@ async fn index(clock: Clock, orders: Vec<Order>) -> Markup {
         Column::new("Total", |row: &Order| html! { (number_to_currency(row.total)) }),
         Column::new("Items", |row: &Order| html! { (pluralize(row.item_count, "item")) }),
         Column::new("Placed", |row: &Order| {
-            html! { (time_ago_in_words(row.placed_at, &clock)) }
+            html! { (time_ago_in_words(row.placed_at, clock.now())) }
         }),
     ];
 
@@ -97,17 +97,18 @@ custom marker (e.g. `" [read more]"`).
 
 ## Deterministic relative time in tests
 
-`time_ago_in_words` takes any [`autumn_web::time::ClockSource`], so tests
-get exact, non-flaky output with [`autumn_web::time::FixedClock`]:
+`time_ago_in_words` takes `now` as a plain `DateTime<Utc>` — pass
+`clock.now()` from the `Clock` extractor in handlers, or from any
+`ClockSource` (like `FixedClock`) in tests for exact, non-flaky output:
 
 ```rust
 use autumn_web::prelude::*;
-use autumn_web::time::FixedClock;
+use autumn_web::time::{ClockSource, FixedClock};
 use chrono::{TimeZone, Utc};
 
 let posted_at = Utc.with_ymd_and_hms(2026, 1, 1, 11, 58, 0).unwrap();
-let clock = FixedClock::at(Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap());
-assert_eq!(time_ago_in_words(posted_at, &clock).into_string(), "2 minutes ago");
+let now = FixedClock::at(Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap()).now();
+assert_eq!(time_ago_in_words(posted_at, now).into_string(), "2 minutes ago");
 ```
 
 ## Out of scope
