@@ -17,5 +17,18 @@ serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 
+[dev-dependencies]
+example-e2e = { path = "../../example-e2e" }
+tokio = { version = "1", features = ["full"] }
+
+[features]
+# Enable the headless-browser system smoke. Requires Chromium on the host.
+#   cargo test -p wiki --features system-tests --test smoke -- --include-ignored
+system-tests = ["autumn-web/system-tests"]
+
+[[test]]
+name = "smoke"
+path = "tests/system/smoke.rs"
+
 [lints.rust]
 unsafe_code = "forbid"

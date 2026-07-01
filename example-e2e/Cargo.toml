@@ -1,0 +1,18 @@
+[package]
+name = "example-e2e"
+version = "0.1.0"
+edition = { workspace = true }
+rust-version = { workspace = true }
+publish = false
+
+[dependencies]
+autumn-web = { path = "../autumn", features = ["system-tests", "test-support"] }
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true }
+tokio = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+thiserror = { workspace = true }
+futures = { workspace = true }
+
+[lints.rust]
+unsafe_code = "forbid"

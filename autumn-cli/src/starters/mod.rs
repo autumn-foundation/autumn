@@ -636,6 +636,13 @@ mod tests {
                 if rel == "static/css/app.css" {
                     continue;
                 }
+                // tests/system/smoke.rs is workspace-internal e2e tooling (issue
+                // #1192) that depends on the path-only `example-e2e` crate — it
+                // has no meaning outside the autumn monorepo, same category of
+                // divergence as Cargo.toml's path-vs-versioned dependency above.
+                if rel == "tests/system/smoke.rs" {
+                    continue;
+                }
                 assert!(
                     starter_paths.contains(&rel),
                     "examples/saas has {rel} which the embedded starter does not produce"

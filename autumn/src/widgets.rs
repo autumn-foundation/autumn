@@ -13,6 +13,7 @@
 //! | `property_list` | `<dl>` of label/value rows for a record detail view |
 //! | `data_table` | Column-driven, sortable `<table>` |
 //! | `breadcrumb` | Accessible `<nav>` breadcrumb trail |
+//! | `hero` | Landing-page banner: headline, optional subtitle, and CTAs |
 //!
 //! # Interactive / search widgets
 //!
@@ -1228,13 +1229,31 @@ impl<'a> CardConfig<'a> {
     }
 }
 
-/// Build the `class` string for the root card element, merging the base `"card"`
-/// with any caller-supplied extra classes.
+/// Build a root element's `class` string, merging `base` with any
+/// caller-supplied extra class. Shared by every widget with a `.class()`
+/// escape hatch (`card`, `hero`, ...).
 #[cfg(feature = "maud")]
-fn merge_class(extra: Option<&str>) -> String {
+fn merge_class(base: &str, extra: Option<&str>) -> String {
     match extra {
-        Some(e) if !e.is_empty() => format!("card {e}"),
-        _ => "card".to_string(),
+        Some(e) if !e.is_empty() => format!("{base} {e}"),
+        _ => base.to_string(),
+    }
+}
+
+/// Render `content` inside the `<h1>`–`<h6>` element selected by `level`, with
+/// `class` applied. Shared by every widget with a configurable heading level
+/// (`card`, `hero`, ...) so an `HeadingLevel` variant is matched in one place.
+#[cfg(feature = "maud")]
+fn heading(level: HeadingLevel, class: &str, content: &maud::Markup) -> maud::Markup {
+    maud::html! {
+        @match level {
+            HeadingLevel::H1 => h1 class=(class) { (content) },
+            HeadingLevel::H2 => h2 class=(class) { (content) },
+            HeadingLevel::H3 => h3 class=(class) { (content) },
+            HeadingLevel::H4 => h4 class=(class) { (content) },
+            HeadingLevel::H5 => h5 class=(class) { (content) },
+            HeadingLevel::H6 => h6 class=(class) { (content) },
+        }
     }
 }
 
@@ -1296,21 +1315,14 @@ fn merge_class(extra: Option<&str>) -> String {
 #[cfg(feature = "maud")]
 #[must_use]
 pub fn card(body: &maud::Markup, config: &CardConfig<'_>) -> maud::Markup {
-    let root_class = merge_class(config.class);
+    let root_class = merge_class("card", config.class);
     let has_header = config.title.is_some() || config.header_action.is_some();
     maud::html! {
         div class=(root_class) {
             @if has_header {
                 div class="card-header" {
                     @if let Some(title) = &config.title {
-                        @match config.level {
-                            HeadingLevel::H1 => h1 class="card-title" { (title) },
-                            HeadingLevel::H2 => h2 class="card-title" { (title) },
-                            HeadingLevel::H3 => h3 class="card-title" { (title) },
-                            HeadingLevel::H4 => h4 class="card-title" { (title) },
-                            HeadingLevel::H5 => h5 class="card-title" { (title) },
-                            HeadingLevel::H6 => h6 class="card-title" { (title) },
-                        }
+                        (heading(config.level, "card-title", title))
                     }
                     @if let Some(action) = &config.header_action {
                         (action)
@@ -1361,6 +1373,221 @@ pub fn stat_card(label: &str, value: &str, link: Option<(&str, &str)>) -> maud::
             @if let Some((href, text)) = link {
                 div class="stat-link" {
                     a href=(href) { (text) }
+                }
+            }
+        }
+    }
+}
+
+// ── hero ──────────────────────────────────────────────────────────────────
+
+/// Primary/secondary style hint for a [`Cta`] link rendered by [`hero`].
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CtaStyle {
+    /// The main call-to-action (default) — rendered with `.autumn-hero__cta--primary`.
+    #[default]
+    Primary,
+    /// A secondary, lower-emphasis call-to-action — rendered with
+    /// `.autumn-hero__cta--secondary`.
+    Secondary,
+}
+
+/// A single call-to-action link rendered by [`hero`].
+///
+/// Build with [`Cta::primary`] or [`Cta::secondary`]. `label` and `href`
+/// accept anything convertible to `String` (a `&str` literal or an owned
+/// `String` built from request data, e.g. `format!("/posts/{id}")`) so
+/// building a CTA from computed values never fights the borrow checker.
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cta {
+    /// Visible link text. HTML-escaped by Maud.
+    pub label: String,
+    /// Link target URL.
+    pub href: String,
+    /// Visual style hint (default [`CtaStyle::Primary`]).
+    pub style: CtaStyle,
+}
+
+#[cfg(feature = "maud")]
+impl Cta {
+    /// Create a primary call-to-action link.
+    #[must_use]
+    pub fn primary(label: impl Into<String>, href: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            href: href.into(),
+            style: CtaStyle::Primary,
+        }
+    }
+
+    /// Create a secondary call-to-action link.
+    #[must_use]
+    pub fn secondary(label: impl Into<String>, href: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            href: href.into(),
+            style: CtaStyle::Secondary,
+        }
+    }
+}
+
+/// Configuration for a [`hero`] widget.
+///
+/// Build with [`HeroConfig::new`] (title is required) and chain builder
+/// methods for the optional subtitle and CTAs.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use autumn_web::widgets::{Cta, HeroConfig, hero};
+///
+/// let config = HeroConfig::new("Welcome to the Blog")
+///     .subtitle("Thoughts, tutorials, and stories.")
+///     .cta(Cta::primary("New post", "/admin/new"))
+///     .cta(Cta::secondary("About", "/about"));
+///
+/// let markup = hero(&config);
+/// ```
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone)]
+pub struct HeroConfig {
+    /// Headline text/markup, rendered in a single top-level heading element.
+    title: maud::Markup,
+    /// Heading level for the title element (default [`HeadingLevel::H1`]).
+    level: HeadingLevel,
+    /// Optional subtitle/lede rendered below the title.
+    subtitle: Option<maud::Markup>,
+    /// Zero or more call-to-action links rendered below the subtitle.
+    ctas: Vec<Cta>,
+    /// Extra CSS class(es) appended to the root `autumn-hero` element.
+    class: Option<String>,
+}
+
+#[cfg(feature = "maud")]
+impl HeroConfig {
+    /// Create a new hero configuration with the required `title`, heading
+    /// level `H1`, and no subtitle or CTAs.
+    #[must_use]
+    pub fn new(title: &str) -> Self {
+        Self {
+            title: maud::html! { (title) },
+            level: HeadingLevel::H1,
+            subtitle: None,
+            ctas: Vec::new(),
+            class: None,
+        }
+    }
+
+    /// Set the headline from pre-built [`maud::Markup`] for rich heading
+    /// content (e.g. a title with an inline highlight span).
+    ///
+    /// Callers are responsible for escaping any user-supplied content inside `title`.
+    #[must_use]
+    pub fn title_html(mut self, title: maud::Markup) -> Self {
+        self.title = title;
+        self
+    }
+
+    /// Set the heading level for the title element (default [`HeadingLevel::H1`]).
+    #[must_use]
+    pub const fn level(mut self, level: HeadingLevel) -> Self {
+        self.level = level;
+        self
+    }
+
+    /// Set the subtitle/lede from a plain `&str`. The text is HTML-escaped by Maud.
+    ///
+    /// Use [`HeroConfig::subtitle_html`] when you need rich markup in the subtitle.
+    #[must_use]
+    pub fn subtitle(mut self, subtitle: &str) -> Self {
+        self.subtitle = Some(maud::html! { (subtitle) });
+        self
+    }
+
+    /// Set the subtitle/lede from pre-built [`maud::Markup`].
+    ///
+    /// Callers are responsible for escaping any user-supplied content inside `subtitle`.
+    #[must_use]
+    pub fn subtitle_html(mut self, subtitle: maud::Markup) -> Self {
+        self.subtitle = Some(subtitle);
+        self
+    }
+
+    /// Append a call-to-action link. May be called multiple times; an empty
+    /// CTA list is valid and renders no button container.
+    #[must_use]
+    pub fn cta(mut self, cta: Cta) -> Self {
+        self.ctas.push(cta);
+        self
+    }
+
+    /// Add extra CSS class(es) to the root `autumn-hero` element.
+    #[must_use]
+    pub fn class(mut self, class: impl Into<String>) -> Self {
+        self.class = Some(class.into());
+        self
+    }
+}
+
+/// Render a landing-page hero banner: headline, optional subtitle, and zero
+/// or more call-to-action links.
+///
+/// Emits a `<section class="autumn-hero">` containing a single top-level
+/// heading (`<h1>` by default, configurable via [`HeroConfig::level`]), an
+/// optional `<p class="autumn-hero__subtitle">`, and — only when at least one
+/// CTA is configured — a `<div class="autumn-hero__actions">` of `<a>` links.
+/// A hero with zero CTAs renders no actions container at all.
+///
+/// # CSS hooks
+///
+/// | Selector | Element |
+/// |---|---|
+/// | `.autumn-hero` | Root `<section>` wrapper |
+/// | `.autumn-hero__title` | Headline heading element |
+/// | `.autumn-hero__subtitle` | Subtitle/lede paragraph (only when set) |
+/// | `.autumn-hero__actions` | CTA container (only when non-empty) |
+/// | `.autumn-hero__cta` | Every CTA link |
+/// | `.autumn-hero__cta--primary` / `.autumn-hero__cta--secondary` | Style hint per [`CtaStyle`] |
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_web::widgets::{Cta, HeroConfig, hero};
+///
+/// let config = HeroConfig::new("Welcome to the Blog")
+///     .subtitle("Thoughts, tutorials, and stories.")
+///     .cta(Cta::primary("New post", "/admin/new"));
+///
+/// let html = hero(&config).into_string();
+/// assert!(html.contains(r#"class="autumn-hero""#));
+/// assert!(html.contains("<h1"));
+/// assert!(html.contains(r#"class="autumn-hero__subtitle""#));
+/// assert!(html.contains(r#"class="autumn-hero__actions""#));
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn hero(config: &HeroConfig) -> maud::Markup {
+    let root_class = merge_class("autumn-hero", config.class.as_deref());
+    maud::html! {
+        section class=(root_class) {
+            (heading(config.level, "autumn-hero__title", &config.title))
+            @if let Some(subtitle) = &config.subtitle {
+                p class="autumn-hero__subtitle" { (subtitle) }
+            }
+            @if !config.ctas.is_empty() {
+                div class="autumn-hero__actions" {
+                    @for cta in &config.ctas {
+                        @match cta.style {
+                            CtaStyle::Primary => {
+                                a href=(cta.href) class="autumn-hero__cta autumn-hero__cta--primary" { (cta.label) }
+                            }
+                            CtaStyle::Secondary => {
+                                a href=(cta.href) class="autumn-hero__cta autumn-hero__cta--secondary" { (cta.label) }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -2518,5 +2745,100 @@ mod tests {
         let html = stat_card("L", "<b>x</b>", None).into_string();
         assert!(html.contains("&lt;b&gt;"), "{html}");
         assert!(!html.contains("<b>x</b>"), "{html}");
+    }
+
+    // ── hero ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn hero_title_only() {
+        let html = hero(&HeroConfig::new("Welcome")).into_string();
+        assert!(html.contains("Welcome"), "{html}");
+        assert!(html.contains(r#"class="autumn-hero""#), "{html}");
+        // Single top-level heading, no subtitle, no CTA container.
+        assert!(html.contains("<h1"), "{html}");
+        assert_eq!(html.matches("<h1").count(), 1, "{html}");
+        assert!(!html.contains("autumn-hero__subtitle"), "{html}");
+        assert!(!html.contains("autumn-hero__actions"), "{html}");
+        assert!(!html.contains("<a"), "{html}");
+    }
+
+    #[test]
+    fn hero_title_and_subtitle() {
+        let html = hero(&HeroConfig::new("Welcome").subtitle("A tagline")).into_string();
+        assert!(html.contains("Welcome"), "{html}");
+        assert!(html.contains(r#"class="autumn-hero__subtitle""#), "{html}");
+        assert!(html.contains("A tagline"), "{html}");
+    }
+
+    #[test]
+    fn hero_title_subtitle_two_ctas() {
+        let html = hero(
+            &HeroConfig::new("Welcome")
+                .subtitle("A tagline")
+                .cta(Cta::primary("Get started", "/signup"))
+                .cta(Cta::secondary("Learn more", "/about")),
+        )
+        .into_string();
+        assert!(html.contains(r#"class="autumn-hero__actions""#), "{html}");
+        assert!(html.contains(r#"href="/signup""#), "{html}");
+        assert!(html.contains("Get started"), "{html}");
+        assert!(html.contains(r#"href="/about""#), "{html}");
+        assert!(html.contains("Learn more"), "{html}");
+        assert!(html.contains("autumn-hero__cta--primary"), "{html}");
+        assert!(html.contains("autumn-hero__cta--secondary"), "{html}");
+    }
+
+    #[test]
+    fn hero_heading_level_configurable() {
+        let html = hero(&HeroConfig::new("Welcome").level(HeadingLevel::H2)).into_string();
+        assert!(html.contains("<h2"), "{html}");
+        assert!(!html.contains("<h1"), "{html}");
+    }
+
+    #[test]
+    fn hero_default_heading_level_is_h1() {
+        let config = HeroConfig::new("Welcome");
+        let html = hero(&config).into_string();
+        assert!(html.contains("<h1"), "{html}");
+    }
+
+    #[test]
+    fn hero_escapes_title_and_subtitle() {
+        let html = hero(&HeroConfig::new("<b>hi</b>").subtitle("<i>tag</i>")).into_string();
+        assert!(html.contains("&lt;b&gt;"), "{html}");
+        assert!(!html.contains("<b>hi</b>"), "{html}");
+        assert!(html.contains("&lt;i&gt;"), "{html}");
+        assert!(!html.contains("<i>tag</i>"), "{html}");
+    }
+
+    #[test]
+    fn hero_extra_class_escape_hatch() {
+        let html = hero(&HeroConfig::new("Welcome").class("centered")).into_string();
+        assert!(html.contains(r#"class="autumn-hero centered""#), "{html}");
+    }
+
+    #[test]
+    fn hero_cta_and_class_accept_owned_strings_built_inline() {
+        // Cta::primary/secondary and .class() take `impl Into<String>` so a
+        // caller can build them from owned data (e.g. a DB row) in the same
+        // expression, without a `let` binding to extend a temporary's lifetime.
+        let post_id = 42;
+        let html = hero(
+            &HeroConfig::new("Welcome")
+                .class(format!("theme-{post_id}"))
+                .cta(Cta::primary(
+                    format!("Read post {post_id}"),
+                    format!("/posts/{post_id}"),
+                )),
+        )
+        .into_string();
+        assert!(html.contains(r#"class="autumn-hero theme-42""#), "{html}");
+        assert!(html.contains(r#"href="/posts/42""#), "{html}");
+        assert!(html.contains("Read post 42"), "{html}");
+    }
+
+    #[test]
+    fn cta_style_default_is_primary() {
+        assert_eq!(CtaStyle::default(), CtaStyle::Primary);
     }
 }

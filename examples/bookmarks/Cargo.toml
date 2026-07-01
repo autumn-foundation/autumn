@@ -25,6 +25,16 @@ autumn-web = { path = "../../autumn", features = ["test-support"] }
 serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }
 diesel = { version = "2", features = ["postgres", "chrono"] }
+example-e2e = { path = "../../example-e2e" }
+
+[features]
+# Enable the headless-browser system smoke. Requires Chromium on the host.
+#   cargo test -p bookmarks --features system-tests --test smoke -- --include-ignored
+system-tests = ["autumn-web/system-tests"]
+
+[[test]]
+name = "smoke"
+path = "tests/system/smoke.rs"
 
 [lints.rust]
 unsafe_code = "forbid"

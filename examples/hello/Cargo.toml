@@ -7,5 +7,18 @@ publish = false
 [dependencies]
 autumn-web = { path = "../../autumn" }
 
+[dev-dependencies]
+example-e2e = { path = "../../example-e2e" }
+tokio = { workspace = true }
+
+[features]
+# Enable the headless-browser system smoke. Requires Chromium on the host.
+#   cargo test -p hello --features system-tests --test smoke -- --include-ignored
+system-tests = ["autumn-web/system-tests"]
+
+[[test]]
+name = "smoke"
+path = "tests/system/smoke.rs"
+
 [lints.rust]
 unsafe_code = "forbid"

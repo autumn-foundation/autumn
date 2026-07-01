@@ -27,6 +27,17 @@ autumn-web = { path = "../../autumn", features = ["test-support"] }
 autumn-cache-redis = { path = "../../autumn-cache-redis" }
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
+diesel_migrations = "2"
+example-e2e = { path = "../../example-e2e" }
+
+[features]
+# Enable the headless-browser system smoke. Requires Chromium on the host.
+#   cargo test -p bookmarks-distributed --features system-tests --test smoke -- --include-ignored
+system-tests = ["autumn-web/system-tests"]
+
+[[test]]
+name = "smoke"
+path = "tests/system/smoke.rs"
 
 [lints.rust]
 unsafe_code = "forbid"

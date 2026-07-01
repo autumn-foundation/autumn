@@ -10,6 +10,7 @@ name: Publish Gate
 #   semver        — public API SemVer compatibility vs last crates.io version
 #   release-notes — workspace version / CHANGELOG / tag alignment
 #   smoke         — fresh downstream project compiles against the candidate crate set
+#   examples-e2e  — every example builds, boots for real, and passes a Chromium smoke
 
 on:
   push:
@@ -55,6 +56,62 @@ jobs:
       - uses: actions/checkout@v4
       - name: Check benchmark harness completeness
         run: ./scripts/check-benchmarks.sh
+
+  # ---------------------------------------------------------------------------
+  # 0c. Example fleet e2e gate — issue #1192
+  #
+  # Builds every catalog-supported example and drives a managed headless
+  # Chromium against its real, unmodified binary (booted with isolated
+  # ephemeral testcontainer Postgres where needed), asserting primary-route
+  # content and no uncaught console errors. Aggregates across the whole
+  # fleet — a broken example never aborts the run — and fails the gate if
+  # any example fails to build or smoke. See scripts/check-examples-e2e.sh.
+  # ---------------------------------------------------------------------------
+  examples-e2e:
+    name: Example fleet e2e gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android \
+                      /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        continue-on-error: true
+
+      # Docker is preinstalled on ubuntu-latest runners, so the testcontainer
+      # -provisioned Postgres each DB-backed example's smoke needs works with
+      # no extra setup.
+      - name: Install Chromium
+        id: setup-chrome
+        uses: browser-actions/setup-chrome@v1
+
+      # Every example's layout references its Tailwind-compiled
+      # `/static/css/autumn.css`. Without this, each example's build.rs finds
+      # no `tailwindcss` binary and skips regenerating it (a warning, not a
+      # build failure) — the smoke would then boot against a real app that's
+      # 404ing on its own stylesheet, which the browser reports as a
+      # `Log.entryAdded` error (see `SystemTest`'s console-error capture)
+      # even though nothing is actually broken. `autumn setup` is the
+      # project's own first-party installer (downloads to
+      # `target/autumn/tailwindcss`, where every example's build.rs already
+      # looks first).
+      - name: Install Tailwind CSS CLI
+        run: cargo run -p autumn-cli --bin autumn -- setup
+
+      - name: Build and Chromium-smoke every example
+        env:
+          AUTUMN_CHROMIUM: ${{ steps.setup-chrome.outputs.chrome-path }}
+          # This job provisions Chromium and Docker specifically so every
+          # example gets real coverage — a SKIP here means that provisioning
+          # silently broke, so it must fail the release gate rather than let
+          # "all checks passed" mask degraded coverage.
+          REQUIRE_FULL_COVERAGE: "1"
+        run: ./scripts/check-examples-e2e.sh
 
   # ---------------------------------------------------------------------------
   # 1. Crate metadata
@@ -207,7 +264,7 @@ jobs:
     runs-on: ubuntu-latest
     # Only runs on tag pushes; depends on all gate jobs so artifacts are only
     # produced when every check passes.
-    needs: [semver, release-notes, smoke]
+    needs: [semver, release-notes, smoke, examples-e2e]
     if: github.ref_type == 'tag'
     steps:
       - uses: actions/checkout@v4

@@ -169,16 +169,17 @@ pub use validator::Validate;
 pub use crate::form::{Changeset, ChangesetForm, IntoChangeset};
 
 // ── Display & search widgets ───────────────────────────────────────
-/// Card, stat tile, active search, autocomplete, data table, property list,
-/// and breadcrumb configuration types and rendering helpers.
+/// Card, stat tile, hero, active search, autocomplete, data table, property
+/// list, and breadcrumb configuration types and rendering helpers.
 ///
 /// See [`crate::widgets`] for the full API.
 #[cfg(feature = "maud")]
 pub use crate::widgets::{
-    ActiveSearchConfig, AutocompleteConfig, CardConfig, Column, Crumb, DataTableConfig,
-    HeadingLevel, SearchMethod, SortDir, active_search, active_search_empty_state,
-    active_search_input, active_search_results, autocomplete_empty_state, autocomplete_input,
-    autocomplete_option, breadcrumb, card, data_table, property_list, stat_card,
+    ActiveSearchConfig, AutocompleteConfig, CardConfig, Column, Crumb, Cta, CtaStyle,
+    DataTableConfig, HeadingLevel, HeroConfig, SearchMethod, SortDir, active_search,
+    active_search_empty_state, active_search_input, active_search_results,
+    autocomplete_empty_state, autocomplete_input, autocomplete_option, breadcrumb, card,
+    data_table, hero, property_list, stat_card,
 };
 
 // ── Hooks ───────────────────────────────────────────────────────

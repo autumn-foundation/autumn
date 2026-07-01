@@ -28,5 +28,7 @@ ignore:
   - "benchmarks/runtime/gate/src/main.rs"  # CLI shell: arg parsing + file IO + process::exit — untestable in unit tests; all pure gate logic (parse_budgets/parse_k6_summary/median_p99/check_gate/format_*) lives in lib.rs and is fully unit-tested there
   - "autumn-cli/src/templates/**"
   - "autumn-cache-redis/**"     # Requires a live Redis server (testcontainers); all tests are #[ignore] for cross-platform CI
+  - "example-e2e/**"    # Spawns real example binaries against testcontainers Postgres + headless Chromium (issue #1192); all tests are #[ignore] for cross-platform CI, same pattern as autumn-cache-redis
+  - "autumn/src/system_test.rs"  # SystemTest/Page/SystemTestRunner drive a live headless-Chromium browser over CDP — untestable without a real browser; all such tests are #[ignore] for cross-platform CI, same pattern as autumn-cache-redis
   - "**/*_test.rs"
   - "**/tests/**"
