@@ -41,6 +41,63 @@ use diesel_migrations::{EmbeddedMigrations, embed_migrations};
 
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
 
+/// A dev-only placeholder signing secret — 64 hex chars (32 bytes), the
+/// framework's `security.signing_secret` minimum. Never used outside this
+/// process; each test run gets an ephemeral testcontainer database anyway.
+const TEST_SIGNING_SECRET: &str = "e2e0123456789abcdef0123456789abcdef0123456789abcdef0123456789a";
+
+/// Build a scratch directory unique to `(this process, test_name)` — plain
+/// `std::process::id()` alone would collide if `cargo test` runs more than
+/// one `#[tokio::test]` from this binary concurrently (the default).
+fn scratch_dir(test_name: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "bookmarks-distributed-smoke-{}-{test_name}",
+        std::process::id()
+    ))
+}
+
+/// Write a scratch `autumn.toml` (`database` config plus whatever
+/// `extra_toml` sections the caller needs) and symlink `static/` into it —
+/// see module docs for why both are necessary under `AUTUMN_MANIFEST_DIR`.
+fn setup_scratch_dir(
+    dir: &std::path::Path,
+    primary_url: &str,
+    replica_url: &str,
+    extra_toml: &str,
+) {
+    // A prior run that panicked before its own cleanup (or a reused PID)
+    // could leave this scratch dir behind; without clearing it first, the
+    // `static` symlink below would fail with `AlreadyExists`.
+    let _ = std::fs::remove_dir_all(dir);
+    std::fs::create_dir_all(dir).expect("create scratch config dir");
+    std::fs::write(
+        dir.join("autumn.toml"),
+        format!(
+            r#"
+[health]
+path = "/health"
+
+[database]
+primary_url = "{primary_url}"
+replica_url = "{replica_url}"
+primary_pool_size = 2
+replica_pool_size = 2
+replica_fallback = "fail_readiness"
+
+{extra_toml}
+"#
+        ),
+    )
+    .expect("write scratch autumn.toml");
+
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("static"),
+        dir.join("static"),
+    )
+    .expect("symlink scratch static dir to the real project's static dir");
+}
+
 #[tokio::test]
 #[ignore = "requires Chromium + Docker — set AUTUMN_CHROMIUM or install chromium-browser"]
 async fn bookmarks_distributed_boots_with_dual_pools() {
@@ -54,41 +111,8 @@ async fn bookmarks_distributed_boots_with_dual_pools() {
     autumn_web::migrate::run_pending(replica_url, MIGRATIONS)
         .expect("migrate replica-stand-in testcontainer");
 
-    // Redirect both `DistributedConfig::load()` and the framework's own
-    // `AutumnConfig` to a scratch autumn.toml carrying the testcontainer
-    // URLs — see module docs.
-    let scratch_dir = std::env::temp_dir().join(format!(
-        "bookmarks-distributed-smoke-{}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&scratch_dir).expect("create scratch config dir");
-    std::fs::write(
-        scratch_dir.join("autumn.toml"),
-        format!(
-            r#"
-[health]
-path = "/health"
-
-[database]
-primary_url = "{primary_url}"
-replica_url = "{replica_url}"
-primary_pool_size = 2
-replica_pool_size = 2
-replica_fallback = "fail_readiness"
-"#
-        ),
-    )
-    .expect("write scratch autumn.toml");
-
-    // See module docs: redirecting AUTUMN_MANIFEST_DIR to the scratch dir
-    // also redirects `/static` file serving there, so without this the page
-    // would 404 on its real CSS/JS instead of exercising them.
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("static"),
-        scratch_dir.join("static"),
-    )
-    .expect("symlink scratch static dir to the real project's static dir");
+    let scratch_dir = scratch_dir("boots_with_dual_pools");
+    setup_scratch_dir(&scratch_dir, primary_url, replica_url, "");
 
     let app = example_e2e::spawn_example(
         env!("CARGO_BIN_EXE_bookmarks-distributed"),
@@ -115,6 +139,114 @@ replica_fallback = "fail_readiness"
     page.expect_no_console_errors()
         .await
         .expect("no console errors on /");
+
+    let _ = std::fs::remove_dir_all(&scratch_dir);
+}
+
+/// Regression guard for the RYWW wiring in `BookmarkRepository::conn()`
+/// (see `src/repositories.rs`): a client that just created a bookmark must
+/// see it on the very next page load, even though `list()` normally reads
+/// from the replica pool.
+///
+/// This example's "replica" is a second, wholly independent testcontainer
+/// database (no real streaming replication — see module docs), so without
+/// RYWW correctly redirecting the post-write read to primary, the create ->
+/// redirect -> list flow below would deterministically show "No bookmarks
+/// yet." rather than the bookmark just created — there is no lag/flakiness
+/// to race against, it either redirects or it doesn't.
+#[tokio::test]
+#[ignore = "requires Chromium + Docker — set AUTUMN_CHROMIUM or install chromium-browser"]
+async fn bookmarks_distributed_read_your_own_write_after_create() {
+    let db = example_e2e::provision_postgres(2).await;
+    let primary_url = &db.urls()[0];
+    let replica_url = &db.urls()[1];
+
+    autumn_web::migrate::run_pending(primary_url, MIGRATIONS)
+        .expect("migrate primary testcontainer");
+    autumn_web::migrate::run_pending(replica_url, MIGRATIONS)
+        .expect("migrate replica-stand-in testcontainer");
+
+    let scratch_dir = scratch_dir("read_your_own_write_after_create");
+    setup_scratch_dir(
+        &scratch_dir,
+        primary_url,
+        replica_url,
+        &format!(
+            r#"
+read_your_writes = "session"
+pin_after_write_secs = 10
+
+[security.signing_secret]
+secret = "{TEST_SIGNING_SECRET}"
+"#
+        ),
+    );
+
+    let app = example_e2e::spawn_example(
+        env!("CARGO_BIN_EXE_bookmarks-distributed"),
+        env!("CARGO_MANIFEST_DIR"),
+        &[(
+            "AUTUMN_MANIFEST_DIR",
+            scratch_dir.to_str().expect("scratch dir path is UTF-8"),
+        )],
+        example_e2e::DEFAULT_READY_TIMEOUT,
+    )
+    .await
+    .expect("spawn bookmarks-distributed example — is it built?");
+
+    let runner = app
+        .attach_browser()
+        .await
+        .expect("attach browser — is Chromium installed?");
+    let page = runner.page().await.expect("open page");
+
+    // A fresh page load hits the replica-routed list before any write has
+    // happened in this browser session, so there is nothing to see yet.
+    page.visit("/").await.expect("visit /");
+    page.expect_text("No bookmarks yet.")
+        .await
+        .expect("list starts empty on the replica-stand-in database");
+
+    // Real form submission — a plain (non-htmx) POST that 303-redirects to
+    // the list, the same create -> redirect -> list flow a real user drives.
+    page.visit("/new").await.expect("visit /new");
+    page.fill("#url", "https://example.com/ryww")
+        .await
+        .expect("fill url");
+    page.fill("#title", "RYWW smoke bookmark")
+        .await
+        .expect("fill title");
+    page.fill("#tag", "ryww").await.expect("fill tag");
+    page.click("button[type=submit]")
+        .await
+        .expect("submit create form");
+
+    // `list()` is the only route that renders bookmark cards, so this text
+    // appearing is itself proof the 303 redirect landed back on `/`.
+    page.expect_text("RYWW smoke bookmark").await.expect(
+        "created bookmark visible on the very next list read — RYWW must have redirected \
+             this replica-routed read to primary, since the replica-stand-in database never \
+             receives this write",
+    );
+    page.expect_no_console_errors()
+        .await
+        .expect("no console errors across the create -> redirect -> list flow");
+
+    // `/api/bookmarks/count` sits behind a 30s process-wide cache
+    // (`cached_bookmark_count()`), unkeyed by session — bypassed while RYWW-
+    // pinned so this still reflects the just-created bookmark rather than a
+    // stale (here: zero) cached count. See BookmarkRepository::bookmark_api_count.
+    page.evaluate(
+        "fetch('/api/bookmarks/count')\
+         .then(r => r.text())\
+         .then(t => { document.body.textContent = 'count:' + t; })",
+    )
+    .await
+    .expect("evaluate count fetch");
+    page.expect_text("count:1").await.expect(
+        "the cached /api/bookmarks/count endpoint must also see the just-created bookmark \
+         while RYWW-pinned, not the 30s-stale cached count",
+    );
 
     let _ = std::fs::remove_dir_all(&scratch_dir);
 }

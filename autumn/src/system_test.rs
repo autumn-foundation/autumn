@@ -225,6 +225,19 @@ pub enum SystemTestError {
     Browser(#[from] chromiumoxide::error::CdpError),
 }
 
+/// True for CDP errors that just mean "the page navigated away mid-poll" —
+/// e.g. a plain (non-htmx) form submit's full-page redirect racing an
+/// in-flight `evaluate()` call, which briefly leaves no valid JS execution
+/// context to evaluate against. Transient by construction, not a real
+/// failure: assertion polling loops treat these as "not ready yet" and keep
+/// polling rather than aborting on the first unlucky tick.
+fn is_transient_navigation_error(err: &chromiumoxide::error::CdpError) -> bool {
+    matches!(
+        err,
+        chromiumoxide::error::CdpError::Chrome(inner) if inner.message.contains("context")
+    )
+}
+
 // ── Artifact directory ─────────────────────────────────────────────────────
 
 /// Return the canonical artifact directory for a given test name.
@@ -820,15 +833,19 @@ impl Page {
         let deadline = tokio::time::Instant::now() + timeout;
 
         loop {
-            let result = self
+            let evaluated = self
                 .inner
                 .evaluate(format!(
                     "document.body && document.body.innerText.includes({})",
                     js_string_literal(text)
                 ))
-                .await?;
+                .await;
 
-            let found: bool = result.into_value().unwrap_or(false);
+            let found = match evaluated {
+                Ok(result) => result.into_value().unwrap_or(false),
+                Err(e) if is_transient_navigation_error(&e) => false,
+                Err(e) => return Err(e.into()),
+            };
             if found {
                 return Ok(self);
             }
@@ -854,15 +871,19 @@ impl Page {
         let deadline = tokio::time::Instant::now() + timeout;
 
         loop {
-            let result = self
+            let evaluated = self
                 .inner
                 .evaluate(format!(
                     "window.location.href.includes({})",
                     js_string_literal(pattern)
                 ))
-                .await?;
+                .await;
 
-            let found: bool = result.into_value().unwrap_or(false);
+            let found = match evaluated {
+                Ok(result) => result.into_value().unwrap_or(false),
+                Err(e) if is_transient_navigation_error(&e) => false,
+                Err(e) => return Err(e.into()),
+            };
             if found {
                 return Ok(self);
             }
@@ -910,8 +931,11 @@ impl Page {
                 attr = js_string_literal(attr),
                 val = js_string_literal(value),
             );
-            let result = self.inner.evaluate(js).await?;
-            let found: bool = result.into_value().unwrap_or(false);
+            let found = match self.inner.evaluate(js).await {
+                Ok(result) => result.into_value().unwrap_or(false),
+                Err(e) if is_transient_navigation_error(&e) => false,
+                Err(e) => return Err(e.into()),
+            };
             if found {
                 return Ok(self);
             }
@@ -1041,9 +1065,11 @@ impl Page {
                 id = js_string_literal(stream_id)
             );
 
-            let result = self.inner.evaluate(js).await?;
-
-            let text: Option<String> = result.into_value().ok();
+            let text: Option<String> = match self.inner.evaluate(js).await {
+                Ok(result) => result.into_value().ok(),
+                Err(e) if is_transient_navigation_error(&e) => None,
+                Err(e) => return Err(e.into()),
+            };
             if let Some(ref t) = text
                 && predicate(t)
             {
@@ -1096,11 +1122,19 @@ impl Page {
     async fn wait_for_hx_settle(&self) -> Result<(), SystemTestError> {
         let deadline = tokio::time::Instant::now() + self.hx_settle_timeout;
         loop {
-            let result = self
+            let evaluated = self
                 .inner
                 .evaluate("document.querySelectorAll('.htmx-request,.htmx-settling,.htmx-swapping').length === 0")
-                .await?;
-            let settled: bool = result.into_value().unwrap_or(true);
+                .await;
+            // A destroyed execution context (the page navigated away, e.g. a
+            // plain form submit's full-page redirect) means there is no more
+            // htmx activity on that page to wait for — that counts as settled,
+            // not "keep polling a page that no longer exists".
+            let settled = match evaluated {
+                Ok(result) => result.into_value().unwrap_or(true),
+                Err(e) if is_transient_navigation_error(&e) => true,
+                Err(e) => return Err(e.into()),
+            };
             if settled {
                 return Ok(());
             }
