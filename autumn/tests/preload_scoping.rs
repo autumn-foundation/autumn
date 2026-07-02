@@ -166,6 +166,23 @@ async fn retain_fails_closed_when_tenant_scoped_without_context() {
 }
 
 #[tokio::test]
+async fn retain_fails_closed_on_empty_rows_without_tenant_context() {
+    // Regression guard for the many-to-many (`through =`) fail-closed parity
+    // probe: `through` preload loaders call `__autumn_preload_retain` with an
+    // *empty* `Vec` specifically to surface this error even when their join
+    // returns zero rows (which would otherwise mean the per-row
+    // `__autumn_preload_keep` loop never runs, and the fail-closed check
+    // never fires). `retain` must not special-case an empty input and skip
+    // the tenant check ahead of it.
+    let result = ScopedItem::__autumn_preload_retain(Vec::new());
+    let err = result.expect_err("must fail closed without tenant context, even for zero rows");
+    assert!(
+        err.to_string().to_lowercase().contains("tenant"),
+        "error should mention tenant context, got: {err}"
+    );
+}
+
+#[tokio::test]
 async fn retain_isolates_each_tenant() {
     let make = || {
         vec![

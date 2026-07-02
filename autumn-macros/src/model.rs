@@ -514,17 +514,19 @@ fn emit_association_items(
                     /// The preloaded related records (possibly empty).
                     /// `Err(NotLoaded)` if this association was not preloaded.
                     fn #name_ident(&self) -> ::core::result::Result<
-                        &[::std::sync::Arc<::autumn_web::preload::Preloaded<#target>>],
+                        ::std::vec::Vec<&::autumn_web::preload::Preloaded<#target>>,
                         ::autumn_web::preload::NotLoaded,
                     >;
                 });
                 accessor_impls.push(quote! {
                     fn #name_ident(&self) -> ::core::result::Result<
-                        &[::std::sync::Arc<::autumn_web::preload::Preloaded<#target>>],
+                        ::std::vec::Vec<&::autumn_web::preload::Preloaded<#target>>,
                         ::autumn_web::preload::NotLoaded,
                     > {
                         match self.associations().get::<#stored_ty>(#key) {
-                            ::core::option::Option::Some(v) => ::core::result::Result::Ok(v.as_slice()),
+                            ::core::option::Option::Some(v) => ::core::result::Result::Ok(
+                                v.iter().map(|__a| &**__a).collect()
+                            ),
                             ::core::option::Option::None => ::core::result::Result::Err(
                                 ::autumn_web::preload::NotLoaded::new(#model_str, #key),
                             ),
@@ -539,7 +541,16 @@ fn emit_association_items(
                     // single batched `INNER JOIN` loader keyed on the join
                     // table's own two columns.
                     let model_snake = pascal_to_snake(&model_ident.to_string());
-                    let join_mod_ident = format_ident!("__autumn_m2m_{model_snake}_{}", assoc.name);
+                    // Length-prefix `model_snake` so the module name can't
+                    // collide between two different (model, association)
+                    // pairs, e.g. model `Post` assoc `tag_things` vs. model
+                    // `PostTag` assoc `things` would otherwise both produce
+                    // `__autumn_m2m_post_tag_things`.
+                    let join_mod_ident = format_ident!(
+                        "__autumn_m2m_{}_{model_snake}_{}",
+                        model_snake.len(),
+                        assoc.name
+                    );
                     let join_table_ident = format_ident!("{}", through.table);
                     let target_fk_ident = format_ident!("{}", through.target_fk);
 
@@ -607,12 +618,6 @@ fn emit_association_items(
                             // case the per-row `__autumn_preload_keep` loop
                             // below never runs).
                             let _ = #target::__autumn_preload_retain(::std::vec::Vec::new())?;
-                            let mut __kept_pairs: ::std::vec::Vec<(i64, #target)> = ::std::vec::Vec::new();
-                            for (__fk, __row) in __pairs {
-                                if #target::__autumn_preload_keep(&__row)? {
-                                    __kept_pairs.push((__fk, __row));
-                                }
-                            }
                             // The same target row can appear once per linking
                             // parent (that's the point of many-to-many), so
                             // recursing into nested associations must run on a
@@ -622,11 +627,21 @@ fn emit_association_items(
                             // one of them fully grouped) copy of its nested
                             // associations. Dedup by id, recurse once, then
                             // share the single recursed record across every
-                            // parent via `Arc`.
+                            // parent via `Arc`. Filter and dedup in the same
+                            // pass: each kept row is moved directly into
+                            // `__unique_by_id` (no clone) and only its
+                            // lightweight `(parent_key, target_id)` pair is
+                            // kept in `__links` for the final grouping pass
+                            // below.
                             let mut __unique_by_id: ::std::collections::HashMap<i64, #target> =
                                 ::std::collections::HashMap::new();
-                            for (_, __row) in &__kept_pairs {
-                                __unique_by_id.entry(__row.id).or_insert_with(|| __row.clone());
+                            let mut __links: ::std::vec::Vec<(i64, i64)> = ::std::vec::Vec::new();
+                            for (__fk, __row) in __pairs {
+                                if #target::__autumn_preload_keep(&__row)? {
+                                    let __id = __row.id;
+                                    __links.push((__fk, __id));
+                                    __unique_by_id.entry(__id).or_insert(__row);
+                                }
                             }
                             let mut __unique_children: ::std::vec::Vec<
                                 ::autumn_web::preload::Preloaded<#target>
@@ -645,8 +660,8 @@ fn emit_association_items(
                                 .collect();
                             let mut __groups: ::std::collections::HashMap<i64, #stored_ty> =
                                 ::std::collections::HashMap::new();
-                            for (__fk, __row) in &__kept_pairs {
-                                if let ::core::option::Option::Some(__arc) = __arc_by_id.get(&__row.id) {
+                            for (__fk, __id) in &__links {
+                                if let ::core::option::Option::Some(__arc) = __arc_by_id.get(__id) {
                                     __groups.entry(*__fk).or_default().push(::std::sync::Arc::clone(__arc));
                                 }
                             }
@@ -2219,6 +2234,16 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // Built from the model's own field set (the loading model can't see these
     // columns): soft-delete drops `deleted_at IS NOT NULL`; tenant scoping
     // keeps only rows matching the ambient `CURRENT_TENANT` when one is set.
+    //
+    // IMPORTANT: do not add an `if rows.is_empty() { return Ok(rows); }`
+    // early return ahead of the tenant check below. Many-to-many preload
+    // loaders (`through =`) call `__autumn_preload_retain(Vec::new())` as a
+    // fail-closed parity probe specifically to get the "no tenant context"
+    // error even when their join returns zero rows (model.rs, the
+    // `__autumn_m2m_...` loader block) — an empty-input early return would
+    // silently skip that check and break tenant isolation for a whole class
+    // of m2m preloads with no matching join rows. See
+    // `preload_retain_empty_rows_still_fails_closed_without_tenant` below.
     let deleted_at_field = all_fields
         .iter()
         .find(|f| f.ident.as_ref().is_some_and(|id| id == "deleted_at"))
@@ -2291,59 +2316,6 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     } else {
         quote! { rows }
     };
-    // Per-row sibling of `__autumn_preload_retain`, built from the same
-    // soft-delete/tenant predicates. Many-to-many (`through =`) preload
-    // loaders pair each child row with its parent key before grouping, so
-    // they can't run a batch `Vec<Self>::retain` without losing that pairing
-    // — `__autumn_preload_keep` lets them filter `(parent_key, Self)` pairs
-    // one row at a time while applying the identical scoping rules.
-    let soft_delete_keep = match deleted_at_field {
-        Some(f) if is_option_type(&f.ty) => quote! {
-            if <Self>::__autumn_repo_soft_delete_scope()
-                && ::core::option::Option::is_some(&row.deleted_at)
-            {
-                return ::core::result::Result::Ok(false);
-            }
-        },
-        _ => quote! {},
-    };
-    let tenant_keep = tenant_id_field.as_ref().map_or_else(
-        || quote! {},
-        |f| {
-            let cmp = if is_option_type(&f.ty) {
-                quote! { row.tenant_id.as_deref() == ::core::option::Option::Some(__t.as_str()) }
-            } else {
-                quote! { row.tenant_id == __t }
-            };
-            quote! {
-                if <Self>::__autumn_repo_tenant_scope()
-                    && !::autumn_web::preload::preload_across_tenants()
-                {
-                    match ::autumn_web::tenancy::CURRENT_TENANT
-                        .try_with(|__c| __c.clone())
-                        .ok()
-                        .flatten()
-                    {
-                        ::core::option::Option::Some(__t) => {
-                            if !(#cmp) {
-                                return ::core::result::Result::Ok(false);
-                            }
-                        }
-                        // Fail closed, exactly like `__autumn_preload_retain`:
-                        // never attach cross-tenant rows when tenant context is
-                        // missing (job/admin path that lost the tenant, etc.).
-                        ::core::option::Option::None => {
-                            return ::core::result::Result::Err(
-                                ::autumn_web::AutumnError::internal_server_error_msg(
-                                    "Query scoped to tenant, but no tenant context was established"
-                                )
-                            );
-                        }
-                    }
-                }
-            }
-        },
-    );
     let preload_retain_impl = quote! {
         impl #name {
             /// Apply this model's repository read scoping (tenant isolation +
@@ -2366,13 +2338,18 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
             /// Per-row sibling of `__autumn_preload_retain`, applying the
             /// identical scoping rules to a single row. Used by many-to-many
-            /// (`through =`) preload loaders.
+            /// (`through =`) preload loaders, which pair each child row with
+            /// its parent key before grouping and so can't run a batch
+            /// `Vec<Self>::retain` without losing that pairing. Delegates to
+            /// `__autumn_preload_retain` (a single-row batch) rather than
+            /// re-deriving the soft-delete/tenant predicates, so the two
+            /// can never drift apart.
             #[doc(hidden)]
             pub fn __autumn_preload_keep(row: &Self) -> ::autumn_web::AutumnResult<bool> {
-                #preload_scope_in_scope
-                #soft_delete_keep
-                #tenant_keep
-                ::core::result::Result::Ok(true)
+                let __kept = <Self>::__autumn_preload_retain(
+                    ::std::vec![::core::clone::Clone::clone(row)]
+                )?;
+                ::core::result::Result::Ok(!__kept.is_empty())
             }
         }
     };
