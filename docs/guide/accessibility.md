@@ -120,9 +120,10 @@ html! {
 ### `date_input` / `datetime_input`
 
 Render `<input type="date">` and `<input type="datetime-local">`
-respectively. The current value is normalized to the exact shape each
-control requires (`YYYY-MM-DD` / `YYYY-MM-DDTHH:MM`), regardless of whether
-the underlying field serializes as a bare date or a full RFC 3339 timestamp.
+respectively. The current value is normalized to the shape each control
+requires (`YYYY-MM-DD` / `YYYY-MM-DDTHH:MM[:SS[.f]]`, preserving
+seconds/fractional seconds when present), regardless of whether the
+underlying field serializes as a bare date or a full RFC 3339 timestamp.
 
 ```rust
 html! {
@@ -130,6 +131,22 @@ html! {
     (datetime_input(&changeset, "starts_at", "Starts at"))
 }
 ```
+
+`<input type="datetime-local">` has no timezone concept, so a
+`chrono::DateTime<Utc>` field's rendered value never carries an offset —
+chrono's default `Deserialize` for `DateTime<Utc>` requires one and rejects
+the submission. Attach `deserialize_datetime_local_utc` (or
+`deserialize_datetime_local_utc_option` for `Option<DateTime<Utc>>`):
+
+```rust
+#[derive(serde::Deserialize)]
+struct EventForm {
+    #[serde(deserialize_with = "autumn_web::form::deserialize_datetime_local_utc")]
+    starts_at: chrono::DateTime<chrono::Utc>,
+}
+```
+
+`chrono::NaiveDateTime` fields need no such attribute.
 
 ### `select_input`
 

@@ -1127,6 +1127,84 @@ fn normalize_datetime_local_value(raw: &str) -> String {
     raw.to_owned()
 }
 
+/// Pad an HTML `datetime-local` submission (`YYYY-MM-DDTHH:MM`, seconds
+/// omitted by the browser at minute granularity) to `YYYY-MM-DDTHH:MM:00` so
+/// chrono's parser — which requires the seconds component — accepts it.
+#[cfg(feature = "maud")]
+fn pad_datetime_local_seconds(raw: &str) -> String {
+    if raw.chars().count() == 16 {
+        format!("{raw}:00")
+    } else {
+        raw.to_owned()
+    }
+}
+
+/// Deserialize an HTML `datetime-local` submission into `chrono::DateTime<Utc>`,
+/// treating the submitted wall-clock value as UTC.
+///
+/// `<input type="datetime-local">` has no timezone concept, so [`datetime_input`]
+/// necessarily strips any offset when rendering a `DateTime<Utc>` field's
+/// current value — the browser then posts back an offsetless string (e.g.
+/// `2024-03-15T10:30:56`). Chrono's *default* `Deserialize` for
+/// `DateTime<Utc>` requires an RFC 3339 offset and rejects that string with
+/// "premature end of input" on every submission. Attach this function to any
+/// `DateTime<Utc>` field rendered with `datetime_input`:
+///
+/// ```rust,ignore
+/// #[derive(serde::Deserialize)]
+/// struct EventForm {
+///     #[serde(deserialize_with = "autumn_web::form::deserialize_datetime_local_utc")]
+///     starts_at: chrono::DateTime<chrono::Utc>,
+/// }
+/// ```
+///
+/// `chrono::NaiveDateTime` fields need no such attribute — chrono's default
+/// `Deserialize` for `NaiveDateTime` doesn't require an offset.
+///
+/// # Errors
+///
+/// Returns a deserializer error when the submitted value isn't a valid
+/// `YYYY-MM-DDTHH:MM[:SS[.f]]` local datetime string.
+#[cfg(feature = "maud")]
+pub fn deserialize_datetime_local_utc<'de, D>(
+    deserializer: D,
+) -> Result<chrono::DateTime<chrono::Utc>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = <String as serde::Deserialize>::deserialize(deserializer)?;
+    chrono::NaiveDateTime::parse_from_str(&pad_datetime_local_seconds(&raw), "%Y-%m-%dT%H:%M:%S%.f")
+        .map(|ndt| ndt.and_utc())
+        .map_err(serde::de::Error::custom)
+}
+
+/// `Option<chrono::DateTime<Utc>>` counterpart to
+/// [`deserialize_datetime_local_utc`], for a nullable field — an absent or
+/// empty submitted value decodes as `None`.
+///
+/// # Errors
+///
+/// Returns a deserializer error when a non-empty submitted value isn't a
+/// valid `YYYY-MM-DDTHH:MM[:SS[.f]]` local datetime string.
+#[cfg(feature = "maud")]
+pub fn deserialize_datetime_local_utc_option<'de, D>(
+    deserializer: D,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = <Option<String> as serde::Deserialize>::deserialize(deserializer)?;
+    match raw {
+        Some(s) if !s.is_empty() => chrono::NaiveDateTime::parse_from_str(
+            &pad_datetime_local_seconds(&s),
+            "%Y-%m-%dT%H:%M:%S%.f",
+        )
+        .map(|ndt| Some(ndt.and_utc()))
+        .map_err(serde::de::Error::custom),
+        _ => Ok(None),
+    }
+}
+
 /// Render a labeled `<input type="date">` tied to a changeset field.
 ///
 /// The current value is normalized via `normalize_date_value` to the
@@ -1181,6 +1259,16 @@ pub fn date_input<T: Serialize>(
 /// constraint validation (the default step is minute-granularity). Wraps in
 /// `<div id="{field}-field">` for stable htmx targeting. ARIA annotations
 /// behave identically to [`text_input`].
+///
+/// # `DateTime<Utc>` fields need [`deserialize_datetime_local_utc`]
+///
+/// `<input type="datetime-local">` has no timezone concept, so the value
+/// this renders for a `DateTime<Utc>` field never carries an offset —
+/// chrono's default `Deserialize` for `DateTime<Utc>` requires one and
+/// rejects the submission. Attach [`deserialize_datetime_local_utc`] (or
+/// [`deserialize_datetime_local_utc_option`] for `Option<DateTime<Utc>>`)
+/// via `#[serde(deserialize_with = "...")]` on that field. `NaiveDateTime`
+/// fields need no such attribute.
 #[cfg(feature = "maud")]
 #[must_use]
 pub fn datetime_input<T: Serialize>(
@@ -2570,6 +2658,102 @@ mod tests {
         let decoded: Decoded =
             serde_urlencoded::from_str(&body).expect("pre-filled value must decode");
         assert_eq!(decoded.starts_at, stored);
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn datetime_input_value_round_trips_for_utc_datetime_with_deserialize_helper() {
+        // Regression test: a DateTime<Utc> field's datetime_input value has
+        // no offset (datetime-local has no timezone concept), which chrono's
+        // *default* Deserialize for DateTime<Utc> rejects. Confirm the
+        // pre-filled value decodes successfully when the field is annotated
+        // with deserialize_datetime_local_utc, as documented on
+        // datetime_input.
+        #[derive(serde::Serialize)]
+        struct F {
+            starts_at: chrono::DateTime<chrono::Utc>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Decoded {
+            #[serde(deserialize_with = "deserialize_datetime_local_utc")]
+            starts_at: chrono::DateTime<chrono::Utc>,
+        }
+        let stored = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+            chrono::NaiveDate::from_ymd_opt(2024, 3, 15)
+                .unwrap()
+                .and_hms_opt(10, 30, 56)
+                .unwrap(),
+            chrono::Utc,
+        );
+        let cs = Changeset::new(F { starts_at: stored });
+        let html = datetime_input(&cs, "starts_at", "Starts at").into_string();
+        // The rendered value must not carry an offset/Z (would break the
+        // datetime-local input); confirm that first.
+        let value = html
+            .split("value=\"")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .expect("value attribute present");
+        assert!(!value.contains('Z') && !value.contains('+'), "{value}");
+
+        let body = format!("starts_at={value}");
+        let decoded: Decoded =
+            serde_urlencoded::from_str(&body).expect("pre-filled value must decode");
+        assert_eq!(decoded.starts_at, stored);
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn deserialize_datetime_local_utc_pads_missing_seconds() {
+        #[derive(serde::Deserialize)]
+        struct Decoded {
+            #[serde(deserialize_with = "deserialize_datetime_local_utc")]
+            starts_at: chrono::DateTime<chrono::Utc>,
+        }
+        let decoded: Decoded = serde_urlencoded::from_str("starts_at=2024-03-15T10:30").unwrap();
+        assert_eq!(
+            decoded.starts_at,
+            chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+                chrono::NaiveDate::from_ymd_opt(2024, 3, 15)
+                    .unwrap()
+                    .and_hms_opt(10, 30, 0)
+                    .unwrap(),
+                chrono::Utc,
+            )
+        );
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn deserialize_datetime_local_utc_option_absent_key_is_none() {
+        #[derive(serde::Deserialize)]
+        struct Decoded {
+            #[serde(default, deserialize_with = "deserialize_datetime_local_utc_option")]
+            starts_at: Option<chrono::DateTime<chrono::Utc>>,
+        }
+        let decoded: Decoded = serde_urlencoded::from_str("").unwrap();
+        assert_eq!(decoded.starts_at, None);
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn deserialize_datetime_local_utc_option_present_key_is_some() {
+        #[derive(serde::Deserialize)]
+        struct Decoded {
+            #[serde(default, deserialize_with = "deserialize_datetime_local_utc_option")]
+            starts_at: Option<chrono::DateTime<chrono::Utc>>,
+        }
+        let decoded: Decoded = serde_urlencoded::from_str("starts_at=2024-03-15T10:30:56").unwrap();
+        assert_eq!(
+            decoded.starts_at,
+            Some(chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+                chrono::NaiveDate::from_ymd_opt(2024, 3, 15)
+                    .unwrap()
+                    .and_hms_opt(10, 30, 56)
+                    .unwrap(),
+                chrono::Utc,
+            ))
+        );
     }
 
     #[cfg(feature = "maud")]
