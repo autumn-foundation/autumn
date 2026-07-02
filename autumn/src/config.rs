@@ -7114,11 +7114,11 @@ path = "/healthz"
     #[test]
     fn jobs_toml_deserializes_tracking_fields() {
         let config: AutumnConfig = toml::from_str(
-            r#"
+            r"
             [jobs.tracking]
             ttl_secs = 7200
             route_enabled = false
-            "#,
+            ",
         )
         .unwrap();
 

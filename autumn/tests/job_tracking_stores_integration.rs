@@ -59,10 +59,18 @@ async fn redis_backend_persists_tracked_job_and_expires_it() {
         .expect("redis port");
     let redis_url = format!("redis://127.0.0.1:{port}");
 
-    let mut config = JobConfig::default();
-    config.backend = "redis".to_owned();
-    config.redis.url = Some(redis_url.clone());
-    config.tracking.ttl_secs = 1;
+    let config = JobConfig {
+        backend: "redis".to_owned(),
+        redis: autumn_web::config::JobRedisConfig {
+            url: Some(redis_url.clone()),
+            ..Default::default()
+        },
+        tracking: autumn_web::config::JobTrackingConfig {
+            ttl_secs: 1,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
 
     let state = AppState::for_test().with_profile("dev");
     let shutdown = tokio_util::sync::CancellationToken::new();
@@ -163,9 +171,14 @@ async fn postgres_backend_persists_tracked_job_and_expires_it() {
             .expect("apply create_job_tracking migration");
     }
 
-    let mut config = JobConfig::default();
-    config.backend = "postgres".to_owned();
-    config.tracking.ttl_secs = 1;
+    let config = JobConfig {
+        backend: "postgres".to_owned(),
+        tracking: autumn_web::config::JobTrackingConfig {
+            ttl_secs: 1,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
 
     let state = AppState::for_test()
         .with_profile("dev")

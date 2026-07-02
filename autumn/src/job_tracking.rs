@@ -1600,8 +1600,10 @@ mod tests {
     #[cfg(feature = "redis")]
     #[tokio::test]
     async fn store_for_config_falls_back_to_memory_when_redis_backend_has_no_url() {
-        let mut config = crate::config::JobConfig::default();
-        config.backend = "redis".to_owned();
+        let config = crate::config::JobConfig {
+            backend: "redis".to_owned(),
+            ..Default::default()
+        };
         let state = AppState::for_test();
         // Falling back must not panic; the resulting store is still usable.
         let store = store_for_config(&state, &config);
