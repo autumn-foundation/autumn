@@ -40,10 +40,20 @@ impl TrackedJobOwner {
     /// other anonymous callers, and not other sessions once the user logs in
     /// elsewhere — may poll the status.
     pub async fn from_session(session: &crate::session::Session, state: &AppState) -> Self {
-        match session.get(state.auth_session_key()).await {
-            Some(user_id) => Self::User(user_id),
-            None => Self::Session(session.id().await),
+        if let Some(user_id) = session.get(state.auth_session_key()).await {
+            return Self::User(user_id);
         }
+        // A session with no prior cookie is only persisted (and only gets a
+        // Set-Cookie on the response) if something dirties it during this
+        // request. Reading `session.id()` alone does not — so without
+        // forcing it, the id we bind to here would never actually reach the
+        // browser as a cookie, and the next poll request would present a
+        // different session entirely, getting the same 404 as an
+        // unauthorized caller.
+        if !session.is_cookie_backed().await {
+            session.touch().await;
+        }
+        Self::Session(session.id().await)
     }
 
     /// Whether a request authenticated as `session` may poll a record bound
@@ -1341,6 +1351,61 @@ mod tests {
 
     fn store() -> InMemoryJobTrackingStore {
         InMemoryJobTrackingStore::new(86_400)
+    }
+
+    // ── TrackedJobOwner::from_session ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn from_session_touches_a_fresh_non_cookie_backed_session_so_its_cookie_is_set() {
+        let session = crate::session::Session::new_for_test_without_cookie(
+            "fresh-session-id".to_owned(),
+            HashMap::new(),
+        );
+        let state = AppState::for_test();
+
+        let owner = TrackedJobOwner::from_session(&session, &state).await;
+
+        assert_eq!(
+            owner,
+            TrackedJobOwner::Session("fresh-session-id".to_owned())
+        );
+        assert!(
+            session.has_pending_changes().await,
+            "from_session must dirty a fresh, non-cookie-backed session so the browser \
+             actually receives a cookie for the id the tracked job is bound to"
+        );
+    }
+
+    #[tokio::test]
+    async fn from_session_does_not_redundantly_touch_an_already_cookie_backed_session() {
+        let session =
+            crate::session::Session::new_for_test("existing-session-id".to_owned(), HashMap::new());
+        let state = AppState::for_test();
+
+        let owner = TrackedJobOwner::from_session(&session, &state).await;
+
+        assert_eq!(
+            owner,
+            TrackedJobOwner::Session("existing-session-id".to_owned())
+        );
+        assert!(
+            !session.has_pending_changes().await,
+            "an already cookie-backed session doesn't need a forced re-save"
+        );
+    }
+
+    #[tokio::test]
+    async fn from_session_prefers_the_authenticated_user_id_over_the_session_id() {
+        let session = crate::session::Session::new_for_test_without_cookie(
+            "fresh-session-id".to_owned(),
+            HashMap::new(),
+        );
+        let state = AppState::for_test();
+        session.insert(state.auth_session_key(), "user-42").await;
+
+        let owner = TrackedJobOwner::from_session(&session, &state).await;
+
+        assert_eq!(owner, TrackedJobOwner::User("user-42".to_owned()));
     }
 
     #[tokio::test]

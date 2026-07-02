@@ -2499,6 +2499,11 @@ impl JobClient {
                 "enqueue_after_commit: failed to serialize payload for job '{name}': {e}"
             )))
         })?;
+        // Also validate eagerly: the deferred callback below calls
+        // enqueue_due (which re-checks this), but that runs after the
+        // transaction has already committed — by then it's too late for the
+        // caller to roll back on a rejected payload.
+        crate::job_tracking::reject_reserved_envelope_marker(&payload)?;
         let client = self.clone();
         // Keep a copy for the debug log in the eager path (name is moved into f_opt).
         let name_for_log = name.clone();
@@ -13961,6 +13966,57 @@ mod tests {
             "job should be delivered immediately for past due time outside tx"
         );
         assert_eq!(received.unwrap().unwrap().name, "test_job");
+
+        clear_global_job_client();
+    }
+
+    #[tokio::test]
+    async fn enqueue_after_commit_rejects_a_colliding_payload_eagerly_not_in_the_deferred_callback()
+    {
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+
+        let (tx, mut rx) = mpsc::channel(16);
+        init_global_job_client(JobClient {
+            local_sender: Some(tx),
+            local_coordination: None,
+            #[cfg(feature = "redis")]
+            redis: None,
+            #[cfg(feature = "db")]
+            pg_pool: None,
+            registry: crate::actuator::JobRegistry::new(),
+            job_admin: JobAdminMemoryBackend::new_for_test(32),
+            default_max_attempts: 3,
+            default_initial_backoff_ms: 100,
+            per_job_settings: HashMap::from([(
+                "test_job".to_string(),
+                JobRuntimeSettings::basic(3, 100),
+            )]),
+            interceptor: None,
+            resilience_config: None,
+        });
+
+        // Called outside a db.tx, so without the eager check this would
+        // enqueue immediately (see the test above) before ever reaching
+        // enqueue_due's own check — which is exactly what would let a
+        // colliding payload slip through a committed transaction when
+        // called from inside one.
+        let err = enqueue_after_commit(
+            "test_job",
+            serde_json::json!({"__autumn_tracked": {"k": "abc"}}),
+        )
+        .await
+        .expect_err("a colliding payload must be rejected before any commit/delivery");
+        assert!(
+            err.to_string().contains("__autumn_tracked"),
+            "unexpected error: {err}"
+        );
+
+        let received = tokio::time::timeout(Duration::from_millis(50), rx.recv()).await;
+        assert!(
+            received.is_err(),
+            "a rejected payload must never reach the queue"
+        );
 
         clear_global_job_client();
     }
