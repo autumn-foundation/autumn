@@ -10,3 +10,48 @@
     @apply top-0 outline-none ring-2 ring-offset-2 ring-blue-500;
   }
 }
+
+@layer components {
+  /* Hooks for autumn_web::widgets::nav_bar() — see its rustdoc for the full
+     class list. nav_bar itself emits no inline styles; only the responsive
+     collapse/dropdown behavior below needs app CSS. */
+  .autumn-nav {
+    @apply flex items-center gap-4 px-4 py-3;
+  }
+  .autumn-nav__brand {
+    @apply font-semibold text-gray-900 no-underline;
+  }
+  .autumn-nav__toggle {
+    @apply hidden;
+  }
+  .autumn-nav__items {
+    @apply flex items-center gap-4 list-none;
+  }
+  .autumn-nav__items--trailing {
+    @apply ml-auto;
+  }
+  .autumn-nav__item--menu {
+    @apply relative;
+  }
+  .autumn-nav__menu {
+    @apply list-none;
+  }
+  .autumn-nav__menu[hidden] {
+    @apply hidden;
+  }
+
+  @media (max-width: 768px) {
+    .autumn-nav--enhanced .autumn-nav__toggle {
+      @apply flex;
+    }
+    .autumn-nav--enhanced .autumn-nav__collapse {
+      @apply hidden w-full basis-full;
+    }
+    .autumn-nav--enhanced .autumn-nav__collapse--open {
+      @apply block;
+    }
+    .autumn-nav--enhanced .autumn-nav__items {
+      @apply flex-col items-start;
+    }
+  }
+}

@@ -11,7 +11,9 @@ use autumn_web::job::{
 use autumn_web::pagination::Page;
 use autumn_web::runtime_config::{ConfigChangeRecord, ConfigEntry};
 use autumn_web::ui::pagination::{PagerOptions, pagination_nav};
-use autumn_web::widgets::{CardConfig, card, nav_link, stat_card};
+use autumn_web::widgets::{
+    CardConfig, NavBarConfig, NavBarLayout, NavItem, card, nav_bar, stat_card,
+};
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 use serde_json::Value;
 
@@ -90,7 +92,8 @@ const ADMIN_CSS: &str = "
         padding: 2rem;
         min-width: 0;
     }
-    .admin-logo {
+    .admin-sidebar .autumn-nav__brand {
+        display: block;
         font-size: 1.125rem;
         font-weight: 700;
         padding: 0 1.5rem 1rem;
@@ -98,8 +101,8 @@ const ADMIN_CSS: &str = "
         margin-bottom: 1rem;
         color: var(--text);
     }
-    .admin-nav { list-style: none; }
-    .admin-nav li a {
+    .admin-sidebar .autumn-nav__items { list-style: none; }
+    .admin-sidebar .autumn-nav__item a {
         display: block;
         padding: 0.5rem 1.5rem;
         color: var(--text-muted);
@@ -108,17 +111,17 @@ const ADMIN_CSS: &str = "
         border-left: 3px solid transparent;
         transition: all 0.15s;
     }
-    .admin-nav li a:hover {
+    .admin-sidebar .autumn-nav__item a:hover {
         background: var(--bg);
         color: var(--text);
         text-decoration: none;
     }
-    .admin-nav li a.active {
+    .admin-sidebar .autumn-nav__item a.active {
         background: var(--primary-light);
         color: var(--primary);
         border-left-color: var(--primary);
     }
-    .admin-nav-section {
+    .admin-sidebar .autumn-nav__section {
         font-size: 0.7rem;
         text-transform: uppercase;
         letter-spacing: 0.05em;
@@ -425,6 +428,30 @@ pub fn admin_layout(
         Some(RUNTIME_CONFIG_NAV_SLUG) => config_href.clone(),
         Some(slug) => format!("{prefix}/{slug}"),
     };
+
+    let mut nav_items = vec![NavItem::link(prefix, "Dashboard")];
+    if registry.model_count() > 0 {
+        nav_items.push(NavItem::section("Models"));
+        nav_items.extend(registry.iter().map(|(slug, model)| {
+            NavItem::link(&format!("{prefix}/{slug}"), model.display_name_plural())
+        }));
+    }
+    nav_items.push(NavItem::section("System"));
+    nav_items.push(NavItem::link(&jobs_href, "Jobs"));
+    if show_config {
+        nav_items.push(NavItem::link(&config_href, "Runtime Config"));
+    }
+    nav_items.push(NavItem::plain_link(
+        &format!("{actuator_prefix}/ui"),
+        "Actuator",
+    ));
+    let sidebar_nav = NavBarConfig::new()
+        .brand_html(html! { "🍂 Autumn Admin" }, None)
+        .items(nav_items)
+        .aria_label("Admin navigation")
+        .layout(NavBarLayout::Sidebar)
+        .class("admin-sidebar");
+
     html! {
         (DOCTYPE)
         html lang="en" {
@@ -454,38 +481,7 @@ pub fn admin_layout(
                 div class="admin-layout" {
                     // Sidebar navigation landmark
                     header role="banner" {
-                        nav class="admin-sidebar" aria-label="Admin navigation" {
-                            div class="admin-logo" { "🍂 Autumn Admin" }
-                            ul class="admin-nav" {
-                                li { (nav_link(&current_path, prefix, "Dashboard")) }
-                                @if registry.model_count() > 0 {
-                                    li { div class="admin-nav-section" { "Models" } }
-                                    @for (slug, model) in registry.iter() {
-                                        li {
-                                            (nav_link(
-                                                &current_path,
-                                                &format!("{prefix}/{slug}"),
-                                                model.display_name_plural(),
-                                            ))
-                                        }
-                                    }
-                                }
-                                li { div class="admin-nav-section" { "System" } }
-                                li {
-                                    (nav_link(&current_path, &jobs_href, "Jobs"))
-                                }
-                                @if show_config {
-                                    li {
-                                        (nav_link(
-                                            &current_path,
-                                            &config_href,
-                                            "Runtime Config",
-                                        ))
-                                    }
-                                }
-                                li { a href={ (actuator_prefix) "/ui" } { "Actuator" } }
-                            }
-                        }
+                        (nav_bar(&current_path, &sidebar_nav))
                     }
                     // Main content landmark
                     main id="admin-main" class="admin-main" {
@@ -4068,7 +4064,10 @@ mod tests {
     fn admin_layout_renders_nav_bar_sidebar() {
         let html = render_layout(None);
         assert!(html.contains("autumn-nav--sidebar"), "{html}");
-        assert!(html.contains(r#"class="admin-sidebar"#), "{html}");
+        assert!(
+            html.contains(r#"class="autumn-nav autumn-nav--sidebar admin-sidebar""#),
+            "{html}"
+        );
         assert!(html.contains(r#"aria-label="Admin navigation""#), "{html}");
     }
 
