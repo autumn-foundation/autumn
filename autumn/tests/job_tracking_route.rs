@@ -288,6 +288,39 @@ async fn accept_text_html_without_htmx_header_also_receives_fragment() {
 }
 
 #[tokio::test]
+async fn bare_wildcard_accept_still_receives_json_not_the_html_fragment() {
+    let _guard = job::global_job_runtime_test_lock().lock().await;
+    job::clear_global_job_client();
+
+    let client = TestApp::new()
+        .config(test_config())
+        .plugin(TrackedGateJobPlugin)
+        .build();
+
+    let handle = job::enqueue_tracked("tracked_gate_job", json!({"mode": "succeed"}))
+        .await
+        .unwrap();
+
+    poll_until(&client, &handle.status_path(), |body| {
+        body["status"] == "running"
+    })
+    .await;
+
+    // A bare wildcard Accept (curl's default, and many fetch()/HTTP-client
+    // defaults) carries no real preference and must not be treated as a
+    // browser navigation — this JSON-first route should still return JSON.
+    let response = client
+        .get(&handle.status_path())
+        .header("Accept", "*/*")
+        .send()
+        .await;
+    assert_eq!(response.header("content-type"), Some("application/json"));
+
+    RELEASE_GATE.notify_waiters();
+    job::clear_global_job_client();
+}
+
+#[tokio::test]
 async fn succeeded_fragment_renders_download_link_and_stops_polling() {
     let _guard = job::global_job_runtime_test_lock().lock().await;
     job::clear_global_job_client();

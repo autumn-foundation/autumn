@@ -5101,6 +5101,16 @@ async fn recover_stale_redis_jobs(
                         .job_registry
                         .record_failure(&dead.name, error.clone(), true);
                     job_admin.record_failure(&dead.id, error);
+                    // The worker that held this claim is gone and the job is
+                    // now terminally dead-lettered — settle the tracked
+                    // record too, or it stays pending/running until TTL
+                    // expiry even though the job will never run again.
+                    crate::job_tracking::settle_tracked_payload_as_failed(
+                        state,
+                        &dead.payload,
+                        crate::job_tracking::GENERIC_FAILURE_MESSAGE,
+                    )
+                    .await;
                 }
             }
         }
@@ -9877,6 +9887,84 @@ mod tests {
                 .unwrap(),
             EnqueueOutcome::Queued,
             "a dead worker must not deadlock the unique key"
+        );
+    }
+
+    #[cfg(feature = "redis")]
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn redis_stale_recovery_dead_letter_settles_the_tracked_record() {
+        let (_container, client) = redis_test_client().await;
+        // 10ms visibility timeout: an unsettled claim is immediately stale.
+        let worker_config = redis_test_worker_config("crash-tracked", "dead-worker", 10);
+        let mut connection = new_redis_connection_manager(&client, "test redis worker").unwrap();
+        let state = AppState::for_test().with_profile("dev");
+        state.job_registry().register("crashy_tracked");
+        let job_admin = JobAdminMemoryBackend::new_for_test(32);
+
+        let store: Arc<dyn crate::job_tracking::JobTrackingStore> =
+            Arc::new(crate::job_tracking::InMemoryJobTrackingStore::new(60));
+        crate::job_tracking::install_tracking_store(&state, store.clone());
+        let key = "crash-tracking-key";
+        store
+            .create(key, crate::job_tracking::TrackedJobOwner::Anonymous)
+            .await
+            .unwrap();
+        let payload = crate::job_tracking::wrap_tracked_payload(key, &serde_json::json!({}));
+
+        let connection_producer =
+            new_redis_connection_manager(&client, "test redis producer").unwrap();
+        let producer = RedisClient {
+            connection: connection_producer,
+            key_prefix: worker_config.key_prefix.clone(),
+            delayed_key: worker_config.delayed_key.clone(),
+            record_prefix: worker_config.record_prefix.clone(),
+            unique_prefix: worker_config.unique_prefix.clone(),
+        };
+        let constraints = ResolvedJobConstraints {
+            unique_key: None,
+            unique_window: None,
+            concurrency_limit: None,
+            concurrency_scope: None,
+        };
+        // max_attempts = 1 so stale recovery dead-letters instead of requeueing.
+        assert_eq!(
+            producer
+                .enqueue(
+                    "x1".to_string(),
+                    "crashy_tracked",
+                    "default",
+                    payload,
+                    1,
+                    1,
+                    None,
+                    &constraints,
+                )
+                .await
+                .unwrap(),
+            EnqueueOutcome::Queued
+        );
+
+        // Simulate a crashed worker: claim, never settle.
+        let _claimed = claim_next_redis_job(
+            &mut connection,
+            &worker_config,
+            std::slice::from_ref(&worker_config.queue_key),
+        )
+        .await
+        .unwrap()
+        .expect("claim");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        recover_stale_redis_jobs(&mut connection, &worker_config, &state, &job_admin)
+            .await
+            .unwrap();
+
+        let record = store.get(key).await.unwrap().expect("record");
+        assert_eq!(
+            record.status,
+            crate::job_tracking::TrackedJobStatus::Failed,
+            "a stale-recovered, terminally dead-lettered tracked job must settle its status \
+             record instead of leaving it pending/running until TTL expiry"
         );
     }
 

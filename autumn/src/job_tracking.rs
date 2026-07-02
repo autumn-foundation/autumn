@@ -697,16 +697,36 @@ async fn job_status_handler(
 }
 
 /// Whether the request prefers an htmx-pollable HTML fragment over JSON:
-/// true for an htmx request (`HX-Request: true`) or a browser `Accept`
-/// header, per [`crate::middleware::error_page_filter::accept_prefers_html`]
-/// (an absent/empty `Accept` header — the typical API client — prefers
-/// JSON). Rendering is only possible with the `maud` feature enabled.
+/// true for an htmx request (`HX-Request: true`) or an `Accept` header that
+/// explicitly prefers `text/html` over JSON, per
+/// [`crate::middleware::error_page_filter::accept_prefers_html`]. An absent,
+/// empty, or bare-wildcard (`*/*`) `Accept` header — curl and most
+/// `fetch()`/HTTP-client defaults — prefers JSON, since this route is
+/// JSON-first for API clients and only a real browser navigation sends an
+/// explicit `text/html` preference. Rendering is only possible with the
+/// `maud` feature enabled.
 #[cfg(feature = "maud")]
 fn wants_html_response(headers: &axum::http::HeaderMap) -> bool {
     let is_htmx = headers
         .get("hx-request")
         .is_some_and(|value| value == "true");
-    is_htmx || crate::middleware::error_page_filter::accept_prefers_html(headers)
+    if is_htmx {
+        return true;
+    }
+    // `accept_prefers_html` treats a bare wildcard Accept as "probably a
+    // browser" — a reasonable default for its original use (full-page error
+    // rendering), where a real browser navigation and a bare `*/*` both
+    // reasonably get an HTML page. This status route is JSON-first for API
+    // clients, though, and a bare wildcard is exactly what curl and many
+    // `fetch()`/HTTP-client defaults send with no real preference — so only
+    // defer to it once an explicit `text/html` preference is present; an
+    // actual browser navigation always sends one.
+    let accept = headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    accept.contains("text/html")
+        && crate::middleware::error_page_filter::accept_prefers_html(headers)
 }
 
 #[cfg(feature = "maud")]
