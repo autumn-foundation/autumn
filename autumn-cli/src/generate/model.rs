@@ -117,7 +117,13 @@ pub fn plan_model_with_options(
     let schema_fields = augment_fields_for_soft_delete(&fields, options.soft_delete)?;
 
     let mut plan = Plan::new(project_root);
-    check_reference_targets(&mut plan, project_root, &fields)?;
+    check_reference_targets(
+        &mut plan,
+        project_root,
+        &fields,
+        &table,
+        Some(options.id_type),
+    )?;
 
     // (a) `src/models/<snake>.rs` + `src/models/mod.rs`
     let models_dir = project_root.join("src").join("models");
@@ -291,7 +297,7 @@ fn extract_struct_body(content: &str, struct_name: &str) -> Option<String> {
 
 /// Whether a `#[model]` struct body's primary key (the field tagged `#[id]`,
 /// regardless of its name — the macro identifies the PK by attribute, not by
-/// the name `id`) is a `uuid::Uuid`.
+/// the name `id`) is a UUID.
 fn struct_has_uuid_pk(struct_body: &str) -> bool {
     let lines: Vec<&str> = struct_body.lines().map(str::trim).collect();
     lines.iter().enumerate().any(|(i, line)| {
@@ -299,16 +305,39 @@ fn struct_has_uuid_pk(struct_body: &str) -> bool {
             && lines[i + 1..]
                 .iter()
                 .find(|l| !l.is_empty())
-                .is_some_and(|field_line| field_line.contains("uuid::Uuid"))
+                .is_some_and(|field_line| field_type_is_uuid(field_line))
     })
+}
+
+/// Whether a `pub <name>: <Type>,` field declaration's type is a UUID —
+/// either the fully-qualified `uuid::Uuid` (what the generator itself always
+/// emits) or the bare `Uuid` (idiomatic with a `use uuid::Uuid;` import at
+/// the top of the file, a common hand-edit of a generated model).
+fn field_type_is_uuid(field_line: &str) -> bool {
+    let Some((_, after_colon)) = field_line.split_once(':') else {
+        return false;
+    };
+    let ty = after_colon.trim().trim_end_matches(',').trim();
+    ty == "uuid::Uuid" || ty == "Uuid"
 }
 
 /// Validate every `references` field against its target model (issue #1026):
 ///
-/// - If the target model can't be found anywhere (AC8), record a warning on
-///   `plan` — the generator still scaffolds the FK column, constraint, and
-///   index, simply assuming the referenced table already exists (e.g. it's
-///   created by an out-of-band migration, or generated in a later command).
+/// - A *self*-reference (the target table is `own_table` — the resource this
+///   very command is generating) is checked against `own_id_type` directly
+///   instead of a filesystem lookup: the target model's file doesn't exist
+///   yet (this command is creating it), so a file-existence check could
+///   never see it, and a naive "not found, assume it exists" warning would
+///   both misfire (the table obviously exists — it's the one being created)
+///   and, worse, skip the UUID check entirely. `own_id_type` is `None` for
+///   callers that don't track a PK type for the table being altered (`generate
+///   migration Add…To…`, which only ever `ALTER TABLE`s an existing table) —
+///   in that case the self-reference is simply left unvalidated.
+/// - Otherwise, if the target model can't be found anywhere (AC8), record a
+///   warning on `plan` — the generator still scaffolds the FK column,
+///   constraint, and index, simply assuming the referenced table already
+///   exists (e.g. it's created by an out-of-band migration, or generated in
+///   a later command).
 /// - If the target model *can* be found and its own `#[id]` field is a UUID,
 ///   fail loudly: `references` only supports the i64/BIGSERIAL PK convention
 ///   (see issue #1026's scope), and emitting a `BIGINT` FK column against a
@@ -322,12 +351,14 @@ fn struct_has_uuid_pk(struct_body: &str) -> bool {
 /// feedback regardless of which subcommand declares it.
 ///
 /// # Errors
-/// Returns [`GenerateError::Config`] when a referenced model's own `#[id]`
-/// field is a UUID.
+/// Returns [`GenerateError::Config`] when a referenced (or self-referenced)
+/// model's `#[id]` field is a UUID.
 pub(super) fn check_reference_targets(
     plan: &mut Plan,
     project_root: &Path,
     fields: &[Field],
+    own_table: &str,
+    own_id_type: Option<IdType>,
 ) -> Result<(), GenerateError> {
     for f in fields {
         if !f.kind.is_reference() {
@@ -337,6 +368,19 @@ pub(super) fn check_reference_targets(
             continue;
         };
         let base = f.name.strip_suffix("_id").unwrap_or(&f.name);
+
+        if table == own_table {
+            if own_id_type == Some(IdType::Uuid) {
+                return Err(GenerateError::Config(format!(
+                    "'{}' is a self-referential foreign key, but this model uses a UUID \
+                     primary key (`--id uuid`). `references` fields only support \
+                     i64/BIGSERIAL-keyed targets (issue #1026).",
+                    f.name
+                )));
+            }
+            continue;
+        }
+
         if !model_file_exists(project_root, &table, base) {
             plan.warn(format!(
                 "'{}' references model '{base}', but src/models/{base}.rs (or a matching \
@@ -2197,5 +2241,92 @@ autumn-web = \"0.3\"\n";
             "an unrelated field named 'id' must not trigger a false UUID-PK error: {:?}",
             plan.warnings
         );
+    }
+
+    #[test]
+    fn references_field_detects_unqualified_uuid_type() {
+        // A hand-edited model using `use uuid::Uuid;` + `pub id: Uuid,`
+        // (idiomatic, not what the generator itself emits, but a common
+        // hand-edit) must still be detected as a UUID primary key.
+        let tmp = project();
+        let models_dir = tmp.path().join("src/models");
+        fs::create_dir_all(&models_dir).unwrap();
+        fs::write(
+            models_dir.join("post.rs"),
+            "use uuid::Uuid;\n\n#[autumn_web::model]\npub struct Post {\n    #[id]\n    pub id: Uuid,\n}\n",
+        )
+        .unwrap();
+
+        let err = plan_model(
+            tmp.path(),
+            "Comment",
+            &["post:references".into()],
+            "20260427000000",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("UUID"));
+    }
+
+    // ── self-referential `references` (issue #1026 follow-up) ──────────────
+
+    #[test]
+    fn self_referential_references_errors_when_own_id_is_uuid() {
+        // `Category category:references --id uuid`: the target model
+        // ("Category" itself) doesn't exist on disk yet — this command is
+        // creating it — so a filesystem lookup can never see it. The
+        // self-reference must be checked against the model's own
+        // `--id uuid` directly instead of silently skipping the UUID check.
+        let tmp = project();
+        let err = plan_model_with_options(
+            tmp.path(),
+            "Category",
+            &["name:String".into(), "category:references".into()],
+            "20260427000000",
+            &ModelOptions {
+                id_type: IdType::Uuid,
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("UUID"));
+        assert!(err.to_string().contains("self-referential"));
+    }
+
+    #[test]
+    fn self_referential_references_fine_with_default_bigserial_id() {
+        let tmp = project();
+        let plan = plan_model(
+            tmp.path(),
+            "Category",
+            &["name:String".into(), "category:references".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        assert!(
+            plan.warnings.is_empty(),
+            "a self-reference to the table being created now must not warn \
+             'model not found': {:?}",
+            plan.warnings
+        );
+    }
+
+    #[test]
+    fn self_referential_references_emits_correct_fk_sql() {
+        let tmp = project();
+        let plan = plan_model(
+            tmp.path(),
+            "Category",
+            &["name:String".into(), "category:references".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let up = fs::read_to_string(
+            tmp.path()
+                .join("migrations/20260427000000_create_categories/up.sql"),
+        )
+        .unwrap();
+        assert!(up.contains("category_id BIGINT NOT NULL REFERENCES categories(id)"));
     }
 }

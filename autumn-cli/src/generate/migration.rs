@@ -64,7 +64,11 @@ pub fn plan_migration(
             // UUID-PK error as `generate model`/`generate scaffold` (issue
             // #1026) — otherwise the same DSL token gives inconsistent
             // feedback depending only on which subcommand declared it.
-            super::model::check_reference_targets(&mut plan, project_root, &fields)?;
+            // `own_id_type` is `None`: this shape only `ALTER TABLE`s an
+            // *existing* table, so its actual primary-key type isn't tracked
+            // anywhere the generator can see — a self-reference here is left
+            // unvalidated rather than guessed at.
+            super::model::check_reference_targets(&mut plan, project_root, &fields, table, None)?;
             (
                 add_columns_up_sql(table, &fields),
                 add_columns_down_sql(table, &fields),
@@ -391,5 +395,23 @@ pub struct Post {
         )
         .unwrap_err();
         assert!(err.to_string().contains("UUID"));
+    }
+
+    #[test]
+    fn add_columns_self_reference_to_table_being_altered_has_no_warning() {
+        // `AddCategoryToCategories category:references` targets the very
+        // table it's altering — a filesystem lookup for a "Category" model
+        // is irrelevant here (the table obviously already exists, that's
+        // the point of ALTER TABLE), so no "model not found" warning should
+        // fire for the self-reference.
+        let tmp = project();
+        let plan = plan_migration(
+            tmp.path(),
+            "AddCategoryToCategories",
+            &["category:references".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        assert!(plan.warnings.is_empty(), "warnings: {:?}", plan.warnings);
     }
 }
