@@ -66,8 +66,11 @@ impl ModelMetadata {
 
 /// Compute every action a `generate model` invocation would perform.
 ///
-/// Pure planning step — no I/O happens here. Tests use this directly so they
-/// can inspect the emitted file list and contents without touching the disk.
+/// Planning-only step — no file is *written* here (that's [`Plan::execute`]).
+/// It does read a few existing files (`mod.rs`/`schema.rs` to merge into, and
+/// any `references` target's model file to validate it — see
+/// [`check_reference_targets`]), so tests can inspect the emitted file list
+/// and contents without any writes reaching disk.
 ///
 /// # Errors
 /// Surfaces project-layout, DSL, and naming errors before any file is written.
@@ -186,42 +189,101 @@ pub fn plan_model_with_options(
     Ok(plan)
 }
 
-/// Where a referenced model's source was found, per [`find_model_file`].
-enum ModelFileMatch {
-    /// The conventional per-resource `src/models/<base>.rs` — its entire
-    /// content belongs to exactly this one model, so it's safe to inspect
-    /// for that model's own `#[id]` type.
-    PerResource(std::path::PathBuf),
-    /// The single-file `src/models.rs` layout, which may define several
-    /// models in one file — content-based checks scoped to *this* model
-    /// (like the UUID-PK check below) can't safely be run against it.
-    SingleFile,
-}
-
-/// Locate the source file (if any) that defines resource `base`'s model,
+/// Whether resource `base`'s model can be found anywhere in the project,
 /// checking both layouts the codebase already treats as valid (see
 /// `migration.rs`'s `AddSearch` migration shape, which checks the same two
-/// locations): the per-resource `src/models/<base>.rs`, and the single-file
-/// `src/models.rs` — the latter only counts as a match if its content
-/// actually references the resource's table (`use crate::schema::<table>;`,
-/// which every generated model file emits), so an unrelated `src/models.rs`
-/// doesn't produce a false "model exists" result.
-fn find_model_file(project_root: &Path, table: &str, base: &str) -> Option<ModelFileMatch> {
+/// locations): the per-resource `src/models/<base>.rs` (mere existence
+/// counts — it's this resource's own file, however it's written), and the
+/// single-file `src/models.rs` (only counts if its content actually declares
+/// the resource's table, via a word-boundary-aware check so `posts` isn't
+/// confused with a longer table name like `posts_tags`).
+fn model_file_exists(project_root: &Path, table: &str, base: &str) -> bool {
     let per_resource = project_root
         .join("src")
         .join("models")
         .join(format!("{base}.rs"));
     if per_resource.exists() {
-        return Some(ModelFileMatch::PerResource(per_resource));
+        return true;
+    }
+    let single_file = project_root.join("src").join("models.rs");
+    single_file.exists() && declares_schema_table(&read_or_empty(&single_file), table)
+}
+
+/// True if `content` contains `schema::<table>` immediately followed by a
+/// non-identifier character (or nothing) — i.e. an exact match on `table`,
+/// not merely a prefix of a longer table name sharing the same start.
+fn declares_schema_table(content: &str, table: &str) -> bool {
+    let needle = format!("schema::{table}");
+    content.match_indices(&needle).any(|(idx, _)| {
+        content[idx + needle.len()..]
+            .chars()
+            .next()
+            .is_none_or(|c| !c.is_alphanumeric() && c != '_')
+    })
+}
+
+/// Locate the source text of resource `base`'s `#[model]` struct body (the
+/// text between its opening and matching closing brace), checking both
+/// model-file layouts (see [`model_file_exists`]).
+///
+/// Scoping to the specific struct's body (rather than the whole file) means
+/// callers can inspect the resource's own `#[id]` field even when other
+/// models are declared in the same `src/models.rs`. Returns `None` when the
+/// struct can't be located textually (e.g. a hand-written model using an
+/// unconventional struct name) — callers should treat that as "can't verify,
+/// don't guess" rather than "model missing", since [`model_file_exists`]
+/// already established the model is present.
+fn find_model_struct_body(project_root: &Path, base: &str) -> Option<String> {
+    let pascal_name = pascal(base);
+    let per_resource = project_root
+        .join("src")
+        .join("models")
+        .join(format!("{base}.rs"));
+    if per_resource.exists() {
+        return extract_struct_body(&read_or_empty(&per_resource), &pascal_name);
     }
     let single_file = project_root.join("src").join("models.rs");
     if single_file.exists() {
-        let content = read_or_empty(&single_file);
-        if content.contains(&format!("schema::{table}")) {
-            return Some(ModelFileMatch::SingleFile);
+        return extract_struct_body(&read_or_empty(&single_file), &pascal_name);
+    }
+    None
+}
+
+/// Extract the text between `struct <name> {` and its matching closing `}`,
+/// tracking brace depth so a struct containing nested braces (there are none
+/// in practice — model fields are plain types — but this stays correct if
+/// that ever changes) isn't truncated at the first inner `}`.
+fn extract_struct_body(content: &str, struct_name: &str) -> Option<String> {
+    let needle = format!("struct {struct_name} {{");
+    let start = content.find(&needle)? + needle.len();
+    let mut depth: usize = 1;
+    for (i, b) in content.as_bytes()[start..].iter().enumerate() {
+        match b {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(content[start..start + i].to_string());
+                }
+            }
+            _ => {}
         }
     }
     None
+}
+
+/// Whether a `#[model]` struct body's primary key (the field tagged `#[id]`,
+/// regardless of its name — the macro identifies the PK by attribute, not by
+/// the name `id`) is a `uuid::Uuid`.
+fn struct_has_uuid_pk(struct_body: &str) -> bool {
+    let lines: Vec<&str> = struct_body.lines().map(str::trim).collect();
+    lines.iter().enumerate().any(|(i, line)| {
+        *line == "#[id]"
+            && lines[i + 1..]
+                .iter()
+                .find(|l| !l.is_empty())
+                .is_some_and(|field_line| field_line.contains("uuid::Uuid"))
+    })
 }
 
 /// Validate every `references` field against its target model (issue #1026):
@@ -258,30 +320,23 @@ pub(super) fn check_reference_targets(
             continue;
         };
         let base = f.name.strip_suffix("_id").unwrap_or(&f.name);
-        match find_model_file(project_root, &table, base) {
-            None => {
-                plan.warn(format!(
-                    "'{}' references model '{base}', but src/models/{base}.rs (or src/models.rs) \
-                     was not found — assuming table '{table}' already exists.",
-                    f.name
-                ));
-            }
-            Some(ModelFileMatch::PerResource(path)) => {
-                if read_or_empty(&path).contains("pub id: uuid::Uuid,") {
-                    return Err(GenerateError::Config(format!(
-                        "'{}' references model '{base}' ({}), which declares a UUID primary \
-                         key. `references` fields only support i64/BIGSERIAL-keyed targets \
-                         (issue #1026) — hand-write the migration for a UUID foreign key instead.",
-                        f.name,
-                        path.display()
-                    )));
-                }
-            }
-            Some(ModelFileMatch::SingleFile) => {
-                // Can't safely isolate this one model's `#[id]` type from a
-                // shared `src/models.rs` file that may define several models,
-                // so the UUID-PK check is skipped for that layout.
-            }
+        if !model_file_exists(project_root, &table, base) {
+            plan.warn(format!(
+                "'{}' references model '{base}', but src/models/{base}.rs (or a matching \
+                 src/models.rs declaration) was not found — assuming table '{table}' \
+                 already exists.",
+                f.name
+            ));
+            continue;
+        }
+        if find_model_struct_body(project_root, base).is_some_and(|body| struct_has_uuid_pk(&body))
+        {
+            return Err(GenerateError::Config(format!(
+                "'{}' references model '{base}', which declares a UUID primary key. \
+                 `references` fields only support i64/BIGSERIAL-keyed targets \
+                 (issue #1026) — hand-write the migration for a UUID foreign key instead.",
+                f.name
+            )));
         }
     }
     Ok(())
@@ -1938,5 +1993,86 @@ autumn-web = \"0.3\"\n";
         )
         .unwrap();
         assert_eq!(plan.warnings.len(), 1, "warnings: {:?}", plan.warnings);
+    }
+
+    #[test]
+    fn references_field_not_confused_by_table_name_prefix_in_single_file_models_rs() {
+        // Only `posts_tags`/`PostsTag` is declared — `posts` must not be
+        // treated as found just because it's a string-prefix of
+        // `posts_tags` (regression: word-boundary-unaware substring match).
+        let tmp = project();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(
+            tmp.path().join("src/models.rs"),
+            "use crate::schema::posts_tags;\n\n#[autumn_web::model]\npub struct PostsTag {\n    #[id]\n    pub id: i64,\n}\n",
+        )
+        .unwrap();
+
+        let plan = plan_model(
+            tmp.path(),
+            "Comment",
+            &["post:references".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        assert_eq!(
+            plan.warnings.len(),
+            1,
+            "'posts_tags' must not satisfy a reference to 'posts': {:?}",
+            plan.warnings
+        );
+    }
+
+    #[test]
+    fn references_field_detects_uuid_pk_even_when_id_field_is_renamed() {
+        // The `#[model]` macro identifies the primary key by the `#[id]`
+        // attribute, not by the field name `id` — a hand-edited model file
+        // (the generator's own doc comment says these are "ordinary user
+        // code" once generated) can legally rename it.
+        let tmp = project();
+        let models_dir = tmp.path().join("src/models");
+        fs::create_dir_all(&models_dir).unwrap();
+        fs::write(
+            models_dir.join("post.rs"),
+            "#[autumn_web::model]\npub struct Post {\n    #[id]\n    pub uid: uuid::Uuid,\n}\n",
+        )
+        .unwrap();
+
+        let err = plan_model(
+            tmp.path(),
+            "Comment",
+            &["post:references".into()],
+            "20260427000000",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("UUID"));
+    }
+
+    #[test]
+    fn references_field_not_confused_by_an_unrelated_field_literally_named_id() {
+        // The real primary key is `pk: i64`; an unrelated field happens to be
+        // named `id` and typed `uuid::Uuid`. Only the `#[id]`-tagged field
+        // should be inspected.
+        let tmp = project();
+        let models_dir = tmp.path().join("src/models");
+        fs::create_dir_all(&models_dir).unwrap();
+        fs::write(
+            models_dir.join("post.rs"),
+            "#[autumn_web::model]\npub struct Post {\n    #[id]\n    pub pk: i64,\n    pub id: uuid::Uuid,\n}\n",
+        )
+        .unwrap();
+
+        let plan = plan_model(
+            tmp.path(),
+            "Comment",
+            &["post:references".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        assert!(
+            plan.warnings.is_empty(),
+            "an unrelated field named 'id' must not trigger a false UUID-PK error: {:?}",
+            plan.warnings
+        );
     }
 }

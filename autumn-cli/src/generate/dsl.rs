@@ -394,7 +394,10 @@ fn parse_type(ty: &str) -> Option<(FieldKind, bool)> {
     // recognized for `references` (`post:references?`) — every other type
     // must use `Option<…>` for nullability, so this doesn't silently expand
     // the DSL's accepted grammar (e.g. `count:i64?` stays an error).
-    if matches!(ty.strip_suffix('?'), Some("references" | "References")) {
+    if matches!(
+        ty.strip_suffix('?').map(str::trim),
+        Some("references" | "References")
+    ) {
         return Some((FieldKind::References, true));
     }
     if let Some(inner) = strip_wrapper(ty, "Option") {
@@ -926,6 +929,18 @@ mod tests {
         assert_eq!(f.rust_type(), "Option<i64>");
         assert_eq!(f.schema_type(), "Nullable<Int8>");
         assert_eq!(f.sql_nullability(), "NULL");
+    }
+
+    #[test]
+    fn references_nullable_form_tolerates_internal_whitespace() {
+        // `parse_field` trims the raw type text before `parse_type` sees it,
+        // but a CLI token could still carry whitespace before the `?` (e.g.
+        // `"post: references ?"` after the name/type split trims only the
+        // outer edges); this must still resolve to a nullable reference
+        // rather than "unsupported type".
+        let f = parse_field("post: references ?").unwrap();
+        assert_eq!(f.kind, FieldKind::References);
+        assert!(f.nullable);
     }
 
     #[test]
