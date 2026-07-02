@@ -74,10 +74,18 @@ pub fn plan_migration(
                 add_columns_down_sql(table, &fields),
             )
         }
-        MigrationShape::RemoveColumns { ref table } if !fields.is_empty() => (
-            remove_columns_up_sql(table, &fields),
-            remove_columns_down_sql(table, &fields),
-        ),
+        MigrationShape::RemoveColumns { ref table } if !fields.is_empty() => {
+            // `remove_columns_down_sql`'s rollback restores the FK
+            // constraint/index for a `references` field (issue #1026), so it
+            // needs the same UUID-PK guard as `AddColumns` — otherwise a
+            // target with a UUID primary key still produces a `down.sql`
+            // that fails to apply on rollback.
+            super::model::check_reference_targets(&mut plan, project_root, &fields, table, None)?;
+            (
+                remove_columns_up_sql(table, &fields),
+                remove_columns_down_sql(table, &fields),
+            )
+        }
         MigrationShape::EncryptColumns {
             ref table,
             ref columns,
@@ -295,6 +303,44 @@ mod tests {
             down.contains("CREATE INDEX idx_comments_post_id ON comments (post_id);"),
             "down.sql: {down}"
         );
+    }
+
+    #[test]
+    fn remove_columns_with_references_field_errors_on_uuid_target() {
+        // The restored FK constraint in remove_columns_down_sql needs the
+        // same UUID-PK guard as AddColumns — otherwise a target with a UUID
+        // primary key still produces a down.sql that fails on rollback.
+        let tmp = project();
+        let models_dir = tmp.path().join("src/models");
+        fs::create_dir_all(&models_dir).unwrap();
+        fs::write(
+            models_dir.join("post.rs"),
+            "#[autumn_web::model]\npub struct Post {\n    #[id]\n    pub id: uuid::Uuid,\n}\n",
+        )
+        .unwrap();
+
+        let err = plan_migration(
+            tmp.path(),
+            "RemovePostFromComments",
+            &["post:references".into()],
+            "20260427000000",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("UUID"));
+    }
+
+    #[test]
+    fn remove_columns_with_references_field_warns_when_target_model_missing() {
+        let tmp = project();
+        let plan = plan_migration(
+            tmp.path(),
+            "RemovePostFromComments",
+            &["post:references".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        assert_eq!(plan.warnings.len(), 1, "warnings: {:?}", plan.warnings);
+        assert!(plan.warnings[0].contains("posts"));
     }
 
     #[test]
