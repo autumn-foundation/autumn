@@ -1112,6 +1112,32 @@ fn generate_channel_ws_emits_ws_handler() {
     assert!(cargo.contains("\"ws\""));
 }
 
+/// Regression test: `autumn generate channel Chat --ws --force` after a
+/// plain SSE run must not leave `main.rs` referencing `chat_page`/
+/// `chat_events`, which `src/channels/chat.rs` no longer defines once
+/// `--ws` overwrites it.
+#[test]
+fn generate_channel_force_transport_switch_does_not_strand_stale_routes() {
+    let (_tmp, project) = fresh_project("channel-switch-app");
+    run_autumn(&project, &["generate", "channel", "Chat"]);
+    run_autumn(&project, &["generate", "channel", "Chat", "--ws", "--force"]);
+
+    let main = fs::read_to_string(project.join("src/main.rs")).unwrap();
+    assert!(
+        !main.contains("chat_page"),
+        "stale SSE page route must be removed: {main}"
+    );
+    assert!(
+        !main.contains("chat_events"),
+        "stale SSE events route must be removed: {main}"
+    );
+    assert!(main.contains("channels::chat::chat_ws"));
+    assert!(main.contains("channels::chat::chat_publish"));
+
+    let channel = fs::read_to_string(project.join("src/channels/chat.rs")).unwrap();
+    assert!(channel.contains(r#"#[ws("/chat/ws")]"#));
+}
+
 #[test]
 fn generate_channel_dry_run_writes_nothing() {
     let (_tmp, project) = fresh_project("channel-dry-app");

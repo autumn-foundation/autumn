@@ -441,10 +441,10 @@ pub async fn chat_events(State(state): State<AppState>) -> impl IntoResponse {
 pub async fn chat_publish(
     State(state): State<AppState>,
     Form(form): Form<ChatForm>,
-) -> AutumnResult<Markup> {
-    let fragment = message_fragment(&form.message);
-    state.broadcast().publish(TOPIC, fragment.clone().into_string())?;
-    Ok(fragment)
+) -> AutumnResult<&'static str> {
+    let fragment = message_fragment(&form.message).into_string();
+    state.broadcast().publish(TOPIC, fragment)?;
+    Ok("published")
 }
 ```
 
