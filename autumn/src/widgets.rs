@@ -1128,6 +1128,21 @@ pub enum NavLinkMatch {
 /// Render a navigation anchor, marked active when `href` equals `current_path`.
 ///
 /// Uses [`NavLinkMatch::Exact`]; see [`nav_link_matched`] for prefix matching.
+/// Pair with the [`CurrentPath`](crate::extract::CurrentPath) extractor to
+/// get `current_path` from the incoming request.
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_web::widgets::nav_link;
+///
+/// let html = nav_link("/posts", "/posts/new", "New Post").into_string();
+/// assert!(!html.contains("active"), "different path stays inactive: {html}");
+///
+/// let html = nav_link("/posts", "/posts", "Posts").into_string();
+/// assert!(html.contains(r#"class="active""#));
+/// assert!(html.contains(r#"aria-current="page""#));
+/// ```
 #[cfg(feature = "maud")]
 #[must_use]
 pub fn nav_link(current_path: &str, href: &str, label: &str) -> maud::Markup {
