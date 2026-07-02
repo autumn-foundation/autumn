@@ -10,14 +10,14 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::AutumnResult;
 use crate::time::{ClockSource, SystemClock};
+use crate::{AppState, AutumnError, AutumnResult};
 
 /// Who is allowed to poll a tracked job's status.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,6 +95,341 @@ pub trait JobTrackingStore: Send + Sync + 'static {
 /// `AppState` extension carrying the installed [`JobTrackingStore`].
 #[derive(Clone)]
 pub struct JobTrackingStoreEntry(pub Arc<dyn JobTrackingStore>);
+
+// ── Job context (progress reporting from inside a handler) ───────────────────
+
+tokio::task_local! {
+    static CURRENT_JOB_CONTEXT: JobContext;
+}
+
+/// A generic, user-safe failure message persisted when a tracked job's
+/// handler fails or panics without calling
+/// [`JobContext::set_user_error`].
+pub(crate) const GENERIC_FAILURE_MESSAGE: &str = "The job failed.";
+
+struct JobContextInner {
+    key: String,
+    store: Arc<dyn JobTrackingStore>,
+    result: Mutex<Option<Value>>,
+    user_error: Mutex<Option<String>>,
+}
+
+/// Ambient handle a `#[job]` handler uses to report progress and to record a
+/// terminal result or a user-safe error for a tracked job.
+///
+/// [`JobContext::current`] always returns a value. For a job enqueued via
+/// plain [`crate::job::enqueue`] (not tracked), it is a no-op: every method is
+/// a harmless no-op and [`is_tracked`](Self::is_tracked) reports `false`.
+#[derive(Clone)]
+pub struct JobContext(Option<Arc<JobContextInner>>);
+
+impl JobContext {
+    pub(crate) fn tracked(key: String, store: Arc<dyn JobTrackingStore>) -> Self {
+        Self(Some(Arc::new(JobContextInner {
+            key,
+            store,
+            result: Mutex::new(None),
+            user_error: Mutex::new(None),
+        })))
+    }
+
+    pub(crate) const fn none() -> Self {
+        Self(None)
+    }
+
+    /// The ambient context for the currently-executing job, or a no-op
+    /// context when called outside a job or for an untracked job.
+    #[must_use]
+    pub fn current() -> Self {
+        CURRENT_JOB_CONTEXT
+            .try_with(Clone::clone)
+            .unwrap_or_else(|_| Self::none())
+    }
+
+    /// Whether this context is bound to a tracked job's status record.
+    #[must_use]
+    pub const fn is_tracked(&self) -> bool {
+        self.0.is_some()
+    }
+
+    /// Report progress. `pct` is clamped to `0..=100`. A no-op for an
+    /// untracked context.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying store write fails.
+    pub async fn set_progress(&self, pct: u8, message: Option<&str>) -> AutumnResult<()> {
+        let Some(inner) = &self.0 else {
+            return Ok(());
+        };
+        inner
+            .store
+            .set_progress(&inner.key, pct, message.map(str::to_owned))
+            .await
+    }
+
+    /// Record the JSON result to persist when the job succeeds. A no-op for
+    /// an untracked context.
+    pub fn set_result(&self, result: Value) {
+        if let Some(inner) = &self.0 {
+            *inner
+                .result
+                .lock()
+                .expect("job context result lock poisoned") = Some(result);
+        }
+    }
+
+    /// Record the user-safe error message to persist if the job ultimately
+    /// fails (its last attempt, or a panic). A no-op for an untracked
+    /// context.
+    pub fn set_user_error(&self, message: impl Into<String>) {
+        if let Some(inner) = &self.0 {
+            *inner
+                .user_error
+                .lock()
+                .expect("job context error lock poisoned") = Some(message.into());
+        }
+    }
+
+    /// Persist the terminal success result. A no-op for an untracked context.
+    pub(crate) async fn settle_success(&self) {
+        let Some(inner) = &self.0 else {
+            return;
+        };
+        let result = inner
+            .result
+            .lock()
+            .expect("job context result lock poisoned")
+            .take()
+            .unwrap_or(Value::Null);
+        let _ = inner.store.complete(&inner.key, result).await;
+    }
+
+    /// Persist the terminal failure, using `default_message` if the handler
+    /// never called [`Self::set_user_error`]. A no-op for an untracked
+    /// context.
+    pub(crate) async fn settle_failure(&self, default_message: &str) {
+        let Some(inner) = &self.0 else {
+            return;
+        };
+        let message = inner
+            .user_error
+            .lock()
+            .expect("job context error lock poisoned")
+            .take()
+            .unwrap_or_else(|| default_message.to_owned());
+        let _ = inner.store.fail(&inner.key, message).await;
+    }
+}
+
+/// Run `future` with `ctx` as the ambient [`JobContext`], so
+/// [`JobContext::current`] resolves it from anywhere inside `future`
+/// (including across `.await` points and nested async calls).
+pub(crate) async fn scope<F: Future>(ctx: JobContext, future: F) -> F::Output {
+    CURRENT_JOB_CONTEXT.scope(ctx, future).await
+}
+
+// ── Tracked-payload envelope ──────────────────────────────────────────────────
+
+const ENVELOPE_MARKER: &str = "__autumn_tracked";
+const ENVELOPE_KEY: &str = "k";
+const ENVELOPE_ARGS: &str = "args";
+
+/// Wrap `args` in the tracked-job envelope carrying the tracking key (a hash
+/// of the raw token — never the raw token itself, so a leaked payload, admin
+/// record, or queue dump never exposes the polling capability).
+pub(crate) fn wrap_tracked_payload(key: &str, args: Value) -> Value {
+    serde_json::json!({
+        ENVELOPE_MARKER: { ENVELOPE_KEY: key },
+        ENVELOPE_ARGS: args,
+    })
+}
+
+/// If `payload` is a tracked-job envelope, remove and return `(Some(key),
+/// inner_args)`; otherwise return `(None, payload)` unchanged.
+///
+/// This is the single place a job handler's payload is unwrapped before
+/// execution — called from the one choke point all three job backends run
+/// handlers through.
+pub(crate) fn take_tracked_payload(payload: Value) -> (Option<String>, Value) {
+    let Value::Object(mut obj) = payload else {
+        return (None, payload);
+    };
+    let key = obj
+        .get(ENVELOPE_MARKER)
+        .and_then(Value::as_object)
+        .and_then(|marker| marker.get(ENVELOPE_KEY))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    match key {
+        Some(key) => {
+            let inner = obj.remove(ENVELOPE_ARGS).unwrap_or(Value::Null);
+            (Some(key), inner)
+        }
+        None => (None, Value::Object(obj)),
+    }
+}
+
+/// Borrowing counterpart of [`take_tracked_payload`], for callers (uniqueness
+/// hashing, principal/correlation extraction) that only need to read fields
+/// off the inner args without consuming the payload.
+pub(crate) fn split_tracked_payload(payload: &Value) -> (Option<&str>, &Value) {
+    let Some(obj) = payload.as_object() else {
+        return (None, payload);
+    };
+    let Some(key) = obj
+        .get(ENVELOPE_MARKER)
+        .and_then(Value::as_object)
+        .and_then(|marker| marker.get(ENVELOPE_KEY))
+        .and_then(Value::as_str)
+    else {
+        return (None, payload);
+    };
+    (Some(key), obj.get(ENVELOPE_ARGS).unwrap_or(payload))
+}
+
+// ── Global tracking-store install/resolve ─────────────────────────────────────
+
+static GLOBAL_TRACKING_STORE: OnceLock<RwLock<Option<Arc<dyn JobTrackingStore>>>> =
+    OnceLock::new();
+
+const DEFAULT_TRACKING_TTL_SECS: u64 = 86_400;
+
+/// Install `store` as this app's tracking store: both an `AppState`
+/// extension (for [`tracking_store_from_state`], used where a state is
+/// already in hand — e.g. inside the job-execution choke point) and the
+/// process-global fallback used by the free `enqueue_tracked` functions,
+/// which have no `AppState` to resolve an extension from — mirroring
+/// [`crate::job::install_job_client`].
+pub(crate) fn install_tracking_store(state: &AppState, store: Arc<dyn JobTrackingStore>) {
+    state.insert_extension(JobTrackingStoreEntry(store.clone()));
+    let lock = GLOBAL_TRACKING_STORE.get_or_init(|| RwLock::new(None));
+    if let Ok(mut guard) = lock.write() {
+        *guard = Some(store);
+    }
+}
+
+/// Install a default in-memory tracking store if this app doesn't already
+/// have one installed. Called whenever a job runtime starts so
+/// `enqueue_tracked` works even when a `JobClient` is constructed directly
+/// (as the backend starters and their tests do) rather than through
+/// `crate::job::start_runtime`, which installs a config-driven store first.
+pub(crate) fn ensure_tracking_store_installed(state: &AppState) {
+    if tracking_store_from_state(state).is_none() {
+        install_tracking_store(
+            state,
+            Arc::new(InMemoryJobTrackingStore::new(DEFAULT_TRACKING_TTL_SECS)),
+        );
+    }
+}
+
+/// Resolve the tracking store from `state`'s extensions.
+pub(crate) fn tracking_store_from_state(state: &AppState) -> Option<Arc<dyn JobTrackingStore>> {
+    state
+        .extension::<JobTrackingStoreEntry>()
+        .map(|entry| entry.0.clone())
+}
+
+/// Resolve the process-global tracking store used by the free
+/// `enqueue_tracked` functions (which have no `AppState`).
+pub(crate) fn global_tracking_store() -> Option<Arc<dyn JobTrackingStore>> {
+    GLOBAL_TRACKING_STORE.get()?.read().ok()?.clone()
+}
+
+/// Reset the process-global tracking store, mirroring
+/// [`crate::job::clear_global_job_client`].
+pub(crate) fn clear_global_tracking_store() {
+    if let Some(lock) = GLOBAL_TRACKING_STORE.get() {
+        if let Ok(mut guard) = lock.write() {
+            *guard = None;
+        }
+    } else {
+        let _ = GLOBAL_TRACKING_STORE.set(RwLock::new(None));
+    }
+}
+
+// ── enqueue_tracked ────────────────────────────────────────────────────────────
+
+/// Built-in route prefix for polling a tracked job's status: the full path is
+/// `{JOB_STATUS_PATH_PREFIX}{token}`.
+pub(crate) const JOB_STATUS_PATH_PREFIX: &str = "/_autumn/jobs/";
+
+/// A handle returned by [`enqueue_tracked`]/[`enqueue_tracked_for`] carrying
+/// the public, unguessable token used to poll the job's tracked status.
+///
+/// The token is distinct from (and never reveals) the internal job id.
+#[derive(Debug, Clone)]
+pub struct TrackedJobHandle {
+    /// The raw, unguessable polling token. Deliver this to the caller (e.g.
+    /// embed it in a redirect or JSON response) — it cannot be recovered
+    /// later; only its hash is persisted.
+    pub token: String,
+}
+
+impl TrackedJobHandle {
+    /// The path of the built-in status route for this handle's token.
+    #[must_use]
+    pub fn status_path(&self) -> String {
+        format!("{JOB_STATUS_PATH_PREFIX}{}", self.token)
+    }
+}
+
+/// Enqueue `name` with `payload`, returning a [`TrackedJobHandle`] whose
+/// token is an anonymous capability: anyone holding the token may poll the
+/// job's status. Use [`enqueue_tracked_for`] to bind status access to a
+/// session or authenticated user instead.
+///
+/// # Errors
+///
+/// Returns an internal error when the job runtime or its tracking store are
+/// not initialized, when `name` does not match a registered job, or when the
+/// active backend rejects the enqueue operation.
+pub async fn enqueue_tracked(name: &str, payload: Value) -> AutumnResult<TrackedJobHandle> {
+    enqueue_tracked_for(name, payload, TrackedJobOwner::Anonymous).await
+}
+
+/// Like [`enqueue_tracked`], binding the tracked status record to `owner` so
+/// only a request matching that session/user may poll it.
+///
+/// # Errors
+///
+/// See [`enqueue_tracked`].
+pub async fn enqueue_tracked_for(
+    name: &str,
+    payload: Value,
+    owner: TrackedJobOwner,
+) -> AutumnResult<TrackedJobHandle> {
+    let client = crate::job::global_job_client().ok_or_else(|| {
+        AutumnError::internal_server_error(std::io::Error::other(
+            "job runtime is not initialized; register jobs with AppBuilder::jobs()",
+        ))
+    })?;
+    let store = global_tracking_store().ok_or_else(|| {
+        AutumnError::internal_server_error(std::io::Error::other(
+            "job tracking store is not initialized; register jobs with AppBuilder::jobs()",
+        ))
+    })?;
+
+    let token = crate::auth::generate_raw_token();
+    let key = crate::auth::hash_api_token(&token);
+    store.create(&key, owner).await?;
+
+    let wrapped = wrap_tracked_payload(&key, payload);
+    match client.enqueue_with_outcome(name, wrapped).await {
+        Ok(crate::job::EnqueueOutcome::Queued) => {}
+        Ok(crate::job::EnqueueOutcome::Deduplicated) => {
+            store
+                .fail(
+                    &key,
+                    "An equivalent job is already in progress.".to_owned(),
+                )
+                .await?;
+        }
+        Err(error) => return Err(error),
+    }
+
+    Ok(TrackedJobHandle { token })
+}
 
 // ── In-memory store ───────────────────────────────────────────────────────────
 
@@ -398,5 +733,152 @@ mod tests {
         // Expired: reads see it as gone, and writes must not resurrect it.
         store.set_progress("k1", 50, None).await.unwrap();
         assert!(store.get("k1").await.unwrap().is_none());
+    }
+
+    // ── envelope ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn wrap_then_take_roundtrips_key_and_inner_args() {
+        let args = serde_json::json!({"account_id": 42});
+        let wrapped = wrap_tracked_payload("abc123", args.clone());
+
+        let (key, inner) = take_tracked_payload(wrapped);
+        assert_eq!(key.as_deref(), Some("abc123"));
+        assert_eq!(inner, args);
+    }
+
+    #[test]
+    fn take_tracked_payload_on_untracked_payload_is_a_passthrough() {
+        let args = serde_json::json!({"account_id": 42});
+        let (key, inner) = take_tracked_payload(args.clone());
+        assert!(key.is_none());
+        assert_eq!(inner, args);
+    }
+
+    #[test]
+    fn split_tracked_payload_borrows_inner_args_without_consuming() {
+        let args = serde_json::json!({"account_id": 42});
+        let wrapped = wrap_tracked_payload("abc123", args.clone());
+
+        let (key, inner) = split_tracked_payload(&wrapped);
+        assert_eq!(key, Some("abc123"));
+        assert_eq!(inner, &args);
+    }
+
+    #[test]
+    fn split_tracked_payload_on_untracked_payload_is_a_passthrough() {
+        let args = serde_json::json!({"account_id": 42});
+        let (key, inner) = split_tracked_payload(&args);
+        assert!(key.is_none());
+        assert_eq!(inner, &args);
+    }
+
+    // ── JobContext ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn job_context_current_outside_job_is_noop() {
+        let ctx = JobContext::current();
+        assert!(!ctx.is_tracked());
+    }
+
+    #[tokio::test]
+    async fn noop_context_methods_never_panic_or_error() {
+        let ctx = JobContext::none();
+        assert!(ctx.set_progress(50, Some("halfway")).await.is_ok());
+        ctx.set_result(serde_json::json!({"ok": true}));
+        ctx.set_user_error("should be discarded");
+        // Settling a no-op context must not panic even though nothing is stored.
+        ctx.settle_success().await;
+        ctx.settle_failure(GENERIC_FAILURE_MESSAGE).await;
+    }
+
+    #[tokio::test]
+    async fn scope_makes_context_ambient_for_current() {
+        let store: Arc<dyn JobTrackingStore> = Arc::new(InMemoryJobTrackingStore::new(60));
+        store.create("k1", TrackedJobOwner::Anonymous).await.unwrap();
+        let ctx = JobContext::tracked("k1".to_owned(), store.clone());
+
+        let observed = scope(ctx, async { JobContext::current() }).await;
+        assert!(observed.is_tracked());
+
+        observed.set_progress(75, Some("almost done")).await.unwrap();
+        let record = store.get("k1").await.unwrap().expect("record");
+        assert_eq!(record.progress_pct, Some(75));
+    }
+
+    #[tokio::test]
+    async fn settle_success_persists_ctx_result() {
+        let store: Arc<dyn JobTrackingStore> = Arc::new(InMemoryJobTrackingStore::new(60));
+        store.create("k1", TrackedJobOwner::Anonymous).await.unwrap();
+        let ctx = JobContext::tracked("k1".to_owned(), store.clone());
+
+        ctx.set_result(serde_json::json!({"download_url": "/blob/abc.csv"}));
+        ctx.settle_success().await;
+
+        let record = store.get("k1").await.unwrap().expect("record");
+        assert_eq!(record.status, TrackedJobStatus::Succeeded);
+        assert_eq!(
+            record.result,
+            Some(serde_json::json!({"download_url": "/blob/abc.csv"}))
+        );
+    }
+
+    #[tokio::test]
+    async fn settle_success_without_set_result_stores_null() {
+        let store: Arc<dyn JobTrackingStore> = Arc::new(InMemoryJobTrackingStore::new(60));
+        store.create("k1", TrackedJobOwner::Anonymous).await.unwrap();
+        let ctx = JobContext::tracked("k1".to_owned(), store.clone());
+
+        ctx.settle_success().await;
+
+        let record = store.get("k1").await.unwrap().expect("record");
+        assert_eq!(record.status, TrackedJobStatus::Succeeded);
+        assert_eq!(record.result, Some(Value::Null));
+    }
+
+    #[tokio::test]
+    async fn settle_failure_uses_set_user_error_over_default() {
+        let store: Arc<dyn JobTrackingStore> = Arc::new(InMemoryJobTrackingStore::new(60));
+        store.create("k1", TrackedJobOwner::Anonymous).await.unwrap();
+        let ctx = JobContext::tracked("k1".to_owned(), store.clone());
+
+        ctx.set_user_error("The export could not reach storage.");
+        ctx.settle_failure(GENERIC_FAILURE_MESSAGE).await;
+
+        let record = store.get("k1").await.unwrap().expect("record");
+        assert_eq!(record.status, TrackedJobStatus::Failed);
+        assert_eq!(
+            record.error.as_deref(),
+            Some("The export could not reach storage.")
+        );
+    }
+
+    #[tokio::test]
+    async fn settle_failure_without_set_user_error_uses_default_message() {
+        let store: Arc<dyn JobTrackingStore> = Arc::new(InMemoryJobTrackingStore::new(60));
+        store.create("k1", TrackedJobOwner::Anonymous).await.unwrap();
+        let ctx = JobContext::tracked("k1".to_owned(), store.clone());
+
+        ctx.settle_failure(GENERIC_FAILURE_MESSAGE).await;
+
+        let record = store.get("k1").await.unwrap().expect("record");
+        assert_eq!(record.status, TrackedJobStatus::Failed);
+        assert_eq!(record.error.as_deref(), Some(GENERIC_FAILURE_MESSAGE));
+    }
+
+    // ── enqueue_tracked (error paths reachable without a running job runtime) ─
+
+    #[tokio::test]
+    async fn enqueue_tracked_errors_when_job_runtime_is_not_initialized() {
+        let _guard = crate::job::global_job_runtime_test_lock().lock().await;
+        crate::job::clear_global_job_client();
+
+        let err = enqueue_tracked("export_orders", serde_json::json!({}))
+            .await
+            .expect_err("no job runtime should be an error, not a panic");
+        assert!(
+            err.to_string().contains("job runtime is not initialized"),
+            "unexpected error: {err}"
+        );
     }
 }

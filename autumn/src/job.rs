@@ -16,6 +16,11 @@ use serde_json::Value;
 
 use crate::{AppState, AutumnError, AutumnResult};
 
+pub use crate::job_tracking::{
+    JobContext, JobTrackingStore, JobTrackingStoreEntry, TrackedJobHandle, TrackedJobOwner,
+    TrackedJobRecord, TrackedJobStatus, enqueue_tracked, enqueue_tracked_for,
+};
+
 /// The asynchronous function signature for a background job.
 ///
 /// Handlers receive the full `AppState` and a JSON `Value` representing the job's payload.
@@ -1211,6 +1216,7 @@ fn fnv1a_64(input: &str) -> u64 {
 /// of each selected field (missing fields read as `null`); otherwise it is a
 /// stable hash of the full canonicalized payload.
 fn job_unique_key(uniqueness: &JobUniqueness, payload: &Value) -> String {
+    let (_, payload) = crate::job_tracking::split_tracked_payload(payload);
     if uniqueness.by.is_empty() {
         let mut canonical = String::new();
         write_canonical_json(payload, &mut canonical);
@@ -1235,6 +1241,7 @@ fn job_unique_key(uniqueness: &JobUniqueness, payload: &Value) -> String {
 /// type). A configured-but-missing field reads as canonical `null` so all
 /// payloads lacking the field share one scope.
 fn job_concurrency_scope(concurrency: &JobConcurrency, payload: &Value) -> Option<String> {
+    let (_, payload) = crate::job_tracking::split_tracked_payload(payload);
     concurrency.key.as_ref().map(|field| {
         let mut scope = String::new();
         write_canonical_json(payload.get(field).unwrap_or(&Value::Null), &mut scope);
@@ -1243,6 +1250,7 @@ fn job_concurrency_scope(concurrency: &JobConcurrency, payload: &Value) -> Optio
 }
 
 fn job_payload_identity(payload: &Value) -> (Option<String>, Option<String>) {
+    let (_, payload) = crate::job_tracking::split_tracked_payload(payload);
     let principal = first_payload_string(payload, &["principal_id", "principal", "user_id"]);
     let correlation = first_payload_string(payload, &["correlation_id", "request_id"]);
     (principal, correlation)
@@ -1631,7 +1639,26 @@ async fn run_job_handler(
     handler: JobHandler,
     state: AppState,
     payload: Value,
+    final_attempt: bool,
 ) -> JobExecutionOutcome {
+    // Tracked jobs carry their args wrapped in an envelope keyed by a hash of
+    // the polling token (never the raw token). Strip it here — the single
+    // choke point all three backends run handlers through — so the handler
+    // itself only ever sees the caller's original args, and make a
+    // `JobContext` ambient for the duration of execution so `ctx.set_progress`
+    // works from anywhere inside the handler.
+    let (tracked_key, payload) = crate::job_tracking::take_tracked_payload(payload);
+    let ctx = match &tracked_key {
+        Some(key) => match crate::job_tracking::tracking_store_from_state(&state) {
+            Some(store) => {
+                let _ = store.mark_running(key).await;
+                crate::job_tracking::JobContext::tracked(key.clone(), store)
+            }
+            None => crate::job_tracking::JobContext::none(),
+        },
+        None => crate::job_tracking::JobContext::none(),
+    };
+
     // Make this job's app the ambient event context so a job (or durable event
     // listener) that calls the free `events::publish` dispatches against its own
     // app rather than the process-global bus.
@@ -1665,17 +1692,45 @@ async fn run_job_handler(
         }
     }));
 
-    let future = match interceptor_res {
-        Ok(future) => future,
-        Err(panic) => return JobExecutionOutcome::Panicked(format_job_panic(panic.as_ref())),
+    let outcome = match interceptor_res {
+        Ok(future) => {
+            let execution = std::panic::AssertUnwindSafe(future).catch_unwind();
+            match crate::job_tracking::scope(
+                ctx.clone(),
+                crate::events::scope_event_app(event_app, execution),
+            )
+            .await
+            {
+                Ok(Ok(())) => JobExecutionOutcome::Succeeded,
+                Ok(Err(error)) => JobExecutionOutcome::Failed(error.to_string()),
+                Err(panic) => JobExecutionOutcome::Panicked(format_job_panic(panic.as_ref())),
+            }
+        }
+        Err(panic) => JobExecutionOutcome::Panicked(format_job_panic(panic.as_ref())),
     };
 
-    let execution = std::panic::AssertUnwindSafe(future).catch_unwind();
-    match crate::events::scope_event_app(event_app, execution).await {
-        Ok(Ok(())) => JobExecutionOutcome::Succeeded,
-        Ok(Err(error)) => JobExecutionOutcome::Failed(error.to_string()),
-        Err(panic) => JobExecutionOutcome::Panicked(format_job_panic(panic.as_ref())),
+    if tracked_key.is_some() {
+        match &outcome {
+            JobExecutionOutcome::Succeeded => ctx.settle_success().await,
+            // Panics always dead-letter regardless of remaining attempts
+            // (matching every backend's worker loop), so they are always
+            // terminal for tracking purposes too.
+            JobExecutionOutcome::Panicked(_) => {
+                ctx.settle_failure(crate::job_tracking::GENERIC_FAILURE_MESSAGE)
+                    .await;
+            }
+            JobExecutionOutcome::Failed(_) if final_attempt => {
+                ctx.settle_failure(crate::job_tracking::GENERIC_FAILURE_MESSAGE)
+                    .await;
+            }
+            JobExecutionOutcome::Failed(_) => {
+                // A retry is pending; leave the record running so progress
+                // persists across attempts.
+            }
+        }
     }
+
+    outcome
 }
 
 fn format_job_panic(panic: &(dyn std::any::Any + Send)) -> String {
@@ -1737,6 +1792,11 @@ pub fn global_job_client() -> Option<Arc<JobClient>> {
 pub(crate) fn install_job_client(state: &AppState, client: JobClient) {
     state.insert_extension(client.clone());
     init_global_job_client(client);
+    // `enqueue_tracked` needs a tracking store the moment a job runtime is
+    // live, even for backends/tests that build a `JobClient` directly rather
+    // than going through `start_runtime` (which installs a config-driven
+    // store before the backend starter runs and gets here).
+    crate::job_tracking::ensure_tracking_store_installed(state);
 }
 
 pub(crate) fn init_global_job_client(client: JobClient) {
@@ -1757,6 +1817,7 @@ pub fn clear_global_job_client() {
     } else {
         let _ = GLOBAL_JOB_CLIENT.set(RwLock::new(None));
     }
+    crate::job_tracking::clear_global_tracking_store();
 }
 
 /// Enqueue a job payload on the configured runtime backend.
@@ -3214,7 +3275,14 @@ async fn execute_local_job(
         use tracing_opentelemetry::OpenTelemetrySpanExt as _;
         let _ = job_span.set_parent(cx);
     }
-    let f = run_job_handler(&job.name, handler, state.clone(), job.payload.clone());
+    let final_attempt = job.attempt >= max_attempts;
+    let f = run_job_handler(
+        &job.name,
+        handler,
+        state.clone(),
+        job.payload.clone(),
+        final_attempt,
+    );
     let outcome = tracing::Instrument::instrument(f, job_span).await;
     match outcome {
         JobExecutionOutcome::Succeeded => {
@@ -5279,7 +5347,14 @@ async fn process_redis_job_record(
         use tracing_opentelemetry::OpenTelemetrySpanExt as _;
         let _ = job_span.set_parent(cx);
     }
-    let f = run_job_handler(&record.name, handler, state.clone(), record.payload.clone());
+    let final_attempt = record.attempt >= record.max_attempts;
+    let f = run_job_handler(
+        &record.name,
+        handler,
+        state.clone(),
+        record.payload.clone(),
+        final_attempt,
+    );
     match tracing::Instrument::instrument(f, job_span).await {
         JobExecutionOutcome::Succeeded => {
             match ack_redis_success(connection, worker_config, &record).await {
@@ -6435,7 +6510,8 @@ async fn pg_execute_job(
         use tracing_opentelemetry::OpenTelemetrySpanExt as _;
         let _ = job_span.set_parent(cx);
     }
-    let f = run_job_handler(&row.name, handler, state.clone(), payload);
+    let final_attempt = attempt >= max_attempts;
+    let f = run_job_handler(&row.name, handler, state.clone(), payload, final_attempt);
     match tracing::Instrument::instrument(f, job_span).await {
         JobExecutionOutcome::Succeeded => {
             let ack = pg_ack_success(pool, &row.id, worker_id).await;
@@ -7366,6 +7442,7 @@ mod tests {
             instantly_panicking_handler,
             state,
             serde_json::json!({}),
+            true,
         )
         .await;
         assert_eq!(
@@ -7417,8 +7494,14 @@ mod tests {
             Arc::new(PanickingJobInterceptor) as Arc<dyn crate::interceptor::JobInterceptor>
         );
 
-        let outcome =
-            run_job_handler("test_job", success_handler, state, serde_json::json!({})).await;
+        let outcome = run_job_handler(
+            "test_job",
+            success_handler,
+            state,
+            serde_json::json!({}),
+            true,
+        )
+        .await;
 
         assert_eq!(
             outcome,
@@ -7485,6 +7568,7 @@ mod tests {
             side_effect_handler,
             state,
             serde_json::json!({}),
+            true,
         )
         .await;
 
@@ -10222,7 +10306,14 @@ mod tests {
     async fn run_job_handler_reports_async_panics() {
         let state = AppState::for_test().with_profile("dev");
         let outcome =
-            run_job_handler("test_job", panicking_handler, state, serde_json::json!({})).await;
+            run_job_handler(
+                "test_job",
+                panicking_handler,
+                state,
+                serde_json::json!({}),
+                true,
+            )
+            .await;
         assert_eq!(
             outcome,
             JobExecutionOutcome::Panicked("job handler panicked: forced panic".to_string())
