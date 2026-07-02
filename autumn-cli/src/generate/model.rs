@@ -252,80 +252,74 @@ fn declares_schema_table(content: &str, table: &str) -> bool {
 /// Scoping to the specific struct's body (rather than the whole file) means
 /// callers can inspect the resource's own `#[id]` field even when other
 /// models are declared in the same `src/models.rs`. Returns `None` when the
-/// struct can't be located textually (e.g. a hand-written model using an
-/// unconventional struct name) — callers should treat that as "can't verify,
-/// don't guess" rather than "model missing", since [`model_file_exists`]
-/// already established the model is present.
-fn find_model_struct_body(project_root: &Path, base: &str) -> Option<String> {
+/// struct can't be located/parsed (e.g. a hand-written model using an
+/// unconventional struct name, or the file fails to parse as valid Rust) —
+/// callers should treat that as "can't verify, don't guess" rather than
+/// "model missing", since [`model_file_exists`] already established the
+/// model is present.
+///
+/// Parses the file with `syn` rather than scanning text: earlier text-based
+/// heuristics here kept missing real UUID primary keys behind cosmetic
+/// variation the compiler doesn't care about — grouped attributes, doc
+/// comments, and both `//` and `/* */` comments all defeated a
+/// string-matching approach one at a time (issue #1026 follow-ups). A real
+/// parse isn't fooled by any of that, since it operates on the token tree,
+/// not the source text.
+fn model_struct_has_uuid_pk(project_root: &Path, base: &str) -> bool {
     let pascal_name = pascal(base);
     let per_resource = project_root
         .join("src")
         .join("models")
         .join(format!("{base}.rs"));
-    if per_resource.exists() {
-        return extract_struct_body(&read_or_empty(&per_resource), &pascal_name);
-    }
-    let single_file = project_root.join("src").join("models.rs");
-    if single_file.exists() {
-        return extract_struct_body(&read_or_empty(&single_file), &pascal_name);
-    }
-    None
-}
-
-/// Extract the text between `struct <name> {` and its matching closing `}`,
-/// tracking brace depth so a struct containing nested braces (there are none
-/// in practice — model fields are plain types — but this stays correct if
-/// that ever changes) isn't truncated at the first inner `}`.
-fn extract_struct_body(content: &str, struct_name: &str) -> Option<String> {
-    let needle = format!("struct {struct_name} {{");
-    let start = content.find(&needle)? + needle.len();
-    let mut depth: usize = 1;
-    for (i, b) in content.as_bytes()[start..].iter().enumerate() {
-        match b {
-            b'{' => depth += 1,
-            b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(content[start..start + i].to_string());
-                }
-            }
-            _ => {}
+    let content = if per_resource.exists() {
+        read_or_empty(&per_resource)
+    } else {
+        let single_file = project_root.join("src").join("models.rs");
+        if !single_file.exists() {
+            return false;
         }
-    }
-    None
-}
+        read_or_empty(&single_file)
+    };
 
-/// Whether a `#[model]` struct body's primary key (the field tagged `#[id]`,
-/// regardless of its name — the macro identifies the PK by attribute, not by
-/// the name `id`) is a UUID.
-fn struct_has_uuid_pk(struct_body: &str) -> bool {
-    let lines: Vec<&str> = struct_body.lines().map(str::trim).collect();
-    lines.iter().enumerate().any(|(i, line)| {
-        *line == "#[id]"
-            && lines[i + 1..]
-                // Skip blank lines, any other attributes (`#[...]`), and doc
-                // comments (`///`/`//!`) that may sit between `#[id]` and the
-                // actual field declaration (e.g. `#[serde(rename = "id")]`).
-                .iter()
-                .find(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with("//"))
-                .is_some_and(|field_line| field_type_is_uuid(field_line))
-    })
-}
-
-/// Whether a `pub <name>: <Type>,` field declaration's type is a UUID —
-/// either the fully-qualified `uuid::Uuid` (what the generator itself always
-/// emits) or the bare `Uuid` (idiomatic with a `use uuid::Uuid;` import at
-/// the top of the file, a common hand-edit of a generated model). Tolerates
-/// a trailing `// comment` on the same line (e.g. `pub id: uuid::Uuid, //
-/// primary key`), which would otherwise get swept into the extracted type
-/// text since it comes after the trailing comma.
-fn field_type_is_uuid(field_line: &str) -> bool {
-    let code = field_line.split("//").next().unwrap_or(field_line);
-    let Some((_, after_colon)) = code.split_once(':') else {
+    let Ok(file) = syn::parse_file(&content) else {
         return false;
     };
-    let ty = after_colon.trim().trim_end_matches(',').trim();
-    ty == "uuid::Uuid" || ty == "Uuid"
+
+    let Some(item_struct) = file.items.iter().find_map(|item| match item {
+        syn::Item::Struct(s) if s.ident == pascal_name => Some(s),
+        _ => None,
+    }) else {
+        return false;
+    };
+
+    let syn::Fields::Named(fields) = &item_struct.fields else {
+        return false;
+    };
+    fields
+        .named
+        .iter()
+        .find(|field| field.attrs.iter().any(|a| a.path().is_ident("id")))
+        .is_some_and(|field| type_is_uuid(&field.ty))
+}
+
+/// Whether a `syn::Type` is a UUID — either the fully-qualified `uuid::Uuid`
+/// (what the generator itself always emits) or the bare `Uuid` (idiomatic
+/// with a `use uuid::Uuid;` import at the top of the file, a common
+/// hand-edit of a generated model).
+fn type_is_uuid(ty: &syn::Type) -> bool {
+    let syn::Type::Path(type_path) = ty else {
+        return false;
+    };
+    if type_path.qself.is_some() {
+        return false;
+    }
+    match type_path.path.segments.len() {
+        1 => type_path.path.segments[0].ident == "Uuid",
+        2 => {
+            type_path.path.segments[0].ident == "uuid" && type_path.path.segments[1].ident == "Uuid"
+        }
+        _ => false,
+    }
 }
 
 /// Validate every `references` field against its target model (issue #1026):
@@ -396,9 +390,7 @@ pub(super) fn check_reference_targets(
                 // "model not found" for a self-reference, since the table
                 // obviously already exists (that's the point of ALTER TABLE).
                 None => {
-                    if find_model_struct_body(project_root, base)
-                        .is_some_and(|body| struct_has_uuid_pk(&body))
-                    {
+                    if model_struct_has_uuid_pk(project_root, base) {
                         return Err(GenerateError::Config(format!(
                             "'{}' is a self-referential foreign key, but the existing model \
                              declares a UUID primary key. `references` fields only support \
@@ -420,8 +412,7 @@ pub(super) fn check_reference_targets(
             ));
             continue;
         }
-        if find_model_struct_body(project_root, base).is_some_and(|body| struct_has_uuid_pk(&body))
-        {
+        if model_struct_has_uuid_pk(project_root, base) {
             return Err(GenerateError::Config(format!(
                 "'{}' references model '{base}', which declares a UUID primary key. \
                  `references` fields only support i64/BIGSERIAL-keyed targets \
@@ -2364,6 +2355,73 @@ autumn-web = \"0.3\"\n";
         )
         .unwrap_err();
         assert!(err.to_string().contains("UUID"));
+    }
+
+    #[test]
+    fn references_field_detects_uuid_pk_with_trailing_block_comment() {
+        // `pub id: uuid::Uuid, /* primary key */` — a block comment, not a
+        // line comment. The syn-based parser isn't fooled by either.
+        let tmp = project();
+        let models_dir = tmp.path().join("src/models");
+        fs::create_dir_all(&models_dir).unwrap();
+        fs::write(
+            models_dir.join("post.rs"),
+            "#[autumn_web::model]\npub struct Post {\n    #[id]\n    pub id: uuid::Uuid, /* primary key */\n}\n",
+        )
+        .unwrap();
+
+        let err = plan_model(
+            tmp.path(),
+            "Comment",
+            &["post:references".into()],
+            "20260427000000",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("UUID"));
+    }
+
+    #[test]
+    fn references_field_detects_uuid_pk_regardless_of_attribute_order() {
+        // `#[id]` doesn't have to be the first attribute on the field — a
+        // real parse (unlike a "look at the line after #[id]" scan) handles
+        // any attribute order the same way rustc does.
+        let tmp = project();
+        let models_dir = tmp.path().join("src/models");
+        fs::create_dir_all(&models_dir).unwrap();
+        fs::write(
+            models_dir.join("post.rs"),
+            "#[autumn_web::model]\npub struct Post {\n    #[serde(rename = \"id\")]\n    #[id]\n    pub id: uuid::Uuid,\n}\n",
+        )
+        .unwrap();
+
+        let err = plan_model(
+            tmp.path(),
+            "Comment",
+            &["post:references".into()],
+            "20260427000000",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("UUID"));
+    }
+
+    #[test]
+    fn references_field_handles_unparseable_model_file_gracefully() {
+        // A model file that isn't valid Rust (or uses a struct name that
+        // doesn't match) must not panic — "can't verify" falls back to no
+        // error, same as if the model couldn't be found at all.
+        let tmp = project();
+        let models_dir = tmp.path().join("src/models");
+        fs::create_dir_all(&models_dir).unwrap();
+        fs::write(models_dir.join("post.rs"), "this is not valid rust {{{").unwrap();
+
+        let plan = plan_model(
+            tmp.path(),
+            "Comment",
+            &["post:references".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        assert!(plan.warnings.is_empty());
     }
 
     // ── self-referential `references` (issue #1026 follow-up) ──────────────
