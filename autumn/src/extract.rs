@@ -742,9 +742,9 @@ mod tests {
 /// query string.
 ///
 /// Infallible — always succeeds, even on requests with no matched route.
-/// Intended for path-aware view helpers such as
-/// [`nav_link`](crate::widgets::nav_link), which need to know the current
-/// path to decide whether a navigation link is active.
+/// Intended for path-aware view helpers such as `nav_link`
+/// (`autumn_web::widgets::nav_link`, behind the `maud` feature), which need
+/// to know the current path to decide whether a navigation link is active.
 ///
 /// # Example
 ///
