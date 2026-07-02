@@ -497,6 +497,51 @@ async fn swr_without_ttl_never_goes_stale() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn swr_past_grace_window_becomes_cold_miss() {
+    let _guard = METRICS_LOCK.lock().await;
+    let cache = fresh_cache();
+    let key = unique_key("swr_past_grace_window_becomes_cold_miss");
+    let fill_count = Arc::new(AtomicUsize::new(0));
+
+    let opts = GetOrComputeOptions::new()
+        .ttl(Duration::from_millis(30))
+        .stale_while_revalidate(Duration::from_millis(30));
+
+    let fc = fill_count.clone();
+    let v: String = get_or_compute_with(&cache, &key, opts.clone(), move || async move {
+        fc.fetch_add(1, Ordering::SeqCst);
+        Ok::<String, String>("v1".to_string())
+    })
+    .await
+    .unwrap();
+    assert_eq!(v, "v1");
+
+    // Elapse past both `ttl` (30ms) and `grace` (30ms): per the docs ("Once
+    // past ttl + grace, the key is treated as a cold miss again"), the entry
+    // must no longer be served as stale-but-usable data — the in-process
+    // Moka backend never physically evicts it on its own (its own per-cache
+    // TTL here is `None`), so this can't rely on eviction to happen.
+    tokio::time::sleep(Duration::from_millis(120)).await;
+
+    let fc = fill_count.clone();
+    let v: String = get_or_compute_with(&cache, &key, opts.clone(), move || async move {
+        fc.fetch_add(1, Ordering::SeqCst);
+        Ok::<String, String>("v2".to_string())
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        v, "v2",
+        "past ttl + grace the caller must get a fresh fill, not the ancient stale value"
+    );
+    assert_eq!(
+        fill_count.load(Ordering::SeqCst),
+        2,
+        "exactly one fresh fill should run for the cold-miss read"
+    );
+}
+
 /// A minimal `Cache` implementation that only ever stores `RawCacheBytes`
 /// (mirroring how a serializing, cross-process backend like Redis behaves),
 /// proving `get_or_compute` works over the serde slow path too.

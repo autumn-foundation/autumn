@@ -282,8 +282,7 @@ pub fn jittered_ttl(base: Duration, fraction: f64) -> Duration {
         // Fallback entropy source if the OS RNG is unavailable.
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(0);
+            .map_or(0, |d| d.subsec_nanos());
         buf = nanos.to_le_bytes();
     }
     let unit = f64::from(u32::from_le_bytes(buf)) / f64::from(u32::MAX);
@@ -431,6 +430,13 @@ const MAX_LOCK_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// Shared by the immediate-`Acquired` path and the poll loop's re-acquire
 /// path in [`run_leader_fill`], which otherwise duplicate this exact
 /// increment-fill-release-finish sequence.
+///
+/// The lock is released only *after* `finish_fill` has written and published
+/// the value, not right after `fill()` returns: releasing it earlier opens a
+/// window where a contending replica's poll tick sees both "no value yet" and
+/// "lock free," acquires the now-unlocked lock, and runs its own redundant
+/// fill — exactly the duplicate-recompute the distributed lock exists to
+/// prevent.
 async fn run_fill_and_release<V, E, F, Fut>(
     cache: &Arc<dyn Cache>,
     key: &str,
@@ -449,8 +455,9 @@ where
         .fill_lock_acquires
         .fetch_add(1, Ordering::Relaxed);
     let result = fill().await;
+    let outcome = finish_fill(cache, key, options, result, tx);
     cache.release_fill_lock(key, token);
-    finish_fill(cache, key, options, result, tx)
+    outcome
 }
 
 /// Run the fill closure (honoring the distributed fill lock if enabled),
@@ -669,6 +676,17 @@ where
     }
 }
 
+/// Whether an SWR envelope is still usable (fresh or stale-but-in-grace) at
+/// `now`, i.e. `now < fresh_until_unix_ms + grace`. Once this is false the
+/// entry is past `ttl + grace` and must be treated as a cold miss rather than
+/// served indefinitely: relying on physical eviction to make that happen
+/// doesn't hold for the in-process Moka backend, which (per its own
+/// per-cache TTL, commonly `None`) may never evict the entry on its own.
+fn swr_within_grace(now_unix_ms: u64, fresh_until_unix_ms: u64, grace: Option<Duration>) -> bool {
+    let grace_ms = grace.map_or(0, |g| u64::try_from(g.as_millis()).unwrap_or(u64::MAX));
+    now_unix_ms < fresh_until_unix_ms.saturating_add(grace_ms)
+}
+
 /// Stale-while-revalidate read-through: `fill` must be `'static` because a
 /// stale read may hand it to a background task instead of awaiting it.
 async fn swr_read_through<V, E, F, Fut>(
@@ -684,45 +702,62 @@ where
     Fut: Future<Output = Result<V, E>> + Send + 'static,
 {
     loop {
-        match get_cached::<SwrEnvelope<V>>(cache.as_ref(), key) {
-            Some(envelope)
-                if now_unix_ms(options.clock.as_ref()) < envelope.fresh_until_unix_ms =>
-            {
+        let envelope = get_cached::<SwrEnvelope<V>>(cache.as_ref(), key);
+        let now = now_unix_ms(options.clock.as_ref());
+
+        if let Some(envelope) = &envelope {
+            if now < envelope.fresh_until_unix_ms {
                 read_through_metrics().hits.fetch_add(1, Ordering::Relaxed);
-                return Ok(envelope.value);
+                return Ok(envelope.value.clone());
             }
-            Some(envelope) => {
+            if swr_within_grace(
+                now,
+                envelope.fresh_until_unix_ms,
+                options.stale_while_revalidate,
+            ) {
                 read_through_metrics()
                     .stale_serves
                     .fetch_add(1, Ordering::Relaxed);
                 spawn_background_refresh(cache.clone(), key.to_owned(), options.clone(), fill);
-                return Ok(envelope.value);
+                return Ok(envelope.value.clone());
             }
-            None => {
-                read_through_metrics()
-                    .misses
-                    .fetch_add(1, Ordering::Relaxed);
-                match claim_role(cache, key) {
-                    Role::Leader(tx, guard) => {
-                        if let Some(envelope) = get_cached::<SwrEnvelope<V>>(cache.as_ref(), key) {
-                            let _ = tx.send(FillState::Done(Arc::new(envelope.value.clone())));
-                            drop(guard);
-                            return Ok(envelope.value);
-                        }
-                        let result = run_leader_fill(cache, key, &options, fill, tx).await;
-                        drop(guard);
-                        return result;
-                    }
-                    Role::Waiter(rx) => {
-                        read_through_metrics()
-                            .coalesced_waits
-                            .fetch_add(1, Ordering::Relaxed);
-                        if let Some(result) = await_result::<V, E>(rx).await {
-                            return result;
-                        }
-                        // Channel closed or type mismatch: loop back and re-contend.
-                    }
+            // Past `ttl + grace`: fall through to the cold-miss path below
+            // instead of serving this indefinitely-stale value forever.
+        }
+
+        read_through_metrics()
+            .misses
+            .fetch_add(1, Ordering::Relaxed);
+        match claim_role(cache, key) {
+            Role::Leader(tx, guard) => {
+                // Double-check: another leader may have refreshed the key
+                // between the read above and winning leadership. Only trust
+                // that write if it's actually usable (fresh or in grace) —
+                // otherwise this would just re-observe the same expired
+                // envelope and skip filling entirely.
+                if let Some(envelope) = get_cached::<SwrEnvelope<V>>(cache.as_ref(), key)
+                    && swr_within_grace(
+                        now_unix_ms(options.clock.as_ref()),
+                        envelope.fresh_until_unix_ms,
+                        options.stale_while_revalidate,
+                    )
+                {
+                    let _ = tx.send(FillState::Done(Arc::new(envelope.value.clone())));
+                    drop(guard);
+                    return Ok(envelope.value);
                 }
+                let result = run_leader_fill(cache, key, &options, fill, tx).await;
+                drop(guard);
+                return result;
+            }
+            Role::Waiter(rx) => {
+                read_through_metrics()
+                    .coalesced_waits
+                    .fetch_add(1, Ordering::Relaxed);
+                if let Some(result) = await_result::<V, E>(rx).await {
+                    return result;
+                }
+                // Channel closed or type mismatch: loop back and re-contend.
             }
         }
     }
