@@ -1121,7 +1121,11 @@ pub enum NavLinkMatch {
     Exact,
     /// Active when the current path equals `href`, or starts with `href`
     /// followed by a `/` segment boundary — so `/admin/posts/3/edit`
-    /// activates an `/admin/posts` link, but `/admin/postsX` does not.
+    /// activates an `/admin/posts` link, but `/admin/postsX` does not. A
+    /// trailing slash on `href` is normalized away first, so `/admin/posts/`
+    /// behaves identically to `/admin/posts`. An empty `href` — or `href`
+    /// that normalizes to one — never matches, since that would otherwise
+    /// activate on every absolute path.
     Prefix,
 }
 
@@ -1190,10 +1194,19 @@ fn nav_link_is_active(current_path: &str, href: &str, mode: NavLinkMatch) -> boo
     match mode {
         NavLinkMatch::Exact => current_path == href,
         NavLinkMatch::Prefix => {
-            current_path == href
-                || current_path
-                    .strip_prefix(href)
-                    .is_some_and(|rest| rest.starts_with('/'))
+            if current_path == href {
+                return true;
+            }
+            // Normalize a trailing slash so "/posts/" behaves the same as
+            // "/posts", but preserve a bare "/" rather than trimming it to an
+            // empty prefix — same convention as tenancy::is_public_path, since
+            // an empty prefix would otherwise match every absolute path.
+            let href = if href.len() > 1 {
+                href.trim_end_matches('/')
+            } else {
+                href
+            };
+            !href.is_empty() && crate::router::path_matches_route_prefix(current_path, href)
         }
     }
 }
@@ -2479,6 +2492,40 @@ mod tests {
             NavLinkMatch::Prefix,
         )
         .into_string();
+        assert!(html.contains(r#"class="active""#), "{html}");
+    }
+
+    #[test]
+    fn nav_link_prefix_mode_trailing_slash_href_still_matches() {
+        // href with a trailing slash must behave the same as without one.
+        let html = nav_link_matched(
+            "/admin/posts/3/edit",
+            "/admin/posts/",
+            "Posts",
+            NavLinkMatch::Prefix,
+        )
+        .into_string();
+        assert!(html.contains(r#"class="active""#), "{html}");
+    }
+
+    #[test]
+    fn nav_link_prefix_mode_empty_href_never_matches() {
+        // An empty href must never act as a wildcard that matches every path.
+        let html = nav_link_matched("/admin/posts/3/edit", "", "Posts", NavLinkMatch::Prefix)
+            .into_string();
+        assert!(!html.contains("active"), "{html}");
+        assert!(!html.contains("aria-current"), "{html}");
+    }
+
+    #[test]
+    fn nav_link_prefix_mode_root_href_does_not_match_every_path() {
+        // href="/" must not wildcard-match every path either; only an exact "/"
+        // current_path is active.
+        let html =
+            nav_link_matched("/admin/posts", "/", "Home", NavLinkMatch::Prefix).into_string();
+        assert!(!html.contains("active"), "{html}");
+
+        let html = nav_link_matched("/", "/", "Home", NavLinkMatch::Prefix).into_string();
         assert!(html.contains(r#"class="active""#), "{html}");
     }
 
