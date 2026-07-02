@@ -775,9 +775,18 @@ where
 
     async fn from_request_parts(
         parts: &mut axum::http::request::Parts,
-        _state: &S,
+        state: &S,
     ) -> Result<Self, Self::Rejection> {
-        Ok(Self(parts.uri.path().to_owned()))
+        // Use OriginalUri rather than parts.uri directly: axum's Router::nest
+        // strips the mount prefix from parts.uri inside the nested service,
+        // but nav_link needs the full browser-visible path to compare against
+        // normal absolute hrefs. OriginalUri falls back to parts.uri itself
+        // when the request wasn't dispatched through a nested router.
+        let axum::extract::OriginalUri(uri) =
+            axum::extract::OriginalUri::from_request_parts(parts, state)
+                .await
+                .unwrap();
+        Ok(Self(uri.path().to_owned()))
     }
 }
 
@@ -1110,6 +1119,29 @@ mod trusted_proxy_extractor_tests {
         let app = Router::new().route("/admin/posts", get(handler));
         let req = axum::http::Request::builder()
             .uri("/admin/posts?page=2")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 64).await.unwrap();
+        assert_eq!(&body[..], b"/admin/posts");
+    }
+
+    #[tokio::test]
+    async fn current_path_preserves_prefix_under_nested_router() {
+        // axum's Router::nest strips the mount prefix from `parts.uri` inside
+        // the nested service, so a request to "/admin/posts" is seen as
+        // "/posts" there. nav_link's documented use compares CurrentPath
+        // against normal absolute hrefs like "/admin/posts", so CurrentPath
+        // must return the browser-visible path (via OriginalUri), not the
+        // nest-relative one.
+        async fn handler(CurrentPath(path): CurrentPath) -> String {
+            path
+        }
+
+        let inner = Router::new().route("/posts", get(handler));
+        let app = Router::new().nest("/admin", inner);
+        let req = axum::http::Request::builder()
+            .uri("/admin/posts")
             .body(Body::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
