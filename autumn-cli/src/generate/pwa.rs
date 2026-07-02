@@ -44,9 +44,10 @@ pub fn plan_pwa(project_root: &Path) -> Result<Plan, GenerateError> {
     })?;
     if layout_missing_current_path(&main_existing) {
         return Err(GenerateError::Config(format!(
-            "{}'s layout() doesn't accept current_path — update it to \
-             layout(title: &str, current_path: &str, flash: Markup, content: Markup) \
-             (see autumn-cli/src/templates/main.rs.tmpl for the current shape) \
+            "{}'s layout() takes fewer than 4 parameters — the current \
+             nav_bar-based scaffold needs layout(title: &str, current_path: &str, \
+             flash: Markup, content: Markup) (see autumn-cli/src/templates/main.rs.tmpl \
+             for the current shape; the path parameter's name doesn't matter) \
              before running `autumn generate pwa`",
             main_path.display()
         )));
@@ -427,25 +428,80 @@ fn inject_pwa_meta_into_head(source: &str) -> String {
     result
 }
 
-/// True when `source` defines a `layout()` function whose signature doesn't
-/// mention `current_path` — the pre-`nav_bar` scaffold shape
-/// (`layout(title, flash, content)`) rather than the current one
-/// (`layout(title, current_path, flash, content)`). `pwa_offline`'s
-/// generated call assumes the current shape, so this gates [`plan_pwa`]
-/// with an actionable error instead of emitting code with the wrong arity.
+/// True when `source` defines a `layout()` function with fewer than 4
+/// parameters — the pre-`nav_bar` scaffold shape (`layout(title, flash,
+/// content)`) rather than the current one (`layout(title, current_path,
+/// flash, content)`). `pwa_offline`'s generated call assumes 4 positional
+/// arguments, so this gates [`plan_pwa`] with an actionable error instead
+/// of emitting code with the wrong arity.
 ///
-/// Scans the whole signature span (from `fn layout(` up to the function
-/// body's opening brace), not just the physical line `fn layout(` appears
-/// on — rustfmt wraps this signature across multiple lines at its default
-/// column width, which would otherwise put `current_path` on a line the
-/// check never looks at.
+/// Checks parameter *count*, not a specific name — Rust calls are
+/// positional, so a caller who named their path parameter `path` or
+/// `request_path` instead of `current_path` still compiles fine and must
+/// not be rejected.
 fn layout_missing_current_path(source: &str) -> bool {
     let Some(start) = source.find("fn layout(") else {
         return false;
     };
-    let rest = &source[start..];
-    let signature = rest.find('{').map_or(rest, |brace| &rest[..brace]);
-    !signature.contains("current_path")
+    let after_paren = &source[start + "fn layout(".len()..];
+    let Some(params) = balanced_prefix(after_paren) else {
+        return false;
+    };
+    count_params(params) < 4
+}
+
+/// Count comma-separated parameters in a (possibly multi-line, possibly
+/// trailing-comma) parameter list — the trailing comma rustfmt always adds
+/// when it wraps a signature onto separate lines doesn't itself count as an
+/// extra parameter.
+fn count_params(params: &str) -> usize {
+    let trimmed = params.trim();
+    if trimmed.is_empty() {
+        return 0;
+    }
+    let commas = count_top_level_commas(trimmed);
+    if trimmed.ends_with(',') {
+        commas
+    } else {
+        commas + 1
+    }
+}
+
+/// The prefix of `s` up to (not including) the `)` that closes the opening
+/// paren implicit in the caller's position — tracks `(`/`[` nesting (e.g. a
+/// closure-typed parameter like `Fn(i32) -> bool`) so an inner `)` doesn't
+/// end the scan early. Returns `None` if unbalanced.
+fn balanced_prefix(s: &str) -> Option<&str> {
+    let mut depth = 0i32;
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' | '[' => depth += 1,
+            ')' if depth == 0 => return Some(&s[..i]),
+            ')' | ']' => depth -= 1,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Count commas in `s` that aren't nested inside `(...)`/`[...]` — a cheap
+/// proxy for "how many parameters does this signature have" without a real
+/// parser. Doesn't track `<...>` generic nesting, so a parameter type with a
+/// top-level comma inside angle brackets (e.g. `HashMap<K, V>`) would
+/// over-count — harmless here since over-counting only makes this check
+/// *more* permissive, never a false rejection.
+fn count_top_level_commas(s: &str) -> usize {
+    let mut depth = 0i32;
+    let mut count = 0;
+    for c in s.chars() {
+        match c {
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth -= 1,
+            ',' if depth == 0 => count += 1,
+            _ => {}
+        }
+    }
+    count
 }
 
 /// Append `pwa_manifest`, `pwa_service_worker`, `pwa_register_js`, and `pwa_offline`
@@ -692,6 +748,26 @@ async fn main() {
         let tmp = project_with_main(&wrapped_main);
         plan_pwa(tmp.path())
             .expect("rustfmt-wrapped current_path parameter must still be detected");
+    }
+
+    #[test]
+    fn plan_pwa_accepts_layout_with_renamed_path_parameter() {
+        // Rust calls are positional — a layout() with 4 parameters compiles
+        // fine against pwa_offline's 4-arg call regardless of what the
+        // second parameter is named. Requiring the literal name
+        // "current_path" would reject valid, already-migrated apps that
+        // simply chose a different name (e.g. `path`, `request_path`).
+        let renamed_main = DEFAULT_MAIN.replace(
+            "pub fn layout(title: &str, current_path: &str, flash: maud::Markup, content: maud::Markup) -> maud::Markup {",
+            "pub fn layout(title: &str, request_path: &str, flash: maud::Markup, content: maud::Markup) -> maud::Markup {",
+        );
+        assert_ne!(
+            renamed_main, DEFAULT_MAIN,
+            "replacement must actually match"
+        );
+        let tmp = project_with_main(&renamed_main);
+        plan_pwa(tmp.path())
+            .expect("a differently-named 4th parameter must still be accepted (arity, not name)");
     }
 
     #[test]
