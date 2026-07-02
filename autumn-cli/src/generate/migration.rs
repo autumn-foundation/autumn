@@ -55,12 +55,21 @@ pub fn plan_migration(
     let dir_name = format!("{timestamp}_{}", snake_or_pascal_to_snake(name));
     let migration_dir = project_root.join("migrations").join(&dir_name);
 
+    let mut plan = Plan::new(project_root);
+
     let shape = detect_migration_shape(&pascalish(name));
     let (up, down) = match shape {
-        MigrationShape::AddColumns { ref table } if !fields.is_empty() => (
-            add_columns_up_sql(table, &fields),
-            add_columns_down_sql(table, &fields),
-        ),
+        MigrationShape::AddColumns { ref table } if !fields.is_empty() => {
+            // A `references` field here gets the same target-model warning /
+            // UUID-PK error as `generate model`/`generate scaffold` (issue
+            // #1026) — otherwise the same DSL token gives inconsistent
+            // feedback depending only on which subcommand declared it.
+            super::model::check_reference_targets(&mut plan, project_root, &fields)?;
+            (
+                add_columns_up_sql(table, &fields),
+                add_columns_down_sql(table, &fields),
+            )
+        }
         MigrationShape::RemoveColumns { ref table } if !fields.is_empty() => (
             remove_columns_up_sql(table, &fields),
             remove_columns_down_sql(table, &fields),
@@ -140,7 +149,6 @@ pub fn plan_migration(
         _ => (String::new(), String::new()),
     };
 
-    let mut plan = Plan::new(project_root);
     plan.create(migration_dir.join("up.sql"), up);
     plan.create(migration_dir.join("down.sql"), down);
     Ok(plan)
@@ -326,5 +334,62 @@ pub struct Post {
         );
         assert!(down.contains("DROP INDEX IF EXISTS idx_posts_search_vector;"));
         assert!(down.contains("ALTER TABLE posts DROP COLUMN IF EXISTS search_vector;"));
+    }
+
+    // ── references field: parity with `generate model` (issue #1026) ───────
+
+    #[test]
+    fn add_columns_with_references_field_emits_fk_and_index() {
+        let tmp = project();
+        let plan = plan_migration(
+            tmp.path(),
+            "AddPostToComments",
+            &["post:references".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let up = fs::read_to_string(
+            tmp.path()
+                .join("migrations/20260427000000_add_post_to_comments/up.sql"),
+        )
+        .unwrap();
+        assert!(up.contains("post_id BIGINT NOT NULL REFERENCES posts(id)"));
+        assert!(up.contains("CREATE INDEX idx_comments_post_id ON comments (post_id);"));
+    }
+
+    #[test]
+    fn add_columns_with_references_field_warns_when_target_model_missing() {
+        let tmp = project();
+        let plan = plan_migration(
+            tmp.path(),
+            "AddPostToComments",
+            &["post:references".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        assert_eq!(plan.warnings.len(), 1, "warnings: {:?}", plan.warnings);
+        assert!(plan.warnings[0].contains("posts"));
+    }
+
+    #[test]
+    fn add_columns_with_references_field_errors_on_uuid_target() {
+        let tmp = project();
+        let models_dir = tmp.path().join("src/models");
+        fs::create_dir_all(&models_dir).unwrap();
+        fs::write(
+            models_dir.join("post.rs"),
+            "#[autumn_web::model]\npub struct Post {\n    #[id]\n    pub id: uuid::Uuid,\n}\n",
+        )
+        .unwrap();
+
+        let err = plan_migration(
+            tmp.path(),
+            "AddPostToComments",
+            &["post:references".into()],
+            "20260427000000",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("UUID"));
     }
 }

@@ -1841,11 +1841,19 @@ fn render_api_smoke_test(plural: &str, id_schema_type: &str, setup_calls: &str) 
 /// A minimal stand-in table (just the `id` column the FK constraint checks
 /// against) is enough to satisfy Postgres without duplicating the target's
 /// full schema.
-fn render_reference_stub_tables_sql(fields: &[Field]) -> String {
+///
+/// Skips `own_table` — a self-referential `references` field (e.g. a
+/// `Category` model with a `category:references` field) targets the model's
+/// own table, which is about to be created for real by the very next
+/// statement. Postgres allows a self-referential FK within the same
+/// `CREATE TABLE`, so no stub is needed there; emitting one anyway would
+/// collide with the real (non-`IF NOT EXISTS`) `CREATE TABLE` that follows.
+fn render_reference_stub_tables_sql(fields: &[Field], own_table: &str) -> String {
     let mut out = String::new();
     let mut seen = BTreeSet::new();
     for f in fields {
         if let Some(target) = f.reference_table()
+            && target != own_table
             && seen.insert(target.clone())
         {
             let _ = writeln!(
@@ -1875,7 +1883,7 @@ fn render_smoke_test(
     indexes: &BTreeSet<String>,
     defaults: &BTreeMap<String, String>,
 ) -> String {
-    let stub_tables_sql = render_reference_stub_tables_sql(fields);
+    let stub_tables_sql = render_reference_stub_tables_sql(fields, plural);
     let create_table_sql =
         create_table_sql_with_metadata_and_id(plural, fields, indexes, defaults, id_type);
     let mut setup_calls = render_execute_sql_calls(&stub_tables_sql);
@@ -3334,22 +3342,66 @@ async fn main() {
 
     #[test]
     fn render_reference_stub_tables_sql_dedupes_identical_targets() {
-        // Two references whose base names happen to pluralise to the same
-        // table must only emit one `CREATE TABLE IF NOT EXISTS` for it.
-        let fields = super::super::dsl::parse_fields(&[
-            "person:references".into(),
-            "people:references".into(),
-        ])
-        .unwrap();
-        let sql = render_reference_stub_tables_sql(&fields);
+        // Two references that resolve to the same target table must only
+        // emit one `CREATE TABLE IF NOT EXISTS` for it. Constructed directly
+        // (bypassing `parse_fields`, which enforces unique column names) so
+        // the collision is deterministic rather than relying on two English
+        // words coincidentally pluralising to the same string.
+        let fields = vec![
+            Field {
+                name: "author_id".to_string(),
+                kind: FieldKind::References,
+                nullable: false,
+            },
+            Field {
+                name: "author_id".to_string(),
+                kind: FieldKind::References,
+                nullable: true,
+            },
+        ];
+        assert_eq!(
+            fields[0].reference_table(),
+            fields[1].reference_table(),
+            "test setup: both fields must target the same table"
+        );
+        let sql = render_reference_stub_tables_sql(&fields, "unrelated_table");
         assert_eq!(
             sql.matches("CREATE TABLE IF NOT EXISTS").count(),
-            fields
-                .iter()
-                .filter_map(Field::reference_table)
-                .collect::<BTreeSet<_>>()
-                .len(),
-            "stub tables must be de-duplicated by target name: {sql}"
+            1,
+            "identical targets must be de-duplicated: {sql}"
         );
+    }
+
+    #[test]
+    fn render_reference_stub_tables_sql_skips_own_table() {
+        // A self-referential `references` field (e.g. `Category` with
+        // `category:references`) targets the model's own table, which the
+        // real (non-`IF NOT EXISTS`) `CREATE TABLE` creates right after —
+        // stubbing it first would collide with that statement.
+        let fields = super::super::dsl::parse_fields(&["category:references".into()]).unwrap();
+        assert_eq!(fields[0].reference_table().as_deref(), Some("categories"));
+        let sql = render_reference_stub_tables_sql(&fields, "categories");
+        assert!(sql.is_empty(), "must not stub the model's own table: {sql}");
+    }
+
+    #[test]
+    fn scaffold_self_referential_reference_compiles_one_create_table() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Category",
+            &["name:String".into(), "category:references".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let test = fs::read_to_string(tmp.path().join("tests/category.rs")).unwrap();
+        assert_eq!(
+            test.matches("CREATE TABLE").count(),
+            1,
+            "a self-referential FK must not stub its own table before creating it for real: {test}"
+        );
+        assert!(test.contains("category_id BIGINT NOT NULL REFERENCES categories(id)"));
     }
 }

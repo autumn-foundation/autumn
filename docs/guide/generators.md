@@ -84,10 +84,18 @@ flag required. Append `?` for a nullable foreign key
 autumn generate scaffold Comment body:Text post:references
 ```
 
-If the referenced model doesn't exist yet (no `src/models/post.rs`), the
-generator still scaffolds the column, constraint, and index — it just prints
-a warning that the referenced table is assumed to already exist. Composite
-foreign keys, cascade policy (`ON DELETE`/`ON UPDATE`), and runtime
+If the referenced model doesn't exist yet (no `src/models/post.rs`, or a
+matching declaration in a single-file `src/models.rs`), the generator still
+scaffolds the column, constraint, and index — it just prints a warning that
+the referenced table is assumed to already exist.
+
+`references` only supports the i64/BIGSERIAL primary-key convention. If the
+referenced model *is* found but was generated with `--id uuid`, the generator
+fails fast with an error instead of emitting a migration that would break at
+`autumn migrate` time with a `BIGINT`-vs-`UUID` type mismatch — hand-write
+the migration for a UUID foreign key instead.
+
+Composite foreign keys, cascade policy (`ON DELETE`/`ON UPDATE`), and runtime
 association traversal (`belongs_to`/`has_many`) are not in scope for this
 token — see issue #835 for the latter.
 

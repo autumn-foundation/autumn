@@ -133,11 +133,8 @@ impl Plan {
     /// an existing file and `--force` was not passed; or [`GenerateError::Io`]
     /// for filesystem failures during emission.
     pub fn execute(&self, flags: Flags) -> Result<(), GenerateError> {
-        for warning in &self.warnings {
-            eprintln!("Warning: {warning}");
-        }
-
         if flags.dry_run {
+            self.print_warnings();
             self.print_dry_run();
             return Ok(());
         }
@@ -148,6 +145,8 @@ impl Plan {
                 return Err(GenerateError::Collisions(collisions));
             }
         }
+
+        self.print_warnings();
 
         // Make sure parent directories of every file action exist.
         let mut dirs: BTreeSet<PathBuf> = BTreeSet::new();
@@ -201,6 +200,17 @@ impl Plan {
             }
         }
         Ok(())
+    }
+
+    /// Print every advisory warning to stderr. Called only on a path that
+    /// will actually run (dry-run or a real, non-colliding execution) — never
+    /// before a `--force`/collision check that might abort the plan, so a
+    /// failed, no-op run never emits misleading warnings about a plan that
+    /// was never applied.
+    fn print_warnings(&self) {
+        for warning in &self.warnings {
+            eprintln!("Warning: {warning}");
+        }
     }
 
     fn print_dry_run(&self) {
@@ -257,6 +267,21 @@ mod tests {
         assert_eq!(plan.warnings.len(), 1);
         // A warning never fails the plan — it's advisory only.
         plan.execute(Flags::default()).unwrap();
+    }
+
+    #[test]
+    fn warnings_do_not_block_a_collision_error() {
+        // A colliding Create must still fail with Collisions even when the
+        // plan also carries a warning (the warning is printed to stderr,
+        // which this test can't capture in-process, but it must never be
+        // allowed to suppress or alter the underlying error).
+        let (tmp, mut plan) = fixture();
+        let target = tmp.path().join("out.txt");
+        fs::write(&target, "existing").unwrap();
+        plan.warn("some advisory message");
+        plan.create(target, "new");
+        let err = plan.execute(Flags::default()).unwrap_err();
+        assert!(matches!(err, GenerateError::Collisions(_)));
     }
 
     #[test]

@@ -390,12 +390,12 @@ pub fn parse_fields(tokens: &[String]) -> Result<Vec<Field>, GenerateError> {
 }
 
 fn parse_type(ty: &str) -> Option<(FieldKind, bool)> {
-    // A trailing `?` is a terser nullable marker than `Option<…>` — chiefly
-    // used for `references` fields (`post:references?`), but accepted for any
-    // atomic type.
-    if let Some(inner) = ty.strip_suffix('?') {
-        let kind = atomic_type(inner.trim())?;
-        return Some((kind, true));
+    // A trailing `?` is a terser nullable marker than `Option<…>`, but is only
+    // recognized for `references` (`post:references?`) — every other type
+    // must use `Option<…>` for nullability, so this doesn't silently expand
+    // the DSL's accepted grammar (e.g. `count:i64?` stays an error).
+    if matches!(ty.strip_suffix('?'), Some("references" | "References")) {
+        return Some((FieldKind::References, true));
     }
     if let Some(inner) = strip_wrapper(ty, "Option") {
         let kind = atomic_type(inner.trim())?;
@@ -926,6 +926,26 @@ mod tests {
         assert_eq!(f.rust_type(), "Option<i64>");
         assert_eq!(f.schema_type(), "Nullable<Int8>");
         assert_eq!(f.sql_nullability(), "NULL");
+    }
+
+    #[test]
+    fn question_mark_suffix_is_not_a_general_nullability_marker() {
+        // `?` is only recognized for `references` — every other type must use
+        // `Option<…>`. Otherwise this silently expands the DSL's grammar
+        // (undocumented and untested) for every field kind.
+        for token in [
+            "count:i64?",
+            "flag:bool?",
+            "title:String?",
+            "data:Vec<u8>?",
+            "id:Uuid?",
+        ] {
+            let err = parse_field(token).unwrap_err();
+            assert!(
+                err.to_string().contains("unsupported type"),
+                "expected '{token}' to be rejected like before: {err}"
+            );
+        }
     }
 
     #[test]

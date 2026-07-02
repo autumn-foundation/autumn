@@ -114,7 +114,7 @@ pub fn plan_model_with_options(
     let schema_fields = augment_fields_for_soft_delete(&fields, options.soft_delete)?;
 
     let mut plan = Plan::new(project_root);
-    warn_about_unknown_references(&mut plan, project_root, &fields);
+    check_reference_targets(&mut plan, project_root, &fields)?;
 
     // (a) `src/models/<snake>.rs` + `src/models/mod.rs`
     let models_dir = project_root.join("src").join("models");
@@ -186,16 +186,70 @@ pub fn plan_model_with_options(
     Ok(plan)
 }
 
-/// Warn on every `references` field whose target model file doesn't exist in
-/// this project yet (AC8, issue #1026). The generator still scaffolds the FK
-/// column, constraint, and index — the referenced table is simply assumed to
-/// already exist (e.g. it's created by an out-of-band migration, or the
-/// referenced model will be generated in a later command).
-pub(super) fn warn_about_unknown_references(
+/// Where a referenced model's source was found, per [`find_model_file`].
+enum ModelFileMatch {
+    /// The conventional per-resource `src/models/<base>.rs` — its entire
+    /// content belongs to exactly this one model, so it's safe to inspect
+    /// for that model's own `#[id]` type.
+    PerResource(std::path::PathBuf),
+    /// The single-file `src/models.rs` layout, which may define several
+    /// models in one file — content-based checks scoped to *this* model
+    /// (like the UUID-PK check below) can't safely be run against it.
+    SingleFile,
+}
+
+/// Locate the source file (if any) that defines resource `base`'s model,
+/// checking both layouts the codebase already treats as valid (see
+/// `migration.rs`'s `AddSearch` migration shape, which checks the same two
+/// locations): the per-resource `src/models/<base>.rs`, and the single-file
+/// `src/models.rs` — the latter only counts as a match if its content
+/// actually references the resource's table (`use crate::schema::<table>;`,
+/// which every generated model file emits), so an unrelated `src/models.rs`
+/// doesn't produce a false "model exists" result.
+fn find_model_file(project_root: &Path, table: &str, base: &str) -> Option<ModelFileMatch> {
+    let per_resource = project_root
+        .join("src")
+        .join("models")
+        .join(format!("{base}.rs"));
+    if per_resource.exists() {
+        return Some(ModelFileMatch::PerResource(per_resource));
+    }
+    let single_file = project_root.join("src").join("models.rs");
+    if single_file.exists() {
+        let content = read_or_empty(&single_file);
+        if content.contains(&format!("schema::{table}")) {
+            return Some(ModelFileMatch::SingleFile);
+        }
+    }
+    None
+}
+
+/// Validate every `references` field against its target model (issue #1026):
+///
+/// - If the target model can't be found anywhere (AC8), record a warning on
+///   `plan` — the generator still scaffolds the FK column, constraint, and
+///   index, simply assuming the referenced table already exists (e.g. it's
+///   created by an out-of-band migration, or generated in a later command).
+/// - If the target model *can* be found and its own `#[id]` field is a UUID,
+///   fail loudly: `references` only supports the i64/BIGSERIAL PK convention
+///   (see issue #1026's scope), and emitting a `BIGINT` FK column against a
+///   `UUID PRIMARY KEY` would produce a migration that fails at
+///   `autumn migrate` time with an opaque Postgres type-mismatch error —
+///   better to fail fast here with an actionable message.
+///
+/// Shared by `generate model`, `generate scaffold` (via
+/// [`plan_model_with_options`]), and `generate migration Add…To…` (via
+/// `migration::plan_migration`) so a `references` field gets the same
+/// feedback regardless of which subcommand declares it.
+///
+/// # Errors
+/// Returns [`GenerateError::Config`] when a referenced model's own `#[id]`
+/// field is a UUID.
+pub(super) fn check_reference_targets(
     plan: &mut Plan,
     project_root: &Path,
     fields: &[Field],
-) {
+) -> Result<(), GenerateError> {
     for f in fields {
         if !f.kind.is_reference() {
             continue;
@@ -204,18 +258,33 @@ pub(super) fn warn_about_unknown_references(
             continue;
         };
         let base = f.name.strip_suffix("_id").unwrap_or(&f.name);
-        let model_path = project_root
-            .join("src")
-            .join("models")
-            .join(format!("{base}.rs"));
-        if !model_path.exists() {
-            plan.warn(format!(
-                "'{}' references model '{base}', but src/models/{base}.rs was not found — \
-                 assuming table '{table}' already exists.",
-                f.name
-            ));
+        match find_model_file(project_root, &table, base) {
+            None => {
+                plan.warn(format!(
+                    "'{}' references model '{base}', but src/models/{base}.rs (or src/models.rs) \
+                     was not found — assuming table '{table}' already exists.",
+                    f.name
+                ));
+            }
+            Some(ModelFileMatch::PerResource(path)) => {
+                if read_or_empty(&path).contains("pub id: uuid::Uuid,") {
+                    return Err(GenerateError::Config(format!(
+                        "'{}' references model '{base}' ({}), which declares a UUID primary \
+                         key. `references` fields only support i64/BIGSERIAL-keyed targets \
+                         (issue #1026) — hand-write the migration for a UUID foreign key instead.",
+                        f.name,
+                        path.display()
+                    )));
+                }
+            }
+            Some(ModelFileMatch::SingleFile) => {
+                // Can't safely isolate this one model's `#[id]` type from a
+                // shared `src/models.rs` file that may define several models,
+                // so the UUID-PK check is skipped for that layout.
+            }
         }
     }
+    Ok(())
 }
 
 /// Append the virtual `deleted_at` column that `--soft-delete` models add to
@@ -1768,5 +1837,106 @@ autumn-web = \"0.3\"\n";
         )
         .unwrap();
         assert!(plan.warnings.is_empty());
+    }
+
+    #[test]
+    fn references_field_errors_when_target_model_has_uuid_pk() {
+        // `references` only supports the i64/BIGSERIAL PK convention; a FK
+        // column typed BIGINT against a UUID PRIMARY KEY would fail at
+        // `autumn migrate` time with an opaque Postgres error, so this must
+        // fail loudly at generate time instead.
+        let tmp = project();
+        let models_dir = tmp.path().join("src/models");
+        fs::create_dir_all(&models_dir).unwrap();
+        fs::write(
+            models_dir.join("post.rs"),
+            "#[autumn_web::model]\npub struct Post {\n    #[id]\n    pub id: uuid::Uuid,\n}\n",
+        )
+        .unwrap();
+
+        let err = plan_model(
+            tmp.path(),
+            "Comment",
+            &["post:references".into()],
+            "20260427000000",
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("post"), "error should name the field: {msg}");
+        assert!(
+            msg.contains("UUID"),
+            "error should explain the UUID PK mismatch: {msg}"
+        );
+    }
+
+    #[test]
+    fn references_field_no_error_when_target_model_has_bigserial_pk() {
+        let tmp = project();
+        let models_dir = tmp.path().join("src/models");
+        fs::create_dir_all(&models_dir).unwrap();
+        fs::write(
+            models_dir.join("post.rs"),
+            "#[autumn_web::model]\npub struct Post {\n    #[id]\n    pub id: i64,\n}\n",
+        )
+        .unwrap();
+
+        let plan = plan_model(
+            tmp.path(),
+            "Comment",
+            &["post:references".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        assert!(plan.warnings.is_empty());
+    }
+
+    #[test]
+    fn references_field_no_warning_when_target_declared_in_single_file_models_rs() {
+        // The single-file `src/models.rs` layout is an equally valid place
+        // for a model to live (see `migration.rs`'s `AddSearch` shape, which
+        // checks both locations) — it must not produce a false-positive
+        // "model not found" warning.
+        let tmp = project();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(
+            tmp.path().join("src/models.rs"),
+            "use crate::schema::posts;\n\n#[autumn_web::model]\npub struct Post {\n    #[id]\n    pub id: i64,\n}\n",
+        )
+        .unwrap();
+
+        let plan = plan_model(
+            tmp.path(),
+            "Comment",
+            &["post:references".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        assert!(
+            plan.warnings.is_empty(),
+            "no warning expected once Post is declared in src/models.rs: {:?}",
+            plan.warnings
+        );
+    }
+
+    #[test]
+    fn references_field_still_warns_when_single_file_models_rs_lacks_the_model() {
+        // An unrelated `src/models.rs` (e.g. only declaring `User`) must not
+        // be mistaken for a `Post` declaration.
+        let tmp = project();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(
+            tmp.path().join("src/models.rs"),
+            "use crate::schema::users;\n\n#[autumn_web::model]\npub struct User {\n    #[id]\n    pub id: i64,\n}\n",
+        )
+        .unwrap();
+
+        let plan = plan_model(
+            tmp.path(),
+            "Comment",
+            &["post:references".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        assert_eq!(plan.warnings.len(), 1, "warnings: {:?}", plan.warnings);
     }
 }

@@ -317,6 +317,28 @@ fn generate_model_references_warns_when_target_model_missing() {
 }
 
 #[test]
+fn generate_model_references_warning_not_printed_on_a_failed_collision_run() {
+    // A run that fails before writing anything (a file collision without
+    // --force) must not print advisory warnings for a plan that was never
+    // applied — warnings are informational about what *did* happen.
+    let (_tmp, project) = fresh_project("references-warn-collision-app");
+    run_autumn(
+        &project,
+        &["generate", "model", "Comment", "post:references"],
+    );
+    let (_, stderr, code) = run_autumn_failing(
+        &project,
+        &["generate", "model", "Comment", "post:references"],
+    );
+    assert_eq!(code, Some(1));
+    assert!(stderr.contains("would overwrite"));
+    assert!(
+        !stderr.contains("Warning"),
+        "no warning should print on a failed, no-op run: {stderr}"
+    );
+}
+
+#[test]
 fn generate_model_references_no_warning_when_target_model_exists() {
     let (_tmp, project) = fresh_project("references-nowarn-app");
     run_autumn(&project, &["generate", "model", "Post", "title:String"]);
@@ -383,6 +405,25 @@ fn generate_model_dry_run_lists_migration_file_for_references_field() {
     assert!(stdout.contains("Dry run"));
     assert!(stdout.contains("migrations/"));
     assert!(stdout.contains("create_comments/up.sql"));
+    assert!(!project.join("src/models/comment.rs").exists());
+}
+
+#[test]
+fn generate_model_references_errors_when_target_has_uuid_pk() {
+    let (_tmp, project) = fresh_project("references-uuid-mismatch-app");
+    run_autumn(
+        &project,
+        &["generate", "model", "Post", "--id", "uuid", "title:String"],
+    );
+    let (_, stderr, code) = run_autumn_failing(
+        &project,
+        &["generate", "model", "Comment", "post:references"],
+    );
+    assert_eq!(code, Some(1));
+    assert!(
+        stderr.contains("UUID"),
+        "expected a clear UUID-mismatch error; got stderr: {stderr}"
+    );
     assert!(!project.join("src/models/comment.rs").exists());
 }
 
