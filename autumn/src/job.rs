@@ -320,11 +320,17 @@ impl ResolvedJobConstraints {
     }
 }
 
-/// Whether an enqueue stored a new job or coalesced into an existing one.
+/// Whether an enqueue stored a new job, coalesced into an existing one, or
+/// was never delivered at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EnqueueOutcome {
     Queued,
     Deduplicated,
+    /// A `JobInterceptor::intercept_enqueue` completed without ever awaiting
+    /// the `next` future it was handed, so the job was never actually
+    /// delivered to any backend — distinct from `Queued` (which callers must
+    /// not treat as a successful delivery).
+    Skipped,
 }
 
 /// Specifies the due instant for an after-commit enqueue.
@@ -1072,6 +1078,15 @@ impl JobAdminBackend for JobAdminMemoryBackend {
                     Err(AutumnError::bad_request_msg(
                         "an equivalent unique job is already pending or running; \
                          retry after it settles",
+                    ))
+                }
+                Ok(EnqueueOutcome::Skipped) => {
+                    // A JobInterceptor declined to deliver the retry — the
+                    // record must not be left in a "retrying" state for a
+                    // job that will never actually run.
+                    self.restore_failed_retry(&id);
+                    Err(AutumnError::bad_request_msg(
+                        "the retry was intercepted and not delivered to the queue",
                     ))
                 }
                 Err(error) => {
@@ -2349,7 +2364,11 @@ impl JobClient {
                 .await
             };
             let result = match outcome {
-                Ok(EnqueueOutcome::Queued) => Ok(()),
+                // `Skipped` can never actually be produced here — it's a
+                // synthetic outcome the outer wrapper derives from whether
+                // this closure ran at all — but it's part of the enum, so
+                // the match must stay exhaustive.
+                Ok(EnqueueOutcome::Queued | EnqueueOutcome::Skipped) => Ok(()),
                 Ok(EnqueueOutcome::Deduplicated) => {
                     self.record_deduplicated_enqueue(name, &id_for_enqueue);
                     deduplicated_clone.store(true, ::std::sync::atomic::Ordering::SeqCst);
@@ -2382,13 +2401,19 @@ impl JobClient {
             actual_enqueue.await
         };
 
-        if !started.load(::std::sync::atomic::Ordering::SeqCst) {
+        let started = started.load(::std::sync::atomic::Ordering::SeqCst);
+        if !started {
             self.registry.record_cancel(name);
             self.job_admin.record_cancelled(&id);
         }
         res.map(|()| {
             if deduplicated.load(::std::sync::atomic::Ordering::SeqCst) {
                 EnqueueOutcome::Deduplicated
+            } else if !started {
+                // The interceptor completed without ever awaiting `next`, so
+                // `actual_enqueue` (and thus the real backend write) never
+                // ran — this must not be reported as Queued.
+                EnqueueOutcome::Skipped
             } else {
                 EnqueueOutcome::Queued
             }
@@ -14058,6 +14083,115 @@ mod tests {
         );
         assert_eq!(received.unwrap().unwrap().name, "test_job");
 
+        clear_global_job_client();
+    }
+
+    struct SilentlySkippingInterceptor;
+    impl crate::interceptor::JobInterceptor for SilentlySkippingInterceptor {
+        fn intercept_enqueue<'a>(
+            &'a self,
+            _name: &'a str,
+            _payload: &'a serde_json::Value,
+            _next: std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send + 'a>,
+            >,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send + 'a>>
+        {
+            // Deliberately never awaits `next` — simulates an interceptor
+            // that silently decides not to deliver the job (e.g. a feature
+            // flag or rate limiter) without erroring.
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn intercept_execute<'a>(
+            &'a self,
+            _name: &'a str,
+            _payload: &'a serde_json::Value,
+            next: std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send + 'a>,
+            >,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send + 'a>>
+        {
+            next
+        }
+    }
+
+    #[tokio::test]
+    async fn enqueue_tracked_settles_failed_when_an_interceptor_skips_delivery() {
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+
+        let state = AppState::for_test().with_profile("dev");
+        state
+            .insert_extension(Arc::new(SilentlySkippingInterceptor)
+                as Arc<dyn crate::interceptor::JobInterceptor>);
+
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        start_local_runtime(
+            vec![JobInfo::new(
+                "skipped_tracked",
+                1,
+                10,
+                |_state, _payload| Box::pin(async move { Ok(()) }),
+            )],
+            &state,
+            &shutdown,
+            1,
+            5,
+            250,
+            &crate::config::JobQueuesConfig::default(),
+        );
+
+        let handle = crate::job_tracking::enqueue_tracked("skipped_tracked", serde_json::json!({}))
+            .await
+            .expect("enqueue_tracked itself should still succeed and return a handle");
+
+        let store =
+            crate::job_tracking::tracking_store_from_state(&state).expect("store installed");
+        let key = crate::auth::hash_api_token(&handle.token);
+        let record = store.get(&key).await.unwrap().expect("record");
+        assert_eq!(
+            record.status,
+            crate::job_tracking::TrackedJobStatus::Failed,
+            "a job an interceptor silently skipped must settle its tracked status instead of \
+             staying pending forever"
+        );
+
+        shutdown.cancel();
+        clear_global_job_client();
+    }
+
+    #[tokio::test]
+    async fn plain_enqueue_still_succeeds_when_an_interceptor_skips_delivery() {
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+
+        let state = AppState::for_test().with_profile("dev");
+        state
+            .insert_extension(Arc::new(SilentlySkippingInterceptor)
+                as Arc<dyn crate::interceptor::JobInterceptor>);
+
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        start_local_runtime(
+            vec![JobInfo::new("skipped_plain", 1, 10, |_state, _payload| {
+                Box::pin(async move { Ok(()) })
+            })],
+            &state,
+            &shutdown,
+            1,
+            5,
+            250,
+            &crate::config::JobQueuesConfig::default(),
+        );
+
+        // Untracked enqueue's observable Ok(()) behavior is unchanged: the
+        // new EnqueueOutcome::Skipped variant only changes behavior for
+        // enqueue_tracked, which needs to distinguish it to settle status.
+        enqueue("skipped_plain", serde_json::json!({}))
+            .await
+            .expect("plain enqueue must still return Ok even when an interceptor skips delivery");
+
+        shutdown.cancel();
         clear_global_job_client();
     }
 

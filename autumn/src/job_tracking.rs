@@ -623,6 +623,14 @@ pub async fn enqueue_tracked_for(
                 .fail(&key, "An equivalent job is already in progress.".to_owned())
                 .await?;
         }
+        Ok(crate::job::EnqueueOutcome::Skipped) => {
+            // A JobInterceptor completed without ever delivering the job to
+            // the backend — the record must not be left at Pending forever
+            // for a job that will never actually run.
+            store
+                .fail(&key, "The job could not be enqueued.".to_owned())
+                .await?;
+        }
         Err(error) => {
             // The job never entered the queue, so the `Pending` record
             // created above must not be left to linger until TTL expiry —
