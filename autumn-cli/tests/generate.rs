@@ -1120,7 +1120,10 @@ fn generate_channel_ws_emits_ws_handler() {
 fn generate_channel_force_transport_switch_does_not_strand_stale_routes() {
     let (_tmp, project) = fresh_project("channel-switch-app");
     run_autumn(&project, &["generate", "channel", "Chat"]);
-    run_autumn(&project, &["generate", "channel", "Chat", "--ws", "--force"]);
+    run_autumn(
+        &project,
+        &["generate", "channel", "Chat", "--ws", "--force"],
+    );
 
     let main = fs::read_to_string(project.join("src/main.rs")).unwrap();
     assert!(
