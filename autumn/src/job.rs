@@ -10322,6 +10322,333 @@ mod tests {
         );
     }
 
+    // ── Tracked-job choke-point behavior (#1373) ──────────────────────────────
+    //
+    // run_job_handler is the single point all three backends run handlers
+    // through; these tests drive it via the real local backend + the free
+    // enqueue_tracked function rather than calling it directly, so they also
+    // exercise enqueue_tracked's envelope-wrapping and the local backend's
+    // retry/dead-letter decisions end to end.
+
+    #[tokio::test]
+    async fn enqueue_tracked_token_is_a_64_char_hex_capability_distinct_from_job_ids() {
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+
+        let state = AppState::for_test().with_profile("dev");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        start_local_runtime(
+            vec![JobInfo::new(
+                "tracked_noop",
+                1,
+                10,
+                |_state, _payload| Box::pin(async move { Ok(()) }),
+            )],
+            &state,
+            &shutdown,
+            1,
+            5,
+            250,
+            &crate::config::JobQueuesConfig::default(),
+        );
+
+        let handle = crate::job_tracking::enqueue_tracked("tracked_noop", serde_json::json!({}))
+            .await
+            .unwrap();
+
+        // Internal job ids are UUIDs (36 chars, hyphenated); the tracked
+        // token is a distinct 256-bit hex capability with no hyphens.
+        assert_eq!(handle.token.len(), 64, "token: {}", handle.token);
+        assert!(
+            handle.token.chars().all(|c| c.is_ascii_hexdigit()),
+            "token: {}",
+            handle.token
+        );
+        assert!(!handle.token.contains('-'), "token: {}", handle.token);
+
+        shutdown.cancel();
+        clear_global_job_client();
+    }
+
+    #[tokio::test]
+    async fn tracked_envelope_is_stripped_before_handler_sees_args() {
+        static CAPTURED: std::sync::OnceLock<std::sync::Mutex<Option<Value>>> =
+            std::sync::OnceLock::new();
+        fn captured() -> &'static std::sync::Mutex<Option<Value>> {
+            CAPTURED.get_or_init(|| std::sync::Mutex::new(None))
+        }
+        fn capturing_handler(
+            _state: AppState,
+            payload: Value,
+        ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'static>> {
+            Box::pin(async move {
+                *captured().lock().unwrap() = Some(payload);
+                Ok(())
+            })
+        }
+
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+        *captured().lock().unwrap() = None;
+
+        let state = AppState::for_test().with_profile("dev");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        start_local_runtime(
+            vec![JobInfo::new("capture_args", 1, 10, capturing_handler)],
+            &state,
+            &shutdown,
+            1,
+            5,
+            250,
+            &crate::config::JobQueuesConfig::default(),
+        );
+
+        crate::job_tracking::enqueue_tracked(
+            "capture_args",
+            serde_json::json!({"account_id": 7}),
+        )
+        .await
+        .unwrap();
+
+        let payload = timeout(Duration::from_secs(1), async {
+            loop {
+                let seen = captured().lock().unwrap().clone();
+                if let Some(payload) = seen {
+                    return payload;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("handler should have run within 1s");
+
+        assert_eq!(payload, serde_json::json!({"account_id": 7}));
+        assert!(payload.get("__autumn_tracked").is_none(), "{payload}");
+        assert!(payload.get("args").is_none(), "{payload}");
+
+        shutdown.cancel();
+        clear_global_job_client();
+    }
+
+    #[test]
+    fn job_unique_key_and_identity_use_inner_args_for_tracked_payloads() {
+        let inner = serde_json::json!({"account_id": 42, "principal_id": "user:7"});
+        let wrapped = crate::job_tracking::wrap_tracked_payload("somehash", &inner);
+
+        let uniqueness = JobUniqueness {
+            by: vec!["account_id".to_string()],
+            window: JobUniquenessWindow::Running,
+        };
+        assert_eq!(
+            job_unique_key(&uniqueness, &wrapped),
+            job_unique_key(&uniqueness, &inner),
+            "the tracked envelope must not change the derived unique key"
+        );
+
+        let concurrency = JobConcurrency {
+            limit: 1,
+            key: Some("account_id".to_string()),
+        };
+        assert_eq!(
+            job_concurrency_scope(&concurrency, &wrapped),
+            job_concurrency_scope(&concurrency, &inner)
+        );
+
+        let (principal, _) = job_payload_identity(&wrapped);
+        assert_eq!(principal.as_deref(), Some("user:7"));
+    }
+
+    #[tokio::test]
+    async fn deduplicated_tracked_enqueue_fails_new_token_with_duplicate_message() {
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+
+        let state = AppState::for_test().with_profile("dev");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let mut info = JobInfo::new(
+            "dedup_tracked",
+            1,
+            10,
+            |_state, _payload| Box::pin(async move { Ok(()) }),
+        );
+        info.uniqueness = Some(JobUniqueness {
+            by: Vec::new(),
+            window: JobUniquenessWindow::Running,
+        });
+        start_local_runtime(
+            vec![info],
+            &state,
+            &shutdown,
+            1,
+            5,
+            250,
+            &crate::config::JobQueuesConfig::default(),
+        );
+
+        let first = crate::job_tracking::enqueue_tracked("dedup_tracked", serde_json::json!({"x": 1}))
+            .await
+            .unwrap();
+        let second = crate::job_tracking::enqueue_tracked("dedup_tracked", serde_json::json!({"x": 1}))
+            .await
+            .unwrap();
+        assert_ne!(first.token, second.token);
+
+        let store = crate::job_tracking::tracking_store_from_state(&state).expect("store installed");
+        let key = crate::auth::hash_api_token(&second.token);
+        let record = store.get(&key).await.unwrap().expect("record");
+        assert_eq!(record.status, crate::job_tracking::TrackedJobStatus::Failed);
+        assert_eq!(
+            record.error.as_deref(),
+            Some("An equivalent job is already in progress.")
+        );
+
+        shutdown.cancel();
+        clear_global_job_client();
+    }
+
+    #[tokio::test]
+    async fn retryable_failure_leaves_tracked_record_running_final_attempt_settles_it() {
+        static ATTEMPTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        fn flaky_handler(
+            _state: AppState,
+            _payload: Value,
+        ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'static>> {
+            Box::pin(async move {
+                let attempt = ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                let ctx = crate::job_tracking::JobContext::current();
+                let _ = ctx.set_progress(10, None).await;
+                if attempt < 2 {
+                    Err(AutumnError::internal_server_error(std::io::Error::other(
+                        "transient",
+                    )))
+                } else {
+                    Ok(())
+                }
+            })
+        }
+
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+        ATTEMPTS.store(0, std::sync::atomic::Ordering::SeqCst);
+
+        let state = AppState::for_test().with_profile("dev");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        start_local_runtime(
+            vec![JobInfo::new("flaky_tracked", 2, 10, flaky_handler)],
+            &state,
+            &shutdown,
+            1,
+            5,
+            250,
+            &crate::config::JobQueuesConfig::default(),
+        );
+
+        let handle = crate::job_tracking::enqueue_tracked("flaky_tracked", serde_json::json!({}))
+            .await
+            .unwrap();
+        let store = crate::job_tracking::tracking_store_from_state(&state).unwrap();
+        let key = crate::auth::hash_api_token(&handle.token);
+
+        // Wait for attempt 1 to fail and its settle logic to run.
+        timeout(Duration::from_secs(2), async {
+            while ATTEMPTS.load(std::sync::atomic::Ordering::SeqCst) < 1 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("attempt 1 should run within 2s");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let record = store.get(&key).await.unwrap().expect("record");
+        assert_ne!(
+            record.status,
+            crate::job_tracking::TrackedJobStatus::Failed,
+            "a retryable failure with attempts remaining must not settle the record"
+        );
+
+        // Wait for the retry (attempt 2) to succeed and settle the record.
+        let record = timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(record) = store.get(&key).await.unwrap()
+                    && record.status == crate::job_tracking::TrackedJobStatus::Succeeded
+                {
+                    return record;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("retry should succeed within 2s");
+        assert_eq!(record.status, crate::job_tracking::TrackedJobStatus::Succeeded);
+
+        shutdown.cancel();
+        clear_global_job_client();
+    }
+
+    #[tokio::test]
+    async fn panic_marks_tracked_record_failed_with_generic_message_not_panic_detail() {
+        fn panicking_handler(
+            _state: AppState,
+            _payload: Value,
+        ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'static>> {
+            Box::pin(async move { panic!("sensitive internal detail") })
+        }
+
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+
+        let state = AppState::for_test().with_profile("dev");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        start_local_runtime(
+            // max_attempts = 3: proves a panic dead-letters immediately
+            // regardless of remaining attempts, not just when it's the last one.
+            vec![JobInfo::new("panicking_tracked", 3, 10, panicking_handler)],
+            &state,
+            &shutdown,
+            1,
+            5,
+            250,
+            &crate::config::JobQueuesConfig::default(),
+        );
+
+        let handle =
+            crate::job_tracking::enqueue_tracked("panicking_tracked", serde_json::json!({}))
+                .await
+                .unwrap();
+        let store = crate::job_tracking::tracking_store_from_state(&state).unwrap();
+        let key = crate::auth::hash_api_token(&handle.token);
+
+        let record = timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(record) = store.get(&key).await.unwrap()
+                    && record.status == crate::job_tracking::TrackedJobStatus::Failed
+                {
+                    return record;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("a panic should settle the record to failed within 2s");
+
+        assert_eq!(
+            record.error.as_deref(),
+            Some(crate::job_tracking::GENERIC_FAILURE_MESSAGE)
+        );
+        assert!(
+            !record
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("sensitive internal detail"),
+            "the raw panic message must never reach the tracked record: {:?}",
+            record.error
+        );
+
+        shutdown.cancel();
+        clear_global_job_client();
+    }
+
     #[tokio::test]
     async fn local_unknown_job_name_records_failure_and_does_not_requeue() {
         let state = AppState::for_test().with_profile("dev");
