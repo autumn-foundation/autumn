@@ -502,7 +502,17 @@ where
             // clear the lock is held and unlikely to free up immediately.
             let mut poll_interval = options.lock_poll_interval;
             loop {
-                tokio::time::sleep(poll_interval).await;
+                // Never sleep past the deadline: a growing poll_interval (or
+                // simply a lock_wait_timeout shorter than lock_poll_interval)
+                // could otherwise overshoot lock_wait_timeout by a full
+                // interval before this loop gets a chance to check it,
+                // making the "bounded wait" option not actually bounded.
+                let remaining = options.lock_wait_timeout.saturating_sub(start.elapsed());
+                if remaining.is_zero() {
+                    let result = fill().await;
+                    return finish_fill(cache, key, options, result, &tx);
+                }
+                tokio::time::sleep(poll_interval.min(remaining)).await;
                 poll_interval = poll_interval.saturating_mul(2).min(MAX_LOCK_POLL_INTERVAL);
 
                 if let Some(value) = fast_path_value::<V>(cache, key, options) {

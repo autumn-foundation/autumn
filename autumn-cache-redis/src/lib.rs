@@ -693,6 +693,51 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires Docker (testcontainers)"]
+    async fn redis_lock_wait_timeout_not_overshot_by_poll_interval() {
+        use autumn_web::cache::GetOrComputeOptions;
+
+        let container = RedisImage::default().start().await.unwrap();
+        let port = container.get_host_port_ipv4(6379).await.unwrap();
+        let url = format!("redis://127.0.0.1:{port}");
+        let cache: Arc<dyn Cache> = Arc::new(
+            RedisCache::connect(&url, "lock-timeout-overshoot-test")
+                .await
+                .unwrap(),
+        );
+
+        // Simulate a stuck holder that never releases and outlives the test.
+        let key = "stuck-key-overshoot";
+        assert_eq!(
+            cache.try_acquire_fill_lock(key, "stuck-holder", Duration::from_secs(60)),
+            FillLockStatus::Acquired
+        );
+
+        // A poll interval much larger than the wait timeout must not make the
+        // caller sleep past the timeout before falling back: lock_wait_timeout
+        // bounds the total wait regardless of the poll cadence.
+        let opts = GetOrComputeOptions::new()
+            .distributed_fill_lock(true)
+            .lock_wait_timeout(Duration::from_millis(100))
+            .lock_poll_interval(Duration::from_secs(5));
+
+        let start = std::time::Instant::now();
+        let value: i32 =
+            autumn_web::cache::get_or_compute_with(&cache, key, opts, move || async move {
+                Ok::<i32, String>(456)
+            })
+            .await
+            .unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(value, 456);
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "lock_wait_timeout must bound the wait even when lock_poll_interval is much larger; took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires Docker (testcontainers)"]
     async fn redis_get_or_compute_round_trip() {
         let container = RedisImage::default().start().await.unwrap();
         let port = container.get_host_port_ipv4(6379).await.unwrap();
