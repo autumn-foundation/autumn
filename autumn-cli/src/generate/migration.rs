@@ -268,6 +268,36 @@ mod tests {
     }
 
     #[test]
+    fn remove_columns_migration_with_references_field_restores_fk_on_rollback() {
+        // `RemovePostFromComments post:references` — down.sql must restore
+        // the FK constraint and index, not just a bare column (issue #1026).
+        let tmp = project();
+        let plan = plan_migration(
+            tmp.path(),
+            "RemovePostFromComments",
+            &["post:references".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let down = fs::read_to_string(
+            tmp.path()
+                .join("migrations/20260427000000_remove_post_from_comments/down.sql"),
+        )
+        .unwrap();
+        assert!(
+            down.contains(
+                "ALTER TABLE comments ADD COLUMN post_id BIGINT NOT NULL REFERENCES posts(id);"
+            ),
+            "down.sql: {down}"
+        );
+        assert!(
+            down.contains("CREATE INDEX idx_comments_post_id ON comments (post_id);"),
+            "down.sql: {down}"
+        );
+    }
+
+    #[test]
     fn add_pattern_with_no_fields_is_empty() {
         let tmp = project();
         let plan = plan_migration(tmp.path(), "AddTitleToPosts", &[], "20260427000000").unwrap();

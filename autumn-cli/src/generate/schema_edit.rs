@@ -487,18 +487,33 @@ pub fn remove_columns_up_sql(table: &str, fields: &[Field]) -> String {
     out
 }
 
-/// `down.sql` companion to [`remove_columns_up_sql`].
+/// `down.sql` companion to [`remove_columns_up_sql`]. Restores a `references`
+/// field's `REFERENCES <table>(id)` constraint and automatic index (see
+/// [`create_table_sql_with_metadata_and_id`]/[`add_columns_up_sql`]) — a
+/// bare re-added column would silently drop the foreign-key relationship and
+/// its lookup index on rollback (issue #1026).
 #[must_use]
 pub fn remove_columns_down_sql(table: &str, fields: &[Field]) -> String {
     let mut out = String::new();
     for f in fields.iter().rev() {
-        let _ = writeln!(
+        let _ = write!(
             out,
-            "ALTER TABLE {table} ADD COLUMN {} {} {};",
+            "ALTER TABLE {table} ADD COLUMN {} {} {}",
             f.name,
             f.sql_type(),
             f.sql_nullability()
         );
+        if let Some(target) = f.reference_table() {
+            let _ = write!(out, " REFERENCES {target}(id)");
+        }
+        out.push_str(";\n");
+        if f.kind.is_reference() {
+            let _ = writeln!(
+                out,
+                "CREATE INDEX idx_{table}_{} ON {table} ({});",
+                f.name, f.name
+            );
+        }
     }
     out
 }
@@ -3272,6 +3287,26 @@ mod tests {
             "DROP COLUMN must carry a safety comment; got:\n{sql}"
         );
         assert!(sql.contains("ALTER TABLE posts DROP COLUMN body;"));
+    }
+
+    #[test]
+    fn remove_columns_down_sql_restores_fk_constraint_and_index_for_references_field() {
+        // Rolling back `RemovePostFromComments post:references` must restore
+        // the FK constraint and its index, not just a bare BIGINT column —
+        // otherwise the relationship and its lookup index silently vanish
+        // on rollback (issue #1026).
+        let f = fields(&["post:references"]);
+        let sql = remove_columns_down_sql("comments", &f);
+        assert!(
+            sql.contains(
+                "ALTER TABLE comments ADD COLUMN post_id BIGINT NOT NULL REFERENCES posts(id);"
+            ),
+            "got:\n{sql}"
+        );
+        assert!(
+            sql.contains("CREATE INDEX idx_comments_post_id ON comments (post_id);"),
+            "got:\n{sql}"
+        );
     }
 
     #[test]
