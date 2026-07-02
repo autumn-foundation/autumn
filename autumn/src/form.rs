@@ -948,6 +948,484 @@ pub fn required_text_input<T: Serialize>(
     }
 }
 
+/// Render a labeled `<input type="checkbox">` tied to a `bool` changeset field.
+///
+/// # Required: `#[serde(default)]` on the target field
+///
+/// HTML checkboxes are omitted from submitted form data entirely when
+/// unchecked — there is no way to distinguish "unchecked" from "field not
+/// present" on the wire. **Do not** pair this with a hidden `<input
+/// type="hidden" value="false">` sibling sharing the same `name`: a checked
+/// box then submits the key *twice* (`field=false` from the hidden input,
+/// `field=true` from the checkbox), and `serde_urlencoded` (used by both
+/// axum's `Form` extractor and [`ChangesetForm`]) rejects duplicate keys
+/// with a "duplicate field" deserialize error instead of taking the last
+/// value — every checked submission would 400.
+///
+/// Instead, mark the target `bool` field `#[serde(default)]` so a missing
+/// key decodes as `false`:
+///
+/// ```rust,ignore
+/// #[derive(serde::Deserialize)]
+/// struct PostForm {
+///     #[serde(default)]
+///     published: bool,
+/// }
+/// ```
+///
+/// For a nullable `Option<bool>` field where `None` is a meaningful third
+/// state (distinct from `Some(false)`), a checkbox cannot represent it
+/// losslessly — use [`select_input`] with three options instead.
+///
+/// The `checked` attribute reflects the changeset's current value via
+/// [`Changeset::field_value`], which serializes `bool` as `"true"`/`"false"`.
+/// Wraps in `<div id="{field}-field">` for stable htmx targeting. ARIA
+/// annotations behave identically to [`text_input`].
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn checkbox_input<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+) -> maud::Markup {
+    let errors = changeset.errors_for(field);
+    let has_errors = !errors.is_empty();
+    let checked = changeset.field_value(field).as_deref() == Some("true");
+    let error_id = format!("{field}-error");
+    let wrapper_id = format!("{field}-field");
+
+    maud::html! {
+        div id=(wrapper_id) class="autumn-field" {
+            label for=(field) class="autumn-field__label" { (label) }
+            input
+                type="checkbox"
+                id=(field)
+                name=(field)
+                value="true"
+                checked[checked]
+                class=(if has_errors { "autumn-field__input autumn-field__input--invalid" } else { "autumn-field__input" })
+                aria-invalid=(if has_errors { "true" } else { "false" })
+                aria-describedby=(if has_errors { error_id.as_str() } else { "" });
+            @if has_errors {
+                div id=(error_id) role="alert" class="autumn-field__errors" {
+                    @for error in errors {
+                        p class="autumn-field__error" { (error) }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Render a labeled `<input type="number">` tied to a numeric changeset field
+/// (`i32`, `i64`, `f32`, `f64`).
+///
+/// `step` sets the HTML `step` attribute — pass `Some("1")` for integer
+/// fields, `Some("0.01")` or `Some("any")` for floating-point fields, or
+/// `None` to leave the browser default (`step="1"`, whole numbers only).
+/// Wraps in `<div id="{field}-field">` for stable htmx targeting. ARIA
+/// annotations behave identically to [`text_input`].
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn number_input<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+    step: Option<&str>,
+) -> maud::Markup {
+    let errors = changeset.errors_for(field);
+    let has_errors = !errors.is_empty();
+    let value = changeset.field_value(field).unwrap_or_default();
+    let error_id = format!("{field}-error");
+    let wrapper_id = format!("{field}-field");
+
+    maud::html! {
+        div id=(wrapper_id) class="autumn-field" {
+            label for=(field) class="autumn-field__label" { (label) }
+            input
+                type="number"
+                id=(field)
+                name=(field)
+                value=(value)
+                step=[step]
+                class=(if has_errors { "autumn-field__input autumn-field__input--invalid" } else { "autumn-field__input" })
+                aria-invalid=(if has_errors { "true" } else { "false" })
+                aria-describedby=(if has_errors { error_id.as_str() } else { "" });
+            @if has_errors {
+                div id=(error_id) role="alert" class="autumn-field__errors" {
+                    @for error in errors {
+                        p class="autumn-field__error" { (error) }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Normalize a stored date/datetime string into `YYYY-MM-DD`, the shape the
+/// HTML `<input type="date">` control requires.
+///
+/// Accepts a bare date, a full RFC 3339 timestamp (with offset/`Z`), or a
+/// naive datetime, and keeps just the date component. Falls back to the
+/// input unchanged when none of those shapes match (e.g. an empty string).
+#[cfg(feature = "maud")]
+fn normalize_date_value(raw: &str) -> String {
+    if raw.is_empty() {
+        return String::new();
+    }
+    // `NaiveDateTime`'s `Display` (as opposed to its serde serialization,
+    // which uses `T`) separates date and time with a space, e.g. from a raw
+    // `.to_string()` or some database drivers. Normalize defensively so
+    // those still parse instead of falling through to the raw string.
+    let normalized = raw.replace(' ', "T");
+    if let Ok(date) = chrono::NaiveDate::parse_from_str(&normalized, "%Y-%m-%d") {
+        return date.to_string();
+    }
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&normalized) {
+        return dt.format("%Y-%m-%d").to_string();
+    }
+    if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(&normalized, "%Y-%m-%dT%H:%M:%S%.f") {
+        return ndt.format("%Y-%m-%d").to_string();
+    }
+    raw.to_owned()
+}
+
+/// Normalize a stored datetime string into a shape the HTML `<input
+/// type="datetime-local">` control accepts (`YYYY-MM-DDTHH:MM[:SS[.fff]]`).
+/// Browsers silently reject RFC 3339 timestamps carrying a `Z`/offset
+/// suffix.
+///
+/// **Seconds/fractional-seconds preserved when present.** `chrono`'s default
+/// `serde::Deserialize` for `NaiveDateTime`/`DateTime<Utc>` requires the
+/// seconds component — truncating to `YYYY-MM-DDTHH:MM` here would make
+/// [`ChangesetForm`] fail to decode the *pre-filled* value on any
+/// submission where the user doesn't manually retype it (chrono's parser
+/// returns "premature end of input"). `%.f` omits the fractional part
+/// cleanly when it's zero, so whole-second values still render without a
+/// trailing dot.
+///
+/// **Wall-clock preserved.** For RFC 3339 input with an explicit offset, the
+/// offset is dropped but the local clock components are kept as-is (no
+/// conversion to UTC) — the datetime-local input has no timezone concept, so
+/// shifting the clock would mutate the value on a no-op save.
+#[cfg(feature = "maud")]
+fn normalize_datetime_local_value(raw: &str) -> String {
+    if raw.is_empty() {
+        return String::new();
+    }
+    // See `normalize_date_value`'s comment on space-separated input.
+    let normalized = raw.replace(' ', "T");
+    if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(&normalized, "%Y-%m-%dT%H:%M:%S%.f") {
+        return ndt.format("%Y-%m-%dT%H:%M:%S%.f").to_string();
+    }
+    if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(&normalized, "%Y-%m-%dT%H:%M") {
+        return ndt.format("%Y-%m-%dT%H:%M:%S%.f").to_string();
+    }
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&normalized) {
+        return dt.naive_local().format("%Y-%m-%dT%H:%M:%S%.f").to_string();
+    }
+    raw.to_owned()
+}
+
+/// Pad an HTML `datetime-local` submission (`YYYY-MM-DDTHH:MM`, seconds
+/// omitted by the browser at minute granularity) to `YYYY-MM-DDTHH:MM:00` so
+/// chrono's parser — which requires the seconds component — accepts it.
+#[cfg(feature = "maud")]
+fn pad_datetime_local_seconds(raw: &str) -> String {
+    if raw.chars().count() == 16 {
+        format!("{raw}:00")
+    } else {
+        raw.to_owned()
+    }
+}
+
+/// Deserialize an HTML `datetime-local` submission into `chrono::DateTime<Utc>`,
+/// treating the submitted wall-clock value as UTC.
+///
+/// `<input type="datetime-local">` has no timezone concept, so [`datetime_input`]
+/// necessarily strips any offset when rendering a `DateTime<Utc>` field's
+/// current value — the browser then posts back an offsetless string (e.g.
+/// `2024-03-15T10:30:56`). Chrono's *default* `Deserialize` for
+/// `DateTime<Utc>` requires an RFC 3339 offset and rejects that string with
+/// "premature end of input" on every submission. Attach this function to any
+/// `DateTime<Utc>` field rendered with `datetime_input`:
+///
+/// ```rust,ignore
+/// #[derive(serde::Deserialize)]
+/// struct EventForm {
+///     #[serde(deserialize_with = "autumn_web::form::deserialize_datetime_local_utc")]
+///     starts_at: chrono::DateTime<chrono::Utc>,
+/// }
+/// ```
+///
+/// `chrono::NaiveDateTime` fields don't need an offset, but still benefit
+/// from [`deserialize_naive_datetime_local`] as a defensive measure — see
+/// its doc comment.
+///
+/// # Errors
+///
+/// Returns a deserializer error when the submitted value isn't a valid
+/// `YYYY-MM-DDTHH:MM[:SS[.f]]` local datetime string.
+#[cfg(feature = "maud")]
+pub fn deserialize_datetime_local_utc<'de, D>(
+    deserializer: D,
+) -> Result<chrono::DateTime<chrono::Utc>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = <String as serde::Deserialize>::deserialize(deserializer)?;
+    chrono::NaiveDateTime::parse_from_str(&pad_datetime_local_seconds(&raw), "%Y-%m-%dT%H:%M:%S%.f")
+        .map(|ndt| ndt.and_utc())
+        .map_err(serde::de::Error::custom)
+}
+
+/// `Option<chrono::DateTime<Utc>>` counterpart to
+/// [`deserialize_datetime_local_utc`], for a nullable field — an absent or
+/// empty submitted value decodes as `None`.
+///
+/// # Errors
+///
+/// Returns a deserializer error when a non-empty submitted value isn't a
+/// valid `YYYY-MM-DDTHH:MM[:SS[.f]]` local datetime string.
+#[cfg(feature = "maud")]
+pub fn deserialize_datetime_local_utc_option<'de, D>(
+    deserializer: D,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = <Option<String> as serde::Deserialize>::deserialize(deserializer)?;
+    match raw {
+        Some(s) if !s.is_empty() => chrono::NaiveDateTime::parse_from_str(
+            &pad_datetime_local_seconds(&s),
+            "%Y-%m-%dT%H:%M:%S%.f",
+        )
+        .map(|ndt| Some(ndt.and_utc()))
+        .map_err(serde::de::Error::custom),
+        _ => Ok(None),
+    }
+}
+
+/// Deserialize an HTML `datetime-local` submission into `chrono::NaiveDateTime`.
+///
+/// The *pre-filled* value [`datetime_input`] renders always includes seconds
+/// (see `normalize_datetime_local_value`), so chrono's default `Deserialize`
+/// — which requires the seconds component — decodes an untouched submission
+/// fine on its own. But a value the user actively edits through the
+/// browser's native picker isn't guaranteed to include seconds (`step="any"`
+/// only requests that the control *allow* seconds; it doesn't guarantee
+/// every browser's UI captures them), which would otherwise 400 with
+/// "premature end of input". Attach this function to defend against that:
+///
+/// ```rust,ignore
+/// #[derive(serde::Deserialize)]
+/// struct EventForm {
+///     #[serde(deserialize_with = "autumn_web::form::deserialize_naive_datetime_local")]
+///     starts_at: chrono::NaiveDateTime,
+/// }
+/// ```
+///
+/// # Errors
+///
+/// Returns a deserializer error when the submitted value isn't a valid
+/// `YYYY-MM-DDTHH:MM[:SS[.f]]` local datetime string.
+#[cfg(feature = "maud")]
+pub fn deserialize_naive_datetime_local<'de, D>(
+    deserializer: D,
+) -> Result<chrono::NaiveDateTime, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = <String as serde::Deserialize>::deserialize(deserializer)?;
+    chrono::NaiveDateTime::parse_from_str(&pad_datetime_local_seconds(&raw), "%Y-%m-%dT%H:%M:%S%.f")
+        .map_err(serde::de::Error::custom)
+}
+
+/// `Option<chrono::NaiveDateTime>` counterpart to
+/// [`deserialize_naive_datetime_local`], for a nullable field — an absent or
+/// empty submitted value decodes as `None`.
+///
+/// # Errors
+///
+/// Returns a deserializer error when a non-empty submitted value isn't a
+/// valid `YYYY-MM-DDTHH:MM[:SS[.f]]` local datetime string.
+#[cfg(feature = "maud")]
+pub fn deserialize_naive_datetime_local_option<'de, D>(
+    deserializer: D,
+) -> Result<Option<chrono::NaiveDateTime>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = <Option<String> as serde::Deserialize>::deserialize(deserializer)?;
+    match raw {
+        Some(s) if !s.is_empty() => chrono::NaiveDateTime::parse_from_str(
+            &pad_datetime_local_seconds(&s),
+            "%Y-%m-%dT%H:%M:%S%.f",
+        )
+        .map(Some)
+        .map_err(serde::de::Error::custom),
+        _ => Ok(None),
+    }
+}
+
+/// Render a labeled `<input type="date">` tied to a changeset field.
+///
+/// The current value is normalized via `normalize_date_value` to the
+/// `YYYY-MM-DD` shape HTML5 date pickers require, regardless of whether the
+/// underlying field serializes as a bare date or a full timestamp. Wraps in
+/// `<div id="{field}-field">` for stable htmx targeting. ARIA annotations
+/// behave identically to [`text_input`].
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn date_input<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+) -> maud::Markup {
+    let errors = changeset.errors_for(field);
+    let has_errors = !errors.is_empty();
+    let value = normalize_date_value(&changeset.field_value(field).unwrap_or_default());
+    let error_id = format!("{field}-error");
+    let wrapper_id = format!("{field}-field");
+
+    maud::html! {
+        div id=(wrapper_id) class="autumn-field" {
+            label for=(field) class="autumn-field__label" { (label) }
+            input
+                type="date"
+                id=(field)
+                name=(field)
+                value=(value)
+                class=(if has_errors { "autumn-field__input autumn-field__input--invalid" } else { "autumn-field__input" })
+                aria-invalid=(if has_errors { "true" } else { "false" })
+                aria-describedby=(if has_errors { error_id.as_str() } else { "" });
+            @if has_errors {
+                div id=(error_id) role="alert" class="autumn-field__errors" {
+                    @for error in errors {
+                        p class="autumn-field__error" { (error) }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Render a labeled `<input type="datetime-local">` tied to a changeset
+/// field (`NaiveDateTime` or `DateTime`).
+///
+/// The current value is normalized via `normalize_datetime_local_value` to
+/// the shape HTML5 datetime pickers require, preserving seconds/fractional
+/// seconds when present — `chrono`'s default `Deserialize` requires the
+/// seconds component, so truncating to minutes would break decoding the
+/// pre-filled value on any untouched submission. Renders `step="any"` so a
+/// value carrying seconds doesn't fail the browser's step-mismatch
+/// constraint validation (the default step is minute-granularity). Wraps in
+/// `<div id="{field}-field">` for stable htmx targeting. ARIA annotations
+/// behave identically to [`text_input`].
+///
+/// # Attach a `deserialize_with` matching the field's chrono type
+///
+/// `<input type="datetime-local">` has no timezone concept, so the value
+/// this renders for a `DateTime<Utc>` field never carries an offset —
+/// chrono's default `Deserialize` for `DateTime<Utc>` requires one and
+/// rejects the submission. Attach [`deserialize_datetime_local_utc`] (or
+/// [`deserialize_datetime_local_utc_option`] for `Option<DateTime<Utc>>`)
+/// via `#[serde(deserialize_with = "...")]` on that field.
+///
+/// `NaiveDateTime` fields don't hit that offset problem, but a value the
+/// user actively edits through the browser's native picker isn't guaranteed
+/// to include seconds (unlike the always-seconds-inclusive pre-filled
+/// value), which chrono's default `Deserialize` also rejects. Attach
+/// [`deserialize_naive_datetime_local`] (or
+/// [`deserialize_naive_datetime_local_option`] for `Option<NaiveDateTime>`)
+/// as a defensive measure.
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn datetime_input<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+) -> maud::Markup {
+    let errors = changeset.errors_for(field);
+    let has_errors = !errors.is_empty();
+    let value = normalize_datetime_local_value(&changeset.field_value(field).unwrap_or_default());
+    let error_id = format!("{field}-error");
+    let wrapper_id = format!("{field}-field");
+
+    maud::html! {
+        div id=(wrapper_id) class="autumn-field" {
+            label for=(field) class="autumn-field__label" { (label) }
+            input
+                type="datetime-local"
+                id=(field)
+                name=(field)
+                value=(value)
+                step="any"
+                class=(if has_errors { "autumn-field__input autumn-field__input--invalid" } else { "autumn-field__input" })
+                aria-invalid=(if has_errors { "true" } else { "false" })
+                aria-describedby=(if has_errors { error_id.as_str() } else { "" });
+            @if has_errors {
+                div id=(error_id) role="alert" class="autumn-field__errors" {
+                    @for error in errors {
+                        p class="autumn-field__error" { (error) }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Render a labeled `<select>` tied to a closed-set changeset field, with
+/// `options` given as `(value, label)` pairs.
+///
+/// The option whose `value` matches the changeset's current field value
+/// (via [`Changeset::field_value`]) is marked `selected`. This is the
+/// control the enum ([#1030]) and references ([#1026]) field types render
+/// once those field kinds ship — this slice ships the widget, not the DSL
+/// tokens that will target it.
+/// Wraps in `<div id="{field}-field">` for stable htmx targeting. ARIA
+/// annotations behave identically to [`text_input`].
+///
+/// [#1030]: https://github.com/madmax983/autumn/issues/1030
+/// [#1026]: https://github.com/madmax983/autumn/issues/1026
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn select_input<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+    options: &[(&str, &str)],
+) -> maud::Markup {
+    let errors = changeset.errors_for(field);
+    let has_errors = !errors.is_empty();
+    let current = changeset.field_value(field).unwrap_or_default();
+    let error_id = format!("{field}-error");
+    let wrapper_id = format!("{field}-field");
+
+    maud::html! {
+        div id=(wrapper_id) class="autumn-field" {
+            label for=(field) class="autumn-field__label" { (label) }
+            select
+                id=(field)
+                name=(field)
+                class=(if has_errors { "autumn-field__input autumn-field__input--invalid" } else { "autumn-field__input" })
+                aria-invalid=(if has_errors { "true" } else { "false" })
+                aria-describedby=(if has_errors { error_id.as_str() } else { "" }) {
+                @for (option_value, option_label) in options {
+                    option value=(option_value) selected[*option_value == current] { (option_label) }
+                }
+            }
+            @if has_errors {
+                div id=(error_id) role="alert" class="autumn-field__errors" {
+                    @for error in errors {
+                        p class="autumn-field__error" { (error) }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Render an ARIA live region for htmx swap announcements.
 ///
 /// Emits `<div id="…" role="status" aria-live="polite" aria-atomic="true">`.
@@ -1867,6 +2345,643 @@ mod tests {
         let html = text_input_htmx(&cs, "email", "Email", "/v").into_string();
         assert!(html.contains("email-error"), "{html}");
         assert!(html.contains(r#"aria-describedby="email-error""#), "{html}");
+    }
+
+    // ── Typed inputs: checkbox_input / number_input / date_input /
+    //    datetime_input / select_input (issue #1131) ────────────────
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn checkbox_input_renders_type_checkbox() {
+        #[derive(serde::Serialize)]
+        struct F {
+            active: bool,
+        }
+        let cs = Changeset::new(F { active: false });
+        let html = checkbox_input(&cs, "active", "Active").into_string();
+        assert!(html.contains(r#"type="checkbox""#), "{html}");
+        assert!(html.contains(r#"name="active""#), "{html}");
+        assert!(html.contains("Active"), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn checkbox_input_unchecked_when_value_false() {
+        #[derive(serde::Serialize)]
+        struct F {
+            active: bool,
+        }
+        let cs = Changeset::new(F { active: false });
+        let html = checkbox_input(&cs, "active", "Active").into_string();
+        assert!(!html.contains("checked"), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn checkbox_input_checked_when_value_true() {
+        #[derive(serde::Serialize)]
+        struct F {
+            active: bool,
+        }
+        let cs = Changeset::new(F { active: true });
+        let html = checkbox_input(&cs, "active", "Active").into_string();
+        assert!(html.contains("checked"), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn checkbox_input_never_emits_a_hidden_fallback() {
+        // A hidden "false" sibling sharing the checkbox's `name` would make a
+        // *checked* submission send the key twice (`field=false&field=true`).
+        // serde_urlencoded rejects duplicate keys outright rather than taking
+        // the last value, so every checked submission would 400. Unchecked
+        // state must be recovered via `#[serde(default)]` on the target
+        // field instead (see the function's doc comment) — never via a
+        // hidden fallback input.
+        #[derive(serde::Serialize)]
+        struct F {
+            active: bool,
+        }
+        let cs = Changeset::new(F { active: false });
+        let html = checkbox_input(&cs, "active", "Active").into_string();
+        assert!(!html.contains(r#"type="hidden""#), "{html}");
+        assert_eq!(
+            html.matches(r#"name="active""#).count(),
+            1,
+            "checkbox_input must emit exactly one input named `active` \
+             (a second `name=\"active\"` sibling would duplicate the key \
+             on submission): {html}"
+        );
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn checkbox_input_round_trips_through_real_url_decode_when_checked() {
+        // Regression test for the duplicate-key 400: decode the *exact*
+        // query string a browser sends for a CHECKED box rendered by
+        // checkbox_input (i.e. only the fields checkbox_input itself
+        // renders — no hidden sibling), through the same serde_urlencoded
+        // machinery axum's `Form` extractor and ChangesetForm use.
+        #[derive(serde::Serialize)]
+        struct F {
+            active: bool,
+        }
+        #[derive(serde::Deserialize)]
+        struct Decoded {
+            #[serde(default)]
+            active: bool,
+        }
+        let cs = Changeset::new(F { active: true });
+        let html = checkbox_input(&cs, "active", "Active").into_string();
+        assert!(html.contains("checked"), "{html}");
+
+        // A checked box submits `active=true` and nothing else.
+        let decoded: Decoded = serde_urlencoded::from_str("active=true").unwrap();
+        assert!(decoded.active);
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn checkbox_input_round_trips_through_real_url_decode_when_unchecked() {
+        // An unchecked box submits no `active` key at all; `#[serde(default)]`
+        // must recover `false` rather than erroring "missing field".
+        #[derive(serde::Deserialize)]
+        struct Decoded {
+            #[serde(default)]
+            active: bool,
+        }
+        let decoded: Decoded = serde_urlencoded::from_str("").unwrap();
+        assert!(!decoded.active);
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn checkbox_input_wrapper_div_has_stable_id() {
+        #[derive(serde::Serialize)]
+        struct F {
+            active: bool,
+        }
+        let cs = Changeset::new(F { active: false });
+        let html = checkbox_input(&cs, "active", "Active").into_string();
+        assert!(html.contains(r#"id="active-field""#), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn checkbox_input_emits_aria_invalid_and_errors() {
+        #[derive(serde::Serialize)]
+        struct F {
+            active: bool,
+        }
+        let mut errors = HashMap::new();
+        errors.insert("active".to_string(), vec!["must be true".to_string()]);
+        let cs = Changeset::from_errors(F { active: false }, errors);
+        let html = checkbox_input(&cs, "active", "Active").into_string();
+        assert!(html.contains(r#"aria-invalid="true""#), "{html}");
+        assert!(html.contains(r#"role="alert""#), "{html}");
+        assert!(html.contains("must be true"), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn number_input_renders_type_number() {
+        #[derive(serde::Serialize)]
+        struct F {
+            age: i32,
+        }
+        let cs = Changeset::new(F { age: 30 });
+        let html = number_input(&cs, "age", "Age", Some("1")).into_string();
+        assert!(html.contains(r#"type="number""#), "{html}");
+        assert!(html.contains(r#"name="age""#), "{html}");
+        assert!(html.contains(r#"value="30""#), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn number_input_renders_step_when_provided() {
+        #[derive(serde::Serialize)]
+        struct F {
+            price: f64,
+        }
+        let cs = Changeset::new(F { price: 9.99 });
+        let html = number_input(&cs, "price", "Price", Some("0.01")).into_string();
+        assert!(html.contains(r#"step="0.01""#), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn number_input_omits_step_when_none() {
+        #[derive(serde::Serialize)]
+        struct F {
+            age: i32,
+        }
+        let cs = Changeset::new(F { age: 30 });
+        let html = number_input(&cs, "age", "Age", None).into_string();
+        assert!(!html.contains("step="), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn number_input_emits_aria_invalid_and_errors() {
+        #[derive(serde::Serialize)]
+        struct F {
+            age: i32,
+        }
+        let mut errors = HashMap::new();
+        errors.insert("age".to_string(), vec!["must be positive".to_string()]);
+        let cs = Changeset::from_errors(F { age: -1 }, errors);
+        let html = number_input(&cs, "age", "Age", None).into_string();
+        assert!(html.contains(r#"aria-invalid="true""#), "{html}");
+        assert!(html.contains(r#"role="alert""#), "{html}");
+        assert!(html.contains("must be positive"), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn number_input_wrapper_div_has_stable_id() {
+        #[derive(serde::Serialize)]
+        struct F {
+            age: i32,
+        }
+        let cs = Changeset::new(F { age: 30 });
+        let html = number_input(&cs, "age", "Age", None).into_string();
+        assert!(html.contains(r#"id="age-field""#), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn date_input_renders_type_date() {
+        #[derive(serde::Serialize)]
+        struct F {
+            born_on: String,
+        }
+        let cs = Changeset::new(F {
+            born_on: "2024-03-15".into(),
+        });
+        let html = date_input(&cs, "born_on", "Born on").into_string();
+        assert!(html.contains(r#"type="date""#), "{html}");
+        assert!(html.contains(r#"value="2024-03-15""#), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn date_input_normalizes_full_timestamp_to_date_only() {
+        #[derive(serde::Serialize)]
+        struct F {
+            born_on: String,
+        }
+        let cs = Changeset::new(F {
+            born_on: "2024-03-15T10:30:00Z".into(),
+        });
+        let html = date_input(&cs, "born_on", "Born on").into_string();
+        assert!(html.contains(r#"value="2024-03-15""#), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn date_input_normalizes_space_separated_datetime_to_date_only() {
+        // `NaiveDateTime`'s `Display` (as opposed to its serde
+        // serialization) uses a space separator, e.g. from a raw
+        // `.to_string()` or some database drivers — accept it defensively
+        // rather than falling through to the raw (browser-rejected) string.
+        #[derive(serde::Serialize)]
+        struct F {
+            born_on: String,
+        }
+        let cs = Changeset::new(F {
+            born_on: "2024-03-15 10:30:00".into(),
+        });
+        let html = date_input(&cs, "born_on", "Born on").into_string();
+        assert!(html.contains(r#"value="2024-03-15""#), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn date_input_emits_aria_invalid_and_errors() {
+        #[derive(serde::Serialize)]
+        struct F {
+            born_on: String,
+        }
+        let mut errors = HashMap::new();
+        errors.insert("born_on".to_string(), vec!["required".to_string()]);
+        let cs = Changeset::from_errors(
+            F {
+                born_on: String::new(),
+            },
+            errors,
+        );
+        let html = date_input(&cs, "born_on", "Born on").into_string();
+        assert!(html.contains(r#"aria-invalid="true""#), "{html}");
+        assert!(html.contains(r#"role="alert""#), "{html}");
+        assert!(html.contains("required"), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn datetime_input_renders_type_datetime_local() {
+        #[derive(serde::Serialize)]
+        struct F {
+            starts_at: String,
+        }
+        let cs = Changeset::new(F {
+            starts_at: "2024-03-15T10:30:00".into(),
+        });
+        let html = datetime_input(&cs, "starts_at", "Starts at").into_string();
+        assert!(html.contains(r#"type="datetime-local""#), "{html}");
+        // Seconds must be preserved, not truncated to minutes: chrono's
+        // default Deserialize requires the seconds component, so a
+        // minute-only value would fail to decode on an untouched submission.
+        assert!(html.contains(r#"value="2024-03-15T10:30:00""#), "{html}");
+        // `step="any"` so that value doesn't fail step-mismatch validation
+        // (default step is minute-granularity) and block submission.
+        assert!(html.contains(r#"step="any""#), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn datetime_input_normalizes_rfc3339_with_offset_to_local_shape() {
+        #[derive(serde::Serialize)]
+        struct F {
+            starts_at: String,
+        }
+        let cs = Changeset::new(F {
+            starts_at: "2024-03-15T10:30:00Z".into(),
+        });
+        let html = datetime_input(&cs, "starts_at", "Starts at").into_string();
+        // Browsers reject a trailing `Z`/offset in a `datetime-local` value;
+        // must be reduced to the bare local-shaped `YYYY-MM-DDTHH:MM:SS`.
+        assert!(html.contains(r#"value="2024-03-15T10:30:00""#), "{html}");
+        assert!(!html.contains(r#"value="2024-03-15T10:30:00Z""#), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn datetime_input_normalizes_space_separated_datetime() {
+        // `NaiveDateTime`'s `Display` uses a space separator, e.g. from a
+        // raw `.to_string()` or some database drivers — accept it
+        // defensively rather than falling through to the raw string, which
+        // `<input type="datetime-local">` (strictly requiring `T`) rejects.
+        #[derive(serde::Serialize)]
+        struct F {
+            starts_at: String,
+        }
+        let cs = Changeset::new(F {
+            starts_at: "2024-03-15 10:30:00".into(),
+        });
+        let html = datetime_input(&cs, "starts_at", "Starts at").into_string();
+        assert!(html.contains(r#"value="2024-03-15T10:30:00""#), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn datetime_input_emits_aria_invalid_and_errors() {
+        #[derive(serde::Serialize)]
+        struct F {
+            starts_at: String,
+        }
+        let mut errors = HashMap::new();
+        errors.insert("starts_at".to_string(), vec!["required".to_string()]);
+        let cs = Changeset::from_errors(
+            F {
+                starts_at: String::new(),
+            },
+            errors,
+        );
+        let html = datetime_input(&cs, "starts_at", "Starts at").into_string();
+        assert!(html.contains(r#"aria-invalid="true""#), "{html}");
+        assert!(html.contains(r#"role="alert""#), "{html}");
+        assert!(html.contains("required"), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn datetime_input_value_round_trips_through_chronos_default_deserialize() {
+        // Regression test: chrono's default `serde::Deserialize` for
+        // `NaiveDateTime` requires the seconds component ("premature end of
+        // input" otherwise). A hand-written form using `datetime_input` with
+        // a plain `chrono::NaiveDateTime` changeset field must be able to
+        // submit the *pre-filled, untouched* value and have it decode
+        // successfully — not just render without visible truncation.
+        #[derive(serde::Serialize)]
+        struct F {
+            starts_at: chrono::NaiveDateTime,
+        }
+        #[derive(serde::Deserialize)]
+        struct Decoded {
+            starts_at: chrono::NaiveDateTime,
+        }
+        let stored = chrono::NaiveDate::from_ymd_opt(2024, 3, 15)
+            .unwrap()
+            .and_hms_opt(10, 30, 56)
+            .unwrap();
+        let cs = Changeset::new(F { starts_at: stored });
+        let html = datetime_input(&cs, "starts_at", "Starts at").into_string();
+
+        // Extract the rendered value attribute and submit it exactly as a
+        // browser would on a no-op edit (field untouched).
+        let value = html
+            .split("value=\"")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .expect("value attribute present");
+        let body = format!("starts_at={value}");
+        let decoded: Decoded =
+            serde_urlencoded::from_str(&body).expect("pre-filled value must decode");
+        assert_eq!(decoded.starts_at, stored);
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn datetime_input_value_round_trips_for_utc_datetime_with_deserialize_helper() {
+        // Regression test: a DateTime<Utc> field's datetime_input value has
+        // no offset (datetime-local has no timezone concept), which chrono's
+        // *default* Deserialize for DateTime<Utc> rejects. Confirm the
+        // pre-filled value decodes successfully when the field is annotated
+        // with deserialize_datetime_local_utc, as documented on
+        // datetime_input.
+        #[derive(serde::Serialize)]
+        struct F {
+            starts_at: chrono::DateTime<chrono::Utc>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Decoded {
+            #[serde(deserialize_with = "deserialize_datetime_local_utc")]
+            starts_at: chrono::DateTime<chrono::Utc>,
+        }
+        let stored = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+            chrono::NaiveDate::from_ymd_opt(2024, 3, 15)
+                .unwrap()
+                .and_hms_opt(10, 30, 56)
+                .unwrap(),
+            chrono::Utc,
+        );
+        let cs = Changeset::new(F { starts_at: stored });
+        let html = datetime_input(&cs, "starts_at", "Starts at").into_string();
+        // The rendered value must not carry an offset/Z (would break the
+        // datetime-local input); confirm that first.
+        let value = html
+            .split("value=\"")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .expect("value attribute present");
+        assert!(!value.contains('Z') && !value.contains('+'), "{value}");
+
+        let body = format!("starts_at={value}");
+        let decoded: Decoded =
+            serde_urlencoded::from_str(&body).expect("pre-filled value must decode");
+        assert_eq!(decoded.starts_at, stored);
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn deserialize_datetime_local_utc_pads_missing_seconds() {
+        #[derive(serde::Deserialize)]
+        struct Decoded {
+            #[serde(deserialize_with = "deserialize_datetime_local_utc")]
+            starts_at: chrono::DateTime<chrono::Utc>,
+        }
+        let decoded: Decoded = serde_urlencoded::from_str("starts_at=2024-03-15T10:30").unwrap();
+        assert_eq!(
+            decoded.starts_at,
+            chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+                chrono::NaiveDate::from_ymd_opt(2024, 3, 15)
+                    .unwrap()
+                    .and_hms_opt(10, 30, 0)
+                    .unwrap(),
+                chrono::Utc,
+            )
+        );
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn deserialize_datetime_local_utc_option_absent_key_is_none() {
+        #[derive(serde::Deserialize)]
+        struct Decoded {
+            #[serde(default, deserialize_with = "deserialize_datetime_local_utc_option")]
+            starts_at: Option<chrono::DateTime<chrono::Utc>>,
+        }
+        let decoded: Decoded = serde_urlencoded::from_str("").unwrap();
+        assert_eq!(decoded.starts_at, None);
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn deserialize_datetime_local_utc_option_present_key_is_some() {
+        #[derive(serde::Deserialize)]
+        struct Decoded {
+            #[serde(default, deserialize_with = "deserialize_datetime_local_utc_option")]
+            starts_at: Option<chrono::DateTime<chrono::Utc>>,
+        }
+        let decoded: Decoded = serde_urlencoded::from_str("starts_at=2024-03-15T10:30:56").unwrap();
+        assert_eq!(
+            decoded.starts_at,
+            Some(chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+                chrono::NaiveDate::from_ymd_opt(2024, 3, 15)
+                    .unwrap()
+                    .and_hms_opt(10, 30, 56)
+                    .unwrap(),
+                chrono::Utc,
+            ))
+        );
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn deserialize_naive_datetime_local_pads_missing_seconds() {
+        // Regression test: a value the user actively edits through the
+        // native picker isn't guaranteed to include seconds, unlike the
+        // always-seconds-inclusive pre-filled value — this must not 400.
+        #[derive(serde::Deserialize)]
+        struct Decoded {
+            #[serde(deserialize_with = "deserialize_naive_datetime_local")]
+            starts_at: chrono::NaiveDateTime,
+        }
+        let decoded: Decoded = serde_urlencoded::from_str("starts_at=2024-03-15T10:30").unwrap();
+        assert_eq!(
+            decoded.starts_at,
+            chrono::NaiveDate::from_ymd_opt(2024, 3, 15)
+                .unwrap()
+                .and_hms_opt(10, 30, 0)
+                .unwrap()
+        );
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn deserialize_naive_datetime_local_preserves_seconds_when_present() {
+        #[derive(serde::Deserialize)]
+        struct Decoded {
+            #[serde(deserialize_with = "deserialize_naive_datetime_local")]
+            starts_at: chrono::NaiveDateTime,
+        }
+        let decoded: Decoded = serde_urlencoded::from_str("starts_at=2024-03-15T10:30:56").unwrap();
+        assert_eq!(
+            decoded.starts_at,
+            chrono::NaiveDate::from_ymd_opt(2024, 3, 15)
+                .unwrap()
+                .and_hms_opt(10, 30, 56)
+                .unwrap()
+        );
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn deserialize_naive_datetime_local_option_absent_key_is_none() {
+        #[derive(serde::Deserialize)]
+        struct Decoded {
+            #[serde(default, deserialize_with = "deserialize_naive_datetime_local_option")]
+            starts_at: Option<chrono::NaiveDateTime>,
+        }
+        let decoded: Decoded = serde_urlencoded::from_str("").unwrap();
+        assert_eq!(decoded.starts_at, None);
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn deserialize_naive_datetime_local_option_present_key_is_some() {
+        #[derive(serde::Deserialize)]
+        struct Decoded {
+            #[serde(default, deserialize_with = "deserialize_naive_datetime_local_option")]
+            starts_at: Option<chrono::NaiveDateTime>,
+        }
+        let decoded: Decoded = serde_urlencoded::from_str("starts_at=2024-03-15T10:30").unwrap();
+        assert_eq!(
+            decoded.starts_at,
+            Some(
+                chrono::NaiveDate::from_ymd_opt(2024, 3, 15)
+                    .unwrap()
+                    .and_hms_opt(10, 30, 0)
+                    .unwrap()
+            )
+        );
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn datetime_input_wrapper_div_has_stable_id() {
+        #[derive(serde::Serialize)]
+        struct F {
+            starts_at: String,
+        }
+        let cs = Changeset::new(F {
+            starts_at: "2024-03-15T10:30:00".into(),
+        });
+        let html = datetime_input(&cs, "starts_at", "Starts at").into_string();
+        assert!(html.contains(r#"id="starts_at-field""#), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn select_input_renders_select_element_with_options() {
+        #[derive(serde::Serialize)]
+        struct F {
+            status: String,
+        }
+        let cs = Changeset::new(F {
+            status: "draft".into(),
+        });
+        let options = [("draft", "Draft"), ("published", "Published")];
+        let html = select_input(&cs, "status", "Status", &options).into_string();
+        assert!(html.contains("<select"), "{html}");
+        assert!(html.contains(r#"name="status""#), "{html}");
+        assert!(html.contains(r#"value="draft""#), "{html}");
+        assert!(html.contains("Draft"), "{html}");
+        assert!(html.contains(r#"value="published""#), "{html}");
+        assert!(html.contains("Published"), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn select_input_marks_current_value_selected() {
+        #[derive(serde::Serialize)]
+        struct F {
+            status: String,
+        }
+        let cs = Changeset::new(F {
+            status: "published".into(),
+        });
+        let options = [("draft", "Draft"), ("published", "Published")];
+        let html = select_input(&cs, "status", "Status", &options).into_string();
+        assert!(html.contains(r#"value="published" selected"#), "{html}");
+        assert!(!html.contains(r#"value="draft" selected"#), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn select_input_emits_aria_invalid_and_errors() {
+        #[derive(serde::Serialize)]
+        struct F {
+            status: String,
+        }
+        let mut errors = HashMap::new();
+        errors.insert("status".to_string(), vec!["required".to_string()]);
+        let cs = Changeset::from_errors(
+            F {
+                status: String::new(),
+            },
+            errors,
+        );
+        let options = [("draft", "Draft"), ("published", "Published")];
+        let html = select_input(&cs, "status", "Status", &options).into_string();
+        assert!(html.contains(r#"aria-invalid="true""#), "{html}");
+        assert!(html.contains(r#"role="alert""#), "{html}");
+        assert!(html.contains("required"), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn select_input_wrapper_div_has_stable_id() {
+        #[derive(serde::Serialize)]
+        struct F {
+            status: String,
+        }
+        let cs = Changeset::new(F {
+            status: "draft".into(),
+        });
+        let options = [("draft", "Draft"), ("published", "Published")];
+        let html = select_input(&cs, "status", "Status", &options).into_string();
+        assert!(html.contains(r#"id="status-field""#), "{html}");
     }
 
     // ── ChangesetForm extractor (axum integration) ─────────────────
