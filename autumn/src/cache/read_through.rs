@@ -437,6 +437,14 @@ const MAX_LOCK_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// "lock free," acquires the now-unlocked lock, and runs its own redundant
 /// fill — exactly the duplicate-recompute the distributed lock exists to
 /// prevent.
+///
+/// Re-checks the cache immediately after acquiring the lock, before running
+/// `fill`: another replica's entire acquire-fill-write-release cycle can
+/// complete between this caller's last cache read and this successful
+/// acquisition, in which case the lock is "free" only because that replica
+/// already finished — running `fill` again here would be a redundant (and,
+/// for a non-idempotent fill, harmful) duplicate of work someone else just
+/// did.
 async fn run_fill_and_release<V, E, F, Fut>(
     cache: &Arc<dyn Cache>,
     key: &str,
@@ -451,6 +459,12 @@ where
     F: FnOnce() -> Fut + Send,
     Fut: Future<Output = Result<V, E>> + Send,
 {
+    if let Some(value) = fast_path_value::<V>(cache, key, options) {
+        cache.release_fill_lock(key, token);
+        let _ = tx.send(FillState::Done(Arc::new(value.clone())));
+        return Ok(value);
+    }
+
     read_through_metrics()
         .fill_lock_acquires
         .fetch_add(1, Ordering::Relaxed);
@@ -932,6 +946,45 @@ mod tests {
             fast_path_value::<String>(&cache, key, &options),
             Some("fresh-value".to_string())
         );
+    }
+
+    #[cfg(feature = "cache-moka")]
+    #[tokio::test]
+    async fn run_fill_and_release_skips_fill_if_value_already_present() {
+        use super::super::MokaCache;
+
+        let cache: Arc<dyn Cache> = Arc::new(MokaCache::new(10, None));
+        let key = "recheck-after-lock-key";
+        let options = GetOrComputeOptions::new();
+        let (tx, mut rx) = watch::channel(FillState::Pending);
+
+        // Simulate another replica having already run an entire
+        // acquire-fill-write-release cycle in the gap between this caller's
+        // last cache read and its own (now successful) lock acquisition.
+        insert_cached(cache.as_ref(), key, "already-written".to_string(), None);
+
+        let fill_count = Arc::new(AtomicU64::new(0));
+        let fc = fill_count.clone();
+        let result: Result<String, CacheFillError<String>> = run_fill_and_release(
+            &cache,
+            key,
+            &options,
+            move || async move {
+                fc.fetch_add(1, Ordering::Relaxed);
+                Ok::<String, String>("redundant-recompute".to_string())
+            },
+            &tx,
+            "token",
+        )
+        .await;
+
+        assert_eq!(result.unwrap(), "already-written");
+        assert_eq!(
+            fill_count.load(Ordering::Relaxed),
+            0,
+            "fill must not run when another replica already wrote the value"
+        );
+        assert!(matches!(*rx.borrow_and_update(), FillState::Done(_)));
     }
 
     #[test]
