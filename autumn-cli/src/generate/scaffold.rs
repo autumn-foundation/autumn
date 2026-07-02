@@ -607,8 +607,11 @@ fn render_repository_queries(pascal_name: &str, queries: &[QuerySpec]) -> String
 }
 
 /// Normalizes an HTML `datetime-local` value (`YYYY-MM-DDTHH:MM`, seconds
-/// omitted by the browser) into the `YYYY-MM-DDTHH:MM:SS` shape chrono's
-/// strict datetime parser requires.
+/// omitted by the browser at minute granularity) into the
+/// `YYYY-MM-DDTHH:MM:SS` shape chrono's parser expects at minimum. Callers
+/// parse with the `%.f` format specifier, so fractional seconds (submitted
+/// when a finer-grained `step` is used) are accepted whether or not this
+/// function's padding runs.
 const NORMALIZE_DATETIME_LOCAL_FN: &str = r#"
 fn normalize_datetime_local(raw: &str) -> String {
     if raw.len() == 16 {
@@ -625,7 +628,7 @@ where
     D: serde::Deserializer<'de>,
 {
     let raw = <String as serde::Deserialize>::deserialize(deserializer)?;
-    chrono::NaiveDateTime::parse_from_str(&normalize_datetime_local(&raw), "%Y-%m-%dT%H:%M:%S")
+    chrono::NaiveDateTime::parse_from_str(&normalize_datetime_local(&raw), "%Y-%m-%dT%H:%M:%S%.f")
         .map_err(serde::de::Error::custom)
 }
 "#;
@@ -640,7 +643,7 @@ where
     let raw = <Option<String> as serde::Deserialize>::deserialize(deserializer)?;
     match raw {
         Some(s) if !s.is_empty() => {
-            chrono::NaiveDateTime::parse_from_str(&normalize_datetime_local(&s), "%Y-%m-%dT%H:%M:%S")
+            chrono::NaiveDateTime::parse_from_str(&normalize_datetime_local(&s), "%Y-%m-%dT%H:%M:%S%.f")
                 .map(Some)
                 .map_err(serde::de::Error::custom)
         }
@@ -657,7 +660,7 @@ where
     D: serde::Deserializer<'de>,
 {
     let raw = <String as serde::Deserialize>::deserialize(deserializer)?;
-    chrono::NaiveDateTime::parse_from_str(&normalize_datetime_local(&raw), "%Y-%m-%dT%H:%M:%S")
+    chrono::NaiveDateTime::parse_from_str(&normalize_datetime_local(&raw), "%Y-%m-%dT%H:%M:%S%.f")
         .map(|ndt| ndt.and_utc())
         .map_err(serde::de::Error::custom)
 }
@@ -673,7 +676,7 @@ where
     let raw = <Option<String> as serde::Deserialize>::deserialize(deserializer)?;
     match raw {
         Some(s) if !s.is_empty() => {
-            chrono::NaiveDateTime::parse_from_str(&normalize_datetime_local(&s), "%Y-%m-%dT%H:%M:%S")
+            chrono::NaiveDateTime::parse_from_str(&normalize_datetime_local(&s), "%Y-%m-%dT%H:%M:%S%.f")
                 .map(|ndt| Some(ndt.and_utc()))
                 .map_err(serde::de::Error::custom)
         }
@@ -1561,6 +1564,24 @@ fn has_attachment_fields(fields: &[Field]) -> bool {
     fields.iter().any(|f| f.kind.is_attachment())
 }
 
+// `render_create_form_inputs` and `render_edit_form_inputs` below hand-roll
+// bare HTML (no `Changeset`/`ChangesetForm`, no `autumn-field` wrapper divs
+// or ARIA wiring) rather than calling `autumn_web::form::{checkbox_input,
+// number_input, date_input, datetime_input, select_input}` — consistent
+// with how every other field kind (including plain `String`) has always
+// been emitted here, not a pattern introduced for these widgets. That means
+// the two are independently maintained and can drift; at minimum, keep
+// these invariants in sync with the `autumn_web::form` helpers of the same
+// name when either changes:
+//   - `Bool` (non-nullable): a bare `<input type="checkbox">`, **no** hidden
+//     `value="false"` sibling sharing the `name` — see `checkbox_input`'s
+//     doc comment for why (duplicate-key 400 on every checked submission).
+//   - `Bool` (nullable): a 3-option `<select>` (unset/true/false), never a
+//     checkbox — a checkbox can't represent a `None` distinct from `false`.
+//   - `I32`/`I64`/`F32`/`F64`: `type="number"` with `step="1"` for integers,
+//     `step="any"` for floats.
+//   - `NaiveDateTime`/`DateTime`: `type="datetime-local"`, decoded via a
+//     `%.f`-tolerant parser (see `DESERIALIZE_*_DATETIME_LOCAL_FN` below).
 fn render_create_form_inputs(
     fields: &[Field],
     live_validation: bool,
@@ -1597,21 +1618,39 @@ fn render_create_form_inputs(
             } else {
                 String::new()
             };
-            let input_tag = match f.kind {
-                FieldKind::Bool => format!(
-                    "input type=\"hidden\" name=\"{name}\" value=\"false\"; \
-                     input type=\"checkbox\" name=\"{name}\" value=\"true\"{hx_attrs}",
+            let input_tag = match (f.kind, f.nullable) {
+                // No hidden `false` fallback: a checked box would then submit
+                // the key twice (`field=false` from the hidden input,
+                // `field=true` from the checkbox), and serde_urlencoded
+                // rejects duplicate keys instead of taking the last value —
+                // every checked submission would 400. `#[serde(default)]` on
+                // the DecodedForm field (see render_decoded_form) recovers
+                // `false` from the key's *absence* when unchecked instead.
+                (FieldKind::Bool, false) => format!(
+                    "input type=\"checkbox\" name=\"{name}\" value=\"true\"{hx_attrs}",
                     name = f.name,
                     hx_attrs = hx_attrs
                 ),
-                FieldKind::I32 | FieldKind::I64 | FieldKind::F32 | FieldKind::F64 => format!(
+                // A checkbox can't losslessly represent a nullable bool (no
+                // way to distinguish "leave false" from "set to null" when
+                // unchecked) — a 3-option select keeps NULL reachable.
+                (FieldKind::Bool, true) => format!(
+                    "select name=\"{name}\"{hx_attrs} {{ \
+                         option value=\"\" {{ \"— Unset —\" }} \
+                         option value=\"true\" {{ \"Yes\" }} \
+                         option value=\"false\" {{ \"No\" }} \
+                     }}",
+                    name = f.name,
+                    hx_attrs = hx_attrs
+                ),
+                (FieldKind::I32 | FieldKind::I64 | FieldKind::F32 | FieldKind::F64, _) => format!(
                     "input type=\"number\" name=\"{name}\" step=\"{step}\"{required}{hx_attrs}",
                     name = f.name,
                     step = number_step(f.kind),
                     required = required,
                     hx_attrs = hx_attrs
                 ),
-                FieldKind::NaiveDateTime | FieldKind::DateTime => format!(
+                (FieldKind::NaiveDateTime | FieldKind::DateTime, _) => format!(
                     "input type=\"datetime-local\" name=\"{name}\"{required}{hx_attrs}",
                     name = f.name,
                     required = required,
@@ -1679,15 +1718,28 @@ fn render_edit_form_inputs(
             } else {
                 String::new()
             };
-            let input_tag = match f.kind {
-                FieldKind::Bool => format!(
-                    "input type=\"hidden\" name=\"{name}\" value=\"false\"; \
-                     input type=\"checkbox\" name=\"{name}\" value=\"true\" checked[{checked}]{hx_attrs}",
+            let input_tag = match (f.kind, f.nullable) {
+                // See render_create_form_inputs for why there is no hidden
+                // `false` fallback sibling here.
+                (FieldKind::Bool, false) => format!(
+                    "input type=\"checkbox\" name=\"{name}\" value=\"true\" checked[{checked}]{hx_attrs}",
                     name = f.name,
                     checked = edit_checked_expr(f),
                     hx_attrs = hx_attrs
                 ),
-                FieldKind::I32 | FieldKind::I64 | FieldKind::F32 | FieldKind::F64 => format!(
+                (FieldKind::Bool, true) => {
+                    let (unset, is_true, is_false) = edit_bool_select_selected_exprs(f);
+                    format!(
+                        "select name=\"{name}\"{hx_attrs} {{ \
+                             option value=\"\" selected[{unset}] {{ \"— Unset —\" }} \
+                             option value=\"true\" selected[{is_true}] {{ \"Yes\" }} \
+                             option value=\"false\" selected[{is_false}] {{ \"No\" }} \
+                         }}",
+                        name = f.name,
+                        hx_attrs = hx_attrs
+                    )
+                }
+                (FieldKind::I32 | FieldKind::I64 | FieldKind::F32 | FieldKind::F64, _) => format!(
                     "input type=\"number\" name=\"{name}\" step=\"{step}\" value=({value}){required}{hx_attrs}",
                     name = f.name,
                     step = number_step(f.kind),
@@ -1695,7 +1747,7 @@ fn render_edit_form_inputs(
                     required = required,
                     hx_attrs = hx_attrs
                 ),
-                FieldKind::NaiveDateTime | FieldKind::DateTime => format!(
+                (FieldKind::NaiveDateTime | FieldKind::DateTime, _) => format!(
                     "input type=\"datetime-local\" name=\"{name}\" value=({value}){required}{hx_attrs}",
                     name = f.name,
                     value = edit_datetime_local_value_expr(f),
@@ -1737,6 +1789,20 @@ fn edit_value_expr(field: &Field) -> String {
                 "row.{name}.as_ref().map(|value| String::from_utf8_lossy(value).to_string()).unwrap_or_default()"
             )
         }
+        // f32/f64 Display renders NaN/Infinity as "NaN"/"inf"/"-inf", none of
+        // which satisfy HTML5's <input type="number"> value grammar — the
+        // browser would silently blank the field. Render an explicit empty
+        // value for non-finite floats instead of an invalid one.
+        (true, FieldKind::F32 | FieldKind::F64) => {
+            format!(
+                "row.{name}.as_ref().filter(|value| value.is_finite()).map(ToString::to_string).unwrap_or_default()"
+            )
+        }
+        (false, FieldKind::F32 | FieldKind::F64) => {
+            format!(
+                "if row.{name}.is_finite() {{ row.{name}.to_string() }} else {{ String::new() }}"
+            )
+        }
         (true, _) => {
             format!("row.{name}.as_ref().map(ToString::to_string).unwrap_or_default()")
         }
@@ -1748,15 +1814,27 @@ fn edit_value_expr(field: &Field) -> String {
 }
 
 /// Boolean expression for the `checked[...]` attribute of an edit-form
-/// checkbox — `row.{name}` directly for `bool`, `.unwrap_or(false)` for
-/// `Option<bool>`.
+/// checkbox. Only called for non-nullable `bool` fields — nullable
+/// `Option<bool>` fields render as a 3-option select instead (see
+/// [`edit_bool_select_selected_exprs`]), so there is no `Option<bool>` case
+/// to unwrap here.
 fn edit_checked_expr(field: &Field) -> String {
+    format!("row.{}", field.name)
+}
+
+/// The three `selected[...]` boolean expressions (unset / true / false) for
+/// an edit-form `<select>` rendering a nullable `Option<bool>` field.
+///
+/// A checkbox cannot losslessly represent a nullable bool (no way to
+/// distinguish "leave false" from "set to null" when unchecked), so nullable
+/// `Bool` fields render as this 3-option select instead of a checkbox.
+fn edit_bool_select_selected_exprs(field: &Field) -> (String, String, String) {
     let name = &field.name;
-    if field.nullable {
-        format!("row.{name}.unwrap_or(false)")
-    } else {
-        format!("row.{name}")
-    }
+    (
+        format!("row.{name}.is_none()"),
+        format!("row.{name} == Some(true)"),
+        format!("row.{name} == Some(false)"),
+    )
 }
 
 /// Value expression for an edit-form `datetime-local` input. Unlike
@@ -2944,11 +3022,20 @@ async fn main() {
             !routes.contains("input type=\"text\" name=\"active\""),
             "bool field must not render input type=\"text\": {routes}"
         );
-        // Unchecked checkboxes are absent from submitted form data — a
-        // hidden "false" sibling guarantees the field always round-trips.
+        // No hidden "false" fallback sharing the checkbox's name: a checked
+        // box would then submit the key twice (active=false&active=true),
+        // and serde_urlencoded rejects duplicate keys — every checked
+        // submission would 400 (issue #1131 follow-up fix). Exactly one
+        // `name="active"` input must exist per form.
         assert!(
-            routes.contains("input type=\"hidden\" name=\"active\" value=\"false\""),
+            !routes.contains("input type=\"hidden\" name=\"active\" value=\"false\""),
             "{routes}"
+        );
+        assert_eq!(
+            routes.matches("name=\"active\"").count(),
+            2,
+            "expected exactly one `name=\"active\"` input in each of the \
+             create and edit forms (no duplicate-key hidden fallback): {routes}"
         );
         // Edit form must reflect the current value via `checked[...]`.
         assert!(routes.contains("checked[row.active]"), "{routes}");
@@ -2956,6 +3043,46 @@ async fn main() {
         // (missing key) doesn't 400.
         assert!(
             routes.contains("#[serde(default)]\n    pub active: bool,"),
+            "{routes}"
+        );
+    }
+
+    #[test]
+    fn execute_writes_select_for_nullable_bool_field() {
+        // A checkbox can't losslessly represent Option<bool> (no way to
+        // distinguish "leave false" from "set to null" when unchecked), so
+        // nullable bool fields must render a 3-option select instead.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "archived:Option<bool>".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+
+        assert!(
+            !routes.contains("input type=\"checkbox\" name=\"archived\""),
+            "nullable bool must not render a checkbox: {routes}"
+        );
+        assert!(routes.contains("select name=\"archived\""), "{routes}");
+        assert!(routes.contains("option value=\"\""), "{routes}");
+        assert!(routes.contains("option value=\"true\""), "{routes}");
+        assert!(routes.contains("option value=\"false\""), "{routes}");
+        // Edit form must reflect the current tri-state value.
+        assert!(
+            routes.contains("selected[row.archived.is_none()]"),
+            "{routes}"
+        );
+        assert!(
+            routes.contains("selected[row.archived == Some(true)]"),
+            "{routes}"
+        );
+        assert!(
+            routes.contains("selected[row.archived == Some(false)]"),
             "{routes}"
         );
     }
@@ -3012,6 +3139,42 @@ async fn main() {
         );
         assert!(
             routes.contains("input type=\"number\" name=\"weight\" step=\"any\""),
+            "{routes}"
+        );
+    }
+
+    #[test]
+    fn execute_writes_finite_guard_for_float_edit_form_value() {
+        // f32/f64 Display renders NaN/Infinity as "NaN"/"inf"/"-inf", none
+        // of which satisfy HTML5's <input type="number"> value grammar —
+        // the browser would silently blank the field. The generated value
+        // expression must guard with is_finite() instead of a bare
+        // .to_string() for float fields.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &[
+                "title:String".into(),
+                "price:f64".into(),
+                "weight:Option<f32>".into(),
+            ],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        assert!(
+            routes.contains(
+                "value=(if row.price.is_finite() { row.price.to_string() } else { String::new() })"
+            ),
+            "{routes}"
+        );
+        assert!(
+            routes.contains(
+                "value=(row.weight.as_ref().filter(|value| value.is_finite()).map(ToString::to_string).unwrap_or_default())"
+            ),
             "{routes}"
         );
     }
@@ -3079,6 +3242,10 @@ async fn main() {
             !routes.contains("fn deserialize_utc_datetime_local"),
             "{routes}"
         );
+        // The parse format must accept optional fractional seconds
+        // (`%.f`) — without it, a datetime-local value submitted with
+        // milliseconds (e.g. from a finer-grained `step`) fails to parse.
+        assert!(routes.contains("\"%Y-%m-%dT%H:%M:%S%.f\")"), "{routes}");
     }
 
     #[test]

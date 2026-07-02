@@ -784,6 +784,7 @@ fn generated_scaffold_cargo_checks() {
             "title:String",
             "body:Text",
             "published:bool",
+            "archived:Option<bool>",
             "subtitle:Option<String>",
             "views:Option<i64>",
             "rank:i32",

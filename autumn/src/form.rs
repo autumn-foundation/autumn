@@ -950,12 +950,32 @@ pub fn required_text_input<T: Serialize>(
 
 /// Render a labeled `<input type="checkbox">` tied to a `bool` changeset field.
 ///
-/// HTML checkboxes are omitted from submitted form data when unchecked, so
-/// this always emits a hidden `false` sibling `<input>` ahead of the
-/// checkbox (same `name`) — the checkbox's `"true"` overrides it when
-/// checked, and the hidden fallback wins when unchecked. This gives `bool`
-/// fields (not just `Option<bool>`) a value on every submission with no
-/// extra `#[serde(default)]` ceremony required by hand-written forms.
+/// # Required: `#[serde(default)]` on the target field
+///
+/// HTML checkboxes are omitted from submitted form data entirely when
+/// unchecked — there is no way to distinguish "unchecked" from "field not
+/// present" on the wire. **Do not** pair this with a hidden `<input
+/// type="hidden" value="false">` sibling sharing the same `name`: a checked
+/// box then submits the key *twice* (`field=false` from the hidden input,
+/// `field=true` from the checkbox), and `serde_urlencoded` (used by both
+/// axum's `Form` extractor and [`ChangesetForm`]) rejects duplicate keys
+/// with a "duplicate field" deserialize error instead of taking the last
+/// value — every checked submission would 400.
+///
+/// Instead, mark the target `bool` field `#[serde(default)]` so a missing
+/// key decodes as `false`:
+///
+/// ```rust,ignore
+/// #[derive(serde::Deserialize)]
+/// struct PostForm {
+///     #[serde(default)]
+///     published: bool,
+/// }
+/// ```
+///
+/// For a nullable `Option<bool>` field where `None` is a meaningful third
+/// state (distinct from `Some(false)`), a checkbox cannot represent it
+/// losslessly — use [`select_input`] with three options instead.
 ///
 /// The `checked` attribute reflects the changeset's current value via
 /// [`Changeset::field_value`], which serializes `bool` as `"true"`/`"false"`.
@@ -977,7 +997,6 @@ pub fn checkbox_input<T: Serialize>(
     maud::html! {
         div id=(wrapper_id) class="autumn-field" {
             label for=(field) class="autumn-field__label" { (label) }
-            input type="hidden" name=(field) value="false";
             input
                 type="checkbox"
                 id=(field)
@@ -2190,18 +2209,68 @@ mod tests {
 
     #[cfg(feature = "maud")]
     #[test]
-    fn checkbox_input_emits_hidden_false_fallback() {
-        // Unchecked checkboxes are absent from submitted form data; a hidden
-        // "false" sibling with the same name guarantees the field is always
-        // present so `bool` (not just `Option<bool>`) round-trips.
+    fn checkbox_input_never_emits_a_hidden_fallback() {
+        // A hidden "false" sibling sharing the checkbox's `name` would make a
+        // *checked* submission send the key twice (`field=false&field=true`).
+        // serde_urlencoded rejects duplicate keys outright rather than taking
+        // the last value, so every checked submission would 400. Unchecked
+        // state must be recovered via `#[serde(default)]` on the target
+        // field instead (see the function's doc comment) — never via a
+        // hidden fallback input.
         #[derive(serde::Serialize)]
         struct F {
             active: bool,
         }
         let cs = Changeset::new(F { active: false });
         let html = checkbox_input(&cs, "active", "Active").into_string();
-        assert!(html.contains(r#"type="hidden""#), "{html}");
-        assert!(html.contains(r#"value="false""#), "{html}");
+        assert!(!html.contains(r#"type="hidden""#), "{html}");
+        assert_eq!(
+            html.matches(r#"name="active""#).count(),
+            1,
+            "checkbox_input must emit exactly one input named `active` \
+             (a second `name=\"active\"` sibling would duplicate the key \
+             on submission): {html}"
+        );
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn checkbox_input_round_trips_through_real_url_decode_when_checked() {
+        // Regression test for the duplicate-key 400: decode the *exact*
+        // query string a browser sends for a CHECKED box rendered by
+        // checkbox_input (i.e. only the fields checkbox_input itself
+        // renders — no hidden sibling), through the same serde_urlencoded
+        // machinery axum's `Form` extractor and ChangesetForm use.
+        #[derive(serde::Serialize)]
+        struct F {
+            active: bool,
+        }
+        #[derive(serde::Deserialize)]
+        struct Decoded {
+            #[serde(default)]
+            active: bool,
+        }
+        let cs = Changeset::new(F { active: true });
+        let html = checkbox_input(&cs, "active", "Active").into_string();
+        assert!(html.contains("checked"), "{html}");
+
+        // A checked box submits `active=true` and nothing else.
+        let decoded: Decoded = serde_urlencoded::from_str("active=true").unwrap();
+        assert!(decoded.active);
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn checkbox_input_round_trips_through_real_url_decode_when_unchecked() {
+        // An unchecked box submits no `active` key at all; `#[serde(default)]`
+        // must recover `false` rather than erroring "missing field".
+        #[derive(serde::Deserialize)]
+        struct Decoded {
+            #[serde(default)]
+            active: bool,
+        }
+        let decoded: Decoded = serde_urlencoded::from_str("").unwrap();
+        assert!(!decoded.active);
     }
 
     #[cfg(feature = "maud")]
