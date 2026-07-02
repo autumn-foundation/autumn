@@ -4045,10 +4045,21 @@ return 1
             .query_async(&mut connection)
             .await
             .map_err(|error| redis_admin_error("cancel enqueued job", &error))?;
-        if result == 1
-            && let Some(name) = job_name
-        {
-            self.registry.record_cancel(&name);
+        if result == 1 {
+            if let Some(name) = job_name {
+                self.registry.record_cancel(&name);
+            }
+            // An operator can cancel a job before any worker ever claims it,
+            // which never reaches run_job_handler — settle the tracked
+            // record here too, or it stays pending until TTL expiry even
+            // though the durable job will never run.
+            if let Some(record) = &parsed_record {
+                crate::job_tracking::settle_tracked_payload_as_failed_globally(
+                    &record.payload,
+                    "This job was canceled.",
+                )
+                .await;
+            }
         }
         redis_admin_operation_result(result, id, "cancel enqueued job")
     }
@@ -6769,6 +6780,13 @@ struct PgJobAdminBackend {
 }
 
 #[cfg(feature = "db")]
+#[derive(diesel::QueryableByName)]
+struct PgPayloadRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    payload: String,
+}
+
+#[cfg(feature = "db")]
 impl PgJobAdminBackend {
     async fn pg_snapshot(&self, query: &JobAdminQuery) -> AutumnResult<JobAdminSnapshot> {
         let mut conn = self.pool.get().await.map_err(|e| {
@@ -6887,6 +6905,7 @@ impl PgJobAdminBackend {
     }
 
     async fn pg_cancel_enqueued(&self, id: &str) -> AutumnResult<()> {
+        use diesel::OptionalExtension as _;
         use diesel_async::RunQueryDsl as _;
 
         let mut conn = self.pool.get().await.map_err(|e| {
@@ -6895,19 +6914,31 @@ impl PgJobAdminBackend {
         let updated = diesel::sql_query(
             "UPDATE autumn_jobs \
              SET status = 'discarded', finished_at = NOW() \
-             WHERE id = $1 AND status = 'enqueued'",
+             WHERE id = $1 AND status = 'enqueued' \
+             RETURNING payload::TEXT AS payload",
         )
         .bind::<diesel::sql_types::Text, _>(id)
-        .execute(&mut *conn)
+        .get_result::<PgPayloadRow>(&mut *conn)
         .await
+        .optional()
         .map_err(|e| {
             AutumnError::internal_server_error_msg(format!("pg admin cancel failed: {e}"))
         })?;
-        if updated == 0 {
+        let Some(row) = updated else {
             return Err(AutumnError::not_found_msg(format!(
                 "job '{id}' not found or not in enqueued state"
             )));
-        }
+        };
+        // An operator can cancel a job before any worker ever claims it,
+        // which never reaches run_job_handler — settle the tracked record
+        // here too, or it stays pending until TTL expiry even though the
+        // durable job will never run.
+        let payload = serde_json::from_str::<Value>(&row.payload).unwrap_or(Value::Null);
+        crate::job_tracking::settle_tracked_payload_as_failed_globally(
+            &payload,
+            "This job was canceled.",
+        )
+        .await;
         Ok(())
     }
 }
@@ -9673,6 +9704,74 @@ mod tests {
     }
 
     #[cfg(feature = "redis")]
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn redis_admin_cancel_enqueued_settles_the_tracked_record() {
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+
+        let (_container, client) = redis_test_client().await;
+        let worker_config = redis_test_worker_config("cancel-tracked", "worker-1", 30_000);
+        let admin = redis_admin_test_backend(&client, &worker_config);
+
+        let state = AppState::for_test().with_profile("dev");
+        let store: Arc<dyn crate::job_tracking::JobTrackingStore> =
+            Arc::new(crate::job_tracking::InMemoryJobTrackingStore::new(60));
+        crate::job_tracking::install_tracking_store(&state, store.clone());
+        let key = "cancel-tracked-key";
+        store
+            .create(key, crate::job_tracking::TrackedJobOwner::Anonymous)
+            .await
+            .unwrap();
+        let payload = crate::job_tracking::wrap_tracked_payload(key, &serde_json::json!({}));
+
+        let connection = new_redis_connection_manager(&client, "test redis producer").unwrap();
+        let producer = RedisClient {
+            connection,
+            key_prefix: worker_config.key_prefix.clone(),
+            delayed_key: worker_config.delayed_key.clone(),
+            record_prefix: worker_config.record_prefix.clone(),
+            unique_prefix: worker_config.unique_prefix.clone(),
+        };
+        let constraints = ResolvedJobConstraints {
+            unique_key: None,
+            unique_window: None,
+            concurrency_limit: None,
+            concurrency_scope: None,
+        };
+        assert_eq!(
+            producer
+                .enqueue(
+                    "k-tracked".to_string(),
+                    "cancel_tracked",
+                    "default",
+                    payload,
+                    3,
+                    1,
+                    None,
+                    &constraints,
+                )
+                .await
+                .unwrap(),
+            EnqueueOutcome::Queued
+        );
+
+        // Cancelling an enqueued-but-not-yet-claimed job never reaches
+        // run_job_handler.
+        admin.cancel_enqueued_redis("k-tracked").await.unwrap();
+
+        let record = store.get(key).await.unwrap().expect("record");
+        assert_eq!(
+            record.status,
+            crate::job_tracking::TrackedJobStatus::Failed,
+            "an operator-cancelled enqueued tracked job must settle its status record instead \
+             of staying pending until TTL expiry"
+        );
+
+        clear_global_job_client();
+    }
+
+    #[cfg(feature = "redis")]
     async fn redis_enqueue_with_constraints(
         client: &redis::Client,
         worker_config: &RedisWorkerConfig,
@@ -12325,6 +12424,62 @@ mod tests {
                 .expect("cancel should succeed");
             let row = pg_fetch_by_id(&pool, "cancel-c").await.unwrap();
             assert_eq!(row.status, "discarded");
+        }
+
+        #[tokio::test]
+        #[ignore = "requires Docker (testcontainers)"]
+        async fn pg_admin_cancel_enqueued_settles_the_tracked_record() {
+            use testcontainers::runners::AsyncRunner as _;
+            use testcontainers_modules::postgres::Postgres;
+
+            let container = Postgres::default().start().await.unwrap();
+            let port = container.get_host_port_ipv4(5432).await.unwrap();
+            let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+            let pool = pg_test_pool(&url);
+            pg_run_migration(&pool).await;
+            let backend = PgJobAdminBackend { pool: pool.clone() };
+
+            let _guard = global_job_runtime_test_lock().lock().await;
+            clear_global_job_client();
+            let store: Arc<dyn crate::job_tracking::JobTrackingStore> =
+                Arc::new(crate::job_tracking::InMemoryJobTrackingStore::new(60));
+            crate::job_tracking::install_tracking_store(&AppState::for_test(), store.clone());
+            let key = "pg-cancel-tracked-key";
+            store
+                .create(key, crate::job_tracking::TrackedJobOwner::Anonymous)
+                .await
+                .unwrap();
+            let payload = crate::job_tracking::wrap_tracked_payload(key, &serde_json::json!({}));
+
+            pg_enqueue_job(
+                &pool,
+                "pg-cancel-tracked".to_string(),
+                "job",
+                "default",
+                payload,
+                5,
+                1,
+                &ResolvedJobConstraints::default(),
+            )
+            .await
+            .unwrap();
+
+            // Cancelling an enqueued-but-not-yet-claimed job never reaches
+            // run_job_handler.
+            backend
+                .cancel("pg-cancel-tracked")
+                .await
+                .expect("cancel should succeed");
+
+            let record = store.get(key).await.unwrap().expect("record");
+            assert_eq!(
+                record.status,
+                crate::job_tracking::TrackedJobStatus::Failed,
+                "an operator-cancelled enqueued tracked job must settle its status record \
+                 instead of staying pending until TTL expiry"
+            );
+
+            clear_global_job_client();
         }
 
         /// Helper: fetch a single job row by id for test assertions.

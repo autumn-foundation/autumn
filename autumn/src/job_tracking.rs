@@ -539,11 +539,30 @@ pub(crate) async fn settle_tracked_payload_as_failed(
     payload: &Value,
     message: &str,
 ) {
+    settle_tracked_payload_with_store(tracking_store_from_state(state), payload, message).await;
+}
+
+/// Like [`settle_tracked_payload_as_failed`], but resolves the store from
+/// the process-global fallback instead of an `AppState` extension.
+///
+/// For use by admin backends (`RedisJobAdminBackend`/`PgJobAdminBackend`)
+/// that operate directly against a queue backend with no `AppState` in
+/// hand — an operator cancelling a job that hasn't reached a worker yet
+/// goes through these paths, not `run_job_handler`.
+pub(crate) async fn settle_tracked_payload_as_failed_globally(payload: &Value, message: &str) {
+    settle_tracked_payload_with_store(global_tracking_store(), payload, message).await;
+}
+
+async fn settle_tracked_payload_with_store(
+    store: Option<Arc<dyn JobTrackingStore>>,
+    payload: &Value,
+    message: &str,
+) {
     let (key, _) = split_tracked_payload(payload);
     let Some(key) = key else {
         return;
     };
-    if let Some(store) = tracking_store_from_state(state) {
+    if let Some(store) = store {
         let _ = store.fail(key, message.to_owned()).await;
     }
 }
