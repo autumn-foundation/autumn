@@ -21,7 +21,7 @@ use crate::time::{ClockSource, SystemClock};
 use crate::{AppState, AutumnError, AutumnResult};
 
 /// Who is allowed to poll a tracked job's status.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TrackedJobOwner {
     /// No owner bound — the token itself is the capability.
     Anonymous,
@@ -78,7 +78,7 @@ impl TrackedJobStatus {
 }
 
 /// A snapshot of a tracked job's progress and (if terminal) its result.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrackedJobRecord {
     pub status: TrackedJobStatus,
     pub progress_pct: Option<u8>,
@@ -363,12 +363,45 @@ pub(crate) fn ensure_tracking_store_installed(state: &AppState) {
     }
 }
 
-/// Build the tracking store selected by `config.backend`, honoring
-/// `config.tracking.ttl_secs`.
-///
-/// Every backend gets an in-memory store today; `start_runtime` swaps in the
-/// Redis/Postgres-backed stores for those backends once they exist.
-fn store_for_config(config: &crate::config::JobConfig) -> Arc<dyn JobTrackingStore> {
+/// Build the tracking store matching `config.backend`, honoring
+/// `config.tracking.ttl_secs`: Redis when `backend = "redis"` and a valid
+/// URL is configured, Postgres when `backend = "postgres"` and `state` has a
+/// pool, in-memory otherwise (including as a fallback if the selected
+/// backend isn't actually reachable/configured — logged, not fatal, since
+/// the job runtime itself will raise the real error for that case).
+fn store_for_config(
+    state: &AppState,
+    config: &crate::config::JobConfig,
+) -> Arc<dyn JobTrackingStore> {
+    // Only read when the `db` feature's match arm below exists; without it
+    // (e.g. `redis`-only builds) `state` would otherwise be unused.
+    let _ = state;
+    match config.backend.as_str() {
+        #[cfg(feature = "redis")]
+        "redis" => {
+            if let Some(store) = build_redis_tracking_store(config) {
+                return Arc::new(store);
+            }
+            tracing::warn!(
+                "jobs.backend=redis but jobs.redis.url is not configured; falling back to an \
+                 in-memory job tracking store (tracked job status will not survive a restart)"
+            );
+        }
+        #[cfg(feature = "db")]
+        "postgres" => {
+            if let Some(pool) = state.pool() {
+                return Arc::new(PgJobTrackingStore::new(
+                    pool.clone(),
+                    config.tracking.ttl_secs,
+                ));
+            }
+            tracing::warn!(
+                "jobs.backend=postgres but no database pool is configured; falling back to an \
+                 in-memory job tracking store (tracked job status will not survive a restart)"
+            );
+        }
+        _ => {}
+    }
     Arc::new(InMemoryJobTrackingStore::new(config.tracking.ttl_secs))
 }
 
@@ -385,7 +418,7 @@ pub(crate) fn ensure_tracking_store_installed_from_config(
     config: &crate::config::JobConfig,
 ) {
     if tracking_store_from_state(state).is_none() {
-        install_tracking_store(state, store_for_config(config));
+        install_tracking_store(state, store_for_config(state, config));
     }
 }
 
@@ -816,6 +849,435 @@ impl JobTrackingStore for InMemoryJobTrackingStore {
     }
 }
 
+// ── Redis store ───────────────────────────────────────────────────────────────
+
+/// Redis-backed [`JobTrackingStore`].
+///
+/// Each record is a single JSON blob under `SET … EX ttl_secs`, so a write
+/// both persists and refreshes the TTL in one round trip, and Redis itself
+/// expires stale records — no sweeper needed.
+#[cfg(feature = "redis")]
+#[derive(Clone)]
+pub struct RedisJobTrackingStore {
+    connection: redis::aio::ConnectionManager,
+    key_prefix: String,
+    ttl_secs: u64,
+}
+
+#[cfg(feature = "redis")]
+impl RedisJobTrackingStore {
+    /// Construct a store over an existing connection, namespacing keys under
+    /// `key_prefix` and expiring records `ttl_secs` after their last write.
+    #[must_use]
+    pub fn new(
+        connection: redis::aio::ConnectionManager,
+        key_prefix: impl Into<String>,
+        ttl_secs: u64,
+    ) -> Self {
+        Self {
+            connection,
+            key_prefix: key_prefix.into(),
+            ttl_secs,
+        }
+    }
+
+    fn key_for(&self, key: &str) -> String {
+        format!("{}:tracking:{key}", self.key_prefix)
+    }
+
+    async fn write(&self, key: &str, record: &TrackedJobRecord) -> AutumnResult<()> {
+        use redis::AsyncCommands as _;
+        let payload = serde_json::to_string(record).map_err(|error| {
+            AutumnError::internal_server_error_msg(format!(
+                "job tracking serialize failed: {error}"
+            ))
+        })?;
+        self.connection
+            .clone()
+            .set_ex::<_, _, ()>(self.key_for(key), payload, self.ttl_secs.max(1))
+            .await
+            .map_err(|error| {
+                AutumnError::internal_server_error_msg(format!(
+                    "job tracking redis write failed: {error}"
+                ))
+            })
+    }
+
+    async fn read(&self, key: &str) -> AutumnResult<Option<TrackedJobRecord>> {
+        use redis::AsyncCommands as _;
+        let payload: Option<String> = self
+            .connection
+            .clone()
+            .get(self.key_for(key))
+            .await
+            .map_err(|error| {
+                AutumnError::internal_server_error_msg(format!(
+                    "job tracking redis read failed: {error}"
+                ))
+            })?;
+        payload
+            .map(|payload| {
+                serde_json::from_str::<TrackedJobRecord>(&payload).map_err(|error| {
+                    AutumnError::internal_server_error_msg(format!(
+                        "job tracking deserialize failed: {error}"
+                    ))
+                })
+            })
+            .transpose()
+    }
+
+    /// Read-modify-write: a no-op if the key is unknown or expired.
+    async fn update(&self, key: &str, f: impl FnOnce(&mut TrackedJobRecord)) -> AutumnResult<()> {
+        let Some(mut record) = self.read(key).await? else {
+            return Ok(());
+        };
+        f(&mut record);
+        record.updated_at = chrono::Utc::now();
+        self.write(key, &record).await
+    }
+}
+
+#[cfg(feature = "redis")]
+impl JobTrackingStore for RedisJobTrackingStore {
+    fn create<'a>(&'a self, key: &'a str, owner: TrackedJobOwner) -> BoxFut<'a, AutumnResult<()>> {
+        Box::pin(async move {
+            let record = TrackedJobRecord {
+                status: TrackedJobStatus::Pending,
+                progress_pct: None,
+                progress_message: None,
+                result: None,
+                error: None,
+                owner,
+                updated_at: chrono::Utc::now(),
+            };
+            self.write(key, &record).await
+        })
+    }
+
+    fn mark_running<'a>(&'a self, key: &'a str) -> BoxFut<'a, AutumnResult<()>> {
+        Box::pin(async move {
+            self.update(key, |record| {
+                if !record.status.is_terminal() {
+                    record.status = TrackedJobStatus::Running;
+                }
+            })
+            .await
+        })
+    }
+
+    fn set_progress<'a>(
+        &'a self,
+        key: &'a str,
+        pct: u8,
+        message: Option<String>,
+    ) -> BoxFut<'a, AutumnResult<()>> {
+        Box::pin(async move {
+            let pct = pct.min(100);
+            self.update(key, |record| {
+                if !record.status.is_terminal() {
+                    record.progress_pct = Some(pct);
+                    record.progress_message = message;
+                }
+            })
+            .await
+        })
+    }
+
+    fn complete<'a>(&'a self, key: &'a str, result: Value) -> BoxFut<'a, AutumnResult<()>> {
+        Box::pin(async move {
+            self.update(key, |record| {
+                record.status = TrackedJobStatus::Succeeded;
+                record.result = Some(result);
+                record.error = None;
+            })
+            .await
+        })
+    }
+
+    fn fail<'a>(&'a self, key: &'a str, error: String) -> BoxFut<'a, AutumnResult<()>> {
+        Box::pin(async move {
+            self.update(key, |record| {
+                record.status = TrackedJobStatus::Failed;
+                record.error = Some(error);
+                record.result = None;
+            })
+            .await
+        })
+    }
+
+    fn get<'a>(&'a self, key: &'a str) -> BoxFut<'a, AutumnResult<Option<TrackedJobRecord>>> {
+        Box::pin(async move { self.read(key).await })
+    }
+}
+
+/// Build a [`RedisJobTrackingStore`] from `[jobs.redis]` config. Returns
+/// `None` when no URL is configured or it fails to parse; the connection
+/// manager itself connects lazily, so this never blocks on Redis being up.
+#[cfg(feature = "redis")]
+fn build_redis_tracking_store(config: &crate::config::JobConfig) -> Option<RedisJobTrackingStore> {
+    let url = config
+        .redis
+        .url
+        .clone()
+        .filter(|url| !url.trim().is_empty())?;
+    let client = redis::Client::open(url).ok()?;
+    let connection = redis::aio::ConnectionManager::new_lazy_with_config(
+        client,
+        redis::aio::ConnectionManagerConfig::new(),
+    )
+    .ok()?;
+    Some(RedisJobTrackingStore::new(
+        connection,
+        config.redis.key_prefix.clone(),
+        config.tracking.ttl_secs,
+    ))
+}
+
+// ── Postgres store ───────────────────────────────────────────────────────────
+
+/// Postgres-backed [`JobTrackingStore`].
+///
+/// Each record is a single JSONB blob in `autumn_job_tracking`, keyed by the
+/// token hash, with lazy expiry (reads filter on `expires_at`; writes refresh
+/// it). See the `create_job_tracking` framework migration.
+#[cfg(feature = "db")]
+#[derive(Clone)]
+pub struct PgJobTrackingStore {
+    pool: diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+    ttl_secs: u64,
+    clock: Arc<dyn ClockSource>,
+}
+
+#[cfg(feature = "db")]
+#[derive(diesel::QueryableByName)]
+struct PgTrackingRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    record: String,
+}
+
+#[cfg(feature = "db")]
+impl PgJobTrackingStore {
+    /// Construct a store backed by `pool`, expiring records `ttl_secs` after
+    /// their last write.
+    #[must_use]
+    pub fn new(
+        pool: diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+        ttl_secs: u64,
+    ) -> Self {
+        Self {
+            pool,
+            ttl_secs,
+            clock: Arc::new(SystemClock),
+        }
+    }
+
+    /// Replace the clock used to evaluate expiry.
+    ///
+    /// Defaults to [`SystemClock`]; tests pass a
+    /// [`crate::time::FixedClock`] to make expiry deterministic.
+    #[must_use]
+    pub fn with_clock(mut self, clock: Arc<dyn ClockSource>) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    fn expires_at(&self, now: DateTime<Utc>) -> DateTime<Utc> {
+        now + chrono::TimeDelta::seconds(i64::try_from(self.ttl_secs).unwrap_or(i64::MAX))
+    }
+
+    async fn conn(
+        &self,
+    ) -> AutumnResult<
+        diesel_async::pooled_connection::deadpool::Object<diesel_async::AsyncPgConnection>,
+    > {
+        self.pool.get().await.map_err(|error| {
+            AutumnError::internal_server_error_msg(format!("job tracking pool error: {error}"))
+        })
+    }
+
+    /// Read-modify-write: a no-op if the key is unknown or expired.
+    async fn update(&self, key: &str, f: impl FnOnce(&mut TrackedJobRecord)) -> AutumnResult<()> {
+        use diesel::OptionalExtension as _;
+        use diesel_async::RunQueryDsl as _;
+
+        let now = self.clock.now();
+        let mut conn = self.conn().await?;
+        let row = diesel::sql_query(
+            "SELECT record FROM autumn_job_tracking WHERE key = $1 AND expires_at > $2",
+        )
+        .bind::<diesel::sql_types::Text, _>(key)
+        .bind::<diesel::sql_types::Timestamptz, _>(now)
+        .get_result::<PgTrackingRow>(&mut *conn)
+        .await
+        .optional()
+        .map_err(|error| {
+            AutumnError::internal_server_error_msg(format!("job tracking select failed: {error}"))
+        })?;
+
+        let Some(row) = row else {
+            return Ok(());
+        };
+        let mut record = serde_json::from_str::<TrackedJobRecord>(&row.record).map_err(
+            |error| {
+                AutumnError::internal_server_error_msg(format!(
+                    "job tracking deserialize failed: {error}"
+                ))
+            },
+        )?;
+        f(&mut record);
+        record.updated_at = now;
+        let payload = serde_json::to_string(&record).map_err(|error| {
+            AutumnError::internal_server_error_msg(format!(
+                "job tracking serialize failed: {error}"
+            ))
+        })?;
+
+        diesel::sql_query(
+            "UPDATE autumn_job_tracking SET record = $2::JSONB, updated_at = $3, expires_at = $4 \
+             WHERE key = $1",
+        )
+        .bind::<diesel::sql_types::Text, _>(key)
+        .bind::<diesel::sql_types::Text, _>(&payload)
+        .bind::<diesel::sql_types::Timestamptz, _>(now)
+        .bind::<diesel::sql_types::Timestamptz, _>(self.expires_at(now))
+        .execute(&mut *conn)
+        .await
+        .map_err(|error| {
+            AutumnError::internal_server_error_msg(format!("job tracking update failed: {error}"))
+        })?;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "db")]
+impl JobTrackingStore for PgJobTrackingStore {
+    fn create<'a>(&'a self, key: &'a str, owner: TrackedJobOwner) -> BoxFut<'a, AutumnResult<()>> {
+        Box::pin(async move {
+            use diesel_async::RunQueryDsl as _;
+
+            let now = self.clock.now();
+            let record = TrackedJobRecord {
+                status: TrackedJobStatus::Pending,
+                progress_pct: None,
+                progress_message: None,
+                result: None,
+                error: None,
+                owner,
+                updated_at: now,
+            };
+            let payload = serde_json::to_string(&record).map_err(|error| {
+                AutumnError::internal_server_error_msg(format!(
+                    "job tracking serialize failed: {error}"
+                ))
+            })?;
+            let mut conn = self.conn().await?;
+            diesel::sql_query(
+                "INSERT INTO autumn_job_tracking (key, record, updated_at, expires_at) \
+                 VALUES ($1, $2::JSONB, $3, $4) \
+                 ON CONFLICT (key) DO UPDATE SET \
+                     record = EXCLUDED.record, \
+                     updated_at = EXCLUDED.updated_at, \
+                     expires_at = EXCLUDED.expires_at",
+            )
+            .bind::<diesel::sql_types::Text, _>(key)
+            .bind::<diesel::sql_types::Text, _>(&payload)
+            .bind::<diesel::sql_types::Timestamptz, _>(now)
+            .bind::<diesel::sql_types::Timestamptz, _>(self.expires_at(now))
+            .execute(&mut *conn)
+            .await
+            .map_err(|error| {
+                AutumnError::internal_server_error_msg(format!(
+                    "job tracking insert failed: {error}"
+                ))
+            })?;
+            Ok(())
+        })
+    }
+
+    fn mark_running<'a>(&'a self, key: &'a str) -> BoxFut<'a, AutumnResult<()>> {
+        Box::pin(async move {
+            self.update(key, |record| {
+                if !record.status.is_terminal() {
+                    record.status = TrackedJobStatus::Running;
+                }
+            })
+            .await
+        })
+    }
+
+    fn set_progress<'a>(
+        &'a self,
+        key: &'a str,
+        pct: u8,
+        message: Option<String>,
+    ) -> BoxFut<'a, AutumnResult<()>> {
+        Box::pin(async move {
+            let pct = pct.min(100);
+            self.update(key, |record| {
+                if !record.status.is_terminal() {
+                    record.progress_pct = Some(pct);
+                    record.progress_message = message;
+                }
+            })
+            .await
+        })
+    }
+
+    fn complete<'a>(&'a self, key: &'a str, result: Value) -> BoxFut<'a, AutumnResult<()>> {
+        Box::pin(async move {
+            self.update(key, |record| {
+                record.status = TrackedJobStatus::Succeeded;
+                record.result = Some(result);
+                record.error = None;
+            })
+            .await
+        })
+    }
+
+    fn fail<'a>(&'a self, key: &'a str, error: String) -> BoxFut<'a, AutumnResult<()>> {
+        Box::pin(async move {
+            self.update(key, |record| {
+                record.status = TrackedJobStatus::Failed;
+                record.error = Some(error);
+                record.result = None;
+            })
+            .await
+        })
+    }
+
+    fn get<'a>(&'a self, key: &'a str) -> BoxFut<'a, AutumnResult<Option<TrackedJobRecord>>> {
+        Box::pin(async move {
+            use diesel::OptionalExtension as _;
+            use diesel_async::RunQueryDsl as _;
+
+            let now = self.clock.now();
+            let mut conn = self.conn().await?;
+            let row = diesel::sql_query(
+                "SELECT record FROM autumn_job_tracking WHERE key = $1 AND expires_at > $2",
+            )
+            .bind::<diesel::sql_types::Text, _>(key)
+            .bind::<diesel::sql_types::Timestamptz, _>(now)
+            .get_result::<PgTrackingRow>(&mut *conn)
+            .await
+            .optional()
+            .map_err(|error| {
+                AutumnError::internal_server_error_msg(format!(
+                    "job tracking select failed: {error}"
+                ))
+            })?;
+
+            row.map(|row| {
+                serde_json::from_str::<TrackedJobRecord>(&row.record).map_err(|error| {
+                    AutumnError::internal_server_error_msg(format!(
+                        "job tracking deserialize failed: {error}"
+                    ))
+                })
+            })
+            .transpose()
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1107,5 +1569,42 @@ mod tests {
             err.to_string().contains("job runtime is not initialized"),
             "unexpected error: {err}"
         );
+    }
+
+    // ── Redis/Postgres store selection (no live service needed) ──────────────
+
+    #[cfg(feature = "redis")]
+    #[test]
+    fn build_redis_tracking_store_is_none_without_a_url() {
+        let config = crate::config::JobConfig::default();
+        assert!(config.redis.url.is_none());
+        assert!(build_redis_tracking_store(&config).is_none());
+
+        let mut config = crate::config::JobConfig::default();
+        config.redis.url = Some("   ".to_owned());
+        assert!(build_redis_tracking_store(&config).is_none());
+    }
+
+    #[cfg(feature = "redis")]
+    #[tokio::test]
+    async fn build_redis_tracking_store_is_some_for_an_unreachable_but_well_formed_url() {
+        // ConnectionManager::new_lazy_with_config never dials eagerly, so
+        // construction succeeds even though nothing is listening on this port
+        // — it just needs a Tokio runtime context to spawn its background
+        // reconnect task onto.
+        let mut config = crate::config::JobConfig::default();
+        config.redis.url = Some("redis://127.0.0.1:19999".to_owned());
+        assert!(build_redis_tracking_store(&config).is_some());
+    }
+
+    #[cfg(feature = "redis")]
+    #[tokio::test]
+    async fn store_for_config_falls_back_to_memory_when_redis_backend_has_no_url() {
+        let mut config = crate::config::JobConfig::default();
+        config.backend = "redis".to_owned();
+        let state = AppState::for_test();
+        // Falling back must not panic; the resulting store is still usable.
+        let store = store_for_config(&state, &config);
+        assert!(store.get("nope").await.unwrap().is_none());
     }
 }
