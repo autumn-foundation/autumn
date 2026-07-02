@@ -654,12 +654,9 @@ mod tests {
             .lock_wait_timeout(Duration::from_millis(300))
             .lock_poll_interval(Duration::from_millis(50));
 
-        let value: i32 = autumn_web::cache::get_or_compute_with(&cache, key, opts, move || {
-            let fc = fc.clone();
-            async move {
-                fc.fetch_add(1, Ordering::SeqCst);
-                Ok::<i32, String>(123)
-            }
+        let value: i32 = autumn_web::cache::get_or_compute_with(&cache, key, opts, move || async move {
+            fc.fetch_add(1, Ordering::SeqCst);
+            Ok::<i32, String>(123)
         })
         .await
         .unwrap();
@@ -687,12 +684,9 @@ mod tests {
             &cache,
             "rt-key",
             Some(Duration::from_secs(60)),
-            move || {
-                let fc = fc.clone();
-                async move {
-                    fc.fetch_add(1, Ordering::SeqCst);
-                    Ok::<String, String>("value-from-redis".to_string())
-                }
+            move || async move {
+                fc.fetch_add(1, Ordering::SeqCst);
+                Ok::<String, String>("value-from-redis".to_string())
             },
         )
         .await
@@ -704,12 +698,9 @@ mod tests {
             &cache,
             "rt-key",
             Some(Duration::from_secs(60)),
-            move || {
-                let fc = fc.clone();
-                async move {
-                    fc.fetch_add(1, Ordering::SeqCst);
-                    Ok::<String, String>("should-not-run".to_string())
-                }
+            move || async move {
+                fc.fetch_add(1, Ordering::SeqCst);
+                Ok::<String, String>("should-not-run".to_string())
             },
         )
         .await
@@ -748,13 +739,10 @@ mod tests {
                     .lock_wait_timeout(Duration::from_secs(5));
                 handles.push(tokio::spawn(async move {
                     autumn_web::cache::get_or_compute_with::<String, String, _, _>(
-                        &replica, key, opts, move || {
-                            let fc = fc.clone();
-                            async move {
-                                fc.fetch_add(1, Ordering::SeqCst);
-                                tokio::time::sleep(Duration::from_millis(300)).await;
-                                Ok("cross-replica-value".to_string())
-                            }
+                        &replica, key, opts, move || async move {
+                            fc.fetch_add(1, Ordering::SeqCst);
+                            tokio::time::sleep(Duration::from_millis(300)).await;
+                            Ok("cross-replica-value".to_string())
                         },
                     )
                     .await

@@ -30,11 +30,11 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::watch;
 
-use super::Cache;
+use super::{Cache, FillLockStatus, get_cached, insert_cached};
 
 // ── Options ──────────────────────────────────────────────────────────
 
@@ -203,14 +203,25 @@ impl ReadThroughMetrics {
     /// Take a consistent-enough snapshot of all counters (each counter is
     /// read atomically; the set is not read under a global lock).
     pub fn snapshot(&self) -> ReadThroughMetricsSnapshot {
-        todo!("green phase")
+        ReadThroughMetricsSnapshot {
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+            coalesced_waits: self.coalesced_waits.load(Ordering::Relaxed),
+            fills: self.fills.load(Ordering::Relaxed),
+            fill_failures: self.fill_failures.load(Ordering::Relaxed),
+            stale_serves: self.stale_serves.load(Ordering::Relaxed),
+            fill_lock_acquires: self.fill_lock_acquires.load(Ordering::Relaxed),
+            fill_lock_contended: self.fill_lock_contended.load(Ordering::Relaxed),
+        }
     }
 }
 
 /// The process-wide [`ReadThroughMetrics`] instance updated by
 /// [`get_or_compute`] and [`get_or_compute_with`].
+#[must_use]
 pub fn read_through_metrics() -> &'static ReadThroughMetrics {
-    todo!("green phase")
+    static METRICS: LazyLock<ReadThroughMetrics> = LazyLock::new(ReadThroughMetrics::default);
+    &METRICS
 }
 
 // ── TTL jitter ───────────────────────────────────────────────────────
@@ -224,8 +235,28 @@ pub fn read_through_metrics() -> &'static ReadThroughMetrics {
 /// `0.0` (no jitter).
 #[must_use]
 pub fn jittered_ttl(base: Duration, fraction: f64) -> Duration {
-    let _ = (base, fraction);
-    todo!("green phase")
+    let fraction = if fraction.is_finite() {
+        fraction.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    if fraction == 0.0 {
+        return base;
+    }
+
+    let mut buf = [0_u8; 4];
+    if getrandom::getrandom(&mut buf).is_err() {
+        // Fallback entropy source if the OS RNG is unavailable.
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        buf = nanos.to_le_bytes();
+    }
+    let unit = f64::from(u32::from_le_bytes(buf)) / f64::from(u32::MAX);
+    // factor is uniform in [1 - fraction, 1 + fraction].
+    let factor = fraction.mul_add(2.0f64.mul_add(unit, -1.0), 1.0);
+    base.mul_f64(factor)
 }
 
 // ── In-flight registry (single-flight) ──────────────────────────────
@@ -238,17 +269,20 @@ enum FillState {
     Failed(Arc<str>),
 }
 
+/// Identifies a single in-flight fill: which cache backend, and which key.
+type InFlightKey = (usize, String);
+
 /// In-flight fills, keyed by (cache identity, key). Two distinct
 /// `Arc<dyn Cache>` allocations never coalesce with each other.
-#[allow(dead_code)] // used from the green phase onwards
-static IN_FLIGHT: LazyLock<Mutex<HashMap<(usize, String), watch::Receiver<FillState>>>> =
+static IN_FLIGHT: LazyLock<Mutex<HashMap<InFlightKey, watch::Receiver<FillState>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// RAII removal of an in-flight entry: covers success, error, panic, and
-/// cancellation (the leader's future being dropped mid-fill).
-#[allow(dead_code)] // used from the green phase onwards
+/// cancellation (the leader's future being dropped mid-fill). Dropping the
+/// paired `watch::Sender` also closes the channel, which is how waiters
+/// notice a cancelled leader and re-contend for leadership.
 struct InFlightGuard {
-    key: (usize, String),
+    key: InFlightKey,
 }
 
 impl Drop for InFlightGuard {
@@ -257,6 +291,341 @@ impl Drop for InFlightGuard {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&self.key);
+    }
+}
+
+/// Which role a caller plays for a given (cache, key): the single leader that
+/// runs the fill, or a waiter that awaits the leader's result.
+enum Role {
+    Leader(watch::Sender<FillState>, InFlightGuard),
+    Waiter(watch::Receiver<FillState>),
+}
+
+/// Identity of a cache backend, stable for the lifetime of the `Arc`
+/// allocation. Used so single-flight coalescing is scoped per cache handle:
+/// two distinct `Arc<dyn Cache>`s (e.g. two Redis "replica" connections in a
+/// test) never coalesce with each other, matching the fact that in-process
+/// coalescing is inherently per-process.
+fn cache_identity(cache: &Arc<dyn Cache>) -> usize {
+    (Arc::as_ptr(cache).cast::<()>()) as usize
+}
+
+/// Register as the leader for `(cache, key)`, or discover an existing leader
+/// and become a waiter. The `std::sync::Mutex` guard is held only for this
+/// synchronous lookup/insert — never across an `.await` point.
+fn claim_role(cache: &Arc<dyn Cache>, key: &str) -> Role {
+    use std::collections::hash_map::Entry;
+
+    let map_key: InFlightKey = (cache_identity(cache), key.to_owned());
+    // A single lock acquisition covers the whole check-then-insert so two
+    // threads can never both observe "no entry" and both become leader.
+    let mut in_flight = IN_FLIGHT.lock().unwrap_or_else(PoisonError::into_inner);
+    match in_flight.entry(map_key.clone()) {
+        Entry::Occupied(entry) => Role::Waiter(entry.get().clone()),
+        Entry::Vacant(entry) => {
+            let (tx, rx) = watch::channel(FillState::Pending);
+            entry.insert(rx);
+            Role::Leader(tx, InFlightGuard { key: map_key })
+        }
+    }
+}
+
+/// Await the leader's outcome. Returns `None` when the caller should retry
+/// (`claim_role` again) rather than trust the result: either the leader's
+/// future was dropped/cancelled before publishing an outcome (channel
+/// closed), or the leader published a value of a different type than `V`
+/// (the same key was used with two different value types).
+async fn await_result<V, E>(mut rx: watch::Receiver<FillState>) -> Option<Result<V, CacheFillError<E>>>
+where
+    V: Clone + Send + Sync + 'static,
+{
+    let state = {
+        let waited = rx.wait_for(|s| !matches!(s, FillState::Pending)).await;
+        match waited {
+            Ok(state_ref) => state_ref.clone(),
+            Err(_closed) => return None,
+        }
+    };
+    match state {
+        FillState::Pending => unreachable!("wait_for guarantees a non-pending state"),
+        FillState::Done(value) => value.downcast_ref::<V>().cloned().map(Ok),
+        FillState::Failed(message) => Some(Err(CacheFillError::FillFailed(message))),
+    }
+}
+
+// ── Stale-while-revalidate envelope ─────────────────────────────────
+
+/// Wraps a cached value with its freshness deadline when
+/// stale-while-revalidate is enabled. Stored in place of the bare value, so a
+/// key must be used consistently with or without SWR.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct SwrEnvelope<V> {
+    value: V,
+    fresh_until_unix_ms: u64,
+}
+
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+/// Read the current value regardless of freshness (used for lock-poll and
+/// leader double-checks, where "does a value exist yet" is all that matters).
+fn fast_path_value<V>(cache: &Arc<dyn Cache>, key: &str, options: &GetOrComputeOptions) -> Option<V>
+where
+    V: Clone + serde::de::DeserializeOwned + Send + Sync + 'static,
+{
+    if options.stale_while_revalidate.is_some() {
+        get_cached::<SwrEnvelope<V>>(cache.as_ref(), key).map(|envelope| envelope.value)
+    } else {
+        get_cached::<V>(cache.as_ref(), key)
+    }
+}
+
+/// Run the fill closure (honoring the distributed fill lock if enabled),
+/// write the result, and publish the outcome to `tx`. Shared by the cold-miss
+/// leader path and the stale-while-revalidate background refresh.
+async fn run_leader_fill<V, E, F, Fut>(
+    cache: &Arc<dyn Cache>,
+    key: &str,
+    options: &GetOrComputeOptions,
+    fill: F,
+    tx: watch::Sender<FillState>,
+) -> Result<V, CacheFillError<E>>
+where
+    V: Clone + serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
+    E: std::fmt::Display + Send + 'static,
+    F: FnOnce() -> Fut + Send,
+    Fut: Future<Output = Result<V, E>> + Send,
+{
+    if !options.distributed_fill_lock {
+        let result = fill().await;
+        return finish_fill(cache, key, options, result, &tx);
+    }
+
+    let token = uuid::Uuid::new_v4().to_string();
+    match cache.try_acquire_fill_lock(key, &token, options.lock_ttl) {
+        FillLockStatus::Unsupported => {
+            let result = fill().await;
+            finish_fill(cache, key, options, result, &tx)
+        }
+        FillLockStatus::Acquired => {
+            read_through_metrics()
+                .fill_lock_acquires
+                .fetch_add(1, Ordering::Relaxed);
+            let result = fill().await;
+            cache.release_fill_lock(key, &token);
+            finish_fill(cache, key, options, result, &tx)
+        }
+        FillLockStatus::Held => {
+            read_through_metrics()
+                .fill_lock_contended
+                .fetch_add(1, Ordering::Relaxed);
+            let start = Instant::now();
+            loop {
+                tokio::time::sleep(options.lock_poll_interval).await;
+
+                if let Some(value) = fast_path_value::<V>(cache, key, options) {
+                    let _ = tx.send(FillState::Done(Arc::new(value.clone())));
+                    return Ok(value);
+                }
+
+                if start.elapsed() >= options.lock_wait_timeout {
+                    // Bounded damage: give up waiting and fill locally rather
+                    // than block the caller indefinitely.
+                    let result = fill().await;
+                    return finish_fill(cache, key, options, result, &tx);
+                }
+
+                if cache.try_acquire_fill_lock(key, &token, options.lock_ttl)
+                    == FillLockStatus::Acquired
+                {
+                    read_through_metrics()
+                        .fill_lock_acquires
+                        .fetch_add(1, Ordering::Relaxed);
+                    let result = fill().await;
+                    cache.release_fill_lock(key, &token);
+                    return finish_fill(cache, key, options, result, &tx);
+                }
+            }
+        }
+    }
+}
+
+/// Write the fill outcome to the cache (as a bare value, or a
+/// [`SwrEnvelope`] when stale-while-revalidate is enabled) and publish it to
+/// waiters. A failure writes nothing, so the key is never poisoned.
+fn finish_fill<V, E>(
+    cache: &Arc<dyn Cache>,
+    key: &str,
+    options: &GetOrComputeOptions,
+    result: Result<V, E>,
+    tx: &watch::Sender<FillState>,
+) -> Result<V, CacheFillError<E>>
+where
+    V: Clone + serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
+    E: std::fmt::Display,
+{
+    match result {
+        Ok(value) => {
+            if let Some(grace) = options.stale_while_revalidate {
+                let ttl_ms = options
+                    .ttl
+                    .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+                let envelope = SwrEnvelope {
+                    value: value.clone(),
+                    fresh_until_unix_ms: now_unix_ms().saturating_add(ttl_ms),
+                };
+                let physical_ttl = options.ttl.map(|ttl| ttl + grace);
+                insert_cached(cache.as_ref(), key, envelope, physical_ttl);
+            } else {
+                insert_cached(cache.as_ref(), key, value.clone(), options.ttl);
+            }
+            read_through_metrics().fills.fetch_add(1, Ordering::Relaxed);
+            let _ = tx.send(FillState::Done(Arc::new(value.clone())));
+            Ok(value)
+        }
+        Err(error) => {
+            let message: Arc<str> = error.to_string().into();
+            read_through_metrics()
+                .fill_failures
+                .fetch_add(1, Ordering::Relaxed);
+            let _ = tx.send(FillState::Failed(message));
+            Err(CacheFillError::Fill(error))
+        }
+    }
+}
+
+/// Try to become the leader for a stale-while-revalidate background refresh.
+/// If another fill (a cold-miss leader, or an earlier refresh) is already
+/// in-flight for this key, do nothing and drop `fill` unrun — only one
+/// refresh should run at a time per key.
+fn spawn_background_refresh<V, E, F, Fut>(
+    cache: Arc<dyn Cache>,
+    key: String,
+    options: GetOrComputeOptions,
+    fill: F,
+) where
+    V: Clone + serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
+    E: std::fmt::Display + Send + 'static,
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = Result<V, E>> + Send + 'static,
+{
+    match claim_role(&cache, &key) {
+        Role::Leader(tx, guard) => {
+            tokio::spawn(async move {
+                let _result = run_leader_fill(&cache, &key, &options, fill, tx).await;
+                drop(guard);
+            });
+        }
+        Role::Waiter(_rx) => {
+            // A refresh (or an unrelated fill) is already in flight for this
+            // key; the stale value has already been returned to this caller.
+        }
+    }
+}
+
+/// In-process single-flight read-through: no stale-while-revalidate, so
+/// `fill` need not be `'static` (it is always awaited inline, never spawned).
+async fn simple_read_through<V, E, F, Fut>(
+    cache: &Arc<dyn Cache>,
+    key: &str,
+    options: &GetOrComputeOptions,
+    fill: F,
+) -> Result<V, CacheFillError<E>>
+where
+    V: Clone + serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
+    E: std::fmt::Display + Send + 'static,
+    F: FnOnce() -> Fut + Send,
+    Fut: Future<Output = Result<V, E>> + Send,
+{
+    loop {
+        if let Some(value) = get_cached::<V>(cache.as_ref(), key) {
+            read_through_metrics().hits.fetch_add(1, Ordering::Relaxed);
+            return Ok(value);
+        }
+        read_through_metrics().misses.fetch_add(1, Ordering::Relaxed);
+
+        match claim_role(cache, key) {
+            Role::Leader(tx, guard) => {
+                // Double-check: another leader may have filled the key
+                // between the fast-path read above and winning leadership.
+                if let Some(value) = get_cached::<V>(cache.as_ref(), key) {
+                    let _ = tx.send(FillState::Done(Arc::new(value.clone())));
+                    drop(guard);
+                    return Ok(value);
+                }
+                let result = run_leader_fill(cache, key, options, fill, tx).await;
+                drop(guard);
+                return result;
+            }
+            Role::Waiter(rx) => {
+                read_through_metrics()
+                    .coalesced_waits
+                    .fetch_add(1, Ordering::Relaxed);
+                if let Some(result) = await_result::<V, E>(rx).await {
+                    return result;
+                }
+                // Channel closed or type mismatch: loop back and re-contend.
+            }
+        }
+    }
+}
+
+/// Stale-while-revalidate read-through: `fill` must be `'static` because a
+/// stale read may hand it to a background task instead of awaiting it.
+async fn swr_read_through<V, E, F, Fut>(
+    cache: &Arc<dyn Cache>,
+    key: &str,
+    options: GetOrComputeOptions,
+    fill: F,
+) -> Result<V, CacheFillError<E>>
+where
+    V: Clone + serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
+    E: std::fmt::Display + Send + 'static,
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = Result<V, E>> + Send + 'static,
+{
+    loop {
+        match get_cached::<SwrEnvelope<V>>(cache.as_ref(), key) {
+            Some(envelope) if now_unix_ms() < envelope.fresh_until_unix_ms => {
+                read_through_metrics().hits.fetch_add(1, Ordering::Relaxed);
+                return Ok(envelope.value);
+            }
+            Some(envelope) => {
+                read_through_metrics()
+                    .stale_serves
+                    .fetch_add(1, Ordering::Relaxed);
+                spawn_background_refresh(cache.clone(), key.to_owned(), options.clone(), fill);
+                return Ok(envelope.value);
+            }
+            None => {
+                read_through_metrics().misses.fetch_add(1, Ordering::Relaxed);
+                match claim_role(cache, key) {
+                    Role::Leader(tx, guard) => {
+                        if let Some(envelope) = get_cached::<SwrEnvelope<V>>(cache.as_ref(), key) {
+                            let _ = tx.send(FillState::Done(Arc::new(envelope.value.clone())));
+                            drop(guard);
+                            return Ok(envelope.value);
+                        }
+                        let result = run_leader_fill(cache, key, &options, fill, tx).await;
+                        drop(guard);
+                        return result;
+                    }
+                    Role::Waiter(rx) => {
+                        read_through_metrics()
+                            .coalesced_waits
+                            .fetch_add(1, Ordering::Relaxed);
+                        if let Some(result) = await_result::<V, E>(rx).await {
+                            return result;
+                        }
+                        // Channel closed or type mismatch: loop back and re-contend.
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -293,8 +662,11 @@ where
     F: FnOnce() -> Fut + Send,
     Fut: Future<Output = Result<V, E>> + Send,
 {
-    let _ = (cache, key, ttl, fill);
-    todo!("green phase")
+    let options = GetOrComputeOptions {
+        ttl,
+        ..GetOrComputeOptions::new()
+    };
+    simple_read_through(cache, key, &options, fill).await
 }
 
 /// [`get_or_compute`] with cross-replica options: a distributed fill lock
@@ -319,8 +691,11 @@ where
     F: FnOnce() -> Fut + Send + 'static,
     Fut: Future<Output = Result<V, E>> + Send + 'static,
 {
-    let _ = (cache, key, options, fill);
-    todo!("green phase")
+    if options.stale_while_revalidate.is_some() {
+        swr_read_through(cache, key, options, fill).await
+    } else {
+        simple_read_through(cache, key, &options, fill).await
+    }
 }
 
 #[cfg(test)]
