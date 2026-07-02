@@ -24,10 +24,33 @@ use super::{Flags, GenerateError, ensure_project_root};
 /// Compute the file actions for `autumn generate pwa`.
 ///
 /// # Errors
-/// Returns [`GenerateError::NotInProject`] when not at a project root, or
-/// [`GenerateError::Io`] if `src/main.rs` / `Cargo.toml` can't be read.
+/// Returns [`GenerateError::NotInProject`] when not at a project root,
+/// [`GenerateError::Io`] if `src/main.rs` / `Cargo.toml` can't be read, or
+/// [`GenerateError::Config`] when `src/main.rs`'s `layout()` doesn't accept
+/// `current_path` — the generated `pwa_offline` handler calls `layout()`
+/// with the current `nav_bar`-based scaffold's arity, so an app that
+/// hasn't migrated its own `layout()` needs to before running this.
 pub fn plan_pwa(project_root: &Path) -> Result<Plan, GenerateError> {
     ensure_project_root(project_root)?;
+
+    // Read src/main.rs up front (rather than where it's injected below) so
+    // the layout() shape can be validated before any plan actions are built.
+    let main_path = project_root.join("src").join("main.rs");
+    let main_existing = std::fs::read_to_string(&main_path).map_err(|_| {
+        GenerateError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("missing {}", main_path.display()),
+        ))
+    })?;
+    if layout_missing_current_path(&main_existing) {
+        return Err(GenerateError::Config(format!(
+            "{}'s layout() doesn't accept current_path — update it to \
+             layout(title: &str, current_path: &str, flash: Markup, content: Markup) \
+             (see autumn-cli/src/templates/main.rs.tmpl for the current shape) \
+             before running `autumn generate pwa`",
+            main_path.display()
+        )));
+    }
 
     let mut plan = Plan::new(project_root);
 
@@ -57,13 +80,6 @@ pub fn plan_pwa(project_root: &Path) -> Result<Plan, GenerateError> {
     );
 
     // src/main.rs: inject PWA meta tags + route handlers (idempotent)
-    let main_path = project_root.join("src").join("main.rs");
-    let main_existing = std::fs::read_to_string(&main_path).map_err(|_| {
-        GenerateError::Io(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("missing {}", main_path.display()),
-        ))
-    })?;
     let updated_main = inject_pwa_into_main(&main_existing);
     if updated_main != main_existing {
         plan.modify(main_path, updated_main);
@@ -411,6 +427,19 @@ fn inject_pwa_meta_into_head(source: &str) -> String {
     result
 }
 
+/// True when `source` defines a `layout()` function whose signature doesn't
+/// mention `current_path` — the pre-`nav_bar` scaffold shape
+/// (`layout(title, flash, content)`) rather than the current one
+/// (`layout(title, current_path, flash, content)`). `pwa_offline`'s
+/// generated call assumes the current shape, so this gates [`plan_pwa`]
+/// with an actionable error instead of emitting code with the wrong arity.
+fn layout_missing_current_path(source: &str) -> bool {
+    source
+        .lines()
+        .find(|l| l.contains("fn layout("))
+        .is_some_and(|l| !l.contains("current_path"))
+}
+
 /// Append `pwa_manifest`, `pwa_service_worker`, `pwa_register_js`, and `pwa_offline`
 /// handler functions just before `#[autumn_web::main]`.  Idempotent — skipped when
 /// `pwa_manifest` is already defined.
@@ -575,7 +604,66 @@ async fn main() {
 }
 ";
 
+    /// The pre-`nav_bar` scaffold shape: `layout()` has no `current_path`
+    /// parameter. Apps generated before `nav_bar` shipped still look like this.
+    const OLD_SHAPE_MAIN: &str = "\
+use autumn_web::form::skip_link;
+use autumn_web::migrate::{EmbeddedMigrations, embed_migrations};
+use autumn_web::prelude::*;
+
+const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
+
+pub fn layout(title: &str, flash: maud::Markup, content: maud::Markup) -> maud::Markup {
+    maud::html! {
+        (maud::DOCTYPE)
+        html lang=\"en\" {
+            head {
+                meta charset=\"utf-8\";
+                title { (title) }
+            }
+            body {
+                (skip_link(\"#main-content\", \"Skip to main content\"))
+                main id=\"main-content\" role=\"main\" {
+                    (flash)
+                    (content)
+                }
+            }
+        }
+    }
+}
+
+#[get(\"/\")]
+async fn index(flash: Flash) -> maud::Markup {
+    layout(\"Welcome\", flash.render().await, maud::html! {
+        h1 { \"Welcome!\" }
+    })
+}
+
+#[autumn_web::main]
+async fn main() {
+    autumn_web::app()
+        .routes(routes![index])
+        .migrations(MIGRATIONS)
+        .run()
+        .await;
+}
+";
+
     // ── plan_pwa: file plan tests ─────────────────────────────────────────────
+
+    #[test]
+    fn plan_pwa_rejects_layout_missing_current_path() {
+        // nav_bar's arrival made layout() take current_path as its second
+        // argument; pwa_offline's generated call now assumes that shape.
+        // Running against an app that hasn't migrated must fail loudly with
+        // an actionable message instead of silently emitting a call that
+        // won't compile.
+        let tmp = project_with_main(OLD_SHAPE_MAIN);
+        let err = plan_pwa(tmp.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("current_path"), "{msg}");
+        assert!(msg.contains("layout"), "{msg}");
+    }
 
     #[test]
     fn plan_pwa_requires_project_root() {
