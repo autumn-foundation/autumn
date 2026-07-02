@@ -327,6 +327,171 @@ Semantics:
   adds the nullable `unique_key`/`unique_window`/`concurrency_key`/
   `concurrency_limit` columns; rows and jobs without them behave as before.
 
+## Tracked jobs and progress polling
+
+Plain `enqueue` is fire-and-forget — there's no handle, no progress, and
+nowhere for the caller to check "is it done yet?". `enqueue_tracked` fixes
+that: it returns a handle carrying a public, unguessable token, distinct
+from the internal job id, that the browser can poll at a built-in status
+route while the job reports progress from the inside.
+
+### Enqueue a tracked job
+
+```rust,ignore
+let handle = ExportOrdersJob::enqueue_tracked(ExportArgs { account_id: 42 }).await?;
+// handle.token is the raw, unguessable token — deliver it to the caller.
+// handle.status_path() is "/_autumn/jobs/{token}".
+```
+
+By default the token is an **anonymous capability**: anyone holding it can
+poll the status. To bind status access to the caller's session/user instead,
+use `enqueue_tracked_for` with an owner derived from the current session:
+
+```rust,ignore
+use autumn_web::job::TrackedJobOwner;
+
+let owner = TrackedJobOwner::from_session(&session, &state).await;
+let handle = ExportOrdersJob::enqueue_tracked_for(args, owner).await?;
+```
+
+A request whose session doesn't match the bound owner gets the identical
+`404` an unknown token would — the route is never an existence/ownership
+oracle.
+
+### Report progress from inside the handler
+
+Add a third `JobContext` argument to a `#[job]` handler to opt into
+progress reporting; the two-argument form keeps working unchanged:
+
+```rust,ignore
+#[job(name = "export_orders")]
+async fn export_orders(
+    state: AppState,
+    args: ExportArgs,
+    ctx: JobContext,
+) -> AutumnResult<()> {
+    ctx.set_progress(0, Some("Starting export")).await?;
+
+    // ... do the work, reporting progress as it goes ...
+    ctx.set_progress(50, Some("Rows 2500/5000")).await?;
+
+    // On success, the JSON result is whatever the caller wants back —
+    // e.g. a link to the finished file.
+    ctx.set_result(serde_json::json!({ "download_url": "/blob/orders-42.csv" }));
+    Ok(())
+}
+```
+
+If the handler returns `Err`, the job retries as usual (`max_attempts`,
+backoff); only the **final** failed attempt (or a panic, which always
+dead-letters) settles the tracked record to `failed`. Call
+`ctx.set_user_error("...")` before returning `Err` to control the message
+shown to the caller — otherwise a generic "The job failed." is recorded (the
+raw error is never leaked to the tracked-status response).
+
+### Poll the status
+
+`GET /_autumn/jobs/{token}` (mounted automatically; disable with
+`jobs.tracking.route_enabled = false`) is content-negotiated:
+
+- **API clients** (no `Accept: text/html`, no `HX-Request`) get JSON:
+
+  ```json
+  {"status": "running", "progress": 50, "message": "Rows 2500/5000", "result": null, "error": null}
+  ```
+
+- **htmx requests** (`HX-Request: true`) or a browser `Accept: text/html`
+  get a self-polling fragment. While the job is pending/running, the
+  fragment carries `hx-get={path} hx-trigger="every 2s" hx-swap="outerHTML"`,
+  so it keeps re-fetching and replacing itself with zero app-authored JS.
+  Once the job reaches a terminal state, the fragment drops every `hx-*`
+  attribute — htmx has nothing left to poll — and renders either a download
+  link (when the result carries a `download_url`) or the failure message.
+
+Embed the poll target directly in a page:
+
+```rust,ignore
+html! {
+    div hx-get=(handle.status_path()) hx-trigger="load" hx-swap="outerHTML" {
+        "Starting export…"
+    }
+}
+```
+
+### Result store TTL and backends
+
+Progress/result records expire `jobs.tracking.ttl_secs` after their last
+write (default `86400`, 24h). The record store follows whichever job
+backend is configured — `local` and `redis` use an in-memory or Redis-backed
+store respectively, `postgres` uses the `autumn_job_tracking` table (see
+[Migration notes](#migration-notes)) — so a tracked job's status composes
+with the backend an app already runs, with no extra setup.
+
+### Async CSV export, end to end
+
+The synchronous `GET /{plural}/export.csv` admin route runs inline on the
+request thread — fine for small tables, but a 50k-row export blocks the
+worker and risks tripping a proxy idle timeout. A tracked job moves that
+work off the request thread:
+
+```rust,ignore
+use autumn_web::data::csv::export_csv;
+use autumn_web::prelude::*;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExportOrdersArgs {
+    pub account_id: i64,
+}
+
+#[job(name = "export_orders")]
+async fn export_orders(
+    state: AppState,
+    args: ExportOrdersArgs,
+    ctx: JobContext,
+) -> AutumnResult<()> {
+    let repo = OrderRepository::from_state(&state);
+    let orders = repo.for_account(args.account_id).await?;
+
+    let total = orders.len();
+    let mut buffer = Vec::new();
+    for (i, chunk) in orders.chunks(500).enumerate() {
+        export_csv(chunk.iter().cloned(), &mut buffer)?;
+        let done = (i + 1) * 500.min(total);
+        ctx.set_progress(
+            u8::try_from(done * 100 / total.max(1)).unwrap_or(100),
+            Some(&format!("Rows {done}/{total}")),
+        )
+        .await?;
+    }
+
+    let url = state.storage().put("exports/orders.csv", buffer).await?;
+    ctx.set_result(serde_json::json!({ "download_url": url }));
+    Ok(())
+}
+
+// Kick it off from a request handler and hand back a poll target — the
+// initiating request returns immediately instead of blocking on the export.
+#[post("/orders/export")]
+async fn start_export(state: AppState, session: Session) -> AutumnResult<Markup> {
+    let owner = TrackedJobOwner::from_session(&session, &state).await;
+    let handle = ExportOrdersJob::enqueue_tracked_for(
+        ExportOrdersArgs { account_id: 1 },
+        owner,
+    )
+    .await?;
+
+    Ok(html! {
+        div hx-get=(handle.status_path()) hx-trigger="load" hx-swap="outerHTML" {
+            "Export starting…"
+        }
+    })
+}
+```
+
+The browser gets a progress bar within milliseconds and a download link the
+moment the job finishes — no hand-written status table, token, or polling
+endpoint anywhere in app code.
+
 ## Observability
 
 Mount `autumn-admin-plugin` to get the built-in operator dashboard at
@@ -361,11 +526,14 @@ workers start. Run your app migrations as a one-shot `autumn migrate` job before
 scaling web and worker replicas:
 
 ```bash
-autumn migrate   # creates autumn_jobs, your domain tables, etc.
+autumn migrate   # creates autumn_jobs, autumn_job_tracking, your domain tables, etc.
 ```
 
 The migration is bundled with the framework and is applied automatically by
-`autumn migrate` as long as the `db` feature is enabled.
+`autumn migrate` as long as the `db` feature is enabled. `enqueue_tracked`
+works the same way regardless of `jobs.backend` — the framework migration
+also creates `autumn_job_tracking`, the table the Postgres-backed tracking
+store uses (see [Tracked jobs and progress polling](#tracked-jobs-and-progress-polling)).
 
 ---
 
