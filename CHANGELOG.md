@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **jobs:** tracked job handles with progress reporting and a built-in
+  pollable status route (#1373). `job::enqueue_tracked`/`enqueue_tracked_for`
+  (and the generated `{Job}::enqueue_tracked`/`enqueue_tracked_for`
+  companions) return a `TrackedJobHandle` carrying a public, unguessable
+  token distinct from the internal job id. `#[job]` accepts an optional third
+  `JobContext` argument (`async fn(AppState, Args, JobContext)`) so a handler
+  can call `ctx.set_progress(pct, message)`, `ctx.set_result(json)`, and
+  `ctx.set_user_error(message)`; only the final failed attempt (or a panic)
+  settles the tracked record, so progress survives retries. A new
+  `GET /_autumn/jobs/{token}` route (on by default; opt out via
+  `jobs.tracking.route_enabled = false`) returns the status as JSON for API
+  clients or a self-polling htmx fragment (`hx-trigger="every 2s"`) for
+  browsers, dropping the poll trigger once the job reaches a terminal state.
+  Tokens can be bound to a session/user via `TrackedJobOwner`/
+  `TrackedJobOwner::from_session`; a mismatched or unknown token gets an
+  identical 404 (no enumeration/ownership oracle). Records expire after a
+  configurable TTL (`jobs.tracking.ttl_secs`, default 24h) and are persisted
+  by whichever job backend is already configured — in-memory (`local`),
+  Redis (`redis`), or the new `autumn_job_tracking` table (`postgres`, via a
+  bundled framework migration) — so tracked jobs need no separate setup.
+  Purely additive: existing `#[job]` handlers and `enqueue` calls are
+  unaffected; minor version bump.
+
 - **cli:** `references` field type for `autumn generate model`/`scaffold`
   (#1026). `post:references` (or `references:`, either casing) scaffolds a
   foreign key: the field name resolves to `post_id`, the referenced table is

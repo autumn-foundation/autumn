@@ -121,6 +121,10 @@ fn compile_pass_tests() {
     t.pass("tests/compile-pass/task_basic.rs");
     t.pass("tests/compile-pass/scheduled_coordination.rs");
 
+    // #[job] with a three-arg (AppState, Args, JobContext) signature and the
+    // generated enqueue_tracked/enqueue_tracked_for companions
+    t.pass("tests/compile-pass/job_tracked_three_arg.rs");
+
     // WebSocket macro (requires ws feature)
     #[cfg(feature = "ws")]
     t.pass("tests/compile-pass/ws_basic.rs");

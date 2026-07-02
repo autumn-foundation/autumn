@@ -394,6 +394,23 @@ pub fn scheduled(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// // queues = ["critical", "default", "low"]
 /// SendPasswordResetJob::enqueue(ResetArgs { user_id: 1 }).await?;
 /// ```
+///
+/// Accept an optional third `JobContext` argument to report progress and
+/// record a terminal result/error for jobs enqueued with `enqueue_tracked`
+/// (the companion struct gains `enqueue_tracked` / `enqueue_tracked_for`
+/// alongside `enqueue`):
+///
+/// ```ignore
+/// #[job(name = "export_orders")]
+/// async fn export_orders(state: AppState, args: ExportArgs, ctx: JobContext) -> AutumnResult<()> {
+///     ctx.set_progress(50, Some("Rows 1200/5000")).await?;
+///     ctx.set_result(serde_json::json!({ "download_url": "/blob/abc.csv" }));
+///     Ok(())
+/// }
+///
+/// let handle = ExportOrdersJob::enqueue_tracked(ExportArgs { account_id: 1 }).await?;
+/// println!("poll at {}", handle.status_path());
+/// ```
 #[proc_macro_attribute]
 pub fn job(attr: TokenStream, item: TokenStream) -> TokenStream {
     job::job_macro(attr.into(), item.into()).into()

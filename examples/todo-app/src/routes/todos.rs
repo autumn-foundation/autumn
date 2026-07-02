@@ -264,7 +264,15 @@ fn todo_count_badge(total: i64, done: i64) -> Markup {
                     }
                 }
             }
+            button
+                hx-post=(paths::start_export())
+                hx-target="#export-status"
+                hx-swap="outerHTML"
+                class="text-xs text-amber-700 hover:text-amber-900 underline" {
+                "Export CSV"
+            }
         }
+        div id="export-status" {}
     }
 }
 
@@ -464,6 +472,31 @@ pub async fn create(db: Db, form: ChangesetForm<TodoForm>) -> AutumnResult<impl 
     }
 }
 
+/// Kick off an async CSV export (issue #1373) and hand back an htmx fragment
+/// that polls the built-in tracked-job status route for progress and the
+/// eventual download link. The request itself returns immediately — the
+/// export runs as a background job instead of blocking this thread.
+#[post("/todos/export")]
+pub async fn start_export() -> AutumnResult<Markup> {
+    let handle =
+        crate::jobs::ExportTodosCsvJob::enqueue_tracked(crate::jobs::ExportTodosArgs {}).await?;
+    Ok(export_status_fragment(&handle.status_path()))
+}
+
+/// The self-polling fragment embedded by [`start_export`] and re-rendered by
+/// the built-in `GET /_autumn/jobs/{token}` route on every 2s poll.
+fn export_status_fragment(poll_path: &str) -> Markup {
+    html! {
+        div id="export-status"
+            hx-get=(poll_path)
+            hx-trigger="load"
+            hx-swap="outerHTML"
+            class="text-xs text-stone-400 mt-1" {
+            "Preparing export…"
+        }
+    }
+}
+
 fn page_request_from_hx(hx: &HxRequest) -> PageRequest {
     if let Some(parsed_url) = hx
         .current_url
@@ -560,7 +593,8 @@ autumn_web::paths![
     create,
     validate_title,
     toggle,
-    delete_todo
+    delete_todo,
+    start_export
 ];
 
 #[cfg(test)]
@@ -576,6 +610,15 @@ mod tests {
         assert_eq!(paths::toggle(7), "/todos/7/toggle");
         assert_eq!(paths::delete_todo(3), "/todos/3");
         assert_eq!(paths::create(), "/todos");
+        assert_eq!(paths::start_export(), "/todos/export");
+    }
+
+    #[test]
+    fn export_status_fragment_polls_the_tracked_job_status_route() {
+        let html = export_status_fragment("/_autumn/jobs/abc123").into_string();
+        assert!(html.contains(r#"hx-get="/_autumn/jobs/abc123""#), "{html}");
+        assert!(html.contains(r#"hx-trigger="load""#), "{html}");
+        assert!(html.contains(r#"hx-swap="outerHTML""#), "{html}");
     }
 
     #[test]
