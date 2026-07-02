@@ -129,6 +129,12 @@ const ADMIN_CSS: &str = "
         padding: 1rem 1.5rem 0.375rem;
         font-weight: 600;
     }
+    /* The sidebar hides itself entirely below 768px (see the .admin-sidebar
+       rule in the Responsive section) instead of collapsing behind nav_bar's
+       own hamburger toggle, so the toggle stays hidden at every width. */
+    .admin-sidebar .autumn-nav__toggle {
+        display: none;
+    }
 
     /* Cards */
     .card {
@@ -433,16 +439,16 @@ pub fn admin_layout(
     if registry.model_count() > 0 {
         nav_items.push(NavItem::section("Models"));
         nav_items.extend(registry.iter().map(|(slug, model)| {
-            NavItem::link(&format!("{prefix}/{slug}"), model.display_name_plural())
+            NavItem::link(format!("{prefix}/{slug}"), model.display_name_plural())
         }));
     }
     nav_items.push(NavItem::section("System"));
-    nav_items.push(NavItem::link(&jobs_href, "Jobs"));
+    nav_items.push(NavItem::link(jobs_href, "Jobs"));
     if show_config {
-        nav_items.push(NavItem::link(&config_href, "Runtime Config"));
+        nav_items.push(NavItem::link(config_href, "Runtime Config"));
     }
     nav_items.push(NavItem::plain_link(
-        &format!("{actuator_prefix}/ui"),
+        format!("{actuator_prefix}/ui"),
         "Actuator",
     ));
     let sidebar_nav = NavBarConfig::new()
@@ -467,6 +473,11 @@ pub fn admin_layout(
                 title { (title) " — Autumn Admin" }
                 script src=(HTMX_JS_PATH) {}
                 script src=(HTMX_CSRF_JS_PATH) {}
+                // Reveals/wires up nav_bar's hamburger toggle and any future
+                // dropdown menu; the sidebar itself stays fully visible/hidden
+                // via the .admin-sidebar media-query rule below, not the
+                // toggle, so its own toggle button is kept CSS-hidden always.
+                script src=(autumn_web::htmx::AUTUMN_WIDGETS_JS_PATH) defer {}
                 // External so it runs under the default CSP `script-src 'self'`.
                 script src={ (prefix) (&**ADMIN_JS_PATH) } {}
                 style {
@@ -3971,78 +3982,7 @@ mod tests {
 
     // ── admin_layout nav_bar (#1137) ──────────────────────────────────────
 
-    struct DummyModel {
-        slug: &'static str,
-        name: &'static str,
-    }
-
-    impl crate::traits::AdminModel for DummyModel {
-        fn slug(&self) -> &'static str {
-            self.slug
-        }
-        fn display_name(&self) -> &'static str {
-            self.name
-        }
-        fn display_name_plural(&self) -> &'static str {
-            self.name
-        }
-        fn fields(&self) -> Vec<AdminField> {
-            vec![]
-        }
-        fn list(
-            &self,
-            _pool: &diesel_async::pooled_connection::deadpool::Pool<
-                diesel_async::AsyncPgConnection,
-            >,
-            _params: crate::traits::ListParams,
-        ) -> crate::traits::AdminFuture<'_, ListResult> {
-            Box::pin(async {
-                Ok(ListResult {
-                    records: vec![],
-                    total: 0,
-                    page: 1,
-                    per_page: 25,
-                })
-            })
-        }
-        fn get(
-            &self,
-            _pool: &diesel_async::pooled_connection::deadpool::Pool<
-                diesel_async::AsyncPgConnection,
-            >,
-            _id: i64,
-        ) -> crate::traits::AdminFuture<'_, Option<Value>> {
-            Box::pin(async { Ok(None) })
-        }
-        fn create(
-            &self,
-            _pool: &diesel_async::pooled_connection::deadpool::Pool<
-                diesel_async::AsyncPgConnection,
-            >,
-            data: Value,
-        ) -> crate::traits::AdminFuture<'_, Value> {
-            Box::pin(async move { Ok(data) })
-        }
-        fn update(
-            &self,
-            _pool: &diesel_async::pooled_connection::deadpool::Pool<
-                diesel_async::AsyncPgConnection,
-            >,
-            _id: i64,
-            data: Value,
-        ) -> crate::traits::AdminFuture<'_, Value> {
-            Box::pin(async move { Ok(data) })
-        }
-        fn delete(
-            &self,
-            _pool: &diesel_async::pooled_connection::deadpool::Pool<
-                diesel_async::AsyncPgConnection,
-            >,
-            _id: i64,
-        ) -> crate::traits::AdminFuture<'_, ()> {
-            Box::pin(async { Ok(()) })
-        }
-    }
+    use crate::registry::tests::DummyModel;
 
     fn render_layout_with_registry(registry: &AdminRegistry, active_slug: Option<&str>) -> String {
         admin_layout(
@@ -4122,5 +4062,26 @@ mod tests {
         let html = render_layout(None);
         assert!(!html.contains(r#"class="admin-nav""#), "{html}");
         assert!(!html.contains("admin-logo"), "{html}");
+    }
+
+    #[test]
+    fn admin_layout_loads_nav_bar_widget_runtime() {
+        // nav_bar's hamburger toggle and any future dropdown depend on
+        // autumn-widgets.js to reveal/wire them up; without it the toggle
+        // stays permanently hidden and dead.
+        let html = render_layout(None);
+        assert!(
+            html.contains(autumn_web::htmx::AUTUMN_WIDGETS_JS_PATH),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn admin_sidebar_toggle_stays_hidden() {
+        // The admin sidebar hides itself entirely below 768px (see the
+        // .admin-sidebar { display: none } media rule) rather than using
+        // nav_bar's own collapse-behind-a-hamburger UX, so the toggle must
+        // never become visible even once autumn-widgets.js unhides it.
+        assert!(ADMIN_CSS.contains(".autumn-nav__toggle"), "{ADMIN_CSS}");
     }
 }
