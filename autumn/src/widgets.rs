@@ -1329,7 +1329,7 @@ impl NavItem {
 
     /// A dropdown menu item.
     #[must_use]
-    pub fn menu(menu: NavMenu) -> Self {
+    pub const fn menu(menu: NavMenu) -> Self {
         Self::Menu(menu)
     }
 
@@ -1460,10 +1460,11 @@ impl NavBarConfig {
     }
 }
 
-/// Render an accessible top navigation bar (or sidebar, via
-/// [`NavBarLayout::Sidebar`]): a labelled `<nav>` landmark containing an
-/// optional brand, primary items, a hidden-until-enhanced hamburger toggle,
-/// and an optional right-aligned trailing item list.
+/// Render an accessible top navigation bar (or sidebar, via [`NavBarLayout::Sidebar`]).
+///
+/// Emits a labelled `<nav>` landmark containing an optional brand, primary
+/// items, a hidden-until-enhanced hamburger toggle, and an optional
+/// right-aligned trailing item list.
 ///
 /// Every [`NavItem::Link`] built with [`NavItem::link`] / `link_matched`
 /// renders through [`nav_link_matched`], so it carries `class="active"` and
@@ -1594,10 +1595,10 @@ fn render_nav_items(
 /// [`NavLinkMatch`] mode, or as a plain never-active anchor otherwise.
 #[cfg(feature = "maud")]
 fn render_nav_link_item(current_path: &str, link: &NavLinkItem) -> maud::Markup {
-    match link.match_mode {
-        Some(mode) => nav_link_matched(current_path, &link.href, &link.label, mode),
-        None => maud::html! { a href=(link.href) { (link.label) } },
+    if let Some(mode) = link.match_mode {
+        return nav_link_matched(current_path, &link.href, &link.label, mode);
     }
+    maud::html! { a href=(link.href) { (link.label) } }
 }
 
 /// Render a dropdown menu `<li>`: a trigger `<button>` plus its `<ul>` of
@@ -3133,10 +3134,7 @@ mod tests {
     fn nav_bar_escapes_labels() {
         let config = NavBarConfig::new()
             .brand("<script>alert(1)</script>", "/")
-            .item(NavItem::link(
-                "/posts",
-                "<script>alert(2)</script>",
-            ))
+            .item(NavItem::link("/posts", "<script>alert(2)</script>"))
             .item(NavItem::menu(
                 NavMenu::new("<script>alert(3)</script>").link("/x", "<script>alert(4)</script>"),
             ));
