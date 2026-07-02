@@ -102,9 +102,15 @@
   // so all links stay visible with JS off. Once it runs, the hamburger is
   // revealed and dropdowns collapse into working disclosure widgets.
 
+  // Total open dropdown menus across every nav_bar on the page, so the
+  // document-level click-outside handler below can skip its DOM query
+  // entirely on the common case where nothing is open.
+  var openNavMenuCount = 0;
+
   function closeNavMenu(toggle) {
     var menu = document.getElementById(toggle.getAttribute('aria-controls'));
     if (!menu) return;
+    if (toggle.getAttribute('aria-expanded') === 'true') openNavMenuCount--;
     toggle.setAttribute('aria-expanded', 'false');
     menu.hidden = true;
   }
@@ -112,6 +118,7 @@
   function openNavMenu(toggle) {
     var menu = document.getElementById(toggle.getAttribute('aria-controls'));
     if (!menu) return;
+    if (toggle.getAttribute('aria-expanded') !== 'true') openNavMenuCount++;
     toggle.setAttribute('aria-expanded', 'true');
     menu.hidden = false;
   }
@@ -152,8 +159,10 @@
     });
   }
 
-  // Clicking outside a nav_bar closes any of its open dropdowns.
+  // Clicking outside a nav_bar closes any of its open dropdowns. Skips the
+  // DOM query entirely when no dropdown is open anywhere on the page.
   document.addEventListener('click', function (e) {
+    if (openNavMenuCount === 0) return;
     document.querySelectorAll('[data-nav-menu-toggle][aria-expanded="true"]').forEach(function (menuToggle) {
       var nav = menuToggle.closest('[data-autumn-nav]');
       if (nav && !nav.contains(e.target)) closeNavMenu(menuToggle);
