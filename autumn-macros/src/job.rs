@@ -259,13 +259,15 @@ pub fn job_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             .to_compile_error();
     }
 
-    if input_fn.sig.inputs.len() != 2 {
+    if input_fn.sig.inputs.len() != 2 && input_fn.sig.inputs.len() != 3 {
         return syn::Error::new_spanned(
             &input_fn.sig.ident,
-            "#[job] function must have signature async fn(AppState, Args)",
+            "#[job] function must have signature async fn(AppState, Args) or \
+             async fn(AppState, Args, JobContext)",
         )
         .to_compile_error();
     }
+    let takes_context = input_fn.sig.inputs.len() == 3;
 
     let mut inputs = input_fn.sig.inputs.iter();
     let _state_arg = inputs.next();
@@ -279,6 +281,13 @@ pub fn job_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             .to_compile_error();
         }
     };
+    if takes_context && !matches!(inputs.next(), Some(FnArg::Typed(_))) {
+        return syn::Error::new_spanned(
+            &input_fn.sig.ident,
+            "#[job] third argument must be a typed JobContext",
+        )
+        .to_compile_error();
+    }
 
     let fn_name = &input_fn.sig.ident;
     let companion_name = format_ident!("__autumn_job_info_{fn_name}");
@@ -289,6 +298,12 @@ pub fn job_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let queue = attrs.queue.clone().unwrap_or_else(|| "default".to_string());
     let uniqueness = uniqueness_tokens(&attrs);
     let concurrency = concurrency_tokens(&attrs);
+
+    let handler_call = if takes_context {
+        quote! { #fn_name(state, args, ::autumn_web::job::JobContext::current()).await }
+    } else {
+        quote! { #fn_name(state, args).await }
+    };
 
     quote! {
         #input_fn
@@ -321,6 +336,27 @@ pub fn job_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     .map_err(|e| ::autumn_web::AutumnError::internal_server_error(::std::io::Error::other(format!("job args serialization failed: {e}"))))?;
                 ::autumn_web::job::enqueue_at(#job_name, payload, when).await
             }
+
+            /// Enqueue this job and return a handle carrying a public,
+            /// unguessable token that grants anonymous (capability-only)
+            /// access to its tracked status via the built-in status route.
+            pub async fn enqueue_tracked(args: #args_type) -> ::autumn_web::AutumnResult<::autumn_web::job::TrackedJobHandle> {
+                let payload = ::autumn_web::reexports::serde_json::to_value(&args)
+                    .map_err(|e| ::autumn_web::AutumnError::internal_server_error(::std::io::Error::other(format!("job args serialization failed: {e}"))))?;
+                ::autumn_web::job::enqueue_tracked(#job_name, payload).await
+            }
+
+            /// Like [`Self::enqueue_tracked`], binding the tracked status to
+            /// `owner` so only a request matching that session/user may poll
+            /// it.
+            pub async fn enqueue_tracked_for(
+                args: #args_type,
+                owner: ::autumn_web::job::TrackedJobOwner,
+            ) -> ::autumn_web::AutumnResult<::autumn_web::job::TrackedJobHandle> {
+                let payload = ::autumn_web::reexports::serde_json::to_value(&args)
+                    .map_err(|e| ::autumn_web::AutumnError::internal_server_error(::std::io::Error::other(format!("job args serialization failed: {e}"))))?;
+                ::autumn_web::job::enqueue_tracked_for(#job_name, payload, owner).await
+            }
         }
 
         #[doc(hidden)]
@@ -336,7 +372,7 @@ pub fn job_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     Box::pin(async move {
                         let args: #args_type = ::autumn_web::reexports::serde_json::from_value(payload)
                             .map_err(|e| ::autumn_web::AutumnError::internal_server_error(::std::io::Error::other(format!("job args deserialization failed: {e}"))))?;
-                        #fn_name(state, args).await
+                        #handler_call
                     })
                 },
             }
@@ -569,6 +605,116 @@ mod tests {
         assert!(
             expanded.contains("concurrency : :: std :: option :: Option :: None"),
             "{expanded}"
+        );
+    }
+
+    #[test]
+    fn job_macro_generates_enqueue_tracked_companions() {
+        let expanded = job_macro(
+            quote! { name = "export_orders" },
+            quote! {
+                async fn export_orders(state: AppState, args: ExportArgs) -> AutumnResult<()> {
+                    Ok(())
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            expanded.contains("async fn enqueue_tracked"),
+            "missing enqueue_tracked: {expanded}"
+        );
+        assert!(
+            expanded.contains("async fn enqueue_tracked_for"),
+            "missing enqueue_tracked_for: {expanded}"
+        );
+        assert!(
+            expanded.contains(":: autumn_web :: job :: enqueue_tracked (\"export_orders\" , payload)"),
+            "enqueue_tracked companion should delegate to the module-level free function: {expanded}"
+        );
+        assert!(
+            expanded.contains(":: autumn_web :: job :: enqueue_tracked_for"),
+            "enqueue_tracked_for companion should delegate to the module-level free function: {expanded}"
+        );
+        assert!(
+            expanded.contains("TrackedJobHandle"),
+            "companions should return TrackedJobHandle: {expanded}"
+        );
+        assert!(
+            expanded.contains("TrackedJobOwner"),
+            "enqueue_tracked_for should accept a TrackedJobOwner: {expanded}"
+        );
+    }
+
+    #[test]
+    fn job_macro_accepts_three_arg_signature_and_passes_context_current() {
+        let expanded = job_macro(
+            quote! {},
+            quote! {
+                async fn export_orders(state: AppState, args: ExportArgs, ctx: JobContext) -> AutumnResult<()> {
+                    Ok(())
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            expanded.contains(":: autumn_web :: job :: JobContext :: current ()"),
+            "three-arg handler should be invoked with JobContext::current(): {expanded}"
+        );
+        assert!(
+            expanded.contains("export_orders (state , args , :: autumn_web :: job :: JobContext :: current ())"),
+            "generated handler closure should call the user fn with the context: {expanded}"
+        );
+    }
+
+    #[test]
+    fn job_macro_two_arg_expansion_does_not_reference_job_context() {
+        let expanded = job_macro(
+            quote! {},
+            quote! {
+                async fn plain(state: AppState, args: PlainArgs) -> AutumnResult<()> {
+                    Ok(())
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            !expanded.contains("JobContext"),
+            "two-arg expansion must stay unchanged: {expanded}"
+        );
+        assert!(expanded.contains("plain (state , args) . await"), "{expanded}");
+    }
+
+    #[test]
+    fn job_macro_rejects_one_arg_signature() {
+        let expanded = job_macro(
+            quote! {},
+            quote! {
+                async fn plain(state: AppState) -> AutumnResult<()> {
+                    Ok(())
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            expanded.contains("must have signature"),
+            "expected a compile error about the signature: {expanded}"
+        );
+    }
+
+    #[test]
+    fn job_macro_rejects_four_arg_signature() {
+        let expanded = job_macro(
+            quote! {},
+            quote! {
+                async fn plain(state: AppState, args: PlainArgs, ctx: JobContext, extra: u8) -> AutumnResult<()> {
+                    Ok(())
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            expanded.contains("must have signature"),
+            "expected a compile error about the signature: {expanded}"
         );
     }
 }
