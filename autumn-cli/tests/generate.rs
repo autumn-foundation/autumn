@@ -1049,6 +1049,203 @@ fn generated_job_cargo_checks() {
     );
 }
 
+// ── autumn generate channel integration tests ─────────────────────────────────
+
+#[test]
+fn generate_channel_creates_all_expected_files() {
+    let (_tmp, project) = fresh_project("channel-app");
+    let (stdout, _stderr) = run_autumn(&project, &["generate", "channel", "Chat"]);
+    assert!(
+        stdout.contains("chat.rs") || stdout.contains("Created"),
+        "output should mention created files: {stdout}"
+    );
+
+    assert!(project.join("src/channels/chat.rs").is_file());
+    let channel = fs::read_to_string(project.join("src/channels/chat.rs")).unwrap();
+    assert!(channel.contains(r#"#[get("/chat")]"#));
+    assert!(channel.contains(r#"#[get("/chat/events")]"#));
+    assert!(channel.contains(r#"#[post("/chat/messages")]"#));
+    assert!(channel.contains(r#"sse-connect="/chat/events""#));
+    assert!(channel.contains(r#"sse-swap="message""#));
+    assert!(channel.contains("autumn_web::sse::stream"));
+
+    assert!(project.join("src/channels/mod.rs").is_file());
+    let mod_rs = fs::read_to_string(project.join("src/channels/mod.rs")).unwrap();
+    assert!(mod_rs.contains("pub mod chat;"));
+
+    let main = fs::read_to_string(project.join("src/main.rs")).unwrap();
+    assert!(main.contains("mod channels;"));
+    assert!(main.contains("channels::chat::chat_page"));
+    assert!(main.contains("channels::chat::chat_events"));
+    assert!(main.contains("channels::chat::chat_publish"));
+
+    assert!(project.join("tests/chat_channel.rs").is_file());
+    let test_src = fs::read_to_string(project.join("tests/chat_channel.rs")).unwrap();
+    assert!(test_src.contains("TestApp"));
+    assert!(test_src.contains(".subscribe("));
+    assert!(!test_src.contains("#[ignore"));
+
+    let cargo = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+    assert!(
+        cargo.contains("\"ws\""),
+        "Cargo.toml must enable the ws feature: {cargo}"
+    );
+    assert!(cargo.contains("maud"));
+    assert!(cargo.contains("serde"));
+}
+
+#[test]
+fn generate_channel_ws_emits_ws_handler() {
+    let (_tmp, project) = fresh_project("channel-ws-app");
+    run_autumn(&project, &["generate", "channel", "Chat", "--ws"]);
+
+    let channel = fs::read_to_string(project.join("src/channels/chat.rs")).unwrap();
+    assert!(channel.contains(r#"#[ws("/chat/ws")]"#));
+    assert!(channel.contains("WithShutdown"));
+    assert!(!channel.contains("sse-connect"));
+
+    let main = fs::read_to_string(project.join("src/main.rs")).unwrap();
+    assert!(main.contains("channels::chat::chat_ws"));
+    assert!(main.contains("channels::chat::chat_publish"));
+
+    let cargo = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+    assert!(cargo.contains("\"ws\""));
+}
+
+#[test]
+fn generate_channel_dry_run_writes_nothing() {
+    let (_tmp, project) = fresh_project("channel-dry-app");
+    let (stdout, _) = run_autumn(&project, &["generate", "channel", "Chat", "--dry-run"]);
+    assert!(
+        stdout.contains("Dry run"),
+        "dry run must print Dry run header: {stdout}"
+    );
+    assert!(!project.join("src/channels/chat.rs").exists());
+    assert!(!project.join("tests/chat_channel.rs").exists());
+}
+
+#[test]
+fn generate_channel_collision_without_force_fails() {
+    let (_tmp, project) = fresh_project("channel-collide-app");
+    run_autumn(&project, &["generate", "channel", "Chat"]);
+    let (_, stderr, code) = run_autumn_failing(&project, &["generate", "channel", "Chat"]);
+    assert_eq!(code, Some(1), "second run without --force must exit 1");
+    assert!(
+        stderr.contains("would overwrite") || stderr.contains("chat.rs"),
+        "must report collision: {stderr}"
+    );
+}
+
+#[test]
+fn generate_channel_force_overwrites_existing() {
+    let (_tmp, project) = fresh_project("channel-force-app");
+    run_autumn(&project, &["generate", "channel", "Chat"]);
+    let path = project.join("src/channels/chat.rs");
+    fs::write(&path, "// corrupted").unwrap();
+    run_autumn(&project, &["generate", "channel", "Chat", "--force"]);
+    let content = fs::read_to_string(&path).unwrap();
+    assert!(
+        content.contains("TOPIC"),
+        "--force must regenerate the channel file"
+    );
+}
+
+#[test]
+fn generate_channel_sse_ws_conflict_fails() {
+    let (_tmp, project) = fresh_project("channel-conflict-app");
+    let (_, stderr, code) =
+        run_autumn_failing(&project, &["generate", "channel", "Chat", "--sse", "--ws"]);
+    assert_ne!(code, Some(0), "--sse and --ws together must fail");
+    assert!(
+        stderr.contains("cannot be used with") || stderr.contains("conflict"),
+        "clap should report the conflicting flags: {stderr}"
+    );
+}
+
+/// Slow end-to-end check: scaffold a fresh project, run `autumn generate
+/// channel` (default SSE transport), and `cargo check --tests` the result
+/// against the local `autumn-web` crate. Verifies the generator adds every
+/// dep its emitted code needs and that the generated application and smoke
+/// test actually type-check.
+///
+/// Ignored by default; run with `cargo test -p autumn-cli -- --ignored`.
+#[test]
+#[ignore = "slow: cargo-checks a fresh project — run with `cargo test -p autumn-cli -- --ignored`"]
+fn generated_channel_cargo_checks() {
+    let (_tmp, project) = fresh_project("channel-build");
+    patch_generated_cargo_toml(&project);
+
+    run_autumn(&project, &["generate", "channel", "Chat"]);
+
+    let check = Command::new("cargo")
+        .args(["check", "--tests"])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "cargo check on generated channel (SSE) failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr),
+    );
+}
+
+/// Same as [`generated_channel_cargo_checks`] but for the `--ws` transport.
+///
+/// Ignored by default; run with `cargo test -p autumn-cli -- --ignored`.
+#[test]
+#[ignore = "slow: cargo-checks a fresh project — run with `cargo test -p autumn-cli -- --ignored`"]
+fn generated_channel_ws_cargo_checks() {
+    let (_tmp, project) = fresh_project("channel-ws-build");
+    patch_generated_cargo_toml(&project);
+
+    run_autumn(&project, &["generate", "channel", "Chat", "--ws"]);
+
+    let check = Command::new("cargo")
+        .args(["check", "--tests"])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "cargo check on generated channel (--ws) failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr),
+    );
+}
+
+/// Slow end-to-end check: scaffold a fresh project, run `autumn generate
+/// channel`, and actually run the generated smoke test with `cargo test`.
+/// This is the acceptance-criterion proof that the smoke test does not just
+/// compile but passes on first run with no manual edits — it publishes a
+/// message and asserts a live subscriber receives it.
+///
+/// Ignored by default; run with `cargo test -p autumn-cli -- --ignored`.
+#[test]
+#[ignore = "slow: builds and runs a fresh project's test suite — run with `cargo test -p autumn-cli -- --ignored`"]
+fn generated_channel_smoke_test_passes() {
+    let (_tmp, project) = fresh_project("channel-smoke-build");
+    patch_generated_cargo_toml(&project);
+
+    run_autumn(&project, &["generate", "channel", "Chat"]);
+
+    let test_run = Command::new("cargo")
+        .args(["test", "--test", "chat_channel"])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        test_run.status.success(),
+        "generated chat_channel smoke test failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&test_run.stdout),
+        String::from_utf8_lossy(&test_run.stderr),
+    );
+    assert!(
+        String::from_utf8_lossy(&test_run.stdout).contains("test result: ok"),
+        "expected the smoke test to report success"
+    );
+}
+
 // ── autumn generate auth integration tests ────────────────────────────────────
 
 #[allow(clippy::too_many_lines)]

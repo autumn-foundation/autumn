@@ -9,6 +9,7 @@ single command. Four subcommands cover the cases you actually hit:
 | `autumn generate migration`          | A Diesel migration directory; columns are inferred when the name matches a verb |
 | `autumn generate task`               | A one-off operational `#[task]` skeleton under `tasks/`                         |
 | `autumn generate job`                | A `#[job]` background-job handler with args struct, `registered_jobs()` aggregator, and `.jobs(…)` wiring in `src/main.rs` |
+| `autumn generate channel`            | A real-time broadcast channel over the `Channels` API — an htmx SSE live view by default, or a raw `#[ws]` handler with `--ws` |
 | `autumn generate scaffold`           | Everything `model` does plus `#[repository]`, HTML routes, smoke test, `routes![]` registration |
 | `autumn generate wizard`             | A session-backed multi-step form wizard with per-step validation and a confirm/commit/cancel flow |
 | `autumn generate admin`              | An `AdminModel` adapter for an existing model, wired to `autumn-admin-plugin`   |
@@ -405,6 +406,75 @@ cargo test -p autumn-cli --test generate generated_job_cargo_checks -- --ignored
 ```
 
 This scaffolds a fresh project, runs `autumn generate job`, and asserts that `cargo check --tests` passes with no hand-editing required.
+
+## `autumn generate channel`
+
+For a live feature (chat, notifications, a live-updating list) built entirely
+on Autumn's existing realtime stack — the `Channels` pub/sub API, SSE, and
+`#[ws]` upgrade routes. No new transport is invented; the generator only
+wires up what already ships.
+
+```bash
+autumn generate channel Chat
+```
+
+Produces:
+
+```
+src/channels/chat.rs      # GET /chat (live view), GET /chat/events (SSE), POST /chat/messages
+src/channels/mod.rs       # pub mod chat; (created or appended)
+src/main.rs               # mod channels; + routes![...] entries added in place
+tests/chat_channel.rs     # smoke test: publishes a message, asserts a subscriber receives it
+```
+
+SSE-over-htmx is the default transport — `GET /chat` renders a view wired to
+htmx's `sse-connect`/`sse-swap`, so browser tabs update live with **zero
+client JS authored by the user**:
+
+```rust
+#[get("/chat/events")]
+pub async fn chat_events(State(state): State<AppState>) -> impl IntoResponse {
+    autumn_web::sse::stream(&state, TOPIC)
+}
+
+#[post("/chat/messages")]
+pub async fn chat_publish(
+    State(state): State<AppState>,
+    Form(form): Form<ChatForm>,
+) -> AutumnResult<Markup> {
+    let fragment = message_fragment(&form.message);
+    state.broadcast().publish(TOPIC, fragment.clone().into_string())?;
+    Ok(fragment)
+}
+```
+
+Pass `--ws` to emit a raw `#[ws]` WebSocket handler instead, for clients that
+need a bidirectional socket rather than SSE + form posts:
+
+```bash
+autumn generate channel Chat --ws
+```
+
+Either transport adds the `"ws"` feature to the `autumn-web` dependency in
+`Cargo.toml` — channels, SSE, and `#[ws]` are all gated behind it.
+
+The generated smoke test is a real assertion, not a stub: it publishes
+through the in-process `TestApp`, subscribes to the same topic, and asserts
+the message arrives — no Postgres/Docker required, so it runs on every
+`cargo test`.
+
+### Slow live channel verification
+
+```bash
+cargo test -p autumn-cli --test generate generated_channel_cargo_checks -- --ignored --exact
+cargo test -p autumn-cli --test generate generated_channel_ws_cargo_checks -- --ignored --exact
+cargo test -p autumn-cli --test generate generated_channel_smoke_test_passes -- --ignored --exact
+```
+
+These scaffold a fresh project, run `autumn generate channel` (both
+transports), and assert `cargo check --tests` passes with no hand-editing —
+plus one gate that actually runs the generated smoke test with `cargo test`
+to confirm it passes on first run.
 
 ## `autumn generate scaffold`
 
