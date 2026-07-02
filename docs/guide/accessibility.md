@@ -91,10 +91,11 @@ html! {
 
 ### `checkbox_input`
 
-Renders a labelled `<input type="checkbox">` for a `bool` field. A hidden
-`<input type="hidden" value="false">` with the same `name` precedes it, so
-the field always round-trips even when the checkbox is left unchecked
-(unchecked checkboxes are omitted from submitted form data by the browser).
+Renders a labelled `<input type="checkbox">` for a `bool` field. Unchecked
+checkboxes are omitted from submitted form data by the browser, so the
+target field must be marked with `#[serde(default)]` to decode as `false`
+when absent (rather than pairing it with a hidden input sibling, which
+would cause duplicate-key errors on checked submissions).
 
 ```rust
 html! {

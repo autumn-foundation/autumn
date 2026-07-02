@@ -1073,13 +1073,18 @@ fn normalize_date_value(raw: &str) -> String {
     if raw.is_empty() {
         return String::new();
     }
-    if let Ok(date) = chrono::NaiveDate::parse_from_str(raw, "%Y-%m-%d") {
+    // `NaiveDateTime`'s `Display` (as opposed to its serde serialization,
+    // which uses `T`) separates date and time with a space, e.g. from a raw
+    // `.to_string()` or some database drivers. Normalize defensively so
+    // those still parse instead of falling through to the raw string.
+    let normalized = raw.replace(' ', "T");
+    if let Ok(date) = chrono::NaiveDate::parse_from_str(&normalized, "%Y-%m-%d") {
         return date.to_string();
     }
-    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(raw) {
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&normalized) {
         return dt.format("%Y-%m-%d").to_string();
     }
-    if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%dT%H:%M:%S%.f") {
+    if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(&normalized, "%Y-%m-%dT%H:%M:%S%.f") {
         return ndt.format("%Y-%m-%d").to_string();
     }
     raw.to_owned()
@@ -1098,13 +1103,15 @@ fn normalize_datetime_local_value(raw: &str) -> String {
     if raw.is_empty() {
         return String::new();
     }
-    if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%dT%H:%M") {
+    // See `normalize_date_value`'s comment on space-separated input.
+    let normalized = raw.replace(' ', "T");
+    if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(&normalized, "%Y-%m-%dT%H:%M") {
         return ndt.format("%Y-%m-%dT%H:%M").to_string();
     }
-    if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%dT%H:%M:%S%.f") {
+    if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(&normalized, "%Y-%m-%dT%H:%M:%S%.f") {
         return ndt.format("%Y-%m-%dT%H:%M").to_string();
     }
-    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(raw) {
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&normalized) {
         return dt.naive_local().format("%Y-%m-%dT%H:%M").to_string();
     }
     raw.to_owned()
@@ -1112,7 +1119,7 @@ fn normalize_datetime_local_value(raw: &str) -> String {
 
 /// Render a labeled `<input type="date">` tied to a changeset field.
 ///
-/// The current value is normalized via [`normalize_date_value`] to the
+/// The current value is normalized via `normalize_date_value` to the
 /// `YYYY-MM-DD` shape HTML5 date pickers require, regardless of whether the
 /// underlying field serializes as a bare date or a full timestamp. Wraps in
 /// `<div id="{field}-field">` for stable htmx targeting. ARIA annotations
@@ -1155,7 +1162,7 @@ pub fn date_input<T: Serialize>(
 /// Render a labeled `<input type="datetime-local">` tied to a changeset
 /// field (`NaiveDateTime` or `DateTime`).
 ///
-/// The current value is normalized via [`normalize_datetime_local_value`] to
+/// The current value is normalized via `normalize_datetime_local_value` to
 /// the `YYYY-MM-DDTHH:MM` shape HTML5 datetime pickers require. Wraps in
 /// `<div id="{field}-field">` for stable htmx targeting. ARIA annotations
 /// behave identically to [`text_input`].
@@ -2398,6 +2405,24 @@ mod tests {
 
     #[cfg(feature = "maud")]
     #[test]
+    fn date_input_normalizes_space_separated_datetime_to_date_only() {
+        // `NaiveDateTime`'s `Display` (as opposed to its serde
+        // serialization) uses a space separator, e.g. from a raw
+        // `.to_string()` or some database drivers — accept it defensively
+        // rather than falling through to the raw (browser-rejected) string.
+        #[derive(serde::Serialize)]
+        struct F {
+            born_on: String,
+        }
+        let cs = Changeset::new(F {
+            born_on: "2024-03-15 10:30:00".into(),
+        });
+        let html = date_input(&cs, "born_on", "Born on").into_string();
+        assert!(html.contains(r#"value="2024-03-15""#), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
     fn date_input_emits_aria_invalid_and_errors() {
         #[derive(serde::Serialize)]
         struct F {
@@ -2447,6 +2472,24 @@ mod tests {
         // must be reduced to the bare local-shaped `YYYY-MM-DDTHH:MM`.
         assert!(html.contains(r#"value="2024-03-15T10:30""#), "{html}");
         assert!(!html.contains(r#"value="2024-03-15T10:30:00Z""#), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn datetime_input_normalizes_space_separated_datetime() {
+        // `NaiveDateTime`'s `Display` uses a space separator, e.g. from a
+        // raw `.to_string()` or some database drivers — accept it
+        // defensively rather than falling through to the raw string, which
+        // `<input type="datetime-local">` (strictly requiring `T`) rejects.
+        #[derive(serde::Serialize)]
+        struct F {
+            starts_at: String,
+        }
+        let cs = Changeset::new(F {
+            starts_at: "2024-03-15 10:30:00".into(),
+        });
+        let html = datetime_input(&cs, "starts_at", "Starts at").into_string();
+        assert!(html.contains(r#"value="2024-03-15T10:30""#), "{html}");
     }
 
     #[cfg(feature = "maud")]

@@ -614,7 +614,7 @@ fn render_repository_queries(pascal_name: &str, queries: &[QuerySpec]) -> String
 /// function's padding runs.
 const NORMALIZE_DATETIME_LOCAL_FN: &str = r#"
 fn normalize_datetime_local(raw: &str) -> String {
-    if raw.len() == 16 {
+    if raw.chars().count() == 16 {
         format!("{raw}:00")
     } else {
         raw.to_string()
