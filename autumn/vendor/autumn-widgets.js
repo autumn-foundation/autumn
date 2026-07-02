@@ -96,8 +96,73 @@
     });
   }
 
+  // ── nav_bar widget ──────────────────────────────────────────────────────
+  // Progressive enhancement for autumn_web::widgets::nav_bar: before this
+  // runs, the hamburger toggle is hidden and every dropdown is rendered open
+  // so all links stay visible with JS off. Once it runs, the hamburger is
+  // revealed and dropdowns collapse into working disclosure widgets.
+
+  function closeNavMenu(toggle) {
+    var menu = document.getElementById(toggle.getAttribute('aria-controls'));
+    if (!menu) return;
+    toggle.setAttribute('aria-expanded', 'false');
+    menu.hidden = true;
+  }
+
+  function openNavMenu(toggle) {
+    var menu = document.getElementById(toggle.getAttribute('aria-controls'));
+    if (!menu) return;
+    toggle.setAttribute('aria-expanded', 'true');
+    menu.hidden = false;
+  }
+
+  function initNav(nav) {
+    if (nav.dataset.navInit) return;
+    nav.dataset.navInit = '1';
+    nav.classList.add('autumn-nav--enhanced');
+
+    var toggle = nav.querySelector('[data-nav-toggle]');
+    var collapse = toggle && document.getElementById(toggle.getAttribute('aria-controls'));
+    if (toggle && collapse) {
+      toggle.hidden = false;
+      toggle.addEventListener('click', function () {
+        var open = toggle.getAttribute('aria-expanded') === 'true';
+        toggle.setAttribute('aria-expanded', open ? 'false' : 'true');
+        collapse.classList.toggle('autumn-nav__collapse--open', !open);
+      });
+    }
+
+    var menuToggles = nav.querySelectorAll('[data-nav-menu-toggle]');
+    menuToggles.forEach(function (menuToggle) {
+      closeNavMenu(menuToggle);
+      menuToggle.addEventListener('click', function () {
+        var open = menuToggle.getAttribute('aria-expanded') === 'true';
+        menuToggles.forEach(closeNavMenu);
+        if (!open) openNavMenu(menuToggle);
+      });
+    });
+
+    // Escape closes the open dropdown (if any) and refocuses its trigger.
+    nav.addEventListener('keydown', function (e) {
+      if (e.key !== 'Escape') return;
+      var openToggle = nav.querySelector('[data-nav-menu-toggle][aria-expanded="true"]');
+      if (!openToggle) return;
+      closeNavMenu(openToggle);
+      openToggle.focus();
+    });
+  }
+
+  // Clicking outside a nav_bar closes any of its open dropdowns.
+  document.addEventListener('click', function (e) {
+    document.querySelectorAll('[data-nav-menu-toggle][aria-expanded="true"]').forEach(function (menuToggle) {
+      var nav = menuToggle.closest('[data-autumn-nav]');
+      if (nav && !nav.contains(e.target)) closeNavMenu(menuToggle);
+    });
+  });
+
   function initAll() {
     document.querySelectorAll('[data-ac-value-id]').forEach(initAutocomplete);
+    document.querySelectorAll('[data-autumn-nav]').forEach(initNav);
   }
 
   if (document.readyState === 'loading') {
@@ -106,7 +171,7 @@
     initAll();
   }
 
-  // Re-initialize after htmx swaps in new autocomplete widgets.
+  // Re-initialize after htmx swaps in new widgets.
   // Also check the swapped-in target itself in case it IS the wrapper
   // (e.g. hx-swap="outerHTML" on the wrapper element).
   document.addEventListener('htmx:afterSwap', function (e) {
@@ -116,5 +181,9 @@
       initAutocomplete(t);
     }
     t.querySelectorAll('[data-ac-value-id]').forEach(initAutocomplete);
+    if (t.dataset && 'autumnNav' in t.dataset) {
+      initNav(t);
+    }
+    t.querySelectorAll('[data-autumn-nav]').forEach(initNav);
   });
 })();

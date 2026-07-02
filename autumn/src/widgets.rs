@@ -15,6 +15,7 @@
 //! | `breadcrumb` | Accessible `<nav>` breadcrumb trail |
 //! | `hero` | Landing-page banner: headline, optional subtitle, and CTAs |
 //! | `nav_link` | Navigation anchor, auto-marked active + `aria-current` |
+//! | `nav_bar` | Top-bar/sidebar `<nav>` landmark: brand, links, dropdowns, responsive toggle |
 //!
 //! # Interactive / search widgets
 //!
@@ -1459,11 +1460,170 @@ impl NavBarConfig {
     }
 }
 
-/// Render a navigation bar (STUB — not yet implemented).
+/// Render an accessible top navigation bar (or sidebar, via
+/// [`NavBarLayout::Sidebar`]): a labelled `<nav>` landmark containing an
+/// optional brand, primary items, a hidden-until-enhanced hamburger toggle,
+/// and an optional right-aligned trailing item list.
+///
+/// Every [`NavItem::Link`] built with [`NavItem::link`] / `link_matched`
+/// renders through [`nav_link_matched`], so it carries `class="active"` and
+/// `aria-current="page"` when its `href` matches `current_path` — pair with
+/// the [`CurrentPath`](crate::extract::CurrentPath) extractor to get
+/// `current_path` from the incoming request. [`NavItem::plain_link`] never
+/// becomes active, for links to unrelated tools that shouldn't claim
+/// "you are here" (e.g. an external or admin-actuator link).
+///
+/// [`NavItem::menu`] renders a `<button>` trigger plus a `<ul>` of sub-links.
+/// Before JavaScript enhances the page, the hamburger toggle is hidden (a
+/// horizontal bar with no toggle has nothing to hide) and every dropdown is
+/// rendered open (`aria-expanded="true"`, no `hidden` attribute) so **all
+/// links stay visible with JavaScript off** — the framework's
+/// `/static/js/autumn-widgets.js` runtime (same-origin, CSP-safe under the
+/// default `script-src 'self'`) then reveals the hamburger and wires the
+/// toggle/dropdown/Escape-to-close behavior. No app-authored JavaScript, and
+/// no inline `<script>` or `style=` attributes, are ever required.
+///
+/// # CSS hooks
+///
+/// | Selector | Element |
+/// |---|---|
+/// | `.autumn-nav` | Root `<nav>` landmark |
+/// | `.autumn-nav--sidebar` | Modifier added by [`NavBarLayout::Sidebar`] |
+/// | `.autumn-nav--enhanced` | Added by the JS runtime once initialized |
+/// | `.autumn-nav__brand` | Brand link (`<a>`) or wordmark (`<span>`) |
+/// | `.autumn-nav__toggle` | Hamburger `<button>` |
+/// | `.autumn-nav__collapse` | Collapsible container wrapping the item lists |
+/// | `.autumn-nav__collapse--open` | Added by the JS runtime while expanded |
+/// | `.autumn-nav__items` | Primary or trailing `<ul>` |
+/// | `.autumn-nav__items--trailing` | Added to the trailing `<ul>` only |
+/// | `.autumn-nav__item` | Every `<li>` wrapping a link |
+/// | `.autumn-nav__item--menu` | `<li>` wrapping a dropdown menu |
+/// | `.autumn-nav__section` | Non-interactive group-label `<li>` |
+/// | `.autumn-nav__menu-toggle` | Dropdown trigger `<button>` |
+/// | `.autumn-nav__menu` | Dropdown sub-item `<ul>` |
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_web::widgets::{NavBarConfig, NavItem, NavLinkMatch, NavMenu, nav_bar};
+///
+/// let config = NavBarConfig::new()
+///     .brand("Acme", "/")
+///     .item(NavItem::link("/", "Home"))
+///     .item(NavItem::link_matched("/posts", "Posts", NavLinkMatch::Prefix))
+///     .item(NavItem::link("/about", "About"))
+///     .item(NavItem::menu(
+///         NavMenu::new("Products")
+///             .link("/widgets", "Widgets")
+///             .link("/gadgets", "Gadgets"),
+///     ))
+///     .trailing(NavItem::plain_link("/login", "Log in"));
+///
+/// let html = nav_bar("/posts/3", &config).into_string();
+/// assert!(html.contains(r#"aria-current="page""#));
+/// assert!(!html.contains("style="));
+/// ```
 #[cfg(feature = "maud")]
 #[must_use]
-pub fn nav_bar(_current_path: &str, _config: &NavBarConfig) -> maud::Markup {
-    maud::html! { nav {} }
+pub fn nav_bar(current_path: &str, config: &NavBarConfig) -> maud::Markup {
+    let root_class = merge_class(
+        match config.layout {
+            NavBarLayout::Horizontal => "autumn-nav",
+            NavBarLayout::Sidebar => "autumn-nav autumn-nav--sidebar",
+        },
+        config.class.as_deref(),
+    );
+    let collapse_id = format!("{}-collapse", config.id);
+    let mut menu_counter = 0usize;
+
+    maud::html! {
+        nav id=(config.id) class=(root_class) aria-label=(config.aria_label) data-autumn-nav {
+            @if let Some((brand, href)) = &config.brand {
+                @if let Some(href) = href {
+                    a class="autumn-nav__brand" href=(href) { (brand) }
+                } @else {
+                    span class="autumn-nav__brand" { (brand) }
+                }
+            }
+            button type="button" class="autumn-nav__toggle" aria-expanded="false"
+                aria-controls=(collapse_id) hidden data-nav-toggle {
+                (config.toggle_label)
+            }
+            div id=(collapse_id) class="autumn-nav__collapse" {
+                @if !config.items.is_empty() {
+                    ul class="autumn-nav__items" {
+                        (render_nav_items(current_path, &config.items, &config.id, &mut menu_counter))
+                    }
+                }
+                @if !config.trailing.is_empty() {
+                    ul class="autumn-nav__items autumn-nav__items--trailing" {
+                        (render_nav_items(current_path, &config.trailing, &config.id, &mut menu_counter))
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Render the `<li>` items for one [`nav_bar`] item list (primary or trailing).
+#[cfg(feature = "maud")]
+fn render_nav_items(
+    current_path: &str,
+    items: &[NavItem],
+    id: &str,
+    menu_counter: &mut usize,
+) -> maud::Markup {
+    maud::html! {
+        @for item in items {
+            @match item {
+                NavItem::Link(link) => {
+                    li class="autumn-nav__item" { (render_nav_link_item(current_path, link)) }
+                }
+                NavItem::Section(label) => {
+                    li class="autumn-nav__section" { (label) }
+                }
+                NavItem::Menu(menu) => {
+                    (render_nav_menu(current_path, menu, id, menu_counter))
+                }
+            }
+        }
+    }
+}
+
+/// Render a single nav link: through [`nav_link_matched`] when it has a
+/// [`NavLinkMatch`] mode, or as a plain never-active anchor otherwise.
+#[cfg(feature = "maud")]
+fn render_nav_link_item(current_path: &str, link: &NavLinkItem) -> maud::Markup {
+    match link.match_mode {
+        Some(mode) => nav_link_matched(current_path, &link.href, &link.label, mode),
+        None => maud::html! { a href=(link.href) { (link.label) } },
+    }
+}
+
+/// Render a dropdown menu `<li>`: a trigger `<button>` plus its `<ul>` of
+/// sub-links, using and incrementing `menu_counter` to derive a unique id.
+#[cfg(feature = "maud")]
+fn render_nav_menu(
+    current_path: &str,
+    menu: &NavMenu,
+    id: &str,
+    menu_counter: &mut usize,
+) -> maud::Markup {
+    *menu_counter += 1;
+    let menu_id = format!("{id}-menu-{menu_counter}");
+    maud::html! {
+        li class="autumn-nav__item autumn-nav__item--menu" {
+            button type="button" class="autumn-nav__menu-toggle" aria-expanded="true"
+                aria-controls=(menu_id) data-nav-menu-toggle {
+                (menu.label)
+            }
+            ul id=(menu_id) class="autumn-nav__menu" {
+                @for link in &menu.links {
+                    li class="autumn-nav__item" { (render_nav_link_item(current_path, link)) }
+                }
+            }
+        }
+    }
 }
 
 // ── card ──────────────────────────────────────────────────────────────────
