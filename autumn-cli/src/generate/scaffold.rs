@@ -1650,8 +1650,11 @@ fn render_create_form_inputs(
                     required = required,
                     hx_attrs = hx_attrs
                 ),
+                // `step="any"` lets the browser's picker show/accept
+                // seconds — see edit_datetime_local_value_expr for why a
+                // value with seconds must not be step-mismatch-rejected.
                 (FieldKind::NaiveDateTime | FieldKind::DateTime, _) => format!(
-                    "input type=\"datetime-local\" name=\"{name}\"{required}{hx_attrs}",
+                    "input type=\"datetime-local\" name=\"{name}\" step=\"any\"{required}{hx_attrs}",
                     name = f.name,
                     required = required,
                     hx_attrs = hx_attrs
@@ -1748,7 +1751,7 @@ fn render_edit_form_inputs(
                     hx_attrs = hx_attrs
                 ),
                 (FieldKind::NaiveDateTime | FieldKind::DateTime, _) => format!(
-                    "input type=\"datetime-local\" name=\"{name}\" value=({value}){required}{hx_attrs}",
+                    "input type=\"datetime-local\" name=\"{name}\" step=\"any\" value=({value}){required}{hx_attrs}",
                     name = f.name,
                     value = edit_datetime_local_value_expr(f),
                     required = required,
@@ -1840,16 +1843,26 @@ fn edit_bool_select_selected_exprs(field: &Field) -> (String, String, String) {
 /// Value expression for an edit-form `datetime-local` input. Unlike
 /// [`edit_value_expr`]'s `.to_string()` (which relies on `Display`, e.g.
 /// `"2024-01-15 10:30:00 UTC"` for `DateTime<Utc>` — a shape browsers
-/// reject), this formats explicitly as `YYYY-MM-DDTHH:MM`, the only value
-/// `<input type="datetime-local">` accepts.
+/// reject), this formats explicitly as `YYYY-MM-DDTHH:MM[:SS[.fff]]`, the
+/// value shape `<input type="datetime-local">` accepts.
+///
+/// Seconds/fractional-seconds are included when present (`%.f` omits them
+/// entirely when zero) rather than truncated to `YYYY-MM-DDTHH:MM`: a
+/// minute-only value round-trips back through [`normalize_datetime_local`]
+/// as `:00` seconds, and the generated `update` handler writes every column
+/// unconditionally — a stored `12:34:56.789` would otherwise be silently
+/// overwritten as `12:34:00` by re-submitting the form without touching
+/// this field. Pair with `step="any"` on the input (see
+/// `render_edit_form_inputs`) so a value with seconds doesn't fail the
+/// browser's step constraint validation.
 fn edit_datetime_local_value_expr(field: &Field) -> String {
     let name = &field.name;
     if field.nullable {
         format!(
-            "row.{name}.as_ref().map(|value| value.format(\"%Y-%m-%dT%H:%M\").to_string()).unwrap_or_default()"
+            "row.{name}.as_ref().map(|value| value.format(\"%Y-%m-%dT%H:%M:%S%.f\").to_string()).unwrap_or_default()"
         )
     } else {
-        format!("row.{name}.format(\"%Y-%m-%dT%H:%M\").to_string()")
+        format!("row.{name}.format(\"%Y-%m-%dT%H:%M:%S%.f\").to_string()")
     }
 }
 
@@ -3246,6 +3259,25 @@ async fn main() {
         // (`%.f`) — without it, a datetime-local value submitted with
         // milliseconds (e.g. from a finer-grained `step`) fails to parse.
         assert!(routes.contains("\"%Y-%m-%dT%H:%M:%S%.f\")"), "{routes}");
+        // Regression test: the edit form's value must preserve seconds/
+        // fractional precision, not truncate to minutes. A minute-only
+        // value round-trips as `:00` seconds via normalize_datetime_local,
+        // and the generated update handler writes every column
+        // unconditionally — a no-op re-submit of a row with non-zero
+        // seconds would otherwise silently corrupt the stored timestamp
+        // (e.g. `12:34:56` -> `12:34:00`).
+        assert!(
+            routes
+                .contains("value=(row.published_at.format(\"%Y-%m-%dT%H:%M:%S%.f\").to_string())"),
+            "{routes}"
+        );
+        // `step="any"` so a value carrying seconds/fractional seconds
+        // doesn't fail the browser's step-mismatch constraint validation
+        // (default step is minute-granularity) and block submission.
+        assert!(
+            routes.contains("input type=\"datetime-local\" name=\"published_at\" step=\"any\""),
+            "{routes}"
+        );
     }
 
     #[test]
