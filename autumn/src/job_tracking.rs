@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use axum::response::IntoResponse as _;
@@ -921,6 +922,14 @@ struct MemoryEntry {
     expires_at: DateTime<Utc>,
 }
 
+/// Sweep expired entries out of an [`InMemoryJobTrackingStore`] every this
+/// many [`InMemoryJobTrackingStore::create`] calls, so long-running processes
+/// don't accumulate one dead `HashMap` entry per tracked job forever — `get`
+/// already filters expired entries out of reads, but without this they'd
+/// never actually be freed. Amortized rather than swept on every write to
+/// keep the common-case cost of `create` O(1).
+const IN_MEMORY_SWEEP_INTERVAL: u64 = 100;
+
 /// In-memory [`JobTrackingStore`] for development, testing, and the `local`
 /// job backend. State is lost on restart and not shared across processes.
 #[derive(Clone)]
@@ -928,6 +937,7 @@ pub struct InMemoryJobTrackingStore {
     entries: Arc<RwLock<HashMap<String, MemoryEntry>>>,
     ttl: chrono::TimeDelta,
     clock: Arc<dyn ClockSource>,
+    creates_since_sweep: Arc<AtomicU64>,
 }
 
 impl InMemoryJobTrackingStore {
@@ -939,6 +949,7 @@ impl InMemoryJobTrackingStore {
             entries: Arc::new(RwLock::new(HashMap::new())),
             ttl: chrono::TimeDelta::seconds(i64::try_from(ttl_secs).unwrap_or(i64::MAX)),
             clock: Arc::new(SystemClock),
+            creates_since_sweep: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -955,6 +966,36 @@ impl InMemoryJobTrackingStore {
 
     fn is_live(&self, entry: &MemoryEntry) -> bool {
         entry.expires_at > self.clock.now()
+    }
+
+    #[cfg(test)]
+    fn raw_entry_count(&self) -> usize {
+        self.entries
+            .read()
+            .expect("job tracking store lock poisoned")
+            .len()
+    }
+
+    #[allow(clippy::significant_drop_tightening)]
+    fn insert_and_maybe_sweep(&self, key: &str, record: TrackedJobRecord, now: DateTime<Utc>) {
+        let mut guard = self
+            .entries
+            .write()
+            .expect("job tracking store lock poisoned");
+        guard.insert(
+            key.to_owned(),
+            MemoryEntry {
+                record,
+                expires_at: now + self.ttl,
+            },
+        );
+        if self
+            .creates_since_sweep
+            .fetch_add(1, Ordering::Relaxed)
+            .is_multiple_of(IN_MEMORY_SWEEP_INTERVAL)
+        {
+            guard.retain(|_, entry| entry.expires_at > now);
+        }
     }
 
     #[allow(clippy::significant_drop_tightening)]
@@ -1024,16 +1065,7 @@ impl JobTrackingStore for InMemoryJobTrackingStore {
                 owner,
                 updated_at: now,
             };
-            self.entries
-                .write()
-                .expect("job tracking store lock poisoned")
-                .insert(
-                    key.to_owned(),
-                    MemoryEntry {
-                        record,
-                        expires_at: now + self.ttl,
-                    },
-                );
+            self.insert_and_maybe_sweep(key, record, now);
             Ok(())
         })
     }
@@ -1973,6 +2005,42 @@ mod tests {
         // Expired: reads see it as gone, and writes must not resurrect it.
         store.set_progress("k1", 50, None).await.unwrap();
         assert!(store.get("k1").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn expired_entries_are_evicted_not_just_filtered() {
+        let start = chrono::Utc::now();
+        let store =
+            InMemoryJobTrackingStore::new(1).with_clock(std::sync::Arc::new(FixedClock::at(start)));
+        store
+            .create("expired-key", TrackedJobOwner::Anonymous)
+            .await
+            .unwrap();
+
+        let store = store.with_clock(std::sync::Arc::new(FixedClock::at(
+            start + chrono::TimeDelta::seconds(2),
+        )));
+        assert!(
+            store.get("expired-key").await.unwrap().is_none(),
+            "reads must already treat it as gone"
+        );
+
+        // Drive enough creates to cross the amortized sweep threshold. The
+        // clock stays fixed, so every filler entry is still live when the
+        // sweep runs — only the already-expired one should be removed.
+        for i in 0..IN_MEMORY_SWEEP_INTERVAL {
+            store
+                .create(&format!("filler-{i}"), TrackedJobOwner::Anonymous)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            store.raw_entry_count(),
+            usize::try_from(IN_MEMORY_SWEEP_INTERVAL).unwrap(),
+            "the expired entry must actually be removed from the map, not just filtered on \
+             read, or a long-running process leaks one entry per expired tracked job forever"
+        );
     }
 
     // ── envelope ───────────────────────────────────────────────────────────

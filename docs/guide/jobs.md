@@ -433,11 +433,12 @@ backend is configured — `local` and `redis` use an in-memory or Redis-backed
 store respectively, `postgres` uses the `autumn_job_tracking` table (see
 [Migration notes](#migration-notes)) — so a tracked job's status composes
 with the backend an app already runs, with no extra setup. Expired records
-are invisible to reads/writes immediately (both the Redis and Postgres
-stores filter on expiry); on Postgres, a background sweep also runs every
-5 minutes to `DELETE` expired rows so `autumn_job_tracking` doesn't grow
-unbounded (Redis expires keys natively via `EX`, so it needs no equivalent
-sweep).
+are invisible to reads/writes immediately on all three stores; each also
+actually frees the expired record so long-running processes don't
+accumulate one dead entry per tracked job forever: the in-memory store
+sweeps them out opportunistically (amortized across `create` calls), a
+Postgres background sweep runs every 5 minutes to `DELETE` expired rows,
+and Redis expires keys natively via `EX`.
 
 ### Async CSV export, end to end
 
