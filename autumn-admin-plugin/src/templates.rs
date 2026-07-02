@@ -8,12 +8,14 @@ use autumn_web::flash::{FlashMessage, flash_message_divs};
 use autumn_web::job::{
     JobAdminPage, JobAdminRecord, JobAdminSnapshot, JobAdminStatus, JobScheduleSummary,
 };
+use autumn_web::links::{ButtonToOptions, button_to_with};
 use autumn_web::pagination::Page;
 use autumn_web::runtime_config::{ConfigChangeRecord, ConfigEntry};
 use autumn_web::ui::pagination::{PagerOptions, pagination_nav};
 use autumn_web::widgets::{
     CardConfig, NavBarConfig, NavBarLayout, NavItem, card, nav_bar, stat_card,
 };
+use http::Method;
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 use serde_json::Value;
 
@@ -150,6 +152,7 @@ const ADMIN_CSS: &str = "
         padding: 1rem 1.5rem 0.75rem;
         border-bottom: 1px solid var(--border);
     }
+    .header-actions form { display: inline; }
     .card-title {
         font-size: 1.125rem;
         font-weight: 600;
@@ -1378,8 +1381,15 @@ pub fn model_detail_page(
         }
 
         ({
+            let delete_url = format!("{prefix}/{model_slug}/{id}");
+            let delete_confirm = format!("Are you sure you want to delete this {model_name}?");
+            let delete_attrs = [
+                ("hx-delete", delete_url.as_str()),
+                ("hx-confirm", delete_confirm.as_str()),
+                ("hx-target", "body"),
+            ];
             let header_action = html! {
-                div {
+                div class="header-actions" {
                     @if has_history {
                         a href={ (prefix) "/" (model_slug) "/" (id) "/history" }
                             class="btn btn-secondary" { "History" }
@@ -1388,12 +1398,13 @@ pub fn model_detail_page(
                     a href={ (prefix) "/" (model_slug) "/" (id) "/edit" }
                         class="btn btn-primary" { "Edit" }
                     " "
-                    button class="btn btn-danger"
-                        hx-delete={ (prefix) "/" (model_slug) "/" (id) }
-                        hx-confirm={ "Are you sure you want to delete this " (model_name) "?" }
-                        hx-target="body" {
-                        "Delete"
-                    }
+                    (button_to_with(
+                        "Delete",
+                        &delete_url,
+                        Method::DELETE,
+                        csrf_token,
+                        &ButtonToOptions::new().class("btn btn-danger").attrs(&delete_attrs),
+                    ))
                 }
             };
             let body = html! {
@@ -2914,6 +2925,16 @@ mod tests {
         assert!(
             !html.contains("widgets/99"),
             "payload id 99 must not route mutations: {html}"
+        );
+        // The delete button is now rendered via button_to_with, so a no-JS
+        // form submission also works: POST + _method=DELETE + CSRF.
+        assert!(
+            html.contains(r#"name="_method" value="DELETE""#),
+            "Delete form must carry a _method override: {html}"
+        );
+        assert!(
+            html.contains(r#"name="_csrf" value="t""#),
+            "Delete form must carry the CSRF token: {html}"
         );
     }
 

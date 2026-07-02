@@ -60,6 +60,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that could collide with an ordinary cache key, and SWR freshness is now
   evaluated through the same injectable `ClockSource` used elsewhere in the
   framework rather than a hard-coded `SystemTime::now()`.
+- **views:** `link_to`/`button_to` view helpers for safe, method-aware links
+  (#1138). `link_to`/`link_to_with` render an HTML-escaped GET `<a>` anchor
+  with optional `class`/`target`/`rel`/extra attributes (e.g. htmx `hx-*`),
+  automatically adding `rel="noopener"` when `target="_blank"` is set.
+  `button_to`/`button_to_with` render a single-button `<form>` for
+  state-changing actions: the CSRF token is a **required** argument, so a
+  `button_to` call cannot compile without one in scope. For any method other
+  than `GET`, the form posts and carries a hidden `_method` override (reusing
+  `form::method_input`) plus the hidden CSRF field; `Method::GET` renders a
+  plain GET form with neither. Both helpers accept extra attributes on an
+  options struct, so `button_to_with("Delete", path, Method::DELETE, token,
+  &ButtonToOptions::new().attrs(&[("hx-delete", path)]))` upgrades to an
+  htmx interaction without hand-rolling the form. The admin plugin's
+  hand-rolled delete button now uses `button_to_with`, gaining a working
+  no-JS fallback (POST + `_method=DELETE` + CSRF) for free. Purely additive;
+  minor version bump.
 
 - **jobs:** tracked job handles with progress reporting and a built-in
   pollable status route (#1373). `job::enqueue_tracked`/`enqueue_tracked_for`

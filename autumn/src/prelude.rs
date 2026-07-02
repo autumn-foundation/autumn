@@ -126,6 +126,8 @@ pub use crate::{Presence, PresenceEntry, PresenceEvent, PresenceHandle};
 pub use axum::extract::State;
 /// Trait for types that can be converted into an HTTP response.
 pub use axum::response::IntoResponse;
+/// HTTP methods — pass to [`crate::links::button_to`]/[`crate::links::button_to_with`].
+pub use http::Method;
 /// HTTP status codes.
 pub use http::StatusCode;
 
@@ -183,6 +185,17 @@ pub use crate::widgets::{
     active_search_results, autocomplete_empty_state, autocomplete_input, autocomplete_option,
     breadcrumb, card, data_table, hero, nav_bar, nav_link, nav_link_matched, property_list,
     stat_card,
+};
+
+// ── Link helpers ─────────────────────────────────────────────────
+/// Safe, method-aware `<a>`/`<form>` link helpers: [`crate::links::link_to`]
+/// for GET navigation and [`crate::links::button_to`] for CSRF-protected,
+/// method-override action buttons.
+///
+/// See [`crate::links`] for the full API.
+#[cfg(feature = "maud")]
+pub use crate::links::{
+    ButtonToOptions, LinkToOptions, button_to, button_to_with, link_to, link_to_with,
 };
 
 // ── Hooks ───────────────────────────────────────────────────────
