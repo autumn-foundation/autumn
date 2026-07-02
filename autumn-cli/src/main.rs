@@ -1497,6 +1497,44 @@ enum GenerateCommands {
         #[arg(long)]
         force: bool,
     },
+    /// Scaffold a real-time channel: a pub/sub handler over the built-in
+    /// `Channels` API, an htmx SSE live view (default) or a raw `#[ws]`
+    /// socket handler, `main.rs` route wiring, and an in-process smoke test.
+    ///
+    /// Creates:
+    ///
+    /// - `src/channels/<snake>.rs` — channel handler(s) subscribing/
+    ///   publishing through the existing `Channels` API
+    /// - `src/channels/mod.rs`     — created/updated with `pub mod`
+    /// - `src/main.rs`             — `mod channels;` + route registration
+    /// - `tests/<snake>_channel.rs` — smoke test that publishes a message
+    ///   and asserts a subscriber receives it
+    /// - `Cargo.toml`              — `"ws"` feature added to autumn-web
+    ///   (+ transport-specific deps and dev-deps)
+    ///
+    /// SSE-over-htmx is the default transport (zero client JS authored by
+    /// the user). Pass `--ws` for a raw `#[ws]` WebSocket handler instead.
+    ///
+    /// Example:
+    ///
+    ///   autumn generate channel Chat
+    #[command(verbatim_doc_comment)]
+    Channel {
+        /// Channel name (`PascalCase` or `snake_case`, e.g. `Chat`).
+        name: String,
+        /// Use SSE-over-htmx transport (default when neither flag is given).
+        #[arg(long, conflicts_with = "ws")]
+        sse: bool,
+        /// Emit a raw `#[ws]` WebSocket handler instead of the SSE view.
+        #[arg(long)]
+        ws: bool,
+        /// Print the file plan and exit without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Overwrite existing files instead of erroring on collision.
+        #[arg(long)]
+        force: bool,
+    },
     /// Generate a complete browser authentication flow: signup, login, logout,
     /// account/profile, forgot-password, and reset-password.
     ///
@@ -2583,6 +2621,20 @@ fn run_generate_command(cmd: GenerateCommands) {
             no_layout,
             generate::Flags { dry_run, force },
         ),
+        GenerateCommands::Channel {
+            name,
+            sse: _,
+            ws,
+            dry_run,
+            force,
+        } => {
+            let transport = if ws {
+                generate::channel::Transport::Ws
+            } else {
+                generate::channel::Transport::Sse
+            };
+            generate::channel::run(&name, transport, generate::Flags { dry_run, force });
+        }
         GenerateCommands::InboundMail {
             name,
             dry_run,
@@ -4732,6 +4784,93 @@ mod tests {
             panic!("expected generate mailer");
         };
         assert!(!no_layout, "no_layout must default to false");
+    }
+
+    // ── autumn generate channel tests ──────────────────────────────────────
+
+    #[test]
+    fn parse_generate_channel_with_pascal_name() {
+        let cli = Cli::try_parse_from(["autumn", "generate", "channel", "Chat"]).unwrap();
+        let Commands::Generate(GenerateCommands::Channel {
+            name,
+            sse,
+            ws,
+            dry_run,
+            force,
+        }) = cli.command
+        else {
+            panic!("expected generate channel");
+        };
+        assert_eq!(name, "Chat");
+        assert!(
+            !sse,
+            "--sse must default to false (SSE is the implicit default)"
+        );
+        assert!(!ws, "--ws must default to false");
+        assert!(!dry_run);
+        assert!(!force);
+    }
+
+    #[test]
+    fn parse_generate_channel_with_ws_flag() {
+        let cli = Cli::try_parse_from(["autumn", "generate", "channel", "Chat", "--ws"]).unwrap();
+        let Commands::Generate(GenerateCommands::Channel { ws, sse, .. }) = cli.command else {
+            panic!("expected generate channel");
+        };
+        assert!(ws, "--ws flag must set ws = true");
+        assert!(!sse);
+    }
+
+    #[test]
+    fn parse_generate_channel_with_explicit_sse_flag() {
+        let cli = Cli::try_parse_from(["autumn", "generate", "channel", "Chat", "--sse"]).unwrap();
+        let Commands::Generate(GenerateCommands::Channel { ws, sse, .. }) = cli.command else {
+            panic!("expected generate channel");
+        };
+        assert!(sse, "--sse flag must set sse = true");
+        assert!(!ws);
+    }
+
+    #[test]
+    fn parse_generate_channel_sse_and_ws_conflict_is_error() {
+        assert!(
+            Cli::try_parse_from(["autumn", "generate", "channel", "Chat", "--sse", "--ws"])
+                .is_err(),
+            "--sse and --ws are mutually exclusive"
+        );
+    }
+
+    #[test]
+    fn parse_generate_channel_with_dry_run_and_force() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "generate",
+            "channel",
+            "Chat",
+            "--dry-run",
+            "--force",
+        ])
+        .unwrap();
+        let Commands::Generate(GenerateCommands::Channel { dry_run, force, .. }) = cli.command
+        else {
+            panic!("expected generate channel");
+        };
+        assert!(dry_run);
+        assert!(force);
+    }
+
+    #[test]
+    fn parse_generate_channel_snake_case_name() {
+        let cli = Cli::try_parse_from(["autumn", "generate", "channel", "chat_room"]).unwrap();
+        let Commands::Generate(GenerateCommands::Channel { name, .. }) = cli.command else {
+            panic!("expected generate channel");
+        };
+        assert_eq!(name, "chat_room");
+    }
+
+    #[test]
+    fn parse_generate_channel_without_name_is_error() {
+        assert!(Cli::try_parse_from(["autumn", "generate", "channel"]).is_err());
     }
 
     // ── autumn maintenance tests ───────────────────────────────────────────────

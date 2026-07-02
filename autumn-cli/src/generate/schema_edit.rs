@@ -602,12 +602,13 @@ fn has_mod_declaration(existing: &str, name: &str) -> bool {
         .any(|line| needles.iter().any(|n| line == n))
 }
 
-/// Insert each entry into the body of the *first* `routes![ ... ]` macro
-/// invocation. Skips entries already present.
-fn ensure_routes_entries(existing: &str, entries: &[String]) -> String {
-    let Some(start) = existing.find("routes![") else {
-        return existing.to_owned();
-    };
+/// Locate the body span (byte offsets, exclusive of the enclosing
+/// `routes![`/`]`) of the *first* `routes![ ... ]` macro invocation in
+/// `existing`. Returns `None` if there is no `routes![` or its brackets are
+/// unmatched. Shared by every function that reads or rewrites the
+/// `routes![...]` body so the bracket-scan logic lives in exactly one place.
+fn find_routes_body_range(existing: &str) -> Option<(usize, usize)> {
+    let start = existing.find("routes![")?;
     let body_start = start + "routes![".len();
     // Find the matching closing bracket. The macro body cannot contain a
     // raw `]` outside of nested `[ ... ]`, so we just track depth.
@@ -628,15 +629,66 @@ fn ensure_routes_entries(existing: &str, entries: &[String]) -> String {
         i += 1;
     }
     if depth != 0 {
-        // Unmatched bracket — leave the file untouched.
-        return existing.to_owned();
+        // Unmatched bracket.
+        return None;
     }
-    let body = &existing[body_start..i];
+    Some((body_start, i))
+}
+
+/// Insert each entry into the body of the *first* `routes![ ... ]` macro
+/// invocation. Skips entries already present.
+fn ensure_routes_entries(existing: &str, entries: &[String]) -> String {
+    let Some((body_start, body_end)) = find_routes_body_range(existing) else {
+        return existing.to_owned();
+    };
+    let body = &existing[body_start..body_end];
     let new_body = augment_routes_body(body, entries);
     let mut out = String::with_capacity(existing.len() + new_body.len());
     out.push_str(&existing[..body_start]);
     out.push_str(&new_body);
-    out.push_str(&existing[i..]);
+    out.push_str(&existing[body_end..]);
+    out
+}
+
+/// Remove every entry in the *first* `routes![ ... ]` macro invocation whose
+/// identifier starts with `prefix`. A no-op (returns `existing` unchanged)
+/// if there is no `routes![...]` or no entry matches.
+///
+/// Used by generators that regenerate a resource whose route set can change
+/// between runs (e.g. `autumn generate channel <Name> --force` switching
+/// from the SSE transport's routes to the WS transport's) — call this
+/// before [`update_main_rs`] so stale entries referencing functions the
+/// regenerated file no longer defines are not left dangling in `main.rs`.
+#[must_use]
+pub fn remove_routes_entries_with_prefix(existing: &str, prefix: &str) -> String {
+    let Some((body_start, body_end)) = find_routes_body_range(existing) else {
+        return existing.to_owned();
+    };
+    let body = &existing[body_start..body_end];
+    let original_entries: Vec<&str> = body
+        .split([',', '\n'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    let kept: Vec<&str> = original_entries
+        .iter()
+        .copied()
+        .filter(|s| !s.starts_with(prefix))
+        .collect();
+    if kept.len() == original_entries.len() {
+        return existing.to_owned();
+    }
+    let indent = leading_indent(body);
+    let mut new_body = String::with_capacity(body.len());
+    for entry in &kept {
+        new_body.push_str(&indent);
+        new_body.push_str(entry);
+        new_body.push_str(",\n");
+    }
+    let mut out = String::with_capacity(existing.len());
+    out.push_str(&existing[..body_start]);
+    out.push_str(&new_body);
+    out.push_str(&existing[body_end..]);
     out
 }
 
@@ -3422,6 +3474,60 @@ async fn main() {\n\
         let original = "fn main() {\n    routes![]\n}\n";
         let updated = ensure_routes_entries(original, &["foo".into()]);
         assert!(updated.contains("foo"));
+    }
+
+    // ── remove_routes_entries_with_prefix ──────────────────────────────────
+
+    #[test]
+    fn remove_routes_entries_with_prefix_drops_matching_entries() {
+        let original = "fn main() {\n    routes![\n        index,\n        channels::chat::chat_page,\n        channels::chat::chat_events,\n        channels::chat::chat_publish,\n    ]\n}\n";
+        let updated = remove_routes_entries_with_prefix(original, "channels::chat::");
+        assert!(updated.contains("index,"));
+        assert!(!updated.contains("channels::chat::chat_page"));
+        assert!(!updated.contains("channels::chat::chat_events"));
+        assert!(!updated.contains("channels::chat::chat_publish"));
+    }
+
+    #[test]
+    fn remove_routes_entries_with_prefix_leaves_other_prefixes_untouched() {
+        let original = "fn main() {\n    routes![\n        channels::chat::chat_page,\n        channels::notifications::notifications_page,\n    ]\n}\n";
+        let updated = remove_routes_entries_with_prefix(original, "channels::chat::");
+        assert!(!updated.contains("channels::chat::chat_page"));
+        assert!(updated.contains("channels::notifications::notifications_page"));
+    }
+
+    #[test]
+    fn remove_routes_entries_with_prefix_is_noop_when_nothing_matches() {
+        let original = "fn main() {\n    routes![index, hello]\n}\n";
+        let updated = remove_routes_entries_with_prefix(original, "channels::chat::");
+        assert_eq!(updated, original);
+    }
+
+    #[test]
+    fn remove_routes_entries_with_prefix_no_routes_macro_leaves_file_alone() {
+        let original = "fn main() {}\n";
+        let updated = remove_routes_entries_with_prefix(original, "channels::chat::");
+        assert_eq!(updated, original);
+    }
+
+    #[test]
+    fn remove_then_ensure_routes_entries_composes_for_transport_switch() {
+        // Regression test for the `--force` transport-switch scenario: a
+        // channel generated with SSE routes, then regenerated with the WS
+        // route set, must not leave the stale SSE entries behind.
+        let original = "fn main() {\n    routes![\n        channels::chat::chat_page,\n        channels::chat::chat_events,\n        channels::chat::chat_publish,\n    ]\n}\n";
+        let stripped = remove_routes_entries_with_prefix(original, "channels::chat::");
+        let updated = ensure_routes_entries(
+            &stripped,
+            &[
+                "channels::chat::chat_ws".to_owned(),
+                "channels::chat::chat_publish".to_owned(),
+            ],
+        );
+        assert!(!updated.contains("chat_page"));
+        assert!(!updated.contains("chat_events"));
+        assert!(updated.contains("channels::chat::chat_ws"));
+        assert!(updated.contains("channels::chat::chat_publish"));
     }
 
     // ── add_mail_preview_to_app ───────────────────────────────────────────
