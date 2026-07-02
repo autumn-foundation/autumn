@@ -209,17 +209,34 @@ fn model_file_exists(project_root: &Path, table: &str, base: &str) -> bool {
     single_file.exists() && declares_schema_table(&read_or_empty(&single_file), table)
 }
 
-/// True if `content` contains `schema::<table>` immediately followed by a
-/// non-identifier character (or nothing) — i.e. an exact match on `table`,
-/// not merely a prefix of a longer table name sharing the same start.
+/// True if `content` declares `use crate::schema::<table>` for exactly
+/// `table` — either as a bare `schema::<table>;` import or as one entry of a
+/// grouped import (`schema::{<table>, other};`, possibly wrapped across
+/// multiple lines), which is a multi-model `src/models.rs` layout this repo
+/// itself uses (see `examples/reddit-clone/src/models.rs`:
+/// `use crate::schema::{comments, posts, subreddits, users, votes};`).
+/// Word-boundary-aware so `posts` isn't confused with a longer table name
+/// like `posts_tags`.
 fn declares_schema_table(content: &str, table: &str) -> bool {
-    let needle = format!("schema::{table}");
-    content.match_indices(&needle).any(|(idx, _)| {
-        content[idx + needle.len()..]
-            .chars()
-            .next()
-            .is_none_or(|c| !c.is_alphanumeric() && c != '_')
-    })
+    for (idx, _) in content.match_indices("schema::") {
+        let after = &content[idx + "schema::".len()..];
+        if let Some(rest) = after.strip_prefix('{') {
+            let Some(end) = rest.find('}') else {
+                continue;
+            };
+            if rest[..end].split(',').any(|name| name.trim() == table) {
+                return true;
+            }
+        } else if after.starts_with(table)
+            && after[table.len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| !c.is_alphanumeric() && c != '_')
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Locate the source text of resource `base`'s `#[model]` struct body (the
@@ -1969,6 +1986,112 @@ autumn-web = \"0.3\"\n";
         assert!(
             plan.warnings.is_empty(),
             "no warning expected once Post is declared in src/models.rs: {:?}",
+            plan.warnings
+        );
+    }
+
+    #[test]
+    fn references_field_no_warning_for_grouped_schema_import_in_single_file_models_rs() {
+        // Multi-model `src/models.rs` files commonly group their schema
+        // imports (e.g. `examples/reddit-clone/src/models.rs`:
+        // `use crate::schema::{comments, posts, subreddits, users, votes};`)
+        // rather than one `use` per table — this must still count as "Post
+        // declared here", not a false "model not found" warning.
+        let tmp = project();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(
+            tmp.path().join("src/models.rs"),
+            "use crate::schema::{comments, posts, subreddits, users, votes};\n\n\
+             #[autumn_web::model]\npub struct Post {\n    #[id]\n    pub id: i64,\n}\n",
+        )
+        .unwrap();
+
+        let plan = plan_model(
+            tmp.path(),
+            "Comment",
+            &["post:references".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        assert!(
+            plan.warnings.is_empty(),
+            "grouped schema import must be recognized: {:?}",
+            plan.warnings
+        );
+    }
+
+    #[test]
+    fn references_field_detects_uuid_pk_with_grouped_schema_import() {
+        // Same grouped-import layout, but the target model has a UUID PK —
+        // the hard error must still fire, not be silently skipped.
+        let tmp = project();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(
+            tmp.path().join("src/models.rs"),
+            "use crate::schema::{comments, posts};\n\n\
+             #[autumn_web::model]\npub struct Post {\n    #[id]\n    pub id: uuid::Uuid,\n}\n",
+        )
+        .unwrap();
+
+        let err = plan_model(
+            tmp.path(),
+            "Comment",
+            &["post:references".into()],
+            "20260427000000",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("UUID"));
+    }
+
+    #[test]
+    fn references_field_grouped_schema_import_not_confused_by_table_name_prefix() {
+        // Only `posts_tags` is grouped-imported — `posts` must not match.
+        let tmp = project();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(
+            tmp.path().join("src/models.rs"),
+            "use crate::schema::{posts_tags, users};\n\n\
+             #[autumn_web::model]\npub struct PostsTag {\n    #[id]\n    pub id: i64,\n}\n",
+        )
+        .unwrap();
+
+        let plan = plan_model(
+            tmp.path(),
+            "Comment",
+            &["post:references".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        assert_eq!(
+            plan.warnings.len(),
+            1,
+            "'posts_tags' in a grouped import must not satisfy a reference to 'posts': {:?}",
+            plan.warnings
+        );
+    }
+
+    #[test]
+    fn references_field_no_warning_for_multiline_grouped_schema_import() {
+        // rustfmt commonly wraps long grouped imports across lines.
+        let tmp = project();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(
+            tmp.path().join("src/models.rs"),
+            "use crate::schema::{\n    comments,\n    posts,\n    users,\n};\n\n\
+             #[autumn_web::model]\npub struct Post {\n    #[id]\n    pub id: i64,\n}\n",
+        )
+        .unwrap();
+
+        let plan = plan_model(
+            tmp.path(),
+            "Comment",
+            &["post:references".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        assert!(
+            plan.warnings.is_empty(),
+            "multi-line grouped schema import must be recognized: {:?}",
             plan.warnings
         );
     }
