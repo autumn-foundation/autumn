@@ -2798,6 +2798,8 @@ pub fn start_runtime(
         )))
     })?;
 
+    crate::job_tracking::ensure_tracking_store_installed_from_config(state, config);
+
     match config.backend.as_str() {
         "local" => {
             start_local_runtime(

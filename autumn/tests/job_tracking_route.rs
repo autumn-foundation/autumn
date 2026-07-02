@@ -575,3 +575,45 @@ async fn owner_mismatch_response_is_byte_identical_to_unknown_token() {
 
     job::clear_global_job_client();
 }
+
+// ── TTL end-to-end via config ──────────────────────────────────────────────
+
+#[tokio::test]
+async fn custom_ttl_from_config_expires_the_record_via_route() {
+    let _guard = job::global_job_runtime_test_lock().lock().await;
+    job::clear_global_job_client();
+
+    let mut config = test_config();
+    config.jobs.tracking.ttl_secs = 1;
+
+    let client = TestApp::new()
+        .config(config)
+        .plugin(TrackedGateJobPlugin)
+        .build();
+
+    let handle = job::enqueue_tracked("tracked_gate_job", json!({"mode": "succeed"}))
+        .await
+        .unwrap();
+
+    poll_until(&client, &handle.status_path(), |body| {
+        body["status"] == "running"
+    })
+    .await;
+    RELEASE_GATE.notify_waiters();
+
+    poll_until(&client, &handle.status_path(), |body| {
+        body["status"] == "succeeded"
+    })
+    .await;
+
+    // The 1s TTL configured above (rather than the 86400s default) should
+    // have expired the record shortly after it settled.
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    client
+        .get(&handle.status_path())
+        .send()
+        .await
+        .assert_status(404);
+
+    job::clear_global_job_client();
+}

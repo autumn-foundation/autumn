@@ -352,13 +352,40 @@ pub(crate) fn install_tracking_store(state: &AppState, store: Arc<dyn JobTrackin
 /// have one installed. Called whenever a job runtime starts so
 /// `enqueue_tracked` works even when a `JobClient` is constructed directly
 /// (as the backend starters and their tests do) rather than through
-/// `crate::job::start_runtime`, which installs a config-driven store first.
+/// `crate::job::start_runtime`, which installs a config-driven store first
+/// (making this a no-op fallback in that path).
 pub(crate) fn ensure_tracking_store_installed(state: &AppState) {
     if tracking_store_from_state(state).is_none() {
         install_tracking_store(
             state,
             Arc::new(InMemoryJobTrackingStore::new(DEFAULT_TRACKING_TTL_SECS)),
         );
+    }
+}
+
+/// Build the tracking store selected by `config.backend`, honoring
+/// `config.tracking.ttl_secs`.
+///
+/// Every backend gets an in-memory store today; `start_runtime` swaps in the
+/// Redis/Postgres-backed stores for those backends once they exist.
+fn store_for_config(config: &crate::config::JobConfig) -> Arc<dyn JobTrackingStore> {
+    Arc::new(InMemoryJobTrackingStore::new(config.tracking.ttl_secs))
+}
+
+/// Install a tracking store built from `config` (honoring
+/// `jobs.tracking.ttl_secs`) if this app doesn't already have one installed.
+///
+/// Called by `crate::job::start_runtime` before dispatching to a
+/// backend-specific starter, so the config-driven TTL wins over
+/// [`ensure_tracking_store_installed`]'s hardcoded default (that function
+/// runs afterward, inside `install_job_client`, and is a no-op once a store
+/// is already present).
+pub(crate) fn ensure_tracking_store_installed_from_config(
+    state: &AppState,
+    config: &crate::config::JobConfig,
+) {
+    if tracking_store_from_state(state).is_none() {
+        install_tracking_store(state, store_for_config(config));
     }
 }
 
