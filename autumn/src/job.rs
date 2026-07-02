@@ -10481,15 +10481,14 @@ mod tests {
     #[tokio::test]
     async fn run_job_handler_reports_async_panics() {
         let state = AppState::for_test().with_profile("dev");
-        let outcome =
-            run_job_handler(
-                "test_job",
-                panicking_handler,
-                state,
-                serde_json::json!({}),
-                true,
-            )
-            .await;
+        let outcome = run_job_handler(
+            "test_job",
+            panicking_handler,
+            state,
+            serde_json::json!({}),
+            true,
+        )
+        .await;
         assert_eq!(
             outcome,
             JobExecutionOutcome::Panicked("job handler panicked: forced panic".to_string())
@@ -10512,12 +10511,9 @@ mod tests {
         let state = AppState::for_test().with_profile("dev");
         let shutdown = tokio_util::sync::CancellationToken::new();
         start_local_runtime(
-            vec![JobInfo::new(
-                "tracked_noop",
-                1,
-                10,
-                |_state, _payload| Box::pin(async move { Ok(()) }),
-            )],
+            vec![JobInfo::new("tracked_noop", 1, 10, |_state, _payload| {
+                Box::pin(async move { Ok(()) })
+            })],
             &state,
             &shutdown,
             1,
@@ -10577,12 +10573,9 @@ mod tests {
             &crate::config::JobQueuesConfig::default(),
         );
 
-        crate::job_tracking::enqueue_tracked(
-            "capture_args",
-            serde_json::json!({"account_id": 7}),
-        )
-        .await
-        .unwrap();
+        crate::job_tracking::enqueue_tracked("capture_args", serde_json::json!({"account_id": 7}))
+            .await
+            .unwrap();
 
         let payload = timeout(Duration::from_secs(1), async {
             loop {
@@ -10800,12 +10793,9 @@ mod tests {
 
         let state = AppState::for_test().with_profile("dev");
         let shutdown = tokio_util::sync::CancellationToken::new();
-        let mut info = JobInfo::new(
-            "dedup_tracked",
-            1,
-            10,
-            |_state, _payload| Box::pin(async move { Ok(()) }),
-        );
+        let mut info = JobInfo::new("dedup_tracked", 1, 10, |_state, _payload| {
+            Box::pin(async move { Ok(()) })
+        });
         info.uniqueness = Some(JobUniqueness {
             by: Vec::new(),
             window: JobUniquenessWindow::Running,
@@ -10820,15 +10810,18 @@ mod tests {
             &crate::config::JobQueuesConfig::default(),
         );
 
-        let first = crate::job_tracking::enqueue_tracked("dedup_tracked", serde_json::json!({"x": 1}))
-            .await
-            .unwrap();
-        let second = crate::job_tracking::enqueue_tracked("dedup_tracked", serde_json::json!({"x": 1}))
-            .await
-            .unwrap();
+        let first =
+            crate::job_tracking::enqueue_tracked("dedup_tracked", serde_json::json!({"x": 1}))
+                .await
+                .unwrap();
+        let second =
+            crate::job_tracking::enqueue_tracked("dedup_tracked", serde_json::json!({"x": 1}))
+                .await
+                .unwrap();
         assert_ne!(first.token, second.token);
 
-        let store = crate::job_tracking::tracking_store_from_state(&state).expect("store installed");
+        let store =
+            crate::job_tracking::tracking_store_from_state(&state).expect("store installed");
         let key = crate::auth::hash_api_token(&second.token);
         let record = store.get(&key).await.unwrap().expect("record");
         assert_eq!(record.status, crate::job_tracking::TrackedJobStatus::Failed);
@@ -10914,7 +10907,10 @@ mod tests {
         })
         .await
         .expect("retry should succeed within 2s");
-        assert_eq!(record.status, crate::job_tracking::TrackedJobStatus::Succeeded);
+        assert_eq!(
+            record.status,
+            crate::job_tracking::TrackedJobStatus::Succeeded
+        );
 
         shutdown.cancel();
         clear_global_job_client();

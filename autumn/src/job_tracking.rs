@@ -368,8 +368,7 @@ pub(crate) fn split_tracked_payload(payload: &Value) -> (Option<&str>, &Value) {
 
 // ── Global tracking-store install/resolve ─────────────────────────────────────
 
-static GLOBAL_TRACKING_STORE: OnceLock<RwLock<Option<Arc<dyn JobTrackingStore>>>> =
-    OnceLock::new();
+static GLOBAL_TRACKING_STORE: OnceLock<RwLock<Option<Arc<dyn JobTrackingStore>>>> = OnceLock::new();
 
 const DEFAULT_TRACKING_TTL_SECS: u64 = 86_400;
 
@@ -611,10 +610,7 @@ pub async fn enqueue_tracked_for(
         Ok(crate::job::EnqueueOutcome::Queued) => {}
         Ok(crate::job::EnqueueOutcome::Deduplicated) => {
             store
-                .fail(
-                    &key,
-                    "An equivalent job is already in progress.".to_owned(),
-                )
+                .fail(&key, "An equivalent job is already in progress.".to_owned())
                 .await?;
         }
         Err(error) => {
@@ -665,7 +661,10 @@ impl From<&TrackedJobRecord> for JobStatusDto {
 ///
 /// Mounted automatically unless `jobs.tracking.route_enabled = false`.
 pub(crate) fn status_router() -> axum::Router<AppState> {
-    axum::Router::new().route(JOB_STATUS_ROUTE_PATH, axum::routing::get(job_status_handler))
+    axum::Router::new().route(
+        JOB_STATUS_ROUTE_PATH,
+        axum::routing::get(job_status_handler),
+    )
 }
 
 /// `GET /_autumn/jobs/{token}`: resolve the tracked-job record for `token`
@@ -917,8 +916,10 @@ impl JobTrackingStore for InMemoryJobTrackingStore {
                 .entries
                 .read()
                 .expect("job tracking store lock poisoned");
-            Ok(guard.get(key).filter(|entry| self.is_live(entry)).map(
-                |entry| TrackedJobRecord {
+            Ok(guard
+                .get(key)
+                .filter(|entry| self.is_live(entry))
+                .map(|entry| TrackedJobRecord {
                     status: entry.record.status,
                     progress_pct: entry.record.progress_pct,
                     progress_message: entry.record.progress_message.clone(),
@@ -926,8 +927,7 @@ impl JobTrackingStore for InMemoryJobTrackingStore {
                     error: entry.record.error.clone(),
                     owner: entry.record.owner.clone(),
                     updated_at: entry.record.updated_at,
-                },
-            ))
+                }))
         })
     }
 }
@@ -1055,7 +1055,10 @@ impl JobTrackingStore for RedisJobTrackingStore {
     }
 
     fn complete<'a>(&'a self, key: &'a str, result: Value) -> BoxFut<'a, AutumnResult<()>> {
-        Box::pin(async move { self.update(key, |record| apply_complete(record, result)).await })
+        Box::pin(async move {
+            self.update(key, |record| apply_complete(record, result))
+                .await
+        })
     }
 
     fn fail<'a>(&'a self, key: &'a str, error: String) -> BoxFut<'a, AutumnResult<()>> {
@@ -1174,13 +1177,12 @@ impl PgJobTrackingStore {
         let Some(row) = row else {
             return Ok(());
         };
-        let mut record = serde_json::from_str::<TrackedJobRecord>(&row.record).map_err(
-            |error| {
+        let mut record =
+            serde_json::from_str::<TrackedJobRecord>(&row.record).map_err(|error| {
                 AutumnError::internal_server_error_msg(format!(
                     "job tracking deserialize failed: {error}"
                 ))
-            },
-        )?;
+            })?;
         f(&mut record);
         record.updated_at = now;
         let payload = serde_json::to_string(&record).map_err(|error| {
@@ -1269,7 +1271,10 @@ impl JobTrackingStore for PgJobTrackingStore {
     }
 
     fn complete<'a>(&'a self, key: &'a str, result: Value) -> BoxFut<'a, AutumnResult<()>> {
-        Box::pin(async move { self.update(key, |record| apply_complete(record, result)).await })
+        Box::pin(async move {
+            self.update(key, |record| apply_complete(record, result))
+                .await
+        })
     }
 
     fn fail<'a>(&'a self, key: &'a str, error: String) -> BoxFut<'a, AutumnResult<()>> {
@@ -1374,7 +1379,10 @@ mod tests {
     #[tokio::test]
     async fn set_progress_clamps_above_100_and_persists_message() {
         let store = store();
-        store.create("k1", TrackedJobOwner::Anonymous).await.unwrap();
+        store
+            .create("k1", TrackedJobOwner::Anonymous)
+            .await
+            .unwrap();
         store.mark_running("k1").await.unwrap();
 
         store
@@ -1391,7 +1399,10 @@ mod tests {
     #[tokio::test]
     async fn complete_is_terminal_and_stores_result_json() {
         let store = store();
-        store.create("k1", TrackedJobOwner::Anonymous).await.unwrap();
+        store
+            .create("k1", TrackedJobOwner::Anonymous)
+            .await
+            .unwrap();
         store.mark_running("k1").await.unwrap();
         store.set_progress("k1", 50, None).await.unwrap();
 
@@ -1418,7 +1429,10 @@ mod tests {
     #[tokio::test]
     async fn fail_stores_user_safe_error() {
         let store = store();
-        store.create("k1", TrackedJobOwner::Anonymous).await.unwrap();
+        store
+            .create("k1", TrackedJobOwner::Anonymous)
+            .await
+            .unwrap();
 
         store
             .fail("k1", "The export could not be completed.".to_owned())
@@ -1445,7 +1459,10 @@ mod tests {
         let start = chrono::Utc::now();
         let store = InMemoryJobTrackingStore::new(10)
             .with_clock(std::sync::Arc::new(FixedClock::at(start)));
-        store.create("k1", TrackedJobOwner::Anonymous).await.unwrap();
+        store
+            .create("k1", TrackedJobOwner::Anonymous)
+            .await
+            .unwrap();
 
         let store = store.with_clock(std::sync::Arc::new(FixedClock::at(
             start + chrono::TimeDelta::seconds(11),
@@ -1458,7 +1475,10 @@ mod tests {
         let start = chrono::Utc::now();
         let store = InMemoryJobTrackingStore::new(10)
             .with_clock(std::sync::Arc::new(FixedClock::at(start)));
-        store.create("k1", TrackedJobOwner::Anonymous).await.unwrap();
+        store
+            .create("k1", TrackedJobOwner::Anonymous)
+            .await
+            .unwrap();
 
         // Complete at t=8s, before the original 10s TTL expires — this must
         // push expiry out to t=18s rather than leaving it at t=10s.
@@ -1475,15 +1495,21 @@ mod tests {
             start + chrono::TimeDelta::seconds(15),
         )));
         let record = store.get("k1").await.unwrap();
-        assert!(record.is_some(), "terminal write should have refreshed the TTL");
+        assert!(
+            record.is_some(),
+            "terminal write should have refreshed the TTL"
+        );
     }
 
     #[tokio::test]
     async fn write_to_expired_key_is_a_no_op() {
         let start = chrono::Utc::now();
-        let store = InMemoryJobTrackingStore::new(5)
-            .with_clock(std::sync::Arc::new(FixedClock::at(start)));
-        store.create("k1", TrackedJobOwner::Anonymous).await.unwrap();
+        let store =
+            InMemoryJobTrackingStore::new(5).with_clock(std::sync::Arc::new(FixedClock::at(start)));
+        store
+            .create("k1", TrackedJobOwner::Anonymous)
+            .await
+            .unwrap();
 
         let store = store.with_clock(std::sync::Arc::new(FixedClock::at(
             start + chrono::TimeDelta::seconds(6),
@@ -1549,8 +1575,7 @@ mod tests {
         // A field merely containing the substring, or not exactly matching
         // the reserved key, is not a collision.
         assert!(
-            reject_reserved_envelope_marker(&serde_json::json!({"__autumn_tracked_at": 1}))
-                .is_ok()
+            reject_reserved_envelope_marker(&serde_json::json!({"__autumn_tracked_at": 1})).is_ok()
         );
     }
 
@@ -1593,13 +1618,19 @@ mod tests {
     #[tokio::test]
     async fn scope_makes_context_ambient_for_current() {
         let store: Arc<dyn JobTrackingStore> = Arc::new(InMemoryJobTrackingStore::new(60));
-        store.create("k1", TrackedJobOwner::Anonymous).await.unwrap();
+        store
+            .create("k1", TrackedJobOwner::Anonymous)
+            .await
+            .unwrap();
         let ctx = JobContext::tracked("k1".to_owned(), store.clone());
 
         let observed = scope(ctx, async { JobContext::current() }).await;
         assert!(observed.is_tracked());
 
-        observed.set_progress(75, Some("almost done")).await.unwrap();
+        observed
+            .set_progress(75, Some("almost done"))
+            .await
+            .unwrap();
         let record = store.get("k1").await.unwrap().expect("record");
         assert_eq!(record.progress_pct, Some(75));
     }
@@ -1607,7 +1638,10 @@ mod tests {
     #[tokio::test]
     async fn settle_success_persists_ctx_result() {
         let store: Arc<dyn JobTrackingStore> = Arc::new(InMemoryJobTrackingStore::new(60));
-        store.create("k1", TrackedJobOwner::Anonymous).await.unwrap();
+        store
+            .create("k1", TrackedJobOwner::Anonymous)
+            .await
+            .unwrap();
         let ctx = JobContext::tracked("k1".to_owned(), store.clone());
 
         ctx.set_result(serde_json::json!({"download_url": "/blob/abc.csv"}));
@@ -1624,7 +1658,10 @@ mod tests {
     #[tokio::test]
     async fn settle_success_without_set_result_stores_null() {
         let store: Arc<dyn JobTrackingStore> = Arc::new(InMemoryJobTrackingStore::new(60));
-        store.create("k1", TrackedJobOwner::Anonymous).await.unwrap();
+        store
+            .create("k1", TrackedJobOwner::Anonymous)
+            .await
+            .unwrap();
         let ctx = JobContext::tracked("k1".to_owned(), store.clone());
 
         ctx.settle_success().await;
@@ -1637,7 +1674,10 @@ mod tests {
     #[tokio::test]
     async fn settle_failure_uses_set_user_error_over_default() {
         let store: Arc<dyn JobTrackingStore> = Arc::new(InMemoryJobTrackingStore::new(60));
-        store.create("k1", TrackedJobOwner::Anonymous).await.unwrap();
+        store
+            .create("k1", TrackedJobOwner::Anonymous)
+            .await
+            .unwrap();
         let ctx = JobContext::tracked("k1".to_owned(), store.clone());
 
         ctx.set_user_error("The export could not reach storage.");
@@ -1654,7 +1694,10 @@ mod tests {
     #[tokio::test]
     async fn settle_failure_without_set_user_error_uses_default_message() {
         let store: Arc<dyn JobTrackingStore> = Arc::new(InMemoryJobTrackingStore::new(60));
-        store.create("k1", TrackedJobOwner::Anonymous).await.unwrap();
+        store
+            .create("k1", TrackedJobOwner::Anonymous)
+            .await
+            .unwrap();
         let ctx = JobContext::tracked("k1".to_owned(), store.clone());
 
         ctx.settle_failure(GENERIC_FAILURE_MESSAGE).await;
@@ -1825,7 +1868,10 @@ mod tests {
         assert!(global_tracking_store().is_some(), "sanity: store installed");
 
         crate::job::clear_global_job_client();
-        assert!(global_tracking_store().is_none(), "sanity: clear reset the global");
+        assert!(
+            global_tracking_store().is_none(),
+            "sanity: clear reset the global"
+        );
 
         ensure_tracking_store_installed_from_config(&state, &config);
         assert!(

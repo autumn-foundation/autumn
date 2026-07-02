@@ -629,7 +629,8 @@ mod tests {
             "missing enqueue_tracked_for: {expanded}"
         );
         assert!(
-            expanded.contains(":: autumn_web :: job :: enqueue_tracked (\"export_orders\" , payload)"),
+            expanded
+                .contains(":: autumn_web :: job :: enqueue_tracked (\"export_orders\" , payload)"),
             "enqueue_tracked companion should delegate to the module-level free function: {expanded}"
         );
         assert!(
@@ -662,7 +663,9 @@ mod tests {
             "three-arg handler should be invoked with JobContext::current(): {expanded}"
         );
         assert!(
-            expanded.contains("export_orders (state , args , :: autumn_web :: job :: JobContext :: current ())"),
+            expanded.contains(
+                "export_orders (state , args , :: autumn_web :: job :: JobContext :: current ())"
+            ),
             "generated handler closure should call the user fn with the context: {expanded}"
         );
     }
@@ -682,7 +685,10 @@ mod tests {
             !expanded.contains("JobContext"),
             "two-arg expansion must stay unchanged: {expanded}"
         );
-        assert!(expanded.contains("plain (state , args) . await"), "{expanded}");
+        assert!(
+            expanded.contains("plain (state , args) . await"),
+            "{expanded}"
+        );
     }
 
     #[test]

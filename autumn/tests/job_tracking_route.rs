@@ -65,11 +65,7 @@ fn test_config() -> AutumnConfig {
 }
 
 /// Poll `path` until `predicate` matches the JSON body, or panic after ~1s.
-async fn poll_until(
-    client: &TestClient,
-    path: &str,
-    predicate: impl Fn(&Value) -> bool,
-) -> Value {
+async fn poll_until(client: &TestClient, path: &str, predicate: impl Fn(&Value) -> bool) -> Value {
     for _ in 0..100 {
         let response = client.get(path).send().await;
         assert_eq!(response.header("content-type"), Some("application/json"));
@@ -389,7 +385,11 @@ fn build_owned_client(store: MemoryStore) -> TestClient {
         .build()
 }
 
-async fn get_status(client: &TestClient, path: &str, sid: Option<&str>) -> autumn_web::test::TestResponse {
+async fn get_status(
+    client: &TestClient,
+    path: &str,
+    sid: Option<&str>,
+) -> autumn_web::test::TestResponse {
     let mut request = client.get(path);
     if let Some(sid) = sid {
         request = request.header("Cookie", &format!("autumn.sid={sid}"));
@@ -547,7 +547,12 @@ async fn owner_mismatch_response_is_byte_identical_to_unknown_token() {
 
     seed_session(&store, "sess-stranger", None).await;
     let mismatch = get_status(&client, &handle.status_path(), Some("sess-stranger")).await;
-    let unknown = get_status(&client, "/_autumn/jobs/does-not-exist", Some("sess-stranger")).await;
+    let unknown = get_status(
+        &client,
+        "/_autumn/jobs/does-not-exist",
+        Some("sess-stranger"),
+    )
+    .await;
 
     assert_eq!(
         mismatch.header("content-type"),

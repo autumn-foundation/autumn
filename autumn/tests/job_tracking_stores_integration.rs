@@ -155,7 +155,10 @@ async fn postgres_backend_persists_tracked_job_and_expires_it() {
         .expect("postgres port");
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url);
-    let pool = Pool::builder(manager).max_size(4).build().expect("build pool");
+    let pool = Pool::builder(manager)
+        .max_size(4)
+        .build()
+        .expect("build pool");
 
     {
         let mut conn = pool.get().await.expect("get connection");
