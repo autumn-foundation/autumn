@@ -3404,6 +3404,16 @@ async fn execute_local_job(
                     if !coordination.try_acquire_unique(&job.name, &key, &job.id, unique.window) {
                         state.job_registry.record_deduplicated(&job.name);
                         job_admin.record_deduplicated(&job.id);
+                        // This job will never run again — it was coalesced
+                        // into the duplicate that now owns the unique lock —
+                        // so its tracked record (if any) must settle now
+                        // rather than being left non-terminal until TTL.
+                        crate::job_tracking::settle_tracked_payload_as_failed(
+                            state,
+                            &job.payload,
+                            "An equivalent job is already in progress.",
+                        )
+                        .await;
                         finish_local_slot(coordination, concurrency_group.as_ref(), tx, state);
                         return;
                     }
@@ -4832,7 +4842,7 @@ elseif ARGV[4] == 'retry' then
   if ARGV[10] == 'pending' then
     if not redis.call('SET', KEYS[7], ARGV[1], 'NX', 'PX', tonumber(ARGV[11])) then
       redis.call('DEL', key)
-      return 1
+      return 2
     end
   end
   redis.call('SET', key, ARGV[5])
@@ -4859,9 +4869,9 @@ async fn apply_claimed_redis_transition(
     mode: &str,
     encoded_record: Option<String>,
     due_at_ms: Option<u64>,
-) -> Result<bool, redis::RedisError> {
+) -> Result<i64, redis::RedisError> {
     let Some((claimed_by, claimed_at_ms)) = expected_claim_args(expected) else {
-        return Ok(false);
+        return Ok(0);
     };
 
     // The concurrency slot frees on every settle (success, retry backoff,
@@ -4877,7 +4887,7 @@ async fn apply_claimed_redis_transition(
     } else {
         "0"
     };
-    let applied: usize = redis::cmd("EVAL")
+    let applied: i64 = redis::cmd("EVAL")
         .arg(CLAIMED_REDIS_TRANSITION_SCRIPT)
         .arg(8)
         .arg(&worker_config.processing_key)
@@ -4906,7 +4916,7 @@ async fn apply_claimed_redis_transition(
         .query_async(connection)
         .await?;
 
-    Ok(applied == 1)
+    Ok(applied)
 }
 
 #[cfg(feature = "redis")]
@@ -4923,7 +4933,7 @@ async fn ack_redis_success(
         tracing::warn!(job_id = %record.id, "failed to serialize redis completed record");
         return Ok(false);
     };
-    apply_claimed_redis_transition(
+    let applied = apply_claimed_redis_transition(
         connection,
         worker_config,
         record,
@@ -4931,7 +4941,26 @@ async fn ack_redis_success(
         Some(encoded),
         None,
     )
-    .await
+    .await?;
+    Ok(applied == 1)
+}
+
+/// Outcome of [`schedule_redis_retry`], distinguishing an ordinary applied
+/// retry from a pending-window unique job whose retry was silently dropped
+/// because an equivalent job already claimed the unique slot while this one
+/// ran — the two collapse to the same Lua return code as a plain "claim
+/// changed" no-op would otherwise, but the caller needs to tell them apart:
+/// a dropped retry settles a tracked record; a claim-changed no-op doesn't.
+#[cfg(feature = "redis")]
+enum RedisRetryOutcome {
+    /// The retry record was written normally.
+    Applied,
+    /// A duplicate already held the pending-window unique lock, so the
+    /// record was deleted instead of retried (coalesced into the duplicate).
+    DroppedByDuplicate,
+    /// The claim no longer matched (another worker already settled this
+    /// job), so nothing was changed.
+    ClaimChanged,
 }
 
 #[cfg(feature = "redis")]
@@ -4940,12 +4969,12 @@ async fn schedule_redis_retry(
     worker_config: &RedisWorkerConfig,
     expected: &RedisJobRecord,
     schedule: &RedisRetrySchedule,
-) -> Result<bool, redis::RedisError> {
+) -> Result<RedisRetryOutcome, redis::RedisError> {
     let Ok(encoded) = encode_redis_record(&schedule.record) else {
         tracing::warn!(job_id = %schedule.record.id, "failed to serialize redis retry record");
-        return Ok(false);
+        return Ok(RedisRetryOutcome::ClaimChanged);
     };
-    apply_claimed_redis_transition(
+    let applied = apply_claimed_redis_transition(
         connection,
         worker_config,
         expected,
@@ -4953,7 +4982,12 @@ async fn schedule_redis_retry(
         Some(encoded),
         Some(schedule.due_at_ms),
     )
-    .await
+    .await?;
+    Ok(match applied {
+        1 => RedisRetryOutcome::Applied,
+        2 => RedisRetryOutcome::DroppedByDuplicate,
+        _ => RedisRetryOutcome::ClaimChanged,
+    })
 }
 
 #[cfg(feature = "redis")]
@@ -4967,7 +5001,7 @@ async fn dead_letter_redis_job(
         tracing::warn!(job_id = %record.id, "failed to serialize redis dead-letter record");
         return Ok(false);
     };
-    apply_claimed_redis_transition(
+    let applied = apply_claimed_redis_transition(
         connection,
         worker_config,
         expected,
@@ -4975,7 +5009,8 @@ async fn dead_letter_redis_job(
         Some(encoded),
         None,
     )
-    .await
+    .await?;
+    Ok(applied == 1)
 }
 
 #[cfg(feature = "redis")]
@@ -5312,13 +5347,30 @@ async fn settle_failed_redis_job(
     match action {
         RedisFailureAction::Retry(schedule) => {
             match schedule_redis_retry(connection, worker_config, record, &schedule).await {
-                Ok(true) => {
+                Ok(RedisRetryOutcome::Applied) => {
                     state
                         .job_registry
                         .record_retry(&schedule.record.name, &error, record.attempt);
                     job_admin.record_retrying(&schedule.record.id, &error);
                 }
-                Ok(false) => tracing::warn!(
+                Ok(RedisRetryOutcome::DroppedByDuplicate) => {
+                    // A duplicate already claimed the pending-window unique
+                    // lock while this job ran, so the retry was coalesced
+                    // into it (deleted, not requeued) — this job will never
+                    // run again, so its tracked record (if any) must settle
+                    // now rather than being left non-terminal until TTL.
+                    state
+                        .job_registry
+                        .record_deduplicated(&schedule.record.name);
+                    job_admin.record_deduplicated(&schedule.record.id);
+                    crate::job_tracking::settle_tracked_payload_as_failed(
+                        state,
+                        &record.payload,
+                        "An equivalent job is already in progress.",
+                    )
+                    .await;
+                }
+                Ok(RedisRetryOutcome::ClaimChanged) => tracing::warn!(
                     job = %record.name,
                     job_id = %record.id,
                     outcome = %outcome,
@@ -10018,6 +10070,122 @@ mod tests {
         );
 
         clear_global_job_client();
+    }
+
+    #[cfg(feature = "redis")]
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn redis_dropped_pending_window_retry_settles_the_tracked_record_instead_of_leaving_it_stuck()
+     {
+        REDIS_HANDLER_CALLS.store(0, Ordering::SeqCst);
+        let (_container, client) = redis_test_client().await;
+        let worker_config = redis_test_worker_config("dropped-pending", "worker-a", 30_000);
+        let mut connection = new_redis_connection_manager(&client, "test redis worker").unwrap();
+
+        let state = AppState::for_test().with_profile("dev");
+        let store: Arc<dyn crate::job_tracking::JobTrackingStore> =
+            Arc::new(crate::job_tracking::InMemoryJobTrackingStore::new(60));
+        crate::job_tracking::install_tracking_store(&state, store.clone());
+        let key = "dropped-pending-key";
+        store
+            .create(key, crate::job_tracking::TrackedJobOwner::Anonymous)
+            .await
+            .unwrap();
+        let payload = crate::job_tracking::wrap_tracked_payload(key, &serde_json::json!({}));
+
+        let job_admin = JobAdminMemoryBackend::new_for_test(32);
+        state.job_registry().register("send_email");
+        state.job_registry().record_enqueue("send_email");
+
+        let producer = RedisClient {
+            connection: new_redis_connection_manager(&client, "test redis producer").unwrap(),
+            key_prefix: worker_config.key_prefix.clone(),
+            delayed_key: worker_config.delayed_key.clone(),
+            record_prefix: worker_config.record_prefix.clone(),
+            unique_prefix: worker_config.unique_prefix.clone(),
+        };
+        let constraints = ResolvedJobConstraints {
+            unique_key: Some("dropped-pending-lock".to_string()),
+            unique_window: Some(JobUniquenessWindow::Pending),
+            concurrency_limit: None,
+            concurrency_scope: None,
+        };
+        assert_eq!(
+            producer
+                .enqueue(
+                    "job-original".to_string(),
+                    "send_email",
+                    "default",
+                    payload,
+                    2,
+                    1,
+                    None,
+                    &constraints,
+                )
+                .await
+                .unwrap(),
+            EnqueueOutcome::Queued
+        );
+
+        let jobs = redis_jobs_by_name(redis_counting_failure_handler, 2);
+        let claimed = claim_next_redis_job(
+            &mut connection,
+            &worker_config,
+            std::slice::from_ref(&worker_config.queue_key),
+        )
+        .await
+        .unwrap()
+        .expect("original job should be claimed");
+
+        // Claiming released the pending-window unique lock (see
+        // claim_next_redis_job); a duplicate now takes it over before the
+        // original's retry gets a chance to re-acquire it.
+        assert_eq!(
+            producer
+                .enqueue(
+                    "job-duplicate".to_string(),
+                    "send_email",
+                    "default",
+                    serde_json::json!({}),
+                    2,
+                    1,
+                    None,
+                    &constraints,
+                )
+                .await
+                .unwrap(),
+            EnqueueOutcome::Queued,
+            "the lock must be free for the duplicate to acquire it"
+        );
+
+        process_redis_job_record(
+            &mut connection,
+            claimed,
+            &jobs,
+            &state,
+            &job_admin,
+            &worker_config,
+        )
+        .await;
+
+        let tracked = store.get(key).await.unwrap().expect("record");
+        assert_eq!(
+            tracked.status,
+            crate::job_tracking::TrackedJobStatus::Failed,
+            "a tracked job whose retry was dropped because a duplicate already claimed the \
+             pending-window unique lock must settle its status record instead of staying \
+             pending/running until TTL expiry"
+        );
+        assert_eq!(
+            tracked.error.as_deref(),
+            Some("An equivalent job is already in progress.")
+        );
+
+        let status = state.job_registry().snapshot()["send_email"].clone();
+        assert_eq!(
+            status.total_deduplicated, 1,
+            "the dropped retry must be recorded as deduplicated, not as a normal retry"
+        );
     }
 
     #[cfg(feature = "redis")]
@@ -15586,6 +15754,117 @@ mod uniqueness_concurrency_tests {
             2,
             "exactly the original two attempts run; the duplicate never does"
         );
+
+        shutdown.cancel();
+        clear_global_job_client();
+    }
+
+    static DROPPED_RETRY_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static DROPPED_RETRY_STARTED: OnceLock<tokio::sync::Notify> = OnceLock::new();
+    static DROPPED_RETRY_RELEASE: OnceLock<tokio::sync::Notify> = OnceLock::new();
+    fn dropped_pending_retry_handler(
+        _state: AppState,
+        _payload: Value,
+    ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'static>> {
+        Box::pin(async move {
+            if DROPPED_RETRY_CALLS.fetch_add(1, Ordering::SeqCst) == 0 {
+                // First call: signal that execution has started (the
+                // pending-window key is now released) and hold until the
+                // test lets a duplicate enqueue grab it first.
+                DROPPED_RETRY_STARTED
+                    .get_or_init(tokio::sync::Notify::new)
+                    .notify_one();
+                DROPPED_RETRY_RELEASE
+                    .get_or_init(tokio::sync::Notify::new)
+                    .notified()
+                    .await;
+                Err(AutumnError::internal_server_error(std::io::Error::other(
+                    "forced failure",
+                )))
+            } else {
+                // The duplicate's own (independent) execution.
+                Ok(())
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn local_dropped_pending_window_retry_settles_the_tracked_record_instead_of_leaving_it_stuck()
+     {
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+        DROPPED_RETRY_CALLS.store(0, Ordering::SeqCst);
+
+        let store: Arc<dyn crate::job_tracking::JobTrackingStore> =
+            Arc::new(crate::job_tracking::InMemoryJobTrackingStore::new(60));
+        let state = AppState::for_test().with_profile("dev");
+        crate::job_tracking::install_tracking_store(&state, store.clone());
+
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        start_local_runtime(
+            vec![JobInfo {
+                name: "dropped_pending_retry".to_string(),
+                max_attempts: 2,
+                initial_backoff_ms: 1,
+                queue: "default".to_string(),
+                uniqueness: Some(JobUniqueness {
+                    by: Vec::new(),
+                    window: JobUniquenessWindow::Pending,
+                }),
+                concurrency: None,
+                handler: dropped_pending_retry_handler,
+            }],
+            &state,
+            &shutdown,
+            2,
+            5,
+            250,
+            &crate::config::JobQueuesConfig::default(),
+        );
+
+        let payload = serde_json::json!({"invoice_id": 22});
+        let handle = enqueue_tracked("dropped_pending_retry", payload.clone())
+            .await
+            .unwrap();
+        let key = crate::auth::hash_api_token(&handle.token);
+
+        // Wait for the first attempt to start executing — the pending-window
+        // key is released at that point (see execute_queued_job).
+        DROPPED_RETRY_STARTED
+            .get_or_init(tokio::sync::Notify::new)
+            .notified()
+            .await;
+
+        // A duplicate lands while the key is free and takes it over.
+        enqueue("dropped_pending_retry", payload).await.unwrap();
+
+        // Let the original attempt fail; its retry can no longer re-acquire
+        // the pending key (the duplicate holds it), so the retry is dropped
+        // and coalesced into the duplicate instead.
+        DROPPED_RETRY_RELEASE
+            .get_or_init(tokio::sync::Notify::new)
+            .notify_one();
+
+        assert!(
+            wait_for(2_000, || deduplicated(&state, "dropped_pending_retry") == 1).await,
+            "the dropped retry must be recorded as deduplicated"
+        );
+
+        let record = store.get(&key).await.unwrap().expect("record");
+        assert_eq!(
+            record.status,
+            TrackedJobStatus::Failed,
+            "a tracked job whose retry was dropped because a duplicate already claimed the \
+             pending-window unique lock must settle its status record instead of staying \
+             pending/running until TTL expiry"
+        );
+        assert_eq!(
+            record.error.as_deref(),
+            Some("An equivalent job is already in progress.")
+        );
+
+        // The duplicate itself still runs independently.
+        assert!(wait_for(2_000, || successes(&state, "dropped_pending_retry") == 1).await);
 
         shutdown.cancel();
         clear_global_job_client();
