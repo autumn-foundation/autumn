@@ -358,6 +358,13 @@ A request whose session doesn't match the bound owner gets the identical
 `404` an unknown token would — the route is never an existence/ownership
 oracle.
 
+`enqueue_tracked`/`enqueue_tracked_for` wrap your `Args` in an internal
+envelope under a reserved top-level field named `__autumn_tracked`. Don't
+give a job's `Args` struct a field with that exact name — `enqueue`/
+`enqueue_in`/`enqueue_at` and their `on_conn` variants reject a payload
+shaped that way with a `400` rather than risk it being misread as a tracked
+envelope.
+
 ### Report progress from inside the handler
 
 Add a third `JobContext` argument to a `#[job]` handler to opt into
@@ -456,7 +463,7 @@ async fn export_orders(
     let mut buffer = Vec::new();
     for (i, chunk) in orders.chunks(500).enumerate() {
         export_csv(chunk.iter().cloned(), &mut buffer)?;
-        let done = (i + 1) * 500.min(total);
+        let done = ((i + 1) * 500).min(total);
         ctx.set_progress(
             u8::try_from(done * 100 / total.max(1)).unwrap_or(100),
             Some(&format!("Rows {done}/{total}")),

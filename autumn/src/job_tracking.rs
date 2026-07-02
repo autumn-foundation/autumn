@@ -91,6 +91,39 @@ pub struct TrackedJobRecord {
 
 type BoxFut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+// ── Shared record-mutation logic ──────────────────────────────────────────────
+//
+// Each `JobTrackingStore` impl below applies these same transitions through
+// its own read-modify-write mechanics (in-memory mutex, Redis GET+SET,
+// Postgres SELECT+UPDATE); sharing the transition logic itself means the
+// three backends can never silently drift on what a given status change
+// actually does to a record.
+
+const fn apply_mark_running(record: &mut TrackedJobRecord) {
+    if !record.status.is_terminal() {
+        record.status = TrackedJobStatus::Running;
+    }
+}
+
+fn apply_set_progress(record: &mut TrackedJobRecord, pct: u8, message: Option<String>) {
+    if !record.status.is_terminal() {
+        record.progress_pct = Some(pct);
+        record.progress_message = message;
+    }
+}
+
+fn apply_complete(record: &mut TrackedJobRecord, result: Value) {
+    record.status = TrackedJobStatus::Succeeded;
+    record.result = Some(result);
+    record.error = None;
+}
+
+fn apply_fail(record: &mut TrackedJobRecord, error: String) {
+    record.status = TrackedJobStatus::Failed;
+    record.error = Some(error);
+    record.result = None;
+}
+
 /// Persists tracked-job progress/result, keyed by a hash of the public token.
 ///
 /// Dyn-safe (boxed-future methods) so it can be installed as an
@@ -312,7 +345,13 @@ pub(crate) fn take_tracked_payload(payload: Value) -> (Option<String>, Value) {
 /// Borrowing counterpart of [`take_tracked_payload`], for callers (uniqueness
 /// hashing, principal/correlation extraction) that only need to read fields
 /// off the inner args without consuming the payload.
+///
+/// Agrees with [`take_tracked_payload`] on the fallback for a malformed
+/// envelope (marker present, `args` missing): both report an empty
+/// (`Value::Null`) inner payload rather than one falling back to the whole
+/// wrapper while the other falls back to nothing.
 pub(crate) fn split_tracked_payload(payload: &Value) -> (Option<&str>, &Value) {
+    static NULL_ARGS: Value = Value::Null;
     let Some(obj) = payload.as_object() else {
         return (None, payload);
     };
@@ -324,7 +363,7 @@ pub(crate) fn split_tracked_payload(payload: &Value) -> (Option<&str>, &Value) {
     else {
         return (None, payload);
     };
-    (Some(key), obj.get(ENVELOPE_ARGS).unwrap_or(payload))
+    (Some(key), obj.get(ENVELOPE_ARGS).unwrap_or(&NULL_ARGS))
 }
 
 // ── Global tracking-store install/resolve ─────────────────────────────────────
@@ -354,8 +393,15 @@ pub(crate) fn install_tracking_store(state: &AppState, store: Arc<dyn JobTrackin
 /// (as the backend starters and their tests do) rather than through
 /// `crate::job::start_runtime`, which installs a config-driven store first
 /// (making this a no-op fallback in that path).
+///
+/// Also reinstalls when the process-global fallback is missing even though
+/// `state` already carries an extension: `crate::job::clear_global_job_client`
+/// resets [`GLOBAL_TRACKING_STORE`] but has no `AppState` to strip the
+/// now-stale extension from, so relying on the extension alone would leave
+/// the free `enqueue_tracked` functions permanently unable to resolve a
+/// store after a clear-and-restart cycle that reuses the same `AppState`.
 pub(crate) fn ensure_tracking_store_installed(state: &AppState) {
-    if tracking_store_from_state(state).is_none() {
+    if tracking_store_from_state(state).is_none() || global_tracking_store().is_none() {
         install_tracking_store(
             state,
             Arc::new(InMemoryJobTrackingStore::new(DEFAULT_TRACKING_TTL_SECS)),
@@ -413,11 +459,14 @@ fn store_for_config(
 /// [`ensure_tracking_store_installed`]'s hardcoded default (that function
 /// runs afterward, inside `install_job_client`, and is a no-op once a store
 /// is already present).
+///
+/// See [`ensure_tracking_store_installed`] for why this also reinstalls when
+/// the global fallback is missing, even if `state`'s extension is present.
 pub(crate) fn ensure_tracking_store_installed_from_config(
     state: &AppState,
     config: &crate::config::JobConfig,
 ) {
-    if tracking_store_from_state(state).is_none() {
+    if tracking_store_from_state(state).is_none() || global_tracking_store().is_none() {
         install_tracking_store(state, store_for_config(state, config));
     }
 }
@@ -444,6 +493,49 @@ pub(crate) fn clear_global_tracking_store() {
         }
     } else {
         let _ = GLOBAL_TRACKING_STORE.set(RwLock::new(None));
+    }
+}
+
+/// Reject a payload shaped like the tracked-job envelope: a top-level object
+/// carrying a `__autumn_tracked` field.
+///
+/// Only [`wrap_tracked_payload`] (via `enqueue_tracked`/`enqueue_tracked_for`)
+/// may construct a payload with this shape. Every other enqueue entry point
+/// must call this first so that a plain job's `Args` struct can never
+/// coincidentally collide with — and be silently misinterpreted as — a
+/// tracked job's envelope by [`take_tracked_payload`]/[`split_tracked_payload`].
+pub(crate) fn reject_reserved_envelope_marker(payload: &Value) -> AutumnResult<()> {
+    let collides = payload
+        .as_object()
+        .is_some_and(|obj| obj.contains_key(ENVELOPE_MARKER));
+    if collides {
+        return Err(AutumnError::bad_request_msg(format!(
+            "job payload must not contain a top-level '{ENVELOPE_MARKER}' field; this name is \
+             reserved for autumn_web::job::enqueue_tracked"
+        )));
+    }
+    Ok(())
+}
+
+/// If `payload` is a tracked-job envelope, settle its tracking record to
+/// `failed` with `message`.
+///
+/// Used by each backend's execute path when it short-circuits before
+/// `run_job_handler` runs (an admin-canceled job, an unregistered job name)
+/// — without this, those paths are the only way a tracked job's status
+/// record could be left stuck at `pending`/`running` until TTL expiry, even
+/// though the job itself already reached a terminal outcome.
+pub(crate) async fn settle_tracked_payload_as_failed(
+    state: &AppState,
+    payload: &Value,
+    message: &str,
+) {
+    let (key, _) = split_tracked_payload(payload);
+    let Some(key) = key else {
+        return;
+    };
+    if let Some(store) = tracking_store_from_state(state) {
+        let _ = store.fail(key, message.to_owned()).await;
     }
 }
 
@@ -525,7 +617,15 @@ pub async fn enqueue_tracked_for(
                 )
                 .await?;
         }
-        Err(error) => return Err(error),
+        Err(error) => {
+            // The job never entered the queue, so the `Pending` record
+            // created above must not be left to linger until TTL expiry —
+            // settle it the same way the `Deduplicated` outcome does.
+            let _ = store
+                .fail(&key, "The job could not be enqueued.".to_owned())
+                .await;
+            return Err(error);
+        }
     }
 
     Ok(TrackedJobHandle { token })
@@ -779,11 +879,7 @@ impl JobTrackingStore for InMemoryJobTrackingStore {
 
     fn mark_running<'a>(&'a self, key: &'a str) -> BoxFut<'a, AutumnResult<()>> {
         Box::pin(async move {
-            self.with_record_mut(key, |record| {
-                if !record.status.is_terminal() {
-                    record.status = TrackedJobStatus::Running;
-                }
-            });
+            self.with_record_mut(key, apply_mark_running);
             Ok(())
         })
     }
@@ -796,34 +892,21 @@ impl JobTrackingStore for InMemoryJobTrackingStore {
     ) -> BoxFut<'a, AutumnResult<()>> {
         Box::pin(async move {
             let pct = pct.min(100);
-            self.with_record_mut(key, |record| {
-                if !record.status.is_terminal() {
-                    record.progress_pct = Some(pct);
-                    record.progress_message = message;
-                }
-            });
+            self.with_record_mut(key, |record| apply_set_progress(record, pct, message));
             Ok(())
         })
     }
 
     fn complete<'a>(&'a self, key: &'a str, result: Value) -> BoxFut<'a, AutumnResult<()>> {
         Box::pin(async move {
-            self.with_record_mut(key, |record| {
-                record.status = TrackedJobStatus::Succeeded;
-                record.result = Some(result);
-                record.error = None;
-            });
+            self.with_record_mut(key, |record| apply_complete(record, result));
             Ok(())
         })
     }
 
     fn fail<'a>(&'a self, key: &'a str, error: String) -> BoxFut<'a, AutumnResult<()>> {
         Box::pin(async move {
-            self.with_record_mut(key, |record| {
-                record.status = TrackedJobStatus::Failed;
-                record.error = Some(error);
-                record.result = None;
-            });
+            self.with_record_mut(key, |record| apply_fail(record, error));
             Ok(())
         })
     }
@@ -955,14 +1038,7 @@ impl JobTrackingStore for RedisJobTrackingStore {
     }
 
     fn mark_running<'a>(&'a self, key: &'a str) -> BoxFut<'a, AutumnResult<()>> {
-        Box::pin(async move {
-            self.update(key, |record| {
-                if !record.status.is_terminal() {
-                    record.status = TrackedJobStatus::Running;
-                }
-            })
-            .await
-        })
+        Box::pin(async move { self.update(key, apply_mark_running).await })
     }
 
     fn set_progress<'a>(
@@ -973,36 +1049,17 @@ impl JobTrackingStore for RedisJobTrackingStore {
     ) -> BoxFut<'a, AutumnResult<()>> {
         Box::pin(async move {
             let pct = pct.min(100);
-            self.update(key, |record| {
-                if !record.status.is_terminal() {
-                    record.progress_pct = Some(pct);
-                    record.progress_message = message;
-                }
-            })
-            .await
+            self.update(key, |record| apply_set_progress(record, pct, message))
+                .await
         })
     }
 
     fn complete<'a>(&'a self, key: &'a str, result: Value) -> BoxFut<'a, AutumnResult<()>> {
-        Box::pin(async move {
-            self.update(key, |record| {
-                record.status = TrackedJobStatus::Succeeded;
-                record.result = Some(result);
-                record.error = None;
-            })
-            .await
-        })
+        Box::pin(async move { self.update(key, |record| apply_complete(record, result)).await })
     }
 
     fn fail<'a>(&'a self, key: &'a str, error: String) -> BoxFut<'a, AutumnResult<()>> {
-        Box::pin(async move {
-            self.update(key, |record| {
-                record.status = TrackedJobStatus::Failed;
-                record.error = Some(error);
-                record.result = None;
-            })
-            .await
-        })
+        Box::pin(async move { self.update(key, |record| apply_fail(record, error)).await })
     }
 
     fn get<'a>(&'a self, key: &'a str) -> BoxFut<'a, AutumnResult<Option<TrackedJobRecord>>> {
@@ -1103,7 +1160,7 @@ impl PgJobTrackingStore {
         let now = self.clock.now();
         let mut conn = self.conn().await?;
         let row = diesel::sql_query(
-            "SELECT record FROM autumn_job_tracking WHERE key = $1 AND expires_at > $2",
+            "SELECT record::TEXT AS record FROM autumn_job_tracking WHERE key = $1 AND expires_at > $2",
         )
         .bind::<diesel::sql_types::Text, _>(key)
         .bind::<diesel::sql_types::Timestamptz, _>(now)
@@ -1195,14 +1252,7 @@ impl JobTrackingStore for PgJobTrackingStore {
     }
 
     fn mark_running<'a>(&'a self, key: &'a str) -> BoxFut<'a, AutumnResult<()>> {
-        Box::pin(async move {
-            self.update(key, |record| {
-                if !record.status.is_terminal() {
-                    record.status = TrackedJobStatus::Running;
-                }
-            })
-            .await
-        })
+        Box::pin(async move { self.update(key, apply_mark_running).await })
     }
 
     fn set_progress<'a>(
@@ -1213,36 +1263,17 @@ impl JobTrackingStore for PgJobTrackingStore {
     ) -> BoxFut<'a, AutumnResult<()>> {
         Box::pin(async move {
             let pct = pct.min(100);
-            self.update(key, |record| {
-                if !record.status.is_terminal() {
-                    record.progress_pct = Some(pct);
-                    record.progress_message = message;
-                }
-            })
-            .await
+            self.update(key, |record| apply_set_progress(record, pct, message))
+                .await
         })
     }
 
     fn complete<'a>(&'a self, key: &'a str, result: Value) -> BoxFut<'a, AutumnResult<()>> {
-        Box::pin(async move {
-            self.update(key, |record| {
-                record.status = TrackedJobStatus::Succeeded;
-                record.result = Some(result);
-                record.error = None;
-            })
-            .await
-        })
+        Box::pin(async move { self.update(key, |record| apply_complete(record, result)).await })
     }
 
     fn fail<'a>(&'a self, key: &'a str, error: String) -> BoxFut<'a, AutumnResult<()>> {
-        Box::pin(async move {
-            self.update(key, |record| {
-                record.status = TrackedJobStatus::Failed;
-                record.error = Some(error);
-                record.result = None;
-            })
-            .await
-        })
+        Box::pin(async move { self.update(key, |record| apply_fail(record, error)).await })
     }
 
     fn get<'a>(&'a self, key: &'a str) -> BoxFut<'a, AutumnResult<Option<TrackedJobRecord>>> {
@@ -1253,7 +1284,7 @@ impl JobTrackingStore for PgJobTrackingStore {
             let now = self.clock.now();
             let mut conn = self.conn().await?;
             let row = diesel::sql_query(
-                "SELECT record FROM autumn_job_tracking WHERE key = $1 AND expires_at > $2",
+                "SELECT record::TEXT AS record FROM autumn_job_tracking WHERE key = $1 AND expires_at > $2",
             )
             .bind::<diesel::sql_types::Text, _>(key)
             .bind::<diesel::sql_types::Timestamptz, _>(now)
@@ -1299,6 +1330,44 @@ mod tests {
         assert_eq!(record.status, TrackedJobStatus::Pending);
         assert_eq!(record.owner, TrackedJobOwner::User("user:42".to_owned()));
         assert!(record.progress_pct.is_none());
+        assert!(record.result.is_none());
+    }
+
+    // ── shared mutation logic (single source of truth for all 3 backends) ────
+
+    #[test]
+    fn apply_functions_implement_the_documented_transitions() {
+        let mut record = TrackedJobRecord {
+            status: TrackedJobStatus::Pending,
+            progress_pct: None,
+            progress_message: None,
+            result: None,
+            error: None,
+            owner: TrackedJobOwner::Anonymous,
+            updated_at: chrono::Utc::now(),
+        };
+
+        apply_mark_running(&mut record);
+        assert_eq!(record.status, TrackedJobStatus::Running);
+
+        apply_set_progress(&mut record, 40, Some("40%".to_owned()));
+        assert_eq!(record.progress_pct, Some(40));
+        assert_eq!(record.progress_message.as_deref(), Some("40%"));
+
+        apply_complete(&mut record, serde_json::json!({"ok": true}));
+        assert_eq!(record.status, TrackedJobStatus::Succeeded);
+        assert_eq!(record.result, Some(serde_json::json!({"ok": true})));
+        assert!(record.error.is_none());
+
+        // A terminal record ignores further mark_running/set_progress calls.
+        apply_mark_running(&mut record);
+        assert_eq!(record.status, TrackedJobStatus::Succeeded);
+        apply_set_progress(&mut record, 10, None);
+        assert_eq!(record.progress_pct, Some(40));
+
+        apply_fail(&mut record, "boom".to_owned());
+        assert_eq!(record.status, TrackedJobStatus::Failed);
+        assert_eq!(record.error.as_deref(), Some("boom"));
         assert!(record.result.is_none());
     }
 
@@ -1462,6 +1531,46 @@ mod tests {
         assert_eq!(inner, &args);
     }
 
+    #[test]
+    fn reject_reserved_envelope_marker_rejects_a_colliding_top_level_field() {
+        let colliding = serde_json::json!({"__autumn_tracked": {"k": "anything"}, "other": 1});
+        let err =
+            reject_reserved_envelope_marker(&colliding).expect_err("collision must be rejected");
+        assert!(
+            err.to_string().contains("__autumn_tracked"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn reject_reserved_envelope_marker_allows_ordinary_payloads() {
+        assert!(reject_reserved_envelope_marker(&serde_json::json!({"account_id": 42})).is_ok());
+        assert!(reject_reserved_envelope_marker(&Value::Null).is_ok());
+        // A field merely containing the substring, or not exactly matching
+        // the reserved key, is not a collision.
+        assert!(
+            reject_reserved_envelope_marker(&serde_json::json!({"__autumn_tracked_at": 1}))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn take_and_split_tracked_payload_agree_on_a_malformed_envelope_missing_args() {
+        // The marker is present (so both functions detect a tracked
+        // envelope) but there is no `args` field — a state `wrap_tracked_payload`
+        // itself never produces, but the two unwrap functions must still
+        // agree on how to handle it rather than silently diverging.
+        let malformed = serde_json::json!({"__autumn_tracked": {"k": "abc123"}});
+
+        let (split_key, split_inner) = split_tracked_payload(&malformed);
+        assert_eq!(split_key, Some("abc123"));
+        assert_eq!(split_inner, &Value::Null);
+
+        let (take_key, take_inner) = take_tracked_payload(malformed);
+        assert_eq!(take_key.as_deref(), Some("abc123"));
+        assert_eq!(take_inner, Value::Null);
+    }
+
     // ── JobContext ─────────────────────────────────────────────────────────
 
     #[test]
@@ -1571,7 +1680,162 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn enqueue_failure_settles_the_orphaned_pending_record_instead_of_leaking_it() {
+        struct KeyCapturingStore {
+            inner: InMemoryJobTrackingStore,
+            last_created_key: std::sync::Mutex<Option<String>>,
+        }
+
+        impl JobTrackingStore for KeyCapturingStore {
+            fn create<'a>(
+                &'a self,
+                key: &'a str,
+                owner: TrackedJobOwner,
+            ) -> BoxFut<'a, AutumnResult<()>> {
+                *self.last_created_key.lock().unwrap() = Some(key.to_owned());
+                self.inner.create(key, owner)
+            }
+            fn mark_running<'a>(&'a self, key: &'a str) -> BoxFut<'a, AutumnResult<()>> {
+                self.inner.mark_running(key)
+            }
+            fn set_progress<'a>(
+                &'a self,
+                key: &'a str,
+                pct: u8,
+                message: Option<String>,
+            ) -> BoxFut<'a, AutumnResult<()>> {
+                self.inner.set_progress(key, pct, message)
+            }
+            fn complete<'a>(&'a self, key: &'a str, result: Value) -> BoxFut<'a, AutumnResult<()>> {
+                self.inner.complete(key, result)
+            }
+            fn fail<'a>(&'a self, key: &'a str, error: String) -> BoxFut<'a, AutumnResult<()>> {
+                self.inner.fail(key, error)
+            }
+            fn get<'a>(
+                &'a self,
+                key: &'a str,
+            ) -> BoxFut<'a, AutumnResult<Option<TrackedJobRecord>>> {
+                self.inner.get(key)
+            }
+        }
+
+        let _guard = crate::job::global_job_runtime_test_lock().lock().await;
+        crate::job::clear_global_job_client();
+
+        let store = Arc::new(KeyCapturingStore {
+            inner: InMemoryJobTrackingStore::new(60),
+            last_created_key: std::sync::Mutex::new(None),
+        });
+
+        let state = AppState::for_test().with_profile("dev");
+        install_tracking_store(&state, store.clone());
+
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        crate::job::start_local_runtime(
+            vec![crate::job::JobInfo::new(
+                "registered_job",
+                1,
+                10,
+                |_state, _payload| Box::pin(async move { Ok(()) }),
+            )],
+            &state,
+            &shutdown,
+            1,
+            5,
+            250,
+            &crate::config::JobQueuesConfig::default(),
+        );
+
+        // "unregistered_job" is never registered on this runtime, so the
+        // enqueue itself fails with an `Err` before the job ever reaches the
+        // queue — the exact scenario that used to leak the `Pending` record
+        // `store.create` had already written moments earlier.
+        let err = enqueue_tracked("unregistered_job", serde_json::json!({}))
+            .await
+            .expect_err("enqueueing an unregistered job name must error");
+        assert!(
+            err.to_string().contains("is not registered"),
+            "unexpected error: {err}"
+        );
+
+        let key = store
+            .last_created_key
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("store.create should have been called");
+        let record = store.get(&key).await.unwrap().expect("record");
+        assert_eq!(
+            record.status,
+            TrackedJobStatus::Failed,
+            "the orphaned Pending record must be settled to Failed, not left dangling"
+        );
+
+        shutdown.cancel();
+        crate::job::clear_global_job_client();
+    }
+
     // ── Redis/Postgres store selection (no live service needed) ──────────────
+
+    #[tokio::test]
+    async fn ensure_tracking_store_installed_reinstalls_after_clear_even_with_a_stale_state_extension()
+     {
+        let _guard = crate::job::global_job_runtime_test_lock().lock().await;
+        crate::job::clear_global_job_client();
+
+        let state = AppState::for_test();
+        ensure_tracking_store_installed(&state);
+        assert!(global_tracking_store().is_some(), "sanity: store installed");
+
+        // Simulate a runtime restart that clears global state without ever
+        // constructing a fresh AppState (e.g. an app's own restart helper
+        // that always calls clear_global_job_client() before reinitializing
+        // the runtime on the same, already-built AppState).
+        crate::job::clear_global_job_client();
+        assert!(
+            global_tracking_store().is_none(),
+            "sanity: clear really did reset the global"
+        );
+
+        // `state` still carries the stale JobTrackingStoreEntry extension
+        // from before the clear; without the fix this call would see that
+        // extension and skip reinstalling, leaving GLOBAL_TRACKING_STORE
+        // stuck at None and enqueue_tracked permanently broken.
+        ensure_tracking_store_installed(&state);
+        assert!(
+            global_tracking_store().is_some(),
+            "the tracking store must be reinstalled after a clear even when \
+             the same AppState (with its now-stale extension) is reused"
+        );
+
+        crate::job::clear_global_job_client();
+    }
+
+    #[tokio::test]
+    async fn ensure_tracking_store_installed_from_config_reinstalls_after_clear_even_with_a_stale_state_extension()
+     {
+        let _guard = crate::job::global_job_runtime_test_lock().lock().await;
+        crate::job::clear_global_job_client();
+
+        let state = AppState::for_test();
+        let config = crate::config::JobConfig::default();
+        ensure_tracking_store_installed_from_config(&state, &config);
+        assert!(global_tracking_store().is_some(), "sanity: store installed");
+
+        crate::job::clear_global_job_client();
+        assert!(global_tracking_store().is_none(), "sanity: clear reset the global");
+
+        ensure_tracking_store_installed_from_config(&state, &config);
+        assert!(
+            global_tracking_store().is_some(),
+            "start_runtime's installer must reinstall after a clear even when \
+             the same AppState (with its now-stale extension) is reused"
+        );
+
+        crate::job::clear_global_job_client();
+    }
 
     #[cfg(feature = "redis")]
     #[test]
