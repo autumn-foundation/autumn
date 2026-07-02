@@ -76,11 +76,13 @@ between per-replica Moka caches described in the [cloud-native
 guide](cloud-native.md#shared-cache): if you need a single fill *cluster-wide*,
 enable the Redis backend and the distributed fill lock.
 
-When the lock is contended, the losing replica polls the cache (at
-`lock_poll_interval`, default 50ms) for the winner's value and also
-re-attempts the lock (picking up a crashed holder once its lock TTL expires).
-If neither happens within `lock_wait_timeout` (default 5s), the replica gives
-up waiting and fills locally — bounded extra work, never unavailability.
+When the lock is contended, the losing replica polls the cache (starting at
+`lock_poll_interval`, default 50ms, doubling on each attempt up to a 1s
+ceiling so sustained contention doesn't hammer the backend at a fixed rate)
+for the winner's value and also re-attempts the lock (picking up a crashed
+holder once its lock TTL expires). If neither happens within
+`lock_wait_timeout` (default 5s), the replica gives up waiting and fills
+locally — bounded extra work, never unavailability.
 
 ## Stale-while-revalidate
 
@@ -106,7 +108,13 @@ background task rather than the calling task) — capture owned handles
 (`Arc`-clone your pool) rather than borrows. On the in-process Moka backend,
 per-entry physical expiry isn't available (Moka's TTL is per-cache-instance);
 freshness is tracked in a stored envelope instead, so correctness doesn't
-depend on Moka evicting the entry.
+depend on Moka evicting the entry. Omitting `.ttl(...)` (leaving it at its
+`None` default) combined with SWR means the value is fresh forever — it
+never goes stale and never triggers a background refresh, matching `ttl`'s
+own "no expiry" semantics. A process-wide cap (64) limits how many background
+refreshes can run concurrently across all keys, so a burst of simultaneously
+expiring keys can't spawn unbounded background work; a key that misses the
+cap simply retries the refresh on its next stale read.
 
 ## Failure semantics
 

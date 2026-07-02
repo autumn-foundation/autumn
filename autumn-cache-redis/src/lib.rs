@@ -133,8 +133,19 @@ impl RedisCache {
         format!("{}:{}", self.key_prefix, key)
     }
 
+    /// Physical key for `key`'s distributed fill lock.
+    ///
+    /// Deliberately **not** nested under `key_prefix:` (i.e. not
+    /// `prefixed(format!("{key}:fill-lock"))`): `prefixed()` maps every
+    /// possible `key` onto `"{key_prefix}:{key}"`, so any suffix appended
+    /// under that same namespace is reachable by *some* ordinary cache key
+    /// (e.g. an app key literally named `"session:fill-lock"`) and could
+    /// silently collide with a lock entry. Using a distinct top-level sentinel
+    /// here means a collision would require the operator's own `key_prefix`
+    /// to equal `"__autumn_fill_lock__"`, not merely an unlucky choice of
+    /// cache key.
     fn fill_lock_key(&self, key: &str) -> String {
-        format!("{}:{}:fill-lock", self.key_prefix, key)
+        format!("__autumn_fill_lock__:{}:{}", self.key_prefix, key)
     }
 
     fn redis_get(&self, key: &str) -> Option<Vec<u8>> {
@@ -310,17 +321,22 @@ impl Cache for RedisCache {
         let lock_key = self.fill_lock_key(key);
         let mut conn = self.manager.clone();
         let token = token.to_owned();
-        tokio::task::block_in_place(|| {
+        let result: Result<i64, _> = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async move {
                 let script = redis::Script::new(RELEASE_FILL_LOCK_SCRIPT);
-                let _: Result<i64, _> = script
+                script
                     .key(&lock_key)
                     .arg(&token)
                     .invoke_async(&mut conn)
-                    .await;
-            });
+                    .await
+            })
         });
-        debug!(key, "RedisCache: released fill lock");
+        match result {
+            Ok(_) => debug!(key, "RedisCache: released fill lock"),
+            Err(e) => {
+                debug!(key, error = %e, "RedisCache: fill lock release failed");
+            }
+        }
     }
 }
 

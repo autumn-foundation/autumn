@@ -451,6 +451,52 @@ async fn swr_only_one_background_refresh() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn swr_without_ttl_never_goes_stale() {
+    let _guard = METRICS_LOCK.lock().await;
+    let cache = fresh_cache();
+    let key = unique_key("swr_without_ttl_never_goes_stale");
+    let fill_count = Arc::new(AtomicUsize::new(0));
+
+    // SWR enabled but no `.ttl(...)`: per its own doc comment, `ttl: None`
+    // means "no expiry", so the value must stay fresh forever rather than
+    // going stale (and re-triggering a background refresh) on every read
+    // after the very first.
+    let opts = GetOrComputeOptions::new().stale_while_revalidate(Duration::from_secs(10));
+
+    let fc = fill_count.clone();
+    let v: String = get_or_compute_with(&cache, &key, opts.clone(), move || async move {
+        fc.fetch_add(1, Ordering::SeqCst);
+        Ok::<String, String>("v1".to_string())
+    })
+    .await
+    .unwrap();
+    assert_eq!(v, "v1");
+
+    // Real time elapses. With the bug, any elapsed time makes the entry
+    // stale, since `fresh_until` was stamped as "now" at write time.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    for _ in 0..5 {
+        let fc = fill_count.clone();
+        let v: String = get_or_compute_with(&cache, &key, opts.clone(), move || async move {
+            fc.fetch_add(1, Ordering::SeqCst);
+            Ok::<String, String>("unexpected-refill".to_string())
+        })
+        .await
+        .unwrap();
+        assert_eq!(v, "v1", "a value with no TTL must never appear stale");
+    }
+
+    // Give any (incorrectly) spawned background refresh a chance to run.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        fill_count.load(Ordering::SeqCst),
+        1,
+        "no TTL + SWR must mean 'never stale': only the first fill should ever run"
+    );
+}
+
 /// A minimal `Cache` implementation that only ever stores `RawCacheBytes`
 /// (mirroring how a serializing, cross-process backend like Redis behaves),
 /// proving `get_or_compute` works over the serde slow path too.

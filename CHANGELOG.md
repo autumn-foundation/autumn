@@ -31,6 +31,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   gains two default methods (`try_acquire_fill_lock`/`release_fill_lock`,
   default `Unsupported`/no-op) so existing backends keep working unchanged.
   See the new [Cache Stampede Protection guide](docs/guide/cache-stampede.md).
+  Hardening from review: SWR freshness checks now correctly distinguish a
+  stale envelope from a completed refresh in the lock-poll path, `ttl: None`
+  combined with `stale_while_revalidate` no longer serves as permanently
+  stale, the lock-poll loop backs off exponentially instead of polling at a
+  fixed cadence, background refreshes are capped at 64 concurrent across all
+  keys, the Redis fill-lock key lives in its own namespace instead of one
+  that could collide with an ordinary cache key, and SWR freshness is now
+  evaluated through the same injectable `ClockSource` used elsewhere in the
+  framework rather than a hard-coded `SystemTime::now()`.
 
 - **jobs:** tracked job handles with progress reporting and a built-in
   pollable status route (#1373). `job::enqueue_tracked`/`enqueue_tracked_for`

@@ -32,9 +32,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use tokio::sync::watch;
+use tokio::sync::{Semaphore, watch};
 
 use super::{Cache, FillLockStatus, get_cached, insert_cached};
+use crate::time::{ClockSource, SystemClock, clock_unix_duration};
 
 // ── Options ──────────────────────────────────────────────────────────
 
@@ -42,7 +43,7 @@ use super::{Cache, FillLockStatus, get_cached, insert_cached};
 ///
 /// The default (`GetOrComputeOptions::new()`) is in-process single-flight
 /// only: no TTL, no distributed lock, no stale-while-revalidate.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct GetOrComputeOptions {
     /// Freshness TTL for the value written on fill. `None` = no expiry.
     pub ttl: Option<Duration>,
@@ -65,12 +66,19 @@ pub struct GetOrComputeOptions {
     /// considered stale but is still served for up to `grace` while a single
     /// background task refreshes it.
     pub stale_while_revalidate: Option<Duration>,
+    /// Clock used to evaluate stale-while-revalidate freshness. Defaults to
+    /// [`SystemClock`]; overridden in tests via [`with_clock`] so freshness
+    /// transitions are deterministic instead of depending on real
+    /// `tokio::time::sleep` calls.
+    ///
+    /// [`with_clock`]: GetOrComputeOptions::with_clock
+    clock: Arc<dyn ClockSource>,
 }
 
 impl GetOrComputeOptions {
     /// Create options with defaults: no TTL, in-process single-flight only.
     #[must_use]
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             ttl: None,
             distributed_fill_lock: false,
@@ -78,6 +86,7 @@ impl GetOrComputeOptions {
             lock_poll_interval: Duration::from_millis(50),
             lock_wait_timeout: Duration::from_secs(5),
             stale_while_revalidate: None,
+            clock: Arc::new(SystemClock),
         }
     }
 
@@ -122,11 +131,35 @@ impl GetOrComputeOptions {
         self.stale_while_revalidate = Some(grace);
         self
     }
+
+    /// Override the clock used to evaluate stale-while-revalidate freshness.
+    ///
+    /// Defaults to [`SystemClock`]; tests can pass a
+    /// [`crate::time::FixedClock`] / [`crate::time::TickingClock`] to make
+    /// freshness transitions deterministic.
+    #[must_use]
+    pub fn with_clock(mut self, clock: Arc<dyn ClockSource>) -> Self {
+        self.clock = clock;
+        self
+    }
 }
 
 impl Default for GetOrComputeOptions {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl std::fmt::Debug for GetOrComputeOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GetOrComputeOptions")
+            .field("ttl", &self.ttl)
+            .field("distributed_fill_lock", &self.distributed_fill_lock)
+            .field("lock_ttl", &self.lock_ttl)
+            .field("lock_poll_interval", &self.lock_poll_interval)
+            .field("lock_wait_timeout", &self.lock_wait_timeout)
+            .field("stale_while_revalidate", &self.stale_while_revalidate)
+            .finish_non_exhaustive()
     }
 }
 
@@ -366,24 +399,58 @@ struct SwrEnvelope<V> {
     fresh_until_unix_ms: u64,
 }
 
-fn now_unix_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-        .unwrap_or(0)
+fn now_unix_ms(clock: &dyn ClockSource) -> u64 {
+    u64::try_from(clock_unix_duration(clock).as_millis()).unwrap_or(u64::MAX)
 }
 
-/// Read the current value regardless of freshness (used for lock-poll and
-/// leader double-checks, where "does a value exist yet" is all that matters).
+/// Read the current value, used for the lock-poll loop and the leader's
+/// pre-fill double-check.
+///
+/// In SWR mode this must still check freshness: entry into the poll loop, by
+/// construction, only happens when a *stale* envelope already exists (that's
+/// why a refresh was triggered in the first place), so treating "an envelope
+/// exists" as "the lock winner published a fresh value" would let a losing
+/// replica mistake the old stale envelope for a completed refresh.
 fn fast_path_value<V>(cache: &Arc<dyn Cache>, key: &str, options: &GetOrComputeOptions) -> Option<V>
 where
     V: Clone + serde::de::DeserializeOwned + Send + Sync + 'static,
 {
     if options.stale_while_revalidate.is_some() {
-        get_cached::<SwrEnvelope<V>>(cache.as_ref(), key).map(|envelope| envelope.value)
+        get_cached::<SwrEnvelope<V>>(cache.as_ref(), key)
+            .filter(|envelope| now_unix_ms(options.clock.as_ref()) < envelope.fresh_until_unix_ms)
+            .map(|envelope| envelope.value)
     } else {
         get_cached::<V>(cache.as_ref(), key)
     }
+}
+
+/// Ceiling on the lock-poll loop's exponential backoff (see [`run_leader_fill`]).
+const MAX_LOCK_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Run `fill`, release the distributed lock, and publish/write the result.
+/// Shared by the immediate-`Acquired` path and the poll loop's re-acquire
+/// path in [`run_leader_fill`], which otherwise duplicate this exact
+/// increment-fill-release-finish sequence.
+async fn run_fill_and_release<V, E, F, Fut>(
+    cache: &Arc<dyn Cache>,
+    key: &str,
+    options: &GetOrComputeOptions,
+    fill: F,
+    tx: &watch::Sender<FillState>,
+    token: &str,
+) -> Result<V, CacheFillError<E>>
+where
+    V: Clone + serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
+    E: std::fmt::Display + Send + 'static,
+    F: FnOnce() -> Fut + Send,
+    Fut: Future<Output = Result<V, E>> + Send,
+{
+    read_through_metrics()
+        .fill_lock_acquires
+        .fetch_add(1, Ordering::Relaxed);
+    let result = fill().await;
+    cache.release_fill_lock(key, token);
+    finish_fill(cache, key, options, result, tx)
 }
 
 /// Run the fill closure (honoring the distributed fill lock if enabled),
@@ -414,20 +481,22 @@ where
             finish_fill(cache, key, options, result, &tx)
         }
         FillLockStatus::Acquired => {
-            read_through_metrics()
-                .fill_lock_acquires
-                .fetch_add(1, Ordering::Relaxed);
-            let result = fill().await;
-            cache.release_fill_lock(key, &token);
-            finish_fill(cache, key, options, result, &tx)
+            run_fill_and_release(cache, key, options, fill, &tx, &token).await
         }
         FillLockStatus::Held => {
             read_through_metrics()
                 .fill_lock_contended
                 .fetch_add(1, Ordering::Relaxed);
             let start = Instant::now();
+            // Exponential backoff, capped at MAX_LOCK_POLL_INTERVAL: a flat
+            // poll cadence means every waiting replica hammers Redis (a cache
+            // read plus a lock-acquire attempt, each a block_in_place round
+            // trip) at a constant rate for the whole wait, even once it's
+            // clear the lock is held and unlikely to free up immediately.
+            let mut poll_interval = options.lock_poll_interval;
             loop {
-                tokio::time::sleep(options.lock_poll_interval).await;
+                tokio::time::sleep(poll_interval).await;
+                poll_interval = poll_interval.saturating_mul(2).min(MAX_LOCK_POLL_INTERVAL);
 
                 if let Some(value) = fast_path_value::<V>(cache, key, options) {
                     let _ = tx.send(FillState::Done(Arc::new(value.clone())));
@@ -444,12 +513,7 @@ where
                 if cache.try_acquire_fill_lock(key, &token, options.lock_ttl)
                     == FillLockStatus::Acquired
                 {
-                    read_through_metrics()
-                        .fill_lock_acquires
-                        .fetch_add(1, Ordering::Relaxed);
-                    let result = fill().await;
-                    cache.release_fill_lock(key, &token);
-                    return finish_fill(cache, key, options, result, &tx);
+                    return run_fill_and_release(cache, key, options, fill, &tx, &token).await;
                 }
             }
         }
@@ -473,12 +537,19 @@ where
     match result {
         Ok(value) => {
             if let Some(grace) = options.stale_while_revalidate {
-                let ttl_ms = options
-                    .ttl
-                    .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+                // `ttl: None` means "no expiry" (per its own doc comment): the
+                // envelope must stay fresh forever, not go stale immediately.
+                // Treating a missing TTL as `ttl_ms = 0` would stamp
+                // `fresh_until` as "now", making the very next read (and every
+                // read after) take the stale branch and re-trigger a
+                // background refresh in a tight loop.
+                let fresh_until_unix_ms = options.ttl.map_or(u64::MAX, |ttl| {
+                    let ttl_ms = u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX);
+                    now_unix_ms(options.clock.as_ref()).saturating_add(ttl_ms)
+                });
                 let envelope = SwrEnvelope {
                     value: value.clone(),
-                    fresh_until_unix_ms: now_unix_ms().saturating_add(ttl_ms),
+                    fresh_until_unix_ms,
                 };
                 let physical_ttl = options.ttl.map(|ttl| ttl + grace);
                 insert_cached(cache.as_ref(), key, envelope, physical_ttl);
@@ -500,10 +571,25 @@ where
     }
 }
 
+/// Process-wide ceiling on concurrently running stale-while-revalidate
+/// background refreshes, across *all* keys. The per-key single-flight
+/// registry only dedupes refreshes for the *same* key; without this, many
+/// keys going stale around the same time (e.g. after a bulk write with
+/// unjittered TTLs) could spawn an unbounded number of detached tasks, each
+/// holding open whatever resource the `fill` closure captured (a pooled DB
+/// connection, say), risking pool exhaustion under load.
+const MAX_CONCURRENT_BACKGROUND_REFRESHES: usize = 64;
+
+static BACKGROUND_REFRESH_LIMIT: LazyLock<Semaphore> =
+    LazyLock::new(|| Semaphore::new(MAX_CONCURRENT_BACKGROUND_REFRESHES));
+
 /// Try to become the leader for a stale-while-revalidate background refresh.
 /// If another fill (a cold-miss leader, or an earlier refresh) is already
 /// in-flight for this key, do nothing and drop `fill` unrun — only one
-/// refresh should run at a time per key.
+/// refresh should run at a time per key. If the process-wide concurrent
+/// refresh limit is already saturated, also drop `fill` unrun rather than
+/// spawn an unbounded task: the stale value was already returned to this
+/// caller, and the next stale read will retry the refresh.
 fn spawn_background_refresh<V, E, F, Fut>(
     cache: Arc<dyn Cache>,
     key: String,
@@ -517,7 +603,12 @@ fn spawn_background_refresh<V, E, F, Fut>(
 {
     match claim_role(&cache, &key) {
         Role::Leader(tx, guard) => {
+            let Ok(permit) = BACKGROUND_REFRESH_LIMIT.try_acquire() else {
+                drop(guard);
+                return;
+            };
             tokio::spawn(async move {
+                let _permit = permit;
                 let _result = run_leader_fill(&cache, &key, &options, fill, tx).await;
                 drop(guard);
             });
@@ -594,7 +685,9 @@ where
 {
     loop {
         match get_cached::<SwrEnvelope<V>>(cache.as_ref(), key) {
-            Some(envelope) if now_unix_ms() < envelope.fresh_until_unix_ms => {
+            Some(envelope)
+                if now_unix_ms(options.clock.as_ref()) < envelope.fresh_until_unix_ms =>
+            {
                 read_through_metrics().hits.fetch_add(1, Ordering::Relaxed);
                 return Ok(envelope.value);
             }
@@ -755,6 +848,45 @@ mod tests {
         );
         // Default release is a no-op and must not panic.
         Cache::release_fill_lock(&cache, "k", "token");
+    }
+
+    #[cfg(feature = "cache-moka")]
+    #[test]
+    fn fast_path_value_ignores_stale_swr_envelope() {
+        use super::super::MokaCache;
+
+        let cache: Arc<dyn Cache> = Arc::new(MokaCache::new(10, None));
+        let key = "fast-path-swr-key";
+        let options = GetOrComputeOptions::new().stale_while_revalidate(Duration::from_secs(10));
+
+        // A stale envelope (fresh_until in the past) must NOT be reported as
+        // "the fill landed": the lock-poll loop in `run_leader_fill` relies on
+        // `fast_path_value` to distinguish a fresh write by the lock winner
+        // from the pre-existing stale value that triggered the refresh in the
+        // first place. Reporting the stale value here would make a losing
+        // replica stop waiting/polling prematurely and publish stale data as
+        // if it were the completed refresh.
+        let stale = SwrEnvelope {
+            value: "stale-value".to_string(),
+            fresh_until_unix_ms: 0,
+        };
+        insert_cached(cache.as_ref(), key, stale, None);
+        assert_eq!(
+            fast_path_value::<String>(&cache, key, &options),
+            None,
+            "a stale SWR envelope must not be reported as a completed fill"
+        );
+
+        // A fresh envelope (fresh_until far in the future) is reported.
+        let fresh = SwrEnvelope {
+            value: "fresh-value".to_string(),
+            fresh_until_unix_ms: u64::MAX,
+        };
+        insert_cached(cache.as_ref(), key, fresh, None);
+        assert_eq!(
+            fast_path_value::<String>(&cache, key, &options),
+            Some("fresh-value".to_string())
+        );
     }
 
     #[test]
