@@ -128,14 +128,21 @@
     setNavMenuExpanded(toggle, true);
   }
 
+  // initNav is guarded per-CONTROL (toggle / menu toggle), not once per nav
+  // element: when htmx swaps a <nav data-autumn-nav>'s innerHTML (the nav
+  // itself stays in the DOM, only its children are replaced), the swapped-in
+  // hamburger/dropdown buttons are brand-new nodes with no dataset flags of
+  // their own, so they need wiring again even though the nav was already
+  // initialized once. The keydown listener is the one nav-level exception —
+  // it always queries for the *current* open toggle at Escape-press time, so
+  // it never needs re-registering and must only ever be added once.
   function initNav(nav) {
-    if (nav.dataset.navInit) return;
-    nav.dataset.navInit = '1';
     nav.classList.add('autumn-nav--enhanced');
 
     var toggle = nav.querySelector('[data-nav-toggle]');
     var collapse = toggle && document.getElementById(toggle.getAttribute('aria-controls'));
-    if (toggle && collapse) {
+    if (toggle && collapse && !toggle.dataset.navToggleInit) {
+      toggle.dataset.navToggleInit = '1';
       toggle.hidden = false;
       toggle.addEventListener('click', function () {
         var open = toggle.getAttribute('aria-expanded') === 'true';
@@ -144,19 +151,24 @@
       });
     }
 
-    var menuToggles = nav.querySelectorAll('[data-nav-menu-toggle]');
-    menuToggles.forEach(function (menuToggle) {
+    nav.querySelectorAll('[data-nav-menu-toggle]').forEach(function (menuToggle) {
+      if (menuToggle.dataset.navMenuToggleInit) return;
+      menuToggle.dataset.navMenuToggleInit = '1';
       // Collapse the server-rendered "open" default without decrementing
       // openNavMenuCount — it was never incremented for these, so treating
       // this as a close would drive the counter negative.
       setNavMenuExpanded(menuToggle, false);
       menuToggle.addEventListener('click', function () {
         var open = menuToggle.getAttribute('aria-expanded') === 'true';
-        menuToggles.forEach(closeNavMenu);
+        // Re-query rather than close over the toggle list captured at wiring
+        // time, so a later swap's newly-wired toggles are included too.
+        nav.querySelectorAll('[data-nav-menu-toggle]').forEach(closeNavMenu);
         if (!open) openNavMenu(menuToggle);
       });
     });
 
+    if (nav.dataset.navKeydownInit) return;
+    nav.dataset.navKeydownInit = '1';
     // Escape closes the open dropdown (if any) and refocuses its trigger.
     nav.addEventListener('keydown', function (e) {
       if (e.key !== 'Escape') return;
