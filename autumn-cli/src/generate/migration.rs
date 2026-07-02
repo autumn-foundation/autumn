@@ -55,16 +55,37 @@ pub fn plan_migration(
     let dir_name = format!("{timestamp}_{}", snake_or_pascal_to_snake(name));
     let migration_dir = project_root.join("migrations").join(&dir_name);
 
+    let mut plan = Plan::new(project_root);
+
     let shape = detect_migration_shape(&pascalish(name));
     let (up, down) = match shape {
-        MigrationShape::AddColumns { ref table } if !fields.is_empty() => (
-            add_columns_up_sql(table, &fields),
-            add_columns_down_sql(table, &fields),
-        ),
-        MigrationShape::RemoveColumns { ref table } if !fields.is_empty() => (
-            remove_columns_up_sql(table, &fields),
-            remove_columns_down_sql(table, &fields),
-        ),
+        MigrationShape::AddColumns { ref table } if !fields.is_empty() => {
+            // A `references` field here gets the same target-model warning /
+            // UUID-PK error as `generate model`/`generate scaffold` (issue
+            // #1026) — otherwise the same DSL token gives inconsistent
+            // feedback depending only on which subcommand declared it.
+            // `own_id_type` is `None`: this shape only `ALTER TABLE`s an
+            // *existing* table, so its actual primary-key type isn't tracked
+            // anywhere the generator can see — a self-reference here is left
+            // unvalidated rather than guessed at.
+            super::model::check_reference_targets(&mut plan, project_root, &fields, table, None)?;
+            (
+                add_columns_up_sql(table, &fields),
+                add_columns_down_sql(table, &fields),
+            )
+        }
+        MigrationShape::RemoveColumns { ref table } if !fields.is_empty() => {
+            // `remove_columns_down_sql`'s rollback restores the FK
+            // constraint/index for a `references` field (issue #1026), so it
+            // needs the same UUID-PK guard as `AddColumns` — otherwise a
+            // target with a UUID primary key still produces a `down.sql`
+            // that fails to apply on rollback.
+            super::model::check_reference_targets(&mut plan, project_root, &fields, table, None)?;
+            (
+                remove_columns_up_sql(table, &fields),
+                remove_columns_down_sql(table, &fields),
+            )
+        }
         MigrationShape::EncryptColumns {
             ref table,
             ref columns,
@@ -140,7 +161,6 @@ pub fn plan_migration(
         _ => (String::new(), String::new()),
     };
 
-    let mut plan = Plan::new(project_root);
     plan.create(migration_dir.join("up.sql"), up);
     plan.create(migration_dir.join("down.sql"), down);
     Ok(plan)
@@ -256,6 +276,74 @@ mod tests {
     }
 
     #[test]
+    fn remove_columns_migration_with_references_field_restores_fk_on_rollback() {
+        // `RemovePostFromComments post:references` — down.sql must restore
+        // the FK constraint and index, not just a bare column (issue #1026).
+        let tmp = project();
+        let plan = plan_migration(
+            tmp.path(),
+            "RemovePostFromComments",
+            &["post:references".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let down = fs::read_to_string(
+            tmp.path()
+                .join("migrations/20260427000000_remove_post_from_comments/down.sql"),
+        )
+        .unwrap();
+        assert!(
+            down.contains(
+                "ALTER TABLE comments ADD COLUMN post_id BIGINT NOT NULL REFERENCES posts(id);"
+            ),
+            "down.sql: {down}"
+        );
+        assert!(
+            down.contains("CREATE INDEX idx_comments_post_id ON comments (post_id);"),
+            "down.sql: {down}"
+        );
+    }
+
+    #[test]
+    fn remove_columns_with_references_field_errors_on_uuid_target() {
+        // The restored FK constraint in remove_columns_down_sql needs the
+        // same UUID-PK guard as AddColumns — otherwise a target with a UUID
+        // primary key still produces a down.sql that fails on rollback.
+        let tmp = project();
+        let models_dir = tmp.path().join("src/models");
+        fs::create_dir_all(&models_dir).unwrap();
+        fs::write(
+            models_dir.join("post.rs"),
+            "#[autumn_web::model]\npub struct Post {\n    #[id]\n    pub id: uuid::Uuid,\n}\n",
+        )
+        .unwrap();
+
+        let err = plan_migration(
+            tmp.path(),
+            "RemovePostFromComments",
+            &["post:references".into()],
+            "20260427000000",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("UUID"));
+    }
+
+    #[test]
+    fn remove_columns_with_references_field_warns_when_target_model_missing() {
+        let tmp = project();
+        let plan = plan_migration(
+            tmp.path(),
+            "RemovePostFromComments",
+            &["post:references".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        assert_eq!(plan.warnings.len(), 1, "warnings: {:?}", plan.warnings);
+        assert!(plan.warnings[0].contains("posts"));
+    }
+
+    #[test]
     fn add_pattern_with_no_fields_is_empty() {
         let tmp = project();
         let plan = plan_migration(tmp.path(), "AddTitleToPosts", &[], "20260427000000").unwrap();
@@ -326,5 +414,107 @@ pub struct Post {
         );
         assert!(down.contains("DROP INDEX IF EXISTS idx_posts_search_vector;"));
         assert!(down.contains("ALTER TABLE posts DROP COLUMN IF EXISTS search_vector;"));
+    }
+
+    // ── references field: parity with `generate model` (issue #1026) ───────
+
+    #[test]
+    fn add_columns_with_references_field_emits_fk_and_index() {
+        let tmp = project();
+        let plan = plan_migration(
+            tmp.path(),
+            "AddPostToComments",
+            &["post:references".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let up = fs::read_to_string(
+            tmp.path()
+                .join("migrations/20260427000000_add_post_to_comments/up.sql"),
+        )
+        .unwrap();
+        assert!(up.contains("post_id BIGINT NOT NULL REFERENCES posts(id)"));
+        assert!(up.contains("CREATE INDEX idx_comments_post_id ON comments (post_id);"));
+    }
+
+    #[test]
+    fn add_columns_with_references_field_warns_when_target_model_missing() {
+        let tmp = project();
+        let plan = plan_migration(
+            tmp.path(),
+            "AddPostToComments",
+            &["post:references".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        assert_eq!(plan.warnings.len(), 1, "warnings: {:?}", plan.warnings);
+        assert!(plan.warnings[0].contains("posts"));
+    }
+
+    #[test]
+    fn add_columns_with_references_field_errors_on_uuid_target() {
+        let tmp = project();
+        let models_dir = tmp.path().join("src/models");
+        fs::create_dir_all(&models_dir).unwrap();
+        fs::write(
+            models_dir.join("post.rs"),
+            "#[autumn_web::model]\npub struct Post {\n    #[id]\n    pub id: uuid::Uuid,\n}\n",
+        )
+        .unwrap();
+
+        let err = plan_migration(
+            tmp.path(),
+            "AddPostToComments",
+            &["post:references".into()],
+            "20260427000000",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("UUID"));
+    }
+
+    #[test]
+    fn add_columns_self_reference_to_table_being_altered_has_no_warning() {
+        // `AddCategoryToCategories category:references` targets the very
+        // table it's altering — a filesystem lookup for a "Category" model
+        // is irrelevant here (the table obviously already exists, that's
+        // the point of ALTER TABLE), so no "model not found" warning should
+        // fire for the self-reference.
+        let tmp = project();
+        let plan = plan_migration(
+            tmp.path(),
+            "AddCategoryToCategories",
+            &["category:references".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        assert!(plan.warnings.is_empty(), "warnings: {:?}", plan.warnings);
+    }
+
+    #[test]
+    fn add_columns_self_reference_errors_when_existing_model_has_uuid_pk() {
+        // Unlike `generate model`, `generate migration Add…To…` alters an
+        // EXISTING table — if that table's own model file is on disk and
+        // declares a UUID primary key, the self-reference must still be
+        // caught (it's not "unknown PK type, can't check", it's "known PK
+        // type, from the file the caller didn't think to look at").
+        let tmp = project();
+        let models_dir = tmp.path().join("src/models");
+        fs::create_dir_all(&models_dir).unwrap();
+        fs::write(
+            models_dir.join("category.rs"),
+            "#[autumn_web::model]\npub struct Category {\n    #[id]\n    pub id: uuid::Uuid,\n}\n",
+        )
+        .unwrap();
+
+        let err = plan_migration(
+            tmp.path(),
+            "AddCategoryToCategories",
+            &["category:references".into()],
+            "20260427000000",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("UUID"));
+        assert!(err.to_string().contains("self-referential"));
     }
 }

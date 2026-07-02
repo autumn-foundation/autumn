@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **cli:** `references` field type for `autumn generate model`/`scaffold`
+  (#1026). `post:references` (or `references:`, either casing) scaffolds a
+  foreign key: the field name resolves to `post_id`, the referenced table is
+  derived via the existing `naming::pluralize` (`Post` -> `posts`), and the
+  migration emits `post_id BIGINT NOT NULL REFERENCES posts(id)` plus an
+  automatic index (`idx_<table>_post_id`) — no `--index` flag needed. Append
+  `?` for a nullable FK (`post:references?` -> `post_id: Option<i64>`). The
+  generated `#[model]` field is `post_id: i64` (`Int8` in `schema.rs`), and
+  `down.sql` reverses cleanly (`DROP TABLE`, or an implicit column-owned
+  index/constraint drop for the `ALTER TABLE ADD COLUMN` migration shape). An
+  unknown referenced model (no `src/models/<base>.rs` or matching
+  `src/models.rs` entry) still scaffolds, with a warning that the table is
+  assumed to already exist; a referenced model that *is* found but declares a
+  UUID primary key fails fast with a clear error instead of emitting a
+  `BIGINT`-vs-`UUID` foreign key that would break at `autumn migrate` time.
+  `generate migration Add…To…` gets the same warning/error behavior as
+  `generate model`/`scaffold` for consistency. `references` is listed in
+  `SUPPORTED_TYPES` / `--help`, and the generated scaffold smoke test creates
+  a minimal stand-in for the referenced table (skipping self-referential FKs,
+  which target the table already being created) so it stays runnable
+  standalone.
 - **auth:** scoped service tokens whose scopes flow into policy checks (#1158).
   Mint named, optionally-expiring API tokens carrying a set of flat scopes
   (e.g. `posts:read`) via `IssueTokenSpec` + `issue_scoped_api_token`; tokens

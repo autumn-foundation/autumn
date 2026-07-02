@@ -50,6 +50,10 @@ pub struct Plan {
     pub project_root: PathBuf,
     /// The actions this plan will perform when executed.
     pub actions: Vec<Action>,
+    /// Advisory messages surfaced to the user on [`Plan::execute`] (both
+    /// `--dry-run` and a real run), without failing the generator — e.g. a
+    /// `references` field whose target model doesn't exist yet.
+    pub warnings: Vec<String>,
 }
 
 impl Plan {
@@ -59,7 +63,14 @@ impl Plan {
         Self {
             project_root: project_root.into(),
             actions: Vec::new(),
+            warnings: Vec::new(),
         }
+    }
+
+    /// Record an advisory message, printed by [`Plan::execute`] but never
+    /// fatal to the plan.
+    pub fn warn(&mut self, message: impl Into<String>) {
+        self.warnings.push(message.into());
     }
 
     /// Push a [`Action::Create`] action.
@@ -123,6 +134,7 @@ impl Plan {
     /// for filesystem failures during emission.
     pub fn execute(&self, flags: Flags) -> Result<(), GenerateError> {
         if flags.dry_run {
+            self.print_warnings();
             self.print_dry_run();
             return Ok(());
         }
@@ -133,6 +145,8 @@ impl Plan {
                 return Err(GenerateError::Collisions(collisions));
             }
         }
+
+        self.print_warnings();
 
         // Make sure parent directories of every file action exist.
         let mut dirs: BTreeSet<PathBuf> = BTreeSet::new();
@@ -188,6 +202,17 @@ impl Plan {
         Ok(())
     }
 
+    /// Print every advisory warning to stderr. Called only on a path that
+    /// will actually run (dry-run or a real, non-colliding execution) — never
+    /// before a `--force`/collision check that might abort the plan, so a
+    /// failed, no-op run never emits misleading warnings about a plan that
+    /// was never applied.
+    fn print_warnings(&self) {
+        for warning in &self.warnings {
+            eprintln!("Warning: {warning}");
+        }
+    }
+
     fn print_dry_run(&self) {
         println!("Dry run — no files written.");
         for action in &self.actions {
@@ -227,6 +252,36 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let plan = Plan::new(tmp.path());
         (tmp, plan)
+    }
+
+    #[test]
+    fn new_plan_has_no_warnings() {
+        let (_tmp, plan) = fixture();
+        assert!(plan.warnings.is_empty());
+    }
+
+    #[test]
+    fn warn_records_message_and_execute_does_not_fail() {
+        let (_tmp, mut plan) = fixture();
+        plan.warn("referenced table 'posts' is assumed to exist");
+        assert_eq!(plan.warnings.len(), 1);
+        // A warning never fails the plan — it's advisory only.
+        plan.execute(Flags::default()).unwrap();
+    }
+
+    #[test]
+    fn warnings_do_not_block_a_collision_error() {
+        // A colliding Create must still fail with Collisions even when the
+        // plan also carries a warning (the warning is printed to stderr,
+        // which this test can't capture in-process, but it must never be
+        // allowed to suppress or alter the underlying error).
+        let (tmp, mut plan) = fixture();
+        let target = tmp.path().join("out.txt");
+        fs::write(&target, "existing").unwrap();
+        plan.warn("some advisory message");
+        plan.create(target, "new");
+        let err = plan.execute(Flags::default()).unwrap_err();
+        assert!(matches!(err, GenerateError::Collisions(_)));
     }
 
     #[test]
