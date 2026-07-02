@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **cache:** read-through fills with single-flight cache stampede protection
+  (#1204). `cache::get_or_compute(cache, key, ttl, fill)` computes a missing
+  value once per process for concurrent callers — the first miss becomes the
+  "leader" and runs `fill`; every other concurrent caller for the same key
+  awaits that one fill via a process-global in-flight registry instead of
+  recomputing it. `cache::get_or_compute_with(cache, key, options, fill)`
+  adds opt-in cross-replica protection: `GetOrComputeOptions::
+  distributed_fill_lock(true)` acquires a Redis `SET NX PX` lock (with a Lua
+  compare-and-delete release) so N replicas don't refill the same key N
+  times, and `GetOrComputeOptions::stale_while_revalidate(grace)` serves the
+  last-known value immediately while at most one background refresh runs. A
+  failing fill never poisons the key: the leader gets a typed
+  `CacheFillError::Fill`, waiters get a rendered `CacheFillError::FillFailed`,
+  nothing is written to the cache, and the next caller retries; the
+  distributed lock's TTL bounds the damage from a crashed filler.
+  `cache::jittered_ttl(base, fraction)` de-synchronizes mass expiry of keys
+  written together. New `autumn_cache_read_through_*` and
+  `autumn_cache_fill_lock_*` counters are exposed on both
+  `/actuator/metrics` and `/actuator/prometheus`. Additive: the `Cache` trait
+  gains two default methods (`try_acquire_fill_lock`/`release_fill_lock`,
+  default `Unsupported`/no-op) so existing backends keep working unchanged.
+  See the new [Cache Stampede Protection guide](docs/guide/cache-stampede.md).
+
 - **jobs:** tracked job handles with progress reporting and a built-in
   pollable status route (#1373). `job::enqueue_tracked`/`enqueue_tracked_for`
   (and the generated `{Job}::enqueue_tracked`/`enqueue_tracked_for`

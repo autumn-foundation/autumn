@@ -66,6 +66,7 @@ jobs:
           cargo test -p autumn-web --all-features --test feature_flags_pg_integration -- --ignored
           cargo test -p autumn-web --test scoped_tokens_db -- --ignored
           cargo test -p autumn-admin-plugin --test token_admin_db -- --ignored
+          cargo test -p autumn-cache-redis -- --ignored
 
   coverage:
     name: Coverage
@@ -106,6 +107,7 @@ jobs:
             --test scoped_tokens_db -- --ignored
           cargo llvm-cov --no-report -p autumn-admin-plugin \
             --test token_admin_db -- --ignored
+          cargo llvm-cov --no-report -p autumn-cache-redis -- --ignored
           cargo llvm-cov report --lcov --output-path lcov.info
       - name: Upload to Codecov
         uses: codecov/codecov-action@v6
