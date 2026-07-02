@@ -102,9 +102,15 @@ let opts = GetOrComputeOptions::new()
 
 - While the value is **fresh** (within `ttl`), reads return it immediately.
 - Once **stale** (past `ttl` but within `ttl + grace`), reads still return the
-  last-known value immediately, and kick off **at most one** background
-  refresh per key (through the same single-flight registry — concurrent stale
-  reads never start a second refresh).
+  last-known value immediately, and kick off **at most one background refresh
+  per replica** (through the same process-local single-flight registry —
+  concurrent stale reads on the same replica never start a second refresh).
+  This is a per-process guarantee, not cluster-wide: with only
+  `stale_while_revalidate` enabled, N replicas can each independently start
+  their own refresh for the same stale key at expiry (N fills, not 1). Add
+  `.distributed_fill_lock(true)` for the cluster-wide "at most one refresh
+  fleet-wide" guarantee — the background refresh honors the distributed lock
+  exactly like a cold-miss fill.
 - Once past `ttl + grace`, the key is treated as a cold miss again.
 
 **Trade-offs:** callers may observe a value up to `grace` old. The fill
