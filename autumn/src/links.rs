@@ -28,6 +28,66 @@
 
 use http::Method;
 
+/// Returns `true` when `name` is a valid HTML attribute name: an ASCII
+/// letter followed by ASCII alphanumerics, `-`, `_`, or `:`.
+#[cfg(feature = "maud")]
+fn is_valid_attr_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) if first.is_ascii_alphabetic() => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == ':')
+}
+
+/// Append `text`, HTML-escaped (`&`, `<`, `>`), to `out`.
+#[cfg(feature = "maud")]
+fn push_escaped_text(out: &mut String, text: &str) {
+    for c in text.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            other => out.push(other),
+        }
+    }
+}
+
+/// Append `text`, HTML-escaped for use inside a double-quoted attribute
+/// value (`&`, `<`, `>`, `"`, `'`), to `out`.
+#[cfg(feature = "maud")]
+fn push_escaped_attr_value(out: &mut String, text: &str) {
+    for c in text.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            other => out.push(other),
+        }
+    }
+}
+
+/// Append a ` name="escaped-value"` attribute to `out`.
+///
+/// # Panics
+///
+/// Panics when `name` is not a valid HTML attribute name — see
+/// [`is_valid_attr_name`].
+#[cfg(feature = "maud")]
+fn push_attr(out: &mut String, name: &str, value: &str) {
+    assert!(
+        is_valid_attr_name(name),
+        "invalid HTML attribute name {name:?} passed to link_to/button_to"
+    );
+    out.push(' ');
+    out.push_str(name);
+    out.push_str("=\"");
+    push_escaped_attr_value(out, value);
+    out.push('"');
+}
+
 /// Options for [`link_to_with`]: extra class, `target`, `rel`, and arbitrary
 /// additional attributes (e.g. htmx `hx-*`).
 ///
@@ -229,8 +289,44 @@ pub fn link_to(label: &str, href: &str) -> maud::Markup {
 #[cfg(feature = "maud")]
 #[must_use]
 pub fn link_to_with(label: &str, href: &str, options: &LinkToOptions<'_>) -> maud::Markup {
-    let _ = (label, href, options);
-    todo!("implemented in the green phase of #1138")
+    let rel = effective_rel(options.target, options.rel);
+
+    let mut out = String::from("<a");
+    push_attr(&mut out, "href", href);
+    if let Some(class) = options.class {
+        push_attr(&mut out, "class", class);
+    }
+    if let Some(target) = options.target {
+        push_attr(&mut out, "target", target);
+    }
+    if let Some(rel) = rel.as_deref() {
+        push_attr(&mut out, "rel", rel);
+    }
+    for (name, value) in options.attrs {
+        push_attr(&mut out, name, value);
+    }
+    out.push('>');
+    push_escaped_text(&mut out, label);
+    out.push_str("</a>");
+
+    maud::PreEscaped(out)
+}
+
+/// Compute the effective `rel` value for a link: when `target="_blank"`,
+/// `noopener` is appended to the caller's `rel` (space-separated, no
+/// duplicate) or used on its own.
+#[cfg(feature = "maud")]
+fn effective_rel(target: Option<&str>, rel: Option<&str>) -> Option<String> {
+    if target != Some("_blank") {
+        return rel.map(ToString::to_string);
+    }
+    match rel {
+        Some(rel) if rel.split_whitespace().any(|token| token == "noopener") => {
+            Some(rel.to_string())
+        }
+        Some(rel) => Some(format!("{rel} noopener")),
+        None => Some("noopener".to_string()),
+    }
 }
 
 /// Render a state-changing action button: a single-button `<form>` carrying
@@ -322,8 +418,35 @@ pub fn button_to_with(
     csrf_token: &str,
     options: &ButtonToOptions<'_>,
 ) -> maud::Markup {
-    let _ = (label, href, method, csrf_token, options);
-    todo!("implemented in the green phase of #1138")
+    let mut button = String::from("<button type=\"submit\"");
+    if let Some(class) = options.class {
+        push_attr(&mut button, "class", class);
+    }
+    for (name, value) in options.attrs {
+        push_attr(&mut button, name, value);
+    }
+    button.push('>');
+    push_escaped_text(&mut button, label);
+    button.push_str("</button>");
+    let button = maud::PreEscaped(button);
+
+    let csrf_field = options.csrf_field.unwrap_or("_csrf");
+
+    if method == Method::GET {
+        maud::html! {
+            form action=(href) method="get" class=[options.form_class] {
+                (button)
+            }
+        }
+    } else {
+        maud::html! {
+            form action=(href) method="post" class=[options.form_class] {
+                (crate::form::method_input(method.as_str()))
+                input type="hidden" name=(csrf_field) value=(csrf_token);
+                (button)
+            }
+        }
+    }
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────
@@ -384,7 +507,9 @@ mod tests {
 
     #[test]
     fn link_to_target_blank_no_duplicate_noopener() {
-        let options = LinkToOptions::new().target("_blank").rel("noopener external");
+        let options = LinkToOptions::new()
+            .target("_blank")
+            .rel("noopener external");
         let html = link_to_with("Ext", "https://example.com", &options).into_string();
         assert_eq!(html.matches("noopener").count(), 1, "{html}");
         assert!(html.contains(r#"rel="noopener external""#), "{html}");
@@ -425,7 +550,10 @@ mod tests {
     #[test]
     fn button_to_post_renders_form_csrf_and_button() {
         let html = button_to("Log out", "/logout", Method::POST, "tok123").into_string();
-        assert!(html.contains(r#"<form action="/logout" method="post""#), "{html}");
+        assert!(
+            html.contains(r#"<form action="/logout" method="post""#),
+            "{html}"
+        );
         assert!(
             html.contains(r#"input type="hidden" name="_csrf" value="tok123""#),
             "{html}"
@@ -441,10 +569,7 @@ mod tests {
     fn button_to_delete_adds_method_override() {
         let html = button_to("Delete", "/posts/42", Method::DELETE, "tok123").into_string();
         assert!(html.contains(r#"method="post""#), "{html}");
-        assert!(
-            html.contains(r#"name="_method" value="DELETE""#),
-            "{html}"
-        );
+        assert!(html.contains(r#"name="_method" value="DELETE""#), "{html}");
         assert!(html.contains(r#"name="_csrf" value="tok123""#), "{html}");
     }
 
