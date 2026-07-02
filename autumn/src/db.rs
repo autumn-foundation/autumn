@@ -330,6 +330,35 @@ const fn is_separator(c: char) -> bool {
     )
 }
 
+/// Scrubs literals from a SQL string to create a safe fingerprint for logging and metrics.
+///
+/// This function exists to ensure that raw SQL queries—which may contain personally
+/// identifiable information (PII) or sensitive data—can be safely aggregated and logged.
+/// By replacing string and numeric literals with a placeholder (`?`), it preserves the
+/// structure of the query while removing the dynamic, potentially sensitive values.
+///
+/// # Examples
+///
+/// ```
+/// use autumn_web::db::scrub_sql;
+///
+/// let raw_sql = "SELECT * FROM users WHERE email = 'test@example.com' AND age > 18";
+/// let scrubbed = scrub_sql(raw_sql);
+///
+/// assert_eq!(scrubbed, "SELECT * FROM users WHERE email = '?' AND age > ?");
+/// ```
+///
+/// # Details
+///
+/// This function performs a best-effort, token-aware scrub rather than relying on a
+/// full SQL parser or naive regular expressions. It handles:
+///
+/// - Standard single-quoted strings (`'foo'`)
+/// - Escape strings (`E'foo\n'`)
+/// - Dollar-quoted strings (`$$foo$$` or `$tag$foo$tag$`)
+/// - Standalone numeric literals (`123`, `4.56`, `1e10`, `.5`)
+///
+/// Identifiers (like table or column names) and structural SQL elements are preserved.
 #[must_use]
 pub fn scrub_sql(sql: &str) -> String {
     let mut out = String::with_capacity(sql.len());
