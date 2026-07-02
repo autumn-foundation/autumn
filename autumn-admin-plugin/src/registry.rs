@@ -8,11 +8,22 @@ use std::collections::btree_map::{BTreeMap, Entry};
 
 use crate::traits::AdminModel;
 
+/// Sentinel `active_slug` value that marks the built-in Jobs page active in
+/// the sidebar nav (see `templates::admin_layout`). Reserved below so a
+/// model can never register this exact slug and hijack the Jobs nav item's
+/// active state.
+pub const JOBS_NAV_SLUG: &str = "__admin_jobs";
+
+/// Sentinel `active_slug` value that marks the built-in Runtime Config page
+/// active in the sidebar nav (see `templates::admin_layout`). Reserved below
+/// for the same reason as [`JOBS_NAV_SLUG`].
+pub const RUNTIME_CONFIG_NAV_SLUG: &str = "__admin_config";
+
 // "config" is NOT reserved here: the /config route is only mounted when
 // with_runtime_config is enabled.  The collision check for that case is
 // deferred to AdminPlugin::build() so deployments without runtime-config
 // can freely use a model with slug "config".
-const RESERVED_MODEL_SLUGS: &[&str] = &["jobs"];
+const RESERVED_MODEL_SLUGS: &[&str] = &["jobs", JOBS_NAV_SLUG, RUNTIME_CONFIG_NAV_SLUG];
 
 /// Holds all registered admin models, keyed by their URL slug.
 ///
@@ -204,6 +215,30 @@ mod tests {
         registry.register(DummyModel {
             slug: "jobs",
             name: "Jobs",
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "reserved model slug '__admin_jobs'")]
+    fn reserved_jobs_nav_sentinel_slug_panics() {
+        // admin_layout's sidebar nav derives the active-link path from this
+        // exact sentinel string (JOBS_NAV_SLUG); a model slug matching it
+        // would make the Jobs nav item claim active state instead of the
+        // model's own link.
+        let mut registry = AdminRegistry::new();
+        registry.register(DummyModel {
+            slug: JOBS_NAV_SLUG,
+            name: "Fake Jobs",
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "reserved model slug '__admin_config'")]
+    fn reserved_runtime_config_nav_sentinel_slug_panics() {
+        let mut registry = AdminRegistry::new();
+        registry.register(DummyModel {
+            slug: RUNTIME_CONFIG_NAV_SLUG,
+            name: "Fake Config",
         });
     }
 

@@ -736,6 +736,60 @@ mod tests {
     }
 }
 
+// ── Current request path ─────────────────────────────────────────────────────
+
+/// The current request's URI path (e.g. `"/admin/posts/3/edit"`), without the
+/// query string.
+///
+/// Infallible — always succeeds, even on requests with no matched route.
+/// Intended for path-aware view helpers such as `nav_link`
+/// (`autumn_web::widgets::nav_link`, behind the `maud` feature), which need
+/// to know the current path to decide whether a navigation link is active.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use autumn_web::prelude::*;
+///
+/// #[get("/posts")]
+/// async fn index(CurrentPath(path): CurrentPath) -> Markup {
+///     nav_link(&path, "/posts", "Posts")
+/// }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CurrentPath(pub String);
+
+impl CurrentPath {
+    /// The current request path as a string slice.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<S> FromRequestParts<S> for CurrentPath
+where
+    S: Send + Sync,
+{
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        // Use OriginalUri rather than parts.uri directly: axum's Router::nest
+        // strips the mount prefix from parts.uri inside the nested service,
+        // but nav_link needs the full browser-visible path to compare against
+        // normal absolute hrefs. OriginalUri falls back to parts.uri itself
+        // when the request wasn't dispatched through a nested router.
+        let axum::extract::OriginalUri(uri) =
+            axum::extract::OriginalUri::from_request_parts(parts, state)
+                .await
+                .unwrap();
+        Ok(Self(uri.path().to_owned()))
+    }
+}
+
 // ── Trusted-proxy client-identity extractors ─────────────────────────────────
 
 use crate::security::trusted_proxies::ResolvedClientIdentity;
@@ -1038,5 +1092,60 @@ mod trusted_proxy_extractor_tests {
         let resp = app.oneshot(req).await.unwrap();
         let body = axum::body::to_bytes(resp.into_body(), 64).await.unwrap();
         assert_eq!(&body[..], b"none");
+    }
+
+    #[tokio::test]
+    async fn current_path_extracts_uri_path() {
+        async fn handler(CurrentPath(path): CurrentPath) -> String {
+            path
+        }
+
+        let app = Router::new().route("/admin/posts", get(handler));
+        let req = axum::http::Request::builder()
+            .uri("/admin/posts")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 64).await.unwrap();
+        assert_eq!(&body[..], b"/admin/posts");
+    }
+
+    #[tokio::test]
+    async fn current_path_strips_query_string() {
+        async fn handler(CurrentPath(path): CurrentPath) -> String {
+            path
+        }
+
+        let app = Router::new().route("/admin/posts", get(handler));
+        let req = axum::http::Request::builder()
+            .uri("/admin/posts?page=2")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 64).await.unwrap();
+        assert_eq!(&body[..], b"/admin/posts");
+    }
+
+    #[tokio::test]
+    async fn current_path_preserves_prefix_under_nested_router() {
+        // axum's Router::nest strips the mount prefix from `parts.uri` inside
+        // the nested service, so a request to "/admin/posts" is seen as
+        // "/posts" there. nav_link's documented use compares CurrentPath
+        // against normal absolute hrefs like "/admin/posts", so CurrentPath
+        // must return the browser-visible path (via OriginalUri), not the
+        // nest-relative one.
+        async fn handler(CurrentPath(path): CurrentPath) -> String {
+            path
+        }
+
+        let inner = Router::new().route("/posts", get(handler));
+        let app = Router::new().nest("/admin", inner);
+        let req = axum::http::Request::builder()
+            .uri("/admin/posts")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 64).await.unwrap();
+        assert_eq!(&body[..], b"/admin/posts");
     }
 }
