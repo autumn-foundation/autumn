@@ -499,6 +499,21 @@ The browser gets a progress bar within milliseconds and a download link the
 moment the job finishes — no hand-written status table, token, or polling
 endpoint anywhere in app code.
 
+### Known limitation: tracked status vs. the durable queue record
+
+On the Redis and Postgres backends, a job's tracked status (`succeeded`/
+`failed`) is settled *before* that backend's own success/dead-letter
+acknowledgement is written. In the rare case where that ack later fails or
+is skipped (e.g. the claim changed because another worker recovered it as
+stale in between), the tracked status can briefly report a terminal state
+the durable queue record hasn't actually reached — a poller may stop
+watching a moment before the durable backend finishes catching up, which it
+does automatically on its own retry/recovery path. This window only opens
+on an ack failure, not on ordinary success/failure/retry. Treat the tracked
+status as a progress/UX signal for the caller, not as the source of truth
+for whether a job will run again — use the admin dashboard
+([Observability](#observability)) or `JobAdminBackend` for that.
+
 ## Observability
 
 Mount `autumn-admin-plugin` to get the built-in operator dashboard at
