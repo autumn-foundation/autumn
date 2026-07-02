@@ -5896,6 +5896,14 @@ fn record_pg_row_cancel_after_ack(
 const PG_WORKER_IDLE_SLEEP: std::time::Duration = std::time::Duration::from_millis(200);
 #[cfg(feature = "db")]
 const PG_MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+/// How often to sweep expired rows out of `autumn_job_tracking`. Much
+/// slower than [`PG_MAINTENANCE_INTERVAL`] (which recovers stale claims —
+/// a latency-sensitive concern) since tracking-row expiry has no such
+/// urgency: the row is already invisible to reads/writes the moment it
+/// expires (`PgJobTrackingStore` filters on `expires_at` lazily), so this
+/// sweep exists only to bound table growth over time, not correctness.
+#[cfg(feature = "db")]
+const PG_TRACKING_CLEANUP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Columns returned by every SELECT from `autumn_jobs` when OTLP is disabled.
 #[cfg(all(feature = "db", not(feature = "telemetry-otlp")))]
@@ -6767,6 +6775,8 @@ async fn pg_maintenance_loop(
 ) {
     let mut interval = tokio::time::interval(PG_MAINTENANCE_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut tracking_cleanup_interval = tokio::time::interval(PG_TRACKING_CLEANUP_INTERVAL);
+    tracking_cleanup_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             _ = interval.tick() => {
@@ -6775,8 +6785,34 @@ async fn pg_maintenance_loop(
                     pg_update_concurrency_blocked_gauges(&pool, &state).await;
                 }
             }
+            _ = tracking_cleanup_interval.tick() => {
+                pg_cleanup_expired_tracking_rows(&pool).await;
+            }
             () = shutdown.cancelled() => break,
         }
+    }
+}
+
+/// Delete `autumn_job_tracking` rows past their `expires_at`.
+///
+/// Expired rows are already invisible to `PgJobTrackingStore` reads/writes
+/// (it filters on `expires_at` lazily), so this exists only to bound the
+/// table's growth for high-volume tracked-job usage — every enqueue writes
+/// a row here, and without a sweep those rows would otherwise accumulate
+/// forever.
+#[cfg(feature = "db")]
+async fn pg_cleanup_expired_tracking_rows(pool: &PgPool) {
+    use diesel_async::RunQueryDsl as _;
+
+    let Ok(mut conn) = pool.get().await else {
+        tracing::warn!("job tracking cleanup could not acquire connection");
+        return;
+    };
+    if let Err(e) = diesel::sql_query("DELETE FROM autumn_job_tracking WHERE expires_at <= NOW()")
+        .execute(&mut *conn)
+        .await
+    {
+        tracing::warn!(error = %e, "job tracking cleanup failed");
     }
 }
 
@@ -12758,6 +12794,64 @@ mod tests {
             );
 
             clear_global_job_client();
+        }
+
+        #[tokio::test]
+        #[ignore = "requires Docker (testcontainers)"]
+        async fn pg_tracking_cleanup_deletes_expired_rows_and_keeps_live_ones() {
+            use testcontainers::runners::AsyncRunner as _;
+            use testcontainers_modules::postgres::Postgres;
+
+            let container = Postgres::default().start().await.unwrap();
+            let port = container.get_host_port_ipv4(5432).await.unwrap();
+            let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+            let pool = pg_test_pool(&url);
+
+            let mut conn = pool.get().await.unwrap();
+            let tracking_sql =
+                include_str!("../migrations/20260702000000_create_job_tracking/up.sql");
+            for stmt in tracking_sql.split(';') {
+                let stmt = stmt.trim();
+                if !stmt.is_empty() {
+                    diesel::sql_query(stmt).execute(&mut *conn).await.unwrap();
+                }
+            }
+            drop(conn);
+
+            // A record whose TTL puts `expires_at` far in the past — the
+            // clock only controls what timestamp gets written, not any
+            // filtering here, since `pg_cleanup_expired_tracking_rows`
+            // compares against Postgres's real `NOW()`.
+            let long_ago = chrono::DateTime::parse_from_rfc3339("2000-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc);
+            let expired_store = crate::job_tracking::PgJobTrackingStore::new(pool.clone(), 60)
+                .with_clock(std::sync::Arc::new(crate::time::FixedClock::at(long_ago)));
+            expired_store
+                .create(
+                    "expired-key",
+                    crate::job_tracking::TrackedJobOwner::Anonymous,
+                )
+                .await
+                .unwrap();
+
+            let live_store = crate::job_tracking::PgJobTrackingStore::new(pool.clone(), 86_400);
+            live_store
+                .create("live-key", crate::job_tracking::TrackedJobOwner::Anonymous)
+                .await
+                .unwrap();
+
+            pg_cleanup_expired_tracking_rows(&pool).await;
+
+            let verify_store = crate::job_tracking::PgJobTrackingStore::new(pool.clone(), 86_400);
+            assert!(
+                verify_store.get("expired-key").await.unwrap().is_none(),
+                "an expired tracking row must be swept instead of accumulating forever"
+            );
+            assert!(
+                verify_store.get("live-key").await.unwrap().is_some(),
+                "the cleanup sweep must not touch rows that haven't expired yet"
+            );
         }
 
         /// Helper: fetch a single job row by id for test assertions.
