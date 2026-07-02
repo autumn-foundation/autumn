@@ -107,20 +107,25 @@
   // entirely on the common case where nothing is open.
   var openNavMenuCount = 0;
 
-  function closeNavMenu(toggle) {
+  // Set expanded/collapsed DOM state without touching openNavMenuCount —
+  // used for the init-time normalization below, which collapses the
+  // server-rendered "all open" default rather than reacting to a real
+  // user-driven open/close transition the counter should track.
+  function setNavMenuExpanded(toggle, expanded) {
     var menu = document.getElementById(toggle.getAttribute('aria-controls'));
     if (!menu) return;
+    toggle.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+    menu.hidden = !expanded;
+  }
+
+  function closeNavMenu(toggle) {
     if (toggle.getAttribute('aria-expanded') === 'true') openNavMenuCount--;
-    toggle.setAttribute('aria-expanded', 'false');
-    menu.hidden = true;
+    setNavMenuExpanded(toggle, false);
   }
 
   function openNavMenu(toggle) {
-    var menu = document.getElementById(toggle.getAttribute('aria-controls'));
-    if (!menu) return;
     if (toggle.getAttribute('aria-expanded') !== 'true') openNavMenuCount++;
-    toggle.setAttribute('aria-expanded', 'true');
-    menu.hidden = false;
+    setNavMenuExpanded(toggle, true);
   }
 
   function initNav(nav) {
@@ -141,7 +146,10 @@
 
     var menuToggles = nav.querySelectorAll('[data-nav-menu-toggle]');
     menuToggles.forEach(function (menuToggle) {
-      closeNavMenu(menuToggle);
+      // Collapse the server-rendered "open" default without decrementing
+      // openNavMenuCount — it was never incremented for these, so treating
+      // this as a close would drive the counter negative.
+      setNavMenuExpanded(menuToggle, false);
       menuToggle.addEventListener('click', function () {
         var open = menuToggle.getAttribute('aria-expanded') === 'true';
         menuToggles.forEach(closeNavMenu);
