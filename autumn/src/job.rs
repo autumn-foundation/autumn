@@ -1068,8 +1068,16 @@ impl JobAdminBackend for JobAdminMemoryBackend {
                 AutumnError::service_unavailable_msg("job runtime is not initialized")
             })?;
             let (name, payload) = self.retry_payload(&id)?;
+            let payload_for_reset = payload.clone();
             match client.enqueue_with_outcome(&name, payload).await {
-                Ok(EnqueueOutcome::Queued) => Ok(()),
+                Ok(EnqueueOutcome::Queued) => {
+                    // The record is currently `Failed` (terminal) from the
+                    // original run; reset it to `Pending` so the retried
+                    // attempt's mark_running/set_progress calls (which
+                    // otherwise no-op against a terminal record) surface.
+                    crate::job_tracking::reset_tracked_payload_for_retry(&payload_for_reset).await;
+                    Ok(())
+                }
                 Ok(EnqueueOutcome::Deduplicated) => {
                     // No retry was actually queued: an equivalent unique job
                     // already holds the key. Restore the failed record and
@@ -3889,6 +3897,18 @@ impl RedisJobAdminBackend {
         let mut connection = self.connection.clone();
         let new_id = uuid::Uuid::new_v4().to_string();
         let dead_record_key = format!("{}{id}", self.dead_record_prefix);
+        // Fetch the record's payload first (for a tracked-status reset on
+        // success below) — the script below moves this same dead record.
+        let raw_record: Option<String> = redis::cmd("GET")
+            .arg(&dead_record_key)
+            .query_async(&mut connection)
+            .await
+            .ok()
+            .flatten();
+        let tracked_payload = raw_record
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<RedisJobRecord>(s).ok())
+            .map(|r| r.payload);
         // The unique lock was released when the job dead-lettered, so a
         // retried unique job must take it again under its new id — and the
         // retry must be refused when an equivalent job is already holding it,
@@ -3955,6 +3975,11 @@ return 1
             .query_async(&mut connection)
             .await
             .map_err(|error| redis_admin_error("retry failed job", &error))?;
+        if result == 1
+            && let Some(payload) = tracked_payload
+        {
+            crate::job_tracking::reset_tracked_payload_for_retry(&payload).await;
+        }
         redis_admin_operation_result(result, id, "retry failed job")
     }
 
@@ -6842,6 +6867,7 @@ impl PgJobAdminBackend {
     }
 
     async fn pg_retry_failed(&self, id: &str) -> AutumnResult<()> {
+        use diesel::OptionalExtension as _;
         use diesel_async::RunQueryDsl as _;
 
         let mut conn = self.pool.get().await.map_err(|e| {
@@ -6852,11 +6878,13 @@ impl PgJobAdminBackend {
              SET status = 'enqueued', attempt = 1, run_at = NOW(), enqueued_at = NOW(), \
                  started_at = NULL, finished_at = NULL, \
                  claimed_by = NULL, claimed_at = NULL, last_error = NULL \
-             WHERE id = $1 AND status = 'failed'",
+             WHERE id = $1 AND status = 'failed' \
+             RETURNING payload::TEXT AS payload",
         )
         .bind::<diesel::sql_types::Text, _>(id)
-        .execute(&mut *conn)
+        .get_result::<PgPayloadRow>(&mut *conn)
         .await
+        .optional()
         .map_err(|e| {
             // The retried row keeps its unique_key, so re-enqueueing while an
             // equivalent job is already in flight trips the partial unique
@@ -6871,11 +6899,17 @@ impl PgJobAdminBackend {
                 AutumnError::internal_server_error_msg(format!("pg admin retry failed: {e}"))
             }
         })?;
-        if updated == 0 {
+        let Some(row) = updated else {
             return Err(AutumnError::not_found_msg(format!(
                 "job '{id}' not found or not in failed state"
             )));
-        }
+        };
+        // The record is currently `Failed` (terminal) from the original run;
+        // reset it to `Pending` so the retried attempt's
+        // mark_running/set_progress calls (which otherwise no-op against a
+        // terminal record) surface.
+        let payload = serde_json::from_str::<Value>(&row.payload).unwrap_or(Value::Null);
+        crate::job_tracking::reset_tracked_payload_for_retry(&payload).await;
         Ok(())
     }
 
@@ -7491,6 +7525,76 @@ mod tests {
             .expect("snapshot after retry");
         assert!(snapshot.failed.records.is_empty());
         assert_eq!(snapshot.enqueued.total, 1);
+
+        clear_global_job_client();
+    }
+
+    #[tokio::test]
+    async fn local_admin_retry_resets_tracked_record_off_its_stale_terminal_status() {
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+
+        let store: Arc<dyn crate::job_tracking::JobTrackingStore> =
+            Arc::new(crate::job_tracking::InMemoryJobTrackingStore::new(60));
+        let state = AppState::for_test().with_profile("dev");
+        crate::job_tracking::install_tracking_store(&state, store.clone());
+
+        let key = "retry-reset-key";
+        store
+            .create(key, crate::job_tracking::TrackedJobOwner::Anonymous)
+            .await
+            .unwrap();
+        // The original attempt ran to completion and settled the record
+        // terminally, exactly as `run_job_handler` would on a final-attempt
+        // failure.
+        store
+            .fail(key, "smtp refused recipient".to_string())
+            .await
+            .unwrap();
+        let payload = crate::job_tracking::wrap_tracked_payload(key, &serde_json::json!({}));
+
+        let backend = JobAdminMemoryBackend::new_for_test(32);
+        let (tx, mut rx) = mpsc::channel(1);
+        init_global_job_client(JobClient {
+            local_sender: Some(tx),
+            local_coordination: None,
+            #[cfg(feature = "redis")]
+            redis: None,
+            #[cfg(feature = "db")]
+            pg_pool: None,
+            registry: crate::actuator::JobRegistry::new(),
+            job_admin: backend.clone(),
+            default_max_attempts: 5,
+            default_initial_backoff_ms: 250,
+            per_job_settings: HashMap::from([(
+                "send_email".to_string(),
+                JobRuntimeSettings::basic(5, 250),
+            )]),
+            interceptor: None,
+            resilience_config: None,
+        });
+
+        let failed_id = backend.record_enqueue_for_test("send_email", payload, 2, 5);
+        backend.record_start_for_test(&failed_id, 2);
+        backend.record_failure_for_test(&failed_id, "smtp refused recipient");
+
+        backend
+            .retry(&failed_id)
+            .await
+            .expect("failed job should be retried");
+        let _ = timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("retry should enqueue promptly")
+            .expect("retry should enqueue a job");
+
+        let record = store.get(key).await.unwrap().expect("record");
+        assert_eq!(
+            record.status,
+            crate::job_tracking::TrackedJobStatus::Pending,
+            "an operator retry must reset the tracked record off its stale terminal status so \
+             the retried attempt's mark_running/set_progress calls surface instead of no-op'ing \
+             against a still-Failed record"
+        );
 
         clear_global_job_client();
     }
@@ -9766,6 +9870,79 @@ mod tests {
             crate::job_tracking::TrackedJobStatus::Failed,
             "an operator-cancelled enqueued tracked job must settle its status record instead \
              of staying pending until TTL expiry"
+        );
+
+        clear_global_job_client();
+    }
+
+    #[cfg(feature = "redis")]
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn redis_admin_retry_resets_tracked_record_off_its_stale_terminal_status() {
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+
+        let (_container, client) = redis_test_client().await;
+        let worker_config = redis_test_worker_config("retry-tracked", "worker-1", 30_000);
+        let admin = redis_admin_test_backend(&client, &worker_config);
+        let mut connection = new_redis_connection_manager(&client, "test redis setup").unwrap();
+
+        let state = AppState::for_test().with_profile("dev");
+        let store: Arc<dyn crate::job_tracking::JobTrackingStore> =
+            Arc::new(crate::job_tracking::InMemoryJobTrackingStore::new(60));
+        crate::job_tracking::install_tracking_store(&state, store.clone());
+        let key = "retry-tracked-key";
+        store
+            .create(key, crate::job_tracking::TrackedJobOwner::Anonymous)
+            .await
+            .unwrap();
+        // The original attempt ran to completion and settled the record
+        // terminally, exactly as `run_job_handler` would on a final-attempt
+        // failure.
+        store
+            .fail(key, "smtp refused recipient".to_string())
+            .await
+            .unwrap();
+        let payload = crate::job_tracking::wrap_tracked_payload(key, &serde_json::json!({}));
+
+        let now = now_unix_ms();
+        let record = RedisJobRecord {
+            id: "job-failed-tracked".to_string(),
+            name: "send_email".to_string(),
+            queue: "default".to_string(),
+            payload,
+            attempt: 1,
+            max_attempts: 1,
+            initial_backoff_ms: 250,
+            enqueued_at_ms: Some(now),
+            started_at_ms: Some(now),
+            finished_at_ms: Some(now),
+            claimed_by: Some("worker-1".to_string()),
+            claimed_at_ms: Some(now),
+            last_error: Some("smtp refused recipient".to_string()),
+            unique_key: None,
+            unique_window: None,
+            concurrency_key: None,
+            concurrency_limit: None,
+            #[cfg(feature = "telemetry-otlp")]
+            traceparent: None,
+            #[cfg(feature = "telemetry-otlp")]
+            tracestate: None,
+        };
+        redis_store_history_admin_record(&mut connection, &worker_config, &record, true).await;
+
+        admin
+            .retry(&record.id)
+            .await
+            .expect("failed redis job should be retryable");
+
+        let tracked = store.get(key).await.unwrap().expect("record");
+        assert_eq!(
+            tracked.status,
+            crate::job_tracking::TrackedJobStatus::Pending,
+            "an operator retry must reset the tracked record off its stale terminal status so \
+             the retried attempt's mark_running/set_progress calls surface instead of no-op'ing \
+             against a still-Failed record"
         );
 
         clear_global_job_client();
@@ -12477,6 +12654,71 @@ mod tests {
                 crate::job_tracking::TrackedJobStatus::Failed,
                 "an operator-cancelled enqueued tracked job must settle its status record \
                  instead of staying pending until TTL expiry"
+            );
+
+            clear_global_job_client();
+        }
+
+        #[tokio::test]
+        #[ignore = "requires Docker (testcontainers)"]
+        async fn pg_admin_retry_resets_tracked_record_off_its_stale_terminal_status() {
+            use testcontainers::runners::AsyncRunner as _;
+            use testcontainers_modules::postgres::Postgres;
+
+            let container = Postgres::default().start().await.unwrap();
+            let port = container.get_host_port_ipv4(5432).await.unwrap();
+            let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+            let pool = pg_test_pool(&url);
+            pg_run_migration(&pool).await;
+            let backend = PgJobAdminBackend { pool: pool.clone() };
+
+            let _guard = global_job_runtime_test_lock().lock().await;
+            clear_global_job_client();
+            let store: Arc<dyn crate::job_tracking::JobTrackingStore> =
+                Arc::new(crate::job_tracking::InMemoryJobTrackingStore::new(60));
+            crate::job_tracking::install_tracking_store(&AppState::for_test(), store.clone());
+            let key = "pg-retry-tracked-key";
+            store
+                .create(key, crate::job_tracking::TrackedJobOwner::Anonymous)
+                .await
+                .unwrap();
+            // The original attempt ran to completion and settled the record
+            // terminally, exactly as `run_job_handler` would on a
+            // final-attempt failure.
+            store.fail(key, "boom".to_string()).await.unwrap();
+            let payload = crate::job_tracking::wrap_tracked_payload(key, &serde_json::json!({}));
+
+            pg_enqueue_job(
+                &pool,
+                "pg-retry-tracked".to_string(),
+                "job",
+                "default",
+                payload,
+                1,
+                1,
+                &ResolvedJobConstraints::default(),
+            )
+            .await
+            .unwrap();
+            let claimed = pg_claim_next_job(&pool, "w", false, &["default".to_string()])
+                .await
+                .unwrap();
+            pg_nack_failure(&pool, &claimed.id, "w", "boom", &claimed, None)
+                .await
+                .unwrap();
+
+            backend
+                .retry("pg-retry-tracked")
+                .await
+                .expect("retry should succeed");
+
+            let tracked = store.get(key).await.unwrap().expect("record");
+            assert_eq!(
+                tracked.status,
+                crate::job_tracking::TrackedJobStatus::Pending,
+                "an operator retry must reset the tracked record off its stale terminal status \
+                 so the retried attempt's mark_running/set_progress calls surface instead of \
+                 no-op'ing against a still-Failed record"
             );
 
             clear_global_job_client();

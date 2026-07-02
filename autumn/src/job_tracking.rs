@@ -567,6 +567,32 @@ async fn settle_tracked_payload_with_store(
     }
 }
 
+/// If `payload` is a tracked-job envelope, reset its tracking record back to
+/// `pending` (preserving the existing owner), after an admin retry
+/// successfully re-enqueues it.
+///
+/// `mark_running`/`set_progress` intentionally no-op once a record is
+/// terminal, to protect against a stray write from an abandoned attempt
+/// overwriting a legitimate final result — but that guard also means a
+/// retried job's progress would never surface without this: the public
+/// status would stay at its previous `failed` state until the retry itself
+/// settles. Resolves the store from the process-global fallback since none
+/// of the three admin backends (`JobAdminMemoryBackend`,
+/// `RedisJobAdminBackend`, `PgJobAdminBackend`) carry an `AppState`.
+pub(crate) async fn reset_tracked_payload_for_retry(payload: &Value) {
+    let (key, _) = split_tracked_payload(payload);
+    let Some(key) = key else {
+        return;
+    };
+    let Some(store) = global_tracking_store() else {
+        return;
+    };
+    let Some(record) = store.get(key).await.ok().flatten() else {
+        return;
+    };
+    let _ = store.create(key, record.owner).await;
+}
+
 // ── enqueue_tracked ────────────────────────────────────────────────────────────
 
 /// Built-in route prefix for polling a tracked job's status: the full path is
