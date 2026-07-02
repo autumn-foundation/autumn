@@ -15,7 +15,7 @@ use autumn_web::widgets::{CardConfig, card, nav_link, stat_card};
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 use serde_json::Value;
 
-use crate::registry::AdminRegistry;
+use crate::registry::{AdminRegistry, JOBS_NAV_SLUG, RUNTIME_CONFIG_NAV_SLUG};
 use crate::routes::ADMIN_JS_PATH;
 use crate::traits::{
     AdminAction, AdminField, AdminFieldKind, AdminHistoryPage, AdminImportReport, CsvImportMode,
@@ -25,8 +25,6 @@ use crate::traits::{
 const HTMX_JS_PATH: &str = "/static/js/htmx.min.js";
 const HTMX_CSRF_JS_PATH: &str = "/static/js/autumn-htmx-csrf.js";
 const TOKENS_CSS: &str = include_str!("tokens.css");
-const JOBS_NAV_SLUG: &str = "__admin_jobs";
-const RUNTIME_CONFIG_NAV_SLUG: &str = "__admin_config";
 const FLASH_CSS: &str = "\
 .flash {
     padding: 0.75rem 1rem;
@@ -414,13 +412,17 @@ pub fn admin_layout(
     show_config: bool,
     content: &Markup,
 ) -> Markup {
-    // Synthesize the current path from active_slug so nav_link's own
-    // path-comparison logic (rather than a second hand-rolled comparison)
-    // decides which sidebar item is active.
+    // Each nav item's href is computed once here and reused both to
+    // synthesize current_path (so nav_link's own path-comparison logic
+    // decides which sidebar item is active) and as the anchor's href below —
+    // so the "/jobs" and "/config" route suffixes each appear as a literal
+    // exactly once.
+    let jobs_href = format!("{prefix}/jobs");
+    let config_href = format!("{prefix}/config");
     let current_path = match active_slug {
         None => prefix.to_owned(),
-        Some(JOBS_NAV_SLUG) => format!("{prefix}/jobs"),
-        Some(RUNTIME_CONFIG_NAV_SLUG) => format!("{prefix}/config"),
+        Some(JOBS_NAV_SLUG) => jobs_href.clone(),
+        Some(RUNTIME_CONFIG_NAV_SLUG) => config_href.clone(),
         Some(slug) => format!("{prefix}/{slug}"),
     };
     html! {
@@ -470,13 +472,13 @@ pub fn admin_layout(
                                 }
                                 li { div class="admin-nav-section" { "System" } }
                                 li {
-                                    (nav_link(&current_path, &format!("{prefix}/jobs"), "Jobs"))
+                                    (nav_link(&current_path, &jobs_href, "Jobs"))
                                 }
                                 @if show_config {
                                     li {
                                         (nav_link(
                                             &current_path,
-                                            &format!("{prefix}/config"),
+                                            &config_href,
                                             "Runtime Config",
                                         ))
                                     }
