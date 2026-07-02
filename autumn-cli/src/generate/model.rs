@@ -66,8 +66,11 @@ impl ModelMetadata {
 
 /// Compute every action a `generate model` invocation would perform.
 ///
-/// Pure planning step — no I/O happens here. Tests use this directly so they
-/// can inspect the emitted file list and contents without touching the disk.
+/// Planning-only step — no file is *written* here (that's [`Plan::execute`]).
+/// It does read a few existing files (`mod.rs`/`schema.rs` to merge into, and
+/// any `references` target's model file to validate it — see
+/// [`check_reference_targets`]), so tests can inspect the emitted file list
+/// and contents without any writes reaching disk.
 ///
 /// # Errors
 /// Surfaces project-layout, DSL, and naming errors before any file is written.
@@ -114,6 +117,13 @@ pub fn plan_model_with_options(
     let schema_fields = augment_fields_for_soft_delete(&fields, options.soft_delete)?;
 
     let mut plan = Plan::new(project_root);
+    check_reference_targets(
+        &mut plan,
+        project_root,
+        &fields,
+        &table,
+        Some(options.id_type),
+    )?;
 
     // (a) `src/models/<snake>.rs` + `src/models/mod.rs`
     let models_dir = project_root.join("src").join("models");
@@ -183,6 +193,235 @@ pub fn plan_model_with_options(
     plan_cargo_deps(&mut plan, project_root, &deps);
 
     Ok(plan)
+}
+
+/// Whether resource `base`'s model can be found anywhere in the project,
+/// checking both layouts the codebase already treats as valid (see
+/// `migration.rs`'s `AddSearch` migration shape, which checks the same two
+/// locations): the per-resource `src/models/<base>.rs` (mere existence
+/// counts — it's this resource's own file, however it's written), and the
+/// single-file `src/models.rs` (only counts if its content actually declares
+/// the resource's table, via a word-boundary-aware check so `posts` isn't
+/// confused with a longer table name like `posts_tags`).
+fn model_file_exists(project_root: &Path, table: &str, base: &str) -> bool {
+    let per_resource = project_root
+        .join("src")
+        .join("models")
+        .join(format!("{base}.rs"));
+    if per_resource.exists() {
+        return true;
+    }
+    let single_file = project_root.join("src").join("models.rs");
+    single_file.exists() && declares_schema_table(&read_or_empty(&single_file), table)
+}
+
+/// True if `content` declares `use crate::schema::<table>` for exactly
+/// `table` — either as a bare `schema::<table>;` import or as one entry of a
+/// grouped import (`schema::{<table>, other};`, possibly wrapped across
+/// multiple lines), which is a multi-model `src/models.rs` layout this repo
+/// itself uses (see `examples/reddit-clone/src/models.rs`:
+/// `use crate::schema::{comments, posts, subreddits, users, votes};`).
+/// Word-boundary-aware so `posts` isn't confused with a longer table name
+/// like `posts_tags`.
+fn declares_schema_table(content: &str, table: &str) -> bool {
+    for (idx, _) in content.match_indices("schema::") {
+        let after = &content[idx + "schema::".len()..];
+        if let Some(rest) = after.strip_prefix('{') {
+            let Some(end) = rest.find('}') else {
+                continue;
+            };
+            if rest[..end].split(',').any(|name| name.trim() == table) {
+                return true;
+            }
+        } else if after.starts_with(table)
+            && after[table.len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| !c.is_alphanumeric() && c != '_')
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Locate the source text of resource `base`'s `#[model]` struct body (the
+/// text between its opening and matching closing brace), checking both
+/// model-file layouts (see [`model_file_exists`]).
+///
+/// Scoping to the specific struct's body (rather than the whole file) means
+/// callers can inspect the resource's own `#[id]` field even when other
+/// models are declared in the same `src/models.rs`. Returns `None` when the
+/// struct can't be located/parsed (e.g. a hand-written model using an
+/// unconventional struct name, or the file fails to parse as valid Rust) —
+/// callers should treat that as "can't verify, don't guess" rather than
+/// "model missing", since [`model_file_exists`] already established the
+/// model is present.
+///
+/// Parses the file with `syn` rather than scanning text: earlier text-based
+/// heuristics here kept missing real UUID primary keys behind cosmetic
+/// variation the compiler doesn't care about — grouped attributes, doc
+/// comments, and both `//` and `/* */` comments all defeated a
+/// string-matching approach one at a time (issue #1026 follow-ups). A real
+/// parse isn't fooled by any of that, since it operates on the token tree,
+/// not the source text.
+fn model_struct_has_uuid_pk(project_root: &Path, base: &str) -> bool {
+    let pascal_name = pascal(base);
+    let per_resource = project_root
+        .join("src")
+        .join("models")
+        .join(format!("{base}.rs"));
+    let content = if per_resource.exists() {
+        read_or_empty(&per_resource)
+    } else {
+        let single_file = project_root.join("src").join("models.rs");
+        if !single_file.exists() {
+            return false;
+        }
+        read_or_empty(&single_file)
+    };
+
+    let Ok(file) = syn::parse_file(&content) else {
+        return false;
+    };
+
+    let Some(item_struct) = file.items.iter().find_map(|item| match item {
+        syn::Item::Struct(s) if s.ident == pascal_name => Some(s),
+        _ => None,
+    }) else {
+        return false;
+    };
+
+    let syn::Fields::Named(fields) = &item_struct.fields else {
+        return false;
+    };
+    fields
+        .named
+        .iter()
+        .find(|field| field.attrs.iter().any(|a| a.path().is_ident("id")))
+        .is_some_and(|field| type_is_uuid(&field.ty))
+}
+
+/// Whether a `syn::Type` is a UUID — either the fully-qualified `uuid::Uuid`
+/// (what the generator itself always emits) or the bare `Uuid` (idiomatic
+/// with a `use uuid::Uuid;` import at the top of the file, a common
+/// hand-edit of a generated model).
+fn type_is_uuid(ty: &syn::Type) -> bool {
+    let syn::Type::Path(type_path) = ty else {
+        return false;
+    };
+    if type_path.qself.is_some() {
+        return false;
+    }
+    match type_path.path.segments.len() {
+        1 => type_path.path.segments[0].ident == "Uuid",
+        2 => {
+            type_path.path.segments[0].ident == "uuid" && type_path.path.segments[1].ident == "Uuid"
+        }
+        _ => false,
+    }
+}
+
+/// Validate every `references` field against its target model (issue #1026):
+///
+/// - A *self*-reference (the target table is `own_table` — the resource this
+///   very command is generating) is checked against `own_id_type` directly
+///   instead of a filesystem lookup: the target model's file doesn't exist
+///   yet (this command is creating it), so a file-existence check could
+///   never see it, and a naive "not found, assume it exists" warning would
+///   both misfire (the table obviously exists — it's the one being created)
+///   and, worse, skip the UUID check entirely. `own_id_type` is `None` for
+///   callers that don't track a PK type for the table being altered (`generate
+///   migration Add…To…`, which only ever `ALTER TABLE`s an existing table) —
+///   in that case the self-reference is simply left unvalidated.
+/// - Otherwise, if the target model can't be found anywhere (AC8), record a
+///   warning on `plan` — the generator still scaffolds the FK column,
+///   constraint, and index, simply assuming the referenced table already
+///   exists (e.g. it's created by an out-of-band migration, or generated in
+///   a later command).
+/// - If the target model *can* be found and its own `#[id]` field is a UUID,
+///   fail loudly: `references` only supports the i64/BIGSERIAL PK convention
+///   (see issue #1026's scope), and emitting a `BIGINT` FK column against a
+///   `UUID PRIMARY KEY` would produce a migration that fails at
+///   `autumn migrate` time with an opaque Postgres type-mismatch error —
+///   better to fail fast here with an actionable message.
+///
+/// Shared by `generate model`, `generate scaffold` (via
+/// [`plan_model_with_options`]), and `generate migration Add…To…` (via
+/// `migration::plan_migration`) so a `references` field gets the same
+/// feedback regardless of which subcommand declares it.
+///
+/// # Errors
+/// Returns [`GenerateError::Config`] when a referenced (or self-referenced)
+/// model's `#[id]` field is a UUID.
+pub(super) fn check_reference_targets(
+    plan: &mut Plan,
+    project_root: &Path,
+    fields: &[Field],
+    own_table: &str,
+    own_id_type: Option<IdType>,
+) -> Result<(), GenerateError> {
+    for f in fields {
+        if !f.kind.is_reference() {
+            continue;
+        }
+        let Some(table) = f.reference_table() else {
+            continue;
+        };
+        let base = f.name.strip_suffix("_id").unwrap_or(&f.name);
+
+        if table == own_table {
+            match own_id_type {
+                Some(IdType::Uuid) => {
+                    return Err(GenerateError::Config(format!(
+                        "'{}' is a self-referential foreign key, but this model uses a UUID \
+                         primary key (`--id uuid`). `references` fields only support \
+                         i64/BIGSERIAL-keyed targets (issue #1026).",
+                        f.name
+                    )));
+                }
+                // Known non-UUID PK: the table is being created right now
+                // with that type, so the self-reference is fine.
+                Some(_) => continue,
+                // Unknown (`generate migration Add…To…`, altering a table
+                // whose PK type isn't tracked here): unlike `generate model`,
+                // this table may already exist on disk, so still check its
+                // model file for a UUID PK if one is found — but don't warn
+                // "model not found" for a self-reference, since the table
+                // obviously already exists (that's the point of ALTER TABLE).
+                None => {
+                    if model_struct_has_uuid_pk(project_root, base) {
+                        return Err(GenerateError::Config(format!(
+                            "'{}' is a self-referential foreign key, but the existing model \
+                             declares a UUID primary key. `references` fields only support \
+                             i64/BIGSERIAL-keyed targets (issue #1026).",
+                            f.name
+                        )));
+                    }
+                    continue;
+                }
+            }
+        }
+
+        if !model_file_exists(project_root, &table, base) {
+            plan.warn(format!(
+                "'{}' references model '{base}', but src/models/{base}.rs (or a matching \
+                 src/models.rs declaration) was not found — assuming table '{table}' \
+                 already exists.",
+                f.name
+            ));
+            continue;
+        }
+        if model_struct_has_uuid_pk(project_root, base) {
+            return Err(GenerateError::Config(format!(
+                "'{}' references model '{base}', which declares a UUID primary key. \
+                 `references` fields only support i64/BIGSERIAL-keyed targets \
+                 (issue #1026) — hand-write the migration for a UUID foreign key instead.",
+                f.name
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Append the virtual `deleted_at` column that `--soft-delete` models add to
@@ -669,7 +908,8 @@ fn sql_default_literal(field: &Field, value: &str) -> Result<String, String> {
         | FieldKind::NaiveDateTime
         | FieldKind::DateTime
         | FieldKind::Bytea
-        | FieldKind::Attachment => Err(format!(
+        | FieldKind::Attachment
+        | FieldKind::References => Err(format!(
             "defaults for {} fields are not supported by `autumn generate` yet",
             field.rust_type()
         )),
@@ -1605,5 +1845,645 @@ autumn-web = \"0.3\"\n";
             up.contains("author_id UUID NOT NULL"),
             "FK Uuid migration: {up}"
         );
+    }
+
+    // ── references field type (issue #1026) ────────────────────────────────
+
+    #[test]
+    fn references_field_emits_i64_struct_field_fk_constraint_and_index() {
+        let tmp = project();
+        let plan = plan_model(
+            tmp.path(),
+            "Comment",
+            &["body:Text".into(), "post:references".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let model = fs::read_to_string(tmp.path().join("src/models/comment.rs")).unwrap();
+        assert!(
+            model.contains("pub post_id: i64,"),
+            "references field must render as i64: {model}"
+        );
+
+        let up = fs::read_to_string(
+            tmp.path()
+                .join("migrations/20260427000000_create_comments/up.sql"),
+        )
+        .unwrap();
+        assert!(
+            up.contains("post_id BIGINT NOT NULL REFERENCES posts(id)"),
+            "up.sql must emit the FK column + constraint: {up}"
+        );
+        assert!(
+            up.contains("CREATE INDEX idx_comments_post_id ON comments (post_id);"),
+            "up.sql must emit an automatic FK index: {up}"
+        );
+
+        let down = fs::read_to_string(
+            tmp.path()
+                .join("migrations/20260427000000_create_comments/down.sql"),
+        )
+        .unwrap();
+        assert!(
+            down.contains("DROP TABLE comments"),
+            "down.sql drops the whole table, cleanly reversing the FK/index/column: {down}"
+        );
+
+        let schema = fs::read_to_string(tmp.path().join("src/schema.rs")).unwrap();
+        assert!(
+            schema.contains("post_id -> Int8,"),
+            "schema.rs must use Int8 for the FK column: {schema}"
+        );
+    }
+
+    #[test]
+    fn nullable_references_field_emits_option_i64() {
+        let tmp = project();
+        let plan = plan_model(
+            tmp.path(),
+            "Comment",
+            &["post:references?".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let model = fs::read_to_string(tmp.path().join("src/models/comment.rs")).unwrap();
+        assert!(
+            model.contains("pub post_id: Option<i64>,"),
+            "nullable references field must render as Option<i64>: {model}"
+        );
+
+        let up = fs::read_to_string(
+            tmp.path()
+                .join("migrations/20260427000000_create_comments/up.sql"),
+        )
+        .unwrap();
+        assert!(
+            up.contains("post_id BIGINT NULL REFERENCES posts(id)"),
+            "{up}"
+        );
+    }
+
+    #[test]
+    fn references_field_warns_when_target_model_is_missing() {
+        let tmp = project();
+        let plan = plan_model(
+            tmp.path(),
+            "Comment",
+            &["post:references".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        assert_eq!(plan.warnings.len(), 1, "warnings: {:?}", plan.warnings);
+        assert!(plan.warnings[0].contains("post"));
+        assert!(plan.warnings[0].contains("posts"));
+    }
+
+    #[test]
+    fn references_field_no_warning_when_target_model_exists() {
+        let tmp = project();
+        let models_dir = tmp.path().join("src/models");
+        fs::create_dir_all(&models_dir).unwrap();
+        fs::write(models_dir.join("post.rs"), "// existing Post model\n").unwrap();
+
+        let plan = plan_model(
+            tmp.path(),
+            "Comment",
+            &["post:references".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        assert!(
+            plan.warnings.is_empty(),
+            "no warning expected once src/models/post.rs exists: {:?}",
+            plan.warnings
+        );
+    }
+
+    #[test]
+    fn no_references_field_means_no_warnings() {
+        let tmp = project();
+        let plan = plan_model(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        assert!(plan.warnings.is_empty());
+    }
+
+    #[test]
+    fn references_field_errors_when_target_model_has_uuid_pk() {
+        // `references` only supports the i64/BIGSERIAL PK convention; a FK
+        // column typed BIGINT against a UUID PRIMARY KEY would fail at
+        // `autumn migrate` time with an opaque Postgres error, so this must
+        // fail loudly at generate time instead.
+        let tmp = project();
+        let models_dir = tmp.path().join("src/models");
+        fs::create_dir_all(&models_dir).unwrap();
+        fs::write(
+            models_dir.join("post.rs"),
+            "#[autumn_web::model]\npub struct Post {\n    #[id]\n    pub id: uuid::Uuid,\n}\n",
+        )
+        .unwrap();
+
+        let err = plan_model(
+            tmp.path(),
+            "Comment",
+            &["post:references".into()],
+            "20260427000000",
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("post"), "error should name the field: {msg}");
+        assert!(
+            msg.contains("UUID"),
+            "error should explain the UUID PK mismatch: {msg}"
+        );
+    }
+
+    #[test]
+    fn references_field_no_error_when_target_model_has_bigserial_pk() {
+        let tmp = project();
+        let models_dir = tmp.path().join("src/models");
+        fs::create_dir_all(&models_dir).unwrap();
+        fs::write(
+            models_dir.join("post.rs"),
+            "#[autumn_web::model]\npub struct Post {\n    #[id]\n    pub id: i64,\n}\n",
+        )
+        .unwrap();
+
+        let plan = plan_model(
+            tmp.path(),
+            "Comment",
+            &["post:references".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        assert!(plan.warnings.is_empty());
+    }
+
+    #[test]
+    fn references_field_no_warning_when_target_declared_in_single_file_models_rs() {
+        // The single-file `src/models.rs` layout is an equally valid place
+        // for a model to live (see `migration.rs`'s `AddSearch` shape, which
+        // checks both locations) — it must not produce a false-positive
+        // "model not found" warning.
+        let tmp = project();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(
+            tmp.path().join("src/models.rs"),
+            "use crate::schema::posts;\n\n#[autumn_web::model]\npub struct Post {\n    #[id]\n    pub id: i64,\n}\n",
+        )
+        .unwrap();
+
+        let plan = plan_model(
+            tmp.path(),
+            "Comment",
+            &["post:references".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        assert!(
+            plan.warnings.is_empty(),
+            "no warning expected once Post is declared in src/models.rs: {:?}",
+            plan.warnings
+        );
+    }
+
+    #[test]
+    fn references_field_no_warning_for_grouped_schema_import_in_single_file_models_rs() {
+        // Multi-model `src/models.rs` files commonly group their schema
+        // imports (e.g. `examples/reddit-clone/src/models.rs`:
+        // `use crate::schema::{comments, posts, subreddits, users, votes};`)
+        // rather than one `use` per table — this must still count as "Post
+        // declared here", not a false "model not found" warning.
+        let tmp = project();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(
+            tmp.path().join("src/models.rs"),
+            "use crate::schema::{comments, posts, subreddits, users, votes};\n\n\
+             #[autumn_web::model]\npub struct Post {\n    #[id]\n    pub id: i64,\n}\n",
+        )
+        .unwrap();
+
+        let plan = plan_model(
+            tmp.path(),
+            "Comment",
+            &["post:references".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        assert!(
+            plan.warnings.is_empty(),
+            "grouped schema import must be recognized: {:?}",
+            plan.warnings
+        );
+    }
+
+    #[test]
+    fn references_field_detects_uuid_pk_with_grouped_schema_import() {
+        // Same grouped-import layout, but the target model has a UUID PK —
+        // the hard error must still fire, not be silently skipped.
+        let tmp = project();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(
+            tmp.path().join("src/models.rs"),
+            "use crate::schema::{comments, posts};\n\n\
+             #[autumn_web::model]\npub struct Post {\n    #[id]\n    pub id: uuid::Uuid,\n}\n",
+        )
+        .unwrap();
+
+        let err = plan_model(
+            tmp.path(),
+            "Comment",
+            &["post:references".into()],
+            "20260427000000",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("UUID"));
+    }
+
+    #[test]
+    fn references_field_grouped_schema_import_not_confused_by_table_name_prefix() {
+        // Only `posts_tags` is grouped-imported — `posts` must not match.
+        let tmp = project();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(
+            tmp.path().join("src/models.rs"),
+            "use crate::schema::{posts_tags, users};\n\n\
+             #[autumn_web::model]\npub struct PostsTag {\n    #[id]\n    pub id: i64,\n}\n",
+        )
+        .unwrap();
+
+        let plan = plan_model(
+            tmp.path(),
+            "Comment",
+            &["post:references".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        assert_eq!(
+            plan.warnings.len(),
+            1,
+            "'posts_tags' in a grouped import must not satisfy a reference to 'posts': {:?}",
+            plan.warnings
+        );
+    }
+
+    #[test]
+    fn references_field_no_warning_for_multiline_grouped_schema_import() {
+        // rustfmt commonly wraps long grouped imports across lines.
+        let tmp = project();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(
+            tmp.path().join("src/models.rs"),
+            "use crate::schema::{\n    comments,\n    posts,\n    users,\n};\n\n\
+             #[autumn_web::model]\npub struct Post {\n    #[id]\n    pub id: i64,\n}\n",
+        )
+        .unwrap();
+
+        let plan = plan_model(
+            tmp.path(),
+            "Comment",
+            &["post:references".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        assert!(
+            plan.warnings.is_empty(),
+            "multi-line grouped schema import must be recognized: {:?}",
+            plan.warnings
+        );
+    }
+
+    #[test]
+    fn references_field_still_warns_when_single_file_models_rs_lacks_the_model() {
+        // An unrelated `src/models.rs` (e.g. only declaring `User`) must not
+        // be mistaken for a `Post` declaration.
+        let tmp = project();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(
+            tmp.path().join("src/models.rs"),
+            "use crate::schema::users;\n\n#[autumn_web::model]\npub struct User {\n    #[id]\n    pub id: i64,\n}\n",
+        )
+        .unwrap();
+
+        let plan = plan_model(
+            tmp.path(),
+            "Comment",
+            &["post:references".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        assert_eq!(plan.warnings.len(), 1, "warnings: {:?}", plan.warnings);
+    }
+
+    #[test]
+    fn references_field_not_confused_by_table_name_prefix_in_single_file_models_rs() {
+        // Only `posts_tags`/`PostsTag` is declared — `posts` must not be
+        // treated as found just because it's a string-prefix of
+        // `posts_tags` (regression: word-boundary-unaware substring match).
+        let tmp = project();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(
+            tmp.path().join("src/models.rs"),
+            "use crate::schema::posts_tags;\n\n#[autumn_web::model]\npub struct PostsTag {\n    #[id]\n    pub id: i64,\n}\n",
+        )
+        .unwrap();
+
+        let plan = plan_model(
+            tmp.path(),
+            "Comment",
+            &["post:references".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        assert_eq!(
+            plan.warnings.len(),
+            1,
+            "'posts_tags' must not satisfy a reference to 'posts': {:?}",
+            plan.warnings
+        );
+    }
+
+    #[test]
+    fn references_field_detects_uuid_pk_even_when_id_field_is_renamed() {
+        // The `#[model]` macro identifies the primary key by the `#[id]`
+        // attribute, not by the field name `id` — a hand-edited model file
+        // (the generator's own doc comment says these are "ordinary user
+        // code" once generated) can legally rename it.
+        let tmp = project();
+        let models_dir = tmp.path().join("src/models");
+        fs::create_dir_all(&models_dir).unwrap();
+        fs::write(
+            models_dir.join("post.rs"),
+            "#[autumn_web::model]\npub struct Post {\n    #[id]\n    pub uid: uuid::Uuid,\n}\n",
+        )
+        .unwrap();
+
+        let err = plan_model(
+            tmp.path(),
+            "Comment",
+            &["post:references".into()],
+            "20260427000000",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("UUID"));
+    }
+
+    #[test]
+    fn references_field_not_confused_by_an_unrelated_field_literally_named_id() {
+        // The real primary key is `pk: i64`; an unrelated field happens to be
+        // named `id` and typed `uuid::Uuid`. Only the `#[id]`-tagged field
+        // should be inspected.
+        let tmp = project();
+        let models_dir = tmp.path().join("src/models");
+        fs::create_dir_all(&models_dir).unwrap();
+        fs::write(
+            models_dir.join("post.rs"),
+            "#[autumn_web::model]\npub struct Post {\n    #[id]\n    pub pk: i64,\n    pub id: uuid::Uuid,\n}\n",
+        )
+        .unwrap();
+
+        let plan = plan_model(
+            tmp.path(),
+            "Comment",
+            &["post:references".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        assert!(
+            plan.warnings.is_empty(),
+            "an unrelated field named 'id' must not trigger a false UUID-PK error: {:?}",
+            plan.warnings
+        );
+    }
+
+    #[test]
+    fn references_field_detects_unqualified_uuid_type() {
+        // A hand-edited model using `use uuid::Uuid;` + `pub id: Uuid,`
+        // (idiomatic, not what the generator itself emits, but a common
+        // hand-edit) must still be detected as a UUID primary key.
+        let tmp = project();
+        let models_dir = tmp.path().join("src/models");
+        fs::create_dir_all(&models_dir).unwrap();
+        fs::write(
+            models_dir.join("post.rs"),
+            "use uuid::Uuid;\n\n#[autumn_web::model]\npub struct Post {\n    #[id]\n    pub id: Uuid,\n}\n",
+        )
+        .unwrap();
+
+        let err = plan_model(
+            tmp.path(),
+            "Comment",
+            &["post:references".into()],
+            "20260427000000",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("UUID"));
+    }
+
+    #[test]
+    fn references_field_detects_uuid_pk_through_intervening_attribute() {
+        // An attribute (or doc comment) between `#[id]` and the field
+        // declaration — e.g. `#[serde(rename = "id")]` — must not be
+        // mistaken for the field line itself.
+        let tmp = project();
+        let models_dir = tmp.path().join("src/models");
+        fs::create_dir_all(&models_dir).unwrap();
+        fs::write(
+            models_dir.join("post.rs"),
+            "#[autumn_web::model]\npub struct Post {\n    #[id]\n    #[serde(rename = \"id\")]\n    pub id: uuid::Uuid,\n}\n",
+        )
+        .unwrap();
+
+        let err = plan_model(
+            tmp.path(),
+            "Comment",
+            &["post:references".into()],
+            "20260427000000",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("UUID"));
+    }
+
+    #[test]
+    fn references_field_detects_uuid_pk_through_intervening_doc_comment() {
+        let tmp = project();
+        let models_dir = tmp.path().join("src/models");
+        fs::create_dir_all(&models_dir).unwrap();
+        fs::write(
+            models_dir.join("post.rs"),
+            "#[autumn_web::model]\npub struct Post {\n    #[id]\n    /// The primary key.\n    pub id: uuid::Uuid,\n}\n",
+        )
+        .unwrap();
+
+        let err = plan_model(
+            tmp.path(),
+            "Comment",
+            &["post:references".into()],
+            "20260427000000",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("UUID"));
+    }
+
+    #[test]
+    fn references_field_detects_uuid_pk_with_trailing_inline_comment() {
+        // `pub id: uuid::Uuid, // primary key` — the trailing comment must
+        // not get swept into the extracted type text (which would make it
+        // compare unequal to "uuid::Uuid" and miss the UUID PK).
+        let tmp = project();
+        let models_dir = tmp.path().join("src/models");
+        fs::create_dir_all(&models_dir).unwrap();
+        fs::write(
+            models_dir.join("post.rs"),
+            "#[autumn_web::model]\npub struct Post {\n    #[id]\n    pub id: uuid::Uuid, // primary key\n}\n",
+        )
+        .unwrap();
+
+        let err = plan_model(
+            tmp.path(),
+            "Comment",
+            &["post:references".into()],
+            "20260427000000",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("UUID"));
+    }
+
+    #[test]
+    fn references_field_detects_uuid_pk_with_trailing_block_comment() {
+        // `pub id: uuid::Uuid, /* primary key */` — a block comment, not a
+        // line comment. The syn-based parser isn't fooled by either.
+        let tmp = project();
+        let models_dir = tmp.path().join("src/models");
+        fs::create_dir_all(&models_dir).unwrap();
+        fs::write(
+            models_dir.join("post.rs"),
+            "#[autumn_web::model]\npub struct Post {\n    #[id]\n    pub id: uuid::Uuid, /* primary key */\n}\n",
+        )
+        .unwrap();
+
+        let err = plan_model(
+            tmp.path(),
+            "Comment",
+            &["post:references".into()],
+            "20260427000000",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("UUID"));
+    }
+
+    #[test]
+    fn references_field_detects_uuid_pk_regardless_of_attribute_order() {
+        // `#[id]` doesn't have to be the first attribute on the field — a
+        // real parse (unlike a "look at the line after #[id]" scan) handles
+        // any attribute order the same way rustc does.
+        let tmp = project();
+        let models_dir = tmp.path().join("src/models");
+        fs::create_dir_all(&models_dir).unwrap();
+        fs::write(
+            models_dir.join("post.rs"),
+            "#[autumn_web::model]\npub struct Post {\n    #[serde(rename = \"id\")]\n    #[id]\n    pub id: uuid::Uuid,\n}\n",
+        )
+        .unwrap();
+
+        let err = plan_model(
+            tmp.path(),
+            "Comment",
+            &["post:references".into()],
+            "20260427000000",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("UUID"));
+    }
+
+    #[test]
+    fn references_field_handles_unparseable_model_file_gracefully() {
+        // A model file that isn't valid Rust (or uses a struct name that
+        // doesn't match) must not panic — "can't verify" falls back to no
+        // error, same as if the model couldn't be found at all.
+        let tmp = project();
+        let models_dir = tmp.path().join("src/models");
+        fs::create_dir_all(&models_dir).unwrap();
+        fs::write(models_dir.join("post.rs"), "this is not valid rust {{{").unwrap();
+
+        let plan = plan_model(
+            tmp.path(),
+            "Comment",
+            &["post:references".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        assert!(plan.warnings.is_empty());
+    }
+
+    // ── self-referential `references` (issue #1026 follow-up) ──────────────
+
+    #[test]
+    fn self_referential_references_errors_when_own_id_is_uuid() {
+        // `Category category:references --id uuid`: the target model
+        // ("Category" itself) doesn't exist on disk yet — this command is
+        // creating it — so a filesystem lookup can never see it. The
+        // self-reference must be checked against the model's own
+        // `--id uuid` directly instead of silently skipping the UUID check.
+        let tmp = project();
+        let err = plan_model_with_options(
+            tmp.path(),
+            "Category",
+            &["name:String".into(), "category:references".into()],
+            "20260427000000",
+            &ModelOptions {
+                id_type: IdType::Uuid,
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("UUID"));
+        assert!(err.to_string().contains("self-referential"));
+    }
+
+    #[test]
+    fn self_referential_references_fine_with_default_bigserial_id() {
+        let tmp = project();
+        let plan = plan_model(
+            tmp.path(),
+            "Category",
+            &["name:String".into(), "category:references".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        assert!(
+            plan.warnings.is_empty(),
+            "a self-reference to the table being created now must not warn \
+             'model not found': {:?}",
+            plan.warnings
+        );
+    }
+
+    #[test]
+    fn self_referential_references_emits_correct_fk_sql() {
+        let tmp = project();
+        let plan = plan_model(
+            tmp.path(),
+            "Category",
+            &["name:String".into(), "category:references".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let up = fs::read_to_string(
+            tmp.path()
+                .join("migrations/20260427000000_create_categories/up.sql"),
+        )
+        .unwrap();
+        assert!(up.contains("category_id BIGINT NOT NULL REFERENCES categories(id)"));
     }
 }

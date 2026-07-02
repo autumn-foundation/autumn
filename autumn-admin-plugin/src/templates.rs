@@ -11,11 +11,11 @@ use autumn_web::job::{
 use autumn_web::pagination::Page;
 use autumn_web::runtime_config::{ConfigChangeRecord, ConfigEntry};
 use autumn_web::ui::pagination::{PagerOptions, pagination_nav};
-use autumn_web::widgets::{CardConfig, card, stat_card};
+use autumn_web::widgets::{CardConfig, card, nav_link, stat_card};
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 use serde_json::Value;
 
-use crate::registry::AdminRegistry;
+use crate::registry::{AdminRegistry, JOBS_NAV_SLUG, RUNTIME_CONFIG_NAV_SLUG};
 use crate::routes::ADMIN_JS_PATH;
 use crate::traits::{
     AdminAction, AdminField, AdminFieldKind, AdminHistoryPage, AdminImportReport, CsvImportMode,
@@ -25,8 +25,6 @@ use crate::traits::{
 const HTMX_JS_PATH: &str = "/static/js/htmx.min.js";
 const HTMX_CSRF_JS_PATH: &str = "/static/js/autumn-htmx-csrf.js";
 const TOKENS_CSS: &str = include_str!("tokens.css");
-const JOBS_NAV_SLUG: &str = "__admin_jobs";
-const RUNTIME_CONFIG_NAV_SLUG: &str = "__admin_config";
 const FLASH_CSS: &str = "\
 .flash {
     padding: 0.75rem 1rem;
@@ -414,6 +412,19 @@ pub fn admin_layout(
     show_config: bool,
     content: &Markup,
 ) -> Markup {
+    // Each nav item's href is computed once here and reused both to
+    // synthesize current_path (so nav_link's own path-comparison logic
+    // decides which sidebar item is active) and as the anchor's href below —
+    // so the "/jobs" and "/config" route suffixes each appear as a literal
+    // exactly once.
+    let jobs_href = format!("{prefix}/jobs");
+    let config_href = format!("{prefix}/config");
+    let current_path = match active_slug {
+        None => prefix.to_owned(),
+        Some(JOBS_NAV_SLUG) => jobs_href.clone(),
+        Some(RUNTIME_CONFIG_NAV_SLUG) => config_href.clone(),
+        Some(slug) => format!("{prefix}/{slug}"),
+    };
     html! {
         (DOCTYPE)
         html lang="en" {
@@ -446,35 +457,30 @@ pub fn admin_layout(
                         nav class="admin-sidebar" aria-label="Admin navigation" {
                             div class="admin-logo" { "🍂 Autumn Admin" }
                             ul class="admin-nav" {
-                                li {
-                                    a href=(prefix) class=[active_slug.is_none().then_some("active")] {
-                                        "Dashboard"
-                                    }
-                                }
+                                li { (nav_link(&current_path, prefix, "Dashboard")) }
                                 @if registry.model_count() > 0 {
                                     li { div class="admin-nav-section" { "Models" } }
                                     @for (slug, model) in registry.iter() {
                                         li {
-                                            a href={ (prefix) "/" (slug) }
-                                              class=[(active_slug == Some(slug)).then_some("active")] {
-                                                (model.display_name_plural())
-                                            }
+                                            (nav_link(
+                                                &current_path,
+                                                &format!("{prefix}/{slug}"),
+                                                model.display_name_plural(),
+                                            ))
                                         }
                                     }
                                 }
                                 li { div class="admin-nav-section" { "System" } }
                                 li {
-                                    a href={ (prefix) "/jobs" }
-                                      class=[(active_slug == Some(JOBS_NAV_SLUG)).then_some("active")] {
-                                        "Jobs"
-                                    }
+                                    (nav_link(&current_path, &jobs_href, "Jobs"))
                                 }
                                 @if show_config {
                                     li {
-                                        a href={ (prefix) "/config" }
-                                          class=[(active_slug == Some(RUNTIME_CONFIG_NAV_SLUG)).then_some("active")] {
-                                            "Runtime Config"
-                                        }
+                                        (nav_link(
+                                            &current_path,
+                                            &config_href,
+                                            "Runtime Config",
+                                        ))
                                     }
                                 }
                                 li { a href={ (actuator_prefix) "/ui" } { "Actuator" } }
@@ -3904,5 +3910,66 @@ mod tests {
         // 2023-11-14 22:13:20 UTC
         let s = format_timestamp(1_700_000_000);
         assert!(s.contains("2023"), "expected 2023 in formatted output: {s}");
+    }
+
+    // ── admin_layout nav (#1134) ─────────────────────────────────────────
+
+    fn render_layout(active_slug: Option<&str>) -> String {
+        let registry = AdminRegistry::new();
+        admin_layout(
+            &registry,
+            active_slug,
+            "Title",
+            "/admin",
+            "/actuator",
+            "tok",
+            "X-CSRF-Token",
+            &[],
+            true,
+            &html! {},
+        )
+        .into_string()
+    }
+
+    #[test]
+    fn admin_layout_dashboard_active_has_aria_current() {
+        let html = render_layout(None);
+        assert_eq!(html.matches(r#"aria-current="page""#).count(), 1, "{html}");
+        assert!(
+            html.contains(r#"href="/admin" class="active" aria-current="page""#),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn admin_layout_jobs_active_has_aria_current() {
+        let html = render_layout(Some(JOBS_NAV_SLUG));
+        assert_eq!(html.matches(r#"aria-current="page""#).count(), 1, "{html}");
+        assert!(
+            html.contains(r#"href="/admin/jobs" class="active" aria-current="page""#),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn admin_layout_runtime_config_active_has_aria_current() {
+        let html = render_layout(Some(RUNTIME_CONFIG_NAV_SLUG));
+        assert_eq!(html.matches(r#"aria-current="page""#).count(), 1, "{html}");
+        assert!(
+            html.contains(r#"href="/admin/config" class="active" aria-current="page""#),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn admin_layout_no_active_slug_has_no_dashboard_aria_current() {
+        // active_slug = Some(...) for an unrelated slug: Dashboard must not
+        // claim the active state, and nothing else should either since the
+        // registry is empty (no model nav items).
+        let html = render_layout(Some(JOBS_NAV_SLUG));
+        assert!(
+            !html.contains(r#"href="/admin" class="active""#),
+            "dashboard must not be active: {html}"
+        );
     }
 }

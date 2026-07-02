@@ -119,12 +119,25 @@ pub fn create_table_sql_with_metadata_and_id(
             f.sql_type(),
             f.sql_nullability()
         );
+        if let Some(target) = f.reference_table() {
+            let _ = write!(sql, " REFERENCES {target}(id)");
+        }
         if let Some(default) = defaults.get(&f.name) {
             let _ = write!(sql, " DEFAULT {default}");
         }
     }
     sql.push_str(",\n    created_at TIMESTAMP NOT NULL DEFAULT NOW()\n);\n");
-    for field_name in indexes {
+    // Every `references` field gets an index automatically (Rails' `add_reference`
+    // behaviour), in addition to any explicit `--index` fields. Merging into the
+    // same sorted set keeps `CREATE INDEX` output deterministic and de-duplicates
+    // a reference field that was *also* passed via `--index`.
+    let mut index_fields = indexes.clone();
+    for f in fields {
+        if f.kind.is_reference() {
+            index_fields.insert(f.name.clone());
+        }
+    }
+    for field_name in &index_fields {
         let _ = writeln!(
             sql,
             "CREATE INDEX idx_{table}_{field_name} ON {table} ({field_name});"
@@ -264,13 +277,26 @@ pub fn add_columns_up_sql(table: &str, fields: &[Field]) -> String {
                  -- add a DEFAULT or backfill existing rows before enforcing NOT NULL"
             );
         }
-        let _ = writeln!(
+        let _ = write!(
             out,
-            "ALTER TABLE {table} ADD COLUMN {} {} {};",
+            "ALTER TABLE {table} ADD COLUMN {} {} {}",
             f.name,
             f.sql_type(),
             f.sql_nullability()
         );
+        if let Some(target) = f.reference_table() {
+            let _ = write!(out, " REFERENCES {target}(id)");
+        }
+        out.push_str(";\n");
+        if f.kind.is_reference() {
+            // Postgres auto-drops this index (and the FK constraint above) when
+            // the column is dropped, so `add_columns_down_sql` needs no change.
+            let _ = writeln!(
+                out,
+                "CREATE INDEX idx_{table}_{} ON {table} ({});",
+                f.name, f.name
+            );
+        }
     }
     out
 }
@@ -461,18 +487,33 @@ pub fn remove_columns_up_sql(table: &str, fields: &[Field]) -> String {
     out
 }
 
-/// `down.sql` companion to [`remove_columns_up_sql`].
+/// `down.sql` companion to [`remove_columns_up_sql`]. Restores a `references`
+/// field's `REFERENCES <table>(id)` constraint and automatic index (see
+/// [`create_table_sql_with_metadata_and_id`]/[`add_columns_up_sql`]) — a
+/// bare re-added column would silently drop the foreign-key relationship and
+/// its lookup index on rollback (issue #1026).
 #[must_use]
 pub fn remove_columns_down_sql(table: &str, fields: &[Field]) -> String {
     let mut out = String::new();
     for f in fields.iter().rev() {
-        let _ = writeln!(
+        let _ = write!(
             out,
-            "ALTER TABLE {table} ADD COLUMN {} {} {};",
+            "ALTER TABLE {table} ADD COLUMN {} {} {}",
             f.name,
             f.sql_type(),
             f.sql_nullability()
         );
+        if let Some(target) = f.reference_table() {
+            let _ = write!(out, " REFERENCES {target}(id)");
+        }
+        out.push_str(";\n");
+        if f.kind.is_reference() {
+            let _ = writeln!(
+                out,
+                "CREATE INDEX idx_{table}_{} ON {table} ({});",
+                f.name, f.name
+            );
+        }
     }
     out
 }
@@ -3057,6 +3098,88 @@ mod tests {
         assert_eq!(drop_table_sql("posts"), "DROP TABLE posts;\n");
     }
 
+    // ── references field: FK column + constraint + index (issue #1026) ─────
+
+    #[test]
+    fn create_table_sql_emits_fk_column_with_constraint() {
+        let sql = create_table_sql_with_metadata_and_id(
+            "comments",
+            &fields(&["body:Text", "post:references"]),
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            IdType::BigSerial,
+        );
+        assert!(
+            sql.contains("post_id BIGINT NOT NULL REFERENCES posts(id)"),
+            "expected FK column with constraint; got:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn create_table_sql_emits_fk_index_automatically() {
+        let sql = create_table_sql_with_metadata_and_id(
+            "comments",
+            &fields(&["post:references"]),
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            IdType::BigSerial,
+        );
+        assert!(
+            sql.contains("CREATE INDEX idx_comments_post_id ON comments (post_id);"),
+            "expected an automatic FK index; got:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn create_table_sql_nullable_reference_has_no_not_null_but_keeps_constraint_and_index() {
+        let sql = create_table_sql_with_metadata_and_id(
+            "comments",
+            &fields(&["post:references?"]),
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            IdType::BigSerial,
+        );
+        assert!(
+            sql.contains("post_id BIGINT NULL REFERENCES posts(id)"),
+            "nullable FK column must omit NOT NULL but keep the constraint; got:\n{sql}"
+        );
+        assert!(sql.contains("CREATE INDEX idx_comments_post_id ON comments (post_id);"));
+    }
+
+    #[test]
+    fn create_table_sql_fk_index_not_duplicated_when_also_passed_via_index_flag() {
+        let mut explicit_indexes = BTreeSet::new();
+        explicit_indexes.insert("post_id".to_owned());
+        let sql = create_table_sql_with_metadata_and_id(
+            "comments",
+            &fields(&["post:references"]),
+            &explicit_indexes,
+            &BTreeMap::new(),
+            IdType::BigSerial,
+        );
+        assert_eq!(
+            sql.matches("CREATE INDEX idx_comments_post_id").count(),
+            1,
+            "the FK index and an explicit --index on the same field must not \
+             produce two CREATE INDEX statements:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn add_columns_up_sql_emits_fk_constraint_and_index() {
+        let sql = add_columns_up_sql("comments", &fields(&["post:references"]));
+        assert!(
+            sql.contains(
+                "ALTER TABLE comments ADD COLUMN post_id BIGINT NOT NULL REFERENCES posts(id);"
+            ),
+            "got:\n{sql}"
+        );
+        assert!(
+            sql.contains("CREATE INDEX idx_comments_post_id ON comments (post_id);"),
+            "got:\n{sql}"
+        );
+    }
+
     #[test]
     fn detect_add_migration() {
         match detect_migration_shape("AddTitleToPosts") {
@@ -3164,6 +3287,26 @@ mod tests {
             "DROP COLUMN must carry a safety comment; got:\n{sql}"
         );
         assert!(sql.contains("ALTER TABLE posts DROP COLUMN body;"));
+    }
+
+    #[test]
+    fn remove_columns_down_sql_restores_fk_constraint_and_index_for_references_field() {
+        // Rolling back `RemovePostFromComments post:references` must restore
+        // the FK constraint and its index, not just a bare BIGINT column —
+        // otherwise the relationship and its lookup index silently vanish
+        // on rollback (issue #1026).
+        let f = fields(&["post:references"]);
+        let sql = remove_columns_down_sql("comments", &f);
+        assert!(
+            sql.contains(
+                "ALTER TABLE comments ADD COLUMN post_id BIGINT NOT NULL REFERENCES posts(id);"
+            ),
+            "got:\n{sql}"
+        );
+        assert!(
+            sql.contains("CREATE INDEX idx_comments_post_id ON comments (post_id);"),
+            "got:\n{sql}"
+        );
     }
 
     #[test]

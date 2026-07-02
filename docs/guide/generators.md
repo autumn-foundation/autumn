@@ -56,6 +56,7 @@ set.
 | `at:NaiveDateTime`| `chrono::NaiveDateTime`         | `Timestamp`        | `TIMESTAMP`         |
 | `at:DateTime`     | `chrono::DateTime<chrono::Utc>` | `Timestamptz`      | `TIMESTAMPTZ`       |
 | `data:Bytea` *(or `Vec<u8>`)* | `Vec<u8>`           | `Bytea`            | `BYTEA`             |
+| `post:references` | `i64`                           | `Int8`             | `BIGINT`            |
 
 Wrap any of the above in `Option<…>` to make the column nullable
 (`Option<String>`, `Option<i64>`, `Option<NaiveDateTime>`, …). The generator
@@ -67,6 +68,36 @@ Every generated table also includes:
   in Autumn).
 - `created_at TIMESTAMP NOT NULL DEFAULT NOW()` annotated `#[default]` on
   the model so it stays out of `NewX`.
+
+### Foreign keys with `references`
+
+`post:references` scaffolds a foreign-key column: the declared name is
+rewritten to end in `_id` (`post` -> `post_id`), the referenced table is
+derived by pluralising the base name (`post` -> `posts`, matching
+`naming::pluralize`), and the column is emitted as
+`post_id BIGINT NOT NULL REFERENCES posts(id)` with an automatic index
+(`CREATE INDEX idx_comments_post_id ON comments (post_id);`) — no `--index`
+flag required. Append `?` for a nullable foreign key
+(`post:references?` -> `post_id: Option<i64>`, column `NULL`):
+
+```bash
+autumn generate scaffold Comment body:Text post:references
+```
+
+If the referenced model doesn't exist yet (no `src/models/post.rs`, or a
+matching declaration in a single-file `src/models.rs`), the generator still
+scaffolds the column, constraint, and index — it just prints a warning that
+the referenced table is assumed to already exist.
+
+`references` only supports the i64/BIGSERIAL primary-key convention. If the
+referenced model *is* found but was generated with `--id uuid`, the generator
+fails fast with an error instead of emitting a migration that would break at
+`autumn migrate` time with a `BIGINT`-vs-`UUID` type mismatch — hand-write
+the migration for a UUID foreign key instead.
+
+Composite foreign keys, cascade policy (`ON DELETE`/`ON UPDATE`), and runtime
+association traversal (`belongs_to`/`has_many`) are not in scope for this
+token — see issue #835 for the latter.
 
 ## `autumn generate model`
 

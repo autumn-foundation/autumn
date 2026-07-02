@@ -266,6 +266,167 @@ fn generate_model_invalid_field_lists_supported_set() {
     assert!(stderr.contains("String"));
 }
 
+// ── `references` field type (issue #1026) ───────────────────────────────────
+
+#[test]
+fn generate_model_references_field_emits_fk_column_constraint_and_index() {
+    let (_tmp, project) = fresh_project("references-app");
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "model",
+            "Comment",
+            "body:Text",
+            "post:references",
+        ],
+    );
+
+    let model = fs::read_to_string(project.join("src/models/comment.rs")).unwrap();
+    assert!(model.contains("pub post_id: i64,"));
+
+    let schema = fs::read_to_string(project.join("src/schema.rs")).unwrap();
+    assert!(schema.contains("post_id -> Int8,"));
+
+    let migrations = fs::read_dir(project.join("migrations"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .ends_with("_create_comments")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(migrations.len(), 1);
+    let up = fs::read_to_string(migrations[0].path().join("up.sql")).unwrap();
+    assert!(up.contains("post_id BIGINT NOT NULL REFERENCES posts(id)"));
+    assert!(up.contains("CREATE INDEX idx_comments_post_id ON comments (post_id);"));
+}
+
+#[test]
+fn generate_model_references_warns_when_target_model_missing() {
+    let (_tmp, project) = fresh_project("references-warn-app");
+    let (_stdout, stderr) = run_autumn(
+        &project,
+        &["generate", "model", "Comment", "post:references"],
+    );
+    assert!(
+        stderr.contains("Warning") && stderr.contains("posts"),
+        "expected a warning about the missing 'post' model; got stderr: {stderr}"
+    );
+}
+
+#[test]
+fn generate_model_references_warning_not_printed_on_a_failed_collision_run() {
+    // A run that fails before writing anything (a file collision without
+    // --force) must not print advisory warnings for a plan that was never
+    // applied — warnings are informational about what *did* happen.
+    let (_tmp, project) = fresh_project("references-warn-collision-app");
+    run_autumn(
+        &project,
+        &["generate", "model", "Comment", "post:references"],
+    );
+    let (_, stderr, code) = run_autumn_failing(
+        &project,
+        &["generate", "model", "Comment", "post:references"],
+    );
+    assert_eq!(code, Some(1));
+    assert!(stderr.contains("would overwrite"));
+    assert!(
+        !stderr.contains("Warning"),
+        "no warning should print on a failed, no-op run: {stderr}"
+    );
+}
+
+#[test]
+fn generate_model_references_no_warning_when_target_model_exists() {
+    let (_tmp, project) = fresh_project("references-nowarn-app");
+    run_autumn(&project, &["generate", "model", "Post", "title:String"]);
+    let (_stdout, stderr) = run_autumn(
+        &project,
+        &["generate", "model", "Comment", "post:references"],
+    );
+    assert!(
+        !stderr.contains("Warning"),
+        "no warning expected once the Post model exists; got stderr: {stderr}"
+    );
+}
+
+#[test]
+fn generate_model_references_nullable_form() {
+    let (_tmp, project) = fresh_project("references-nullable-app");
+    run_autumn(
+        &project,
+        &["generate", "model", "Comment", "post:references?"],
+    );
+    let model = fs::read_to_string(project.join("src/models/comment.rs")).unwrap();
+    assert!(model.contains("pub post_id: Option<i64>,"));
+}
+
+#[test]
+fn generate_model_help_documents_references_field() {
+    let tmp = tempfile::tempdir().unwrap();
+    let autumn_bin = env!("CARGO_BIN_EXE_autumn");
+    let output = Command::new(autumn_bin)
+        .args(["generate", "model", "--help"])
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("references"));
+}
+
+#[test]
+fn generate_scaffold_help_documents_references_field() {
+    let tmp = tempfile::tempdir().unwrap();
+    let autumn_bin = env!("CARGO_BIN_EXE_autumn");
+    let output = Command::new(autumn_bin)
+        .args(["generate", "scaffold", "--help"])
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("references"));
+}
+
+#[test]
+fn generate_model_dry_run_lists_migration_file_for_references_field() {
+    let (_tmp, project) = fresh_project("references-dryrun-app");
+    let (stdout, _stderr) = run_autumn(
+        &project,
+        &[
+            "generate",
+            "model",
+            "Comment",
+            "post:references",
+            "--dry-run",
+        ],
+    );
+    assert!(stdout.contains("Dry run"));
+    assert!(stdout.contains("migrations/"));
+    assert!(stdout.contains("create_comments/up.sql"));
+    assert!(!project.join("src/models/comment.rs").exists());
+}
+
+#[test]
+fn generate_model_references_errors_when_target_has_uuid_pk() {
+    let (_tmp, project) = fresh_project("references-uuid-mismatch-app");
+    run_autumn(
+        &project,
+        &["generate", "model", "Post", "--id", "uuid", "title:String"],
+    );
+    let (_, stderr, code) = run_autumn_failing(
+        &project,
+        &["generate", "model", "Comment", "post:references"],
+    );
+    assert_eq!(code, Some(1));
+    assert!(
+        stderr.contains("UUID"),
+        "expected a clear UUID-mismatch error; got stderr: {stderr}"
+    );
+    assert!(!project.join("src/models/comment.rs").exists());
+}
+
 #[test]
 fn generate_migration_add_columns_emits_alter() {
     let (_tmp, project) = fresh_project("migrate-app");
@@ -784,9 +945,14 @@ fn generated_scaffold_cargo_checks() {
             "title:String",
             "body:Text",
             "published:bool",
+            "archived:Option<bool>",
             "subtitle:Option<String>",
             "views:Option<i64>",
+            "rank:i32",
+            "rating:f64",
+            "weight:Option<f32>",
             "published_at:Option<NaiveDateTime>",
+            "scheduled_at:DateTime",
             "token:Option<Uuid>",
         ],
     );

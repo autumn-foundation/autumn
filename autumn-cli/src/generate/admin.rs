@@ -335,7 +335,8 @@ const fn admin_field_kind(field: &Field) -> &'static str {
     match field.kind {
         FieldKind::String | FieldKind::Uuid => "AdminFieldKind::Text",
         FieldKind::Text => "AdminFieldKind::TextArea",
-        FieldKind::I32 | FieldKind::I64 => "AdminFieldKind::Integer",
+        // A foreign-key id renders the same as any other integer column.
+        FieldKind::I32 | FieldKind::I64 | FieldKind::References => "AdminFieldKind::Integer",
         FieldKind::Bool => "AdminFieldKind::Boolean",
         FieldKind::F32 | FieldKind::F64 => "AdminFieldKind::Float",
         FieldKind::NaiveDateTime | FieldKind::DateTime => "AdminFieldKind::DateTime",

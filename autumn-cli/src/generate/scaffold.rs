@@ -606,10 +606,159 @@ fn render_repository_queries(pascal_name: &str, queries: &[QuerySpec]) -> String
     out
 }
 
-fn render_decoded_form(_pascal_name: &str, fields: &[Field]) -> (String, String) {
+/// Normalizes an HTML `datetime-local` value (`YYYY-MM-DDTHH:MM`, seconds
+/// omitted by the browser at minute granularity) into the
+/// `YYYY-MM-DDTHH:MM:SS` shape chrono's parser expects at minimum. Callers
+/// parse with the `%.f` format specifier, so fractional seconds (submitted
+/// when a finer-grained `step` is used) are accepted whether or not this
+/// function's padding runs.
+const NORMALIZE_DATETIME_LOCAL_FN: &str = r#"
+fn normalize_datetime_local(raw: &str) -> String {
+    if raw.chars().count() == 16 {
+        format!("{raw}:00")
+    } else {
+        raw.to_string()
+    }
+}
+"#;
+
+const DESERIALIZE_NAIVE_DATETIME_LOCAL_FN: &str = r#"
+fn deserialize_naive_datetime_local<'de, D>(deserializer: D) -> Result<chrono::NaiveDateTime, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = <String as serde::Deserialize>::deserialize(deserializer)?;
+    chrono::NaiveDateTime::parse_from_str(&normalize_datetime_local(&raw), "%Y-%m-%dT%H:%M:%S%.f")
+        .map_err(serde::de::Error::custom)
+}
+"#;
+
+const DESERIALIZE_OPTION_NAIVE_DATETIME_LOCAL_FN: &str = r#"
+fn deserialize_option_naive_datetime_local<'de, D>(
+    deserializer: D,
+) -> Result<Option<chrono::NaiveDateTime>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = <Option<String> as serde::Deserialize>::deserialize(deserializer)?;
+    match raw {
+        Some(s) if !s.is_empty() => {
+            chrono::NaiveDateTime::parse_from_str(&normalize_datetime_local(&s), "%Y-%m-%dT%H:%M:%S%.f")
+                .map(Some)
+                .map_err(serde::de::Error::custom)
+        }
+        _ => Ok(None),
+    }
+}
+"#;
+
+const DESERIALIZE_UTC_DATETIME_LOCAL_FN: &str = r#"
+fn deserialize_utc_datetime_local<'de, D>(
+    deserializer: D,
+) -> Result<chrono::DateTime<chrono::Utc>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = <String as serde::Deserialize>::deserialize(deserializer)?;
+    chrono::NaiveDateTime::parse_from_str(&normalize_datetime_local(&raw), "%Y-%m-%dT%H:%M:%S%.f")
+        .map(|ndt| ndt.and_utc())
+        .map_err(serde::de::Error::custom)
+}
+"#;
+
+const DESERIALIZE_OPTION_UTC_DATETIME_LOCAL_FN: &str = r#"
+fn deserialize_option_utc_datetime_local<'de, D>(
+    deserializer: D,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = <Option<String> as serde::Deserialize>::deserialize(deserializer)?;
+    match raw {
+        Some(s) if !s.is_empty() => {
+            chrono::NaiveDateTime::parse_from_str(&normalize_datetime_local(&s), "%Y-%m-%dT%H:%M:%S%.f")
+                .map(|ndt| Some(ndt.and_utc()))
+                .map_err(serde::de::Error::custom)
+        }
+        _ => Ok(None),
+    }
+}
+"#;
+
+/// Tracks which `datetime-local` deserialize helpers a `DecodedForm` actually
+/// references, so [`datetime_helper_fns`] emits only what's used — an unused
+/// helper would be dead code in the generated project.
+#[derive(Default)]
+#[allow(clippy::struct_excessive_bools)] // orthogonal flags on a plain tally, not a state machine
+struct DatetimeHelpersNeeded {
+    naive_scalar: bool,
+    naive_option: bool,
+    utc_scalar: bool,
+    utc_option: bool,
+}
+
+/// The `#[serde(...)]` attribute + struct-field line for a `NaiveDateTime`/
+/// `DateTime` field, recording which shared deserialize helper it needs.
+fn datetime_struct_field_line(f: &Field, needed: &mut DatetimeHelpersNeeded) -> String {
+    let attr = match (f.kind, f.nullable) {
+        (FieldKind::NaiveDateTime, false) => {
+            needed.naive_scalar = true;
+            "#[serde(deserialize_with = \"deserialize_naive_datetime_local\")]"
+        }
+        (FieldKind::NaiveDateTime, true) => {
+            needed.naive_option = true;
+            "#[serde(default, deserialize_with = \"deserialize_option_naive_datetime_local\")]"
+        }
+        (FieldKind::DateTime, false) => {
+            needed.utc_scalar = true;
+            "#[serde(deserialize_with = \"deserialize_utc_datetime_local\")]"
+        }
+        (FieldKind::DateTime, true) => {
+            needed.utc_option = true;
+            "#[serde(default, deserialize_with = \"deserialize_option_utc_datetime_local\")]"
+        }
+        _ => unreachable!("called only for NaiveDateTime | DateTime fields"),
+    };
+    format!(
+        "    {attr}\n    pub {name}: {rust_type},\n",
+        name = f.name,
+        rust_type = f.rust_type()
+    )
+}
+
+/// Assemble just the shared helper functions a `DecodedForm` needs, per
+/// [`DatetimeHelpersNeeded`].
+fn datetime_helper_fns(needed: &DatetimeHelpersNeeded) -> String {
+    let mut helper_fns = String::new();
+    if needed.naive_scalar || needed.naive_option || needed.utc_scalar || needed.utc_option {
+        helper_fns.push_str(NORMALIZE_DATETIME_LOCAL_FN);
+    }
+    if needed.naive_scalar {
+        helper_fns.push_str(DESERIALIZE_NAIVE_DATETIME_LOCAL_FN);
+    }
+    if needed.naive_option {
+        helper_fns.push_str(DESERIALIZE_OPTION_NAIVE_DATETIME_LOCAL_FN);
+    }
+    if needed.utc_scalar {
+        helper_fns.push_str(DESERIALIZE_UTC_DATETIME_LOCAL_FN);
+    }
+    if needed.utc_option {
+        helper_fns.push_str(DESERIALIZE_OPTION_UTC_DATETIME_LOCAL_FN);
+    }
+    helper_fns
+}
+
+/// Emit the `DecodedForm` struct, its field-by-field mapping into
+/// `New{Pascal}`, and any shared helper functions its `#[serde(...)]`
+/// attributes reference (currently just the `datetime-local` deserializers).
+///
+/// Returns `(decoded_struct, mapping_fields, helper_fns)`. `helper_fns` is
+/// empty unless a `NaiveDateTime`/`DateTime` field is present.
+fn render_decoded_form(_pascal_name: &str, fields: &[Field]) -> (String, String, String) {
     use std::fmt::Write;
     let mut struct_fields = String::new();
     let mut mapping_fields = String::new();
+    let mut needed = DatetimeHelpersNeeded::default();
 
     for f in fields {
         if f.kind.is_attachment() {
@@ -636,6 +785,28 @@ fn render_decoded_form(_pascal_name: &str, fields: &[Field]) -> (String, String)
                  }},",
                 name = f.name
             );
+        } else if f.kind == FieldKind::Bool {
+            // Unchecked checkboxes are absent from submitted form data;
+            // `#[serde(default)]` maps that absence to `false` instead of a
+            // "missing field" 400.
+            let _ = writeln!(
+                struct_fields,
+                "    #[serde(default)]\n    pub {name}: {rust_type},",
+                name = f.name,
+                rust_type = f.rust_type()
+            );
+            let _ = writeln!(
+                mapping_fields,
+                "        {name}: decoded.{name},",
+                name = f.name
+            );
+        } else if matches!(f.kind, FieldKind::NaiveDateTime | FieldKind::DateTime) {
+            struct_fields.push_str(&datetime_struct_field_line(f, &mut needed));
+            let _ = writeln!(
+                mapping_fields,
+                "        {name}: decoded.{name},",
+                name = f.name
+            );
         } else {
             let _ = writeln!(
                 struct_fields,
@@ -658,7 +829,7 @@ fn render_decoded_form(_pascal_name: &str, fields: &[Field]) -> (String, String)
          }}"
     );
 
-    (decoded_struct, mapping_fields)
+    (decoded_struct, mapping_fields, datetime_helper_fns(&needed))
 }
 
 #[allow(
@@ -688,7 +859,8 @@ fn render_routes_file(
     let update_columns = render_update_columns(plural, fields);
     let nullable_field_match = render_nullable_field_match(fields);
     let has_attachments = has_attachment_fields(fields);
-    let (decoded_form_struct, decoded_form_mapping) = render_decoded_form(pascal_name, fields);
+    let (decoded_form_struct, decoded_form_mapping, datetime_helper_fns) =
+        render_decoded_form(pascal_name, fields);
     // The destroy handler must honour the resource's delete semantics: when the
     // scaffold was generated with `--soft-delete`, mark `deleted_at` (matching
     // the soft-delete repository) instead of issuing a physical `DELETE`.
@@ -1325,7 +1497,7 @@ pub async fn destroy(
 }}
 
 {decoded_form_struct}
-
+{datetime_helper_fns}
 {decode_form_sig} {{
     let pairs: Vec<_> = url::form_urlencoded::parse(body.as_ref())
         .filter(|(key, value)| !(value.is_empty() && is_nullable_form_field(key)))
@@ -1392,6 +1564,24 @@ fn has_attachment_fields(fields: &[Field]) -> bool {
     fields.iter().any(|f| f.kind.is_attachment())
 }
 
+// `render_create_form_inputs` and `render_edit_form_inputs` below hand-roll
+// bare HTML (no `Changeset`/`ChangesetForm`, no `autumn-field` wrapper divs
+// or ARIA wiring) rather than calling `autumn_web::form::{checkbox_input,
+// number_input, date_input, datetime_input, select_input}` — consistent
+// with how every other field kind (including plain `String`) has always
+// been emitted here, not a pattern introduced for these widgets. That means
+// the two are independently maintained and can drift; at minimum, keep
+// these invariants in sync with the `autumn_web::form` helpers of the same
+// name when either changes:
+//   - `Bool` (non-nullable): a bare `<input type="checkbox">`, **no** hidden
+//     `value="false"` sibling sharing the `name` — see `checkbox_input`'s
+//     doc comment for why (duplicate-key 400 on every checked submission).
+//   - `Bool` (nullable): a 3-option `<select>` (unset/true/false), never a
+//     checkbox — a checkbox can't represent a `None` distinct from `false`.
+//   - `I32`/`I64`/`F32`/`F64`: `type="number"` with `step="1"` for integers,
+//     `step="any"` for floats.
+//   - `NaiveDateTime`/`DateTime`: `type="datetime-local"`, decoded via a
+//     `%.f`-tolerant parser (see `DESERIALIZE_*_DATETIME_LOCAL_FN` below).
 fn render_create_form_inputs(
     fields: &[Field],
     live_validation: bool,
@@ -1428,17 +1618,73 @@ fn render_create_form_inputs(
             } else {
                 String::new()
             };
+            let input_tag = match (f.kind, f.nullable) {
+                // No hidden `false` fallback: a checked box would then submit
+                // the key twice (`field=false` from the hidden input,
+                // `field=true` from the checkbox), and serde_urlencoded
+                // rejects duplicate keys instead of taking the last value —
+                // every checked submission would 400. `#[serde(default)]` on
+                // the DecodedForm field (see render_decoded_form) recovers
+                // `false` from the key's *absence* when unchecked instead.
+                (FieldKind::Bool, false) => format!(
+                    "input type=\"checkbox\" name=\"{name}\" value=\"true\"{hx_attrs}",
+                    name = f.name,
+                    hx_attrs = hx_attrs
+                ),
+                // A checkbox can't losslessly represent a nullable bool (no
+                // way to distinguish "leave false" from "set to null" when
+                // unchecked) — a 3-option select keeps NULL reachable.
+                (FieldKind::Bool, true) => format!(
+                    "select name=\"{name}\"{hx_attrs} {{ \
+                         option value=\"\" {{ \"— Unset —\" }} \
+                         option value=\"true\" {{ \"Yes\" }} \
+                         option value=\"false\" {{ \"No\" }} \
+                     }}",
+                    name = f.name,
+                    hx_attrs = hx_attrs
+                ),
+                (FieldKind::I32 | FieldKind::I64 | FieldKind::F32 | FieldKind::F64, _) => format!(
+                    "input type=\"number\" name=\"{name}\" step=\"{step}\"{required}{hx_attrs}",
+                    name = f.name,
+                    step = number_step(f.kind),
+                    required = required,
+                    hx_attrs = hx_attrs
+                ),
+                // `step="any"` lets the browser's picker show/accept
+                // seconds — see edit_datetime_local_value_expr for why a
+                // value with seconds must not be step-mismatch-rejected.
+                (FieldKind::NaiveDateTime | FieldKind::DateTime, _) => format!(
+                    "input type=\"datetime-local\" name=\"{name}\" step=\"any\"{required}{hx_attrs}",
+                    name = f.name,
+                    required = required,
+                    hx_attrs = hx_attrs
+                ),
+                _ => format!(
+                    "input type=\"text\" name=\"{name}\"{required}{hx_attrs}",
+                    name = f.name,
+                    required = required,
+                    hx_attrs = hx_attrs
+                ),
+            };
             let _ = writeln!(
                 out,
-                "            label {{ \"{name}\" }} input type=\"text\" name=\"{name}\"{required}{hx_attrs};{error_span}",
+                "            label {{ \"{name}\" }} {input_tag};{error_span}",
                 name = f.name,
-                required = required,
-                hx_attrs = hx_attrs,
+                input_tag = input_tag,
                 error_span = error_span
             );
         }
     }
     out
+}
+
+/// The HTML `step` attribute value for a `number_input`-shaped `FieldKind`.
+/// Integers step by whole numbers; floating-point fields allow any value.
+const fn number_step(kind: FieldKind) -> &'static str {
+    match kind {
+        FieldKind::F32 | FieldKind::F64 => "any",
+        _ => "1",
+    }
 }
 
 fn render_edit_form_inputs(
@@ -1460,7 +1706,6 @@ fn render_edit_form_inputs(
                 name = f.name
             );
         } else {
-            let value = edit_value_expr(f);
             let required = required_attr(f);
             let hx_attrs = if live_validation && validated.contains(&f.name.as_str()) {
                 format!(
@@ -1476,13 +1721,55 @@ fn render_edit_form_inputs(
             } else {
                 String::new()
             };
+            let input_tag = match (f.kind, f.nullable) {
+                // See render_create_form_inputs for why there is no hidden
+                // `false` fallback sibling here.
+                (FieldKind::Bool, false) => format!(
+                    "input type=\"checkbox\" name=\"{name}\" value=\"true\" checked[{checked}]{hx_attrs}",
+                    name = f.name,
+                    checked = edit_checked_expr(f),
+                    hx_attrs = hx_attrs
+                ),
+                (FieldKind::Bool, true) => {
+                    let (unset, is_true, is_false) = edit_bool_select_selected_exprs(f);
+                    format!(
+                        "select name=\"{name}\"{hx_attrs} {{ \
+                             option value=\"\" selected[{unset}] {{ \"— Unset —\" }} \
+                             option value=\"true\" selected[{is_true}] {{ \"Yes\" }} \
+                             option value=\"false\" selected[{is_false}] {{ \"No\" }} \
+                         }}",
+                        name = f.name,
+                        hx_attrs = hx_attrs
+                    )
+                }
+                (FieldKind::I32 | FieldKind::I64 | FieldKind::F32 | FieldKind::F64, _) => format!(
+                    "input type=\"number\" name=\"{name}\" step=\"{step}\" value=({value}){required}{hx_attrs}",
+                    name = f.name,
+                    step = number_step(f.kind),
+                    value = edit_value_expr(f),
+                    required = required,
+                    hx_attrs = hx_attrs
+                ),
+                (FieldKind::NaiveDateTime | FieldKind::DateTime, _) => format!(
+                    "input type=\"datetime-local\" name=\"{name}\" step=\"any\" value=({value}){required}{hx_attrs}",
+                    name = f.name,
+                    value = edit_datetime_local_value_expr(f),
+                    required = required,
+                    hx_attrs = hx_attrs
+                ),
+                _ => format!(
+                    "input type=\"text\" name=\"{name}\" value=({value}){required}{hx_attrs}",
+                    name = f.name,
+                    value = edit_value_expr(f),
+                    required = required,
+                    hx_attrs = hx_attrs
+                ),
+            };
             let _ = writeln!(
                 out,
-                "            label {{ \"{name}\" }} input type=\"text\" name=\"{name}\" value=({value}){required}{hx_attrs};{error_span}",
+                "            label {{ \"{name}\" }} {input_tag};{error_span}",
                 name = f.name,
-                value = value,
-                required = required,
-                hx_attrs = hx_attrs,
+                input_tag = input_tag,
                 error_span = error_span
             );
         }
@@ -1505,6 +1792,20 @@ fn edit_value_expr(field: &Field) -> String {
                 "row.{name}.as_ref().map(|value| String::from_utf8_lossy(value).to_string()).unwrap_or_default()"
             )
         }
+        // f32/f64 Display renders NaN/Infinity as "NaN"/"inf"/"-inf", none of
+        // which satisfy HTML5's <input type="number"> value grammar — the
+        // browser would silently blank the field. Render an explicit empty
+        // value for non-finite floats instead of an invalid one.
+        (true, FieldKind::F32 | FieldKind::F64) => {
+            format!(
+                "row.{name}.as_ref().filter(|value| value.is_finite()).map(ToString::to_string).unwrap_or_default()"
+            )
+        }
+        (false, FieldKind::F32 | FieldKind::F64) => {
+            format!(
+                "if row.{name}.is_finite() {{ row.{name}.to_string() }} else {{ String::new() }}"
+            )
+        }
         (true, _) => {
             format!("row.{name}.as_ref().map(ToString::to_string).unwrap_or_default()")
         }
@@ -1512,6 +1813,57 @@ fn edit_value_expr(field: &Field) -> String {
             format!("String::from_utf8_lossy(&row.{name}).to_string()")
         }
         (false, _) => format!("row.{name}.to_string()"),
+    }
+}
+
+/// Boolean expression for the `checked[...]` attribute of an edit-form
+/// checkbox. Only called for non-nullable `bool` fields — nullable
+/// `Option<bool>` fields render as a 3-option select instead (see
+/// [`edit_bool_select_selected_exprs`]), so there is no `Option<bool>` case
+/// to unwrap here.
+fn edit_checked_expr(field: &Field) -> String {
+    format!("row.{}", field.name)
+}
+
+/// The three `selected[...]` boolean expressions (unset / true / false) for
+/// an edit-form `<select>` rendering a nullable `Option<bool>` field.
+///
+/// A checkbox cannot losslessly represent a nullable bool (no way to
+/// distinguish "leave false" from "set to null" when unchecked), so nullable
+/// `Bool` fields render as this 3-option select instead of a checkbox.
+fn edit_bool_select_selected_exprs(field: &Field) -> (String, String, String) {
+    let name = &field.name;
+    (
+        format!("row.{name}.is_none()"),
+        format!("row.{name} == Some(true)"),
+        format!("row.{name} == Some(false)"),
+    )
+}
+
+/// Value expression for an edit-form `datetime-local` input. Unlike
+/// [`edit_value_expr`]'s `.to_string()` (which relies on `Display`, e.g.
+/// `"2024-01-15 10:30:00 UTC"` for `DateTime<Utc>` — a shape browsers
+/// reject), this formats explicitly as `YYYY-MM-DDTHH:MM[:SS[.fff]]`, the
+/// value shape `<input type="datetime-local">` accepts.
+///
+/// Seconds/fractional-seconds are included when present (`%.f` omits them
+/// entirely when zero) rather than truncated to `YYYY-MM-DDTHH:MM`: a
+/// minute-only value round-trips back through the generated project's
+/// `normalize_datetime_local` (see `NORMALIZE_DATETIME_LOCAL_FN` below) as
+/// `:00` seconds, and the generated `update` handler writes every column
+/// unconditionally — a stored `12:34:56.789` would otherwise be silently
+/// overwritten as `12:34:00` by re-submitting the form without touching
+/// this field. Pair with `step="any"` on the input (see
+/// `render_edit_form_inputs`) so a value with seconds doesn't fail the
+/// browser's step constraint validation.
+fn edit_datetime_local_value_expr(field: &Field) -> String {
+    let name = &field.name;
+    if field.nullable {
+        format!(
+            "row.{name}.as_ref().map(|value| value.format(\"%Y-%m-%dT%H:%M:%S%.f\").to_string()).unwrap_or_default()"
+        )
+    } else {
+        format!("row.{name}.format(\"%Y-%m-%dT%H:%M:%S%.f\").to_string()")
     }
 }
 
@@ -1829,13 +2181,51 @@ fn render_api_smoke_test(plural: &str, id_schema_type: &str, setup_calls: &str) 
     )
 }
 
+/// Emit `CREATE TABLE IF NOT EXISTS <target> (id BIGSERIAL PRIMARY KEY);` for
+/// every distinct table a `references` field points at.
+///
+/// `TestDb::shared()` starts one Postgres testcontainer per `tests/*.rs`
+/// binary (a process-global `OnceLock`), so a scaffold's own smoke test can't
+/// assume some *other* scaffolded resource's smoke test already created the
+/// referenced table — `CREATE TABLE comments (... REFERENCES posts(id) ...)`
+/// would otherwise fail with "relation posts does not exist" whenever
+/// `Comment` is scaffolded without also scaffolding `Post` in the same run.
+/// A minimal stand-in table (just the `id` column the FK constraint checks
+/// against) is enough to satisfy Postgres without duplicating the target's
+/// full schema.
+///
+/// Skips `own_table` — a self-referential `references` field (e.g. a
+/// `Category` model with a `category:references` field) targets the model's
+/// own table, which is about to be created for real by the very next
+/// statement. Postgres allows a self-referential FK within the same
+/// `CREATE TABLE`, so no stub is needed there; emitting one anyway would
+/// collide with the real (non-`IF NOT EXISTS`) `CREATE TABLE` that follows.
+fn render_reference_stub_tables_sql(fields: &[Field], own_table: &str) -> String {
+    let mut out = String::new();
+    let mut seen = BTreeSet::new();
+    for f in fields {
+        if let Some(target) = f.reference_table()
+            && target != own_table
+            && seen.insert(target.clone())
+        {
+            let _ = writeln!(
+                out,
+                "CREATE TABLE IF NOT EXISTS {target} (id BIGSERIAL PRIMARY KEY);"
+            );
+        }
+    }
+    out
+}
+
 /// Render the `tests/<snake>.rs` smoke test.
 ///
 /// Delegates to [`render_index_smoke_test`] or [`render_api_smoke_test`]
 /// depending on `api`, after computing the exact `CREATE TABLE`/`CREATE
 /// INDEX` SQL the generated migration also emits (see
 /// [`create_table_sql_with_metadata_and_id`]), so the throwaway table the
-/// test creates in `TestDb` matches the real schema.
+/// test creates in `TestDb` matches the real schema. Any `references` field
+/// also gets a stub target table created first — see
+/// [`render_reference_stub_tables_sql`].
 fn render_smoke_test(
     pascal_name: &str,
     plural: &str,
@@ -1845,9 +2235,11 @@ fn render_smoke_test(
     indexes: &BTreeSet<String>,
     defaults: &BTreeMap<String, String>,
 ) -> String {
+    let stub_tables_sql = render_reference_stub_tables_sql(fields, plural);
     let create_table_sql =
         create_table_sql_with_metadata_and_id(plural, fields, indexes, defaults, id_type);
-    let setup_calls = render_execute_sql_calls(&create_table_sql);
+    let mut setup_calls = render_execute_sql_calls(&stub_tables_sql);
+    setup_calls.push_str(&render_execute_sql_calls(&create_table_sql));
     let id_schema_type = id_type.schema_type();
 
     if api {
@@ -2090,16 +2482,16 @@ async fn main() {
         );
         assert!(
             routes.contains(
-                r#"label { "views" } input type="text" name="views" value=(row.views.as_ref().map(ToString::to_string).unwrap_or_default());"#
+                r#"label { "views" } input type="number" name="views" step="1" value=(row.views.as_ref().map(ToString::to_string).unwrap_or_default());"#
             ),
-            "edit form must prefill nullable numeric fields from the loaded row: {routes}"
+            "edit form must prefill nullable numeric fields from the loaded row as a number input (issue #1131): {routes}"
         );
         assert!(
             routes.contains(r#"label { "subtitle" } input type="text" name="subtitle";"#),
             "new form must not mark nullable fields required: {routes}"
         );
         assert!(
-            routes.contains(r#"label { "views" } input type="text" name="views";"#),
+            routes.contains(r#"label { "views" } input type="number" name="views" step="1";"#),
             "new form must not mark nullable numeric fields required: {routes}"
         );
     }
@@ -2658,6 +3050,385 @@ async fn main() {
         assert!(routes.contains("pub avatar: Option<String>"));
     }
 
+    // ── Typed form-input widgets (issue #1131) ──────────────────────
+
+    #[test]
+    fn execute_writes_checkbox_for_bool_field() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "active:bool".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+
+        // Both create and edit forms must render a real checkbox for `active`,
+        // never a text box.
+        assert!(
+            routes.contains("input type=\"checkbox\" name=\"active\""),
+            "{routes}"
+        );
+        assert!(
+            !routes.contains("input type=\"text\" name=\"active\""),
+            "bool field must not render input type=\"text\": {routes}"
+        );
+        // No hidden "false" fallback sharing the checkbox's name: a checked
+        // box would then submit the key twice (active=false&active=true),
+        // and serde_urlencoded rejects duplicate keys — every checked
+        // submission would 400 (issue #1131 follow-up fix). Exactly one
+        // `name="active"` input must exist per form.
+        assert!(
+            !routes.contains("input type=\"hidden\" name=\"active\" value=\"false\""),
+            "{routes}"
+        );
+        assert_eq!(
+            routes.matches("name=\"active\"").count(),
+            2,
+            "expected exactly one `name=\"active\"` input in each of the \
+             create and edit forms (no duplicate-key hidden fallback): {routes}"
+        );
+        // Edit form must reflect the current value via `checked[...]`.
+        assert!(routes.contains("checked[row.active]"), "{routes}");
+        // DecodedForm must default the field so an unchecked submission
+        // (missing key) doesn't 400.
+        assert!(
+            routes.contains("#[serde(default)]\n    pub active: bool,"),
+            "{routes}"
+        );
+    }
+
+    #[test]
+    fn execute_writes_select_for_nullable_bool_field() {
+        // A checkbox can't losslessly represent Option<bool> (no way to
+        // distinguish "leave false" from "set to null" when unchecked), so
+        // nullable bool fields must render a 3-option select instead.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "archived:Option<bool>".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+
+        assert!(
+            !routes.contains("input type=\"checkbox\" name=\"archived\""),
+            "nullable bool must not render a checkbox: {routes}"
+        );
+        assert!(routes.contains("select name=\"archived\""), "{routes}");
+        assert!(routes.contains("option value=\"\""), "{routes}");
+        assert!(routes.contains("option value=\"true\""), "{routes}");
+        assert!(routes.contains("option value=\"false\""), "{routes}");
+        // Edit form must reflect the current tri-state value.
+        assert!(
+            routes.contains("selected[row.archived.is_none()]"),
+            "{routes}"
+        );
+        assert!(
+            routes.contains("selected[row.archived == Some(true)]"),
+            "{routes}"
+        );
+        assert!(
+            routes.contains("selected[row.archived == Some(false)]"),
+            "{routes}"
+        );
+    }
+
+    #[test]
+    fn execute_writes_number_input_for_integer_fields() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "views:i64".into(), "rank:i32".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+
+        assert!(
+            routes.contains("input type=\"number\" name=\"views\" step=\"1\""),
+            "{routes}"
+        );
+        assert!(
+            routes.contains("input type=\"number\" name=\"rank\" step=\"1\""),
+            "{routes}"
+        );
+        assert!(
+            !routes.contains("input type=\"text\" name=\"views\""),
+            "{routes}"
+        );
+    }
+
+    #[test]
+    fn execute_writes_number_input_with_any_step_for_float_fields() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &[
+                "title:String".into(),
+                "price:f64".into(),
+                "weight:f32".into(),
+            ],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+
+        assert!(
+            routes.contains("input type=\"number\" name=\"price\" step=\"any\""),
+            "{routes}"
+        );
+        assert!(
+            routes.contains("input type=\"number\" name=\"weight\" step=\"any\""),
+            "{routes}"
+        );
+    }
+
+    #[test]
+    fn execute_writes_finite_guard_for_float_edit_form_value() {
+        // f32/f64 Display renders NaN/Infinity as "NaN"/"inf"/"-inf", none
+        // of which satisfy HTML5's <input type="number"> value grammar —
+        // the browser would silently blank the field. The generated value
+        // expression must guard with is_finite() instead of a bare
+        // .to_string() for float fields.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &[
+                "title:String".into(),
+                "price:f64".into(),
+                "weight:Option<f32>".into(),
+            ],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        assert!(
+            routes.contains(
+                "value=(if row.price.is_finite() { row.price.to_string() } else { String::new() })"
+            ),
+            "{routes}"
+        );
+        assert!(
+            routes.contains(
+                "value=(row.weight.as_ref().filter(|value| value.is_finite()).map(ToString::to_string).unwrap_or_default())"
+            ),
+            "{routes}"
+        );
+    }
+
+    #[test]
+    fn execute_writes_number_input_value_on_edit_form() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "views:i64".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        assert!(
+            routes.contains(
+                "input type=\"number\" name=\"views\" step=\"1\" value=(row.views.to_string())"
+            ),
+            "{routes}"
+        );
+    }
+
+    #[test]
+    fn execute_writes_datetime_local_input_for_naive_datetime_field() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "published_at:NaiveDateTime".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+
+        assert!(
+            routes.contains("input type=\"datetime-local\" name=\"published_at\""),
+            "{routes}"
+        );
+        assert!(
+            !routes.contains("input type=\"text\" name=\"published_at\""),
+            "{routes}"
+        );
+        // DecodedForm must use the local-shape-aware deserializer so a
+        // browser-submitted `YYYY-MM-DDTHH:MM` value parses without a
+        // hand-edit.
+        assert!(
+            routes.contains(
+                "#[serde(deserialize_with = \"deserialize_naive_datetime_local\")]\n    pub published_at: chrono::NaiveDateTime,"
+            ),
+            "{routes}"
+        );
+        assert!(
+            routes.contains("fn deserialize_naive_datetime_local"),
+            "{routes}"
+        );
+        assert!(routes.contains("fn normalize_datetime_local"), "{routes}");
+        // No DateTime<Utc> field present — the tz-aware helper must not be
+        // emitted as dead code.
+        assert!(
+            !routes.contains("fn deserialize_utc_datetime_local"),
+            "{routes}"
+        );
+        // The parse format must accept optional fractional seconds
+        // (`%.f`) — without it, a datetime-local value submitted with
+        // milliseconds (e.g. from a finer-grained `step`) fails to parse.
+        assert!(routes.contains("\"%Y-%m-%dT%H:%M:%S%.f\")"), "{routes}");
+        // Regression test: the edit form's value must preserve seconds/
+        // fractional precision, not truncate to minutes. A minute-only
+        // value round-trips as `:00` seconds via normalize_datetime_local,
+        // and the generated update handler writes every column
+        // unconditionally — a no-op re-submit of a row with non-zero
+        // seconds would otherwise silently corrupt the stored timestamp
+        // (e.g. `12:34:56` -> `12:34:00`).
+        assert!(
+            routes
+                .contains("value=(row.published_at.format(\"%Y-%m-%dT%H:%M:%S%.f\").to_string())"),
+            "{routes}"
+        );
+        // `step="any"` so a value carrying seconds/fractional seconds
+        // doesn't fail the browser's step-mismatch constraint validation
+        // (default step is minute-granularity) and block submission.
+        assert!(
+            routes.contains("input type=\"datetime-local\" name=\"published_at\" step=\"any\""),
+            "{routes}"
+        );
+    }
+
+    #[test]
+    fn execute_writes_datetime_local_input_for_tz_datetime_field() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "scheduled_at:DateTime".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+
+        assert!(
+            routes.contains("input type=\"datetime-local\" name=\"scheduled_at\""),
+            "{routes}"
+        );
+        assert!(
+            routes.contains(
+                "#[serde(deserialize_with = \"deserialize_utc_datetime_local\")]\n    pub scheduled_at: chrono::DateTime<chrono::Utc>,"
+            ),
+            "{routes}"
+        );
+        assert!(
+            routes.contains("fn deserialize_utc_datetime_local"),
+            "{routes}"
+        );
+        assert!(
+            !routes.contains("fn deserialize_naive_datetime_local"),
+            "{routes}"
+        );
+    }
+
+    #[test]
+    fn execute_writes_datetime_local_input_for_nullable_datetime_field() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &[
+                "title:String".into(),
+                "published_at:Option<NaiveDateTime>".into(),
+            ],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        assert!(
+            routes.contains(
+                "#[serde(default, deserialize_with = \"deserialize_option_naive_datetime_local\")]\n    pub published_at: Option<chrono::NaiveDateTime>,"
+            ),
+            "{routes}"
+        );
+        assert!(
+            routes.contains("fn deserialize_option_naive_datetime_local"),
+            "{routes}"
+        );
+        // Scalar variant must not be emitted when only the nullable form is used.
+        assert!(
+            !routes.contains("fn deserialize_naive_datetime_local<'de, D>(deserializer: D) -> Result<chrono::NaiveDateTime, D::Error>"),
+            "{routes}"
+        );
+    }
+
+    #[test]
+    fn execute_writes_text_input_only_for_genuine_string_fields() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &[
+                "title:String".into(),
+                "body:Text".into(),
+                "active:bool".into(),
+                "views:i64".into(),
+                "published_at:NaiveDateTime".into(),
+            ],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        assert!(
+            routes.contains("input type=\"text\" name=\"title\""),
+            "{routes}"
+        );
+        assert!(
+            routes.contains("input type=\"text\" name=\"body\""),
+            "{routes}"
+        );
+        assert!(
+            !routes.contains("input type=\"text\" name=\"active\""),
+            "{routes}"
+        );
+        assert!(
+            !routes.contains("input type=\"text\" name=\"views\""),
+            "{routes}"
+        );
+        assert!(
+            !routes.contains("input type=\"text\" name=\"published_at\""),
+            "{routes}"
+        );
+    }
+
     #[test]
     fn plan_scaffold_api_only_skips_html() {
         let tmp = project_with_main(default_main());
@@ -3206,5 +3977,162 @@ async fn main() {
             1,
             "CREATE TABLE must appear in a single execute_sql call, not split across two: {test}"
         );
+    }
+
+    // ── references field: scaffold + smoke-test wiring (issue #1026) ───────
+
+    #[test]
+    fn scaffold_references_field_emits_fk_column_constraint_and_index() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Comment",
+            &["body:Text".into(), "post:references".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let up = fs::read_to_string(
+            tmp.path()
+                .join("migrations/20260427000000_create_comments/up.sql"),
+        )
+        .unwrap();
+        assert!(
+            up.contains("post_id BIGINT NOT NULL REFERENCES posts(id)"),
+            "up.sql: {up}"
+        );
+        assert!(
+            up.contains("CREATE INDEX idx_comments_post_id ON comments (post_id);"),
+            "up.sql: {up}"
+        );
+    }
+
+    #[test]
+    fn scaffold_references_field_warns_when_target_model_missing() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Comment",
+            &["post:references".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        assert_eq!(plan.warnings.len(), 1, "warnings: {:?}", plan.warnings);
+        assert!(plan.warnings[0].contains("posts"));
+    }
+
+    #[test]
+    fn scaffold_smoke_test_creates_a_stub_referenced_table_before_the_real_one() {
+        // The generated smoke test runs in its own throwaway `TestDb` (one
+        // Postgres testcontainer per `tests/*.rs` binary, per-process — see
+        // `TestDb::shared()`), so it can't rely on some *other* scaffolded
+        // resource's smoke test having already created the referenced table.
+        // A `CREATE TABLE comments (... REFERENCES posts(id) ...)` would fail
+        // with "relation posts does not exist" unless the comments smoke test
+        // creates a minimal stand-in `posts` table itself first.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Comment",
+            &["body:Text".into(), "post:references".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let test = fs::read_to_string(tmp.path().join("tests/comment.rs")).unwrap();
+        let stub_pos = test
+            .find("CREATE TABLE IF NOT EXISTS posts")
+            .unwrap_or_else(|| panic!("expected a stub `posts` table in the smoke test: {test}"));
+        let real_pos = test.find("CREATE TABLE comments").unwrap_or_else(|| {
+            panic!("expected the real `comments` table in the smoke test: {test}")
+        });
+        assert!(
+            stub_pos < real_pos,
+            "the stub referenced table must be created before the table under test: {test}"
+        );
+    }
+
+    #[test]
+    fn scaffold_smoke_test_emits_one_stub_per_distinct_reference_target() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Follow",
+            &["follower:references".into(), "followee:references".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let test = fs::read_to_string(tmp.path().join("tests/follow.rs")).unwrap();
+        assert!(test.contains("CREATE TABLE IF NOT EXISTS followers"));
+        assert!(test.contains("CREATE TABLE IF NOT EXISTS followees"));
+    }
+
+    #[test]
+    fn render_reference_stub_tables_sql_dedupes_identical_targets() {
+        // Two references that resolve to the same target table must only
+        // emit one `CREATE TABLE IF NOT EXISTS` for it. Constructed directly
+        // (bypassing `parse_fields`, which enforces unique column names) so
+        // the collision is deterministic rather than relying on two English
+        // words coincidentally pluralising to the same string.
+        let fields = vec![
+            Field {
+                name: "author_id".to_string(),
+                kind: FieldKind::References,
+                nullable: false,
+            },
+            Field {
+                name: "author_id".to_string(),
+                kind: FieldKind::References,
+                nullable: true,
+            },
+        ];
+        assert_eq!(
+            fields[0].reference_table(),
+            fields[1].reference_table(),
+            "test setup: both fields must target the same table"
+        );
+        let sql = render_reference_stub_tables_sql(&fields, "unrelated_table");
+        assert_eq!(
+            sql.matches("CREATE TABLE IF NOT EXISTS").count(),
+            1,
+            "identical targets must be de-duplicated: {sql}"
+        );
+    }
+
+    #[test]
+    fn render_reference_stub_tables_sql_skips_own_table() {
+        // A self-referential `references` field (e.g. `Category` with
+        // `category:references`) targets the model's own table, which the
+        // real (non-`IF NOT EXISTS`) `CREATE TABLE` creates right after —
+        // stubbing it first would collide with that statement.
+        let fields = super::super::dsl::parse_fields(&["category:references".into()]).unwrap();
+        assert_eq!(fields[0].reference_table().as_deref(), Some("categories"));
+        let sql = render_reference_stub_tables_sql(&fields, "categories");
+        assert!(sql.is_empty(), "must not stub the model's own table: {sql}");
+    }
+
+    #[test]
+    fn scaffold_self_referential_reference_compiles_one_create_table() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Category",
+            &["name:String".into(), "category:references".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let test = fs::read_to_string(tmp.path().join("tests/category.rs")).unwrap();
+        assert_eq!(
+            test.matches("CREATE TABLE").count(),
+            1,
+            "a self-referential FK must not stub its own table before creating it for real: {test}"
+        );
+        assert!(test.contains("category_id BIGINT NOT NULL REFERENCES categories(id)"));
     }
 }
