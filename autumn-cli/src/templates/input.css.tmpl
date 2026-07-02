@@ -24,6 +24,14 @@
   .autumn-nav__toggle {
     @apply hidden;
   }
+  /* Wraps the primary and trailing item lists. Must be a flex row itself
+     (and grow to fill the space brand/toggle don't use) or the two lists
+     just stack as ordinary block children instead of sitting side by side —
+     which would leave .autumn-nav__items--trailing's ml-auto below with
+     nothing to push against. */
+  .autumn-nav__collapse {
+    @apply flex items-center gap-4 flex-1;
+  }
   .autumn-nav__items {
     @apply flex items-center gap-4 list-none;
   }
@@ -51,10 +59,10 @@
       @apply flex;
     }
     .autumn-nav--enhanced .autumn-nav__collapse {
-      @apply hidden w-full basis-full;
+      @apply hidden w-full basis-full flex-col items-start;
     }
     .autumn-nav--enhanced .autumn-nav__collapse--open {
-      @apply block;
+      @apply flex;
     }
     .autumn-nav--enhanced .autumn-nav__items {
       @apply flex-col items-start;

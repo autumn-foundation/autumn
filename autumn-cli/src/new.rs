@@ -858,23 +858,48 @@ mod tests {
         // to a new row if the row itself is allowed to wrap. Without flex-wrap
         // on the enhanced root, the opened mobile menu squeezes/overflows onto
         // the same row as the brand and toggle instead of appearing below them.
-        //
-        // Bare-selector match (not a literal multi-line blob) so this doesn't
-        // depend on the file's line-ending style — this repo checks out
-        // `*.tmpl` as `text=auto`, which normalizes to CRLF on Windows, and
-        // an embedded `\n` here would never match the CRLF-containing string
-        // `include_str!` reads back on that platform.
-        let css = templates::INPUT_CSS;
-        let rule_start = css
-            .find(".autumn-nav--enhanced {")
-            .expect("no bare .autumn-nav--enhanced rule found in input.css.tmpl");
-        let rule_body = &css[rule_start..][..css[rule_start..]
-            .find('}')
-            .expect("unterminated .autumn-nav--enhanced rule")];
+        let rule_body = css_rule_body(templates::INPUT_CSS, ".autumn-nav--enhanced {");
         assert!(
             rule_body.contains("flex-wrap"),
             "the mobile media query must set flex-wrap on .autumn-nav--enhanced itself \
              so .autumn-nav__collapse's basis-full can actually start a new row, got:\n{}",
+            templates::INPUT_CSS
+        );
+    }
+
+    /// Extract the declaration block (without the braces) of the first CSS
+    /// rule whose selector text starts with `selector_prefix` (which must
+    /// include the trailing ` {`). Scans by byte position rather than
+    /// matching a literal multi-line blob, so it doesn't depend on the
+    /// source file's line-ending style — this repo checks out `*.tmpl` as
+    /// `text=auto`, which normalizes to CRLF on Windows, and a pattern with
+    /// an embedded `\n` would never match the CRLF-containing string
+    /// `include_str!` reads back on that platform.
+    fn css_rule_body<'a>(css: &'a str, selector_prefix: &str) -> &'a str {
+        let rule_start = css
+            .find(selector_prefix)
+            .unwrap_or_else(|| panic!("no bare `{selector_prefix}` rule found in input.css.tmpl"));
+        let rest = &css[rule_start..];
+        &rest[..rest
+            .find('}')
+            .unwrap_or_else(|| panic!("unterminated `{selector_prefix}` rule"))]
+    }
+
+    #[test]
+    fn input_css_nav_collapse_is_flex_row_so_trailing_items_align_right() {
+        // .autumn-nav__collapse wraps both the primary .autumn-nav__items
+        // list and the .autumn-nav__items--trailing list; without collapse
+        // itself being a flex row (and growing to fill the nav's remaining
+        // width), the trailing list's ml-auto has no flex row to push
+        // against — the two lists just stack vertically as ordinary block
+        // children instead of sitting side by side with trailing pinned to
+        // the far right, as nav_bar's trailing-slot design intends.
+        let rule_body = css_rule_body(templates::INPUT_CSS, ".autumn-nav__collapse {");
+        assert!(
+            rule_body.contains("flex") && !rule_body.contains("flex-col"),
+            "the base (non-mobile) .autumn-nav__collapse rule must be a flex row \
+             so .autumn-nav__items--trailing's ml-auto can push it to the right \
+             edge of the nav, got:\n{}",
             templates::INPUT_CSS
         );
     }
