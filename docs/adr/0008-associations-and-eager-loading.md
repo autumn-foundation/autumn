@@ -183,11 +183,13 @@ exactly.
   for arbitrary predicates (e.g. "only top-level comments"). Callers needing
   that filter client-side after preloading or keep a hand-written scoped query.
 - **Scope / limitations** (deliberately out of scope for this slice):
-  polymorphic associations, `has_and_belongs_to_many` / join tables,
-  write-side cascades, cross-database/shard preloading, and ORM-style implicit
-  lazy loading. Keys are assumed `i64` and primary keys named `id`, matching
-  the rest of the repository layer; association targets must use the inferred
-  table name. Nullable foreign keys and custom-table targets are follow-ups.
+  polymorphic associations, write-side cascades, cross-database/shard
+  preloading, and ORM-style implicit lazy loading. Keys are assumed `i64` and
+  primary keys named `id`, matching the rest of the repository layer;
+  association targets must use the inferred table name. Nullable foreign
+  keys and custom-table targets are follow-ups. `has_and_belongs_to_many` /
+  join tables shipped as a `through =` follow-up — see "Update: many-to-many
+  (#1324)" below.
 
 ## Success metrics (reddit-clone, before/after)
 
@@ -197,3 +199,50 @@ exactly.
   size — asserted by `tests/preload_pg_integration.rs`
   (`preload_is_batched_no_n_plus_one`), which proves the statement count for a
   2-comment post equals that for a 40-comment post.
+
+## Update: many-to-many (#1324)
+
+Extended `#[has_many]` with `through = <join_table>` — a HABTM-style join
+covering the pure association (two FK columns, no join-row payload), reusing
+this ADR's `Preloadable`/`{Model}Preload`/`NotLoaded` machinery rather than
+introducing a parallel system:
+
+- **Join table**: `#[model]` emits a hidden per-association `diesel::table!`
+  for the join table (so two models can both declare `through =` the same
+  physical table without colliding types) rather than requiring a
+  hand-written `schema.rs` entry. Join columns default to `{source}_id` /
+  `{target}_id`, overridable with `fk = ...` / `target_fk = ...`; the join
+  table needs a composite primary key on both columns.
+- **Preload**: one batched `INNER JOIN` per association level, same "no N+1"
+  contract as `belongs_to`/`has_many`/`has_one`. Unlike plain `has_many`,
+  the *same* target row can legitimately belong to more than one
+  currently-loaded parent (that's the point of many-to-many), so
+  `#[has_many(..., through = ...)]`'s stored/accessor type is
+  `Vec<Arc<Preloaded<Target>>>` rather than `has_many`'s owned
+  `Vec<Preloaded<Target>>` — targets are deduplicated by id before recursing
+  into nested `_with` specs, then shared via `Arc::clone` across every
+  linking parent (mirroring how `belongs_to`/`has_one` already share a
+  parent-side target). Getting this wrong silently drops nested associations
+  for every parent but the first one sharing a target — covered by
+  `m2m_nested_through_path` in `examples/reddit-clone/tests/m2m_pg_integration.rs`.
+- **Mutations**: each `through =` association generates a small mutation
+  trait (`add_{singular}` / `remove_{singular}` / `set_{plural}`) blanket-
+  implemented for any repository whose new `M2mConnSource::Model` associated
+  type matches — `#[repository(Model, ...)]` implements `M2mConnSource`
+  unconditionally, and the `Model` bound is what keeps method resolution
+  unambiguous when a model has more than one `through =` association, or two
+  models' mutation traits are both in scope. `add_*` is idempotent via
+  `ON CONFLICT DO NOTHING` on the join table's composite key; `set_*` wraps
+  delete-then-insert in one transaction.
+- **Scoping**: preload reads apply the target's existing tenant/soft-delete
+  scoping via a new per-row `__autumn_preload_keep` (the row-at-a-time
+  sibling of the batch `__autumn_preload_retain` this ADR introduced —
+  needed because m2m loaders pair each row with its parent key before
+  grouping, so a `Vec::retain` would lose that pairing). Mutation helpers
+  write the join table directly and do **not** apply tenant scoping, hooks,
+  or broadcasts on the join row — documented limitation, not a gap to close
+  in this slice.
+
+See `autumn-macros/src/lib.rs`'s `#[model]` doc comment for the full
+`through =` syntax and `examples/reddit-clone` (`Post` ↔ `Tag` via
+`post_tags`) for the reference implementation.

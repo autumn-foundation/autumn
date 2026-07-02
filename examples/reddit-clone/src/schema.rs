@@ -71,6 +71,17 @@ diesel::table! {
     }
 }
 
+// `post_tags` (the Post <-> Tag join table, #1324) has no entry here --
+// `#[has_many(Tag, through = post_tags)]` on `Post` generates its own hidden
+// `diesel::table!` for it.
+diesel::table! {
+    tags (id) {
+        id -> Int8,
+        name -> Text,
+        slug -> Text,
+    }
+}
+
 diesel::joinable!(posts -> users (author_id));
 diesel::joinable!(posts -> subreddits (subreddit_id));
 diesel::joinable!(comments -> users (author_id));
@@ -84,4 +95,5 @@ diesel::allow_tables_to_appear_in_same_query!(
     comments,
     votes,
     live_feed_events,
+    tags,
 );

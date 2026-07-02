@@ -15,9 +15,10 @@
 
 use crate::hooks::PostHooks;
 use crate::models::{
-    NewPost, NewSubreddit, Post, PostDraftExt, Subreddit, UpdatePost, UpdateSubreddit,
+    NewPost, NewSubreddit, NewTag, Post, PostDraftExt, Subreddit, Tag, UpdatePost, UpdateSubreddit,
+    UpdateTag,
 };
-use crate::schema::{posts, subreddits};
+use crate::schema::{posts, subreddits, tags};
 
 #[autumn_web::repository(Subreddit, api = "/api/subreddits")]
 pub trait SubredditRepository {
@@ -41,6 +42,17 @@ pub trait PostRepository {
 
     /// SELECT * FROM posts WHERE author_id = $1
     fn find_by_author_id(author_id: i64) -> Vec<Post>;
+}
+
+// Backs the Post <-> Tag many-to-many demo (#1324). `#[model]`'s
+// `#[has_many(Tag, through = post_tags)]` on `Post` generates `add_tag` /
+// `remove_tag` / `set_tags`, blanket-implemented once this repository (via
+// `#[repository]`) implements `M2mConnSource<Model = Post>` -- see
+// `crate::routes::posts::manage_tags`.
+#[autumn_web::repository(Tag)]
+pub trait TagRepository {
+    /// SELECT * FROM tags WHERE slug = $1
+    fn find_by_slug(slug: String) -> Vec<Tag>;
 }
 
 #[derive(Clone, Debug)]

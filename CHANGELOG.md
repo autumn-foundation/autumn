@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **model:** many-to-many associations via `#[has_many(Target, through =
+  join_table)]` (#1324). Extends the `belongs_to`/`has_many`/`has_one`
+  associations from #835 with a join-table variant: join columns default to
+  `{source}_id` / `{target}_id` (overridable with `fk = ...` / `target_fk =
+  ...`), and `#[model]` emits the join table's `diesel::table!` itself — no
+  hand-written `schema.rs` entry needed, only a migration creating the join
+  table with a composite primary key on both columns. Participates in the
+  existing `{Model}Preload` builder and `Preloadable` machinery: `preload(&[
+  ...])` issues one batched `INNER JOIN` query per association level (fixed
+  query count regardless of result-set size), and un-preloaded access yields
+  the typed `NotLoaded` state. Nested preload paths work through a join
+  (`Post::preload().tags_with(Tag::preload().posts())`). The generated
+  `#[repository]` gets three mutation helpers per association —
+  `add_{singular}`, `remove_{singular}`, `set_{plural}` (replace-all) — each
+  idempotent (`add`/`set` use `ON CONFLICT DO NOTHING`) and, for `set_*`,
+  wrapped in a single transaction. `examples/reddit-clone` demonstrates a
+  real Post↔Tag many-to-many with preload and mutation usage in
+  `src/routes/posts.rs`. Purely additive extension of the `#[has_many]`
+  syntax; existing `belongs_to`/`has_many`/`has_one` usage is unaffected;
+  minor version bump.
+
 - **jobs:** tracked job handles with progress reporting and a built-in
   pollable status route (#1373). `job::enqueue_tracked`/`enqueue_tracked_for`
   (and the generated `{Job}::enqueue_tracked`/`enqueue_tracked_for`

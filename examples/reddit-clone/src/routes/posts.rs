@@ -15,9 +15,11 @@ use diesel_async::RunQueryDsl;
 use scoped_futures::ScopedFutureExt;
 
 use crate::jobs::{PostPublicationArgs, PostPublicationJob};
-use crate::models::{Comment, CommentAssociations, Post, PostAssociations, Subreddit};
+use crate::models::{
+    Comment, CommentAssociations, NewTag, Post, PostAssociations, PostTagsMutations, Subreddit, Tag,
+};
 use crate::repositories::{PgPostRepository, PostRepository};
-use crate::schema::{posts, subreddits};
+use crate::schema::{posts, subreddits, tags};
 use crate::slugify::slugify;
 
 fn posts_per_page() -> i64 {
@@ -567,21 +569,26 @@ pub async fn show(
     // primary too (`on_primary`) to keep both reads on one consistent role.
     drop(db);
 
-    // Eager-load the post's author and its comments (each with their author),
-    // replacing the per-row author lookup + hand-written comment/author join.
-    // For a post with N comments this is a fixed 2 extra queries (post.author,
-    // comments) + 1 (comments.author) = at most 3 here, never `2 + N`.
+    // Eager-load the post's author, its comments (each with their author),
+    // and its tags (#1324, many-to-many through `post_tags`) -- replacing
+    // the per-row author lookup + hand-written comment/author join, and what
+    // would otherwise be a hand-rolled `post_tags` join query. For a post
+    // with N comments and M tags this is a fixed 2 extra queries
+    // (post.author, comments) + 1 (comments.author) + 1 (post.tags) = at
+    // most 4 here, never `3 + N + M`.
     let mut loaded = repo
         .on_primary()
         .preload(
             vec![post],
             Post::preload()
                 .author()
-                .comments_with(Comment::preload().author()),
+                .comments_with(Comment::preload().author())
+                .tags(),
         )
         .await?;
     let post = loaded.remove(0);
     let author = post.author()?;
+    let post_tags = post.tags()?;
 
     // Show top-level comments (parent_id IS NULL), highest score first.
     let mut post_comments: Vec<&autumn_web::preload::Preloaded<Comment>> = post
@@ -644,6 +651,18 @@ pub async fn show(
                                 }
                             }
                         }
+                        // Preloaded many-to-many tags (#1324): `post.tags()`
+                        // reads the batched `post_tags` join loaded above, no
+                        // per-tag query.
+                        @if !post_tags.is_empty() {
+                            div class="flex flex-wrap gap-2 mt-3" {
+                                @for tag in post_tags {
+                                    span class="px-2 py-0.5 rounded-full bg-orange-50 text-orange-700 text-xs" {
+                                        "#" (tag.slug)
+                                    }
+                                }
+                            }
+                        }
                         @if is_author {
                             div class="flex gap-3 mt-4 pt-4 border-t border-gray-100 text-sm" {
                                 a href=(paths::edit_form(&sub.slug, &post.slug))
@@ -653,6 +672,20 @@ pub async fn show(
                                     hx-confirm="Delete this post? This cannot be undone."
                                     class="text-red-500 hover:text-red-700 cursor-pointer" {
                                     "Delete"
+                                }
+                            }
+                            form action=(paths::manage_tags(&sub.slug, &post.slug)) method="post"
+                                 class="flex items-center gap-2 mt-3 text-sm" {
+                                input type="hidden" name="_csrf" value=(csrf.token());
+                                input type="text" name="tags"
+                                      value=(post_tags.iter().map(|t| t.slug.clone()).collect::<Vec<_>>().join(", "))
+                                      placeholder="tags, comma separated"
+                                      class="flex-1 border border-gray-300 rounded px-2 py-1 text-xs \
+                                             focus:outline-none focus:ring-2 focus:ring-orange-400" {}
+                                button type="submit"
+                                       class="px-3 py-1 bg-gray-100 text-gray-700 rounded text-xs \
+                                              hover:bg-gray-200" {
+                                    "Save tags"
                                 }
                             }
                         }
@@ -877,6 +910,103 @@ pub async fn update(
     Ok(Redirect::to(&paths::show(&sub_slug, &new_slug)))
 }
 
+// ── Manage tags (#1324 many-to-many demo) ───────────────────────
+
+#[derive(serde::Deserialize)]
+pub struct ManageTagsForm {
+    /// Comma/whitespace-separated tag names, e.g. `"rust, webdev"`.
+    #[serde(default)]
+    pub tags: String,
+}
+
+/// Resolve free-text tag names to ids, creating any tag that doesn't exist
+/// yet (find-then-insert; a losing race just means the loser's `insert`
+/// fails on the table's `slug` unique constraint, in which case the
+/// already-created row is looked up instead — the same shape the DB layer
+/// as a whole already handles via other unique constraints in this app).
+async fn resolve_or_create_tag_ids(raw: &str, db: &mut Db) -> AutumnResult<Vec<i64>> {
+    let mut ids = Vec::new();
+    for piece in raw.split([',', '\n']) {
+        let name = piece.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let slug = slugify(name);
+        if slug.is_empty() {
+            continue;
+        }
+        let existing: Option<Tag> = tags::table
+            .filter(tags::slug.eq(&slug))
+            .select(Tag::as_select())
+            .first(&mut **db)
+            .await
+            .optional()?;
+        let id = if let Some(tag) = existing {
+            tag.id
+        } else {
+            let inserted: Option<Tag> = diesel::insert_into(tags::table)
+                .values(&NewTag {
+                    name: name.to_string(),
+                    slug: slug.clone(),
+                })
+                .on_conflict(tags::slug)
+                .do_nothing()
+                .get_result(&mut **db)
+                .await
+                .optional()?;
+            match inserted {
+                Some(tag) => tag.id,
+                None => {
+                    // Lost the race to another concurrent create: the row
+                    // now exists, look it up.
+                    tags::table
+                        .filter(tags::slug.eq(&slug))
+                        .select(Tag::as_select())
+                        .first(&mut **db)
+                        .await?
+                        .id
+                }
+            }
+        };
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    Ok(ids)
+}
+
+/// Replace a post's tags with the free-text `tags` field, creating any new
+/// tags. Demonstrates the generated `set_tags` (#[has_many(Tag, through =
+/// post_tags)]) mutation helper end-to-end from an HTTP handler.
+#[secured]
+#[post("/r/{sub_slug}/posts/{post_slug}/tags")]
+pub async fn manage_tags(
+    Path((sub_slug, post_slug)): Path<(String, String)>,
+    State(state): State<AppState>,
+    session: Session,
+    mut db: Db,
+    repo: PgPostRepository,
+    flash: Flash,
+    form: Form<ManageTagsForm>,
+) -> AutumnResult<Redirect> {
+    let post: Post = posts::table
+        .inner_join(subreddits::table.on(posts::subreddit_id.eq(subreddits::id)))
+        .filter(subreddits::slug.eq(&sub_slug))
+        .filter(posts::slug.eq(&post_slug))
+        .select(Post::as_select())
+        .first(&mut *db)
+        .await
+        .map_err(|_| AutumnError::not_found_msg("Post not found"))?;
+
+    autumn_web::authorization::authorize::<Post>(&state, &session, "update", &post).await?;
+
+    let tag_ids = resolve_or_create_tag_ids(&form.0.tags, &mut db).await?;
+    repo.set_tags(post.id, &tag_ids).await?;
+
+    flash.success("Tags updated.").await;
+    Ok(Redirect::to(&paths::show(&sub_slug, &post_slug)))
+}
+
 // ── Delete post (htmx) ────────────────────────────────────────
 
 #[secured]
@@ -973,6 +1103,7 @@ autumn_web::paths![
     show,
     edit_form,
     update,
+    manage_tags,
     delete_post
 ];
 
