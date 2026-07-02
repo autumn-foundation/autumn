@@ -803,6 +803,41 @@ mod tests {
         assert!(content.contains("autumn_web::app()"));
     }
 
+    // ── nav_bar scaffold layout (#1137) ─────────────────────────────
+
+    #[test]
+    fn main_template_uses_nav_bar_widget() {
+        assert!(
+            templates::MAIN_RS.contains("nav_bar("),
+            "main.rs.tmpl should render its nav via nav_bar(), got:\n{}",
+            templates::MAIN_RS
+        );
+        assert!(
+            templates::MAIN_RS.contains("NavBarConfig::new()"),
+            "main.rs.tmpl should build a NavBarConfig, got:\n{}",
+            templates::MAIN_RS
+        );
+        assert!(
+            !templates::MAIN_RS.contains(r#"nav aria-label="Main navigation""#),
+            "main.rs.tmpl should no longer hand-roll its <nav>, got:\n{}",
+            templates::MAIN_RS
+        );
+    }
+
+    #[test]
+    fn main_template_layout_takes_current_path() {
+        assert!(
+            templates::MAIN_RS.contains("current_path: &str"),
+            "layout() should take current_path so nav_bar can mark the active link, got:\n{}",
+            templates::MAIN_RS
+        );
+        assert!(
+            templates::MAIN_RS.contains("CurrentPath"),
+            "index() should extract CurrentPath to pass to layout(), got:\n{}",
+            templates::MAIN_RS
+        );
+    }
+
     #[test]
     fn autumn_toml_has_defaults() {
         let tmp = TempDir::new().unwrap();

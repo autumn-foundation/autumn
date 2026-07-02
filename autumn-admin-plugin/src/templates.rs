@@ -3972,4 +3972,156 @@ mod tests {
             "dashboard must not be active: {html}"
         );
     }
+
+    // ── admin_layout nav_bar (#1137) ──────────────────────────────────────
+
+    struct DummyModel {
+        slug: &'static str,
+        name: &'static str,
+    }
+
+    impl crate::traits::AdminModel for DummyModel {
+        fn slug(&self) -> &'static str {
+            self.slug
+        }
+        fn display_name(&self) -> &'static str {
+            self.name
+        }
+        fn display_name_plural(&self) -> &'static str {
+            self.name
+        }
+        fn fields(&self) -> Vec<AdminField> {
+            vec![]
+        }
+        fn list(
+            &self,
+            _pool: &diesel_async::pooled_connection::deadpool::Pool<
+                diesel_async::AsyncPgConnection,
+            >,
+            _params: crate::traits::ListParams,
+        ) -> crate::traits::AdminFuture<'_, ListResult> {
+            Box::pin(async {
+                Ok(ListResult {
+                    records: vec![],
+                    total: 0,
+                    page: 1,
+                    per_page: 25,
+                })
+            })
+        }
+        fn get(
+            &self,
+            _pool: &diesel_async::pooled_connection::deadpool::Pool<
+                diesel_async::AsyncPgConnection,
+            >,
+            _id: i64,
+        ) -> crate::traits::AdminFuture<'_, Option<Value>> {
+            Box::pin(async { Ok(None) })
+        }
+        fn create(
+            &self,
+            _pool: &diesel_async::pooled_connection::deadpool::Pool<
+                diesel_async::AsyncPgConnection,
+            >,
+            data: Value,
+        ) -> crate::traits::AdminFuture<'_, Value> {
+            Box::pin(async move { Ok(data) })
+        }
+        fn update(
+            &self,
+            _pool: &diesel_async::pooled_connection::deadpool::Pool<
+                diesel_async::AsyncPgConnection,
+            >,
+            _id: i64,
+            data: Value,
+        ) -> crate::traits::AdminFuture<'_, Value> {
+            Box::pin(async move { Ok(data) })
+        }
+        fn delete(
+            &self,
+            _pool: &diesel_async::pooled_connection::deadpool::Pool<
+                diesel_async::AsyncPgConnection,
+            >,
+            _id: i64,
+        ) -> crate::traits::AdminFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    fn render_layout_with_registry(registry: &AdminRegistry, active_slug: Option<&str>) -> String {
+        admin_layout(
+            registry,
+            active_slug,
+            "Title",
+            "/admin",
+            "/actuator",
+            "tok",
+            "X-CSRF-Token",
+            &[],
+            true,
+            &html! {},
+        )
+        .into_string()
+    }
+
+    #[test]
+    fn admin_layout_renders_nav_bar_sidebar() {
+        let html = render_layout(None);
+        assert!(html.contains("autumn-nav--sidebar"), "{html}");
+        assert!(html.contains(r#"class="admin-sidebar"#), "{html}");
+        assert!(html.contains(r#"aria-label="Admin navigation""#), "{html}");
+    }
+
+    #[test]
+    fn admin_layout_brand_uses_nav_brand_class() {
+        let html = render_layout(None);
+        assert!(html.contains("autumn-nav__brand"), "{html}");
+        assert!(html.contains("🍂 Autumn Admin"), "{html}");
+        assert!(!html.contains(r#"class="admin-logo""#), "{html}");
+    }
+
+    #[test]
+    fn admin_layout_sections_render_as_nav_sections_without_models() {
+        let html = render_layout(None);
+        assert!(
+            html.contains(r#"<li class="autumn-nav__section">System</li>"#),
+            "{html}"
+        );
+        assert!(!html.contains("Models"), "{html}");
+    }
+
+    #[test]
+    fn admin_layout_sections_render_as_nav_sections_with_models() {
+        let mut registry = AdminRegistry::new();
+        registry.register(DummyModel {
+            slug: "projects",
+            name: "Projects",
+        });
+        let html = render_layout_with_registry(&registry, None);
+        assert!(
+            html.contains(r#"<li class="autumn-nav__section">Models</li>"#),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"<li class="autumn-nav__section">System</li>"#),
+            "{html}"
+        );
+        assert!(html.contains(r#"href="/admin/projects""#), "{html}");
+    }
+
+    #[test]
+    fn admin_layout_actuator_link_is_plain() {
+        let html = render_layout(None);
+        assert!(html.contains(r#"href="/actuator/ui""#), "{html}");
+        // Only one aria-current in the whole page: Dashboard's. The Actuator
+        // link must never claim active state even though it's the last item.
+        assert_eq!(html.matches(r#"aria-current="page""#).count(), 1, "{html}");
+    }
+
+    #[test]
+    fn admin_layout_has_no_hand_rolled_nav_markup() {
+        let html = render_layout(None);
+        assert!(!html.contains(r#"class="admin-nav""#), "{html}");
+        assert!(!html.contains("admin-logo"), "{html}");
+    }
 }
