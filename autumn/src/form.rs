@@ -1090,9 +1090,19 @@ fn normalize_date_value(raw: &str) -> String {
     raw.to_owned()
 }
 
-/// Normalize a stored datetime string into `YYYY-MM-DDTHH:MM`, the only
-/// shape the HTML `<input type="datetime-local">` control accepts. Browsers
-/// silently reject RFC 3339 timestamps carrying a `Z`/offset suffix.
+/// Normalize a stored datetime string into a shape the HTML `<input
+/// type="datetime-local">` control accepts (`YYYY-MM-DDTHH:MM[:SS[.fff]]`).
+/// Browsers silently reject RFC 3339 timestamps carrying a `Z`/offset
+/// suffix.
+///
+/// **Seconds/fractional-seconds preserved when present.** `chrono`'s default
+/// `serde::Deserialize` for `NaiveDateTime`/`DateTime<Utc>` requires the
+/// seconds component — truncating to `YYYY-MM-DDTHH:MM` here would make
+/// [`ChangesetForm`] fail to decode the *pre-filled* value on any
+/// submission where the user doesn't manually retype it (chrono's parser
+/// returns "premature end of input"). `%.f` omits the fractional part
+/// cleanly when it's zero, so whole-second values still render without a
+/// trailing dot.
 ///
 /// **Wall-clock preserved.** For RFC 3339 input with an explicit offset, the
 /// offset is dropped but the local clock components are kept as-is (no
@@ -1105,14 +1115,14 @@ fn normalize_datetime_local_value(raw: &str) -> String {
     }
     // See `normalize_date_value`'s comment on space-separated input.
     let normalized = raw.replace(' ', "T");
-    if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(&normalized, "%Y-%m-%dT%H:%M") {
-        return ndt.format("%Y-%m-%dT%H:%M").to_string();
-    }
     if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(&normalized, "%Y-%m-%dT%H:%M:%S%.f") {
-        return ndt.format("%Y-%m-%dT%H:%M").to_string();
+        return ndt.format("%Y-%m-%dT%H:%M:%S%.f").to_string();
+    }
+    if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(&normalized, "%Y-%m-%dT%H:%M") {
+        return ndt.format("%Y-%m-%dT%H:%M:%S%.f").to_string();
     }
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&normalized) {
-        return dt.naive_local().format("%Y-%m-%dT%H:%M").to_string();
+        return dt.naive_local().format("%Y-%m-%dT%H:%M:%S%.f").to_string();
     }
     raw.to_owned()
 }
@@ -1163,7 +1173,12 @@ pub fn date_input<T: Serialize>(
 /// field (`NaiveDateTime` or `DateTime`).
 ///
 /// The current value is normalized via `normalize_datetime_local_value` to
-/// the `YYYY-MM-DDTHH:MM` shape HTML5 datetime pickers require. Wraps in
+/// the shape HTML5 datetime pickers require, preserving seconds/fractional
+/// seconds when present — `chrono`'s default `Deserialize` requires the
+/// seconds component, so truncating to minutes would break decoding the
+/// pre-filled value on any untouched submission. Renders `step="any"` so a
+/// value carrying seconds doesn't fail the browser's step-mismatch
+/// constraint validation (the default step is minute-granularity). Wraps in
 /// `<div id="{field}-field">` for stable htmx targeting. ARIA annotations
 /// behave identically to [`text_input`].
 #[cfg(feature = "maud")]
@@ -1187,6 +1202,7 @@ pub fn datetime_input<T: Serialize>(
                 id=(field)
                 name=(field)
                 value=(value)
+                step="any"
                 class=(if has_errors { "autumn-field__input autumn-field__input--invalid" } else { "autumn-field__input" })
                 aria-invalid=(if has_errors { "true" } else { "false" })
                 aria-describedby=(if has_errors { error_id.as_str() } else { "" });
@@ -2454,7 +2470,13 @@ mod tests {
         });
         let html = datetime_input(&cs, "starts_at", "Starts at").into_string();
         assert!(html.contains(r#"type="datetime-local""#), "{html}");
-        assert!(html.contains(r#"value="2024-03-15T10:30""#), "{html}");
+        // Seconds must be preserved, not truncated to minutes: chrono's
+        // default Deserialize requires the seconds component, so a
+        // minute-only value would fail to decode on an untouched submission.
+        assert!(html.contains(r#"value="2024-03-15T10:30:00""#), "{html}");
+        // `step="any"` so that value doesn't fail step-mismatch validation
+        // (default step is minute-granularity) and block submission.
+        assert!(html.contains(r#"step="any""#), "{html}");
     }
 
     #[cfg(feature = "maud")]
@@ -2469,8 +2491,8 @@ mod tests {
         });
         let html = datetime_input(&cs, "starts_at", "Starts at").into_string();
         // Browsers reject a trailing `Z`/offset in a `datetime-local` value;
-        // must be reduced to the bare local-shaped `YYYY-MM-DDTHH:MM`.
-        assert!(html.contains(r#"value="2024-03-15T10:30""#), "{html}");
+        // must be reduced to the bare local-shaped `YYYY-MM-DDTHH:MM:SS`.
+        assert!(html.contains(r#"value="2024-03-15T10:30:00""#), "{html}");
         assert!(!html.contains(r#"value="2024-03-15T10:30:00Z""#), "{html}");
     }
 
@@ -2489,7 +2511,7 @@ mod tests {
             starts_at: "2024-03-15 10:30:00".into(),
         });
         let html = datetime_input(&cs, "starts_at", "Starts at").into_string();
-        assert!(html.contains(r#"value="2024-03-15T10:30""#), "{html}");
+        assert!(html.contains(r#"value="2024-03-15T10:30:00""#), "{html}");
     }
 
     #[cfg(feature = "maud")]
@@ -2511,6 +2533,43 @@ mod tests {
         assert!(html.contains(r#"aria-invalid="true""#), "{html}");
         assert!(html.contains(r#"role="alert""#), "{html}");
         assert!(html.contains("required"), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn datetime_input_value_round_trips_through_chronos_default_deserialize() {
+        // Regression test: chrono's default `serde::Deserialize` for
+        // `NaiveDateTime` requires the seconds component ("premature end of
+        // input" otherwise). A hand-written form using `datetime_input` with
+        // a plain `chrono::NaiveDateTime` changeset field must be able to
+        // submit the *pre-filled, untouched* value and have it decode
+        // successfully — not just render without visible truncation.
+        #[derive(serde::Serialize)]
+        struct F {
+            starts_at: chrono::NaiveDateTime,
+        }
+        #[derive(serde::Deserialize)]
+        struct Decoded {
+            starts_at: chrono::NaiveDateTime,
+        }
+        let stored = chrono::NaiveDate::from_ymd_opt(2024, 3, 15)
+            .unwrap()
+            .and_hms_opt(10, 30, 56)
+            .unwrap();
+        let cs = Changeset::new(F { starts_at: stored });
+        let html = datetime_input(&cs, "starts_at", "Starts at").into_string();
+
+        // Extract the rendered value attribute and submit it exactly as a
+        // browser would on a no-op edit (field untouched).
+        let value = html
+            .split("value=\"")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .expect("value attribute present");
+        let body = format!("starts_at={value}");
+        let decoded: Decoded =
+            serde_urlencoded::from_str(&body).expect("pre-filled value must decode");
+        assert_eq!(decoded.starts_at, stored);
     }
 
     #[cfg(feature = "maud")]
