@@ -542,6 +542,40 @@ approach `JobTrackingStore::reset_for_retry` already uses to make an
 operator retry race-safe); tracked as a follow-up rather than folded into
 this change.
 
+### Known limitation: a `JobInterceptor` erroring after `next` still settles the tracked record as failed
+
+`enqueue_tracked`/`enqueue_tracked_for` treat any `Err` from the enqueue call
+as "never delivered" and settle the tracked record to `failed`. If an app
+installs a `JobInterceptor` whose `intercept_enqueue`
+successfully awaits `next` (so the job *was* delivered to the backend) and
+then its own post-`next` logic returns an error — e.g. an audit-log call
+that fails — that error is indistinguishable, from this call site alone,
+from a delivery failure: the tracked record settles to `failed` and the
+caller sees an error even though the job will still run. A caller that
+retries on that error risks enqueueing a duplicate. Closing this requires
+`JobClient::enqueue_with_outcome` to expose whether the backend write
+actually happened on its error path too (it currently tracks this
+internally via a `started` flag but only uses it to select the `Ok`
+variant), which is a signature change shared by every enqueue path — plain
+`enqueue()` has the identical gap for the same reason — not just the
+tracked ones; tracked as a follow-up. In the meantime, avoid returning an
+error from `intercept_enqueue` after `next` has resolved successfully.
+
+### Known limitation: the built-in job-status route can collide with a user route
+
+`GET /_autumn/jobs/{token}` mounts by default (`jobs.tracking.route_enabled
+= true`) for every app that registers jobs, merged after user routes are
+already mounted. If an app happens to define its own route at that exact
+path, `try_build_router_inner` panics on the resulting Axum overlapping-route
+error at startup rather than surfacing a typed, recoverable collision error
+(the framework's other reserved-but-default-on routes — the mail
+unsubscribe endpoint, mail previews — have the same gap). `/_autumn/` is a
+framework-reserved path prefix, so this should not come up in practice;
+set `jobs.tracking.route_enabled = false` if a conflict is ever hit.
+Building a general framework-route-vs-user-route collision preflight
+(mirroring the existing OpenAPI/MCP-vs-everything check) is a broader
+router-building change than this PR's scope; tracked as a follow-up.
+
 ## Observability
 
 Mount `autumn-admin-plugin` to get the built-in operator dashboard at
