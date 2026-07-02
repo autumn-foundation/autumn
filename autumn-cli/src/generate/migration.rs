@@ -414,4 +414,31 @@ pub struct Post {
         .unwrap();
         assert!(plan.warnings.is_empty(), "warnings: {:?}", plan.warnings);
     }
+
+    #[test]
+    fn add_columns_self_reference_errors_when_existing_model_has_uuid_pk() {
+        // Unlike `generate model`, `generate migration Add…To…` alters an
+        // EXISTING table — if that table's own model file is on disk and
+        // declares a UUID primary key, the self-reference must still be
+        // caught (it's not "unknown PK type, can't check", it's "known PK
+        // type, from the file the caller didn't think to look at").
+        let tmp = project();
+        let models_dir = tmp.path().join("src/models");
+        fs::create_dir_all(&models_dir).unwrap();
+        fs::write(
+            models_dir.join("category.rs"),
+            "#[autumn_web::model]\npub struct Category {\n    #[id]\n    pub id: uuid::Uuid,\n}\n",
+        )
+        .unwrap();
+
+        let err = plan_migration(
+            tmp.path(),
+            "AddCategoryToCategories",
+            &["category:references".into()],
+            "20260427000000",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("UUID"));
+        assert!(err.to_string().contains("self-referential"));
+    }
 }

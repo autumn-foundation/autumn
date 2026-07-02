@@ -315,9 +315,13 @@ fn struct_has_uuid_pk(struct_body: &str) -> bool {
 /// Whether a `pub <name>: <Type>,` field declaration's type is a UUID —
 /// either the fully-qualified `uuid::Uuid` (what the generator itself always
 /// emits) or the bare `Uuid` (idiomatic with a `use uuid::Uuid;` import at
-/// the top of the file, a common hand-edit of a generated model).
+/// the top of the file, a common hand-edit of a generated model). Tolerates
+/// a trailing `// comment` on the same line (e.g. `pub id: uuid::Uuid, //
+/// primary key`), which would otherwise get swept into the extracted type
+/// text since it comes after the trailing comma.
 fn field_type_is_uuid(field_line: &str) -> bool {
-    let Some((_, after_colon)) = field_line.split_once(':') else {
+    let code = field_line.split("//").next().unwrap_or(field_line);
+    let Some((_, after_colon)) = code.split_once(':') else {
         return false;
     };
     let ty = after_colon.trim().trim_end_matches(',').trim();
@@ -373,15 +377,38 @@ pub(super) fn check_reference_targets(
         let base = f.name.strip_suffix("_id").unwrap_or(&f.name);
 
         if table == own_table {
-            if own_id_type == Some(IdType::Uuid) {
-                return Err(GenerateError::Config(format!(
-                    "'{}' is a self-referential foreign key, but this model uses a UUID \
-                     primary key (`--id uuid`). `references` fields only support \
-                     i64/BIGSERIAL-keyed targets (issue #1026).",
-                    f.name
-                )));
+            match own_id_type {
+                Some(IdType::Uuid) => {
+                    return Err(GenerateError::Config(format!(
+                        "'{}' is a self-referential foreign key, but this model uses a UUID \
+                         primary key (`--id uuid`). `references` fields only support \
+                         i64/BIGSERIAL-keyed targets (issue #1026).",
+                        f.name
+                    )));
+                }
+                // Known non-UUID PK: the table is being created right now
+                // with that type, so the self-reference is fine.
+                Some(_) => continue,
+                // Unknown (`generate migration Add…To…`, altering a table
+                // whose PK type isn't tracked here): unlike `generate model`,
+                // this table may already exist on disk, so still check its
+                // model file for a UUID PK if one is found — but don't warn
+                // "model not found" for a self-reference, since the table
+                // obviously already exists (that's the point of ALTER TABLE).
+                None => {
+                    if find_model_struct_body(project_root, base)
+                        .is_some_and(|body| struct_has_uuid_pk(&body))
+                    {
+                        return Err(GenerateError::Config(format!(
+                            "'{}' is a self-referential foreign key, but the existing model \
+                             declares a UUID primary key. `references` fields only support \
+                             i64/BIGSERIAL-keyed targets (issue #1026).",
+                            f.name
+                        )));
+                    }
+                    continue;
+                }
             }
-            continue;
         }
 
         if !model_file_exists(project_root, &table, base) {
@@ -2302,6 +2329,30 @@ autumn-web = \"0.3\"\n";
         fs::write(
             models_dir.join("post.rs"),
             "#[autumn_web::model]\npub struct Post {\n    #[id]\n    /// The primary key.\n    pub id: uuid::Uuid,\n}\n",
+        )
+        .unwrap();
+
+        let err = plan_model(
+            tmp.path(),
+            "Comment",
+            &["post:references".into()],
+            "20260427000000",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("UUID"));
+    }
+
+    #[test]
+    fn references_field_detects_uuid_pk_with_trailing_inline_comment() {
+        // `pub id: uuid::Uuid, // primary key` — the trailing comment must
+        // not get swept into the extracted type text (which would make it
+        // compare unequal to "uuid::Uuid" and miss the UUID PK).
+        let tmp = project();
+        let models_dir = tmp.path().join("src/models");
+        fs::create_dir_all(&models_dir).unwrap();
+        fs::write(
+            models_dir.join("post.rs"),
+            "#[autumn_web::model]\npub struct Post {\n    #[id]\n    pub id: uuid::Uuid, // primary key\n}\n",
         )
         .unwrap();
 
