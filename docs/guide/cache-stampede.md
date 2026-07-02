@@ -22,18 +22,23 @@ read-through API fixes both:
 ## Quick start
 
 ```rust,ignore
-use autumn_web::cache::{get_or_compute, Cache};
+use autumn_web::cache::{get_or_compute, Cache, CacheFillError};
 use std::sync::Arc;
 use std::time::Duration;
 
-async fn cached_bookmark_count(cache: &Arc<dyn Cache>) -> Result<i64, sqlx::Error> {
+async fn cached_bookmark_count(
+    cache: &Arc<dyn Cache>,
+) -> Result<i64, CacheFillError<sqlx::Error>> {
     get_or_compute(cache, "bookmark_count", Some(Duration::from_secs(30)), || async {
         count_bookmarks_in_db().await
     })
     .await
-    .map_err(|e| e.into_fill().expect("fill error is the only variant reachable here"))
 }
 ```
+
+Concurrent callers that coalesce onto someone else's in-flight fill can see
+`CacheFillError::FillFailed` (not just `CacheFillError::Fill`) if that fill
+failed — don't assume `into_fill()` always returns `Some`.
 
 On a hit, the cached value returns immediately. On a miss, the first caller
 runs the closure; every concurrent caller for the same key awaits that one
