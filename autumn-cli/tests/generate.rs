@@ -786,7 +786,11 @@ fn generated_scaffold_cargo_checks() {
             "published:bool",
             "subtitle:Option<String>",
             "views:Option<i64>",
+            "rank:i32",
+            "rating:f64",
+            "weight:Option<f32>",
             "published_at:Option<NaiveDateTime>",
+            "scheduled_at:DateTime",
             "token:Option<Uuid>",
         ],
     );

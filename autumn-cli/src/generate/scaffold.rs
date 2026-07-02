@@ -606,10 +606,156 @@ fn render_repository_queries(pascal_name: &str, queries: &[QuerySpec]) -> String
     out
 }
 
-fn render_decoded_form(_pascal_name: &str, fields: &[Field]) -> (String, String) {
+/// Normalizes an HTML `datetime-local` value (`YYYY-MM-DDTHH:MM`, seconds
+/// omitted by the browser) into the `YYYY-MM-DDTHH:MM:SS` shape chrono's
+/// strict datetime parser requires.
+const NORMALIZE_DATETIME_LOCAL_FN: &str = r#"
+fn normalize_datetime_local(raw: &str) -> String {
+    if raw.len() == 16 {
+        format!("{raw}:00")
+    } else {
+        raw.to_string()
+    }
+}
+"#;
+
+const DESERIALIZE_NAIVE_DATETIME_LOCAL_FN: &str = r#"
+fn deserialize_naive_datetime_local<'de, D>(deserializer: D) -> Result<chrono::NaiveDateTime, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = <String as serde::Deserialize>::deserialize(deserializer)?;
+    chrono::NaiveDateTime::parse_from_str(&normalize_datetime_local(&raw), "%Y-%m-%dT%H:%M:%S")
+        .map_err(serde::de::Error::custom)
+}
+"#;
+
+const DESERIALIZE_OPTION_NAIVE_DATETIME_LOCAL_FN: &str = r#"
+fn deserialize_option_naive_datetime_local<'de, D>(
+    deserializer: D,
+) -> Result<Option<chrono::NaiveDateTime>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = <Option<String> as serde::Deserialize>::deserialize(deserializer)?;
+    match raw {
+        Some(s) if !s.is_empty() => {
+            chrono::NaiveDateTime::parse_from_str(&normalize_datetime_local(&s), "%Y-%m-%dT%H:%M:%S")
+                .map(Some)
+                .map_err(serde::de::Error::custom)
+        }
+        _ => Ok(None),
+    }
+}
+"#;
+
+const DESERIALIZE_UTC_DATETIME_LOCAL_FN: &str = r#"
+fn deserialize_utc_datetime_local<'de, D>(
+    deserializer: D,
+) -> Result<chrono::DateTime<chrono::Utc>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = <String as serde::Deserialize>::deserialize(deserializer)?;
+    chrono::NaiveDateTime::parse_from_str(&normalize_datetime_local(&raw), "%Y-%m-%dT%H:%M:%S")
+        .map(|ndt| ndt.and_utc())
+        .map_err(serde::de::Error::custom)
+}
+"#;
+
+const DESERIALIZE_OPTION_UTC_DATETIME_LOCAL_FN: &str = r#"
+fn deserialize_option_utc_datetime_local<'de, D>(
+    deserializer: D,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = <Option<String> as serde::Deserialize>::deserialize(deserializer)?;
+    match raw {
+        Some(s) if !s.is_empty() => {
+            chrono::NaiveDateTime::parse_from_str(&normalize_datetime_local(&s), "%Y-%m-%dT%H:%M:%S")
+                .map(|ndt| Some(ndt.and_utc()))
+                .map_err(serde::de::Error::custom)
+        }
+        _ => Ok(None),
+    }
+}
+"#;
+
+/// Tracks which `datetime-local` deserialize helpers a `DecodedForm` actually
+/// references, so [`datetime_helper_fns`] emits only what's used — an unused
+/// helper would be dead code in the generated project.
+#[derive(Default)]
+#[allow(clippy::struct_excessive_bools)] // orthogonal flags on a plain tally, not a state machine
+struct DatetimeHelpersNeeded {
+    naive_scalar: bool,
+    naive_option: bool,
+    utc_scalar: bool,
+    utc_option: bool,
+}
+
+/// The `#[serde(...)]` attribute + struct-field line for a `NaiveDateTime`/
+/// `DateTime` field, recording which shared deserialize helper it needs.
+fn datetime_struct_field_line(f: &Field, needed: &mut DatetimeHelpersNeeded) -> String {
+    let attr = match (f.kind, f.nullable) {
+        (FieldKind::NaiveDateTime, false) => {
+            needed.naive_scalar = true;
+            "#[serde(deserialize_with = \"deserialize_naive_datetime_local\")]"
+        }
+        (FieldKind::NaiveDateTime, true) => {
+            needed.naive_option = true;
+            "#[serde(default, deserialize_with = \"deserialize_option_naive_datetime_local\")]"
+        }
+        (FieldKind::DateTime, false) => {
+            needed.utc_scalar = true;
+            "#[serde(deserialize_with = \"deserialize_utc_datetime_local\")]"
+        }
+        (FieldKind::DateTime, true) => {
+            needed.utc_option = true;
+            "#[serde(default, deserialize_with = \"deserialize_option_utc_datetime_local\")]"
+        }
+        _ => unreachable!("called only for NaiveDateTime | DateTime fields"),
+    };
+    format!(
+        "    {attr}\n    pub {name}: {rust_type},\n",
+        name = f.name,
+        rust_type = f.rust_type()
+    )
+}
+
+/// Assemble just the shared helper functions a `DecodedForm` needs, per
+/// [`DatetimeHelpersNeeded`].
+fn datetime_helper_fns(needed: &DatetimeHelpersNeeded) -> String {
+    let mut helper_fns = String::new();
+    if needed.naive_scalar || needed.naive_option || needed.utc_scalar || needed.utc_option {
+        helper_fns.push_str(NORMALIZE_DATETIME_LOCAL_FN);
+    }
+    if needed.naive_scalar {
+        helper_fns.push_str(DESERIALIZE_NAIVE_DATETIME_LOCAL_FN);
+    }
+    if needed.naive_option {
+        helper_fns.push_str(DESERIALIZE_OPTION_NAIVE_DATETIME_LOCAL_FN);
+    }
+    if needed.utc_scalar {
+        helper_fns.push_str(DESERIALIZE_UTC_DATETIME_LOCAL_FN);
+    }
+    if needed.utc_option {
+        helper_fns.push_str(DESERIALIZE_OPTION_UTC_DATETIME_LOCAL_FN);
+    }
+    helper_fns
+}
+
+/// Emit the `DecodedForm` struct, its field-by-field mapping into
+/// `New{Pascal}`, and any shared helper functions its `#[serde(...)]`
+/// attributes reference (currently just the `datetime-local` deserializers).
+///
+/// Returns `(decoded_struct, mapping_fields, helper_fns)`. `helper_fns` is
+/// empty unless a `NaiveDateTime`/`DateTime` field is present.
+fn render_decoded_form(_pascal_name: &str, fields: &[Field]) -> (String, String, String) {
     use std::fmt::Write;
     let mut struct_fields = String::new();
     let mut mapping_fields = String::new();
+    let mut needed = DatetimeHelpersNeeded::default();
 
     for f in fields {
         if f.kind.is_attachment() {
@@ -636,6 +782,28 @@ fn render_decoded_form(_pascal_name: &str, fields: &[Field]) -> (String, String)
                  }},",
                 name = f.name
             );
+        } else if f.kind == FieldKind::Bool {
+            // Unchecked checkboxes are absent from submitted form data;
+            // `#[serde(default)]` maps that absence to `false` instead of a
+            // "missing field" 400.
+            let _ = writeln!(
+                struct_fields,
+                "    #[serde(default)]\n    pub {name}: {rust_type},",
+                name = f.name,
+                rust_type = f.rust_type()
+            );
+            let _ = writeln!(
+                mapping_fields,
+                "        {name}: decoded.{name},",
+                name = f.name
+            );
+        } else if matches!(f.kind, FieldKind::NaiveDateTime | FieldKind::DateTime) {
+            struct_fields.push_str(&datetime_struct_field_line(f, &mut needed));
+            let _ = writeln!(
+                mapping_fields,
+                "        {name}: decoded.{name},",
+                name = f.name
+            );
         } else {
             let _ = writeln!(
                 struct_fields,
@@ -658,7 +826,7 @@ fn render_decoded_form(_pascal_name: &str, fields: &[Field]) -> (String, String)
          }}"
     );
 
-    (decoded_struct, mapping_fields)
+    (decoded_struct, mapping_fields, datetime_helper_fns(&needed))
 }
 
 #[allow(
@@ -688,7 +856,8 @@ fn render_routes_file(
     let update_columns = render_update_columns(plural, fields);
     let nullable_field_match = render_nullable_field_match(fields);
     let has_attachments = has_attachment_fields(fields);
-    let (decoded_form_struct, decoded_form_mapping) = render_decoded_form(pascal_name, fields);
+    let (decoded_form_struct, decoded_form_mapping, datetime_helper_fns) =
+        render_decoded_form(pascal_name, fields);
     // The destroy handler must honour the resource's delete semantics: when the
     // scaffold was generated with `--soft-delete`, mark `deleted_at` (matching
     // the soft-delete repository) instead of issuing a physical `DELETE`.
@@ -1325,7 +1494,7 @@ pub async fn destroy(
 }}
 
 {decoded_form_struct}
-
+{datetime_helper_fns}
 {decode_form_sig} {{
     let pairs: Vec<_> = url::form_urlencoded::parse(body.as_ref())
         .filter(|(key, value)| !(value.is_empty() && is_nullable_form_field(key)))
@@ -1428,17 +1597,52 @@ fn render_create_form_inputs(
             } else {
                 String::new()
             };
+            let input_tag = match f.kind {
+                FieldKind::Bool => format!(
+                    "input type=\"hidden\" name=\"{name}\" value=\"false\"; \
+                     input type=\"checkbox\" name=\"{name}\" value=\"true\"{hx_attrs}",
+                    name = f.name,
+                    hx_attrs = hx_attrs
+                ),
+                FieldKind::I32 | FieldKind::I64 | FieldKind::F32 | FieldKind::F64 => format!(
+                    "input type=\"number\" name=\"{name}\" step=\"{step}\"{required}{hx_attrs}",
+                    name = f.name,
+                    step = number_step(f.kind),
+                    required = required,
+                    hx_attrs = hx_attrs
+                ),
+                FieldKind::NaiveDateTime | FieldKind::DateTime => format!(
+                    "input type=\"datetime-local\" name=\"{name}\"{required}{hx_attrs}",
+                    name = f.name,
+                    required = required,
+                    hx_attrs = hx_attrs
+                ),
+                _ => format!(
+                    "input type=\"text\" name=\"{name}\"{required}{hx_attrs}",
+                    name = f.name,
+                    required = required,
+                    hx_attrs = hx_attrs
+                ),
+            };
             let _ = writeln!(
                 out,
-                "            label {{ \"{name}\" }} input type=\"text\" name=\"{name}\"{required}{hx_attrs};{error_span}",
+                "            label {{ \"{name}\" }} {input_tag};{error_span}",
                 name = f.name,
-                required = required,
-                hx_attrs = hx_attrs,
+                input_tag = input_tag,
                 error_span = error_span
             );
         }
     }
     out
+}
+
+/// The HTML `step` attribute value for a `number_input`-shaped `FieldKind`.
+/// Integers step by whole numbers; floating-point fields allow any value.
+const fn number_step(kind: FieldKind) -> &'static str {
+    match kind {
+        FieldKind::F32 | FieldKind::F64 => "any",
+        _ => "1",
+    }
 }
 
 fn render_edit_form_inputs(
@@ -1460,7 +1664,6 @@ fn render_edit_form_inputs(
                 name = f.name
             );
         } else {
-            let value = edit_value_expr(f);
             let required = required_attr(f);
             let hx_attrs = if live_validation && validated.contains(&f.name.as_str()) {
                 format!(
@@ -1476,13 +1679,42 @@ fn render_edit_form_inputs(
             } else {
                 String::new()
             };
+            let input_tag = match f.kind {
+                FieldKind::Bool => format!(
+                    "input type=\"hidden\" name=\"{name}\" value=\"false\"; \
+                     input type=\"checkbox\" name=\"{name}\" value=\"true\" checked[{checked}]{hx_attrs}",
+                    name = f.name,
+                    checked = edit_checked_expr(f),
+                    hx_attrs = hx_attrs
+                ),
+                FieldKind::I32 | FieldKind::I64 | FieldKind::F32 | FieldKind::F64 => format!(
+                    "input type=\"number\" name=\"{name}\" step=\"{step}\" value=({value}){required}{hx_attrs}",
+                    name = f.name,
+                    step = number_step(f.kind),
+                    value = edit_value_expr(f),
+                    required = required,
+                    hx_attrs = hx_attrs
+                ),
+                FieldKind::NaiveDateTime | FieldKind::DateTime => format!(
+                    "input type=\"datetime-local\" name=\"{name}\" value=({value}){required}{hx_attrs}",
+                    name = f.name,
+                    value = edit_datetime_local_value_expr(f),
+                    required = required,
+                    hx_attrs = hx_attrs
+                ),
+                _ => format!(
+                    "input type=\"text\" name=\"{name}\" value=({value}){required}{hx_attrs}",
+                    name = f.name,
+                    value = edit_value_expr(f),
+                    required = required,
+                    hx_attrs = hx_attrs
+                ),
+            };
             let _ = writeln!(
                 out,
-                "            label {{ \"{name}\" }} input type=\"text\" name=\"{name}\" value=({value}){required}{hx_attrs};{error_span}",
+                "            label {{ \"{name}\" }} {input_tag};{error_span}",
                 name = f.name,
-                value = value,
-                required = required,
-                hx_attrs = hx_attrs,
+                input_tag = input_tag,
                 error_span = error_span
             );
         }
@@ -1512,6 +1744,34 @@ fn edit_value_expr(field: &Field) -> String {
             format!("String::from_utf8_lossy(&row.{name}).to_string()")
         }
         (false, _) => format!("row.{name}.to_string()"),
+    }
+}
+
+/// Boolean expression for the `checked[...]` attribute of an edit-form
+/// checkbox — `row.{name}` directly for `bool`, `.unwrap_or(false)` for
+/// `Option<bool>`.
+fn edit_checked_expr(field: &Field) -> String {
+    let name = &field.name;
+    if field.nullable {
+        format!("row.{name}.unwrap_or(false)")
+    } else {
+        format!("row.{name}")
+    }
+}
+
+/// Value expression for an edit-form `datetime-local` input. Unlike
+/// [`edit_value_expr`]'s `.to_string()` (which relies on `Display`, e.g.
+/// `"2024-01-15 10:30:00 UTC"` for `DateTime<Utc>` — a shape browsers
+/// reject), this formats explicitly as `YYYY-MM-DDTHH:MM`, the only value
+/// `<input type="datetime-local">` accepts.
+fn edit_datetime_local_value_expr(field: &Field) -> String {
+    let name = &field.name;
+    if field.nullable {
+        format!(
+            "row.{name}.as_ref().map(|value| value.format(\"%Y-%m-%dT%H:%M\").to_string()).unwrap_or_default()"
+        )
+    } else {
+        format!("row.{name}.format(\"%Y-%m-%dT%H:%M\").to_string()")
     }
 }
 
@@ -2090,16 +2350,16 @@ async fn main() {
         );
         assert!(
             routes.contains(
-                r#"label { "views" } input type="text" name="views" value=(row.views.as_ref().map(ToString::to_string).unwrap_or_default());"#
+                r#"label { "views" } input type="number" name="views" step="1" value=(row.views.as_ref().map(ToString::to_string).unwrap_or_default());"#
             ),
-            "edit form must prefill nullable numeric fields from the loaded row: {routes}"
+            "edit form must prefill nullable numeric fields from the loaded row as a number input (issue #1131): {routes}"
         );
         assert!(
             routes.contains(r#"label { "subtitle" } input type="text" name="subtitle";"#),
             "new form must not mark nullable fields required: {routes}"
         );
         assert!(
-            routes.contains(r#"label { "views" } input type="text" name="views";"#),
+            routes.contains(r#"label { "views" } input type="number" name="views" step="1";"#),
             "new form must not mark nullable numeric fields required: {routes}"
         );
     }
@@ -2656,6 +2916,277 @@ async fn main() {
         // Assert decode_form contains DecodedForm struct
         assert!(routes.contains("struct DecodedForm"));
         assert!(routes.contains("pub avatar: Option<String>"));
+    }
+
+    // ── Typed form-input widgets (issue #1131) ──────────────────────
+
+    #[test]
+    fn execute_writes_checkbox_for_bool_field() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "active:bool".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+
+        // Both create and edit forms must render a real checkbox for `active`,
+        // never a text box.
+        assert!(
+            routes.contains("input type=\"checkbox\" name=\"active\""),
+            "{routes}"
+        );
+        assert!(
+            !routes.contains("input type=\"text\" name=\"active\""),
+            "bool field must not render input type=\"text\": {routes}"
+        );
+        // Unchecked checkboxes are absent from submitted form data — a
+        // hidden "false" sibling guarantees the field always round-trips.
+        assert!(
+            routes.contains("input type=\"hidden\" name=\"active\" value=\"false\""),
+            "{routes}"
+        );
+        // Edit form must reflect the current value via `checked[...]`.
+        assert!(routes.contains("checked[row.active]"), "{routes}");
+        // DecodedForm must default the field so an unchecked submission
+        // (missing key) doesn't 400.
+        assert!(
+            routes.contains("#[serde(default)]\n    pub active: bool,"),
+            "{routes}"
+        );
+    }
+
+    #[test]
+    fn execute_writes_number_input_for_integer_fields() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "views:i64".into(), "rank:i32".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+
+        assert!(
+            routes.contains("input type=\"number\" name=\"views\" step=\"1\""),
+            "{routes}"
+        );
+        assert!(
+            routes.contains("input type=\"number\" name=\"rank\" step=\"1\""),
+            "{routes}"
+        );
+        assert!(
+            !routes.contains("input type=\"text\" name=\"views\""),
+            "{routes}"
+        );
+    }
+
+    #[test]
+    fn execute_writes_number_input_with_any_step_for_float_fields() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &[
+                "title:String".into(),
+                "price:f64".into(),
+                "weight:f32".into(),
+            ],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+
+        assert!(
+            routes.contains("input type=\"number\" name=\"price\" step=\"any\""),
+            "{routes}"
+        );
+        assert!(
+            routes.contains("input type=\"number\" name=\"weight\" step=\"any\""),
+            "{routes}"
+        );
+    }
+
+    #[test]
+    fn execute_writes_number_input_value_on_edit_form() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "views:i64".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        assert!(
+            routes.contains(
+                "input type=\"number\" name=\"views\" step=\"1\" value=(row.views.to_string())"
+            ),
+            "{routes}"
+        );
+    }
+
+    #[test]
+    fn execute_writes_datetime_local_input_for_naive_datetime_field() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "published_at:NaiveDateTime".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+
+        assert!(
+            routes.contains("input type=\"datetime-local\" name=\"published_at\""),
+            "{routes}"
+        );
+        assert!(
+            !routes.contains("input type=\"text\" name=\"published_at\""),
+            "{routes}"
+        );
+        // DecodedForm must use the local-shape-aware deserializer so a
+        // browser-submitted `YYYY-MM-DDTHH:MM` value parses without a
+        // hand-edit.
+        assert!(
+            routes.contains(
+                "#[serde(deserialize_with = \"deserialize_naive_datetime_local\")]\n    pub published_at: chrono::NaiveDateTime,"
+            ),
+            "{routes}"
+        );
+        assert!(
+            routes.contains("fn deserialize_naive_datetime_local"),
+            "{routes}"
+        );
+        assert!(routes.contains("fn normalize_datetime_local"), "{routes}");
+        // No DateTime<Utc> field present — the tz-aware helper must not be
+        // emitted as dead code.
+        assert!(
+            !routes.contains("fn deserialize_utc_datetime_local"),
+            "{routes}"
+        );
+    }
+
+    #[test]
+    fn execute_writes_datetime_local_input_for_tz_datetime_field() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "scheduled_at:DateTime".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+
+        assert!(
+            routes.contains("input type=\"datetime-local\" name=\"scheduled_at\""),
+            "{routes}"
+        );
+        assert!(
+            routes.contains(
+                "#[serde(deserialize_with = \"deserialize_utc_datetime_local\")]\n    pub scheduled_at: chrono::DateTime<chrono::Utc>,"
+            ),
+            "{routes}"
+        );
+        assert!(
+            routes.contains("fn deserialize_utc_datetime_local"),
+            "{routes}"
+        );
+        assert!(
+            !routes.contains("fn deserialize_naive_datetime_local"),
+            "{routes}"
+        );
+    }
+
+    #[test]
+    fn execute_writes_datetime_local_input_for_nullable_datetime_field() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &[
+                "title:String".into(),
+                "published_at:Option<NaiveDateTime>".into(),
+            ],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        assert!(
+            routes.contains(
+                "#[serde(default, deserialize_with = \"deserialize_option_naive_datetime_local\")]\n    pub published_at: Option<chrono::NaiveDateTime>,"
+            ),
+            "{routes}"
+        );
+        assert!(
+            routes.contains("fn deserialize_option_naive_datetime_local"),
+            "{routes}"
+        );
+        // Scalar variant must not be emitted when only the nullable form is used.
+        assert!(
+            !routes.contains("fn deserialize_naive_datetime_local<'de, D>(deserializer: D) -> Result<chrono::NaiveDateTime, D::Error>"),
+            "{routes}"
+        );
+    }
+
+    #[test]
+    fn execute_writes_text_input_only_for_genuine_string_fields() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &[
+                "title:String".into(),
+                "body:Text".into(),
+                "active:bool".into(),
+                "views:i64".into(),
+                "published_at:NaiveDateTime".into(),
+            ],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        assert!(
+            routes.contains("input type=\"text\" name=\"title\""),
+            "{routes}"
+        );
+        assert!(
+            routes.contains("input type=\"text\" name=\"body\""),
+            "{routes}"
+        );
+        assert!(
+            !routes.contains("input type=\"text\" name=\"active\""),
+            "{routes}"
+        );
+        assert!(
+            !routes.contains("input type=\"text\" name=\"views\""),
+            "{routes}"
+        );
+        assert!(
+            !routes.contains("input type=\"text\" name=\"published_at\""),
+            "{routes}"
+        );
     }
 
     #[test]

@@ -948,6 +948,284 @@ pub fn required_text_input<T: Serialize>(
     }
 }
 
+/// Render a labeled `<input type="checkbox">` tied to a `bool` changeset field.
+///
+/// HTML checkboxes are omitted from submitted form data when unchecked, so
+/// this always emits a hidden `false` sibling `<input>` ahead of the
+/// checkbox (same `name`) — the checkbox's `"true"` overrides it when
+/// checked, and the hidden fallback wins when unchecked. This gives `bool`
+/// fields (not just `Option<bool>`) a value on every submission with no
+/// extra `#[serde(default)]` ceremony required by hand-written forms.
+///
+/// The `checked` attribute reflects the changeset's current value via
+/// [`Changeset::field_value`], which serializes `bool` as `"true"`/`"false"`.
+/// Wraps in `<div id="{field}-field">` for stable htmx targeting. ARIA
+/// annotations behave identically to [`text_input`].
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn checkbox_input<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+) -> maud::Markup {
+    let errors = changeset.errors_for(field);
+    let has_errors = !errors.is_empty();
+    let checked = changeset.field_value(field).as_deref() == Some("true");
+    let error_id = format!("{field}-error");
+    let wrapper_id = format!("{field}-field");
+
+    maud::html! {
+        div id=(wrapper_id) class="autumn-field" {
+            label for=(field) class="autumn-field__label" { (label) }
+            input type="hidden" name=(field) value="false";
+            input
+                type="checkbox"
+                id=(field)
+                name=(field)
+                value="true"
+                checked[checked]
+                class=(if has_errors { "autumn-field__input autumn-field__input--invalid" } else { "autumn-field__input" })
+                aria-invalid=(if has_errors { "true" } else { "false" })
+                aria-describedby=(if has_errors { error_id.as_str() } else { "" });
+            @if has_errors {
+                div id=(error_id) role="alert" class="autumn-field__errors" {
+                    @for error in errors {
+                        p class="autumn-field__error" { (error) }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Render a labeled `<input type="number">` tied to a numeric changeset field
+/// (`i32`, `i64`, `f32`, `f64`).
+///
+/// `step` sets the HTML `step` attribute — pass `Some("1")` for integer
+/// fields, `Some("0.01")` or `Some("any")` for floating-point fields, or
+/// `None` to leave the browser default (`step="1"`, whole numbers only).
+/// Wraps in `<div id="{field}-field">` for stable htmx targeting. ARIA
+/// annotations behave identically to [`text_input`].
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn number_input<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+    step: Option<&str>,
+) -> maud::Markup {
+    let errors = changeset.errors_for(field);
+    let has_errors = !errors.is_empty();
+    let value = changeset.field_value(field).unwrap_or_default();
+    let error_id = format!("{field}-error");
+    let wrapper_id = format!("{field}-field");
+
+    maud::html! {
+        div id=(wrapper_id) class="autumn-field" {
+            label for=(field) class="autumn-field__label" { (label) }
+            input
+                type="number"
+                id=(field)
+                name=(field)
+                value=(value)
+                step=[step]
+                class=(if has_errors { "autumn-field__input autumn-field__input--invalid" } else { "autumn-field__input" })
+                aria-invalid=(if has_errors { "true" } else { "false" })
+                aria-describedby=(if has_errors { error_id.as_str() } else { "" });
+            @if has_errors {
+                div id=(error_id) role="alert" class="autumn-field__errors" {
+                    @for error in errors {
+                        p class="autumn-field__error" { (error) }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Normalize a stored date/datetime string into `YYYY-MM-DD`, the shape the
+/// HTML `<input type="date">` control requires.
+///
+/// Accepts a bare date, a full RFC 3339 timestamp (with offset/`Z`), or a
+/// naive datetime, and keeps just the date component. Falls back to the
+/// input unchanged when none of those shapes match (e.g. an empty string).
+#[cfg(feature = "maud")]
+fn normalize_date_value(raw: &str) -> String {
+    if raw.is_empty() {
+        return String::new();
+    }
+    if let Ok(date) = chrono::NaiveDate::parse_from_str(raw, "%Y-%m-%d") {
+        return date.to_string();
+    }
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(raw) {
+        return dt.format("%Y-%m-%d").to_string();
+    }
+    if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%dT%H:%M:%S%.f") {
+        return ndt.format("%Y-%m-%d").to_string();
+    }
+    raw.to_owned()
+}
+
+/// Normalize a stored datetime string into `YYYY-MM-DDTHH:MM`, the only
+/// shape the HTML `<input type="datetime-local">` control accepts. Browsers
+/// silently reject RFC 3339 timestamps carrying a `Z`/offset suffix.
+///
+/// **Wall-clock preserved.** For RFC 3339 input with an explicit offset, the
+/// offset is dropped but the local clock components are kept as-is (no
+/// conversion to UTC) — the datetime-local input has no timezone concept, so
+/// shifting the clock would mutate the value on a no-op save.
+#[cfg(feature = "maud")]
+fn normalize_datetime_local_value(raw: &str) -> String {
+    if raw.is_empty() {
+        return String::new();
+    }
+    if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%dT%H:%M") {
+        return ndt.format("%Y-%m-%dT%H:%M").to_string();
+    }
+    if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%dT%H:%M:%S%.f") {
+        return ndt.format("%Y-%m-%dT%H:%M").to_string();
+    }
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(raw) {
+        return dt.naive_local().format("%Y-%m-%dT%H:%M").to_string();
+    }
+    raw.to_owned()
+}
+
+/// Render a labeled `<input type="date">` tied to a changeset field.
+///
+/// The current value is normalized via [`normalize_date_value`] to the
+/// `YYYY-MM-DD` shape HTML5 date pickers require, regardless of whether the
+/// underlying field serializes as a bare date or a full timestamp. Wraps in
+/// `<div id="{field}-field">` for stable htmx targeting. ARIA annotations
+/// behave identically to [`text_input`].
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn date_input<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+) -> maud::Markup {
+    let errors = changeset.errors_for(field);
+    let has_errors = !errors.is_empty();
+    let value = normalize_date_value(&changeset.field_value(field).unwrap_or_default());
+    let error_id = format!("{field}-error");
+    let wrapper_id = format!("{field}-field");
+
+    maud::html! {
+        div id=(wrapper_id) class="autumn-field" {
+            label for=(field) class="autumn-field__label" { (label) }
+            input
+                type="date"
+                id=(field)
+                name=(field)
+                value=(value)
+                class=(if has_errors { "autumn-field__input autumn-field__input--invalid" } else { "autumn-field__input" })
+                aria-invalid=(if has_errors { "true" } else { "false" })
+                aria-describedby=(if has_errors { error_id.as_str() } else { "" });
+            @if has_errors {
+                div id=(error_id) role="alert" class="autumn-field__errors" {
+                    @for error in errors {
+                        p class="autumn-field__error" { (error) }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Render a labeled `<input type="datetime-local">` tied to a changeset
+/// field (`NaiveDateTime` or `DateTime`).
+///
+/// The current value is normalized via [`normalize_datetime_local_value`] to
+/// the `YYYY-MM-DDTHH:MM` shape HTML5 datetime pickers require. Wraps in
+/// `<div id="{field}-field">` for stable htmx targeting. ARIA annotations
+/// behave identically to [`text_input`].
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn datetime_input<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+) -> maud::Markup {
+    let errors = changeset.errors_for(field);
+    let has_errors = !errors.is_empty();
+    let value = normalize_datetime_local_value(&changeset.field_value(field).unwrap_or_default());
+    let error_id = format!("{field}-error");
+    let wrapper_id = format!("{field}-field");
+
+    maud::html! {
+        div id=(wrapper_id) class="autumn-field" {
+            label for=(field) class="autumn-field__label" { (label) }
+            input
+                type="datetime-local"
+                id=(field)
+                name=(field)
+                value=(value)
+                class=(if has_errors { "autumn-field__input autumn-field__input--invalid" } else { "autumn-field__input" })
+                aria-invalid=(if has_errors { "true" } else { "false" })
+                aria-describedby=(if has_errors { error_id.as_str() } else { "" });
+            @if has_errors {
+                div id=(error_id) role="alert" class="autumn-field__errors" {
+                    @for error in errors {
+                        p class="autumn-field__error" { (error) }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Render a labeled `<select>` tied to a closed-set changeset field, with
+/// `options` given as `(value, label)` pairs.
+///
+/// The option whose `value` matches the changeset's current field value
+/// (via [`Changeset::field_value`]) is marked `selected`. This is the
+/// control the enum ([#1030]) and references ([#1026]) field types render
+/// once those field kinds ship — this slice ships the widget, not the DSL
+/// tokens that will target it.
+/// Wraps in `<div id="{field}-field">` for stable htmx targeting. ARIA
+/// annotations behave identically to [`text_input`].
+///
+/// [#1030]: https://github.com/madmax983/autumn/issues/1030
+/// [#1026]: https://github.com/madmax983/autumn/issues/1026
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn select_input<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+    options: &[(&str, &str)],
+) -> maud::Markup {
+    let errors = changeset.errors_for(field);
+    let has_errors = !errors.is_empty();
+    let current = changeset.field_value(field).unwrap_or_default();
+    let error_id = format!("{field}-error");
+    let wrapper_id = format!("{field}-field");
+
+    maud::html! {
+        div id=(wrapper_id) class="autumn-field" {
+            label for=(field) class="autumn-field__label" { (label) }
+            select
+                id=(field)
+                name=(field)
+                class=(if has_errors { "autumn-field__input autumn-field__input--invalid" } else { "autumn-field__input" })
+                aria-invalid=(if has_errors { "true" } else { "false" })
+                aria-describedby=(if has_errors { error_id.as_str() } else { "" }) {
+                @for (option_value, option_label) in options {
+                    option value=(option_value) selected[*option_value == current] { (option_label) }
+                }
+            }
+            @if has_errors {
+                div id=(error_id) role="alert" class="autumn-field__errors" {
+                    @for error in errors {
+                        p class="autumn-field__error" { (error) }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Render an ARIA live region for htmx swap announcements.
 ///
 /// Emits `<div id="…" role="status" aria-live="polite" aria-atomic="true">`.
@@ -1867,6 +2145,347 @@ mod tests {
         let html = text_input_htmx(&cs, "email", "Email", "/v").into_string();
         assert!(html.contains("email-error"), "{html}");
         assert!(html.contains(r#"aria-describedby="email-error""#), "{html}");
+    }
+
+    // ── Typed inputs: checkbox_input / number_input / date_input /
+    //    datetime_input / select_input (issue #1131) ────────────────
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn checkbox_input_renders_type_checkbox() {
+        #[derive(serde::Serialize)]
+        struct F {
+            active: bool,
+        }
+        let cs = Changeset::new(F { active: false });
+        let html = checkbox_input(&cs, "active", "Active").into_string();
+        assert!(html.contains(r#"type="checkbox""#), "{html}");
+        assert!(html.contains(r#"name="active""#), "{html}");
+        assert!(html.contains("Active"), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn checkbox_input_unchecked_when_value_false() {
+        #[derive(serde::Serialize)]
+        struct F {
+            active: bool,
+        }
+        let cs = Changeset::new(F { active: false });
+        let html = checkbox_input(&cs, "active", "Active").into_string();
+        assert!(!html.contains("checked"), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn checkbox_input_checked_when_value_true() {
+        #[derive(serde::Serialize)]
+        struct F {
+            active: bool,
+        }
+        let cs = Changeset::new(F { active: true });
+        let html = checkbox_input(&cs, "active", "Active").into_string();
+        assert!(html.contains("checked"), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn checkbox_input_emits_hidden_false_fallback() {
+        // Unchecked checkboxes are absent from submitted form data; a hidden
+        // "false" sibling with the same name guarantees the field is always
+        // present so `bool` (not just `Option<bool>`) round-trips.
+        #[derive(serde::Serialize)]
+        struct F {
+            active: bool,
+        }
+        let cs = Changeset::new(F { active: false });
+        let html = checkbox_input(&cs, "active", "Active").into_string();
+        assert!(html.contains(r#"type="hidden""#), "{html}");
+        assert!(html.contains(r#"value="false""#), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn checkbox_input_wrapper_div_has_stable_id() {
+        #[derive(serde::Serialize)]
+        struct F {
+            active: bool,
+        }
+        let cs = Changeset::new(F { active: false });
+        let html = checkbox_input(&cs, "active", "Active").into_string();
+        assert!(html.contains(r#"id="active-field""#), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn checkbox_input_emits_aria_invalid_and_errors() {
+        #[derive(serde::Serialize)]
+        struct F {
+            active: bool,
+        }
+        let mut errors = HashMap::new();
+        errors.insert("active".to_string(), vec!["must be true".to_string()]);
+        let cs = Changeset::from_errors(F { active: false }, errors);
+        let html = checkbox_input(&cs, "active", "Active").into_string();
+        assert!(html.contains(r#"aria-invalid="true""#), "{html}");
+        assert!(html.contains(r#"role="alert""#), "{html}");
+        assert!(html.contains("must be true"), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn number_input_renders_type_number() {
+        #[derive(serde::Serialize)]
+        struct F {
+            age: i32,
+        }
+        let cs = Changeset::new(F { age: 30 });
+        let html = number_input(&cs, "age", "Age", Some("1")).into_string();
+        assert!(html.contains(r#"type="number""#), "{html}");
+        assert!(html.contains(r#"name="age""#), "{html}");
+        assert!(html.contains(r#"value="30""#), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn number_input_renders_step_when_provided() {
+        #[derive(serde::Serialize)]
+        struct F {
+            price: f64,
+        }
+        let cs = Changeset::new(F { price: 9.99 });
+        let html = number_input(&cs, "price", "Price", Some("0.01")).into_string();
+        assert!(html.contains(r#"step="0.01""#), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn number_input_omits_step_when_none() {
+        #[derive(serde::Serialize)]
+        struct F {
+            age: i32,
+        }
+        let cs = Changeset::new(F { age: 30 });
+        let html = number_input(&cs, "age", "Age", None).into_string();
+        assert!(!html.contains("step="), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn number_input_emits_aria_invalid_and_errors() {
+        #[derive(serde::Serialize)]
+        struct F {
+            age: i32,
+        }
+        let mut errors = HashMap::new();
+        errors.insert("age".to_string(), vec!["must be positive".to_string()]);
+        let cs = Changeset::from_errors(F { age: -1 }, errors);
+        let html = number_input(&cs, "age", "Age", None).into_string();
+        assert!(html.contains(r#"aria-invalid="true""#), "{html}");
+        assert!(html.contains(r#"role="alert""#), "{html}");
+        assert!(html.contains("must be positive"), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn number_input_wrapper_div_has_stable_id() {
+        #[derive(serde::Serialize)]
+        struct F {
+            age: i32,
+        }
+        let cs = Changeset::new(F { age: 30 });
+        let html = number_input(&cs, "age", "Age", None).into_string();
+        assert!(html.contains(r#"id="age-field""#), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn date_input_renders_type_date() {
+        #[derive(serde::Serialize)]
+        struct F {
+            born_on: String,
+        }
+        let cs = Changeset::new(F {
+            born_on: "2024-03-15".into(),
+        });
+        let html = date_input(&cs, "born_on", "Born on").into_string();
+        assert!(html.contains(r#"type="date""#), "{html}");
+        assert!(html.contains(r#"value="2024-03-15""#), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn date_input_normalizes_full_timestamp_to_date_only() {
+        #[derive(serde::Serialize)]
+        struct F {
+            born_on: String,
+        }
+        let cs = Changeset::new(F {
+            born_on: "2024-03-15T10:30:00Z".into(),
+        });
+        let html = date_input(&cs, "born_on", "Born on").into_string();
+        assert!(html.contains(r#"value="2024-03-15""#), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn date_input_emits_aria_invalid_and_errors() {
+        #[derive(serde::Serialize)]
+        struct F {
+            born_on: String,
+        }
+        let mut errors = HashMap::new();
+        errors.insert("born_on".to_string(), vec!["required".to_string()]);
+        let cs = Changeset::from_errors(
+            F {
+                born_on: String::new(),
+            },
+            errors,
+        );
+        let html = date_input(&cs, "born_on", "Born on").into_string();
+        assert!(html.contains(r#"aria-invalid="true""#), "{html}");
+        assert!(html.contains(r#"role="alert""#), "{html}");
+        assert!(html.contains("required"), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn datetime_input_renders_type_datetime_local() {
+        #[derive(serde::Serialize)]
+        struct F {
+            starts_at: String,
+        }
+        let cs = Changeset::new(F {
+            starts_at: "2024-03-15T10:30:00".into(),
+        });
+        let html = datetime_input(&cs, "starts_at", "Starts at").into_string();
+        assert!(html.contains(r#"type="datetime-local""#), "{html}");
+        assert!(html.contains(r#"value="2024-03-15T10:30""#), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn datetime_input_normalizes_rfc3339_with_offset_to_local_shape() {
+        #[derive(serde::Serialize)]
+        struct F {
+            starts_at: String,
+        }
+        let cs = Changeset::new(F {
+            starts_at: "2024-03-15T10:30:00Z".into(),
+        });
+        let html = datetime_input(&cs, "starts_at", "Starts at").into_string();
+        // Browsers reject a trailing `Z`/offset in a `datetime-local` value;
+        // must be reduced to the bare local-shaped `YYYY-MM-DDTHH:MM`.
+        assert!(html.contains(r#"value="2024-03-15T10:30""#), "{html}");
+        assert!(!html.contains(r#"value="2024-03-15T10:30:00Z""#), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn datetime_input_emits_aria_invalid_and_errors() {
+        #[derive(serde::Serialize)]
+        struct F {
+            starts_at: String,
+        }
+        let mut errors = HashMap::new();
+        errors.insert("starts_at".to_string(), vec!["required".to_string()]);
+        let cs = Changeset::from_errors(
+            F {
+                starts_at: String::new(),
+            },
+            errors,
+        );
+        let html = datetime_input(&cs, "starts_at", "Starts at").into_string();
+        assert!(html.contains(r#"aria-invalid="true""#), "{html}");
+        assert!(html.contains(r#"role="alert""#), "{html}");
+        assert!(html.contains("required"), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn datetime_input_wrapper_div_has_stable_id() {
+        #[derive(serde::Serialize)]
+        struct F {
+            starts_at: String,
+        }
+        let cs = Changeset::new(F {
+            starts_at: "2024-03-15T10:30:00".into(),
+        });
+        let html = datetime_input(&cs, "starts_at", "Starts at").into_string();
+        assert!(html.contains(r#"id="starts_at-field""#), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn select_input_renders_select_element_with_options() {
+        #[derive(serde::Serialize)]
+        struct F {
+            status: String,
+        }
+        let cs = Changeset::new(F {
+            status: "draft".into(),
+        });
+        let options = [("draft", "Draft"), ("published", "Published")];
+        let html = select_input(&cs, "status", "Status", &options).into_string();
+        assert!(html.contains("<select"), "{html}");
+        assert!(html.contains(r#"name="status""#), "{html}");
+        assert!(html.contains(r#"value="draft""#), "{html}");
+        assert!(html.contains("Draft"), "{html}");
+        assert!(html.contains(r#"value="published""#), "{html}");
+        assert!(html.contains("Published"), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn select_input_marks_current_value_selected() {
+        #[derive(serde::Serialize)]
+        struct F {
+            status: String,
+        }
+        let cs = Changeset::new(F {
+            status: "published".into(),
+        });
+        let options = [("draft", "Draft"), ("published", "Published")];
+        let html = select_input(&cs, "status", "Status", &options).into_string();
+        assert!(html.contains(r#"value="published" selected"#), "{html}");
+        assert!(!html.contains(r#"value="draft" selected"#), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn select_input_emits_aria_invalid_and_errors() {
+        #[derive(serde::Serialize)]
+        struct F {
+            status: String,
+        }
+        let mut errors = HashMap::new();
+        errors.insert("status".to_string(), vec!["required".to_string()]);
+        let cs = Changeset::from_errors(
+            F {
+                status: String::new(),
+            },
+            errors,
+        );
+        let options = [("draft", "Draft"), ("published", "Published")];
+        let html = select_input(&cs, "status", "Status", &options).into_string();
+        assert!(html.contains(r#"aria-invalid="true""#), "{html}");
+        assert!(html.contains(r#"role="alert""#), "{html}");
+        assert!(html.contains("required"), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn select_input_wrapper_div_has_stable_id() {
+        #[derive(serde::Serialize)]
+        struct F {
+            status: String,
+        }
+        let cs = Changeset::new(F {
+            status: "draft".into(),
+        });
+        let options = [("draft", "Draft"), ("published", "Published")];
+        let html = select_input(&cs, "status", "Status", &options).into_string();
+        assert!(html.contains(r#"id="status-field""#), "{html}");
     }
 
     // ── ChangesetForm extractor (axum integration) ─────────────────
