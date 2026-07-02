@@ -57,12 +57,12 @@ pub use crate::canary::CanaryRoute;
 /// Database connection extractor.
 #[cfg(feature = "db")]
 pub use crate::db::Db;
-/// Current request path extractor, for path-aware view helpers like `nav_link`.
-pub use crate::extract::CurrentPath;
 /// Typed domain event bus publisher extractor. The `Event` trait it works with
 /// lives at [`crate::events::Event`] (kept out of the prelude to avoid clashing
 /// with [`crate::sse::Event`]).
 pub use crate::events::Events;
+/// Current request path extractor, for path-aware view helpers like `nav_link`.
+pub use crate::extract::CurrentPath;
 /// Form data extractor.
 pub use crate::extract::Form;
 /// JSON request/response type.

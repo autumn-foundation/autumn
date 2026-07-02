@@ -11,7 +11,7 @@ use autumn_web::job::{
 use autumn_web::pagination::Page;
 use autumn_web::runtime_config::{ConfigChangeRecord, ConfigEntry};
 use autumn_web::ui::pagination::{PagerOptions, pagination_nav};
-use autumn_web::widgets::{CardConfig, card, stat_card};
+use autumn_web::widgets::{CardConfig, card, nav_link, stat_card};
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 use serde_json::Value;
 
@@ -414,6 +414,15 @@ pub fn admin_layout(
     show_config: bool,
     content: &Markup,
 ) -> Markup {
+    // Synthesize the current path from active_slug so nav_link's own
+    // path-comparison logic (rather than a second hand-rolled comparison)
+    // decides which sidebar item is active.
+    let current_path = match active_slug {
+        None => prefix.to_owned(),
+        Some(JOBS_NAV_SLUG) => format!("{prefix}/jobs"),
+        Some(RUNTIME_CONFIG_NAV_SLUG) => format!("{prefix}/config"),
+        Some(slug) => format!("{prefix}/{slug}"),
+    };
     html! {
         (DOCTYPE)
         html lang="en" {
@@ -446,35 +455,30 @@ pub fn admin_layout(
                         nav class="admin-sidebar" aria-label="Admin navigation" {
                             div class="admin-logo" { "🍂 Autumn Admin" }
                             ul class="admin-nav" {
-                                li {
-                                    a href=(prefix) class=[active_slug.is_none().then_some("active")] {
-                                        "Dashboard"
-                                    }
-                                }
+                                li { (nav_link(&current_path, prefix, "Dashboard")) }
                                 @if registry.model_count() > 0 {
                                     li { div class="admin-nav-section" { "Models" } }
                                     @for (slug, model) in registry.iter() {
                                         li {
-                                            a href={ (prefix) "/" (slug) }
-                                              class=[(active_slug == Some(slug)).then_some("active")] {
-                                                (model.display_name_plural())
-                                            }
+                                            (nav_link(
+                                                &current_path,
+                                                &format!("{prefix}/{slug}"),
+                                                model.display_name_plural(),
+                                            ))
                                         }
                                     }
                                 }
                                 li { div class="admin-nav-section" { "System" } }
                                 li {
-                                    a href={ (prefix) "/jobs" }
-                                      class=[(active_slug == Some(JOBS_NAV_SLUG)).then_some("active")] {
-                                        "Jobs"
-                                    }
+                                    (nav_link(&current_path, &format!("{prefix}/jobs"), "Jobs"))
                                 }
                                 @if show_config {
                                     li {
-                                        a href={ (prefix) "/config" }
-                                          class=[(active_slug == Some(RUNTIME_CONFIG_NAV_SLUG)).then_some("active")] {
-                                            "Runtime Config"
-                                        }
+                                        (nav_link(
+                                            &current_path,
+                                            &format!("{prefix}/config"),
+                                            "Runtime Config",
+                                        ))
                                     }
                                 }
                                 li { a href={ (actuator_prefix) "/ui" } { "Actuator" } }
