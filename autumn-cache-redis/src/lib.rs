@@ -613,7 +613,9 @@ mod tests {
         let container = RedisImage::default().start().await.unwrap();
         let port = container.get_host_port_ipv4(6379).await.unwrap();
         let url = format!("redis://127.0.0.1:{port}");
-        let cache = RedisCache::connect(&url, "fill-lock-ttl-test").await.unwrap();
+        let cache = RedisCache::connect(&url, "fill-lock-ttl-test")
+            .await
+            .unwrap();
 
         assert_eq!(
             cache.try_acquire_fill_lock("k", "crashed-filler", Duration::from_millis(200)),
@@ -637,8 +639,11 @@ mod tests {
         let container = RedisImage::default().start().await.unwrap();
         let port = container.get_host_port_ipv4(6379).await.unwrap();
         let url = format!("redis://127.0.0.1:{port}");
-        let cache: Arc<dyn Cache> =
-            Arc::new(RedisCache::connect(&url, "lock-timeout-test").await.unwrap());
+        let cache: Arc<dyn Cache> = Arc::new(
+            RedisCache::connect(&url, "lock-timeout-test")
+                .await
+                .unwrap(),
+        );
 
         // Simulate a stuck holder that never releases and outlives the test.
         let key = "stuck-key";
@@ -654,12 +659,13 @@ mod tests {
             .lock_wait_timeout(Duration::from_millis(300))
             .lock_poll_interval(Duration::from_millis(50));
 
-        let value: i32 = autumn_web::cache::get_or_compute_with(&cache, key, opts, move || async move {
-            fc.fetch_add(1, Ordering::SeqCst);
-            Ok::<i32, String>(123)
-        })
-        .await
-        .unwrap();
+        let value: i32 =
+            autumn_web::cache::get_or_compute_with(&cache, key, opts, move || async move {
+                fc.fetch_add(1, Ordering::SeqCst);
+                Ok::<i32, String>(123)
+            })
+            .await
+            .unwrap();
 
         assert_eq!(value, 123);
         assert_eq!(
@@ -675,8 +681,11 @@ mod tests {
         let container = RedisImage::default().start().await.unwrap();
         let port = container.get_host_port_ipv4(6379).await.unwrap();
         let url = format!("redis://127.0.0.1:{port}");
-        let cache: Arc<dyn Cache> =
-            Arc::new(RedisCache::connect(&url, "read-through-test").await.unwrap());
+        let cache: Arc<dyn Cache> = Arc::new(
+            RedisCache::connect(&url, "read-through-test")
+                .await
+                .unwrap(),
+        );
 
         let fill_count = Arc::new(AtomicUsize::new(0));
         let fc = fill_count.clone();
@@ -705,7 +714,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(v, "value-from-redis", "second call must hit via RawCacheBytes deserialization");
+        assert_eq!(
+            v, "value-from-redis",
+            "second call must hit via RawCacheBytes deserialization"
+        );
         assert_eq!(fill_count.load(Ordering::SeqCst), 1);
     }
 
@@ -739,7 +751,10 @@ mod tests {
                     .lock_wait_timeout(Duration::from_secs(5));
                 handles.push(tokio::spawn(async move {
                     autumn_web::cache::get_or_compute_with::<String, String, _, _>(
-                        &replica, key, opts, move || async move {
+                        &replica,
+                        key,
+                        opts,
+                        move || async move {
                             fc.fetch_add(1, Ordering::SeqCst);
                             tokio::time::sleep(Duration::from_millis(300)).await;
                             Ok("cross-replica-value".to_string())

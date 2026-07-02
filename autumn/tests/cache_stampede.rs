@@ -12,11 +12,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 
+use autumn_web::cache::MokaCache;
 use autumn_web::cache::{
-    Cache, CacheFillError, GetOrComputeOptions, get_or_compute, get_or_compute_with, get_cached,
+    Cache, CacheFillError, GetOrComputeOptions, get_cached, get_or_compute, get_or_compute_with,
     read_through_metrics,
 };
-use autumn_web::cache::MokaCache;
 
 /// Serializes tests that touch `read_through_metrics()` (a process-wide
 /// singleton), since `cargo test` runs tests in parallel by default and
@@ -134,7 +134,10 @@ async fn concurrent_misses_run_fill_once() {
 
     let after = read_through_metrics().snapshot();
     assert_eq!(after.fills - before.fills, 1);
-    assert_eq!(after.coalesced_waits - before.coalesced_waits, (K - 1) as u64);
+    assert_eq!(
+        after.coalesced_waits - before.coalesced_waits,
+        (K - 1) as u64
+    );
     assert!(after.misses - before.misses >= 1);
 }
 
@@ -179,15 +182,24 @@ async fn fill_error_propagates_and_does_not_poison() {
                 saw_typed_fill = true;
             }
             Err(CacheFillError::FillFailed(msg)) => {
-                assert!(msg.contains("boom"), "waiter error should mention 'boom': {msg}");
+                assert!(
+                    msg.contains("boom"),
+                    "waiter error should mention 'boom': {msg}"
+                );
                 saw_fill_failed = true;
             }
             Ok(_) => panic!("a failing fill must never return Ok"),
         }
     }
-    assert!(saw_typed_fill, "the leader must get a typed CacheFillError::Fill");
+    assert!(
+        saw_typed_fill,
+        "the leader must get a typed CacheFillError::Fill"
+    );
     // With WAITERS=4 concurrent callers there should be at least one coalesced waiter.
-    assert!(saw_fill_failed, "at least one waiter must see CacheFillError::FillFailed");
+    assert!(
+        saw_fill_failed,
+        "at least one waiter must see CacheFillError::FillFailed"
+    );
 
     assert!(
         get_cached::<i32>(&*cache, &key).is_none(),
@@ -214,7 +226,10 @@ async fn fill_error_propagates_and_does_not_poison() {
         1,
         "retry after failure must run its fill closure exactly once"
     );
-    assert!(attempt.load(Ordering::SeqCst) >= 1, "the failing round must have run at least once");
+    assert!(
+        attempt.load(Ordering::SeqCst) >= 1,
+        "the failing round must have run at least once"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -242,12 +257,13 @@ async fn cancelled_leader_does_not_deadlock_waiters() {
 
     let waiter_key = key.clone();
     let waiter_cache = cache.clone();
-    let waiter = tokio::spawn(async move {
-        get_or_compute::<i32, String, _, _>(&waiter_cache, &waiter_key, None, || async move {
-            Ok(2)
-        })
-        .await
-    });
+    let waiter =
+        tokio::spawn(async move {
+            get_or_compute::<i32, String, _, _>(&waiter_cache, &waiter_key, None, || async move {
+                Ok(2)
+            })
+            .await
+        });
 
     // Abort the stuck leader; the waiter must recover (re-contend for
     // leadership) instead of hanging forever.
@@ -293,7 +309,11 @@ async fn different_keys_do_not_coalesce() {
 
     assert_eq!(a.await.unwrap().unwrap(), 1);
     assert_eq!(b.await.unwrap().unwrap(), 2);
-    assert_eq!(fill_count.load(Ordering::SeqCst), 2, "distinct keys must each fill");
+    assert_eq!(
+        fill_count.load(Ordering::SeqCst),
+        2,
+        "distinct keys must each fill"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -332,7 +352,10 @@ async fn swr_serves_stale_and_refreshes_in_background() {
     .await
     .unwrap();
     let elapsed = start.elapsed();
-    assert_eq!(v, "v1", "a stale-but-in-grace value must be served immediately");
+    assert_eq!(
+        v, "v1",
+        "a stale-but-in-grace value must be served immediately"
+    );
     assert!(
         elapsed < Duration::from_millis(150),
         "serving stale must not wait on the slow background refresh, took {elapsed:?}"
@@ -404,7 +427,10 @@ async fn swr_only_one_background_refresh() {
 
     for h in handles {
         let v: String = h.await.unwrap().unwrap();
-        assert_eq!(v, "v1", "all concurrent stale reads must return the stale value fast");
+        assert_eq!(
+            v, "v1",
+            "all concurrent stale reads must return the stale value fast"
+        );
     }
 
     // Give the single background refresh time to land, then confirm exactly
@@ -447,11 +473,17 @@ impl Cache for RawBytesCache {
     }
 
     fn invalidate(&self, key: &str) {
-        self.inner.lock().unwrap_or_else(PoisonError::into_inner).remove(key);
+        self.inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(key);
     }
 
     fn clear(&self) {
-        self.inner.lock().unwrap_or_else(PoisonError::into_inner).clear();
+        self.inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
     }
 
     fn insert_raw_bytes(&self, key: &str, bytes: Vec<u8>, _ttl: Option<Duration>) {

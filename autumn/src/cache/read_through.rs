@@ -335,7 +335,9 @@ fn claim_role(cache: &Arc<dyn Cache>, key: &str) -> Role {
 /// future was dropped/cancelled before publishing an outcome (channel
 /// closed), or the leader published a value of a different type than `V`
 /// (the same key was used with two different value types).
-async fn await_result<V, E>(mut rx: watch::Receiver<FillState>) -> Option<Result<V, CacheFillError<E>>>
+async fn await_result<V, E>(
+    mut rx: watch::Receiver<FillState>,
+) -> Option<Result<V, CacheFillError<E>>>
 where
     V: Clone + Send + Sync + 'static,
 {
@@ -546,7 +548,9 @@ where
             read_through_metrics().hits.fetch_add(1, Ordering::Relaxed);
             return Ok(value);
         }
-        read_through_metrics().misses.fetch_add(1, Ordering::Relaxed);
+        read_through_metrics()
+            .misses
+            .fetch_add(1, Ordering::Relaxed);
 
         match claim_role(cache, key) {
             Role::Leader(tx, guard) => {
@@ -602,7 +606,9 @@ where
                 return Ok(envelope.value);
             }
             None => {
-                read_through_metrics().misses.fetch_add(1, Ordering::Relaxed);
+                read_through_metrics()
+                    .misses
+                    .fetch_add(1, Ordering::Relaxed);
                 match claim_role(cache, key) {
                     Role::Leader(tx, guard) => {
                         if let Some(envelope) = get_cached::<SwrEnvelope<V>>(cache.as_ref(), key) {
