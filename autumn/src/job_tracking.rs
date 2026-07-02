@@ -31,6 +31,34 @@ pub enum TrackedJobOwner {
     User(String),
 }
 
+impl TrackedJobOwner {
+    /// Derive an owner binding from the current request's session: the
+    /// authenticated user id if logged in (per `state.auth_session_key()`),
+    /// else the raw (anonymous) session id.
+    ///
+    /// Binding to the session id means only *this* browser session — not
+    /// other anonymous callers, and not other sessions once the user logs in
+    /// elsewhere — may poll the status.
+    pub async fn from_session(session: &crate::session::Session, state: &AppState) -> Self {
+        match session.get(state.auth_session_key()).await {
+            Some(user_id) => Self::User(user_id),
+            None => Self::Session(session.id().await),
+        }
+    }
+
+    /// Whether a request authenticated as `session` may poll a record bound
+    /// to this owner.
+    async fn authorizes(&self, session: &crate::session::Session, state: &AppState) -> bool {
+        match self {
+            Self::Anonymous => true,
+            Self::User(expected) => {
+                session.get(state.auth_session_key()).await.as_deref() == Some(expected.as_str())
+            }
+            Self::Session(expected) => &session.id().await == expected,
+        }
+    }
+}
+
 /// Lifecycle status of a tracked job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -482,12 +510,13 @@ pub(crate) fn status_router() -> axum::Router<AppState> {
 
 /// `GET /_autumn/jobs/{token}`: resolve the tracked-job record for `token`
 /// and return it as JSON for API clients, or an htmx-pollable HTML fragment
-/// for browsers (content-negotiated). Unknown, expired, and (once owner
-/// binding lands) unauthorized tokens all render the identical 404 so the
-/// route is never an existence/ownership oracle.
+/// for browsers (content-negotiated). Unknown, expired, and unauthorized
+/// tokens all render the identical 404 so the route is never an
+/// existence/ownership oracle.
 async fn job_status_handler(
     axum::extract::State(state): axum::extract::State<AppState>,
     axum::extract::Path(token): axum::extract::Path<String>,
+    session: crate::session::Session,
     headers: axum::http::HeaderMap,
 ) -> AutumnResult<axum::response::Response> {
     let not_found = || AutumnError::not_found_msg("This job status page could not be found.");
@@ -495,6 +524,9 @@ async fn job_status_handler(
     let store = tracking_store_from_state(&state).ok_or_else(not_found)?;
     let key = crate::auth::hash_api_token(&token);
     let record = store.get(&key).await?.ok_or_else(not_found)?;
+    if !record.owner.authorizes(&session, &state).await {
+        return Err(not_found());
+    }
 
     let path = format!("{JOB_STATUS_PATH_PREFIX}{token}");
     let mut response = render_status_response(&record, &headers, &path);

@@ -9,8 +9,9 @@ use std::time::Duration;
 
 use autumn_web::app::AppBuilder;
 use autumn_web::config::AutumnConfig;
-use autumn_web::job::{self, JobInfo};
+use autumn_web::job::{self, JobInfo, TrackedJobOwner};
 use autumn_web::plugin::Plugin;
+use autumn_web::session::{MemoryStore, SessionConfig, SessionLayer, SessionStore};
 use autumn_web::test::{TestApp, TestClient};
 use autumn_web::{AppState, AutumnError, AutumnResult};
 use serde_json::{Value, json};
@@ -366,6 +367,211 @@ async fn failed_fragment_shows_user_safe_error_and_stops_polling() {
         !done.contains("hx-trigger"),
         "terminal fragment must not keep polling (no hx-trigger): {done}"
     );
+
+    job::clear_global_job_client();
+}
+
+// ── Owner authorization ───────────────────────────────────────────────────
+
+async fn seed_session(store: &MemoryStore, sid: &str, user_id: Option<&str>) {
+    let mut data = std::collections::HashMap::new();
+    if let Some(user_id) = user_id {
+        data.insert("user_id".to_owned(), user_id.to_owned());
+    }
+    store.save(sid, data).await.unwrap();
+}
+
+fn build_owned_client(store: MemoryStore) -> TestClient {
+    TestApp::new()
+        .config(test_config())
+        .plugin(TrackedGateJobPlugin)
+        .layer(SessionLayer::new(store, SessionConfig::default()))
+        .build()
+}
+
+async fn get_status(client: &TestClient, path: &str, sid: Option<&str>) -> autumn_web::test::TestResponse {
+    let mut request = client.get(path);
+    if let Some(sid) = sid {
+        request = request.header("Cookie", &format!("autumn.sid={sid}"));
+    }
+    request.send().await
+}
+
+#[tokio::test]
+async fn anonymous_token_readable_with_token_alone() {
+    let _guard = job::global_job_runtime_test_lock().lock().await;
+    job::clear_global_job_client();
+
+    let store = MemoryStore::new();
+    let client = build_owned_client(store.clone());
+
+    // Anonymous handle: no owner binding at all.
+    let handle = job::enqueue_tracked("tracked_gate_job", json!({"mode": "succeed"}))
+        .await
+        .unwrap();
+    RELEASE_GATE.notify_waiters();
+
+    // No cookie whatsoever still reads it.
+    get_status(&client, &handle.status_path(), None)
+        .await
+        .assert_status(200);
+    // An arbitrary session cookie also reads it — the token is the only capability.
+    seed_session(&store, "sess-anyone", None).await;
+    get_status(&client, &handle.status_path(), Some("sess-anyone"))
+        .await
+        .assert_status(200);
+
+    job::clear_global_job_client();
+}
+
+#[tokio::test]
+async fn session_bound_token_404_for_other_session() {
+    let _guard = job::global_job_runtime_test_lock().lock().await;
+    job::clear_global_job_client();
+
+    let store = MemoryStore::new();
+    let client = build_owned_client(store.clone());
+
+    // Seeding the session ID in the store is what makes the middleware trust
+    // the client-supplied cookie value; an unseeded ID is treated as unknown
+    // and gets a freshly minted (different) session id instead.
+    seed_session(&store, "sess-owner", None).await;
+
+    let handle = job::enqueue_tracked_for(
+        "tracked_gate_job",
+        json!({"mode": "succeed"}),
+        TrackedJobOwner::Session("sess-owner".to_owned()),
+    )
+    .await
+    .unwrap();
+    RELEASE_GATE.notify_waiters();
+
+    // The owning session reads it fine.
+    get_status(&client, &handle.status_path(), Some("sess-owner"))
+        .await
+        .assert_status(200);
+
+    // A different session — even an authenticated one — does not.
+    seed_session(&store, "sess-stranger", None).await;
+    get_status(&client, &handle.status_path(), Some("sess-stranger"))
+        .await
+        .assert_status(404);
+
+    // No cookie at all (a fresh anonymous session) does not either.
+    get_status(&client, &handle.status_path(), None)
+        .await
+        .assert_status(404);
+
+    job::clear_global_job_client();
+}
+
+#[tokio::test]
+async fn user_bound_token_allowed_across_sessions_of_same_user() {
+    let _guard = job::global_job_runtime_test_lock().lock().await;
+    job::clear_global_job_client();
+
+    let store = MemoryStore::new();
+    let client = build_owned_client(store.clone());
+
+    let handle = job::enqueue_tracked_for(
+        "tracked_gate_job",
+        json!({"mode": "succeed"}),
+        TrackedJobOwner::User("user-42".to_owned()),
+    )
+    .await
+    .unwrap();
+    RELEASE_GATE.notify_waiters();
+
+    // Two different (unauthenticated) session ids, both logged in as the
+    // same user, both may poll — the binding is to the user, not a session.
+    seed_session(&store, "sess-a", Some("user-42")).await;
+    seed_session(&store, "sess-b", Some("user-42")).await;
+    get_status(&client, &handle.status_path(), Some("sess-a"))
+        .await
+        .assert_status(200);
+    get_status(&client, &handle.status_path(), Some("sess-b"))
+        .await
+        .assert_status(200);
+
+    job::clear_global_job_client();
+}
+
+#[tokio::test]
+async fn user_bound_token_404_for_other_user_and_anonymous() {
+    let _guard = job::global_job_runtime_test_lock().lock().await;
+    job::clear_global_job_client();
+
+    let store = MemoryStore::new();
+    let client = build_owned_client(store.clone());
+
+    let handle = job::enqueue_tracked_for(
+        "tracked_gate_job",
+        json!({"mode": "succeed"}),
+        TrackedJobOwner::User("user-42".to_owned()),
+    )
+    .await
+    .unwrap();
+    RELEASE_GATE.notify_waiters();
+
+    // A different authenticated user is rejected.
+    seed_session(&store, "sess-other-user", Some("user-999")).await;
+    get_status(&client, &handle.status_path(), Some("sess-other-user"))
+        .await
+        .assert_status(404);
+
+    // An anonymous (logged-out) session is rejected.
+    seed_session(&store, "sess-anonymous", None).await;
+    get_status(&client, &handle.status_path(), Some("sess-anonymous"))
+        .await
+        .assert_status(404);
+
+    job::clear_global_job_client();
+}
+
+#[tokio::test]
+async fn owner_mismatch_response_is_byte_identical_to_unknown_token() {
+    let _guard = job::global_job_runtime_test_lock().lock().await;
+    job::clear_global_job_client();
+
+    let store = MemoryStore::new();
+    let client = build_owned_client(store.clone());
+
+    let handle = job::enqueue_tracked_for(
+        "tracked_gate_job",
+        json!({"mode": "succeed"}),
+        TrackedJobOwner::Session("sess-owner".to_owned()),
+    )
+    .await
+    .unwrap();
+    RELEASE_GATE.notify_waiters();
+
+    seed_session(&store, "sess-stranger", None).await;
+    let mismatch = get_status(&client, &handle.status_path(), Some("sess-stranger")).await;
+    let unknown = get_status(&client, "/_autumn/jobs/does-not-exist", Some("sess-stranger")).await;
+
+    assert_eq!(
+        mismatch.header("content-type"),
+        Some("application/problem+json")
+    );
+    assert_eq!(
+        unknown.header("content-type"),
+        Some("application/problem+json")
+    );
+    let mismatch_body: Value = mismatch.json();
+    let unknown_body: Value = unknown.json();
+    mismatch.assert_status(404);
+    unknown.assert_status(404);
+    // Compare only the fields a client actually sees as "the reason" — not
+    // `instance` (which just echoes back the requested path, and naturally
+    // differs since the two requests hit different URLs) or `request_id`
+    // (unique per request by design).
+    for field in ["type", "title", "status", "detail", "code"] {
+        assert_eq!(
+            mismatch_body[field], unknown_body[field],
+            "owner mismatch and unknown-token responses must render an \
+             identical reason for field {field:?}: {mismatch_body} vs {unknown_body}"
+        );
+    }
 
     job::clear_global_job_client();
 }
