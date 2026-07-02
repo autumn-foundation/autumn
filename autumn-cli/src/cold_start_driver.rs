@@ -199,7 +199,7 @@ fn measure_cold_start_once(shape: ColdStartShape) -> Result<u64, String> {
     // a server that boots fine look like a serve failure. `start` still drives the
     // measured duration recorded below.
     let url = format!("http://127.0.0.1:{port}/");
-    let deadline = Instant::now() + Duration::from_millis(budget_for(class_for(shape)).max_ms * 2);
+    let deadline = Instant::now().checked_add(Duration::from_millis(budget_for(class_for(shape)).max_ms * 2)).unwrap_or_else(Instant::now);
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(2))
         .build()

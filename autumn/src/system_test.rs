@@ -830,7 +830,7 @@ impl Page {
     /// [`SystemTestError::Timeout`] or [`SystemTestError::AssertionFailed`].
     pub async fn expect_text(&self, text: &str) -> Result<&Self, SystemTestError> {
         let timeout = Duration::from_secs(5);
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = tokio::time::Instant::now().checked_add(timeout).unwrap_or_else(tokio::time::Instant::now);
 
         loop {
             let evaluated = self
@@ -868,7 +868,7 @@ impl Page {
     /// [`SystemTestError::Timeout`] or [`SystemTestError::AssertionFailed`].
     pub async fn expect_url(&self, pattern: &str) -> Result<&Self, SystemTestError> {
         let timeout = Duration::from_secs(5);
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = tokio::time::Instant::now().checked_add(timeout).unwrap_or_else(tokio::time::Instant::now);
 
         loop {
             let evaluated = self
@@ -919,7 +919,7 @@ impl Page {
         value: &str,
     ) -> Result<&Self, SystemTestError> {
         let timeout = Duration::from_secs(5);
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = tokio::time::Instant::now().checked_add(timeout).unwrap_or_else(tokio::time::Instant::now);
 
         loop {
             let js = format!(
@@ -1006,7 +1006,7 @@ impl Page {
     /// [`SystemTestError::AssertionFailed`] listing every captured message,
     /// with a screenshot + HTML dump written to the artifact directory.
     pub async fn expect_no_console_errors(&self) -> Result<&Self, SystemTestError> {
-        let deadline = tokio::time::Instant::now() + CONSOLE_ERROR_GRACE;
+        let deadline = tokio::time::Instant::now().checked_add(CONSOLE_ERROR_GRACE).unwrap_or_else(tokio::time::Instant::now);
         loop {
             let errors = self.console_errors();
             if !errors.is_empty() {
@@ -1045,7 +1045,7 @@ impl Page {
         predicate: impl Fn(&str) -> bool,
     ) -> Result<&Self, SystemTestError> {
         let timeout = Duration::from_secs(10);
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = tokio::time::Instant::now().checked_add(timeout).unwrap_or_else(tokio::time::Instant::now);
 
         loop {
             // Try getElementById(stream_id) first — this handles IDs with CSS
@@ -1120,7 +1120,7 @@ impl Page {
     // ── Internal helpers ──────────────────────────────────────────────────
 
     async fn wait_for_hx_settle(&self) -> Result<(), SystemTestError> {
-        let deadline = tokio::time::Instant::now() + self.hx_settle_timeout;
+        let deadline = tokio::time::Instant::now().checked_add(self.hx_settle_timeout).unwrap_or_else(tokio::time::Instant::now);
         loop {
             let evaluated = self
                 .inner

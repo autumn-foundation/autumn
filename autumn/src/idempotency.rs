@@ -467,7 +467,7 @@ impl IdempotencyStore for MemoryIdempotencyStore {
         let entry = IdempotencyEntry {
             record,
             body_hash,
-            expires_at: Instant::now() + ttl,
+            expires_at: Instant::now().checked_add(ttl).unwrap_or_else(Instant::now),
         };
         let mut entries = self.entries.write().unwrap();
         entries.insert(key.to_owned(), entry);
@@ -504,7 +504,7 @@ impl IdempotencyStore for MemoryIdempotencyStore {
             key.to_owned(),
             MemoryInFlightLock {
                 owner: owner.to_owned(),
-                expires_at: now + ttl,
+                expires_at: now.checked_add(ttl).unwrap_or(now),
             },
         );
         true
@@ -631,7 +631,7 @@ mod redis_store {
                                     body_hash: e.body_hash,
                                     // Redis manages TTL natively. Use a fixed 24 h offset
                                     // so the in-process expiry check never fires early.
-                                    expires_at: Instant::now() + Duration::from_secs(86_400),
+                                    expires_at: Instant::now().checked_add(Duration::from_secs(86_400)).unwrap_or_else(Instant::now),
                                 }
                             })
                             .map_err(|e| {

@@ -16,7 +16,7 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = bool>,
 {
-    let deadline = tokio::time::Instant::now() + timeout;
+    let deadline = tokio::time::Instant::now().checked_add(timeout).unwrap_or_else(tokio::time::Instant::now);
     loop {
         if condition().await {
             return;

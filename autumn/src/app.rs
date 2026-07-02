@@ -5309,7 +5309,7 @@ async fn run_shutdown_hooks_with_timeout(
     per_hook_budget: std::time::Duration,
     total_budget: std::time::Duration,
 ) {
-    let deadline = tokio::time::Instant::now() + total_budget;
+    let deadline = tokio::time::Instant::now().checked_add(total_budget).unwrap_or_else(tokio::time::Instant::now);
     for hook in hooks.iter().rev() {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {

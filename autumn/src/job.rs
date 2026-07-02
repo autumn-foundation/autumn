@@ -1375,7 +1375,7 @@ impl RedisMaintenanceThrottle {
         if now < self.next_run_at {
             return false;
         }
-        self.next_run_at = now + self.interval;
+        self.next_run_at = now.checked_add(self.interval).unwrap_or(now);
         true
     }
 }
@@ -2853,7 +2853,7 @@ impl LocalJobCoordination {
             }
         }
         let expires_at = match window {
-            JobUniquenessWindow::TtlMs(ms) => Some(now + std::time::Duration::from_millis(ms)),
+            JobUniquenessWindow::TtlMs(ms) => Some(now.checked_add(std::time::Duration::from_millis(ms)).unwrap_or(now)),
             JobUniquenessWindow::Pending | JobUniquenessWindow::Running => None,
         };
         inner.unique_holds.insert(
@@ -13135,7 +13135,7 @@ mod uniqueness_concurrency_tests {
 
     /// Poll `cond` every few milliseconds until it holds or `deadline_ms` passes.
     async fn wait_for(deadline_ms: u64, mut cond: impl FnMut() -> bool) -> bool {
-        let deadline = std::time::Instant::now() + Duration::from_millis(deadline_ms);
+        let deadline = std::time::Instant::now().checked_add(Duration::from_millis(deadline_ms)).unwrap_or_else(std::time::Instant::now);
         while std::time::Instant::now() < deadline {
             if cond() {
                 return true;

@@ -727,7 +727,7 @@ fn spawn_live_event_relay_task(
     let reconnect_interval = options.reconnect_interval;
 
     tokio::spawn(async move {
-        let mut next_reconnect_at = tokio::time::Instant::now() + reconnect_interval;
+        let mut next_reconnect_at = tokio::time::Instant::now().checked_add(reconnect_interval).unwrap_or_else(tokio::time::Instant::now);
 
         loop {
             tokio::select! {
@@ -752,7 +752,7 @@ fn spawn_live_event_relay_task(
                             );
                         }
                     }
-                    next_reconnect_at = tokio::time::Instant::now() + reconnect_interval;
+                    next_reconnect_at = tokio::time::Instant::now().checked_add(reconnect_interval).unwrap_or_else(tokio::time::Instant::now);
                 }
                 wake = wait_for_live_event_wakeup(listener.as_mut(), poll_interval) => {
                     match wake {

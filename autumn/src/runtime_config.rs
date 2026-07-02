@@ -1270,7 +1270,7 @@ pub mod pg {
             store.cache_raw_until(
                 "posts_per_page",
                 Some("25".to_owned()),
-                Instant::now() + Duration::from_secs(60),
+                Instant::now().checked_add(Duration::from_secs(60)).unwrap_or_else(Instant::now),
             );
 
             assert_eq!(
@@ -1307,7 +1307,7 @@ pub mod pg {
             store.cache_raw_until(
                 "posts_per_page",
                 Some("25".to_owned()),
-                Instant::now() + Duration::from_secs(60),
+                Instant::now().checked_add(Duration::from_secs(60)).unwrap_or_else(Instant::now),
             );
             store.invalidate_cached_raw("posts_per_page");
 

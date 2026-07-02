@@ -1200,3 +1200,4 @@ mod tests {
         let _builder = builder.routes(vec![]);
     }
 }
+mod circuit_breaker_test;

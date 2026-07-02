@@ -499,7 +499,7 @@ impl DirectoryShardRouter {
                 key,
                 DirectoryCacheEntry {
                     shard,
-                    expires_at: std::time::Instant::now() + self.ttl,
+                    expires_at: std::time::Instant::now().checked_add(self.ttl).unwrap_or_else(std::time::Instant::now),
                 },
             );
         }

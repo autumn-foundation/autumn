@@ -319,7 +319,7 @@ async fn wait_until_healthy(
     child: &mut Child,
     timeout: Duration,
 ) -> Result<(), SpawnError> {
-    let deadline = tokio::time::Instant::now() + timeout;
+    let deadline = tokio::time::Instant::now().checked_add(timeout).unwrap_or_else(tokio::time::Instant::now);
     let url = format!("{base_url}/health");
     loop {
         if let Ok(Some(status)) = child.try_wait() {

@@ -1499,7 +1499,7 @@ mod tests {
         drop(registry_guard);
         std::thread::sleep(std::time::Duration::from_millis(25));
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let deadline = std::time::Instant::now().checked_add(std::time::Duration::from_secs(1)).unwrap_or_else(std::time::Instant::now);
         let registry_released_before_metrics = loop {
             match backend.inner.registry.try_lock() {
                 Ok(registry) => {
