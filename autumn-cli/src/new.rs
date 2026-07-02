@@ -858,8 +858,21 @@ mod tests {
         // to a new row if the row itself is allowed to wrap. Without flex-wrap
         // on the enhanced root, the opened mobile menu squeezes/overflows onto
         // the same row as the brand and toggle instead of appearing below them.
+        //
+        // Bare-selector match (not a literal multi-line blob) so this doesn't
+        // depend on the file's line-ending style — this repo checks out
+        // `*.tmpl` as `text=auto`, which normalizes to CRLF on Windows, and
+        // an embedded `\n` here would never match the CRLF-containing string
+        // `include_str!` reads back on that platform.
+        let css = templates::INPUT_CSS;
+        let rule_start = css
+            .find(".autumn-nav--enhanced {")
+            .expect("no bare .autumn-nav--enhanced rule found in input.css.tmpl");
+        let rule_body = &css[rule_start..][..css[rule_start..]
+            .find('}')
+            .expect("unterminated .autumn-nav--enhanced rule")];
         assert!(
-            templates::INPUT_CSS.contains(".autumn-nav--enhanced {\n      @apply flex-wrap;"),
+            rule_body.contains("flex-wrap"),
             "the mobile media query must set flex-wrap on .autumn-nav--enhanced itself \
              so .autumn-nav__collapse's basis-full can actually start a new row, got:\n{}",
             templates::INPUT_CSS
