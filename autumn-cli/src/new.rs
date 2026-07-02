@@ -839,6 +839,19 @@ mod tests {
     }
 
     #[test]
+    fn main_template_nav_keeps_descriptive_aria_label() {
+        // The old hand-rolled <nav> had aria-label="Main navigation"; nav_bar's
+        // own default is just "Main", so the template must call .aria_label(...)
+        // explicitly or the landmark's accessible name silently degrades.
+        assert!(
+            templates::MAIN_RS.contains(r#".aria_label("Main navigation")"#),
+            "layout()'s NavBarConfig should keep the descriptive \"Main navigation\" \
+             aria-label instead of nav_bar's generic \"Main\" default, got:\n{}",
+            templates::MAIN_RS
+        );
+    }
+
+    #[test]
     fn autumn_toml_has_defaults() {
         let tmp = TempDir::new().unwrap();
         generate("cfg-check", tmp.path()).unwrap();

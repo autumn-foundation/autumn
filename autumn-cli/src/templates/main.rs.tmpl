@@ -19,6 +19,7 @@ static EMBEDDED_STATIC: autumn_web::include_dir::Dir = autumn_web::embed_static!
 pub fn layout(title: &str, current_path: &str, flash: maud::Markup, content: maud::Markup) -> maud::Markup {
     let nav = NavBarConfig::new()
         .brand("{{project_name}}", "/")
+        .aria_label("Main navigation")
         .item(NavItem::link("/", "Home"));
     maud::html! {
         (maud::DOCTYPE)
