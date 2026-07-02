@@ -514,6 +514,28 @@ status as a progress/UX signal for the caller, not as the source of truth
 for whether a job will run again — use the admin dashboard
 ([Observability](#observability)) or `JobAdminBackend` for that.
 
+### Known limitation: stale progress writes on the Redis/Postgres stores
+
+`mark_running`/`set_progress` intentionally no-op once a tracked record is
+already terminal, so a stray write from an abandoned attempt can't overwrite
+a legitimate final result — but on the Redis and Postgres tracking stores
+that guard is evaluated against the value read at the *start* of that write
+(read the record, decide, write it back), not atomically at write time. If a
+worker's claim times out and it keeps running past that point while a
+replacement worker claims and completes the same job, the original worker's
+next progress write can land *after* the replacement's terminal write and
+briefly clobber it, because its in-memory guard was evaluated against the
+`running` record it read before the replacement settled. The record
+self-corrects on the next terminal write (the replacement's own retry
+path settles it, or TTL expiry clears it), so this is a transient display
+glitch, not a lost result — the queue's own durable state (visible via the
+admin dashboard) is never affected. Closing this fully means moving the
+terminal-status guard into the durable write itself (a Lua script for
+Redis, a conditional `UPDATE` for Postgres — the same compare-and-swap
+approach `JobTrackingStore::reset_for_retry` already uses to make an
+operator retry race-safe); tracked as a follow-up rather than folded into
+this change.
+
 ## Observability
 
 Mount `autumn-admin-plugin` to get the built-in operator dashboard at
