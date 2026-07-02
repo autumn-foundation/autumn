@@ -162,6 +162,20 @@ pub trait JobTrackingStore: Send + Sync + 'static {
 
     /// Fetch the current record, or `None` if unknown or expired.
     fn get<'a>(&'a self, key: &'a str) -> BoxFut<'a, AutumnResult<Option<TrackedJobRecord>>>;
+
+    /// Reset `key` back to a fresh `pending` record for a retried attempt —
+    /// but only if the stored record's `updated_at` still equals
+    /// `expected_updated_at` (the value read just before the retry decision
+    /// was made). If a worker has already re-executed and settled the
+    /// record in the meantime, `updated_at` will have moved on and this is a
+    /// no-op, so a fast retry can never clobber the fresher terminal write
+    /// with a stale `pending` reset.
+    fn reset_for_retry<'a>(
+        &'a self,
+        key: &'a str,
+        owner: TrackedJobOwner,
+        expected_updated_at: DateTime<Utc>,
+    ) -> BoxFut<'a, AutumnResult<()>>;
 }
 
 /// `AppState` extension carrying the installed [`JobTrackingStore`].
@@ -579,6 +593,13 @@ async fn settle_tracked_payload_with_store(
 /// settles. Resolves the store from the process-global fallback since none
 /// of the three admin backends (`JobAdminMemoryBackend`,
 /// `RedisJobAdminBackend`, `PgJobAdminBackend`) carry an `AppState`.
+///
+/// The reset only applies if the record is unchanged since it was read here
+/// ([`JobTrackingStore::reset_for_retry`] is a compare-and-swap on
+/// `updated_at`): the retried job is re-enqueued (and may already be
+/// claimed and executing) before this runs, so without that guard a very
+/// fast retry could settle to a terminal status and then have this call
+/// stomp it back to a stale `pending`.
 pub(crate) async fn reset_tracked_payload_for_retry(payload: &Value) {
     let (key, _) = split_tracked_payload(payload);
     let Some(key) = key else {
@@ -590,7 +611,9 @@ pub(crate) async fn reset_tracked_payload_for_retry(payload: &Value) {
     let Some(record) = store.get(key).await.ok().flatten() else {
         return;
     };
-    let _ = store.create(key, record.owner).await;
+    let _ = store
+        .reset_for_retry(key, record.owner, record.updated_at)
+        .await;
 }
 
 // ── enqueue_tracked ────────────────────────────────────────────────────────────
@@ -930,6 +953,40 @@ impl InMemoryJobTrackingStore {
             entry.expires_at = now + self.ttl;
         }
     }
+
+    #[allow(clippy::significant_drop_tightening)]
+    fn reset_for_retry_if_unchanged(
+        &self,
+        key: &str,
+        owner: TrackedJobOwner,
+        expected_updated_at: DateTime<Utc>,
+    ) {
+        let now = self.clock.now();
+        let mut guard = self
+            .entries
+            .write()
+            .expect("job tracking store lock poisoned");
+        if let Some(entry) = guard.get(key)
+            && self.is_live(entry)
+            && entry.record.updated_at == expected_updated_at
+        {
+            guard.insert(
+                key.to_owned(),
+                MemoryEntry {
+                    record: TrackedJobRecord {
+                        status: TrackedJobStatus::Pending,
+                        progress_pct: None,
+                        progress_message: None,
+                        result: None,
+                        error: None,
+                        owner,
+                        updated_at: now,
+                    },
+                    expires_at: now + self.ttl,
+                },
+            );
+        }
+    }
 }
 
 impl JobTrackingStore for InMemoryJobTrackingStore {
@@ -989,6 +1046,18 @@ impl JobTrackingStore for InMemoryJobTrackingStore {
     fn fail<'a>(&'a self, key: &'a str, error: String) -> BoxFut<'a, AutumnResult<()>> {
         Box::pin(async move {
             self.with_record_mut(key, |record| apply_fail(record, error));
+            Ok(())
+        })
+    }
+
+    fn reset_for_retry<'a>(
+        &'a self,
+        key: &'a str,
+        owner: TrackedJobOwner,
+        expected_updated_at: DateTime<Utc>,
+    ) -> BoxFut<'a, AutumnResult<()>> {
+        Box::pin(async move {
+            self.reset_for_retry_if_unchanged(key, owner, expected_updated_at);
             Ok(())
         })
     }
@@ -1101,6 +1170,59 @@ impl RedisJobTrackingStore {
         record.updated_at = chrono::Utc::now();
         self.write(key, &record).await
     }
+
+    /// Atomically overwrite the record with `new_record`, but only if the
+    /// currently-stored record's `updated_at` still equals
+    /// `expected_updated_at` — a compare-and-swap guard evaluated inside a
+    /// single Lua script so the check-then-write cannot race against a
+    /// concurrent write landing in between.
+    async fn write_if_unchanged(
+        &self,
+        key: &str,
+        expected_updated_at: DateTime<Utc>,
+        new_record: &TrackedJobRecord,
+    ) -> AutumnResult<()> {
+        const SCRIPT: &str = r"
+local raw = redis.call('GET', KEYS[1])
+if not raw then
+  return 0
+end
+local record = cjson.decode(raw)
+if record.updated_at ~= ARGV[1] then
+  return 0
+end
+redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3])
+return 1
+";
+        let expected = serde_json::to_string(&expected_updated_at).map_err(|error| {
+            AutumnError::internal_server_error_msg(format!(
+                "job tracking serialize failed: {error}"
+            ))
+        })?;
+        // cjson.decode(raw).updated_at yields the unquoted string value, so
+        // strip the JSON string quotes serde_json wraps it in above.
+        let expected = expected.trim_matches('"').to_owned();
+        let payload = serde_json::to_string(new_record).map_err(|error| {
+            AutumnError::internal_server_error_msg(format!(
+                "job tracking serialize failed: {error}"
+            ))
+        })?;
+        redis::cmd("EVAL")
+            .arg(SCRIPT)
+            .arg(1)
+            .arg(self.key_for(key))
+            .arg(expected)
+            .arg(payload)
+            .arg(self.ttl_secs.max(1))
+            .query_async::<i64>(&mut self.connection.clone())
+            .await
+            .map_err(|error| {
+                AutumnError::internal_server_error_msg(format!(
+                    "job tracking redis reset failed: {error}"
+                ))
+            })?;
+        Ok(())
+    }
 }
 
 #[cfg(feature = "redis")]
@@ -1146,6 +1268,27 @@ impl JobTrackingStore for RedisJobTrackingStore {
 
     fn fail<'a>(&'a self, key: &'a str, error: String) -> BoxFut<'a, AutumnResult<()>> {
         Box::pin(async move { self.update(key, |record| apply_fail(record, error)).await })
+    }
+
+    fn reset_for_retry<'a>(
+        &'a self,
+        key: &'a str,
+        owner: TrackedJobOwner,
+        expected_updated_at: DateTime<Utc>,
+    ) -> BoxFut<'a, AutumnResult<()>> {
+        Box::pin(async move {
+            let record = TrackedJobRecord {
+                status: TrackedJobStatus::Pending,
+                progress_pct: None,
+                progress_message: None,
+                result: None,
+                error: None,
+                owner,
+                updated_at: chrono::Utc::now(),
+            };
+            self.write_if_unchanged(key, expected_updated_at, &record)
+                .await
+        })
     }
 
     fn get<'a>(&'a self, key: &'a str) -> BoxFut<'a, AutumnResult<Option<TrackedJobRecord>>> {
@@ -1364,6 +1507,56 @@ impl JobTrackingStore for PgJobTrackingStore {
         Box::pin(async move { self.update(key, |record| apply_fail(record, error)).await })
     }
 
+    fn reset_for_retry<'a>(
+        &'a self,
+        key: &'a str,
+        owner: TrackedJobOwner,
+        expected_updated_at: DateTime<Utc>,
+    ) -> BoxFut<'a, AutumnResult<()>> {
+        Box::pin(async move {
+            use diesel_async::RunQueryDsl as _;
+
+            let now = self.clock.now();
+            let record = TrackedJobRecord {
+                status: TrackedJobStatus::Pending,
+                progress_pct: None,
+                progress_message: None,
+                result: None,
+                error: None,
+                owner,
+                updated_at: now,
+            };
+            let payload = serde_json::to_string(&record).map_err(|error| {
+                AutumnError::internal_server_error_msg(format!(
+                    "job tracking serialize failed: {error}"
+                ))
+            })?;
+            let mut conn = self.conn().await?;
+            // The WHERE clause is a compare-and-swap guard: it only takes
+            // effect if nothing has written to this record (e.g. the
+            // retried attempt itself already settling) since
+            // `expected_updated_at` was read, so a fast retry can never
+            // clobber a fresher terminal write with a stale reset.
+            diesel::sql_query(
+                "UPDATE autumn_job_tracking SET record = $2::JSONB, updated_at = $3, \
+                 expires_at = $4 WHERE key = $1 AND updated_at = $5",
+            )
+            .bind::<diesel::sql_types::Text, _>(key)
+            .bind::<diesel::sql_types::Text, _>(&payload)
+            .bind::<diesel::sql_types::Timestamptz, _>(now)
+            .bind::<diesel::sql_types::Timestamptz, _>(self.expires_at(now))
+            .bind::<diesel::sql_types::Timestamptz, _>(expected_updated_at)
+            .execute(&mut *conn)
+            .await
+            .map_err(|error| {
+                AutumnError::internal_server_error_msg(format!(
+                    "job tracking reset failed: {error}"
+                ))
+            })?;
+            Ok(())
+        })
+    }
+
     fn get<'a>(&'a self, key: &'a str) -> BoxFut<'a, AutumnResult<Option<TrackedJobRecord>>> {
         Box::pin(async move {
             use diesel::OptionalExtension as _;
@@ -1474,6 +1667,64 @@ mod tests {
         assert_eq!(record.owner, TrackedJobOwner::User("user:42".to_owned()));
         assert!(record.progress_pct.is_none());
         assert!(record.result.is_none());
+    }
+
+    #[tokio::test]
+    async fn reset_for_retry_applies_when_the_record_is_unchanged() {
+        let store = store();
+        store
+            .create("k1", TrackedJobOwner::User("user:42".to_owned()))
+            .await
+            .unwrap();
+        store.fail("k1", "boom".to_owned()).await.unwrap();
+        let stale = store.get("k1").await.unwrap().expect("record");
+        assert_eq!(stale.status, TrackedJobStatus::Failed);
+
+        store
+            .reset_for_retry("k1", stale.owner.clone(), stale.updated_at)
+            .await
+            .unwrap();
+
+        let record = store.get("k1").await.unwrap().expect("record");
+        assert_eq!(record.status, TrackedJobStatus::Pending);
+        assert_eq!(record.owner, TrackedJobOwner::User("user:42".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn reset_for_retry_is_a_no_op_when_a_fresher_write_already_landed() {
+        // Simulates the race Codex flagged: the retried job is re-enqueued,
+        // claimed, and settles to a terminal status before the admin retry
+        // path gets around to calling `reset_for_retry` with the
+        // `updated_at` it read *before* deciding to retry.
+        let store = store();
+        store
+            .create("k1", TrackedJobOwner::Anonymous)
+            .await
+            .unwrap();
+        store.fail("k1", "boom".to_owned()).await.unwrap();
+        let stale = store.get("k1").await.unwrap().expect("record");
+        assert_eq!(stale.status, TrackedJobStatus::Failed);
+
+        // The retried attempt runs to completion in the meantime.
+        store
+            .complete("k1", serde_json::json!({"already": "done"}))
+            .await
+            .unwrap();
+
+        // The admin retry path's reset, still holding the pre-retry
+        // snapshot, must not clobber the fresher terminal result.
+        store
+            .reset_for_retry("k1", stale.owner, stale.updated_at)
+            .await
+            .unwrap();
+
+        let record = store.get("k1").await.unwrap().expect("record");
+        assert_eq!(
+            record.status,
+            TrackedJobStatus::Succeeded,
+            "a reset computed from a stale read must not overwrite a write that landed since"
+        );
+        assert_eq!(record.result, Some(serde_json::json!({"already": "done"})));
     }
 
     // ── shared mutation logic (single source of truth for all 3 backends) ────
@@ -1893,6 +2144,14 @@ mod tests {
             }
             fn fail<'a>(&'a self, key: &'a str, error: String) -> BoxFut<'a, AutumnResult<()>> {
                 self.inner.fail(key, error)
+            }
+            fn reset_for_retry<'a>(
+                &'a self,
+                key: &'a str,
+                owner: TrackedJobOwner,
+                expected_updated_at: DateTime<Utc>,
+            ) -> BoxFut<'a, AutumnResult<()>> {
+                self.inner.reset_for_retry(key, owner, expected_updated_at)
             }
             fn get<'a>(
                 &'a self,
