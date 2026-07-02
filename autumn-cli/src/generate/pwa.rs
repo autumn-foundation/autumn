@@ -455,9 +455,10 @@ async fn pwa_register_js() -> impl IntoResponse {\n\
 }\n\
 \n\
 #[get(\"/offline\")]\n\
-async fn pwa_offline(flash: Flash) -> maud::Markup {\n\
+async fn pwa_offline(flash: Flash, path: CurrentPath) -> maud::Markup {\n\
     layout(\n\
         \"Offline\",\n\
+        path.as_str(),\n\
         flash.render().await,\n\
         maud::html! {\n\
             h1 { \"You are offline\" }\n\
@@ -524,7 +525,11 @@ use autumn_web::prelude::*;
 
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
 
-pub fn layout(title: &str, flash: maud::Markup, content: maud::Markup) -> maud::Markup {
+pub fn layout(title: &str, current_path: &str, flash: maud::Markup, content: maud::Markup) -> maud::Markup {
+    let nav = NavBarConfig::new()
+        .brand(\"My App\", \"/\")
+        .aria_label(\"Main navigation\")
+        .item(NavItem::link(\"/\", \"Home\"));
     maud::html! {
         (maud::DOCTYPE)
         html lang=\"en\" {
@@ -534,13 +539,12 @@ pub fn layout(title: &str, flash: maud::Markup, content: maud::Markup) -> maud::
                 title { (title) }
                 link rel=\"stylesheet\" href=(autumn_web::flash::FLASH_CSS_PATH);
                 link rel=\"stylesheet\" href=\"/static/css/app.css\";
+                script src=(autumn_web::htmx::AUTUMN_WIDGETS_JS_PATH) defer {}
             }
             body {
                 (skip_link(\"#main-content\", \"Skip to main content\"))
                 header role=\"banner\" {
-                    nav aria-label=\"Main navigation\" {
-                        a href=\"/\" { \"My App\" }
-                    }
+                    (nav_bar(current_path, &nav))
                 }
                 main id=\"main-content\" role=\"main\" {
                     (flash)
@@ -555,8 +559,8 @@ pub fn layout(title: &str, flash: maud::Markup, content: maud::Markup) -> maud::
 }
 
 #[get(\"/\")]
-async fn index(flash: Flash) -> maud::Markup {
-    layout(\"Welcome\", flash.render().await, maud::html! {
+async fn index(flash: Flash, path: CurrentPath) -> maud::Markup {
+    layout(\"Welcome\", path.as_str(), flash.render().await, maud::html! {
         h1 { \"Welcome!\" }
     })
 }
@@ -922,6 +926,26 @@ async fn main() {
         let twice = inject_pwa_into_main(&once);
         let handler_count = twice.matches("async fn pwa_manifest()").count();
         assert_eq!(handler_count, 1, "must not duplicate pwa_manifest handler");
+    }
+
+    #[test]
+    fn pwa_offline_handler_matches_current_layout_arity() {
+        // The scaffold's layout() takes (title, current_path, flash, content) —
+        // pwa_offline must extract CurrentPath and pass it through, or the
+        // generated src/main.rs fails to compile with an arity mismatch.
+        let updated = inject_pwa_into_main(DEFAULT_MAIN);
+        assert!(
+            updated.contains("async fn pwa_offline(flash: Flash, path: CurrentPath)"),
+            "pwa_offline must extract CurrentPath alongside Flash: {updated}"
+        );
+        let offline_fn_start = updated
+            .find("async fn pwa_offline")
+            .expect("pwa_offline handler must be present");
+        let offline_fn = &updated[offline_fn_start..offline_fn_start + 200];
+        assert!(
+            offline_fn.contains("\"Offline\"") && offline_fn.contains("path.as_str()"),
+            "pwa_offline must pass path.as_str() as layout()'s second argument: {offline_fn}"
+        );
     }
 
     // ── plan execution ────────────────────────────────────────────────────────
