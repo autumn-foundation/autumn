@@ -12,6 +12,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
+use axum::response::IntoResponse as _;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -429,6 +430,65 @@ pub async fn enqueue_tracked_for(
     }
 
     Ok(TrackedJobHandle { token })
+}
+
+// ── Status route ───────────────────────────────────────────────────────────────
+
+/// The built-in status route's axum path pattern (mounted at
+/// `mount_framework_routes` time when `jobs.tracking.route_enabled`).
+pub(crate) const JOB_STATUS_ROUTE_PATH: &str = "/_autumn/jobs/{token}";
+
+/// JSON representation of a tracked job's status, returned by the built-in
+/// status route to API clients (and reused as the data behind the htmx
+/// fragment for browser clients).
+#[derive(Debug, Clone, Serialize)]
+struct JobStatusDto {
+    status: TrackedJobStatus,
+    progress: Option<u8>,
+    message: Option<String>,
+    result: Option<Value>,
+    error: Option<String>,
+}
+
+impl From<&TrackedJobRecord> for JobStatusDto {
+    fn from(record: &TrackedJobRecord) -> Self {
+        Self {
+            status: record.status,
+            progress: record.progress_pct,
+            message: record.progress_message.clone(),
+            result: record.result.clone(),
+            error: record.error.clone(),
+        }
+    }
+}
+
+/// Router for the framework's built-in tracked-job status endpoint.
+///
+/// Mounted automatically unless `jobs.tracking.route_enabled = false`.
+pub(crate) fn status_router() -> axum::Router<AppState> {
+    axum::Router::new().route(JOB_STATUS_ROUTE_PATH, axum::routing::get(job_status_handler))
+}
+
+/// `GET /_autumn/jobs/{token}`: resolve the tracked-job record for `token`
+/// and return it as JSON. Unknown, expired, and (once owner binding lands)
+/// unauthorized tokens all render the identical 404 so the route is never an
+/// existence/ownership oracle.
+async fn job_status_handler(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::extract::Path(token): axum::extract::Path<String>,
+) -> AutumnResult<axum::response::Response> {
+    let not_found = || AutumnError::not_found_msg("This job status page could not be found.");
+
+    let store = tracking_store_from_state(&state).ok_or_else(not_found)?;
+    let key = crate::auth::hash_api_token(&token);
+    let record = store.get(&key).await?.ok_or_else(not_found)?;
+
+    let mut response = axum::Json(JobStatusDto::from(&record)).into_response();
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    Ok(response)
 }
 
 // ── In-memory store ───────────────────────────────────────────────────────────

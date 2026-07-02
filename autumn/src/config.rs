@@ -104,6 +104,8 @@
 //! | `AUTUMN_JOBS__REDIS__KEY_PREFIX` | `jobs.redis.key_prefix` | `String` |
 //! | `AUTUMN_JOBS__REDIS__VISIBILITY_TIMEOUT_MS` | `jobs.redis.visibility_timeout_ms` | `u64` |
 //! | `AUTUMN_JOBS__POSTGRES__VISIBILITY_TIMEOUT_MS` | `jobs.postgres.visibility_timeout_ms` | `u64` |
+//! | `AUTUMN_JOBS__TRACKING__TTL_SECS` | `jobs.tracking.ttl_secs` | `u64` |
+//! | `AUTUMN_JOBS__TRACKING__ROUTE_ENABLED` | `jobs.tracking.route_enabled` | `bool` |
 //! | `AUTUMN_SCHEDULER__BACKEND` | `scheduler.backend` | `in_process` / `postgres` |
 //! | `AUTUMN_SCHEDULER__LEASE_TTL_SECS` | `scheduler.lease_ttl_secs` | `u64` |
 //! | `AUTUMN_SCHEDULER__REPLICA_ID` | `scheduler.replica_id` | `String` |
@@ -1710,6 +1712,10 @@ pub struct JobConfig {
     /// Postgres backend options.
     #[serde(default)]
     pub postgres: JobPostgresConfig,
+    /// Tracked-job progress/result store options (`enqueue_tracked`, the
+    /// built-in `GET /_autumn/jobs/{token}` status route).
+    #[serde(default)]
+    pub tracking: JobTrackingConfig,
 }
 
 impl Default for JobConfig {
@@ -1722,6 +1728,7 @@ impl Default for JobConfig {
             queues: JobQueuesConfig::default(),
             redis: JobRedisConfig::default(),
             postgres: JobPostgresConfig::default(),
+            tracking: JobTrackingConfig::default(),
         }
     }
 }
@@ -1910,6 +1917,36 @@ impl Default for JobPostgresConfig {
             visibility_timeout_ms: default_jobs_pg_visibility_timeout_ms(),
         }
     }
+}
+
+/// Tracked-job progress/result store configuration.
+#[derive(Debug, Clone, Deserialize)]
+pub struct JobTrackingConfig {
+    /// How long a tracked job's progress/result record is retained after its
+    /// last write, in seconds. Default: 24 hours.
+    #[serde(default = "default_jobs_tracking_ttl_secs")]
+    pub ttl_secs: u64,
+    /// Whether the built-in `GET /_autumn/jobs/{token}` status route is
+    /// mounted. Default: `true`.
+    #[serde(default = "default_jobs_tracking_route_enabled")]
+    pub route_enabled: bool,
+}
+
+impl Default for JobTrackingConfig {
+    fn default() -> Self {
+        Self {
+            ttl_secs: default_jobs_tracking_ttl_secs(),
+            route_enabled: default_jobs_tracking_route_enabled(),
+        }
+    }
+}
+
+const fn default_jobs_tracking_ttl_secs() -> u64 {
+    86_400
+}
+
+const fn default_jobs_tracking_route_enabled() -> bool {
+    true
 }
 
 const fn default_jobs_pg_visibility_timeout_ms() -> u64 {
@@ -2474,6 +2511,8 @@ impl AutumnConfig {
     /// - `AUTUMN_JOBS__REDIS__URL` → `jobs.redis.url` (`String`)
     /// - `AUTUMN_JOBS__REDIS__KEY_PREFIX` → `jobs.redis.key_prefix` (`String`)
     /// - `AUTUMN_JOBS__REDIS__VISIBILITY_TIMEOUT_MS` → `jobs.redis.visibility_timeout_ms` (`u64`)
+    /// - `AUTUMN_JOBS__TRACKING__TTL_SECS` → `jobs.tracking.ttl_secs` (`u64`)
+    /// - `AUTUMN_JOBS__TRACKING__ROUTE_ENABLED` → `jobs.tracking.route_enabled` (`bool`)
     ///
     /// # Signed webhooks
     /// - `AUTUMN_SECURITY__WEBHOOKS__REPLAY__BACKEND` -> `security.webhooks.replay.backend` (`memory` / `redis`)
@@ -2991,6 +3030,16 @@ impl AutumnConfig {
             env,
             "AUTUMN_JOBS__POSTGRES__VISIBILITY_TIMEOUT_MS",
             &mut self.jobs.postgres.visibility_timeout_ms,
+        );
+        parse_env(
+            env,
+            "AUTUMN_JOBS__TRACKING__TTL_SECS",
+            &mut self.jobs.tracking.ttl_secs,
+        );
+        parse_env_bool(
+            env,
+            "AUTUMN_JOBS__TRACKING__ROUTE_ENABLED",
+            &mut self.jobs.tracking.route_enabled,
         );
     }
 
@@ -7041,6 +7090,40 @@ path = "/healthz"
         );
         assert_eq!(config.jobs.redis.key_prefix, "myapp:jobs");
         assert_eq!(config.jobs.redis.visibility_timeout_ms, 45_000);
+    }
+
+    #[test]
+    fn job_tracking_config_defaults_ttl_86400_and_route_enabled() {
+        let config = AutumnConfig::default();
+        assert_eq!(config.jobs.tracking.ttl_secs, 86_400);
+        assert!(config.jobs.tracking.route_enabled);
+    }
+
+    #[test]
+    fn env_override_jobs_tracking_fields() {
+        let env = MockEnv::new()
+            .with("AUTUMN_JOBS__TRACKING__TTL_SECS", "3600")
+            .with("AUTUMN_JOBS__TRACKING__ROUTE_ENABLED", "false");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+
+        assert_eq!(config.jobs.tracking.ttl_secs, 3_600);
+        assert!(!config.jobs.tracking.route_enabled);
+    }
+
+    #[test]
+    fn jobs_toml_deserializes_tracking_fields() {
+        let config: AutumnConfig = toml::from_str(
+            r#"
+            [jobs.tracking]
+            ttl_secs = 7200
+            route_enabled = false
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(config.jobs.tracking.ttl_secs, 7_200);
+        assert!(!config.jobs.tracking.route_enabled);
     }
 
     #[test]

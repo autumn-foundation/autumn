@@ -1079,6 +1079,13 @@ fn collect_claimed_get_paths(
     if config.mail.should_mount_unsubscribe_endpoint() {
         claimed.insert(crate::mail::UNSUBSCRIBE_PATH.to_owned());
     }
+    // The tracked-job status endpoint merges a GET before the late-merged
+    // OpenAPI/MCP routers, so reserve it too (same rationale as unsubscribe
+    // above): an OpenAPI/MCP mount at this path should surface the typed
+    // collision instead of panicking in `router.merge`.
+    if config.jobs.tracking.route_enabled {
+        claimed.insert(crate::job_tracking::JOB_STATUS_ROUTE_PATH.to_owned());
+    }
     claimed
 }
 
@@ -1512,6 +1519,16 @@ fn mount_framework_routes(
         tracing::debug!(
             path = crate::mail::UNSUBSCRIBE_PATH,
             "Mounted default unsubscribe endpoint"
+        );
+    }
+
+    // Tracked-job status endpoint (enqueue_tracked / #[job] JobContext) — on
+    // by default; opt out via `jobs.tracking.route_enabled = false`.
+    if config.jobs.tracking.route_enabled {
+        router = router.merge(crate::job_tracking::status_router());
+        tracing::debug!(
+            path = crate::job_tracking::JOB_STATUS_ROUTE_PATH,
+            "Mounted tracked-job status endpoint"
         );
     }
 
@@ -4720,6 +4737,41 @@ mod tests {
                 field: "openapi_json_path",
                 ref path,
             } if path == crate::mail::UNSUBSCRIBE_PATH
+        ));
+    }
+
+    #[cfg(feature = "openapi")]
+    #[tokio::test]
+    async fn try_build_router_rejects_openapi_path_on_job_status_endpoint() {
+        // The tracked-job status endpoint merges a GET at
+        // `/_autumn/jobs/{token}` before the late-merged OpenAPI router (on by
+        // default), so the collision preflight must reserve it too.
+        let config = AutumnConfig::default();
+        assert!(config.jobs.tracking.route_enabled);
+        let openapi = crate::openapi::OpenApiConfig::new("Demo", "1.0.0")
+            .openapi_json_path(crate::job_tracking::JOB_STATUS_ROUTE_PATH);
+        let ctx = RouterContext {
+            exception_filters: Vec::new(),
+            scoped_groups: Vec::new(),
+            merge_routers: Vec::new(),
+            nest_routers: Vec::new(),
+            custom_layers: Vec::new(),
+            static_gate_layers: Vec::new(),
+            #[cfg(feature = "maud")]
+            error_page_renderer: None,
+            session_store: None,
+            openapi: Some(openapi),
+            #[cfg(feature = "mcp")]
+            mcp: None,
+        };
+        let err = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx)
+            .expect_err("job status endpoint path should be reserved");
+        assert!(matches!(
+            err,
+            RouterBuildError::OpenApiPathCollision {
+                field: "openapi_json_path",
+                ref path,
+            } if path == crate::job_tracking::JOB_STATUS_ROUTE_PATH
         ));
     }
 
