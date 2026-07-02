@@ -11,7 +11,9 @@ use autumn_web::job::{
 use autumn_web::pagination::Page;
 use autumn_web::runtime_config::{ConfigChangeRecord, ConfigEntry};
 use autumn_web::ui::pagination::{PagerOptions, pagination_nav};
-use autumn_web::widgets::{CardConfig, card, nav_link, stat_card};
+use autumn_web::widgets::{
+    CardConfig, NavBarConfig, NavBarLayout, NavItem, card, nav_bar, stat_card,
+};
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 use serde_json::Value;
 
@@ -90,7 +92,8 @@ const ADMIN_CSS: &str = "
         padding: 2rem;
         min-width: 0;
     }
-    .admin-logo {
+    .admin-sidebar .autumn-nav__brand {
+        display: block;
         font-size: 1.125rem;
         font-weight: 700;
         padding: 0 1.5rem 1rem;
@@ -98,8 +101,8 @@ const ADMIN_CSS: &str = "
         margin-bottom: 1rem;
         color: var(--text);
     }
-    .admin-nav { list-style: none; }
-    .admin-nav li a {
+    .admin-sidebar .autumn-nav__items { list-style: none; }
+    .admin-sidebar .autumn-nav__item a {
         display: block;
         padding: 0.5rem 1.5rem;
         color: var(--text-muted);
@@ -108,23 +111,29 @@ const ADMIN_CSS: &str = "
         border-left: 3px solid transparent;
         transition: all 0.15s;
     }
-    .admin-nav li a:hover {
+    .admin-sidebar .autumn-nav__item a:hover {
         background: var(--bg);
         color: var(--text);
         text-decoration: none;
     }
-    .admin-nav li a.active {
+    .admin-sidebar .autumn-nav__item a.active {
         background: var(--primary-light);
         color: var(--primary);
         border-left-color: var(--primary);
     }
-    .admin-nav-section {
+    .admin-sidebar .autumn-nav__section {
         font-size: 0.7rem;
         text-transform: uppercase;
         letter-spacing: 0.05em;
         color: var(--text-muted);
         padding: 1rem 1.5rem 0.375rem;
         font-weight: 600;
+    }
+    /* The sidebar hides itself entirely below 768px (see the .admin-sidebar
+       rule in the Responsive section) instead of collapsing behind nav_bar's
+       own hamburger toggle, so the toggle stays hidden at every width. */
+    .admin-sidebar .autumn-nav__toggle {
+        display: none;
     }
 
     /* Cards */
@@ -425,6 +434,30 @@ pub fn admin_layout(
         Some(RUNTIME_CONFIG_NAV_SLUG) => config_href.clone(),
         Some(slug) => format!("{prefix}/{slug}"),
     };
+
+    let mut nav_items = vec![NavItem::link(prefix, "Dashboard")];
+    if registry.model_count() > 0 {
+        nav_items.push(NavItem::section("Models"));
+        nav_items.extend(registry.iter().map(|(slug, model)| {
+            NavItem::link(format!("{prefix}/{slug}"), model.display_name_plural())
+        }));
+    }
+    nav_items.push(NavItem::section("System"));
+    nav_items.push(NavItem::link(jobs_href, "Jobs"));
+    if show_config {
+        nav_items.push(NavItem::link(config_href, "Runtime Config"));
+    }
+    nav_items.push(NavItem::plain_link(
+        format!("{actuator_prefix}/ui"),
+        "Actuator",
+    ));
+    let sidebar_nav = NavBarConfig::new()
+        .brand_html(html! { "🍂 Autumn Admin" }, None)
+        .items(nav_items)
+        .aria_label("Admin navigation")
+        .layout(NavBarLayout::Sidebar)
+        .class("admin-sidebar");
+
     html! {
         (DOCTYPE)
         html lang="en" {
@@ -440,6 +473,11 @@ pub fn admin_layout(
                 title { (title) " — Autumn Admin" }
                 script src=(HTMX_JS_PATH) {}
                 script src=(HTMX_CSRF_JS_PATH) {}
+                // Reveals/wires up nav_bar's hamburger toggle and any future
+                // dropdown menu; the sidebar itself stays fully visible/hidden
+                // via the .admin-sidebar media-query rule below, not the
+                // toggle, so its own toggle button is kept CSS-hidden always.
+                script src=(autumn_web::htmx::AUTUMN_WIDGETS_JS_PATH) defer {}
                 // External so it runs under the default CSP `script-src 'self'`.
                 script src={ (prefix) (&**ADMIN_JS_PATH) } {}
                 style {
@@ -454,38 +492,7 @@ pub fn admin_layout(
                 div class="admin-layout" {
                     // Sidebar navigation landmark
                     header role="banner" {
-                        nav class="admin-sidebar" aria-label="Admin navigation" {
-                            div class="admin-logo" { "🍂 Autumn Admin" }
-                            ul class="admin-nav" {
-                                li { (nav_link(&current_path, prefix, "Dashboard")) }
-                                @if registry.model_count() > 0 {
-                                    li { div class="admin-nav-section" { "Models" } }
-                                    @for (slug, model) in registry.iter() {
-                                        li {
-                                            (nav_link(
-                                                &current_path,
-                                                &format!("{prefix}/{slug}"),
-                                                model.display_name_plural(),
-                                            ))
-                                        }
-                                    }
-                                }
-                                li { div class="admin-nav-section" { "System" } }
-                                li {
-                                    (nav_link(&current_path, &jobs_href, "Jobs"))
-                                }
-                                @if show_config {
-                                    li {
-                                        (nav_link(
-                                            &current_path,
-                                            &config_href,
-                                            "Runtime Config",
-                                        ))
-                                    }
-                                }
-                                li { a href={ (actuator_prefix) "/ui" } { "Actuator" } }
-                            }
-                        }
+                        (nav_bar(&current_path, &sidebar_nav))
                     }
                     // Main content landmark
                     main id="admin-main" class="admin-main" {
@@ -3971,5 +3978,110 @@ mod tests {
             !html.contains(r#"href="/admin" class="active""#),
             "dashboard must not be active: {html}"
         );
+    }
+
+    // ── admin_layout nav_bar (#1137) ──────────────────────────────────────
+
+    use crate::registry::tests::DummyModel;
+
+    fn render_layout_with_registry(registry: &AdminRegistry, active_slug: Option<&str>) -> String {
+        admin_layout(
+            registry,
+            active_slug,
+            "Title",
+            "/admin",
+            "/actuator",
+            "tok",
+            "X-CSRF-Token",
+            &[],
+            true,
+            &html! {},
+        )
+        .into_string()
+    }
+
+    #[test]
+    fn admin_layout_renders_nav_bar_sidebar() {
+        let html = render_layout(None);
+        assert!(html.contains("autumn-nav--sidebar"), "{html}");
+        assert!(
+            html.contains(r#"class="autumn-nav autumn-nav--sidebar admin-sidebar""#),
+            "{html}"
+        );
+        assert!(html.contains(r#"aria-label="Admin navigation""#), "{html}");
+    }
+
+    #[test]
+    fn admin_layout_brand_uses_nav_brand_class() {
+        let html = render_layout(None);
+        assert!(html.contains("autumn-nav__brand"), "{html}");
+        assert!(html.contains("🍂 Autumn Admin"), "{html}");
+        assert!(!html.contains(r#"class="admin-logo""#), "{html}");
+    }
+
+    #[test]
+    fn admin_layout_sections_render_as_nav_sections_without_models() {
+        let html = render_layout(None);
+        assert!(
+            html.contains(r#"<li class="autumn-nav__section">System</li>"#),
+            "{html}"
+        );
+        assert!(!html.contains("Models"), "{html}");
+    }
+
+    #[test]
+    fn admin_layout_sections_render_as_nav_sections_with_models() {
+        let mut registry = AdminRegistry::new();
+        registry.register(DummyModel {
+            slug: "projects",
+            name: "Projects",
+        });
+        let html = render_layout_with_registry(&registry, None);
+        assert!(
+            html.contains(r#"<li class="autumn-nav__section">Models</li>"#),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"<li class="autumn-nav__section">System</li>"#),
+            "{html}"
+        );
+        assert!(html.contains(r#"href="/admin/projects""#), "{html}");
+    }
+
+    #[test]
+    fn admin_layout_actuator_link_is_plain() {
+        let html = render_layout(None);
+        assert!(html.contains(r#"href="/actuator/ui""#), "{html}");
+        // Only one aria-current in the whole page: Dashboard's. The Actuator
+        // link must never claim active state even though it's the last item.
+        assert_eq!(html.matches(r#"aria-current="page""#).count(), 1, "{html}");
+    }
+
+    #[test]
+    fn admin_layout_has_no_hand_rolled_nav_markup() {
+        let html = render_layout(None);
+        assert!(!html.contains(r#"class="admin-nav""#), "{html}");
+        assert!(!html.contains("admin-logo"), "{html}");
+    }
+
+    #[test]
+    fn admin_layout_loads_nav_bar_widget_runtime() {
+        // nav_bar's hamburger toggle and any future dropdown depend on
+        // autumn-widgets.js to reveal/wire them up; without it the toggle
+        // stays permanently hidden and dead.
+        let html = render_layout(None);
+        assert!(
+            html.contains(autumn_web::htmx::AUTUMN_WIDGETS_JS_PATH),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn admin_sidebar_toggle_stays_hidden() {
+        // The admin sidebar hides itself entirely below 768px (see the
+        // .admin-sidebar { display: none } media rule) rather than using
+        // nav_bar's own collapse-behind-a-hamburger UX, so the toggle must
+        // never become visible even once autumn-widgets.js unhides it.
+        assert!(ADMIN_CSS.contains(".autumn-nav__toggle"), "{ADMIN_CSS}");
     }
 }

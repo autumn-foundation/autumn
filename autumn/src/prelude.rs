@@ -178,10 +178,11 @@ pub use crate::form::{Changeset, ChangesetForm, IntoChangeset};
 #[cfg(feature = "maud")]
 pub use crate::widgets::{
     ActiveSearchConfig, AutocompleteConfig, CardConfig, Column, Crumb, Cta, CtaStyle,
-    DataTableConfig, HeadingLevel, HeroConfig, NavLinkMatch, SearchMethod, SortDir, active_search,
-    active_search_empty_state, active_search_input, active_search_results,
-    autocomplete_empty_state, autocomplete_input, autocomplete_option, breadcrumb, card,
-    data_table, hero, nav_link, nav_link_matched, property_list, stat_card,
+    DataTableConfig, HeadingLevel, HeroConfig, NavBarConfig, NavBarLayout, NavItem, NavLinkMatch,
+    NavMenu, SearchMethod, SortDir, active_search, active_search_empty_state, active_search_input,
+    active_search_results, autocomplete_empty_state, autocomplete_input, autocomplete_option,
+    breadcrumb, card, data_table, hero, nav_bar, nav_link, nav_link_matched, property_list,
+    stat_card,
 };
 
 // ── Hooks ───────────────────────────────────────────────────────

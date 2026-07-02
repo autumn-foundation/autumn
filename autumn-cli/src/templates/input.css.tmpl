@@ -10,3 +10,62 @@
     @apply top-0 outline-none ring-2 ring-offset-2 ring-blue-500;
   }
 }
+
+@layer components {
+  /* Hooks for autumn_web::widgets::nav_bar() — see its rustdoc for the full
+     class list. nav_bar itself emits no inline styles; only the responsive
+     collapse/dropdown behavior below needs app CSS. */
+  .autumn-nav {
+    @apply flex items-center gap-4 px-4 py-3;
+  }
+  .autumn-nav__brand {
+    @apply font-semibold text-gray-900 no-underline;
+  }
+  .autumn-nav__toggle {
+    @apply hidden;
+  }
+  /* Wraps the primary and trailing item lists. Must be a flex row itself
+     (and grow to fill the space brand/toggle don't use) or the two lists
+     just stack as ordinary block children instead of sitting side by side —
+     which would leave .autumn-nav__items--trailing's ml-auto below with
+     nothing to push against. */
+  .autumn-nav__collapse {
+    @apply flex items-center gap-4 flex-1;
+  }
+  .autumn-nav__items {
+    @apply flex items-center gap-4 list-none;
+  }
+  .autumn-nav__items--trailing {
+    @apply ml-auto;
+  }
+  .autumn-nav__item--menu {
+    @apply relative;
+  }
+  .autumn-nav__menu {
+    @apply list-none;
+  }
+  .autumn-nav__menu[hidden] {
+    @apply hidden;
+  }
+
+  @media (max-width: 768px) {
+    /* .autumn-nav is a nowrap flex row; .autumn-nav__collapse's basis-full
+       below only starts a new row (dropping the menu under the brand/toggle
+       instead of squeezing onto the same row) once the row itself can wrap. */
+    .autumn-nav--enhanced {
+      @apply flex-wrap;
+    }
+    .autumn-nav--enhanced .autumn-nav__toggle {
+      @apply flex;
+    }
+    .autumn-nav--enhanced .autumn-nav__collapse {
+      @apply hidden w-full basis-full flex-col items-start;
+    }
+    .autumn-nav--enhanced .autumn-nav__collapse--open {
+      @apply flex;
+    }
+    .autumn-nav--enhanced .autumn-nav__items {
+      @apply flex-col items-start;
+    }
+  }
+}

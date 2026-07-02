@@ -24,10 +24,34 @@ use super::{Flags, GenerateError, ensure_project_root};
 /// Compute the file actions for `autumn generate pwa`.
 ///
 /// # Errors
-/// Returns [`GenerateError::NotInProject`] when not at a project root, or
-/// [`GenerateError::Io`] if `src/main.rs` / `Cargo.toml` can't be read.
+/// Returns [`GenerateError::NotInProject`] when not at a project root,
+/// [`GenerateError::Io`] if `src/main.rs` / `Cargo.toml` can't be read, or
+/// [`GenerateError::Config`] when `src/main.rs`'s `layout()` doesn't accept
+/// `current_path` — the generated `pwa_offline` handler calls `layout()`
+/// with the current `nav_bar`-based scaffold's arity, so an app that
+/// hasn't migrated its own `layout()` needs to before running this.
 pub fn plan_pwa(project_root: &Path) -> Result<Plan, GenerateError> {
     ensure_project_root(project_root)?;
+
+    // Read src/main.rs up front (rather than where it's injected below) so
+    // the layout() shape can be validated before any plan actions are built.
+    let main_path = project_root.join("src").join("main.rs");
+    let main_existing = std::fs::read_to_string(&main_path).map_err(|_| {
+        GenerateError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("missing {}", main_path.display()),
+        ))
+    })?;
+    if layout_missing_current_path(&main_existing) {
+        return Err(GenerateError::Config(format!(
+            "{}'s layout() takes fewer than 4 parameters — the current \
+             nav_bar-based scaffold needs layout(title: &str, current_path: &str, \
+             flash: Markup, content: Markup) (see autumn-cli/src/templates/main.rs.tmpl \
+             for the current shape; the path parameter's name doesn't matter) \
+             before running `autumn generate pwa`",
+            main_path.display()
+        )));
+    }
 
     let mut plan = Plan::new(project_root);
 
@@ -57,13 +81,6 @@ pub fn plan_pwa(project_root: &Path) -> Result<Plan, GenerateError> {
     );
 
     // src/main.rs: inject PWA meta tags + route handlers (idempotent)
-    let main_path = project_root.join("src").join("main.rs");
-    let main_existing = std::fs::read_to_string(&main_path).map_err(|_| {
-        GenerateError::Io(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("missing {}", main_path.display()),
-        ))
-    })?;
     let updated_main = inject_pwa_into_main(&main_existing);
     if updated_main != main_existing {
         plan.modify(main_path, updated_main);
@@ -411,6 +428,82 @@ fn inject_pwa_meta_into_head(source: &str) -> String {
     result
 }
 
+/// True when `source` defines a `layout()` function with fewer than 4
+/// parameters — the pre-`nav_bar` scaffold shape (`layout(title, flash,
+/// content)`) rather than the current one (`layout(title, current_path,
+/// flash, content)`). `pwa_offline`'s generated call assumes 4 positional
+/// arguments, so this gates [`plan_pwa`] with an actionable error instead
+/// of emitting code with the wrong arity.
+///
+/// Checks parameter *count*, not a specific name — Rust calls are
+/// positional, so a caller who named their path parameter `path` or
+/// `request_path` instead of `current_path` still compiles fine and must
+/// not be rejected.
+fn layout_missing_current_path(source: &str) -> bool {
+    let Some(start) = source.find("fn layout(") else {
+        return false;
+    };
+    let after_paren = &source[start + "fn layout(".len()..];
+    let Some(params) = balanced_prefix(after_paren) else {
+        return false;
+    };
+    count_params(params) < 4
+}
+
+/// Count comma-separated parameters in a (possibly multi-line, possibly
+/// trailing-comma) parameter list — the trailing comma rustfmt always adds
+/// when it wraps a signature onto separate lines doesn't itself count as an
+/// extra parameter.
+fn count_params(params: &str) -> usize {
+    let trimmed = params.trim();
+    if trimmed.is_empty() {
+        return 0;
+    }
+    let commas = count_top_level_commas(trimmed);
+    if trimmed.ends_with(',') {
+        commas
+    } else {
+        commas + 1
+    }
+}
+
+/// The prefix of `s` up to (not including) the `)` that closes the opening
+/// paren implicit in the caller's position — tracks `(`/`[` nesting (e.g. a
+/// closure-typed parameter like `Fn(i32) -> bool`) so an inner `)` doesn't
+/// end the scan early. Returns `None` if unbalanced.
+fn balanced_prefix(s: &str) -> Option<&str> {
+    let mut depth = 0i32;
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' | '[' => depth += 1,
+            ')' if depth == 0 => return Some(&s[..i]),
+            ')' | ']' => depth -= 1,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Count commas in `s` that aren't nested inside `(...)`/`[...]` — a cheap
+/// proxy for "how many parameters does this signature have" without a real
+/// parser. Doesn't track `<...>` generic nesting, so a parameter type with a
+/// top-level comma inside angle brackets (e.g. `HashMap<K, V>`) would
+/// over-count — harmless here since over-counting only makes this check
+/// *more* permissive, never a false rejection.
+fn count_top_level_commas(s: &str) -> usize {
+    let mut depth = 0i32;
+    let mut count = 0;
+    for c in s.chars() {
+        match c {
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth -= 1,
+            ',' if depth == 0 => count += 1,
+            _ => {}
+        }
+    }
+    count
+}
+
 /// Append `pwa_manifest`, `pwa_service_worker`, `pwa_register_js`, and `pwa_offline`
 /// handler functions just before `#[autumn_web::main]`.  Idempotent — skipped when
 /// `pwa_manifest` is already defined.
@@ -455,9 +548,10 @@ async fn pwa_register_js() -> impl IntoResponse {\n\
 }\n\
 \n\
 #[get(\"/offline\")]\n\
-async fn pwa_offline(flash: Flash) -> maud::Markup {\n\
+async fn pwa_offline(flash: Flash, path: CurrentPath) -> maud::Markup {\n\
     layout(\n\
         \"Offline\",\n\
+        path.as_str(),\n\
         flash.render().await,\n\
         maud::html! {\n\
             h1 { \"You are offline\" }\n\
@@ -524,7 +618,11 @@ use autumn_web::prelude::*;
 
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
 
-pub fn layout(title: &str, flash: maud::Markup, content: maud::Markup) -> maud::Markup {
+pub fn layout(title: &str, current_path: &str, flash: maud::Markup, content: maud::Markup) -> maud::Markup {
+    let nav = NavBarConfig::new()
+        .brand(\"My App\", \"/\")
+        .aria_label(\"Main navigation\")
+        .item(NavItem::link(\"/\", \"Home\"));
     maud::html! {
         (maud::DOCTYPE)
         html lang=\"en\" {
@@ -534,13 +632,12 @@ pub fn layout(title: &str, flash: maud::Markup, content: maud::Markup) -> maud::
                 title { (title) }
                 link rel=\"stylesheet\" href=(autumn_web::flash::FLASH_CSS_PATH);
                 link rel=\"stylesheet\" href=\"/static/css/app.css\";
+                script src=(autumn_web::htmx::AUTUMN_WIDGETS_JS_PATH) defer {}
             }
             body {
                 (skip_link(\"#main-content\", \"Skip to main content\"))
                 header role=\"banner\" {
-                    nav aria-label=\"Main navigation\" {
-                        a href=\"/\" { \"My App\" }
-                    }
+                    (nav_bar(current_path, &nav))
                 }
                 main id=\"main-content\" role=\"main\" {
                     (flash)
@@ -548,6 +645,51 @@ pub fn layout(title: &str, flash: maud::Markup, content: maud::Markup) -> maud::
                 }
                 footer role=\"contentinfo\" {
                     p { \"Built with Autumn\" }
+                }
+            }
+        }
+    }
+}
+
+#[get(\"/\")]
+async fn index(flash: Flash, path: CurrentPath) -> maud::Markup {
+    layout(\"Welcome\", path.as_str(), flash.render().await, maud::html! {
+        h1 { \"Welcome!\" }
+    })
+}
+
+#[autumn_web::main]
+async fn main() {
+    autumn_web::app()
+        .routes(routes![index])
+        .migrations(MIGRATIONS)
+        .run()
+        .await;
+}
+";
+
+    /// The pre-`nav_bar` scaffold shape: `layout()` has no `current_path`
+    /// parameter. Apps generated before `nav_bar` shipped still look like this.
+    const OLD_SHAPE_MAIN: &str = "\
+use autumn_web::form::skip_link;
+use autumn_web::migrate::{EmbeddedMigrations, embed_migrations};
+use autumn_web::prelude::*;
+
+const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
+
+pub fn layout(title: &str, flash: maud::Markup, content: maud::Markup) -> maud::Markup {
+    maud::html! {
+        (maud::DOCTYPE)
+        html lang=\"en\" {
+            head {
+                meta charset=\"utf-8\";
+                title { (title) }
+            }
+            body {
+                (skip_link(\"#main-content\", \"Skip to main content\"))
+                main id=\"main-content\" role=\"main\" {
+                    (flash)
+                    (content)
                 }
             }
         }
@@ -572,6 +714,61 @@ async fn main() {
 ";
 
     // ── plan_pwa: file plan tests ─────────────────────────────────────────────
+
+    #[test]
+    fn plan_pwa_rejects_layout_missing_current_path() {
+        // nav_bar's arrival made layout() take current_path as its second
+        // argument; pwa_offline's generated call now assumes that shape.
+        // Running against an app that hasn't migrated must fail loudly with
+        // an actionable message instead of silently emitting a call that
+        // won't compile.
+        let tmp = project_with_main(OLD_SHAPE_MAIN);
+        let err = plan_pwa(tmp.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("current_path"), "{msg}");
+        assert!(msg.contains("layout"), "{msg}");
+    }
+
+    #[test]
+    fn plan_pwa_accepts_rustfmt_wrapped_layout_signature() {
+        // rustfmt wraps layout()'s ~108-char signature onto separate lines
+        // (verified: `rustfmt` puts each param on its own line at the
+        // default 100-column width) — current_path then no longer shares a
+        // physical line with `fn layout(`, so a naive single-line scan would
+        // false-positive as "missing current_path" on any formatted,
+        // up-to-date project.
+        let wrapped_main = DEFAULT_MAIN.replace(
+            "pub fn layout(title: &str, current_path: &str, flash: maud::Markup, content: maud::Markup) -> maud::Markup {",
+            "pub fn layout(\n    title: &str,\n    current_path: &str,\n    flash: maud::Markup,\n    content: maud::Markup,\n) -> maud::Markup {",
+        );
+        assert_ne!(
+            wrapped_main, DEFAULT_MAIN,
+            "replacement must actually match"
+        );
+        let tmp = project_with_main(&wrapped_main);
+        plan_pwa(tmp.path())
+            .expect("rustfmt-wrapped current_path parameter must still be detected");
+    }
+
+    #[test]
+    fn plan_pwa_accepts_layout_with_renamed_path_parameter() {
+        // Rust calls are positional — a layout() with 4 parameters compiles
+        // fine against pwa_offline's 4-arg call regardless of what the
+        // second parameter is named. Requiring the literal name
+        // "current_path" would reject valid, already-migrated apps that
+        // simply chose a different name (e.g. `path`, `request_path`).
+        let renamed_main = DEFAULT_MAIN.replace(
+            "pub fn layout(title: &str, current_path: &str, flash: maud::Markup, content: maud::Markup) -> maud::Markup {",
+            "pub fn layout(title: &str, request_path: &str, flash: maud::Markup, content: maud::Markup) -> maud::Markup {",
+        );
+        assert_ne!(
+            renamed_main, DEFAULT_MAIN,
+            "replacement must actually match"
+        );
+        let tmp = project_with_main(&renamed_main);
+        plan_pwa(tmp.path())
+            .expect("a differently-named 4th parameter must still be accepted (arity, not name)");
+    }
 
     #[test]
     fn plan_pwa_requires_project_root() {
@@ -922,6 +1119,26 @@ async fn main() {
         let twice = inject_pwa_into_main(&once);
         let handler_count = twice.matches("async fn pwa_manifest()").count();
         assert_eq!(handler_count, 1, "must not duplicate pwa_manifest handler");
+    }
+
+    #[test]
+    fn pwa_offline_handler_matches_current_layout_arity() {
+        // The scaffold's layout() takes (title, current_path, flash, content) —
+        // pwa_offline must extract CurrentPath and pass it through, or the
+        // generated src/main.rs fails to compile with an arity mismatch.
+        let updated = inject_pwa_into_main(DEFAULT_MAIN);
+        assert!(
+            updated.contains("async fn pwa_offline(flash: Flash, path: CurrentPath)"),
+            "pwa_offline must extract CurrentPath alongside Flash: {updated}"
+        );
+        let offline_fn_start = updated
+            .find("async fn pwa_offline")
+            .expect("pwa_offline handler must be present");
+        let offline_fn = &updated[offline_fn_start..offline_fn_start + 200];
+        assert!(
+            offline_fn.contains("\"Offline\"") && offline_fn.contains("path.as_str()"),
+            "pwa_offline must pass path.as_str() as layout()'s second argument: {offline_fn}"
+        );
     }
 
     // ── plan execution ────────────────────────────────────────────────────────

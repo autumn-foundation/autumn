@@ -803,6 +803,107 @@ mod tests {
         assert!(content.contains("autumn_web::app()"));
     }
 
+    // ── nav_bar scaffold layout (#1137) ─────────────────────────────
+
+    #[test]
+    fn main_template_uses_nav_bar_widget() {
+        assert!(
+            templates::MAIN_RS.contains("nav_bar("),
+            "main.rs.tmpl should render its nav via nav_bar(), got:\n{}",
+            templates::MAIN_RS
+        );
+        assert!(
+            templates::MAIN_RS.contains("NavBarConfig::new()"),
+            "main.rs.tmpl should build a NavBarConfig, got:\n{}",
+            templates::MAIN_RS
+        );
+        assert!(
+            !templates::MAIN_RS.contains(r#"nav aria-label="Main navigation""#),
+            "main.rs.tmpl should no longer hand-roll its <nav>, got:\n{}",
+            templates::MAIN_RS
+        );
+    }
+
+    #[test]
+    fn main_template_layout_takes_current_path() {
+        assert!(
+            templates::MAIN_RS.contains("current_path: &str"),
+            "layout() should take current_path so nav_bar can mark the active link, got:\n{}",
+            templates::MAIN_RS
+        );
+        assert!(
+            templates::MAIN_RS.contains("CurrentPath"),
+            "index() should extract CurrentPath to pass to layout(), got:\n{}",
+            templates::MAIN_RS
+        );
+    }
+
+    #[test]
+    fn main_template_nav_keeps_descriptive_aria_label() {
+        // The old hand-rolled <nav> had aria-label="Main navigation"; nav_bar's
+        // own default is just "Main", so the template must call .aria_label(...)
+        // explicitly or the landmark's accessible name silently degrades.
+        assert!(
+            templates::MAIN_RS.contains(r#".aria_label("Main navigation")"#),
+            "layout()'s NavBarConfig should keep the descriptive \"Main navigation\" \
+             aria-label instead of nav_bar's generic \"Main\" default, got:\n{}",
+            templates::MAIN_RS
+        );
+    }
+
+    #[test]
+    fn input_css_mobile_nav_collapse_wraps_below_header() {
+        // .autumn-nav is a flex row (nowrap by default) and .autumn-nav__collapse
+        // is one of its flex items; giving that item `basis-full` only drops it
+        // to a new row if the row itself is allowed to wrap. Without flex-wrap
+        // on the enhanced root, the opened mobile menu squeezes/overflows onto
+        // the same row as the brand and toggle instead of appearing below them.
+        let rule_body = css_rule_body(templates::INPUT_CSS, ".autumn-nav--enhanced {");
+        assert!(
+            rule_body.contains("flex-wrap"),
+            "the mobile media query must set flex-wrap on .autumn-nav--enhanced itself \
+             so .autumn-nav__collapse's basis-full can actually start a new row, got:\n{}",
+            templates::INPUT_CSS
+        );
+    }
+
+    /// Extract the declaration block (without the braces) of the first CSS
+    /// rule whose selector text starts with `selector_prefix` (which must
+    /// include the trailing ` {`). Scans by byte position rather than
+    /// matching a literal multi-line blob, so it doesn't depend on the
+    /// source file's line-ending style — this repo checks out `*.tmpl` as
+    /// `text=auto`, which normalizes to CRLF on Windows, and a pattern with
+    /// an embedded `\n` would never match the CRLF-containing string
+    /// `include_str!` reads back on that platform.
+    fn css_rule_body<'a>(css: &'a str, selector_prefix: &str) -> &'a str {
+        let rule_start = css
+            .find(selector_prefix)
+            .unwrap_or_else(|| panic!("no bare `{selector_prefix}` rule found in input.css.tmpl"));
+        let rest = &css[rule_start..];
+        &rest[..rest
+            .find('}')
+            .unwrap_or_else(|| panic!("unterminated `{selector_prefix}` rule"))]
+    }
+
+    #[test]
+    fn input_css_nav_collapse_is_flex_row_so_trailing_items_align_right() {
+        // .autumn-nav__collapse wraps both the primary .autumn-nav__items
+        // list and the .autumn-nav__items--trailing list; without collapse
+        // itself being a flex row (and growing to fill the nav's remaining
+        // width), the trailing list's ml-auto has no flex row to push
+        // against — the two lists just stack vertically as ordinary block
+        // children instead of sitting side by side with trailing pinned to
+        // the far right, as nav_bar's trailing-slot design intends.
+        let rule_body = css_rule_body(templates::INPUT_CSS, ".autumn-nav__collapse {");
+        assert!(
+            rule_body.contains("flex") && !rule_body.contains("flex-col"),
+            "the base (non-mobile) .autumn-nav__collapse rule must be a flex row \
+             so .autumn-nav__items--trailing's ml-auto can push it to the right \
+             edge of the nav, got:\n{}",
+            templates::INPUT_CSS
+        );
+    }
+
     #[test]
     fn autumn_toml_has_defaults() {
         let tmp = TempDir::new().unwrap();

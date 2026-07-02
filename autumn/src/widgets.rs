@@ -15,6 +15,7 @@
 //! | `breadcrumb` | Accessible `<nav>` breadcrumb trail |
 //! | `hero` | Landing-page banner: headline, optional subtitle, and CTAs |
 //! | `nav_link` | Navigation anchor, auto-marked active + `aria-current` |
+//! | `nav_bar` | Top-bar/sidebar `<nav>` landmark: brand, links, dropdowns, responsive toggle |
 //!
 //! # Interactive / search widgets
 //!
@@ -1207,6 +1208,432 @@ fn nav_link_is_active(current_path: &str, href: &str, mode: NavLinkMatch) -> boo
                 href
             };
             !href.is_empty() && crate::router::path_matches_route_prefix(current_path, href)
+        }
+    }
+}
+
+// ── nav_bar ──────────────────────────────────────────────────────────────────
+
+/// Layout variant for [`nav_bar`] — selects a modifier class on the root
+/// `<nav>` element.
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NavBarLayout {
+    /// Horizontal top navigation bar (default).
+    #[default]
+    Horizontal,
+    /// Vertical sidebar / dashboard nav — adds `.autumn-nav--sidebar`.
+    Sidebar,
+}
+
+/// A single navigation link, as rendered inside a [`nav_bar`] or [`NavMenu`].
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone)]
+pub struct NavLinkItem {
+    href: String,
+    label: String,
+    match_mode: Option<NavLinkMatch>,
+}
+
+#[cfg(feature = "maud")]
+impl NavLinkItem {
+    /// Build from anything convertible to `String` — an owned `String`
+    /// (e.g. a `format!()` result) moves in for free via `.into()`, while a
+    /// `&str` literal still works ergonomically.
+    fn new(
+        href: impl Into<String>,
+        label: impl Into<String>,
+        match_mode: Option<NavLinkMatch>,
+    ) -> Self {
+        Self {
+            href: href.into(),
+            label: label.into(),
+            match_mode,
+        }
+    }
+}
+
+/// A dropdown navigation item: a `<button>` trigger plus a `<ul>` of
+/// sub-links. Build with [`NavMenu::new`] and chain `.link()` / `.link_matched()`
+/// / `.plain_link()` for each sub-item.
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone)]
+pub struct NavMenu {
+    label: String,
+    links: Vec<NavLinkItem>,
+}
+
+#[cfg(feature = "maud")]
+impl NavMenu {
+    /// Create a new dropdown menu with the given trigger label and no sub-items.
+    #[must_use]
+    pub fn new(label: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            links: Vec::new(),
+        }
+    }
+
+    /// Append a sub-link using [`NavLinkMatch::Exact`] matching.
+    #[must_use]
+    pub fn link(self, href: impl Into<String>, label: impl Into<String>) -> Self {
+        self.link_matched(href, label, NavLinkMatch::Exact)
+    }
+
+    /// Append a sub-link with an explicit [`NavLinkMatch`] mode.
+    #[must_use]
+    pub fn link_matched(
+        mut self,
+        href: impl Into<String>,
+        label: impl Into<String>,
+        mode: NavLinkMatch,
+    ) -> Self {
+        self.links.push(NavLinkItem::new(href, label, Some(mode)));
+        self
+    }
+
+    /// Append a sub-link that never becomes active (e.g. an external link).
+    #[must_use]
+    pub fn plain_link(mut self, href: impl Into<String>, label: impl Into<String>) -> Self {
+        self.links.push(NavLinkItem::new(href, label, None));
+        self
+    }
+}
+
+/// One item in a [`nav_bar`]'s primary or trailing item list.
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone)]
+pub enum NavItem {
+    /// A single navigation link.
+    Link(NavLinkItem),
+    /// A dropdown menu of sub-links.
+    Menu(NavMenu),
+    /// A non-interactive group label (e.g. `"Models"` in a sidebar nav).
+    Section(String),
+}
+
+#[cfg(feature = "maud")]
+impl NavItem {
+    /// A link using [`NavLinkMatch::Exact`] matching against the current path.
+    #[must_use]
+    pub fn link(href: impl Into<String>, label: impl Into<String>) -> Self {
+        Self::link_matched(href, label, NavLinkMatch::Exact)
+    }
+
+    /// A link with an explicit [`NavLinkMatch`] mode.
+    #[must_use]
+    pub fn link_matched(
+        href: impl Into<String>,
+        label: impl Into<String>,
+        mode: NavLinkMatch,
+    ) -> Self {
+        Self::Link(NavLinkItem::new(href, label, Some(mode)))
+    }
+
+    /// A link that never becomes active regardless of the current path —
+    /// e.g. a link to an unrelated tool (an admin actuator page) that should
+    /// never claim `aria-current`.
+    #[must_use]
+    pub fn plain_link(href: impl Into<String>, label: impl Into<String>) -> Self {
+        Self::Link(NavLinkItem::new(href, label, None))
+    }
+
+    /// A dropdown menu item.
+    #[must_use]
+    pub const fn menu(menu: NavMenu) -> Self {
+        Self::Menu(menu)
+    }
+
+    /// A non-interactive group label.
+    #[must_use]
+    pub fn section(label: impl Into<String>) -> Self {
+        Self::Section(label.into())
+    }
+}
+
+/// Configuration for [`nav_bar`]. Build with [`NavBarConfig::new`].
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone)]
+pub struct NavBarConfig {
+    id: String,
+    aria_label: String,
+    brand: Option<(maud::Markup, Option<String>)>,
+    items: Vec<NavItem>,
+    trailing: Vec<NavItem>,
+    layout: NavBarLayout,
+    toggle_label: String,
+    class: Option<String>,
+}
+
+#[cfg(feature = "maud")]
+impl Default for NavBarConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "maud")]
+impl NavBarConfig {
+    /// Create a new nav bar configuration: no brand or items, `aria-label`
+    /// `"Main"`, id `"autumn-nav"`, toggle label `"Menu"`, horizontal layout.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            id: "autumn-nav".to_string(),
+            aria_label: "Main".to_string(),
+            brand: None,
+            items: Vec::new(),
+            trailing: Vec::new(),
+            layout: NavBarLayout::Horizontal,
+            toggle_label: "Menu".to_string(),
+            class: None,
+        }
+    }
+
+    /// Set the brand/logo slot from plain text linking to `href`. The text is
+    /// HTML-escaped by Maud.
+    #[must_use]
+    pub fn brand(self, label: &str, href: &str) -> Self {
+        self.brand_html(maud::html! { (label) }, Some(href))
+    }
+
+    /// Set the brand/logo slot from pre-built [`maud::Markup`]. When `href`
+    /// is `Some`, the brand renders as an anchor; when `None`, it renders as
+    /// a `<span>` (e.g. for a plain wordmark with no link).
+    ///
+    /// Callers are responsible for escaping any user-supplied content inside `brand`.
+    #[must_use]
+    pub fn brand_html(mut self, brand: maud::Markup, href: Option<&str>) -> Self {
+        self.brand = Some((brand, href.map(str::to_string)));
+        self
+    }
+
+    /// Append a primary navigation item.
+    #[must_use]
+    pub fn item(mut self, item: NavItem) -> Self {
+        self.items.push(item);
+        self
+    }
+
+    /// Append multiple primary navigation items at once — convenient when
+    /// building the list from a dynamic source (e.g. a loop over registered models).
+    #[must_use]
+    pub fn items(mut self, items: impl IntoIterator<Item = NavItem>) -> Self {
+        self.items.extend(items);
+        self
+    }
+
+    /// Append an item to the right-aligned trailing slot (account menu, CTA, etc.).
+    #[must_use]
+    pub fn trailing(mut self, item: NavItem) -> Self {
+        self.trailing.push(item);
+        self
+    }
+
+    /// Set the `aria-label` on the `<nav>` landmark (default `"Main"`). Give
+    /// each `nav_bar` on a page a distinct label so screen-reader users can
+    /// tell them apart.
+    #[must_use]
+    pub fn aria_label(mut self, label: &str) -> Self {
+        self.aria_label = label.to_string();
+        self
+    }
+
+    /// Set the layout variant (default [`NavBarLayout::Horizontal`]).
+    #[must_use]
+    pub const fn layout(mut self, layout: NavBarLayout) -> Self {
+        self.layout = layout;
+        self
+    }
+
+    /// Set the element `id` used to derive `aria-controls` target ids
+    /// (default `"autumn-nav"`). Give a second `nav_bar` on the same page a
+    /// distinct id so their collapse/menu ids don't collide.
+    #[must_use]
+    pub fn id(mut self, id: &str) -> Self {
+        self.id = id.to_string();
+        self
+    }
+
+    /// Set the visible/accessible text of the hamburger toggle button
+    /// (default `"Menu"`).
+    #[must_use]
+    pub fn toggle_label(mut self, label: &str) -> Self {
+        self.toggle_label = label.to_string();
+        self
+    }
+
+    /// Add extra CSS class(es) to the root `autumn-nav` element.
+    #[must_use]
+    pub fn class(mut self, class: impl Into<String>) -> Self {
+        self.class = Some(class.into());
+        self
+    }
+}
+
+/// Render an accessible top navigation bar (or sidebar, via [`NavBarLayout::Sidebar`]).
+///
+/// Emits a labelled `<nav>` landmark containing an optional brand, primary
+/// items, a hidden-until-enhanced hamburger toggle, and an optional
+/// right-aligned trailing item list.
+///
+/// Every [`NavItem::Link`] built with [`NavItem::link`] / `link_matched`
+/// renders through [`nav_link_matched`], so it carries `class="active"` and
+/// `aria-current="page"` when its `href` matches `current_path` — pair with
+/// the [`CurrentPath`](crate::extract::CurrentPath) extractor to get
+/// `current_path` from the incoming request. [`NavItem::plain_link`] never
+/// becomes active, for links to unrelated tools that shouldn't claim
+/// "you are here" (e.g. an external or admin-actuator link).
+///
+/// [`NavItem::menu`] renders a `<button>` trigger plus a `<ul>` of sub-links.
+/// Before JavaScript enhances the page, the hamburger toggle is hidden (a
+/// horizontal bar with no toggle has nothing to hide) and every dropdown is
+/// rendered open (`aria-expanded="true"`, no `hidden` attribute) so **all
+/// links stay visible with JavaScript off** — the framework's
+/// `/static/js/autumn-widgets.js` runtime (same-origin, CSP-safe under the
+/// default `script-src 'self'`) then reveals the hamburger and wires the
+/// toggle/dropdown/Escape-to-close behavior. No app-authored JavaScript, and
+/// no inline `<script>` or `style=` attributes, are ever required.
+///
+/// # CSS hooks
+///
+/// | Selector | Element |
+/// |---|---|
+/// | `.autumn-nav` | Root `<nav>` landmark |
+/// | `.autumn-nav--sidebar` | Modifier added by [`NavBarLayout::Sidebar`] |
+/// | `.autumn-nav--enhanced` | Added by the JS runtime once initialized |
+/// | `.autumn-nav__brand` | Brand link (`<a>`) or wordmark (`<span>`) |
+/// | `.autumn-nav__toggle` | Hamburger `<button>` |
+/// | `.autumn-nav__collapse` | Collapsible container wrapping the item lists |
+/// | `.autumn-nav__collapse--open` | Added by the JS runtime while expanded |
+/// | `.autumn-nav__items` | Primary or trailing `<ul>` |
+/// | `.autumn-nav__items--trailing` | Added to the trailing `<ul>` only |
+/// | `.autumn-nav__item` | Every `<li>` wrapping a link |
+/// | `.autumn-nav__item--menu` | `<li>` wrapping a dropdown menu |
+/// | `.autumn-nav__section` | Non-interactive group-label `<li>` |
+/// | `.autumn-nav__menu-toggle` | Dropdown trigger `<button>` |
+/// | `.autumn-nav__menu` | Dropdown sub-item `<ul>` |
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_web::widgets::{NavBarConfig, NavItem, NavLinkMatch, NavMenu, nav_bar};
+///
+/// let config = NavBarConfig::new()
+///     .brand("Acme", "/")
+///     .item(NavItem::link("/", "Home"))
+///     .item(NavItem::link_matched("/posts", "Posts", NavLinkMatch::Prefix))
+///     .item(NavItem::link("/about", "About"))
+///     .item(NavItem::menu(
+///         NavMenu::new("Products")
+///             .link("/widgets", "Widgets")
+///             .link("/gadgets", "Gadgets"),
+///     ))
+///     .trailing(NavItem::plain_link("/login", "Log in"));
+///
+/// let html = nav_bar("/posts/3", &config).into_string();
+/// assert!(html.contains(r#"aria-current="page""#));
+/// assert!(!html.contains("style="));
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn nav_bar(current_path: &str, config: &NavBarConfig) -> maud::Markup {
+    let root_class = merge_class(
+        match config.layout {
+            NavBarLayout::Horizontal => "autumn-nav",
+            NavBarLayout::Sidebar => "autumn-nav autumn-nav--sidebar",
+        },
+        config.class.as_deref(),
+    );
+    let collapse_id = format!("{}-collapse", config.id);
+    let mut menu_counter = 0usize;
+
+    maud::html! {
+        nav id=(config.id) class=(root_class) aria-label=(config.aria_label) data-autumn-nav {
+            @if let Some((brand, href)) = &config.brand {
+                @if let Some(href) = href {
+                    a class="autumn-nav__brand" href=(href) { (brand) }
+                } @else {
+                    span class="autumn-nav__brand" { (brand) }
+                }
+            }
+            button type="button" class="autumn-nav__toggle" aria-expanded="false"
+                aria-controls=(collapse_id) hidden data-nav-toggle {
+                (config.toggle_label)
+            }
+            div id=(collapse_id) class="autumn-nav__collapse" {
+                @if !config.items.is_empty() {
+                    ul class="autumn-nav__items" {
+                        (render_nav_items(current_path, &config.items, &config.id, &mut menu_counter))
+                    }
+                }
+                @if !config.trailing.is_empty() {
+                    ul class="autumn-nav__items autumn-nav__items--trailing" {
+                        (render_nav_items(current_path, &config.trailing, &config.id, &mut menu_counter))
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Render the `<li>` items for one [`nav_bar`] item list (primary or trailing).
+#[cfg(feature = "maud")]
+fn render_nav_items(
+    current_path: &str,
+    items: &[NavItem],
+    id: &str,
+    menu_counter: &mut usize,
+) -> maud::Markup {
+    maud::html! {
+        @for item in items {
+            @match item {
+                NavItem::Link(link) => {
+                    li class="autumn-nav__item" { (render_nav_link_item(current_path, link)) }
+                }
+                NavItem::Section(label) => {
+                    li class="autumn-nav__section" { (label) }
+                }
+                NavItem::Menu(menu) => {
+                    (render_nav_menu(current_path, menu, id, menu_counter))
+                }
+            }
+        }
+    }
+}
+
+/// Render a single nav link: through [`nav_link_matched`] when it has a
+/// [`NavLinkMatch`] mode, or as a plain never-active anchor otherwise.
+#[cfg(feature = "maud")]
+fn render_nav_link_item(current_path: &str, link: &NavLinkItem) -> maud::Markup {
+    if let Some(mode) = link.match_mode {
+        return nav_link_matched(current_path, &link.href, &link.label, mode);
+    }
+    maud::html! { a href=(link.href) { (link.label) } }
+}
+
+/// Render a dropdown menu `<li>`: a trigger `<button>` plus its `<ul>` of
+/// sub-links, using and incrementing `menu_counter` to derive a unique id.
+#[cfg(feature = "maud")]
+fn render_nav_menu(
+    current_path: &str,
+    menu: &NavMenu,
+    id: &str,
+    menu_counter: &mut usize,
+) -> maud::Markup {
+    *menu_counter += 1;
+    let menu_id = format!("{id}-menu-{menu_counter}");
+    maud::html! {
+        li class="autumn-nav__item autumn-nav__item--menu" {
+            button type="button" class="autumn-nav__menu-toggle" aria-expanded="true"
+                aria-controls=(menu_id) data-nav-menu-toggle {
+                (menu.label)
+            }
+            ul id=(menu_id) class="autumn-nav__menu" {
+                @for link in &menu.links {
+                    li class="autumn-nav__item" { (render_nav_link_item(current_path, link)) }
+                }
+            }
         }
     }
 }
@@ -2534,6 +2961,233 @@ mod tests {
         let html = nav_link("/somewhere/else", "/admin/posts", "Posts").into_string();
         assert!(html.contains(r#"href="/admin/posts""#), "{html}");
         assert!(html.contains(">Posts<"), "{html}");
+    }
+
+    // ── nav_bar ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn nav_bar_renders_single_nav_landmark_with_default_label() {
+        let config = NavBarConfig::new();
+        let html = nav_bar("/", &config).into_string();
+        assert_eq!(html.matches("<nav").count(), 1, "{html}");
+        assert!(html.contains(r#"aria-label="Main""#), "{html}");
+        assert!(html.contains(r#"class="autumn-nav""#), "{html}");
+        assert!(html.contains("data-autumn-nav"), "{html}");
+    }
+
+    #[test]
+    fn nav_bar_custom_aria_label() {
+        let config = NavBarConfig::new().aria_label("Admin navigation");
+        let html = nav_bar("/", &config).into_string();
+        assert!(html.contains(r#"aria-label="Admin navigation""#), "{html}");
+    }
+
+    #[test]
+    fn nav_bar_brand_text_renders_brand_link() {
+        let config = NavBarConfig::new().brand("Acme", "/");
+        let html = nav_bar("/", &config).into_string();
+        assert!(
+            html.contains(r#"<a class="autumn-nav__brand" href="/">Acme</a>"#),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn nav_bar_brand_html_without_href_renders_span() {
+        let config = NavBarConfig::new().brand_html(maud::html! { "Acme" }, None);
+        let html = nav_bar("/", &config).into_string();
+        assert!(
+            html.contains(r#"<span class="autumn-nav__brand">Acme</span>"#),
+            "{html}"
+        );
+        assert!(!html.contains("<a class=\"autumn-nav__brand\""), "{html}");
+    }
+
+    #[test]
+    fn nav_bar_without_brand_omits_brand_element() {
+        let config = NavBarConfig::new();
+        let html = nav_bar("/", &config).into_string();
+        assert!(!html.contains("autumn-nav__brand"), "{html}");
+    }
+
+    #[test]
+    fn nav_bar_active_link_gets_aria_current() {
+        let config = NavBarConfig::new().item(NavItem::link("/posts", "Posts"));
+        let html = nav_bar("/posts", &config).into_string();
+        assert_eq!(html.matches(r#"aria-current="page""#).count(), 1, "{html}");
+        assert!(html.contains(r#"class="active""#), "{html}");
+    }
+
+    #[test]
+    fn nav_bar_prefix_match_mode_activates_on_subpath() {
+        let config = NavBarConfig::new().item(NavItem::link_matched(
+            "/posts",
+            "Posts",
+            NavLinkMatch::Prefix,
+        ));
+        let html = nav_bar("/posts/3/edit", &config).into_string();
+        assert!(html.contains(r#"aria-current="page""#), "{html}");
+    }
+
+    #[test]
+    fn nav_bar_plain_link_never_active() {
+        let config = NavBarConfig::new().item(NavItem::plain_link("/actuator/ui", "Actuator"));
+        let html = nav_bar("/actuator/ui", &config).into_string();
+        assert!(!html.contains("aria-current"), "{html}");
+        assert!(!html.contains(r#"class="active""#), "{html}");
+        assert!(html.contains(r#"href="/actuator/ui""#), "{html}");
+    }
+
+    #[test]
+    fn nav_bar_section_renders_label_li() {
+        let config = NavBarConfig::new().item(NavItem::section("System"));
+        let html = nav_bar("/", &config).into_string();
+        assert!(
+            html.contains(r#"<li class="autumn-nav__section">System</li>"#),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn nav_bar_menu_renders_button_controlling_ul() {
+        let config = NavBarConfig::new().item(NavItem::menu(
+            NavMenu::new("Products").link("/widgets", "Widgets"),
+        ));
+        let html = nav_bar("/", &config).into_string();
+        assert!(html.contains(r#"type="button""#), "{html}");
+        assert!(html.contains("data-nav-menu-toggle"), "{html}");
+        assert!(html.contains(r#"aria-expanded="true""#), "{html}");
+        assert!(
+            html.contains(r#"aria-controls="autumn-nav-menu-1""#),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"<ul id="autumn-nav-menu-1" class="autumn-nav__menu""#),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn nav_bar_menu_sub_link_active_gets_aria_current() {
+        let config = NavBarConfig::new().item(NavItem::menu(
+            NavMenu::new("Products").link("/widgets", "Widgets"),
+        ));
+        let html = nav_bar("/widgets", &config).into_string();
+        assert!(html.contains(r#"aria-current="page""#), "{html}");
+    }
+
+    #[test]
+    fn nav_bar_menu_ids_unique_and_respect_custom_id() {
+        let config = NavBarConfig::new()
+            .item(NavItem::menu(NavMenu::new("A").link("/a", "A")))
+            .item(NavItem::menu(NavMenu::new("B").link("/b", "B")))
+            .id("top");
+        let html = nav_bar("/", &config).into_string();
+        assert!(html.contains(r#"aria-controls="top-menu-1""#), "{html}");
+        assert!(html.contains(r#"id="top-menu-1""#), "{html}");
+        assert!(html.contains(r#"aria-controls="top-menu-2""#), "{html}");
+        assert!(html.contains(r#"id="top-menu-2""#), "{html}");
+        assert!(html.contains(r#"id="top-collapse""#), "{html}");
+    }
+
+    #[test]
+    fn nav_bar_toggle_button_is_hidden_with_accessible_name() {
+        let config = NavBarConfig::new();
+        let html = nav_bar("/", &config).into_string();
+        assert!(html.contains("data-nav-toggle"), "{html}");
+        assert!(html.contains("hidden"), "{html}");
+        assert!(html.contains(r#"aria-expanded="false""#), "{html}");
+        assert!(
+            html.contains(r#"aria-controls="autumn-nav-collapse""#),
+            "{html}"
+        );
+        assert!(html.contains(">Menu<"), "{html}");
+
+        let config = NavBarConfig::new().toggle_label("Navigation");
+        let html = nav_bar("/", &config).into_string();
+        assert!(html.contains(">Navigation<"), "{html}");
+    }
+
+    #[test]
+    fn nav_bar_trailing_slot_renders_separate_list() {
+        let config = NavBarConfig::new().trailing(NavItem::plain_link("/login", "Log in"));
+        let html = nav_bar("/", &config).into_string();
+        assert!(html.contains("autumn-nav__items--trailing"), "{html}");
+        assert!(html.contains(r#"href="/login""#), "{html}");
+
+        let config = NavBarConfig::new();
+        let html = nav_bar("/", &config).into_string();
+        assert!(!html.contains("autumn-nav__items--trailing"), "{html}");
+    }
+
+    #[test]
+    fn nav_bar_sidebar_layout_adds_modifier() {
+        let config = NavBarConfig::new().layout(NavBarLayout::Sidebar);
+        let html = nav_bar("/", &config).into_string();
+        assert!(html.contains("autumn-nav--sidebar"), "{html}");
+
+        let config = NavBarConfig::new();
+        let html = nav_bar("/", &config).into_string();
+        assert!(!html.contains("autumn-nav--sidebar"), "{html}");
+    }
+
+    #[test]
+    fn nav_bar_class_merges_extra() {
+        let config = NavBarConfig::new().class("admin-sidebar");
+        let html = nav_bar("/", &config).into_string();
+        assert!(
+            html.contains(r#"class="autumn-nav admin-sidebar""#),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn nav_item_constructors_accept_owned_strings_without_extra_copy() {
+        // href/label should accept `impl Into<String>` (like Cta::primary),
+        // not force callers with an already-owned String (e.g. from
+        // format!()) through an extra borrow-then-reallocate round trip.
+        let post_id = 3;
+        let href: String = format!("/posts/{post_id}");
+        let label: String = "Posts".to_string();
+        let config = NavBarConfig::new()
+            .item(NavItem::link(href, label))
+            .item(NavItem::plain_link("/x".to_string(), "X".to_string()))
+            .item(NavItem::section("System".to_string()))
+            .item(NavItem::menu(
+                NavMenu::new("Products".to_string())
+                    .link(format!("/widgets/{post_id}"), "Widgets".to_string())
+                    .plain_link("/external".to_string(), "External".to_string()),
+            ));
+        let html = nav_bar("/posts/3", &config).into_string();
+        assert!(html.contains(r#"href="/posts/3""#), "{html}");
+        assert!(html.contains(r#"aria-current="page""#), "{html}");
+    }
+
+    #[test]
+    fn nav_bar_escapes_labels() {
+        let config = NavBarConfig::new()
+            .brand("<script>alert(1)</script>", "/")
+            .item(NavItem::link("/posts", "<script>alert(2)</script>"))
+            .item(NavItem::menu(
+                NavMenu::new("<script>alert(3)</script>").link("/x", "<script>alert(4)</script>"),
+            ));
+        let html = nav_bar("/", &config).into_string();
+        assert!(!html.contains("<script>"), "{html}");
+        assert!(html.contains("&lt;script&gt;"), "{html}");
+    }
+
+    #[test]
+    fn nav_bar_emits_no_inline_style_or_script() {
+        let config = NavBarConfig::new()
+            .brand("Acme", "/")
+            .item(NavItem::link("/", "Home"))
+            .item(NavItem::menu(
+                NavMenu::new("Products").link("/widgets", "Widgets"),
+            ))
+            .trailing(NavItem::plain_link("/login", "Log in"));
+        let html = nav_bar("/", &config).into_string();
+        assert!(!html.contains("style="), "{html}");
+        assert!(!html.contains("<script"), "{html}");
     }
 
     // ── property_list ──────────────────────────────────────────────────

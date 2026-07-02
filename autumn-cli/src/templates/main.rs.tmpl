@@ -13,7 +13,14 @@ static EMBEDDED_STATIC: autumn_web::include_dir::Dir = autumn_web::embed_static!
 // `flash` carries one-shot notices set with `flash.success(...)` before a
 // redirect. Pass `flash.render().await` from your handlers; it renders any
 // pending messages (and clears them) and is harmless when empty.
-pub fn layout(title: &str, flash: maud::Markup, content: maud::Markup) -> maud::Markup {
+//
+// `current_path` (from the `CurrentPath` extractor) lets nav_bar mark the
+// link matching the current page with `aria-current="page"`.
+pub fn layout(title: &str, current_path: &str, flash: maud::Markup, content: maud::Markup) -> maud::Markup {
+    let nav = NavBarConfig::new()
+        .brand("{{project_name}}", "/")
+        .aria_label("Main navigation")
+        .item(NavItem::link("/", "Home"));
     maud::html! {
         (maud::DOCTYPE)
         html lang="en" {
@@ -24,13 +31,12 @@ pub fn layout(title: &str, flash: maud::Markup, content: maud::Markup) -> maud::
                 link rel="stylesheet" href=(autumn_web::flash::FLASH_CSS_PATH);
                 link rel="stylesheet" href="/static/css/app.css";
                 (javascript_include_tag("htmx"))
+                script src=(autumn_web::htmx::AUTUMN_WIDGETS_JS_PATH) defer {}
             }
             body {
                 (skip_link("#main-content", "Skip to main content"))
                 header role="banner" {
-                    nav aria-label="Main navigation" {
-                        a href="/" { "{{project_name}}" }
-                    }
+                    (nav_bar(current_path, &nav))
                 }
                 main id="main-content" role="main" {
                     (flash)
@@ -45,8 +51,8 @@ pub fn layout(title: &str, flash: maud::Markup, content: maud::Markup) -> maud::
 }
 
 #[get("/")]
-async fn index(flash: Flash) -> maud::Markup {
-    layout("Welcome", flash.render().await, maud::html! {
+async fn index(flash: Flash, path: CurrentPath) -> maud::Markup {
+    layout("Welcome", path.as_str(), flash.render().await, maud::html! {
         h1 { "Welcome to {{project_name}}!" }
         p { "Edit " code { "src/main.rs" } " to get started." }
     })
