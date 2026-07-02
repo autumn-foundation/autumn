@@ -1135,6 +1135,24 @@ pub fn nav_link(current_path: &str, href: &str, label: &str) -> maud::Markup {
 }
 
 /// Render a navigation anchor with an explicit [`NavLinkMatch`] mode.
+///
+/// When active, the anchor carries `class="active"` and
+/// `aria-current="page"`; when inactive, neither attribute is emitted.
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_web::widgets::{NavLinkMatch, nav_link, nav_link_matched};
+///
+/// let html = nav_link("/posts", "/posts", "Posts").into_string();
+/// assert!(html.contains(r#"class="active""#));
+/// assert!(html.contains(r#"aria-current="page""#));
+///
+/// // `/posts/3/edit` activates the `/posts` link only in Prefix mode.
+/// let html = nav_link_matched("/posts/3/edit", "/posts", "Posts", NavLinkMatch::Prefix)
+///     .into_string();
+/// assert!(html.contains(r#"class="active""#));
+/// ```
 #[cfg(feature = "maud")]
 #[must_use]
 pub fn nav_link_matched(
@@ -1143,10 +1161,25 @@ pub fn nav_link_matched(
     label: &str,
     mode: NavLinkMatch,
 ) -> maud::Markup {
-    // Red-phase stub: renders the anchor without any active-state handling.
-    let _ = (current_path, mode);
+    let active = nav_link_is_active(current_path, href, mode);
     maud::html! {
-        a href=(href) { (label) }
+        a href=(href) class=[active.then_some("active")] aria-current=[active.then_some("page")] {
+            (label)
+        }
+    }
+}
+
+/// Decide whether `href` is the active link for `current_path` under `mode`.
+#[cfg(feature = "maud")]
+fn nav_link_is_active(current_path: &str, href: &str, mode: NavLinkMatch) -> bool {
+    match mode {
+        NavLinkMatch::Exact => current_path == href,
+        NavLinkMatch::Prefix => {
+            current_path == href
+                || current_path
+                    .strip_prefix(href)
+                    .is_some_and(|rest| rest.starts_with('/'))
+        }
     }
 }
 
