@@ -6459,13 +6459,22 @@ async fn pg_ack_dead_letter(
     .map_err(|e| AutumnError::internal_server_error_msg(format!("pg job dead-letter failed: {e}")))
 }
 
+#[cfg(feature = "db")]
+#[derive(diesel::QueryableByName)]
+struct PgStaleRecoveryRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    payload: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    status: String,
+}
+
 /// Recover jobs whose visibility timeout has expired.
 ///
 /// Uses a single `UPDATE … WHERE id IN (SELECT … FOR UPDATE SKIP LOCKED)` so
 /// concurrent maintenance tasks from multiple replicas each recover disjoint
 /// sets of stale jobs.
 #[cfg(feature = "db")]
-async fn pg_recover_stale_claims(pool: &PgPool, visibility_timeout_ms: u64) {
+async fn pg_recover_stale_claims(pool: &PgPool, visibility_timeout_ms: u64, state: &AppState) {
     use diesel_async::RunQueryDsl as _;
 
     let Ok(mut conn) = pool.get().await else {
@@ -6476,7 +6485,7 @@ async fn pg_recover_stale_claims(pool: &PgPool, visibility_timeout_ms: u64) {
     // there is no window where status='enqueued' and unique_key=NULL co-exist.
     // The CASE subquery checks for already-committed duplicates; if one exists
     // the key stays NULL (best-effort, same behaviour as pg_nack_failure).
-    let _ = diesel::sql_query(
+    let rows = diesel::sql_query(
         "UPDATE autumn_jobs \
          SET \
            status = CASE \
@@ -6523,12 +6532,32 @@ async fn pg_recover_stale_claims(pool: &PgPool, visibility_timeout_ms: u64) {
              AND claimed_at < NOW() - ($1::BIGINT * INTERVAL '1 millisecond') \
            FOR UPDATE SKIP LOCKED \
            LIMIT 100 \
-         )",
+         ) \
+         RETURNING payload::TEXT AS payload, status",
     )
     .bind::<diesel::sql_types::BigInt, _>(i64::try_from(visibility_timeout_ms).unwrap_or(i64::MAX))
-    .execute(&mut *conn)
-    .await
-    .map_err(|e| tracing::warn!(error = %e, "postgres stale claim recovery failed"));
+    .get_results::<PgStaleRecoveryRow>(&mut *conn)
+    .await;
+
+    // Rows this UPDATE flipped straight to 'failed' (the job's final
+    // attempt) are terminally dead-lettered with no further code path
+    // touching them — settle their tracked status too, or a tracked job
+    // whose worker crashed on its last attempt stays "running" until TTL
+    // expiry even though it will never run again.
+    match rows {
+        Ok(rows) => {
+            for row in rows.into_iter().filter(|row| row.status == "failed") {
+                let payload = serde_json::from_str::<Value>(&row.payload).unwrap_or(Value::Null);
+                crate::job_tracking::settle_tracked_payload_as_failed(
+                    state,
+                    &payload,
+                    crate::job_tracking::GENERIC_FAILURE_MESSAGE,
+                )
+                .await;
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "postgres stale claim recovery failed"),
+    }
 }
 
 /// Execute one claimed job and ack/nack based on the outcome.
@@ -6665,7 +6694,7 @@ async fn pg_maintenance_loop(
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                pg_recover_stale_claims(&pool, visibility_timeout_ms).await;
+                pg_recover_stale_claims(&pool, visibility_timeout_ms, &state).await;
                 if survey_blocked {
                     pg_update_concurrency_blocked_gauges(&pool, &state).await;
                 }
@@ -12059,7 +12088,7 @@ mod tests {
             )).await;
 
             // Recover stale claims with a 1-second timeout
-            pg_recover_stale_claims(&pool, 1_000).await;
+            pg_recover_stale_claims(&pool, 1_000, &AppState::for_test()).await;
 
             let row = pg_fetch_by_id(&pool, &job_id).await.unwrap();
             assert_eq!(
@@ -12594,7 +12623,7 @@ mod tests {
 
             // Stale recovery dead-letters the final attempt, which must free
             // both the unique key and the concurrency slot.
-            pg_recover_stale_claims(&pool, 10).await;
+            pg_recover_stale_claims(&pool, 10, &AppState::for_test()).await;
             let recovered = pg_fetch_by_id(&pool, "crash-1").await.unwrap();
             assert_eq!(recovered.status, "failed");
 
@@ -12626,6 +12655,68 @@ mod tests {
                     .await
                     .is_some(),
                 "the concurrency slot must be free after stale recovery"
+            );
+        }
+
+        #[tokio::test]
+        #[ignore = "requires Docker (testcontainers)"]
+        async fn pg_stale_claim_recovery_dead_letter_settles_the_tracked_record() {
+            use testcontainers::runners::AsyncRunner as _;
+            use testcontainers_modules::postgres::Postgres;
+
+            let container = Postgres::default().start().await.unwrap();
+            let port = container.get_host_port_ipv4(5432).await.unwrap();
+            let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+            let pool = pg_test_pool(&url);
+            pg_run_migration(&pool).await;
+
+            let state = AppState::for_test().with_profile("dev");
+            let store: Arc<dyn crate::job_tracking::JobTrackingStore> =
+                Arc::new(crate::job_tracking::InMemoryJobTrackingStore::new(60));
+            crate::job_tracking::install_tracking_store(&state, store.clone());
+            let key = "pg-crash-tracking-key";
+            store
+                .create(key, crate::job_tracking::TrackedJobOwner::Anonymous)
+                .await
+                .unwrap();
+            let payload = crate::job_tracking::wrap_tracked_payload(key, &serde_json::json!({}));
+
+            // max_attempts = 1 so stale recovery dead-letters instead of requeueing.
+            pg_enqueue_job(
+                &pool,
+                "pg-crash-1".to_string(),
+                "crashy_tracked",
+                "default",
+                payload,
+                1,
+                10,
+                &ResolvedJobConstraints {
+                    unique_key: None,
+                    unique_window: None,
+                    concurrency_limit: None,
+                    concurrency_scope: None,
+                },
+            )
+            .await
+            .unwrap();
+
+            // Simulate a crashed worker: claim, never settle.
+            let row = pg_claim_next_job(&pool, "dead-worker", false, &["default".to_string()])
+                .await
+                .expect("claim");
+            assert_eq!(row.id, "pg-crash-1");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            pg_recover_stale_claims(&pool, 10, &state).await;
+            let recovered = pg_fetch_by_id(&pool, "pg-crash-1").await.unwrap();
+            assert_eq!(recovered.status, "failed");
+
+            let record = store.get(key).await.unwrap().expect("record");
+            assert_eq!(
+                record.status,
+                crate::job_tracking::TrackedJobStatus::Failed,
+                "a stale-recovered, terminally dead-lettered tracked job must settle its \
+                 status record instead of leaving it running until TTL expiry"
             );
         }
 
