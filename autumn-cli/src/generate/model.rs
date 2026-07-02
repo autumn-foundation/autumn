@@ -303,8 +303,11 @@ fn struct_has_uuid_pk(struct_body: &str) -> bool {
     lines.iter().enumerate().any(|(i, line)| {
         *line == "#[id]"
             && lines[i + 1..]
+                // Skip blank lines, any other attributes (`#[...]`), and doc
+                // comments (`///`/`//!`) that may sit between `#[id]` and the
+                // actual field declaration (e.g. `#[serde(rename = "id")]`).
                 .iter()
-                .find(|l| !l.is_empty())
+                .find(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with("//"))
                 .is_some_and(|field_line| field_type_is_uuid(field_line))
     })
 }
@@ -2254,6 +2257,51 @@ autumn-web = \"0.3\"\n";
         fs::write(
             models_dir.join("post.rs"),
             "use uuid::Uuid;\n\n#[autumn_web::model]\npub struct Post {\n    #[id]\n    pub id: Uuid,\n}\n",
+        )
+        .unwrap();
+
+        let err = plan_model(
+            tmp.path(),
+            "Comment",
+            &["post:references".into()],
+            "20260427000000",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("UUID"));
+    }
+
+    #[test]
+    fn references_field_detects_uuid_pk_through_intervening_attribute() {
+        // An attribute (or doc comment) between `#[id]` and the field
+        // declaration — e.g. `#[serde(rename = "id")]` — must not be
+        // mistaken for the field line itself.
+        let tmp = project();
+        let models_dir = tmp.path().join("src/models");
+        fs::create_dir_all(&models_dir).unwrap();
+        fs::write(
+            models_dir.join("post.rs"),
+            "#[autumn_web::model]\npub struct Post {\n    #[id]\n    #[serde(rename = \"id\")]\n    pub id: uuid::Uuid,\n}\n",
+        )
+        .unwrap();
+
+        let err = plan_model(
+            tmp.path(),
+            "Comment",
+            &["post:references".into()],
+            "20260427000000",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("UUID"));
+    }
+
+    #[test]
+    fn references_field_detects_uuid_pk_through_intervening_doc_comment() {
+        let tmp = project();
+        let models_dir = tmp.path().join("src/models");
+        fs::create_dir_all(&models_dir).unwrap();
+        fs::write(
+            models_dir.join("post.rs"),
+            "#[autumn_web::model]\npub struct Post {\n    #[id]\n    /// The primary key.\n    pub id: uuid::Uuid,\n}\n",
         )
         .unwrap();
 
