@@ -38,12 +38,25 @@
 
 use std::any::Any;
 use std::sync::Arc;
+use std::time::Duration;
 
-use autumn_web::cache::{Cache, RawCacheBytes};
+use autumn_web::cache::{Cache, FillLockStatus, RawCacheBytes};
 use redis::AsyncCommands as _;
 use redis::aio::ConnectionManager;
 use thiserror::Error;
 use tracing::debug;
+
+/// Lua script for a compare-and-delete fill-lock release: only deletes the
+/// lock key if it still holds the caller's token, so a caller can never
+/// release a lock that another replica has since acquired (e.g. after this
+/// caller's lock expired and was taken over).
+const RELEASE_FILL_LOCK_SCRIPT: &str = r"
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+    return redis.call('DEL', KEYS[1])
+else
+    return 0
+end
+";
 
 /// Errors that can occur when constructing or using a [`RedisCache`].
 #[derive(Debug, Error)]
@@ -118,6 +131,21 @@ impl RedisCache {
 
     fn prefixed(&self, key: &str) -> String {
         format!("{}:{}", self.key_prefix, key)
+    }
+
+    /// Physical key for `key`'s distributed fill lock.
+    ///
+    /// Deliberately **not** nested under `key_prefix:` (i.e. not
+    /// `prefixed(format!("{key}:fill-lock"))`): `prefixed()` maps every
+    /// possible `key` onto `"{key_prefix}:{key}"`, so any suffix appended
+    /// under that same namespace is reachable by *some* ordinary cache key
+    /// (e.g. an app key literally named `"session:fill-lock"`) and could
+    /// silently collide with a lock entry. Using a distinct top-level sentinel
+    /// here means a collision would require the operator's own `key_prefix`
+    /// to equal `"__autumn_fill_lock__"`, not merely an unlucky choice of
+    /// cache key.
+    fn fill_lock_key(&self, key: &str) -> String {
+        format!("__autumn_fill_lock__:{}:{}", self.key_prefix, key)
     }
 
     fn redis_get(&self, key: &str) -> Option<Vec<u8>> {
@@ -254,6 +282,62 @@ impl Cache for RedisCache {
             });
         });
     }
+
+    /// Acquires a cross-replica fill lock via `SET NX PX`. Redis errors are
+    /// treated as [`FillLockStatus::Held`] (fail closed toward "someone else
+    /// may be filling") — the caller's `lock_wait_timeout` bounds how long it
+    /// waits before falling back to filling locally.
+    fn try_acquire_fill_lock(&self, key: &str, token: &str, ttl: Duration) -> FillLockStatus {
+        let lock_key = self.fill_lock_key(key);
+        let millis = ttl_millis_for_redis(ttl);
+        let mut conn = self.manager.clone();
+        let token = token.to_owned();
+        let acquired = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move {
+                redis::cmd("SET")
+                    .arg(&lock_key)
+                    .arg(&token)
+                    .arg("NX")
+                    .arg("PX")
+                    .arg(millis)
+                    .query_async::<Option<String>>(&mut conn)
+                    .await
+            })
+        });
+        match acquired {
+            Ok(Some(_)) => FillLockStatus::Acquired,
+            Ok(None) => FillLockStatus::Held,
+            Err(e) => {
+                debug!(key, error = %e, "RedisCache: fill lock acquire failed, treating as held");
+                FillLockStatus::Held
+            }
+        }
+    }
+
+    /// Releases the fill lock only if `token` still owns it (compare-and-delete
+    /// via a Lua script), so a caller can never release a lock another replica
+    /// has since taken over after this caller's lock expired.
+    fn release_fill_lock(&self, key: &str, token: &str) {
+        let lock_key = self.fill_lock_key(key);
+        let mut conn = self.manager.clone();
+        let token = token.to_owned();
+        let result: Result<i64, _> = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move {
+                let script = redis::Script::new(RELEASE_FILL_LOCK_SCRIPT);
+                script
+                    .key(&lock_key)
+                    .arg(&token)
+                    .invoke_async(&mut conn)
+                    .await
+            })
+        });
+        match result {
+            Ok(_) => debug!(key, "RedisCache: released fill lock"),
+            Err(e) => {
+                debug!(key, error = %e, "RedisCache: fill lock release failed");
+            }
+        }
+    }
 }
 
 // ── Plugin ────────────────────────────────────────────────────────────────────
@@ -311,6 +395,7 @@ impl autumn_web::plugin::Plugin for RedisCachePlugin {
 mod tests {
     use super::*;
     use autumn_web::cache::{get_cached, insert_cached};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use testcontainers::runners::AsyncRunner;
     use testcontainers_modules::redis::Redis as RedisImage;
 
@@ -430,7 +515,6 @@ mod tests {
     #[ignore = "requires Docker (testcontainers)"]
     async fn redis_cache_response_layer_caches_http_gets() {
         use std::convert::Infallible;
-        use std::sync::atomic::{AtomicUsize, Ordering};
 
         use autumn_web::cache::CacheResponseLayer;
         use autumn_web::reexports::axum::body::{Body, to_bytes};
@@ -503,5 +587,254 @@ mod tests {
         assert_eq!(counter.load(Ordering::SeqCst), 1);
 
         cache.invalidate("http:/redis-backed");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn redis_fill_lock_acquire_conflict_release() {
+        let container = RedisImage::default().start().await.unwrap();
+        let port = container.get_host_port_ipv4(6379).await.unwrap();
+        let url = format!("redis://127.0.0.1:{port}");
+        let cache = RedisCache::connect(&url, "fill-lock-test").await.unwrap();
+
+        assert_eq!(
+            cache.try_acquire_fill_lock("k", "token-a", Duration::from_secs(10)),
+            FillLockStatus::Acquired
+        );
+        assert_eq!(
+            cache.try_acquire_fill_lock("k", "token-b", Duration::from_secs(10)),
+            FillLockStatus::Held,
+            "a second replica must not acquire a lock already held"
+        );
+
+        // Releasing with the wrong token must not free the lock.
+        cache.release_fill_lock("k", "token-b");
+        assert_eq!(
+            cache.try_acquire_fill_lock("k", "token-b", Duration::from_secs(10)),
+            FillLockStatus::Held,
+            "releasing with a stale/foreign token must be a no-op"
+        );
+
+        // Releasing with the owning token frees it for the next acquirer.
+        cache.release_fill_lock("k", "token-a");
+        assert_eq!(
+            cache.try_acquire_fill_lock("k", "token-b", Duration::from_secs(10)),
+            FillLockStatus::Acquired
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn redis_fill_lock_expires_after_ttl() {
+        let container = RedisImage::default().start().await.unwrap();
+        let port = container.get_host_port_ipv4(6379).await.unwrap();
+        let url = format!("redis://127.0.0.1:{port}");
+        let cache = RedisCache::connect(&url, "fill-lock-ttl-test")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            cache.try_acquire_fill_lock("k", "crashed-filler", Duration::from_millis(200)),
+            FillLockStatus::Acquired
+        );
+        // Never release — simulate a filler that crashed while holding the lock.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        assert_eq!(
+            cache.try_acquire_fill_lock("k", "new-filler", Duration::from_secs(10)),
+            FillLockStatus::Acquired,
+            "the lock TTL must bound damage from a crashed filler"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn redis_lock_wait_timeout_falls_back_to_self_fill() {
+        use autumn_web::cache::GetOrComputeOptions;
+
+        let container = RedisImage::default().start().await.unwrap();
+        let port = container.get_host_port_ipv4(6379).await.unwrap();
+        let url = format!("redis://127.0.0.1:{port}");
+        let cache: Arc<dyn Cache> = Arc::new(
+            RedisCache::connect(&url, "lock-timeout-test")
+                .await
+                .unwrap(),
+        );
+
+        // Simulate a stuck holder that never releases and outlives the test.
+        let key = "stuck-key";
+        assert_eq!(
+            cache.try_acquire_fill_lock(key, "stuck-holder", Duration::from_secs(60)),
+            FillLockStatus::Acquired
+        );
+
+        let fill_count = Arc::new(AtomicUsize::new(0));
+        let fc = fill_count.clone();
+        let opts = GetOrComputeOptions::new()
+            .distributed_fill_lock(true)
+            .lock_wait_timeout(Duration::from_millis(300))
+            .lock_poll_interval(Duration::from_millis(50));
+
+        let value: i32 =
+            autumn_web::cache::get_or_compute_with(&cache, key, opts, move || async move {
+                fc.fetch_add(1, Ordering::SeqCst);
+                Ok::<i32, String>(123)
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(value, 123);
+        assert_eq!(
+            fill_count.load(Ordering::SeqCst),
+            1,
+            "after the wait timeout the caller must fall back to filling locally"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn redis_lock_wait_timeout_not_overshot_by_poll_interval() {
+        use autumn_web::cache::GetOrComputeOptions;
+
+        let container = RedisImage::default().start().await.unwrap();
+        let port = container.get_host_port_ipv4(6379).await.unwrap();
+        let url = format!("redis://127.0.0.1:{port}");
+        let cache: Arc<dyn Cache> = Arc::new(
+            RedisCache::connect(&url, "lock-timeout-overshoot-test")
+                .await
+                .unwrap(),
+        );
+
+        // Simulate a stuck holder that never releases and outlives the test.
+        let key = "stuck-key-overshoot";
+        assert_eq!(
+            cache.try_acquire_fill_lock(key, "stuck-holder", Duration::from_secs(60)),
+            FillLockStatus::Acquired
+        );
+
+        // A poll interval much larger than the wait timeout must not make the
+        // caller sleep past the timeout before falling back: lock_wait_timeout
+        // bounds the total wait regardless of the poll cadence.
+        let opts = GetOrComputeOptions::new()
+            .distributed_fill_lock(true)
+            .lock_wait_timeout(Duration::from_millis(100))
+            .lock_poll_interval(Duration::from_secs(5));
+
+        let start = std::time::Instant::now();
+        let value: i32 =
+            autumn_web::cache::get_or_compute_with(&cache, key, opts, move || async move {
+                Ok::<i32, String>(456)
+            })
+            .await
+            .unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(value, 456);
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "lock_wait_timeout must bound the wait even when lock_poll_interval is much larger; took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn redis_get_or_compute_round_trip() {
+        let container = RedisImage::default().start().await.unwrap();
+        let port = container.get_host_port_ipv4(6379).await.unwrap();
+        let url = format!("redis://127.0.0.1:{port}");
+        let cache: Arc<dyn Cache> = Arc::new(
+            RedisCache::connect(&url, "read-through-test")
+                .await
+                .unwrap(),
+        );
+
+        let fill_count = Arc::new(AtomicUsize::new(0));
+        let fc = fill_count.clone();
+        let v: String = autumn_web::cache::get_or_compute(
+            &cache,
+            "rt-key",
+            Some(Duration::from_secs(60)),
+            move || async move {
+                fc.fetch_add(1, Ordering::SeqCst);
+                Ok::<String, String>("value-from-redis".to_string())
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(v, "value-from-redis");
+
+        let fc = fill_count.clone();
+        let v: String = autumn_web::cache::get_or_compute(
+            &cache,
+            "rt-key",
+            Some(Duration::from_secs(60)),
+            move || async move {
+                fc.fetch_add(1, Ordering::SeqCst);
+                Ok::<String, String>("should-not-run".to_string())
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            v, "value-from-redis",
+            "second call must hit via RawCacheBytes deserialization"
+        );
+        assert_eq!(fill_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn redis_cross_replica_single_fill() {
+        use autumn_web::cache::GetOrComputeOptions;
+
+        let container = RedisImage::default().start().await.unwrap();
+        let port = container.get_host_port_ipv4(6379).await.unwrap();
+        let url = format!("redis://127.0.0.1:{port}");
+
+        // Two independent connections sharing the same key prefix, modeling
+        // two application replicas.
+        let replica_a: Arc<dyn Cache> =
+            Arc::new(RedisCache::connect(&url, "xrepl-fill").await.unwrap());
+        let replica_b: Arc<dyn Cache> =
+            Arc::new(RedisCache::connect(&url, "xrepl-fill").await.unwrap());
+
+        let fill_count = Arc::new(AtomicUsize::new(0));
+        let key = "hot-key";
+
+        let mut handles = Vec::new();
+        for replica in [replica_a, replica_b] {
+            for _ in 0..4 {
+                let replica = replica.clone();
+                let fc = fill_count.clone();
+                let opts = GetOrComputeOptions::new()
+                    .distributed_fill_lock(true)
+                    .lock_poll_interval(Duration::from_millis(30))
+                    .lock_wait_timeout(Duration::from_secs(5));
+                handles.push(tokio::spawn(async move {
+                    autumn_web::cache::get_or_compute_with::<String, String, _, _>(
+                        &replica,
+                        key,
+                        opts,
+                        move || async move {
+                            fc.fetch_add(1, Ordering::SeqCst);
+                            tokio::time::sleep(Duration::from_millis(300)).await;
+                            Ok("cross-replica-value".to_string())
+                        },
+                    )
+                    .await
+                }));
+            }
+        }
+
+        for h in handles {
+            let v = h.await.unwrap().unwrap();
+            assert_eq!(v, "cross-replica-value");
+        }
+
+        assert_eq!(
+            fill_count.load(Ordering::SeqCst),
+            1,
+            "the distributed fill lock must limit total fills to 1 across both replicas"
+        );
     }
 }

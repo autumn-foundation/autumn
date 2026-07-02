@@ -38,16 +38,22 @@ mod fragment;
 mod layer;
 #[cfg(feature = "cache-moka")]
 mod moka_impl;
+mod read_through;
 
 #[cfg(feature = "maud")]
 pub use fragment::{cache_fragment, cache_fragment_global};
 pub use layer::{CacheResponseLayer, CacheResponseService};
 #[cfg(feature = "cache-moka")]
 pub use moka_impl::MokaCache;
+pub use read_through::{
+    CacheFillError, GetOrComputeOptions, ReadThroughMetrics, ReadThroughMetricsSnapshot,
+    get_or_compute, get_or_compute_with, jittered_ttl, read_through_metrics,
+};
 
 use std::any::Any;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 // ── Global cache registry ────────────────────────────────────────────
 
@@ -148,6 +154,45 @@ pub trait Cache: Send + Sync + 'static {
     ///
     /// [`insert_value`]: Cache::insert_value
     fn insert_raw_bytes(&self, _key: &str, _bytes: Vec<u8>, _ttl: Option<std::time::Duration>) {}
+
+    /// Try to acquire a cross-replica fill lock for `key`, used by
+    /// [`get_or_compute_with`] to ensure at most one replica refills a hot
+    /// key at a time.
+    ///
+    /// `token` identifies the caller so [`release_fill_lock`] can safely
+    /// release only a lock it still owns. `ttl` bounds how long the lock is
+    /// held if the caller crashes before releasing it.
+    ///
+    /// The default implementation reports [`FillLockStatus::Unsupported`],
+    /// which degrades callers to in-process-only single-flight protection —
+    /// safe for backends (like the in-process Moka cache) that have no
+    /// cross-replica visibility.
+    ///
+    /// [`release_fill_lock`]: Cache::release_fill_lock
+    fn try_acquire_fill_lock(&self, _key: &str, _token: &str, _ttl: Duration) -> FillLockStatus {
+        FillLockStatus::Unsupported
+    }
+
+    /// Release the fill lock previously acquired with `token`, if this
+    /// caller still owns it. The default is a no-op, matching the default
+    /// [`try_acquire_fill_lock`] returning [`FillLockStatus::Unsupported`].
+    ///
+    /// [`try_acquire_fill_lock`]: Cache::try_acquire_fill_lock
+    fn release_fill_lock(&self, _key: &str, _token: &str) {}
+}
+
+/// Outcome of [`Cache::try_acquire_fill_lock`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FillLockStatus {
+    /// The caller now holds the lock and must call
+    /// [`Cache::release_fill_lock`] when the fill completes (success or
+    /// failure).
+    Acquired,
+    /// Another replica currently holds the lock.
+    Held,
+    /// This backend has no cross-replica fill lock; callers fall back to
+    /// in-process-only single-flight protection.
+    Unsupported,
 }
 
 // ── Typed convenience functions ──────────────────────────────────────
