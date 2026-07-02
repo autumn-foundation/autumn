@@ -1235,6 +1235,24 @@ pub struct NavLinkItem {
     match_mode: Option<NavLinkMatch>,
 }
 
+#[cfg(feature = "maud")]
+impl NavLinkItem {
+    /// Build from anything convertible to `String` — an owned `String`
+    /// (e.g. a `format!()` result) moves in for free via `.into()`, while a
+    /// `&str` literal still works ergonomically.
+    fn new(
+        href: impl Into<String>,
+        label: impl Into<String>,
+        match_mode: Option<NavLinkMatch>,
+    ) -> Self {
+        Self {
+            href: href.into(),
+            label: label.into(),
+            match_mode,
+        }
+    }
+}
+
 /// A dropdown navigation item: a `<button>` trigger plus a `<ul>` of
 /// sub-links. Build with [`NavMenu::new`] and chain `.link()` / `.link_matched()`
 /// / `.plain_link()` for each sub-item.
@@ -1249,38 +1267,35 @@ pub struct NavMenu {
 impl NavMenu {
     /// Create a new dropdown menu with the given trigger label and no sub-items.
     #[must_use]
-    pub fn new(label: &str) -> Self {
+    pub fn new(label: impl Into<String>) -> Self {
         Self {
-            label: label.to_string(),
+            label: label.into(),
             links: Vec::new(),
         }
     }
 
     /// Append a sub-link using [`NavLinkMatch::Exact`] matching.
     #[must_use]
-    pub fn link(self, href: &str, label: &str) -> Self {
+    pub fn link(self, href: impl Into<String>, label: impl Into<String>) -> Self {
         self.link_matched(href, label, NavLinkMatch::Exact)
     }
 
     /// Append a sub-link with an explicit [`NavLinkMatch`] mode.
     #[must_use]
-    pub fn link_matched(mut self, href: &str, label: &str, mode: NavLinkMatch) -> Self {
-        self.links.push(NavLinkItem {
-            href: href.to_string(),
-            label: label.to_string(),
-            match_mode: Some(mode),
-        });
+    pub fn link_matched(
+        mut self,
+        href: impl Into<String>,
+        label: impl Into<String>,
+        mode: NavLinkMatch,
+    ) -> Self {
+        self.links.push(NavLinkItem::new(href, label, Some(mode)));
         self
     }
 
     /// Append a sub-link that never becomes active (e.g. an external link).
     #[must_use]
-    pub fn plain_link(mut self, href: &str, label: &str) -> Self {
-        self.links.push(NavLinkItem {
-            href: href.to_string(),
-            label: label.to_string(),
-            match_mode: None,
-        });
+    pub fn plain_link(mut self, href: impl Into<String>, label: impl Into<String>) -> Self {
+        self.links.push(NavLinkItem::new(href, label, None));
         self
     }
 }
@@ -1301,30 +1316,26 @@ pub enum NavItem {
 impl NavItem {
     /// A link using [`NavLinkMatch::Exact`] matching against the current path.
     #[must_use]
-    pub fn link(href: &str, label: &str) -> Self {
+    pub fn link(href: impl Into<String>, label: impl Into<String>) -> Self {
         Self::link_matched(href, label, NavLinkMatch::Exact)
     }
 
     /// A link with an explicit [`NavLinkMatch`] mode.
     #[must_use]
-    pub fn link_matched(href: &str, label: &str, mode: NavLinkMatch) -> Self {
-        Self::Link(NavLinkItem {
-            href: href.to_string(),
-            label: label.to_string(),
-            match_mode: Some(mode),
-        })
+    pub fn link_matched(
+        href: impl Into<String>,
+        label: impl Into<String>,
+        mode: NavLinkMatch,
+    ) -> Self {
+        Self::Link(NavLinkItem::new(href, label, Some(mode)))
     }
 
     /// A link that never becomes active regardless of the current path —
     /// e.g. a link to an unrelated tool (an admin actuator page) that should
     /// never claim `aria-current`.
     #[must_use]
-    pub fn plain_link(href: &str, label: &str) -> Self {
-        Self::Link(NavLinkItem {
-            href: href.to_string(),
-            label: label.to_string(),
-            match_mode: None,
-        })
+    pub fn plain_link(href: impl Into<String>, label: impl Into<String>) -> Self {
+        Self::Link(NavLinkItem::new(href, label, None))
     }
 
     /// A dropdown menu item.
@@ -1335,8 +1346,8 @@ impl NavItem {
 
     /// A non-interactive group label.
     #[must_use]
-    pub fn section(label: &str) -> Self {
-        Self::Section(label.to_string())
+    pub fn section(label: impl Into<String>) -> Self {
+        Self::Section(label.into())
     }
 }
 
@@ -3128,6 +3139,28 @@ mod tests {
             html.contains(r#"class="autumn-nav admin-sidebar""#),
             "{html}"
         );
+    }
+
+    #[test]
+    fn nav_item_constructors_accept_owned_strings_without_extra_copy() {
+        // href/label should accept `impl Into<String>` (like Cta::primary),
+        // not force callers with an already-owned String (e.g. from
+        // format!()) through an extra borrow-then-reallocate round trip.
+        let post_id = 3;
+        let href: String = format!("/posts/{post_id}");
+        let label: String = "Posts".to_string();
+        let config = NavBarConfig::new()
+            .item(NavItem::link(href, label))
+            .item(NavItem::plain_link("/x".to_string(), "X".to_string()))
+            .item(NavItem::section("System".to_string()))
+            .item(NavItem::menu(
+                NavMenu::new("Products".to_string())
+                    .link(format!("/widgets/{post_id}"), "Widgets".to_string())
+                    .plain_link("/external".to_string(), "External".to_string()),
+            ));
+        let html = nav_bar("/posts/3", &config).into_string();
+        assert!(html.contains(r#"href="/posts/3""#), "{html}");
+        assert!(html.contains(r#"aria-current="page""#), "{html}");
     }
 
     #[test]
