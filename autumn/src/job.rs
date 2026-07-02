@@ -1069,13 +1069,20 @@ impl JobAdminBackend for JobAdminMemoryBackend {
             })?;
             let (name, payload) = self.retry_payload(&id)?;
             let payload_for_reset = payload.clone();
+            // Snapshot the tracking record's owner/updated_at *before*
+            // re-enqueueing makes the retry visible to workers, so the
+            // reset below can detect (and skip) a retry that completes
+            // faster than this function returns.
+            let retry_snapshot =
+                crate::job_tracking::capture_retry_snapshot(&payload_for_reset).await;
             match client.enqueue_with_outcome(&name, payload).await {
                 Ok(EnqueueOutcome::Queued) => {
-                    // The record is currently `Failed` (terminal) from the
-                    // original run; reset it to `Pending` so the retried
-                    // attempt's mark_running/set_progress calls (which
-                    // otherwise no-op against a terminal record) surface.
-                    crate::job_tracking::reset_tracked_payload_for_retry(&payload_for_reset).await;
+                    // The record was `Failed` (terminal) from the original
+                    // run; reset it to `Pending` so the retried attempt's
+                    // mark_running/set_progress calls (which otherwise
+                    // no-op against a terminal record) surface.
+                    crate::job_tracking::apply_retry_reset(&payload_for_reset, retry_snapshot)
+                        .await;
                     Ok(())
                 }
                 Ok(EnqueueOutcome::Deduplicated) => {
@@ -3909,6 +3916,14 @@ impl RedisJobAdminBackend {
             .as_deref()
             .and_then(|s| serde_json::from_str::<RedisJobRecord>(s).ok())
             .map(|r| r.payload);
+        // Snapshot the tracking record's owner/updated_at *before* the EVAL
+        // script below makes the retry visible to workers, so the reset can
+        // detect (and skip) a retry that completes faster than this
+        // function returns.
+        let retry_snapshot = match &tracked_payload {
+            Some(payload) => crate::job_tracking::capture_retry_snapshot(payload).await,
+            None => None,
+        };
         // The unique lock was released when the job dead-lettered, so a
         // retried unique job must take it again under its new id — and the
         // retry must be refused when an equivalent job is already holding it,
@@ -3978,7 +3993,7 @@ return 1
         if result == 1
             && let Some(payload) = tracked_payload
         {
-            crate::job_tracking::reset_tracked_payload_for_retry(&payload).await;
+            crate::job_tracking::apply_retry_reset(&payload, retry_snapshot).await;
         }
         redis_admin_operation_result(result, id, "retry failed job")
     }
@@ -6873,6 +6888,27 @@ impl PgJobAdminBackend {
         let mut conn = self.pool.get().await.map_err(|e| {
             AutumnError::internal_server_error_msg(format!("pg admin pool error: {e}"))
         })?;
+        // Snapshot the tracking record's owner/updated_at *before* the
+        // UPDATE below makes the retry visible to workers, so the reset can
+        // detect (and skip) a retry that completes faster than this
+        // function returns.
+        let pre_retry_row = diesel::sql_query(
+            "SELECT payload::TEXT AS payload FROM autumn_jobs WHERE id = $1 AND status = 'failed'",
+        )
+        .bind::<diesel::sql_types::Text, _>(id)
+        .get_result::<PgPayloadRow>(&mut *conn)
+        .await
+        .optional()
+        .map_err(|e| {
+            AutumnError::internal_server_error_msg(format!("pg admin retry failed: {e}"))
+        })?;
+        let retry_snapshot = match &pre_retry_row {
+            Some(row) => {
+                let payload = serde_json::from_str::<Value>(&row.payload).unwrap_or(Value::Null);
+                crate::job_tracking::capture_retry_snapshot(&payload).await
+            }
+            None => None,
+        };
         let updated = diesel::sql_query(
             "UPDATE autumn_jobs \
              SET status = 'enqueued', attempt = 1, run_at = NOW(), enqueued_at = NOW(), \
@@ -6909,7 +6945,7 @@ impl PgJobAdminBackend {
         // mark_running/set_progress calls (which otherwise no-op against a
         // terminal record) surface.
         let payload = serde_json::from_str::<Value>(&row.payload).unwrap_or(Value::Null);
-        crate::job_tracking::reset_tracked_payload_for_retry(&payload).await;
+        crate::job_tracking::apply_retry_reset(&payload, retry_snapshot).await;
         Ok(())
     }
 

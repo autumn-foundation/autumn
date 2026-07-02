@@ -581,9 +581,34 @@ async fn settle_tracked_payload_with_store(
     }
 }
 
-/// If `payload` is a tracked-job envelope, reset its tracking record back to
-/// `pending` (preserving the existing owner), after an admin retry
-/// successfully re-enqueues it.
+/// A tracking record's owner and `updated_at`, captured *before* an admin
+/// retry makes the job visible to workers again, so
+/// [`apply_retry_reset`] can later detect whether anything wrote to the
+/// record in the meantime.
+pub(crate) type RetrySnapshot = (TrackedJobOwner, DateTime<Utc>);
+
+/// If `payload` is a tracked-job envelope, read its current tracking record.
+///
+/// Callers on the admin retry paths must call this *before* re-enqueueing —
+/// i.e. before the retried job can possibly be claimed and executed — and
+/// pass the result to [`apply_retry_reset`] once the retry is confirmed.
+/// Reading it any later (e.g. after the re-enqueue) defeats the purpose: a
+/// fast retry could already have run to completion and settled the record,
+/// and a read at that point would capture the *fresh* terminal write as the
+/// CAS baseline, making the later reset believe nothing has changed since
+/// and clobber it anyway.
+pub(crate) async fn capture_retry_snapshot(payload: &Value) -> Option<RetrySnapshot> {
+    let (key, _) = split_tracked_payload(payload);
+    let key = key?;
+    let store = global_tracking_store()?;
+    let record = store.get(key).await.ok().flatten()?;
+    Some((record.owner, record.updated_at))
+}
+
+/// If `payload` is a tracked-job envelope and `snapshot` is `Some` (i.e.
+/// [`capture_retry_snapshot`] found a record before the retry was
+/// re-enqueued), reset the tracking record back to `pending` — preserving
+/// the captured owner — now that the admin retry has succeeded.
 ///
 /// `mark_running`/`set_progress` intentionally no-op once a record is
 /// terminal, to protect against a stray write from an abandoned attempt
@@ -594,13 +619,15 @@ async fn settle_tracked_payload_with_store(
 /// of the three admin backends (`JobAdminMemoryBackend`,
 /// `RedisJobAdminBackend`, `PgJobAdminBackend`) carry an `AppState`.
 ///
-/// The reset only applies if the record is unchanged since it was read here
-/// ([`JobTrackingStore::reset_for_retry`] is a compare-and-swap on
-/// `updated_at`): the retried job is re-enqueued (and may already be
-/// claimed and executing) before this runs, so without that guard a very
-/// fast retry could settle to a terminal status and then have this call
-/// stomp it back to a stale `pending`.
-pub(crate) async fn reset_tracked_payload_for_retry(payload: &Value) {
+/// The reset only applies if the record is unchanged since `snapshot` was
+/// captured ([`JobTrackingStore::reset_for_retry`] is a compare-and-swap on
+/// `updated_at`), so a fast retry that already settled the record before
+/// this call runs is left alone rather than stomped back to a stale
+/// `pending`.
+pub(crate) async fn apply_retry_reset(payload: &Value, snapshot: Option<RetrySnapshot>) {
+    let Some((owner, expected_updated_at)) = snapshot else {
+        return;
+    };
     let (key, _) = split_tracked_payload(payload);
     let Some(key) = key else {
         return;
@@ -608,12 +635,7 @@ pub(crate) async fn reset_tracked_payload_for_retry(payload: &Value) {
     let Some(store) = global_tracking_store() else {
         return;
     };
-    let Some(record) = store.get(key).await.ok().flatten() else {
-        return;
-    };
-    let _ = store
-        .reset_for_retry(key, record.owner, record.updated_at)
-        .await;
+    let _ = store.reset_for_retry(key, owner, expected_updated_at).await;
 }
 
 // ── enqueue_tracked ────────────────────────────────────────────────────────────
@@ -1725,6 +1747,51 @@ mod tests {
             "a reset computed from a stale read must not overwrite a write that landed since"
         );
         assert_eq!(record.result, Some(serde_json::json!({"already": "done"})));
+    }
+
+    #[tokio::test]
+    async fn capture_retry_snapshot_before_enqueue_protects_a_fast_retry_from_being_reset() {
+        // A snapshot taken *after* re-enqueueing can itself already observe
+        // the retried job's terminal write (it settled faster than the
+        // admin retry path got around to reading it), which would make the
+        // CAS trivially "unchanged" and reset the fresh terminal record
+        // right back to `pending`. `capture_retry_snapshot` must be called
+        // *before* the retry is made visible so it captures the original
+        // `failed` record instead.
+        let _guard = crate::job::global_job_runtime_test_lock().lock().await;
+        crate::job::clear_global_job_client();
+
+        let store: Arc<dyn JobTrackingStore> = Arc::new(InMemoryJobTrackingStore::new(60));
+        let state = AppState::for_test().with_profile("dev");
+        install_tracking_store(&state, store.clone());
+
+        let key = "retry-snapshot-key";
+        store.create(key, TrackedJobOwner::Anonymous).await.unwrap();
+        store.fail(key, "boom".to_owned()).await.unwrap();
+        let payload = wrap_tracked_payload(key, &serde_json::json!({}));
+
+        // Captured while the record is still the original `failed` one —
+        // i.e. before the retry is re-enqueued/made visible.
+        let snapshot = capture_retry_snapshot(&payload).await;
+
+        // The retry runs to completion before `apply_retry_reset` is called.
+        store
+            .complete(key, serde_json::json!({"already": "done"}))
+            .await
+            .unwrap();
+
+        apply_retry_reset(&payload, snapshot).await;
+
+        let record = store.get(key).await.unwrap().expect("record");
+        assert_eq!(
+            record.status,
+            TrackedJobStatus::Succeeded,
+            "a snapshot captured before the retry was exposed must not let apply_retry_reset \
+             clobber a terminal write that landed since"
+        );
+        assert_eq!(record.result, Some(serde_json::json!({"already": "done"})));
+
+        crate::job::clear_global_job_client();
     }
 
     // ── shared mutation logic (single source of truth for all 3 backends) ────
