@@ -1848,8 +1848,9 @@ fn edit_bool_select_selected_exprs(field: &Field) -> (String, String, String) {
 ///
 /// Seconds/fractional-seconds are included when present (`%.f` omits them
 /// entirely when zero) rather than truncated to `YYYY-MM-DDTHH:MM`: a
-/// minute-only value round-trips back through [`normalize_datetime_local`]
-/// as `:00` seconds, and the generated `update` handler writes every column
+/// minute-only value round-trips back through the generated project's
+/// `normalize_datetime_local` (see `NORMALIZE_DATETIME_LOCAL_FN` below) as
+/// `:00` seconds, and the generated `update` handler writes every column
 /// unconditionally — a stored `12:34:56.789` would otherwise be silently
 /// overwritten as `12:34:00` by re-submitting the form without touching
 /// this field. Pair with `step="any"` on the input (see
