@@ -433,11 +433,19 @@ fn inject_pwa_meta_into_head(source: &str) -> String {
 /// (`layout(title, current_path, flash, content)`). `pwa_offline`'s
 /// generated call assumes the current shape, so this gates [`plan_pwa`]
 /// with an actionable error instead of emitting code with the wrong arity.
+///
+/// Scans the whole signature span (from `fn layout(` up to the function
+/// body's opening brace), not just the physical line `fn layout(` appears
+/// on — rustfmt wraps this signature across multiple lines at its default
+/// column width, which would otherwise put `current_path` on a line the
+/// check never looks at.
 fn layout_missing_current_path(source: &str) -> bool {
-    source
-        .lines()
-        .find(|l| l.contains("fn layout("))
-        .is_some_and(|l| !l.contains("current_path"))
+    let Some(start) = source.find("fn layout(") else {
+        return false;
+    };
+    let rest = &source[start..];
+    let signature = rest.find('{').map_or(rest, |brace| &rest[..brace]);
+    !signature.contains("current_path")
 }
 
 /// Append `pwa_manifest`, `pwa_service_worker`, `pwa_register_js`, and `pwa_offline`
@@ -663,6 +671,27 @@ async fn main() {
         let msg = err.to_string();
         assert!(msg.contains("current_path"), "{msg}");
         assert!(msg.contains("layout"), "{msg}");
+    }
+
+    #[test]
+    fn plan_pwa_accepts_rustfmt_wrapped_layout_signature() {
+        // rustfmt wraps layout()'s ~108-char signature onto separate lines
+        // (verified: `rustfmt` puts each param on its own line at the
+        // default 100-column width) — current_path then no longer shares a
+        // physical line with `fn layout(`, so a naive single-line scan would
+        // false-positive as "missing current_path" on any formatted,
+        // up-to-date project.
+        let wrapped_main = DEFAULT_MAIN.replace(
+            "pub fn layout(title: &str, current_path: &str, flash: maud::Markup, content: maud::Markup) -> maud::Markup {",
+            "pub fn layout(\n    title: &str,\n    current_path: &str,\n    flash: maud::Markup,\n    content: maud::Markup,\n) -> maud::Markup {",
+        );
+        assert_ne!(
+            wrapped_main, DEFAULT_MAIN,
+            "replacement must actually match"
+        );
+        let tmp = project_with_main(&wrapped_main);
+        plan_pwa(tmp.path())
+            .expect("rustfmt-wrapped current_path parameter must still be detected");
     }
 
     #[test]
