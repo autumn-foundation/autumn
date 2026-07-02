@@ -146,7 +146,21 @@ struct EventForm {
 }
 ```
 
-`chrono::NaiveDateTime` fields need no such attribute.
+`chrono::NaiveDateTime` fields don't hit that offset problem, but a value
+the user actively edits through the browser's native picker isn't
+guaranteed to include seconds (unlike the always-seconds-inclusive
+pre-filled value), which chrono's default `Deserialize` also rejects.
+Attach `deserialize_naive_datetime_local` (or
+`deserialize_naive_datetime_local_option` for `Option<NaiveDateTime>`) as a
+defensive measure:
+
+```rust
+#[derive(serde::Deserialize)]
+struct EventForm {
+    #[serde(deserialize_with = "autumn_web::form::deserialize_naive_datetime_local")]
+    starts_at: chrono::NaiveDateTime,
+}
+```
 
 ### `select_input`
 

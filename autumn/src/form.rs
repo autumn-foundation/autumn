@@ -1158,8 +1158,9 @@ fn pad_datetime_local_seconds(raw: &str) -> String {
 /// }
 /// ```
 ///
-/// `chrono::NaiveDateTime` fields need no such attribute — chrono's default
-/// `Deserialize` for `NaiveDateTime` doesn't require an offset.
+/// `chrono::NaiveDateTime` fields don't need an offset, but still benefit
+/// from [`deserialize_naive_datetime_local`] as a defensive measure — see
+/// its doc comment.
 ///
 /// # Errors
 ///
@@ -1200,6 +1201,68 @@ where
             "%Y-%m-%dT%H:%M:%S%.f",
         )
         .map(|ndt| Some(ndt.and_utc()))
+        .map_err(serde::de::Error::custom),
+        _ => Ok(None),
+    }
+}
+
+/// Deserialize an HTML `datetime-local` submission into `chrono::NaiveDateTime`.
+///
+/// The *pre-filled* value [`datetime_input`] renders always includes seconds
+/// (see `normalize_datetime_local_value`), so chrono's default `Deserialize`
+/// — which requires the seconds component — decodes an untouched submission
+/// fine on its own. But a value the user actively edits through the
+/// browser's native picker isn't guaranteed to include seconds (`step="any"`
+/// only requests that the control *allow* seconds; it doesn't guarantee
+/// every browser's UI captures them), which would otherwise 400 with
+/// "premature end of input". Attach this function to defend against that:
+///
+/// ```rust,ignore
+/// #[derive(serde::Deserialize)]
+/// struct EventForm {
+///     #[serde(deserialize_with = "autumn_web::form::deserialize_naive_datetime_local")]
+///     starts_at: chrono::NaiveDateTime,
+/// }
+/// ```
+///
+/// # Errors
+///
+/// Returns a deserializer error when the submitted value isn't a valid
+/// `YYYY-MM-DDTHH:MM[:SS[.f]]` local datetime string.
+#[cfg(feature = "maud")]
+pub fn deserialize_naive_datetime_local<'de, D>(
+    deserializer: D,
+) -> Result<chrono::NaiveDateTime, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = <String as serde::Deserialize>::deserialize(deserializer)?;
+    chrono::NaiveDateTime::parse_from_str(&pad_datetime_local_seconds(&raw), "%Y-%m-%dT%H:%M:%S%.f")
+        .map_err(serde::de::Error::custom)
+}
+
+/// `Option<chrono::NaiveDateTime>` counterpart to
+/// [`deserialize_naive_datetime_local`], for a nullable field — an absent or
+/// empty submitted value decodes as `None`.
+///
+/// # Errors
+///
+/// Returns a deserializer error when a non-empty submitted value isn't a
+/// valid `YYYY-MM-DDTHH:MM[:SS[.f]]` local datetime string.
+#[cfg(feature = "maud")]
+pub fn deserialize_naive_datetime_local_option<'de, D>(
+    deserializer: D,
+) -> Result<Option<chrono::NaiveDateTime>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = <Option<String> as serde::Deserialize>::deserialize(deserializer)?;
+    match raw {
+        Some(s) if !s.is_empty() => chrono::NaiveDateTime::parse_from_str(
+            &pad_datetime_local_seconds(&s),
+            "%Y-%m-%dT%H:%M:%S%.f",
+        )
+        .map(Some)
         .map_err(serde::de::Error::custom),
         _ => Ok(None),
     }
@@ -1260,15 +1323,22 @@ pub fn date_input<T: Serialize>(
 /// `<div id="{field}-field">` for stable htmx targeting. ARIA annotations
 /// behave identically to [`text_input`].
 ///
-/// # `DateTime<Utc>` fields need [`deserialize_datetime_local_utc`]
+/// # Attach a `deserialize_with` matching the field's chrono type
 ///
 /// `<input type="datetime-local">` has no timezone concept, so the value
 /// this renders for a `DateTime<Utc>` field never carries an offset —
 /// chrono's default `Deserialize` for `DateTime<Utc>` requires one and
 /// rejects the submission. Attach [`deserialize_datetime_local_utc`] (or
 /// [`deserialize_datetime_local_utc_option`] for `Option<DateTime<Utc>>`)
-/// via `#[serde(deserialize_with = "...")]` on that field. `NaiveDateTime`
-/// fields need no such attribute.
+/// via `#[serde(deserialize_with = "...")]` on that field.
+///
+/// `NaiveDateTime` fields don't hit that offset problem, but a value the
+/// user actively edits through the browser's native picker isn't guaranteed
+/// to include seconds (unlike the always-seconds-inclusive pre-filled
+/// value), which chrono's default `Deserialize` also rejects. Attach
+/// [`deserialize_naive_datetime_local`] (or
+/// [`deserialize_naive_datetime_local_option`] for `Option<NaiveDateTime>`)
+/// as a defensive measure.
 #[cfg(feature = "maud")]
 #[must_use]
 pub fn datetime_input<T: Serialize>(
@@ -2753,6 +2823,77 @@ mod tests {
                     .unwrap(),
                 chrono::Utc,
             ))
+        );
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn deserialize_naive_datetime_local_pads_missing_seconds() {
+        // Regression test: a value the user actively edits through the
+        // native picker isn't guaranteed to include seconds, unlike the
+        // always-seconds-inclusive pre-filled value — this must not 400.
+        #[derive(serde::Deserialize)]
+        struct Decoded {
+            #[serde(deserialize_with = "deserialize_naive_datetime_local")]
+            starts_at: chrono::NaiveDateTime,
+        }
+        let decoded: Decoded = serde_urlencoded::from_str("starts_at=2024-03-15T10:30").unwrap();
+        assert_eq!(
+            decoded.starts_at,
+            chrono::NaiveDate::from_ymd_opt(2024, 3, 15)
+                .unwrap()
+                .and_hms_opt(10, 30, 0)
+                .unwrap()
+        );
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn deserialize_naive_datetime_local_preserves_seconds_when_present() {
+        #[derive(serde::Deserialize)]
+        struct Decoded {
+            #[serde(deserialize_with = "deserialize_naive_datetime_local")]
+            starts_at: chrono::NaiveDateTime,
+        }
+        let decoded: Decoded = serde_urlencoded::from_str("starts_at=2024-03-15T10:30:56").unwrap();
+        assert_eq!(
+            decoded.starts_at,
+            chrono::NaiveDate::from_ymd_opt(2024, 3, 15)
+                .unwrap()
+                .and_hms_opt(10, 30, 56)
+                .unwrap()
+        );
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn deserialize_naive_datetime_local_option_absent_key_is_none() {
+        #[derive(serde::Deserialize)]
+        struct Decoded {
+            #[serde(default, deserialize_with = "deserialize_naive_datetime_local_option")]
+            starts_at: Option<chrono::NaiveDateTime>,
+        }
+        let decoded: Decoded = serde_urlencoded::from_str("").unwrap();
+        assert_eq!(decoded.starts_at, None);
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn deserialize_naive_datetime_local_option_present_key_is_some() {
+        #[derive(serde::Deserialize)]
+        struct Decoded {
+            #[serde(default, deserialize_with = "deserialize_naive_datetime_local_option")]
+            starts_at: Option<chrono::NaiveDateTime>,
+        }
+        let decoded: Decoded = serde_urlencoded::from_str("starts_at=2024-03-15T10:30").unwrap();
+        assert_eq!(
+            decoded.starts_at,
+            Some(
+                chrono::NaiveDate::from_ymd_opt(2024, 3, 15)
+                    .unwrap()
+                    .and_hms_opt(10, 30, 0)
+                    .unwrap()
+            )
         );
     }
 
