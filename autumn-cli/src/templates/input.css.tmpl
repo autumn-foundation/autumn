@@ -41,6 +41,12 @@
   }
 
   @media (max-width: 768px) {
+    /* .autumn-nav is a nowrap flex row; .autumn-nav__collapse's basis-full
+       below only starts a new row (dropping the menu under the brand/toggle
+       instead of squeezing onto the same row) once the row itself can wrap. */
+    .autumn-nav--enhanced {
+      @apply flex-wrap;
+    }
     .autumn-nav--enhanced .autumn-nav__toggle {
       @apply flex;
     }

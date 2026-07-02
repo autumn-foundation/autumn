@@ -852,6 +852,21 @@ mod tests {
     }
 
     #[test]
+    fn input_css_mobile_nav_collapse_wraps_below_header() {
+        // .autumn-nav is a flex row (nowrap by default) and .autumn-nav__collapse
+        // is one of its flex items; giving that item `basis-full` only drops it
+        // to a new row if the row itself is allowed to wrap. Without flex-wrap
+        // on the enhanced root, the opened mobile menu squeezes/overflows onto
+        // the same row as the brand and toggle instead of appearing below them.
+        assert!(
+            templates::INPUT_CSS.contains(".autumn-nav--enhanced {\n      @apply flex-wrap;"),
+            "the mobile media query must set flex-wrap on .autumn-nav--enhanced itself \
+             so .autumn-nav__collapse's basis-full can actually start a new row, got:\n{}",
+            templates::INPUT_CSS
+        );
+    }
+
+    #[test]
     fn autumn_toml_has_defaults() {
         let tmp = TempDir::new().unwrap();
         generate("cfg-check", tmp.path()).unwrap();
