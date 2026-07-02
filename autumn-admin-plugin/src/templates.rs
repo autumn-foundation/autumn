@@ -3905,4 +3905,65 @@ mod tests {
         let s = format_timestamp(1_700_000_000);
         assert!(s.contains("2023"), "expected 2023 in formatted output: {s}");
     }
+
+    // ── admin_layout nav (#1134) ─────────────────────────────────────────
+
+    fn render_layout(active_slug: Option<&str>) -> String {
+        let registry = AdminRegistry::new();
+        admin_layout(
+            &registry,
+            active_slug,
+            "Title",
+            "/admin",
+            "/actuator",
+            "tok",
+            "X-CSRF-Token",
+            &[],
+            true,
+            &html! {},
+        )
+        .into_string()
+    }
+
+    #[test]
+    fn admin_layout_dashboard_active_has_aria_current() {
+        let html = render_layout(None);
+        assert_eq!(html.matches(r#"aria-current="page""#).count(), 1, "{html}");
+        assert!(
+            html.contains(r#"href="/admin" class="active" aria-current="page""#),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn admin_layout_jobs_active_has_aria_current() {
+        let html = render_layout(Some(JOBS_NAV_SLUG));
+        assert_eq!(html.matches(r#"aria-current="page""#).count(), 1, "{html}");
+        assert!(
+            html.contains(r#"href="/admin/jobs" class="active" aria-current="page""#),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn admin_layout_runtime_config_active_has_aria_current() {
+        let html = render_layout(Some(RUNTIME_CONFIG_NAV_SLUG));
+        assert_eq!(html.matches(r#"aria-current="page""#).count(), 1, "{html}");
+        assert!(
+            html.contains(r#"href="/admin/config" class="active" aria-current="page""#),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn admin_layout_no_active_slug_has_no_dashboard_aria_current() {
+        // active_slug = Some(...) for an unrelated slug: Dashboard must not
+        // claim the active state, and nothing else should either since the
+        // registry is empty (no model nav items).
+        let html = render_layout(Some(JOBS_NAV_SLUG));
+        assert!(
+            !html.contains(r#"href="/admin" class="active""#),
+            "dashboard must not be active: {html}"
+        );
+    }
 }
