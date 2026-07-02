@@ -171,6 +171,11 @@ impl JobContext {
 
     /// Record the JSON result to persist when the job succeeds. A no-op for
     /// an untracked context.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal result mutex is poisoned (only possible if a
+    /// previous holder panicked while holding it).
     pub fn set_result(&self, result: Value) {
         if let Some(inner) = &self.0 {
             *inner
@@ -183,6 +188,11 @@ impl JobContext {
     /// Record the user-safe error message to persist if the job ultimately
     /// fails (its last attempt, or a panic). A no-op for an untracked
     /// context.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal error mutex is poisoned (only possible if a
+    /// previous holder panicked while holding it).
     pub fn set_user_error(&self, message: impl Into<String>) {
         if let Some(inner) = &self.0 {
             *inner
@@ -239,7 +249,7 @@ const ENVELOPE_ARGS: &str = "args";
 /// Wrap `args` in the tracked-job envelope carrying the tracking key (a hash
 /// of the raw token — never the raw token itself, so a leaked payload, admin
 /// record, or queue dump never exposes the polling capability).
-pub(crate) fn wrap_tracked_payload(key: &str, args: Value) -> Value {
+pub(crate) fn wrap_tracked_payload(key: &str, args: &Value) -> Value {
     serde_json::json!({
         ENVELOPE_MARKER: { ENVELOPE_KEY: key },
         ENVELOPE_ARGS: args,
@@ -375,10 +385,11 @@ impl TrackedJobHandle {
     }
 }
 
-/// Enqueue `name` with `payload`, returning a [`TrackedJobHandle`] whose
-/// token is an anonymous capability: anyone holding the token may poll the
-/// job's status. Use [`enqueue_tracked_for`] to bind status access to a
-/// session or authenticated user instead.
+/// Enqueue `name` with `payload`, returning a [`TrackedJobHandle`].
+///
+/// The handle's token is an anonymous capability: anyone holding the token
+/// may poll the job's status. Use [`enqueue_tracked_for`] to bind status
+/// access to a session or authenticated user instead.
 ///
 /// # Errors
 ///
@@ -415,7 +426,7 @@ pub async fn enqueue_tracked_for(
     let key = crate::auth::hash_api_token(&token);
     store.create(&key, owner).await?;
 
-    let wrapped = wrap_tracked_payload(&key, payload);
+    let wrapped = wrap_tracked_payload(&key, &payload);
     match client.enqueue_with_outcome(name, wrapped).await {
         Ok(crate::job::EnqueueOutcome::Queued) => {}
         Ok(crate::job::EnqueueOutcome::Deduplicated) => {
@@ -470,12 +481,14 @@ pub(crate) fn status_router() -> axum::Router<AppState> {
 }
 
 /// `GET /_autumn/jobs/{token}`: resolve the tracked-job record for `token`
-/// and return it as JSON. Unknown, expired, and (once owner binding lands)
-/// unauthorized tokens all render the identical 404 so the route is never an
-/// existence/ownership oracle.
+/// and return it as JSON for API clients, or an htmx-pollable HTML fragment
+/// for browsers (content-negotiated). Unknown, expired, and (once owner
+/// binding lands) unauthorized tokens all render the identical 404 so the
+/// route is never an existence/ownership oracle.
 async fn job_status_handler(
     axum::extract::State(state): axum::extract::State<AppState>,
     axum::extract::Path(token): axum::extract::Path<String>,
+    headers: axum::http::HeaderMap,
 ) -> AutumnResult<axum::response::Response> {
     let not_found = || AutumnError::not_found_msg("This job status page could not be found.");
 
@@ -483,12 +496,103 @@ async fn job_status_handler(
     let key = crate::auth::hash_api_token(&token);
     let record = store.get(&key).await?.ok_or_else(not_found)?;
 
-    let mut response = axum::Json(JobStatusDto::from(&record)).into_response();
+    let path = format!("{JOB_STATUS_PATH_PREFIX}{token}");
+    let mut response = render_status_response(&record, &headers, &path);
     response.headers_mut().insert(
         axum::http::header::CACHE_CONTROL,
         axum::http::HeaderValue::from_static("no-store"),
     );
     Ok(response)
+}
+
+/// Whether the request prefers an htmx-pollable HTML fragment over JSON:
+/// true for an htmx request (`HX-Request: true`) or a browser `Accept`
+/// header, per [`crate::middleware::error_page_filter::accept_prefers_html`]
+/// (an absent/empty `Accept` header — the typical API client — prefers
+/// JSON). Rendering is only possible with the `maud` feature enabled.
+#[cfg(feature = "maud")]
+fn wants_html_response(headers: &axum::http::HeaderMap) -> bool {
+    let is_htmx = headers
+        .get("hx-request")
+        .is_some_and(|value| value == "true");
+    is_htmx || crate::middleware::error_page_filter::accept_prefers_html(headers)
+}
+
+#[cfg(feature = "maud")]
+fn render_status_response(
+    record: &TrackedJobRecord,
+    headers: &axum::http::HeaderMap,
+    path: &str,
+) -> axum::response::Response {
+    if wants_html_response(headers) {
+        status_fragment(record, path).into_response()
+    } else {
+        axum::Json(JobStatusDto::from(record)).into_response()
+    }
+}
+
+#[cfg(not(feature = "maud"))]
+fn render_status_response(
+    record: &TrackedJobRecord,
+    _headers: &axum::http::HeaderMap,
+    _path: &str,
+) -> axum::response::Response {
+    axum::Json(JobStatusDto::from(record)).into_response()
+}
+
+/// Render the htmx-pollable status fragment.
+///
+/// While pending/running, the wrapper `div` carries
+/// `hx-get={path} hx-trigger="every 2s" hx-swap="outerHTML"` so it re-fetches
+/// and replaces itself every 2 seconds with zero app-authored JS. Once the
+/// job reaches a terminal state the fragment carries **no** `hx-*`
+/// attributes, so htmx has nothing left to poll — it renders the download
+/// link (when the result carries a `download_url`) or the failure message.
+#[cfg(feature = "maud")]
+fn status_fragment(record: &TrackedJobRecord, path: &str) -> maud::Markup {
+    let terminal = record.status.is_terminal();
+    let (hx_get, hx_trigger, hx_swap) = if terminal {
+        (None, None, None)
+    } else {
+        (Some(path), Some("every 2s"), Some("outerHTML"))
+    };
+    let pct = record.progress_pct.unwrap_or(0);
+
+    maud::html! {
+        div id="autumn-job-status" class="autumn-job-status"
+            hx-get=[hx_get] hx-trigger=[hx_trigger] hx-swap=[hx_swap]
+        {
+            @match record.status {
+                TrackedJobStatus::Pending | TrackedJobStatus::Running => {
+                    progress class="autumn-job-status__bar" value=(pct) max="100" {}
+                    @if let Some(message) = &record.progress_message {
+                        p class="autumn-job-status__message" { (message) }
+                    } @else {
+                        p class="autumn-job-status__message" { (pct) "%" }
+                    }
+                }
+                TrackedJobStatus::Succeeded => {
+                    @if let Some(url) = record
+                        .result
+                        .as_ref()
+                        .and_then(|result| result.get("download_url"))
+                        .and_then(Value::as_str)
+                    {
+                        p class="autumn-job-status__success" {
+                            a href=(url) download="" { "Download" }
+                        }
+                    } @else {
+                        p class="autumn-job-status__success" { "Completed." }
+                    }
+                }
+                TrackedJobStatus::Failed => {
+                    p class="autumn-job-status__error" {
+                        (record.error.as_deref().unwrap_or(GENERIC_FAILURE_MESSAGE))
+                    }
+                }
+            }
+        }
+    }
 }
 
 // ── In-memory store ───────────────────────────────────────────────────────────
@@ -534,7 +638,8 @@ impl InMemoryJobTrackingStore {
         entry.expires_at > self.clock.now()
     }
 
-    fn with_record_mut<F>(&self, key: &str, f: F) -> AutumnResult<()>
+    #[allow(clippy::significant_drop_tightening)]
+    fn with_record_mut<F>(&self, key: &str, f: F)
     where
         F: FnOnce(&mut TrackedJobRecord),
     {
@@ -550,7 +655,6 @@ impl InMemoryJobTrackingStore {
             entry.record.updated_at = now;
             entry.expires_at = now + self.ttl;
         }
-        Ok(())
     }
 }
 
@@ -587,7 +691,8 @@ impl JobTrackingStore for InMemoryJobTrackingStore {
                 if !record.status.is_terminal() {
                     record.status = TrackedJobStatus::Running;
                 }
-            })
+            });
+            Ok(())
         })
     }
 
@@ -604,7 +709,8 @@ impl JobTrackingStore for InMemoryJobTrackingStore {
                     record.progress_pct = Some(pct);
                     record.progress_message = message;
                 }
-            })
+            });
+            Ok(())
         })
     }
 
@@ -614,7 +720,8 @@ impl JobTrackingStore for InMemoryJobTrackingStore {
                 record.status = TrackedJobStatus::Succeeded;
                 record.result = Some(result);
                 record.error = None;
-            })
+            });
+            Ok(())
         })
     }
 
@@ -624,7 +731,8 @@ impl JobTrackingStore for InMemoryJobTrackingStore {
                 record.status = TrackedJobStatus::Failed;
                 record.error = Some(error);
                 record.result = None;
-            })
+            });
+            Ok(())
         })
     }
 
@@ -800,7 +908,7 @@ mod tests {
     #[test]
     fn wrap_then_take_roundtrips_key_and_inner_args() {
         let args = serde_json::json!({"account_id": 42});
-        let wrapped = wrap_tracked_payload("abc123", args.clone());
+        let wrapped = wrap_tracked_payload("abc123", &args);
 
         let (key, inner) = take_tracked_payload(wrapped);
         assert_eq!(key.as_deref(), Some("abc123"));
@@ -818,7 +926,7 @@ mod tests {
     #[test]
     fn split_tracked_payload_borrows_inner_args_without_consuming() {
         let args = serde_json::json!({"account_id": 42});
-        let wrapped = wrap_tracked_payload("abc123", args.clone());
+        let wrapped = wrap_tracked_payload("abc123", &args);
 
         let (key, inner) = split_tracked_payload(&wrapped);
         assert_eq!(key, Some("abc123"));

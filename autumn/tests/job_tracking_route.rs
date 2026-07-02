@@ -81,6 +81,28 @@ async fn poll_until(
     panic!("condition on {path} was not met in time");
 }
 
+/// Poll `path` via an htmx request (`HX-Request: true`) until `predicate`
+/// matches the returned HTML fragment text, or panic after ~1s.
+async fn poll_until_html(
+    client: &TestClient,
+    path: &str,
+    predicate: impl Fn(&str) -> bool,
+) -> String {
+    for _ in 0..100 {
+        let response = client.get(path).header("HX-Request", "true").send().await;
+        assert_eq!(
+            response.header("content-type"),
+            Some("text/html; charset=utf-8")
+        );
+        let body = response.text();
+        if predicate(&body) {
+            return body;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("condition on {path} was not met in time");
+}
+
 #[tokio::test]
 async fn status_route_tracks_progress_through_to_success_as_json() {
     let _guard = job::global_job_runtime_test_lock().lock().await;
@@ -185,6 +207,165 @@ async fn route_disabled_via_config_is_not_mounted() {
         .send()
         .await
         .assert_status(404);
+
+    job::clear_global_job_client();
+}
+
+#[tokio::test]
+async fn htmx_request_receives_fragment_with_every_2s_trigger_while_running() {
+    let _guard = job::global_job_runtime_test_lock().lock().await;
+    job::clear_global_job_client();
+
+    let client = TestApp::new()
+        .config(test_config())
+        .plugin(TrackedGateJobPlugin)
+        .build();
+
+    let handle = job::enqueue_tracked("tracked_gate_job", json!({"mode": "succeed"}))
+        .await
+        .unwrap();
+
+    let running = poll_until_html(&client, &handle.status_path(), |body| {
+        // Wait for the actual progress write, not just the initial pending
+        // record (whose unset progress would also render "0%").
+        body.contains("Rows 400/1000")
+    })
+    .await;
+    assert!(
+        running.contains(r#"hx-get="/_autumn/jobs/"#),
+        "expected self hx-get while running: {running}"
+    );
+    assert!(
+        running.contains(r#"hx-trigger="every 2s""#),
+        "expected hx-trigger=\"every 2s\" while running: {running}"
+    );
+    assert!(
+        running.contains(r#"hx-swap="outerHTML""#),
+        "expected hx-swap=\"outerHTML\" while running: {running}"
+    );
+    assert!(
+        running.contains(r#"value="40""#),
+        "expected the progress bar to reflect 40%: {running}"
+    );
+
+    RELEASE_GATE.notify_waiters();
+    job::clear_global_job_client();
+}
+
+#[tokio::test]
+async fn accept_text_html_without_htmx_header_also_receives_fragment() {
+    let _guard = job::global_job_runtime_test_lock().lock().await;
+    job::clear_global_job_client();
+
+    let client = TestApp::new()
+        .config(test_config())
+        .plugin(TrackedGateJobPlugin)
+        .build();
+
+    let handle = job::enqueue_tracked("tracked_gate_job", json!({"mode": "succeed"}))
+        .await
+        .unwrap();
+
+    // Wait for the job to actually be running (via the JSON leg, so we don't
+    // depend on the behavior under test to observe readiness), then re-fetch
+    // with a browser-style Accept header and no HX-Request.
+    poll_until(&client, &handle.status_path(), |body| {
+        body["status"] == "running"
+    })
+    .await;
+
+    let response = client
+        .get(&handle.status_path())
+        .header("Accept", "text/html")
+        .send()
+        .await;
+    assert_eq!(
+        response.header("content-type"),
+        Some("text/html; charset=utf-8")
+    );
+    let body = response.text();
+    assert!(body.contains("autumn-job-status"), "{body}");
+
+    RELEASE_GATE.notify_waiters();
+    job::clear_global_job_client();
+}
+
+#[tokio::test]
+async fn succeeded_fragment_renders_download_link_and_stops_polling() {
+    let _guard = job::global_job_runtime_test_lock().lock().await;
+    job::clear_global_job_client();
+
+    let client = TestApp::new()
+        .config(test_config())
+        .plugin(TrackedGateJobPlugin)
+        .build();
+
+    let handle = job::enqueue_tracked("tracked_gate_job", json!({"mode": "succeed"}))
+        .await
+        .unwrap();
+
+    poll_until(&client, &handle.status_path(), |body| {
+        body["status"] == "running"
+    })
+    .await;
+    RELEASE_GATE.notify_waiters();
+
+    let done = poll_until_html(&client, &handle.status_path(), |body| {
+        body.contains("autumn-job-status__success")
+    })
+    .await;
+    assert!(
+        done.contains(r#"href="/blob/abc.csv""#),
+        "expected a download link: {done}"
+    );
+    assert!(
+        !done.contains("hx-get"),
+        "terminal fragment must not keep polling (no hx-get): {done}"
+    );
+    assert!(
+        !done.contains("hx-trigger"),
+        "terminal fragment must not keep polling (no hx-trigger): {done}"
+    );
+
+    job::clear_global_job_client();
+}
+
+#[tokio::test]
+async fn failed_fragment_shows_user_safe_error_and_stops_polling() {
+    let _guard = job::global_job_runtime_test_lock().lock().await;
+    job::clear_global_job_client();
+
+    let client = TestApp::new()
+        .config(test_config())
+        .plugin(TrackedGateJobPlugin)
+        .build();
+
+    let handle = job::enqueue_tracked("tracked_gate_job", json!({"mode": "fail"}))
+        .await
+        .unwrap();
+
+    poll_until(&client, &handle.status_path(), |body| {
+        body["status"] == "running"
+    })
+    .await;
+    RELEASE_GATE.notify_waiters();
+
+    let done = poll_until_html(&client, &handle.status_path(), |body| {
+        body.contains("autumn-job-status__error")
+    })
+    .await;
+    assert!(
+        done.contains("The export could not reach storage."),
+        "expected the user-safe error message: {done}"
+    );
+    assert!(
+        !done.contains("hx-get"),
+        "terminal fragment must not keep polling (no hx-get): {done}"
+    );
+    assert!(
+        !done.contains("hx-trigger"),
+        "terminal fragment must not keep polling (no hx-trigger): {done}"
+    );
 
     job::clear_global_job_client();
 }

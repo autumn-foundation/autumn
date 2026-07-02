@@ -243,6 +243,7 @@ fn concurrency_tokens(attrs: &JobAttrs) -> TokenStream {
     )
 }
 
+#[allow(clippy::too_many_lines)]
 pub fn job_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let attrs = match parse_job_args(attr) {
         Ok(a) => a,
