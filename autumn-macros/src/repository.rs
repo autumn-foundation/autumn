@@ -10794,8 +10794,7 @@ mod tests {
 
     #[test]
     fn parse_repo_args_with_mcp() {
-        let tokens: proc_macro2::TokenStream =
-            r#"Post, api = "/api/posts", mcp"#.parse().unwrap();
+        let tokens: proc_macro2::TokenStream = r#"Post, api = "/api/posts", mcp"#.parse().unwrap();
         let config = parse_repo_args(tokens).unwrap();
         assert_eq!(
             config.mcp_expose,
@@ -10820,10 +10819,7 @@ mod tests {
     fn parse_repo_args_mcp_defaults_off() {
         let tokens: proc_macro2::TokenStream = r#"Post, api = "/api/posts""#.parse().unwrap();
         let config = parse_repo_args(tokens).unwrap();
-        assert_eq!(
-            config.mcp_expose, None,
-            "no `mcp` key => no MCP exposure"
-        );
+        assert_eq!(config.mcp_expose, None, "no `mcp` key => no MCP exposure");
     }
 
     #[test]

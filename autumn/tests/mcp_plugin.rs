@@ -261,7 +261,9 @@ async fn plugin_without_expose_mcp_stays_invisible() {
 
     let names = list_tool_names(&client).await;
     assert!(
-        !names.iter().any(|n| n == "hl_list_runs" || n == "hl_create_run"),
+        !names
+            .iter()
+            .any(|n| n == "hl_list_runs" || n == "hl_create_run"),
         "host did not opt in => plugin routes stay invisible: {names:?}"
     );
 }
