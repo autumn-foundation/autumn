@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **mcp:** plugins and repositories can now layer in MCP. Chainable route
+  toggles `Route::mcp()`, `Route::mcp_exclude()`, and `Route::mcp_stream()`
+  mirror the `#[api_doc(mcp)]` / `mcp = false` / `mcp, stream` attribute
+  forms at registration time, so a plugin can offer a fluent
+  `MyPlugin::new().expose_mcp()` switch and let the *host* decide at install
+  time whether the plugin's typed routes become MCP tools — no source
+  attributes needed on handlers the host doesn't own (the flags are inert
+  unless the host enables the `mcp` feature and calls `mount_mcp`). The
+  `#[repository]` macro gains an `mcp` key:
+  `#[repository(Model, api = "/path", mcp)]` exposes all five generated CRUD
+  routes as tools and `mcp = "read"` exposes only list/get, with the usual
+  verb-derived safety annotations (`readOnlyHint` on reads,
+  `destructiveHint` on delete); `mcp` without `api = "/path"` is a compile
+  error. To support the generated `DELETE`, `204 No Content` routes are now
+  MCP-eligible under an explicit opt-in — a deliberate empty success
+  contract is no longer conflated with a schema-less HTML route.
+  `McpToolInfo` gains public read accessors (`name()`, `description()`,
+  `input_schema()`, `annotations()`, `method()`, `path_template()`,
+  `streams()`) so hosts can introspect derived tools. Routes registered by
+  plugins via `routes()`/`scoped()` were already derived into tools; this is
+  now pinned by tests and documented. Raw `nest()`/`merge()` routers remain
+  MCP-invisible (documented follow-up). See the
+  [MCP guide](docs/guide/mcp.md) §9–§10.
+
 - **cache:** read-through fills with single-flight cache stampede protection
   (#1204). `cache::get_or_compute(cache, key, ttl, fill)` computes a missing
   value once per process for concurrent callers — the first miss becomes the

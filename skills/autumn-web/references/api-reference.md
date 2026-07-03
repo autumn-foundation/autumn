@@ -61,7 +61,7 @@ All publishable crates share `[workspace.package].version = "0.5.0"`.
 | `#[static_get]`, `static_routes![...]` | Static pre-render routes for `autumn build` |
 | `#[ws]` | WebSocket route handler (`ws`) |
 | `#[model]` | Diesel model derives (`db`) |
-| `#[repository]` | CRUD repository and generated API (`db`) |
+| `#[repository]` | CRUD repository and generated API (`db`); `mcp` / `mcp = "read"` expose the generated routes as MCP tools |
 | `#[service]` | Service implementation scaffolding (`db`) |
 | `#[secured]` | Session auth and role guard |
 | `#[authorize]` | Record-level policy guard |
@@ -110,7 +110,7 @@ All publishable crates share `[workspace.package].version = "0.5.0"`.
 | `one_off_tasks(Vec<OneOffTaskInfo>)` | CLI tasks |
 | `migrations(EmbeddedMigrations)` | Diesel embedded migrations |
 | `openapi(OpenApiConfig)` | OpenAPI generation |
-| `mount_mcp(path)`, `expose_all_as_mcp()`, `secure_mcp(layer)` | MCP endpoint projection (`mcp`) |
+| `mount_mcp(path)`, `expose_all_as_mcp()`, `secure_mcp(layer)` | MCP endpoint projection (`mcp`); `Route::mcp()/mcp_exclude()/mcp_stream()` toggle exposure per route (plugin fluent opt-in) |
 | `exception_filter(...)`, `error_pages(...)` | Error rendering |
 | `scoped(prefix, layer, routes)` | Scoped route group |
 | `layer(...)`, `has_layer<T>()`, `get_layer_types()` | Tower middleware |

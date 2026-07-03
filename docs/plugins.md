@@ -153,6 +153,47 @@ impl Plugin for MyTelemetryPlugin {
 [`Plugin::name`]: https://docs.rs/autumn-web/latest/autumn_web/plugin/trait.Plugin.html#method.name
 [`AppBuilder::has_plugin`]: https://docs.rs/autumn-web/latest/autumn_web/app/struct.AppBuilder.html#method.has_plugin
 
+## Exposing plugin routes as MCP tools
+
+Typed routes a plugin registers via `AppBuilder::routes()`/`scoped()` flow
+into the host's route registry, so they can be projected into MCP tools like
+any user route (see the [MCP guide](guide/mcp.md)). The convention is to make
+this **host opt-in** through your fluent config, flipping the routes with the
+chainable `Route::mcp()` toggle at build time:
+
+```rust
+use autumn_web::Route;
+
+pub struct HarvestPlugin {
+    expose_mcp: bool,
+}
+
+impl HarvestPlugin {
+    #[must_use]
+    pub fn expose_mcp(mut self) -> Self {
+        self.expose_mcp = true;
+        self
+    }
+}
+
+impl Plugin for HarvestPlugin {
+    fn build(self, app: AppBuilder) -> AppBuilder {
+        let mut rs = routes![list_runs, create_run];
+        if self.expose_mcp {
+            rs = rs.into_iter().map(Route::mcp).collect();
+        }
+        app.routes(rs)
+    }
+}
+```
+
+`Route::mcp_exclude()` and `Route::mcp_stream()` mirror the other
+`#[api_doc]` forms. The flags are plain metadata — inert unless the host
+enables the `mcp` feature and calls `mount_mcp` — so setting them requires no
+feature gate in your plugin crate. Raw routers mounted via `nest()`/`merge()`
+are opaque to the registry and cannot be derived into tools; register typed
+routes for any endpoint that should be MCP-exposable.
+
 ---
 
 ## Plugin conformance and publishing checklist

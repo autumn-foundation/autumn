@@ -416,9 +416,112 @@ WARN skipping MCP exposure: endpoint has no JSON response schema
      operation_id="dashboard" method="GET" path="/dashboard"
 ```
 
+**Exception: `204 No Content`.** A route whose success status is `204` has no
+response schema *by contract* — a deliberate empty success (like the
+repository macro's generated `DELETE`), structurally distinct from an HTML
+route's schema-less `200`. Such routes stay eligible; the tool result of a
+successful call is empty text.
+
 ---
 
-## 9. End-to-end example
+## 9. Repository CRUD tools
+
+The `#[repository(Model, api = "/path")]` macro generates five CRUD routes.
+Add the `mcp` key to expose them as tools — no hand-written handlers or
+attributes needed:
+
+```rust
+// list/get/create/update/delete all become tools:
+#[autumn_web::repository(Post, api = "/api/posts", policy = PostPolicy, mcp)]
+pub trait PostRepository {}
+
+// reads only — list and get:
+#[autumn_web::repository(Post, api = "/api/posts", policy = PostPolicy, mcp = "read")]
+pub trait PostRepository {}
+```
+
+- **Bare `mcp`** opts in all five operations. The usual safety annotations
+  apply: `list`/`get` carry `readOnlyHint: true`, and `delete` carries
+  `destructiveHint: true`, so agents and UIs can warn before destructive
+  calls.
+- **`mcp = "read"`** opts in only `list` and `get`.
+- `mcp` requires `api = "/path"` (there are no routes to derive tools from
+  otherwise) — the macro rejects it at compile time.
+- Every tool call still dispatches through the real pipeline, so a
+  `policy = ...` repository enforces the same record-level checks for an
+  agent as for any HTTP client.
+
+The `create`/`update` tools take a `body` argument referencing the generated
+`New<Model>`/`Update<Model>` component schemas. By default those resolve to
+placeholder object schemas; register the real schemas on your
+`OpenApiConfig` (the same registration the OpenAPI document uses) to give
+agents fully-typed inputs.
+
+---
+
+## 10. Plugins and route-level opt-in
+
+Typed routes registered by a [plugin](../plugins.md) — via
+`AppBuilder::routes()` or `scoped()` inside `Plugin::build` — flow into the
+same route registry as your own, so a plugin route tagged `#[api_doc(mcp)]`
+becomes a tool exactly like a user route.
+
+More often, a plugin author doesn't want to hard-wire the decision. The
+chainable `Route` toggles — `Route::mcp()`, `Route::mcp_exclude()`, and
+`Route::mcp_stream()` — mirror the attribute forms at registration time, so
+a plugin can offer a fluent switch and let the **host** decide at install
+time:
+
+```rust
+use autumn_web::Route;
+
+pub struct HarvestPlugin {
+    expose_mcp: bool,
+}
+
+impl HarvestPlugin {
+    #[must_use]
+    pub fn expose_mcp(mut self) -> Self {
+        self.expose_mcp = true;
+        self
+    }
+}
+
+impl Plugin for HarvestPlugin {
+    fn build(self, app: AppBuilder) -> AppBuilder {
+        let mut rs = routes![list_runs, create_run, signal_run];
+        if self.expose_mcp {
+            rs = rs.into_iter().map(Route::mcp).collect();
+        }
+        app.routes(rs)
+    }
+}
+```
+
+```rust
+// Host app: the management API becomes MCP tools only because the host said so.
+autumn_web::app()
+    .plugin(HarvestPlugin::new().expose_mcp())
+    .mount_mcp("/mcp")
+    .run()
+    .await;
+```
+
+The toggles follow the same semantics as the attributes: an explicit
+`mcp()` exposes any verb, `mcp_exclude()` always wins (even over
+`expose_all_as_mcp()`), and `mcp_stream()` implies the opt-in while
+exempting an `Sse` route from the JSON-out gate. The flags are plain
+`ApiDoc` metadata, so a plugin crate can set them while compiling against
+base `autumn-web` — they take effect only when the host enables the `mcp`
+feature and calls `mount_mcp`.
+
+> **Limitation:** raw routers mounted via `nest()`/`merge()` are opaque to
+> the route registry — Autumn cannot derive tools from them. Register typed
+> routes if a plugin's endpoints should be MCP-exposable.
+
+---
+
+## 11. End-to-end example
 
 `examples/todo-app` ships an `/mcp` endpoint. Its bearer-token JSON API is
 mounted in a `scoped("/api", RequireApiToken, …)` group and tagged
@@ -446,7 +549,7 @@ header to watch progress frames arrive as the scan runs.
 
 ---
 
-## 10. How a tool call is dispatched (and why it can't loop)
+## 12. How a tool call is dispatched (and why it can't loop)
 
 When a `tools/call` arrives, the MCP handler reconstructs an ordinary HTTP
 request — filling the path template, building the query string, and attaching
@@ -476,7 +579,7 @@ that from convention to a structural guarantee.)
 
 ---
 
-## 11. Scope and roadmap
+## 13. Scope and roadmap
 
 This slice is **tools-only**. Tool results are buffered by default, with
 **opt-in progressive streaming over SSE** (§5). The following remain **out of
@@ -486,7 +589,12 @@ scope** and are tracked as follow-ups:
   [#1119](https://github.com/madmax983/autumn/issues/1119).
 - **Durable workflow tools** — exposing Harvest `#[workflow]`s as
   start/status/signal MCP tools on top of this layer
-  ([autumn-harvest#597](https://github.com/madmax983/autumn-harvest)).
+  ([autumn-harvest#597](https://github.com/madmax983/autumn-harvest)); the
+  management API itself can already be exposed via the plugin route toggles
+  (§10).
+- **Tool declarations for raw `nest()`/`merge()` routers** — opaque routers
+  carry no `ApiDoc`, so plugins must register typed routes to be
+  MCP-exposable (§10).
 - **MCP resources, prompts, and sampling** — this slice is tools-only.
 - **stdio transport** — agents target deployed apps, so HTTP only for v1.
 - **Non-JSON endpoints** (file upload/download, HTML).
