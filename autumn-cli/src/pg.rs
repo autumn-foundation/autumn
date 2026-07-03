@@ -325,6 +325,30 @@ fn take_pair(pairs: &mut Vec<(String, String)>, key: &str) -> Option<String> {
     Some(pairs.remove(index).1)
 }
 
+/// Fill in `host`/`hostaddr` from `PGHOST`/`PGHOSTADDR` if `host_present`
+/// and `hostaddr_present` (as the caller determined for its own connection
+/// string shape) are both false — `tokio_postgres::connect` refuses to
+/// connect at all if neither ends up set on the final `Config`, so a bare
+/// connection string relying on either (the way `psql`/`libpq` would) must
+/// not be handed off still empty. (`libpq`'s further fallback to a
+/// platform-default Unix socket directory when even `PGHOST` is unset isn't
+/// replicated here — that default is a compile-time detail of the actual
+/// `libpq` build in use, not something derivable from this crate alone.)
+fn fill_in_pghost_fallback(
+    pairs: &mut Vec<(String, String)>,
+    host_present: bool,
+    hostaddr_present: bool,
+) {
+    if host_present || hostaddr_present {
+        return;
+    }
+    if let Ok(pghost) = std::env::var("PGHOST") {
+        pairs.push(("host".to_owned(), pghost));
+    } else if let Ok(pghostaddr) = std::env::var("PGHOSTADDR") {
+        pairs.push(("hostaddr".to_owned(), pghostaddr));
+    }
+}
+
 /// Return the value of the first `(key, value)` pair matching `key`, if any.
 fn find_pair<'a>(pairs: &'a [(String, String)], key: &str) -> Option<&'a str> {
     pairs
@@ -663,6 +687,10 @@ fn sanitize_url_form(mut url: url::Url) -> Result<String, CommandError> {
     // error over a parameter it was never going to need anyway.
     let passfile = take_pair(&mut pairs, "passfile");
 
+    let host_present = is_explicit(&pairs, "host");
+    let hostaddr_present = is_explicit(&pairs, "hostaddr");
+    fill_in_pghost_fallback(&mut pairs, host_present, hostaddr_present);
+
     let host = explicit_host
         .clone()
         .or_else(|| find_pair(&pairs, "host").map(str::to_owned))
@@ -746,6 +774,10 @@ fn sanitize_keyword_form(pairs: Vec<(String, String)>) -> Result<String, Command
     // See the identical comment in `sanitize_url_form` — `passfile` must
     // always be consumed and stripped, not just when it turns out to matter.
     let passfile = take_pair(&mut pairs, "passfile");
+
+    let host_present = find_pair(&pairs, "host").is_some();
+    let hostaddr_present = find_pair(&pairs, "hostaddr").is_some();
+    fill_in_pghost_fallback(&mut pairs, host_present, hostaddr_present);
 
     if find_pair(&pairs, "password").is_none() {
         let host = find_pair(&pairs, "host")
@@ -1102,6 +1134,47 @@ mod tests {
     fn sanitize_passes_through_strings_matching_neither_shape() {
         let input = "not a valid connection string at all";
         assert_eq!(sanitize_db_url(input).unwrap(), input);
+    }
+
+    #[test]
+    fn sanitize_fills_in_pghost_when_url_has_neither_host_nor_hostaddr() {
+        // `tokio_postgres::connect` errors "both host and hostaddr are
+        // missing" if neither is set on the final `Config` — a bare
+        // `postgres:///app` (a common local-dev Unix-socket-style
+        // connection string, or one relying on `PGHOST` the way `psql`
+        // itself would) must not be handed to it as-is.
+        temp_env::with_var("PGHOST", Some("db.internal"), || {
+            let sanitized = sanitize_db_url("postgres:///app").unwrap();
+            let config: tokio_postgres::Config = sanitized.parse().unwrap();
+            assert_eq!(
+                config.get_hosts(),
+                &[tokio_postgres::config::Host::Tcp("db.internal".to_owned())]
+            );
+        });
+    }
+
+    #[test]
+    fn sanitize_fills_in_pghost_when_keyword_form_has_neither_host_nor_hostaddr() {
+        temp_env::with_var("PGHOST", Some("db.internal"), || {
+            let sanitized = sanitize_db_url("dbname=app").unwrap();
+            let config: tokio_postgres::Config = sanitized.parse().unwrap();
+            assert_eq!(
+                config.get_hosts(),
+                &[tokio_postgres::config::Host::Tcp("db.internal".to_owned())]
+            );
+        });
+    }
+
+    #[test]
+    fn sanitize_does_not_override_an_explicit_host_with_pghost() {
+        temp_env::with_var("PGHOST", Some("wrong-host"), || {
+            let sanitized = sanitize_db_url("postgres://right-host/app").unwrap();
+            let config: tokio_postgres::Config = sanitized.parse().unwrap();
+            assert_eq!(
+                config.get_hosts(),
+                &[tokio_postgres::config::Host::Tcp("right-host".to_owned())]
+            );
+        });
     }
 
     #[test]
