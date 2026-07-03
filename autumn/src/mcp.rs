@@ -365,7 +365,10 @@ fn should_expose(doc: &ApiDoc, expose_all: bool) -> bool {
     // here from a legitimately body-less route — both leave `request_body`
     // unset. Such routes are a documented non-target for MCP exposure (see
     // `AppBuilder::mount_mcp`): opting one in yields a tool with no body input.
-    if doc.response.is_none() {
+    // Exception: 204 No Content is a deliberate empty success contract (e.g.
+    // the repository macro's generated DELETE), structurally distinct from an
+    // HTML route's schema-less 200-with-body. It stays eligible.
+    if doc.response.is_none() && doc.success_status != 204 {
         return false;
     }
     if doc.mcp_tool {
@@ -525,10 +528,12 @@ pub fn derive_tools(
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for doc in docs {
         // Surface the "opted in but ineligible" case as a build-time note.
-        // Streaming tools legitimately have no JSON response schema, so they
-        // are exempt from this "missing response" warning/skip.
+        // Streaming tools legitimately have no JSON response schema, and a
+        // 204 No Content route's empty body is its contract, so both are
+        // exempt from this "missing response" warning/skip.
         if (doc.mcp_tool || (expose_all && is_read_only(doc.method)))
             && doc.response.is_none()
+            && doc.success_status != 204
             && !doc.mcp_stream
             && !doc.mcp_exclude
             && !doc.hidden
@@ -1878,6 +1883,56 @@ mod tests {
         d.response = None; // HTML/Maud route
         d.mcp_tool = true;
         assert!(!should_expose(&d, false));
+    }
+
+    #[test]
+    fn no_content_delete_with_opt_in_is_eligible() {
+        // A 204 No Content route (e.g. the repository macro's generated
+        // DELETE) has no response schema *by contract*, not because it is an
+        // HTML route. An explicit opt-in must expose it.
+        let mut d = doc("DELETE", "/api/widgets/{id}", "widget_api_delete");
+        d.response = None;
+        d.success_status = 204;
+        d.mcp_tool = true;
+        assert!(
+            should_expose(&d, false),
+            "opted-in 204 route is a deliberate empty success contract"
+        );
+    }
+
+    #[test]
+    fn no_content_without_opt_in_stays_hidden() {
+        let mut d = doc("DELETE", "/api/widgets/{id}", "widget_api_delete");
+        d.response = None;
+        d.success_status = 204;
+        assert!(!should_expose(&d, false), "no opt-in => hidden");
+    }
+
+    #[test]
+    fn no_content_under_hatch_pins_behavior() {
+        // A read-only, deliberately body-less endpoint under the whole-API
+        // hatch: 204 is a structural JSON-API signal (unlike an HTML route's
+        // 200-with-body), so the hatch includes it.
+        let mut d = doc("GET", "/api/ping", "ping");
+        d.response = None;
+        d.success_status = 204;
+        assert!(should_expose(&d, true));
+        assert!(!should_expose(&d, false), "still requires hatch or opt-in");
+    }
+
+    #[test]
+    fn derive_tools_keeps_opted_in_no_content_route() {
+        // The "opted in but no JSON response" warn/skip block in
+        // `derive_tools` must not silently drop a 204 route that
+        // `should_expose` accepts.
+        let mut d = doc("DELETE", "/api/widgets/{id}", "widget_api_delete");
+        d.response = None;
+        d.success_status = 204;
+        d.mcp_tool = true;
+        let tools = derive_tools(&[d], false, None);
+        assert_eq!(tools.len(), 1, "204 opt-in must derive a tool");
+        assert_eq!(tools[0].name, "widget_api_delete");
+        assert_eq!(tools[0].annotations["destructiveHint"], true);
     }
 
     #[test]
