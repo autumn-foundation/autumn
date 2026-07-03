@@ -63,11 +63,26 @@ struct Association {
     kind: AssocKind,
     target: syn::Ident,
     /// The foreign-key column name. For `belongs_to` it is a column on this
-    /// model; for `has_many`/`has_one` it is a column on the target.
+    /// model; for `has_many`/`has_one` it is a column on the target. For a
+    /// `through =` (many-to-many) `has_many`, this is the join table's
+    /// column pointing back at *this* model (e.g. `post_id`).
     fk: String,
     /// The accessor method name and association store key, e.g. `author`,
     /// `comments`, `subreddit`.
     name: String,
+    /// Set for a many-to-many `has_many(Target, through = join_table)`
+    /// association: the join table this association is preloaded/mutated
+    /// through, plus the join table's column pointing at the target model.
+    through: Option<ThroughSpec>,
+}
+
+/// The join-table half of a many-to-many `has_many(..., through = ...)`
+/// association.
+struct ThroughSpec {
+    /// The join table name, e.g. `post_tags`.
+    table: String,
+    /// The join table's column pointing at the target model, e.g. `tag_id`.
+    target_fk: String,
 }
 
 /// Resolve the foreign-key column and accessor name for an association,
@@ -117,44 +132,82 @@ fn parse_assoc_attr(
 ) -> syn::Result<Association> {
     use syn::parse::ParseStream;
 
-    let (target, explicit_fk, explicit_name) = attr.parse_args_with(|input: ParseStream| {
-        let target: syn::Ident = input.parse()?;
-        let mut explicit_fk: Option<String> = None;
-        let mut explicit_name: Option<String> = None;
-        // Zero or more trailing `, key = value` pairs (`fk`, `name`), any order.
-        while input.peek(syn::Token![,]) {
-            input.parse::<syn::Token![,]>()?;
-            let key: syn::Ident = input.parse()?;
-            input.parse::<syn::Token![=]>()?;
-            // Accept either a bare identifier (`fk = author_id`) or a string
-            // literal (`fk = "author_id"`).
-            let value = if input.peek(LitStr) {
-                input.parse::<LitStr>()?.value()
-            } else {
-                input.parse::<syn::Ident>()?.to_string()
-            };
-            if key == "fk" {
-                explicit_fk = Some(value);
-            } else if key == "name" {
-                explicit_name = Some(value);
-            } else {
-                return Err(syn::Error::new_spanned(
-                    &key,
-                    "expected `fk = <column>` or `name = <accessor>` in association attribute",
-                ));
+    let (target, explicit_fk, explicit_name, explicit_through, explicit_target_fk) = attr
+        .parse_args_with(|input: ParseStream| {
+            let target: syn::Ident = input.parse()?;
+            let mut explicit_fk: Option<String> = None;
+            let mut explicit_name: Option<String> = None;
+            let mut explicit_through: Option<String> = None;
+            let mut explicit_target_fk: Option<String> = None;
+            // Zero or more trailing `, key = value` pairs (`fk`, `name`,
+            // `through`, `target_fk`), any order.
+            while input.peek(syn::Token![,]) {
+                input.parse::<syn::Token![,]>()?;
+                let key: syn::Ident = input.parse()?;
+                input.parse::<syn::Token![=]>()?;
+                // Accept either a bare identifier (`fk = author_id`) or a string
+                // literal (`fk = "author_id"`).
+                let value = if input.peek(LitStr) {
+                    input.parse::<LitStr>()?.value()
+                } else {
+                    input.parse::<syn::Ident>()?.to_string()
+                };
+                if key == "fk" {
+                    explicit_fk = Some(value);
+                } else if key == "name" {
+                    explicit_name = Some(value);
+                } else if key == "through" {
+                    explicit_through = Some(value);
+                } else if key == "target_fk" {
+                    explicit_target_fk = Some(value);
+                } else {
+                    return Err(syn::Error::new_spanned(
+                        &key,
+                        "expected `fk = <column>`, `name = <accessor>`, \
+                         `through = <join_table>`, or `target_fk = <column>` \
+                         in association attribute",
+                    ));
+                }
             }
-        }
-        Ok((target, explicit_fk, explicit_name))
-    })?;
+            Ok((
+                target,
+                explicit_fk,
+                explicit_name,
+                explicit_through,
+                explicit_target_fk,
+            ))
+        })?;
+
+    if explicit_through.is_some() && kind != AssocKind::HasMany {
+        return Err(syn::Error::new_spanned(
+            &target,
+            "`through = <join_table>` (many-to-many) is only supported on \
+             `has_many`, not `belongs_to`/`has_one`",
+        ));
+    }
+    if explicit_target_fk.is_some() && explicit_through.is_none() {
+        return Err(syn::Error::new_spanned(
+            &target,
+            "`target_fk = <column>` requires `through = <join_table>`",
+        ));
+    }
 
     let (fk, derived_name) =
         resolve_fk_and_name(kind, model_ident, &target, explicit_fk.as_deref());
     let name = explicit_name.unwrap_or(derived_name);
+
+    let through = explicit_through.map(|table| {
+        let snake_target = pascal_to_snake(&target.to_string());
+        let target_fk = explicit_target_fk.unwrap_or_else(|| format!("{snake_target}_id"));
+        ThroughSpec { table, target_fk }
+    });
+
     Ok(Association {
         kind,
         target,
         fk,
         name,
+        through,
     })
 }
 
@@ -177,7 +230,43 @@ fn resolve_associations(
         };
         out.push(parse_assoc_attr(attr, kind, model_ident)?);
     }
+    check_m2m_mutation_name_collisions(&out)?;
     Ok(out)
+}
+
+/// The singular form used to derive a many-to-many association's mutation
+/// helper names (`add_{singular}`, `remove_{singular}`), mirroring the
+/// codebase's naive `{target}s` pluralization in reverse: strip a trailing
+/// `s` if present.
+fn m2m_mutation_singular(assoc_name: &str) -> &str {
+    assoc_name.strip_suffix('s').unwrap_or(assoc_name)
+}
+
+/// Reject a model whose many-to-many associations would generate colliding
+/// `add_*`/`remove_*`/`set_*` mutation helper names (e.g. two `through =`
+/// associations that both derive `add_tag`), rather than emitting a trait
+/// with duplicate method definitions.
+fn check_m2m_mutation_name_collisions(assocs: &[Association]) -> syn::Result<()> {
+    let mut seen: std::collections::HashMap<&str, &syn::Ident> = std::collections::HashMap::new();
+    for assoc in assocs {
+        if assoc.through.is_none() {
+            continue;
+        }
+        let singular = m2m_mutation_singular(&assoc.name);
+        if let Some(_prev) = seen.insert(singular, &assoc.target) {
+            return Err(syn::Error::new_spanned(
+                &assoc.target,
+                format!(
+                    "many-to-many association `{}` would generate a mutation \
+                     helper `add_{singular}`/`remove_{singular}` that collides \
+                     with another `through =` association on this model; \
+                     disambiguate with `name = ...`",
+                    assoc.name
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Whether an attribute is one of the association declarations consumed by
@@ -219,6 +308,10 @@ fn emit_association_items(
     let mut accessor_impls: Vec<TokenStream> = Vec::new();
     // Loader body statements (one block per association).
     let mut loader_blocks: Vec<TokenStream> = Vec::new();
+    // Top-level items for many-to-many (`through =`) associations: the
+    // hidden join-table module and the per-association mutation trait +
+    // blanket impl. Emitted alongside (not inside) the `Preloadable` impl.
+    let mut m2m_items: Vec<TokenStream> = Vec::new();
 
     for assoc in assocs {
         let name_ident = format_ident!("{}", assoc.name);
@@ -338,8 +431,12 @@ fn emit_association_items(
                     }
                 });
             }
-            AssocKind::HasMany => {
-                // Many related records owned per-parent.
+            AssocKind::HasMany if assoc.through.is_none() => {
+                // Many related records owned per-parent. Each child row is
+                // fetched at most once (its own primary key is unique in the
+                // `WHERE fk IN (...)` result set), so it can be moved
+                // directly into its one owning parent's `Vec` — no sharing
+                // needed.
                 let stored_ty = quote! {
                     ::std::vec::Vec<::autumn_web::preload::Preloaded<#target>>
                 };
@@ -399,6 +496,345 @@ fn emit_association_items(
                         }
                     }
                 });
+            }
+            AssocKind::HasMany => {
+                let through = assoc
+                    .through
+                    .as_ref()
+                    .expect("through checked by guard above");
+                // Many-to-many: unlike plain has_many, the *same* target row
+                // can legitimately belong to more than one currently-loaded
+                // parent (the whole point of m2m), so children are shared via
+                // `Arc` — mirroring belongs_to/has_one — rather than moved
+                // into one owning parent's `Vec`.
+                let stored_ty = quote! {
+                    ::std::vec::Vec<::std::sync::Arc<::autumn_web::preload::Preloaded<#target>>>
+                };
+                accessor_sigs.push(quote! {
+                    /// The preloaded related records (possibly empty).
+                    /// `Err(NotLoaded)` if this association was not preloaded.
+                    fn #name_ident(&self) -> ::core::result::Result<
+                        ::std::vec::Vec<&::autumn_web::preload::Preloaded<#target>>,
+                        ::autumn_web::preload::NotLoaded,
+                    >;
+                });
+                accessor_impls.push(quote! {
+                    fn #name_ident(&self) -> ::core::result::Result<
+                        ::std::vec::Vec<&::autumn_web::preload::Preloaded<#target>>,
+                        ::autumn_web::preload::NotLoaded,
+                    > {
+                        match self.associations().get::<#stored_ty>(#key) {
+                            ::core::option::Option::Some(v) => ::core::result::Result::Ok(
+                                v.iter().map(|__a| &**__a).collect()
+                            ),
+                            ::core::option::Option::None => ::core::result::Result::Err(
+                                ::autumn_web::preload::NotLoaded::new(#model_str, #key),
+                            ),
+                        }
+                    }
+                });
+                {
+                    // Many-to-many: the fk lives on a join table, not on the
+                    // target. Emit a hidden module declaring the join table
+                    // (so this and the target model can both be `through =`
+                    // the same physical table without colliding), then a
+                    // single batched `INNER JOIN` loader keyed on the join
+                    // table's own two columns.
+                    let model_snake = pascal_to_snake(&model_ident.to_string());
+                    // Length-prefix `model_snake` so the module name can't
+                    // collide between two different (model, association)
+                    // pairs, e.g. model `Post` assoc `tag_things` vs. model
+                    // `PostTag` assoc `things` would otherwise both produce
+                    // `__autumn_m2m_post_tag_things`.
+                    let join_mod_ident = format_ident!(
+                        "__autumn_m2m_{}_{model_snake}_{}",
+                        model_snake.len(),
+                        assoc.name
+                    );
+                    let join_table_ident = format_ident!("{}", through.table);
+                    let target_fk_ident = format_ident!("{}", through.target_fk);
+
+                    m2m_items.push(quote! {
+                        // Hidden Diesel table declaration for the
+                        // `#join_table_ident` join table backing
+                        // `#model_ident::#name_ident` (`through = #join_table_ident`).
+                        // Scoped to its own module (keyed by model + association
+                        // name) so two models declaring `through` on the same
+                        // physical join table don't produce colliding types.
+                        #[allow(
+                            missing_docs,
+                            unreachable_pub,
+                            clippy::all,
+                            clippy::pedantic,
+                            clippy::nursery
+                        )]
+                        mod #join_mod_ident {
+                            #[allow(unused_imports)]
+                            use super::*;
+                            ::autumn_web::reexports::diesel::table! {
+                                #join_table_ident (#fk_ident, #target_fk_ident) {
+                                    #fk_ident -> Int8,
+                                    #target_fk_ident -> Int8,
+                                }
+                            }
+                            ::autumn_web::reexports::diesel::allow_tables_to_appear_in_same_query!(
+                                #join_table_ident, #target_table
+                            );
+                        }
+                    });
+
+                    loader_blocks.push(quote! {
+                        if let ::core::option::Option::Some(__child_spec) = &spec.#name_ident {
+                            #[allow(unused_imports)]
+                            use ::autumn_web::reexports::diesel::query_dsl::JoinOnDsl as _;
+                            let mut __keys: ::std::vec::Vec<i64> =
+                                records.iter().map(|__r| __r.id).collect();
+                            __keys.sort_unstable();
+                            __keys.dedup();
+                            let __pairs: ::std::vec::Vec<(i64, #target)> =
+                                #join_mod_ident::#join_table_ident::table
+                                    .inner_join(
+                                        #target_table::table.on(
+                                            #target_table::id.eq(
+                                                #join_mod_ident::#join_table_ident::#target_fk_ident
+                                            )
+                                        )
+                                    )
+                                    .filter(
+                                        #join_mod_ident::#join_table_ident::#fk_ident.eq_any(__keys)
+                                    )
+                                    .select((
+                                        #join_mod_ident::#join_table_ident::#fk_ident,
+                                        <#target as ::autumn_web::reexports::diesel::SelectableHelper<::autumn_web::reexports::diesel::pg::Pg>>::as_select(),
+                                    ))
+                                    .load::<(i64, #target)>(&mut *conn)
+                                    .await
+                                    .map_err(::autumn_web::AutumnError::from)?;
+                            // Fail-closed parity probe: run the target's batch
+                            // retain against an empty `Vec` so a tenant-scoped
+                            // target with no tenant context errors exactly like
+                            // belongs_to/has_one/has_many, even when every
+                            // parent's join rows happen to be empty (in which
+                            // case the per-row `__autumn_preload_keep` loop
+                            // below never runs).
+                            let _ = #target::__autumn_preload_retain(::std::vec::Vec::new())?;
+                            // The same target row can appear once per linking
+                            // parent (that's the point of many-to-many), so
+                            // recursing into nested associations must run on a
+                            // *deduplicated* set of targets, not once per join
+                            // row — otherwise two parents sharing a target
+                            // would each get their own independent (and only
+                            // one of them fully grouped) copy of its nested
+                            // associations. Dedup by id, recurse once, then
+                            // share the single recursed record across every
+                            // parent via `Arc`. Filter and dedup in the same
+                            // pass: each kept row is moved directly into
+                            // `__unique_by_id` (no clone) and only its
+                            // lightweight `(parent_key, target_id)` pair is
+                            // kept in `__links` for the final grouping pass
+                            // below.
+                            let mut __unique_by_id: ::std::collections::HashMap<i64, #target> =
+                                ::std::collections::HashMap::new();
+                            let mut __links: ::std::vec::Vec<(i64, i64)> = ::std::vec::Vec::new();
+                            for (__fk, __row) in __pairs {
+                                if let ::core::option::Option::Some(__row) =
+                                    #target::__autumn_preload_keep(__row)?
+                                {
+                                    let __id = __row.id;
+                                    __links.push((__fk, __id));
+                                    __unique_by_id.entry(__id).or_insert(__row);
+                                }
+                            }
+                            let mut __unique_children: ::std::vec::Vec<
+                                ::autumn_web::preload::Preloaded<#target>
+                            > = __unique_by_id
+                                .into_values()
+                                .map(::autumn_web::preload::Preloaded::new)
+                                .collect();
+                            <#target as ::autumn_web::preload::Preloadable>::load_associations(
+                                &mut __unique_children, &**__child_spec, &mut *conn,
+                            ).await?;
+                            let __arc_by_id: ::std::collections::HashMap<
+                                i64, ::std::sync::Arc<::autumn_web::preload::Preloaded<#target>>
+                            > = __unique_children
+                                .into_iter()
+                                .map(|__c| (__c.id, ::std::sync::Arc::new(__c)))
+                                .collect();
+                            let mut __groups: ::std::collections::HashMap<i64, #stored_ty> =
+                                ::std::collections::HashMap::new();
+                            for (__fk, __id) in &__links {
+                                if let ::core::option::Option::Some(__arc) = __arc_by_id.get(__id) {
+                                    __groups.entry(*__fk).or_default().push(::std::sync::Arc::clone(__arc));
+                                }
+                            }
+                            for __r in records.iter_mut() {
+                                let __v: #stored_ty = __groups.get(&__r.id).cloned().unwrap_or_default();
+                                __r.associations_mut().insert::<#stored_ty>(#key, __v);
+                            }
+                        }
+                    });
+
+                    // Mutation helpers: `add_{singular}` / `remove_{singular}`
+                    // / `set_{plural}` (replace-all), generated once per
+                    // `through =` association and blanket-implemented for any
+                    // repository whose `M2mConnSource::Model` is this model —
+                    // keeping method resolution unambiguous when a model has
+                    // more than one m2m association, or when two models' m2m
+                    // traits are both in scope.
+                    let mutation_trait_ident =
+                        format_ident!("{model_ident}{}Mutations", pascal_case(&assoc.name));
+                    let singular = m2m_mutation_singular(&assoc.name);
+                    let add_ident = format_ident!("add_{singular}");
+                    let remove_ident = format_ident!("remove_{singular}");
+                    let set_ident = format_ident!("set_{}", assoc.name);
+                    let mutation_trait_doc = format!(
+                        "Mutation helpers for the `{}` many-to-many association \
+                         (`#[has_many({}, through = {})]`). Each method acquires \
+                         its own primary-pool connection and is idempotent; \
+                         `{set_ident}` wraps its delete-then-insert in a single \
+                         transaction.",
+                        assoc.name, target, through.table,
+                    );
+
+                    m2m_items.push(quote! {
+                        #[doc = #mutation_trait_doc]
+                        #vis trait #mutation_trait_ident {
+                            /// Link `child_id` to `parent_id`. A duplicate call
+                            /// is a no-op (`ON CONFLICT DO NOTHING` on the join
+                            /// table's composite primary key), not a
+                            /// unique-constraint error.
+                            fn #add_ident(
+                                &self,
+                                parent_id: i64,
+                                child_id: i64,
+                            ) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<()>> + Send;
+                            /// Unlink `child_id` from `parent_id`. A no-op if
+                            /// the pair was not linked.
+                            fn #remove_ident(
+                                &self,
+                                parent_id: i64,
+                                child_id: i64,
+                            ) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<()>> + Send;
+                            /// Replace the full set of children linked to
+                            /// `parent_id` with exactly `child_ids`
+                            /// (deduplicated), in a single transaction.
+                            fn #set_ident(
+                                &self,
+                                parent_id: i64,
+                                child_ids: &[i64],
+                            ) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<()>> + Send;
+                        }
+
+                        impl<__R> #mutation_trait_ident for __R
+                        where
+                            __R: ::autumn_web::repository::M2mConnSource<Model = #model_ident>
+                                + ::core::marker::Sync,
+                        {
+                            async fn #add_ident(
+                                &self,
+                                parent_id: i64,
+                                child_id: i64,
+                            ) -> ::autumn_web::AutumnResult<()> {
+                                use ::autumn_web::reexports::diesel::{ExpressionMethods as _, QueryDsl as _};
+                                use ::autumn_web::reexports::diesel_async::RunQueryDsl as _;
+                                let mut conn = self.__autumn_m2m_write_conn().await?;
+                                ::autumn_web::reexports::diesel::insert_into(
+                                    #join_mod_ident::#join_table_ident::table
+                                )
+                                .values((
+                                    #join_mod_ident::#join_table_ident::#fk_ident.eq(parent_id),
+                                    #join_mod_ident::#join_table_ident::#target_fk_ident.eq(child_id),
+                                ))
+                                .on_conflict((
+                                    #join_mod_ident::#join_table_ident::#fk_ident,
+                                    #join_mod_ident::#join_table_ident::#target_fk_ident,
+                                ))
+                                .do_nothing()
+                                .execute(&mut conn)
+                                .await
+                                .map_err(::autumn_web::AutumnError::from)?;
+                                ::core::result::Result::Ok(())
+                            }
+
+                            async fn #remove_ident(
+                                &self,
+                                parent_id: i64,
+                                child_id: i64,
+                            ) -> ::autumn_web::AutumnResult<()> {
+                                use ::autumn_web::reexports::diesel::{ExpressionMethods as _, QueryDsl as _};
+                                use ::autumn_web::reexports::diesel_async::RunQueryDsl as _;
+                                let mut conn = self.__autumn_m2m_write_conn().await?;
+                                ::autumn_web::reexports::diesel::delete(
+                                    #join_mod_ident::#join_table_ident::table
+                                        .filter(
+                                            #join_mod_ident::#join_table_ident::#fk_ident.eq(parent_id)
+                                        )
+                                        .filter(
+                                            #join_mod_ident::#join_table_ident::#target_fk_ident.eq(child_id)
+                                        ),
+                                )
+                                .execute(&mut conn)
+                                .await
+                                .map_err(::autumn_web::AutumnError::from)?;
+                                ::core::result::Result::Ok(())
+                            }
+
+                            async fn #set_ident(
+                                &self,
+                                parent_id: i64,
+                                child_ids: &[i64],
+                            ) -> ::autumn_web::AutumnResult<()> {
+                                use ::autumn_web::reexports::diesel::{ExpressionMethods as _, QueryDsl as _};
+                                use ::autumn_web::reexports::diesel_async::RunQueryDsl as _;
+                                use ::autumn_web::reexports::diesel_async::AsyncConnection as _;
+                                use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
+                                let mut __ids: ::std::vec::Vec<i64> = child_ids.to_vec();
+                                __ids.sort_unstable();
+                                __ids.dedup();
+                                let mut conn = self.__autumn_m2m_write_conn().await?;
+                                conn.transaction::<(), ::autumn_web::AutumnError, _>(|conn| {
+                                    async move {
+                                        ::autumn_web::reexports::diesel::delete(
+                                            #join_mod_ident::#join_table_ident::table.filter(
+                                                #join_mod_ident::#join_table_ident::#fk_ident
+                                                    .eq(parent_id)
+                                            ),
+                                        )
+                                        .execute(conn)
+                                        .await
+                                        .map_err(::autumn_web::AutumnError::from)?;
+                                        if !__ids.is_empty() {
+                                            let __values: ::std::vec::Vec<_> = __ids
+                                                .iter()
+                                                .map(|__child_id| (
+                                                    #join_mod_ident::#join_table_ident::#fk_ident
+                                                        .eq(parent_id),
+                                                    #join_mod_ident::#join_table_ident::#target_fk_ident
+                                                        .eq(*__child_id),
+                                                ))
+                                                .collect();
+                                            ::autumn_web::reexports::diesel::insert_into(
+                                                #join_mod_ident::#join_table_ident::table
+                                            )
+                                            .values(__values)
+                                            .on_conflict((
+                                                #join_mod_ident::#join_table_ident::#fk_ident,
+                                                #join_mod_ident::#join_table_ident::#target_fk_ident,
+                                            ))
+                                            .do_nothing()
+                                            .execute(conn)
+                                            .await
+                                            .map_err(::autumn_web::AutumnError::from)?;
+                                        }
+                                        ::core::result::Result::Ok(())
+                                    }
+                                    .scope_boxed()
+                                })
+                                .await
+                            }
+                        }
+                    });
+                }
             }
         }
     }
@@ -472,6 +908,8 @@ fn emit_association_items(
                 })
             }
         }
+
+        #(#m2m_items)*
     }
 }
 
@@ -1798,6 +2236,16 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // Built from the model's own field set (the loading model can't see these
     // columns): soft-delete drops `deleted_at IS NOT NULL`; tenant scoping
     // keeps only rows matching the ambient `CURRENT_TENANT` when one is set.
+    //
+    // IMPORTANT: do not add an `if rows.is_empty() { return Ok(rows); }`
+    // early return ahead of the tenant check below. Many-to-many preload
+    // loaders (`through =`) call `__autumn_preload_retain(Vec::new())` as a
+    // fail-closed parity probe specifically to get the "no tenant context"
+    // error even when their join returns zero rows (model.rs, the
+    // `__autumn_m2m_...` loader block) — an empty-input early return would
+    // silently skip that check and break tenant isolation for a whole class
+    // of m2m preloads with no matching join rows. See
+    // `preload_retain_empty_rows_still_fails_closed_without_tenant` below.
     let deleted_at_field = all_fields
         .iter()
         .find(|f| f.ident.as_ref().is_some_and(|id| id == "deleted_at"))
@@ -1888,6 +2336,24 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 #soft_delete_retain
                 #tenant_retain
                 ::core::result::Result::Ok(rows)
+            }
+
+            /// Per-row sibling of `__autumn_preload_retain`, applying the
+            /// identical scoping rules to a single row. Used by many-to-many
+            /// (`through =`) preload loaders, which pair each child row with
+            /// its parent key before grouping and so can't run a batch
+            /// `Vec<Self>::retain` without losing that pairing. Takes `row`
+            /// by value (no `Clone` bound needed) and hands it back on
+            /// `Some` when it passes scoping. Delegates to
+            /// `__autumn_preload_retain` (a single-row batch) rather than
+            /// re-deriving the soft-delete/tenant predicates, so the two
+            /// can never drift apart.
+            #[doc(hidden)]
+            pub fn __autumn_preload_keep(
+                row: Self,
+            ) -> ::autumn_web::AutumnResult<::core::option::Option<Self>> {
+                let mut __kept = <Self>::__autumn_preload_retain(::std::vec![row])?;
+                ::core::result::Result::Ok(__kept.pop())
             }
         }
     };
@@ -3147,6 +3613,171 @@ mod tests {
         assert_eq!(assocs[0].name, "authored");
         assert_eq!(assocs[1].fk, "approver_id");
         assert_eq!(assocs[1].name, "approved");
+    }
+
+    // ── Many-to-many (`through = join_table`) parsing (#1324) ────────────
+
+    #[test]
+    fn has_many_through_infers_join_columns_and_name() {
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[has_many(Tag, through = post_tags)])];
+        let assocs = resolve_associations(&model, &attrs).expect("parse ok");
+        assert_eq!(assocs.len(), 1);
+        assert_eq!(assocs[0].kind, AssocKind::HasMany);
+        // Join-table column pointing back at the source model.
+        assert_eq!(assocs[0].fk, "post_id");
+        assert_eq!(assocs[0].name, "tags");
+        let through = assocs[0].through.as_ref().expect("through present");
+        assert_eq!(through.table, "post_tags");
+        // Join-table column pointing at the target model.
+        assert_eq!(through.target_fk, "tag_id");
+    }
+
+    #[test]
+    fn has_many_through_accepts_fk_and_target_fk_overrides() {
+        let model: syn::Ident = syn::parse_quote!(Article);
+        let attrs: Vec<syn::Attribute> = vec![syn::parse_quote!(
+            #[has_many(Label, through = taggings, fk = piece_id, target_fk = sticker_id)]
+        )];
+        let assocs = resolve_associations(&model, &attrs).expect("parse ok");
+        assert_eq!(assocs[0].fk, "piece_id");
+        assert_eq!(assocs[0].name, "labels");
+        let through = assocs[0].through.as_ref().expect("through present");
+        assert_eq!(through.table, "taggings");
+        assert_eq!(through.target_fk, "sticker_id");
+    }
+
+    #[test]
+    fn through_rejected_on_belongs_to_and_has_one() {
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let belongs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[belongs_to(User, through = post_users)])];
+        assert!(resolve_associations(&model, &belongs).is_err());
+        let has_one: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[has_one(Profile, through = post_profiles)])];
+        assert!(resolve_associations(&model, &has_one).is_err());
+    }
+
+    #[test]
+    fn target_fk_without_through_is_error() {
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[has_many(Tag, target_fk = tag_id)])];
+        assert!(resolve_associations(&model, &attrs).is_err());
+    }
+
+    #[test]
+    fn m2m_colliding_mutation_method_names_rejected() {
+        // `tags` and `name = tag` both derive an `add_tag` helper — reject at
+        // macro time rather than emitting a trait with duplicate methods.
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let attrs: Vec<syn::Attribute> = vec![
+            syn::parse_quote!(#[has_many(Tag, through = post_tags)]),
+            syn::parse_quote!(#[has_many(Label, through = post_labels, name = tag)]),
+        ];
+        assert!(resolve_associations(&model, &attrs).is_err());
+    }
+
+    // ── Many-to-many codegen shape (#1324) ────────────────────────────────
+
+    #[test]
+    fn model_macro_m2m_emits_hidden_join_table_module() {
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[has_many(Tag, through = post_tags)]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub title: String,
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("__autumn_m2m_post_tags") || generated.contains("__autumn_m2m"),
+            "expected a hidden m2m join-table module, got: {generated}"
+        );
+        assert!(
+            generated.contains("table !"),
+            "expected a diesel table! invocation"
+        );
+        assert!(
+            generated.contains("allow_tables_to_appear_in_same_query"),
+            "expected the join table to be allowed alongside the target table"
+        );
+    }
+
+    #[test]
+    fn model_macro_m2m_loader_uses_single_inner_join_and_keep() {
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[has_many(Tag, through = post_tags)]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub title: String,
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("inner_join"),
+            "expected a single inner_join loader"
+        );
+        assert!(
+            generated.contains("eq_any"),
+            "expected a batched WHERE ... IN filter"
+        );
+        assert!(
+            generated.contains("__autumn_preload_keep"),
+            "expected the m2m loader to scope rows with the per-row keep predicate"
+        );
+    }
+
+    #[test]
+    fn model_macro_m2m_emits_mutation_trait() {
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[has_many(Tag, through = post_tags)]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub title: String,
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("PostTagsMutations"),
+            "expected a per-association mutation trait"
+        );
+        assert!(
+            generated.contains("add_tag"),
+            "expected an add_tag mutation helper"
+        );
+        assert!(
+            generated.contains("remove_tag"),
+            "expected a remove_tag mutation helper"
+        );
+        assert!(
+            generated.contains("set_tags"),
+            "expected a set_tags (replace-all) mutation helper"
+        );
+        assert!(
+            generated.contains("on_conflict_do_nothing") || generated.contains("on_conflict"),
+            "expected add_tag to be idempotent via ON CONFLICT DO NOTHING"
+        );
+        assert!(
+            generated.contains("M2mConnSource"),
+            "expected the mutation trait to be blanket-implemented over M2mConnSource"
+        );
     }
 
     #[test]

@@ -5,6 +5,8 @@
 //! Maud templates with Tailwind CSS, and feature-flag fragment gating
 //! via the `Flags` extractor.
 
+use std::collections::HashMap;
+
 use autumn_web::experiments::Experiments;
 use autumn_web::extract::Path;
 use autumn_web::extract::State;
@@ -15,9 +17,11 @@ use diesel_async::RunQueryDsl;
 use scoped_futures::ScopedFutureExt;
 
 use crate::jobs::{PostPublicationArgs, PostPublicationJob};
-use crate::models::{Comment, CommentAssociations, Post, PostAssociations, Subreddit};
+use crate::models::{
+    Comment, CommentAssociations, NewTag, Post, PostAssociations, PostTagsMutations, Subreddit, Tag,
+};
 use crate::repositories::{PgPostRepository, PostRepository};
-use crate::schema::{posts, subreddits};
+use crate::schema::{posts, subreddits, tags};
 use crate::slugify::slugify;
 
 fn posts_per_page() -> i64 {
@@ -567,21 +571,26 @@ pub async fn show(
     // primary too (`on_primary`) to keep both reads on one consistent role.
     drop(db);
 
-    // Eager-load the post's author and its comments (each with their author),
-    // replacing the per-row author lookup + hand-written comment/author join.
-    // For a post with N comments this is a fixed 2 extra queries (post.author,
-    // comments) + 1 (comments.author) = at most 3 here, never `2 + N`.
+    // Eager-load the post's author, its comments (each with their author),
+    // and its tags (#1324, many-to-many through `post_tags`) -- replacing
+    // the per-row author lookup + hand-written comment/author join, and what
+    // would otherwise be a hand-rolled `post_tags` join query. For a post
+    // with N comments and M tags this is a fixed 2 extra queries
+    // (post.author, comments) + 1 (comments.author) + 1 (post.tags) = at
+    // most 4 here, never `3 + N + M`.
     let mut loaded = repo
         .on_primary()
         .preload(
             vec![post],
             Post::preload()
                 .author()
-                .comments_with(Comment::preload().author()),
+                .comments_with(Comment::preload().author())
+                .tags(),
         )
         .await?;
     let post = loaded.remove(0);
     let author = post.author()?;
+    let post_tags = post.tags()?;
 
     // Show top-level comments (parent_id IS NULL), highest score first.
     let mut post_comments: Vec<&autumn_web::preload::Preloaded<Comment>> = post
@@ -644,6 +653,18 @@ pub async fn show(
                                 }
                             }
                         }
+                        // Preloaded many-to-many tags (#1324): `post.tags()`
+                        // reads the batched `post_tags` join loaded above, no
+                        // per-tag query.
+                        @if !post_tags.is_empty() {
+                            div class="flex flex-wrap gap-2 mt-3" {
+                                @for tag in &post_tags {
+                                    span class="px-2 py-0.5 rounded-full bg-orange-50 text-orange-700 text-xs" {
+                                        "#" (tag.slug)
+                                    }
+                                }
+                            }
+                        }
                         @if is_author {
                             div class="flex gap-3 mt-4 pt-4 border-t border-gray-100 text-sm" {
                                 a href=(paths::edit_form(&sub.slug, &post.slug))
@@ -653,6 +674,20 @@ pub async fn show(
                                     hx-confirm="Delete this post? This cannot be undone."
                                     class="text-red-500 hover:text-red-700 cursor-pointer" {
                                     "Delete"
+                                }
+                            }
+                            form action=(paths::manage_tags(&sub.slug, &post.slug)) method="post"
+                                 class="flex items-center gap-2 mt-3 text-sm" {
+                                input type="hidden" name="_csrf" value=(csrf.token());
+                                input type="text" name="tags"
+                                      value=(post_tags.iter().map(|t| t.slug.clone()).collect::<Vec<_>>().join(", "))
+                                      placeholder="tags, comma separated"
+                                      class="flex-1 border border-gray-300 rounded px-2 py-1 text-xs \
+                                             focus:outline-none focus:ring-2 focus:ring-orange-400" {}
+                                button type="submit"
+                                       class="px-3 py-1 bg-gray-100 text-gray-700 rounded text-xs \
+                                              hover:bg-gray-200" {
+                                    "Save tags"
                                 }
                             }
                         }
@@ -736,6 +771,30 @@ pub async fn show(
 
 // ── Edit post ──────────────────────────────────────────────────
 
+/// Load a post by `(sub_slug, post_slug)` and authorize `action` against it,
+/// or fail with 404/authorization error. Shared by every handler that
+/// mutates (or renders a mutation form for) a single post.
+async fn load_post_and_authorize(
+    state: &AppState,
+    session: &Session,
+    db: &mut Db,
+    sub_slug: &str,
+    post_slug: &str,
+    action: &str,
+) -> AutumnResult<Post> {
+    let post: Post = posts::table
+        .inner_join(subreddits::table.on(posts::subreddit_id.eq(subreddits::id)))
+        .filter(subreddits::slug.eq(sub_slug))
+        .filter(posts::slug.eq(post_slug))
+        .select(Post::as_select())
+        .first(&mut *db)
+        .await
+        .map_err(|_| AutumnError::not_found_msg("Post not found"))?;
+
+    autumn_web::authorization::authorize::<Post>(state, session, action, &post).await?;
+    Ok(post)
+}
+
 #[secured]
 #[get("/r/{sub_slug}/posts/{post_slug}/edit")]
 pub async fn edit_form(
@@ -747,16 +806,8 @@ pub async fn edit_form(
 ) -> AutumnResult<Markup> {
     let current_user = session.get("username").await;
 
-    let post: Post = posts::table
-        .inner_join(subreddits::table.on(posts::subreddit_id.eq(subreddits::id)))
-        .filter(subreddits::slug.eq(&sub_slug))
-        .filter(posts::slug.eq(&post_slug))
-        .select(Post::as_select())
-        .first(&mut *db)
-        .await
-        .map_err(|_| AutumnError::not_found_msg("Post not found"))?;
-
-    autumn_web::authorization::authorize::<Post>(&state, &session, "update", &post).await?;
+    let post =
+        load_post_and_authorize(&state, &session, &mut db, &sub_slug, &post_slug, "update").await?;
 
     Ok(layout(
         &format!("Edit: {}", post.title),
@@ -820,16 +871,8 @@ pub async fn update(
     flash: Flash,
     form: Form<EditPostForm>,
 ) -> AutumnResult<Redirect> {
-    let post: Post = posts::table
-        .inner_join(subreddits::table.on(posts::subreddit_id.eq(subreddits::id)))
-        .filter(subreddits::slug.eq(&sub_slug))
-        .filter(posts::slug.eq(&post_slug))
-        .select(Post::as_select())
-        .first(&mut *db)
-        .await
-        .map_err(|_| AutumnError::not_found_msg("Post not found"))?;
-
-    autumn_web::authorization::authorize::<Post>(&state, &session, "update", &post).await?;
+    let post =
+        load_post_and_authorize(&state, &session, &mut db, &sub_slug, &post_slug, "update").await?;
 
     let title = form.0.title.trim().to_string();
     if title.is_empty() || title.len() > 300 {
@@ -877,6 +920,124 @@ pub async fn update(
     Ok(Redirect::to(&paths::show(&sub_slug, &new_slug)))
 }
 
+// ── Manage tags (#1324 many-to-many demo) ───────────────────────
+
+#[derive(serde::Deserialize)]
+pub struct ManageTagsForm {
+    /// Comma-separated tag names (newlines also split), e.g. `"rust, webdev"`.
+    #[serde(default)]
+    pub tags: String,
+}
+
+/// Resolve free-text tag names to ids, creating any tag that doesn't exist
+/// yet. Batched to at most one lookup, one insert, and one lookup for any
+/// insert that lost a create race to a concurrent request (find-then-insert;
+/// a losing insert just means the slug already exists by the time it runs,
+/// in which case the already-created row is looked up instead — the same
+/// shape the DB layer as a whole already handles via other unique
+/// constraints in this app) — 1-3 round trips total, not per tag name.
+async fn resolve_or_create_tag_ids(raw: &str, db: &mut Db) -> AutumnResult<Vec<i64>> {
+    let mut slug_order: Vec<String> = Vec::new();
+    let mut name_by_slug: HashMap<String, String> = HashMap::new();
+    for piece in raw.split([',', '\n']) {
+        let name = piece.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let slug = slugify(name);
+        if slug.is_empty() {
+            continue;
+        }
+        if !name_by_slug.contains_key(&slug) {
+            slug_order.push(slug.clone());
+        }
+        name_by_slug.insert(slug, name.to_string());
+    }
+    if slug_order.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut id_by_slug: HashMap<String, i64> = tags::table
+        .filter(tags::slug.eq_any(slug_order.clone()))
+        .select(Tag::as_select())
+        .load(&mut **db)
+        .await?
+        .into_iter()
+        .map(|tag| (tag.slug, tag.id))
+        .collect();
+
+    let missing: Vec<String> = slug_order
+        .iter()
+        .filter(|slug| !id_by_slug.contains_key(*slug))
+        .cloned()
+        .collect();
+    if !missing.is_empty() {
+        let new_tags: Vec<NewTag> = missing
+            .iter()
+            .map(|slug| NewTag {
+                name: name_by_slug[slug].clone(),
+                slug: slug.clone(),
+            })
+            .collect();
+        let inserted: Vec<Tag> = diesel::insert_into(tags::table)
+            .values(&new_tags)
+            .on_conflict(tags::slug)
+            .do_nothing()
+            .get_results(&mut **db)
+            .await?;
+        id_by_slug.extend(inserted.into_iter().map(|tag| (tag.slug, tag.id)));
+
+        // Any slug still missing lost a create race to a concurrent insert;
+        // the row now exists, look it up.
+        let still_missing: Vec<String> = missing
+            .into_iter()
+            .filter(|slug| !id_by_slug.contains_key(slug))
+            .collect();
+        if !still_missing.is_empty() {
+            let races: Vec<Tag> = tags::table
+                .filter(tags::slug.eq_any(still_missing))
+                .select(Tag::as_select())
+                .load(&mut **db)
+                .await?;
+            id_by_slug.extend(races.into_iter().map(|tag| (tag.slug, tag.id)));
+        }
+    }
+
+    let mut ids = Vec::with_capacity(slug_order.len());
+    for slug in &slug_order {
+        let id = id_by_slug.get(slug).copied().ok_or_else(|| {
+            AutumnError::not_found_msg(format!("Tag slug '{slug}' not found after resolution"))
+        })?;
+        ids.push(id);
+    }
+    Ok(ids)
+}
+
+/// Replace a post's tags with the free-text `tags` field, creating any new
+/// tags. Demonstrates the generated `set_tags` (#[has_many(Tag, through =
+/// post_tags)]) mutation helper end-to-end from an HTTP handler.
+#[secured]
+#[post("/r/{sub_slug}/posts/{post_slug}/tags")]
+pub async fn manage_tags(
+    Path((sub_slug, post_slug)): Path<(String, String)>,
+    State(state): State<AppState>,
+    session: Session,
+    mut db: Db,
+    repo: PgPostRepository,
+    flash: Flash,
+    form: Form<ManageTagsForm>,
+) -> AutumnResult<Redirect> {
+    let post =
+        load_post_and_authorize(&state, &session, &mut db, &sub_slug, &post_slug, "update").await?;
+
+    let tag_ids = resolve_or_create_tag_ids(&form.0.tags, &mut db).await?;
+    drop(db);
+    repo.set_tags(post.id, &tag_ids).await?;
+
+    flash.success("Tags updated.").await;
+    Ok(Redirect::to(&paths::show(&sub_slug, &post_slug)))
+}
+
 // ── Delete post (htmx) ────────────────────────────────────────
 
 #[secured]
@@ -889,16 +1050,8 @@ pub async fn delete_post(
     repo: PgPostRepository,
     flash: Flash,
 ) -> AutumnResult<autumn_web::reexports::axum::response::Response> {
-    let post: Post = posts::table
-        .inner_join(subreddits::table.on(posts::subreddit_id.eq(subreddits::id)))
-        .filter(subreddits::slug.eq(&sub_slug))
-        .filter(posts::slug.eq(&post_slug))
-        .select(Post::as_select())
-        .first(&mut *db)
-        .await
-        .map_err(|_| AutumnError::not_found_msg("Post not found"))?;
-
-    autumn_web::authorization::authorize::<Post>(&state, &session, "delete", &post).await?;
+    let post =
+        load_post_and_authorize(&state, &session, &mut db, &sub_slug, &post_slug, "delete").await?;
 
     repo.delete_by_id(post.id).await?;
 
@@ -973,6 +1126,7 @@ autumn_web::paths![
     show,
     edit_form,
     update,
+    manage_tags,
     delete_post
 ];
 

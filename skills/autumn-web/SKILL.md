@@ -255,6 +255,51 @@ pub trait PostRepository {}
 allow_unauthorized_repository_api = true # only when intentional
 ```
 
+### Associations and preloading
+
+Declare `#[belongs_to]` / `#[has_many]` / `#[has_one]` on a `#[model]` for
+batched eager loading — no N+1, no lazy loading (un-preloaded access returns
+typed `NotLoaded`, never issues SQL):
+
+```rust
+#[autumn_web::model]
+#[belongs_to(User, fk = author_id)]
+#[has_many(Comment)]
+#[has_many(Tag, through = post_tags)] // many-to-many join table
+pub struct Post {
+    #[id]
+    pub id: i64,
+    pub author_id: i64,
+    pub title: String,
+}
+
+let posts = repo.find_all().await?;
+let posts = repo.preload(posts, Post::preload().author().comments().tags()).await?;
+for post in &posts {
+    let author = post.author()?;     // Result<Option<&Preloaded<User>>, NotLoaded>
+    let comments = post.comments()?; // Result<&[Preloaded<Comment>], NotLoaded>
+    let tags = post.tags()?;         // Result<&[Arc<Preloaded<Tag>>], NotLoaded>
+}
+```
+
+`through = <join_table>` on `#[has_many]` declares a many-to-many
+association: join columns default to `{source}_id` / `{target}_id`
+(`fk = ...` / `target_fk = ...` to override), the macro emits the join
+table's `diesel::table!` itself (only a migration with a composite primary
+key on both columns is needed — no `schema.rs` entry), and the repository
+gets `add_{singular}` / `remove_{singular}` / `set_{plural}` mutation
+helpers, each idempotent:
+
+```rust
+repo.add_tag(post_id, tag_id).await?;    // ON CONFLICT DO NOTHING
+repo.remove_tag(post_id, tag_id).await?; // no-op if unlinked
+repo.set_tags(post_id, &tag_ids).await?; // replace-all, one transaction
+```
+
+See `examples/reddit-clone` (`Post` ↔ `Tag` via `post_tags`) for a full
+worked example, and `docs/adr/0008-associations-and-eager-loading.md` for
+the design.
+
 ## Security and auth
 
 ```rust

@@ -16,7 +16,7 @@ use std::path::Path;
 
 use super::dsl::{Field, FieldKind, parse_fields};
 use super::emit::Plan;
-use super::naming::{pascal, pluralize, snake};
+use super::naming::{humanize_label, pascal, pluralize, snake};
 use super::schema_edit::add_mod_declaration;
 use super::{Flags, GenerateError, ensure_project_root, read_or_empty};
 
@@ -333,7 +333,11 @@ fn detect_encrypted_fields(model_source: &str, pascal_name: &str) -> (Vec<String
 
 const fn admin_field_kind(field: &Field) -> &'static str {
     match field.kind {
-        FieldKind::String | FieldKind::Uuid => "AdminFieldKind::Text",
+        // `Enum`'s "AdminFieldKind::Text" here is never actually emitted:
+        // `render_fields_vec` always overrides an enum field with an explicit
+        // `AdminFieldKind::Select(...)` (issue #1030), the same way an
+        // explicit `--select` overrides this base kind today.
+        FieldKind::String | FieldKind::Uuid | FieldKind::Enum => "AdminFieldKind::Text",
         FieldKind::Text => "AdminFieldKind::TextArea",
         // A foreign-key id renders the same as any other integer column.
         FieldKind::I32 | FieldKind::I64 | FieldKind::References => "AdminFieldKind::Integer",
@@ -601,16 +605,7 @@ fn render_select_kind(spec: &SelectSpec) -> String {
         .values
         .iter()
         .map(|v| {
-            let label = v
-                .split(['_', '-'])
-                .map(|word| {
-                    let mut chars = word.chars();
-                    chars.next().map_or_else(String::new, |c| {
-                        c.to_uppercase().collect::<String>() + chars.as_str()
-                    })
-                })
-                .collect::<Vec<_>>()
-                .join(" ");
+            let label = humanize_label(v);
             format!("SelectOption {{ value: \"{v}\".into(), label: \"{label}\".into() }}")
         })
         .collect::<Vec<_>>()
@@ -629,13 +624,29 @@ fn render_fields_vec(
         if options.exclude.contains(&f.name) || is_lock_version_field(f, lock_version_field) {
             continue;
         }
-        let select_spec = options.select.iter().find(|s| s.field == f.name);
+        // A closed-set `enum{...}` field is a `Select` widget by construction
+        // (issue #1030) — auto-derive one from its variants unless an
+        // explicit `--select` already overrides it (e.g. to curate a subset
+        // or relabel the options). One `effective_select` covers both
+        // sources so every downstream "is this field select-shaped" check
+        // only has to consult one place.
+        let effective_select: Option<SelectSpec> = options
+            .select
+            .iter()
+            .find(|s| s.field == f.name)
+            .cloned()
+            .or_else(|| {
+                f.is_enum().then(|| SelectSpec {
+                    field: f.name.clone(),
+                    values: f.variants.clone(),
+                })
+            });
         let kind_str: String =
             if options.hidden.contains(&f.name) || matches!(f.kind, FieldKind::Bytea) {
                 "AdminFieldKind::Hidden".into()
             } else if options.password.contains(&f.name) {
                 "AdminFieldKind::Password".into()
-            } else if let Some(spec) = select_spec {
+            } else if let Some(spec) = &effective_select {
                 render_select_kind(spec)
             } else {
                 admin_field_kind(f).into()
@@ -651,7 +662,7 @@ fn render_fields_vec(
         // Select, hidden, and encrypted fields are not text-searchable. An
         // encrypted column stores ciphertext envelopes, so an `ILIKE` against it
         // for plaintext would never match (#805) — omit it from search.
-        let is_select_or_hidden = select_spec.is_some() || options.hidden.contains(&f.name);
+        let is_select_or_hidden = effective_select.is_some() || options.hidden.contains(&f.name);
         if is_default_searchable(f)
             && !is_select_or_hidden
             && !admin_field_is_encrypted(options, &f.name)
@@ -956,7 +967,13 @@ fn render_admin_smoke_test(
     } else {
         writable
             .iter()
-            .map(|f| format!("{}=test", f.name))
+            .map(|f| {
+                // An enum field is a closed set by construction, so the
+                // generic "test" sample value fails its own validation;
+                // use the field's own first declared variant instead.
+                let sample = f.variants.first().map_or("test", String::as_str);
+                format!("{}={sample}", f.name)
+            })
             .collect::<Vec<_>>()
             .join("&")
     };
@@ -1820,6 +1837,83 @@ pub struct Account {
         assert!(admin.contains("\"archived\""), "option values must appear");
         // Labels are humanized from values
         assert!(admin.contains("\"Draft\""), "labels must be title-cased");
+    }
+
+    #[test]
+    fn enum_field_auto_derives_select_kind() {
+        // issue #1030: an `enum{...}` field is a closed set by construction,
+        // so it should render as a `Select` widget without needing an
+        // explicit `--select` flag repeating the same variant list.
+        let tmp = project_with_model("post");
+        let plan = plan_admin_with_options(
+            tmp.path(),
+            "Post",
+            &["status:enum{draft,published,archived}".into()],
+            &AdminOptions::default(),
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let admin = fs::read_to_string(tmp.path().join("src/admin/post.rs")).unwrap();
+        assert!(
+            admin.contains(
+                "AdminField::new(\"status\", AdminFieldKind::Select(vec![SelectOption { value: \"draft\".into(), label: \"Draft\".into() }, SelectOption { value: \"published\".into(), label: \"Published\".into() }, SelectOption { value: \"archived\".into(), label: \"Archived\".into() }]))"
+            ),
+            "got:\n{admin}"
+        );
+    }
+
+    #[test]
+    fn explicit_select_overrides_enum_auto_derivation() {
+        // A user-supplied `--select` should still win over the automatic
+        // derivation, e.g. to present a curated subset or different labels.
+        let tmp = project_with_model("post");
+        let options = AdminOptions {
+            select: vec![SelectSpec {
+                field: "status".into(),
+                values: vec!["draft".into(), "published".into()],
+            }],
+            ..Default::default()
+        };
+        let plan = plan_admin_with_options(
+            tmp.path(),
+            "Post",
+            &["status:enum{draft,published,archived}".into()],
+            &options,
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let admin = fs::read_to_string(tmp.path().join("src/admin/post.rs")).unwrap();
+        assert!(!admin.contains("\"archived\""), "got:\n{admin}");
+    }
+
+    #[test]
+    fn admin_smoke_test_uses_first_variant_for_enum_fields() {
+        // The generated create smoke test posts a sample value for every
+        // writable field; `status=test` fails the enum's own closed-set
+        // validation (`test` is not a declared variant), so the generated
+        // test would itself get a validation error instead of the expected
+        // redirect. Use the field's own first variant instead.
+        let tmp = project_with_model("post");
+        let plan = plan_admin_with_options(
+            tmp.path(),
+            "Post",
+            &["status:enum{draft,published,archived}".into()],
+            &AdminOptions::default(),
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let smoke = fs::read_to_string(tmp.path().join("tests/post_admin.rs")).unwrap();
+        assert!(
+            smoke.contains("status=draft"),
+            "expected the enum's first variant in the sample form body; got:\n{smoke}"
+        );
+        assert!(
+            !smoke.contains("status=test"),
+            "must not submit an out-of-set sample value for an enum field; got:\n{smoke}"
+        );
     }
 
     #[test]

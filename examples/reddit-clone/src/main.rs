@@ -126,6 +126,7 @@ async fn main() {
             routes::posts::show,
             routes::posts::edit_form,
             routes::posts::update,
+            routes::posts::manage_tags,
             routes::posts::delete_post,
             routes::comments::create,
             routes::comments::list_comments,

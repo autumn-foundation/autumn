@@ -39,6 +39,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   MCP-invisible (documented follow-up). See the
   [MCP guide](docs/guide/mcp.md) §9–§10.
 
+- **model:** many-to-many associations via `#[has_many(Target, through =
+  join_table)]` (#1324). Extends the `belongs_to`/`has_many`/`has_one`
+  associations from #835 with a join-table variant: join columns default to
+  `{source}_id` / `{target}_id` (overridable with `fk = ...` / `target_fk =
+  ...`), and `#[model]` emits the join table's `diesel::table!` itself — no
+  hand-written `schema.rs` entry needed, only a migration creating the join
+  table with a composite primary key on both columns. Participates in the
+  existing `{Model}Preload` builder and `Preloadable` machinery: `preload(&[
+  ...])` issues one batched `INNER JOIN` query per association level (fixed
+  query count regardless of result-set size), and un-preloaded access yields
+  the typed `NotLoaded` state. Nested preload paths work through a join
+  (`Post::preload().tags_with(Tag::preload().posts())`). The generated
+  `#[repository]` gets three mutation helpers per association —
+  `add_{singular}`, `remove_{singular}`, `set_{plural}` (replace-all) — each
+  idempotent (`add`/`set` use `ON CONFLICT DO NOTHING`) and, for `set_*`,
+  wrapped in a single transaction. `examples/reddit-clone` demonstrates a
+  real Post↔Tag many-to-many with preload and mutation usage in
+  `src/routes/posts.rs`. Purely additive extension of the `#[has_many]`
+  syntax; existing `belongs_to`/`has_many`/`has_one` usage is unaffected;
+  minor version bump.
 - **cache:** read-through fills with single-flight cache stampede protection
   (#1204). `cache::get_or_compute(cache, key, ttl, fill)` computes a missing
   value once per process for concurrent callers — the first miss becomes the
@@ -70,6 +90,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that could collide with an ordinary cache key, and SWR freshness is now
   evaluated through the same injectable `ClockSource` used elsewhere in the
   framework rather than a hard-coded `SystemTime::now()`.
+- **views:** `link_to`/`button_to` view helpers for safe, method-aware links
+  (#1138). `link_to`/`link_to_with` render an HTML-escaped GET `<a>` anchor
+  with optional `class`/`target`/`rel`/extra attributes (e.g. htmx `hx-*`),
+  automatically adding `rel="noopener"` when `target="_blank"` is set.
+  `button_to`/`button_to_with` render a single-button `<form>` for
+  state-changing actions: the CSRF token is a **required** argument, so a
+  `button_to` call cannot compile without one in scope. For any method other
+  than `GET`, the form posts and carries a hidden `_method` override (reusing
+  `form::method_input`) plus the hidden CSRF field; `Method::GET` renders a
+  plain GET form with neither. Both helpers accept extra attributes on an
+  options struct, so `button_to_with("Delete", path, Method::DELETE, token,
+  &ButtonToOptions::new().attrs(&[("hx-delete", path)]))` upgrades to an
+  htmx interaction without hand-rolling the form. The admin plugin's
+  hand-rolled delete button now uses `button_to_with` (honoring a
+  customized `security.csrf.form_field` via `.csrf_field(...)`), gaining a
+  working no-JS fallback (POST + `_method=DELETE` + CSRF) for free. `attrs`
+  entries that collide with a named option (`href`/`class`/`target`/`rel`
+  for `link_to`, `type`/`class` for `button_to`) panic rather than silently
+  emitting duplicate-attribute markup, and `target="_blank"`/`rel="noopener"`
+  handling is ASCII-case-insensitive. Purely additive; minor version bump.
 
 - **jobs:** tracked job handles with progress reporting and a built-in
   pollable status route (#1373). `job::enqueue_tracked`/`enqueue_tracked_for`
@@ -115,6 +155,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a minimal stand-in for the referenced table (skipping self-referential FKs,
   which target the table already being created) so it stays runnable
   standalone.
+- **cli:** `enum{a,b,c}` field type for `autumn generate model`/`scaffold`/
+  `migration` (#1030). `status:enum{draft,published,archived}` scaffolds a
+  closed-set column end to end: a generated `PascalCase` Rust enum (`Status`)
+  wired for Diesel `TEXT` storage (manual `ToSql`/`FromSql` over
+  `AsExpression`/`FromSqlRow`) and `serde`; a `CHECK (status IN (...))`
+  constraint in the migration so an out-of-set `INSERT` fails at the database
+  layer (restored on `RemoveXFromY` rollback, matching the `references`
+  field's FK-restoration precedent); a `<select>` form widget matching the
+  admin generator's `--select` output (auto-derived for `generate admin` too,
+  unless an explicit `--select` overrides it); and request-boundary
+  validation that rejects an out-of-set form value with a 400 naming the
+  field rather than a 500 or silent coercion. `--default field=variant` sets
+  both the SQL `DEFAULT` and the enum's `#[default]` variant; an unknown
+  variant errors at generate time, as does a non-identifier or keyword
+  variant (`enum{2fa}`). Nullable (`Option<enum{...}>`) is supported. The
+  generated scaffold smoke test asserts an out-of-set value is rejected at
+  both the database layer (raw `INSERT` fails, zero rows written) and the
+  request boundary (400). Not supported by `generate job` (no model file to
+  declare the type in) or `--query` (no import path for it yet). Quote the
+  token in bash/zsh — an unquoted `enum{a,b}` is brace-expanded by the shell
+  before `autumn` ever sees it; the parser detects this and suggests
+  quoting.
 - **auth:** scoped service tokens whose scopes flow into policy checks (#1158).
   Mint named, optionally-expiring API tokens carrying a set of flat scopes
   (e.g. `posts:read`) via `IssueTokenSpec` + `issue_scoped_api_token`; tokens

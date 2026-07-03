@@ -1529,16 +1529,19 @@ mod tests {
                 name: "title".into(),
                 kind: FieldKind::String,
                 nullable: false,
+                variants: Vec::new(),
             },
             Field {
                 name: "body".into(),
                 kind: FieldKind::Text,
                 nullable: false,
+                variants: Vec::new(),
             },
             Field {
                 name: "published".into(),
                 kind: FieldKind::Bool,
                 nullable: false,
+                variants: Vec::new(),
             },
         ];
         let greenfield = render_model_file_for_test("Post", "posts", &fields);
