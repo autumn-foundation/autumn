@@ -1826,6 +1826,69 @@ fn generate_scaffold_multiple_unique_fields_smoke_test_isolates_the_target_field
 }
 
 #[test]
+fn generate_scaffold_multiple_unique_fields_request_boundary_check_isolates_the_target_field() {
+    // Regression guard (issue #1032 review follow-up): the DB-level check's
+    // duplicate insert was fixed to vary non-target unique columns (see
+    // generate_scaffold_multiple_unique_fields_smoke_test_isolates_the_target_field),
+    // but the request-boundary stand-in handler is a single compiled
+    // function invoked via two separate HTTP calls with no way to tell
+    // "first call" from "second call" apart -- it kept reusing one literal
+    // insert for both, so a non-target unique column would still collide
+    // with itself. It must instead pick between the two insert variants at
+    // runtime based on whether the table is still empty.
+    let (_tmp, project) = fresh_project("unique-multi-field-boundary-app");
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "User",
+            "email:String:unique",
+            "username:String:unique",
+        ],
+    );
+
+    let test_file = fs::read_to_string(project.join("tests/user.rs")).unwrap();
+    for (field, other_field) in [("email", "username"), ("username", "email")] {
+        let test_start = test_file
+            .find(&format!("async fn users_rejects_duplicate_{field}()"))
+            .unwrap_or_else(|| panic!("users_rejects_duplicate_{field} test should exist"));
+        let next_test_start = test_file[test_start + 1..]
+            .find("async fn users_rejects_duplicate_")
+            .map_or(test_file.len(), |i| test_start + 1 + i);
+        let test_body = &test_file[test_start..next_test_start];
+
+        assert!(
+            test_body
+                .contains("let existing: i64 = users::table.count().get_result(&mut *db).await?;"),
+            "the request-boundary handler must branch on the table's row \
+             count to tell the two calls apart; got:\n{test_body}"
+        );
+        let branch_line = test_body
+            .lines()
+            .find(|l| l.contains("let insert_sql = if existing == 0"))
+            .unwrap_or_else(|| panic!("expected an insert_sql branch; got:\n{test_body}"));
+        // Pull out just the quoted SQL literal from each branch (the second
+        // `"..."`-delimited token — the first is the `if existing == 0`
+        // condition itself, which has no quotes) so the comparison is
+        // against the actual INSERT statement, not incidental surrounding
+        // syntax that always differs between an if- and else-arm.
+        let quoted: Vec<&str> = branch_line.split('"').collect();
+        assert!(
+            quoted.len() >= 4,
+            "expected two quoted SQL literals in the branch; got: {branch_line}"
+        );
+        let (if_sql, else_sql) = (quoted[1], quoted[3]);
+        assert_ne!(
+            if_sql, else_sql,
+            "the two insert_sql branches must give the non-target unique \
+             field {other_field} different values, or the second HTTP call \
+             would collide on it too; got: {branch_line}"
+        );
+    }
+}
+
+#[test]
 fn generate_scaffold_long_unique_field_name_agrees_across_migration_and_routes() {
     // Regression guard (issue #1032 review follow-up): `idx_<table>_<field>_
     // unique` is unbounded, and PostgreSQL silently truncates identifiers

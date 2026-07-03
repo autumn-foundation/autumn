@@ -3198,7 +3198,21 @@ fn render_unique_violation_smoke_test(
                  async fn create(mut db: Db) -> AutumnResult<autumn_web::reexports::axum::response::Response> {{\n\
                  \x20\x20\x20\x20use autumn_web::reexports::axum::response::IntoResponse as _;\n\
                  \x20\x20\x20\x20let result: AutumnResult<()> = async {{\n\
-                 \x20\x20\x20\x20\x20\x20\x20\x20diesel::sql_query(\"{escaped_insert}\").execute(&mut *db).await?;\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20// The client sends this same request twice (see below) to prove\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20// the 200-then-422 path — this one compiled handler runs for both\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20// calls, so it can't statically bake in \"first insert\" vs.\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20// \"duplicate insert\" the way the DB-level check above does.\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20// Reading the row count instead tells the two calls apart at\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20// runtime: 0 means this is the first (must succeed) call, so\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20// every unique column gets its plain sample value; any other\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20// count means this is the second (must collide) call, so\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20// non-target unique columns switch to their distinct variant —\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20// otherwise a scaffold with more than one unique field would\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20// duplicate a *different* column too and Postgres could report\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20// that one instead of {field_name}'s.\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20let existing: i64 = {plural}::table.count().get_result(&mut *db).await?;\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20let insert_sql = if existing == 0 {{ \"{escaped_insert}\" }} else {{ \"{escaped_insert_dup}\" }};\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20diesel::sql_query(insert_sql).execute(&mut *db).await?;\n\
                  \x20\x20\x20\x20\x20\x20\x20\x20Ok(())\n\
                  \x20\x20\x20\x20}}.await;\n\
                  \x20\x20\x20\x20if let Err(err) = result {{\n\
