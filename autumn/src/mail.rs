@@ -13,10 +13,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::FromRequestParts;
 use axum::response::{Html, IntoResponse, Response};
-use lettre::message::{Mailbox, MultiPart, SinglePart};
+use lettre::message::header::{ContentTransferEncoding, ContentType};
+use lettre::message::{
+    Attachment as LettreAttachment, Body as LettreBody, Mailbox, MultiPart, SinglePart,
+};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{AppState, AutumnError, AutumnResult};
@@ -388,8 +391,33 @@ pub fn compose_layout(layout: &str, body: &str) -> String {
     }
 }
 
+/// A file attached to a [`Mail`] message.
+///
+/// Built via [`MailBuilder::attach`]. Carries raw, undecoded bytes so it
+/// round-trips byte-identical through every transport and through a durable
+/// [`MailDeliveryQueue`].
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MailAttachment {
+    /// Attachment filename, as presented to the recipient's mail client.
+    pub filename: String,
+    /// Declared MIME content type (e.g. `"application/pdf"`).
+    pub content_type: String,
+    /// Raw attachment bytes.
+    pub bytes: Vec<u8>,
+}
+
+impl std::fmt::Debug for MailAttachment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MailAttachment")
+            .field("filename", &self.filename)
+            .field("content_type", &self.content_type)
+            .field("bytes", &format_args!("<{} bytes>", self.bytes.len()))
+            .finish()
+    }
+}
+
 /// A transactional email.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Mail {
     /// Optional From header. Falls back to [`Mailer`]'s default.
     pub from: Option<String>,
@@ -413,6 +441,8 @@ pub struct Mail {
     /// carry the computed `List-Unsubscribe` / `List-Unsubscribe-Post` headers,
     /// but available for any custom header.
     pub extra_headers: Vec<(String, String)>,
+    /// Files attached to this message, in declared order.
+    pub attachments: Vec<MailAttachment>,
 }
 
 /// Stable root path for the dev mail preview UI.
@@ -559,6 +589,7 @@ pub struct MailBuilder {
     text_layout: Option<String>,
     list_unsubscribe: Option<String>,
     extra_headers: Vec<(String, String)>,
+    attachments: Vec<MailAttachment>,
 }
 
 impl MailBuilder {
@@ -623,6 +654,34 @@ impl MailBuilder {
         self
     }
 
+    /// Attach a file. Calling this repeatedly appends attachments in the
+    /// order they were declared; the SMTP and file transports both encode
+    /// them as `multipart/mixed` parts with a `base64`
+    /// `Content-Transfer-Encoding`.
+    ///
+    /// ```rust,ignore
+    /// let mail = Mail::builder()
+    ///     .to("ada@example.com")
+    ///     .subject("Your invoice")
+    ///     .text("Your invoice is attached.")
+    ///     .attach("invoice.pdf", "application/pdf", pdf_bytes)
+    ///     .build()?;
+    /// ```
+    #[must_use]
+    pub fn attach(
+        mut self,
+        filename: impl Into<String>,
+        content_type: impl Into<String>,
+        bytes: impl Into<Vec<u8>>,
+    ) -> Self {
+        self.attachments.push(MailAttachment {
+            filename: filename.into(),
+            content_type: content_type.into(),
+            bytes: bytes.into(),
+        });
+        self
+    }
+
     /// Wrap the HTML and text bodies in a shared layout.
     ///
     /// The layout strings must contain [`MAIL_LAYOUT_CONTENT_MARKER`]
@@ -664,6 +723,22 @@ impl MailBuilder {
                 "mail must include html or text body".to_owned(),
             ));
         }
+        for attachment in &self.attachments {
+            if attachment.filename.trim().is_empty()
+                || attachment.filename.chars().any(char::is_control)
+            {
+                return Err(MailError::InvalidMessage(format!(
+                    "attachment filename {:?} must be non-empty and free of control characters",
+                    attachment.filename
+                )));
+            }
+            if let Err(error) = ContentType::parse(&attachment.content_type) {
+                return Err(MailError::InvalidMessage(format!(
+                    "attachment {:?} has invalid content type {:?}: {error}",
+                    attachment.filename, attachment.content_type
+                )));
+            }
+        }
         // A layout is only applied when the corresponding body is present.
         // If only one of html/text is set, the other layout half is intentionally
         // skipped rather than erroring — a text-only mailer may legitimately pass
@@ -685,6 +760,7 @@ impl MailBuilder {
             text,
             list_unsubscribe: self.list_unsubscribe,
             extra_headers: self.extra_headers,
+            attachments: self.attachments,
         })
     }
 }
@@ -1699,6 +1775,7 @@ impl MailTransport for LogTransport {
                 subject = %mail.subject,
                 text = ?mail.text,
                 html = ?mail.html,
+                attachments = mail.attachments.len(),
                 "mail captured by log transport"
             );
             Ok(())
@@ -1833,6 +1910,74 @@ fn sanitize_filename(value: &str) -> String {
         .collect()
 }
 
+/// RFC 2231 `attr-char`: alphanumerics plus these ASCII punctuation marks may
+/// appear unescaped in an extended parameter value; everything else
+/// (including all non-ASCII and control bytes) is percent-encoded.
+const RFC2231_ATTR_CHAR: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+    .remove(b'!')
+    .remove(b'#')
+    .remove(b'$')
+    .remove(b'&')
+    .remove(b'+')
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'^')
+    .remove(b'_')
+    .remove(b'`')
+    .remove(b'|')
+    .remove(b'~');
+
+/// Strips CR/LF and other ASCII/Unicode control characters from a header
+/// value written by the hand-rolled `.eml` renderer, so untrusted `Mail`
+/// field content (which may arrive via `Deserialize` from a durable queue,
+/// bypassing [`MailBuilder::build`]'s validation) can never inject an extra
+/// header line.
+fn strip_header_controls(value: &str) -> String {
+    value.chars().filter(|ch| !ch.is_control()).collect()
+}
+
+fn quote_header_value(value: &str) -> String {
+    let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\"")
+}
+
+/// Builds the `Content-Disposition: attachment; …` parameter section for the
+/// hand-rolled `.eml` renderer. Always ASCII and CR/LF-free by construction:
+/// control characters are stripped, and non-ASCII filenames are RFC 2231
+/// percent-encoded (`filename*=UTF-8''…`) alongside an ASCII fallback
+/// `filename="…"` for readers that don't understand extended parameters.
+fn content_disposition_params(filename: &str) -> String {
+    let mut clean = strip_header_controls(filename);
+    if clean.trim().is_empty() {
+        "attachment".clone_into(&mut clean);
+    }
+    if clean.is_ascii() {
+        format!("filename={}", quote_header_value(&clean))
+    } else {
+        let fallback: String = clean
+            .chars()
+            .map(|ch| if ch.is_ascii() { ch } else { '_' })
+            .collect();
+        let encoded = percent_encoding::utf8_percent_encode(&clean, RFC2231_ATTR_CHAR);
+        format!(
+            "filename={}; filename*=UTF-8''{encoded}",
+            quote_header_value(&fallback)
+        )
+    }
+}
+
+/// Base64-encodes `bytes` and hard-wraps at 76 columns per RFC 2045.
+fn base64_wrap76(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+    encoded
+        .as_bytes()
+        .chunks(76)
+        .map(|chunk| std::str::from_utf8(chunk).expect("base64 output is always ASCII"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn file_transport_filename(mail: &Mail) -> String {
     let sequence = FILE_TRANSPORT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     format!(
@@ -1877,6 +2022,34 @@ fn render_eml(mail: &Mail) -> String {
         out.push('\n');
     }
     out.push_str("MIME-Version: 1.0\n");
+    if mail.attachments.is_empty() {
+        render_eml_bodies(mail, &mut out);
+    } else {
+        out.push_str("Content-Type: multipart/mixed; boundary=\"autumn-mixed\"\n\n");
+        out.push_str("--autumn-mixed\n");
+        render_eml_bodies(mail, &mut out);
+        for attachment in &mail.attachments {
+            out.push_str("--autumn-mixed\n");
+            out.push_str("Content-Type: ");
+            out.push_str(&strip_header_controls(&attachment.content_type));
+            out.push('\n');
+            out.push_str("Content-Disposition: attachment; ");
+            out.push_str(&content_disposition_params(&attachment.filename));
+            out.push('\n');
+            out.push_str("Content-Transfer-Encoding: base64\n\n");
+            out.push_str(&base64_wrap76(&attachment.bytes));
+            out.push('\n');
+        }
+        out.push_str("--autumn-mixed--\n");
+    }
+    out
+}
+
+/// Renders the html/text body part(s) of an `.eml` message — everything
+/// after the `MIME-Version` header, before any `multipart/mixed` attachment
+/// wrapper. Pulled out of [`render_eml`] so the attachment-less code path is
+/// provably byte-identical to what it was before attachments existed.
+fn render_eml_bodies(mail: &Mail, out: &mut String) {
     if mail.html.is_some() && mail.text.is_some() {
         out.push_str("Content-Type: multipart/alternative; boundary=\"autumn-mail\"\n\n");
         if let Some(text) = &mail.text {
@@ -1899,7 +2072,6 @@ fn render_eml(mail: &Mail) -> String {
         out.push_str(text);
         out.push('\n');
     }
-    out
 }
 
 #[derive(Debug, Clone)]
@@ -1910,6 +2082,7 @@ struct ParsedMail {
     date: Option<String>,
     html: Option<String>,
     text: Option<String>,
+    attachments: Vec<ParsedAttachment>,
     raw: String,
 }
 
@@ -1920,6 +2093,14 @@ impl ParsedMail {
             .find(|(header, _)| header.eq_ignore_ascii_case(name))
             .map(|(_, value)| value.as_str())
     }
+}
+
+/// An attachment as surfaced by the dev mail preview: just enough to list it
+/// (filename, declared content type) without decoding its body.
+#[derive(Debug, Clone)]
+struct ParsedAttachment {
+    filename: String,
+    content_type: String,
 }
 
 #[derive(Debug, Clone)]
@@ -2146,7 +2327,7 @@ fn parse_eml(raw: &str) -> ParsedMail {
     let normalized = raw.replace("\r\n", "\n");
     let (headers, body) = split_headers_body(&normalized);
     let content_type = header_value(&headers, "Content-Type").unwrap_or_default();
-    let (html, text) = parse_mail_body(&content_type, body);
+    let (html, text, attachments) = parse_mail_body(&content_type, body);
     let to = header_values(&headers, "To");
     let subject = header_value(&headers, "Subject").unwrap_or_else(|| "(no subject)".to_owned());
     let date = header_value(&headers, "Date");
@@ -2158,6 +2339,7 @@ fn parse_eml(raw: &str) -> ParsedMail {
         date,
         html,
         text,
+        attachments,
         raw: raw.to_owned(),
     }
 }
@@ -2209,20 +2391,97 @@ fn header_values(headers: &[(String, String)], name: &str) -> Vec<String> {
         .collect()
 }
 
-fn parse_mail_body(content_type: &str, body: &str) -> (Option<String>, Option<String>) {
-    if content_type
-        .to_ascii_lowercase()
-        .contains("multipart/alternative")
+fn parse_mail_body(
+    content_type: &str,
+    body: &str,
+) -> (Option<String>, Option<String>, Vec<ParsedAttachment>) {
+    let lower = content_type.to_ascii_lowercase();
+    if lower.contains("multipart/mixed")
         && let Some(boundary) = content_type_boundary(content_type)
     {
-        return parse_multipart_alternative(body, &boundary);
+        return parse_multipart_mixed(body, &boundary);
     }
 
-    if content_type.to_ascii_lowercase().contains("text/html") {
-        (Some(trim_body(body)), None)
-    } else {
-        (None, Some(trim_body(body)))
+    if lower.contains("multipart/alternative")
+        && let Some(boundary) = content_type_boundary(content_type)
+    {
+        let (html, text) = parse_multipart_alternative(body, &boundary);
+        return (html, text, Vec::new());
     }
+
+    if lower.contains("text/html") {
+        (Some(trim_body(body)), None, Vec::new())
+    } else {
+        (None, Some(trim_body(body)), Vec::new())
+    }
+}
+
+/// Parses a `multipart/mixed` body: the first non-attachment part is
+/// recursed into for html/text (it is itself typically a nested
+/// `multipart/alternative`), and every part with an `attachment`
+/// `Content-Disposition` is collected into the returned attachment list.
+fn parse_multipart_mixed(
+    body: &str,
+    boundary: &str,
+) -> (Option<String>, Option<String>, Vec<ParsedAttachment>) {
+    let marker = format!("--{boundary}");
+    let mut html = None;
+    let mut text = None;
+    let mut attachments = Vec::new();
+
+    for segment in body.split(&marker).skip(1) {
+        let segment = segment.trim_start_matches(['\n', '\r']);
+        if segment.starts_with("--") {
+            break;
+        }
+        let (headers, part_body) = split_headers_body(segment);
+        let disposition = header_value(&headers, "Content-Disposition").unwrap_or_default();
+        let part_content_type = header_value(&headers, "Content-Type").unwrap_or_default();
+        if disposition.to_ascii_lowercase().contains("attachment") {
+            attachments.push(ParsedAttachment {
+                filename: extract_attachment_filename(&disposition),
+                content_type: content_type_without_params(&part_content_type),
+            });
+        } else {
+            let (nested_html, nested_text, _) = parse_mail_body(&part_content_type, part_body);
+            html = html.or(nested_html);
+            text = text.or(nested_text);
+        }
+    }
+
+    (html, text, attachments)
+}
+
+/// Extracts a filename from a `Content-Disposition: attachment; …` header
+/// value, preferring the RFC 2231 extended `filename*=UTF-8''…` parameter
+/// (percent-decoded) over the plain `filename="…"` fallback when both are
+/// present.
+fn extract_attachment_filename(disposition: &str) -> String {
+    let params: Vec<&str> = disposition.split(';').skip(1).map(str::trim).collect();
+    if let Some(value) = params
+        .iter()
+        .find_map(|part| part.strip_prefix("filename*=UTF-8''"))
+    {
+        return percent_encoding::percent_decode_str(value)
+            .decode_utf8_lossy()
+            .into_owned();
+    }
+    if let Some(value) = params
+        .iter()
+        .find_map(|part| part.strip_prefix("filename="))
+    {
+        return value.trim_matches('"').to_owned();
+    }
+    "attachment".to_owned()
+}
+
+fn content_type_without_params(content_type: &str) -> String {
+    content_type
+        .split(';')
+        .next()
+        .unwrap_or(content_type)
+        .trim()
+        .to_owned()
 }
 
 fn parse_multipart_alternative(body: &str, boundary: &str) -> (Option<String>, Option<String>) {
@@ -2344,6 +2603,20 @@ fn render_mail_detail(parsed: &ParsedMail, label: &str) -> String {
     body.push_str(&escape_html(parsed.text.as_deref().unwrap_or("")));
     body.push_str("</pre></details>");
 
+    if !parsed.attachments.is_empty() {
+        body.push_str("<details open><summary>Attachments (");
+        body.push_str(&parsed.attachments.len().to_string());
+        body.push_str(")</summary><ul>");
+        for attachment in &parsed.attachments {
+            body.push_str("<li>");
+            body.push_str(&escape_html(&attachment.filename));
+            body.push_str(" <span class=\"muted\">(");
+            body.push_str(&escape_html(&attachment.content_type));
+            body.push_str(")</span></li>");
+        }
+        body.push_str("</ul></details>");
+    }
+
     body.push_str("<details><summary>Headers</summary><dl>");
     for header in [
         "From",
@@ -2460,6 +2733,47 @@ fn canonical_subscriber(recipient: &str) -> String {
     )
 }
 
+/// The html/text body of a message, before any attachment wrapping is
+/// decided. Kept as an enum so the attachment-less code path can hand a
+/// `SinglePart` straight to `Message::builder().singlepart(...)` exactly as
+/// it did before attachments existed — a `MultiPart::mixed()` wrapper is
+/// only introduced when there is at least one attachment.
+enum MailBodyPart {
+    Single(SinglePart),
+    Multi(MultiPart),
+}
+
+fn lettre_body_part(mail: &Mail) -> Result<MailBodyPart, MailError> {
+    match (&mail.text, &mail.html) {
+        (Some(text), Some(html)) => Ok(MailBodyPart::Multi(
+            MultiPart::alternative()
+                .singlepart(SinglePart::plain(text.clone()))
+                .singlepart(SinglePart::html(html.clone())),
+        )),
+        (Some(text), None) => Ok(MailBodyPart::Single(SinglePart::plain(text.clone()))),
+        (None, Some(html)) => Ok(MailBodyPart::Single(SinglePart::html(html.clone()))),
+        (None, None) => Err(MailError::InvalidMessage(
+            "mail must include html or text body".to_owned(),
+        )),
+    }
+}
+
+fn lettre_attachment_part(attachment: &MailAttachment) -> Result<SinglePart, MailError> {
+    let content_type = ContentType::parse(&attachment.content_type).map_err(|error| {
+        MailError::InvalidMessage(format!(
+            "attachment {:?} has invalid content type {:?}: {error}",
+            attachment.filename, attachment.content_type
+        ))
+    })?;
+    // Force base64 regardless of content: lettre's automatic encoder picks
+    // `7bit` for short ASCII byte buffers, but attachments must always carry
+    // a `base64` Content-Transfer-Encoding per the framework's contract.
+    let body =
+        LettreBody::new_with_encoding(attachment.bytes.clone(), ContentTransferEncoding::Base64)
+            .expect("base64 encoding is always valid for any byte buffer");
+    Ok(LettreAttachment::new(attachment.filename.clone()).body(body, content_type))
+}
+
 fn lettre_message(mail: &Mail) -> Result<Message, MailError> {
     let from = mail
         .from
@@ -2490,18 +2804,23 @@ fn lettre_message(mail: &Mail) -> Result<Message, MailError> {
         }
     }
 
-    match (&mail.text, &mail.html) {
-        (Some(text), Some(html)) => Ok(builder.multipart(
-            MultiPart::alternative()
-                .singlepart(SinglePart::plain(text.clone()))
-                .singlepart(SinglePart::html(html.clone())),
-        )?),
-        (Some(text), None) => Ok(builder.singlepart(SinglePart::plain(text.clone()))?),
-        (None, Some(html)) => Ok(builder.singlepart(SinglePart::html(html.clone()))?),
-        (None, None) => Err(MailError::InvalidMessage(
-            "mail must include html or text body".to_owned(),
-        )),
+    let body_part = lettre_body_part(mail)?;
+
+    if mail.attachments.is_empty() {
+        return Ok(match body_part {
+            MailBodyPart::Multi(multi) => builder.multipart(multi)?,
+            MailBodyPart::Single(single) => builder.singlepart(single)?,
+        });
     }
+
+    let mut mixed = match body_part {
+        MailBodyPart::Multi(multi) => MultiPart::mixed().multipart(multi),
+        MailBodyPart::Single(single) => MultiPart::mixed().singlepart(single),
+    };
+    for attachment in &mail.attachments {
+        mixed = mixed.singlepart(lettre_attachment_part(attachment)?);
+    }
+    Ok(builder.multipart(mixed)?)
 }
 
 struct InterceptedMailTransport {
@@ -3165,7 +3484,11 @@ mod tests {
             .to("user@example.com")
             .subject("Hi")
             .text("hello")
-            .attach("evil\r\nX-Injected: 1.pdf", "application/pdf", b"x".to_vec())
+            .attach(
+                "evil\r\nX-Injected: 1.pdf",
+                "application/pdf",
+                b"x".to_vec(),
+            )
             .build()
             .expect_err("CRLF in filename should be rejected");
         assert!(err.to_string().contains("filename"));
@@ -3220,7 +3543,7 @@ mod tests {
     // ── Attachments (issue #1256): render_eml (file transport) ───────────
 
     fn blob_all_byte_values() -> Vec<u8> {
-        (0_u16..=255).cycle().take(4096).map(|b| b as u8).collect()
+        (0_u8..=255).cycle().take(4096).collect()
     }
 
     fn sha256_hex(bytes: &[u8]) -> String {
@@ -3250,6 +3573,7 @@ mod tests {
 
     #[test]
     fn render_eml_attachment_bytes_round_trip_sha256() {
+        use base64::Engine as _;
         let blob = blob_all_byte_values();
         let expected_digest = sha256_hex(&blob);
         let mail = Mail::builder()
@@ -3267,10 +3591,11 @@ mod tests {
             .expect("base64 section present")
             + "Content-Transfer-Encoding: base64\n\n".len();
         let rest = &eml[start..];
-        let end = rest.find("--autumn-mixed").expect("closing boundary present");
+        let end = rest
+            .find("--autumn-mixed")
+            .expect("closing boundary present");
         let encoded: String = rest[..end].chars().filter(|c| !c.is_whitespace()).collect();
 
-        use base64::Engine as _;
         let decoded = base64::engine::general_purpose::STANDARD
             .decode(encoded)
             .expect("attachment body should be valid base64");
@@ -3372,7 +3697,10 @@ mod tests {
             content_disposition_params("weird\"na\\me.txt"),
             "filename=\"weird\\\"na\\\\me.txt\""
         );
-        assert_eq!(content_disposition_params("evil\r\nX: 1"), "filename=\"evilX: 1\"");
+        assert_eq!(
+            content_disposition_params("evil\r\nX: 1"),
+            "filename=\"evilX: 1\""
+        );
         assert_eq!(content_disposition_params(""), "filename=\"attachment\"");
         assert_eq!(content_disposition_params("   "), "filename=\"attachment\"");
         let non_ascii = content_disposition_params("café.txt");
@@ -3397,9 +3725,15 @@ mod tests {
             .expect("base64 section present")
             + "Content-Transfer-Encoding: base64\n\n".len();
         let rest = &eml[start..];
-        let end = rest.find("--autumn-mixed").expect("closing boundary present");
+        let end = rest
+            .find("--autumn-mixed")
+            .expect("closing boundary present");
         for line in rest[..end].lines() {
-            assert!(line.len() <= 76, "base64 line too long: {} chars", line.len());
+            assert!(
+                line.len() <= 76,
+                "base64 line too long: {} chars",
+                line.len()
+            );
         }
     }
 
@@ -3452,6 +3786,7 @@ mod tests {
 
     #[test]
     fn lettre_message_attachment_round_trips_sha256() {
+        use base64::Engine as _;
         let blob = blob_all_byte_values();
         let expected_digest = sha256_hex(&blob);
         let mail = Mail::builder()
@@ -3468,7 +3803,6 @@ mod tests {
         let boundary = extract_boundary(&normalized);
         let encoded = extract_attachment_base64(&normalized, &boundary);
 
-        use base64::Engine as _;
         let decoded = base64::engine::general_purpose::STANDARD
             .decode(encoded)
             .expect("attachment body should be valid base64");

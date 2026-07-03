@@ -52,6 +52,44 @@ async fn reset(mailer: Mailer) -> AutumnResult<&'static str> {
 }
 ```
 
+## Attachments
+
+Attach a file with `.attach(filename, content_type, bytes)` — call it once per
+file, in the order you want them to appear:
+
+```rust
+use autumn_web::prelude::*;
+
+#[post("/orders/{id}/confirm")]
+async fn confirm(mailer: Mailer, id: String) -> AutumnResult<&'static str> {
+    let invoice: Vec<u8> = render_invoice_pdf(&id); // your own PDF generator
+
+    let mail = Mail::builder()
+        .to("ada@example.com")
+        .subject("Your order confirmation")
+        .text("Thanks for your order! Your invoice is attached.")
+        .attach("invoice.pdf", "application/pdf", invoice)
+        .build()?;
+
+    mailer.deliver_later(mail).await?;
+    Ok("queued")
+}
+```
+
+- Attachments are declared-order, `multipart/mixed` parts on both the `smtp`
+  and `file` transports, encoded `base64` with the `Content-Type` you passed
+  in. A `Mail` with zero attachments produces byte-for-byte the same message
+  it always has — attachments are purely additive.
+- Filenames are sanitized against header injection and RFC 2231/2047-encoded
+  automatically when they contain non-ASCII characters; you never need to
+  escape a filename yourself.
+- `Mail` (including its attachments) is `Serialize`/`Deserialize`, so
+  attachments survive a round-trip through `deliver_later` and any custom
+  [`MailDeliveryQueue`] outbox unchanged.
+- Out of scope for this API: inline/CID attachments (`cid:` image embeds),
+  attaching directly from a file path or `BlobStore` handle, and attachment
+  size limits — enforce those at the call site if your app needs them.
+
 ## `#[mailer]`
 
 Put templates on a small struct and let the macro generate `send_*` and
@@ -198,7 +236,8 @@ Adds a `#[mailer(list_unsubscribe = "newsletter")]` attribute and creates a
 When the active profile is `dev` and `[mail] transport = "file"`, Autumn mounts
 the mail preview UI at `/_autumn/mail`. The index shows recent `.eml` captures
 from `mail.file_dir` newest-first and links to a detail view with sandboxed HTML,
-plain text, selected headers, and raw source.
+plain text, an attachments list (filename and content type) when the message
+has any, selected headers, and raw source.
 
 Register sample-data previews with `#[mailer_preview]` and `mail_previews![...]`:
 
@@ -298,7 +337,9 @@ imply durable delivery on their own. The framework provides two paths:
    ```
 
    When a queue is registered, `deliver_later` routes through it instead of
-   the in-process fallback.
+   the in-process fallback. `Mail` — [attachments](#attachments) included —
+   is the same value across `send`, `deliver_later`, and the queue, so a
+   deferred email with attachments arrives intact.
 
 ### Production Guard
 

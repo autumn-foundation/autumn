@@ -248,7 +248,7 @@ async fn file_transport_round_trips_attachment_bytes() {
         .build()
         .expect("file mailer should build");
 
-    let blob: Vec<u8> = (0_u16..=255).cycle().take(4096).map(|b| b as u8).collect();
+    let blob: Vec<u8> = (0_u8..=255).cycle().take(4096).collect();
     let expected_digest = sha256_hex(&blob);
 
     let mail = Mail::builder()

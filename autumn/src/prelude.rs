@@ -94,8 +94,9 @@ pub use crate::live::LiveFragment;
 /// Transactional email types and extractor.
 #[cfg(feature = "mail")]
 pub use crate::mail::{
-    Mail, MailConfig, MailDeliveryQueue, MailDeliveryQueueHandle, MailError, MailPreview,
-    MailPreviewError, MailPreviewRegistry, MailTransport, Mailer, SmtpConfig, TlsMode, Transport,
+    Mail, MailAttachment, MailConfig, MailDeliveryQueue, MailDeliveryQueueHandle, MailError,
+    MailPreview, MailPreviewError, MailPreviewRegistry, MailTransport, Mailer, SmtpConfig, TlsMode,
+    Transport,
 };
 #[cfg(all(feature = "presence", feature = "maud"))]
 pub use crate::presence_badge;
