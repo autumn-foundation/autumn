@@ -15,8 +15,14 @@
 //! on the OS closing the socket to make Postgres abort it server-side.
 
 use crate::text_width::display_width;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::crypto::CryptoProvider;
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{DigitallySignedStruct, SignatureScheme};
+use std::sync::Arc;
 use tokio_postgres::types::ToSql;
-use tokio_postgres::{Client, NoTls, Row};
+use tokio_postgres::{Client, Row};
+use tokio_postgres_rustls::MakeRustlsConnect;
 
 /// Run `fut` to completion on a fresh single-threaded Tokio runtime.
 ///
@@ -68,15 +74,96 @@ impl<T, E: std::fmt::Display> ResultExt<T> for Result<T, E> {
     }
 }
 
+/// Accepts any server certificate without validating its chain or hostname,
+/// while still cryptographically verifying the TLS handshake signatures
+/// (i.e. the connection is genuinely encrypted to *some* holder of the
+/// presented key — this is not "no security", only "no identity check").
+///
+/// This mirrors `libpq`/`psql`'s actual behavior for `sslmode=require` (and
+/// the default `prefer`): those modes encrypt the connection but do
+/// *not* validate the server's certificate — only `verify-ca`/`verify-full`
+/// do that, and `tokio_postgres`'s own `sslmode` parser doesn't even accept
+/// those two values (see `Config`'s `sslmode` match arms — only `disable`,
+/// `prefer`, and `require` parse; anything else is a config error). A
+/// verifier backed by the OS trust store would reject the private-CA and
+/// self-signed certificates that `sslmode=require` deployments commonly use
+/// (this was tried and broke against a default Debian Postgres install's
+/// snakeoil cert), which `psql` never rejected under the modes this crate
+/// can actually reach.
+#[derive(Debug)]
+struct NoServerCertVerification(CryptoProvider);
+
+impl ServerCertVerifier for NoServerCertVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+/// Build a `rustls`-backed TLS connector.
+///
+/// `tokio_postgres::connect` parses `sslmode` out of `db_url` itself
+/// (defaulting to `prefer`, matching `libpq`/`psql`) and decides whether to
+/// negotiate TLS at all — `disable` skips it entirely, `prefer` tries TLS
+/// first and falls back to plaintext if the server doesn't offer it, and
+/// `require` insists on it. That decision keys off whether the `TlsConnect`
+/// passed in can actually connect, so the only thing this module needs to
+/// provide is a real connector: passing `NoTls` (as this module used to)
+/// forces plaintext unconditionally regardless of `sslmode`, which broke
+/// connections to managed Postgres instances that require TLS.
+fn tls_connector() -> MakeRustlsConnect {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .expect("ring provider supports rustls's default protocol versions")
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoServerCertVerification((*provider).clone())))
+        .with_no_client_auth();
+    MakeRustlsConnect::new(config)
+}
+
 /// Connect to `db_url`, returning a [`CommandError::Connect`] on failure so
 /// callers can propagate it with `?` rather than exiting immediately.
-///
-/// Uses `NoTls` — the same plaintext transport `autumn-web`'s own
-/// `diesel-async`/`tokio-postgres` connection pool uses by default; TLS
-/// parameters embedded in the URL itself (`sslmode=...`) are unaffected
-/// either way since we pass the URL straight through.
 pub async fn connect(label: &str, db_url: &str) -> Result<Client, CommandError> {
-    let (client, connection) = tokio_postgres::connect(db_url, NoTls)
+    let (client, connection) = tokio_postgres::connect(db_url, tls_connector())
         .await
         .map_err(|e| CommandError::Connect(format!("failed to connect to the database: {e}")))?;
 
@@ -257,6 +344,21 @@ mod tests {
     #[test]
     fn print_table_smoke_does_not_panic_on_empty_rows() {
         print_table(&["key", "value"], &[]);
+    }
+
+    #[test]
+    fn tls_connector_builds_without_panicking() {
+        let _ = tls_connector();
+    }
+
+    #[test]
+    fn no_server_cert_verification_reports_supported_signature_schemes() {
+        // A verifier with zero supported schemes would make every TLS
+        // handshake fail signature checks; this pins down that the ring
+        // provider's schemes actually get threaded through.
+        let provider = rustls::crypto::ring::default_provider();
+        let verifier = NoServerCertVerification(provider);
+        assert!(!verifier.supported_verify_schemes().is_empty());
     }
 
     #[test]
