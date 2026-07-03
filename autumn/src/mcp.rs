@@ -598,6 +598,53 @@ pub struct McpToolInfo {
     streams: bool,
 }
 
+impl McpToolInfo {
+    /// Tool name advertised in `tools/list` (the route's operation id).
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Human-readable description derived from the route's
+    /// `description`/`summary`.
+    #[must_use]
+    pub fn description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
+
+    /// JSON Schema for the tool's arguments, built from the handler's typed
+    /// contract (path params, query, JSON body).
+    #[must_use]
+    pub const fn input_schema(&self) -> &Value {
+        &self.input_schema
+    }
+
+    /// MCP safety annotations (`readOnlyHint`, `destructiveHint`, `title`)
+    /// derived from the HTTP verb.
+    #[must_use]
+    pub const fn annotations(&self) -> &Value {
+        &self.annotations
+    }
+
+    /// HTTP method the tool dispatches with.
+    #[must_use]
+    pub fn method(&self) -> &str {
+        &self.method
+    }
+
+    /// Route path template the tool dispatches to (e.g. `/api/todos/{id}`).
+    #[must_use]
+    pub fn path_template(&self) -> &str {
+        &self.path_template
+    }
+
+    /// Whether this is a streaming (`Sse`) tool.
+    #[must_use]
+    pub const fn streams(&self) -> bool {
+        self.streams
+    }
+}
+
 impl McpServer {
     /// Assemble the server state from derived tools, a dispatch router, and the
     /// router-supplied [`McpWiring`] (CORS, trusted hosts, tenant/CSRF headers).
