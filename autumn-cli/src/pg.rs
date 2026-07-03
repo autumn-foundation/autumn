@@ -443,6 +443,15 @@ fn fill_in_libpq_env_defaults(
     {
         pairs.push(("dbname".to_owned(), pgdatabase));
     }
+    // `connect_timeout` has no URL-authority equivalent (unlike
+    // `host`/`port`, it's always just a plain query/keyword pair), so
+    // there's no explicit-tracking struct field for it — checking `pairs`
+    // directly is enough.
+    if find_pair(pairs, "connect_timeout").is_none()
+        && let Ok(pgconnect_timeout) = std::env::var("PGCONNECT_TIMEOUT")
+    {
+        pairs.push(("connect_timeout".to_owned(), pgconnect_timeout));
+    }
     injected_port
 }
 
@@ -802,12 +811,14 @@ fn sanitize_url_form(mut url: url::Url) -> Result<String, CommandError> {
     // need this snapshot below to detect whether a later merge is safe
     // to fold back into the query string at all (see the comment by
     // `needs_keyword_form`). `username()`/`password()`/`path()` are
-    // percent-encoded as `url::Url` stores them — fine when we hand the
-    // whole URL back to `tokio_postgres` to reparse (it does its own
-    // percent-decoding), but [`keyword_value_token`] has no
-    // percent-encoding concept at all, so these must be decoded before
-    // any of them can end up as a keyword-form value (see
-    // `needs_keyword_form` below).
+    // percent-encoded as `url::Url` stores them, and so is `host_str()` for
+    // the "opaque host" case `tokio_postgres`'s Unix-socket-path URL form
+    // uses (e.g. `postgresql://%2Fvar%2Frun%2Fpostgresql/db`) — fine when we
+    // hand the whole URL back to `tokio_postgres` to reparse (it does its
+    // own percent-decoding), but [`keyword_value_token`] has no
+    // percent-encoding concept at all, so these must be decoded before any
+    // of them can end up as a keyword-form value (see `needs_keyword_form`
+    // below).
     let explicit_user = Some(url.username())
         .filter(|u| !u.is_empty())
         .map(percent_decode)
@@ -819,7 +830,7 @@ fn sanitize_url_form(mut url: url::Url) -> Result<String, CommandError> {
     let explicit_host = url
         .host_str()
         .filter(|h| !h.is_empty())
-        .map(str::to_owned)
+        .map(percent_decode)
         .or_else(|| find_pair(&pairs, "host").map(str::to_owned));
     let explicit_port = url
         .port()
@@ -1696,6 +1707,48 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_uses_pgconnect_timeout_env_var_when_url_omits_it() {
+        // `tokio_postgres` supports `connect_timeout` as a connection
+        // parameter but never reads `PGCONNECT_TIMEOUT` itself (unlike
+        // `psql`, which honors it as a documented libpq environment
+        // variable) — a URL relying on it the way `psql` did would
+        // otherwise wait on the OS-level TCP timeout instead of the
+        // configured bound.
+        temp_env::with_var("PGCONNECT_TIMEOUT", Some("10"), || {
+            let sanitized = sanitize_db_url("postgres://db.internal").unwrap();
+            let config: tokio_postgres::Config = sanitized.parse().unwrap();
+            assert_eq!(
+                config.get_connect_timeout(),
+                Some(&std::time::Duration::from_secs(10))
+            );
+        });
+    }
+
+    #[test]
+    fn sanitize_uses_pgconnect_timeout_env_var_in_keyword_form_too() {
+        temp_env::with_var("PGCONNECT_TIMEOUT", Some("10"), || {
+            let sanitized = sanitize_db_url("host=db.internal").unwrap();
+            let config: tokio_postgres::Config = sanitized.parse().unwrap();
+            assert_eq!(
+                config.get_connect_timeout(),
+                Some(&std::time::Duration::from_secs(10))
+            );
+        });
+    }
+
+    #[test]
+    fn sanitize_does_not_override_explicit_connect_timeout_with_pgconnect_timeout_env_var() {
+        temp_env::with_var("PGCONNECT_TIMEOUT", Some("999"), || {
+            let sanitized = sanitize_db_url("postgres://db.internal?connect_timeout=10").unwrap();
+            let config: tokio_postgres::Config = sanitized.parse().unwrap();
+            assert_eq!(
+                config.get_connect_timeout(),
+                Some(&std::time::Duration::from_secs(10))
+            );
+        });
+    }
+
+    #[test]
     fn sanitize_leaves_password_unset_when_no_source_is_configured() {
         temp_env::with_vars(
             [
@@ -1983,6 +2036,42 @@ mod tests {
                 let config: tokio_postgres::Config = sanitized.parse().unwrap();
                 assert_eq!(config.get_user(), Some("user"));
                 assert_eq!(config.get_password(), Some(b"p@ss".as_slice()));
+                assert_eq!(config.get_ports(), &[6543]);
+            },
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn sanitize_percent_decodes_explicit_unix_socket_host_when_forced_into_keyword_form() {
+        // `tokio_postgres`'s Unix-socket-path URL form uses the host
+        // component as a percent-encoded path (e.g.
+        // `postgresql://%2Fvar%2Frun%2Fpostgresql/db`) — `url::Url::host_str`
+        // returns that raw, never decoded. Same fix as the password case
+        // above: a service-supplied port that forces `needs_keyword_form`
+        // must not re-emit `host=%2Fvar%2Frun%2Fpostgresql` literally, or
+        // `tokio_postgres` tries to resolve that as a hostname instead of
+        // using the socket directory.
+        let dir = tempfile::tempdir().unwrap();
+        let service_path = dir.path().join("pg_service.conf");
+        std::fs::write(&service_path, "[prod]\nport=6543\n").unwrap();
+        temp_env::with_vars(
+            [
+                ("PGSERVICEFILE", Some(service_path.to_str().unwrap())),
+                ("PGPASSWORD", None::<&str>),
+                ("PGPASSFILE", Some("/nonexistent-pgpass-for-test")),
+            ],
+            || {
+                let sanitized =
+                    sanitize_db_url("postgresql://%2Fvar%2Frun%2Fpostgresql/db?service=prod")
+                        .unwrap();
+                let config: tokio_postgres::Config = sanitized.parse().unwrap();
+                assert_eq!(
+                    config.get_hosts(),
+                    &[tokio_postgres::config::Host::Unix(
+                        std::path::PathBuf::from("/var/run/postgresql")
+                    )]
+                );
                 assert_eq!(config.get_ports(), &[6543]);
             },
         );
