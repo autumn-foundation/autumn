@@ -203,7 +203,8 @@ fn filter_ssl_params(
     pairs: impl Iterator<Item = (String, String)>,
 ) -> Result<Vec<(String, String)>, CommandError> {
     let pairs: Vec<(String, String)> = pairs.collect();
-    if find_pair(&pairs, "sslmode") == Some("require") && find_pair(&pairs, "sslrootcert").is_some()
+    if find_last_pair(&pairs, "sslmode") == Some("require")
+        && find_pair(&pairs, "sslrootcert").is_some()
     {
         return Err(CommandError::Other(
             "sslmode=require with sslrootcert is not supported: PostgreSQL treats this \
@@ -582,6 +583,21 @@ fn fill_in_libpq_ssl_env_defaults(pairs: &mut Vec<(String, String)>) {
 fn find_pair<'a>(pairs: &'a [(String, String)], key: &str) -> Option<&'a str> {
     pairs
         .iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.as_str())
+}
+
+/// Like [`find_pair`], but returns the *last* matching pair instead of the
+/// first — for a key like `sslmode` that `tokio_postgres::Config::param`
+/// simply overwrites on every occurrence (unlike `host`/`port`, which
+/// accumulate), the last occurrence in `pairs` is the one that actually
+/// takes effect once `tokio_postgres` reparses the reassembled connection
+/// string, so callers reasoning about the *effective* value of such a key
+/// must use this instead of `find_pair`.
+fn find_last_pair<'a>(pairs: &'a [(String, String)], key: &str) -> Option<&'a str> {
+    pairs
+        .iter()
+        .rev()
         .find(|(k, _)| k == key)
         .map(|(_, v)| v.as_str())
 }
@@ -1350,6 +1366,28 @@ mod tests {
         let err = sanitize_db_url("postgres://host/db?sslrootcert=/etc/ca.pem&sslmode=require")
             .unwrap_err();
         assert!(err.message().contains("sslrootcert"));
+    }
+
+    #[test]
+    fn sanitize_rejects_require_with_sslrootcert_when_an_earlier_sslmode_shadows_it() {
+        // `sslmode` is an overwrite-semantics field in `tokio_postgres::Config`
+        // (`Config::param`'s "sslmode" arm calls `self.ssl_mode(mode)`
+        // unconditionally each time it's invoked) — a later `sslmode=` in the
+        // same connection string wins over an earlier one, exactly like
+        // `user`/`password`/`dbname`. `find_pair`'s first-match semantics
+        // would instead see the *first* `sslmode=prefer` here, miss the
+        // require+sslrootcert combination entirely, and let `sslrootcert` get
+        // silently dropped by the unconditional `UNSUPPORTED_SSL_PARAMS` loop
+        // while both `sslmode` values survive — so the final string
+        // `tokio_postgres` reparses would connect under the *effective*
+        // `sslmode=require` with no certificate verification at all, exactly
+        // the silent downgrade this whole check exists to prevent.
+        let err = sanitize_db_url(
+            "postgres://host/db?sslmode=prefer&sslrootcert=/etc/ca.pem&sslmode=require",
+        )
+        .unwrap_err();
+        assert!(err.message().contains("sslrootcert"));
+        assert!(err.message().contains("require"));
     }
 
     #[test]
@@ -2170,22 +2208,40 @@ mod tests {
         // "ops+cli" to `tokio_postgres`, not "ops cli" — reading the query
         // string through `query_pairs()` before this sanitizer even runs
         // would already have corrupted it.
-        let sanitized =
-            sanitize_db_url("postgres://db.internal/mydb?application_name=ops+cli").unwrap();
-        let config: tokio_postgres::Config = sanitized.parse().unwrap();
-        assert_eq!(config.get_application_name(), Some("ops+cli"));
+        // Scopes away PGSSLMODE/PGSSLROOTCERT so an ambient/racing
+        // `PGSSLMODE=require` plus `PGSSLROOTCERT` (set by another test via
+        // `temp_env` on a different thread) can't trip the
+        // require+sslrootcert rejection and turn this `unwrap()` into a
+        // flake, per the established test-isolation precedent in this file.
+        temp_env::with_vars(
+            [("PGSSLMODE", None::<&str>), ("PGSSLROOTCERT", None::<&str>)],
+            || {
+                let sanitized =
+                    sanitize_db_url("postgres://db.internal/mydb?application_name=ops+cli")
+                        .unwrap();
+                let config: tokio_postgres::Config = sanitized.parse().unwrap();
+                assert_eq!(config.get_application_name(), Some("ops+cli"));
+            },
+        );
     }
 
     #[test]
     fn sanitize_still_percent_decodes_url_query_values_with_plus_present() {
         // Companion to `sanitize_preserves_literal_plus_in_url_query_values`
         // — confirms the fix doesn't regress plain percent-decoding (`%20`
-        // for a space) just because it stopped treating `+` as space.
-        let sanitized =
-            sanitize_db_url("postgres://db.internal/mydb?options=-c%20search_path%3Dapp+public")
+        // for a space) just because it stopped treating `+` as space. See
+        // that test for why PGSSLMODE/PGSSLROOTCERT are scoped away.
+        temp_env::with_vars(
+            [("PGSSLMODE", None::<&str>), ("PGSSLROOTCERT", None::<&str>)],
+            || {
+                let sanitized = sanitize_db_url(
+                    "postgres://db.internal/mydb?options=-c%20search_path%3Dapp+public",
+                )
                 .unwrap();
-        let config: tokio_postgres::Config = sanitized.parse().unwrap();
-        assert_eq!(config.get_options(), Some("-c search_path=app+public"));
+                let config: tokio_postgres::Config = sanitized.parse().unwrap();
+                assert_eq!(config.get_options(), Some("-c search_path=app+public"));
+            },
+        );
     }
 
     #[test]
