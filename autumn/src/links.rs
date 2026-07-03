@@ -26,6 +26,8 @@
 //! [`ChangesetForm::form_tag`](crate::form::ChangesetForm::form_tag) instead —
 //! `button_to` is a zero-field action button, not a form builder.
 
+use std::borrow::Cow;
+
 use http::Method;
 
 /// Returns `true` when `name` is a valid HTML attribute name: an ASCII
@@ -296,7 +298,8 @@ pub fn link_to(label: &str, href: &str) -> maud::Markup {
 pub fn link_to_with(label: &str, href: &str, options: &LinkToOptions<'_>) -> maud::Markup {
     let rel = effective_rel(options.target, options.rel);
 
-    let mut out = String::from("<a");
+    let mut out = String::with_capacity(64 + href.len() + label.len());
+    out.push_str("<a");
     push_attr(&mut out, "href", href);
     if let Some(class) = options.class {
         push_attr(&mut out, "class", class);
@@ -309,9 +312,9 @@ pub fn link_to_with(label: &str, href: &str, options: &LinkToOptions<'_>) -> mau
     }
     for (name, value) in options.attrs {
         let is_reserved = name.eq_ignore_ascii_case("href")
-            || (options.class.is_some() && name.eq_ignore_ascii_case("class"))
-            || (options.target.is_some() && name.eq_ignore_ascii_case("target"))
-            || (rel.is_some() && name.eq_ignore_ascii_case("rel"));
+            || name.eq_ignore_ascii_case("class")
+            || name.eq_ignore_ascii_case("target")
+            || name.eq_ignore_ascii_case("rel");
         assert!(
             !is_reserved,
             "attrs cannot override the built-in {name:?} attribute on link_to; use the dedicated option instead"
@@ -329,10 +332,11 @@ pub fn link_to_with(label: &str, href: &str, options: &LinkToOptions<'_>) -> mau
 /// (compared case-insensitively, matching the HTML browsing-context keyword),
 /// `noopener` is appended to the caller's `rel` (space-separated, no
 /// duplicate — also compared case-insensitively) or used on its own.
+/// Borrows the caller's `rel` when no allocation is needed.
 #[cfg(feature = "maud")]
-fn effective_rel(target: Option<&str>, rel: Option<&str>) -> Option<String> {
+fn effective_rel<'a>(target: Option<&str>, rel: Option<&'a str>) -> Option<Cow<'a, str>> {
     if !target.is_some_and(|t| t.eq_ignore_ascii_case("_blank")) {
-        return rel.map(ToString::to_string);
+        return rel.map(Cow::Borrowed);
     }
     match rel {
         Some(rel)
@@ -340,10 +344,10 @@ fn effective_rel(target: Option<&str>, rel: Option<&str>) -> Option<String> {
                 .split_whitespace()
                 .any(|token| token.eq_ignore_ascii_case("noopener")) =>
         {
-            Some(rel.to_string())
+            Some(Cow::Borrowed(rel))
         }
-        Some(rel) => Some(format!("{rel} noopener")),
-        None => Some("noopener".to_string()),
+        Some(rel) => Some(Cow::Owned(format!("{rel} noopener"))),
+        None => Some(Cow::Borrowed("noopener")),
     }
 }
 
@@ -441,13 +445,13 @@ pub fn button_to_with(
     csrf_token: &str,
     options: &ButtonToOptions<'_>,
 ) -> maud::Markup {
-    let mut button = String::from("<button type=\"submit\"");
+    let mut button = String::with_capacity(64 + label.len());
+    button.push_str("<button type=\"submit\"");
     if let Some(class) = options.class {
         push_attr(&mut button, "class", class);
     }
     for (name, value) in options.attrs {
-        let is_reserved = name.eq_ignore_ascii_case("type")
-            || (options.class.is_some() && name.eq_ignore_ascii_case("class"));
+        let is_reserved = name.eq_ignore_ascii_case("type") || name.eq_ignore_ascii_case("class");
         assert!(
             !is_reserved,
             "attrs cannot override the built-in {name:?} attribute on button_to; use the dedicated option instead"
@@ -604,6 +608,32 @@ mod tests {
         let _ = link_to_with("x", "/x", &options);
     }
 
+    #[test]
+    #[should_panic(expected = "attrs cannot override the built-in \"class\" attribute")]
+    fn link_to_attrs_cannot_override_class_without_option_set_panics() {
+        // Regression: `class`/`target`/`rel` must be reserved even when the
+        // dedicated option was never called, not only when it collides with
+        // an already-set value.
+        let options = LinkToOptions::new().attrs(&[("class", "evil")]);
+        let _ = link_to_with("x", "/x", &options);
+    }
+
+    #[test]
+    #[should_panic(expected = "attrs cannot override the built-in \"target\" attribute")]
+    fn link_to_attrs_cannot_override_target_without_option_set_panics() {
+        // Regression: bypassing `.target("_blank")` via attrs would skip the
+        // automatic `rel="noopener"` safety net entirely.
+        let options = LinkToOptions::new().attrs(&[("target", "_blank")]);
+        let _ = link_to_with("x", "/x", &options);
+    }
+
+    #[test]
+    #[should_panic(expected = "attrs cannot override the built-in \"rel\" attribute")]
+    fn link_to_attrs_cannot_override_rel_without_option_set_panics() {
+        let options = LinkToOptions::new().attrs(&[("rel", "nofollow")]);
+        let _ = link_to_with("x", "/x", &options);
+    }
+
     // ── button_to ───────────────────────────────────────────────────────
 
     #[test]
@@ -741,6 +771,15 @@ mod tests {
         let options = ButtonToOptions::new()
             .class("btn")
             .attrs(&[("class", "evil")]);
+        let _ = button_to_with("x", "/x", Method::POST, "tok", &options);
+    }
+
+    #[test]
+    #[should_panic(expected = "attrs cannot override the built-in \"class\" attribute")]
+    fn button_to_attrs_cannot_override_class_without_option_set_panics() {
+        // Regression: `class` must be reserved even when `.class()` was
+        // never called, not only when it collides with an already-set value.
+        let options = ButtonToOptions::new().attrs(&[("class", "evil")]);
         let _ = button_to_with("x", "/x", Method::POST, "tok", &options);
     }
 }
