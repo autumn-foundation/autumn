@@ -198,6 +198,23 @@ fn filter_ssl_params(
                  verifying the server's certificate, or sslmode=disable to connect in plaintext."
             )));
         }
+        if key == "sslmode" && value == "allow" {
+            // `tokio_postgres::Config`'s own parser only recognizes
+            // disable/prefer/require for `sslmode` — `allow` (try plaintext
+            // first, retry with TLS only if that's refused) isn't a mode it
+            // can express at all, so letting it through would surface a
+            // generic "invalid value for option" parse error instead of
+            // this clearer one. `prefer` is the closest supported
+            // alternative, and a strictly stronger default (it prefers
+            // encryption rather than only falling back to it).
+            return Err(CommandError::Other(
+                "sslmode=allow is not supported: this native connection path only implements \
+                 disable/prefer/require semantics. Use sslmode=prefer to negotiate TLS \
+                 opportunistically (preferring it, rather than allow's plaintext-first order), \
+                 or sslmode=require to mandate it."
+                    .to_owned(),
+            ));
+        }
         out.push((key, value));
     }
     Ok(out)
@@ -888,6 +905,22 @@ mod tests {
     fn sanitize_rejects_verify_ca_in_url_form_instead_of_downgrading() {
         let err = sanitize_db_url("postgres://host/db?sslmode=verify-ca").unwrap_err();
         assert!(err.message().contains("verify-ca"));
+    }
+
+    #[test]
+    fn sanitize_rejects_sslmode_allow_with_a_clear_message() {
+        // `tokio_postgres::Config`'s own parser only accepts
+        // disable/prefer/require for `sslmode` (verified against the real
+        // parser below, not just our own logic) — `allow` is a valid libpq
+        // mode this native path can't honor, so it must fail with a message
+        // pointing at what *is* supported rather than surfacing
+        // tokio_postgres's generic "invalid value for option" parse error.
+        let err = sanitize_db_url("postgres://host/db?sslmode=allow").unwrap_err();
+        assert!(err.message().contains("sslmode=allow"));
+        assert!(err.message().contains("prefer"));
+
+        let err = sanitize_db_url("host=localhost sslmode=allow").unwrap_err();
+        assert!(err.message().contains("sslmode=allow"));
     }
 
     #[test]
