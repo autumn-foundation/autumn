@@ -214,6 +214,21 @@ fn filter_ssl_params(
                 .to_owned(),
         ));
     }
+    if find_pair(&pairs, "sslcert").is_some() || find_pair(&pairs, "sslkey").is_some() {
+        // `tls_connector` builds its `rustls::ClientConfig` with
+        // `with_no_client_auth()` — silently dropping `sslcert`/`sslkey`
+        // (and `sslpassword`, for an encrypted key) would leave a
+        // `cert`/`clientcert=verify-ca` deployment that presented this
+        // certificate under `psql` instead failing opaquely at the server's
+        // auth layer, with nothing in this CLI's own error pointing at the
+        // real cause.
+        return Err(CommandError::Other(
+            "sslcert/sslkey (client-certificate authentication) is not supported: this native \
+             connection path doesn't load a client certificate for the TLS handshake. Configure \
+             password-based authentication instead, or omit sslcert/sslkey/sslpassword."
+                .to_owned(),
+        ));
+    }
 
     let mut out = Vec::new();
     for (key, value) in pairs {
@@ -1396,31 +1411,123 @@ mod tests {
 
     #[test]
     fn sanitize_leaves_ordinary_url_unchanged_in_content() {
-        let sanitized = sanitize_db_url("postgres://user:pw@host:5432/db?sslmode=require").unwrap();
-        let parsed = url::Url::parse(&sanitized).unwrap();
-        let pairs: std::collections::HashMap<_, _> = parsed.query_pairs().into_owned().collect();
-        assert_eq!(pairs.get("sslmode").map(String::as_str), Some("require"));
+        // Scope away PGSSLROOTCERT/PGSSLMODE so this can't race against
+        // another test's `temp_env`-scoped value for either — with
+        // `sslmode=require` already explicit here, an ambient
+        // `PGSSLROOTCERT` would trip the require+sslrootcert rejection this
+        // test isn't about at all.
+        temp_env::with_vars(
+            [("PGSSLROOTCERT", None::<&str>), ("PGSSLMODE", None::<&str>)],
+            || {
+                let sanitized =
+                    sanitize_db_url("postgres://user:pw@host:5432/db?sslmode=require").unwrap();
+                let parsed = url::Url::parse(&sanitized).unwrap();
+                let pairs: std::collections::HashMap<_, _> =
+                    parsed.query_pairs().into_owned().collect();
+                assert_eq!(pairs.get("sslmode").map(String::as_str), Some("require"));
+            },
+        );
     }
 
     #[test]
-    fn sanitize_drops_all_ssl_cert_params_from_url() {
+    fn sanitize_drops_ca_and_crl_ssl_params_from_url() {
         // No password is given anywhere in this URL, which would otherwise
         // make `sanitize_db_url` consult `PGPASSWORD`/`.pgpass` — scope both
         // away so this test (which isn't about credential resolution at all)
         // can't flake against whatever's ambient in the environment, or race
         // another test's `temp_env`-scoped value for the same variable.
+        //
+        // `sslcert`/`sslkey`/`sslpassword` (client-certificate auth) aren't
+        // included here — those are rejected outright rather than silently
+        // dropped, tested separately below. Also scopes away
+        // PGSSLMODE/PGSSLROOTCERT — this URL sets no `sslmode`, so an
+        // ambient/racing `PGSSLMODE=require` plus `PGSSLROOTCERT` could
+        // otherwise trip the require+sslrootcert rejection this test isn't
+        // about at all.
         temp_env::with_vars(
             [
                 ("PGPASSWORD", None::<&str>),
                 ("PGPASSFILE", Some("/nonexistent-pgpass-file-for-test")),
+                ("PGSSLMODE", None::<&str>),
+                ("PGSSLROOTCERT", None::<&str>),
             ],
             || {
-                let sanitized = sanitize_db_url(
-                    "postgres://host/db?sslcert=/c.pem&sslkey=/k.pem&sslpassword=x&sslcrl=/crl.pem&sslcrldir=/crls",
-                )
-                .unwrap();
+                let sanitized =
+                    sanitize_db_url("postgres://host/db?sslcrl=/crl.pem&sslcrldir=/crls").unwrap();
                 let parsed = url::Url::parse(&sanitized).unwrap();
                 assert_eq!(parsed.query_pairs().count(), 0);
+            },
+        );
+    }
+
+    #[test]
+    fn sanitize_rejects_sslcert_in_url_form_instead_of_silently_dropping() {
+        // Client-certificate authentication (`sslcert`/`sslkey`, optionally
+        // `sslpassword` for an encrypted key) isn't implemented by this
+        // native connection path — `tls_connector` builds its `rustls`
+        // config with `with_no_client_auth()`. Silently dropping these
+        // params would leave a `cert`/`clientcert=verify-ca` deployment that
+        // `psql` authenticated to failing opaquely at the server's auth
+        // layer, with nothing in the CLI's own output pointing at the real
+        // cause — reject clearly instead.
+        //
+        // Scopes away PGSSLMODE/PGSSLROOTCERT so an ambient/racing
+        // `PGSSLMODE=require` plus `PGSSLROOTCERT` can't instead trip the
+        // require+sslrootcert rejection (checked first) and produce a
+        // message that doesn't mention `sslcert` at all.
+        temp_env::with_vars(
+            [("PGSSLMODE", None::<&str>), ("PGSSLROOTCERT", None::<&str>)],
+            || {
+                let err =
+                    sanitize_db_url("postgres://host/db?sslcert=/c.pem&sslkey=/k.pem").unwrap_err();
+                assert!(err.message().contains("sslcert"));
+            },
+        );
+    }
+
+    #[test]
+    fn sanitize_rejects_sslkey_alone_in_url_form() {
+        // See the comment on `sanitize_rejects_sslcert_in_url_form_instead_of_silently_dropping`
+        // for why this scopes away PGSSLMODE/PGSSLROOTCERT.
+        temp_env::with_vars(
+            [("PGSSLMODE", None::<&str>), ("PGSSLROOTCERT", None::<&str>)],
+            || {
+                let err = sanitize_db_url("postgres://host/db?sslkey=/k.pem").unwrap_err();
+                assert!(err.message().contains("sslkey"));
+            },
+        );
+    }
+
+    #[test]
+    fn sanitize_rejects_sslcert_in_keyword_form() {
+        // See the comment on `sanitize_rejects_sslcert_in_url_form_instead_of_silently_dropping`
+        // for why this scopes away PGSSLMODE/PGSSLROOTCERT.
+        temp_env::with_vars(
+            [("PGSSLMODE", None::<&str>), ("PGSSLROOTCERT", None::<&str>)],
+            || {
+                let err = sanitize_db_url("host=host dbname=db sslcert=/c.pem sslkey=/k.pem")
+                    .unwrap_err();
+                assert!(err.message().contains("sslcert"));
+            },
+        );
+    }
+
+    #[test]
+    fn sanitize_rejects_sslcert_from_a_service_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let service_path = dir.path().join("pg_service.conf");
+        std::fs::write(&service_path, "[prod]\nsslcert=/c.pem\nsslkey=/k.pem\n").unwrap();
+        temp_env::with_vars(
+            [
+                ("PGSERVICEFILE", Some(service_path.to_str().unwrap())),
+                ("PGPASSWORD", None::<&str>),
+                ("PGPASSFILE", Some("/nonexistent-pgpass-for-test")),
+                ("PGSSLMODE", None::<&str>),
+                ("PGSSLROOTCERT", None::<&str>),
+            ],
+            || {
+                let err = sanitize_db_url("postgres://host/db?service=prod").unwrap_err();
+                assert!(err.message().contains("sslcert"));
             },
         );
     }
