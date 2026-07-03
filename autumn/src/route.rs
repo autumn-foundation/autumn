@@ -173,3 +173,69 @@ pub struct Route {
     /// Per-route override for the global inbound request timeout.
     pub timeout: RouteTimeout,
 }
+
+impl Route {
+    /// Opt this route in as an MCP tool, equivalent to tagging the handler
+    /// with `#[api_doc(mcp)]`.
+    ///
+    /// This is the registration-time escape hatch for code that can't (or
+    /// shouldn't) carry the attribute — most notably plugins, which can offer
+    /// a fluent `expose_mcp()` switch and let the *host* decide at install
+    /// time whether the plugin's routes become tools:
+    ///
+    /// ```rust,no_run
+    /// use autumn_web::Route;
+    /// use autumn_web::app::AppBuilder;
+    /// use autumn_web::plugin::Plugin;
+    /// use autumn_web::prelude::*;
+    ///
+    /// # #[get("/harvest/runs")]
+    /// # async fn list_runs() -> &'static str { "" }
+    /// pub struct HarvestPlugin {
+    ///     expose_mcp: bool,
+    /// }
+    ///
+    /// impl Plugin for HarvestPlugin {
+    ///     fn build(self, app: AppBuilder) -> AppBuilder {
+    ///         let mut rs = routes![list_runs];
+    ///         if self.expose_mcp {
+    ///             rs = rs.into_iter().map(Route::mcp).collect();
+    ///         }
+    ///         app.routes(rs)
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// Like the attribute form, an explicit opt-in exposes any verb (not just
+    /// reads) and the usual eligibility rules still apply. The flag is inert
+    /// unless the host enables the `mcp` feature and calls `mount_mcp`.
+    #[must_use]
+    pub fn mcp(mut self) -> Self {
+        self.api_doc.mcp_tool = true;
+        self
+    }
+
+    /// Exclude this route from MCP exposure, equivalent to
+    /// `#[api_doc(mcp = false)]`.
+    ///
+    /// Exclusion always wins — even over the whole-API
+    /// `expose_all_as_mcp()` hatch and a prior [`mcp()`](Self::mcp) call.
+    #[must_use]
+    pub fn mcp_exclude(mut self) -> Self {
+        self.api_doc.mcp_exclude = true;
+        self
+    }
+
+    /// Opt this route in as a *streaming* MCP tool, equivalent to
+    /// `#[api_doc(mcp, stream)]` on an [`Sse`](crate::sse::Sse) handler.
+    ///
+    /// Implies [`mcp()`](Self::mcp) — `stream` alone is never exposed — and
+    /// exempts the route from the JSON-response eligibility gate, since an
+    /// SSE handler has no JSON response schema by nature.
+    #[must_use]
+    pub fn mcp_stream(mut self) -> Self {
+        self.api_doc.mcp_tool = true;
+        self.api_doc.mcp_stream = true;
+        self
+    }
+}
