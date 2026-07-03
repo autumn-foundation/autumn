@@ -2539,20 +2539,24 @@ fn render_enum_rejection_smoke_test(
 ) -> String {
     // `setup_calls` is shared with (and identical to) the base index/api
     // smoke test's own setup, which issues a plain, non-idempotent
-    // `CREATE TABLE {plural} (...)` (matching the real migration). Both
-    // tests run against the same `TestDb::shared()` Postgres container in
-    // the same test binary, so whichever one runs second would hit
-    // "relation already exists" — make *this* test's own copy of the
-    // `CREATE TABLE` idempotent so it works whether it runs alongside the
-    // base test or standalone (e.g. `cargo test posts_rejects_out_of_set_status
-    // -- --ignored`). The reference-stub-table `CREATE TABLE`s are already
-    // `IF NOT EXISTS` (see `render_reference_stub_tables_sql`), so only the
-    // main table's statement needs the same treatment.
+    // `CREATE TABLE {plural} (...)` and, for any `--index`/`references`
+    // field, a plain `CREATE INDEX idx_{plural}_{field} ...` (matching the
+    // real migration). Both tests run against the same `TestDb::shared()`
+    // Postgres container in the same test binary, so whichever one runs
+    // second would hit "relation already exists" — make *this* test's own
+    // copies of both statement kinds idempotent so it works whether it runs
+    // alongside the base test or standalone (e.g. `cargo test
+    // posts_rejects_out_of_set_status -- --ignored`). The reference-stub-table
+    // `CREATE TABLE`s are already `IF NOT EXISTS` (see
+    // `render_reference_stub_tables_sql`), so only the main table's statement
+    // needs the same treatment; `CREATE INDEX` has no per-index counterpart
+    // to worry about, so every occurrence is rewritten.
     let setup_calls = setup_calls.replacen(
         &format!("CREATE TABLE {plural} ("),
         &format!("CREATE TABLE IF NOT EXISTS {plural} ("),
         1,
     );
+    let setup_calls = setup_calls.replace("CREATE INDEX idx_", "CREATE INDEX IF NOT EXISTS idx_");
     let setup_calls = setup_calls.as_str();
     let mut out = String::new();
     for target in fields.iter().filter(|f| f.is_enum()) {
@@ -4706,6 +4710,52 @@ async fn main() {
             base_test_setup.contains("CREATE TABLE posts (")
                 && !base_test_setup.contains("CREATE TABLE IF NOT EXISTS posts ("),
             "the base index test's own setup must be unchanged (plain CREATE TABLE, \
+             matching the real migration exactly): {base_test_setup}"
+        );
+    }
+
+    #[test]
+    fn scaffold_enum_rejection_test_uses_idempotent_create_index() {
+        // Regression test: `setup_calls` also contains `CREATE INDEX` for any
+        // `--index`/`references` field, not just the `CREATE TABLE` — the
+        // enum-rejection test's own copy of that index statement needs the
+        // same `IF NOT EXISTS` treatment, or it panics with "relation
+        // \"idx_posts_title\" already exists" when it runs after the base test.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &[
+                "title:String".into(),
+                "status:enum{draft,published,archived}".into(),
+            ],
+            "20260427000000",
+            &ScaffoldOptions {
+                model: ModelOptions {
+                    indexes: vec!["title".into()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let test = fs::read_to_string(tmp.path().join("tests/post.rs")).unwrap();
+
+        let enum_test_pos = test
+            .find("fn posts_rejects_out_of_set_status")
+            .unwrap_or_else(|| panic!("expected the enum rejection test: {test}"));
+        let enum_test_setup = &test[enum_test_pos..];
+        assert!(
+            enum_test_setup.contains("CREATE INDEX IF NOT EXISTS idx_posts_title"),
+            "the enum-rejection test's own CREATE INDEX must be idempotent: {enum_test_setup}"
+        );
+
+        let base_test_setup = &test[..enum_test_pos];
+        assert!(
+            base_test_setup.contains("CREATE INDEX idx_posts_title")
+                && !base_test_setup.contains("CREATE INDEX IF NOT EXISTS idx_posts_title"),
+            "the base index test's own setup must be unchanged (plain CREATE INDEX, \
              matching the real migration exactly): {base_test_setup}"
         );
     }

@@ -473,6 +473,17 @@ fn parse_enum_type(ty: &str) -> Result<Option<(Vec<String>, bool)>, String> {
             ));
         }
         let pascal = naming::pascal(variant);
+        // `is_valid_ident` allows a leading/all-underscore variant (e.g.
+        // `_2fa`, `__`), but `pascal()` strips leading underscores without
+        // introducing a letter, which can leave an empty string or a result
+        // starting with a digit — neither is a valid Rust identifier, so the
+        // generated enum variant would fail to compile.
+        if pascal.is_empty() || pascal.starts_with(|c: char| c.is_ascii_digit()) {
+            return Err(format!(
+                "'{variant}' does not produce a valid Rust identifier once converted to \
+                 PascalCase ('{pascal}'); rename the variant"
+            ));
+        }
         if !seen_pascal.insert(pascal.clone()) {
             return Err(format!(
                 "duplicate enum variant '{pascal}' (variants must be distinct once converted to PascalCase)"
@@ -1173,6 +1184,35 @@ mod tests {
         let err = parse_field("status:enum{2fa,ok}").unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("2fa"), "must name the bad variant: {msg}");
+        assert!(
+            msg.contains("identifier"),
+            "must explain the identifier rule: {msg}"
+        );
+    }
+
+    #[test]
+    fn enum_rejects_variant_pascalizing_to_leading_digit() {
+        // `_2fa` passes `is_valid_ident` (leading `_` is allowed), but
+        // `pascal("_2fa")` strips the leading underscore and capitalizes
+        // nothing before the digit, producing `2fa` — not a valid Rust
+        // identifier, so the generated enum variant fails to compile.
+        let err = parse_field("status:enum{_2fa,ok}").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("_2fa"), "must name the bad variant: {msg}");
+        assert!(
+            msg.contains("identifier"),
+            "must explain the identifier rule: {msg}"
+        );
+    }
+
+    #[test]
+    fn enum_rejects_variant_pascalizing_to_empty() {
+        // `__` passes `is_valid_ident` (all underscores are allowed chars),
+        // but `pascal("__")` produces an empty string — not a valid Rust
+        // identifier.
+        let err = parse_field("status:enum{__,ok}").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("__"), "must name the bad variant: {msg}");
         assert!(
             msg.contains("identifier"),
             "must explain the identifier rule: {msg}"
