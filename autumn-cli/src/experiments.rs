@@ -1,9 +1,10 @@
 //! `autumn experiments` — inspect and manage A/B experiments at runtime.
 //!
-//! All commands connect directly to the configured Postgres database.
-//! The database URL is resolved from `autumn.toml`, profile overrides, or
-//! the `AUTUMN_DATABASE__PRIMARY_URL` / `AUTUMN_DATABASE__URL` / `DATABASE_URL`
-//! environment variables.
+//! All commands connect directly to the configured Postgres database over a
+//! native `tokio_postgres` connection (see issue #1243) — no `psql` binary
+//! required. The database URL is resolved from `autumn.toml`, profile
+//! overrides, or the `AUTUMN_DATABASE__PRIMARY_URL` / `AUTUMN_DATABASE__URL`
+//! / `DATABASE_URL` environment variables.
 //!
 //! # Commands
 //!
@@ -15,7 +16,7 @@
 //! autumn experiments override <name> <actor_id> <variant>  # pin actor to variant (QA/staff)
 //! ```
 
-use std::process::Command;
+use crate::pg;
 
 // ── Options ───────────────────────────────────────────────────────────────────
 
@@ -52,69 +53,88 @@ pub struct OverrideOptions {
 
 // ── SQL helpers ──────────────────────────────────────────────────────────────
 
-const LIST_SQL: &str = "SELECT name, state, \
-    (SELECT string_agg(v->>'name' || '=' || v->>'weight', ', ' ORDER BY v->>'name') \
+const LIST_SQL: &str = "SELECT name, state::text, \
+    (SELECT string_agg((v->>'name') || '=' || (v->>'weight'), ', ' ORDER BY v->>'name') \
         FROM jsonb_array_elements(variants::jsonb) v) AS variants, \
-    winner, updated_at \
+    winner, updated_at::text AS updated_at \
     FROM autumn_experiments ORDER BY name;";
 
-const STATUS_SQL: &str = "SELECT name, description, state, variants, winner, \
-    exclusion_group, updated_at \
-    FROM autumn_experiments WHERE name = :'name';";
+const STATUS_SQL: &str = "SELECT name, description, state::text, variants::text, winner, \
+    exclusion_group, updated_at::text AS updated_at \
+    FROM autumn_experiments WHERE name = $1;";
 
-const SET_WEIGHTS_SQL: &str = "BEGIN; \
-SELECT 1/(SELECT COUNT(*)::int FROM autumn_experiments \
-    WHERE name = :'name' AND state NOT IN ('concluded', 'archived')) AS exists_check; \
-UPDATE autumn_experiments SET variants = :'variants'::jsonb, updated_at = NOW() \
-    WHERE name = :'name'; \
-INSERT INTO autumn_experiment_changes (experiment, mutation, actor) \
-    VALUES (:'name', 'set_weights=' || :'variants', :'actor'); \
-COMMIT;";
+const SET_WEIGHTS_EXISTS_SQL: &str = "SELECT COUNT(*)::bigint FROM autumn_experiments \
+    WHERE name = $1 AND state NOT IN ('concluded', 'archived');";
 
-const CONCLUDE_SQL: &str = "BEGIN; \
-SELECT 1/( \
-    SELECT COUNT(*)::int FROM autumn_experiments, \
+const SET_WEIGHTS_SQL: &str =
+    "UPDATE autumn_experiments SET variants = $1::jsonb, updated_at = NOW() WHERE name = $2;";
+
+const CONCLUDE_WINNER_CHECK_SQL: &str = "SELECT COUNT(*)::bigint FROM autumn_experiments, \
     jsonb_array_elements(variants::jsonb) v \
-    WHERE name = :'name' AND state != 'archived' AND v->>'name' = :'winner' \
-) AS winner_check; \
-UPDATE autumn_experiments SET state = 'concluded', winner = :'winner', updated_at = NOW() \
-    WHERE name = :'name'; \
-INSERT INTO autumn_experiment_changes (experiment, mutation, actor) \
-    VALUES (:'name', 'concluded=' || :'winner', :'actor'); \
-COMMIT;";
+    WHERE name = $1 AND state != 'archived' AND v->>'name' = $2;";
 
-const OVERRIDE_SQL: &str = "BEGIN; \
-SELECT 1/( \
-    SELECT COUNT(*)::int FROM autumn_experiments, \
+const CONCLUDE_SQL: &str = "UPDATE autumn_experiments SET state = 'concluded', winner = $1, \
+    updated_at = NOW() WHERE name = $2;";
+
+const OVERRIDE_VARIANT_CHECK_SQL: &str = "SELECT COUNT(*)::bigint FROM autumn_experiments, \
     jsonb_array_elements(variants::jsonb) v \
-    WHERE name = :'name' AND v->>'name' = :'variant' \
-) AS variant_check; \
-INSERT INTO autumn_experiment_overrides (experiment, actor, variant) \
-    VALUES (:'name', :'actor_id', :'variant') \
-    ON CONFLICT (experiment, actor) DO UPDATE SET variant = :'variant'; \
-INSERT INTO autumn_experiment_changes (experiment, mutation, actor) \
-    VALUES (:'name', 'override=' || :'actor_id' || ':' || :'variant', :'actor'); \
-COMMIT;";
+    WHERE name = $1 AND v->>'name' = $2;";
+
+const OVERRIDE_UPSERT_SQL: &str = "INSERT INTO autumn_experiment_overrides (experiment, actor, variant) \
+    VALUES ($1, $2, $3) \
+    ON CONFLICT (experiment, actor) DO UPDATE SET variant = $3;";
+
+// Shared audit-log insert for every mutation below; the DB trigger on this
+// table fans out `NOTIFY autumn_experiments, <name>` to running replicas.
+const EXPERIMENT_AUDIT_SQL: &str =
+    "INSERT INTO autumn_experiment_changes (experiment, mutation, actor) VALUES ($1, $2, $3);";
 
 // ── Public runners ────────────────────────────────────────────────────────────
 
 /// Run `autumn experiments list`.
 pub fn run_list(_opts: &ListOptions) {
     let db_url = resolve_database_url();
-    let mut cmd = psql_command(&db_url);
-    cmd.arg("--command").arg("\\pset footer off");
-    cmd.arg("--command").arg(LIST_SQL);
-    exec(cmd, "experiments list");
+    pg::block_on(async {
+        let client = pg::connect_or_die("experiments list", &db_url).await;
+        let rows = client
+            .query(LIST_SQL, &[])
+            .await
+            .unwrap_or_else(|e| pg::die("experiments list", e));
+        pg::print_table(
+            &["name", "state", "variants", "winner", "updated_at"],
+            &rows.iter().map(pg::row_to_strings).collect::<Vec<_>>(),
+        );
+    });
 }
 
 /// Run `autumn experiments status <name>`.
 pub fn run_status(opts: &StatusOptions) {
     let db_url = resolve_database_url();
-    let mut cmd = psql_command(&db_url);
-    cmd.arg("--variable").arg(format!("name={}", opts.name));
-    cmd.arg("--command").arg("\\pset footer off");
-    cmd.arg("--command").arg(STATUS_SQL);
-    exec(cmd, "experiments status");
+    pg::block_on(async {
+        let client = pg::connect_or_die("experiments status", &db_url).await;
+        let rows = client
+            .query(STATUS_SQL, &[&opts.name])
+            .await
+            .unwrap_or_else(|e| pg::die("experiments status", e));
+        if rows.is_empty() {
+            pg::die(
+                "experiments status",
+                format!("experiment '{}' not found", opts.name),
+            );
+        }
+        pg::print_table(
+            &[
+                "name",
+                "description",
+                "state",
+                "variants",
+                "winner",
+                "exclusion_group",
+                "updated_at",
+            ],
+            &rows.iter().map(pg::row_to_strings).collect::<Vec<_>>(),
+        );
+    });
 }
 
 /// Run `autumn experiments set-weights <name> <weights>`.
@@ -126,13 +146,42 @@ pub fn run_set_weights(opts: &SetWeightsOptions) {
         eprintln!("autumn experiments set-weights: {e}");
         std::process::exit(1);
     });
-    let mut cmd = psql_command(&db_url);
-    cmd.arg("--variable").arg(format!("name={}", opts.name));
-    cmd.arg("--variable")
-        .arg(format!("variants={variants_json}"));
-    cmd.arg("--variable").arg(format!("actor={actor}"));
-    cmd.arg("--command").arg(SET_WEIGHTS_SQL);
-    exec(cmd, "experiments set-weights");
+    let mutation = format!("set_weights={variants_json}");
+    // Bind as a typed JSON value (not a bare string) — the `$1::jsonb` cast in
+    // SET_WEIGHTS_SQL makes Postgres report the parameter's type as jsonb, and
+    // `postgres-types`'s `ToSql` for `String`/`&str` only declares itself
+    // compatible with text-ish types, not JSON/JSONB.
+    let variants_value: serde_json::Value = serde_json::from_str(&variants_json)
+        .unwrap_or_else(|e| pg::die("experiments set-weights", e));
+    pg::block_on(async {
+        let mut client = pg::connect_or_die("experiments set-weights", &db_url).await;
+        let exists = client
+            .query_one(SET_WEIGHTS_EXISTS_SQL, &[&opts.name])
+            .await
+            .unwrap_or_else(|e| pg::die("experiments set-weights", e));
+        if exists.get::<_, i64>(0) == 0 {
+            pg::die(
+                "experiments set-weights",
+                format!(
+                    "experiment '{}' does not exist or is concluded/archived",
+                    opts.name
+                ),
+            );
+        }
+        let txn = client
+            .transaction()
+            .await
+            .unwrap_or_else(|e| pg::die("experiments set-weights", e));
+        txn.execute(SET_WEIGHTS_SQL, &[&variants_value, &opts.name])
+            .await
+            .unwrap_or_else(|e| pg::die("experiments set-weights", e));
+        txn.execute(EXPERIMENT_AUDIT_SQL, &[&opts.name, &mutation, &actor])
+            .await
+            .unwrap_or_else(|e| pg::die("experiments set-weights", e));
+        txn.commit()
+            .await
+            .unwrap_or_else(|e| pg::die("experiments set-weights", e));
+    });
     println!(
         "✓ Experiment '{}' weights updated to {}.",
         opts.name, opts.weights
@@ -143,12 +192,36 @@ pub fn run_set_weights(opts: &SetWeightsOptions) {
 pub fn run_conclude(opts: &ConcludeOptions) {
     let db_url = resolve_database_url();
     let actor = opts.actor.as_deref().unwrap_or("cli");
-    let mut cmd = psql_command(&db_url);
-    cmd.arg("--variable").arg(format!("name={}", opts.name));
-    cmd.arg("--variable").arg(format!("winner={}", opts.winner));
-    cmd.arg("--variable").arg(format!("actor={actor}"));
-    cmd.arg("--command").arg(CONCLUDE_SQL);
-    exec(cmd, "experiments conclude");
+    let mutation = format!("concluded={}", opts.winner);
+    pg::block_on(async {
+        let mut client = pg::connect_or_die("experiments conclude", &db_url).await;
+        let exists = client
+            .query_one(CONCLUDE_WINNER_CHECK_SQL, &[&opts.name, &opts.winner])
+            .await
+            .unwrap_or_else(|e| pg::die("experiments conclude", e));
+        if exists.get::<_, i64>(0) == 0 {
+            pg::die(
+                "experiments conclude",
+                format!(
+                    "'{}' is not a variant of a non-archived experiment '{}'",
+                    opts.winner, opts.name
+                ),
+            );
+        }
+        let txn = client
+            .transaction()
+            .await
+            .unwrap_or_else(|e| pg::die("experiments conclude", e));
+        txn.execute(CONCLUDE_SQL, &[&opts.winner, &opts.name])
+            .await
+            .unwrap_or_else(|e| pg::die("experiments conclude", e));
+        txn.execute(EXPERIMENT_AUDIT_SQL, &[&opts.name, &mutation, &actor])
+            .await
+            .unwrap_or_else(|e| pg::die("experiments conclude", e));
+        txn.commit()
+            .await
+            .unwrap_or_else(|e| pg::die("experiments conclude", e));
+    });
     println!(
         "✓ Experiment '{}' concluded with winner '{}'.",
         opts.name, opts.winner
@@ -159,15 +232,39 @@ pub fn run_conclude(opts: &ConcludeOptions) {
 pub fn run_override(opts: &OverrideOptions) {
     let db_url = resolve_database_url();
     let actor = opts.actor.as_deref().unwrap_or("cli");
-    let mut cmd = psql_command(&db_url);
-    cmd.arg("--variable").arg(format!("name={}", opts.name));
-    cmd.arg("--variable")
-        .arg(format!("actor_id={}", opts.actor_id));
-    cmd.arg("--variable")
-        .arg(format!("variant={}", opts.variant));
-    cmd.arg("--variable").arg(format!("actor={actor}"));
-    cmd.arg("--command").arg(OVERRIDE_SQL);
-    exec(cmd, "experiments override");
+    let mutation = format!("override={}:{}", opts.actor_id, opts.variant);
+    pg::block_on(async {
+        let mut client = pg::connect_or_die("experiments override", &db_url).await;
+        let exists = client
+            .query_one(OVERRIDE_VARIANT_CHECK_SQL, &[&opts.name, &opts.variant])
+            .await
+            .unwrap_or_else(|e| pg::die("experiments override", e));
+        if exists.get::<_, i64>(0) == 0 {
+            pg::die(
+                "experiments override",
+                format!(
+                    "'{}' is not a variant of experiment '{}'",
+                    opts.variant, opts.name
+                ),
+            );
+        }
+        let txn = client
+            .transaction()
+            .await
+            .unwrap_or_else(|e| pg::die("experiments override", e));
+        txn.execute(
+            OVERRIDE_UPSERT_SQL,
+            &[&opts.name, &opts.actor_id, &opts.variant],
+        )
+        .await
+        .unwrap_or_else(|e| pg::die("experiments override", e));
+        txn.execute(EXPERIMENT_AUDIT_SQL, &[&opts.name, &mutation, &actor])
+            .await
+            .unwrap_or_else(|e| pg::die("experiments override", e));
+        txn.commit()
+            .await
+            .unwrap_or_else(|e| pg::die("experiments override", e));
+    });
     println!(
         "✓ Actor '{}' pinned to variant '{}' in experiment '{}'.",
         opts.actor_id, opts.variant, opts.name
@@ -208,24 +305,6 @@ fn resolve_database_url() -> String {
     crate::config::resolve_database_url()
 }
 
-fn psql_command(db_url: &str) -> Command {
-    let mut cmd = Command::new("psql");
-    cmd.arg(db_url);
-    cmd.arg("--no-psqlrc");
-    cmd.arg("--set=ON_ERROR_STOP=on");
-    cmd
-}
-
-fn exec(mut cmd: Command, label: &str) {
-    let status = cmd.status().unwrap_or_else(|e| {
-        eprintln!("autumn {label}: failed to run psql: {e}");
-        std::process::exit(1);
-    });
-    if !status.success() {
-        std::process::exit(status.code().unwrap_or(1));
-    }
-}
-
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -236,47 +315,38 @@ mod tests {
     fn sql_queries_reference_correct_tables() {
         assert!(LIST_SQL.contains("autumn_experiments"));
         assert!(STATUS_SQL.contains("autumn_experiments"));
+        assert!(SET_WEIGHTS_EXISTS_SQL.contains("autumn_experiments"));
         assert!(SET_WEIGHTS_SQL.contains("autumn_experiments"));
-        assert!(SET_WEIGHTS_SQL.contains("autumn_experiment_changes"));
+        assert!(CONCLUDE_WINNER_CHECK_SQL.contains("autumn_experiments"));
         assert!(CONCLUDE_SQL.contains("autumn_experiments"));
-        assert!(CONCLUDE_SQL.contains("autumn_experiment_changes"));
-        assert!(OVERRIDE_SQL.contains("autumn_experiment_overrides"));
-        assert!(OVERRIDE_SQL.contains("autumn_experiment_changes"));
-    }
-
-    #[test]
-    fn sql_mutations_use_transactions() {
-        for sql in [SET_WEIGHTS_SQL, CONCLUDE_SQL, OVERRIDE_SQL] {
-            assert!(
-                sql.starts_with("BEGIN;"),
-                "mutation SQL must use BEGIN: {sql}"
-            );
-            assert!(
-                sql.contains("COMMIT;"),
-                "mutation SQL must use COMMIT: {sql}"
-            );
-        }
+        assert!(OVERRIDE_VARIANT_CHECK_SQL.contains("autumn_experiments"));
+        assert!(OVERRIDE_UPSERT_SQL.contains("autumn_experiment_overrides"));
+        assert!(EXPERIMENT_AUDIT_SQL.contains("autumn_experiment_changes"));
     }
 
     #[test]
     fn conclude_sql_sets_winner_and_state() {
         assert!(CONCLUDE_SQL.contains("state = 'concluded'"));
-        assert!(CONCLUDE_SQL.contains("winner = :'winner'"));
+        assert!(CONCLUDE_SQL.contains("winner = $"));
     }
 
     #[test]
     fn override_sql_uses_upsert() {
         assert!(
-            OVERRIDE_SQL.contains("ON CONFLICT"),
+            OVERRIDE_UPSERT_SQL.contains("ON CONFLICT"),
             "override SQL must use INSERT ... ON CONFLICT"
         );
     }
 
     #[test]
     fn mutation_sql_have_existence_checks() {
-        for sql in [SET_WEIGHTS_SQL, CONCLUDE_SQL, OVERRIDE_SQL] {
+        for sql in [
+            SET_WEIGHTS_EXISTS_SQL,
+            CONCLUDE_WINNER_CHECK_SQL,
+            OVERRIDE_VARIANT_CHECK_SQL,
+        ] {
             assert!(
-                sql.contains("EXISTS") || sql.contains("COUNT(*)"),
+                sql.contains("COUNT(*)"),
                 "mutation SQL must have an existence check: {sql}"
             );
         }
@@ -285,32 +355,83 @@ mod tests {
     #[test]
     fn conclude_sql_validates_winner_in_variants() {
         assert!(
-            CONCLUDE_SQL.contains("jsonb_array_elements"),
-            "conclude SQL must check winner against variants: {CONCLUDE_SQL}"
+            CONCLUDE_WINNER_CHECK_SQL.contains("jsonb_array_elements"),
+            "conclude SQL must check winner against variants: {CONCLUDE_WINNER_CHECK_SQL}"
         );
     }
 
     #[test]
     fn override_sql_validates_variant_in_variants() {
         assert!(
-            OVERRIDE_SQL.contains("jsonb_array_elements"),
-            "override SQL must check variant against variants: {OVERRIDE_SQL}"
+            OVERRIDE_VARIANT_CHECK_SQL.contains("jsonb_array_elements"),
+            "override SQL must check variant against variants: {OVERRIDE_VARIANT_CHECK_SQL}"
         );
     }
 
     #[test]
     fn set_weights_sql_guards_non_editable_states() {
         assert!(
-            SET_WEIGHTS_SQL.contains("concluded") && SET_WEIGHTS_SQL.contains("archived"),
-            "set_weights SQL must reject concluded and archived experiments: {SET_WEIGHTS_SQL}"
+            SET_WEIGHTS_EXISTS_SQL.contains("concluded")
+                && SET_WEIGHTS_EXISTS_SQL.contains("archived"),
+            "set_weights SQL must reject concluded and archived experiments: {SET_WEIGHTS_EXISTS_SQL}"
         );
     }
 
     #[test]
     fn conclude_sql_guards_against_archived() {
         assert!(
-            CONCLUDE_SQL.contains("archived"),
-            "conclude SQL must reject archived experiments: {CONCLUDE_SQL}"
+            CONCLUDE_WINNER_CHECK_SQL.contains("archived"),
+            "conclude SQL must reject archived experiments: {CONCLUDE_WINNER_CHECK_SQL}"
+        );
+    }
+
+    // ── Issue #1243: no more psql shell-out ─────────────────────────────────
+
+    #[test]
+    fn no_sql_constant_uses_psql_variable_syntax() {
+        for sql in [
+            LIST_SQL,
+            STATUS_SQL,
+            SET_WEIGHTS_EXISTS_SQL,
+            SET_WEIGHTS_SQL,
+            CONCLUDE_WINNER_CHECK_SQL,
+            CONCLUDE_SQL,
+            OVERRIDE_VARIANT_CHECK_SQL,
+            OVERRIDE_UPSERT_SQL,
+            EXPERIMENT_AUDIT_SQL,
+        ] {
+            assert!(
+                !sql.contains(":'"),
+                "SQL must use native $n placeholders, not psql variable substitution: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_sql_constant_uses_textual_transaction_control_or_division_hack() {
+        for sql in [
+            SET_WEIGHTS_EXISTS_SQL,
+            SET_WEIGHTS_SQL,
+            CONCLUDE_WINNER_CHECK_SQL,
+            CONCLUDE_SQL,
+            OVERRIDE_VARIANT_CHECK_SQL,
+            OVERRIDE_UPSERT_SQL,
+        ] {
+            assert!(!sql.contains("BEGIN;"), "no textual BEGIN: {sql}");
+            assert!(!sql.contains("COMMIT;"), "no textual COMMIT: {sql}");
+            assert!(
+                !sql.contains("1/("),
+                "no division-by-zero existence hack: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn module_does_not_shell_out_to_psql() {
+        let src = include_str!("experiments.rs");
+        assert!(
+            !src.contains("Command::new(\"psql\")"),
+            "experiments.rs must not shell out to the psql binary (issue #1243)"
         );
     }
 

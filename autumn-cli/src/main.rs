@@ -24,6 +24,7 @@ mod migrate;
 mod monitor;
 mod new;
 mod paths;
+mod pg;
 mod plugin_check;
 mod process;
 mod release;

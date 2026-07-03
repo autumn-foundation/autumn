@@ -1,9 +1,10 @@
 //! `autumn flags` — inspect and toggle feature flags at runtime.
 //!
-//! All commands connect directly to the configured Postgres database.
-//! The database URL is resolved from `autumn.toml`, profile overrides, or
-//! the `AUTUMN_DATABASE__PRIMARY_URL` / `AUTUMN_DATABASE__URL` / `DATABASE_URL`
-//! environment variables.
+//! All commands connect directly to the configured Postgres database over a
+//! native `tokio_postgres` connection (see issue #1243) — no `psql` binary
+//! required. The database URL is resolved from `autumn.toml`, profile
+//! overrides, or the `AUTUMN_DATABASE__PRIMARY_URL` / `AUTUMN_DATABASE__URL`
+//! / `DATABASE_URL` environment variables.
 //!
 //! # Commands
 //!
@@ -15,7 +16,7 @@
 //! autumn flags allow <key> <actor_id>     # add actor_id to the explicit allowlist
 //! ```
 
-use std::process::Command;
+use crate::pg;
 
 // ── Options ───────────────────────────────────────────────────────────────────
 
@@ -55,82 +56,92 @@ const LIST_SQL: &str = "SELECT key, \
            rollout_pct || '%' AS rollout, \
            actor_allowlist, \
            group_allowlist, \
-           updated_at \
+           updated_at::text AS updated_at \
     FROM autumn_feature_flags ORDER BY key;";
 
 // enable() sets enabled=true + rollout_pct=100 (globally on for all actors).
-// Wrapped in an explicit transaction so the audit row is always written
-// together with the flag change; ON_ERROR_STOP exits psql on failure and the
-// un-committed transaction is rolled back when the connection closes.
-const ENABLE_SQL: &str = "BEGIN; \
-INSERT INTO autumn_feature_flags (key, enabled, rollout_pct) \
-    VALUES (:'key', TRUE, 100) \
-    ON CONFLICT (key) DO UPDATE SET enabled = TRUE, rollout_pct = 100, updated_at = NOW(); \
-INSERT INTO feature_flag_changes (key, mutation, actor) \
-    VALUES (:'key', 'enabled', :'actor'); \
-COMMIT;";
+const ENABLE_SQL: &str = "INSERT INTO autumn_feature_flags (key, enabled, rollout_pct) \
+    VALUES ($1, TRUE, 100) \
+    ON CONFLICT (key) DO UPDATE SET enabled = TRUE, rollout_pct = 100, updated_at = NOW();";
 
 // disable() is a kill-switch: sets enabled=false, preserves rollout config.
-const DISABLE_SQL: &str = "BEGIN; \
-INSERT INTO autumn_feature_flags (key, enabled) \
-    VALUES (:'key', FALSE) \
-    ON CONFLICT (key) DO UPDATE SET enabled = FALSE, updated_at = NOW(); \
-INSERT INTO feature_flag_changes (key, mutation, actor) \
-    VALUES (:'key', 'disabled', :'actor'); \
-COMMIT;";
+const DISABLE_SQL: &str = "INSERT INTO autumn_feature_flags (key, enabled) \
+    VALUES ($1, FALSE) \
+    ON CONFLICT (key) DO UPDATE SET enabled = FALSE, updated_at = NOW();";
 
 // set_rollout() also clears the kill-switch (sets enabled=true).
-const SET_ROLLOUT_SQL: &str = "BEGIN; \
-INSERT INTO autumn_feature_flags (key, enabled, rollout_pct) \
-    VALUES (:'key', TRUE, :'pct'::smallint) \
+const SET_ROLLOUT_SQL: &str = "INSERT INTO autumn_feature_flags (key, enabled, rollout_pct) \
+    VALUES ($1, TRUE, $2) \
     ON CONFLICT (key) DO UPDATE \
-        SET enabled = TRUE, rollout_pct = :'pct'::smallint, updated_at = NOW(); \
-INSERT INTO feature_flag_changes (key, mutation, actor) \
-    VALUES (:'key', 'rollout=' || :'pct', :'actor'); \
-COMMIT;";
+        SET enabled = TRUE, rollout_pct = $2, updated_at = NOW();";
 
-const ALLOW_SQL: &str = "BEGIN; \
-INSERT INTO autumn_feature_flags (key, enabled, rollout_pct) \
-    VALUES (:'key', TRUE, 0) ON CONFLICT (key) DO UPDATE \
+const ALLOW_UPSERT_SQL: &str = "INSERT INTO autumn_feature_flags (key, enabled, rollout_pct) \
+    VALUES ($1, TRUE, 0) ON CONFLICT (key) DO UPDATE \
         SET enabled = TRUE, \
             rollout_pct = CASE WHEN NOT autumn_feature_flags.enabled THEN 0 \
                                ELSE autumn_feature_flags.rollout_pct END, \
-            updated_at = NOW(); \
-UPDATE autumn_feature_flags \
+            updated_at = NOW();";
+
+const ALLOW_UPDATE_SQL: &str = "UPDATE autumn_feature_flags \
     SET actor_allowlist = ( \
         SELECT json_agg(DISTINCT elem)::text \
         FROM ( \
             SELECT jsonb_array_elements_text(actor_allowlist::jsonb) AS elem \
-            UNION SELECT :'actor_id' \
+            UNION SELECT $1::text \
         ) t \
     ), updated_at = NOW() \
-    WHERE key = :'key'; \
-INSERT INTO feature_flag_changes (key, mutation, actor) \
-    VALUES (:'key', 'allowed_actor=' || :'actor_id', :'actor'); \
-COMMIT;";
+    WHERE key = $2;";
+
+// Shared audit-log insert for every mutation below; the DB trigger on this
+// table fans out `NOTIFY autumn_flags, <key>` to running replicas.
+const FLAG_AUDIT_SQL: &str =
+    "INSERT INTO feature_flag_changes (key, mutation, actor) VALUES ($1, $2, $3);";
 
 // ── Public runners ────────────────────────────────────────────────────────────
 
 /// Run `autumn flags list`.
 pub fn run_list(_opts: &ListOptions) {
     let db_url = resolve_database_url();
-    let mut cmd = psql_command(&db_url);
-    // Use separate -c arguments: psql meta-commands and SQL cannot be mixed
-    // in a single --command string.
-    cmd.arg("--command").arg("\\pset footer off");
-    cmd.arg("--command").arg(LIST_SQL);
-    exec(cmd, "flags list");
+    pg::block_on(async {
+        let client = pg::connect_or_die("flags list", &db_url).await;
+        let rows = client
+            .query(LIST_SQL, &[])
+            .await
+            .unwrap_or_else(|e| pg::die("flags list", e));
+        pg::print_table(
+            &[
+                "key",
+                "enabled",
+                "rollout",
+                "actor_allowlist",
+                "group_allowlist",
+                "updated_at",
+            ],
+            &rows.iter().map(pg::row_to_strings).collect::<Vec<_>>(),
+        );
+    });
 }
 
 /// Run `autumn flags enable <key>`.
 pub fn run_enable(opts: &EnableOptions) {
     let db_url = resolve_database_url();
     let actor = opts.actor.as_deref().unwrap_or("cli");
-    let mut cmd = psql_command(&db_url);
-    cmd.arg("--variable").arg(format!("key={}", opts.key));
-    cmd.arg("--variable").arg(format!("actor={actor}"));
-    cmd.arg("--command").arg(ENABLE_SQL);
-    exec(cmd, "flags enable");
+    pg::block_on(async {
+        let mut client = pg::connect_or_die("flags enable", &db_url).await;
+        let txn = client
+            .transaction()
+            .await
+            .unwrap_or_else(|e| pg::die("flags enable", e));
+        txn.execute(ENABLE_SQL, &[&opts.key])
+            .await
+            .unwrap_or_else(|e| pg::die("flags enable", e));
+        txn.execute(FLAG_AUDIT_SQL, &[&opts.key, &"enabled", &actor])
+            .await
+            .unwrap_or_else(|e| pg::die("flags enable", e));
+        txn.commit()
+            .await
+            .unwrap_or_else(|e| pg::die("flags enable", e));
+    });
     println!("✓ Flag '{}' enabled globally.", opts.key);
 }
 
@@ -138,11 +149,22 @@ pub fn run_enable(opts: &EnableOptions) {
 pub fn run_disable(opts: &DisableOptions) {
     let db_url = resolve_database_url();
     let actor = opts.actor.as_deref().unwrap_or("cli");
-    let mut cmd = psql_command(&db_url);
-    cmd.arg("--variable").arg(format!("key={}", opts.key));
-    cmd.arg("--variable").arg(format!("actor={actor}"));
-    cmd.arg("--command").arg(DISABLE_SQL);
-    exec(cmd, "flags disable");
+    pg::block_on(async {
+        let mut client = pg::connect_or_die("flags disable", &db_url).await;
+        let txn = client
+            .transaction()
+            .await
+            .unwrap_or_else(|e| pg::die("flags disable", e));
+        txn.execute(DISABLE_SQL, &[&opts.key])
+            .await
+            .unwrap_or_else(|e| pg::die("flags disable", e));
+        txn.execute(FLAG_AUDIT_SQL, &[&opts.key, &"disabled", &actor])
+            .await
+            .unwrap_or_else(|e| pg::die("flags disable", e));
+        txn.commit()
+            .await
+            .unwrap_or_else(|e| pg::die("flags disable", e));
+    });
     println!("✓ Flag '{}' disabled globally.", opts.key);
 }
 
@@ -150,12 +172,24 @@ pub fn run_disable(opts: &DisableOptions) {
 pub fn run_set_rollout(opts: &SetRolloutOptions) {
     let db_url = resolve_database_url();
     let actor = opts.actor.as_deref().unwrap_or("cli");
-    let mut cmd = psql_command(&db_url);
-    cmd.arg("--variable").arg(format!("key={}", opts.key));
-    cmd.arg("--variable").arg(format!("pct={}", opts.pct));
-    cmd.arg("--variable").arg(format!("actor={actor}"));
-    cmd.arg("--command").arg(SET_ROLLOUT_SQL);
-    exec(cmd, "flags set-rollout");
+    let pct = i16::from(opts.pct);
+    let mutation = format!("rollout={}", opts.pct);
+    pg::block_on(async {
+        let mut client = pg::connect_or_die("flags set-rollout", &db_url).await;
+        let txn = client
+            .transaction()
+            .await
+            .unwrap_or_else(|e| pg::die("flags set-rollout", e));
+        txn.execute(SET_ROLLOUT_SQL, &[&opts.key, &pct])
+            .await
+            .unwrap_or_else(|e| pg::die("flags set-rollout", e));
+        txn.execute(FLAG_AUDIT_SQL, &[&opts.key, &mutation, &actor])
+            .await
+            .unwrap_or_else(|e| pg::die("flags set-rollout", e));
+        txn.commit()
+            .await
+            .unwrap_or_else(|e| pg::die("flags set-rollout", e));
+    });
     println!("✓ Flag '{}' rollout set to {}%.", opts.key, opts.pct);
 }
 
@@ -163,13 +197,26 @@ pub fn run_set_rollout(opts: &SetRolloutOptions) {
 pub fn run_allow(opts: &AllowOptions) {
     let db_url = resolve_database_url();
     let actor = opts.actor.as_deref().unwrap_or("cli");
-    let mut cmd = psql_command(&db_url);
-    cmd.arg("--variable").arg(format!("key={}", opts.key));
-    cmd.arg("--variable")
-        .arg(format!("actor_id={}", opts.actor_id));
-    cmd.arg("--variable").arg(format!("actor={actor}"));
-    cmd.arg("--command").arg(ALLOW_SQL);
-    exec(cmd, "flags allow");
+    let mutation = format!("allowed_actor={}", opts.actor_id);
+    pg::block_on(async {
+        let mut client = pg::connect_or_die("flags allow", &db_url).await;
+        let txn = client
+            .transaction()
+            .await
+            .unwrap_or_else(|e| pg::die("flags allow", e));
+        txn.execute(ALLOW_UPSERT_SQL, &[&opts.key])
+            .await
+            .unwrap_or_else(|e| pg::die("flags allow", e));
+        txn.execute(ALLOW_UPDATE_SQL, &[&opts.actor_id, &opts.key])
+            .await
+            .unwrap_or_else(|e| pg::die("flags allow", e));
+        txn.execute(FLAG_AUDIT_SQL, &[&opts.key, &mutation, &actor])
+            .await
+            .unwrap_or_else(|e| pg::die("flags allow", e));
+        txn.commit()
+            .await
+            .unwrap_or_else(|e| pg::die("flags allow", e));
+    });
     println!(
         "✓ Actor '{}' added to allowlist for flag '{}'.",
         opts.actor_id, opts.key
@@ -182,24 +229,6 @@ fn resolve_database_url() -> String {
     crate::config::resolve_database_url()
 }
 
-fn psql_command(db_url: &str) -> Command {
-    let mut cmd = Command::new("psql");
-    cmd.arg(db_url);
-    cmd.arg("--no-psqlrc");
-    cmd.arg("--set=ON_ERROR_STOP=on");
-    cmd
-}
-
-fn exec(mut cmd: Command, label: &str) {
-    let status = cmd.status().unwrap_or_else(|e| {
-        eprintln!("autumn {label}: failed to run psql: {e}");
-        std::process::exit(1);
-    });
-    if !status.success() {
-        std::process::exit(status.code().unwrap_or(1));
-    }
-}
-
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -210,25 +239,11 @@ mod tests {
     fn sql_queries_reference_correct_tables() {
         assert!(LIST_SQL.contains("autumn_feature_flags"));
         assert!(ENABLE_SQL.contains("autumn_feature_flags"));
-        assert!(ENABLE_SQL.contains("feature_flag_changes"));
         assert!(DISABLE_SQL.contains("autumn_feature_flags"));
-        assert!(DISABLE_SQL.contains("feature_flag_changes"));
         assert!(SET_ROLLOUT_SQL.contains("autumn_feature_flags"));
-        assert!(SET_ROLLOUT_SQL.contains("feature_flag_changes"));
-        assert!(ALLOW_SQL.contains("autumn_feature_flags"));
-        assert!(ALLOW_SQL.contains("feature_flag_changes"));
-    }
-
-    #[test]
-    fn sql_queries_contain_notify_columns() {
-        // Every mutation inserts into feature_flag_changes which triggers
-        // NOTIFY via the DB trigger.
-        for sql in [ENABLE_SQL, DISABLE_SQL, SET_ROLLOUT_SQL, ALLOW_SQL] {
-            assert!(
-                sql.contains("feature_flag_changes"),
-                "mutation SQL must record into feature_flag_changes: {sql}"
-            );
-        }
+        assert!(ALLOW_UPSERT_SQL.contains("autumn_feature_flags"));
+        assert!(ALLOW_UPDATE_SQL.contains("autumn_feature_flags"));
+        assert!(FLAG_AUDIT_SQL.contains("feature_flag_changes"));
     }
 
     #[test]
@@ -244,6 +259,70 @@ mod tests {
         assert!(
             DISABLE_SQL.contains("ON CONFLICT"),
             "disable SQL must use INSERT ... ON CONFLICT"
+        );
+    }
+
+    #[test]
+    fn allow_upsert_sql_uses_upsert() {
+        assert!(
+            ALLOW_UPSERT_SQL.contains("ON CONFLICT"),
+            "allow upsert SQL must use INSERT ... ON CONFLICT"
+        );
+    }
+
+    // ── Issue #1243: no more psql shell-out ─────────────────────────────────
+
+    #[test]
+    fn no_sql_constant_uses_psql_variable_syntax() {
+        for sql in [
+            LIST_SQL,
+            ENABLE_SQL,
+            DISABLE_SQL,
+            SET_ROLLOUT_SQL,
+            ALLOW_UPSERT_SQL,
+            ALLOW_UPDATE_SQL,
+            FLAG_AUDIT_SQL,
+        ] {
+            assert!(
+                !sql.contains(":'"),
+                "SQL must use native $n placeholders, not psql variable substitution: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_sql_constant_uses_textual_transaction_control() {
+        // Transactions are now driven by tokio_postgres::Client::transaction(),
+        // not textual BEGIN/COMMIT statements sent through psql.
+        for sql in [ENABLE_SQL, DISABLE_SQL, SET_ROLLOUT_SQL, ALLOW_UPSERT_SQL] {
+            assert!(!sql.contains("BEGIN;"), "no textual BEGIN: {sql}");
+            assert!(!sql.contains("COMMIT;"), "no textual COMMIT: {sql}");
+        }
+    }
+
+    #[test]
+    fn mutation_sql_uses_dollar_placeholders() {
+        for sql in [
+            ENABLE_SQL,
+            DISABLE_SQL,
+            SET_ROLLOUT_SQL,
+            ALLOW_UPSERT_SQL,
+            ALLOW_UPDATE_SQL,
+            FLAG_AUDIT_SQL,
+        ] {
+            assert!(
+                sql.contains('$'),
+                "mutation SQL must take native params via $n: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn module_does_not_shell_out_to_psql() {
+        let src = include_str!("flags.rs");
+        assert!(
+            !src.contains("Command::new(\"psql\")"),
+            "flags.rs must not shell out to the psql binary (issue #1243)"
         );
     }
 }

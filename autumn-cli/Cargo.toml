@@ -39,6 +39,8 @@ serde_json = { workspace = true }
 sha2 = "0.10"
 syn = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
 toml = { workspace = true }
 url = "2.5.8"
 
@@ -55,7 +57,6 @@ proptest = "1.4"
 temp-env = { version = "0.3.6", features = ["async_closure"] }
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
-tokio = { workspace = true }
 
 [lints]
 workspace = true

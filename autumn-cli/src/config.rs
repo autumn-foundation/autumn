@@ -1,7 +1,9 @@
 //! `autumn config` — inspect and mutate runtime configuration values.
 //!
-//! All commands connect directly to the configured Postgres database via
-//! `psql`, following the same profile-aware URL-resolution strategy as the app.
+//! All commands connect directly to the configured Postgres database over a
+//! native `tokio_postgres` connection (see issue #1243) — no `psql` binary
+//! required — following the same profile-aware URL-resolution strategy as
+//! the app.
 //!
 //! # Commands
 //!
@@ -13,9 +15,9 @@
 //! autumn config history <key>           # show the change history for a key
 //! ```
 
-use std::process::Command;
-
 use autumn_web::config::{AutumnConfig, Env, OsEnv};
+
+use crate::pg;
 
 /// Options for `autumn config list`.
 pub struct ListOptions;
@@ -44,110 +46,113 @@ pub struct HistoryOptions {
     pub limit: usize,
 }
 
-const CONFIG_SET_SQL: &str = "BEGIN; \
-    SELECT pg_advisory_xact_lock(1, hashtext(:'key')); \
-    WITH \
-        prior AS ( \
-            SELECT raw_value \
-            FROM autumn_runtime_config_values \
-            WHERE key = :'key' \
-        ), \
-        upsert AS ( \
-            INSERT INTO autumn_runtime_config_values (key, raw_value, updated_at) \
-                VALUES (:'key', :'value', NOW()) \
-                ON CONFLICT (key) DO UPDATE \
-                    SET raw_value = EXCLUDED.raw_value, \
-                        updated_at = EXCLUDED.updated_at \
-        ) \
-    INSERT INTO autumn_runtime_config_changes (key, old_value, new_value, actor) \
-        VALUES ( \
-            :'key', \
-            (SELECT raw_value FROM prior), \
-            :'value', \
-            :'actor' \
-        ); \
-    COMMIT;";
+const LIST_SQL: &str = "SELECT key, raw_value, updated_at::text AS updated_at \
+     FROM autumn_runtime_config_values \
+     ORDER BY key;";
 
-const CONFIG_UNSET_SQL: &str = "BEGIN; \
-    SELECT pg_advisory_xact_lock(1, hashtext(:'key')); \
-    WITH \
-        removed AS ( \
-            DELETE FROM autumn_runtime_config_values \
-            WHERE key = :'key' \
-            RETURNING raw_value \
-        ) \
-    INSERT INTO autumn_runtime_config_changes (key, old_value, new_value, actor) \
-        SELECT :'key', raw_value, NULL, :'actor' \
-        FROM removed; \
-    COMMIT;";
+const GET_SQL: &str = "SELECT key, raw_value, updated_at::text AS updated_at \
+     FROM autumn_runtime_config_values \
+     WHERE key = $1;";
+
+// Per-key advisory lock: serializes concurrent set/unset on the same key so
+// T2 blocks here until T1 commits, and the next statement then sees T1's
+// committed row under READ COMMITTED's per-statement snapshot.
+const CONFIG_LOCK_SQL: &str = "SELECT pg_advisory_xact_lock(1, hashtext($1));";
+
+const CONFIG_GET_PRIOR_SQL: &str =
+    "SELECT raw_value FROM autumn_runtime_config_values WHERE key = $1;";
+
+const CONFIG_UPSERT_SQL: &str = "INSERT INTO autumn_runtime_config_values (key, raw_value, updated_at) \
+        VALUES ($1, $2, NOW()) \
+        ON CONFLICT (key) DO UPDATE \
+            SET raw_value = EXCLUDED.raw_value, \
+                updated_at = EXCLUDED.updated_at;";
+
+const CONFIG_SET_AUDIT_SQL: &str = "INSERT INTO autumn_runtime_config_changes \
+    (key, old_value, new_value, actor) VALUES ($1, $2, $3, $4);";
+
+const CONFIG_UNSET_DELETE_SQL: &str = "DELETE FROM autumn_runtime_config_values \
+    WHERE key = $1 \
+    RETURNING raw_value;";
+
+const CONFIG_UNSET_AUDIT_SQL: &str = "INSERT INTO autumn_runtime_config_changes \
+    (key, old_value, new_value, actor) VALUES ($1, $2, NULL, $3);";
+
+const CONFIG_HISTORY_SQL: &str = "SELECT id::text, key, old_value, new_value, actor, changed_at::text AS changed_at \
+     FROM autumn_runtime_config_changes \
+     WHERE key = $1 \
+     ORDER BY changed_at DESC \
+     LIMIT $2;";
 
 // ── Public entry points ────────────────────────────────────────────────────────
 
 /// Run `autumn config list`.
 pub fn run_list(_opts: &ListOptions) {
     let url = resolve_database_url();
-    check_psql();
-    run_psql_or_die(
-        &url,
-        "SELECT key, raw_value, updated_at \
-         FROM autumn_runtime_config_values \
-         ORDER BY key;",
-    );
+    pg::block_on(async {
+        let client = pg::connect_or_die("config list", &url).await;
+        let rows = client
+            .query(LIST_SQL, &[])
+            .await
+            .unwrap_or_else(|e| pg::die("config list", e));
+        pg::print_table(
+            &["key", "raw_value", "updated_at"],
+            &rows.iter().map(pg::row_to_strings).collect::<Vec<_>>(),
+        );
+    });
 }
 
 /// Run `autumn config get <key>`.
 pub fn run_get(opts: &GetOptions) {
     let url = resolve_database_url();
-    check_psql();
-    // Probe for existence with tuples-only output so 0 rows vs 1 row is unambiguous
-    // regardless of locale (no "(0 rows)" footer to parse).
-    let mut probe = Command::new("psql");
-    probe.arg(&url).args(["-t", "-A"]);
-    probe.args(["-v", &format!("key={}", opts.key)]).args([
-        "-c",
-        "SELECT 1 FROM autumn_runtime_config_values WHERE key = :'key';",
-    ]);
-    match probe.output() {
-        Ok(out) if out.status.success() => {
-            if String::from_utf8_lossy(&out.stdout).trim().is_empty() {
-                eprintln!("\u{2717} Key '{}' has no active override.", opts.key);
-                std::process::exit(1);
-            }
-        }
-        Ok(_) => {
-            eprintln!("\u{2717} psql probe failed. Check the output above.");
+    pg::block_on(async {
+        let client = pg::connect_or_die("config get", &url).await;
+        let rows = client
+            .query(GET_SQL, &[&opts.key])
+            .await
+            .unwrap_or_else(|e| pg::die("config get", e));
+        if rows.is_empty() {
+            eprintln!("\u{2717} Key '{}' has no active override.", opts.key);
             std::process::exit(1);
         }
-        Err(e) => {
-            eprintln!("\u{2717} Failed to run psql: {e}");
-            std::process::exit(1);
-        }
-    }
-    // Key exists — print the full row with headers.
-    run_psql_with_vars_or_die(
-        &url,
-        "SELECT key, raw_value, updated_at \
-         FROM autumn_runtime_config_values \
-         WHERE key = :'key';",
-        &[("key", &opts.key)],
-    );
+        pg::print_table(
+            &["key", "raw_value", "updated_at"],
+            &rows.iter().map(pg::row_to_strings).collect::<Vec<_>>(),
+        );
+    });
 }
 
 /// Run `autumn config set <key> <value>`.
 pub fn run_set(opts: &SetOptions) {
     let url = resolve_database_url();
-    check_psql();
     let actor = opts.actor.as_deref().unwrap_or("cli");
-
-    // Acquire a per-key advisory lock before reading the prior value so that
-    // concurrent writers on a brand-new key are serialised: T2 blocks here
-    // until T1 commits, and the next statement then sees T1's committed row
-    // under READ COMMITTED's per-statement snapshot.
-    run_psql_with_vars_or_die(
-        &url,
-        CONFIG_SET_SQL,
-        &[("key", &opts.key), ("value", &opts.value), ("actor", actor)],
-    );
+    pg::block_on(async {
+        let mut client = pg::connect_or_die("config set", &url).await;
+        let txn = client
+            .transaction()
+            .await
+            .unwrap_or_else(|e| pg::die("config set", e));
+        txn.execute(CONFIG_LOCK_SQL, &[&opts.key])
+            .await
+            .unwrap_or_else(|e| pg::die("config set", e));
+        let prior_rows = txn
+            .query(CONFIG_GET_PRIOR_SQL, &[&opts.key])
+            .await
+            .unwrap_or_else(|e| pg::die("config set", e));
+        let old_value: Option<String> = prior_rows.first().map(|r| r.get::<_, String>(0));
+        txn.execute(CONFIG_UPSERT_SQL, &[&opts.key, &opts.value])
+            .await
+            .unwrap_or_else(|e| pg::die("config set", e));
+        txn.execute(
+            CONFIG_SET_AUDIT_SQL,
+            &[&opts.key, &old_value, &opts.value, &actor],
+        )
+        .await
+        .unwrap_or_else(|e| pg::die("config set", e));
+        txn.commit()
+            .await
+            .unwrap_or_else(|e| pg::die("config set", e));
+    });
 
     eprintln!(
         "\u{2713} Set '{key}' = '{value}'",
@@ -159,16 +164,30 @@ pub fn run_set(opts: &SetOptions) {
 /// Run `autumn config unset <key>`.
 pub fn run_unset(opts: &UnsetOptions) {
     let url = resolve_database_url();
-    check_psql();
     let actor = opts.actor.as_deref().unwrap_or("cli");
-
-    // Use the same per-key advisory lock as set before DELETE RETURNING captures
-    // old_value, keeping set/unset audit history ordered under concurrent writes.
-    run_psql_with_vars_or_die(
-        &url,
-        CONFIG_UNSET_SQL,
-        &[("key", &opts.key), ("actor", actor)],
-    );
+    pg::block_on(async {
+        let mut client = pg::connect_or_die("config unset", &url).await;
+        let txn = client
+            .transaction()
+            .await
+            .unwrap_or_else(|e| pg::die("config unset", e));
+        txn.execute(CONFIG_LOCK_SQL, &[&opts.key])
+            .await
+            .unwrap_or_else(|e| pg::die("config unset", e));
+        let removed = txn
+            .query(CONFIG_UNSET_DELETE_SQL, &[&opts.key])
+            .await
+            .unwrap_or_else(|e| pg::die("config unset", e));
+        if let Some(row) = removed.first() {
+            let old_value: String = row.get(0);
+            txn.execute(CONFIG_UNSET_AUDIT_SQL, &[&opts.key, &old_value, &actor])
+                .await
+                .unwrap_or_else(|e| pg::die("config unset", e));
+        }
+        txn.commit()
+            .await
+            .unwrap_or_else(|e| pg::die("config unset", e));
+    });
     eprintln!(
         "\u{2713} Unset '{key}' (reverted to compile-time default)",
         key = opts.key
@@ -178,17 +197,18 @@ pub fn run_unset(opts: &UnsetOptions) {
 /// Run `autumn config history <key>`.
 pub fn run_history(opts: &HistoryOptions) {
     let url = resolve_database_url();
-    check_psql();
-    let limit = opts.limit.to_string();
-    run_psql_with_vars_or_die(
-        &url,
-        "SELECT id, key, old_value, new_value, actor, changed_at \
-         FROM autumn_runtime_config_changes \
-         WHERE key = :'key' \
-         ORDER BY changed_at DESC \
-         LIMIT :'limit'::int;",
-        &[("key", &opts.key), ("limit", &limit)],
-    );
+    let limit = i64::try_from(opts.limit).unwrap_or(i64::MAX);
+    pg::block_on(async {
+        let client = pg::connect_or_die("config history", &url).await;
+        let rows = client
+            .query(CONFIG_HISTORY_SQL, &[&opts.key, &limit])
+            .await
+            .unwrap_or_else(|e| pg::die("config history", e));
+        pg::print_table(
+            &["id", "key", "old_value", "new_value", "actor", "changed_at"],
+            &rows.iter().map(pg::row_to_strings).collect::<Vec<_>>(),
+        );
+    });
 }
 
 // ── Database URL resolution (mirrors token.rs) ────────────────────────────────
@@ -262,60 +282,6 @@ where
     None
 }
 
-// ── psql helpers ──────────────────────────────────────────────────────────────
-
-fn check_psql() {
-    match Command::new("psql").arg("--version").output() {
-        Ok(out) if out.status.success() => {
-            let v = String::from_utf8_lossy(&out.stdout);
-            eprintln!("  Using {}", v.trim());
-        }
-        _ => {
-            eprintln!("\u{2717} psql not found on PATH.");
-            eprintln!("  Install PostgreSQL client tools (e.g. `apt install postgresql-client`).");
-            std::process::exit(1);
-        }
-    }
-}
-
-fn run_psql_or_die(database_url: &str, sql: &str) {
-    let status = Command::new("psql")
-        .args([database_url, "-v", "ON_ERROR_STOP=on", "-c", sql])
-        .status();
-    match status {
-        Ok(s) if s.success() => {}
-        Ok(_) => {
-            eprintln!("\u{2717} psql command failed.");
-            std::process::exit(1);
-        }
-        Err(e) => {
-            eprintln!("\u{2717} Failed to run psql: {e}");
-            std::process::exit(1);
-        }
-    }
-}
-
-fn run_psql_with_vars_or_die(database_url: &str, sql: &str, vars: &[(&str, &str)]) {
-    let mut cmd = Command::new("psql");
-    cmd.arg(database_url);
-    cmd.args(["-v", "ON_ERROR_STOP=on"]);
-    for (name, value) in vars {
-        cmd.args(["-v", &format!("{name}={value}")]);
-    }
-    cmd.args(["-c", sql]);
-    match cmd.status() {
-        Ok(s) if s.success() => {}
-        Ok(_) => {
-            eprintln!("\u{2717} psql command failed. Check the output above.");
-            std::process::exit(1);
-        }
-        Err(e) => {
-            eprintln!("\u{2717} Failed to run psql: {e}");
-            std::process::exit(1);
-        }
-    }
-}
-
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -323,15 +289,64 @@ mod tests {
     use super::*;
 
     #[test]
-    fn unset_sql_takes_key_advisory_lock_before_delete() {
-        let lock = CONFIG_UNSET_SQL
-            .find("pg_advisory_xact_lock(1, hashtext(:'key'))")
-            .expect("unset should acquire the per-key advisory lock");
-        let delete = CONFIG_UNSET_SQL
-            .find("DELETE FROM autumn_runtime_config_values")
-            .expect("unset should delete the override row");
+    fn lock_sql_acquires_per_key_advisory_lock() {
+        assert!(
+            CONFIG_LOCK_SQL.contains("pg_advisory_xact_lock(1, hashtext($1))"),
+            "set/unset should acquire the per-key advisory lock before reading/writing"
+        );
+    }
 
-        assert!(lock < delete, "unset must take the key lock before DELETE");
+    #[test]
+    fn unset_delete_sql_deletes_and_returns_prior_value() {
+        assert!(CONFIG_UNSET_DELETE_SQL.contains("DELETE FROM autumn_runtime_config_values"));
+        assert!(CONFIG_UNSET_DELETE_SQL.contains("RETURNING raw_value"));
+    }
+
+    #[test]
+    fn config_set_sql_upserts() {
+        assert!(
+            CONFIG_UPSERT_SQL.contains("ON CONFLICT"),
+            "config set must use INSERT ... ON CONFLICT"
+        );
+    }
+
+    // ── Issue #1243: no more psql shell-out ─────────────────────────────────
+
+    #[test]
+    fn no_sql_constant_uses_psql_variable_syntax() {
+        for sql in [
+            LIST_SQL,
+            GET_SQL,
+            CONFIG_LOCK_SQL,
+            CONFIG_GET_PRIOR_SQL,
+            CONFIG_UPSERT_SQL,
+            CONFIG_SET_AUDIT_SQL,
+            CONFIG_UNSET_DELETE_SQL,
+            CONFIG_UNSET_AUDIT_SQL,
+            CONFIG_HISTORY_SQL,
+        ] {
+            assert!(
+                !sql.contains(":'"),
+                "SQL must use native $n placeholders, not psql variable substitution: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_sql_constant_uses_textual_transaction_control() {
+        for sql in [CONFIG_UPSERT_SQL, CONFIG_UNSET_DELETE_SQL] {
+            assert!(!sql.contains("BEGIN;"), "no textual BEGIN: {sql}");
+            assert!(!sql.contains("COMMIT;"), "no textual COMMIT: {sql}");
+        }
+    }
+
+    #[test]
+    fn module_does_not_shell_out_to_psql() {
+        let src = include_str!("config.rs");
+        assert!(
+            !src.contains("Command::new(\"psql\")"),
+            "config.rs must not shell out to the psql binary (issue #1243)"
+        );
     }
 
     #[test]
