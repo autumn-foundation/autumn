@@ -736,7 +736,8 @@ fn sanitize_url_form(mut url: url::Url) -> Result<String, CommandError> {
     // is used for why that specifically forces a keyword-form rebuild.
     let mut needs_keyword_form = false;
 
-    if let Some(service_name) = take_pair(&mut pairs, "service") {
+    let service_name = take_pair(&mut pairs, "service").or_else(|| std::env::var("PGSERVICE").ok());
+    if let Some(service_name) = service_name {
         for (key, value) in filter_ssl_params(load_service(&service_name)?.into_iter())? {
             if !is_explicit(&pairs, &key) {
                 needs_keyword_form |= key == "host" || key == "port";
@@ -827,7 +828,8 @@ fn sanitize_url_form(mut url: url::Url) -> Result<String, CommandError> {
 fn sanitize_keyword_form(pairs: Vec<(String, String)>) -> Result<String, CommandError> {
     let mut pairs = filter_ssl_params(pairs.into_iter())?;
 
-    if let Some(service_name) = take_pair(&mut pairs, "service") {
+    let service_name = take_pair(&mut pairs, "service").or_else(|| std::env::var("PGSERVICE").ok());
+    if let Some(service_name) = service_name {
         for (key, value) in filter_ssl_params(load_service(&service_name)?.into_iter())? {
             if find_pair(&pairs, &key).is_none() {
                 pairs.push((key, value));
@@ -1697,6 +1699,74 @@ mod tests {
             || {
                 let err = sanitize_db_url("postgres://host/db?service=missing").unwrap_err();
                 assert!(err.message().contains("missing"));
+            },
+        );
+    }
+
+    #[test]
+    fn sanitize_uses_pgservice_env_var_when_no_inline_service_param() {
+        // `PGSERVICE` behaves like an inline `service=` parameter per
+        // `libpq`'s own docs — a bare connection string relying on it (the
+        // way `psql` did) must not silently skip service-file resolution
+        // just because `service=` wasn't spelled out in the string itself.
+        let dir = tempfile::tempdir().unwrap();
+        let service_path = dir.path().join("pg_service.conf");
+        std::fs::write(&service_path, "[prod]\ndbname=svcdb\n").unwrap();
+        temp_env::with_vars(
+            [
+                ("PGSERVICEFILE", Some(service_path.to_str().unwrap())),
+                ("PGSERVICE", Some("prod")),
+                ("PGPASSWORD", None::<&str>),
+                ("PGPASSFILE", Some("/nonexistent-pgpass-for-test")),
+            ],
+            || {
+                let sanitized = sanitize_db_url("postgres://host").unwrap();
+                let config: tokio_postgres::Config = sanitized.parse().unwrap();
+                assert_eq!(config.get_dbname(), Some("svcdb"));
+            },
+        );
+    }
+
+    #[test]
+    fn sanitize_uses_pgservice_env_var_in_keyword_form_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let service_path = dir.path().join("pg_service.conf");
+        std::fs::write(&service_path, "[prod]\ndbname=svcdb\n").unwrap();
+        temp_env::with_vars(
+            [
+                ("PGSERVICEFILE", Some(service_path.to_str().unwrap())),
+                ("PGSERVICE", Some("prod")),
+                ("PGPASSWORD", None::<&str>),
+                ("PGPASSFILE", Some("/nonexistent-pgpass-for-test")),
+            ],
+            || {
+                let sanitized = sanitize_db_url("host=host").unwrap();
+                let config: tokio_postgres::Config = sanitized.parse().unwrap();
+                assert_eq!(config.get_dbname(), Some("svcdb"));
+            },
+        );
+    }
+
+    #[test]
+    fn sanitize_prefers_inline_service_param_over_pgservice_env_var() {
+        let dir = tempfile::tempdir().unwrap();
+        let service_path = dir.path().join("pg_service.conf");
+        std::fs::write(
+            &service_path,
+            "[inline_wins]\ndbname=inline_db\n[wrong]\ndbname=wrong_db\n",
+        )
+        .unwrap();
+        temp_env::with_vars(
+            [
+                ("PGSERVICEFILE", Some(service_path.to_str().unwrap())),
+                ("PGSERVICE", Some("wrong")),
+                ("PGPASSWORD", None::<&str>),
+                ("PGPASSFILE", Some("/nonexistent-pgpass-for-test")),
+            ],
+            || {
+                let sanitized = sanitize_db_url("postgres://host?service=inline_wins").unwrap();
+                let config: tokio_postgres::Config = sanitized.parse().unwrap();
+                assert_eq!(config.get_dbname(), Some("inline_db"));
             },
         );
     }
