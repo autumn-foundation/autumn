@@ -820,8 +820,8 @@ fn parse_service_file(contents: &str, service_name: &str) -> Option<Vec<(String,
 /// Connection Service File" — unlike `.pgpass`, which drops its leading dot
 /// to become `pgpass.conf` on Windows, the service file keeps its dot on both
 /// platforms; see [`pgpass_file_path`] for why `BaseDirs::config_dir()` is
-/// the right call on Windows). The system-wide service file `libpq` also
-/// consults isn't supported here.
+/// the right call on Windows). See [`system_service_file_path`] for the
+/// system-wide service file `libpq` also consults.
 #[cfg(not(windows))]
 fn service_file_path() -> Option<PathBuf> {
     if let Ok(path) = std::env::var("PGSERVICEFILE") {
@@ -847,29 +847,64 @@ fn service_file_path() -> Option<PathBuf> {
     )
 }
 
-/// Load the `[service_name]` group's parameters from the service file,
-/// erroring clearly if no service file can be found or the named group
-/// isn't in it — silently ignoring an explicitly requested `service=` would
-/// leave a connection missing parameters the operator expected to be set.
+/// Path to the system-wide service file, if `PGSYSCONFDIR` is set —
+/// `libpq` also falls back to a compiled-in default sysconfdir when this
+/// isn't set (see `pg_config --sysconfdir`), but that default is a
+/// build-time detail of the actual `libpq`/`postgres` install in use, not
+/// something derivable from this crate alone (same precedent as
+/// [`fill_in_libpq_env_defaults`] not replicating `libpq`'s compiled-in
+/// default Unix socket directory).
+fn system_service_file_path() -> Option<PathBuf> {
+    std::env::var("PGSYSCONFDIR")
+        .ok()
+        .map(|dir| PathBuf::from(dir).join("pg_service.conf"))
+}
+
+/// Load the `[service_name]` group's parameters, checking the per-user
+/// service file first and falling back to the system-wide one (via
+/// [`system_service_file_path`]) if the per-user file doesn't define this
+/// service — matching `libpq`'s documented precedence ("If the same service
+/// name exists in both the user and the system file, the user file takes
+/// precedence", <https://www.postgresql.org/docs/current/libpq-pgservice.html>).
+/// Errors clearly if neither file defines it — silently ignoring an
+/// explicitly requested `service=` would leave a connection missing
+/// parameters the operator expected to be set.
 fn load_service(service_name: &str) -> Result<Vec<(String, String)>, CommandError> {
-    let path = service_file_path().ok_or_else(|| {
-        CommandError::Other(format!(
+    let mut checked_paths = Vec::new();
+
+    if let Some(path) = service_file_path() {
+        if let Ok(contents) = std::fs::read_to_string(&path)
+            && let Some(pairs) = parse_service_file(&contents, service_name)
+        {
+            return Ok(pairs);
+        }
+        checked_paths.push(path);
+    }
+
+    if let Some(path) = system_service_file_path() {
+        if let Ok(contents) = std::fs::read_to_string(&path)
+            && let Some(pairs) = parse_service_file(&contents, service_name)
+        {
+            return Ok(pairs);
+        }
+        checked_paths.push(path);
+    }
+
+    if checked_paths.is_empty() {
+        return Err(CommandError::Other(format!(
             "service={service_name} was requested but no service file could be located \
-             (set PGSERVICEFILE or create ~/.pg_service.conf)"
-        ))
-    })?;
-    let contents = std::fs::read_to_string(&path).map_err(|e| {
-        CommandError::Other(format!(
-            "service={service_name} was requested but its service file {} could not be read: {e}",
-            path.display()
-        ))
-    })?;
-    parse_service_file(&contents, service_name).ok_or_else(|| {
-        CommandError::Other(format!(
-            "service \"{service_name}\" was not found in service file {}",
-            path.display()
-        ))
-    })
+             (set PGSERVICEFILE or PGSYSCONFDIR, or create ~/.pg_service.conf)"
+        )));
+    }
+
+    Err(CommandError::Other(format!(
+        "service \"{service_name}\" was not found in {}",
+        checked_paths
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(" or ")
+    )))
 }
 
 /// Adapt `db_url` for `tokio_postgres` before connecting — see
@@ -2876,9 +2911,102 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let service_path = dir.path().join("pg_service.conf");
         std::fs::write(&service_path, "[other]\nhost=x\n").unwrap();
-        temp_env::with_var(
-            "PGSERVICEFILE",
-            Some(service_path.to_str().unwrap()),
+        // Scopes away PGSYSCONFDIR so an ambient/racing value pointing at a
+        // real system-wide service file that happens to define "missing"
+        // can't turn this into a flake now that `load_service` also checks
+        // it as a fallback.
+        temp_env::with_vars(
+            [
+                ("PGSERVICEFILE", Some(service_path.to_str().unwrap())),
+                ("PGSYSCONFDIR", None::<&str>),
+            ],
+            || {
+                let err = sanitize_db_url("postgres://host/db?service=missing").unwrap_err();
+                assert!(err.message().contains("missing"));
+            },
+        );
+    }
+
+    #[test]
+    fn sanitize_falls_back_to_system_wide_service_file_via_pgsysconfdir() {
+        // PostgreSQL documents (libpq-pgservice.html) that a service name
+        // may be defined in either the per-user service file or a
+        // system-wide `pg_service.conf` located via `PGSYSCONFDIR` -- the
+        // compiled-in sysconfdir default isn't derivable from this crate
+        // (same precedent as not replicating libpq's compiled-in default
+        // Unix socket directory), so only the `PGSYSCONFDIR` override is
+        // supported. `PGSERVICEFILE` points at a file that doesn't define
+        // the service at all, so this must fall through to the system file.
+        let user_dir = tempfile::tempdir().unwrap();
+        let user_service_path = user_dir.path().join("pg_service.conf");
+        std::fs::write(&user_service_path, "[other]\nhost=x\n").unwrap();
+
+        let sys_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            sys_dir.path().join("pg_service.conf"),
+            "[prod]\nhost=syswide\nport=6543\n",
+        )
+        .unwrap();
+
+        temp_env::with_vars(
+            [
+                ("PGSERVICEFILE", Some(user_service_path.to_str().unwrap())),
+                ("PGSYSCONFDIR", Some(sys_dir.path().to_str().unwrap())),
+                ("PGPASSWORD", None::<&str>),
+                ("PGPASSFILE", Some("/nonexistent-pgpass-for-test")),
+            ],
+            || {
+                let sanitized = sanitize_db_url("postgres://host/db?service=prod").unwrap();
+                let config: tokio_postgres::Config = sanitized.parse().unwrap();
+                assert_eq!(config.get_ports(), &[6543]);
+            },
+        );
+    }
+
+    #[test]
+    fn sanitize_prefers_user_service_file_over_system_wide_one() {
+        // libpq docs: "If the same service name exists in both the user and
+        // the system file, the user file takes precedence."
+        let user_dir = tempfile::tempdir().unwrap();
+        let user_service_path = user_dir.path().join("pg_service.conf");
+        std::fs::write(&user_service_path, "[prod]\nhost=userhost\nport=1111\n").unwrap();
+
+        let sys_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            sys_dir.path().join("pg_service.conf"),
+            "[prod]\nhost=syshost\nport=2222\n",
+        )
+        .unwrap();
+
+        temp_env::with_vars(
+            [
+                ("PGSERVICEFILE", Some(user_service_path.to_str().unwrap())),
+                ("PGSYSCONFDIR", Some(sys_dir.path().to_str().unwrap())),
+                ("PGPASSWORD", None::<&str>),
+                ("PGPASSFILE", Some("/nonexistent-pgpass-for-test")),
+            ],
+            || {
+                let sanitized = sanitize_db_url("postgres://host/db?service=prod").unwrap();
+                let config: tokio_postgres::Config = sanitized.parse().unwrap();
+                assert_eq!(config.get_ports(), &[1111]);
+            },
+        );
+    }
+
+    #[test]
+    fn sanitize_errors_when_service_is_missing_from_both_user_and_system_files() {
+        let user_dir = tempfile::tempdir().unwrap();
+        let user_service_path = user_dir.path().join("pg_service.conf");
+        std::fs::write(&user_service_path, "[other]\nhost=x\n").unwrap();
+
+        let sys_dir = tempfile::tempdir().unwrap();
+        std::fs::write(sys_dir.path().join("pg_service.conf"), "[other]\nhost=y\n").unwrap();
+
+        temp_env::with_vars(
+            [
+                ("PGSERVICEFILE", Some(user_service_path.to_str().unwrap())),
+                ("PGSYSCONFDIR", Some(sys_dir.path().to_str().unwrap())),
+            ],
             || {
                 let err = sanitize_db_url("postgres://host/db?service=missing").unwrap_err();
                 assert!(err.message().contains("missing"));
