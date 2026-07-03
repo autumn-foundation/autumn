@@ -18,7 +18,7 @@ use super::model::{
     ModelOptions, augment_fields_for_soft_delete, field_by_name, parse_model_metadata,
     plan_cargo_deps, plan_model_with_options,
 };
-use super::naming::{pascal, pluralize, snake};
+use super::naming::{humanize_label, pascal, pluralize, snake};
 use super::schema_edit::{
     add_mod_declaration, create_table_sql_with_metadata_and_id, ensure_autumn_web_feature,
     ensure_dev_dependency_test_support, ensure_dev_dependency_tokio_test_features, update_main_rs,
@@ -109,6 +109,9 @@ pub fn plan_scaffold_with_options(
         ));
     }
     let fields = parse_fields(field_tokens)?;
+    if !options.api {
+        validate_enum_field_names_against_routes_imports(&fields)?;
+    }
     // Resolve shard key before planning the model (propagates to model render).
     let resolved_shard_key = resolve_shard_key(&fields, &options.model)?;
     let model_options_with_key = ModelOptions {
@@ -350,6 +353,59 @@ pub fn run(name: &str, field_tokens: &[String], flags: Flags, options: &Scaffold
     }
 }
 
+/// Fixed, unconditional (non-`--live`, non-attachment-gated) names the
+/// generated `src/routes/<plural>.rs` file imports for every non-`--api`
+/// scaffold — see the `use` block at the top of [`render_routes_file`]'s
+/// template. An enum field whose generated type name (`pascal(field)`)
+/// matches one of these produces a second, conflicting `use` of the same
+/// name (`use crate::models::…::{…, Path}` alongside
+/// `use autumn_web::extract::Path;`), which fails with E0252 before the
+/// scaffold can compile — confirmed by generating `path:enum{a,b}`.
+///
+/// Lowercase framework imports (`get`, `html`, `post`, `secured`,
+/// `pagination_nav`) can never collide: `pascal()` always capitalizes the
+/// first letter, so a `snake_case` field name can't produce a lowercase type
+/// name.
+const ROUTES_FILE_RESERVED_NAMES: &[&str] = &[
+    "Path",
+    "Page",
+    "PageRequest",
+    "Bytes",
+    "CsrfFormField",
+    "CsrfToken",
+    "PagerOptions",
+    "Flash",
+    "ShardedDb",
+    "Db",
+    "AutumnError",
+    "AutumnResult",
+    "Markup",
+    "RunQueryDsl",
+    "ToString",
+];
+
+/// Reject an `enum{…}` field whose generated type name collides with one of
+/// [`ROUTES_FILE_RESERVED_NAMES`]. Only relevant when `generate scaffold`
+/// will actually emit `src/routes/<plural>.rs` (i.e. not `--api`, which
+/// skips that file entirely).
+fn validate_enum_field_names_against_routes_imports(fields: &[Field]) -> Result<(), GenerateError> {
+    for f in fields {
+        let Some(enum_ty) = f.enum_type_name() else {
+            continue;
+        };
+        if ROUTES_FILE_RESERVED_NAMES.contains(&enum_ty.as_str()) {
+            return Err(GenerateError::InvalidField {
+                token: format!("{}:enum{{...}}", f.name),
+                reason: format!(
+                    "the generated enum type '{enum_ty}' collides with a name the scaffold's \
+                     routes file always imports; rename the field"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn parse_query_specs(
     fields: &[Field],
     queries: &[String],
@@ -385,6 +441,17 @@ fn parse_query_specs(
                 reason: format!(
                     "query method suffix '{method_field}' must match field '{field_name}'"
                 ),
+            });
+        }
+        if field.is_enum() {
+            // The repository file's `use crate::models::<snake>::{...}` import
+            // only brings in the model + New/Update companions — not a
+            // per-field generated enum type — so a derived-query parameter of
+            // that type wouldn't resolve. Reject rather than emit code that
+            // fails to compile.
+            return Err(GenerateError::InvalidField {
+                token: query.clone(),
+                reason: format!("`--query` on enum field '{field_name}' is not yet supported"),
             });
         }
         if parsed.iter().any(|spec: &QuerySpec| spec.method == method) {
@@ -807,6 +874,43 @@ fn render_decoded_form(_pascal_name: &str, fields: &[Field]) -> (String, String,
                 "        {name}: decoded.{name},",
                 name = f.name
             );
+        } else if let Some(enum_ty) = f.enum_type_name() {
+            // Decoded as a plain `String` (not `serde`-deserialized straight
+            // into the generated enum — `serde_urlencoded`'s support for
+            // unit-variant enums is unreliable and its error wouldn't name
+            // the field), then parsed via the enum's `FromStr`. An
+            // out-of-set value yields a 400 naming the field, not a 500 or a
+            // silently-coerced/dropped value.
+            if f.nullable {
+                // A blank nullable field is already filtered out of the
+                // encoded pairs above (`is_nullable_form_field`), and
+                // `serde_urlencoded` treats a wholly-absent key as `None` for
+                // an `Option<…>` field — the same convention every other
+                // nullable field kind relies on in the `else` branch below.
+                let _ = writeln!(
+                    struct_fields,
+                    "    pub {name}: Option<String>,",
+                    name = f.name
+                );
+                let _ = writeln!(
+                    mapping_fields,
+                    "        {name}: decoded.{name}\n\
+                         \x20\x20\x20\x20\x20\x20\x20\x20.map(|v| v.parse::<{enum_ty}>())\n\
+                         \x20\x20\x20\x20\x20\x20\x20\x20.transpose()\n\
+                         \x20\x20\x20\x20\x20\x20\x20\x20.map_err(|err| autumn_web::AutumnError::bad_request_msg(format!(\"{name}: {{err}}\")))?,",
+                    name = f.name,
+                    enum_ty = enum_ty
+                );
+            } else {
+                let _ = writeln!(struct_fields, "    pub {name}: String,", name = f.name);
+                let _ = writeln!(
+                    mapping_fields,
+                    "        {name}: decoded.{name}.parse::<{enum_ty}>()\n\
+                         \x20\x20\x20\x20\x20\x20\x20\x20.map_err(|err| autumn_web::AutumnError::bad_request_msg(format!(\"{name}: {{err}}\")))?,",
+                    name = f.name,
+                    enum_ty = enum_ty
+                );
+            }
         } else {
             let _ = writeln!(
                 struct_fields,
@@ -861,6 +965,18 @@ fn render_routes_file(
     let has_attachments = has_attachment_fields(fields);
     let (decoded_form_struct, decoded_form_mapping, datetime_helper_fns) =
         render_decoded_form(pascal_name, fields);
+    // Enum fields need their generated Rust type in scope here — the
+    // `DecodedForm` mapping parses into it (see `render_decoded_form`) and
+    // the edit form's `selected[...]` expressions compare against its
+    // variants (see the `FieldKind::Enum` arm of `render_edit_form_inputs`).
+    let enum_import_suffix: String =
+        fields
+            .iter()
+            .filter_map(Field::enum_type_name)
+            .fold(String::new(), |mut out, ty| {
+                let _ = write!(out, ", {ty}");
+                out
+            });
     // The destroy handler must honour the resource's delete semantics: when the
     // scaffold was generated with `--soft-delete`, mark `deleted_at` (matching
     // the soft-delete repository) instead of issuing a physical `DELETE`.
@@ -1297,7 +1413,7 @@ use autumn_web::ui::pagination::{{PagerOptions, pagination_nav}};
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 
-use crate::models::{snake_name}::{{{pascal_name}, New{pascal_name}, Update{pascal_name}}};
+use crate::models::{snake_name}::{{{pascal_name}, New{pascal_name}, Update{pascal_name}{enum_import_suffix}}};
 use crate::repositories::{snake_name}::{{{pascal_name}Repository, Pg{pascal_name}Repository}};
 use crate::schema::{plural};",
         attachment_note = if has_attachments {
@@ -1659,6 +1775,28 @@ fn render_create_form_inputs(
                     required = required,
                     hx_attrs = hx_attrs
                 ),
+                // A closed-set field always renders as a `<select>` — one
+                // `<option>` per variant, matching the admin generator's
+                // `--select` widget output (see `admin::render_select_kind`).
+                (FieldKind::Enum, _) => {
+                    let placeholder = if f.nullable {
+                        "— Unset —"
+                    } else {
+                        "— Select —"
+                    };
+                    let mut options_body = format!("option value=\"\" {{ \"{placeholder}\" }}");
+                    for v in &f.variants {
+                        let label = humanize_label(v);
+                        let _ = write!(options_body, " option value=\"{v}\" {{ \"{label}\" }}");
+                    }
+                    format!(
+                        "select name=\"{name}\"{required}{hx_attrs} {{ {options_body} }}",
+                        name = f.name,
+                        required = required,
+                        hx_attrs = hx_attrs,
+                        options_body = options_body
+                    )
+                }
                 _ => format!(
                     "input type=\"text\" name=\"{name}\"{required}{hx_attrs}",
                     name = f.name,
@@ -1687,6 +1825,12 @@ const fn number_step(kind: FieldKind) -> &'static str {
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "One match arm per field-kind widget — splitting it produces less \
+              readable output, not more. See render_create_form_inputs's \
+              module-level comment for the shared invariants across both."
+)]
 fn render_edit_form_inputs(
     fields: &[Field],
     live_validation: bool,
@@ -1757,6 +1901,44 @@ fn render_edit_form_inputs(
                     required = required,
                     hx_attrs = hx_attrs
                 ),
+                (FieldKind::Enum, _) => {
+                    let placeholder = if f.nullable {
+                        "— Unset —"
+                    } else {
+                        "— Select —"
+                    };
+                    let unset_selected = if f.nullable {
+                        format!("row.{}.is_none()", f.name)
+                    } else {
+                        "false".to_owned()
+                    };
+                    let mut options_body = format!(
+                        "option value=\"\" selected[{unset_selected}] {{ \"{placeholder}\" }}"
+                    );
+                    let enum_ty = f
+                        .enum_type_name()
+                        .expect("FieldKind::Enum always has an enum_type_name");
+                    for v in &f.variants {
+                        let label = humanize_label(v);
+                        let variant = pascal(v);
+                        let selected_expr = if f.nullable {
+                            format!("row.{} == Some({enum_ty}::{variant})", f.name)
+                        } else {
+                            format!("row.{} == {enum_ty}::{variant}", f.name)
+                        };
+                        let _ = write!(
+                            options_body,
+                            " option value=\"{v}\" selected[{selected_expr}] {{ \"{label}\" }}"
+                        );
+                    }
+                    format!(
+                        "select name=\"{name}\"{required}{hx_attrs} {{ {options_body} }}",
+                        name = f.name,
+                        required = required,
+                        hx_attrs = hx_attrs,
+                        options_body = options_body
+                    )
+                }
                 _ => format!(
                     "input type=\"text\" name=\"{name}\" value=({value}){required}{hx_attrs}",
                     name = f.name,
@@ -2036,10 +2218,18 @@ fn render_update_columns(plural: &str, fields: &[Field]) -> String {
 fn render_execute_sql_calls(sql: &str) -> String {
     let mut out = String::new();
     for statement in crate::migrate::safety::split_statements(sql) {
-        let escaped = statement.replace('\\', "\\\\").replace('"', "\\\"");
+        let escaped = escape_sql_for_rust_literal(&statement);
         let _ = writeln!(out, "db.execute_sql(\"{escaped};\").await;");
     }
     out
+}
+
+/// Escape a raw SQL string so it survives verbatim as a Rust string literal
+/// (`"..."`) in generated test code — used both for the `db.execute_sql(...)`
+/// setup calls above and for the raw `diesel::sql_query(...)` issued by the
+/// enum out-of-set rejection smoke test (see `enum_rejection_insert_sql`).
+fn escape_sql_for_rust_literal(sql: &str) -> String {
+    sql.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 /// Render the `tests/<snake>.rs` smoke test's HTML (non-`--api`) shape: an
@@ -2212,6 +2402,15 @@ fn render_reference_stub_tables_sql(fields: &[Field], own_table: &str) -> String
                 out,
                 "CREATE TABLE IF NOT EXISTS {target} (id BIGSERIAL PRIMARY KEY);"
             );
+            // Seed one row (id 1, since BIGSERIAL starts there) so a NOT NULL
+            // `references` column pointing at this stub has a real id to
+            // reference. Without this, any raw INSERT the smoke test issues
+            // against the table under test — e.g. the enum out-of-set
+            // rejection test's deliberately-invalid INSERT, see
+            // `enum_rejection_insert_sql` — would fail on this FK constraint
+            // regardless of the column it's actually trying to exercise,
+            // masking the real assertion behind an unrelated failure.
+            let _ = writeln!(out, "INSERT INTO {target} DEFAULT VALUES;");
         }
     }
     out
@@ -2242,11 +2441,185 @@ fn render_smoke_test(
     setup_calls.push_str(&render_execute_sql_calls(&create_table_sql));
     let id_schema_type = id_type.schema_type();
 
-    if api {
+    let base = if api {
         render_api_smoke_test(plural, id_schema_type, &setup_calls)
     } else {
         render_index_smoke_test(pascal_name, plural, id_schema_type, &setup_calls)
+    };
+
+    if fields.iter().any(Field::is_enum) {
+        base + &render_enum_rejection_smoke_test(plural, fields, defaults, &setup_calls, api)
+    } else {
+        base
     }
+}
+
+/// A representative non-`NULL` literal for a `FieldKind`, used to fill in the
+/// "other" `NOT NULL` columns of the raw `INSERT` [`render_enum_rejection_smoke_test`]
+/// issues directly against the database — every column but the one under
+/// test needs *some* valid value so the `INSERT`'s failure is attributable to
+/// the target enum column's `CHECK` constraint rather than some other
+/// required column being left out.
+const fn sql_sample_literal(kind: FieldKind) -> &'static str {
+    match kind {
+        // `Enum`'s "'sample'" here is never actually used: `enum_rejection_insert_sql`
+        // special-cases every enum column (the field under test gets the
+        // deliberately out-of-set literal; any *other* required enum column
+        // gets one of its own real variants instead — see that function).
+        FieldKind::String | FieldKind::Text | FieldKind::Enum => "'sample'",
+        FieldKind::I32 | FieldKind::I64 | FieldKind::References => "1",
+        FieldKind::Bool => "TRUE",
+        FieldKind::F32 | FieldKind::F64 => "1.0",
+        FieldKind::Uuid => "gen_random_uuid()",
+        FieldKind::NaiveDateTime | FieldKind::DateTime => "NOW()",
+        FieldKind::Bytea => "'\\x00'::bytea",
+        // Always nullable (see `FieldKind::Attachment`'s doc comment), so it
+        // never needs a sample literal to satisfy a `NOT NULL` constraint.
+        FieldKind::Attachment => "NULL",
+    }
+}
+
+/// Build a raw `INSERT INTO <plural> (...)` statement that sets `target`'s
+/// enum column to a value guaranteed to be outside its declared variant set,
+/// and every other required (`NOT NULL`, no `DEFAULT`) column to a valid
+/// sample value — see [`sql_sample_literal`].
+fn enum_rejection_insert_sql(
+    plural: &str,
+    fields: &[Field],
+    target: &Field,
+    defaults: &BTreeMap<String, String>,
+) -> String {
+    let mut columns = Vec::new();
+    let mut values = Vec::new();
+    for f in fields {
+        if f.name == target.name {
+            columns.push(f.name.clone());
+            values.push("'__not_a_real_variant__'".to_owned());
+        } else if !f.nullable && !defaults.contains_key(&f.name) {
+            columns.push(f.name.clone());
+            // A scaffold can have more than one required enum column; the
+            // generic `sql_sample_literal` fallback ("'sample'") isn't a
+            // real variant of any *other* enum field's own closed set, which
+            // would trip that field's CHECK too and muddy which column's
+            // constraint actually failed.
+            let value = if f.is_enum() {
+                format!("'{}'", f.variants.first().expect("enum field has variants"))
+            } else {
+                sql_sample_literal(f.kind).to_owned()
+            };
+            values.push(value);
+        }
+    }
+    format!(
+        "INSERT INTO {plural} ({}) VALUES ({})",
+        columns.join(", "),
+        values.join(", ")
+    )
+}
+
+/// Render one `#[ignore]`d `#[tokio::test]` per enum field that asserts the
+/// closed set is enforced at both layers (issue #1030's success metric):
+///
+/// 1. A raw `INSERT` (bypassing the app entirely) with an out-of-set value
+///    for the field must fail — proving the database-level `CHECK`
+///    constraint, independent of any application code.
+/// 2. For an HTML (non-`--api`) scaffold, a stand-in `POST` handler — same
+///    convention as [`render_index_smoke_test`]'s stand-in `GET` handler —
+///    rejects an out-of-set form value with `400` naming the field, proving
+///    the request-boundary validation (issue #1030's `--query`-free path
+///    through `decode_form`'s `FromStr` parse, reproduced here since a
+///    `tests/*.rs` binary cannot import the project's own handler code).
+/// 3. Either way, the table ends up with zero rows.
+fn render_enum_rejection_smoke_test(
+    plural: &str,
+    fields: &[Field],
+    defaults: &BTreeMap<String, String>,
+    setup_calls: &str,
+    api: bool,
+) -> String {
+    // `setup_calls` is shared with (and identical to) the base index/api
+    // smoke test's own setup, which issues a plain, non-idempotent
+    // `CREATE TABLE {plural} (...)` and, for any `--index`/`references`
+    // field, a plain `CREATE INDEX idx_{plural}_{field} ...` (matching the
+    // real migration). Both tests run against the same `TestDb::shared()`
+    // Postgres container in the same test binary, so whichever one runs
+    // second would hit "relation already exists" — make *this* test's own
+    // copies of both statement kinds idempotent so it works whether it runs
+    // alongside the base test or standalone (e.g. `cargo test
+    // posts_rejects_out_of_set_status -- --ignored`). The reference-stub-table
+    // `CREATE TABLE`s are already `IF NOT EXISTS` (see
+    // `render_reference_stub_tables_sql`), so only the main table's statement
+    // needs the same treatment; `CREATE INDEX` has no per-index counterpart
+    // to worry about, so every occurrence is rewritten.
+    let setup_calls = setup_calls.replacen(
+        &format!("CREATE TABLE {plural} ("),
+        &format!("CREATE TABLE IF NOT EXISTS {plural} ("),
+        1,
+    );
+    let setup_calls = setup_calls.replace("CREATE INDEX idx_", "CREATE INDEX IF NOT EXISTS idx_");
+    let setup_calls = setup_calls.as_str();
+    let mut out = String::new();
+    for target in fields.iter().filter(|f| f.is_enum()) {
+        let field_name = &target.name;
+        let insert_sql = enum_rejection_insert_sql(plural, fields, target, defaults);
+        let escaped_insert = escape_sql_for_rust_literal(&insert_sql);
+        let allowed_values = target
+            .variants
+            .iter()
+            .map(|v| format!("\"{v}\""))
+            .collect::<Vec<_>>()
+            .join(" | ");
+
+        let request_boundary_check = if api {
+            String::new()
+        } else {
+            format!(
+                "#[post(\"/{plural}\")]\n\
+                 async fn create(body: autumn_web::reexports::axum::body::Bytes) -> AutumnResult<&'static str> {{\n\
+                 \x20\x20\x20\x20let value = url::form_urlencoded::parse(body.as_ref())\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20.find(|(k, _)| k == \"{field_name}\")\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20.map(|(_, v)| v.into_owned())\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20.unwrap_or_default();\n\
+                 \x20\x20\x20\x20if !matches!(value.as_str(), {allowed_values}) {{\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20return Err(AutumnError::bad_request_msg(format!(\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\"{field_name}: must be one of {variants_display}\"\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20)));\n\
+                 \x20\x20\x20\x20}}\n\
+                 \x20\x20\x20\x20Ok(\"ok\")\n\
+                 }}\n\
+                 \n\
+                 \x20\x20\x20\x20let client: TestClient = TestApp::new().routes(routes![create]).with_db(db.pool()).build();\n\
+                 \n\
+                 \x20\x20\x20\x20client.post(\"/{plural}\").form(\"{field_name}=__not_a_real_variant__\").send().await\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20.assert_status(400)\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20.assert_body_contains(\"{field_name}\");\n",
+                field_name = field_name,
+                allowed_values = allowed_values,
+                variants_display = target.variants.join(", "),
+            )
+        };
+
+        let _ = write!(
+            out,
+            "\n#[tokio::test]\n\
+             #[ignore = \"requires Docker (testcontainers) via TestDb; run `cargo test -- --ignored`\"]\n\
+             async fn {plural}_rejects_out_of_set_{field_name}() {{\n\
+             \x20\x20\x20\x20let db = TestDb::shared().await;\n\
+             {setup_calls}\
+             \x20\x20\x20\x20db.execute_sql(\"TRUNCATE {plural} RESTART IDENTITY\").await;\n\
+             \n\
+             {request_boundary_check}\
+             \n\
+             \x20\x20\x20\x20let mut conn = db.pool().get().await.expect(\"failed to get db connection\");\n\
+             \x20\x20\x20\x20let result = diesel::sql_query(\"{escaped_insert}\").execute(&mut *conn).await;\n\
+             \x20\x20\x20\x20assert!(result.is_err(), \"out-of-set {field_name} must violate the CHECK constraint\");\n\
+             \n\
+             \x20\x20\x20\x20let count: i64 = {plural}::table.count().get_result(&mut *conn).await.unwrap();\n\
+             \x20\x20\x20\x20assert_eq!(count, 0, \"the rejected row must not have been written\");\n\
+             }}\n",
+        );
+    }
+    out
 }
 
 fn main_route_entries(
@@ -2425,6 +2798,307 @@ async fn main() {
         assert!(!routes.contains("#[delete("));
         // The HTML delete route must be present and use POST (not DELETE).
         assert!(routes.contains(r#"#[post("/posts/{id}/delete")]"#));
+    }
+
+    // ── enum field: form widgets, boundary validation, imports (issue #1030) ─
+
+    fn plan_and_execute_post_scaffold_with_status_enum(tmp: &TempDir) {
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &[
+                "title:String".into(),
+                "status:enum{draft,published,archived}".into(),
+            ],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+    }
+
+    #[test]
+    fn scaffold_create_form_renders_enum_select() {
+        let tmp = project_with_main(default_main());
+        plan_and_execute_post_scaffold_with_status_enum(&tmp);
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+
+        assert!(
+            routes.contains("select name=\"status\"") && routes.contains("required"),
+            "got:\n{routes}"
+        );
+        assert!(
+            routes.contains("option value=\"\" { \"— Select —\" }"),
+            "got:\n{routes}"
+        );
+        assert!(
+            routes.contains("option value=\"draft\" { \"Draft\" }"),
+            "got:\n{routes}"
+        );
+        assert!(
+            routes.contains("option value=\"published\" { \"Published\" }"),
+            "got:\n{routes}"
+        );
+        assert!(
+            routes.contains("option value=\"archived\" { \"Archived\" }"),
+            "got:\n{routes}"
+        );
+    }
+
+    #[test]
+    fn scaffold_edit_form_marks_current_enum_variant_selected() {
+        let tmp = project_with_main(default_main());
+        plan_and_execute_post_scaffold_with_status_enum(&tmp);
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+
+        assert!(
+            routes.contains(
+                "option value=\"draft\" selected[row.status == Status::Draft] { \"Draft\" }"
+            ),
+            "got:\n{routes}"
+        );
+        assert!(
+            routes.contains(
+                "option value=\"published\" selected[row.status == Status::Published] { \"Published\" }"
+            ),
+            "got:\n{routes}"
+        );
+    }
+
+    #[test]
+    fn scaffold_edit_form_required_enum_select_carries_required_attr() {
+        // Regression test: a required (non-nullable) enum field's edit-form
+        // `<select>` must carry `required`, matching the create form's own
+        // enum select and every other non-nullable field kind's edit input.
+        let tmp = project_with_main(default_main());
+        plan_and_execute_post_scaffold_with_status_enum(&tmp);
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+
+        let select_line = routes
+            .lines()
+            .find(|l| l.contains("select name=\"status\""))
+            .unwrap_or_else(|| panic!("no status select found in:\n{routes}"));
+        assert!(
+            select_line.contains("select name=\"status\" required"),
+            "required enum field's edit select must carry `required`: {select_line}"
+        );
+    }
+
+    #[test]
+    fn scaffold_decoded_form_parses_enum_with_field_error() {
+        let tmp = project_with_main(default_main());
+        plan_and_execute_post_scaffold_with_status_enum(&tmp);
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+
+        assert!(routes.contains("pub status: String,"), "got:\n{routes}");
+        assert!(
+            routes.contains("decoded.status.parse::<Status>()"),
+            "got:\n{routes}"
+        );
+        assert!(
+            routes.contains("AutumnError::bad_request_msg(format!(\"status: {err}\"))"),
+            "got:\n{routes}"
+        );
+    }
+
+    #[test]
+    fn scaffold_routes_import_enum_type() {
+        let tmp = project_with_main(default_main());
+        plan_and_execute_post_scaffold_with_status_enum(&tmp);
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+
+        assert!(
+            routes.contains("use crate::models::post::{Post, NewPost, UpdatePost, Status};"),
+            "got:\n{routes}"
+        );
+    }
+
+    #[test]
+    fn scaffold_update_columns_set_enum_directly() {
+        let tmp = project_with_main(default_main());
+        plan_and_execute_post_scaffold_with_status_enum(&tmp);
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+
+        assert!(
+            routes.contains("posts::status.eq(form.status.clone())"),
+            "got:\n{routes}"
+        );
+    }
+
+    #[test]
+    fn scaffold_default_enum_field_is_dropped_from_forms() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &[
+                "title:String".into(),
+                "status:enum{draft,published,archived}".into(),
+            ],
+            "20260427000000",
+            &ScaffoldOptions {
+                model: ModelOptions {
+                    defaults: vec!["status=draft".into()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        assert!(
+            !routes.contains("select name=\"status\""),
+            "a --default field must be excluded from the create/edit forms: {routes}"
+        );
+    }
+
+    #[test]
+    fn scaffold_query_on_enum_field_is_rejected() {
+        let tmp = project_with_main(default_main());
+        let err = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "status:enum{draft,published}".into()],
+            "20260427000000",
+            &ScaffoldOptions {
+                queries: vec!["find_by_status:status".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, GenerateError::InvalidField { .. }));
+    }
+
+    #[test]
+    fn scaffold_enum_field_colliding_with_routes_import_is_rejected() {
+        // `path:enum{a,b}` would generate `use crate::models::post::{…, Path}`
+        // in routes.rs alongside the file's own `use autumn_web::extract::Path;`
+        // — two different types both named `Path`, which is E0252. Verified by
+        // generating this exact scaffold and observing the duplicate import.
+        for field_name in ["path", "page", "bytes", "flash", "db"] {
+            let tmp = project_with_main(default_main());
+            let err = plan_scaffold(
+                tmp.path(),
+                "Post",
+                &[format!("{field_name}:enum{{a,b}}")],
+                "20260427000000",
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, GenerateError::InvalidField { .. }),
+                "expected '{field_name}' to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn scaffold_enum_field_named_to_string_is_rejected() {
+        // `to_string:enum{a,b}` pascalizes to `ToString`, imported into
+        // routes.rs; a nullable field of that type renders its edit-form
+        // value via `row.to_string.as_ref().map(ToString::to_string)`, an
+        // unqualified path expression that resolves to the enum instead of
+        // the prelude trait and fails to compile.
+        let tmp = project_with_main(default_main());
+        let err = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["to_string:Option<enum{a,b}>".into()],
+            "20260427000000",
+        )
+        .unwrap_err();
+        assert!(matches!(err, GenerateError::InvalidField { .. }));
+    }
+
+    #[test]
+    fn scaffold_enum_field_colliding_with_routes_import_is_accepted_for_api_only() {
+        // `--api` scaffolds never emit `src/routes/<plural>.rs`, so the
+        // routes-file reserved names don't apply.
+        let tmp = project_with_main(default_main());
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["path:enum{a,b}".into()],
+            "20260427000000",
+            &ScaffoldOptions {
+                api: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    }
+
+    // ── enum field: nullable (issue #1030) ──────────────────────────────────
+
+    fn plan_and_execute_post_scaffold_with_nullable_status_enum(tmp: &TempDir) {
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &[
+                "title:String".into(),
+                "status:Option<enum{draft,published}>".into(),
+            ],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+    }
+
+    #[test]
+    fn scaffold_nullable_enum_create_form_has_no_required_attr_and_unset_placeholder() {
+        let tmp = project_with_main(default_main());
+        plan_and_execute_post_scaffold_with_nullable_status_enum(&tmp);
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+
+        assert!(
+            routes.contains("option value=\"\" { \"— Unset —\" }"),
+            "got:\n{routes}"
+        );
+        // The select for `status` itself must not carry ` required` — check
+        // the specific select tag rather than the whole file (title's own
+        // `required` text input is expected to remain required).
+        let select_line = routes
+            .lines()
+            .find(|l| l.contains("select name=\"status\""))
+            .unwrap_or_else(|| panic!("no status select found in:\n{routes}"));
+        assert!(
+            !select_line.contains("required"),
+            "nullable enum select must not be required: {select_line}"
+        );
+    }
+
+    #[test]
+    fn scaffold_nullable_enum_edit_form_selected_exprs_wrap_in_some() {
+        let tmp = project_with_main(default_main());
+        plan_and_execute_post_scaffold_with_nullable_status_enum(&tmp);
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+
+        assert!(
+            routes.contains("option value=\"\" selected[row.status.is_none()] { \"— Unset —\" }"),
+            "got:\n{routes}"
+        );
+        assert!(
+            routes.contains(
+                "option value=\"draft\" selected[row.status == Some(Status::Draft)] { \"Draft\" }"
+            ),
+            "got:\n{routes}"
+        );
+    }
+
+    #[test]
+    fn scaffold_nullable_enum_decoded_form_is_option_string_with_transpose() {
+        let tmp = project_with_main(default_main());
+        plan_and_execute_post_scaffold_with_nullable_status_enum(&tmp);
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+
+        assert!(
+            routes.contains("pub status: Option<String>,"),
+            "got:\n{routes}"
+        );
+        assert!(
+            routes.contains("decoded.status") && routes.contains(".transpose()"),
+            "got:\n{routes}"
+        );
     }
 
     #[test]
@@ -3979,6 +4653,232 @@ async fn main() {
         );
     }
 
+    // ── enum field: generated out-of-set rejection smoke test (issue #1030) ─
+
+    #[test]
+    fn scaffold_smoke_test_asserts_out_of_set_post_rejected() {
+        let tmp = project_with_main(default_main());
+        plan_and_execute_post_scaffold_with_status_enum(&tmp);
+
+        let test = fs::read_to_string(tmp.path().join("tests/post.rs")).unwrap();
+        assert!(
+            test.contains("CHECK (status IN ('draft', 'published', 'archived'))"),
+            "the raw-INSERT test needs the real CHECK constraint in its setup SQL: {test}"
+        );
+        assert!(
+            test.contains("fn posts_rejects_out_of_set_status"),
+            "got:\n{test}"
+        );
+        assert!(test.contains(".assert_status(400)"), "got:\n{test}");
+        assert!(
+            test.contains(".assert_body_contains(\"status\")"),
+            "got:\n{test}"
+        );
+        assert!(
+            test.contains("is_err()"),
+            "must assert the raw out-of-set INSERT fails at the DB layer: {test}"
+        );
+        assert!(
+            test.contains("posts::table.count()"),
+            "must assert zero rows were written: {test}"
+        );
+    }
+
+    #[test]
+    fn scaffold_enum_rejection_test_uses_idempotent_create_table() {
+        // Regression test: both the base index test and the enum-rejection
+        // test run against the same shared `TestDb` in the same test binary
+        // and both issue a `CREATE TABLE posts (...)` as part of setup —
+        // without `IF NOT EXISTS` on (at least) one of them, whichever test
+        // runs second fails with "relation \"posts\" already exists" instead
+        // of reaching its actual assertions.
+        let tmp = project_with_main(default_main());
+        plan_and_execute_post_scaffold_with_status_enum(&tmp);
+        let test = fs::read_to_string(tmp.path().join("tests/post.rs")).unwrap();
+
+        let enum_test_pos = test
+            .find("fn posts_rejects_out_of_set_status")
+            .unwrap_or_else(|| panic!("expected the enum rejection test: {test}"));
+        let enum_test_setup = &test[enum_test_pos..];
+        assert!(
+            enum_test_setup.contains("CREATE TABLE IF NOT EXISTS posts ("),
+            "the enum-rejection test's own CREATE TABLE must be idempotent: {enum_test_setup}"
+        );
+
+        let base_test_setup = &test[..enum_test_pos];
+        assert!(
+            base_test_setup.contains("CREATE TABLE posts (")
+                && !base_test_setup.contains("CREATE TABLE IF NOT EXISTS posts ("),
+            "the base index test's own setup must be unchanged (plain CREATE TABLE, \
+             matching the real migration exactly): {base_test_setup}"
+        );
+    }
+
+    #[test]
+    fn scaffold_enum_rejection_test_uses_idempotent_create_index() {
+        // Regression test: `setup_calls` also contains `CREATE INDEX` for any
+        // `--index`/`references` field, not just the `CREATE TABLE` — the
+        // enum-rejection test's own copy of that index statement needs the
+        // same `IF NOT EXISTS` treatment, or it panics with "relation
+        // \"idx_posts_title\" already exists" when it runs after the base test.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &[
+                "title:String".into(),
+                "status:enum{draft,published,archived}".into(),
+            ],
+            "20260427000000",
+            &ScaffoldOptions {
+                model: ModelOptions {
+                    indexes: vec!["title".into()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let test = fs::read_to_string(tmp.path().join("tests/post.rs")).unwrap();
+
+        let enum_test_pos = test
+            .find("fn posts_rejects_out_of_set_status")
+            .unwrap_or_else(|| panic!("expected the enum rejection test: {test}"));
+        let enum_test_setup = &test[enum_test_pos..];
+        assert!(
+            enum_test_setup.contains("CREATE INDEX IF NOT EXISTS idx_posts_title"),
+            "the enum-rejection test's own CREATE INDEX must be idempotent: {enum_test_setup}"
+        );
+
+        let base_test_setup = &test[..enum_test_pos];
+        assert!(
+            base_test_setup.contains("CREATE INDEX idx_posts_title")
+                && !base_test_setup.contains("CREATE INDEX IF NOT EXISTS idx_posts_title"),
+            "the base index test's own setup must be unchanged (plain CREATE INDEX, \
+             matching the real migration exactly): {base_test_setup}"
+        );
+    }
+
+    #[test]
+    fn scaffold_api_smoke_test_asserts_check_constraint_but_no_http_assertion() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &[
+                "title:String".into(),
+                "status:enum{draft,published,archived}".into(),
+            ],
+            "20260427000000",
+            &ScaffoldOptions {
+                api: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let test = fs::read_to_string(tmp.path().join("tests/post.rs")).unwrap();
+        assert!(
+            test.contains("fn posts_rejects_out_of_set_status"),
+            "got:\n{test}"
+        );
+        assert!(
+            test.contains("is_err()"),
+            "must assert the raw out-of-set INSERT fails at the DB layer: {test}"
+        );
+        assert!(
+            !test.contains(".assert_status(400)"),
+            "the --api smoke test has no HTML form route to POST to: {test}"
+        );
+    }
+
+    #[test]
+    fn scaffold_smoke_test_absent_when_no_enum_fields() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let test = fs::read_to_string(tmp.path().join("tests/post.rs")).unwrap();
+        assert!(
+            !test.contains("rejects_out_of_set"),
+            "no enum field means no rejection test: {test}"
+        );
+    }
+
+    #[test]
+    fn scaffold_multiple_enum_fields_each_use_own_variant_as_other_columns_sample() {
+        // A second required enum column's raw-INSERT sample value must be one
+        // of *its own* variants, not the generic `'sample'` placeholder —
+        // otherwise it would trip its own CHECK too and the test would no
+        // longer isolate the failure to the column actually under test.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &[
+                "status:enum{draft,published,archived}".into(),
+                "priority:enum{low,high}".into(),
+            ],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let test = fs::read_to_string(tmp.path().join("tests/post.rs")).unwrap();
+        assert!(
+            test.contains(
+                "INSERT INTO posts (status, priority) VALUES ('__not_a_real_variant__', 'low')"
+            ),
+            "got:\n{test}"
+        );
+        assert!(
+            test.contains(
+                "INSERT INTO posts (status, priority) VALUES ('draft', '__not_a_real_variant__')"
+            ),
+            "got:\n{test}"
+        );
+    }
+
+    #[test]
+    fn scaffold_enum_rejection_test_isolates_check_failure_from_required_references_field() {
+        // Regression test: a required `references` field co-occurring with
+        // the enum field under test must not make the raw out-of-set INSERT
+        // fail for the wrong reason (an FK violation on a dangling stub-table
+        // reference) instead of the CHECK constraint actually being tested.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &[
+                "author:references".into(),
+                "status:enum{draft,published,archived}".into(),
+            ],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let test = fs::read_to_string(tmp.path().join("tests/post.rs")).unwrap();
+        assert!(
+            test.contains("INSERT INTO authors DEFAULT VALUES;"),
+            "the stub `authors` table must be seeded so author_id=1 is a valid FK: {test}"
+        );
+        assert!(
+            test.contains(
+                "INSERT INTO posts (author_id, status) VALUES (1, '__not_a_real_variant__')"
+            ),
+            "got:\n{test}"
+        );
+    }
+
     // ── references field: scaffold + smoke-test wiring (issue #1026) ───────
 
     #[test]
@@ -4083,11 +4983,13 @@ async fn main() {
                 name: "author_id".to_string(),
                 kind: FieldKind::References,
                 nullable: false,
+                variants: Vec::new(),
             },
             Field {
                 name: "author_id".to_string(),
                 kind: FieldKind::References,
                 nullable: true,
+                variants: Vec::new(),
             },
         ];
         assert_eq!(
@@ -4100,6 +5002,48 @@ async fn main() {
             sql.matches("CREATE TABLE IF NOT EXISTS").count(),
             1,
             "identical targets must be de-duplicated: {sql}"
+        );
+    }
+
+    #[test]
+    fn render_reference_stub_tables_sql_seeds_a_row_so_fk_id_1_is_valid() {
+        // Regression test: a raw INSERT the smoke test issues against the
+        // table under test (e.g. the enum out-of-set rejection test) uses a
+        // NOT NULL `references` column's sample literal ("1" — see
+        // `sql_sample_literal`); without a seeded row, that INSERT would
+        // fail on the FK constraint regardless of what it's actually trying
+        // to exercise.
+        let fields = super::super::dsl::parse_fields(&["author:references".into()]).unwrap();
+        let sql = render_reference_stub_tables_sql(&fields, "posts");
+        assert_eq!(
+            sql,
+            "CREATE TABLE IF NOT EXISTS authors (id BIGSERIAL PRIMARY KEY);\n\
+             INSERT INTO authors DEFAULT VALUES;\n",
+            "got:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn render_reference_stub_tables_sql_seeds_only_once_per_distinct_target() {
+        let fields = vec![
+            Field {
+                name: "author_id".to_string(),
+                kind: FieldKind::References,
+                nullable: false,
+                variants: Vec::new(),
+            },
+            Field {
+                name: "author_id".to_string(),
+                kind: FieldKind::References,
+                nullable: true,
+                variants: Vec::new(),
+            },
+        ];
+        let sql = render_reference_stub_tables_sql(&fields, "unrelated_table");
+        assert_eq!(
+            sql.matches("INSERT INTO authors DEFAULT VALUES;").count(),
+            1,
+            "got:\n{sql}"
         );
     }
 

@@ -43,6 +43,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   when `<dialog>.showModal` is unsupported, so a destructive action is
   never submitted without some confirmation. Purely additive; minor
   version bump.
+- **mcp:** plugins and repositories can now layer in MCP. Chainable route
+  toggles `Route::mcp()`, `Route::mcp_exclude()`, and `Route::mcp_stream()`
+  mirror the `#[api_doc(mcp)]` / `mcp = false` / `mcp, stream` attribute
+  forms at registration time, so a plugin can offer a fluent
+  `MyPlugin::new().expose_mcp()` switch and let the *host* decide at install
+  time whether the plugin's typed routes become MCP tools — no source
+  attributes needed on handlers the host doesn't own (the flags are inert
+  unless the host enables the `mcp` feature and calls `mount_mcp`). The
+  `#[repository]` macro gains an `mcp` key:
+  `#[repository(Model, api = "/path", mcp)]` exposes all five generated CRUD
+  routes as tools and `mcp = "read"` exposes only list/get, with the usual
+  verb-derived safety annotations (`readOnlyHint` on reads,
+  `destructiveHint` on delete); `mcp` without `api = "/path"` is a compile
+  error. Duplicate `mcp` keys are a compile error rather than silently
+  last-write-wins. To support the generated `DELETE`, routes declaring an
+  empty-body success status (`204 No Content`, `205 Reset Content`) are no
+  longer conflated with schema-less HTML routes: they are MCP-eligible under
+  an explicit opt-in, and an *untagged* read-only `204`/`205` route is now
+  also auto-included under a pre-existing `expose_all_as_mcp()` hatch —
+  hatch users can gain tools on upgrade. The result of a successful call to
+  such a tool is enforced to be empty text, so a route that mislabels its
+  status can't leak a response body to agents.
+  `McpToolInfo` gains public read accessors (`name()`, `description()`,
+  `input_schema()`, `annotations()`, `method()`, `path_template()`,
+  `streams()`) so hosts can introspect derived tools. Routes registered by
+  plugins via `routes()`/`scoped()` were already derived into tools; this is
+  now pinned by tests and documented. Raw `nest()`/`merge()` routers remain
+  MCP-invisible (documented follow-up). See the
+  [MCP guide](docs/guide/mcp.md) §9–§10.
+
 - **model:** many-to-many associations via `#[has_many(Target, through =
   join_table)]` (#1324). Extends the `belongs_to`/`has_many`/`has_one`
   associations from #835 with a join-table variant: join columns default to
@@ -159,6 +189,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a minimal stand-in for the referenced table (skipping self-referential FKs,
   which target the table already being created) so it stays runnable
   standalone.
+- **cli:** `enum{a,b,c}` field type for `autumn generate model`/`scaffold`/
+  `migration` (#1030). `status:enum{draft,published,archived}` scaffolds a
+  closed-set column end to end: a generated `PascalCase` Rust enum (`Status`)
+  wired for Diesel `TEXT` storage (manual `ToSql`/`FromSql` over
+  `AsExpression`/`FromSqlRow`) and `serde`; a `CHECK (status IN (...))`
+  constraint in the migration so an out-of-set `INSERT` fails at the database
+  layer (restored on `RemoveXFromY` rollback, matching the `references`
+  field's FK-restoration precedent); a `<select>` form widget matching the
+  admin generator's `--select` output (auto-derived for `generate admin` too,
+  unless an explicit `--select` overrides it); and request-boundary
+  validation that rejects an out-of-set form value with a 400 naming the
+  field rather than a 500 or silent coercion. `--default field=variant` sets
+  both the SQL `DEFAULT` and the enum's `#[default]` variant; an unknown
+  variant errors at generate time, as does a non-identifier or keyword
+  variant (`enum{2fa}`). Nullable (`Option<enum{...}>`) is supported. The
+  generated scaffold smoke test asserts an out-of-set value is rejected at
+  both the database layer (raw `INSERT` fails, zero rows written) and the
+  request boundary (400). Not supported by `generate job` (no model file to
+  declare the type in) or `--query` (no import path for it yet). Quote the
+  token in bash/zsh — an unquoted `enum{a,b}` is brace-expanded by the shell
+  before `autumn` ever sees it; the parser detects this and suggests
+  quoting.
 - **auth:** scoped service tokens whose scopes flow into policy checks (#1158).
   Mint named, optionally-expiring API tokens carrying a set of flat scopes
   (e.g. `posts:read`) via `IssueTokenSpec` + `issue_scoped_api_token`; tokens

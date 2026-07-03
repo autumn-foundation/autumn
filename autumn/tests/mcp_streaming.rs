@@ -254,6 +254,64 @@ async fn buffered_tool_is_unchanged_by_streaming_support() {
 }
 
 #[tokio::test]
+async fn route_mcp_stream_toggle_exposes_untagged_sse_handler() {
+    // An SSE handler with NO `#[api_doc(...)]` attributes, opted in at
+    // registration time via the chainable `Route::mcp_stream()` toggle —
+    // the plugin-author escape hatch when the handler source can't carry
+    // attributes. `mcp_stream()` implies the opt-in and bypasses the
+    // JSON-out eligibility gate, mirroring `#[api_doc(mcp, stream)]`.
+    #[get("/api/untagged-stream")]
+    async fn untagged_stream() -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+        let stream = stream::iter(vec![
+            Ok(Event::default().data("chunk 1")),
+            Ok(Event::default().data("chunk 2")),
+        ]);
+        Sse::new(stream)
+    }
+
+    let client = TestApp::new()
+        .routes(
+            routes![untagged_stream]
+                .into_iter()
+                .map(autumn_web::Route::mcp_stream)
+                .collect(),
+        )
+        .mount_mcp("/mcp")
+        .build();
+
+    // Listed despite having no JSON response schema.
+    let resp = client
+        .post("/mcp")
+        .json(&serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))
+        .send()
+        .await;
+    resp.assert_ok();
+    let out = resp.json::<serde_json::Value>();
+    let tools = out["result"]["tools"].as_array().unwrap();
+    let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+    assert!(
+        names.contains(&"untagged_stream"),
+        "Route::mcp_stream() must expose the tool: {names:?}"
+    );
+
+    // A non-SSE client still gets a usable buffered result.
+    let resp = client
+        .post("/mcp")
+        .header("accept", "application/json")
+        .json(&serde_json::json!({
+            "jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params": {"name":"untagged_stream","arguments":{}}
+        }))
+        .send()
+        .await;
+    resp.assert_ok();
+    let out = resp.json::<serde_json::Value>();
+    assert_ne!(out["result"]["isError"], true);
+    let text = out["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("chunk 1"), "buffered stream content: {text}");
+}
+
+#[tokio::test]
 async fn first_progress_arrives_before_the_slow_tool_completes() {
     // Success metric: time-to-first-signal is decoupled from total duration.
     // The handler sleeps after the first event; the first SSE frame must be

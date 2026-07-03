@@ -284,6 +284,42 @@ async fn tools_call_dispatches_read_tool_through_real_pipeline() {
     assert_eq!(payload["title"], "todo 7");
 }
 
+// Declares an empty-body 204 contract but actually returns a 200 with an
+// HTML body — the mislabeled-status case the dispatch-side enforcement
+// exists for.
+#[get("/api/cache/purge")]
+#[api_doc(mcp, status = 204, summary = "Purge the cache")]
+async fn purge_cache() -> &'static str {
+    "<html>internal dashboard</html>"
+}
+
+#[tokio::test]
+async fn empty_body_contract_tool_never_leaks_a_body() {
+    // A schema-less route is only MCP-eligible when it declares an empty-body
+    // status (204/205), and the advertised result of such a tool is empty
+    // text. Dispatch enforces the contract rather than trusting the declared
+    // status, so a mislabeled HTML route cannot leak its body to the agent.
+    let client = TestApp::new()
+        .routes(routes![purge_cache])
+        .mount_mcp("/mcp")
+        .build();
+
+    let out = rpc(
+        &client,
+        serde_json::json!({
+            "jsonrpc":"2.0","id":11,"method":"tools/call",
+            "params": {"name":"purge_cache","arguments":{}}
+        }),
+    )
+    .await;
+
+    assert_ne!(out["result"]["isError"], true);
+    assert_eq!(
+        out["result"]["content"][0]["text"], "",
+        "empty-body-contract tool must return empty text, not the handler body"
+    );
+}
+
 #[tokio::test]
 async fn static_gate_is_excluded_from_mcp_dispatch_in_dynamic_mode() {
     // A fully-dynamic app (no SSG `dist`) with a redirect-style `static_gate`

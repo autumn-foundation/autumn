@@ -106,9 +106,10 @@ pub fn plan_model_with_options(
     validate_resource_name(name)?;
     let fields = parse_fields(field_tokens)?;
     validate_field_names(&fields)?;
+    let pascal_name = pascal(name);
+    validate_enum_field_collisions(&pascal_name, &fields)?;
     let metadata = parse_model_metadata(&fields, options)?;
 
-    let pascal_name = pascal(name);
     let snake_name = snake(name);
     let table = pluralize(&snake_name);
 
@@ -453,6 +454,7 @@ pub(super) fn augment_fields_for_soft_delete(
         name: "deleted_at".to_owned(),
         kind: FieldKind::NaiveDateTime,
         nullable: true,
+        variants: Vec::new(),
     });
     Ok(std::borrow::Cow::Owned(augmented))
 }
@@ -743,6 +745,95 @@ fn validate_field_names(fields: &[Field]) -> Result<(), GenerateError> {
     Ok(())
 }
 
+/// `std`/prelude type names a generated enum's own impl block (see
+/// `render_enum_decl`) and the surrounding generated model/scaffold code rely
+/// on being their real, unqualified meaning — `String::new()`, `s.parse()`
+/// returning a real `std::string::String`, `Vec<u8>` Bytea handling, etc. A
+/// field that pascalizes to one of these (e.g. `string:enum{a,b}` ->
+/// `pub enum String`) shadows the prelude import for the *entire file* it's
+/// declared in (and, once imported via `use crate::models::…::{…, String}`,
+/// for the entire scaffold routes file too), breaking unrelated code far
+/// from this DSL token — confirmed by generating `string:enum{a,b}` and
+/// observing `cargo check` fail with E0308/E0599 throughout the model and
+/// routes files.
+const PRELUDE_TYPE_NAMES: &[&str] = &["String", "Vec", "Option", "Result", "Box", "Into"];
+
+/// Reject an `enum{…}` field whose generated Rust type name (`pascal(field)`)
+/// collides with the model struct itself, one of the companion types the
+/// `#[model]`/`#[repository]` macros and the scaffold generator emit from the
+/// same resource name, another enum field's own generated type name, or a
+/// commonly-relied-upon `std`/prelude type (see [`PRELUDE_TYPE_NAMES`]).
+///
+/// The companion-type list is `New{Pascal}`, `Update{Pascal}`, `{Pascal}Field`,
+/// `{Pascal}DraftExt`, `{Pascal}Preload`, `{Pascal}Associations`,
+/// `{Pascal}Factory` (all from `#[model]`; the preload/associations/factory
+/// scaffolding is always emitted, even for a model with no associations —
+/// see `autumn-macros/src/model.rs`), `{Pascal}Repository`/
+/// `Pg{Pascal}Repository` (from `#[repository]`, which `generate scaffold`
+/// always adds on top of the model), and `DecodedForm` (the scaffold's form
+/// struct). A silent collision would produce a duplicate-type-definition
+/// compile error far from this DSL token, so it's rejected here with a
+/// pointer back to the offending field.
+///
+/// Two enum fields on the *same* model can also collide with each other:
+/// `pascal()` is not injective (`in_review` and `in__review` both pascalize
+/// to `InReview`), so distinct, individually-valid field names can still
+/// generate the same enum type name. Each enum field's generated name is
+/// checked against every earlier one for exactly this reason.
+fn validate_enum_field_collisions(
+    pascal_name: &str,
+    fields: &[Field],
+) -> Result<(), GenerateError> {
+    let mut seen_enum_types: Vec<(String, String)> = Vec::new();
+    for f in fields {
+        let Some(enum_ty) = f.enum_type_name() else {
+            continue;
+        };
+        if PRELUDE_TYPE_NAMES.contains(&enum_ty.as_str()) {
+            return Err(GenerateError::InvalidField {
+                token: format!("{}:enum{{...}}", f.name),
+                reason: format!(
+                    "the generated enum type '{enum_ty}' would shadow the standard library's \
+                     `{enum_ty}` for the rest of the file; rename the field"
+                ),
+            });
+        }
+        let reserved = [
+            pascal_name.to_owned(),
+            format!("New{pascal_name}"),
+            format!("Update{pascal_name}"),
+            format!("{pascal_name}Field"),
+            format!("{pascal_name}DraftExt"),
+            format!("{pascal_name}Preload"),
+            format!("{pascal_name}Associations"),
+            format!("{pascal_name}Factory"),
+            format!("{pascal_name}Repository"),
+            format!("Pg{pascal_name}Repository"),
+            "DecodedForm".to_owned(),
+        ];
+        if reserved.contains(&enum_ty) {
+            return Err(GenerateError::InvalidField {
+                token: format!("{}:enum{{...}}", f.name),
+                reason: format!(
+                    "the generated enum type '{enum_ty}' collides with a type the generator \
+                     already emits for '{pascal_name}'; rename the field"
+                ),
+            });
+        }
+        if let Some((other_name, _)) = seen_enum_types.iter().find(|(_, ty)| *ty == enum_ty) {
+            return Err(GenerateError::InvalidField {
+                token: format!("{}:enum{{...}}", f.name),
+                reason: format!(
+                    "the generated enum type '{enum_ty}' collides with the one generated for \
+                     field '{other_name}'; rename one of the fields"
+                ),
+            });
+        }
+        seen_enum_types.push((f.name.clone(), enum_ty));
+    }
+    Ok(())
+}
+
 pub fn parse_model_metadata(
     fields: &[Field],
     options: &ModelOptions,
@@ -877,6 +968,18 @@ const fn is_string_like(field: &Field) -> bool {
     matches!(field.kind, FieldKind::String | FieldKind::Text)
 }
 
+/// Strip a single layer of matching double or single quotes from a
+/// `--default` value, tolerating an unquoted value. Shared by the
+/// `String`/`Text` and `Enum` arms of [`sql_default_literal`], which both
+/// accept `field=value`, `field="value"`, and `field='value'` equivalently.
+fn unquote_default_value(value: &str) -> &str {
+    value
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .or_else(|| value.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+        .unwrap_or(value)
+}
+
 fn sql_default_literal(field: &Field, value: &str) -> Result<String, String> {
     match field.kind {
         FieldKind::Bool => match value.to_ascii_lowercase().as_str() {
@@ -885,11 +988,7 @@ fn sql_default_literal(field: &Field, value: &str) -> Result<String, String> {
             _ => Err("bool defaults must be true or false".to_owned()),
         },
         FieldKind::String | FieldKind::Text => {
-            let unquoted = value
-                .strip_prefix('"')
-                .and_then(|s| s.strip_suffix('"'))
-                .or_else(|| value.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
-                .unwrap_or(value);
+            let unquoted = unquote_default_value(value);
             Ok(format!("'{}'", unquoted.replace('\'', "''")))
         }
         FieldKind::I32 => value
@@ -913,6 +1012,17 @@ fn sql_default_literal(field: &Field, value: &str) -> Result<String, String> {
             "defaults for {} fields are not supported by `autumn generate` yet",
             field.rust_type()
         )),
+        FieldKind::Enum => {
+            let unquoted = unquote_default_value(value);
+            if field.variants.iter().any(|v| v == unquoted) {
+                Ok(format!("'{unquoted}'"))
+            } else {
+                Err(format!(
+                    "'{unquoted}' is not a variant of this enum; expected one of: {}",
+                    field.variants.join(", ")
+                ))
+            }
+        }
     }
 }
 
@@ -933,6 +1043,148 @@ pub(super) fn render_model_file_for_test(name: &str, table: &str, fields: &[Fiel
     )
 }
 
+/// Render the Rust enum type for an `enum{…}` field, plus the trait
+/// machinery needed to store it as a `TEXT` column (issue #1030):
+/// `Display`/`FromStr` for the form/edit-view round-trip, and manual
+/// `diesel::serialize::ToSql`/`deserialize::FromSql` impls (the
+/// `AsExpression`/`FromSqlRow` derives alone only describe the SQL type, not
+/// how to encode/decode it).
+///
+/// Always derives `Default` (every model field's Rust type must — see the
+/// comment inside). `default_variant`, if given, must be one of
+/// `field.variants` and marks that variant `#[default]`, matching the
+/// `--default field=variant` SQL default written to the migration;
+/// otherwise the first declared variant is `#[default]`.
+#[must_use]
+#[allow(
+    clippy::too_many_lines,
+    reason = "This is a single template emitting one enum type plus its trait \
+              impls — splitting it produces less readable output, not more."
+)]
+fn render_enum_decl(field: &Field, default_variant: Option<&str>) -> String {
+    use std::fmt::Write as _;
+    let ty = field
+        .enum_type_name()
+        .expect("render_enum_decl called on a non-enum field");
+    let variants: Vec<String> = field.variants.iter().map(|v| pascal(v)).collect();
+
+    let mut out = String::new();
+
+    // Always derive `Default`, even without an explicit `--default`: the
+    // `#[model]` macro's generated `UpdateX` patch struct wraps every field
+    // in `Patch<T>` and unconditionally derives `Default` on itself, and
+    // `#[derive(Default)]` on a generic type adds a `T: Default` bound for
+    // every type parameter regardless of which variant is `#[default]`d —
+    // so every field's Rust type must implement `Default`, the same
+    // requirement every other field kind already satisfies via `std`. Absent
+    // an explicit `--default field=variant`, the first declared variant is
+    // the natural, unsurprising choice (matching how other kinds default to
+    // a canonical baseline, e.g. `i32::default() == 0`).
+    let default_raw = default_variant.unwrap_or_else(|| {
+        field
+            .variants
+            .first()
+            .expect("an enum field always has at least one variant")
+    });
+    let derives = [
+        "Debug",
+        "Clone",
+        "Copy",
+        "PartialEq",
+        "Eq",
+        "Default",
+        "serde::Serialize",
+        "serde::Deserialize",
+        "diesel::expression::AsExpression",
+        "diesel::deserialize::FromSqlRow",
+    ];
+    let _ = writeln!(out, "#[derive({})]", derives.join(", "));
+    out.push_str("#[diesel(sql_type = diesel::sql_types::Text)]\n");
+    let _ = writeln!(out, "pub enum {ty} {{");
+    for (raw, variant) in field.variants.iter().zip(&variants) {
+        if raw == default_raw {
+            out.push_str("    #[default]\n");
+        }
+        let _ = writeln!(out, "    #[serde(rename = \"{raw}\")]");
+        let _ = writeln!(out, "    {variant},");
+    }
+    out.push_str("}\n\n");
+
+    let _ = writeln!(out, "impl {ty} {{");
+    let _ = writeln!(
+        out,
+        "    pub const VARIANTS: [Self; {}] = [{}];",
+        variants.len(),
+        variants
+            .iter()
+            .map(|v| format!("Self::{v}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    out.push('\n');
+    out.push_str("    #[must_use]\n");
+    out.push_str("    pub const fn as_str(&self) -> &'static str {\n");
+    out.push_str("        match self {\n");
+    for (raw, variant) in field.variants.iter().zip(&variants) {
+        let _ = writeln!(out, "            Self::{variant} => \"{raw}\",");
+    }
+    out.push_str("        }\n");
+    out.push_str("    }\n");
+    out.push_str("}\n\n");
+
+    let _ = writeln!(out, "impl std::fmt::Display for {ty} {{");
+    out.push_str("    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n");
+    out.push_str("        f.write_str(self.as_str())\n");
+    out.push_str("    }\n");
+    out.push_str("}\n\n");
+
+    let _ = writeln!(out, "impl std::str::FromStr for {ty} {{");
+    out.push_str("    type Err = String;\n\n");
+    out.push_str("    fn from_str(s: &str) -> Result<Self, Self::Err> {\n");
+    out.push_str("        match s {\n");
+    for (raw, variant) in field.variants.iter().zip(&variants) {
+        let _ = writeln!(out, "            \"{raw}\" => Ok(Self::{variant}),");
+    }
+    let _ = writeln!(
+        out,
+        "            _ => Err(\"must be one of {}\".to_owned()),",
+        field.variants.join(", ")
+    );
+    out.push_str("        }\n");
+    out.push_str("    }\n");
+    out.push_str("}\n\n");
+
+    let _ = writeln!(
+        out,
+        "impl diesel::serialize::ToSql<diesel::sql_types::Text, diesel::pg::Pg> for {ty} {{"
+    );
+    out.push_str(
+        "    fn to_sql<'b>(&'b self, out: &mut diesel::serialize::Output<'b, '_, diesel::pg::Pg>) -> diesel::serialize::Result {\n",
+    );
+    out.push_str(
+        "        <str as diesel::serialize::ToSql<diesel::sql_types::Text, diesel::pg::Pg>>::to_sql(self.as_str(), out)\n",
+    );
+    out.push_str("    }\n");
+    out.push_str("}\n\n");
+
+    let _ = writeln!(
+        out,
+        "impl diesel::deserialize::FromSql<diesel::sql_types::Text, diesel::pg::Pg> for {ty} {{"
+    );
+    out.push_str(
+        "    fn from_sql(bytes: diesel::pg::PgValue<'_>) -> diesel::deserialize::Result<Self> {\n",
+    );
+    let _ = writeln!(
+        out,
+        "        let s = <String as diesel::deserialize::FromSql<diesel::sql_types::Text, diesel::pg::Pg>>::from_sql(bytes)?;"
+    );
+    out.push_str("        s.parse().map_err(Into::into)\n");
+    out.push_str("    }\n");
+    out.push_str("}\n");
+
+    out
+}
+
 fn render_model_file(
     name: &str,
     table: &str,
@@ -950,6 +1202,17 @@ fn render_model_file(
     out.push_str("//! framework treats this as ordinary user code.\n\n");
     let _ = writeln!(out, "use crate::schema::{table};");
     out.push('\n');
+    for f in fields {
+        if f.is_enum() {
+            let default_variant = metadata
+                .defaults
+                .get(&f.name)
+                .and_then(|literal| literal.strip_prefix('\''))
+                .and_then(|s| s.strip_suffix('\''));
+            out.push_str(&render_enum_decl(f, default_variant));
+            out.push('\n');
+        }
+    }
     out.push_str("#[autumn_web::model]\n");
     if let Some(key) = shard_key {
         let _ = writeln!(out, "#[shard_key = \"{key}\"]");
@@ -1120,6 +1383,337 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let err = plan_model(tmp.path(), "Post", &[], "20260427000000").unwrap_err();
         assert!(matches!(err, GenerateError::NotInProject));
+    }
+
+    // ── enum field: generated Rust type (issue #1030) ───────────────────────
+
+    #[test]
+    fn model_file_declares_enum_type() {
+        let tmp = project();
+        let plan = plan_model(
+            tmp.path(),
+            "Post",
+            &[
+                "title:String".into(),
+                "status:enum{draft,published,archived}".into(),
+            ],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let model = fs::read_to_string(tmp.path().join("src/models/post.rs")).unwrap();
+        assert!(model.contains("pub enum Status"), "got:\n{model}");
+        assert!(
+            model.contains("#[diesel(sql_type = diesel::sql_types::Text)]"),
+            "got:\n{model}"
+        );
+        assert!(
+            model.contains("diesel::expression::AsExpression"),
+            "got:\n{model}"
+        );
+        assert!(
+            model.contains("diesel::deserialize::FromSqlRow"),
+            "got:\n{model}"
+        );
+        assert!(
+            model.contains("#[serde(rename = \"draft\")]"),
+            "got:\n{model}"
+        );
+        assert!(
+            model.contains("#[serde(rename = \"published\")]"),
+            "got:\n{model}"
+        );
+        assert!(
+            model.contains("#[serde(rename = \"archived\")]"),
+            "got:\n{model}"
+        );
+        assert!(model.contains("Draft,"), "got:\n{model}");
+        assert!(model.contains("Published,"), "got:\n{model}");
+        assert!(model.contains("Archived,"), "got:\n{model}");
+        assert!(model.contains("pub status: Status,"), "got:\n{model}");
+    }
+
+    #[test]
+    fn model_file_enum_impls_display_fromstr_tosql_fromsql() {
+        let tmp = project();
+        let plan = plan_model(
+            tmp.path(),
+            "Post",
+            &["status:enum{draft,published}".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let model = fs::read_to_string(tmp.path().join("src/models/post.rs")).unwrap();
+        assert!(
+            model.contains("impl std::fmt::Display for Status"),
+            "got:\n{model}"
+        );
+        assert!(
+            model.contains("impl std::str::FromStr for Status"),
+            "got:\n{model}"
+        );
+        assert!(
+            model.contains("must be one of draft, published"),
+            "got:\n{model}"
+        );
+        assert!(
+            model.contains(
+                "impl diesel::serialize::ToSql<diesel::sql_types::Text, diesel::pg::Pg> for Status"
+            ),
+            "got:\n{model}"
+        );
+        assert!(
+            model.contains("impl diesel::deserialize::FromSql<diesel::sql_types::Text, diesel::pg::Pg> for Status"),
+            "got:\n{model}"
+        );
+        assert!(model.contains("const VARIANTS"), "got:\n{model}");
+        assert!(model.contains("pub const fn as_str"), "got:\n{model}");
+    }
+
+    #[test]
+    fn enum_field_name_colliding_with_model_name_is_rejected() {
+        let tmp = project();
+        let err = plan_model(
+            tmp.path(),
+            "Status",
+            &["status:enum{draft,published}".into()],
+            "20260427000000",
+        )
+        .unwrap_err();
+        assert!(matches!(err, GenerateError::InvalidField { .. }));
+        assert!(err.to_string().contains("Status"), "got: {err}");
+    }
+
+    #[test]
+    fn enum_field_name_colliding_with_generated_companion_type_is_rejected() {
+        // `status:enum{...}` on a `Field` model would generate `pub enum
+        // Field`, colliding with the `#[model]` macro's own `FieldField` enum
+        // (one variant per mutable column, used for audit/CDC payloads).
+        let tmp = project();
+        let err = plan_model(
+            tmp.path(),
+            "Field",
+            &["field:enum{a,b}".into()],
+            "20260427000000",
+        )
+        .unwrap_err();
+        assert!(matches!(err, GenerateError::InvalidField { .. }));
+    }
+
+    #[test]
+    fn enum_field_name_colliding_with_preload_associations_or_factory_is_rejected() {
+        // The `#[model]` macro always emits `{Pascal}Preload`, `{Pascal}Associations`,
+        // and `{Pascal}Factory` (autumn-macros/src/model.rs), even for a model
+        // with no associations — a field that pascalizes to one of these on
+        // model `Post` must be rejected, not just the shorter, already-covered
+        // companion names.
+        for field_name in ["post_preload", "post_associations", "post_factory"] {
+            let tmp = project();
+            let err = plan_model(
+                tmp.path(),
+                "Post",
+                &[format!("{field_name}:enum{{a,b}}")],
+                "20260427000000",
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, GenerateError::InvalidField { .. }),
+                "expected '{field_name}' to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn two_enum_fields_colliding_with_each_other_are_rejected() {
+        // `pascal()` is not injective: `in_review` and `in__review` both
+        // pascalize to `InReview`. Without this check, both fields would
+        // pass (neither collides with a *reserved* name) and the generator
+        // would emit `pub enum InReview` twice in the same model file.
+        let tmp = project();
+        let err = plan_model(
+            tmp.path(),
+            "Post",
+            &["in_review:enum{a,b}".into(), "in__review:enum{c,d}".into()],
+            "20260427000000",
+        )
+        .unwrap_err();
+        assert!(matches!(err, GenerateError::InvalidField { .. }));
+    }
+
+    #[test]
+    fn distinct_enum_fields_with_non_colliding_names_are_accepted() {
+        let tmp = project();
+        plan_model(
+            tmp.path(),
+            "Post",
+            &[
+                "status:enum{draft,published}".into(),
+                "priority:enum{low,high}".into(),
+            ],
+            "20260427000000",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn enum_field_name_shadowing_prelude_type_is_rejected() {
+        // A field that pascalizes to `String`/`Vec`/`Option`/`Result`/`Box`/`Into`
+        // shadows the prelude import for the entire generated file (and, once
+        // imported into the scaffold's routes file, that file too) — verified
+        // by generating `string:enum{a,b}` and observing `cargo check` fail
+        // with E0308/E0599 far from this token. `into` is included because
+        // `render_enum_decl`'s `FromSql` impl calls the unqualified
+        // `Into::into` — a field named `into` would generate `pub enum Into`,
+        // which shadows that path expression too.
+        for field_name in ["string", "vec", "option", "result", "box", "into"] {
+            let tmp = project();
+            let err = plan_model(
+                tmp.path(),
+                "Post",
+                &[format!("{field_name}:enum{{a,b}}")],
+                "20260427000000",
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, GenerateError::InvalidField { .. }),
+                "expected '{field_name}' to be rejected"
+            );
+        }
+    }
+
+    // ── enum field: --default (issue #1030) ─────────────────────────────────
+
+    #[test]
+    fn enum_sql_default_literal_quotes_variant() {
+        let fields = parse_fields(&["status:enum{draft,published,archived}".into()]).unwrap();
+        let metadata = parse_model_metadata(
+            &fields,
+            &ModelOptions {
+                defaults: vec!["status=draft".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            metadata.defaults().get("status").map(String::as_str),
+            Some("'draft'")
+        );
+    }
+
+    #[test]
+    fn enum_sql_default_literal_accepts_quoted_variant() {
+        // `--default status="draft"`/`status='draft'` must unquote the same
+        // way the String/Text arm does (shared `unquote_default_value`).
+        let fields = parse_fields(&["status:enum{draft,published}".into()]).unwrap();
+        for token in ["status=\"draft\"", "status='draft'"] {
+            let metadata = parse_model_metadata(
+                &fields,
+                &ModelOptions {
+                    defaults: vec![token.into()],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                metadata.defaults().get("status").map(String::as_str),
+                Some("'draft'"),
+                "token '{token}' should unquote to 'draft'"
+            );
+        }
+    }
+
+    #[test]
+    fn enum_default_unknown_variant_errors_at_generate_time() {
+        let fields = parse_fields(&["status:enum{draft,published,archived}".into()]).unwrap();
+        let err = parse_model_metadata(
+            &fields,
+            &ModelOptions {
+                defaults: vec!["status=bogus".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("bogus"), "got: {msg}");
+        assert!(msg.contains("draft"), "got: {msg}");
+        assert!(msg.contains("published"), "got: {msg}");
+        assert!(msg.contains("archived"), "got: {msg}");
+    }
+
+    #[test]
+    fn enum_default_emits_rust_default_impl_and_sql_default() {
+        let tmp = project();
+        let plan = plan_model_with_options(
+            tmp.path(),
+            "Post",
+            &["status:enum{draft,published,archived}".into()],
+            "20260427000000",
+            &ModelOptions {
+                defaults: vec!["status=draft".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let model = fs::read_to_string(tmp.path().join("src/models/post.rs")).unwrap();
+        assert!(
+            model.contains("#[derive(")
+                && model.contains("Default")
+                && model.contains("pub enum Status"),
+            "expected Default in the enum's derive list: {model}"
+        );
+        assert!(
+            model.contains("#[default]\n    #[serde(rename = \"draft\")]\n    Draft,"),
+            "expected #[default] on the Draft variant: {model}"
+        );
+        assert!(
+            model.contains("#[default]\n    pub status: Status,"),
+            "field-level #[default] marker must still be emitted so status is \
+             excluded from NewPost: {model}"
+        );
+
+        let up = fs::read_to_string(
+            tmp.path()
+                .join("migrations/20260427000000_create_posts/up.sql"),
+        )
+        .unwrap();
+        assert!(up.contains("DEFAULT 'draft'"), "got:\n{up}");
+    }
+
+    // ── enum field: nullable (issue #1030) ──────────────────────────────────
+
+    #[test]
+    fn nullable_enum_model_field_is_option() {
+        let tmp = project();
+        let plan = plan_model(
+            tmp.path(),
+            "Post",
+            &["status:Option<enum{draft,published}>".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let model = fs::read_to_string(tmp.path().join("src/models/post.rs")).unwrap();
+        assert!(
+            model.contains("pub status: Option<Status>,"),
+            "got:\n{model}"
+        );
+
+        let up = fs::read_to_string(
+            tmp.path()
+                .join("migrations/20260427000000_create_posts/up.sql"),
+        )
+        .unwrap();
+        assert!(up.contains("status TEXT NULL"), "got:\n{up}");
+        assert!(
+            up.contains("CHECK (status IN ('draft', 'published'))"),
+            "got:\n{up}"
+        );
     }
 
     #[test]

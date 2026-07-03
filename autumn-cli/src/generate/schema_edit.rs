@@ -125,6 +125,9 @@ pub fn create_table_sql_with_metadata_and_id(
         if let Some(default) = defaults.get(&f.name) {
             let _ = write!(sql, " DEFAULT {default}");
         }
+        if let Some(check) = enum_check_suffix(f) {
+            let _ = write!(sql, " {check}");
+        }
     }
     sql.push_str(",\n    created_at TIMESTAMP NOT NULL DEFAULT NOW()\n);\n");
     // Every `references` field gets an index automatically (Rails' `add_reference`
@@ -150,6 +153,25 @@ pub fn create_table_sql_with_metadata_and_id(
 #[must_use]
 pub fn drop_table_sql(table: &str) -> String {
     format!("DROP TABLE {table};\n")
+}
+
+/// For an `enum{…}` field, the trailing ` CHECK (col IN ('a', 'b', …))`
+/// clause that enforces the closed set at the database layer. `None` for
+/// every other field kind.
+///
+/// Variants are validated `snake_case` identifiers (see
+/// [`super::dsl::parse_field`]), so no SQL-escaping is needed here.
+fn enum_check_suffix(field: &Field) -> Option<String> {
+    if !field.kind.is_enum() {
+        return None;
+    }
+    let quoted = field
+        .variants
+        .iter()
+        .map(|v| format!("'{v}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!("CHECK ({} IN ({quoted}))", field.name))
 }
 
 /// Result of inferring a migration shape from its name.
@@ -286,6 +308,9 @@ pub fn add_columns_up_sql(table: &str, fields: &[Field]) -> String {
         );
         if let Some(target) = f.reference_table() {
             let _ = write!(out, " REFERENCES {target}(id)");
+        }
+        if let Some(check) = enum_check_suffix(f) {
+            let _ = write!(out, " {check}");
         }
         out.push_str(";\n");
         if f.kind.is_reference() {
@@ -491,7 +516,9 @@ pub fn remove_columns_up_sql(table: &str, fields: &[Field]) -> String {
 /// field's `REFERENCES <table>(id)` constraint and automatic index (see
 /// [`create_table_sql_with_metadata_and_id`]/[`add_columns_up_sql`]) — a
 /// bare re-added column would silently drop the foreign-key relationship and
-/// its lookup index on rollback (issue #1026).
+/// its lookup index on rollback (issue #1026). Likewise restores an `enum{…}`
+/// field's `CHECK` constraint (issue #1030) — otherwise the closed set would
+/// silently stop being enforced after a rollback.
 #[must_use]
 pub fn remove_columns_down_sql(table: &str, fields: &[Field]) -> String {
     let mut out = String::new();
@@ -505,6 +532,9 @@ pub fn remove_columns_down_sql(table: &str, fields: &[Field]) -> String {
         );
         if let Some(target) = f.reference_table() {
             let _ = write!(out, " REFERENCES {target}(id)");
+        }
+        if let Some(check) = enum_check_suffix(f) {
+            let _ = write!(out, " {check}");
         }
         out.push_str(";\n");
         if f.kind.is_reference() {
@@ -3368,6 +3398,106 @@ mod tests {
         let title_pos = sql.find("DROP COLUMN title").unwrap();
         let count_pos = sql.find("DROP COLUMN count").unwrap();
         assert!(count_pos < title_pos);
+    }
+
+    // ── enum field: CHECK constraint (issue #1030) ──────────────────────────
+
+    #[test]
+    fn create_table_emits_check_constraint_for_enum() {
+        let sql = create_table_sql_with_metadata_and_id(
+            "posts",
+            &fields(&["status:enum{draft,published,archived}"]),
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            IdType::BigSerial,
+        );
+        assert!(
+            sql.contains(
+                "status TEXT NOT NULL CHECK (status IN ('draft', 'published', 'archived'))"
+            ),
+            "got:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn create_table_check_comes_after_default() {
+        let mut defaults = BTreeMap::new();
+        defaults.insert("status".to_owned(), "'draft'".to_owned());
+        let sql = create_table_sql_with_metadata_and_id(
+            "posts",
+            &fields(&["status:enum{draft,published}"]),
+            &BTreeSet::new(),
+            &defaults,
+            IdType::BigSerial,
+        );
+        assert!(
+            sql.contains(
+                "status TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft', 'published'))"
+            ),
+            "got:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn create_table_nullable_enum_check_allows_null() {
+        let sql = create_table_sql_with_metadata_and_id(
+            "posts",
+            &fields(&["status:Option<enum{draft,published}>"]),
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            IdType::BigSerial,
+        );
+        assert!(
+            sql.contains("status TEXT NULL CHECK (status IN ('draft', 'published'))"),
+            "got:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn add_columns_emits_check_constraint_for_enum() {
+        let f = fields(&["status:enum{draft,published,archived}"]);
+        let sql = add_columns_up_sql("posts", &f);
+        assert!(
+            sql.contains(
+                "ALTER TABLE posts ADD COLUMN status TEXT NOT NULL CHECK (status IN ('draft', 'published', 'archived'));"
+            ),
+            "got:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn add_columns_down_drops_enum_column_plainly() {
+        let f = fields(&["status:enum{draft,published}"]);
+        let sql = add_columns_down_sql("posts", &f);
+        assert_eq!(sql, "ALTER TABLE posts DROP COLUMN status;\n");
+    }
+
+    #[test]
+    fn non_enum_column_has_no_check_constraint() {
+        let sql = create_table_sql_with_metadata_and_id(
+            "posts",
+            &fields(&["title:String"]),
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            IdType::BigSerial,
+        );
+        assert!(!sql.contains("CHECK"), "got:\n{sql}");
+    }
+
+    #[test]
+    fn remove_columns_down_sql_restores_check_constraint_for_enum_field() {
+        // Symmetric with the FK-restoration precedent above: rolling back a
+        // `RemoveStatusFromPosts` migration must restore the CHECK constraint,
+        // not just a bare TEXT column — otherwise the closed set silently
+        // stops being enforced after a rollback.
+        let f = fields(&["status:enum{draft,published,archived}"]);
+        let sql = remove_columns_down_sql("posts", &f);
+        assert!(
+            sql.contains(
+                "ALTER TABLE posts ADD COLUMN status TEXT NOT NULL CHECK (status IN ('draft', 'published', 'archived'));"
+            ),
+            "got:\n{sql}"
+        );
     }
 
     #[test]
