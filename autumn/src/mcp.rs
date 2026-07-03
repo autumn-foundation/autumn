@@ -1352,31 +1352,44 @@ async fn serve_tools_call(
         String::from_utf8_lossy(&bytes).into_owned()
     };
 
-    let value = if status.is_success() {
-        // An empty-body-contract tool (declared 204/205, no response schema)
-        // advertises "empty text on success". Enforce that here rather than
-        // trusting the declaration: a handler whose real response carries a
-        // body (e.g. an HTML route mislabeled `status = 204`) must not leak
-        // it into the tool result.
-        if tool.empty_body {
-            success(id, tool_ok(""))
-        } else {
-            success(id, tool_ok(&text))
-        }
-    } else {
-        success(
-            id,
-            tool_error(&format!(
-                "handler returned HTTP {}: {text}",
-                status.as_u16()
-            )),
-        )
-    };
+    let value = buffered_tool_result(tool, id, status, &text);
     let mut resp = json_response(&value);
     for cookie in cookies {
         resp.headers_mut().append(header::SET_COOKIE, cookie);
     }
     resp
+}
+
+/// Package a buffered handler response as the JSON-RPC tool result.
+///
+/// An empty-body-contract tool (declared 204/205, no response schema)
+/// advertises "empty text on success". Enforce that here rather than
+/// trusting the declaration: a handler whose real response carries a body
+/// (e.g. an HTML route mislabeled `status = 204`) must not leak it into the
+/// tool result. Discarding silently would hide the mislabel, so surface it.
+fn buffered_tool_result(tool: &McpTool, id: Value, status: StatusCode, text: &str) -> Value {
+    if !status.is_success() {
+        return success(
+            id,
+            tool_error(&format!(
+                "handler returned HTTP {}: {text}",
+                status.as_u16()
+            )),
+        );
+    }
+    if tool.empty_body {
+        if !text.is_empty() {
+            tracing::warn!(
+                tool = %tool.name,
+                body_len = text.len(),
+                "empty-body-contract tool returned a non-empty body; \
+                 discarding it (the route's declared 204/205 status does \
+                 not match what its handler actually returns)"
+            );
+        }
+        return success(id, tool_ok(""));
+    }
+    success(id, tool_ok(text))
 }
 
 // ── Progressive (SSE) tool-result projection ──────────────────────
