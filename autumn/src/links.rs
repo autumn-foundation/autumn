@@ -399,13 +399,21 @@ pub fn button_to(label: &str, href: &str, method: Method, csrf_token: &str) -> m
 ///
 /// Panics when an extra attribute name is not a valid HTML attribute name
 /// (must start with an ASCII letter, followed by ASCII alphanumerics, `-`,
-/// `_`, or `:`), or when it collides (case-insensitively) with an attribute
-/// this helper already sets via a named option. Attribute names passed via
-/// `.attrs(...)` must be static, developer-authored literals (like
-/// `hx-delete` or `data-id`) — **never** built from user input or other
-/// untrusted runtime data — since a bad name panics in both debug and
-/// release builds by design, surfacing the typo instead of silently
-/// emitting broken or duplicate-attribute markup.
+/// `_`, or `:`), when it collides (case-insensitively) with an attribute
+/// this helper already sets via a named option, or when it is one of the
+/// `<button>` submit-override attributes (`formaction`, `formmethod`,
+/// `formenctype`, `formnovalidate`, `formtarget`) — those would silently
+/// change which URL/method/CSRF-field the no-JS form actually submits to,
+/// defeating the CSRF/method-override guarantee this helper exists to
+/// provide. Also panics when `method` is not `GET`, `POST`, `PUT`, `PATCH`,
+/// or `DELETE`, since a `<form>` cannot represent any other HTTP method and
+/// [`crate::form::method_input`] has no override for it — submitting would
+/// silently hit a plain `POST` at the same URL instead of the declared
+/// method. Attribute names passed via `.attrs(...)` must be static,
+/// developer-authored literals (like `hx-delete` or `data-id`) — **never**
+/// built from user input or other untrusted runtime data — since a bad name
+/// panics in both debug and release builds by design, surfacing the typo
+/// instead of silently emitting broken or duplicate-attribute markup.
 ///
 /// # Example
 ///
@@ -445,13 +453,29 @@ pub fn button_to_with(
     csrf_token: &str,
     options: &ButtonToOptions<'_>,
 ) -> maud::Markup {
+    assert!(
+        method == Method::GET
+            || method == Method::POST
+            || method == Method::PUT
+            || method == Method::PATCH
+            || method == Method::DELETE,
+        "button_to only supports GET, POST, PUT, PATCH, or DELETE (got {method}); \
+         a <form> cannot represent any other HTTP method"
+    );
+
     let mut button = String::with_capacity(64 + label.len());
     button.push_str("<button type=\"submit\"");
     if let Some(class) = options.class {
         push_attr(&mut button, "class", class);
     }
     for (name, value) in options.attrs {
-        let is_reserved = name.eq_ignore_ascii_case("type") || name.eq_ignore_ascii_case("class");
+        let is_reserved = name.eq_ignore_ascii_case("type")
+            || name.eq_ignore_ascii_case("class")
+            || name.eq_ignore_ascii_case("formaction")
+            || name.eq_ignore_ascii_case("formmethod")
+            || name.eq_ignore_ascii_case("formenctype")
+            || name.eq_ignore_ascii_case("formnovalidate")
+            || name.eq_ignore_ascii_case("formtarget");
         assert!(
             !is_reserved,
             "attrs cannot override the built-in {name:?} attribute on button_to; use the dedicated option instead"
@@ -781,5 +805,34 @@ mod tests {
         // never called, not only when it collides with an already-set value.
         let options = ButtonToOptions::new().attrs(&[("class", "evil")]);
         let _ = button_to_with("x", "/x", Method::POST, "tok", &options);
+    }
+
+    #[test]
+    #[should_panic(expected = "attrs cannot override the built-in \"formmethod\" attribute")]
+    fn button_to_attrs_cannot_override_formmethod_panics() {
+        // Regression: <button formmethod> overrides the wrapping <form>'s
+        // method for a no-JS submission, which would silently defeat the
+        // declared method (e.g. submitting DELETE's override fields as GET).
+        let options = ButtonToOptions::new().attrs(&[("formmethod", "get")]);
+        let _ = button_to_with("x", "/x", Method::DELETE, "tok", &options);
+    }
+
+    #[test]
+    #[should_panic(expected = "attrs cannot override the built-in \"formaction\" attribute")]
+    fn button_to_attrs_cannot_override_formaction_panics() {
+        // Regression: <button formaction> overrides the wrapping <form>'s
+        // action for a no-JS submission, redirecting the CSRF token and
+        // _method override to a different URL.
+        let options = ButtonToOptions::new().attrs(&[("formaction", "/evil")]);
+        let _ = button_to_with("x", "/x", Method::DELETE, "tok", &options);
+    }
+
+    #[test]
+    #[should_panic(expected = "button_to only supports GET, POST, PUT, PATCH, or DELETE")]
+    fn button_to_rejects_unsupported_method_panics() {
+        // Regression: a <form> cannot represent HEAD/OPTIONS/etc., and
+        // method_input has no override for them — silently falling through
+        // to a plain POST would submit to the wrong handler.
+        let _ = button_to("x", "/x", Method::HEAD, "tok");
     }
 }
