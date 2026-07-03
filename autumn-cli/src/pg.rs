@@ -442,6 +442,39 @@ fn fill_in_libpq_env_defaults(
     injected_port
 }
 
+/// Fill in `sslmode`/`sslrootcert` from `PGSSLMODE`/`PGSSLROOTCERT` for
+/// whichever of those isn't already set, mirroring the same
+/// environment-variable fallback [`fill_in_libpq_env_defaults`] already
+/// provides for `host`/`port`/`user`/`dbname` — `tokio_postgres` never reads
+/// either of these on its own, so a connection string that omits them and
+/// relies on the environment the way `psql` did would otherwise silently
+/// connect under the default `sslmode=prefer` (no verification requested at
+/// all) instead.
+///
+/// `explicit_sslrootcert` must be captured from the *original* connection
+/// string (or keyword pairs) before [`filter_ssl_params`] ever ran on it —
+/// that function unconditionally strips `sslrootcert` from `pairs`
+/// afterward (see [`UNSUPPORTED_SSL_PARAMS`]), so by the time this runs
+/// `pairs` itself can no longer distinguish "never set" from "set, but
+/// already dropped."
+///
+/// Unlike [`fill_in_libpq_env_defaults`], the values injected here still
+/// need to go through [`filter_ssl_params`]'s validation (the
+/// `verify-ca`/`verify-full`/`allow` rejection, and the
+/// `require`+`sslrootcert` rejection) — neither key was validated by the
+/// caller's earlier `filter_ssl_params` call, since neither was present yet.
+/// Callers must re-run `filter_ssl_params` over `pairs` after calling this.
+fn fill_in_libpq_ssl_env_defaults(pairs: &mut Vec<(String, String)>, explicit_sslrootcert: bool) {
+    if find_pair(pairs, "sslmode").is_none()
+        && let Ok(pgsslmode) = std::env::var("PGSSLMODE")
+    {
+        pairs.push(("sslmode".to_owned(), pgsslmode));
+    }
+    if !explicit_sslrootcert && let Ok(pgsslrootcert) = std::env::var("PGSSLROOTCERT") {
+        pairs.push(("sslrootcert".to_owned(), pgsslrootcert));
+    }
+}
+
 /// Return the value of the first `(key, value)` pair matching `key`, if any.
 fn find_pair<'a>(pairs: &'a [(String, String)], key: &str) -> Option<&'a str> {
     pairs
@@ -593,6 +626,50 @@ fn resolve_password(
         .or_else(|| pgpass_password(host, port, dbname, user, passfile_override))
 }
 
+/// If no password is already explicit, resolve one via [`resolve_password`]
+/// (using whichever of `host`/`port`/`user`/`dbname` is already known,
+/// falling back to `pairs` and then the same defaults `tokio_postgres`
+/// itself would use) and push it into `pairs`.
+///
+/// `explicit_host`/`port`/`user`/`dbname` are `None` for
+/// [`sanitize_keyword_form`], which has no URL-structure concept of
+/// "explicit" separate from `pairs` itself; [`sanitize_url_form`] passes its
+/// own snapshots so a value already decided from the URL's structure (not
+/// just its query string) is preferred over a same-named `pairs` entry.
+fn fill_in_missing_password(
+    pairs: &mut Vec<(String, String)>,
+    is_explicit_password: bool,
+    explicit_host: Option<&str>,
+    explicit_port: Option<&str>,
+    explicit_user: Option<&str>,
+    explicit_dbname: Option<&str>,
+    passfile: Option<&str>,
+) {
+    let host = explicit_host
+        .map(str::to_owned)
+        .or_else(|| find_pair(pairs, "host").map(str::to_owned))
+        .or_else(|| find_pair(pairs, "hostaddr").map(str::to_owned))
+        .unwrap_or_else(|| "localhost".to_owned());
+    let port = explicit_port
+        .map(str::to_owned)
+        .or_else(|| find_pair(pairs, "port").map(str::to_owned))
+        .unwrap_or_else(|| "5432".to_owned());
+    let user = explicit_user
+        .map(str::to_owned)
+        .or_else(|| find_pair(pairs, "user").map(str::to_owned))
+        .unwrap_or_else(current_os_user);
+    let dbname = explicit_dbname
+        .map(str::to_owned)
+        .or_else(|| find_pair(pairs, "dbname").map(str::to_owned))
+        .unwrap_or_else(|| user.clone());
+
+    if !is_explicit_password
+        && let Some(password) = resolve_password(&host, &port, &dbname, &user, passfile)
+    {
+        pairs.push(("password".to_owned(), password));
+    }
+}
+
 /// Parse a `pg_service.conf`-style file, returning the `key=value` pairs of
 /// the `[service_name]` section, or `None` if that section isn't present.
 /// Lines starting with `#` or `;` are comments, matching `libpq`'s own
@@ -707,10 +784,12 @@ fn sanitize_db_url(db_url: &str) -> Result<String, CommandError> {
 
 /// The URL-form half of [`sanitize_db_url`].
 fn sanitize_url_form(mut url: url::Url) -> Result<String, CommandError> {
-    let mut pairs = filter_ssl_params(
-        url.query_pairs()
-            .map(|(k, v)| (k.into_owned(), v.into_owned())),
-    )?;
+    let raw_pairs: Vec<(String, String)> = url
+        .query_pairs()
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    let explicit_sslrootcert = find_pair(&raw_pairs, "sslrootcert").is_some();
+    let mut pairs = filter_ssl_params(raw_pairs.into_iter())?;
 
     // Capture what the URL's own structure (as opposed to its query
     // string) already says explicitly, once, up front: `host`/`port`
@@ -785,30 +864,19 @@ fn sanitize_url_form(mut url: url::Url) -> Result<String, CommandError> {
 
     let explicit_fields = explicit_fields(|key| is_explicit(&pairs, key));
     needs_keyword_form |= fill_in_libpq_env_defaults(&mut pairs, &explicit_fields);
+    fill_in_libpq_ssl_env_defaults(&mut pairs, explicit_sslrootcert);
+    pairs = filter_ssl_params(pairs.into_iter())?;
 
-    let host = explicit_host
-        .clone()
-        .or_else(|| find_pair(&pairs, "host").map(str::to_owned))
-        .or_else(|| find_pair(&pairs, "hostaddr").map(str::to_owned))
-        .unwrap_or_else(|| "localhost".to_owned());
-    let port = explicit_port
-        .clone()
-        .or_else(|| find_pair(&pairs, "port").map(str::to_owned))
-        .unwrap_or_else(|| "5432".to_owned());
-    let user = explicit_user
-        .clone()
-        .or_else(|| find_pair(&pairs, "user").map(str::to_owned))
-        .unwrap_or_else(current_os_user);
-    let dbname = explicit_dbname
-        .clone()
-        .or_else(|| find_pair(&pairs, "dbname").map(str::to_owned))
-        .unwrap_or_else(|| user.clone());
-
-    if !is_explicit(&pairs, "password")
-        && let Some(password) = resolve_password(&host, &port, &dbname, &user, passfile.as_deref())
-    {
-        pairs.push(("password".to_owned(), password));
-    }
+    let is_explicit_password = is_explicit(&pairs, "password");
+    fill_in_missing_password(
+        &mut pairs,
+        is_explicit_password,
+        explicit_host.as_deref(),
+        explicit_port.as_deref(),
+        explicit_user.as_deref(),
+        explicit_dbname.as_deref(),
+        passfile.as_deref(),
+    );
 
     if needs_keyword_form {
         // `tokio_postgres`'s URL-form parser bakes a default `port=5432`
@@ -856,6 +924,7 @@ fn sanitize_url_form(mut url: url::Url) -> Result<String, CommandError> {
 
 /// The keyword/value-form half of [`sanitize_db_url`].
 fn sanitize_keyword_form(pairs: Vec<(String, String)>) -> Result<String, CommandError> {
+    let explicit_sslrootcert = find_pair(&pairs, "sslrootcert").is_some();
     let mut pairs = filter_ssl_params(pairs.into_iter())?;
 
     let service_name = take_pair(&mut pairs, "service").or_else(|| std::env::var("PGSERVICE").ok());
@@ -873,19 +942,19 @@ fn sanitize_keyword_form(pairs: Vec<(String, String)>) -> Result<String, Command
 
     let explicit_fields = explicit_fields(|key| find_pair(&pairs, key).is_some());
     fill_in_libpq_env_defaults(&mut pairs, &explicit_fields);
+    fill_in_libpq_ssl_env_defaults(&mut pairs, explicit_sslrootcert);
+    let mut pairs = filter_ssl_params(pairs.into_iter())?;
 
-    if find_pair(&pairs, "password").is_none() {
-        let host = find_pair(&pairs, "host")
-            .or_else(|| find_pair(&pairs, "hostaddr"))
-            .map_or_else(|| "localhost".to_owned(), str::to_owned);
-        let port = find_pair(&pairs, "port").map_or_else(|| "5432".to_owned(), str::to_owned);
-        let user = find_pair(&pairs, "user").map_or_else(current_os_user, str::to_owned);
-        let dbname = find_pair(&pairs, "dbname").map_or_else(|| user.clone(), str::to_owned);
-        if let Some(password) = resolve_password(&host, &port, &dbname, &user, passfile.as_deref())
-        {
-            pairs.push(("password".to_owned(), password));
-        }
-    }
+    let is_explicit_password = find_pair(&pairs, "password").is_some();
+    fill_in_missing_password(
+        &mut pairs,
+        is_explicit_password,
+        None,
+        None,
+        None,
+        None,
+        passfile.as_deref(),
+    );
 
     Ok(pairs
         .iter()
@@ -1149,6 +1218,126 @@ mod tests {
             config.get_ssl_mode(),
             tokio_postgres::config::SslMode::Prefer
         );
+    }
+
+    #[test]
+    fn sanitize_uses_pgsslmode_env_var_when_url_has_no_inline_sslmode() {
+        // `PGSSLMODE` is documented to behave the same as an inline
+        // `sslmode=` parameter — a bare connection string relying on it (the
+        // way `psql` did) must not silently connect under the default
+        // `prefer` instead.
+        temp_env::with_var("PGSSLMODE", Some("require"), || {
+            let sanitized = sanitize_db_url("postgres://host/db").unwrap();
+            let config: tokio_postgres::Config = sanitized.parse().unwrap();
+            assert_eq!(
+                config.get_ssl_mode(),
+                tokio_postgres::config::SslMode::Require
+            );
+        });
+    }
+
+    #[test]
+    fn sanitize_uses_pgsslmode_env_var_in_keyword_form_too() {
+        temp_env::with_var("PGSSLMODE", Some("require"), || {
+            let sanitized = sanitize_db_url("host=host dbname=db").unwrap();
+            let config: tokio_postgres::Config = sanitized.parse().unwrap();
+            assert_eq!(
+                config.get_ssl_mode(),
+                tokio_postgres::config::SslMode::Require
+            );
+        });
+    }
+
+    #[test]
+    fn sanitize_prefers_inline_sslmode_over_pgsslmode_env_var() {
+        temp_env::with_var("PGSSLMODE", Some("require"), || {
+            let sanitized = sanitize_db_url("postgres://host/db?sslmode=disable").unwrap();
+            let config: tokio_postgres::Config = sanitized.parse().unwrap();
+            assert_eq!(
+                config.get_ssl_mode(),
+                tokio_postgres::config::SslMode::Disable
+            );
+        });
+    }
+
+    #[test]
+    fn sanitize_rejects_verify_full_from_pgsslmode_env_var() {
+        temp_env::with_var("PGSSLMODE", Some("verify-full"), || {
+            let err = sanitize_db_url("postgres://host/db").unwrap_err();
+            assert!(err.message().contains("verify-full"));
+        });
+    }
+
+    #[test]
+    fn sanitize_rejects_require_pgsslmode_combined_with_pgsslrootcert_env_var() {
+        // The literal scenario libpq documents: an operator relying entirely
+        // on environment variables (the way `psql` did) for TLS policy,
+        // with no inline `sslmode=`/`sslrootcert=` at all. This must get the
+        // same loud rejection as the inline-string case, not silently
+        // connect under the default `prefer` with no verification.
+        temp_env::with_vars(
+            [
+                ("PGSSLMODE", Some("require")),
+                ("PGSSLROOTCERT", Some("/etc/ca.pem")),
+            ],
+            || {
+                let err = sanitize_db_url("postgres://host/db").unwrap_err();
+                assert!(err.message().contains("sslrootcert"));
+            },
+        );
+    }
+
+    #[test]
+    fn sanitize_rejects_require_pgsslmode_combined_with_pgsslrootcert_env_var_in_keyword_form() {
+        temp_env::with_vars(
+            [
+                ("PGSSLMODE", Some("require")),
+                ("PGSSLROOTCERT", Some("/etc/ca.pem")),
+            ],
+            || {
+                let err = sanitize_db_url("host=host dbname=db").unwrap_err();
+                assert!(err.message().contains("sslrootcert"));
+            },
+        );
+    }
+
+    #[test]
+    fn sanitize_ignores_pgsslrootcert_env_var_when_effective_sslmode_is_not_require() {
+        // The require+sslrootcert quirk is specific to `require` — a
+        // `PGSSLROOTCERT` env var with no `require` in play anywhere (inline
+        // or via `PGSSLMODE`) must just be dropped like any other unsupported
+        // cert param, not rejected.
+        temp_env::with_vars(
+            [
+                ("PGSSLMODE", None::<&str>),
+                ("PGSSLROOTCERT", Some("/etc/ca.pem")),
+            ],
+            || {
+                let sanitized = sanitize_db_url("postgres://host/db?sslmode=prefer").unwrap();
+                let config: tokio_postgres::Config = sanitized.parse().unwrap();
+                assert_eq!(
+                    config.get_ssl_mode(),
+                    tokio_postgres::config::SslMode::Prefer
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn sanitize_does_not_override_explicit_inline_sslrootcert_with_pgsslrootcert_env_var() {
+        // An inline `sslrootcert=` (even one that ends up dropped because
+        // `sslmode` isn't `require`) still represents an explicit choice —
+        // `PGSSLROOTCERT` must not be injected on top of it.
+        temp_env::with_var("PGSSLROOTCERT", Some("/etc/env-ca.pem"), || {
+            let sanitized =
+                sanitize_db_url("postgres://host/db?sslmode=prefer&sslrootcert=/etc/inline-ca.pem")
+                    .unwrap();
+            let config: tokio_postgres::Config = sanitized.parse().unwrap();
+            assert_eq!(
+                config.get_ssl_mode(),
+                tokio_postgres::config::SslMode::Prefer
+            );
+        });
     }
 
     #[test]
