@@ -190,7 +190,7 @@ impl Route {
     /// use autumn_web::prelude::*;
     ///
     /// # #[get("/harvest/runs")]
-    /// # async fn list_runs() -> &'static str { "" }
+    /// # async fn list_runs() -> Json<Vec<String>> { Json(vec![]) }
     /// pub struct HarvestPlugin {
     ///     expose_mcp: bool,
     /// }
@@ -207,7 +207,10 @@ impl Route {
     /// ```
     ///
     /// Like the attribute form, an explicit opt-in exposes any verb (not just
-    /// reads) and the usual eligibility rules still apply. The flag is inert
+    /// reads) and the usual eligibility rules still apply: the handler must
+    /// return `Json<T>`, declare an empty-body status (204/205), or use
+    /// [`mcp_stream()`](Self::mcp_stream) for an `Sse` handler — a schema-less
+    /// route opted in with plain `mcp()` derives no tool. The flag is inert
     /// unless the host enables the `mcp` feature and calls `mount_mcp`.
     #[must_use]
     pub const fn mcp(mut self) -> Self {

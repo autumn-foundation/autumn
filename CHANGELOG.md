@@ -22,9 +22,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   routes as tools and `mcp = "read"` exposes only list/get, with the usual
   verb-derived safety annotations (`readOnlyHint` on reads,
   `destructiveHint` on delete); `mcp` without `api = "/path"` is a compile
-  error. To support the generated `DELETE`, `204 No Content` routes are now
-  MCP-eligible under an explicit opt-in — a deliberate empty success
-  contract is no longer conflated with a schema-less HTML route.
+  error. Duplicate `mcp` keys are a compile error rather than silently
+  last-write-wins. To support the generated `DELETE`, routes declaring an
+  empty-body success status (`204 No Content`, `205 Reset Content`) are no
+  longer conflated with schema-less HTML routes: they are MCP-eligible under
+  an explicit opt-in, and an *untagged* read-only `204`/`205` route is now
+  also auto-included under a pre-existing `expose_all_as_mcp()` hatch —
+  hatch users can gain tools on upgrade. The result of a successful call to
+  such a tool is enforced to be empty text, so a route that mislabels its
+  status can't leak a response body to agents.
   `McpToolInfo` gains public read accessors (`name()`, `description()`,
   `input_schema()`, `annotations()`, `method()`, `path_template()`,
   `streams()`) so hosts can introspect derived tools. Routes registered by

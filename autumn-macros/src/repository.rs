@@ -189,6 +189,7 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
     let mut commit_hooks = false;
     let mut api_path: Option<String> = None;
     let mut mcp_expose: Option<McpExpose> = None;
+    let mut mcp_span: Option<proc_macro2::Span> = None;
     let mut policy_type: Option<Ident> = None;
     let mut scope_type: Option<Ident> = None;
     let mut cursor_key: Option<String> = None;
@@ -242,18 +243,37 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
             api_path = Some(value.value());
             Ok(())
         } else if meta.path.is_ident("mcp") {
+            if mcp_expose.is_some() {
+                return Err(meta.error(
+                    "duplicate `mcp` key: specify `mcp` or `mcp = \"read\"` exactly once \
+                     (they don't compose — the last one would silently win)",
+                ));
+            }
+            mcp_span = Some(meta.path.segments[0].ident.span());
             if meta.input.peek(syn::Token![=]) {
-                let value: LitStr = meta.value()?.parse()?;
-                match value.value().as_str() {
-                    "read" => mcp_expose = Some(McpExpose::Read),
+                let lit: syn::Lit = meta.value()?.parse()?;
+                match &lit {
+                    syn::Lit::Str(value) => match value.value().as_str() {
+                        "read" => mcp_expose = Some(McpExpose::Read),
+                        other => {
+                            return Err(syn::Error::new(
+                                value.span(),
+                                format!(
+                                    "unknown mcp mode `{other}`; expected bare `mcp` (expose \
+                                     all five CRUD routes as MCP tools) or `mcp = \"read\"` \
+                                     (list/get only)"
+                                ),
+                            ));
+                        }
+                    },
                     other => {
                         return Err(syn::Error::new(
-                            value.span(),
-                            format!(
-                                "unknown mcp mode `{other}`; expected bare `mcp` (expose all \
-                                 five CRUD routes as MCP tools) or `mcp = \"read\"` (list/get \
-                                 only)"
-                            ),
+                            // `mcp = false`/`true` is the natural guess coming from
+                            // `#[api_doc(mcp = false)]`; name the forms that exist here.
+                            other.span(),
+                            "mcp takes no boolean: use bare `mcp` (expose all five CRUD \
+                             routes as MCP tools), `mcp = \"read\"` (list/get only), or omit \
+                             the key to keep MCP exposure off (the default)",
                         ));
                     }
                 }
@@ -327,7 +347,7 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
     }
     if mcp_expose.is_some() && api_path.is_none() {
         return Err(syn::Error::new(
-            proc_macro2::Span::call_site(),
+            mcp_span.unwrap_or_else(proc_macro2::Span::call_site),
             "mcp requires api = \"/path\": MCP tools are derived from the generated CRUD routes",
         ));
     }
@@ -7788,10 +7808,20 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         let id_path = format!("{api_path}/{{id}}");
 
-        // MCP opt-in derived from the `mcp` key: reads (list/get) are flagged
-        // in both modes; the mutating routes only under bare `mcp`.
-        let mcp_read_ops = config.mcp_expose.is_some();
-        let mcp_write_ops = config.mcp_expose == Some(McpExpose::All);
+        // MCP opt-in classified by each generated route's verb (mirroring the
+        // runtime read-only rule), not hand-placed per site — a future
+        // generated route picks up the right classification from the same
+        // `method:` literal it declares.
+        let mcp_for = |method: &str| match config.mcp_expose {
+            None => false,
+            Some(McpExpose::Read) => matches!(method, "GET" | "HEAD"),
+            Some(McpExpose::All) => true,
+        };
+        let mcp_list_op = mcp_for("GET");
+        let mcp_get_op = mcp_for("GET");
+        let mcp_create_op = mcp_for("POST");
+        let mcp_update_op = mcp_for("PUT");
+        let mcp_delete_op = mcp_for("DELETE");
 
         let has_policy = config.policy_type.is_some();
         let policy_check_show = if has_policy {
@@ -8347,7 +8377,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 ),
                             }
                         ),
-                        mcp_tool: #mcp_read_ops,
+                        mcp_tool: #mcp_list_op,
                         ..::core::default::Default::default()
                     },
                     repository: ::core::option::Option::Some(::autumn_web::RepositoryApiMeta {
@@ -8400,7 +8430,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 kind: ::autumn_web::openapi::SchemaKind::Ref,
                             }
                         ),
-                        mcp_tool: #mcp_read_ops,
+                        mcp_tool: #mcp_get_op,
                         ..::core::default::Default::default()
                     },
                     repository: ::core::option::Option::Some(::autumn_web::RepositoryApiMeta {
@@ -8450,7 +8480,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 kind: ::autumn_web::openapi::SchemaKind::Ref,
                             }
                         ),
-                        mcp_tool: #mcp_write_ops,
+                        mcp_tool: #mcp_create_op,
                         ..::core::default::Default::default()
                     },
                     repository: ::core::option::Option::Some(::autumn_web::RepositoryApiMeta {
@@ -8502,7 +8532,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 kind: ::autumn_web::openapi::SchemaKind::Ref,
                             }
                         ),
-                        mcp_tool: #mcp_write_ops,
+                        mcp_tool: #mcp_update_op,
                         ..::core::default::Default::default()
                     },
                     repository: ::core::option::Option::Some(::autumn_web::RepositoryApiMeta {
@@ -8541,7 +8571,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         operation_id: ::core::stringify!(#delete_fn),
                         path_params: &["id"],
                         success_status: 204,
-                        mcp_tool: #mcp_write_ops,
+                        mcp_tool: #mcp_delete_op,
                         ..::core::default::Default::default()
                     },
                     repository: ::core::option::Option::Some(::autumn_web::RepositoryApiMeta {
@@ -10751,6 +10781,38 @@ mod tests {
         };
         assert!(
             err.to_string().contains("read"),
+            "error must name the accepted forms: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_repo_args_rejects_duplicate_mcp() {
+        // `mcp = "read", mcp` must not silently escalate a read-only opt-in
+        // to full write exposure via last-write-wins (nor silently narrow in
+        // the reverse order).
+        let tokens: proc_macro2::TokenStream =
+            r#"Post, api = "/api/posts", mcp = "read", mcp"#.parse().unwrap();
+        let Err(err) = parse_repo_args(tokens) else {
+            panic!("duplicate mcp keys must be rejected");
+        };
+        assert!(
+            err.to_string().contains("duplicate"),
+            "error must call out the duplicate key: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_repo_args_mcp_bool_gets_tailored_error() {
+        // The natural guess coming from `#[api_doc(mcp = false)]` — the error
+        // must name the forms that exist instead of syn's generic
+        // "expected string literal".
+        let tokens: proc_macro2::TokenStream =
+            r#"Post, api = "/api/posts", mcp = false"#.parse().unwrap();
+        let Err(err) = parse_repo_args(tokens) else {
+            panic!("mcp = false must be rejected");
+        };
+        assert!(
+            err.to_string().contains("mcp takes no boolean"),
             "error must name the accepted forms: {err}"
         );
     }

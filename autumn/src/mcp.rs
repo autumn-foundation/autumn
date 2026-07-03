@@ -146,6 +146,7 @@ impl McpRuntime {
 /// A single derived MCP tool plus the metadata needed to replay it as an
 /// in-process HTTP request.
 #[derive(Clone, Debug)]
+#[allow(clippy::struct_excessive_bools)] // independent dispatch flags mirroring ApiDoc metadata
 struct McpTool {
     name: String,
     description: Option<String>,
@@ -161,6 +162,12 @@ struct McpTool {
     /// True for a `#[api_doc(mcp, stream)]` tool whose handler returns an
     /// Autumn `Sse` stream, projected onto the Streamable-HTTP SSE channel.
     streams: bool,
+    /// True for a tool derived from an empty-body-contract route (declared
+    /// 204/205, no response schema). Dispatch enforces the contract by
+    /// returning empty text on success, so a route that mislabels its status
+    /// (e.g. an HTML handler tagged `status = 204`) can't leak its body into
+    /// the tool result.
+    empty_body: bool,
 }
 
 impl McpTool {
@@ -365,10 +372,11 @@ fn should_expose(doc: &ApiDoc, expose_all: bool) -> bool {
     // here from a legitimately body-less route — both leave `request_body`
     // unset. Such routes are a documented non-target for MCP exposure (see
     // `AppBuilder::mount_mcp`): opting one in yields a tool with no body input.
-    // Exception: 204 No Content is a deliberate empty success contract (e.g.
-    // the repository macro's generated DELETE), structurally distinct from an
-    // HTML route's schema-less 200-with-body. It stays eligible.
-    if doc.response.is_none() && doc.success_status != 204 {
+    // Exception: a status whose body is empty *by contract* (e.g. the
+    // repository macro's generated DELETE returning 204) is structurally
+    // distinct from an HTML route's schema-less 200-with-body. It stays
+    // eligible, and dispatch enforces the empty result (see `call_tool`).
+    if doc.response.is_none() && !has_empty_body_contract(doc.success_status) {
         return false;
     }
     if doc.mcp_tool {
@@ -383,6 +391,15 @@ fn should_expose(doc: &ApiDoc, expose_all: bool) -> bool {
 /// `GET` (and `HEAD`) are read-only; everything else mutates.
 fn is_read_only(method: &str) -> bool {
     matches!(method.to_ascii_uppercase().as_str(), "GET" | "HEAD")
+}
+
+/// A declared success status whose body is empty *by contract* (RFC 9110):
+/// `204 No Content` and `205 Reset Content`. For these, a missing response
+/// schema is the deliberate shape of the endpoint, not the signal of an
+/// HTML/Maud route. Shared by [`should_expose`] and the warn/skip gate in
+/// [`derive_tools`] so the exemption list lives in exactly one place.
+const fn has_empty_body_contract(status: u16) -> bool {
+    matches!(status, 204 | 205)
 }
 
 /// MCP safety annotations derived purely from the HTTP verb.
@@ -528,12 +545,12 @@ pub fn derive_tools(
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for doc in docs {
         // Surface the "opted in but ineligible" case as a build-time note.
-        // Streaming tools legitimately have no JSON response schema, and a
-        // 204 No Content route's empty body is its contract, so both are
-        // exempt from this "missing response" warning/skip.
+        // Streaming tools legitimately have no JSON response schema, and an
+        // empty-body status (204/205) makes the missing schema the route's
+        // contract, so both are exempt from this "missing response" warn/skip.
         if (doc.mcp_tool || (expose_all && is_read_only(doc.method)))
             && doc.response.is_none()
-            && doc.success_status != 204
+            && !has_empty_body_contract(doc.success_status)
             && !doc.mcp_stream
             && !doc.mcp_exclude
             && !doc.hidden
@@ -542,8 +559,10 @@ pub fn derive_tools(
                 operation_id = doc.operation_id,
                 method = doc.method,
                 path = doc.path,
-                "skipping MCP exposure: endpoint has no JSON response schema \
-                 (HTML/Maud routes are not eligible as MCP tools)"
+                "skipping MCP exposure: endpoint has no JSON response schema; \
+                 eligible tools return Json<T>, declare an empty-body status \
+                 (204/205), or opt in as streaming (`stream`/`Route::mcp_stream`) \
+                 — HTML/Maud routes are not eligible"
             );
             continue;
         }
@@ -576,6 +595,9 @@ pub fn derive_tools(
             has_body: doc.request_body.is_some(),
             has_query: doc.query_schema.is_some(),
             streams: doc.mcp_stream,
+            empty_body: doc.response.is_none()
+                && has_empty_body_contract(doc.success_status)
+                && !doc.mcp_stream,
         });
     }
     tools
@@ -585,6 +607,7 @@ pub fn derive_tools(
 /// [`derive_tools`] and consumed by the framework when assembling the MCP
 /// endpoint router.
 #[derive(Clone, Debug)]
+#[allow(clippy::struct_excessive_bools)] // independent dispatch flags mirroring ApiDoc metadata
 pub struct McpToolInfo {
     name: String,
     description: Option<String>,
@@ -596,6 +619,7 @@ pub struct McpToolInfo {
     has_body: bool,
     has_query: bool,
     streams: bool,
+    empty_body: bool,
 }
 
 impl McpToolInfo {
@@ -663,6 +687,7 @@ impl McpServer {
                 has_body: t.has_body,
                 has_query: t.has_query,
                 streams: t.streams,
+                empty_body: t.empty_body,
             })
             .collect();
         let by_name = tools
@@ -1328,7 +1353,16 @@ async fn serve_tools_call(
     };
 
     let value = if status.is_success() {
-        success(id, tool_ok(&text))
+        // An empty-body-contract tool (declared 204/205, no response schema)
+        // advertises "empty text on success". Enforce that here rather than
+        // trusting the declaration: a handler whose real response carries a
+        // body (e.g. an HTML route mislabeled `status = 204`) must not leak
+        // it into the tool result.
+        if tool.empty_body {
+            success(id, tool_ok(""))
+        } else {
+            success(id, tool_ok(&text))
+        }
     } else {
         success(
             id,
@@ -1948,6 +1982,31 @@ mod tests {
     }
 
     #[test]
+    fn reset_content_205_with_opt_in_is_eligible() {
+        // 205 Reset Content is the other empty-body-by-contract status; the
+        // exemption is a shared predicate, not a hard-coded 204 literal.
+        let mut d = doc("POST", "/api/forms/clear", "clear_form");
+        d.response = None;
+        d.success_status = 205;
+        d.mcp_tool = true;
+        assert!(should_expose(&d, false));
+        let tools = derive_tools(&[d], false, None);
+        assert_eq!(tools.len(), 1, "opted-in 205 route must derive a tool");
+    }
+
+    #[test]
+    fn opted_in_202_is_skipped_not_exposed() {
+        // 202 Accepted does not guarantee an empty body, so a schema-less 202
+        // route stays behind the JSON-out gate even when opted in.
+        let mut d = doc("POST", "/api/enqueue", "enqueue");
+        d.response = None;
+        d.success_status = 202;
+        d.mcp_tool = true;
+        assert!(!should_expose(&d, false));
+        assert!(derive_tools(&[d], false, None).is_empty());
+    }
+
+    #[test]
     fn no_content_without_opt_in_stays_hidden() {
         let mut d = doc("DELETE", "/api/widgets/{id}", "widget_api_delete");
         d.response = None;
@@ -2139,6 +2198,7 @@ mod tests {
             has_body,
             has_query,
             streams: false,
+            empty_body: false,
         }
     }
 

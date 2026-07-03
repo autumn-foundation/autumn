@@ -411,16 +411,22 @@ If you tag an HTML route with `#[api_doc(mcp)]`, it is skipped with a
 build-time log note rather than a runtime surprise:
 
 ```text
-WARN skipping MCP exposure: endpoint has no JSON response schema
-     (HTML/Maud routes are not eligible as MCP tools)
+WARN skipping MCP exposure: endpoint has no JSON response schema;
+     eligible tools return Json<T>, declare an empty-body status (204/205),
+     or opt in as streaming (`stream`/`Route::mcp_stream`)
+     — HTML/Maud routes are not eligible
      operation_id="dashboard" method="GET" path="/dashboard"
 ```
 
-**Exception: `204 No Content`.** A route whose success status is `204` has no
-response schema *by contract* — a deliberate empty success (like the
-repository macro's generated `DELETE`), structurally distinct from an HTML
-route's schema-less `200`. Such routes stay eligible; the tool result of a
-successful call is empty text.
+**Exception: empty-body statuses (`204`, `205`).** A route whose success
+status is `204 No Content` or `205 Reset Content` has no response schema *by
+contract* — a deliberate empty success (like the repository macro's generated
+`DELETE`), structurally distinct from an HTML route's schema-less `200`. Such
+routes stay eligible under the same rules as any schema'd route: an explicit
+opt-in exposes any verb, and the `expose_all_as_mcp()` hatch auto-includes
+untagged read-only ones. The tool result of a successful call is empty text —
+**enforced** at dispatch, so a route that mislabels its status (say, an HTML
+handler tagged `status = 204`) cannot leak its response body to agents.
 
 ---
 
@@ -514,6 +520,21 @@ exempting an `Sse` route from the JSON-out gate. The flags are plain
 `ApiDoc` metadata, so a plugin crate can set them while compiling against
 base `autumn-web` — they take effect only when the host enables the `mcp`
 feature and calls `mount_mcp`.
+
+> **Mixed route sets:** don't map `mcp()` uniformly over a set that contains
+> `Sse` handlers — a streaming route has no JSON response schema, so plain
+> `mcp()` leaves it ineligible and it is skipped with the build-time warning
+> above. Apply `mcp_stream()` to the streaming routes instead:
+>
+> ```rust
+> rs = rs
+>     .into_iter()
+>     .map(|r| {
+>         // `Route.name` is the handler fn name; pick out the SSE routes.
+>         if r.name == "watch_run_events" { r.mcp_stream() } else { r.mcp() }
+>     })
+>     .collect();
+> ```
 
 > **Limitation:** raw routers mounted via `nest()`/`merge()` are opaque to
 > the route registry — Autumn cannot derive tools from them. Register typed
