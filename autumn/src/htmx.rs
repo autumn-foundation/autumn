@@ -696,6 +696,20 @@ mod tests {
         assert!(!js.contains("window.confirm"), "{js}");
     }
 
+    #[test]
+    fn widgets_js_polyfills_light_dismiss_backdrop_click() {
+        // PR review (chatgpt-codex-connector): closedby="any" (see
+        // ModalConfig::light_dismiss) has limited browser support, so
+        // backdrop clicks must be polyfilled for browsers that don't honor
+        // it natively yet — mirroring the command/commandfor fallback above.
+        let js = std::str::from_utf8(AUTUMN_WIDGETS_JS)
+            .expect("autumn-widgets.js should be valid UTF-8");
+        assert!(
+            js.contains(r#"dialog[closedby="any"][open]"#),
+            "must polyfill backdrop-click dismissal for closedby=\"any\" dialogs: {js}"
+        );
+    }
+
     #[tokio::test]
     async fn hx_request_extractor_parses_headers() -> Result<(), axum::http::Error> {
         let req = Request::builder()

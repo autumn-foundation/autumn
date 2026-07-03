@@ -214,6 +214,22 @@
     });
   }
 
+  // ── modal light-dismiss (closedby="any") backdrop-click polyfill ──────────
+  // `closedby="any"` (ModalConfig::light_dismiss) is a newer <dialog>
+  // feature with limited browser support — where it's unsupported, the
+  // native backdrop click silently does nothing. Always wired (not
+  // feature-detected): dialog.close() on an already-closed dialog is a
+  // spec'd no-op, so this never double-fires where closedby IS natively
+  // supported. e.target === the dialog itself only happens for a genuine
+  // backdrop click here: .autumn-modal has zero padding and its one child,
+  // .autumn-modal__content, fills the whole box, so any click landing
+  // inside the visible dialog always targets a descendant, never the
+  // <dialog> element directly.
+  document.addEventListener('click', function (e) {
+    var t = e.target;
+    if (t.matches && t.matches('dialog[closedby="any"][open]')) t.close();
+  });
+
   function initAll() {
     document.querySelectorAll('[data-ac-value-id]').forEach(initAutocomplete);
     document.querySelectorAll('[data-autumn-nav]').forEach(initNav);

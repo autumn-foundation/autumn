@@ -2,6 +2,20 @@
 // Served from /{prefix}/static/admin.js so it works under CSP `script-src 'self'`.
 
 (function () {
+  // form.requestSubmit() shipped later than <dialog> support in some
+  // browsers (e.g. Safari 15.4-15.6 has <dialog> but not requestSubmit,
+  // which arrived in Safari 16) and may be absent in older headless test
+  // runners, where calling it directly throws a TypeError. Fall back to
+  // the older form.submit() (which the browser accepts everywhere <dialog>
+  // does) rather than letting the resubmit fail silently.
+  function submitForm(form) {
+    if (typeof form.requestSubmit === "function") {
+      form.requestSubmit();
+    } else {
+      form.submit();
+    }
+  }
+
   // Select-all checkbox toggles every .row-check in the current table.
   document.addEventListener("click", function (e) {
     var t = e.target;
@@ -59,7 +73,7 @@
         // true, then return"). Scheduling it after the current dispatch
         // finishes lets the resubmit actually happen.
         setTimeout(function () {
-          form.requestSubmit();
+          submitForm(form);
         }, 0);
       }
       return;
@@ -80,7 +94,7 @@
     var form = document.querySelector('form[action$="/actions"]');
     if (!form) return;
     form.dataset.bulkConfirmed = "1";
-    form.requestSubmit();
+    submitForm(form);
   });
 
   // CSV import form: multipart/form-data bypasses form-field CSRF scanning, so

@@ -2208,7 +2208,12 @@ impl ModalConfig {
     }
 
     /// When `true`, emits `closedby="any"` on the `<dialog>` so the backdrop
-    /// and Escape dismiss it (default `false`).
+    /// and Escape dismiss it (default `false`). Escape-to-close is universal
+    /// `<dialog>` behavior; `closedby="any"` itself has limited browser
+    /// support (unsupported in Firefox and Safari as of this writing), so
+    /// `autumn-widgets.js` ships a backdrop-click polyfill scoped to
+    /// `dialog[closedby="any"]` for browsers that don't honor the attribute
+    /// natively yet.
     #[must_use]
     pub const fn light_dismiss(mut self, light_dismiss: bool) -> Self {
         self.light_dismiss = light_dismiss;
@@ -2480,7 +2485,8 @@ impl<'a> ConfirmActionConfig<'a> {
 
     /// When `true`, the dialog's backdrop and Escape dismiss it (default
     /// `false` — a destructive confirm isn't accidentally dismissed by a
-    /// stray click).
+    /// stray click). See [`ModalConfig::light_dismiss`] for browser support
+    /// notes on the underlying `closedby="any"` attribute.
     #[must_use]
     pub const fn light_dismiss(mut self, light_dismiss: bool) -> Self {
         self.light_dismiss = light_dismiss;

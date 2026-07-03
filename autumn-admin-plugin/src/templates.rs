@@ -3870,6 +3870,42 @@ mod tests {
     }
 
     #[test]
+    fn admin_js_requestsubmit_has_form_submit_fallback() {
+        // PR review (gemini-code-assist): form.requestSubmit() shipped later
+        // than <dialog> support in some browsers (e.g. Safari 15.4-15.6 has
+        // <dialog> but not requestSubmit, which arrived in Safari 16) and
+        // may be absent in older headless test runners — calling it
+        // unguarded throws a TypeError. Both call sites must go through a
+        // feature-detected fallback to form.submit() instead of calling
+        // requestSubmit directly.
+        let js = include_str!("admin.js");
+        assert!(
+            js.contains(r#"typeof form.requestSubmit === "function""#),
+            "must feature-detect requestSubmit before calling it: {js}"
+        );
+        assert!(
+            js.contains("form.submit();"),
+            "must fall back to form.submit() when requestSubmit is unavailable: {js}"
+        );
+        // The only *call statement* invoking requestSubmit() should be
+        // inside the feature-detected submitForm() helper itself (matched
+        // with a trailing `;` so an explanatory comment mentioning the same
+        // method name doesn't also count) — every other resubmit call site
+        // routes through submitForm(form) instead.
+        assert_eq!(
+            js.matches("form.requestSubmit();").count(),
+            1,
+            "form.requestSubmit() should only be called from inside the \
+             feature-detected submitForm() helper, not unguarded elsewhere: {js}"
+        );
+        assert_eq!(
+            js.matches("submitForm(form);").count(),
+            2,
+            "both bulk-action resubmit call sites must route through submitForm(): {js}"
+        );
+    }
+
+    #[test]
     fn pagination_range_start_underflow_protection() {
         // The start calculation could previously panic in debug mode if current was 0.
         let result = crate::traits::ListResult {
