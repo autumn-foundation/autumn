@@ -40,6 +40,7 @@ pub fn block_on<F: std::future::Future>(fut: F) -> F::Output {
 /// An error from a `run_*` command's async body, distinguishing connection
 /// failures (exit code 2, mirroring `psql`'s own convention) from every
 /// other failure (exit code 1).
+#[derive(Debug)]
 pub enum CommandError {
     Connect(String),
     Other(String),
@@ -170,52 +171,168 @@ fn tls_connector() -> MakeRustlsConnect {
 const UNSUPPORTED_SSL_PARAMS: &[&str] =
     &["sslrootcert", "sslcert", "sslkey", "sslpassword", "sslcrl"];
 
-/// Adapt `db_url` for `tokio_postgres`, which — unlike `libpq` — only
-/// recognizes `sslmode=disable/prefer/require` (no `verify-ca`/
-/// `verify-full`) and hard-errors on any unrecognized query parameter. Maps
-/// the stricter modes to `require` (the closest `tokio_postgres` mode; see
-/// [`tls_connector`] for why chain verification isn't attempted here
-/// either way) and drops [`UNSUPPORTED_SSL_PARAMS`], so URLs written for
-/// `psql`/other libpq clients still parse here instead of failing before
-/// any connection attempt.
+/// Drop [`UNSUPPORTED_SSL_PARAMS`] from `pairs`, and reject `sslmode=
+/// verify-ca`/`verify-full` outright rather than silently downgrading them.
 ///
-/// URLs that aren't `scheme://`-shaped (e.g. libpq's space-separated
-/// `key=value` form) are passed through unchanged — `tokio_postgres`'s own
-/// parser already handles that form directly.
-fn sanitize_url_for_tokio_postgres(db_url: &str) -> String {
-    let Ok(mut url) = url::Url::parse(db_url) else {
-        return db_url.to_owned();
-    };
-
-    let pairs: Vec<(String, String)> = url
-        .query_pairs()
-        .filter(|(key, _)| !UNSUPPORTED_SSL_PARAMS.contains(&key.as_ref()))
-        .map(|(key, value)| {
-            if key == "sslmode" && matches!(value.as_ref(), "verify-ca" | "verify-full") {
-                (key.into_owned(), "require".to_owned())
-            } else {
-                (key.into_owned(), value.into_owned())
-            }
-        })
-        .collect();
-
-    if pairs.is_empty() {
-        url.set_query(None);
-    } else {
-        let mut query_pairs = url.query_pairs_mut();
-        query_pairs.clear();
-        for (key, value) in &pairs {
-            query_pairs.append_pair(key, value);
+/// `tokio_postgres` only recognizes `sslmode=disable/prefer/require` — no
+/// `verify-ca`/`verify-full` — and [`tls_connector`] doesn't validate
+/// certificate chains at all (see [`NoServerCertVerification`]). Silently
+/// remapping a `verify-ca`/`verify-full` request down to `require` would
+/// make the CLI accept *any* certificate when an operator explicitly asked
+/// for identity verification — a worse security posture than the request,
+/// delivered silently. Failing loudly instead means an operator relying on
+/// verification finds out immediately rather than being quietly exposed.
+fn filter_ssl_params(
+    pairs: impl Iterator<Item = (String, String)>,
+) -> Result<Vec<(String, String)>, CommandError> {
+    let mut out = Vec::new();
+    for (key, value) in pairs {
+        if UNSUPPORTED_SSL_PARAMS.contains(&key.as_str()) {
+            continue;
         }
-        drop(query_pairs);
+        if key == "sslmode" && matches!(value.as_str(), "verify-ca" | "verify-full") {
+            return Err(CommandError::Other(format!(
+                "sslmode={value} is not supported: certificate verification isn't implemented \
+                 for this native connection path. Use sslmode=require to encrypt without \
+                 verifying the server's certificate, or sslmode=disable to connect in plaintext."
+            )));
+        }
+        out.push((key, value));
     }
-    url.into()
+    Ok(out)
+}
+
+/// Tokenize a `libpq` keyword/value connection string (e.g.
+/// `host=localhost dbname=mydb sslmode=require`) using the same grammar
+/// `tokio_postgres`'s own `Parser` does: whitespace-separated `key=value`
+/// pairs, where a value is either a run of non-whitespace characters or a
+/// `'...'`-quoted string, both supporting `\`-escapes. Returns `None` if
+/// `s` doesn't parse as this grammar at all — callers fall back to passing
+/// `s` through unchanged so `tokio_postgres` can produce its own error.
+fn parse_keyword_value_pairs(s: &str) -> Option<Vec<(String, String)>> {
+    let mut pairs = Vec::new();
+    let mut chars = s.char_indices().peekable();
+
+    loop {
+        while matches!(chars.peek(), Some((_, c)) if c.is_whitespace()) {
+            chars.next();
+        }
+        let Some(&(key_start, _)) = chars.peek() else {
+            break;
+        };
+        while matches!(chars.peek(), Some((_, c)) if !c.is_whitespace() && *c != '=') {
+            chars.next();
+        }
+        let key_end = chars.peek().map_or(s.len(), |&(i, _)| i);
+        if key_end == key_start {
+            return None;
+        }
+        let key = &s[key_start..key_end];
+
+        while matches!(chars.peek(), Some((_, c)) if c.is_whitespace()) {
+            chars.next();
+        }
+        if chars.next().map(|(_, c)| c) != Some('=') {
+            return None;
+        }
+        while matches!(chars.peek(), Some((_, c)) if c.is_whitespace()) {
+            chars.next();
+        }
+
+        let mut value = String::new();
+        if matches!(chars.peek(), Some((_, '\''))) {
+            chars.next();
+            let mut terminated = false;
+            while let Some((_, c)) = chars.next() {
+                if c == '\'' {
+                    terminated = true;
+                    break;
+                }
+                if c == '\\' {
+                    if let Some((_, c2)) = chars.next() {
+                        value.push(c2);
+                    }
+                } else {
+                    value.push(c);
+                }
+            }
+            if !terminated {
+                return None;
+            }
+        } else {
+            while matches!(chars.peek(), Some((_, c)) if !c.is_whitespace()) {
+                let (_, c) = chars.next().unwrap();
+                if c == '\\' {
+                    if let Some((_, c2)) = chars.next() {
+                        value.push(c2);
+                    }
+                } else {
+                    value.push(c);
+                }
+            }
+            if value.is_empty() {
+                return None;
+            }
+        }
+
+        pairs.push((key.to_owned(), value));
+    }
+
+    if pairs.is_empty() { None } else { Some(pairs) }
+}
+
+/// Quote `value` in `libpq` keyword/value form if needed (empty, contains
+/// whitespace, or contains a quote/backslash), escaping `\` and `'`.
+fn keyword_value_token(key: &str, value: &str) -> String {
+    if value.is_empty() || value.contains(|c: char| c.is_whitespace() || c == '\'' || c == '\\') {
+        let escaped = value.replace('\\', "\\\\").replace('\'', "\\'");
+        format!("{key}='{escaped}'")
+    } else {
+        format!("{key}={value}")
+    }
+}
+
+/// Adapt `db_url` for `tokio_postgres` before connecting — see
+/// [`filter_ssl_params`] for what's dropped/rejected and why. Handles both
+/// connection-string shapes `tokio_postgres` itself accepts: URL form
+/// (`postgres://...?sslmode=...`) and `libpq`'s keyword/value form
+/// (`host=... sslmode=...`). A string matching neither shape is passed
+/// through unchanged so `tokio_postgres` can produce its own error.
+fn sanitize_db_url(db_url: &str) -> Result<String, CommandError> {
+    if let Ok(mut url) = url::Url::parse(db_url) {
+        let pairs = filter_ssl_params(
+            url.query_pairs()
+                .map(|(k, v)| (k.into_owned(), v.into_owned())),
+        )?;
+        if pairs.is_empty() {
+            url.set_query(None);
+        } else {
+            let mut query_pairs = url.query_pairs_mut();
+            query_pairs.clear();
+            for (key, value) in &pairs {
+                query_pairs.append_pair(key, value);
+            }
+            drop(query_pairs);
+        }
+        return Ok(url.into());
+    }
+
+    if let Some(pairs) = parse_keyword_value_pairs(db_url) {
+        let pairs = filter_ssl_params(pairs.into_iter())?;
+        return Ok(pairs
+            .iter()
+            .map(|(key, value)| keyword_value_token(key, value))
+            .collect::<Vec<_>>()
+            .join(" "));
+    }
+
+    Ok(db_url.to_owned())
 }
 
 /// Connect to `db_url`, returning a [`CommandError::Connect`] on failure so
 /// callers can propagate it with `?` rather than exiting immediately.
 pub async fn connect(label: &str, db_url: &str) -> Result<Client, CommandError> {
-    let db_url = sanitize_url_for_tokio_postgres(db_url);
+    let db_url = sanitize_db_url(db_url)?;
     let (client, connection) = tokio_postgres::connect(&db_url, tls_connector())
         .await
         .map_err(|e| CommandError::Connect(format!("failed to connect to the database: {e}")))?;
@@ -405,10 +522,11 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_drops_unsupported_ssl_params_and_remaps_verify_full() {
-        let sanitized = sanitize_url_for_tokio_postgres(
-            "postgres://user:pw@host/db?sslmode=verify-full&sslrootcert=/etc/ca.pem&connect_timeout=5",
-        );
+    fn sanitize_drops_unsupported_ssl_params_from_url() {
+        let sanitized = sanitize_db_url(
+            "postgres://user:pw@host/db?sslmode=require&sslrootcert=/etc/ca.pem&connect_timeout=5",
+        )
+        .unwrap();
         let parsed = url::Url::parse(&sanitized).unwrap();
         let pairs: std::collections::HashMap<_, _> = parsed.query_pairs().into_owned().collect();
         assert_eq!(pairs.get("sslmode").map(String::as_str), Some("require"));
@@ -417,35 +535,73 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_remaps_verify_ca_to_require() {
-        let sanitized = sanitize_url_for_tokio_postgres("postgres://host/db?sslmode=verify-ca");
-        assert!(sanitized.contains("sslmode=require"));
+    fn sanitize_rejects_verify_full_in_url_form_instead_of_downgrading() {
+        // A silent downgrade to `require` would make the CLI accept any
+        // certificate when an operator explicitly asked for verification —
+        // this must fail loudly instead.
+        let err = sanitize_db_url("postgres://host/db?sslmode=verify-full").unwrap_err();
+        assert!(err.message().contains("verify-full"));
+    }
+
+    #[test]
+    fn sanitize_rejects_verify_ca_in_url_form_instead_of_downgrading() {
+        let err = sanitize_db_url("postgres://host/db?sslmode=verify-ca").unwrap_err();
+        assert!(err.message().contains("verify-ca"));
     }
 
     #[test]
     fn sanitize_leaves_ordinary_url_unchanged_in_content() {
-        let sanitized =
-            sanitize_url_for_tokio_postgres("postgres://user:pw@host:5432/db?sslmode=require");
+        let sanitized = sanitize_db_url("postgres://user:pw@host:5432/db?sslmode=require").unwrap();
         let parsed = url::Url::parse(&sanitized).unwrap();
         let pairs: std::collections::HashMap<_, _> = parsed.query_pairs().into_owned().collect();
         assert_eq!(pairs.get("sslmode").map(String::as_str), Some("require"));
     }
 
     #[test]
-    fn sanitize_passes_through_non_url_shaped_strings() {
-        // libpq's space-separated `key=value` form isn't URL-shaped;
-        // tokio_postgres's own parser handles it directly.
-        let input = "host=localhost dbname=mydb sslmode=require";
-        assert_eq!(sanitize_url_for_tokio_postgres(input), input);
+    fn sanitize_drops_all_ssl_cert_params_from_url() {
+        let sanitized = sanitize_db_url(
+            "postgres://host/db?sslcert=/c.pem&sslkey=/k.pem&sslpassword=x&sslcrl=/crl.pem",
+        )
+        .unwrap();
+        let parsed = url::Url::parse(&sanitized).unwrap();
+        assert_eq!(parsed.query_pairs().count(), 0);
     }
 
     #[test]
-    fn sanitize_drops_all_ssl_cert_params() {
-        let sanitized = sanitize_url_for_tokio_postgres(
-            "postgres://host/db?sslcert=/c.pem&sslkey=/k.pem&sslpassword=x&sslcrl=/crl.pem",
+    fn sanitize_drops_unsupported_ssl_params_from_keyword_form() {
+        let sanitized =
+            sanitize_db_url("host=localhost dbname=mydb sslmode=require sslrootcert=/etc/ca.pem")
+                .unwrap();
+        // Verify against tokio_postgres's *actual* parser, not just our own
+        // tokenizer's self-consistency.
+        let config: tokio_postgres::Config = sanitized.parse().unwrap();
+        assert_eq!(config.get_dbname(), Some("mydb"));
+        assert_eq!(
+            config.get_ssl_mode(),
+            tokio_postgres::config::SslMode::Require
         );
-        let parsed = url::Url::parse(&sanitized).unwrap();
-        assert_eq!(parsed.query_pairs().count(), 0);
+    }
+
+    #[test]
+    fn sanitize_rejects_verify_full_in_keyword_form_instead_of_downgrading() {
+        let err = sanitize_db_url("host=localhost dbname=mydb sslmode=verify-full").unwrap_err();
+        assert!(err.message().contains("verify-full"));
+    }
+
+    #[test]
+    fn sanitize_handles_quoted_values_in_keyword_form() {
+        let sanitized = sanitize_db_url(
+            "host=localhost dbname='my db' sslmode=require sslrootcert=/etc/ca.pem",
+        )
+        .unwrap();
+        let config: tokio_postgres::Config = sanitized.parse().unwrap();
+        assert_eq!(config.get_dbname(), Some("my db"));
+    }
+
+    #[test]
+    fn sanitize_passes_through_strings_matching_neither_shape() {
+        let input = "not a valid connection string at all";
+        assert_eq!(sanitize_db_url(input).unwrap(), input);
     }
 
     #[test]
