@@ -378,13 +378,30 @@ fn pgpass_lookup(
     })
 }
 
-/// Path to the `.pgpass` file: `PGPASSFILE` if set, else `~/.pgpass`
-/// (matching `libpq`'s own precedence).
+/// Path to the `.pgpass` file: `PGPASSFILE` if set, else the platform
+/// default `libpq` itself uses — `~/.pgpass` on Unix, or
+/// `%APPDATA%\postgresql\pgpass.conf` on Windows (`PostgreSQL` docs, "The
+/// Password File"; `BaseDirs::config_dir()` resolves to the roaming
+/// `%APPDATA%` known folder on Windows).
+#[cfg(not(windows))]
 fn pgpass_file_path() -> Option<PathBuf> {
     if let Ok(path) = std::env::var("PGPASSFILE") {
         return Some(PathBuf::from(path));
     }
     Some(directories::BaseDirs::new()?.home_dir().join(".pgpass"))
+}
+
+#[cfg(windows)]
+fn pgpass_file_path() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("PGPASSFILE") {
+        return Some(PathBuf::from(path));
+    }
+    Some(
+        directories::BaseDirs::new()?
+            .config_dir()
+            .join("postgresql")
+            .join("pgpass.conf"),
+    )
 }
 
 /// `libpq` refuses to use a `.pgpass` file that's readable by anyone but its
@@ -398,7 +415,7 @@ fn pgpass_permissions_ok(path: &Path) -> bool {
 }
 
 #[cfg(not(unix))]
-fn pgpass_permissions_ok(_path: &Path) -> bool {
+const fn pgpass_permissions_ok(_path: &Path) -> bool {
     true
 }
 
@@ -454,9 +471,13 @@ fn parse_service_file(contents: &str, service_name: &str) -> Option<Vec<(String,
     found.then_some(pairs)
 }
 
-/// Path to the service file: `PGSERVICEFILE` if set, else `~/.pg_service.conf`
-/// (matching `libpq`'s own precedence; the system-wide service file `libpq`
-/// also consults isn't supported here).
+/// Path to the service file: `PGSERVICEFILE` if set, else the platform
+/// default `libpq` itself uses — `~/.pg_service.conf` on Unix, or
+/// `%APPDATA%\postgresql\pg_service.conf` on Windows (`PostgreSQL` docs, "The
+/// Connection Service File"; see [`pgpass_file_path`] for why
+/// `BaseDirs::config_dir()` is the right call on Windows). The system-wide
+/// service file `libpq` also consults isn't supported here.
+#[cfg(not(windows))]
 fn service_file_path() -> Option<PathBuf> {
     if let Ok(path) = std::env::var("PGSERVICEFILE") {
         return Some(PathBuf::from(path));
@@ -465,6 +486,19 @@ fn service_file_path() -> Option<PathBuf> {
         directories::BaseDirs::new()?
             .home_dir()
             .join(".pg_service.conf"),
+    )
+}
+
+#[cfg(windows)]
+fn service_file_path() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("PGSERVICEFILE") {
+        return Some(PathBuf::from(path));
+    }
+    Some(
+        directories::BaseDirs::new()?
+            .config_dir()
+            .join("postgresql")
+            .join("pg_service.conf"),
     )
 }
 
@@ -571,7 +605,7 @@ fn sanitize_url_form(mut url: url::Url) -> Result<String, CommandError> {
     let mut needs_keyword_form = false;
 
     if let Some(service_name) = take_pair(&mut pairs, "service") {
-        for (key, value) in load_service(&service_name)? {
+        for (key, value) in filter_ssl_params(load_service(&service_name)?.into_iter())? {
             if !is_explicit(&pairs, &key) {
                 needs_keyword_form |= key == "host" || key == "port";
                 pairs.push((key, value));
@@ -651,7 +685,7 @@ fn sanitize_keyword_form(pairs: Vec<(String, String)>) -> Result<String, Command
     let mut pairs = filter_ssl_params(pairs.into_iter())?;
 
     if let Some(service_name) = take_pair(&mut pairs, "service") {
-        for (key, value) in load_service(&service_name)? {
+        for (key, value) in filter_ssl_params(load_service(&service_name)?.into_iter())? {
             if find_pair(&pairs, &key).is_none() {
                 pairs.push((key, value));
             }
@@ -1163,6 +1197,74 @@ mod tests {
                 let sanitized = sanitize_db_url("host=localhost service=prod").unwrap();
                 let config: tokio_postgres::Config = sanitized.parse().unwrap();
                 assert_eq!(config.get_dbname(), Some("svcdb"));
+            },
+        );
+    }
+
+    #[test]
+    fn sanitize_drops_unsupported_ssl_params_from_a_service_group_in_url_form() {
+        // A service group can carry the exact same libpq-only TLS params an
+        // inline connection string can — they must go through the same
+        // filter/rejection, not reach `tokio_postgres` unfiltered.
+        let dir = tempfile::tempdir().unwrap();
+        let service_path = dir.path().join("pg_service.conf");
+        std::fs::write(
+            &service_path,
+            "[prod]\ndbname=svcdb\nsslmode=require\nsslrootcert=/ca.pem\n",
+        )
+        .unwrap();
+        temp_env::with_vars(
+            [
+                ("PGSERVICEFILE", Some(service_path.to_str().unwrap())),
+                ("PGPASSWORD", None::<&str>),
+                ("PGPASSFILE", Some("/nonexistent-pgpass-for-test")),
+            ],
+            || {
+                let sanitized = sanitize_db_url("postgres://host/db?service=prod").unwrap();
+                // Must parse against tokio_postgres's *real* parser — it
+                // rejects `sslrootcert` outright, so this proves the
+                // service group's params were actually filtered rather
+                // than just checking our own string content.
+                let config: tokio_postgres::Config = sanitized.parse().unwrap();
+                assert_eq!(config.get_dbname(), Some("db"));
+                assert_eq!(
+                    config.get_ssl_mode(),
+                    tokio_postgres::config::SslMode::Require
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn sanitize_drops_unsupported_ssl_params_from_a_service_group_in_keyword_form() {
+        let dir = tempfile::tempdir().unwrap();
+        let service_path = dir.path().join("pg_service.conf");
+        std::fs::write(&service_path, "[prod]\nsslrootcert=/ca.pem\n").unwrap();
+        temp_env::with_vars(
+            [
+                ("PGSERVICEFILE", Some(service_path.to_str().unwrap())),
+                ("PGPASSWORD", None::<&str>),
+                ("PGPASSFILE", Some("/nonexistent-pgpass-for-test")),
+            ],
+            || {
+                let sanitized = sanitize_db_url("host=localhost dbname=db service=prod").unwrap();
+                let config: tokio_postgres::Config = sanitized.parse().unwrap();
+                assert_eq!(config.get_dbname(), Some("db"));
+            },
+        );
+    }
+
+    #[test]
+    fn sanitize_rejects_verify_full_from_a_service_group_instead_of_a_raw_parse_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let service_path = dir.path().join("pg_service.conf");
+        std::fs::write(&service_path, "[prod]\nsslmode=verify-full\n").unwrap();
+        temp_env::with_var(
+            "PGSERVICEFILE",
+            Some(service_path.to_str().unwrap()),
+            || {
+                let err = sanitize_db_url("postgres://host/db?service=prod").unwrap_err();
+                assert!(err.message().contains("verify-full"));
             },
         );
     }
