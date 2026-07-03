@@ -53,6 +53,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a minimal stand-in for the referenced table (skipping self-referential FKs,
   which target the table already being created) so it stays runnable
   standalone.
+- **cli:** `enum{a,b,c}` field type for `autumn generate model`/`scaffold`/
+  `migration` (#1030). `status:enum{draft,published,archived}` scaffolds a
+  closed-set column end to end: a generated `PascalCase` Rust enum (`Status`)
+  wired for Diesel `TEXT` storage (manual `ToSql`/`FromSql` over
+  `AsExpression`/`FromSqlRow`) and `serde`; a `CHECK (status IN (...))`
+  constraint in the migration so an out-of-set `INSERT` fails at the database
+  layer (restored on `RemoveXFromY` rollback, matching the `references`
+  field's FK-restoration precedent); a `<select>` form widget matching the
+  admin generator's `--select` output (auto-derived for `generate admin` too,
+  unless an explicit `--select` overrides it); and request-boundary
+  validation that rejects an out-of-set form value with a 400 naming the
+  field rather than a 500 or silent coercion. `--default field=variant` sets
+  both the SQL `DEFAULT` and the enum's `#[default]` variant; an unknown
+  variant errors at generate time, as does a non-identifier or keyword
+  variant (`enum{2fa}`). Nullable (`Option<enum{...}>`) is supported. The
+  generated scaffold smoke test asserts an out-of-set value is rejected at
+  both the database layer (raw `INSERT` fails, zero rows written) and the
+  request boundary (400). Not supported by `generate job` (no model file to
+  declare the type in) or `--query` (no import path for it yet). Quote the
+  token in bash/zsh — an unquoted `enum{a,b}` is brace-expanded by the shell
+  before `autumn` ever sees it; the parser detects this and suggests
+  quoting.
 - **auth:** scoped service tokens whose scopes flow into policy checks (#1158).
   Mint named, optionally-expiring API tokens carrying a set of flat scopes
   (e.g. `posts:read`) via `IssueTokenSpec` + `issue_scoped_api_token`; tokens

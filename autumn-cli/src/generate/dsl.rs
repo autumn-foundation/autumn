@@ -16,18 +16,40 @@ pub struct Field {
     pub kind: FieldKind,
     /// True when the field was given as `Option<…>`.
     pub nullable: bool,
+    /// The declared variant tokens (`snake_case`) for [`FieldKind::Enum`]
+    /// fields, in declaration order. Empty for every other kind.
+    pub variants: Vec<String>,
 }
 
 impl Field {
     /// The Rust type for the `#[model]` struct.
+    ///
+    /// For [`FieldKind::Enum`], this is the generated enum's `PascalCase`
+    /// name (see [`Field::enum_type_name`]) rather than [`FieldKind::rust_type`]'s
+    /// `String` storage-representation fallback.
     #[must_use]
     pub fn rust_type(&self) -> String {
-        let inner = self.kind.rust_type();
+        let inner = self
+            .enum_type_name()
+            .unwrap_or_else(|| self.kind.rust_type().to_owned());
         if self.nullable {
             format!("Option<{inner}>")
         } else {
-            inner.to_string()
+            inner
         }
+    }
+
+    /// For [`FieldKind::Enum`] fields, the `PascalCase` name of the generated
+    /// Rust enum (`status` -> `Status`). `None` for every other field kind.
+    #[must_use]
+    pub fn enum_type_name(&self) -> Option<String> {
+        self.kind.is_enum().then(|| naming::pascal(&self.name))
+    }
+
+    /// Returns `true` for a closed-set `enum{…}` field.
+    #[must_use]
+    pub const fn is_enum(&self) -> bool {
+        self.kind.is_enum()
     }
 
     /// The Diesel `schema.rs` type token (always a single identifier).
@@ -111,6 +133,14 @@ pub enum FieldKind {
     /// referenced table is derived from the base name via [`naming::pluralize`]
     /// (`post` -> `posts`). See [`Field::reference_table`].
     References,
+    /// `enum{a,b,c}` — a closed-set column. Stored as `TEXT` with a `CHECK`
+    /// constraint enumerating the allowed values (see
+    /// [`create_table_sql_with_metadata_and_id`](super::schema_edit::create_table_sql_with_metadata_and_id)),
+    /// and rendered in the `#[model]` struct as a generated Rust enum rather
+    /// than the bare `String` [`FieldKind::rust_type`] reports here — see
+    /// [`Field::rust_type`] and [`Field::enum_type_name`], which override this
+    /// storage-representation fallback with the real generated type name.
+    Enum,
 }
 
 impl FieldKind {
@@ -121,7 +151,10 @@ impl FieldKind {
     #[must_use]
     pub const fn rust_type(self) -> &'static str {
         match self {
-            Self::String | Self::Text => "String",
+            // `Enum`'s "String" here is a storage-representation fallback
+            // only — `Field::rust_type()` overrides it with the generated
+            // enum's real type name.
+            Self::String | Self::Text | Self::Enum => "String",
             Self::I32 => "i32",
             // `References` is always `i64`, matching the default `i64` PK convention.
             Self::I64 | Self::References => "i64",
@@ -140,7 +173,7 @@ impl FieldKind {
     #[must_use]
     pub const fn schema_type(self) -> &'static str {
         match self {
-            Self::String | Self::Text => "Text",
+            Self::String | Self::Text | Self::Enum => "Text",
             Self::I32 => "Int4",
             Self::I64 | Self::References => "Int8",
             Self::Bool => "Bool",
@@ -158,7 +191,7 @@ impl FieldKind {
     #[must_use]
     pub const fn sql_type(self) -> &'static str {
         match self {
-            Self::String | Self::Text => "TEXT",
+            Self::String | Self::Text | Self::Enum => "TEXT",
             Self::I32 => "INTEGER",
             Self::I64 | Self::References => "BIGINT",
             Self::Bool => "BOOLEAN",
@@ -185,6 +218,12 @@ impl FieldKind {
     #[must_use]
     pub const fn is_reference(self) -> bool {
         matches!(self, Self::References)
+    }
+
+    /// Returns `true` for a closed-set `enum{…}` field.
+    #[must_use]
+    pub const fn is_enum(self) -> bool {
+        matches!(self, Self::Enum)
     }
 }
 
@@ -265,7 +304,8 @@ impl IdType {
 
 /// Comma-separated list of supported types, for error messages and `--help`.
 pub const SUPPORTED_TYPES: &str = "String, Text, i32, i64, bool, f32, f64, \
-    Uuid, NaiveDateTime, DateTime, Vec<u8>, Bytea, Attachment, references, Option<…>";
+    Uuid, NaiveDateTime, DateTime, Vec<u8>, Bytea, Attachment, references, \
+    enum{a,b,…}, Option<…>";
 
 /// Comma-separated list of supported Postgres column types (`udt_name`), for
 /// the `db pull` introspection error message.
@@ -343,6 +383,20 @@ pub fn parse_field(token: &str) -> Result<Field, GenerateError> {
         });
     }
 
+    if let Some((variants, nullable)) =
+        parse_enum_type(ty).map_err(|reason| GenerateError::InvalidField {
+            token: token.to_owned(),
+            reason,
+        })?
+    {
+        return Ok(Field {
+            name: name.to_owned(),
+            kind: FieldKind::Enum,
+            nullable,
+            variants,
+        });
+    }
+
     let (kind, nullable) = parse_type(ty).ok_or_else(|| GenerateError::InvalidField {
         token: token.to_owned(),
         reason: format!("unsupported type '{ty}'. Supported: {SUPPORTED_TYPES}"),
@@ -361,7 +415,77 @@ pub fn parse_field(token: &str) -> Result<Field, GenerateError> {
         name,
         kind,
         nullable,
+        variants: Vec::new(),
     })
+}
+
+/// Parse an `enum{a,b,c}` (optionally `Option<enum{a,b,c}>`) type token.
+///
+/// Returns `Ok(None)` when `ty` isn't an enum token at all, so the caller
+/// falls through to [`parse_type`]/[`atomic_type`] unchanged. Returns
+/// `Err(reason)` when `ty` looks like an enum token but is malformed (bad
+/// variant, too few variants, unbalanced braces, …) — every reason is an
+/// actionable message, consistent with the field-name guarding above.
+///
+/// # Errors
+/// See above.
+fn parse_enum_type(ty: &str) -> Result<Option<(Vec<String>, bool)>, String> {
+    let (body, nullable) =
+        strip_wrapper(ty, "Option").map_or((ty, false), |inner| (inner.trim(), true));
+
+    let Some(rest) = body.strip_prefix("enum") else {
+        return Ok(None);
+    };
+    let rest = rest.trim_start();
+
+    let Some(inner) = rest.strip_prefix('{') else {
+        // Looks like an enum token (starts with `enum`) but has no opening
+        // brace — the most common cause is bash/zsh brace-expanding an
+        // unquoted `enum{a,b}` before the CLI ever sees it, turning
+        // `status:enum{draft,published}` into two separate arguments whose
+        // surviving fragment reads like `status:enumdraft`.
+        return Err(
+            "expected enum{variant1,variant2,…} — if you typed this in bash or zsh, \
+             quote the token so the shell doesn't brace-expand it, \
+             e.g. 'status:enum{draft,published}'"
+                .to_owned(),
+        );
+    };
+    let Some(body_inner) = inner.strip_suffix('}') else {
+        return Err("expected enum{variant1,variant2,…} (missing closing brace)".to_owned());
+    };
+
+    let mut variants: Vec<String> = Vec::new();
+    let mut seen_pascal = std::collections::HashSet::new();
+    for raw in body_inner.split(',') {
+        let variant = raw.trim();
+        if variant.is_empty() {
+            return Err("enum variants cannot be empty".to_owned());
+        }
+        if !is_valid_ident(variant) {
+            return Err(format!("'{variant}' is not a valid snake_case identifier"));
+        }
+        if is_rust_keyword(variant) {
+            return Err(format!(
+                "'{variant}' is a Rust keyword and cannot be used as an enum variant"
+            ));
+        }
+        let pascal = naming::pascal(variant);
+        if !seen_pascal.insert(pascal.clone()) {
+            return Err(format!(
+                "duplicate enum variant '{pascal}' (variants must be distinct once converted to PascalCase)"
+            ));
+        }
+        variants.push(variant.to_owned());
+    }
+
+    if variants.len() < 2 {
+        return Err(
+            "an enum needs at least two variants; use String for a free-form field".to_owned(),
+        );
+    }
+
+    Ok(Some((variants, nullable)))
 }
 
 /// Parse a list of `name:Type` tokens.
@@ -995,5 +1119,125 @@ mod tests {
             assert!(msg.contains("uuid"), "error must list 'uuid': {msg}");
             assert!(msg.contains("bigint"), "error must list 'bigint': {msg}");
         }
+    }
+
+    // ------------------------------------------------------------------
+    // enum field kind (issue #1030)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn parse_enum_field() {
+        let f = parse_field("status:enum{draft,published,archived}").unwrap();
+        assert_eq!(f.name, "status");
+        assert_eq!(f.kind, FieldKind::Enum);
+        assert_eq!(f.variants, vec!["draft", "published", "archived"]);
+        assert!(!f.nullable);
+        assert_eq!(f.rust_type(), "Status");
+        assert_eq!(f.enum_type_name().as_deref(), Some("Status"));
+        assert_eq!(f.schema_type(), "Text");
+        assert_eq!(f.sql_type(), "TEXT");
+        assert_eq!(f.sql_nullability(), "NOT NULL");
+        assert!(f.is_enum());
+        assert!(FieldKind::Enum.is_enum());
+        assert!(!FieldKind::String.is_enum());
+    }
+
+    #[test]
+    fn parse_enum_field_multiword_name_pascalizes_type() {
+        let f = parse_field("review_state:enum{open,closed}").unwrap();
+        assert_eq!(f.rust_type(), "ReviewState");
+        assert_eq!(f.enum_type_name().as_deref(), Some("ReviewState"));
+    }
+
+    #[test]
+    fn parse_enum_field_trims_variant_whitespace() {
+        let f = parse_field("status:enum{ draft , published }").unwrap();
+        assert_eq!(f.variants, vec!["draft", "published"]);
+    }
+
+    #[test]
+    fn parse_nullable_enum_field() {
+        let f = parse_field("status:Option<enum{draft,published}>").unwrap();
+        assert_eq!(f.kind, FieldKind::Enum);
+        assert!(f.nullable);
+        assert_eq!(f.rust_type(), "Option<Status>");
+        assert_eq!(f.schema_type(), "Nullable<Text>");
+        assert_eq!(f.sql_nullability(), "NULL");
+    }
+
+    #[test]
+    fn enum_rejects_non_ident_variant() {
+        // `2fa` cannot become a Rust enum variant (`2Fa` is not an identifier).
+        let err = parse_field("status:enum{2fa,ok}").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("2fa"), "must name the bad variant: {msg}");
+        assert!(
+            msg.contains("identifier"),
+            "must explain the identifier rule: {msg}"
+        );
+    }
+
+    #[test]
+    fn enum_rejects_uppercase_variant() {
+        let err = parse_field("status:enum{Draft,ok}").unwrap_err();
+        assert!(err.to_string().contains("snake_case identifier"));
+    }
+
+    #[test]
+    fn enum_rejects_keyword_variant() {
+        // Consistent with field-name guarding: never emit code needing r#…
+        let err = parse_field("status:enum{type,ok}").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("type"), "must name the bad variant: {msg}");
+        assert!(msg.contains("keyword"), "must explain why: {msg}");
+    }
+
+    #[test]
+    fn enum_rejects_duplicate_variants() {
+        let err = parse_field("status:enum{draft,draft}").unwrap_err();
+        assert!(err.to_string().contains("duplicate"));
+    }
+
+    #[test]
+    fn enum_rejects_pascal_colliding_variants() {
+        // `in_review` and `in__review` both pascalize to `InReview`.
+        let err = parse_field("status:enum{in_review,in__review}").unwrap_err();
+        assert!(err.to_string().contains("InReview"));
+    }
+
+    #[test]
+    fn enum_rejects_empty_body() {
+        let err = parse_field("status:enum{}").unwrap_err();
+        assert!(err.to_string().contains("variant"));
+    }
+
+    #[test]
+    fn enum_rejects_single_variant() {
+        let err = parse_field("status:enum{draft}").unwrap_err();
+        assert!(err.to_string().contains("at least two"));
+    }
+
+    #[test]
+    fn enum_rejects_unclosed_brace() {
+        let err = parse_field("status:enum{draft,published").unwrap_err();
+        assert!(err.to_string().contains("enum{"));
+    }
+
+    #[test]
+    fn enum_error_hints_about_shell_brace_expansion() {
+        // bash/zsh expand an unquoted `enum{a,b}` into `enuma enumb`, so the
+        // token the CLI actually receives looks like `status:enumdraft`. Point
+        // the user at quoting instead of a bare "unsupported type".
+        let err = parse_field("status:enumdraft").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("quote"), "must suggest quoting: {msg}");
+    }
+
+    #[test]
+    fn enum_appears_in_supported_types_constant() {
+        assert!(
+            SUPPORTED_TYPES.contains("enum{"),
+            "SUPPORTED_TYPES must list enum{{…}}"
+        );
     }
 }

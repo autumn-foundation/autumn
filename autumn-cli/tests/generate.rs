@@ -390,6 +390,169 @@ fn generate_scaffold_help_documents_references_field() {
 }
 
 #[test]
+fn generate_model_help_documents_enum_field() {
+    let tmp = tempfile::tempdir().unwrap();
+    let autumn_bin = env!("CARGO_BIN_EXE_autumn");
+    let output = Command::new(autumn_bin)
+        .args(["generate", "model", "--help"])
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("enum{"));
+}
+
+#[test]
+fn generate_scaffold_help_documents_enum_field() {
+    let tmp = tempfile::tempdir().unwrap();
+    let autumn_bin = env!("CARGO_BIN_EXE_autumn");
+    let output = Command::new(autumn_bin)
+        .args(["generate", "scaffold", "--help"])
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("enum{"));
+}
+
+// ── enum field type (issue #1030) ───────────────────────────────────────────
+
+#[test]
+fn generate_model_with_enum_writes_check_and_enum_type() {
+    let (_tmp, project) = fresh_project("enum-model-app");
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "model",
+            "Post",
+            "title:String",
+            "status:enum{draft,published,archived}",
+        ],
+    );
+
+    let model = fs::read_to_string(project.join("src/models/post.rs")).unwrap();
+    assert!(model.contains("pub enum Status"), "got:\n{model}");
+    assert!(model.contains("pub status: Status,"), "got:\n{model}");
+
+    let migration = fs::read_dir(project.join("migrations"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|e| e.file_name().to_string_lossy().ends_with("_create_posts"))
+        .expect("create_posts migration should exist");
+    let up = fs::read_to_string(migration.path().join("up.sql")).unwrap();
+    assert!(
+        up.contains("status TEXT NOT NULL CHECK (status IN ('draft', 'published', 'archived'))"),
+        "got:\n{up}"
+    );
+}
+
+#[test]
+fn generate_migration_add_enum_column_emits_check() {
+    let (_tmp, project) = fresh_project("enum-migration-app");
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "migration",
+            "AddStatusToPosts",
+            "status:enum{draft,published}",
+        ],
+    );
+
+    let migrations = fs::read_dir(project.join("migrations"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .ends_with("_add_status_to_posts")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(migrations.len(), 1);
+    let up = fs::read_to_string(migrations[0].path().join("up.sql")).unwrap();
+    assert!(
+        up.contains(
+            "ALTER TABLE posts ADD COLUMN status TEXT NOT NULL CHECK (status IN ('draft', 'published'));"
+        ),
+        "got:\n{up}"
+    );
+}
+
+#[test]
+fn generate_scaffold_rejects_bad_enum_default() {
+    let (_tmp, project) = fresh_project("enum-bad-default-app");
+    let (_, stderr, code) = run_autumn_failing(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Post",
+            "status:enum{draft,published,archived}",
+            "--default",
+            "status=bogus",
+        ],
+    );
+
+    assert_eq!(code, Some(1));
+    assert!(
+        stderr.contains("bogus") && stderr.contains("draft") && stderr.contains("archived"),
+        "expected an enum-default membership error listing the variants; got stderr: {stderr}"
+    );
+    assert!(!project.join("src/models/post.rs").exists());
+}
+
+#[test]
+fn generate_scaffold_with_enum_dry_run_lists_files_and_then_collides_without_force() {
+    let (_tmp, project) = fresh_project("enum-dryrun-app");
+    let (stdout, _stderr) = run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Post",
+            "status:enum{draft,published,archived}",
+            "--dry-run",
+        ],
+    );
+    assert!(stdout.contains("Dry run"));
+    assert!(stdout.contains("src/models/post.rs"));
+    assert!(stdout.contains("src/repositories/post.rs"));
+    assert!(stdout.contains("src/routes/posts.rs"));
+    assert!(stdout.contains("tests/post.rs"));
+    assert!(!project.join("src/models/post.rs").exists());
+
+    // A real (non-dry-run) run actually writes the files...
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Post",
+            "status:enum{draft,published,archived}",
+        ],
+    );
+    assert!(project.join("src/models/post.rs").exists());
+
+    // ...and running it again without --force must error on collision rather
+    // than silently overwriting.
+    let (_, stderr, code) = run_autumn_failing(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Post",
+            "status:enum{draft,published,archived}",
+        ],
+    );
+    assert_eq!(code, Some(1));
+    assert!(
+        stderr.contains("overwrite"),
+        "expected a collision error; got stderr: {stderr}"
+    );
+}
+
+#[test]
 fn generate_model_dry_run_lists_migration_file_for_references_field() {
     let (_tmp, project) = fresh_project("references-dryrun-app");
     let (stdout, _stderr) = run_autumn(
@@ -954,6 +1117,8 @@ fn generated_scaffold_cargo_checks() {
             "published_at:Option<NaiveDateTime>",
             "scheduled_at:DateTime",
             "token:Option<Uuid>",
+            "status:enum{draft,published,archived}",
+            "mood:Option<enum{happy,sad}>",
         ],
     );
 

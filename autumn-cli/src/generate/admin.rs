@@ -333,7 +333,11 @@ fn detect_encrypted_fields(model_source: &str, pascal_name: &str) -> (Vec<String
 
 const fn admin_field_kind(field: &Field) -> &'static str {
     match field.kind {
-        FieldKind::String | FieldKind::Uuid => "AdminFieldKind::Text",
+        // `Enum`'s "AdminFieldKind::Text" here is never actually emitted:
+        // `render_fields_vec` always overrides an enum field with an explicit
+        // `AdminFieldKind::Select(...)` (issue #1030), the same way an
+        // explicit `--select` overrides this base kind today.
+        FieldKind::String | FieldKind::Uuid | FieldKind::Enum => "AdminFieldKind::Text",
         FieldKind::Text => "AdminFieldKind::TextArea",
         // A foreign-key id renders the same as any other integer column.
         FieldKind::I32 | FieldKind::I64 | FieldKind::References => "AdminFieldKind::Integer",
@@ -630,12 +634,26 @@ fn render_fields_vec(
             continue;
         }
         let select_spec = options.select.iter().find(|s| s.field == f.name);
+        // A closed-set `enum{...}` field is a `Select` widget by construction
+        // (issue #1030) — auto-derive one from its variants unless an
+        // explicit `--select` already overrides it (e.g. to curate a subset
+        // or relabel the options).
+        let auto_select_spec = if select_spec.is_none() && f.is_enum() {
+            Some(SelectSpec {
+                field: f.name.clone(),
+                values: f.variants.clone(),
+            })
+        } else {
+            None
+        };
         let kind_str: String =
             if options.hidden.contains(&f.name) || matches!(f.kind, FieldKind::Bytea) {
                 "AdminFieldKind::Hidden".into()
             } else if options.password.contains(&f.name) {
                 "AdminFieldKind::Password".into()
             } else if let Some(spec) = select_spec {
+                render_select_kind(spec)
+            } else if let Some(spec) = &auto_select_spec {
                 render_select_kind(spec)
             } else {
                 admin_field_kind(f).into()
@@ -651,7 +669,8 @@ fn render_fields_vec(
         // Select, hidden, and encrypted fields are not text-searchable. An
         // encrypted column stores ciphertext envelopes, so an `ILIKE` against it
         // for plaintext would never match (#805) — omit it from search.
-        let is_select_or_hidden = select_spec.is_some() || options.hidden.contains(&f.name);
+        let is_select_or_hidden =
+            select_spec.is_some() || auto_select_spec.is_some() || options.hidden.contains(&f.name);
         if is_default_searchable(f)
             && !is_select_or_hidden
             && !admin_field_is_encrypted(options, &f.name)
@@ -1820,6 +1839,55 @@ pub struct Account {
         assert!(admin.contains("\"archived\""), "option values must appear");
         // Labels are humanized from values
         assert!(admin.contains("\"Draft\""), "labels must be title-cased");
+    }
+
+    #[test]
+    fn enum_field_auto_derives_select_kind() {
+        // issue #1030: an `enum{...}` field is a closed set by construction,
+        // so it should render as a `Select` widget without needing an
+        // explicit `--select` flag repeating the same variant list.
+        let tmp = project_with_model("post");
+        let plan = plan_admin_with_options(
+            tmp.path(),
+            "Post",
+            &["status:enum{draft,published,archived}".into()],
+            &AdminOptions::default(),
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let admin = fs::read_to_string(tmp.path().join("src/admin/post.rs")).unwrap();
+        assert!(
+            admin.contains(
+                "AdminField::new(\"status\", AdminFieldKind::Select(vec![SelectOption { value: \"draft\".into(), label: \"Draft\".into() }, SelectOption { value: \"published\".into(), label: \"Published\".into() }, SelectOption { value: \"archived\".into(), label: \"Archived\".into() }]))"
+            ),
+            "got:\n{admin}"
+        );
+    }
+
+    #[test]
+    fn explicit_select_overrides_enum_auto_derivation() {
+        // A user-supplied `--select` should still win over the automatic
+        // derivation, e.g. to present a curated subset or different labels.
+        let tmp = project_with_model("post");
+        let options = AdminOptions {
+            select: vec![SelectSpec {
+                field: "status".into(),
+                values: vec!["draft".into(), "published".into()],
+            }],
+            ..Default::default()
+        };
+        let plan = plan_admin_with_options(
+            tmp.path(),
+            "Post",
+            &["status:enum{draft,published,archived}".into()],
+            &options,
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let admin = fs::read_to_string(tmp.path().join("src/admin/post.rs")).unwrap();
+        assert!(!admin.contains("\"archived\""), "got:\n{admin}");
     }
 
     #[test]

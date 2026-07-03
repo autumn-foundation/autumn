@@ -1362,17 +1362,24 @@ enum GenerateCommands {
     /// Generate a `#[model]` struct, Diesel migration, and schema entry.
     ///
     /// Field types: String, Text, i32, i64, bool, f32, f64, Uuid, `NaiveDateTime`,
-    /// `DateTime`, Vec<u8>/Bytea, Attachment, references, Option<...>.
+    /// `DateTime`, Vec<u8>/Bytea, Attachment, references, `enum{a,b,...}`, Option<...>.
     ///
     /// `field:references` scaffolds a foreign key: a `field_id BIGINT` column
     /// with a `REFERENCES <table>(id)` constraint and an index, where `<table>`
     /// is the pluralised form of `field`. Append `?` for a nullable FK
     /// (`post:references?` -> `post_id: Option<i64>`).
     ///
+    /// `field:enum{a,b,c}` scaffolds a closed-set column: a generated Rust
+    /// enum (`PascalCase` variants) stored as `TEXT` with a `CHECK` constraint
+    /// enumerating the allowed values, plus `--default field=variant` support.
+    /// Quote the token in bash/zsh — an unquoted `enum{a,b}` is brace-expanded
+    /// by the shell before `autumn` ever sees it.
+    ///
     /// Examples:
     ///
     ///   autumn generate model Post title:String body:Text published:bool
     ///   autumn generate model Comment body:Text post:references
+    ///   autumn generate model Post 'status:enum{draft,published,archived}'
     #[command(verbatim_doc_comment)]
     Model {
         /// Resource name (`PascalCase` or `snake_case`, e.g. `Post`).
@@ -1396,7 +1403,9 @@ enum GenerateCommands {
     ///
     /// When the migration name follows the `Add<Field>To<Table>` or
     /// `Remove<Field>From<Table>` convention, the generator emits the
-    /// matching `ALTER TABLE` statements automatically.
+    /// matching `ALTER TABLE` statements automatically. Accepts the same
+    /// field DSL as `generate model`/`scaffold`, including `enum{a,b,c}`
+    /// (emits `TEXT` + a `CHECK` constraint) — quote the token in bash/zsh.
     Migration {
         /// Migration name (`PascalCase` or `snake_case`).
         name: String,
@@ -1757,11 +1766,16 @@ enum GenerateCommands {
     /// register the new routes in `src/main.rs`.
     ///
     /// Field types: String, Text, i32, i64, bool, f32, f64, Uuid, `NaiveDateTime`,
-    /// `DateTime`, Vec<u8>/Bytea, Attachment, references, Option<...>.
+    /// `DateTime`, Vec<u8>/Bytea, Attachment, references, `enum{a,b,...}`, Option<...>.
     ///
     /// `field:references` scaffolds a foreign key (`field_id BIGINT
     /// REFERENCES <table>(id)` plus an index), e.g.
     /// `autumn generate scaffold Comment body:Text post:references`.
+    ///
+    /// `field:enum{a,b,c}` scaffolds a closed-set column: a generated Rust
+    /// enum, a `CHECK` constraint, a `<select>` form widget, and
+    /// request-boundary validation that rejects an out-of-set value with a
+    /// 400. Quote the token in bash/zsh (see `generate model --help`).
     Scaffold {
         /// Resource name (`PascalCase` or `snake_case`, e.g. `Post`).
         name: String,
