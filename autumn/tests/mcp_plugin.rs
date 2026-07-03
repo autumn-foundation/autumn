@@ -199,12 +199,12 @@ struct HarvestLikePlugin {
 }
 
 impl HarvestLikePlugin {
-    fn new() -> Self {
+    const fn new() -> Self {
         Self { expose_mcp: false }
     }
 
     #[must_use]
-    fn expose_mcp(mut self) -> Self {
+    const fn expose_mcp(mut self) -> Self {
         self.expose_mcp = true;
         self
     }

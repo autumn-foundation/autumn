@@ -210,7 +210,7 @@ impl Route {
     /// reads) and the usual eligibility rules still apply. The flag is inert
     /// unless the host enables the `mcp` feature and calls `mount_mcp`.
     #[must_use]
-    pub fn mcp(mut self) -> Self {
+    pub const fn mcp(mut self) -> Self {
         self.api_doc.mcp_tool = true;
         self
     }
@@ -221,7 +221,7 @@ impl Route {
     /// Exclusion always wins — even over the whole-API
     /// `expose_all_as_mcp()` hatch and a prior [`mcp()`](Self::mcp) call.
     #[must_use]
-    pub fn mcp_exclude(mut self) -> Self {
+    pub const fn mcp_exclude(mut self) -> Self {
         self.api_doc.mcp_exclude = true;
         self
     }
@@ -233,7 +233,7 @@ impl Route {
     /// exempts the route from the JSON-response eligibility gate, since an
     /// SSE handler has no JSON response schema by nature.
     #[must_use]
-    pub fn mcp_stream(mut self) -> Self {
+    pub const fn mcp_stream(mut self) -> Self {
         self.api_doc.mcp_tool = true;
         self.api_doc.mcp_stream = true;
         self

@@ -14,7 +14,7 @@
 
 #![cfg(all(feature = "db", feature = "mcp"))]
 
-use autumn_web::mcp::derive_tools;
+use autumn_web::mcp::{McpToolInfo, derive_tools};
 
 mod schema {
     autumn_web::reexports::diesel::table! {
@@ -71,7 +71,7 @@ fn gear_docs() -> Vec<autumn_web::openapi::ApiDoc> {
 #[test]
 fn repository_mcp_derives_five_tools_with_verb_annotations() {
     let tools = derive_tools(&gear_docs(), false, None);
-    let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+    let names: Vec<&str> = tools.iter().map(McpToolInfo::name).collect();
     assert_eq!(
         names,
         vec![
@@ -150,7 +150,7 @@ fn repository_mcp_read_derives_only_list_and_get() {
         __autumn_route_info_pulley_api_delete().api_doc,
     ];
     let tools = derive_tools(&docs, false, None);
-    let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+    let names: Vec<&str> = tools.iter().map(McpToolInfo::name).collect();
     assert_eq!(
         names,
         vec!["pulley_api_list", "pulley_api_get"],
