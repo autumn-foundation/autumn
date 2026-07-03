@@ -834,14 +834,23 @@ fn sanitize_url_form(mut url: url::Url) -> Result<String, CommandError> {
     // percent-encoding concept at all, so these must be decoded before any
     // of them can end up as a keyword-form value (see `needs_keyword_form`
     // below).
-    let explicit_user = Some(url.username())
-        .filter(|u| !u.is_empty())
-        .map(percent_decode)
-        .or_else(|| find_pair(&pairs, "user").map(str::to_owned));
-    let explicit_password = url
-        .password()
-        .map(percent_decode)
-        .or_else(|| find_pair(&pairs, "password").map(str::to_owned));
+    // `user`/`password`/`dbname` are each a single field `tokio_postgres`'s
+    // own URL parser *overwrites* — unlike `host`/`port`, which accumulate —
+    // so when a URL names one via userinfo/path *and* separately as a query
+    // parameter, the query parameter is what actually takes effect (parsed
+    // after, and last write wins). The query pair is therefore checked
+    // first here, not as a fallback — getting this backwards wouldn't break
+    // the connection itself (the unmodified URL still reparses correctly),
+    // but would make `.pgpass` lookup below match against the wrong,
+    // no-longer-effective identity.
+    let explicit_user = find_pair(&pairs, "user").map(str::to_owned).or_else(|| {
+        Some(url.username())
+            .filter(|u| !u.is_empty())
+            .map(percent_decode)
+    });
+    let explicit_password = find_pair(&pairs, "password")
+        .map(str::to_owned)
+        .or_else(|| url.password().map(percent_decode));
     let explicit_host = url
         .host_str()
         .filter(|h| !h.is_empty())
@@ -851,10 +860,11 @@ fn sanitize_url_form(mut url: url::Url) -> Result<String, CommandError> {
         .port()
         .map(|p| p.to_string())
         .or_else(|| find_pair(&pairs, "port").map(str::to_owned));
-    let explicit_dbname = Some(url.path())
-        .filter(|p| p.len() > 1)
-        .map(|p| percent_decode(p.trim_start_matches('/')))
-        .or_else(|| find_pair(&pairs, "dbname").map(str::to_owned));
+    let explicit_dbname = find_pair(&pairs, "dbname").map(str::to_owned).or_else(|| {
+        Some(url.path())
+            .filter(|p| p.len() > 1)
+            .map(|p| percent_decode(p.trim_start_matches('/')))
+    });
 
     // Checks the *current* `pairs` (not just the `explicit_*` snapshot
     // taken above) for every key, not only the catch-all arm below — a
@@ -875,7 +885,17 @@ fn sanitize_url_form(mut url: url::Url) -> Result<String, CommandError> {
     // Whether the service merge below ends up filling in a `host` or
     // `port` that wasn't already explicit — see the comment where this
     // is used for why that specifically forces a keyword-form rebuild.
-    let mut needs_keyword_form = false;
+    //
+    // A `port=` given as a query parameter (rather than as part of
+    // `host:port`) needs the exact same treatment as soon as the authority
+    // names any host at all: `tokio_postgres`'s URL parser bakes a port
+    // into the config for every authority host (its own explicit port if
+    // given, otherwise a default of 5432) and *separately* appends whatever
+    // the query string's own `port=` says, producing two port entries
+    // `tokio_postgres::connect` then rejects with "invalid number of
+    // ports" — even for an ordinary URL `psql` always accepted.
+    let mut needs_keyword_form =
+        url.host_str().is_some_and(|h| !h.is_empty()) && find_pair(&pairs, "port").is_some();
 
     let service_name = take_pair(&mut pairs, "service").or_else(|| std::env::var("PGSERVICE").ok());
     if let Some(service_name) = service_name {
@@ -1425,6 +1445,104 @@ mod tests {
                 let pairs: std::collections::HashMap<_, _> =
                     parsed.query_pairs().into_owned().collect();
                 assert_eq!(pairs.get("sslmode").map(String::as_str), Some("require"));
+            },
+        );
+    }
+
+    #[test]
+    fn sanitize_rebuilds_as_keyword_form_when_port_is_a_query_parameter() {
+        // `tokio_postgres`'s URL-form parser bakes a port into the config
+        // for every host in the authority (the authority's own explicit
+        // port if given, else a default of 5432) *and separately* appends
+        // whatever the query string's own `port=` says — so a URL like
+        // `postgres://db/app?port=6543` (port given as a query parameter,
+        // not as part of `host:port`) ends up with two port entries and
+        // `tokio_postgres::connect` rejects it with "invalid number of
+        // ports", even though this is a perfectly ordinary URL `psql` always
+        // accepted. This needs the exact same keyword-form-rebuild
+        // treatment already used for a service/PGPORT-supplied port.
+        temp_env::with_vars(
+            [
+                ("PGPASSWORD", None::<&str>),
+                ("PGPASSFILE", Some("/nonexistent-pgpass-for-test")),
+            ],
+            || {
+                let sanitized = sanitize_db_url("postgres://db.internal/app?port=6543").unwrap();
+                let config: tokio_postgres::Config = sanitized.parse().unwrap();
+                assert_eq!(config.get_ports(), &[6543]);
+                assert_eq!(config.get_dbname(), Some("app"));
+            },
+        );
+    }
+
+    #[test]
+    fn sanitize_rebuilds_as_keyword_form_when_port_is_a_query_parameter_alongside_an_authority_port()
+     {
+        // Same duplication risk even when the authority *also* names an
+        // (overridden) port — `parse_host` bakes in the authority's own
+        // port unconditionally, so the query-string `port=` still ends up
+        // as a second entry rather than replacing it.
+        temp_env::with_vars(
+            [
+                ("PGPASSWORD", None::<&str>),
+                ("PGPASSFILE", Some("/nonexistent-pgpass-for-test")),
+            ],
+            || {
+                let sanitized =
+                    sanitize_db_url("postgres://db.internal:5432/app?port=6543").unwrap();
+                let config: tokio_postgres::Config = sanitized.parse().unwrap();
+                assert_eq!(config.get_ports(), &[6543]);
+            },
+        );
+    }
+
+    #[test]
+    fn sanitize_prefers_query_user_password_dbname_over_url_structure() {
+        // `tokio_postgres`'s URL parser applies the query string *after*
+        // parsing userinfo/path, and `user`/`password`/`dbname` are single
+        // overwritten fields (unlike `host`/`port`, which accumulate) — so a
+        // URL like `postgres://alice:secret1@db/app1?user=bob&password=secret2&dbname=app2`
+        // actually authenticates as `bob`/`secret2` against `app2`, not
+        // `alice`/`secret1`/`app1`. `explicit_user`/`password`/`dbname` must
+        // reflect that same effective precedence, or `.pgpass` lookup (which
+        // uses these values to pick a row) matches against the wrong
+        // identity entirely.
+        let sanitized = sanitize_db_url(
+            "postgres://alice:secret1@db.internal/app1?user=bob&password=secret2&dbname=app2",
+        )
+        .unwrap();
+        let config: tokio_postgres::Config = sanitized.parse().unwrap();
+        assert_eq!(config.get_user(), Some("bob"));
+        assert_eq!(config.get_password(), Some(b"secret2".as_slice()));
+        assert_eq!(config.get_dbname(), Some("app2"));
+    }
+
+    #[test]
+    fn sanitize_uses_query_user_for_pgpass_lookup_not_url_userinfo() {
+        // The concrete failure mode: a `.pgpass` entry keyed to the
+        // *effectively* connecting user (`bob`) must be the one that gets
+        // matched, not one keyed to the URL's userinfo (`alice`) that
+        // `tokio_postgres` ends up overriding anyway.
+        let dir = tempfile::tempdir().unwrap();
+        let pgpass_path = dir.path().join(".pgpass");
+        std::fs::write(
+            &pgpass_path,
+            "db.internal:5432:app:alice:wrong_password\n\
+             db.internal:5432:app:bob:right_password\n",
+        )
+        .unwrap();
+        set_pgpass_permissions_safe(&pgpass_path);
+        temp_env::with_vars(
+            [
+                ("PGPASSWORD", None::<&str>),
+                ("PGPASSFILE", Some(pgpass_path.to_str().unwrap())),
+            ],
+            || {
+                let sanitized =
+                    sanitize_db_url("postgres://alice@db.internal/app?user=bob").unwrap();
+                let config: tokio_postgres::Config = sanitized.parse().unwrap();
+                assert_eq!(config.get_user(), Some("bob"));
+                assert_eq!(config.get_password(), Some(b"right_password".as_slice()));
             },
         );
     }
