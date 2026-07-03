@@ -387,13 +387,17 @@ fn pgpass_lookup(
     })
 }
 
-/// Path to the `.pgpass` file: `PGPASSFILE` if set, else the platform
-/// default `libpq` itself uses — `~/.pgpass` on Unix, or
+/// Path to the `.pgpass` file: `passfile_override` (the connection string's
+/// own `passfile=` parameter, if any) if set, else `PGPASSFILE`, else the
+/// platform default `libpq` itself uses — `~/.pgpass` on Unix, or
 /// `%APPDATA%\postgresql\pgpass.conf` on Windows (`PostgreSQL` docs, "The
 /// Password File"; `BaseDirs::config_dir()` resolves to the roaming
 /// `%APPDATA%` known folder on Windows).
 #[cfg(not(windows))]
-fn pgpass_file_path() -> Option<PathBuf> {
+fn pgpass_file_path(passfile_override: Option<&str>) -> Option<PathBuf> {
+    if let Some(path) = passfile_override {
+        return Some(PathBuf::from(path));
+    }
     if let Ok(path) = std::env::var("PGPASSFILE") {
         return Some(PathBuf::from(path));
     }
@@ -401,7 +405,10 @@ fn pgpass_file_path() -> Option<PathBuf> {
 }
 
 #[cfg(windows)]
-fn pgpass_file_path() -> Option<PathBuf> {
+fn pgpass_file_path(passfile_override: Option<&str>) -> Option<PathBuf> {
+    if let Some(path) = passfile_override {
+        return Some(PathBuf::from(path));
+    }
     if let Ok(path) = std::env::var("PGPASSFILE") {
         return Some(PathBuf::from(path));
     }
@@ -428,10 +435,17 @@ const fn pgpass_permissions_ok(_path: &Path) -> bool {
     true
 }
 
-/// Look up a password for `(host, port, dbname, user)` in the `.pgpass` file,
-/// if one exists and has safe permissions.
-fn pgpass_password(host: &str, port: &str, dbname: &str, user: &str) -> Option<String> {
-    let path = pgpass_file_path()?;
+/// Look up a password for `(host, port, dbname, user)` in the `.pgpass` file
+/// (or `passfile_override`, if given), if one exists and has safe
+/// permissions.
+fn pgpass_password(
+    host: &str,
+    port: &str,
+    dbname: &str,
+    user: &str,
+    passfile_override: Option<&str>,
+) -> Option<String> {
+    let path = pgpass_file_path(passfile_override)?;
     if !path.is_file() {
         return None;
     }
@@ -448,11 +462,18 @@ fn pgpass_password(host: &str, port: &str, dbname: &str, user: &str) -> Option<S
 
 /// Resolve a password for `(host, port, dbname, user)` the same way `libpq`
 /// does when none is given explicitly: the `PGPASSWORD` environment
-/// variable first, then the `.pgpass` file.
-fn resolve_password(host: &str, port: &str, dbname: &str, user: &str) -> Option<String> {
+/// variable first, then the `.pgpass` file (or `passfile_override`, `libpq`'s
+/// own `passfile=` connection parameter, if the caller has one).
+fn resolve_password(
+    host: &str,
+    port: &str,
+    dbname: &str,
+    user: &str,
+    passfile_override: Option<&str>,
+) -> Option<String> {
     std::env::var("PGPASSWORD")
         .ok()
-        .or_else(|| pgpass_password(host, port, dbname, user))
+        .or_else(|| pgpass_password(host, port, dbname, user, passfile_override))
 }
 
 /// Parse a `pg_service.conf`-style file, returning the `key=value` pairs of
@@ -635,9 +656,17 @@ fn sanitize_url_form(mut url: url::Url) -> Result<String, CommandError> {
         }
     }
 
+    // `tokio_postgres` has no `passfile` key of its own — it must always be
+    // consumed here and stripped, regardless of whether it ends up mattering
+    // (i.e. even if a password is already explicit), or `tokio_postgres`
+    // would reject the connection string outright with an UnknownOption
+    // error over a parameter it was never going to need anyway.
+    let passfile = take_pair(&mut pairs, "passfile");
+
     let host = explicit_host
         .clone()
         .or_else(|| find_pair(&pairs, "host").map(str::to_owned))
+        .or_else(|| find_pair(&pairs, "hostaddr").map(str::to_owned))
         .unwrap_or_else(|| "localhost".to_owned());
     let port = explicit_port
         .clone()
@@ -653,7 +682,7 @@ fn sanitize_url_form(mut url: url::Url) -> Result<String, CommandError> {
         .unwrap_or_else(|| user.clone());
 
     if !is_explicit(&pairs, "password")
-        && let Some(password) = resolve_password(&host, &port, &dbname, &user)
+        && let Some(password) = resolve_password(&host, &port, &dbname, &user, passfile.as_deref())
     {
         pairs.push(("password".to_owned(), password));
     }
@@ -714,12 +743,19 @@ fn sanitize_keyword_form(pairs: Vec<(String, String)>) -> Result<String, Command
         }
     }
 
+    // See the identical comment in `sanitize_url_form` — `passfile` must
+    // always be consumed and stripped, not just when it turns out to matter.
+    let passfile = take_pair(&mut pairs, "passfile");
+
     if find_pair(&pairs, "password").is_none() {
-        let host = find_pair(&pairs, "host").map_or_else(|| "localhost".to_owned(), str::to_owned);
+        let host = find_pair(&pairs, "host")
+            .or_else(|| find_pair(&pairs, "hostaddr"))
+            .map_or_else(|| "localhost".to_owned(), str::to_owned);
         let port = find_pair(&pairs, "port").map_or_else(|| "5432".to_owned(), str::to_owned);
         let user = find_pair(&pairs, "user").map_or_else(current_os_user, str::to_owned);
         let dbname = find_pair(&pairs, "dbname").map_or_else(|| user.clone(), str::to_owned);
-        if let Some(password) = resolve_password(&host, &port, &dbname, &user) {
+        if let Some(password) = resolve_password(&host, &port, &dbname, &user, passfile.as_deref())
+        {
             pairs.push(("password".to_owned(), password));
         }
     }
@@ -1225,6 +1261,103 @@ mod tests {
                 let sanitized = sanitize_db_url("postgres://host/db?service=prod").unwrap();
                 let config: tokio_postgres::Config = sanitized.parse().unwrap();
                 assert_eq!(config.get_password(), Some(b"svcpass".as_slice()));
+            },
+        );
+    }
+
+    #[test]
+    fn sanitize_falls_back_to_hostaddr_for_pgpass_lookup_when_host_is_absent() {
+        // libpq matches a `.pgpass` entry's host field against `hostaddr`
+        // when no `host` is given at all — defaulting straight to
+        // "localhost" (as if `hostaddr` weren't there) misses that entry.
+        let dir = tempfile::tempdir().unwrap();
+        let pgpass_path = dir.path().join("pgpass");
+        std::fs::write(&pgpass_path, "10.0.0.5:5432:db:user:from-hostaddr-pgpass\n").unwrap();
+        set_pgpass_permissions_safe(&pgpass_path);
+        temp_env::with_vars(
+            [
+                ("PGPASSWORD", None::<&str>),
+                ("PGPASSFILE", Some(pgpass_path.to_str().unwrap())),
+            ],
+            || {
+                let sanitized = sanitize_db_url("hostaddr=10.0.0.5 dbname=db user=user").unwrap();
+                let config: tokio_postgres::Config = sanitized.parse().unwrap();
+                assert_eq!(
+                    config.get_password(),
+                    Some(b"from-hostaddr-pgpass".as_slice())
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn sanitize_falls_back_to_hostaddr_for_pgpass_lookup_in_url_form_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let pgpass_path = dir.path().join("pgpass");
+        std::fs::write(&pgpass_path, "10.0.0.5:5432:db:user:from-hostaddr-pgpass\n").unwrap();
+        set_pgpass_permissions_safe(&pgpass_path);
+        temp_env::with_vars(
+            [
+                ("PGPASSWORD", None::<&str>),
+                ("PGPASSFILE", Some(pgpass_path.to_str().unwrap())),
+            ],
+            || {
+                let sanitized =
+                    sanitize_db_url("postgres:///db?hostaddr=10.0.0.5&user=user").unwrap();
+                let config: tokio_postgres::Config = sanitized.parse().unwrap();
+                assert_eq!(
+                    config.get_password(),
+                    Some(b"from-hostaddr-pgpass".as_slice())
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn sanitize_uses_passfile_parameter_for_password_lookup_in_url_form() {
+        let dir = tempfile::tempdir().unwrap();
+        let passfile_path = dir.path().join("custom_pgpass");
+        std::fs::write(&passfile_path, "host:5432:db:user:from-passfile\n").unwrap();
+        set_pgpass_permissions_safe(&passfile_path);
+        temp_env::with_vars(
+            [
+                ("PGPASSWORD", None::<&str>),
+                ("PGPASSFILE", Some("/nonexistent-pgpassfile-for-test")),
+            ],
+            || {
+                let sanitized = sanitize_db_url(&format!(
+                    "postgres://user@host/db?passfile={}",
+                    passfile_path.to_str().unwrap()
+                ))
+                .unwrap();
+                // Parsing successfully at all proves "passfile" was
+                // stripped — tokio_postgres has no such key and would
+                // otherwise reject it with an UnknownOption error.
+                let config: tokio_postgres::Config = sanitized.parse().unwrap();
+                assert_eq!(config.get_password(), Some(b"from-passfile".as_slice()));
+            },
+        );
+    }
+
+    #[test]
+    fn sanitize_uses_passfile_parameter_for_password_lookup_in_keyword_form() {
+        let dir = tempfile::tempdir().unwrap();
+        let passfile_path = dir.path().join("custom_pgpass");
+        std::fs::write(&passfile_path, "host:5432:db:user:from-passfile\n").unwrap();
+        set_pgpass_permissions_safe(&passfile_path);
+        temp_env::with_vars(
+            [
+                ("PGPASSWORD", None::<&str>),
+                ("PGPASSFILE", Some("/nonexistent-pgpassfile-for-test")),
+            ],
+            || {
+                let sanitized = sanitize_db_url(&format!(
+                    "host=host dbname=db user=user passfile={}",
+                    passfile_path.to_str().unwrap()
+                ))
+                .unwrap();
+                let config: tokio_postgres::Config = sanitized.parse().unwrap();
+                assert_eq!(config.get_password(), Some(b"from-passfile".as_slice()));
             },
         );
     }
