@@ -352,6 +352,28 @@ fn percent_decode(s: &str) -> String {
         .into_owned()
 }
 
+/// Parse `query` (a URL's raw, still-percent-encoded query string, e.g. from
+/// [`url::Url::query`]) into `(key, value)` pairs using pure
+/// percent-decoding, splitting on `&` then the first `=` in each segment —
+/// exactly the grammar `tokio_postgres`'s own `UrlParser::parse_params`
+/// uses. This is deliberately *not* `url::Url::query_pairs()`: that method
+/// applies `application/x-www-form-urlencoded` decoding, which also turns a
+/// literal `+` into a space, but `tokio_postgres`'s decoder
+/// (`percent_encoding::percent_decode`, see `UrlParser::decode`) never does
+/// that — so reading a query string through `query_pairs()` would silently
+/// turn `application_name=ops+cli` into `ops cli` before this sanitizer
+/// even got a chance to look at it.
+fn parse_raw_query_pairs(query: &str) -> Vec<(String, String)> {
+    query
+        .split('&')
+        .filter(|segment| !segment.is_empty())
+        .map(|segment| match segment.split_once('=') {
+            Some((key, value)) => (percent_decode(key), percent_decode(value)),
+            None => (percent_decode(segment), String::new()),
+        })
+        .collect()
+}
+
 /// Percent-encode `s` for use as a URL query key or value being handed to
 /// `tokio_postgres` — not `url::Url`'s own `query_pairs_mut()`, whose
 /// `form_urlencoded` serialization encodes a space as `+`, which
@@ -488,6 +510,7 @@ const SIMPLE_LIBPQ_ENV_FALLBACKS: &[(&str, &str)] = &[
     ("channel_binding", "PGCHANNELBINDING"),
     ("options", "PGOPTIONS"),
     ("application_name", "PGAPPNAME"),
+    ("load_balance_hosts", "PGLOADBALANCEHOSTS"),
 ];
 
 /// Fill in each of [`SIMPLE_LIBPQ_ENV_FALLBACKS`] from its environment
@@ -869,10 +892,7 @@ fn sanitize_url_form(mut url: url::Url) -> Result<String, CommandError> {
     // source (this URL's own query string, then a merged-in service group)
     // separately, as this used to do, can't see a `require`+`sslrootcert`
     // combination split across two sources.
-    let mut pairs: Vec<(String, String)> = url
-        .query_pairs()
-        .map(|(k, v)| (k.into_owned(), v.into_owned()))
-        .collect();
+    let mut pairs: Vec<(String, String)> = parse_raw_query_pairs(url.query().unwrap_or(""));
 
     // Capture what the URL's own structure (as opposed to its query
     // string) already says explicitly, once, up front: `host`/`port`
@@ -2135,6 +2155,53 @@ mod tests {
             assert_eq!(
                 config.get_connect_timeout(),
                 Some(&std::time::Duration::from_secs(10))
+            );
+        });
+    }
+
+    #[test]
+    fn sanitize_preserves_literal_plus_in_url_query_values() {
+        // `url::Url::query_pairs()` applies `application/x-www-form-urlencoded`
+        // decoding, which turns a literal `+` into a space — but
+        // `tokio_postgres`'s own query-string decoder (`UrlParser::decode`,
+        // via `percent_encoding::percent_decode`) does pure percent-decoding
+        // and never treats `+` as space. A URL like
+        // `...?application_name=ops+cli` therefore means the literal string
+        // "ops+cli" to `tokio_postgres`, not "ops cli" — reading the query
+        // string through `query_pairs()` before this sanitizer even runs
+        // would already have corrupted it.
+        let sanitized =
+            sanitize_db_url("postgres://db.internal/mydb?application_name=ops+cli").unwrap();
+        let config: tokio_postgres::Config = sanitized.parse().unwrap();
+        assert_eq!(config.get_application_name(), Some("ops+cli"));
+    }
+
+    #[test]
+    fn sanitize_still_percent_decodes_url_query_values_with_plus_present() {
+        // Companion to `sanitize_preserves_literal_plus_in_url_query_values`
+        // — confirms the fix doesn't regress plain percent-decoding (`%20`
+        // for a space) just because it stopped treating `+` as space.
+        let sanitized =
+            sanitize_db_url("postgres://db.internal/mydb?options=-c%20search_path%3Dapp+public")
+                .unwrap();
+        let config: tokio_postgres::Config = sanitized.parse().unwrap();
+        assert_eq!(config.get_options(), Some("-c search_path=app+public"));
+    }
+
+    #[test]
+    fn sanitize_uses_pgloadbalancehosts_env_var_when_url_omits_it() {
+        // `tokio_postgres` supports `load_balance_hosts` as a connection
+        // parameter (disable/random) but never reads `PGLOADBALANCEHOSTS`
+        // itself (unlike `psql`, which honors it as a documented libpq
+        // environment variable) — a multi-host connection string relying on
+        // it the way `psql` did would otherwise silently fall back to
+        // ordered/default host selection instead of randomizing.
+        temp_env::with_var("PGLOADBALANCEHOSTS", Some("random"), || {
+            let sanitized = sanitize_db_url("postgres://db.internal").unwrap();
+            let config: tokio_postgres::Config = sanitized.parse().unwrap();
+            assert_eq!(
+                config.get_load_balance_hosts(),
+                tokio_postgres::config::LoadBalanceHosts::Random
             );
         });
     }
