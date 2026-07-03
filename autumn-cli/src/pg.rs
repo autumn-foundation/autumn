@@ -1424,9 +1424,13 @@ mod tests {
                 ("PGPASSFILE", Some("/nonexistent-pgpassfile-for-test")),
             ],
             || {
+                // `keyword_value_token` (rather than raw interpolation)
+                // properly quotes/escapes the path — load-bearing on
+                // Windows, where paths contain backslashes that this
+                // format's own escaping syntax would otherwise misparse.
                 let sanitized = sanitize_db_url(&format!(
-                    "host=host dbname=db user=user passfile={}",
-                    passfile_path.to_str().unwrap()
+                    "host=host dbname=db user=user {}",
+                    keyword_value_token("passfile", passfile_path.to_str().unwrap())
                 ))
                 .unwrap();
                 let config: tokio_postgres::Config = sanitized.parse().unwrap();
