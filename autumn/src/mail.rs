@@ -442,6 +442,7 @@ pub struct Mail {
     /// but available for any custom header.
     pub extra_headers: Vec<(String, String)>,
     /// Files attached to this message, in declared order.
+    #[serde(default)]
     pub attachments: Vec<MailAttachment>,
 }
 
@@ -1970,12 +1971,18 @@ fn content_disposition_params(filename: &str) -> String {
 fn base64_wrap76(bytes: &[u8]) -> String {
     use base64::Engine as _;
     let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
-    encoded
-        .as_bytes()
-        .chunks(76)
-        .map(|chunk| std::str::from_utf8(chunk).expect("base64 output is always ASCII"))
-        .collect::<Vec<_>>()
-        .join("\n")
+    if encoded.len() <= 76 {
+        return encoded;
+    }
+    let newlines = (encoded.len() - 1) / 76;
+    let mut wrapped = String::with_capacity(encoded.len() + newlines);
+    for chunk in encoded.as_bytes().chunks(76) {
+        if !wrapped.is_empty() {
+            wrapped.push('\n');
+        }
+        wrapped.push_str(std::str::from_utf8(chunk).expect("base64 output is always ASCII"));
+    }
+    wrapped
 }
 
 fn file_transport_filename(mail: &Mail) -> String {
@@ -1993,17 +2000,17 @@ fn render_eml(mail: &Mail) -> String {
     let mut out = String::new();
     if let Some(from) = &mail.from {
         out.push_str("From: ");
-        out.push_str(from);
+        out.push_str(&strip_header_controls(from));
         out.push('\n');
     }
     for to in &mail.to {
         out.push_str("To: ");
-        out.push_str(to);
+        out.push_str(&strip_header_controls(to));
         out.push('\n');
     }
     if let Some(reply_to) = &mail.reply_to {
         out.push_str("Reply-To: ");
-        out.push_str(reply_to);
+        out.push_str(&strip_header_controls(reply_to));
         out.push('\n');
     }
     out.push_str("Date: ");
@@ -2013,12 +2020,12 @@ fn render_eml(mail: &Mail) -> String {
     out.push_str(&uuid::Uuid::new_v4().to_string());
     out.push_str("@autumn.local>\n");
     out.push_str("Subject: ");
-    out.push_str(&mail.subject);
+    out.push_str(&strip_header_controls(&mail.subject));
     out.push('\n');
     for (name, value) in &mail.extra_headers {
-        out.push_str(name);
+        out.push_str(&strip_header_controls(name));
         out.push_str(": ");
-        out.push_str(value);
+        out.push_str(&strip_header_controls(value));
         out.push('\n');
     }
     out.push_str("MIME-Version: 1.0\n");
@@ -2031,7 +2038,12 @@ fn render_eml(mail: &Mail) -> String {
         for attachment in &mail.attachments {
             out.push_str("--autumn-mixed\n");
             out.push_str("Content-Type: ");
-            out.push_str(&strip_header_controls(&attachment.content_type));
+            let content_type = strip_header_controls(&attachment.content_type);
+            if ContentType::parse(&content_type).is_ok() {
+                out.push_str(&content_type);
+            } else {
+                out.push_str("application/octet-stream");
+            }
             out.push('\n');
             out.push_str("Content-Disposition: attachment; ");
             out.push_str(&content_disposition_params(&attachment.filename));
@@ -2437,7 +2449,11 @@ fn parse_multipart_mixed(
         let (headers, part_body) = split_headers_body(segment);
         let disposition = header_value(&headers, "Content-Disposition").unwrap_or_default();
         let part_content_type = header_value(&headers, "Content-Type").unwrap_or_default();
-        if disposition.to_ascii_lowercase().contains("attachment") {
+        let disposition_type = split_mime_params(&disposition)
+            .first()
+            .copied()
+            .unwrap_or("");
+        if disposition_type.eq_ignore_ascii_case("attachment") {
             attachments.push(ParsedAttachment {
                 filename: extract_attachment_filename(&disposition),
                 content_type: content_type_without_params(&part_content_type),
@@ -2452,25 +2468,76 @@ fn parse_multipart_mixed(
     (html, text, attachments)
 }
 
+/// Splits a `Content-Disposition`/`Content-Type` parameter list on `;`,
+/// respecting RFC 2045 quoted-string boundaries so a value like
+/// `filename="a;b.txt"` is not mistaken for two parameters.
+fn split_mime_params(value: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut in_quotes = false;
+    let mut escaped = false;
+    for (i, ch) in value.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if in_quotes => escaped = true,
+            '"' => in_quotes = !in_quotes,
+            ';' if !in_quotes => {
+                parts.push(value[start..i].trim());
+                start = i + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    parts.push(value[start..].trim());
+    parts
+}
+
+/// Reverses RFC 2045 quoted-string escaping (`\\` → `\`, `\"` → `"`), the
+/// inverse of [`quote_header_value`].
+fn unescape_quoted_string(value: &str) -> String {
+    let mut result = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\\'
+            && let Some(next) = chars.next()
+        {
+            result.push(next);
+        } else {
+            result.push(ch);
+        }
+    }
+    result
+}
+
 /// Extracts a filename from a `Content-Disposition: attachment; …` header
-/// value, preferring the RFC 2231 extended `filename*=UTF-8''…` parameter
-/// (percent-decoded) over the plain `filename="…"` fallback when both are
+/// value, preferring the RFC 2231 extended `filename*=charset'lang'…`
+/// parameter (percent-decoded, case-insensitive charset/param name, any
+/// language tag) over the plain `filename="…"` fallback when both are
 /// present.
 fn extract_attachment_filename(disposition: &str) -> String {
-    let params: Vec<&str> = disposition.split(';').skip(1).map(str::trim).collect();
-    if let Some(value) = params
-        .iter()
-        .find_map(|part| part.strip_prefix("filename*=UTF-8''"))
-    {
-        return percent_encoding::percent_decode_str(value)
+    let params = split_mime_params(disposition);
+    if let Some(value) = params.iter().skip(1).find_map(|part| {
+        let (key, val) = part.split_once('=')?;
+        key.trim().eq_ignore_ascii_case("filename*").then_some(val)
+    }) {
+        let encoded = value.splitn(3, '\'').nth(2).unwrap_or(value);
+        return percent_encoding::percent_decode_str(encoded)
             .decode_utf8_lossy()
             .into_owned();
     }
-    if let Some(value) = params
-        .iter()
-        .find_map(|part| part.strip_prefix("filename="))
-    {
-        return value.trim_matches('"').to_owned();
+    if let Some(value) = params.iter().skip(1).find_map(|part| {
+        let (key, val) = part.split_once('=')?;
+        key.trim()
+            .eq_ignore_ascii_case("filename")
+            .then_some(val.trim())
+    }) {
+        if let Some(inner) = value.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+            return unescape_quoted_string(inner);
+        }
+        return value.to_owned();
     }
     "attachment".to_owned()
 }
@@ -3665,6 +3732,64 @@ mod tests {
     }
 
     #[test]
+    fn render_eml_blocks_header_injection_in_all_deserialized_fields() {
+        // Same threat model as `render_eml_blocks_filename_header_injection`,
+        // but for the pre-existing `subject`/`to`/`from`/`reply_to`/
+        // `extra_headers` fields — these are just as reachable via an
+        // untrusted `Deserialize`d `Mail` as the attachment filename is.
+        let mail = Mail {
+            from: Some("from@example.com\r\nX-From-Injected: 1".to_owned()),
+            reply_to: Some("reply@example.com\r\nX-Reply-Injected: 1".to_owned()),
+            to: vec!["user@example.com\r\nX-To-Injected: 1".to_owned()],
+            subject: "Hi\r\nX-Subject-Injected: 1".to_owned(),
+            html: None,
+            text: Some("hello".to_owned()),
+            list_unsubscribe: None,
+            extra_headers: vec![(
+                "X-Custom\r\nX-Header-Injected".to_owned(),
+                "1\r\nX-Value-Injected: 1".to_owned(),
+            )],
+            attachments: Vec::new(),
+        };
+        let eml = render_eml(&mail);
+        assert!(
+            !eml.lines().any(|line| line.starts_with("X-From-Injected")
+                || line.starts_with("X-Reply-Injected")
+                || line.starts_with("X-To-Injected")
+                || line.starts_with("X-Subject-Injected")
+                || line.starts_with("X-Header-Injected")
+                || line.starts_with("X-Value-Injected")),
+            "CRLF in any header-bound field must not inject a standalone header line: {eml}"
+        );
+        assert!(!eml.contains('\r'));
+    }
+
+    #[test]
+    fn render_eml_falls_back_to_octet_stream_for_invalid_content_type() {
+        // A `Mail` bypassing `build()` could carry a syntactically invalid
+        // content type; the file transport must not write it verbatim, to
+        // stay consistent with the SMTP transport (which rejects it).
+        let mail = Mail {
+            from: Some("from@example.com".to_owned()),
+            reply_to: None,
+            to: vec!["user@example.com".to_owned()],
+            subject: "Hi".to_owned(),
+            html: None,
+            text: Some("hello".to_owned()),
+            list_unsubscribe: None,
+            extra_headers: Vec::new(),
+            attachments: vec![MailAttachment {
+                filename: "file.bin".to_owned(),
+                content_type: "not a mime type".to_owned(),
+                bytes: b"x".to_vec(),
+            }],
+        };
+        let eml = render_eml(&mail);
+        assert!(eml.contains("Content-Type: application/octet-stream"));
+        assert!(!eml.contains("not a mime type"));
+    }
+
+    #[test]
     fn render_eml_encodes_non_ascii_filename_rfc2231() {
         let mail = Mail {
             from: Some("from@example.com".to_owned()),
@@ -3887,6 +4012,71 @@ mod tests {
         assert_eq!(parsed.attachments[1].filename, "receipt.csv");
         assert_eq!(parsed.html.as_deref(), Some("<p>html</p>"));
         assert_eq!(parsed.text.as_deref(), Some("plain"));
+    }
+
+    #[test]
+    fn extract_attachment_filename_handles_semicolon_in_quoted_filename() {
+        // Naive `disposition.split(';')` would truncate this at "invoice".
+        assert_eq!(
+            extract_attachment_filename(r#"attachment; filename="invoice;2026.pdf""#),
+            "invoice;2026.pdf"
+        );
+    }
+
+    #[test]
+    fn extract_attachment_filename_unescapes_quoted_pairs() {
+        assert_eq!(
+            extract_attachment_filename(r#"attachment; filename="weird\"na\\me.txt""#),
+            "weird\"na\\me.txt"
+        );
+    }
+
+    #[test]
+    fn extract_attachment_filename_is_case_insensitive_and_handles_language_tag() {
+        assert_eq!(
+            extract_attachment_filename("attachment; filename*=utf-8'en'r%C3%A9sum%C3%A9.pdf"),
+            "résumé.pdf"
+        );
+    }
+
+    #[test]
+    fn extract_attachment_filename_round_trips_through_dev_preview() {
+        let mail = Mail::builder()
+            .from("from@example.com")
+            .to("user@example.com")
+            .subject("Invoice")
+            .text("plain")
+            .attach(r#"a;b"c\d.txt"#, "text/plain", b"x".to_vec())
+            .build()
+            .expect("mail should build");
+        let eml = render_eml(&mail);
+        let parsed = parse_eml(&eml);
+        assert_eq!(parsed.attachments.len(), 1);
+        assert_eq!(parsed.attachments[0].filename, r#"a;b"c\d.txt"#);
+    }
+
+    #[test]
+    fn parse_multipart_mixed_does_not_misclassify_inline_as_attachment() {
+        let (_, _, attachments) = parse_multipart_mixed(
+            "--b\nContent-Disposition: inline; filename=\"my-attachment-notes.pdf\"\nContent-Type: text/plain\n\nhi\n--b--\n",
+            "b",
+        );
+        assert!(
+            attachments.is_empty(),
+            "an `inline` disposition must not be classified as an attachment: {attachments:?}"
+        );
+    }
+
+    #[test]
+    fn mail_deserializes_from_pre_attachments_json_shape() {
+        // `Mail::attachments` must default on a missing key so a `Mail`
+        // serialized by an older binary (before this field existed) still
+        // deserializes from a durable delivery queue during a rolling
+        // deploy.
+        let json = r#"{"from":null,"reply_to":null,"to":["a@example.com"],"subject":"hi","html":null,"text":"hello","list_unsubscribe":null,"extra_headers":[]}"#;
+        let mail: Mail =
+            serde_json::from_str(json).expect("pre-attachments JSON should deserialize");
+        assert!(mail.attachments.is_empty());
     }
 
     #[test]

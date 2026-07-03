@@ -71,7 +71,7 @@ async fn confirm(mailer: Mailer, id: String) -> AutumnResult<&'static str> {
         .attach("invoice.pdf", "application/pdf", invoice)
         .build()?;
 
-    mailer.deliver_later(mail).await?;
+    mailer.deliver_later(mail);
     Ok("queued")
 }
 ```
