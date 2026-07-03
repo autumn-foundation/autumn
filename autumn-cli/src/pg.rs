@@ -169,8 +169,14 @@ fn tls_connector() -> MakeRustlsConnect {
 /// [`NoServerCertVerification`]), a custom root CA wouldn't be consulted
 /// even if we accepted it, so these are simply dropped rather than
 /// implemented.
-const UNSUPPORTED_SSL_PARAMS: &[&str] =
-    &["sslrootcert", "sslcert", "sslkey", "sslpassword", "sslcrl"];
+const UNSUPPORTED_SSL_PARAMS: &[&str] = &[
+    "sslrootcert",
+    "sslcert",
+    "sslkey",
+    "sslpassword",
+    "sslcrl",
+    "sslcrldir",
+];
 
 /// Drop [`UNSUPPORTED_SSL_PARAMS`] from `pairs`, and reject `sslmode=
 /// verify-ca`/`verify-full` outright rather than silently downgrading them.
@@ -325,28 +331,87 @@ fn take_pair(pairs: &mut Vec<(String, String)>, key: &str) -> Option<String> {
     Some(pairs.remove(index).1)
 }
 
-/// Fill in `host`/`hostaddr` from `PGHOST`/`PGHOSTADDR` if `host_present`
-/// and `hostaddr_present` (as the caller determined for its own connection
-/// string shape) are both false — `tokio_postgres::connect` refuses to
-/// connect at all if neither ends up set on the final `Config`, so a bare
-/// connection string relying on either (the way `psql`/`libpq` would) must
-/// not be handed off still empty. (`libpq`'s further fallback to a
+/// Which fields of a connection string are already set explicitly, from the
+/// caller's own connection-string shape (URL structure and/or query pairs
+/// for `sanitize_url_form`; plain pairs for `sanitize_keyword_form`) — used
+/// by [`fill_in_libpq_env_defaults`] to know which `PG*` environment
+/// variables it may still fill in without overriding anything the caller
+/// already decided.
+#[allow(clippy::struct_excessive_bools)] // five independent flags, not a state machine
+struct ExplicitFields {
+    host: bool,
+    hostaddr: bool,
+    port: bool,
+    user: bool,
+    dbname: bool,
+}
+
+/// Build an [`ExplicitFields`] by asking `is_set` about each field's key —
+/// `is_set` is the caller's own "is this key already present" check
+/// (`is_explicit` for `sanitize_url_form`, a plain `find_pair` lookup for
+/// `sanitize_keyword_form`).
+fn explicit_fields(is_set: impl Fn(&str) -> bool) -> ExplicitFields {
+    ExplicitFields {
+        host: is_set("host"),
+        hostaddr: is_set("hostaddr"),
+        port: is_set("port"),
+        user: is_set("user"),
+        dbname: is_set("dbname"),
+    }
+}
+
+/// Fill in `host`/`hostaddr`/`port`/`user`/`dbname` from `PGHOST`/
+/// `PGHOSTADDR`/`PGPORT`/`PGUSER`/`PGDATABASE` for whichever of those
+/// `explicit` says aren't already set — `tokio_postgres` never consults any
+/// of these environment variables on its own (unlike `psql`, which honors
+/// them as documented `libpq` environment variables), so a connection
+/// string that omits one of these fields and relies on the environment the
+/// way `psql` did would otherwise get a hard-coded default instead (and for
+/// `host`/`hostaddr` specifically, `tokio_postgres::connect` refuses to
+/// connect at all if neither ends up set). (`libpq`'s further fallback to a
 /// platform-default Unix socket directory when even `PGHOST` is unset isn't
 /// replicated here — that default is a compile-time detail of the actual
 /// `libpq` build in use, not something derivable from this crate alone.)
-fn fill_in_pghost_fallback(
+///
+/// Returns whether it injected a `port` — the one field here with the same
+/// authority-baked-default duplication risk `needs_keyword_form` already
+/// guards against for a service-supplied `host`/`port` (see that comment):
+/// if the URL's own authority already names a host, `tokio_postgres` has
+/// already baked a default `port=5432` into the config by the time this
+/// runs, so adding `PGPORT`'s value as a query parameter would sit
+/// alongside that default instead of replacing it. `host`/`hostaddr`
+/// injected here don't have the same risk — they only fire when the
+/// authority had no host at all, so no default was ever baked in.
+fn fill_in_libpq_env_defaults(
     pairs: &mut Vec<(String, String)>,
-    host_present: bool,
-    hostaddr_present: bool,
-) {
-    if host_present || hostaddr_present {
-        return;
+    explicit: &ExplicitFields,
+) -> bool {
+    if !explicit.host && !explicit.hostaddr {
+        if let Ok(pghost) = std::env::var("PGHOST") {
+            pairs.push(("host".to_owned(), pghost));
+        } else if let Ok(pghostaddr) = std::env::var("PGHOSTADDR") {
+            pairs.push(("hostaddr".to_owned(), pghostaddr));
+        }
     }
-    if let Ok(pghost) = std::env::var("PGHOST") {
-        pairs.push(("host".to_owned(), pghost));
-    } else if let Ok(pghostaddr) = std::env::var("PGHOSTADDR") {
-        pairs.push(("hostaddr".to_owned(), pghostaddr));
+    let injected_port = if !explicit.port
+        && let Ok(pgport) = std::env::var("PGPORT")
+    {
+        pairs.push(("port".to_owned(), pgport));
+        true
+    } else {
+        false
+    };
+    if !explicit.user
+        && let Ok(pguser) = std::env::var("PGUSER")
+    {
+        pairs.push(("user".to_owned(), pguser));
     }
+    if !explicit.dbname
+        && let Ok(pgdatabase) = std::env::var("PGDATABASE")
+    {
+        pairs.push(("dbname".to_owned(), pgdatabase));
+    }
+    injected_port
 }
 
 /// Return the value of the first `(key, value)` pair matching `key`, if any.
@@ -687,9 +752,8 @@ fn sanitize_url_form(mut url: url::Url) -> Result<String, CommandError> {
     // error over a parameter it was never going to need anyway.
     let passfile = take_pair(&mut pairs, "passfile");
 
-    let host_present = is_explicit(&pairs, "host");
-    let hostaddr_present = is_explicit(&pairs, "hostaddr");
-    fill_in_pghost_fallback(&mut pairs, host_present, hostaddr_present);
+    let explicit_fields = explicit_fields(|key| is_explicit(&pairs, key));
+    needs_keyword_form |= fill_in_libpq_env_defaults(&mut pairs, &explicit_fields);
 
     let host = explicit_host
         .clone()
@@ -775,9 +839,8 @@ fn sanitize_keyword_form(pairs: Vec<(String, String)>) -> Result<String, Command
     // always be consumed and stripped, not just when it turns out to matter.
     let passfile = take_pair(&mut pairs, "passfile");
 
-    let host_present = find_pair(&pairs, "host").is_some();
-    let hostaddr_present = find_pair(&pairs, "hostaddr").is_some();
-    fill_in_pghost_fallback(&mut pairs, host_present, hostaddr_present);
+    let explicit_fields = explicit_fields(|key| find_pair(&pairs, key).is_some());
+    fill_in_libpq_env_defaults(&mut pairs, &explicit_fields);
 
     if find_pair(&pairs, "password").is_none() {
         let host = find_pair(&pairs, "host")
@@ -1069,7 +1132,7 @@ mod tests {
             ],
             || {
                 let sanitized = sanitize_db_url(
-                    "postgres://host/db?sslcert=/c.pem&sslkey=/k.pem&sslpassword=x&sslcrl=/crl.pem",
+                    "postgres://host/db?sslcert=/c.pem&sslkey=/k.pem&sslpassword=x&sslcrl=/crl.pem&sslcrldir=/crls",
                 )
                 .unwrap();
                 let parsed = url::Url::parse(&sanitized).unwrap();
@@ -1175,6 +1238,72 @@ mod tests {
                 &[tokio_postgres::config::Host::Tcp("right-host".to_owned())]
             );
         });
+    }
+
+    #[test]
+    fn sanitize_fills_in_pgport_pguser_pgdatabase_when_url_omits_them() {
+        // `tokio_postgres` never reads these on its own (unlike `psql`, which
+        // honors them as documented libpq environment variables), so a URL
+        // that omits port/user/dbname and relies on the environment the way
+        // `psql` did would otherwise connect as the OS login on the default
+        // port to a database named after that login instead.
+        temp_env::with_vars(
+            [
+                ("PGPORT", Some("6543")),
+                ("PGUSER", Some("app_user")),
+                ("PGDATABASE", Some("app_db")),
+                ("PGPASSWORD", None),
+                ("PGPASSFILE", Some("/nonexistent-pgpass-for-test")),
+            ],
+            || {
+                let sanitized = sanitize_db_url("postgres://db.internal").unwrap();
+                let config: tokio_postgres::Config = sanitized.parse().unwrap();
+                assert_eq!(config.get_ports(), &[6543]);
+                assert_eq!(config.get_user(), Some("app_user"));
+                assert_eq!(config.get_dbname(), Some("app_db"));
+            },
+        );
+    }
+
+    #[test]
+    fn sanitize_fills_in_pgport_pguser_pgdatabase_in_keyword_form_too() {
+        temp_env::with_vars(
+            [
+                ("PGPORT", Some("6543")),
+                ("PGUSER", Some("app_user")),
+                ("PGDATABASE", Some("app_db")),
+                ("PGPASSWORD", None),
+                ("PGPASSFILE", Some("/nonexistent-pgpass-for-test")),
+            ],
+            || {
+                let sanitized = sanitize_db_url("host=db.internal").unwrap();
+                let config: tokio_postgres::Config = sanitized.parse().unwrap();
+                assert_eq!(config.get_ports(), &[6543]);
+                assert_eq!(config.get_user(), Some("app_user"));
+                assert_eq!(config.get_dbname(), Some("app_db"));
+            },
+        );
+    }
+
+    #[test]
+    fn sanitize_does_not_override_explicit_port_user_dbname_with_env_vars() {
+        temp_env::with_vars(
+            [
+                ("PGPORT", Some("9999")),
+                ("PGUSER", Some("wrong_user")),
+                ("PGDATABASE", Some("wrong_db")),
+                ("PGPASSWORD", None),
+                ("PGPASSFILE", Some("/nonexistent-pgpass-for-test")),
+            ],
+            || {
+                let sanitized =
+                    sanitize_db_url("postgres://right_user@db.internal:6543/right_db").unwrap();
+                let config: tokio_postgres::Config = sanitized.parse().unwrap();
+                assert_eq!(config.get_ports(), &[6543]);
+                assert_eq!(config.get_user(), Some("right_user"));
+                assert_eq!(config.get_dbname(), Some("right_db"));
+            },
+        );
     }
 
     #[test]
