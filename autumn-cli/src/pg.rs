@@ -410,9 +410,14 @@ fn fill_in_libpq_env_defaults(
     explicit: &ExplicitFields,
 ) -> bool {
     if !explicit.host && !explicit.hostaddr {
+        // Both may be set together — libpq connects via `PGHOSTADDR` while
+        // retaining `PGHOST` as the name used for other purposes (e.g.
+        // certificate/auth checks), so both are injected independently
+        // rather than treating them as mutually exclusive.
         if let Ok(pghost) = std::env::var("PGHOST") {
             pairs.push(("host".to_owned(), pghost));
-        } else if let Ok(pghostaddr) = std::env::var("PGHOSTADDR") {
+        }
+        if let Ok(pghostaddr) = std::env::var("PGHOSTADDR") {
             pairs.push(("hostaddr".to_owned(), pghostaddr));
         }
     }
@@ -1316,6 +1321,57 @@ mod tests {
                 &[tokio_postgres::config::Host::Tcp("right-host".to_owned())]
             );
         });
+    }
+
+    #[test]
+    fn sanitize_fills_in_both_pghost_and_pghostaddr_when_url_has_neither() {
+        // libpq allows both `PGHOST` and `PGHOSTADDR` to be set together —
+        // it connects to `PGHOSTADDR` while retaining `PGHOST` as the name
+        // used for e.g. certificate/auth checks (a common setup when DNS
+        // isn't available or `PGHOST` is only meaningful as a name, not an
+        // address). `tokio_postgres::Config` supports the same pairing
+        // (`connect.rs` requires `host`/`hostaddr` to have equal lengths
+        // when both are set, then uses `hostaddr` to open the socket).
+        temp_env::with_vars(
+            [
+                ("PGHOST", Some("db.internal")),
+                ("PGHOSTADDR", Some("10.0.0.5")),
+            ],
+            || {
+                let sanitized = sanitize_db_url("postgres:///app").unwrap();
+                let config: tokio_postgres::Config = sanitized.parse().unwrap();
+                assert_eq!(
+                    config.get_hosts(),
+                    &[tokio_postgres::config::Host::Tcp("db.internal".to_owned())]
+                );
+                assert_eq!(
+                    config.get_hostaddrs(),
+                    &["10.0.0.5".parse::<std::net::IpAddr>().unwrap()]
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn sanitize_fills_in_both_pghost_and_pghostaddr_in_keyword_form_too() {
+        temp_env::with_vars(
+            [
+                ("PGHOST", Some("db.internal")),
+                ("PGHOSTADDR", Some("10.0.0.5")),
+            ],
+            || {
+                let sanitized = sanitize_db_url("dbname=app").unwrap();
+                let config: tokio_postgres::Config = sanitized.parse().unwrap();
+                assert_eq!(
+                    config.get_hosts(),
+                    &[tokio_postgres::config::Host::Tcp("db.internal".to_owned())]
+                );
+                assert_eq!(
+                    config.get_hostaddrs(),
+                    &["10.0.0.5".parse::<std::net::IpAddr>().unwrap()]
+                );
+            },
+        );
     }
 
     #[test]
