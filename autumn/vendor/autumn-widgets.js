@@ -189,6 +189,47 @@
     });
   });
 
+  // ── modal / confirm_action ────────────────────────────────────────────────
+  // autumn_web::widgets::modal / confirm_action open and close their
+  // <dialog> via the native HTML Invoker Commands API (command="show-modal"
+  // / command="close" + commandfor) wherever it's supported — no JS needed
+  // there. This is the fallback for browsers that don't support it yet:
+  // one delegated click handler wired to the same data-modal-open /
+  // data-modal-close attributes the widget always emits. showModal()/close()
+  // give ESC-close, a focus trap, and focus-into/-return-from the dialog for
+  // free from the browser in both paths.
+  if (!('command' in HTMLButtonElement.prototype)) {
+    document.addEventListener('click', function (e) {
+      var opener = e.target.closest('[data-modal-open]');
+      if (opener) {
+        var toOpen = document.getElementById(opener.getAttribute('data-modal-open'));
+        if (toOpen && toOpen.showModal) toOpen.showModal();
+        return;
+      }
+      var closer = e.target.closest('[data-modal-close]');
+      if (closer) {
+        var toClose = document.getElementById(closer.getAttribute('data-modal-close'));
+        if (toClose && toClose.close) toClose.close();
+      }
+    });
+  }
+
+  // ── modal light-dismiss (closedby="any") backdrop-click polyfill ──────────
+  // `closedby="any"` (ModalConfig::light_dismiss) is a newer <dialog>
+  // feature with limited browser support — where it's unsupported, the
+  // native backdrop click silently does nothing. Always wired (not
+  // feature-detected): dialog.close() on an already-closed dialog is a
+  // spec'd no-op, so this never double-fires where closedby IS natively
+  // supported. e.target === the dialog itself only happens for a genuine
+  // backdrop click here: .autumn-modal has zero padding and its one child,
+  // .autumn-modal__content, fills the whole box, so any click landing
+  // inside the visible dialog always targets a descendant, never the
+  // <dialog> element directly.
+  document.addEventListener('click', function (e) {
+    var t = e.target;
+    if (t.matches && t.matches('dialog[closedby="any"][open]')) t.close();
+  });
+
   function initAll() {
     document.querySelectorAll('[data-ac-value-id]').forEach(initAutocomplete);
     document.querySelectorAll('[data-autumn-nav]').forEach(initNav);

@@ -8,12 +8,12 @@ use autumn_web::flash::{FlashMessage, flash_message_divs};
 use autumn_web::job::{
     JobAdminPage, JobAdminRecord, JobAdminSnapshot, JobAdminStatus, JobScheduleSummary,
 };
-use autumn_web::links::{ButtonToOptions, button_to_with};
 use autumn_web::pagination::Page;
 use autumn_web::runtime_config::{ConfigChangeRecord, ConfigEntry};
 use autumn_web::ui::pagination::{PagerOptions, pagination_nav};
 use autumn_web::widgets::{
-    CardConfig, NavBarConfig, NavBarLayout, NavItem, card, nav_bar, stat_card,
+    CardConfig, ConfirmActionConfig, ModalConfig, NavBarConfig, NavBarLayout, NavItem, card,
+    confirm_action, modal, modal_close_button, nav_bar, stat_card,
 };
 use http::Method;
 use maud::{DOCTYPE, Markup, PreEscaped, html};
@@ -1112,6 +1112,27 @@ pub fn model_list_page(
 
                 } // /form
 
+                // Shared confirm dialog for destructive bulk actions — rendered
+                // once per page when at least one declared action requires
+                // confirmation. admin.js intercepts the bulk form's submit,
+                // shows this dialog instead of window.confirm(), and fills in
+                // [data-bulk-confirm-detail] with the action/count description.
+                @if actions.iter().any(|a| a.confirm) {
+                    (modal(
+                        "admin-bulk-confirm",
+                        "Confirm bulk action",
+                        &html! { p data-bulk-confirm-detail {} },
+                        &ModalConfig::new().footer(html! {
+                            (modal_close_button("Cancel", "admin-bulk-confirm", Some("btn")))
+                            button type="button" class="btn btn-danger"
+                                command="close" commandfor="admin-bulk-confirm"
+                                data-modal-close="admin-bulk-confirm" data-bulk-confirm {
+                                "Confirm"
+                            }
+                        }),
+                    ))
+                }
+
                 // Pagination
                 @if result.total_pages() > 1 {
                     (render_pagination(result, model_slug, &search_enc, sort_by, sort_dir, &filters_enc, prefix))
@@ -1383,12 +1404,8 @@ pub fn model_detail_page(
 
         ({
             let delete_url = format!("{prefix}/{model_slug}/{id}");
-            let delete_confirm = format!("Are you sure you want to delete this {model_name}?");
-            let delete_attrs = [
-                ("hx-delete", delete_url.as_str()),
-                ("hx-confirm", delete_confirm.as_str()),
-                ("hx-target", "body"),
-            ];
+            let delete_dialog_id = format!("delete-confirm-{id}");
+            let delete_title = format!("Delete this {model_name}?");
             let header_action = html! {
                 div class="header-actions" {
                     @if has_history {
@@ -1399,15 +1416,18 @@ pub fn model_detail_page(
                     a href={ (prefix) "/" (model_slug) "/" (id) "/edit" }
                         class="btn btn-primary" { "Edit" }
                     " "
-                    (button_to_with(
+                    (confirm_action(
+                        &delete_dialog_id,
                         "Delete",
                         &delete_url,
                         Method::DELETE,
                         csrf_token,
-                        &ButtonToOptions::new()
-                            .class("btn btn-danger")
-                            .csrf_field(csrf_form_field)
-                            .attrs(&delete_attrs),
+                        &ConfirmActionConfig::new()
+                            .title(&delete_title)
+                            .message(html! { p { "This action cannot be undone." } })
+                            .trigger_class("btn btn-danger")
+                            .confirm_class("btn btn-danger")
+                            .csrf_field(csrf_form_field),
                     ))
                 }
             };
@@ -2924,15 +2944,15 @@ mod tests {
             "Edit link must use path id 42: {html}"
         );
         assert!(
-            html.contains(r#"hx-delete="/admin/widgets/42""#),
-            "Delete must target path id 42: {html}"
+            html.contains(r#"<form action="/admin/widgets/42" method="post""#),
+            "Delete confirm form must target path id 42: {html}"
         );
         assert!(
             !html.contains("widgets/99"),
             "payload id 99 must not route mutations: {html}"
         );
-        // The delete button is now rendered via button_to_with, so a no-JS
-        // form submission also works: POST + _method=DELETE + CSRF.
+        // The delete button is now rendered via confirm_action (a server-rendered
+        // <dialog>), so a no-JS form submission also works: POST + _method=DELETE + CSRF.
         assert!(
             html.contains(r#"name="_method" value="DELETE""#),
             "Delete form must carry a _method override: {html}"
@@ -2941,6 +2961,47 @@ mod tests {
             html.contains(r#"name="_csrf" value="t""#),
             "Delete form must carry the CSRF token: {html}"
         );
+    }
+
+    #[test]
+    fn detail_page_delete_uses_confirm_dialog_not_hx_confirm() {
+        // Issue #1233: the admin delete confirmation must be a server-rendered,
+        // testable <dialog> (autumn_web::widgets::confirm_action), not the
+        // native window.confirm() reached via hx-confirm.
+        let r = dummy_registry();
+        let fields = vec![AdminField::new("name", AdminFieldKind::Text)];
+        let record = serde_json::json!({"id": 42, "name": "x"});
+        let html = model_detail_page(
+            &r,
+            "widgets",
+            "Widget",
+            "Widgets",
+            &fields,
+            &record,
+            "#42",
+            42,
+            &[],
+            "t",
+            "_csrf",
+            "X-CSRF-Token",
+            "/admin",
+            "/actuator",
+            false,
+            false,
+        )
+        .into_string();
+        assert!(!html.contains("hx-confirm"), "{html}");
+        assert!(!html.contains("hx-delete"), "{html}");
+        assert!(html.contains("<dialog"), "{html}");
+        assert!(html.contains(r#"aria-modal="true""#), "{html}");
+        assert!(
+            html.contains("Widget"),
+            "confirm dialog title should mention the model name: {html}"
+        );
+        // The trigger button opens the dialog via the native invoker
+        // commands (with a JS-fallback data attribute) rather than hx-delete.
+        assert!(html.contains(r#"command="show-modal""#), "{html}");
+        assert!(html.contains("data-modal-open"), "{html}");
     }
 
     #[test]
@@ -3448,6 +3509,71 @@ mod tests {
             html.contains(r#"data-confirm="1""#),
             "destructive action should set data-confirm: {html}"
         );
+        // Issue #1233: a shared confirm <dialog> is rendered because at
+        // least one action (delete) requires confirmation. admin.js
+        // intercepts the bulk submit and shows this dialog instead of
+        // calling window.confirm().
+        assert!(
+            html.contains(r#"<dialog id="admin-bulk-confirm""#),
+            "list view with a confirm-requiring action must render the bulk confirm dialog: {html}"
+        );
+        assert!(html.contains("data-bulk-confirm-detail"), "{html}");
+        // Regression: "data-bulk-confirm" is a substring of
+        // "data-bulk-confirm-detail", so a plain `.contains("data-bulk-confirm")`
+        // would pass even if the Confirm button's own attribute were removed.
+        // Require an occurrence NOT immediately followed by `-` (i.e. not part
+        // of `-detail`) so this actually verifies the button's bare attribute.
+        assert!(
+            html.match_indices("data-bulk-confirm")
+                .any(|(i, m)| html.as_bytes().get(i + m.len()) != Some(&b'-')),
+            "confirm button must carry a standalone data-bulk-confirm attribute: {html}"
+        );
+        assert!(!html.contains("window.confirm"), "{html}");
+    }
+
+    #[test]
+    fn list_page_skips_bulk_confirm_dialog_when_no_action_requires_confirm() {
+        use crate::traits::{ActionStyle, ListResult};
+        let r = dummy_registry();
+        let fields = vec![AdminField::new("name", AdminFieldKind::Text)];
+        let actions = vec![AdminAction {
+            name: "archive",
+            label: "Archive".to_owned(),
+            style: ActionStyle::Default,
+            confirm: false,
+        }];
+        let result = ListResult {
+            records: vec![serde_json::json!({"id": 1, "name": "x"})],
+            total: 1,
+            page: 1,
+            per_page: 25,
+        };
+        let html = model_list_page(
+            &r,
+            "widgets",
+            "Widgets",
+            &fields,
+            &actions,
+            &result,
+            "",
+            None,
+            SortDirection::Asc,
+            &[],
+            &[],
+            "tok",
+            "admin_csrf",
+            "X-CSRF-Token",
+            "/admin",
+            "/actuator",
+            false,
+            false,
+            false,
+        )
+        .into_string();
+        assert!(
+            !html.contains("admin-bulk-confirm"),
+            "no action requires confirmation, so no dialog should render: {html}"
+        );
     }
 
     #[test]
@@ -3674,7 +3800,7 @@ mod tests {
 
     #[test]
     fn admin_js_does_not_contain_inline_event_handlers() {
-        // Sanity-check the shipped JS: has the two behaviours we expect.
+        // Sanity-check the shipped JS: has the behaviours we expect.
         let js = include_str!("admin.js");
         assert!(
             js.contains("select-all"),
@@ -3683,6 +3809,142 @@ mod tests {
         assert!(
             js.contains("removeAttribute(\"name\")"),
             "admin.js should strip blank password input names"
+        );
+    }
+
+    #[test]
+    fn admin_js_uses_confirm_dialog_as_primary_path() {
+        // Issue #1233: the bulk-action confirm's primary path is the
+        // server-rendered #admin-bulk-confirm <dialog>
+        // (autumn_web::widgets::modal), not the native window.confirm().
+        let js = include_str!("admin.js");
+        assert!(js.contains("data-bulk-confirm"), "{js}");
+        assert!(js.contains("showModal"), "{js}");
+    }
+
+    #[test]
+    fn admin_js_window_confirm_only_reached_as_showmodal_fallback() {
+        // Code-review fix: window.confirm() must not be the primary confirm
+        // mechanism, but it IS kept as a fallback for browsers without
+        // <dialog>.showModal support — otherwise a destructive bulk action
+        // would submit with zero confirmation on those browsers (fail-open).
+        // Verify it's only reachable after the showModal support guard, not
+        // called unconditionally earlier in the file.
+        let js = include_str!("admin.js");
+        let guard_idx = js
+            .find("!dialog.showModal")
+            .unwrap_or_else(|| panic!("must feature-detect <dialog>.showModal support: {js}"));
+        // Search for the actual call site (not just the substring
+        // "window.confirm", which also appears in an explanatory comment
+        // earlier in the file).
+        let confirm_idx = js
+            .find("window.confirm(message)")
+            .unwrap_or_else(|| panic!("must keep a window.confirm() fallback: {js}"));
+        assert!(
+            confirm_idx > guard_idx,
+            "window.confirm() must only be reached after the showModal support guard: {js}"
+        );
+    }
+
+    #[test]
+    fn admin_js_defers_showmodal_fallback_resubmit() {
+        // Regression (caught by a real-browser Playwright check, not by any
+        // string-matching test): calling form.requestSubmit() synchronously
+        // from within that same form's still-dispatching `submit` event
+        // handler is a no-op per the HTML spec's reentrancy guard ("if
+        // form's firing submit event is true, then return"). The
+        // window.confirm() fallback branch runs inside that handler, so its
+        // resubmit must be deferred (e.g. via setTimeout) past the current
+        // dispatch — otherwise the confirmed action silently never submits.
+        let js = include_str!("admin.js");
+        let confirm_idx = js
+            .find("window.confirm(message)")
+            .unwrap_or_else(|| panic!("must keep a window.confirm() fallback: {js}"));
+        let defer_idx = js
+            .find("setTimeout")
+            .unwrap_or_else(|| panic!("fallback resubmit must be deferred: {js}"));
+        assert!(
+            defer_idx > confirm_idx,
+            "the deferred resubmit must be inside the window.confirm() fallback branch: {js}"
+        );
+    }
+
+    #[test]
+    fn admin_js_requestsubmit_has_form_submit_fallback() {
+        // PR review (gemini-code-assist): form.requestSubmit() shipped later
+        // than <dialog> support in some browsers (e.g. Safari 15.4-15.6 has
+        // <dialog> but not requestSubmit, which arrived in Safari 16) and
+        // may be absent in older headless test runners — calling it
+        // unguarded throws a TypeError. Both call sites must go through a
+        // feature-detected fallback to form.submit() instead of calling
+        // requestSubmit directly.
+        let js = include_str!("admin.js");
+        assert!(
+            js.contains(r#"typeof form.requestSubmit === "function""#),
+            "must feature-detect requestSubmit before calling it: {js}"
+        );
+        assert!(
+            js.contains("form.submit();"),
+            "must fall back to form.submit() when requestSubmit is unavailable: {js}"
+        );
+        // The only *call statement* invoking requestSubmit() should be
+        // inside the feature-detected submitForm() helper itself (matched
+        // with a trailing `;` so an explanatory comment mentioning the same
+        // method name doesn't also count) — every other resubmit call site
+        // routes through submitForm(form) instead.
+        assert_eq!(
+            js.matches("form.requestSubmit();").count(),
+            1,
+            "form.requestSubmit() should only be called from inside the \
+             feature-detected submitForm() helper, not unguarded elsewhere: {js}"
+        );
+        assert_eq!(
+            js.matches("submitForm(form);").count(),
+            2,
+            "both bulk-action resubmit call sites must route through submitForm(): {js}"
+        );
+    }
+
+    #[test]
+    fn admin_js_clears_bulk_confirmed_before_fallback_submit() {
+        // PR review (chatgpt-codex-connector): form.submit() (the
+        // requestSubmit-unavailable fallback) bypasses the 'submit' event
+        // entirely, so the top-level submit handler's `bulkConfirmed`
+        // cleanup never runs for that path. Without an explicit clear here,
+        // a bfcache-restored page after that fallback submit would carry a
+        // stale "confirmed" flag into the next, unrelated bulk-action
+        // attempt and skip its confirmation dialog. The clear must happen
+        // in the same branch as (and before) the form.submit() fallback
+        // call, not just "somewhere in the file".
+        let js = include_str!("admin.js");
+        let fallback_idx = js
+            .find("form.submit();")
+            .unwrap_or_else(|| panic!("must keep a form.submit() fallback: {js}"));
+        // `find` (first occurrence), not `rfind`: the top-level submit-event
+        // handler has its own, unrelated "delete ...;" later in the file
+        // (its normal one-shot-flag consumption on a genuine event) — this
+        // must find the one inside submitForm() itself, which comes first.
+        let clear_idx = js
+            .find("delete form.dataset.bulkConfirmed;")
+            .unwrap_or_else(|| {
+                panic!("must clear bulkConfirmed before the form.submit() fallback: {js}")
+            });
+        assert!(
+            clear_idx < fallback_idx,
+            "bulkConfirmed must be cleared BEFORE the form.submit() fallback call \
+             (form.submit() bypasses the submit event, so clearing it after — or \
+             relying on the submit-event listener to clear it — never happens): {js}"
+        );
+        // Clearing must live inside submitForm() itself, not just at one of
+        // its call sites, so it applies regardless of which call site
+        // triggers the fallback path.
+        let submit_form_idx = js
+            .find("function submitForm(form)")
+            .unwrap_or_else(|| panic!("submitForm() helper must exist: {js}"));
+        assert!(
+            submit_form_idx < clear_idx && clear_idx < fallback_idx,
+            "the bulkConfirmed clear must be inside submitForm(), immediately \
+             guarding its form.submit() fallback: {js}"
         );
     }
 

@@ -9,6 +9,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **views:** `modal`/`confirm_action` widgets — an accessible, testable
+  confirm for destructive actions (#1233). `modal(id, title, body, config)`
+  renders a native `<dialog>` (`aria-modal="true"`, `aria-labelledby`, a body
+  slot, and an optional footer slot via `ModalConfig::footer`) with only
+  `autumn-modal*` BEM classes. `confirm_action(id, trigger_label, action,
+  method, csrf_token, config)` composes it with `link_to`/`button_to`'s
+  `button_to_with` (#1138) into a full confirm flow: a trigger button opens
+  the dialog, the cancel button closes it, and the confirm button is a real
+  `button_to_with` submit carrying the correct HTTP method (`_method`
+  override) and CSRF token, so a `TestClient` test can assert the dialog,
+  its title, and the confirm button's action/method/CSRF token — impossible
+  with the native `window.confirm()`/htmx `hx-confirm` it replaces. Opening
+  and closing require zero app-authored JavaScript: triggers use the native
+  `command`/`commandfor` HTML Invoker Commands API, with a `data-modal-open`/
+  `data-modal-close` fallback shipped in `autumn-widgets.js` for browsers
+  that don't support it yet. `showModal()` gives ESC-close, a focus trap,
+  and focus-into/-return-from the dialog for free from the browser in both
+  paths. The confirm button carries a danger semantic class
+  (`autumn-modal__confirm--danger`) by default (`ConfirmActionConfig::
+  danger(false)` to opt out), and `ConfirmActionConfig::light_dismiss`/
+  `level`/`modal_class` pass through to the underlying `ModalConfig` for
+  callers that need them. A `<noscript>` fallback renders the same confirm
+  button directly (unconfirmed, matching a plain HTML form) so the action
+  stays reachable with JavaScript disabled, since the trigger's `command`
+  attribute alone can't open the dialog before JS runs. The admin plugin's
+  detail-view delete button and bulk-action confirm are migrated to
+  `confirm_action`/`modal`, dropping their `hx-confirm`/`window.confirm()`
+  reliance entirely; the bulk-action dialog's Confirm button now closes via
+  the same `data-modal-close` mechanism as its Cancel button, and its
+  triggering form is re-queried rather than stashed on the dialog node.
+  The bulk-action confirm keeps a `window.confirm()` fallback, reached only
+  when `<dialog>.showModal` is unsupported, so a destructive action is
+  never submitted without some confirmation. Purely additive; minor
+  version bump.
 - **mcp:** plugins and repositories can now layer in MCP. Chainable route
   toggles `Route::mcp()`, `Route::mcp_exclude()`, and `Route::mcp_stream()`
   mirror the `#[api_doc(mcp)]` / `mcp = false` / `mcp, stream` attribute

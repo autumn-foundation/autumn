@@ -979,9 +979,13 @@ async fn model_action(
 
 /// `DELETE /admin/{slug}/{id}` — Delete a record.
 ///
-/// Called from the detail view's `hx-delete` button, and reachable as a
-/// plain form submission (`POST` + `_method=DELETE`) from the no-JS
-/// `button_to_with` fallback. htmx requests get an empty 200 body with
+/// Called from the detail view's `confirm_action` dialog (a plain `POST` +
+/// `_method=DELETE` form submission, not `hx-delete` — see
+/// `autumn_web::widgets::confirm_action`), or its `<noscript>` fallback
+/// button when JavaScript is disabled. Neither path sends `HX-Request`
+/// today, so the `hx.is_htmx` branch below is currently unreached by the
+/// admin plugin's own UI; it's kept for direct API/htmx clients that set
+/// the header themselves, in which case they get an empty 200 body with
 /// `HX-Redirect` so htmx performs a full-page navigation to the list view
 /// (updating `window.location`), rather than swapping the list HTML into
 /// the stale detail page. Non-htmx requests get a real 303 redirect, since
