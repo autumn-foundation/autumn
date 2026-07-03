@@ -192,10 +192,16 @@ pub fn row_to_strings(row: &Row) -> Vec<Option<String>> {
         .collect()
 }
 
-/// Print a result set as a simple aligned table: a header row, a `-`
-/// separator, then the data rows — no trailing row-count footer, matching
-/// the `\pset footer off` output the old psql implementation used.
-pub fn print_table(headers: &[&str], rows: &[Vec<Option<String>>]) {
+/// Build the aligned-table string (extracted from [`print_table`] for
+/// testability, mirroring `routes::format_table`'s shape).
+///
+/// Row cells are joined by `" | "` (3 characters); the separator's `+`
+/// markers must land under each `|` exactly, so each dash segment is padded
+/// to just the column width and the segments are joined by `"-+-"` (also 3
+/// characters, with `+` in the middle position like `|` is in `" | "`) —
+/// not `w + 1` dashes joined by a bare `"+"`, which drifts out of alignment
+/// by one character per column from the third column onward.
+pub fn format_table(headers: &[&str], rows: &[Vec<Option<String>>]) -> String {
     let mut widths: Vec<usize> = headers.iter().map(|h| display_width(h)).collect();
     for row in rows {
         for (i, cell) in row.iter().enumerate() {
@@ -218,19 +224,30 @@ pub fn print_table(headers: &[&str], rows: &[Vec<Option<String>>]) {
             .to_owned()
     };
 
-    println!("{}", format_row(headers));
-    println!(
-        "{}",
-        widths
+    let mut out = String::new();
+    out.push_str(&format_row(headers));
+    out.push('\n');
+    out.push_str(
+        &widths
             .iter()
-            .map(|w| "-".repeat(w + 1))
+            .map(|w| "-".repeat(*w))
             .collect::<Vec<_>>()
-            .join("+")
+            .join("-+-"),
     );
+    out.push('\n');
     for row in rows {
         let cells: Vec<&str> = row.iter().map(|c| c.as_deref().unwrap_or("")).collect();
-        println!("{}", format_row(&cells));
+        out.push_str(&format_row(&cells));
+        out.push('\n');
     }
+    out
+}
+
+/// Print a result set as a simple aligned table: a header row, a `-`
+/// separator, then the data rows — no trailing row-count footer, matching
+/// the `\pset footer off` output the old psql implementation used.
+pub fn print_table(headers: &[&str], rows: &[Vec<Option<String>>]) {
+    print!("{}", format_table(headers, rows));
 }
 
 #[cfg(test)]
@@ -240,6 +257,41 @@ mod tests {
     #[test]
     fn print_table_smoke_does_not_panic_on_empty_rows() {
         print_table(&["key", "value"], &[]);
+    }
+
+    #[test]
+    fn separator_plus_marks_align_with_header_pipes_for_three_plus_columns() {
+        // Regression test: the separator's `+` markers must land in the
+        // exact same column as each header/data row's `|`, for tables with
+        // more than two columns (where a naive `w + 1` / `"+"`-joined
+        // separator drifts out of alignment by one character per column).
+        let table = format_table(
+            &["name", "state", "variants", "winner"],
+            &[vec![
+                Some("checkout_flow".to_owned()),
+                Some("running".to_owned()),
+                Some("control=50, treatment=50".to_owned()),
+                None,
+            ]],
+        );
+        let lines: Vec<&str> = table.lines().collect();
+        let header_pipes: Vec<usize> = lines[0]
+            .char_indices()
+            .filter(|(_, c)| *c == '|')
+            .map(|(i, _)| i)
+            .collect();
+        let separator_plusses: Vec<usize> = lines[1]
+            .char_indices()
+            .filter(|(_, c)| *c == '+')
+            .map(|(i, _)| i)
+            .collect();
+        let data_pipes: Vec<usize> = lines[2]
+            .char_indices()
+            .filter(|(_, c)| *c == '|')
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(header_pipes, separator_plusses);
+        assert_eq!(header_pipes, data_pipes);
     }
 
     #[test]
