@@ -109,6 +109,9 @@ pub fn plan_scaffold_with_options(
         ));
     }
     let fields = parse_fields(field_tokens)?;
+    if !options.api {
+        validate_enum_field_names_against_routes_imports(&fields)?;
+    }
     // Resolve shard key before planning the model (propagates to model render).
     let resolved_shard_key = resolve_shard_key(&fields, &options.model)?;
     let model_options_with_key = ModelOptions {
@@ -348,6 +351,58 @@ pub fn run(name: &str, field_tokens: &[String], flags: Flags, options: &Scaffold
             std::process::exit(1);
         }
     }
+}
+
+/// Fixed, unconditional (non-`--live`, non-attachment-gated) names the
+/// generated `src/routes/<plural>.rs` file imports for every non-`--api`
+/// scaffold — see the `use` block at the top of [`render_routes_file`]'s
+/// template. An enum field whose generated type name (`pascal(field)`)
+/// matches one of these produces a second, conflicting `use` of the same
+/// name (`use crate::models::…::{…, Path}` alongside
+/// `use autumn_web::extract::Path;`), which fails with E0252 before the
+/// scaffold can compile — confirmed by generating `path:enum{a,b}`.
+///
+/// Lowercase framework imports (`get`, `html`, `post`, `secured`,
+/// `pagination_nav`) can never collide: `pascal()` always capitalizes the
+/// first letter, so a `snake_case` field name can't produce a lowercase type
+/// name.
+const ROUTES_FILE_RESERVED_NAMES: &[&str] = &[
+    "Path",
+    "Page",
+    "PageRequest",
+    "Bytes",
+    "CsrfFormField",
+    "CsrfToken",
+    "PagerOptions",
+    "Flash",
+    "ShardedDb",
+    "Db",
+    "AutumnError",
+    "AutumnResult",
+    "Markup",
+    "RunQueryDsl",
+];
+
+/// Reject an `enum{…}` field whose generated type name collides with one of
+/// [`ROUTES_FILE_RESERVED_NAMES`]. Only relevant when `generate scaffold`
+/// will actually emit `src/routes/<plural>.rs` (i.e. not `--api`, which
+/// skips that file entirely).
+fn validate_enum_field_names_against_routes_imports(fields: &[Field]) -> Result<(), GenerateError> {
+    for f in fields {
+        let Some(enum_ty) = f.enum_type_name() else {
+            continue;
+        };
+        if ROUTES_FILE_RESERVED_NAMES.contains(&enum_ty.as_str()) {
+            return Err(GenerateError::InvalidField {
+                token: format!("{}:enum{{...}}", f.name),
+                reason: format!(
+                    "the generated enum type '{enum_ty}' collides with a name the scaffold's \
+                     routes file always imports; rename the field"
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn parse_query_specs(
@@ -2481,6 +2536,23 @@ fn render_enum_rejection_smoke_test(
     setup_calls: &str,
     api: bool,
 ) -> String {
+    // `setup_calls` is shared with (and identical to) the base index/api
+    // smoke test's own setup, which issues a plain, non-idempotent
+    // `CREATE TABLE {plural} (...)` (matching the real migration). Both
+    // tests run against the same `TestDb::shared()` Postgres container in
+    // the same test binary, so whichever one runs second would hit
+    // "relation already exists" — make *this* test's own copy of the
+    // `CREATE TABLE` idempotent so it works whether it runs alongside the
+    // base test or standalone (e.g. `cargo test posts_rejects_out_of_set_status
+    // -- --ignored`). The reference-stub-table `CREATE TABLE`s are already
+    // `IF NOT EXISTS` (see `render_reference_stub_tables_sql`), so only the
+    // main table's statement needs the same treatment.
+    let setup_calls = setup_calls.replacen(
+        &format!("CREATE TABLE {plural} ("),
+        &format!("CREATE TABLE IF NOT EXISTS {plural} ("),
+        1,
+    );
+    let setup_calls = setup_calls.as_str();
     let mut out = String::new();
     for target in fields.iter().filter(|f| f.is_enum()) {
         let field_name = &target.name;
@@ -2891,6 +2963,46 @@ async fn main() {
         )
         .unwrap_err();
         assert!(matches!(err, GenerateError::InvalidField { .. }));
+    }
+
+    #[test]
+    fn scaffold_enum_field_colliding_with_routes_import_is_rejected() {
+        // `path:enum{a,b}` would generate `use crate::models::post::{…, Path}`
+        // in routes.rs alongside the file's own `use autumn_web::extract::Path;`
+        // — two different types both named `Path`, which is E0252. Verified by
+        // generating this exact scaffold and observing the duplicate import.
+        for field_name in ["path", "page", "bytes", "flash", "db"] {
+            let tmp = project_with_main(default_main());
+            let err = plan_scaffold(
+                tmp.path(),
+                "Post",
+                &[format!("{field_name}:enum{{a,b}}")],
+                "20260427000000",
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, GenerateError::InvalidField { .. }),
+                "expected '{field_name}' to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn scaffold_enum_field_colliding_with_routes_import_is_accepted_for_api_only() {
+        // `--api` scaffolds never emit `src/routes/<plural>.rs`, so the
+        // routes-file reserved names don't apply.
+        let tmp = project_with_main(default_main());
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["path:enum{a,b}".into()],
+            "20260427000000",
+            &ScaffoldOptions {
+                api: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
     }
 
     // ── enum field: nullable (issue #1030) ──────────────────────────────────
@@ -4546,6 +4658,36 @@ async fn main() {
         assert!(
             test.contains("posts::table.count()"),
             "must assert zero rows were written: {test}"
+        );
+    }
+
+    #[test]
+    fn scaffold_enum_rejection_test_uses_idempotent_create_table() {
+        // Regression test: both the base index test and the enum-rejection
+        // test run against the same shared `TestDb` in the same test binary
+        // and both issue a `CREATE TABLE posts (...)` as part of setup —
+        // without `IF NOT EXISTS` on (at least) one of them, whichever test
+        // runs second fails with "relation \"posts\" already exists" instead
+        // of reaching its actual assertions.
+        let tmp = project_with_main(default_main());
+        plan_and_execute_post_scaffold_with_status_enum(&tmp);
+        let test = fs::read_to_string(tmp.path().join("tests/post.rs")).unwrap();
+
+        let enum_test_pos = test
+            .find("fn posts_rejects_out_of_set_status")
+            .unwrap_or_else(|| panic!("expected the enum rejection test: {test}"));
+        let enum_test_setup = &test[enum_test_pos..];
+        assert!(
+            enum_test_setup.contains("CREATE TABLE IF NOT EXISTS posts ("),
+            "the enum-rejection test's own CREATE TABLE must be idempotent: {enum_test_setup}"
+        );
+
+        let base_test_setup = &test[..enum_test_pos];
+        assert!(
+            base_test_setup.contains("CREATE TABLE posts (")
+                && !base_test_setup.contains("CREATE TABLE IF NOT EXISTS posts ("),
+            "the base index test's own setup must be unchanged (plain CREATE TABLE, \
+             matching the real migration exactly): {base_test_setup}"
         );
     }
 

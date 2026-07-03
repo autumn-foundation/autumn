@@ -745,10 +745,24 @@ fn validate_field_names(fields: &[Field]) -> Result<(), GenerateError> {
     Ok(())
 }
 
+/// `std`/prelude type names a generated enum's own impl block (see
+/// `render_enum_decl`) and the surrounding generated model/scaffold code rely
+/// on being their real, unqualified meaning — `String::new()`, `s.parse()`
+/// returning a real `std::string::String`, `Vec<u8>` Bytea handling, etc. A
+/// field that pascalizes to one of these (e.g. `string:enum{a,b}` ->
+/// `pub enum String`) shadows the prelude import for the *entire file* it's
+/// declared in (and, once imported via `use crate::models::…::{…, String}`,
+/// for the entire scaffold routes file too), breaking unrelated code far
+/// from this DSL token — confirmed by generating `string:enum{a,b}` and
+/// observing `cargo check` fail with E0308/E0599 throughout the model and
+/// routes files.
+const PRELUDE_TYPE_NAMES: &[&str] = &["String", "Vec", "Option", "Result", "Box"];
+
 /// Reject an `enum{…}` field whose generated Rust type name (`pascal(field)`)
 /// collides with the model struct itself, one of the companion types the
 /// `#[model]`/`#[repository]` macros and the scaffold generator emit from the
-/// same resource name, or another enum field's own generated type name.
+/// same resource name, another enum field's own generated type name, or a
+/// commonly-relied-upon `std`/prelude type (see [`PRELUDE_TYPE_NAMES`]).
 ///
 /// The companion-type list is `New{Pascal}`, `Update{Pascal}`, `{Pascal}Field`,
 /// `{Pascal}DraftExt`, `{Pascal}Preload`, `{Pascal}Associations`,
@@ -775,6 +789,15 @@ fn validate_enum_field_collisions(
         let Some(enum_ty) = f.enum_type_name() else {
             continue;
         };
+        if PRELUDE_TYPE_NAMES.contains(&enum_ty.as_str()) {
+            return Err(GenerateError::InvalidField {
+                token: format!("{}:enum{{...}}", f.name),
+                reason: format!(
+                    "the generated enum type '{enum_ty}' would shadow the standard library's \
+                     `{enum_ty}` for the rest of the file; rename the field"
+                ),
+            });
+        }
         let reserved = [
             pascal_name.to_owned(),
             format!("New{pascal_name}"),
@@ -1533,6 +1556,29 @@ mod tests {
             "20260427000000",
         )
         .unwrap();
+    }
+
+    #[test]
+    fn enum_field_name_shadowing_prelude_type_is_rejected() {
+        // A field that pascalizes to `String`/`Vec`/`Option`/`Result`/`Box`
+        // shadows the prelude import for the entire generated file (and, once
+        // imported into the scaffold's routes file, that file too) — verified
+        // by generating `string:enum{a,b}` and observing `cargo check` fail
+        // with E0308/E0599 far from this token.
+        for field_name in ["string", "vec", "option", "result", "box"] {
+            let tmp = project();
+            let err = plan_model(
+                tmp.path(),
+                "Post",
+                &[format!("{field_name}:enum{{a,b}}")],
+                "20260427000000",
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, GenerateError::InvalidField { .. }),
+                "expected '{field_name}' to be rejected"
+            );
+        }
     }
 
     // ── enum field: --default (issue #1030) ─────────────────────────────────
