@@ -1124,7 +1124,9 @@ pub fn model_list_page(
                         &html! { p data-bulk-confirm-detail {} },
                         &ModalConfig::new().footer(html! {
                             (modal_close_button("Cancel", "admin-bulk-confirm", Some("btn")))
-                            button type="button" class="btn btn-danger" data-bulk-confirm {
+                            button type="button" class="btn btn-danger"
+                                command="close" commandfor="admin-bulk-confirm"
+                                data-modal-close="admin-bulk-confirm" data-bulk-confirm {
                                 "Confirm"
                             }
                         }),
@@ -3516,7 +3518,16 @@ mod tests {
             "list view with a confirm-requiring action must render the bulk confirm dialog: {html}"
         );
         assert!(html.contains("data-bulk-confirm-detail"), "{html}");
-        assert!(html.contains("data-bulk-confirm"), "{html}");
+        // Regression: "data-bulk-confirm" is a substring of
+        // "data-bulk-confirm-detail", so a plain `.contains("data-bulk-confirm")`
+        // would pass even if the Confirm button's own attribute were removed.
+        // Require an occurrence NOT immediately followed by `-` (i.e. not part
+        // of `-detail`) so this actually verifies the button's bare attribute.
+        assert!(
+            html.match_indices("data-bulk-confirm")
+                .any(|(i, m)| html.as_bytes().get(i + m.len()) != Some(&b'-')),
+            "confirm button must carry a standalone data-bulk-confirm attribute: {html}"
+        );
         assert!(!html.contains("window.confirm"), "{html}");
     }
 
@@ -3802,14 +3813,60 @@ mod tests {
     }
 
     #[test]
-    fn admin_js_uses_confirm_dialog_not_window_confirm() {
-        // Issue #1233: the bulk-action confirm must go through the
-        // server-rendered #admin-bulk-confirm <dialog> (autumn_web::widgets::modal),
-        // not the native window.confirm().
+    fn admin_js_uses_confirm_dialog_as_primary_path() {
+        // Issue #1233: the bulk-action confirm's primary path is the
+        // server-rendered #admin-bulk-confirm <dialog>
+        // (autumn_web::widgets::modal), not the native window.confirm().
         let js = include_str!("admin.js");
-        assert!(!js.contains("window.confirm"), "{js}");
         assert!(js.contains("data-bulk-confirm"), "{js}");
         assert!(js.contains("showModal"), "{js}");
+    }
+
+    #[test]
+    fn admin_js_window_confirm_only_reached_as_showmodal_fallback() {
+        // Code-review fix: window.confirm() must not be the primary confirm
+        // mechanism, but it IS kept as a fallback for browsers without
+        // <dialog>.showModal support — otherwise a destructive bulk action
+        // would submit with zero confirmation on those browsers (fail-open).
+        // Verify it's only reachable after the showModal support guard, not
+        // called unconditionally earlier in the file.
+        let js = include_str!("admin.js");
+        let guard_idx = js
+            .find("!dialog.showModal")
+            .unwrap_or_else(|| panic!("must feature-detect <dialog>.showModal support: {js}"));
+        // Search for the actual call site (not just the substring
+        // "window.confirm", which also appears in an explanatory comment
+        // earlier in the file).
+        let confirm_idx = js
+            .find("window.confirm(message)")
+            .unwrap_or_else(|| panic!("must keep a window.confirm() fallback: {js}"));
+        assert!(
+            confirm_idx > guard_idx,
+            "window.confirm() must only be reached after the showModal support guard: {js}"
+        );
+    }
+
+    #[test]
+    fn admin_js_defers_showmodal_fallback_resubmit() {
+        // Regression (caught by a real-browser Playwright check, not by any
+        // string-matching test): calling form.requestSubmit() synchronously
+        // from within that same form's still-dispatching `submit` event
+        // handler is a no-op per the HTML spec's reentrancy guard ("if
+        // form's firing submit event is true, then return"). The
+        // window.confirm() fallback branch runs inside that handler, so its
+        // resubmit must be deferred (e.g. via setTimeout) past the current
+        // dispatch — otherwise the confirmed action silently never submits.
+        let js = include_str!("admin.js");
+        let confirm_idx = js
+            .find("window.confirm(message)")
+            .unwrap_or_else(|| panic!("must keep a window.confirm() fallback: {js}"));
+        let defer_idx = js
+            .find("setTimeout")
+            .unwrap_or_else(|| panic!("fallback resubmit must be deferred: {js}"));
+        assert!(
+            defer_idx > confirm_idx,
+            "the deferred resubmit must be inside the window.confirm() fallback branch: {js}"
+        );
     }
 
     #[test]

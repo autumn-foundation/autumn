@@ -28,10 +28,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and focus-into/-return-from the dialog for free from the browser in both
   paths. The confirm button carries a danger semantic class
   (`autumn-modal__confirm--danger`) by default (`ConfirmActionConfig::
-  danger(false)` to opt out). The admin plugin's detail-view delete button
-  and bulk-action confirm are migrated to `confirm_action`/`modal`,
-  dropping their `hx-confirm`/`window.confirm()` reliance entirely. Purely
-  additive; minor version bump.
+  danger(false)` to opt out), and `ConfirmActionConfig::light_dismiss`/
+  `level`/`modal_class` pass through to the underlying `ModalConfig` for
+  callers that need them. A `<noscript>` fallback renders the same confirm
+  button directly (unconfirmed, matching a plain HTML form) so the action
+  stays reachable with JavaScript disabled, since the trigger's `command`
+  attribute alone can't open the dialog before JS runs. The admin plugin's
+  detail-view delete button and bulk-action confirm are migrated to
+  `confirm_action`/`modal`, dropping their `hx-confirm`/`window.confirm()`
+  reliance entirely; the bulk-action dialog's Confirm button now closes via
+  the same `data-modal-close` mechanism as its Cancel button, and its
+  triggering form is re-queried rather than stashed on the dialog node.
+  The bulk-action confirm keeps a `window.confirm()` fallback, reached only
+  when `<dialog>.showModal` is unsupported, so a destructive action is
+  never submitted without some confirmation. Purely additive; minor
+  version bump.
 - **model:** many-to-many associations via `#[has_many(Target, through =
   join_table)]` (#1324). Extends the `belongs_to`/`has_many`/`has_one`
   associations from #835 with a join-table variant: join columns default to

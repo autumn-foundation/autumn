@@ -331,7 +331,12 @@
 }
 
 .autumn-modal__confirm--danger {
-    background-color: #dc2626;
-    border-color: #dc2626;
+    background-color: var(--autumn-danger, #dc2626);
+    border-color: var(--autumn-danger, #dc2626);
     color: #fff;
+}
+
+.autumn-modal__confirm--danger:hover {
+    background-color: var(--autumn-danger-hover, #b91c1c);
+    border-color: var(--autumn-danger-hover, #b91c1c);
 }

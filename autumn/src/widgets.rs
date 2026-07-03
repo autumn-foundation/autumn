@@ -2364,6 +2364,15 @@ pub struct ConfirmActionConfig<'a> {
     csrf_field: Option<&'a str>,
     /// Extra attributes rendered on the confirm `<button>`, e.g. `hx-*`, `data-*`.
     attrs: &'a [(&'a str, &'a str)],
+    /// Heading level for the dialog title, forwarded to [`ModalConfig::level`]
+    /// (default [`HeadingLevel::H2`]).
+    level: HeadingLevel,
+    /// Extra CSS class(es) appended to the dialog's root `autumn-modal`
+    /// element, forwarded to [`ModalConfig::class`].
+    modal_class: Option<&'a str>,
+    /// When `true`, the dialog's backdrop and Escape dismiss it, forwarded
+    /// to [`ModalConfig::light_dismiss`] (default `false`).
+    light_dismiss: bool,
 }
 
 #[cfg(feature = "maud")]
@@ -2382,6 +2391,9 @@ impl<'a> ConfirmActionConfig<'a> {
             danger: true,
             csrf_field: None,
             attrs: &[],
+            level: HeadingLevel::H2,
+            modal_class: None,
+            light_dismiss: false,
         }
     }
 
@@ -2451,6 +2463,29 @@ impl<'a> ConfirmActionConfig<'a> {
         self.attrs = attrs;
         self
     }
+
+    /// Set the heading level for the dialog title (default [`HeadingLevel::H2`]).
+    #[must_use]
+    pub const fn level(mut self, level: HeadingLevel) -> Self {
+        self.level = level;
+        self
+    }
+
+    /// Add extra CSS class(es) to the dialog's root `autumn-modal` element.
+    #[must_use]
+    pub const fn modal_class(mut self, class: &'a str) -> Self {
+        self.modal_class = Some(class);
+        self
+    }
+
+    /// When `true`, the dialog's backdrop and Escape dismiss it (default
+    /// `false` — a destructive confirm isn't accidentally dismissed by a
+    /// stray click).
+    #[must_use]
+    pub const fn light_dismiss(mut self, light_dismiss: bool) -> Self {
+        self.light_dismiss = light_dismiss;
+        self
+    }
 }
 
 #[cfg(feature = "maud")]
@@ -2466,7 +2501,11 @@ impl Default for ConfirmActionConfig<'_> {
 /// Opening the dialog requires no app-authored JavaScript
 /// ([`modal_trigger`]/[`modal_close_button`]), and the confirm
 /// button is a [`crate::links::button_to_with`] submit — the correct HTTP
-/// method (via the `_method` override) and CSRF token are always present.
+/// method (via the `_method` override) and CSRF token are always present. A
+/// `<noscript>` fallback renders the same submit button directly (no
+/// confirmation, matching plain HTML forms), so the action stays reachable
+/// with JavaScript disabled — before JS runs, the trigger's `command`
+/// attribute alone can't open the dialog.
 ///
 /// This is the framework's answer to `window.confirm()` / htmx's
 /// `hx-confirm`: the whole confirmation UI is server-rendered, so a
@@ -2546,14 +2585,11 @@ pub fn confirm_action(
 ) -> maud::Markup {
     let confirm_label = config.confirm_label.unwrap_or(trigger_label);
 
-    let mut confirm_class = String::from("autumn-modal__confirm");
-    if config.danger {
-        confirm_class.push_str(" autumn-modal__confirm--danger");
-    }
-    if let Some(extra) = config.confirm_class {
-        confirm_class.push(' ');
-        confirm_class.push_str(extra);
-    }
+    let danger_class = config.danger.then_some("autumn-modal__confirm--danger");
+    let confirm_class = merge_class(
+        &merge_class("autumn-modal__confirm", danger_class),
+        config.confirm_class,
+    );
 
     let mut button_options = crate::links::ButtonToOptions::new()
         .class(confirm_class.as_str())
@@ -2563,8 +2599,13 @@ pub fn confirm_action(
         button_options = button_options.csrf_field(field);
     }
 
-    let confirm_button =
-        crate::links::button_to_with(confirm_label, action, method, csrf_token, &button_options);
+    let confirm_button = crate::links::button_to_with(
+        confirm_label,
+        action,
+        method.clone(),
+        csrf_token,
+        &button_options,
+    );
 
     let footer = maud::html! {
         (modal_close_button(config.cancel_label, id, Some("autumn-modal__cancel")))
@@ -2572,11 +2613,33 @@ pub fn confirm_action(
     };
 
     let body = config.message.clone().unwrap_or_else(|| maud::html! {});
-    let modal_config = ModalConfig::new().footer(footer);
+    let mut modal_config = ModalConfig::new()
+        .footer(footer)
+        .level(config.level)
+        .light_dismiss(config.light_dismiss);
+    if let Some(class) = config.modal_class {
+        modal_config = modal_config.class(class);
+    }
+
+    // No-JS / no-Invoker-Commands fallback: the trigger above can't open the
+    // dialog without either the native `command`/`commandfor` API or the
+    // `autumn-widgets.js` fallback running, so this plain, always-working
+    // (unconfirmed) submit button keeps the action reachable — the same
+    // fallback pattern `active_search`/`autocomplete_input` use.
+    let mut noscript_options = crate::links::ButtonToOptions::new().attrs(config.attrs);
+    if let Some(class) = config.trigger_class {
+        noscript_options = noscript_options.class(class);
+    }
+    if let Some(field) = config.csrf_field {
+        noscript_options = noscript_options.csrf_field(field);
+    }
+    let noscript_button =
+        crate::links::button_to_with(trigger_label, action, method, csrf_token, &noscript_options);
 
     maud::html! {
         div class="autumn-confirm" {
             (modal_trigger(trigger_label, id, config.trigger_class))
+            noscript { (noscript_button) }
             (modal(id, config.title, &body, &modal_config))
         }
     }

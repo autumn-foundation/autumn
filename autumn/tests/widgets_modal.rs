@@ -195,7 +195,7 @@ mod modal_trigger_tests {
 
 #[cfg(feature = "maud")]
 mod confirm_action_tests {
-    use autumn_web::widgets::{ConfirmActionConfig, confirm_action};
+    use autumn_web::widgets::{ConfirmActionConfig, HeadingLevel, confirm_action};
     use http::Method;
 
     #[test]
@@ -347,8 +347,9 @@ mod confirm_action_tests {
             &ConfirmActionConfig::new(),
         )
         .into_string();
-        // Both the trigger button and the confirm submit button read "Delete post".
-        assert_eq!(html.matches("Delete post").count(), 2, "{html}");
+        // The trigger button, the noscript fallback button, and the confirm
+        // submit button all read "Delete post".
+        assert_eq!(html.matches("Delete post").count(), 3, "{html}");
     }
 
     #[test]
@@ -372,7 +373,7 @@ mod confirm_action_tests {
         .into_string();
         assert!(html.contains("Cancel"), "{html}");
         assert!(html.contains(r#"command="close""#), "{html}");
-        assert!(html.contains(&format!(r#"commandfor="d1""#)), "{html}");
+        assert!(html.contains(r#"commandfor="d1""#), "{html}");
     }
 
     #[test]
@@ -418,6 +419,75 @@ mod confirm_action_tests {
         .into_string();
         assert!(!html.contains("hx-confirm"), "{html}");
         assert!(!html.contains("window.confirm"), "{html}");
+    }
+
+    #[test]
+    fn empty_confirm_class_does_not_leave_trailing_space() {
+        // Regression: confirm_class("") used to bypass merge_class's
+        // empty-string guard and leave a trailing space in the class attr.
+        let config = ConfirmActionConfig::new().confirm_class("");
+        let html = confirm_action("d1", "Delete", "/posts/1", Method::DELETE, "tok", &config)
+            .into_string();
+        assert!(
+            html.contains(r#"class="autumn-modal__confirm autumn-modal__confirm--danger""#),
+            "{html}"
+        );
+        assert!(!html.contains(r#"--danger ""#), "{html}");
+    }
+
+    #[test]
+    fn noscript_fallback_renders_working_submit_button() {
+        // Regression: opening the dialog requires JS or native Invoker
+        // Commands support, so a no-JS user needs a real fallback to reach
+        // the action at all (matching the pre-widget behavior).
+        let config = ConfirmActionConfig::new().trigger_class("btn btn-danger");
+        let html = confirm_action("d1", "Delete", "/posts/42", Method::DELETE, "tok", &config)
+            .into_string();
+        assert!(html.contains("<noscript>"), "{html}");
+        let noscript_start = html.find("<noscript>").unwrap();
+        let noscript_end = html.find("</noscript>").unwrap();
+        let noscript_html = &html[noscript_start..noscript_end];
+        assert!(
+            noscript_html.contains(r#"<form action="/posts/42" method="post">"#),
+            "{noscript_html}"
+        );
+        assert!(
+            noscript_html.contains(r#"name="_method" value="DELETE""#),
+            "{noscript_html}"
+        );
+        assert!(
+            noscript_html.contains(r#"name="_csrf" value="tok""#),
+            "{noscript_html}"
+        );
+        assert!(
+            noscript_html.contains(r#"class="btn btn-danger""#),
+            "{noscript_html}"
+        );
+    }
+
+    #[test]
+    fn light_dismiss_forwards_to_underlying_modal() {
+        let config = ConfirmActionConfig::new().light_dismiss(true);
+        let html =
+            confirm_action("d1", "Archive", "/posts/1", Method::POST, "tok", &config).into_string();
+        assert!(html.contains(r#"closedby="any""#), "{html}");
+    }
+
+    #[test]
+    fn level_forwards_to_underlying_modal() {
+        let config = ConfirmActionConfig::new().level(HeadingLevel::H3);
+        let html =
+            confirm_action("d1", "Archive", "/posts/1", Method::POST, "tok", &config).into_string();
+        assert!(html.contains("<h3 "), "{html}");
+        assert!(!html.contains("<h2 "), "{html}");
+    }
+
+    #[test]
+    fn modal_class_forwards_to_underlying_modal() {
+        let config = ConfirmActionConfig::new().modal_class("wide");
+        let html =
+            confirm_action("d1", "Archive", "/posts/1", Method::POST, "tok", &config).into_string();
+        assert!(html.contains(r#"class="autumn-modal wide""#), "{html}");
     }
 }
 

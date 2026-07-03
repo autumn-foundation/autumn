@@ -16,8 +16,11 @@
   // selected action is marked as requiring confirmation (data-confirm="1"
   // on the option) — show the server-rendered #admin-bulk-confirm <dialog>
   // (autumn_web::widgets::modal) rather than a native browser confirm popup.
-  // Once the dialog's Confirm button is clicked, the submit is re-issued
-  // and allowed through (see the click handler below).
+  // preventDefault() always runs once confirmation is required, regardless
+  // of <dialog>.showModal support, so a destructive submit is never let
+  // through unconfirmed: browsers without it fall back to window.confirm().
+  // Once confirmed, the submit is re-issued and allowed through (see the
+  // click handler below), which also clears the one-shot flag below.
   document.addEventListener("submit", function (e) {
     var form = e.target;
     if (
@@ -35,36 +38,49 @@
       window.alert("Select at least one row first.");
       return;
     }
-    if (form.dataset.bulkConfirmed === "1") return;
+    if (form.dataset.bulkConfirmed === "1") {
+      delete form.dataset.bulkConfirmed;
+      return;
+    }
     var sel = form.querySelector('select[name="action"]');
     if (!sel) return;
     var opt = sel.options[sel.selectedIndex];
     if (!opt || opt.dataset.confirm !== "1") return;
-    var dialog = document.getElementById("admin-bulk-confirm");
-    if (!dialog || !dialog.showModal) return;
     e.preventDefault();
-    var detail = dialog.querySelector("[data-bulk-confirm-detail]");
-    if (detail) {
-      detail.textContent =
-        "Apply '" + opt.text + "' to " + checked.length + " record(s)?";
+    var message =
+      "Apply '" + opt.text + "' to " + checked.length + " record(s)?";
+    var dialog = document.getElementById("admin-bulk-confirm");
+    if (!dialog || !dialog.showModal) {
+      if (window.confirm(message)) {
+        form.dataset.bulkConfirmed = "1";
+        // Deferred: requestSubmit() called synchronously from within this
+        // same form's still-dispatching submit handler is a no-op per the
+        // HTML spec's reentrancy guard ("if form's firing submit event is
+        // true, then return"). Scheduling it after the current dispatch
+        // finishes lets the resubmit actually happen.
+        setTimeout(function () {
+          form.requestSubmit();
+        }, 0);
+      }
+      return;
     }
-    dialog.autumnBulkForm = form;
+    var detail = dialog.querySelector("[data-bulk-confirm-detail]");
+    if (detail) detail.textContent = message;
     dialog.showModal();
   });
 
-  // Bulk-action confirm dialog: clicking [data-bulk-confirm] closes the
-  // dialog and re-submits the form it was opened for.
+  // Bulk-action confirm dialog: clicking [data-bulk-confirm] re-submits the
+  // bulk-action form. Closing the dialog itself is handled by the button's
+  // own command="close"/data-modal-close attributes (see templates.rs),
+  // routed through the same shared mechanism modal_close_button uses — no
+  // bespoke close call needed here.
   document.addEventListener("click", function (e) {
     var confirmBtn = e.target.closest("[data-bulk-confirm]");
     if (!confirmBtn) return;
-    var dialog = confirmBtn.closest("dialog");
-    if (!dialog) return;
-    var form = dialog.autumnBulkForm;
-    dialog.close();
-    if (form) {
-      form.dataset.bulkConfirmed = "1";
-      form.requestSubmit();
-    }
+    var form = document.querySelector('form[action$="/actions"]');
+    if (!form) return;
+    form.dataset.bulkConfirmed = "1";
+    form.requestSubmit();
   });
 
   // CSV import form: multipart/form-data bypasses form-field CSRF scanning, so
