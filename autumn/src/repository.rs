@@ -214,6 +214,37 @@ pub trait ModelPrimaryKey {
     fn primary_key_value(&self) -> Self::IdType;
 }
 
+/// Framework plumbing bridging a `#[repository]`-generated struct to the
+/// many-to-many (`#[has_many(Target, through = join_table)]`) mutation
+/// helpers `#[model]` generates. `#[repository(Model, ...)]` implements this
+/// once, unconditionally, alongside the model's other generated impls; the
+/// `Model` associated type is what keeps `add_*`/`remove_*`/`set_*` method
+/// resolution unambiguous when more than one m2m trait is in scope (e.g. two
+/// models both associate `through` the same join table, or a model has more
+/// than one m2m association) — each mutation trait is blanket-implemented
+/// only for `M2mConnSource<Model = TheAssociationsOwner>`.
+///
+/// Not part of the public API; not implemented by hand.
+#[cfg(feature = "db")]
+#[doc(hidden)]
+pub trait M2mConnSource: Send + Sync {
+    /// The model whose `#[has_many(..., through = ...)]` associations this
+    /// repository's mutation helpers operate on.
+    type Model;
+
+    /// Acquire a primary-pool connection for an `add_*`/`remove_*`/`set_*`
+    /// many-to-many mutation. Mirrors the write-connection acquisition every
+    /// other mutating generated method uses (marks the read-your-writes pin
+    /// on success).
+    fn __autumn_m2m_write_conn(
+        &self,
+    ) -> impl ::std::future::Future<
+        Output = crate::AutumnResult<
+            diesel_async::pooled_connection::deadpool::Object<diesel_async::AsyncPgConnection>,
+        >,
+    > + Send;
+}
+
 /// Metadata trait implemented for model structs to expose FTS configuration.
 pub trait AutumnSearchableModel {
     const IS_SEARCHABLE: bool;

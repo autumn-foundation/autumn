@@ -75,6 +75,16 @@ All publishable crates share `[workspace.package].version = "0.5.0"`.
 | `#[mailer]`, `#[mailer_preview]`, `mail_previews![...]` | Mail helpers (`mail`) |
 | `t!(...)` | Compile-time checked translation lookup (`i18n`) |
 
+`#[model]` also recognizes `#[belongs_to]` / `#[has_many]` / `#[has_one]`
+struct-level attributes for declarative associations with batched eager
+preloading (`Model::preload()`, `repo.preload(records, spec)`); these are
+consumed by `#[model]` itself, not separately-registered proc macros.
+`#[has_many(Target, through = join_table)]` declares a many-to-many
+association through a join table, adding `add_{singular}` /
+`remove_{singular}` / `set_{plural}` mutation helpers to the generated
+`#[repository]`. See the `#[model]` doc comment in `autumn-macros/src/lib.rs`
+and `docs/adr/0008-associations-and-eager-loading.md`.
+
 ## Prelude contents
 
 `use autumn_web::prelude::*;` includes:

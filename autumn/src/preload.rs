@@ -301,6 +301,16 @@ macro_rules! impl_preloadable_leaf {
             ) -> $crate::AutumnResult<::std::vec::Vec<Self>> {
                 ::core::result::Result::Ok(rows)
             }
+
+            /// Identity per-row scoping for a hand-written preload target. See
+            /// [`Preloaded`] and the per-row sibling of `__autumn_preload_retain`
+            /// used by many-to-many (`through =`) preload loaders.
+            #[doc(hidden)]
+            pub fn __autumn_preload_keep(
+                row: Self,
+            ) -> $crate::AutumnResult<::core::option::Option<Self>> {
+                ::core::result::Result::Ok(::core::option::Option::Some(row))
+            }
         }
 
         impl $crate::preload::Preloadable for $ty {

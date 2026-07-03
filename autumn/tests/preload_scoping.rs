@@ -166,6 +166,23 @@ async fn retain_fails_closed_when_tenant_scoped_without_context() {
 }
 
 #[tokio::test]
+async fn retain_fails_closed_on_empty_rows_without_tenant_context() {
+    // Regression guard for the many-to-many (`through =`) fail-closed parity
+    // probe: `through` preload loaders call `__autumn_preload_retain` with an
+    // *empty* `Vec` specifically to surface this error even when their join
+    // returns zero rows (which would otherwise mean the per-row
+    // `__autumn_preload_keep` loop never runs, and the fail-closed check
+    // never fires). `retain` must not special-case an empty input and skip
+    // the tenant check ahead of it.
+    let result = ScopedItem::__autumn_preload_retain(Vec::new());
+    let err = result.expect_err("must fail closed without tenant context, even for zero rows");
+    assert!(
+        err.to_string().to_lowercase().contains("tenant"),
+        "error should mention tenant context, got: {err}"
+    );
+}
+
+#[tokio::test]
 async fn retain_isolates_each_tenant() {
     let make = || {
         vec![
@@ -277,4 +294,62 @@ fn retain_is_identity_for_models_without_scoping_columns() {
     ];
     let kept = PlainItem::__autumn_preload_retain(rows).expect("identity");
     assert_eq!(kept.iter().map(|r| r.id).collect::<Vec<_>>(), vec![1, 2]);
+}
+
+// ── `__autumn_preload_keep` (per-row sibling of `__autumn_preload_retain`,
+// used by many-to-many `through =` preload loaders which pair each child row
+// with its parent key and so can't batch-`retain` a `Vec<Self>`) — #1324 ────
+
+#[tokio::test]
+async fn keep_matches_retain_for_scoped_rows() {
+    let rows = vec![
+        item(1, "acme", false),   // kept
+        item(2, "globex", false), // other tenant → dropped
+        item(3, "acme", true),    // soft-deleted → dropped
+        item(4, "acme", false),   // kept
+    ];
+
+    let kept_ids = CURRENT_TENANT
+        .scope(Some("acme".to_string()), async {
+            let mut kept_ids = Vec::new();
+            for row in rows {
+                if let Some(row) = ScopedItem::__autumn_preload_keep(row)? {
+                    kept_ids.push(row.id);
+                }
+            }
+            autumn_web::AutumnResult::Ok(kept_ids)
+        })
+        .await
+        .expect("tenant context present");
+
+    assert_eq!(kept_ids, vec![1, 4]);
+}
+
+#[tokio::test]
+async fn keep_fails_closed_without_tenant_context_per_row() {
+    let row = item(1, "acme", false);
+    let err = ScopedItem::__autumn_preload_keep(row)
+        .expect_err("must fail closed without tenant context");
+    assert!(
+        err.to_string().to_lowercase().contains("tenant"),
+        "error should mention tenant context, got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn keep_identity_for_leaf_models() {
+    // A hand-written `Preloadable` target (`impl_preloadable_leaf!`) applies
+    // no scoping, mirroring its batch `__autumn_preload_retain`.
+    struct LeafItem {
+        #[allow(dead_code)]
+        id: i64,
+    }
+    autumn_web::impl_preloadable_leaf!(LeafItem);
+
+    let row = LeafItem { id: 1 };
+    assert!(
+        LeafItem::__autumn_preload_keep(row)
+            .expect("identity never fails")
+            .is_some()
+    );
 }

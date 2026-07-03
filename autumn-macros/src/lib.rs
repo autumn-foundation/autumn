@@ -321,6 +321,88 @@ pub fn mail_previews(input: TokenStream) -> TokenStream {
 ///     pub title: String,
 /// }
 /// ```
+///
+/// # Associations
+///
+/// Declare `#[belongs_to]`, `#[has_many]`, and `#[has_one]` on the struct to
+/// get batched eager preloading for free — no hand-written join queries, no
+/// N+1. Foreign keys and accessor names are inferred from the target's type
+/// name, with `fk = ...` / `name = ...` overrides:
+///
+/// ```ignore
+/// #[model]
+/// #[belongs_to(User, fk = author_id)]  // fk on THIS model
+/// #[has_many(Comment)]                 // fk (post_id) on the TARGET
+/// pub struct Post {
+///     #[id]
+///     pub id: i64,
+///     pub author_id: i64,
+///     pub title: String,
+/// }
+/// ```
+///
+/// Preload associations through a repository (`Model::preload()` builds the
+/// spec; `_with` nests into the related model's own associations):
+///
+/// ```ignore
+/// let posts = repo.find_all().await?;
+/// let posts = repo.preload(posts, Post::preload().author().comments()).await?;
+/// for post in &posts {
+///     let author = post.author()?;      // Result<Option<&Preloaded<User>>, NotLoaded>
+///     let comments = post.comments()?;  // Result<&[Preloaded<Comment>], NotLoaded>
+/// }
+/// ```
+///
+/// An association that was not preloaded returns `NotLoaded` from its
+/// accessor rather than issuing SQL — autumn never lazy-loads.
+///
+/// ## Many-to-many (`through =`)
+///
+/// Add `through = <join_table>` to `#[has_many]` to declare a many-to-many
+/// association backed by a join table, with the same batched preload
+/// semantics as `belongs_to`/`has_many`/`has_one`:
+///
+/// ```ignore
+/// #[model]
+/// #[has_many(Tag, through = post_tags)]  // join columns default to post_id / tag_id
+/// pub struct Post {
+///     #[id]
+///     pub id: i64,
+///     pub title: String,
+/// }
+/// ```
+///
+/// Join columns default to `{source}_id` / `{target}_id` and can be
+/// overridden with `fk = ...` and `target_fk = ...`; the join table itself
+/// needs no hand-written `diesel::table!` — the macro emits one and requires
+/// a composite primary key on `(fk, target_fk)`:
+///
+/// ```sql
+/// CREATE TABLE post_tags (
+///     post_id BIGINT NOT NULL REFERENCES posts(id),
+///     tag_id  BIGINT NOT NULL REFERENCES tags(id),
+///     PRIMARY KEY (post_id, tag_id)
+/// );
+/// ```
+///
+/// `Post::preload().tags()` issues one batched `INNER JOIN` query (plus one
+/// more per level of `_with` nesting) — a fixed number of queries regardless
+/// of how many tags each post has. The generated `tags()` accessor returns
+/// `&[Arc<Preloaded<Tag>>]` (rather than `has_many`'s plain
+/// `&[Preloaded<Tag>]`): the same tag can legitimately be linked to more than
+/// one currently-loaded post, so it's shared via `Arc` instead of being
+/// duplicated per parent.
+///
+/// The association also generates three mutation helpers on the model's
+/// `#[repository]` — `add_{singular}`, `remove_{singular}`, and
+/// `set_{plural}` (replace-all) — each idempotent and requiring no
+/// hand-written SQL:
+///
+/// ```ignore
+/// repo.add_tag(post_id, tag_id).await?;      // idempotent: ON CONFLICT DO NOTHING
+/// repo.remove_tag(post_id, tag_id).await?;   // idempotent: no-op if unlinked
+/// repo.set_tags(post_id, &tag_ids).await?;   // replace-all, one transaction
+/// ```
 #[proc_macro_attribute]
 pub fn model(attr: TokenStream, item: TokenStream) -> TokenStream {
     model::model_macro(attr.into(), item.into()).into()
