@@ -605,12 +605,19 @@ fn sanitize_url_form(mut url: url::Url) -> Result<String, CommandError> {
         .map(|p| percent_decode(p.trim_start_matches('/')))
         .or_else(|| find_pair(&pairs, "dbname").map(str::to_owned));
 
+    // Checks the *current* `pairs` (not just the `explicit_*` snapshot
+    // taken above) for every key, not only the catch-all arm below — a
+    // service group merged in earlier in this function's own control flow
+    // (see the loop right after this) lands in `pairs`, and a later
+    // re-check (e.g. before consulting PGPASSWORD/.pgpass) must see that
+    // merge too, or an ambient fallback would look past an already-decided
+    // value and silently override it.
     let is_explicit = |pairs: &[(String, String)], key: &str| match key {
-        "user" => explicit_user.is_some(),
-        "password" => explicit_password.is_some(),
-        "host" => explicit_host.is_some(),
-        "port" => explicit_port.is_some(),
-        "dbname" => explicit_dbname.is_some(),
+        "user" => explicit_user.is_some() || find_pair(pairs, "user").is_some(),
+        "password" => explicit_password.is_some() || find_pair(pairs, "password").is_some(),
+        "host" => explicit_host.is_some() || find_pair(pairs, "host").is_some(),
+        "port" => explicit_port.is_some() || find_pair(pairs, "port").is_some(),
+        "dbname" => explicit_dbname.is_some() || find_pair(pairs, "dbname").is_some(),
         _ => find_pair(pairs, key).is_some(),
     };
 
@@ -1193,6 +1200,31 @@ mod tests {
                 assert_eq!(config.get_user(), Some("svcuser"));
                 assert_eq!(config.get_password(), Some(b"svcpass".as_slice()));
                 assert_eq!(config.get_ports(), &[6543]);
+            },
+        );
+    }
+
+    #[test]
+    fn sanitize_prefers_service_file_password_over_an_ambient_pgpassword() {
+        // Regression test: `is_explicit`'s "password" arm must reflect the
+        // *current* state of `pairs` (after the service merge has already
+        // run), not a stale pre-merge snapshot — otherwise a service group
+        // that supplies its own password still looks "unset" to the
+        // PGPASSWORD/.pgpass fallback below it, which then appends a
+        // second `password` pair that `tokio_postgres` treats as
+        // overriding the service's (last query-string occurrence wins).
+        let dir = tempfile::tempdir().unwrap();
+        let service_path = dir.path().join("pg_service.conf");
+        std::fs::write(&service_path, "[prod]\npassword=svcpass\n").unwrap();
+        temp_env::with_vars(
+            [
+                ("PGSERVICEFILE", Some(service_path.to_str().unwrap())),
+                ("PGPASSWORD", Some("ambient-password")),
+            ],
+            || {
+                let sanitized = sanitize_db_url("postgres://host/db?service=prod").unwrap();
+                let config: tokio_postgres::Config = sanitized.parse().unwrap();
+                assert_eq!(config.get_password(), Some(b"svcpass".as_slice()));
             },
         );
     }
