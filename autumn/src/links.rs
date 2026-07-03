@@ -5,10 +5,12 @@
 //! but composing them by hand for every "Delete" button invites a forgotten
 //! CSRF field. These helpers close that gap:
 //!
-//! - [`link_to`] / [`link_to_with`] render a plain `<a>` anchor for GET
-//!   navigation, HTML-escaping both label and href, and automatically adding
-//!   `rel="noopener"` when `target="_blank"` is requested.
-//! - [`button_to`] / [`button_to_with`] render a single-button `<form>` for
+//! - [`link_to`](crate::links::link_to) / [`link_to_with`](crate::links::link_to_with)
+//!   render a plain `<a>` anchor for GET navigation, HTML-escaping both
+//!   label and href, and automatically adding `rel="noopener"` when
+//!   `target="_blank"` is requested.
+//! - [`button_to`](crate::links::button_to) / [`button_to_with`](crate::links::button_to_with)
+//!   render a single-button `<form>` for
 //!   state-changing actions: the browser transport is `POST`, a hidden
 //!   `_method` input (via [`crate::form::method_input`]) upgrades it to
 //!   `PUT`/`PATCH`/`DELETE` for the
