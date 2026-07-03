@@ -746,19 +746,31 @@ fn validate_field_names(fields: &[Field]) -> Result<(), GenerateError> {
 }
 
 /// Reject an `enum{…}` field whose generated Rust type name (`pascal(field)`)
-/// collides with the model struct itself or one of the companion types the
+/// collides with the model struct itself, one of the companion types the
 /// `#[model]`/`#[repository]` macros and the scaffold generator emit from the
-/// same resource name — `New{Pascal}`, `Update{Pascal}`, `{Pascal}Field`,
-/// `{Pascal}DraftExt` (from `#[model]`), `{Pascal}Repository`/
+/// same resource name, or another enum field's own generated type name.
+///
+/// The companion-type list is `New{Pascal}`, `Update{Pascal}`, `{Pascal}Field`,
+/// `{Pascal}DraftExt`, `{Pascal}Preload`, `{Pascal}Associations`,
+/// `{Pascal}Factory` (all from `#[model]`; the preload/associations/factory
+/// scaffolding is always emitted, even for a model with no associations —
+/// see `autumn-macros/src/model.rs`), `{Pascal}Repository`/
 /// `Pg{Pascal}Repository` (from `#[repository]`, which `generate scaffold`
 /// always adds on top of the model), and `DecodedForm` (the scaffold's form
 /// struct). A silent collision would produce a duplicate-type-definition
 /// compile error far from this DSL token, so it's rejected here with a
 /// pointer back to the offending field.
+///
+/// Two enum fields on the *same* model can also collide with each other:
+/// `pascal()` is not injective (`in_review` and `in__review` both pascalize
+/// to `InReview`), so distinct, individually-valid field names can still
+/// generate the same enum type name. Each enum field's generated name is
+/// checked against every earlier one for exactly this reason.
 fn validate_enum_field_collisions(
     pascal_name: &str,
     fields: &[Field],
 ) -> Result<(), GenerateError> {
+    let mut seen_enum_types: Vec<(String, String)> = Vec::new();
     for f in fields {
         let Some(enum_ty) = f.enum_type_name() else {
             continue;
@@ -769,6 +781,9 @@ fn validate_enum_field_collisions(
             format!("Update{pascal_name}"),
             format!("{pascal_name}Field"),
             format!("{pascal_name}DraftExt"),
+            format!("{pascal_name}Preload"),
+            format!("{pascal_name}Associations"),
+            format!("{pascal_name}Factory"),
             format!("{pascal_name}Repository"),
             format!("Pg{pascal_name}Repository"),
             "DecodedForm".to_owned(),
@@ -782,6 +797,16 @@ fn validate_enum_field_collisions(
                 ),
             });
         }
+        if let Some((other_name, _)) = seen_enum_types.iter().find(|(_, ty)| *ty == enum_ty) {
+            return Err(GenerateError::InvalidField {
+                token: format!("{}:enum{{...}}", f.name),
+                reason: format!(
+                    "the generated enum type '{enum_ty}' collides with the one generated for \
+                     field '{other_name}'; rename one of the fields"
+                ),
+            });
+        }
+        seen_enum_types.push((f.name.clone(), enum_ty));
     }
     Ok(())
 }
@@ -920,6 +945,18 @@ const fn is_string_like(field: &Field) -> bool {
     matches!(field.kind, FieldKind::String | FieldKind::Text)
 }
 
+/// Strip a single layer of matching double or single quotes from a
+/// `--default` value, tolerating an unquoted value. Shared by the
+/// `String`/`Text` and `Enum` arms of [`sql_default_literal`], which both
+/// accept `field=value`, `field="value"`, and `field='value'` equivalently.
+fn unquote_default_value(value: &str) -> &str {
+    value
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .or_else(|| value.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+        .unwrap_or(value)
+}
+
 fn sql_default_literal(field: &Field, value: &str) -> Result<String, String> {
     match field.kind {
         FieldKind::Bool => match value.to_ascii_lowercase().as_str() {
@@ -928,11 +965,7 @@ fn sql_default_literal(field: &Field, value: &str) -> Result<String, String> {
             _ => Err("bool defaults must be true or false".to_owned()),
         },
         FieldKind::String | FieldKind::Text => {
-            let unquoted = value
-                .strip_prefix('"')
-                .and_then(|s| s.strip_suffix('"'))
-                .or_else(|| value.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
-                .unwrap_or(value);
+            let unquoted = unquote_default_value(value);
             Ok(format!("'{}'", unquoted.replace('\'', "''")))
         }
         FieldKind::I32 => value
@@ -957,11 +990,7 @@ fn sql_default_literal(field: &Field, value: &str) -> Result<String, String> {
             field.rust_type()
         )),
         FieldKind::Enum => {
-            let unquoted = value
-                .strip_prefix('"')
-                .and_then(|s| s.strip_suffix('"'))
-                .or_else(|| value.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
-                .unwrap_or(value);
+            let unquoted = unquote_default_value(value);
             if field.variants.iter().any(|v| v == unquoted) {
                 Ok(format!("'{unquoted}'"))
             } else {
@@ -1451,6 +1480,61 @@ mod tests {
         assert!(matches!(err, GenerateError::InvalidField { .. }));
     }
 
+    #[test]
+    fn enum_field_name_colliding_with_preload_associations_or_factory_is_rejected() {
+        // The `#[model]` macro always emits `{Pascal}Preload`, `{Pascal}Associations`,
+        // and `{Pascal}Factory` (autumn-macros/src/model.rs), even for a model
+        // with no associations — a field that pascalizes to one of these on
+        // model `Post` must be rejected, not just the shorter, already-covered
+        // companion names.
+        for field_name in ["post_preload", "post_associations", "post_factory"] {
+            let tmp = project();
+            let err = plan_model(
+                tmp.path(),
+                "Post",
+                &[format!("{field_name}:enum{{a,b}}")],
+                "20260427000000",
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, GenerateError::InvalidField { .. }),
+                "expected '{field_name}' to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn two_enum_fields_colliding_with_each_other_are_rejected() {
+        // `pascal()` is not injective: `in_review` and `in__review` both
+        // pascalize to `InReview`. Without this check, both fields would
+        // pass (neither collides with a *reserved* name) and the generator
+        // would emit `pub enum InReview` twice in the same model file.
+        let tmp = project();
+        let err = plan_model(
+            tmp.path(),
+            "Post",
+            &["in_review:enum{a,b}".into(), "in__review:enum{c,d}".into()],
+            "20260427000000",
+        )
+        .unwrap_err();
+        assert!(matches!(err, GenerateError::InvalidField { .. }));
+    }
+
+    #[test]
+    fn distinct_enum_fields_with_non_colliding_names_are_accepted() {
+        let tmp = project();
+        plan_model(
+            tmp.path(),
+            "Post",
+            &[
+                "status:enum{draft,published}".into(),
+                "priority:enum{low,high}".into(),
+            ],
+            "20260427000000",
+        )
+        .unwrap();
+    }
+
     // ── enum field: --default (issue #1030) ─────────────────────────────────
 
     #[test]
@@ -1468,6 +1552,28 @@ mod tests {
             metadata.defaults().get("status").map(String::as_str),
             Some("'draft'")
         );
+    }
+
+    #[test]
+    fn enum_sql_default_literal_accepts_quoted_variant() {
+        // `--default status="draft"`/`status='draft'` must unquote the same
+        // way the String/Text arm does (shared `unquote_default_value`).
+        let fields = parse_fields(&["status:enum{draft,published}".into()]).unwrap();
+        for token in ["status=\"draft\"", "status='draft'"] {
+            let metadata = parse_model_metadata(
+                &fields,
+                &ModelOptions {
+                    defaults: vec![token.into()],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                metadata.defaults().get("status").map(String::as_str),
+                Some("'draft'"),
+                "token '{token}' should unquote to 'draft'"
+            );
+        }
     }
 
     #[test]

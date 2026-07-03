@@ -16,7 +16,7 @@ use std::path::Path;
 
 use super::dsl::{Field, FieldKind, parse_fields};
 use super::emit::Plan;
-use super::naming::{pascal, pluralize, snake};
+use super::naming::{humanize_label, pascal, pluralize, snake};
 use super::schema_edit::add_mod_declaration;
 use super::{Flags, GenerateError, ensure_project_root, read_or_empty};
 
@@ -605,16 +605,7 @@ fn render_select_kind(spec: &SelectSpec) -> String {
         .values
         .iter()
         .map(|v| {
-            let label = v
-                .split(['_', '-'])
-                .map(|word| {
-                    let mut chars = word.chars();
-                    chars.next().map_or_else(String::new, |c| {
-                        c.to_uppercase().collect::<String>() + chars.as_str()
-                    })
-                })
-                .collect::<Vec<_>>()
-                .join(" ");
+            let label = humanize_label(v);
             format!("SelectOption {{ value: \"{v}\".into(), label: \"{label}\".into() }}")
         })
         .collect::<Vec<_>>()
@@ -633,27 +624,29 @@ fn render_fields_vec(
         if options.exclude.contains(&f.name) || is_lock_version_field(f, lock_version_field) {
             continue;
         }
-        let select_spec = options.select.iter().find(|s| s.field == f.name);
         // A closed-set `enum{...}` field is a `Select` widget by construction
         // (issue #1030) — auto-derive one from its variants unless an
         // explicit `--select` already overrides it (e.g. to curate a subset
-        // or relabel the options).
-        let auto_select_spec = if select_spec.is_none() && f.is_enum() {
-            Some(SelectSpec {
-                field: f.name.clone(),
-                values: f.variants.clone(),
-            })
-        } else {
-            None
-        };
+        // or relabel the options). One `effective_select` covers both
+        // sources so every downstream "is this field select-shaped" check
+        // only has to consult one place.
+        let effective_select: Option<SelectSpec> = options
+            .select
+            .iter()
+            .find(|s| s.field == f.name)
+            .cloned()
+            .or_else(|| {
+                f.is_enum().then(|| SelectSpec {
+                    field: f.name.clone(),
+                    values: f.variants.clone(),
+                })
+            });
         let kind_str: String =
             if options.hidden.contains(&f.name) || matches!(f.kind, FieldKind::Bytea) {
                 "AdminFieldKind::Hidden".into()
             } else if options.password.contains(&f.name) {
                 "AdminFieldKind::Password".into()
-            } else if let Some(spec) = select_spec {
-                render_select_kind(spec)
-            } else if let Some(spec) = &auto_select_spec {
+            } else if let Some(spec) = &effective_select {
                 render_select_kind(spec)
             } else {
                 admin_field_kind(f).into()
@@ -669,8 +662,7 @@ fn render_fields_vec(
         // Select, hidden, and encrypted fields are not text-searchable. An
         // encrypted column stores ciphertext envelopes, so an `ILIKE` against it
         // for plaintext would never match (#805) — omit it from search.
-        let is_select_or_hidden =
-            select_spec.is_some() || auto_select_spec.is_some() || options.hidden.contains(&f.name);
+        let is_select_or_hidden = effective_select.is_some() || options.hidden.contains(&f.name);
         if is_default_searchable(f)
             && !is_select_or_hidden
             && !admin_field_is_encrypted(options, &f.name)

@@ -76,6 +76,26 @@ pub fn pascal(s: &str) -> String {
     }
 }
 
+/// Humanize a `snake_case`/`kebab-case` token into a display label:
+/// split on `_`/`-`, then title-case each word (`in_review` → `In Review`).
+///
+/// Shared by the admin generator's `--select` widget and the scaffold
+/// generator's `enum{…}` field `<select>` widget, so both render the same
+/// label for the same value.
+#[must_use]
+pub fn humanize_label(value: &str) -> String {
+    value
+        .split(['_', '-'])
+        .map(|word| {
+            let mut chars = word.chars();
+            chars.next().map_or_else(String::new, |c| {
+                c.to_uppercase().collect::<String>() + chars.as_str()
+            })
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,5 +177,12 @@ mod tests {
     #[test]
     fn pascal_normalises_snake() {
         assert_eq!(pascal("blog_post"), "BlogPost");
+    }
+
+    #[test]
+    fn humanize_label_title_cases_snake_case() {
+        assert_eq!(humanize_label("draft"), "Draft");
+        assert_eq!(humanize_label("in_review"), "In Review");
+        assert_eq!(humanize_label("archived-old"), "Archived Old");
     }
 }

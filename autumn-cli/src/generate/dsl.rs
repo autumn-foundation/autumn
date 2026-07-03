@@ -440,16 +440,18 @@ fn parse_enum_type(ty: &str) -> Result<Option<(Vec<String>, bool)>, String> {
 
     let Some(inner) = rest.strip_prefix('{') else {
         // Looks like an enum token (starts with `enum`) but has no opening
-        // brace — the most common cause is bash/zsh brace-expanding an
+        // brace. The most common cause is bash/zsh brace-expanding an
         // unquoted `enum{a,b}` before the CLI ever sees it, turning
         // `status:enum{draft,published}` into two separate arguments whose
-        // surviving fragment reads like `status:enumdraft`.
-        return Err(
-            "expected enum{variant1,variant2,…} — if you typed this in bash or zsh, \
+        // surviving fragment reads like `status:enumdraft` — but `ty` could
+        // also just be an unrelated typo (e.g. `enumerable`), so the message
+        // covers both: the quoting hint for the shell-expansion case, and
+        // the full supported-types list for a genuine typo.
+        return Err(format!(
+            "expected enum{{variant1,variant2,…}}. If you typed this in bash or zsh, \
              quote the token so the shell doesn't brace-expand it, \
-             e.g. 'status:enum{draft,published}'"
-                .to_owned(),
-        );
+             e.g. 'status:enum{{draft,published}}'. Supported: {SUPPORTED_TYPES}"
+        ));
     };
     let Some(body_inner) = inner.strip_suffix('}') else {
         return Err("expected enum{variant1,variant2,…} (missing closing brace)".to_owned());
@@ -1231,6 +1233,20 @@ mod tests {
         let err = parse_field("status:enumdraft").unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("quote"), "must suggest quoting: {msg}");
+    }
+
+    #[test]
+    fn enum_prefixed_typo_still_lists_supported_types() {
+        // A type name that happens to start with `enum` but isn't a genuine
+        // shell-mangled enum token (e.g. a typo like `enumerable`) must still
+        // see the full supported-types list, not just the brace-expansion
+        // hint — the two audiences (a real shell-expansion victim and a
+        // plain typo) get one message that serves both.
+        let err = parse_field("status:enumerable").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("quote"), "got: {msg}");
+        assert!(msg.contains("Supported:"), "got: {msg}");
+        assert!(msg.contains("String"), "got: {msg}");
     }
 
     #[test]

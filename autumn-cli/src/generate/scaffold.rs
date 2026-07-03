@@ -18,7 +18,7 @@ use super::model::{
     ModelOptions, augment_fields_for_soft_delete, field_by_name, parse_model_metadata,
     plan_cargo_deps, plan_model_with_options,
 };
-use super::naming::{pascal, pluralize, snake};
+use super::naming::{humanize_label, pascal, pluralize, snake};
 use super::schema_edit::{
     add_mod_declaration, create_table_sql_with_metadata_and_id, ensure_autumn_web_feature,
     ensure_dev_dependency_test_support, ensure_dev_dependency_tokio_test_features, update_main_rs,
@@ -1730,7 +1730,7 @@ fn render_create_form_inputs(
                     };
                     let mut options_body = format!("option value=\"\" {{ \"{placeholder}\" }}");
                     for v in &f.variants {
-                        let label = humanize_enum_label(v);
+                        let label = humanize_label(v);
                         let _ = write!(options_body, " option value=\"{v}\" {{ \"{label}\" }}");
                     }
                     format!(
@@ -1758,22 +1758,6 @@ fn render_create_form_inputs(
         }
     }
     out
-}
-
-/// Humanize an enum variant token into a display label, matching the admin
-/// generator's `--select` widget (`admin::render_select_kind`): split on
-/// `_`/`-`, then title-case each word (`in_review` -> `In Review`).
-fn humanize_enum_label(variant: &str) -> String {
-    variant
-        .split(['_', '-'])
-        .map(|word| {
-            let mut chars = word.chars();
-            chars.next().map_or_else(String::new, |c| {
-                c.to_uppercase().collect::<String>() + chars.as_str()
-            })
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 /// The HTML `step` attribute value for a `number_input`-shaped `FieldKind`.
@@ -1879,7 +1863,7 @@ fn render_edit_form_inputs(
                         .enum_type_name()
                         .expect("FieldKind::Enum always has an enum_type_name");
                     for v in &f.variants {
-                        let label = humanize_enum_label(v);
+                        let label = humanize_label(v);
                         let variant = pascal(v);
                         let selected_expr = if f.nullable {
                             format!("row.{} == Some({enum_ty}::{variant})", f.name)
@@ -1892,8 +1876,9 @@ fn render_edit_form_inputs(
                         );
                     }
                     format!(
-                        "select name=\"{name}\"{hx_attrs} {{ {options_body} }}",
+                        "select name=\"{name}\"{required}{hx_attrs} {{ {options_body} }}",
                         name = f.name,
+                        required = required,
                         hx_attrs = hx_attrs,
                         options_body = options_body
                     )
@@ -2177,10 +2162,18 @@ fn render_update_columns(plural: &str, fields: &[Field]) -> String {
 fn render_execute_sql_calls(sql: &str) -> String {
     let mut out = String::new();
     for statement in crate::migrate::safety::split_statements(sql) {
-        let escaped = statement.replace('\\', "\\\\").replace('"', "\\\"");
+        let escaped = escape_sql_for_rust_literal(&statement);
         let _ = writeln!(out, "db.execute_sql(\"{escaped};\").await;");
     }
     out
+}
+
+/// Escape a raw SQL string so it survives verbatim as a Rust string literal
+/// (`"..."`) in generated test code — used both for the `db.execute_sql(...)`
+/// setup calls above and for the raw `diesel::sql_query(...)` issued by the
+/// enum out-of-set rejection smoke test (see `enum_rejection_insert_sql`).
+fn escape_sql_for_rust_literal(sql: &str) -> String {
+    sql.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 /// Render the `tests/<snake>.rs` smoke test's HTML (non-`--api`) shape: an
@@ -2353,6 +2346,15 @@ fn render_reference_stub_tables_sql(fields: &[Field], own_table: &str) -> String
                 out,
                 "CREATE TABLE IF NOT EXISTS {target} (id BIGSERIAL PRIMARY KEY);"
             );
+            // Seed one row (id 1, since BIGSERIAL starts there) so a NOT NULL
+            // `references` column pointing at this stub has a real id to
+            // reference. Without this, any raw INSERT the smoke test issues
+            // against the table under test — e.g. the enum out-of-set
+            // rejection test's deliberately-invalid INSERT, see
+            // `enum_rejection_insert_sql` — would fail on this FK constraint
+            // regardless of the column it's actually trying to exercise,
+            // masking the real assertion behind an unrelated failure.
+            let _ = writeln!(out, "INSERT INTO {target} DEFAULT VALUES;");
         }
     }
     out
@@ -2483,7 +2485,7 @@ fn render_enum_rejection_smoke_test(
     for target in fields.iter().filter(|f| f.is_enum()) {
         let field_name = &target.name;
         let insert_sql = enum_rejection_insert_sql(plural, fields, target, defaults);
-        let escaped_insert = insert_sql.replace('\\', "\\\\").replace('"', "\\\"");
+        let escaped_insert = escape_sql_for_rust_literal(&insert_sql);
         let allowed_values = target
             .variants
             .iter()
@@ -2782,6 +2784,25 @@ async fn main() {
                 "option value=\"published\" selected[row.status == Status::Published] { \"Published\" }"
             ),
             "got:\n{routes}"
+        );
+    }
+
+    #[test]
+    fn scaffold_edit_form_required_enum_select_carries_required_attr() {
+        // Regression test: a required (non-nullable) enum field's edit-form
+        // `<select>` must carry `required`, matching the create form's own
+        // enum select and every other non-nullable field kind's edit input.
+        let tmp = project_with_main(default_main());
+        plan_and_execute_post_scaffold_with_status_enum(&tmp);
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+
+        let select_line = routes
+            .lines()
+            .find(|l| l.contains("select name=\"status\""))
+            .unwrap_or_else(|| panic!("no status select found in:\n{routes}"));
+        assert!(
+            select_line.contains("select name=\"status\" required"),
+            "required enum field's edit select must carry `required`: {select_line}"
         );
     }
 
@@ -4615,6 +4636,38 @@ async fn main() {
         );
     }
 
+    #[test]
+    fn scaffold_enum_rejection_test_isolates_check_failure_from_required_references_field() {
+        // Regression test: a required `references` field co-occurring with
+        // the enum field under test must not make the raw out-of-set INSERT
+        // fail for the wrong reason (an FK violation on a dangling stub-table
+        // reference) instead of the CHECK constraint actually being tested.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &[
+                "author:references".into(),
+                "status:enum{draft,published,archived}".into(),
+            ],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let test = fs::read_to_string(tmp.path().join("tests/post.rs")).unwrap();
+        assert!(
+            test.contains("INSERT INTO authors DEFAULT VALUES;"),
+            "the stub `authors` table must be seeded so author_id=1 is a valid FK: {test}"
+        );
+        assert!(
+            test.contains(
+                "INSERT INTO posts (author_id, status) VALUES (1, '__not_a_real_variant__')"
+            ),
+            "got:\n{test}"
+        );
+    }
+
     // ── references field: scaffold + smoke-test wiring (issue #1026) ───────
 
     #[test]
@@ -4738,6 +4791,48 @@ async fn main() {
             sql.matches("CREATE TABLE IF NOT EXISTS").count(),
             1,
             "identical targets must be de-duplicated: {sql}"
+        );
+    }
+
+    #[test]
+    fn render_reference_stub_tables_sql_seeds_a_row_so_fk_id_1_is_valid() {
+        // Regression test: a raw INSERT the smoke test issues against the
+        // table under test (e.g. the enum out-of-set rejection test) uses a
+        // NOT NULL `references` column's sample literal ("1" — see
+        // `sql_sample_literal`); without a seeded row, that INSERT would
+        // fail on the FK constraint regardless of what it's actually trying
+        // to exercise.
+        let fields = super::super::dsl::parse_fields(&["author:references".into()]).unwrap();
+        let sql = render_reference_stub_tables_sql(&fields, "posts");
+        assert_eq!(
+            sql,
+            "CREATE TABLE IF NOT EXISTS authors (id BIGSERIAL PRIMARY KEY);\n\
+             INSERT INTO authors DEFAULT VALUES;\n",
+            "got:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn render_reference_stub_tables_sql_seeds_only_once_per_distinct_target() {
+        let fields = vec![
+            Field {
+                name: "author_id".to_string(),
+                kind: FieldKind::References,
+                nullable: false,
+                variants: Vec::new(),
+            },
+            Field {
+                name: "author_id".to_string(),
+                kind: FieldKind::References,
+                nullable: true,
+                variants: Vec::new(),
+            },
+        ];
+        let sql = render_reference_stub_tables_sql(&fields, "unrelated_table");
+        assert_eq!(
+            sql.matches("INSERT INTO authors DEFAULT VALUES;").count(),
+            1,
+            "got:\n{sql}"
         );
     }
 
