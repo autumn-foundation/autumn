@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **mcp:** plugins and repositories can now layer in MCP. Chainable route
+  toggles `Route::mcp()`, `Route::mcp_exclude()`, and `Route::mcp_stream()`
+  mirror the `#[api_doc(mcp)]` / `mcp = false` / `mcp, stream` attribute
+  forms at registration time, so a plugin can offer a fluent
+  `MyPlugin::new().expose_mcp()` switch and let the *host* decide at install
+  time whether the plugin's typed routes become MCP tools — no source
+  attributes needed on handlers the host doesn't own (the flags are inert
+  unless the host enables the `mcp` feature and calls `mount_mcp`). The
+  `#[repository]` macro gains an `mcp` key:
+  `#[repository(Model, api = "/path", mcp)]` exposes all five generated CRUD
+  routes as tools and `mcp = "read"` exposes only list/get, with the usual
+  verb-derived safety annotations (`readOnlyHint` on reads,
+  `destructiveHint` on delete); `mcp` without `api = "/path"` is a compile
+  error. Duplicate `mcp` keys are a compile error rather than silently
+  last-write-wins. To support the generated `DELETE`, routes declaring an
+  empty-body success status (`204 No Content`, `205 Reset Content`) are no
+  longer conflated with schema-less HTML routes: they are MCP-eligible under
+  an explicit opt-in, and an *untagged* read-only `204`/`205` route is now
+  also auto-included under a pre-existing `expose_all_as_mcp()` hatch —
+  hatch users can gain tools on upgrade. The result of a successful call to
+  such a tool is enforced to be empty text, so a route that mislabels its
+  status can't leak a response body to agents.
+  `McpToolInfo` gains public read accessors (`name()`, `description()`,
+  `input_schema()`, `annotations()`, `method()`, `path_template()`,
+  `streams()`) so hosts can introspect derived tools. Routes registered by
+  plugins via `routes()`/`scoped()` were already derived into tools; this is
+  now pinned by tests and documented. Raw `nest()`/`merge()` routers remain
+  MCP-invisible (documented follow-up). See the
+  [MCP guide](docs/guide/mcp.md) §9–§10.
+
 - **model:** many-to-many associations via `#[has_many(Target, through =
   join_table)]` (#1324). Extends the `belongs_to`/`has_many`/`has_one`
   associations from #835 with a join-table variant: join columns default to

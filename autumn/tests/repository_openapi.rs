@@ -211,6 +211,77 @@ fn vec_field_emits_array_schema() {
     );
 }
 
+// ── MCP opt-in: `mcp` / `mcp = "read"` on the repository macro ────
+
+mod schema3 {
+    autumn_web::reexports::diesel::table! {
+        gadgets (id) {
+            id -> Int8,
+            name -> Text,
+        }
+    }
+}
+
+use schema3::gadgets;
+
+#[autumn_web::model]
+pub struct Gadget {
+    #[id]
+    pub id: i64,
+    pub name: String,
+}
+
+#[autumn_web::repository(Gadget, api = "/api/gadgets", mcp)]
+pub trait GadgetRepository {}
+
+mod schema4 {
+    autumn_web::reexports::diesel::table! {
+        sprockets (id) {
+            id -> Int8,
+            name -> Text,
+        }
+    }
+}
+
+use schema4::sprockets;
+
+#[autumn_web::model]
+pub struct Sprocket {
+    #[id]
+    pub id: i64,
+    pub name: String,
+}
+
+#[autumn_web::repository(Sprocket, api = "/api/sprockets", mcp = "read")]
+pub trait SprocketRepository {}
+
+#[test]
+fn repository_mcp_opts_in_all_five_crud_routes() {
+    assert!(__autumn_route_info_gadget_api_list().api_doc.mcp_tool);
+    assert!(__autumn_route_info_gadget_api_get().api_doc.mcp_tool);
+    assert!(__autumn_route_info_gadget_api_create().api_doc.mcp_tool);
+    assert!(__autumn_route_info_gadget_api_update().api_doc.mcp_tool);
+    assert!(__autumn_route_info_gadget_api_delete().api_doc.mcp_tool);
+}
+
+#[test]
+fn repository_mcp_read_exposes_only_list_and_get() {
+    assert!(__autumn_route_info_sprocket_api_list().api_doc.mcp_tool);
+    assert!(__autumn_route_info_sprocket_api_get().api_doc.mcp_tool);
+    assert!(!__autumn_route_info_sprocket_api_create().api_doc.mcp_tool);
+    assert!(!__autumn_route_info_sprocket_api_update().api_doc.mcp_tool);
+    assert!(!__autumn_route_info_sprocket_api_delete().api_doc.mcp_tool);
+}
+
+#[test]
+fn repository_without_mcp_defaults_off() {
+    assert!(!__autumn_route_info_widget_api_list().api_doc.mcp_tool);
+    assert!(!__autumn_route_info_widget_api_get().api_doc.mcp_tool);
+    assert!(!__autumn_route_info_widget_api_create().api_doc.mcp_tool);
+    assert!(!__autumn_route_info_widget_api_update().api_doc.mcp_tool);
+    assert!(!__autumn_route_info_widget_api_delete().api_doc.mcp_tool);
+}
+
 #[test]
 fn option_field_emits_nullable_schema() {
     use autumn_web::openapi::OpenApiSchema;
