@@ -352,6 +352,18 @@ fn percent_decode(s: &str) -> String {
         .into_owned()
 }
 
+/// Percent-encode `s` for use as a URL query key or value being handed to
+/// `tokio_postgres` — not `url::Url`'s own `query_pairs_mut()`, whose
+/// `form_urlencoded` serialization encodes a space as `+`, which
+/// `tokio_postgres`'s own query-string decoder (pure percent-decoding, see
+/// `UrlParser::decode`) would then read back as a literal `+` rather than a
+/// space. `NON_ALPHANUMERIC` is broader than strictly necessary (it also
+/// escapes `-`/`_`/`.`/`~`, which are already query-safe), but over-encoding
+/// is harmless to a decoder that only ever percent-decodes.
+fn query_value_token(s: &str) -> String {
+    percent_encoding::utf8_percent_encode(s, percent_encoding::NON_ALPHANUMERIC).to_string()
+}
+
 /// Quote `value` in `libpq` keyword/value form if needed (empty, contains
 /// whitespace, or contains a quote/backslash), escaping `\` and `'`.
 fn keyword_value_token(key: &str, value: &str) -> String {
@@ -458,16 +470,39 @@ fn fill_in_libpq_env_defaults(
     {
         pairs.push(("dbname".to_owned(), pgdatabase));
     }
-    // `connect_timeout` has no URL-authority equivalent (unlike
-    // `host`/`port`, it's always just a plain query/keyword pair), so
-    // there's no explicit-tracking struct field for it — checking `pairs`
-    // directly is enough.
-    if find_pair(pairs, "connect_timeout").is_none()
-        && let Ok(pgconnect_timeout) = std::env::var("PGCONNECT_TIMEOUT")
-    {
-        pairs.push(("connect_timeout".to_owned(), pgconnect_timeout));
-    }
+    fill_in_simple_libpq_env_fallbacks(pairs);
     injected_port
+}
+
+/// `(connection parameter, libpq environment variable)` pairs with no
+/// special parsing semantics of their own — each is just a single
+/// query/keyword pair `tokio_postgres` accepts as-is, with no
+/// URL-authority equivalent (unlike `host`/`port`) and no accumulation or
+/// validation behavior (unlike `sslmode`/`sslrootcert`, which need
+/// [`fill_in_libpq_ssl_env_defaults`]'s extra care around
+/// [`filter_ssl_params`]). New libpq environment variables of this same
+/// simple "one parameter, one env var" shape can be added here directly.
+const SIMPLE_LIBPQ_ENV_FALLBACKS: &[(&str, &str)] = &[
+    ("connect_timeout", "PGCONNECT_TIMEOUT"),
+    ("target_session_attrs", "PGTARGETSESSIONATTRS"),
+    ("channel_binding", "PGCHANNELBINDING"),
+    ("options", "PGOPTIONS"),
+    ("application_name", "PGAPPNAME"),
+];
+
+/// Fill in each of [`SIMPLE_LIBPQ_ENV_FALLBACKS`] from its environment
+/// variable when the connection parameter isn't already set — `pairs`
+/// itself is the source of truth for "already set" here (rather than a
+/// separately captured boolean) since none of these parameters have a
+/// URL-authority form that could go stale the way `host`/`port` can.
+fn fill_in_simple_libpq_env_fallbacks(pairs: &mut Vec<(String, String)>) {
+    for (param, env_var) in SIMPLE_LIBPQ_ENV_FALLBACKS {
+        if find_pair(pairs, param).is_none()
+            && let Ok(value) = std::env::var(env_var)
+        {
+            pairs.push(((*param).to_owned(), value));
+        }
+    }
 }
 
 /// Fill in `sslmode`/`sslrootcert` from `PGSSLMODE`/`PGSSLROOTCERT` for
@@ -918,6 +953,15 @@ fn sanitize_url_form(mut url: url::Url) -> Result<String, CommandError> {
     needs_keyword_form |= fill_in_libpq_env_defaults(&mut pairs, &explicit_fields);
     fill_in_libpq_ssl_env_defaults(&mut pairs);
 
+    // `tokio_postgres`'s URL parser special-cases a query-string `host=`
+    // through a single `Config::host()` call rather than splitting it on
+    // commas the way keyword form (and a multi-host *authority* like
+    // `host1:5432,host2:5432`) do — so a comma-separated `host` ending up
+    // in the query string, from any source (inline, a merged-in service
+    // group, or an injected `PGHOST`), needs the same keyword-form rebuild
+    // rather than being handed back as-is.
+    needs_keyword_form |= find_pair(&pairs, "host").is_some_and(|h| h.contains(','));
+
     let is_explicit_password = is_explicit(&pairs, "password");
     fill_in_missing_password(
         &mut pairs,
@@ -970,12 +1014,19 @@ fn sanitize_url_form(mut url: url::Url) -> Result<String, CommandError> {
     if pairs.is_empty() {
         url.set_query(None);
     } else {
-        let mut query_pairs = url.query_pairs_mut();
-        query_pairs.clear();
-        for (key, value) in &pairs {
-            query_pairs.append_pair(key, value);
-        }
-        drop(query_pairs);
+        // Not `query_pairs_mut()` — its `append_pair` serializes with
+        // `form_urlencoded`, which encodes a space as `+`. `tokio_postgres`'s
+        // own query-string decoder only ever percent-decodes (see
+        // `UrlParser::decode`) and never treats `+` as a space, so a `+`
+        // produced here would come back out as a literal `+` instead of the
+        // space it was meant to represent (this affects any value with a
+        // space, e.g. `options=-c search_path=...` from `PGOPTIONS`).
+        let query = pairs
+            .iter()
+            .map(|(key, value)| format!("{}={}", query_value_token(key), query_value_token(value)))
+            .collect::<Vec<_>>()
+            .join("&");
+        url.set_query(Some(&query));
     }
     Ok(url.into())
 }
@@ -1497,6 +1548,45 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_rebuilds_as_keyword_form_when_query_host_is_comma_separated() {
+        // `tokio_postgres`'s URL parser special-cases a query `host=`
+        // through a single `Config::host()` call rather than splitting on
+        // comma (unlike keyword form, which does split, and unlike a
+        // multi-host *authority* like `host1:5432,host2:5432`, which is
+        // split chunk-by-chunk before parsing) — so `?host=host1,host2`
+        // ends up as one literal (and wrong) hostname `"host1,host2"`
+        // instead of a two-host failover list.
+        let sanitized = sanitize_db_url("postgres:///db?host=host1,host2").unwrap();
+        let config: tokio_postgres::Config = sanitized.parse().unwrap();
+        assert_eq!(
+            config.get_hosts(),
+            &[
+                tokio_postgres::config::Host::Tcp("host1".to_owned()),
+                tokio_postgres::config::Host::Tcp("host2".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn sanitize_rebuilds_as_keyword_form_when_pghost_env_var_is_comma_separated() {
+        // Same bug, reached via the `PGHOST` fallback instead of an inline
+        // query parameter — a hostless URL relying on
+        // `PGHOST=host1,host2` the way `psql` did must not end up with that
+        // whole string pushed into the query string as one literal host.
+        temp_env::with_var("PGHOST", Some("host1,host2"), || {
+            let sanitized = sanitize_db_url("postgres:///db").unwrap();
+            let config: tokio_postgres::Config = sanitized.parse().unwrap();
+            assert_eq!(
+                config.get_hosts(),
+                &[
+                    tokio_postgres::config::Host::Tcp("host1".to_owned()),
+                    tokio_postgres::config::Host::Tcp("host2".to_owned()),
+                ]
+            );
+        });
+    }
+
+    #[test]
     fn sanitize_prefers_query_user_password_dbname_over_url_structure() {
         // `tokio_postgres`'s URL parser applies the query string *after*
         // parsing userinfo/path, and `user`/`password`/`dbname` are single
@@ -1971,6 +2061,108 @@ mod tests {
                 Some(&std::time::Duration::from_secs(10))
             );
         });
+    }
+
+    #[test]
+    fn sanitize_uses_pgtargetsessionattrs_env_var_when_url_omits_it() {
+        // `tokio_postgres` supports `target_session_attrs` as a connection
+        // parameter but never reads `PGTARGETSESSIONATTRS` itself (unlike
+        // `psql`, which honors it as a documented libpq environment
+        // variable) — a multi-host connection string relying on it the way
+        // `psql` did would otherwise default to `any` and could connect to
+        // a read-only standby instead of skipping to the primary.
+        temp_env::with_var("PGTARGETSESSIONATTRS", Some("read-write"), || {
+            let sanitized = sanitize_db_url("postgres://db.internal").unwrap();
+            let config: tokio_postgres::Config = sanitized.parse().unwrap();
+            assert_eq!(
+                config.get_target_session_attrs(),
+                tokio_postgres::config::TargetSessionAttrs::ReadWrite
+            );
+        });
+    }
+
+    #[test]
+    fn sanitize_uses_pgtargetsessionattrs_env_var_in_keyword_form_too() {
+        temp_env::with_var("PGTARGETSESSIONATTRS", Some("read-write"), || {
+            let sanitized = sanitize_db_url("host=db.internal").unwrap();
+            let config: tokio_postgres::Config = sanitized.parse().unwrap();
+            assert_eq!(
+                config.get_target_session_attrs(),
+                tokio_postgres::config::TargetSessionAttrs::ReadWrite
+            );
+        });
+    }
+
+    #[test]
+    fn sanitize_does_not_override_explicit_target_session_attrs_with_env_var() {
+        temp_env::with_var("PGTARGETSESSIONATTRS", Some("read-write"), || {
+            let sanitized =
+                sanitize_db_url("postgres://db.internal?target_session_attrs=any").unwrap();
+            let config: tokio_postgres::Config = sanitized.parse().unwrap();
+            assert_eq!(
+                config.get_target_session_attrs(),
+                tokio_postgres::config::TargetSessionAttrs::Any
+            );
+        });
+    }
+
+    #[test]
+    fn sanitize_uses_pgchannelbinding_env_var_when_url_omits_it() {
+        // `tokio_postgres` defaults `channel_binding` to `Prefer` and never
+        // reads `PGCHANNELBINDING` itself (unlike `psql`, which honors it
+        // as a documented libpq environment variable) — relying on it the
+        // way `psql` did would otherwise silently weaken an operator's
+        // SCRAM channel-binding policy.
+        temp_env::with_var("PGCHANNELBINDING", Some("require"), || {
+            let sanitized = sanitize_db_url("postgres://db.internal").unwrap();
+            let config: tokio_postgres::Config = sanitized.parse().unwrap();
+            assert_eq!(
+                config.get_channel_binding(),
+                tokio_postgres::config::ChannelBinding::Require
+            );
+        });
+    }
+
+    #[test]
+    fn sanitize_uses_pgoptions_env_var_when_url_omits_it() {
+        temp_env::with_var("PGOPTIONS", Some("-c search_path=app,public"), || {
+            let sanitized = sanitize_db_url("postgres://db.internal").unwrap();
+            let config: tokio_postgres::Config = sanitized.parse().unwrap();
+            assert_eq!(config.get_options(), Some("-c search_path=app,public"));
+        });
+    }
+
+    #[test]
+    fn sanitize_uses_pgappname_env_var_when_url_omits_it() {
+        temp_env::with_var("PGAPPNAME", Some("my-app"), || {
+            let sanitized = sanitize_db_url("postgres://db.internal").unwrap();
+            let config: tokio_postgres::Config = sanitized.parse().unwrap();
+            assert_eq!(config.get_application_name(), Some("my-app"));
+        });
+    }
+
+    #[test]
+    fn sanitize_does_not_override_explicit_channel_binding_options_appname_with_env_vars() {
+        temp_env::with_vars(
+            [
+                ("PGCHANNELBINDING", Some("require")),
+                ("PGOPTIONS", Some("-c wrong=1")),
+                ("PGAPPNAME", Some("wrong-app")),
+            ],
+            || {
+                let sanitized = sanitize_db_url(
+                    "postgres://db.internal?channel_binding=disable&options=-c%20right%3D1&application_name=right-app",
+                )
+                .unwrap();
+                let config: tokio_postgres::Config = sanitized.parse().unwrap();
+                assert_eq!(
+                    config.get_channel_binding(),
+                    tokio_postgres::config::ChannelBinding::Disable
+                );
+                assert_eq!(config.get_options(), Some("-c right=1"));
+                assert_eq!(config.get_application_name(), Some("right-app"));
+            },
+        );
     }
 
     #[test]
