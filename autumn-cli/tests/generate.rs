@@ -1471,6 +1471,61 @@ fn generate_scaffold_unique_field_routes_handle_duplicate_with_inline_error() {
 }
 
 #[test]
+fn generate_scaffold_unique_field_create_violation_form_preserves_submitted_values() {
+    // Regression guard (issue #1032 review follow-up): a duplicate
+    // submission must not wipe every field the user entered — only the
+    // colliding unique field needs an inline error; every other field's
+    // submitted value should still be pre-filled when the form re-renders
+    // with a 422.
+    let (_tmp, project) = fresh_project("unique-create-preserve-app");
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "User",
+            "email:String:unique",
+            "age:i32",
+            "active:bool",
+            "status:enum{draft,published}",
+        ],
+    );
+
+    let routes = fs::read_to_string(project.join("src/routes/users.rs")).unwrap();
+    // The plain `new_form` (blank form, no prior submission) must stay
+    // untouched — no reference to `new` at all.
+    let new_form_start = routes
+        .find("pub async fn new_form")
+        .expect("new_form handler");
+    let create_start = routes.find("pub async fn create(").expect("create handler");
+    let new_form_body = &routes[new_form_start..create_start];
+    assert!(
+        !new_form_body.contains("new."),
+        "the blank new_form must not reference `new`; got:\n{new_form_body}"
+    );
+
+    // The violation-branch re-render (spliced into `create`) must restore
+    // every submitted value from `new`.
+    let create_body = &routes[create_start..];
+    assert!(
+        create_body.contains("value=(new.age.to_string())"),
+        "got:\n{create_body}"
+    );
+    assert!(
+        create_body.contains("checked[new.active]"),
+        "got:\n{create_body}"
+    );
+    assert!(
+        create_body.contains("selected[new.status == Status::Draft]"),
+        "got:\n{create_body}"
+    );
+    assert!(
+        create_body.contains("selected[new.status == Status::Published]"),
+        "got:\n{create_body}"
+    );
+}
+
+#[test]
 fn generate_scaffold_unique_field_emits_duplicate_rejection_smoke_test() {
     let (_tmp, project) = fresh_project("unique-scaffold-smoke-app");
     run_autumn(
@@ -1502,6 +1557,116 @@ fn generate_scaffold_unique_field_emits_duplicate_rejection_smoke_test() {
     assert!(
         test_file.contains(".assert_status(422)") && test_file.contains(".assert_status(200)"),
         "got:\n{test_file}"
+    );
+    // Regression guard: the DB-level check above already inserts the target
+    // value once, so the table must be truncated again before the first
+    // client POST — otherwise that "must succeed with 200" request collides
+    // with the row the DB-level check left behind and the smoke test fails
+    // under `cargo test -- --ignored`.
+    let before_200 = test_file
+        .split(".assert_status(200)")
+        .next()
+        .expect("assert_status(200) must appear in the generated test");
+    assert!(
+        before_200
+            .matches("TRUNCATE users RESTART IDENTITY")
+            .count()
+            >= 2,
+        "the table must be truncated again before the request-boundary POSTs; got:\n{test_file}"
+    );
+}
+
+#[test]
+fn generate_scaffold_unique_enum_field_smoke_test_inserts_a_valid_variant() {
+    // Regression guard: the duplicate-insert smoke test's first INSERT must
+    // actually succeed so the *second* insert is the one that trips the
+    // UNIQUE index. A generic `'dup_value'` literal is not a valid enum
+    // variant and would fail the first insert on the enum's CHECK
+    // constraint instead, so the target field's sample value must be one of
+    // its declared variants.
+    let (_tmp, project) = fresh_project("unique-enum-smoke-app");
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Post",
+            "status:enum{draft,published}:unique",
+        ],
+    );
+
+    let test_file = fs::read_to_string(project.join("tests/post.rs")).unwrap();
+    assert!(
+        test_file.contains("async fn posts_rejects_duplicate_status()"),
+        "got:\n{test_file}"
+    );
+    assert!(
+        !test_file.contains("'dup_value'"),
+        "a unique enum field's smoke test must not insert an invalid variant \
+         literal; got:\n{test_file}"
+    );
+    assert!(
+        test_file.contains("(status) VALUES ('draft')"),
+        "the target enum field must be seeded with its first declared \
+         variant; got:\n{test_file}"
+    );
+}
+
+#[test]
+fn generate_scaffold_long_unique_field_name_agrees_across_migration_and_routes() {
+    // Regression guard (issue #1032 review follow-up): `idx_<table>_<field>_
+    // unique` is unbounded, and PostgreSQL silently truncates identifiers
+    // past its 63-byte limit. If the migration's `CREATE UNIQUE INDEX` and
+    // the generated routes' `UNIQUE_CONSTRAINTS` computed that name
+    // independently, a long enough table/field combination would make them
+    // disagree with what Postgres actually names the index, and a real
+    // duplicate submission would fall through to a 500 instead of the
+    // intended 422. Both must resolve to the identical (possibly
+    // truncated+hashed) name.
+    let (_tmp, project) = fresh_project("unique-longname-app");
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "AVeryLongModelNameForTruncationTesting",
+            "an_equally_long_field_name_for_good_measure:String:unique",
+        ],
+    );
+
+    let migration = fs::read_dir(project.join("migrations"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .ends_with("_create_a_very_long_model_name_for_truncation_testings")
+        })
+        .expect("create migration for the long-named model should exist");
+    let up = fs::read_to_string(migration.path().join("up.sql")).unwrap();
+    let index_line = up
+        .lines()
+        .find(|l| l.starts_with("CREATE UNIQUE INDEX"))
+        .unwrap_or_else(|| panic!("expected a CREATE UNIQUE INDEX line; got:\n{up}"));
+    let index_name = index_line
+        .strip_prefix("CREATE UNIQUE INDEX ")
+        .and_then(|rest| rest.split(' ').next())
+        .expect("index name token");
+    assert!(
+        index_name.len() <= 63,
+        "index name must fit Postgres's identifier limit, got {} bytes: {index_name}",
+        index_name.len()
+    );
+
+    let routes = fs::read_to_string(
+        project.join("src/routes/a_very_long_model_name_for_truncation_testings.rs"),
+    )
+    .unwrap();
+    assert!(
+        routes.contains(&format!("\"{index_name}\"")),
+        "the generated routes' UNIQUE_CONSTRAINTS must reference the exact \
+         same (possibly truncated) index name as the migration; index_name=\
+         {index_name}, got:\n{routes}"
     );
 }
 

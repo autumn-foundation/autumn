@@ -10,6 +10,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
+use sha2::{Digest, Sha256};
+
 use super::dsl::{Field, IdType};
 
 /// Append a `pub mod <name>;` line to a `mod.rs` file, returning the new
@@ -172,13 +174,45 @@ pub fn drop_table_sql(table: &str) -> String {
     format!("DROP TABLE {table};\n")
 }
 
+/// `PostgreSQL` silently truncates identifiers past `NAMEDATALEN - 1` bytes
+/// (63 in a stock build) rather than erroring, so an unbounded
+/// `idx_<table>_<field>_unique` can name-collide with what Postgres
+/// actually stores once `table`/`field` are long enough. This is the one
+/// place that name is computed — [`unique_index_sql`] and every generated
+/// caller that needs to match a real constraint name at runtime
+/// ([`super::scaffold`]'s `UNIQUE_CONSTRAINTS` const and its duplicate-
+/// violation smoke test) all call through here so they stay byte-for-byte
+/// in agreement with what Postgres will actually name the index.
+const POSTGRES_MAX_IDENTIFIER_LEN: usize = 63;
+
+/// The `CREATE UNIQUE INDEX` name for `table`/`field` (issue #1032),
+/// distinct from the plain, non-unique `--index` output (`idx_<table>_
+/// <field>`, no `_unique` suffix) so a field that is both `--index`ed and
+/// `unique` doesn't collide on the index name.
+///
+/// When `idx_<table>_<field>_unique` fits Postgres's identifier limit it is
+/// used verbatim. When it doesn't, the name is truncated to fit and a
+/// `_`-prefixed 8-hex-char digest of the *full* untruncated name is
+/// appended, so two distinct long names that happen to truncate to the same
+/// prefix still don't collide with each other.
+#[must_use]
+pub fn unique_index_name(table: &str, field: &str) -> String {
+    let full = format!("idx_{table}_{field}_unique");
+    if full.len() <= POSTGRES_MAX_IDENTIFIER_LEN {
+        return full;
+    }
+    let digest = hex::encode(Sha256::digest(full.as_bytes()));
+    let suffix = format!("_{}", &digest[..8]);
+    let prefix_len = POSTGRES_MAX_IDENTIFIER_LEN - suffix.len();
+    format!("{}{suffix}", &full[..prefix_len])
+}
+
 /// A `CREATE UNIQUE INDEX` statement enforcing single-column uniqueness on
-/// `field` (issue #1032) — distinct from the plain, non-unique `--index`
-/// output (`idx_<table>_<field>`, no `_unique` suffix), so a field that is
-/// both `--index`ed and `unique` doesn't collide on the index name.
+/// `field` (issue #1032). See [`unique_index_name`] for the name it uses.
 #[must_use]
 pub fn unique_index_sql(table: &str, field: &str) -> String {
-    format!("CREATE UNIQUE INDEX idx_{table}_{field}_unique ON {table} ({field});\n")
+    let name = unique_index_name(table, field);
+    format!("CREATE UNIQUE INDEX {name} ON {table} ({field});\n")
 }
 
 /// For an `enum{…}` field, the trailing ` CHECK (col IN ('a', 'b', …))`
@@ -3390,6 +3424,66 @@ mod tests {
         assert_eq!(
             unique_index_sql("users", "email"),
             "CREATE UNIQUE INDEX idx_users_email_unique ON users (email);\n"
+        );
+    }
+
+    #[test]
+    fn unique_index_name_short_names_pass_through_unchanged() {
+        assert_eq!(
+            unique_index_name("users", "email"),
+            "idx_users_email_unique"
+        );
+    }
+
+    #[test]
+    fn unique_index_name_truncates_long_names_to_fit_postgres_limit() {
+        let table = "a_very_long_table_name_that_pushes_the_identifier_over_the_limit";
+        let field = "an_equally_long_field_name_for_good_measure";
+        let name = unique_index_name(table, field);
+        assert!(
+            name.len() <= 63,
+            "index name must fit Postgres's identifier limit, got {} bytes: {name}",
+            name.len()
+        );
+        assert!(
+            name.starts_with("idx_a_very_long_table_name"),
+            "got: {name}"
+        );
+    }
+
+    #[test]
+    fn unique_index_name_disambiguates_distinct_long_names_that_share_a_prefix() {
+        // Two different (table, field) pairs that truncate to the same
+        // prefix must still produce distinct index names (issue #1032 review
+        // follow-up) -- otherwise the runtime `unique_violation_field` match
+        // would misclassify a violation on one field as the other.
+        let table = "a_very_long_table_name_that_pushes_the_identifier_over_the_limit";
+        let name_a = unique_index_name(table, "an_equally_long_field_name_alpha_variant");
+        let name_b = unique_index_name(table, "an_equally_long_field_name_bravo_variant");
+        assert_ne!(name_a, name_b);
+    }
+
+    #[test]
+    fn unique_index_name_is_deterministic() {
+        let table = "a_very_long_table_name_that_pushes_the_identifier_over_the_limit";
+        let field = "an_equally_long_field_name_for_good_measure";
+        assert_eq!(
+            unique_index_name(table, field),
+            unique_index_name(table, field)
+        );
+    }
+
+    #[test]
+    fn unique_index_sql_uses_truncated_name_for_long_identifiers() {
+        let table = "a_very_long_table_name_that_pushes_the_identifier_over_the_limit";
+        let field = "an_equally_long_field_name_for_good_measure";
+        let sql = unique_index_sql(table, field);
+        let expected_name = unique_index_name(table, field);
+        assert!(
+            sql.contains(&format!(
+                "CREATE UNIQUE INDEX {expected_name} ON {table} ({field});"
+            )),
+            "got:\n{sql}"
         );
     }
 

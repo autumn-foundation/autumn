@@ -21,7 +21,8 @@ use super::model::{
 use super::naming::{humanize_label, pascal, pluralize, snake};
 use super::schema_edit::{
     add_mod_declaration, create_table_sql_with_metadata_and_id, ensure_autumn_web_feature,
-    ensure_dev_dependency_test_support, ensure_dev_dependency_tokio_test_features, update_main_rs,
+    ensure_dev_dependency_test_support, ensure_dev_dependency_tokio_test_features,
+    unique_index_name, update_main_rs,
 };
 use super::{Flags, GenerateError, ensure_project_root, read_or_empty, timestamp_now};
 
@@ -1791,9 +1792,10 @@ fn render_unique_constraints_const(plural: &str, unique_fields: &[&Field]) -> St
     use std::fmt::Write as _;
     let mut entries = String::new();
     for f in unique_fields {
+        let index_name = unique_index_name(plural, &f.name);
         let _ = write!(
             entries,
-            "(\"idx_{plural}_{name}_unique\", \"{name}\", \"has already been taken\"),\n    ",
+            "(\"{index_name}\", \"{name}\", \"has already been taken\"),\n    ",
             name = f.name
         );
     }
@@ -1945,6 +1947,12 @@ fn has_attachment_fields(fields: &[Field]) -> bool {
 //     `step="any"` for floats.
 //   - `NaiveDateTime`/`DateTime`: `type="datetime-local"`, decoded via a
 //     `%.f`-tolerant parser (see `DESERIALIZE_*_DATETIME_LOCAL_FN` below).
+#[allow(
+    clippy::too_many_lines,
+    reason = "One match arm per field-kind widget — splitting it produces less \
+              readable output, not more. See render_edit_form_inputs's \
+              module-level comment for the shared invariants across both."
+)]
 fn render_create_form_inputs(
     fields: &[Field],
     live_validation: bool,
@@ -1953,6 +1961,16 @@ fn render_create_form_inputs(
     unique_error_aware: bool,
 ) -> String {
     use std::fmt::Write as _;
+    // Only the `unique_error_aware` re-render (a unique-constraint violation
+    // on `create`, see `render_unique_violation_create_handler`) has a prior
+    // submission to restore — `new: New{Pascal}` is in scope there, holding
+    // the just-decoded, otherwise-valid values that were rejected only for
+    // colliding on the unique column. The plain `new_form` GET always passes
+    // `unique_error_aware = false` (issue #1032 review follow-up: without
+    // this, a duplicate submission wiped every field, not just the one that
+    // collided), so its output stays byte-identical to before this feature
+    // existed.
+    let submitted_var = unique_error_aware.then_some("new");
     let mut out = String::new();
     for f in fields {
         if f.kind.is_attachment() {
@@ -1990,39 +2008,68 @@ fn render_create_form_inputs(
                 // every checked submission would 400. `#[serde(default)]` on
                 // the DecodedForm field (see render_decoded_form) recovers
                 // `false` from the key's *absence* when unchecked instead.
-                (FieldKind::Bool, false) => format!(
-                    "input type=\"checkbox\" name=\"{name}\" value=\"true\"{hx_attrs}",
-                    name = f.name,
-                    hx_attrs = hx_attrs
-                ),
+                (FieldKind::Bool, false) => {
+                    let checked_attr = submitted_var
+                        .map(|var| format!(" checked[{}]", edit_checked_expr(f, var)))
+                        .unwrap_or_default();
+                    format!(
+                        "input type=\"checkbox\" name=\"{name}\" value=\"true\"{checked_attr}{hx_attrs}",
+                        name = f.name,
+                        hx_attrs = hx_attrs
+                    )
+                }
                 // A checkbox can't losslessly represent a nullable bool (no
                 // way to distinguish "leave false" from "set to null" when
                 // unchecked) — a 3-option select keeps NULL reachable.
-                (FieldKind::Bool, true) => format!(
-                    "select name=\"{name}\"{hx_attrs} {{ \
-                         option value=\"\" {{ \"— Unset —\" }} \
-                         option value=\"true\" {{ \"Yes\" }} \
-                         option value=\"false\" {{ \"No\" }} \
-                     }}",
-                    name = f.name,
-                    hx_attrs = hx_attrs
-                ),
-                (FieldKind::I32 | FieldKind::I64 | FieldKind::F32 | FieldKind::F64, _) => format!(
-                    "input type=\"number\" name=\"{name}\" step=\"{step}\"{required}{hx_attrs}",
-                    name = f.name,
-                    step = number_step(f.kind),
-                    required = required,
-                    hx_attrs = hx_attrs
-                ),
+                (FieldKind::Bool, true) => {
+                    let (unset_attr, true_attr, false_attr) = submitted_var.map_or_else(
+                        || (String::new(), String::new(), String::new()),
+                        |var| {
+                            let (unset, is_true, is_false) =
+                                edit_bool_select_selected_exprs(f, var);
+                            (
+                                format!(" selected[{unset}]"),
+                                format!(" selected[{is_true}]"),
+                                format!(" selected[{is_false}]"),
+                            )
+                        },
+                    );
+                    format!(
+                        "select name=\"{name}\"{hx_attrs} {{ \
+                             option value=\"\"{unset_attr} {{ \"— Unset —\" }} \
+                             option value=\"true\"{true_attr} {{ \"Yes\" }} \
+                             option value=\"false\"{false_attr} {{ \"No\" }} \
+                         }}",
+                        name = f.name,
+                        hx_attrs = hx_attrs
+                    )
+                }
+                (FieldKind::I32 | FieldKind::I64 | FieldKind::F32 | FieldKind::F64, _) => {
+                    let value_attr = submitted_var
+                        .map(|var| format!(" value=({})", edit_value_expr(f, var)))
+                        .unwrap_or_default();
+                    format!(
+                        "input type=\"number\" name=\"{name}\" step=\"{step}\"{value_attr}{required}{hx_attrs}",
+                        name = f.name,
+                        step = number_step(f.kind),
+                        required = required,
+                        hx_attrs = hx_attrs
+                    )
+                }
                 // `step="any"` lets the browser's picker show/accept
                 // seconds — see edit_datetime_local_value_expr for why a
                 // value with seconds must not be step-mismatch-rejected.
-                (FieldKind::NaiveDateTime | FieldKind::DateTime, _) => format!(
-                    "input type=\"datetime-local\" name=\"{name}\" step=\"any\"{required}{hx_attrs}",
-                    name = f.name,
-                    required = required,
-                    hx_attrs = hx_attrs
-                ),
+                (FieldKind::NaiveDateTime | FieldKind::DateTime, _) => {
+                    let value_attr = submitted_var
+                        .map(|var| format!(" value=({})", edit_datetime_local_value_expr(f, var)))
+                        .unwrap_or_default();
+                    format!(
+                        "input type=\"datetime-local\" name=\"{name}\" step=\"any\"{value_attr}{required}{hx_attrs}",
+                        name = f.name,
+                        required = required,
+                        hx_attrs = hx_attrs
+                    )
+                }
                 // A closed-set field always renders as a `<select>` — one
                 // `<option>` per variant, matching the admin generator's
                 // `--select` widget output (see `admin::render_select_kind`).
@@ -2032,10 +2079,31 @@ fn render_create_form_inputs(
                     } else {
                         "— Select —"
                     };
-                    let mut options_body = format!("option value=\"\" {{ \"{placeholder}\" }}");
+                    let enum_ty = f
+                        .enum_type_name()
+                        .expect("FieldKind::Enum always has an enum_type_name");
+                    let unset_attr = match submitted_var {
+                        Some(var) if f.nullable => format!(" selected[{var}.{}.is_none()]", f.name),
+                        _ => String::new(),
+                    };
+                    let mut options_body =
+                        format!("option value=\"\"{unset_attr} {{ \"{placeholder}\" }}");
                     for v in &f.variants {
                         let label = humanize_label(v);
-                        let _ = write!(options_body, " option value=\"{v}\" {{ \"{label}\" }}");
+                        let variant = pascal(v);
+                        let selected_attr = match submitted_var {
+                            Some(var) if f.nullable => {
+                                format!(" selected[{var}.{} == Some({enum_ty}::{variant})]", f.name)
+                            }
+                            Some(var) => {
+                                format!(" selected[{var}.{} == {enum_ty}::{variant}]", f.name)
+                            }
+                            None => String::new(),
+                        };
+                        let _ = write!(
+                            options_body,
+                            " option value=\"{v}\"{selected_attr} {{ \"{label}\" }}"
+                        );
                     }
                     format!(
                         "select name=\"{name}\"{required}{hx_attrs} {{ {options_body} }}",
@@ -2045,12 +2113,17 @@ fn render_create_form_inputs(
                         options_body = options_body
                     )
                 }
-                _ => format!(
-                    "input type=\"text\" name=\"{name}\"{required}{hx_attrs}",
-                    name = f.name,
-                    required = required,
-                    hx_attrs = hx_attrs
-                ),
+                _ => {
+                    let value_attr = submitted_var
+                        .map(|var| format!(" value=({})", edit_value_expr(f, var)))
+                        .unwrap_or_default();
+                    format!(
+                        "input type=\"text\" name=\"{name}\"{value_attr}{required}{hx_attrs}",
+                        name = f.name,
+                        required = required,
+                        hx_attrs = hx_attrs
+                    )
+                }
             };
             // Only the `create` handler's failure-re-render branch passes
             // `unique_error_aware = true` (see `render_unique_violation_create_handler`)
@@ -2135,11 +2208,11 @@ fn render_edit_form_inputs(
                 (FieldKind::Bool, false) => format!(
                     "input type=\"checkbox\" name=\"{name}\" value=\"true\" checked[{checked}]{hx_attrs}",
                     name = f.name,
-                    checked = edit_checked_expr(f),
+                    checked = edit_checked_expr(f, "row"),
                     hx_attrs = hx_attrs
                 ),
                 (FieldKind::Bool, true) => {
-                    let (unset, is_true, is_false) = edit_bool_select_selected_exprs(f);
+                    let (unset, is_true, is_false) = edit_bool_select_selected_exprs(f, "row");
                     format!(
                         "select name=\"{name}\"{hx_attrs} {{ \
                              option value=\"\" selected[{unset}] {{ \"— Unset —\" }} \
@@ -2154,14 +2227,14 @@ fn render_edit_form_inputs(
                     "input type=\"number\" name=\"{name}\" step=\"{step}\" value=({value}){required}{hx_attrs}",
                     name = f.name,
                     step = number_step(f.kind),
-                    value = edit_value_expr(f),
+                    value = edit_value_expr(f, "row"),
                     required = required,
                     hx_attrs = hx_attrs
                 ),
                 (FieldKind::NaiveDateTime | FieldKind::DateTime, _) => format!(
                     "input type=\"datetime-local\" name=\"{name}\" step=\"any\" value=({value}){required}{hx_attrs}",
                     name = f.name,
-                    value = edit_datetime_local_value_expr(f),
+                    value = edit_datetime_local_value_expr(f, "row"),
                     required = required,
                     hx_attrs = hx_attrs
                 ),
@@ -2206,7 +2279,7 @@ fn render_edit_form_inputs(
                 _ => format!(
                     "input type=\"text\" name=\"{name}\" value=({value}){required}{hx_attrs}",
                     name = f.name,
-                    value = edit_value_expr(f),
+                    value = edit_value_expr(f, "row"),
                     required = required,
                     hx_attrs = hx_attrs
                 ),
@@ -2236,7 +2309,13 @@ const fn required_attr(field: &Field) -> &'static str {
     if field.nullable { "" } else { " required" }
 }
 
-fn edit_value_expr(field: &Field) -> String {
+/// A value-attribute expression sourcing `field`'s current value off of
+/// `var` (a variable of the model's row/insert type in scope where the
+/// expression is spliced) — `var = "row"` for [`render_edit_form_inputs`]'s
+/// existing-row pre-population, `var = "new"` for
+/// [`render_create_form_inputs`]'s re-submitted-value pre-population on a
+/// unique-constraint violation (issue #1032).
+fn edit_value_expr(field: &Field, var: &str) -> String {
     let name = &field.name;
     match (field.nullable, field.kind) {
         // Attachment fields don't render a value in text inputs — they have
@@ -2244,7 +2323,7 @@ fn edit_value_expr(field: &Field) -> String {
         (_, FieldKind::Attachment) => String::new(),
         (true, FieldKind::Bytea) => {
             format!(
-                "row.{name}.as_ref().map(|value| String::from_utf8_lossy(value).to_string()).unwrap_or_default()"
+                "{var}.{name}.as_ref().map(|value| String::from_utf8_lossy(value).to_string()).unwrap_or_default()"
             )
         }
         // f32/f64 Display renders NaN/Infinity as "NaN"/"inf"/"-inf", none of
@@ -2253,45 +2332,46 @@ fn edit_value_expr(field: &Field) -> String {
         // value for non-finite floats instead of an invalid one.
         (true, FieldKind::F32 | FieldKind::F64) => {
             format!(
-                "row.{name}.as_ref().filter(|value| value.is_finite()).map(ToString::to_string).unwrap_or_default()"
+                "{var}.{name}.as_ref().filter(|value| value.is_finite()).map(ToString::to_string).unwrap_or_default()"
             )
         }
         (false, FieldKind::F32 | FieldKind::F64) => {
             format!(
-                "if row.{name}.is_finite() {{ row.{name}.to_string() }} else {{ String::new() }}"
+                "if {var}.{name}.is_finite() {{ {var}.{name}.to_string() }} else {{ String::new() }}"
             )
         }
         (true, _) => {
-            format!("row.{name}.as_ref().map(ToString::to_string).unwrap_or_default()")
+            format!("{var}.{name}.as_ref().map(ToString::to_string).unwrap_or_default()")
         }
         (false, FieldKind::Bytea) => {
-            format!("String::from_utf8_lossy(&row.{name}).to_string()")
+            format!("String::from_utf8_lossy(&{var}.{name}).to_string()")
         }
-        (false, _) => format!("row.{name}.to_string()"),
+        (false, _) => format!("{var}.{name}.to_string()"),
     }
 }
 
-/// Boolean expression for the `checked[...]` attribute of an edit-form
-/// checkbox. Only called for non-nullable `bool` fields — nullable
-/// `Option<bool>` fields render as a 3-option select instead (see
-/// [`edit_bool_select_selected_exprs`]), so there is no `Option<bool>` case
-/// to unwrap here.
-fn edit_checked_expr(field: &Field) -> String {
-    format!("row.{}", field.name)
+/// Boolean expression for the `checked[...]` attribute of a checkbox
+/// (`var.field`, see [`edit_value_expr`] for what `var` is). Only called for
+/// non-nullable `bool` fields — nullable `Option<bool>` fields render as a
+/// 3-option select instead (see [`edit_bool_select_selected_exprs`]), so
+/// there is no `Option<bool>` case to unwrap here.
+fn edit_checked_expr(field: &Field, var: &str) -> String {
+    format!("{var}.{}", field.name)
 }
 
 /// The three `selected[...]` boolean expressions (unset / true / false) for
-/// an edit-form `<select>` rendering a nullable `Option<bool>` field.
+/// a `<select>` rendering a nullable `Option<bool>` field (`var.field`, see
+/// [`edit_value_expr`] for what `var` is).
 ///
 /// A checkbox cannot losslessly represent a nullable bool (no way to
 /// distinguish "leave false" from "set to null" when unchecked), so nullable
 /// `Bool` fields render as this 3-option select instead of a checkbox.
-fn edit_bool_select_selected_exprs(field: &Field) -> (String, String, String) {
+fn edit_bool_select_selected_exprs(field: &Field, var: &str) -> (String, String, String) {
     let name = &field.name;
     (
-        format!("row.{name}.is_none()"),
-        format!("row.{name} == Some(true)"),
-        format!("row.{name} == Some(false)"),
+        format!("{var}.{name}.is_none()"),
+        format!("{var}.{name} == Some(true)"),
+        format!("{var}.{name} == Some(false)"),
     )
 }
 
@@ -2311,14 +2391,14 @@ fn edit_bool_select_selected_exprs(field: &Field) -> (String, String, String) {
 /// this field. Pair with `step="any"` on the input (see
 /// `render_edit_form_inputs`) so a value with seconds doesn't fail the
 /// browser's step constraint validation.
-fn edit_datetime_local_value_expr(field: &Field) -> String {
+fn edit_datetime_local_value_expr(field: &Field, var: &str) -> String {
     let name = &field.name;
     if field.nullable {
         format!(
-            "row.{name}.as_ref().map(|value| value.format(\"%Y-%m-%dT%H:%M:%S%.f\").to_string()).unwrap_or_default()"
+            "{var}.{name}.as_ref().map(|value| value.format(\"%Y-%m-%dT%H:%M:%S%.f\").to_string()).unwrap_or_default()"
         )
     } else {
-        format!("row.{name}.format(\"%Y-%m-%dT%H:%M:%S%.f\").to_string()")
+        format!("{var}.{name}.format(\"%Y-%m-%dT%H:%M:%S%.f\").to_string()")
     }
 }
 
@@ -2945,7 +3025,12 @@ fn unique_violation_insert_sql(
     for f in fields {
         if f.name == target.name {
             columns.push(f.name.clone());
-            values.push(unique_sample_literal(f.kind).to_owned());
+            let value = if f.is_enum() {
+                format!("'{}'", f.variants.first().expect("enum field has variants"))
+            } else {
+                unique_sample_literal(f.kind).to_owned()
+            };
+            values.push(value);
         } else if !f.nullable && !defaults.contains_key(&f.name) {
             columns.push(f.name.clone());
             let value = if f.is_enum() {
@@ -3018,7 +3103,7 @@ fn render_unique_violation_smoke_test(
         let field_name = &target.name;
         let insert_sql = unique_violation_insert_sql(plural, fields, target, defaults);
         let escaped_insert = escape_sql_for_rust_literal(&insert_sql);
-        let constraint_name = format!("idx_{plural}_{field_name}_unique");
+        let constraint_name = unique_index_name(plural, field_name);
 
         let request_boundary_check = if api {
             String::new()
@@ -3046,6 +3131,7 @@ fn render_unique_violation_smoke_test(
                  \x20\x20\x20\x20Ok(autumn_web::reexports::http::StatusCode::OK.into_response())\n\
                  }}\n\
                  \n\
+                 \x20\x20\x20\x20db.execute_sql(\"TRUNCATE {plural} RESTART IDENTITY\").await;\n\
                  \x20\x20\x20\x20let client: TestClient = TestApp::new().routes(routes![create]).with_db(db.pool()).build();\n\
                  \n\
                  \x20\x20\x20\x20client.post(\"/{plural}\").send().await.assert_status(200);\n\
