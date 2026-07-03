@@ -299,6 +299,15 @@ fn parse_keyword_value_pairs(s: &str) -> Option<Vec<(String, String)>> {
     if pairs.is_empty() { None } else { Some(pairs) }
 }
 
+/// Percent-decode `s` (e.g. `p%40ss` -> `p@ss`) — `url::Url`'s own
+/// `username()`/`password()`/`path()` getters return these components
+/// exactly as they appear on the wire, never decoded.
+fn percent_decode(s: &str) -> String {
+    percent_encoding::percent_decode_str(s)
+        .decode_utf8_lossy()
+        .into_owned()
+}
+
 /// Quote `value` in `libpq` keyword/value form if needed (empty, contains
 /// whitespace, or contains a quote/backslash), escaping `\` and `'`.
 fn keyword_value_token(key: &str, value: &str) -> String {
@@ -567,14 +576,20 @@ fn sanitize_url_form(mut url: url::Url) -> Result<String, CommandError> {
     // string) already says explicitly, once, up front: `host`/`port`
     // need this snapshot below to detect whether a later merge is safe
     // to fold back into the query string at all (see the comment by
-    // `needs_keyword_form`).
+    // `needs_keyword_form`). `username()`/`password()`/`path()` are
+    // percent-encoded as `url::Url` stores them — fine when we hand the
+    // whole URL back to `tokio_postgres` to reparse (it does its own
+    // percent-decoding), but [`keyword_value_token`] has no
+    // percent-encoding concept at all, so these must be decoded before
+    // any of them can end up as a keyword-form value (see
+    // `needs_keyword_form` below).
     let explicit_user = Some(url.username())
         .filter(|u| !u.is_empty())
-        .map(str::to_owned)
+        .map(percent_decode)
         .or_else(|| find_pair(&pairs, "user").map(str::to_owned));
     let explicit_password = url
         .password()
-        .map(str::to_owned)
+        .map(percent_decode)
         .or_else(|| find_pair(&pairs, "password").map(str::to_owned));
     let explicit_host = url
         .host_str()
@@ -587,7 +602,7 @@ fn sanitize_url_form(mut url: url::Url) -> Result<String, CommandError> {
         .or_else(|| find_pair(&pairs, "port").map(str::to_owned));
     let explicit_dbname = Some(url.path())
         .filter(|p| p.len() > 1)
-        .map(|p| p.trim_start_matches('/').to_owned())
+        .map(|p| percent_decode(p.trim_start_matches('/')))
         .or_else(|| find_pair(&pairs, "dbname").map(str::to_owned));
 
     let is_explicit = |pairs: &[(String, String)], key: &str| match key {
@@ -1177,6 +1192,37 @@ mod tests {
                 assert_eq!(config.get_dbname(), Some("db"));
                 assert_eq!(config.get_user(), Some("svcuser"));
                 assert_eq!(config.get_password(), Some(b"svcpass".as_slice()));
+                assert_eq!(config.get_ports(), &[6543]);
+            },
+        );
+    }
+
+    #[test]
+    fn sanitize_percent_decodes_explicit_password_when_forced_into_keyword_form() {
+        // Explicit credentials in a URL are percent-encoded on the wire
+        // (`url::Url::password()` returns the raw "p%40ss", never decoded
+        // by the `url` crate itself) — normally that's fine, since we hand
+        // the URL straight back to tokio_postgres and it decodes when
+        // reparsing. But when a service group supplies a port the URL
+        // authority didn't have, needing_keyword_form kicks in and
+        // re-emits the credentials as literal keyword-form values, which
+        // have no percent-encoding concept at all — so the raw
+        // "p%40ss" must be decoded to "p@ss" before that happens.
+        let dir = tempfile::tempdir().unwrap();
+        let service_path = dir.path().join("pg_service.conf");
+        std::fs::write(&service_path, "[prod]\nport=6543\n").unwrap();
+        temp_env::with_vars(
+            [
+                ("PGSERVICEFILE", Some(service_path.to_str().unwrap())),
+                ("PGPASSWORD", None::<&str>),
+                ("PGPASSFILE", Some("/nonexistent-pgpass-for-test")),
+            ],
+            || {
+                let sanitized =
+                    sanitize_db_url("postgres://user:p%40ss@host/db?service=prod").unwrap();
+                let config: tokio_postgres::Config = sanitized.parse().unwrap();
+                assert_eq!(config.get_user(), Some("user"));
+                assert_eq!(config.get_password(), Some(b"p@ss".as_slice()));
                 assert_eq!(config.get_ports(), &[6543]);
             },
         );
