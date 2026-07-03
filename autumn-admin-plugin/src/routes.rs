@@ -771,6 +771,7 @@ async fn model_detail(
         id,
         &messages,
         csrf.token(),
+        csrf.form_field(),
         csrf.token_header(),
         &prefix,
         &actuator_prefix,

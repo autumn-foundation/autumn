@@ -1365,6 +1365,7 @@ pub fn model_detail_page(
     id: i64,
     messages: &[FlashMessage],
     csrf_token: &str,
+    csrf_form_field: &str,
     csrf_token_header: &str,
     prefix: &str,
     actuator_prefix: &str,
@@ -1403,7 +1404,10 @@ pub fn model_detail_page(
                         &delete_url,
                         Method::DELETE,
                         csrf_token,
-                        &ButtonToOptions::new().class("btn btn-danger").attrs(&delete_attrs),
+                        &ButtonToOptions::new()
+                            .class("btn btn-danger")
+                            .csrf_field(csrf_form_field)
+                            .attrs(&delete_attrs),
                     ))
                 }
             };
@@ -2907,6 +2911,7 @@ mod tests {
             42,
             &[],
             "t",
+            "_csrf",
             "X-CSRF-Token",
             "/admin",
             "/actuator",
@@ -2939,6 +2944,44 @@ mod tests {
     }
 
     #[test]
+    fn detail_page_delete_button_honors_custom_csrf_form_field() {
+        // Regression: the delete button must emit the CSRF hidden input
+        // under the app's configured field name, not a hardcoded "_csrf" —
+        // otherwise a no-JS form submission fails CSRF validation whenever
+        // security.csrf.form_field is customized.
+        let r = dummy_registry();
+        let fields = vec![AdminField::new("name", AdminFieldKind::Text)];
+        let record = serde_json::json!({"id": 42, "name": "x"});
+        let html = model_detail_page(
+            &r,
+            "widgets",
+            "Widget",
+            "Widgets",
+            &fields,
+            &record,
+            "#42",
+            42,
+            &[],
+            "t",
+            "authenticity_token",
+            "X-CSRF-Token",
+            "/admin",
+            "/actuator",
+            false,
+            false,
+        )
+        .into_string();
+        assert!(
+            html.contains(r#"name="authenticity_token" value="t""#),
+            "Delete form must use the configured CSRF field name: {html}"
+        );
+        assert!(
+            !html.contains(r#"name="_csrf""#),
+            "Delete form must not fall back to the default CSRF field name: {html}"
+        );
+    }
+
+    #[test]
     fn detail_view_escapes_malicious_json() {
         let r = dummy_registry();
         let fields = vec![AdminField::new("meta", AdminFieldKind::Json)];
@@ -2959,6 +3002,7 @@ mod tests {
             1,
             &[],
             "t",
+            "_csrf",
             "X-CSRF-Token",
             "/admin",
             "/actuator",

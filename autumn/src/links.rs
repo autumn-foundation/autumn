@@ -267,8 +267,13 @@ pub fn link_to(label: &str, href: &str) -> maud::Markup {
 ///
 /// Panics when an extra attribute name is not a valid HTML attribute name
 /// (must start with an ASCII letter, followed by ASCII alphanumerics, `-`,
-/// `_`, or `:`). Attribute names are developer-authored literals; a panic
-/// surfaces the typo instead of silently emitting broken markup.
+/// `_`, or `:`), or when it collides (case-insensitively) with an attribute
+/// this helper already sets via a named option. Attribute names passed via
+/// `.attrs(...)` must be static, developer-authored literals (like
+/// `hx-delete` or `data-id`) — **never** built from user input or other
+/// untrusted runtime data — since a bad name panics in both debug and
+/// release builds by design, surfacing the typo instead of silently
+/// emitting broken or duplicate-attribute markup.
 ///
 /// # Example
 ///
@@ -303,6 +308,14 @@ pub fn link_to_with(label: &str, href: &str, options: &LinkToOptions<'_>) -> mau
         push_attr(&mut out, "rel", rel);
     }
     for (name, value) in options.attrs {
+        let is_reserved = name.eq_ignore_ascii_case("href")
+            || (options.class.is_some() && name.eq_ignore_ascii_case("class"))
+            || (options.target.is_some() && name.eq_ignore_ascii_case("target"))
+            || (rel.is_some() && name.eq_ignore_ascii_case("rel"));
+        assert!(
+            !is_reserved,
+            "attrs cannot override the built-in {name:?} attribute on link_to; use the dedicated option instead"
+        );
         push_attr(&mut out, name, value);
     }
     out.push('>');
@@ -312,16 +325,21 @@ pub fn link_to_with(label: &str, href: &str, options: &LinkToOptions<'_>) -> mau
     maud::PreEscaped(out)
 }
 
-/// Compute the effective `rel` value for a link: when `target="_blank"`,
+/// Compute the effective `rel` value for a link: when `target="_blank"`
+/// (compared case-insensitively, matching the HTML browsing-context keyword),
 /// `noopener` is appended to the caller's `rel` (space-separated, no
-/// duplicate) or used on its own.
+/// duplicate — also compared case-insensitively) or used on its own.
 #[cfg(feature = "maud")]
 fn effective_rel(target: Option<&str>, rel: Option<&str>) -> Option<String> {
-    if target != Some("_blank") {
+    if !target.is_some_and(|t| t.eq_ignore_ascii_case("_blank")) {
         return rel.map(ToString::to_string);
     }
     match rel {
-        Some(rel) if rel.split_whitespace().any(|token| token == "noopener") => {
+        Some(rel)
+            if rel
+                .split_whitespace()
+                .any(|token| token.eq_ignore_ascii_case("noopener")) =>
+        {
             Some(rel.to_string())
         }
         Some(rel) => Some(format!("{rel} noopener")),
@@ -377,8 +395,13 @@ pub fn button_to(label: &str, href: &str, method: Method, csrf_token: &str) -> m
 ///
 /// Panics when an extra attribute name is not a valid HTML attribute name
 /// (must start with an ASCII letter, followed by ASCII alphanumerics, `-`,
-/// `_`, or `:`). Attribute names are developer-authored literals; a panic
-/// surfaces the typo instead of silently emitting broken markup.
+/// `_`, or `:`), or when it collides (case-insensitively) with an attribute
+/// this helper already sets via a named option. Attribute names passed via
+/// `.attrs(...)` must be static, developer-authored literals (like
+/// `hx-delete` or `data-id`) — **never** built from user input or other
+/// untrusted runtime data — since a bad name panics in both debug and
+/// release builds by design, surfacing the typo instead of silently
+/// emitting broken or duplicate-attribute markup.
 ///
 /// # Example
 ///
@@ -423,6 +446,12 @@ pub fn button_to_with(
         push_attr(&mut button, "class", class);
     }
     for (name, value) in options.attrs {
+        let is_reserved = name.eq_ignore_ascii_case("type")
+            || (options.class.is_some() && name.eq_ignore_ascii_case("class"));
+        assert!(
+            !is_reserved,
+            "attrs cannot override the built-in {name:?} attribute on button_to; use the dedicated option instead"
+        );
         push_attr(&mut button, name, value);
     }
     button.push('>');
@@ -522,6 +551,20 @@ mod tests {
     }
 
     #[test]
+    fn link_to_target_blank_case_insensitive() {
+        let options = LinkToOptions::new().target("_BLANK");
+        let html = link_to_with("Ext", "https://example.com", &options).into_string();
+        assert!(html.contains(r#"rel="noopener""#), "{html}");
+    }
+
+    #[test]
+    fn link_to_target_blank_rel_dedup_case_insensitive() {
+        let options = LinkToOptions::new().target("_blank").rel("NOOPENER");
+        let html = link_to_with("Ext", "https://example.com", &options).into_string();
+        assert_eq!(html.to_lowercase().matches("noopener").count(), 1, "{html}");
+    }
+
+    #[test]
     fn link_to_extra_hx_attrs() {
         let options =
             LinkToOptions::new().attrs(&[("hx-get", "/posts/1"), ("hx-target", "#detail")]);
@@ -542,6 +585,22 @@ mod tests {
     #[should_panic(expected = "invalid HTML attribute name")]
     fn link_to_invalid_attr_name_panics() {
         let options = LinkToOptions::new().attrs(&[("on click", "evil()")]);
+        let _ = link_to_with("x", "/x", &options);
+    }
+
+    #[test]
+    #[should_panic(expected = "attrs cannot override the built-in \"href\" attribute")]
+    fn link_to_attrs_cannot_override_href_panics() {
+        let options = LinkToOptions::new().attrs(&[("href", "/evil")]);
+        let _ = link_to_with("x", "/x", &options);
+    }
+
+    #[test]
+    #[should_panic(expected = "attrs cannot override the built-in \"class\" attribute")]
+    fn link_to_attrs_cannot_override_class_panics() {
+        let options = LinkToOptions::new()
+            .class("btn")
+            .attrs(&[("class", "evil")]);
         let _ = link_to_with("x", "/x", &options);
     }
 
@@ -666,6 +725,22 @@ mod tests {
     #[should_panic(expected = "invalid HTML attribute name")]
     fn button_to_invalid_attr_name_panics() {
         let options = ButtonToOptions::new().attrs(&[("foo=bar", "x")]);
+        let _ = button_to_with("x", "/x", Method::POST, "tok", &options);
+    }
+
+    #[test]
+    #[should_panic(expected = "attrs cannot override the built-in \"type\" attribute")]
+    fn button_to_attrs_cannot_override_type_panics() {
+        let options = ButtonToOptions::new().attrs(&[("type", "reset")]);
+        let _ = button_to_with("x", "/x", Method::POST, "tok", &options);
+    }
+
+    #[test]
+    #[should_panic(expected = "attrs cannot override the built-in \"class\" attribute")]
+    fn button_to_attrs_cannot_override_class_panics() {
+        let options = ButtonToOptions::new()
+            .class("btn")
+            .attrs(&[("class", "evil")]);
         let _ = button_to_with("x", "/x", Method::POST, "tok", &options);
     }
 }

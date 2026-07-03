@@ -73,9 +73,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   options struct, so `button_to_with("Delete", path, Method::DELETE, token,
   &ButtonToOptions::new().attrs(&[("hx-delete", path)]))` upgrades to an
   htmx interaction without hand-rolling the form. The admin plugin's
-  hand-rolled delete button now uses `button_to_with`, gaining a working
-  no-JS fallback (POST + `_method=DELETE` + CSRF) for free. Purely additive;
-  minor version bump.
+  hand-rolled delete button now uses `button_to_with` (honoring a
+  customized `security.csrf.form_field` via `.csrf_field(...)`), gaining a
+  working no-JS fallback (POST + `_method=DELETE` + CSRF) for free. `attrs`
+  entries that collide with a named option (`href`/`class`/`target`/`rel`
+  for `link_to`, `type`/`class` for `button_to`) panic rather than silently
+  emitting duplicate-attribute markup, and `target="_blank"`/`rel="noopener"`
+  handling is ASCII-case-insensitive. Purely additive; minor version bump.
 
 - **jobs:** tracked job handles with progress reporting and a built-in
   pollable status route (#1373). `job::enqueue_tracked`/`enqueue_tracked_for`
