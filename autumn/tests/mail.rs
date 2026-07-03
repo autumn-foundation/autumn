@@ -5,7 +5,19 @@ use autumn_web::mail::{Mail, Mailer, Transport};
 use autumn_web::prelude::*;
 use axum::body::Body;
 use axum::http::Request;
+use base64::Engine as _;
+use sha2::Digest as _;
 use tower::ServiceExt as _;
+
+/// Extracts the `boundary` parameter from a rendered `.eml`'s
+/// `multipart/mixed` `Content-Type` header, since `render_eml` now
+/// generates a random per-message boundary rather than a fixed string.
+fn extract_boundary(body: &str) -> &str {
+    let start = body.find("boundary=\"").expect("boundary present") + "boundary=\"".len();
+    let rest = &body[start..];
+    let end = rest.find('"').expect("boundary closing quote");
+    &rest[..end]
+}
 
 #[test]
 fn dev_profile_defaults_to_log_transport() {
@@ -226,4 +238,93 @@ async fn mailer_is_a_cloneable_handler_extractor() {
             .count(),
         1
     );
+}
+
+// ── Attachments (issue #1256) ──────────────────────────────────────────────
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
+}
+
+#[tokio::test]
+async fn file_transport_round_trips_attachment_bytes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mailer = Mailer::builder()
+        .from("Autumn <noreply@example.com>")
+        .transport(Transport::File)
+        .file_dir(dir.path())
+        .build()
+        .expect("file mailer should build");
+
+    let blob: Vec<u8> = (0_u8..=255).cycle().take(4096).collect();
+    let expected_digest = sha256_hex(&blob);
+
+    let mail = Mail::builder()
+        .to("ada@example.com")
+        .subject("Invoice")
+        .text("see attached")
+        .attach("invoice.pdf", "application/pdf", blob)
+        .build()
+        .expect("mail should build");
+
+    mailer.send(mail).await.expect("send should succeed");
+
+    let files = std::fs::read_dir(dir.path())
+        .expect("mail dir exists")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("mail dir readable");
+    assert_eq!(files.len(), 1);
+    let body = std::fs::read_to_string(files[0].path()).expect("eml readable");
+
+    let boundary = extract_boundary(&body);
+    assert!(boundary.starts_with("autumn-mixed-"));
+    let parts: Vec<&str> = body.split(&format!("--{boundary}")).collect();
+    let attachment_part = parts
+        .iter()
+        .find(|part| part.contains("Content-Disposition: attachment"))
+        .expect("attachment part present");
+
+    let (headers, part_body) = attachment_part
+        .split_once("\n\n")
+        .expect("headers/body separated by a blank line");
+    assert!(headers.contains("Content-Type: application/pdf"));
+    assert!(headers.contains("Content-Transfer-Encoding: base64"));
+    assert!(headers.contains("filename=\"invoice.pdf\""));
+
+    let encoded: String = part_body.chars().filter(|c| !c.is_whitespace()).collect();
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .expect("attachment body should be valid base64");
+    assert_eq!(sha256_hex(&decoded), expected_digest);
+}
+
+#[tokio::test]
+async fn file_transport_without_attachments_has_no_mixed_wrapper() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mailer = Mailer::builder()
+        .from("Autumn <noreply@example.com>")
+        .transport(Transport::File)
+        .file_dir(dir.path())
+        .build()
+        .expect("file mailer should build");
+
+    let mail = Mail::builder()
+        .to("ada@example.com")
+        .subject("Plain")
+        .text("no attachments here")
+        .build()
+        .expect("mail should build");
+
+    mailer.send(mail).await.expect("send should succeed");
+
+    let files = std::fs::read_dir(dir.path())
+        .expect("mail dir exists")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("mail dir readable");
+    let body = std::fs::read_to_string(files[0].path()).expect("eml readable");
+
+    assert!(!body.contains("multipart/mixed"));
+    assert!(body.contains("Subject: Plain"));
 }

@@ -490,8 +490,8 @@ pub use htmx::{HtmxFragments, OobSwap};
 pub use live::LiveFragment;
 #[cfg(feature = "mail")]
 pub use mail::{
-    Mail, MailConfig, MailDeliveryQueue, MailDeliveryQueueHandle, MailError, MailTransport, Mailer,
-    SmtpConfig, TlsMode, Transport,
+    Mail, MailAttachment, MailConfig, MailDeliveryQueue, MailDeliveryQueueHandle, MailError,
+    MailTransport, Mailer, SmtpConfig, TlsMode, Transport,
 };
 /// Extension trait adding `.validate()` to all `validator::Validate` types.
 pub use validation::ValidateExt;
