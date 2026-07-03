@@ -583,6 +583,19 @@ fn fill_in_libpq_ssl_env_defaults(pairs: &mut Vec<(String, String)>) {
     {
         pairs.push(("sslmode".to_owned(), pgsslmode));
     }
+    // `PGREQUIRESSL` is the deprecated predecessor to `PGSSLMODE` — libpq's
+    // own docs: "This environment variable is deprecated in favor of the
+    // PGSSLMODE variable; setting both variables suppresses the effect of
+    // this one." Only fires when `sslmode` is *still* unset after the
+    // `PGSSLMODE` check above, so an explicit `PGSSLMODE` (or inline
+    // `sslmode=`) always wins outright, matching that suppression rule.
+    // Its `requiressl=1` is documented as "equivalent to sslmode require";
+    // `requiressl=0` is the default, already-`prefer`-equivalent behavior,
+    // so no translation is needed for it (or for any other value).
+    if find_pair(pairs, "sslmode").is_none() && std::env::var("PGREQUIRESSL").as_deref() == Ok("1")
+    {
+        pairs.push(("sslmode".to_owned(), "require".to_owned()));
+    }
     if find_pair(pairs, "sslrootcert").is_none()
         && let Ok(pgsslrootcert) = std::env::var("PGSSLROOTCERT")
     {
@@ -793,22 +806,29 @@ fn fill_in_missing_password(
     explicit_dbname: Option<&str>,
     passfile: Option<&str>,
 ) {
+    // The `find_last_pair` fallbacks here (rather than `find_pair`) matter
+    // whenever a caller passes `None` for the corresponding `explicit_*`
+    // (as `sanitize_keyword_form` always does) — `tokio_postgres::Config`'s
+    // own parser overwrites each of these scalar fields on every
+    // occurrence, so a connection string repeating one of these keys (e.g.
+    // `user=alice user=bob`) actually connects as the *last* occurrence,
+    // not the first `find_pair` would return.
     let host = explicit_host
         .map(str::to_owned)
-        .or_else(|| find_pair(pairs, "host").map(str::to_owned))
-        .or_else(|| find_pair(pairs, "hostaddr").map(str::to_owned))
+        .or_else(|| find_last_pair(pairs, "host").map(str::to_owned))
+        .or_else(|| find_last_pair(pairs, "hostaddr").map(str::to_owned))
         .unwrap_or_else(|| "localhost".to_owned());
     let port = explicit_port
         .map(str::to_owned)
-        .or_else(|| find_pair(pairs, "port").map(str::to_owned))
+        .or_else(|| find_last_pair(pairs, "port").map(str::to_owned))
         .unwrap_or_else(|| "5432".to_owned());
     let user = explicit_user
         .map(str::to_owned)
-        .or_else(|| find_pair(pairs, "user").map(str::to_owned))
+        .or_else(|| find_last_pair(pairs, "user").map(str::to_owned))
         .unwrap_or_else(current_os_user);
     let dbname = explicit_dbname
         .map(str::to_owned)
-        .or_else(|| find_pair(pairs, "dbname").map(str::to_owned))
+        .or_else(|| find_last_pair(pairs, "dbname").map(str::to_owned))
         .unwrap_or_else(|| user.clone());
 
     if !is_explicit_password
@@ -996,13 +1016,18 @@ fn sanitize_url_form(mut url: url::Url) -> Result<String, CommandError> {
     // first here, not as a fallback — getting this backwards wouldn't break
     // the connection itself (the unmodified URL still reparses correctly),
     // but would make `.pgpass` lookup below match against the wrong,
-    // no-longer-effective identity.
-    let explicit_user = find_pair(&pairs, "user").map(str::to_owned).or_else(|| {
-        Some(url.username())
-            .filter(|u| !u.is_empty())
-            .map(percent_decode)
-    });
-    let explicit_password = find_pair(&pairs, "password")
+    // no-longer-effective identity. Uses `find_last_pair`, not `find_pair`,
+    // for the same reason: a query string repeating one of these keys
+    // (e.g. `?user=alice&user=bob`) also has its *last* occurrence take
+    // effect once `tokio_postgres` reparses it.
+    let explicit_user = find_last_pair(&pairs, "user")
+        .map(str::to_owned)
+        .or_else(|| {
+            Some(url.username())
+                .filter(|u| !u.is_empty())
+                .map(percent_decode)
+        });
+    let explicit_password = find_last_pair(&pairs, "password")
         .map(str::to_owned)
         .or_else(|| url.password().map(percent_decode));
     // `host`/`port` get the same query-pair-first precedence as
@@ -1018,17 +1043,19 @@ fn sanitize_url_form(mut url: url::Url) -> Result<String, CommandError> {
     // sole effective host/port). `.pgpass` lookup must use that same
     // effective value, not the authority snapshot, or it matches an entry
     // keyed to a host/port the connection doesn't actually use.
-    let explicit_host = find_pair(&pairs, "host")
+    let explicit_host = find_last_pair(&pairs, "host")
         .map(str::to_owned)
         .or_else(|| url.host_str().filter(|h| !h.is_empty()).map(percent_decode));
-    let explicit_port = find_pair(&pairs, "port")
+    let explicit_port = find_last_pair(&pairs, "port")
         .map(str::to_owned)
         .or_else(|| url.port().map(|p| p.to_string()));
-    let explicit_dbname = find_pair(&pairs, "dbname").map(str::to_owned).or_else(|| {
-        Some(url.path())
-            .filter(|p| p.len() > 1)
-            .map(|p| percent_decode(p.trim_start_matches('/')))
-    });
+    let explicit_dbname = find_last_pair(&pairs, "dbname")
+        .map(str::to_owned)
+        .or_else(|| {
+            Some(url.path())
+                .filter(|p| p.len() > 1)
+                .map(|p| percent_decode(p.trim_start_matches('/')))
+        });
 
     // Checks the *current* `pairs` (not just the `explicit_*` snapshot
     // taken above) for every key, not only the catch-all arm below — a
@@ -1550,6 +1577,111 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_uses_pgrequiressl_env_var_when_url_has_no_inline_sslmode() {
+        // `PGREQUIRESSL` is a documented (deprecated in favor of
+        // `PGSSLMODE`) libpq environment variable: "PGREQUIRESSL behaves
+        // the same as the requiressl connection parameter" — and
+        // `requiressl=1` is documented as "equivalent to sslmode require".
+        // A bare connection string relying on the legacy variable (the way
+        // `psql` did) must not silently connect under the default `prefer`
+        // instead.
+        //
+        // Scopes away PGSSLROOTCERT/PGSSLCERT/PGSSLKEY so an ambient/racing
+        // value can't trip the require+sslrootcert or sslcert/sslkey
+        // rejections instead of exercising the translation this test is
+        // actually about.
+        temp_env::with_vars(
+            [
+                ("PGSSLMODE", None::<&str>),
+                ("PGREQUIRESSL", Some("1")),
+                ("PGSSLROOTCERT", None::<&str>),
+                ("PGSSLCERT", None::<&str>),
+                ("PGSSLKEY", None::<&str>),
+            ],
+            || {
+                let sanitized = sanitize_db_url("postgres://host/db").unwrap();
+                let config: tokio_postgres::Config = sanitized.parse().unwrap();
+                assert_eq!(
+                    config.get_ssl_mode(),
+                    tokio_postgres::config::SslMode::Require
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn sanitize_ignores_pgrequiressl_zero() {
+        // `requiressl=0` is documented as the default, negotiated
+        // (`sslmode=prefer`-equivalent) behavior — not a value that needs
+        // translating into an explicit `sslmode=`. Scopes away
+        // PGSSLCERT/PGSSLKEY — see the comment on
+        // `sanitize_uses_pgrequiressl_env_var_when_url_has_no_inline_sslmode`.
+        temp_env::with_vars(
+            [
+                ("PGSSLMODE", None::<&str>),
+                ("PGREQUIRESSL", Some("0")),
+                ("PGSSLCERT", None::<&str>),
+                ("PGSSLKEY", None::<&str>),
+            ],
+            || {
+                let sanitized = sanitize_db_url("postgres://host/db").unwrap();
+                let config: tokio_postgres::Config = sanitized.parse().unwrap();
+                assert_eq!(
+                    config.get_ssl_mode(),
+                    tokio_postgres::config::SslMode::Prefer
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn sanitize_suppresses_pgrequiressl_when_pgsslmode_is_also_set() {
+        // libpq docs: "setting both variables suppresses the effect of
+        // this one" -- PGSSLMODE must win outright, not merely take
+        // precedence when both would otherwise conflict. Scopes away
+        // PGSSLCERT/PGSSLKEY — see the comment on
+        // `sanitize_uses_pgrequiressl_env_var_when_url_has_no_inline_sslmode`.
+        temp_env::with_vars(
+            [
+                ("PGSSLMODE", Some("disable")),
+                ("PGREQUIRESSL", Some("1")),
+                ("PGSSLCERT", None::<&str>),
+                ("PGSSLKEY", None::<&str>),
+            ],
+            || {
+                let sanitized = sanitize_db_url("postgres://host/db").unwrap();
+                let config: tokio_postgres::Config = sanitized.parse().unwrap();
+                assert_eq!(
+                    config.get_ssl_mode(),
+                    tokio_postgres::config::SslMode::Disable
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn sanitize_prefers_inline_sslmode_over_pgrequiressl_env_var() {
+        // Scopes away PGSSLCERT/PGSSLKEY — see the comment on
+        // `sanitize_uses_pgrequiressl_env_var_when_url_has_no_inline_sslmode`.
+        temp_env::with_vars(
+            [
+                ("PGSSLMODE", None::<&str>),
+                ("PGREQUIRESSL", Some("1")),
+                ("PGSSLCERT", None::<&str>),
+                ("PGSSLKEY", None::<&str>),
+            ],
+            || {
+                let sanitized = sanitize_db_url("postgres://host/db?sslmode=disable").unwrap();
+                let config: tokio_postgres::Config = sanitized.parse().unwrap();
+                assert_eq!(
+                    config.get_ssl_mode(),
+                    tokio_postgres::config::SslMode::Disable
+                );
+            },
+        );
+    }
+
+    #[test]
     fn sanitize_rejects_require_pgsslmode_combined_with_pgsslrootcert_env_var() {
         // The literal scenario libpq documents: an operator relying entirely
         // on environment variables (the way `psql` did) for TLS policy,
@@ -1894,14 +2026,21 @@ mod tests {
         // reflect that same effective precedence, or `.pgpass` lookup (which
         // uses these values to pick a row) matches against the wrong
         // identity entirely.
-        let sanitized = sanitize_db_url(
-            "postgres://alice:secret1@db.internal/app1?user=bob&password=secret2&dbname=app2",
-        )
-        .unwrap();
-        let config: tokio_postgres::Config = sanitized.parse().unwrap();
-        assert_eq!(config.get_user(), Some("bob"));
-        assert_eq!(config.get_password(), Some(b"secret2".as_slice()));
-        assert_eq!(config.get_dbname(), Some("app2"));
+        //
+        // Scopes away PGSERVICE so an ambient/racing value set by another
+        // test's `temp_env` call (this URL has no `service=` of its own)
+        // can't send this connection string through service-file
+        // resolution at all and turn the `unwrap()` below into a flake.
+        temp_env::with_var("PGSERVICE", None::<&str>, || {
+            let sanitized = sanitize_db_url(
+                "postgres://alice:secret1@db.internal/app1?user=bob&password=secret2&dbname=app2",
+            )
+            .unwrap();
+            let config: tokio_postgres::Config = sanitized.parse().unwrap();
+            assert_eq!(config.get_user(), Some("bob"));
+            assert_eq!(config.get_password(), Some(b"secret2".as_slice()));
+            assert_eq!(config.get_dbname(), Some("app2"));
+        });
     }
 
     #[test]
@@ -1919,10 +2058,15 @@ mod tests {
         )
         .unwrap();
         set_pgpass_permissions_safe(&pgpass_path);
+        // Scopes away PGSERVICE too — none of these connection strings set
+        // an inline `service=`, so an ambient/racing value would send them
+        // through service-file resolution instead of the pgpass lookup
+        // path this test is actually about.
         temp_env::with_vars(
             [
                 ("PGPASSWORD", None::<&str>),
                 ("PGPASSFILE", Some(pgpass_path.to_str().unwrap())),
+                ("PGSERVICE", None::<&str>),
             ],
             || {
                 let sanitized =
@@ -1953,10 +2097,15 @@ mod tests {
         )
         .unwrap();
         set_pgpass_permissions_safe(&pgpass_path);
+        // Scopes away PGSERVICE too — none of these connection strings set
+        // an inline `service=`, so an ambient/racing value would send them
+        // through service-file resolution instead of the pgpass lookup
+        // path this test is actually about.
         temp_env::with_vars(
             [
                 ("PGPASSWORD", None::<&str>),
                 ("PGPASSFILE", Some(pgpass_path.to_str().unwrap())),
+                ("PGSERVICE", None::<&str>),
             ],
             || {
                 let sanitized =
@@ -1984,16 +2133,95 @@ mod tests {
         )
         .unwrap();
         set_pgpass_permissions_safe(&pgpass_path);
+        // Scopes away PGSERVICE too — none of these connection strings set
+        // an inline `service=`, so an ambient/racing value would send them
+        // through service-file resolution instead of the pgpass lookup
+        // path this test is actually about.
         temp_env::with_vars(
             [
                 ("PGPASSWORD", None::<&str>),
                 ("PGPASSFILE", Some(pgpass_path.to_str().unwrap())),
+                ("PGSERVICE", None::<&str>),
             ],
             || {
                 let sanitized =
                     sanitize_db_url("postgres://postgres@db.internal:5432/app?port=6543").unwrap();
                 let config: tokio_postgres::Config = sanitized.parse().unwrap();
                 assert_eq!(config.get_ports(), &[6543]);
+                assert_eq!(config.get_password(), Some(b"right_password".as_slice()));
+            },
+        );
+    }
+
+    #[test]
+    fn sanitize_uses_last_occurrence_of_repeated_user_for_pgpass_lookup_in_keyword_form() {
+        // `tokio_postgres::Config::param`'s "user" arm overwrites the field
+        // on every occurrence, so `user=alice user=bob` connects as `bob`
+        // (last write wins) — but `fill_in_missing_password`'s internal
+        // `find_pair(pairs, "user")` fallback (used here since
+        // `sanitize_keyword_form` passes `None` for every `explicit_*`
+        // snapshot) returned the *first* match, `alice`, so `.pgpass` would
+        // look up and inject Alice's password while the connection actually
+        // authenticates as Bob.
+        let dir = tempfile::tempdir().unwrap();
+        let pgpass_path = dir.path().join(".pgpass");
+        std::fs::write(
+            &pgpass_path,
+            "db.internal:5432:app:alice:wrong_password\n\
+             db.internal:5432:app:bob:right_password\n",
+        )
+        .unwrap();
+        set_pgpass_permissions_safe(&pgpass_path);
+        // Scopes away PGSERVICE too — none of these connection strings set
+        // an inline `service=`, so an ambient/racing value would send them
+        // through service-file resolution instead of the pgpass lookup
+        // path this test is actually about.
+        temp_env::with_vars(
+            [
+                ("PGPASSWORD", None::<&str>),
+                ("PGPASSFILE", Some(pgpass_path.to_str().unwrap())),
+                ("PGSERVICE", None::<&str>),
+            ],
+            || {
+                let sanitized =
+                    sanitize_db_url("host=db.internal dbname=app user=alice user=bob").unwrap();
+                let config: tokio_postgres::Config = sanitized.parse().unwrap();
+                assert_eq!(config.get_user(), Some("bob"));
+                assert_eq!(config.get_password(), Some(b"right_password".as_slice()));
+            },
+        );
+    }
+
+    #[test]
+    fn sanitize_uses_last_occurrence_of_repeated_dbname_for_pgpass_lookup_in_url_form() {
+        // Same bug, but for `dbname` via a repeated query parameter in URL
+        // form (`explicit_dbname`'s own `find_pair` fallback has the same
+        // first-match problem as `fill_in_missing_password`'s internal one).
+        let dir = tempfile::tempdir().unwrap();
+        let pgpass_path = dir.path().join(".pgpass");
+        std::fs::write(
+            &pgpass_path,
+            "db.internal:5432:old:postgres:wrong_password\n\
+             db.internal:5432:new:postgres:right_password\n",
+        )
+        .unwrap();
+        set_pgpass_permissions_safe(&pgpass_path);
+        // Scopes away PGSERVICE too — none of these connection strings set
+        // an inline `service=`, so an ambient/racing value would send them
+        // through service-file resolution instead of the pgpass lookup
+        // path this test is actually about.
+        temp_env::with_vars(
+            [
+                ("PGPASSWORD", None::<&str>),
+                ("PGPASSFILE", Some(pgpass_path.to_str().unwrap())),
+                ("PGSERVICE", None::<&str>),
+            ],
+            || {
+                let sanitized =
+                    sanitize_db_url("postgres://postgres@db.internal/?dbname=old&dbname=new")
+                        .unwrap();
+                let config: tokio_postgres::Config = sanitized.parse().unwrap();
+                assert_eq!(config.get_dbname(), Some("new"));
                 assert_eq!(config.get_password(), Some(b"right_password".as_slice()));
             },
         );
@@ -2737,10 +2965,15 @@ mod tests {
         let pgpass_path = dir.path().join("pgpass");
         std::fs::write(&pgpass_path, "host:5432:db:user:from-pgpass\n").unwrap();
         set_pgpass_permissions_safe(&pgpass_path);
+        // Scopes away PGSERVICE too — none of these connection strings set
+        // an inline `service=`, so an ambient/racing value would send them
+        // through service-file resolution instead of the pgpass lookup
+        // path this test is actually about.
         temp_env::with_vars(
             [
                 ("PGPASSWORD", None::<&str>),
                 ("PGPASSFILE", Some(pgpass_path.to_str().unwrap())),
+                ("PGSERVICE", None::<&str>),
             ],
             || {
                 let sanitized = sanitize_db_url("postgres://user@host:5432/db").unwrap();
@@ -2758,10 +2991,15 @@ mod tests {
         let pgpass_path = dir.path().join("pgpass");
         std::fs::write(&pgpass_path, "*:*:*:*:insecure-password\n").unwrap();
         std::fs::set_permissions(&pgpass_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        // Scopes away PGSERVICE too — none of these connection strings set
+        // an inline `service=`, so an ambient/racing value would send them
+        // through service-file resolution instead of the pgpass lookup
+        // path this test is actually about.
         temp_env::with_vars(
             [
                 ("PGPASSWORD", None::<&str>),
                 ("PGPASSFILE", Some(pgpass_path.to_str().unwrap())),
+                ("PGSERVICE", None::<&str>),
             ],
             || {
                 let sanitized = sanitize_db_url("postgres://user@host:5432/db").unwrap();
@@ -2862,10 +3100,15 @@ mod tests {
         let pgpass_path = dir.path().join("pgpass");
         std::fs::write(&pgpass_path, "10.0.0.5:5432:db:user:from-hostaddr-pgpass\n").unwrap();
         set_pgpass_permissions_safe(&pgpass_path);
+        // Scopes away PGSERVICE too — none of these connection strings set
+        // an inline `service=`, so an ambient/racing value would send them
+        // through service-file resolution instead of the pgpass lookup
+        // path this test is actually about.
         temp_env::with_vars(
             [
                 ("PGPASSWORD", None::<&str>),
                 ("PGPASSFILE", Some(pgpass_path.to_str().unwrap())),
+                ("PGSERVICE", None::<&str>),
             ],
             || {
                 let sanitized = sanitize_db_url("hostaddr=10.0.0.5 dbname=db user=user").unwrap();
@@ -2884,10 +3127,15 @@ mod tests {
         let pgpass_path = dir.path().join("pgpass");
         std::fs::write(&pgpass_path, "10.0.0.5:5432:db:user:from-hostaddr-pgpass\n").unwrap();
         set_pgpass_permissions_safe(&pgpass_path);
+        // Scopes away PGSERVICE too — none of these connection strings set
+        // an inline `service=`, so an ambient/racing value would send them
+        // through service-file resolution instead of the pgpass lookup
+        // path this test is actually about.
         temp_env::with_vars(
             [
                 ("PGPASSWORD", None::<&str>),
                 ("PGPASSFILE", Some(pgpass_path.to_str().unwrap())),
+                ("PGSERVICE", None::<&str>),
             ],
             || {
                 let sanitized =
