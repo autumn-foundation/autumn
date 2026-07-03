@@ -353,6 +353,34 @@ fn percent_decode(s: &str) -> String {
         .into_owned()
 }
 
+/// Translate a JDBC-compatibility `ssl=true` query parameter into
+/// `sslmode=require`, matching the compatibility note in `PostgreSQL`'s own
+/// URI-format docs ("libpq-connect.html", "Connection URIs"): "for
+/// compatibility with JDBC connection URIs, instances of ssl=true are
+/// translated into sslmode=require." `tokio_postgres` has no `ssl` keyword
+/// of its own (only `sslmode`), so an untranslated `ssl=true` would
+/// otherwise be rejected outright with an `UnknownOption` error before ever
+/// attempting TLS, breaking any `DATABASE_URL` carried over from a
+/// JDBC-style deployment that `psql` accepted. Only the literal `true`
+/// value is documented as translated — any other `ssl=` value isn't a
+/// recognized `libpq` keyword either, so it's left alone to surface
+/// `tokio_postgres`'s own error, same as before this translation existed.
+///
+/// Rewrites each `ssl` pair to `sslmode` *in place* (rather than removing it
+/// and appending a new `sslmode` pair at the end) so its position in
+/// `pairs` — and therefore which of it and any other explicit `sslmode=`
+/// ends up as the *effective* one once `find_last_pair` and
+/// `tokio_postgres`'s own last-write-wins `sslmode` semantics apply — stays
+/// exactly where the operator wrote it in the original connection string.
+fn translate_jdbc_ssl_param(pairs: &mut [(String, String)]) {
+    for (key, value) in pairs.iter_mut() {
+        if key == "ssl" && value == "true" {
+            "sslmode".clone_into(key);
+            "require".clone_into(value);
+        }
+    }
+}
+
 /// Parse `query` (a URL's raw, still-percent-encoded query string, e.g. from
 /// [`url::Url::query`]) into `(key, value)` pairs using pure
 /// percent-decoding, splitting on `&` then the first `=` in each segment —
@@ -944,6 +972,7 @@ fn sanitize_url_form(mut url: url::Url) -> Result<String, CommandError> {
     // separately, as this used to do, can't see a `require`+`sslrootcert`
     // combination split across two sources.
     let mut pairs: Vec<(String, String)> = parse_raw_query_pairs(url.query().unwrap_or(""));
+    translate_jdbc_ssl_param(&mut pairs);
 
     // Capture what the URL's own structure (as opposed to its query
     // string) already says explicitly, once, up front: `host`/`port`
@@ -1018,8 +1047,19 @@ fn sanitize_url_form(mut url: url::Url) -> Result<String, CommandError> {
     // the query string's own `port=` says, producing two port entries
     // `tokio_postgres::connect` then rejects with "invalid number of
     // ports" — even for an ordinary URL `psql` always accepted.
-    let mut needs_keyword_form =
-        url.host_str().is_some_and(|h| !h.is_empty()) && find_pair(&pairs, "port").is_some();
+    //
+    // A query-string `host=` given alongside a non-empty authority host
+    // needs the same treatment for a related but distinct reason: `libpq`'s
+    // own `PQconninfoParse` makes the named `host=` the *sole* effective
+    // host (the authority host is entirely discarded), but
+    // `tokio_postgres`'s URL parser parses the authority host first, then
+    // *appends* the query host as an additional entry rather than replacing
+    // it — producing a two-host list (authority tried first) instead of the
+    // query host alone. Rebuilding as keyword form sidesteps this because
+    // its `pairs`-only output never carries the authority host at all — only
+    // whatever ended up in `pairs`, which is the query host.
+    let mut needs_keyword_form = url.host_str().is_some_and(|h| !h.is_empty())
+        && (find_pair(&pairs, "port").is_some() || find_pair(&pairs, "host").is_some());
 
     let service_name = take_pair(&mut pairs, "service").or_else(|| std::env::var("PGSERVICE").ok());
     if let Some(service_name) = service_name {
@@ -1369,16 +1409,26 @@ mod tests {
     fn sanitize_drops_unsupported_ssl_params_from_url() {
         // `sslmode=prefer` (not `require`) so this stays a plain "unsupported
         // param dropped" case rather than tripping the separate
-        // require+sslrootcert rejection tested below.
-        let sanitized = sanitize_db_url(
-            "postgres://user:pw@host/db?sslmode=prefer&sslrootcert=/etc/ca.pem&connect_timeout=5",
-        )
-        .unwrap();
-        let parsed = url::Url::parse(&sanitized).unwrap();
-        let pairs: std::collections::HashMap<_, _> = parsed.query_pairs().into_owned().collect();
-        assert_eq!(pairs.get("sslmode").map(String::as_str), Some("prefer"));
-        assert!(!pairs.contains_key("sslrootcert"));
-        assert_eq!(pairs.get("connect_timeout").map(String::as_str), Some("5"));
+        // require+sslrootcert rejection tested below. Scopes away
+        // PGSSLCERT/PGSSLKEY (in addition to the connection string's own
+        // lack of sslcert/sslkey) so an ambient/racing value set by another
+        // test's `temp_env` call can't trip the sslcert/sslkey rejection
+        // instead of the plain-drop path this test is actually about.
+        temp_env::with_vars(
+            [("PGSSLCERT", None::<&str>), ("PGSSLKEY", None::<&str>)],
+            || {
+                let sanitized = sanitize_db_url(
+                    "postgres://user:pw@host/db?sslmode=prefer&sslrootcert=/etc/ca.pem&connect_timeout=5",
+                )
+                .unwrap();
+                let parsed = url::Url::parse(&sanitized).unwrap();
+                let pairs: std::collections::HashMap<_, _> =
+                    parsed.query_pairs().into_owned().collect();
+                assert_eq!(pairs.get("sslmode").map(String::as_str), Some("prefer"));
+                assert!(!pairs.contains_key("sslrootcert"));
+                assert_eq!(pairs.get("connect_timeout").map(String::as_str), Some("5"));
+            },
+        );
     }
 
     #[test]
@@ -1576,6 +1626,67 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_translates_jdbc_ssl_true_to_sslmode_require() {
+        // PostgreSQL's own URI-format docs (libpq-connect.html, "Connection
+        // URIs"): "for compatibility with JDBC connection URIs, instances
+        // of ssl=true are translated into sslmode=require." `tokio_postgres`
+        // has no `ssl` keyword of its own (only `sslmode`), so an
+        // untranslated `ssl=true` would otherwise be rejected outright by
+        // its parser with an UnknownOption error before ever attempting
+        // TLS, breaking any `DATABASE_URL` carried over from a JDBC-style
+        // deployment that `psql` accepted.
+        //
+        // Scopes away PGSSLROOTCERT/PGSSLCERT/PGSSLKEY so an ambient/racing
+        // value set by another test's `temp_env` call can't trip the
+        // require+sslrootcert or sslcert/sslkey rejections instead of
+        // exercising the translation this test is actually about.
+        temp_env::with_vars(
+            [
+                ("PGSSLROOTCERT", None::<&str>),
+                ("PGSSLCERT", None::<&str>),
+                ("PGSSLKEY", None::<&str>),
+            ],
+            || {
+                let sanitized = sanitize_db_url("postgres://host/db?ssl=true").unwrap();
+                let config: tokio_postgres::Config = sanitized.parse().unwrap();
+                assert_eq!(
+                    config.get_ssl_mode(),
+                    tokio_postgres::config::SslMode::Require
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn sanitize_does_not_let_jdbc_ssl_true_override_an_explicit_sslmode() {
+        // `sslmode` is itself an overwrite-semantics field (see
+        // `find_last_pair`) -- translating `ssl=true` in place (rather than
+        // just appending an `sslmode=require` at the end regardless of
+        // position) preserves whichever of the two actually comes last, the
+        // same "last one wins" rule that already governs a connection
+        // string with two explicit `sslmode=` occurrences.
+        let sanitized = sanitize_db_url("postgres://host/db?ssl=true&sslmode=disable").unwrap();
+        let config: tokio_postgres::Config = sanitized.parse().unwrap();
+        assert_eq!(
+            config.get_ssl_mode(),
+            tokio_postgres::config::SslMode::Disable
+        );
+    }
+
+    #[test]
+    fn sanitize_leaves_non_true_ssl_value_alone() {
+        // Only the literal `ssl=true` is a documented JDBC compatibility
+        // translation -- `sanitize_db_url` doesn't connect or otherwise
+        // validate parameters it doesn't specifically recognize, so any
+        // other `ssl=` value passes through unchanged here and only fails
+        // once `tokio_postgres` itself tries to parse it (it has no `ssl`
+        // keyword at all), the same as before this translation existed.
+        let sanitized = sanitize_db_url("postgres://host/db?ssl=false").unwrap();
+        let parsed: Result<tokio_postgres::Config, _> = sanitized.parse();
+        assert!(parsed.is_err());
+    }
+
+    #[test]
     fn sanitize_rejects_sslmode_allow_with_a_clear_message() {
         // `tokio_postgres::Config`'s own parser only accepts
         // disable/prefer/require for `sslmode` (verified against the real
@@ -1583,12 +1694,22 @@ mod tests {
         // mode this native path can't honor, so it must fail with a message
         // pointing at what *is* supported rather than surfacing
         // tokio_postgres's generic "invalid value for option" parse error.
-        let err = sanitize_db_url("postgres://host/db?sslmode=allow").unwrap_err();
-        assert!(err.message().contains("sslmode=allow"));
-        assert!(err.message().contains("prefer"));
+        //
+        // Scopes away PGSSLCERT/PGSSLKEY so an ambient/racing value set by
+        // another test's `temp_env` call can't trip the sslcert/sslkey
+        // rejection first (it's checked before the sslmode=allow one) and
+        // produce a message that doesn't mention "sslmode=allow" at all.
+        temp_env::with_vars(
+            [("PGSSLCERT", None::<&str>), ("PGSSLKEY", None::<&str>)],
+            || {
+                let err = sanitize_db_url("postgres://host/db?sslmode=allow").unwrap_err();
+                assert!(err.message().contains("sslmode=allow"));
+                assert!(err.message().contains("prefer"));
 
-        let err = sanitize_db_url("host=localhost sslmode=allow").unwrap_err();
-        assert!(err.message().contains("sslmode=allow"));
+                let err = sanitize_db_url("host=localhost sslmode=allow").unwrap_err();
+                assert!(err.message().contains("sslmode=allow"));
+            },
+        );
     }
 
     #[test]
@@ -1667,14 +1788,68 @@ mod tests {
         // split chunk-by-chunk before parsing) — so `?host=host1,host2`
         // ends up as one literal (and wrong) hostname `"host1,host2"`
         // instead of a two-host failover list.
-        let sanitized = sanitize_db_url("postgres:///db?host=host1,host2").unwrap();
-        let config: tokio_postgres::Config = sanitized.parse().unwrap();
-        assert_eq!(
-            config.get_hosts(),
-            &[
-                tokio_postgres::config::Host::Tcp("host1".to_owned()),
-                tokio_postgres::config::Host::Tcp("host2".to_owned()),
-            ]
+        //
+        // Scopes away PGSSLMODE/PGSSLROOTCERT/PGSSLCERT/PGSSLKEY so an
+        // ambient/racing value set by another test's `temp_env` call can't
+        // trip one of the SSL-param rejections `filter_ssl_params` always
+        // runs (regardless of what this test is actually about) and turn
+        // the `unwrap()` below into a flake.
+        temp_env::with_vars(
+            [
+                ("PGSSLMODE", None::<&str>),
+                ("PGSSLROOTCERT", None::<&str>),
+                ("PGSSLCERT", None::<&str>),
+                ("PGSSLKEY", None::<&str>),
+            ],
+            || {
+                let sanitized = sanitize_db_url("postgres:///db?host=host1,host2").unwrap();
+                let config: tokio_postgres::Config = sanitized.parse().unwrap();
+                assert_eq!(
+                    config.get_hosts(),
+                    &[
+                        tokio_postgres::config::Host::Tcp("host1".to_owned()),
+                        tokio_postgres::config::Host::Tcp("host2".to_owned()),
+                    ]
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn sanitize_rebuilds_as_keyword_form_when_query_host_overrides_a_non_empty_authority_host() {
+        // `libpq`'s own `PQconninfoParse` makes a named `host=` query
+        // parameter the *sole* effective host, discarding the authority
+        // host entirely (confirmed against `tokio_postgres::Config`'s own
+        // parser — see the comment on `needs_keyword_form` below). But
+        // `tokio_postgres`'s URL parser runs `parse_host` (which reads the
+        // authority) *before* `parse_params` (which reads the query
+        // string), and `host` accumulates rather than overwrites — so a URL
+        // like `postgres://authorityhost/db?host=queryhost` ends up with
+        // *two* hosts, `[authorityhost, queryhost]`, tried in that order,
+        // instead of `queryhost` alone. This is the same accumulation risk
+        // `sanitize_rebuilds_as_keyword_form_when_query_host_is_comma_separated`
+        // guards against, just without a comma — an authority host is
+        // enough on its own to trigger the same bug.
+        //
+        // See the comment on
+        // `sanitize_rebuilds_as_keyword_form_when_query_host_is_comma_separated`
+        // for why PGSSLMODE/PGSSLROOTCERT/PGSSLCERT/PGSSLKEY are scoped away.
+        temp_env::with_vars(
+            [
+                ("PGSSLMODE", None::<&str>),
+                ("PGSSLROOTCERT", None::<&str>),
+                ("PGSSLCERT", None::<&str>),
+                ("PGSSLKEY", None::<&str>),
+            ],
+            || {
+                let sanitized =
+                    sanitize_db_url("postgres://authorityhost/db?host=queryhost").unwrap();
+                let config: tokio_postgres::Config = sanitized.parse().unwrap();
+                assert_eq!(
+                    config.get_hosts(),
+                    &[tokio_postgres::config::Host::Tcp("queryhost".to_owned())]
+                );
+            },
         );
     }
 
@@ -1750,25 +1925,47 @@ mod tests {
 
     #[test]
     fn sanitize_drops_ca_and_crl_ssl_params_from_url() {
-        // No password is given anywhere in this URL, which would otherwise
-        // make `sanitize_db_url` consult `PGPASSWORD`/`.pgpass` — scope both
-        // away so this test (which isn't about credential resolution at all)
-        // can't flake against whatever's ambient in the environment, or race
-        // another test's `temp_env`-scoped value for the same variable.
+        // This test asserts an *exact* pair count of zero, so unlike most
+        // other tests here (which only need to scope away the handful of
+        // env vars actually relevant to what they're testing) this one
+        // needs *every* `PG*` env var `sanitize_db_url` ever falls back to
+        // scoped away — an ambient/racing value for *any* of them, set by
+        // another test's `temp_env::with_vars` call on a different thread,
+        // would inject one more surviving pair and break the count. Keep
+        // this list in sync with every `PG*` var this module reads (see
+        // `fill_in_libpq_env_defaults`, `fill_in_simple_libpq_env_fallbacks`,
+        // `fill_in_libpq_ssl_env_defaults`, `service_file_path`,
+        // `system_service_file_path`, `pgpass_file_path`) as new ones are
+        // added.
         //
         // `sslcert`/`sslkey`/`sslpassword` (client-certificate auth) aren't
-        // included here — those are rejected outright rather than silently
-        // dropped, tested separately below. Also scopes away
-        // PGSSLMODE/PGSSLROOTCERT — this URL sets no `sslmode`, so an
-        // ambient/racing `PGSSLMODE=require` plus `PGSSLROOTCERT` could
-        // otherwise trip the require+sslrootcert rejection this test isn't
-        // about at all.
+        // silently dropped like `sslcrl`/`sslcrldir` — they're rejected
+        // outright, tested separately below — but `PGSSLCERT`/`PGSSLKEY`
+        // still need to be scoped away here since an ambient value would
+        // turn this test's `.unwrap()` into a panic rather than a wrong
+        // count.
         temp_env::with_vars(
             [
+                ("PGHOST", None::<&str>),
+                ("PGHOSTADDR", None::<&str>),
+                ("PGPORT", None::<&str>),
+                ("PGUSER", None::<&str>),
+                ("PGDATABASE", None::<&str>),
                 ("PGPASSWORD", None::<&str>),
                 ("PGPASSFILE", Some("/nonexistent-pgpass-file-for-test")),
+                ("PGSERVICEFILE", None::<&str>),
+                ("PGSERVICE", None::<&str>),
+                ("PGSYSCONFDIR", None::<&str>),
                 ("PGSSLMODE", None::<&str>),
                 ("PGSSLROOTCERT", None::<&str>),
+                ("PGSSLCERT", None::<&str>),
+                ("PGSSLKEY", None::<&str>),
+                ("PGCONNECT_TIMEOUT", None::<&str>),
+                ("PGTARGETSESSIONATTRS", None::<&str>),
+                ("PGCHANNELBINDING", None::<&str>),
+                ("PGOPTIONS", None::<&str>),
+                ("PGAPPNAME", None::<&str>),
+                ("PGLOADBALANCEHOSTS", None::<&str>),
             ],
             || {
                 let sanitized =
