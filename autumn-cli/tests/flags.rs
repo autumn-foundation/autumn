@@ -38,8 +38,8 @@ async fn flags_enable_disable_round_trip_without_psql() {
     let tmp = tempfile::tempdir().unwrap();
     let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
 
-    let (_, stderr) = run_autumn_ok(tmp.path(), &["flags", "enable", "new_checkout"], &envs);
-    assert!(stderr.contains("enabled"), "stderr: {stderr}");
+    let (stdout, _) = run_autumn_ok(tmp.path(), &["flags", "enable", "new_checkout"], &envs);
+    assert!(stdout.contains("enabled"), "stdout: {stdout}");
 
     let enabled: Option<String> = common::query_one_text(
         &url,
@@ -57,8 +57,8 @@ async fn flags_enable_disable_round_trip_without_psql() {
     .await;
     assert_eq!(change.as_deref(), Some("enabled"));
 
-    let (_, stderr) = run_autumn_ok(tmp.path(), &["flags", "disable", "new_checkout"], &envs);
-    assert!(stderr.contains("disabled"), "stderr: {stderr}");
+    let (stdout, _) = run_autumn_ok(tmp.path(), &["flags", "disable", "new_checkout"], &envs);
+    assert!(stdout.contains("disabled"), "stdout: {stdout}");
 
     let enabled: Option<String> = common::query_one_text(
         &url,
