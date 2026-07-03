@@ -19,6 +19,7 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio_postgres::types::ToSql;
 use tokio_postgres::{Client, Row};
@@ -292,33 +293,322 @@ fn keyword_value_token(key: &str, value: &str) -> String {
     }
 }
 
+/// Remove and return the first `(key, value)` pair matching `key`, if any.
+fn take_pair(pairs: &mut Vec<(String, String)>, key: &str) -> Option<String> {
+    let index = pairs.iter().position(|(k, _)| k == key)?;
+    Some(pairs.remove(index).1)
+}
+
+/// Return the value of the first `(key, value)` pair matching `key`, if any.
+fn find_pair<'a>(pairs: &'a [(String, String)], key: &str) -> Option<&'a str> {
+    pairs
+        .iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.as_str())
+}
+
+/// The OS login name `tokio_postgres` itself falls back to when a connection
+/// string sets no `user` (see `connect_raw.rs`'s use of `whoami::username()`)
+/// — used here only to resolve the same effective username for `.pgpass`
+/// matching, not to set it explicitly (that stays `tokio_postgres`'s job).
+fn current_os_user() -> String {
+    whoami::username().unwrap_or_else(|_| "postgres".to_owned())
+}
+
+/// Parse one `.pgpass` line into its 5 colon-delimited fields
+/// (`host:port:dbname:user:password`), honoring `\`-escapes for literal `:`
+/// and `\` within a field (the format `libpq` itself uses). Returns `None`
+/// if the line doesn't have exactly 5 fields.
+fn parse_pgpass_line(line: &str) -> Option<[String; 5]> {
+    let mut fields = Vec::with_capacity(5);
+    let mut current = String::new();
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' && matches!(chars.peek(), Some(':' | '\\')) {
+            current.push(chars.next().unwrap());
+        } else if c == ':' {
+            fields.push(std::mem::take(&mut current));
+        } else {
+            current.push(c);
+        }
+    }
+    fields.push(current);
+    fields.try_into().ok()
+}
+
+/// Find the password for `(host, port, dbname, user)` in a `.pgpass` file's
+/// `contents`, using the first line whose fields all match (a field of `*`
+/// matches anything) — mirrors `libpq`'s own `.pgpass` lookup rule.
+fn pgpass_lookup(
+    contents: &str,
+    host: &str,
+    port: &str,
+    dbname: &str,
+    user: &str,
+) -> Option<String> {
+    let field_matches = |field: &str, value: &str| field == "*" || field == value;
+    contents.lines().find_map(|line| {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            return None;
+        }
+        let [f_host, f_port, f_dbname, f_user, f_password] = parse_pgpass_line(trimmed)?;
+        (field_matches(&f_host, host)
+            && field_matches(&f_port, port)
+            && field_matches(&f_dbname, dbname)
+            && field_matches(&f_user, user))
+        .then_some(f_password)
+    })
+}
+
+/// Path to the `.pgpass` file: `PGPASSFILE` if set, else `~/.pgpass`
+/// (matching `libpq`'s own precedence).
+fn pgpass_file_path() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("PGPASSFILE") {
+        return Some(PathBuf::from(path));
+    }
+    Some(directories::BaseDirs::new()?.home_dir().join(".pgpass"))
+}
+
+/// `libpq` refuses to use a `.pgpass` file that's readable by anyone but its
+/// owner, to avoid trusting a password another local user could have
+/// planted; mirror that here rather than silently trusting a
+/// world/group-readable credentials file.
+#[cfg(unix)]
+fn pgpass_permissions_ok(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).is_ok_and(|meta| meta.permissions().mode().trailing_zeros() >= 6)
+}
+
+#[cfg(not(unix))]
+fn pgpass_permissions_ok(_path: &Path) -> bool {
+    true
+}
+
+/// Look up a password for `(host, port, dbname, user)` in the `.pgpass` file,
+/// if one exists and has safe permissions.
+fn pgpass_password(host: &str, port: &str, dbname: &str, user: &str) -> Option<String> {
+    let path = pgpass_file_path()?;
+    if !path.is_file() {
+        return None;
+    }
+    if !pgpass_permissions_ok(&path) {
+        eprintln!(
+            "autumn: ignoring {} — it has group or world access; permissions should be u=rw (0600) or less",
+            path.display()
+        );
+        return None;
+    }
+    let contents = std::fs::read_to_string(&path).ok()?;
+    pgpass_lookup(&contents, host, port, dbname, user)
+}
+
+/// Resolve a password for `(host, port, dbname, user)` the same way `libpq`
+/// does when none is given explicitly: the `PGPASSWORD` environment
+/// variable first, then the `.pgpass` file.
+fn resolve_password(host: &str, port: &str, dbname: &str, user: &str) -> Option<String> {
+    std::env::var("PGPASSWORD")
+        .ok()
+        .or_else(|| pgpass_password(host, port, dbname, user))
+}
+
+/// Parse a `pg_service.conf`-style file, returning the `key=value` pairs of
+/// the `[service_name]` section, or `None` if that section isn't present.
+/// Lines starting with `#` or `;` are comments, matching `libpq`'s own
+/// service-file format.
+fn parse_service_file(contents: &str, service_name: &str) -> Option<Vec<(String, String)>> {
+    let mut pairs = Vec::new();
+    let mut in_section = false;
+    let mut found = false;
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with(';') {
+            continue;
+        }
+        if let Some(name) = trimmed.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            in_section = name == service_name;
+            found |= in_section;
+            continue;
+        }
+        if in_section && let Some((key, value)) = trimmed.split_once('=') {
+            pairs.push((key.trim().to_owned(), value.trim().to_owned()));
+        }
+    }
+    found.then_some(pairs)
+}
+
+/// Path to the service file: `PGSERVICEFILE` if set, else `~/.pg_service.conf`
+/// (matching `libpq`'s own precedence; the system-wide service file `libpq`
+/// also consults isn't supported here).
+fn service_file_path() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("PGSERVICEFILE") {
+        return Some(PathBuf::from(path));
+    }
+    Some(
+        directories::BaseDirs::new()?
+            .home_dir()
+            .join(".pg_service.conf"),
+    )
+}
+
+/// Load the `[service_name]` group's parameters from the service file,
+/// erroring clearly if no service file can be found or the named group
+/// isn't in it — silently ignoring an explicitly requested `service=` would
+/// leave a connection missing parameters the operator expected to be set.
+fn load_service(service_name: &str) -> Result<Vec<(String, String)>, CommandError> {
+    let path = service_file_path().ok_or_else(|| {
+        CommandError::Other(format!(
+            "service={service_name} was requested but no service file could be located \
+             (set PGSERVICEFILE or create ~/.pg_service.conf)"
+        ))
+    })?;
+    let contents = std::fs::read_to_string(&path).map_err(|e| {
+        CommandError::Other(format!(
+            "service={service_name} was requested but its service file {} could not be read: {e}",
+            path.display()
+        ))
+    })?;
+    parse_service_file(&contents, service_name).ok_or_else(|| {
+        CommandError::Other(format!(
+            "service \"{service_name}\" was not found in service file {}",
+            path.display()
+        ))
+    })
+}
+
 /// Adapt `db_url` for `tokio_postgres` before connecting — see
 /// [`filter_ssl_params`] for what's dropped/rejected and why. Handles both
 /// connection-string shapes `tokio_postgres` itself accepts: URL form
 /// (`postgres://...?sslmode=...`) and `libpq`'s keyword/value form
 /// (`host=... sslmode=...`). A string matching neither shape is passed
 /// through unchanged so `tokio_postgres` can produce its own error.
+///
+/// Also resolves two credential sources `tokio_postgres` itself never
+/// consults, but `libpq`/`psql` always did — leaving them out would silently
+/// break authentication for any deployment relying on them instead of
+/// embedding the password directly in the connection string:
+/// - a `service=name` parameter, expanded from the `pg_service.conf` group of
+///   that name (params already set explicitly in `db_url` win over the
+///   service group's, matching `libpq`'s own precedence);
+/// - a still-missing password, resolved from `PGPASSWORD` or `.pgpass` (see
+///   [`resolve_password`]) using the (possibly service-expanded) host/port
+///   /dbname/user.
 fn sanitize_db_url(db_url: &str) -> Result<String, CommandError> {
-    if let Ok(mut url) = url::Url::parse(db_url) {
-        let pairs = filter_ssl_params(
-            url.query_pairs()
-                .map(|(k, v)| (k.into_owned(), v.into_owned())),
-        )?;
-        if pairs.is_empty() {
-            url.set_query(None);
-        } else {
-            let mut query_pairs = url.query_pairs_mut();
-            query_pairs.clear();
-            for (key, value) in &pairs {
-                query_pairs.append_pair(key, value);
-            }
-            drop(query_pairs);
-        }
-        return Ok(url.into());
+    if let Ok(url) = url::Url::parse(db_url) {
+        return sanitize_url_form(url);
     }
 
     if let Some(pairs) = parse_keyword_value_pairs(db_url) {
-        let pairs = filter_ssl_params(pairs.into_iter())?;
+        return sanitize_keyword_form(pairs);
+    }
+
+    Ok(db_url.to_owned())
+}
+
+/// The URL-form half of [`sanitize_db_url`].
+fn sanitize_url_form(mut url: url::Url) -> Result<String, CommandError> {
+    let mut pairs = filter_ssl_params(
+        url.query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned())),
+    )?;
+
+    // Capture what the URL's own structure (as opposed to its query
+    // string) already says explicitly, once, up front: `host`/`port`
+    // need this snapshot below to detect whether a later merge is safe
+    // to fold back into the query string at all (see the comment by
+    // `needs_keyword_form`).
+    let explicit_user = Some(url.username())
+        .filter(|u| !u.is_empty())
+        .map(str::to_owned)
+        .or_else(|| find_pair(&pairs, "user").map(str::to_owned));
+    let explicit_password = url
+        .password()
+        .map(str::to_owned)
+        .or_else(|| find_pair(&pairs, "password").map(str::to_owned));
+    let explicit_host = url
+        .host_str()
+        .filter(|h| !h.is_empty())
+        .map(str::to_owned)
+        .or_else(|| find_pair(&pairs, "host").map(str::to_owned));
+    let explicit_port = url
+        .port()
+        .map(|p| p.to_string())
+        .or_else(|| find_pair(&pairs, "port").map(str::to_owned));
+    let explicit_dbname = Some(url.path())
+        .filter(|p| p.len() > 1)
+        .map(|p| p.trim_start_matches('/').to_owned())
+        .or_else(|| find_pair(&pairs, "dbname").map(str::to_owned));
+
+    let is_explicit = |pairs: &[(String, String)], key: &str| match key {
+        "user" => explicit_user.is_some(),
+        "password" => explicit_password.is_some(),
+        "host" => explicit_host.is_some(),
+        "port" => explicit_port.is_some(),
+        "dbname" => explicit_dbname.is_some(),
+        _ => find_pair(pairs, key).is_some(),
+    };
+
+    // Whether the service merge below ends up filling in a `host` or
+    // `port` that wasn't already explicit — see the comment where this
+    // is used for why that specifically forces a keyword-form rebuild.
+    let mut needs_keyword_form = false;
+
+    if let Some(service_name) = take_pair(&mut pairs, "service") {
+        for (key, value) in load_service(&service_name)? {
+            if !is_explicit(&pairs, &key) {
+                needs_keyword_form |= key == "host" || key == "port";
+                pairs.push((key, value));
+            }
+        }
+    }
+
+    let host = explicit_host
+        .clone()
+        .or_else(|| find_pair(&pairs, "host").map(str::to_owned))
+        .unwrap_or_else(|| "localhost".to_owned());
+    let port = explicit_port
+        .clone()
+        .or_else(|| find_pair(&pairs, "port").map(str::to_owned))
+        .unwrap_or_else(|| "5432".to_owned());
+    let user = explicit_user
+        .clone()
+        .or_else(|| find_pair(&pairs, "user").map(str::to_owned))
+        .unwrap_or_else(current_os_user);
+    let dbname = explicit_dbname
+        .clone()
+        .or_else(|| find_pair(&pairs, "dbname").map(str::to_owned))
+        .unwrap_or_else(|| user.clone());
+
+    if !is_explicit(&pairs, "password")
+        && let Some(password) = resolve_password(&host, &port, &dbname, &user)
+    {
+        pairs.push(("password".to_owned(), password));
+    }
+
+    if needs_keyword_form {
+        // `tokio_postgres`'s URL-form parser bakes a default `port=5432`
+        // into the config as soon as the authority names *any* host —
+        // even with no port given — and both `host` and `port` are
+        // appended to a list rather than overwritten. So folding a
+        // service-provided host/port back in as a query parameter here
+        // wouldn't override that implicit default, it would sit
+        // alongside it as a second entry. Keyword form has no such
+        // authority-parsing special case — every key here is one we
+        // added ourselves — so falling back to it for exactly this case
+        // sidesteps the duplication entirely.
+        for (key, value) in [
+            ("user", explicit_user),
+            ("password", explicit_password),
+            ("host", explicit_host),
+            ("port", explicit_port),
+            ("dbname", explicit_dbname),
+        ] {
+            if let Some(value) = value
+                && find_pair(&pairs, key).is_none()
+            {
+                pairs.push((key.to_owned(), value));
+            }
+        }
         return Ok(pairs
             .iter()
             .map(|(key, value)| keyword_value_token(key, value))
@@ -326,7 +616,46 @@ fn sanitize_db_url(db_url: &str) -> Result<String, CommandError> {
             .join(" "));
     }
 
-    Ok(db_url.to_owned())
+    if pairs.is_empty() {
+        url.set_query(None);
+    } else {
+        let mut query_pairs = url.query_pairs_mut();
+        query_pairs.clear();
+        for (key, value) in &pairs {
+            query_pairs.append_pair(key, value);
+        }
+        drop(query_pairs);
+    }
+    Ok(url.into())
+}
+
+/// The keyword/value-form half of [`sanitize_db_url`].
+fn sanitize_keyword_form(pairs: Vec<(String, String)>) -> Result<String, CommandError> {
+    let mut pairs = filter_ssl_params(pairs.into_iter())?;
+
+    if let Some(service_name) = take_pair(&mut pairs, "service") {
+        for (key, value) in load_service(&service_name)? {
+            if find_pair(&pairs, &key).is_none() {
+                pairs.push((key, value));
+            }
+        }
+    }
+
+    if find_pair(&pairs, "password").is_none() {
+        let host = find_pair(&pairs, "host").map_or_else(|| "localhost".to_owned(), str::to_owned);
+        let port = find_pair(&pairs, "port").map_or_else(|| "5432".to_owned(), str::to_owned);
+        let user = find_pair(&pairs, "user").map_or_else(current_os_user, str::to_owned);
+        let dbname = find_pair(&pairs, "dbname").map_or_else(|| user.clone(), str::to_owned);
+        if let Some(password) = resolve_password(&host, &port, &dbname, &user) {
+            pairs.push(("password".to_owned(), password));
+        }
+    }
+
+    Ok(pairs
+        .iter()
+        .map(|(key, value)| keyword_value_token(key, value))
+        .collect::<Vec<_>>()
+        .join(" "))
 }
 
 /// Connect to `db_url`, returning a [`CommandError::Connect`] on failure so
@@ -511,6 +840,18 @@ pub fn print_table(headers: &[&str], rows: &[Vec<Option<String>>]) {
 mod tests {
     use super::*;
 
+    /// Set `path`'s permissions to satisfy [`pgpass_permissions_ok`] on
+    /// whichever platform the test is running on (a no-op on non-unix,
+    /// where that check always passes).
+    #[cfg(unix)]
+    fn set_pgpass_permissions_safe(path: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    #[cfg(not(unix))]
+    fn set_pgpass_permissions_safe(_path: &std::path::Path) {}
+
     #[test]
     fn print_table_smoke_does_not_panic_on_empty_rows() {
         print_table(&["key", "value"], &[]);
@@ -559,26 +900,50 @@ mod tests {
 
     #[test]
     fn sanitize_drops_all_ssl_cert_params_from_url() {
-        let sanitized = sanitize_db_url(
-            "postgres://host/db?sslcert=/c.pem&sslkey=/k.pem&sslpassword=x&sslcrl=/crl.pem",
-        )
-        .unwrap();
-        let parsed = url::Url::parse(&sanitized).unwrap();
-        assert_eq!(parsed.query_pairs().count(), 0);
+        // No password is given anywhere in this URL, which would otherwise
+        // make `sanitize_db_url` consult `PGPASSWORD`/`.pgpass` — scope both
+        // away so this test (which isn't about credential resolution at all)
+        // can't flake against whatever's ambient in the environment, or race
+        // another test's `temp_env`-scoped value for the same variable.
+        temp_env::with_vars(
+            [
+                ("PGPASSWORD", None::<&str>),
+                ("PGPASSFILE", Some("/nonexistent-pgpass-file-for-test")),
+            ],
+            || {
+                let sanitized = sanitize_db_url(
+                    "postgres://host/db?sslcert=/c.pem&sslkey=/k.pem&sslpassword=x&sslcrl=/crl.pem",
+                )
+                .unwrap();
+                let parsed = url::Url::parse(&sanitized).unwrap();
+                assert_eq!(parsed.query_pairs().count(), 0);
+            },
+        );
     }
 
     #[test]
     fn sanitize_drops_unsupported_ssl_params_from_keyword_form() {
-        let sanitized =
-            sanitize_db_url("host=localhost dbname=mydb sslmode=require sslrootcert=/etc/ca.pem")
+        // See the comment on `sanitize_drops_all_ssl_cert_params_from_url`
+        // for why this scopes away PGPASSWORD/PGPASSFILE.
+        temp_env::with_vars(
+            [
+                ("PGPASSWORD", None::<&str>),
+                ("PGPASSFILE", Some("/nonexistent-pgpass-file-for-test")),
+            ],
+            || {
+                let sanitized = sanitize_db_url(
+                    "host=localhost dbname=mydb sslmode=require sslrootcert=/etc/ca.pem",
+                )
                 .unwrap();
-        // Verify against tokio_postgres's *actual* parser, not just our own
-        // tokenizer's self-consistency.
-        let config: tokio_postgres::Config = sanitized.parse().unwrap();
-        assert_eq!(config.get_dbname(), Some("mydb"));
-        assert_eq!(
-            config.get_ssl_mode(),
-            tokio_postgres::config::SslMode::Require
+                // Verify against tokio_postgres's *actual* parser, not just our
+                // own tokenizer's self-consistency.
+                let config: tokio_postgres::Config = sanitized.parse().unwrap();
+                assert_eq!(config.get_dbname(), Some("mydb"));
+                assert_eq!(
+                    config.get_ssl_mode(),
+                    tokio_postgres::config::SslMode::Require
+                );
+            },
         );
     }
 
@@ -590,18 +955,198 @@ mod tests {
 
     #[test]
     fn sanitize_handles_quoted_values_in_keyword_form() {
-        let sanitized = sanitize_db_url(
-            "host=localhost dbname='my db' sslmode=require sslrootcert=/etc/ca.pem",
-        )
-        .unwrap();
-        let config: tokio_postgres::Config = sanitized.parse().unwrap();
-        assert_eq!(config.get_dbname(), Some("my db"));
+        // See the comment on `sanitize_drops_all_ssl_cert_params_from_url`
+        // for why this scopes away PGPASSWORD/PGPASSFILE.
+        temp_env::with_vars(
+            [
+                ("PGPASSWORD", None::<&str>),
+                ("PGPASSFILE", Some("/nonexistent-pgpass-file-for-test")),
+            ],
+            || {
+                let sanitized = sanitize_db_url(
+                    "host=localhost dbname='my db' sslmode=require sslrootcert=/etc/ca.pem",
+                )
+                .unwrap();
+                let config: tokio_postgres::Config = sanitized.parse().unwrap();
+                assert_eq!(config.get_dbname(), Some("my db"));
+            },
+        );
     }
 
     #[test]
     fn sanitize_passes_through_strings_matching_neither_shape() {
         let input = "not a valid connection string at all";
         assert_eq!(sanitize_db_url(input).unwrap(), input);
+    }
+
+    #[test]
+    fn sanitize_leaves_password_unset_when_no_source_is_configured() {
+        temp_env::with_vars(
+            [
+                ("PGPASSWORD", None::<&str>),
+                ("PGPASSFILE", Some("/nonexistent-pgpass-file-for-test")),
+            ],
+            || {
+                let sanitized = sanitize_db_url("postgres://user@host:5432/db").unwrap();
+                let config: tokio_postgres::Config = sanitized.parse().unwrap();
+                assert_eq!(config.get_password(), None);
+            },
+        );
+    }
+
+    #[test]
+    fn sanitize_fills_missing_password_from_pgpassword_env() {
+        temp_env::with_vars(
+            [
+                ("PGPASSWORD", Some("from-env")),
+                ("PGPASSFILE", Some("/nonexistent-pgpass-file-for-test")),
+            ],
+            || {
+                let sanitized = sanitize_db_url("postgres://user@host:5432/db").unwrap();
+                let config: tokio_postgres::Config = sanitized.parse().unwrap();
+                assert_eq!(config.get_password(), Some(b"from-env".as_slice()));
+            },
+        );
+    }
+
+    #[test]
+    fn sanitize_does_not_override_an_explicit_password_with_pgpassword_env() {
+        temp_env::with_var("PGPASSWORD", Some("from-env"), || {
+            let sanitized = sanitize_db_url("postgres://user:explicit@host:5432/db").unwrap();
+            let config: tokio_postgres::Config = sanitized.parse().unwrap();
+            assert_eq!(config.get_password(), Some(b"explicit".as_slice()));
+        });
+    }
+
+    #[test]
+    fn sanitize_fills_missing_password_from_pgpass_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let pgpass_path = dir.path().join("pgpass");
+        std::fs::write(&pgpass_path, "host:5432:db:user:from-pgpass\n").unwrap();
+        set_pgpass_permissions_safe(&pgpass_path);
+        temp_env::with_vars(
+            [
+                ("PGPASSWORD", None::<&str>),
+                ("PGPASSFILE", Some(pgpass_path.to_str().unwrap())),
+            ],
+            || {
+                let sanitized = sanitize_db_url("postgres://user@host:5432/db").unwrap();
+                let config: tokio_postgres::Config = sanitized.parse().unwrap();
+                assert_eq!(config.get_password(), Some(b"from-pgpass".as_slice()));
+            },
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn pgpass_file_with_insecure_permissions_is_ignored() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let pgpass_path = dir.path().join("pgpass");
+        std::fs::write(&pgpass_path, "*:*:*:*:insecure-password\n").unwrap();
+        std::fs::set_permissions(&pgpass_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        temp_env::with_vars(
+            [
+                ("PGPASSWORD", None::<&str>),
+                ("PGPASSFILE", Some(pgpass_path.to_str().unwrap())),
+            ],
+            || {
+                let sanitized = sanitize_db_url("postgres://user@host:5432/db").unwrap();
+                let config: tokio_postgres::Config = sanitized.parse().unwrap();
+                assert_eq!(config.get_password(), None);
+            },
+        );
+    }
+
+    #[test]
+    fn pgpass_lookup_matches_wildcards_and_skips_non_matching_lines() {
+        let contents = "otherhost:5432:otherdb:otheruser:wrong\n*:*:*:user:right\n";
+        assert_eq!(
+            pgpass_lookup(contents, "host", "5432", "db", "user"),
+            Some("right".to_owned())
+        );
+    }
+
+    #[test]
+    fn pgpass_lookup_handles_escaped_colons_and_backslashes() {
+        let contents = "host:5432:db:user:pa\\:ss\\\\word\n";
+        assert_eq!(
+            pgpass_lookup(contents, "host", "5432", "db", "user"),
+            Some("pa:ss\\word".to_owned())
+        );
+    }
+
+    #[test]
+    fn parse_service_file_extracts_named_section_only() {
+        let contents = "# comment\n[dev]\nhost=devhost\n\n[prod]\nhost=prodhost\nport=6543\n";
+        let pairs = parse_service_file(contents, "prod").unwrap();
+        assert!(pairs.contains(&("host".to_owned(), "prodhost".to_owned())));
+        assert!(pairs.contains(&("port".to_owned(), "6543".to_owned())));
+        assert_eq!(parse_service_file(contents, "missing"), None);
+    }
+
+    #[test]
+    fn sanitize_merges_service_file_params_without_overriding_explicit_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let service_path = dir.path().join("pg_service.conf");
+        std::fs::write(
+            &service_path,
+            "[prod]\nhost=svchost\nport=6543\ndbname=svcdb\nuser=svcuser\npassword=svcpass\n",
+        )
+        .unwrap();
+        temp_env::with_vars(
+            [
+                ("PGSERVICEFILE", Some(service_path.to_str().unwrap())),
+                ("PGPASSWORD", None::<&str>),
+                ("PGPASSFILE", Some("/nonexistent-pgpass-for-test")),
+            ],
+            || {
+                // The explicit host (in the URL authority) and dbname (the URL
+                // path) must win over the service file's `svchost`/`svcdb`; the
+                // port, user, and password are unset explicitly, so those come
+                // from the service group.
+                let sanitized = sanitize_db_url("postgres://host/db?service=prod").unwrap();
+                let config: tokio_postgres::Config = sanitized.parse().unwrap();
+                assert_eq!(config.get_dbname(), Some("db"));
+                assert_eq!(config.get_user(), Some("svcuser"));
+                assert_eq!(config.get_password(), Some(b"svcpass".as_slice()));
+                assert_eq!(config.get_ports(), &[6543]);
+            },
+        );
+    }
+
+    #[test]
+    fn sanitize_merges_service_file_params_in_keyword_form_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let service_path = dir.path().join("pg_service.conf");
+        std::fs::write(&service_path, "[prod]\ndbname=svcdb\n").unwrap();
+        temp_env::with_vars(
+            [
+                ("PGSERVICEFILE", Some(service_path.to_str().unwrap())),
+                ("PGPASSWORD", None),
+                ("PGPASSFILE", Some("/nonexistent-pgpass-for-test")),
+            ],
+            || {
+                let sanitized = sanitize_db_url("host=localhost service=prod").unwrap();
+                let config: tokio_postgres::Config = sanitized.parse().unwrap();
+                assert_eq!(config.get_dbname(), Some("svcdb"));
+            },
+        );
+    }
+
+    #[test]
+    fn sanitize_errors_when_named_service_is_missing_from_service_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let service_path = dir.path().join("pg_service.conf");
+        std::fs::write(&service_path, "[other]\nhost=x\n").unwrap();
+        temp_env::with_var(
+            "PGSERVICEFILE",
+            Some(service_path.to_str().unwrap()),
+            || {
+                let err = sanitize_db_url("postgres://host/db?service=missing").unwrap_err();
+                assert!(err.message().contains("missing"));
+            },
+        );
     }
 
     #[test]
