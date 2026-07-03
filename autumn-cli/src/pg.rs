@@ -620,10 +620,12 @@ fn parse_service_file(contents: &str, service_name: &str) -> Option<Vec<(String,
 
 /// Path to the service file: `PGSERVICEFILE` if set, else the platform
 /// default `libpq` itself uses — `~/.pg_service.conf` on Unix, or
-/// `%APPDATA%\postgresql\pg_service.conf` on Windows (`PostgreSQL` docs, "The
-/// Connection Service File"; see [`pgpass_file_path`] for why
-/// `BaseDirs::config_dir()` is the right call on Windows). The system-wide
-/// service file `libpq` also consults isn't supported here.
+/// `%APPDATA%\postgresql\.pg_service.conf` on Windows (`PostgreSQL` docs, "The
+/// Connection Service File" — unlike `.pgpass`, which drops its leading dot
+/// to become `pgpass.conf` on Windows, the service file keeps its dot on both
+/// platforms; see [`pgpass_file_path`] for why `BaseDirs::config_dir()` is
+/// the right call on Windows). The system-wide service file `libpq` also
+/// consults isn't supported here.
 #[cfg(not(windows))]
 fn service_file_path() -> Option<PathBuf> {
     if let Ok(path) = std::env::var("PGSERVICEFILE") {
@@ -645,7 +647,7 @@ fn service_file_path() -> Option<PathBuf> {
         directories::BaseDirs::new()?
             .config_dir()
             .join("postgresql")
-            .join("pg_service.conf"),
+            .join(".pg_service.conf"),
     )
 }
 
