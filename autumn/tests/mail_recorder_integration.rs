@@ -251,3 +251,35 @@ async fn disabled_transport_captures_nothing_and_no_smtp() {
     // the transport itself is a no-op (no SMTP).
     client.assert_email_count(1);
 }
+
+// ── Attachments (issue #1256) ──────────────────────────────────────────────
+
+#[tokio::test]
+async fn recorder_captures_attachments() {
+    #[get("/send-attachment")]
+    async fn send_with_attachment(mailer: Mailer) -> &'static str {
+        let mail = Mail::builder()
+            .to("ada@example.com")
+            .subject("Invoice")
+            .text("see attached")
+            .attach("invoice.pdf", "application/pdf", b"%PDF-1.4".to_vec())
+            .build()
+            .unwrap();
+        mailer.send(mail).await.unwrap();
+        "ok"
+    }
+
+    let client = TestApp::new()
+        .config(mail_config())
+        .routes(routes![send_with_attachment])
+        .build();
+
+    client.get("/send-attachment").send().await.assert_ok();
+
+    let sent = client.sent_mail();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].attachments.len(), 1);
+    assert_eq!(sent[0].attachments[0].filename, "invoice.pdf");
+    assert_eq!(sent[0].attachments[0].content_type, "application/pdf");
+    assert_eq!(sent[0].attachments[0].bytes, b"%PDF-1.4".to_vec());
+}

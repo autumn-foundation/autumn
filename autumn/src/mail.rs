@@ -2984,6 +2984,609 @@ pub mod db_suppression {
 mod tests {
     use super::*;
 
+    // ── Attachments (issue #1256): pinning tests ──────────────────────────
+    //
+    // These prove attachment support introduces zero byte-for-byte regression
+    // to attachment-less mail. `pinned_render_eml_no_attachments` is a frozen
+    // copy of `render_eml`'s pre-attachment body captured before any
+    // attachment code was added. Do not "fix" drift here — a diff against
+    // this function IS the regression signal (AC: "pure additive, no
+    // regression to existing email output").
+
+    fn pinned_render_eml_no_attachments(mail: &Mail) -> String {
+        let mut out = String::new();
+        if let Some(from) = &mail.from {
+            out.push_str("From: ");
+            out.push_str(from);
+            out.push('\n');
+        }
+        for to in &mail.to {
+            out.push_str("To: ");
+            out.push_str(to);
+            out.push('\n');
+        }
+        if let Some(reply_to) = &mail.reply_to {
+            out.push_str("Reply-To: ");
+            out.push_str(reply_to);
+            out.push('\n');
+        }
+        out.push_str("Date: ");
+        out.push_str("PINNED-DATE");
+        out.push('\n');
+        out.push_str("Message-Id: <");
+        out.push_str("PINNED-ID");
+        out.push_str("@autumn.local>\n");
+        out.push_str("Subject: ");
+        out.push_str(&mail.subject);
+        out.push('\n');
+        for (name, value) in &mail.extra_headers {
+            out.push_str(name);
+            out.push_str(": ");
+            out.push_str(value);
+            out.push('\n');
+        }
+        out.push_str("MIME-Version: 1.0\n");
+        if mail.html.is_some() && mail.text.is_some() {
+            out.push_str("Content-Type: multipart/alternative; boundary=\"autumn-mail\"\n\n");
+            if let Some(text) = &mail.text {
+                out.push_str("--autumn-mail\nContent-Type: text/plain; charset=utf-8\n\n");
+                out.push_str(text);
+                out.push('\n');
+            }
+            if let Some(html) = &mail.html {
+                out.push_str("--autumn-mail\nContent-Type: text/html; charset=utf-8\n\n");
+                out.push_str(html);
+                out.push('\n');
+            }
+            out.push_str("--autumn-mail--\n");
+        } else if let Some(html) = &mail.html {
+            out.push_str("Content-Type: text/html; charset=utf-8\n\n");
+            out.push_str(html);
+            out.push('\n');
+        } else if let Some(text) = &mail.text {
+            out.push_str("Content-Type: text/plain; charset=utf-8\n\n");
+            out.push_str(text);
+            out.push('\n');
+        }
+        out
+    }
+
+    fn mask_nondeterministic(eml: &str) -> String {
+        eml.lines()
+            .map(|line| {
+                if line.starts_with("Date: ") {
+                    "Date: PINNED-DATE"
+                } else if line.starts_with("Message-Id: ") {
+                    "Message-Id: <PINNED-ID@autumn.local>"
+                } else {
+                    line
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn render_eml_without_attachments_matches_pinned_shape() {
+        let mails = [
+            Mail::builder()
+                .from("from@example.com")
+                .to("user@example.com")
+                .subject("Hi")
+                .text("hello text")
+                .html("<p>hello html</p>")
+                .build()
+                .expect("mail should build"),
+            Mail::builder()
+                .from("from@example.com")
+                .to("user@example.com")
+                .subject("Hi")
+                .text("hello text only")
+                .build()
+                .expect("mail should build"),
+            Mail::builder()
+                .from("from@example.com")
+                .to("user@example.com")
+                .subject("Hi")
+                .html("<p>hello html only</p>")
+                .build()
+                .expect("mail should build"),
+        ];
+        for mail in mails {
+            let actual = mask_nondeterministic(&render_eml(&mail));
+            let pinned = mask_nondeterministic(&pinned_render_eml_no_attachments(&mail));
+            assert_eq!(
+                actual, pinned,
+                "render_eml must be byte-identical for attachment-less mail"
+            );
+            assert!(!actual.contains("multipart/mixed"));
+        }
+    }
+
+    #[test]
+    fn lettre_message_without_attachments_has_no_mixed_part() {
+        let mail = Mail::builder()
+            .from("from@example.com")
+            .to("user@example.com")
+            .subject("Hi")
+            .text("hello")
+            .html("<p>hello</p>")
+            .build()
+            .expect("mail should build");
+        let message = lettre_message(&mail).expect("lettre message should build");
+        let formatted = String::from_utf8_lossy(&message.formatted()).into_owned();
+        assert!(formatted.contains("multipart/alternative"));
+        assert!(!formatted.contains("multipart/mixed"));
+    }
+
+    // ── Attachments (issue #1256): model & builder ────────────────────────
+
+    #[test]
+    fn mail_builder_attach_preserves_order_and_count() {
+        let mail = Mail::builder()
+            .to("user@example.com")
+            .subject("Hi")
+            .text("hello")
+            .attach("a.txt", "text/plain", b"aaa".to_vec())
+            .attach("b.txt", "text/plain", b"bbb".to_vec())
+            .attach("c.txt", "text/plain", b"ccc".to_vec())
+            .build()
+            .expect("mail should build");
+        assert_eq!(mail.attachments.len(), 3);
+        assert_eq!(
+            mail.attachments
+                .iter()
+                .map(|a| a.filename.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a.txt", "b.txt", "c.txt"]
+        );
+        assert_eq!(mail.attachments[1].content_type, "text/plain");
+        assert_eq!(mail.attachments[1].bytes, b"bbb".to_vec());
+    }
+
+    #[test]
+    fn mail_serde_round_trips_attachments() {
+        let mail = Mail::builder()
+            .from("from@example.com")
+            .to("user@example.com")
+            .subject("Hi")
+            .text("hello")
+            .attach("invoice.pdf", "application/pdf", vec![0_u8, 1, 2, 255])
+            .build()
+            .expect("mail should build");
+        let json = serde_json::to_string(&mail).expect("mail should serialize");
+        let round_tripped: Mail = serde_json::from_str(&json).expect("mail should deserialize");
+        assert_eq!(round_tripped, mail);
+    }
+
+    #[test]
+    fn mail_builder_rejects_control_chars_in_attachment_filename() {
+        let err = Mail::builder()
+            .to("user@example.com")
+            .subject("Hi")
+            .text("hello")
+            .attach("evil\r\nX-Injected: 1.pdf", "application/pdf", b"x".to_vec())
+            .build()
+            .expect_err("CRLF in filename should be rejected");
+        assert!(err.to_string().contains("filename"));
+
+        let err = Mail::builder()
+            .to("user@example.com")
+            .subject("Hi")
+            .text("hello")
+            .attach("\0evil.pdf", "application/pdf", b"x".to_vec())
+            .build()
+            .expect_err("NUL in filename should be rejected");
+        assert!(err.to_string().contains("filename"));
+
+        let err = Mail::builder()
+            .to("user@example.com")
+            .subject("Hi")
+            .text("hello")
+            .attach("   ", "application/pdf", b"x".to_vec())
+            .build()
+            .expect_err("empty filename should be rejected");
+        assert!(err.to_string().contains("filename"));
+    }
+
+    #[test]
+    fn mail_builder_rejects_invalid_attachment_content_type() {
+        let err = Mail::builder()
+            .to("user@example.com")
+            .subject("Hi")
+            .text("hello")
+            .attach("a.pdf", "not a mime type", b"x".to_vec())
+            .build()
+            .expect_err("invalid content type should be rejected");
+        assert!(err.to_string().contains("content type"));
+    }
+
+    #[test]
+    fn mail_attachment_debug_hides_bytes() {
+        let attachment = MailAttachment {
+            filename: "secret.bin".to_owned(),
+            content_type: "application/octet-stream".to_owned(),
+            bytes: vec![1, 2, 3, 4, 5],
+        };
+        let debug = format!("{attachment:?}");
+        assert!(debug.contains("secret.bin"));
+        assert!(debug.contains('5'), "byte length should appear: {debug}");
+        assert!(
+            !debug.contains("[1, 2, 3, 4, 5]"),
+            "raw byte values must not appear: {debug}"
+        );
+    }
+
+    // ── Attachments (issue #1256): render_eml (file transport) ───────────
+
+    fn blob_all_byte_values() -> Vec<u8> {
+        (0_u16..=255).cycle().take(4096).map(|b| b as u8).collect()
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        use sha2::Digest as _;
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(bytes);
+        format!("{:x}", hasher.finalize())
+    }
+
+    #[test]
+    fn render_eml_with_attachment_emits_multipart_mixed() {
+        let mail = Mail::builder()
+            .from("from@example.com")
+            .to("user@example.com")
+            .subject("Invoice")
+            .text("see attached")
+            .attach("invoice.pdf", "application/pdf", b"%PDF-1.4".to_vec())
+            .build()
+            .expect("mail should build");
+        let eml = render_eml(&mail);
+        assert!(eml.contains("Content-Type: multipart/mixed; boundary=\"autumn-mixed\""));
+        assert!(eml.contains("Content-Disposition: attachment; filename=\"invoice.pdf\""));
+        assert!(eml.contains("Content-Type: application/pdf"));
+        assert!(eml.contains("Content-Transfer-Encoding: base64"));
+        assert!(eml.contains("--autumn-mixed--"));
+    }
+
+    #[test]
+    fn render_eml_attachment_bytes_round_trip_sha256() {
+        let blob = blob_all_byte_values();
+        let expected_digest = sha256_hex(&blob);
+        let mail = Mail::builder()
+            .from("from@example.com")
+            .to("user@example.com")
+            .subject("Blob")
+            .text("see attached")
+            .attach("blob.bin", "application/octet-stream", blob)
+            .build()
+            .expect("mail should build");
+        let eml = render_eml(&mail);
+
+        let start = eml
+            .find("Content-Transfer-Encoding: base64\n\n")
+            .expect("base64 section present")
+            + "Content-Transfer-Encoding: base64\n\n".len();
+        let rest = &eml[start..];
+        let end = rest.find("--autumn-mixed").expect("closing boundary present");
+        let encoded: String = rest[..end].chars().filter(|c| !c.is_whitespace()).collect();
+
+        use base64::Engine as _;
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .expect("attachment body should be valid base64");
+        assert_eq!(sha256_hex(&decoded), expected_digest);
+    }
+
+    #[test]
+    fn render_eml_preserves_attachment_order() {
+        let mail = Mail::builder()
+            .from("from@example.com")
+            .to("user@example.com")
+            .subject("Multi")
+            .text("see attached")
+            .attach("a.txt", "text/plain", b"a".to_vec())
+            .attach("b.txt", "text/plain", b"b".to_vec())
+            .build()
+            .expect("mail should build");
+        let eml = render_eml(&mail);
+        let a_pos = eml.find("filename=\"a.txt\"").expect("a.txt present");
+        let b_pos = eml.find("filename=\"b.txt\"").expect("b.txt present");
+        assert!(a_pos < b_pos, "attachments must render in declared order");
+    }
+
+    #[test]
+    fn render_eml_with_attachment_nests_alternative_body() {
+        let mail = Mail::builder()
+            .from("from@example.com")
+            .to("user@example.com")
+            .subject("Both bodies")
+            .text("plain")
+            .html("<p>html</p>")
+            .attach("a.txt", "text/plain", b"a".to_vec())
+            .build()
+            .expect("mail should build");
+        let eml = render_eml(&mail);
+        assert!(eml.contains("Content-Type: multipart/alternative; boundary=\"autumn-mail\""));
+        assert!(eml.contains("plain"));
+        assert!(eml.contains("<p>html</p>"));
+    }
+
+    #[test]
+    fn render_eml_blocks_filename_header_injection() {
+        // Hand-built Mail bypasses `build()`'s validation entirely — a `Mail`
+        // can also arrive via `Deserialize` from a durable queue, so the
+        // render layer must be injection-proof independent of the builder.
+        let mail = Mail {
+            from: Some("from@example.com".to_owned()),
+            reply_to: None,
+            to: vec!["user@example.com".to_owned()],
+            subject: "Hi".to_owned(),
+            html: None,
+            text: Some("hello".to_owned()),
+            list_unsubscribe: None,
+            extra_headers: Vec::new(),
+            attachments: vec![MailAttachment {
+                filename: "evil\r\nX-Injected: 1.pdf".to_owned(),
+                content_type: "application/pdf".to_owned(),
+                bytes: b"x".to_vec(),
+            }],
+        };
+        let eml = render_eml(&mail);
+        assert!(
+            !eml.lines().any(|line| line.starts_with("X-Injected")),
+            "CRLF in filename must not inject a header: {eml}"
+        );
+        assert!(!eml.contains('\r'));
+    }
+
+    #[test]
+    fn render_eml_encodes_non_ascii_filename_rfc2231() {
+        let mail = Mail {
+            from: Some("from@example.com".to_owned()),
+            reply_to: None,
+            to: vec!["user@example.com".to_owned()],
+            subject: "Hi".to_owned(),
+            html: None,
+            text: Some("hello".to_owned()),
+            list_unsubscribe: None,
+            extra_headers: Vec::new(),
+            attachments: vec![MailAttachment {
+                filename: "Résumé façade.pdf".to_owned(),
+                content_type: "application/pdf".to_owned(),
+                bytes: b"x".to_vec(),
+            }],
+        };
+        let eml = render_eml(&mail);
+        assert!(eml.contains("filename*=UTF-8''"));
+        let disposition_line = eml
+            .lines()
+            .find(|line| line.starts_with("Content-Disposition:"))
+            .expect("Content-Disposition header present");
+        assert!(disposition_line.is_ascii());
+    }
+
+    #[test]
+    fn content_disposition_params_table() {
+        assert_eq!(content_disposition_params("a.txt"), "filename=\"a.txt\"");
+        assert_eq!(
+            content_disposition_params("weird\"na\\me.txt"),
+            "filename=\"weird\\\"na\\\\me.txt\""
+        );
+        assert_eq!(content_disposition_params("evil\r\nX: 1"), "filename=\"evilX: 1\"");
+        assert_eq!(content_disposition_params(""), "filename=\"attachment\"");
+        assert_eq!(content_disposition_params("   "), "filename=\"attachment\"");
+        let non_ascii = content_disposition_params("café.txt");
+        assert!(non_ascii.contains("filename*=UTF-8''caf%C3%A9.txt"));
+        assert!(non_ascii.is_ascii());
+    }
+
+    #[test]
+    fn render_eml_base64_lines_wrap_at_76() {
+        let blob = blob_all_byte_values();
+        let mail = Mail::builder()
+            .from("from@example.com")
+            .to("user@example.com")
+            .subject("Blob")
+            .text("see attached")
+            .attach("blob.bin", "application/octet-stream", blob)
+            .build()
+            .expect("mail should build");
+        let eml = render_eml(&mail);
+        let start = eml
+            .find("Content-Transfer-Encoding: base64\n\n")
+            .expect("base64 section present")
+            + "Content-Transfer-Encoding: base64\n\n".len();
+        let rest = &eml[start..];
+        let end = rest.find("--autumn-mixed").expect("closing boundary present");
+        for line in rest[..end].lines() {
+            assert!(line.len() <= 76, "base64 line too long: {} chars", line.len());
+        }
+    }
+
+    // ── Attachments (issue #1256): lettre_message (SMTP transport) ───────
+
+    #[test]
+    fn lettre_message_with_attachment_is_multipart_mixed() {
+        let mail = Mail::builder()
+            .from("from@example.com")
+            .to("user@example.com")
+            .subject("Invoice")
+            .text("see attached")
+            .attach("invoice.pdf", "application/pdf", b"%PDF-1.4".to_vec())
+            .build()
+            .expect("mail should build");
+        let message = lettre_message(&mail).expect("lettre message should build");
+        let formatted = String::from_utf8_lossy(&message.formatted()).into_owned();
+        assert!(formatted.contains("multipart/mixed"));
+        assert!(formatted.contains("Content-Disposition: attachment"));
+        assert!(formatted.contains("invoice.pdf"));
+        assert!(formatted.contains("base64"));
+    }
+
+    fn extract_boundary(text: &str) -> String {
+        let marker = "boundary=\"";
+        let start = text.find(marker).expect("boundary present") + marker.len();
+        let rest = &text[start..];
+        let end = rest.find('"').expect("boundary closing quote");
+        rest[..end].to_owned()
+    }
+
+    fn extract_attachment_base64(formatted_lf: &str, boundary: &str) -> String {
+        let marker = format!("--{boundary}");
+        for segment in formatted_lf.split(&marker).skip(1) {
+            let segment = segment.trim_start_matches(['\n', '\r']);
+            if segment.starts_with("--") {
+                break;
+            }
+            let (headers, body) = split_headers_body(segment);
+            if header_value(&headers, "Content-Disposition")
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .contains("attachment")
+            {
+                return body.chars().filter(|c| !c.is_whitespace()).collect();
+            }
+        }
+        panic!("attachment part not found in: {formatted_lf}");
+    }
+
+    #[test]
+    fn lettre_message_attachment_round_trips_sha256() {
+        let blob = blob_all_byte_values();
+        let expected_digest = sha256_hex(&blob);
+        let mail = Mail::builder()
+            .from("from@example.com")
+            .to("user@example.com")
+            .subject("Blob")
+            .text("see attached")
+            .attach("blob.bin", "application/octet-stream", blob)
+            .build()
+            .expect("mail should build");
+        let message = lettre_message(&mail).expect("lettre message should build");
+        let formatted = String::from_utf8_lossy(&message.formatted()).into_owned();
+        let normalized = formatted.replace("\r\n", "\n");
+        let boundary = extract_boundary(&normalized);
+        let encoded = extract_attachment_base64(&normalized, &boundary);
+
+        use base64::Engine as _;
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .expect("attachment body should be valid base64");
+        assert_eq!(sha256_hex(&decoded), expected_digest);
+    }
+
+    #[test]
+    fn lettre_message_attachment_headers_ascii_and_injection_free() {
+        for filename in ["evil\r\nX-Injected: 1.pdf", "Résumé façade.pdf"] {
+            let mail = Mail {
+                from: Some("from@example.com".to_owned()),
+                reply_to: None,
+                to: vec!["user@example.com".to_owned()],
+                subject: "Hi".to_owned(),
+                html: None,
+                text: Some("hello".to_owned()),
+                list_unsubscribe: None,
+                extra_headers: Vec::new(),
+                attachments: vec![MailAttachment {
+                    filename: filename.to_owned(),
+                    content_type: "application/pdf".to_owned(),
+                    bytes: b"x".to_vec(),
+                }],
+            };
+            let message = lettre_message(&mail).expect("lettre message should build");
+            let formatted = String::from_utf8_lossy(&message.formatted()).into_owned();
+            let header_section = formatted
+                .split("\r\n\r\n")
+                .next()
+                .expect("header section present");
+            assert!(
+                header_section.is_ascii(),
+                "headers must stay ASCII for filename {filename:?}: {header_section}"
+            );
+            assert!(
+                !formatted.lines().any(|line| line.starts_with("X-Injected")),
+                "CRLF in filename must not inject a header for {filename:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn lettre_message_attachment_with_invalid_content_type_errors() {
+        let mail = Mail {
+            from: Some("from@example.com".to_owned()),
+            reply_to: None,
+            to: vec!["user@example.com".to_owned()],
+            subject: "Hi".to_owned(),
+            html: None,
+            text: Some("hello".to_owned()),
+            list_unsubscribe: None,
+            extra_headers: Vec::new(),
+            attachments: vec![MailAttachment {
+                filename: "a.bin".to_owned(),
+                content_type: "not a mime type".to_owned(),
+                bytes: b"x".to_vec(),
+            }],
+        };
+        let err = lettre_message(&mail).expect_err("invalid content type should error");
+        assert!(matches!(err, MailError::InvalidMessage(_)));
+    }
+
+    // ── Attachments (issue #1256): dev preview ────────────────────────────
+
+    #[test]
+    fn parse_eml_extracts_attachment_list() {
+        let mail = Mail::builder()
+            .from("from@example.com")
+            .to("user@example.com")
+            .subject("Invoice")
+            .text("plain")
+            .html("<p>html</p>")
+            .attach("invoice.pdf", "application/pdf", b"%PDF-1.4".to_vec())
+            .attach("receipt.csv", "text/csv", b"a,b,c".to_vec())
+            .build()
+            .expect("mail should build");
+        let eml = render_eml(&mail);
+        let parsed = parse_eml(&eml);
+        assert_eq!(parsed.attachments.len(), 2);
+        assert_eq!(parsed.attachments[0].filename, "invoice.pdf");
+        assert_eq!(parsed.attachments[0].content_type, "application/pdf");
+        assert_eq!(parsed.attachments[1].filename, "receipt.csv");
+        assert_eq!(parsed.html.as_deref(), Some("<p>html</p>"));
+        assert_eq!(parsed.text.as_deref(), Some("plain"));
+    }
+
+    #[test]
+    fn render_mail_detail_lists_attachments() {
+        let mail = Mail::builder()
+            .from("from@example.com")
+            .to("user@example.com")
+            .subject("Invoice")
+            .text("plain")
+            .attach("invoice.pdf", "application/pdf", b"%PDF-1.4".to_vec())
+            .attach("receipt.csv", "text/csv", b"a,b,c".to_vec())
+            .build()
+            .expect("mail should build");
+        let parsed = parse_eml(&render_eml(&mail));
+        let detail = render_mail_detail(&parsed, "captured");
+        assert!(detail.contains("Attachments (2)"));
+        assert!(detail.contains("invoice.pdf"));
+        assert!(detail.contains("receipt.csv"));
+    }
+
+    #[test]
+    fn render_mail_detail_without_attachments_omits_section() {
+        let mail = Mail::builder()
+            .from("from@example.com")
+            .to("user@example.com")
+            .subject("Plain")
+            .text("plain")
+            .build()
+            .expect("mail should build");
+        let parsed = parse_eml(&render_eml(&mail));
+        let detail = render_mail_detail(&parsed, "captured");
+        assert!(!detail.contains("Attachments"));
+    }
+
     #[test]
     fn mail_builder_rejects_missing_body() {
         let err = Mail::builder()
@@ -3019,6 +3622,7 @@ mod tests {
             .expect("mail should build");
         assert_eq!(mail.list_unsubscribe, None);
         assert!(mail.extra_headers.is_empty());
+        assert!(mail.attachments.is_empty());
     }
 
     #[test]
@@ -3923,6 +4527,35 @@ mod tests {
             .expect("queue should receive the mail");
 
         assert_eq!(received.subject, "Hi");
+    }
+
+    #[tokio::test]
+    async fn deliver_later_preserves_attachments_through_queue() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Mail>();
+
+        let mailer = Mailer::builder()
+            .delivery_queue(CapturingQueue { tx })
+            .build()
+            .expect("mailer should build");
+
+        let mail = Mail::builder()
+            .to("user@example.com")
+            .subject("Hi")
+            .text("hello")
+            .attach("invoice.pdf", "application/pdf", b"%PDF-1.4".to_vec())
+            .build()
+            .expect("mail should build");
+
+        mailer
+            .try_deliver_later(mail.clone())
+            .expect("scheduling onto the queue should succeed");
+
+        let received = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("queue should receive within 1s")
+            .expect("queue should receive the mail");
+
+        assert_eq!(received, mail);
     }
 
     #[tokio::test]
