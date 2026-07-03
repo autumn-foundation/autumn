@@ -967,7 +967,13 @@ fn render_admin_smoke_test(
     } else {
         writable
             .iter()
-            .map(|f| format!("{}=test", f.name))
+            .map(|f| {
+                // An enum field is a closed set by construction, so the
+                // generic "test" sample value fails its own validation;
+                // use the field's own first declared variant instead.
+                let sample = f.variants.first().map_or("test", String::as_str);
+                format!("{}={sample}", f.name)
+            })
             .collect::<Vec<_>>()
             .join("&")
     };
@@ -1880,6 +1886,34 @@ pub struct Account {
 
         let admin = fs::read_to_string(tmp.path().join("src/admin/post.rs")).unwrap();
         assert!(!admin.contains("\"archived\""), "got:\n{admin}");
+    }
+
+    #[test]
+    fn admin_smoke_test_uses_first_variant_for_enum_fields() {
+        // The generated create smoke test posts a sample value for every
+        // writable field; `status=test` fails the enum's own closed-set
+        // validation (`test` is not a declared variant), so the generated
+        // test would itself get a validation error instead of the expected
+        // redirect. Use the field's own first variant instead.
+        let tmp = project_with_model("post");
+        let plan = plan_admin_with_options(
+            tmp.path(),
+            "Post",
+            &["status:enum{draft,published,archived}".into()],
+            &AdminOptions::default(),
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let smoke = fs::read_to_string(tmp.path().join("tests/post_admin.rs")).unwrap();
+        assert!(
+            smoke.contains("status=draft"),
+            "expected the enum's first variant in the sample form body; got:\n{smoke}"
+        );
+        assert!(
+            !smoke.contains("status=test"),
+            "must not submit an out-of-set sample value for an enum field; got:\n{smoke}"
+        );
     }
 
     #[test]

@@ -756,7 +756,7 @@ fn validate_field_names(fields: &[Field]) -> Result<(), GenerateError> {
 /// from this DSL token — confirmed by generating `string:enum{a,b}` and
 /// observing `cargo check` fail with E0308/E0599 throughout the model and
 /// routes files.
-const PRELUDE_TYPE_NAMES: &[&str] = &["String", "Vec", "Option", "Result", "Box"];
+const PRELUDE_TYPE_NAMES: &[&str] = &["String", "Vec", "Option", "Result", "Box", "Into"];
 
 /// Reject an `enum{…}` field whose generated Rust type name (`pascal(field)`)
 /// collides with the model struct itself, one of the companion types the
@@ -1560,12 +1560,15 @@ mod tests {
 
     #[test]
     fn enum_field_name_shadowing_prelude_type_is_rejected() {
-        // A field that pascalizes to `String`/`Vec`/`Option`/`Result`/`Box`
+        // A field that pascalizes to `String`/`Vec`/`Option`/`Result`/`Box`/`Into`
         // shadows the prelude import for the entire generated file (and, once
         // imported into the scaffold's routes file, that file too) — verified
         // by generating `string:enum{a,b}` and observing `cargo check` fail
-        // with E0308/E0599 far from this token.
-        for field_name in ["string", "vec", "option", "result", "box"] {
+        // with E0308/E0599 far from this token. `into` is included because
+        // `render_enum_decl`'s `FromSql` impl calls the unqualified
+        // `Into::into` — a field named `into` would generate `pub enum Into`,
+        // which shadows that path expression too.
+        for field_name in ["string", "vec", "option", "result", "box", "into"] {
             let tmp = project();
             let err = plan_model(
                 tmp.path(),
