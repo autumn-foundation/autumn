@@ -373,7 +373,13 @@ pub fn add_columns_up_sql(table: &str, fields: &[Field]) -> String {
             let _ = write!(out, " {check}");
         }
         out.push_str(";\n");
-        if f.kind.is_reference() {
+        // A `unique` field's own `CREATE UNIQUE INDEX` (emitted below)
+        // already covers lookups on that column, so a `references` field
+        // that is *also* `unique` must not get the plain auto-index too —
+        // same dedup `create_table_sql_with_metadata_and_id` already applies
+        // (issue #1032 review follow-up: this path emitted both, building
+        // and maintaining a redundant second btree index).
+        if f.kind.is_reference() && !f.unique {
             // Postgres auto-drops this index (and the FK constraint above) when
             // the column is dropped, so `add_columns_down_sql` needs no change.
             let _ = writeln!(
@@ -604,7 +610,11 @@ pub fn remove_columns_down_sql(table: &str, fields: &[Field]) -> String {
             let _ = write!(out, " {check}");
         }
         out.push_str(";\n");
-        if f.kind.is_reference() {
+        // See `add_columns_up_sql`'s matching comment: a `unique` field's
+        // own `CREATE UNIQUE INDEX` already covers lookups, so a
+        // `references` field that is also `unique` must not get the plain
+        // auto-index restored too.
+        if f.kind.is_reference() && !f.unique {
             let _ = writeln!(
                 out,
                 "CREATE INDEX idx_{table}_{} ON {table} ({});",
@@ -3416,6 +3426,43 @@ mod tests {
             sql.contains("CREATE UNIQUE INDEX idx_users_email_unique ON users (email);"),
             "rollback of RemoveXFromY must restore the UNIQUE index, not just the \
              bare column; got:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn add_columns_up_sql_unique_reference_skips_redundant_plain_index() {
+        // Regression guard (issue #1032 review follow-up): a `references`
+        // field's own auto-index and a `unique` field's `CREATE UNIQUE
+        // INDEX` were emitted unconditionally and independently here, so a
+        // field that is both (`author:references:unique`) got two
+        // overlapping btree indexes on the same column — the plain one is
+        // fully redundant since the unique index already covers the same
+        // lookup. `create_table_sql_with_metadata_and_id` already dedupes
+        // this for `CREATE TABLE`; `AddXToY` must match.
+        let sql = add_columns_up_sql("posts", &fields(&["author:references:unique"]));
+        assert!(
+            sql.contains("CREATE UNIQUE INDEX idx_posts_author_id_unique ON posts (author_id);"),
+            "got:\n{sql}"
+        );
+        assert!(
+            !sql.contains("CREATE INDEX idx_posts_author_id ON posts (author_id);"),
+            "a references field that is also unique must not get a redundant \
+             plain index alongside its unique index; got:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn remove_columns_down_sql_unique_reference_skips_redundant_plain_index() {
+        // `RemoveXFromY`'s rollback must restore the same shape `AddXToY`
+        // would have created, not the redundant pre-fix pair.
+        let sql = remove_columns_down_sql("posts", &fields(&["author:references:unique"]));
+        assert!(
+            sql.contains("CREATE UNIQUE INDEX idx_posts_author_id_unique ON posts (author_id);"),
+            "got:\n{sql}"
+        );
+        assert!(
+            !sql.contains("CREATE INDEX idx_posts_author_id ON posts (author_id);"),
+            "got:\n{sql}"
         );
     }
 

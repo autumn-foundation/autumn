@@ -667,6 +667,45 @@ fn generate_migration_add_columns_emits_alter() {
 }
 
 #[test]
+fn generate_migration_add_unique_reference_column_skips_redundant_plain_index() {
+    // Regression guard (issue #1032 review follow-up): `AddXToY` emitted
+    // both a `references` field's auto-index and its `CREATE UNIQUE INDEX`
+    // unconditionally, so `author:references:unique` built two overlapping
+    // btree indexes on the same column — the plain one is fully redundant
+    // since the unique index already covers the same lookup.
+    let (_tmp, project) = fresh_project("migrate-unique-reference-app");
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "migration",
+            "AddAuthorToPosts",
+            "author:references:unique",
+        ],
+    );
+    let migrations = fs::read_dir(project.join("migrations"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .ends_with("_add_author_to_posts")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(migrations.len(), 1);
+    let up = fs::read_to_string(migrations[0].path().join("up.sql")).unwrap();
+    assert!(
+        up.contains("CREATE UNIQUE INDEX idx_posts_author_id_unique ON posts (author_id);"),
+        "got:\n{up}"
+    );
+    assert!(
+        !up.contains("CREATE INDEX idx_posts_author_id ON posts (author_id);"),
+        "a references field that is also unique must not get a redundant \
+         plain index alongside its unique index; got:\n{up}"
+    );
+}
+
+#[test]
 fn generate_migration_unknown_pattern_is_empty() {
     let (_tmp, project) = fresh_project("empty-mig-app");
     run_autumn(&project, &["generate", "migration", "BackfillSomething"]);
