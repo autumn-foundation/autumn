@@ -2032,11 +2032,21 @@ fn render_eml(mail: &Mail) -> String {
     if mail.attachments.is_empty() {
         render_eml_bodies(mail, &mut out);
     } else {
-        out.push_str("Content-Type: multipart/mixed; boundary=\"autumn-mixed\"\n\n");
-        out.push_str("--autumn-mixed\n");
+        // Random per-message boundary: text/html bodies are caller-controlled
+        // and may legitimately contain a line matching a fixed boundary
+        // (e.g. `--autumn-mixed`), which would truncate or split the
+        // rendered MIME structure. A boundary the caller cannot predict in
+        // advance can't collide with body content.
+        use std::fmt::Write as _;
+        let boundary = format!("autumn-mixed-{}", uuid::Uuid::new_v4().simple());
+        let _ = write!(
+            out,
+            "Content-Type: multipart/mixed; boundary=\"{boundary}\"\n\n"
+        );
+        let _ = writeln!(out, "--{boundary}");
         render_eml_bodies(mail, &mut out);
         for attachment in &mail.attachments {
-            out.push_str("--autumn-mixed\n");
+            let _ = writeln!(out, "--{boundary}");
             out.push_str("Content-Type: ");
             let content_type = strip_header_controls(&attachment.content_type);
             if ContentType::parse(&content_type).is_ok() {
@@ -2052,7 +2062,7 @@ fn render_eml(mail: &Mail) -> String {
             out.push_str(&base64_wrap76(&attachment.bytes));
             out.push('\n');
         }
-        out.push_str("--autumn-mixed--\n");
+        let _ = writeln!(out, "--{boundary}--");
     }
     out
 }
@@ -3620,6 +3630,17 @@ mod tests {
         format!("{:x}", hasher.finalize())
     }
 
+    /// Extracts the random `multipart/mixed` boundary rendered by
+    /// `render_eml` for an attachment message, so tests can assert against
+    /// it without depending on a fixed boundary string.
+    fn mixed_boundary(eml: &str) -> String {
+        let line = eml
+            .lines()
+            .find(|line| line.starts_with("Content-Type: multipart/mixed;"))
+            .expect("multipart/mixed Content-Type header present");
+        content_type_boundary(line).expect("boundary parameter present")
+    }
+
     #[test]
     fn render_eml_with_attachment_emits_multipart_mixed() {
         let mail = Mail::builder()
@@ -3631,11 +3652,54 @@ mod tests {
             .build()
             .expect("mail should build");
         let eml = render_eml(&mail);
-        assert!(eml.contains("Content-Type: multipart/mixed; boundary=\"autumn-mixed\""));
+        let boundary = mixed_boundary(&eml);
+        assert!(eml.contains(&format!(
+            "Content-Type: multipart/mixed; boundary=\"{boundary}\""
+        )));
         assert!(eml.contains("Content-Disposition: attachment; filename=\"invoice.pdf\""));
         assert!(eml.contains("Content-Type: application/pdf"));
         assert!(eml.contains("Content-Transfer-Encoding: base64"));
-        assert!(eml.contains("--autumn-mixed--"));
+        assert!(eml.contains(&format!("--{boundary}--")));
+    }
+
+    #[test]
+    fn render_eml_boundary_is_unpredictable_and_body_cannot_forge_it() {
+        // A fixed boundary (e.g. a literal `"autumn-mixed"`) lets a body
+        // containing a `--autumn-mixed` line be mistaken for a real MIME
+        // delimiter, truncating or splitting the message. The boundary must
+        // vary per render and not be derivable from body content alone.
+        let mail = Mail::builder()
+            .from("from@example.com")
+            .to("user@example.com")
+            .subject("Spoof attempt")
+            .text("line one\n--autumn-mixed--\nX-Spoofed: header\nline two")
+            .attach("invoice.pdf", "application/pdf", b"%PDF-1.4".to_vec())
+            .build()
+            .expect("mail should build");
+        let eml = render_eml(&mail);
+        let parsed = parse_eml(&eml);
+        assert_eq!(
+            parsed.text.as_deref(),
+            Some("line one\n--autumn-mixed--\nX-Spoofed: header\nline two"),
+            "body content resembling the old fixed boundary must not truncate the message"
+        );
+        assert_eq!(parsed.attachments.len(), 1);
+
+        let other = render_eml(
+            &Mail::builder()
+                .from("from@example.com")
+                .to("user@example.com")
+                .subject("Second message")
+                .text("hi")
+                .attach("invoice.pdf", "application/pdf", b"%PDF-1.4".to_vec())
+                .build()
+                .expect("mail should build"),
+        );
+        assert_ne!(
+            mixed_boundary(&eml),
+            mixed_boundary(&other),
+            "boundary must vary per message, not be a fixed/predictable string"
+        );
     }
 
     #[test]
@@ -3652,6 +3716,7 @@ mod tests {
             .build()
             .expect("mail should build");
         let eml = render_eml(&mail);
+        let boundary = mixed_boundary(&eml);
 
         let start = eml
             .find("Content-Transfer-Encoding: base64\n\n")
@@ -3659,7 +3724,7 @@ mod tests {
             + "Content-Transfer-Encoding: base64\n\n".len();
         let rest = &eml[start..];
         let end = rest
-            .find("--autumn-mixed")
+            .find(&format!("--{boundary}"))
             .expect("closing boundary present");
         let encoded: String = rest[..end].chars().filter(|c| !c.is_whitespace()).collect();
 
@@ -3845,13 +3910,14 @@ mod tests {
             .build()
             .expect("mail should build");
         let eml = render_eml(&mail);
+        let boundary = mixed_boundary(&eml);
         let start = eml
             .find("Content-Transfer-Encoding: base64\n\n")
             .expect("base64 section present")
             + "Content-Transfer-Encoding: base64\n\n".len();
         let rest = &eml[start..];
         let end = rest
-            .find("--autumn-mixed")
+            .find(&format!("--{boundary}"))
             .expect("closing boundary present");
         for line in rest[..end].lines() {
             assert!(

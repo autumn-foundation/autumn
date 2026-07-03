@@ -9,6 +9,16 @@ use base64::Engine as _;
 use sha2::Digest as _;
 use tower::ServiceExt as _;
 
+/// Extracts the `boundary` parameter from a rendered `.eml`'s
+/// `multipart/mixed` `Content-Type` header, since `render_eml` now
+/// generates a random per-message boundary rather than a fixed string.
+fn extract_boundary(body: &str) -> &str {
+    let start = body.find("boundary=\"").expect("boundary present") + "boundary=\"".len();
+    let rest = &body[start..];
+    let end = rest.find('"').expect("boundary closing quote");
+    &rest[..end]
+}
+
 #[test]
 fn dev_profile_defaults_to_log_transport() {
     let env = MockEnv::new().with("AUTUMN_PROFILE", "dev");
@@ -268,8 +278,9 @@ async fn file_transport_round_trips_attachment_bytes() {
     assert_eq!(files.len(), 1);
     let body = std::fs::read_to_string(files[0].path()).expect("eml readable");
 
-    assert!(body.contains("boundary=\"autumn-mixed\""));
-    let parts: Vec<&str> = body.split("--autumn-mixed").collect();
+    let boundary = extract_boundary(&body);
+    assert!(boundary.starts_with("autumn-mixed-"));
+    let parts: Vec<&str> = body.split(&format!("--{boundary}")).collect();
     let attachment_part = parts
         .iter()
         .find(|part| part.contains("Content-Disposition: attachment"))
