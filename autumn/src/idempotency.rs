@@ -631,7 +631,9 @@ mod redis_store {
                                     body_hash: e.body_hash,
                                     // Redis manages TTL natively. Use a fixed 24 h offset
                                     // so the in-process expiry check never fires early.
-                                    expires_at: Instant::now().checked_add(Duration::from_secs(86_400)).unwrap_or_else(Instant::now),
+                                    expires_at: Instant::now()
+                                        .checked_add(Duration::from_secs(86_400))
+                                        .unwrap_or_else(Instant::now),
                                 }
                             })
                             .map_err(|e| {

@@ -1,4 +1,4 @@
-use autumn_web::idempotency::{MemoryIdempotencyStore, IdempotencyStore, IdempotencyRecord};
+use autumn_web::idempotency::{IdempotencyRecord, IdempotencyStore, MemoryIdempotencyStore};
 use proptest::prelude::*;
 use std::time::Duration;
 
