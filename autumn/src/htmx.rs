@@ -666,6 +666,17 @@ mod tests {
         assert!(!HTMX_CSRF_JS.contains("<script"));
     }
 
+    #[test]
+    fn widgets_js_wires_nav_bar() {
+        let js = std::str::from_utf8(AUTUMN_WIDGETS_JS)
+            .expect("autumn-widgets.js should be valid UTF-8");
+        assert!(js.contains("data-autumn-nav"), "{js}");
+        assert!(js.contains("data-nav-toggle"), "{js}");
+        assert!(js.contains("data-nav-menu-toggle"), "{js}");
+        assert!(js.contains("aria-expanded"), "{js}");
+        assert!(js.contains("Escape"), "{js}");
+    }
+
     #[tokio::test]
     async fn hx_request_extractor_parses_headers() -> Result<(), axum::http::Error> {
         let req = Request::builder()

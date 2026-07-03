@@ -1872,6 +1872,16 @@ pub(crate) async fn metrics_endpoint<S: ProvideActuatorState + Send + Sync + 'st
     let snapshot = state.metrics().snapshot();
     let mut result = serde_json::to_value(&snapshot).unwrap_or_default();
 
+    // Include read-through cache stampede-protection counters (always
+    // present; the read-through API works standalone without app state).
+    if let serde_json::Value::Object(ref mut map) = result {
+        map.insert(
+            "cache".to_string(),
+            serde_json::to_value(crate::cache::read_through_metrics().snapshot())
+                .unwrap_or_default(),
+        );
+    }
+
     // Include DB pool stats if available
     #[cfg(feature = "db")]
     if let Some(pool) = state.pool() {
@@ -2301,6 +2311,67 @@ fn write_builtin_http_metrics(
     }
 }
 
+/// Render the built-in `autumn_cache_*` read-through stampede-protection
+/// counters into `out`, tagged with the replica's deploy `version` label.
+/// These counters are process-wide (the read-through API works standalone
+/// without app state), unlike the HTTP metrics which come from per-app state.
+fn write_builtin_cache_metrics(
+    out: &mut String,
+    version: &str,
+    snapshot: &crate::cache::ReadThroughMetricsSnapshot,
+) {
+    use std::fmt::Write;
+
+    for (name, help, value) in [
+        (
+            "autumn_cache_read_through_hits_total",
+            "Read-through cache reads served from a fresh cached value",
+            snapshot.hits,
+        ),
+        (
+            "autumn_cache_read_through_misses_total",
+            "Read-through cache reads that found no fresh cached value",
+            snapshot.misses,
+        ),
+        (
+            "autumn_cache_read_through_coalesced_waits_total",
+            "Read-through callers that awaited a concurrent in-process fill instead of \
+             computing their own (single-flight coalescing)",
+            snapshot.coalesced_waits,
+        ),
+        (
+            "autumn_cache_read_through_fills_total",
+            "Read-through fill closures that completed successfully",
+            snapshot.fills,
+        ),
+        (
+            "autumn_cache_read_through_fill_failures_total",
+            "Read-through fill closures that returned an error",
+            snapshot.fill_failures,
+        ),
+        (
+            "autumn_cache_read_through_stale_serves_total",
+            "Stale-while-revalidate reads that served a stale value while a background \
+             refresh ran",
+            snapshot.stale_serves,
+        ),
+        (
+            "autumn_cache_fill_lock_acquires_total",
+            "Distributed cache fill locks acquired by this process",
+            snapshot.fill_lock_acquires,
+        ),
+        (
+            "autumn_cache_fill_lock_contended_total",
+            "Distributed cache fill lock attempts that found the lock held by another replica",
+            snapshot.fill_lock_contended,
+        ),
+    ] {
+        let _ = writeln!(out, "# HELP {name} {help}");
+        let _ = writeln!(out, "# TYPE {name} counter");
+        let _ = writeln!(out, "{name}{{version=\"{version}\"}} {value}");
+    }
+}
+
 /// `GET <actuator-prefix>/prometheus` -- export metrics in Prometheus format.
 pub(crate) async fn prometheus_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
     State(state): State<S>,
@@ -2313,6 +2384,11 @@ pub(crate) async fn prometheus_endpoint<S: ProvideActuatorState + Send + Sync + 
     let mut out = String::with_capacity(2048);
 
     write_builtin_http_metrics(&mut out, &version, &snapshot);
+    write_builtin_cache_metrics(
+        &mut out,
+        &version,
+        &crate::cache::read_through_metrics().snapshot(),
+    );
 
     // Plugin-contributed metric families — seed with built-in names so
     // plugins cannot shadow or duplicate them.
@@ -2327,6 +2403,14 @@ pub(crate) async fn prometheus_endpoint<S: ProvideActuatorState + Send + Sync + 
             "autumn_read_your_writes_pins_total",
             "autumn_http_route_requests_total",
             "autumn_metrics_source_errors_total",
+            "autumn_cache_read_through_hits_total",
+            "autumn_cache_read_through_misses_total",
+            "autumn_cache_read_through_coalesced_waits_total",
+            "autumn_cache_read_through_fills_total",
+            "autumn_cache_read_through_fill_failures_total",
+            "autumn_cache_read_through_stale_serves_total",
+            "autumn_cache_fill_lock_acquires_total",
+            "autumn_cache_fill_lock_contended_total",
         ]
         .iter()
         .map(|s| (*s).to_string())
@@ -4295,6 +4379,105 @@ mod tests {
         assert!(text.contains("# HELP autumn_read_your_writes_pins_total"));
         assert!(text.contains("# TYPE autumn_read_your_writes_pins_total counter"));
         assert!(text.contains("autumn_read_your_writes_pins_total{version=\"stable\"} 0"));
+    }
+
+    #[cfg(feature = "cache-moka")]
+    #[tokio::test]
+    async fn prometheus_includes_cache_read_through_counters() {
+        // read_through_metrics() is a process-wide singleton shared with other
+        // tests in this crate; assert presence and a monotonic delta rather
+        // than an absolute value.
+        let before = crate::cache::read_through_metrics().snapshot();
+        let cache: std::sync::Arc<dyn crate::cache::Cache> =
+            std::sync::Arc::new(crate::cache::MokaCache::new(10, None));
+        let key = format!("actuator-prometheus-cache-test-{before:?}");
+        let _: i32 =
+            crate::cache::get_or_compute(
+                &cache,
+                &key,
+                None,
+                || async move { Ok::<i32, String>(1) },
+            )
+            .await
+            .unwrap();
+        let after = crate::cache::read_through_metrics().snapshot();
+        assert!(after.fills > before.fills, "fills counter must increase");
+
+        let state = test_state();
+        let app = actuator_router(true).with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/prometheus")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+
+        for name in [
+            "autumn_cache_read_through_hits_total",
+            "autumn_cache_read_through_misses_total",
+            "autumn_cache_read_through_coalesced_waits_total",
+            "autumn_cache_read_through_fills_total",
+            "autumn_cache_read_through_fill_failures_total",
+            "autumn_cache_read_through_stale_serves_total",
+            "autumn_cache_fill_lock_acquires_total",
+            "autumn_cache_fill_lock_contended_total",
+        ] {
+            assert!(
+                text.contains(&format!("# TYPE {name} counter")),
+                "missing TYPE line for {name} in:\n{text}"
+            );
+            assert!(
+                text.contains(&format!("{name}{{version=\"stable\"}}")),
+                "missing value line for {name} in:\n{text}"
+            );
+        }
+    }
+
+    #[cfg(feature = "cache-moka")]
+    #[tokio::test]
+    async fn metrics_json_includes_cache_section() {
+        let cache: std::sync::Arc<dyn crate::cache::Cache> =
+            std::sync::Arc::new(crate::cache::MokaCache::new(10, None));
+        let key = "actuator-metrics-json-cache-test";
+        let _: i32 =
+            crate::cache::get_or_compute(&cache, key, None, || async move { Ok::<i32, String>(1) })
+                .await
+                .unwrap();
+
+        let state = test_state();
+        let app = actuator_router(true).with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["cache"]["fills"].as_u64().unwrap() >= 1);
+        assert!(json["cache"]["hits"].is_u64());
+        assert!(json["cache"]["misses"].is_u64());
+        assert!(json["cache"]["coalesced_waits"].is_u64());
+        assert!(json["cache"]["fill_failures"].is_u64());
+        assert!(json["cache"]["stale_serves"].is_u64());
+        assert!(json["cache"]["fill_lock_acquires"].is_u64());
+        assert!(json["cache"]["fill_lock_contended"].is_u64());
     }
 
     #[tokio::test]

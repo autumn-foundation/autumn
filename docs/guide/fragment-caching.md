@@ -227,3 +227,5 @@ written against these helpers works identically with or without a cache.
 - [`#[cached]` and data caching](cloud-native.md) — cache query/function results
 - [Conditional GET and ETags](conditional-get.md) — skip the *network* path
 - [Version history](version-history.md) — per-record version tokens
+- [Cache Stampede Protection](cache-stampede.md) — coalesce concurrent misses
+  into a single fill
