@@ -179,7 +179,8 @@ const UNSUPPORTED_SSL_PARAMS: &[&str] = &[
 ];
 
 /// Drop [`UNSUPPORTED_SSL_PARAMS`] from `pairs`, and reject `sslmode=
-/// verify-ca`/`verify-full` outright rather than silently downgrading them.
+/// verify-ca`/`verify-full` (and `sslmode=require` combined with
+/// `sslrootcert`) outright rather than silently downgrading them.
 ///
 /// `tokio_postgres` only recognizes `sslmode=disable/prefer/require` — no
 /// `verify-ca`/`verify-full` — and [`tls_connector`] doesn't validate
@@ -189,9 +190,31 @@ const UNSUPPORTED_SSL_PARAMS: &[&str] = &[
 /// for identity verification — a worse security posture than the request,
 /// delivered silently. Failing loudly instead means an operator relying on
 /// verification finds out immediately rather than being quietly exposed.
+///
+/// `sslmode=require` combined with `sslrootcert` gets the same treatment for
+/// the same reason: `libpq` documents that `require` auto-upgrades to
+/// certificate verification when a root CA file is available (a
+/// backwards-compatibility quirk specific to `require` — `prefer`/`allow`
+/// never auto-upgrade even with a CA present), so silently dropping
+/// `sslrootcert` here — as [`UNSUPPORTED_SSL_PARAMS`] otherwise
+/// unconditionally does — would connect to any certificate exactly where an
+/// operator relying on that documented behavior expects verification.
 fn filter_ssl_params(
     pairs: impl Iterator<Item = (String, String)>,
 ) -> Result<Vec<(String, String)>, CommandError> {
+    let pairs: Vec<(String, String)> = pairs.collect();
+    if find_pair(&pairs, "sslmode") == Some("require") && find_pair(&pairs, "sslrootcert").is_some()
+    {
+        return Err(CommandError::Other(
+            "sslmode=require with sslrootcert is not supported: PostgreSQL treats this \
+             combination as requiring certificate verification against that CA file, but this \
+             native connection path doesn't implement CA-based verification. Use sslmode=require \
+             without sslrootcert to encrypt without verifying the server's certificate, or \
+             sslmode=disable to connect in plaintext."
+                .to_owned(),
+        ));
+    }
+
     let mut out = Vec::new();
     for (key, value) in pairs {
         if UNSUPPORTED_SSL_PARAMS.contains(&key.as_str()) {
@@ -1070,15 +1093,55 @@ mod tests {
 
     #[test]
     fn sanitize_drops_unsupported_ssl_params_from_url() {
+        // `sslmode=prefer` (not `require`) so this stays a plain "unsupported
+        // param dropped" case rather than tripping the separate
+        // require+sslrootcert rejection tested below.
         let sanitized = sanitize_db_url(
-            "postgres://user:pw@host/db?sslmode=require&sslrootcert=/etc/ca.pem&connect_timeout=5",
+            "postgres://user:pw@host/db?sslmode=prefer&sslrootcert=/etc/ca.pem&connect_timeout=5",
         )
         .unwrap();
         let parsed = url::Url::parse(&sanitized).unwrap();
         let pairs: std::collections::HashMap<_, _> = parsed.query_pairs().into_owned().collect();
-        assert_eq!(pairs.get("sslmode").map(String::as_str), Some("require"));
+        assert_eq!(pairs.get("sslmode").map(String::as_str), Some("prefer"));
         assert!(!pairs.contains_key("sslrootcert"));
         assert_eq!(pairs.get("connect_timeout").map(String::as_str), Some("5"));
+    }
+
+    #[test]
+    fn sanitize_rejects_require_with_sslrootcert_in_url_form() {
+        // Real libpq/psql treats `sslmode=require` combined with a root CA
+        // file as requiring certificate verification against that CA (a
+        // documented backwards-compatibility quirk specific to `require`).
+        // This native path doesn't implement CA verification, so silently
+        // dropping `sslrootcert` and connecting via `NoServerCertVerification`
+        // would be a real security downgrade from what an operator relying on
+        // that combination expects — it must fail loudly instead.
+        let err = sanitize_db_url("postgres://host/db?sslmode=require&sslrootcert=/etc/ca.pem")
+            .unwrap_err();
+        assert!(err.message().contains("sslrootcert"));
+        assert!(err.message().contains("require"));
+    }
+
+    #[test]
+    fn sanitize_rejects_require_with_sslrootcert_in_url_form_regardless_of_param_order() {
+        let err = sanitize_db_url("postgres://host/db?sslrootcert=/etc/ca.pem&sslmode=require")
+            .unwrap_err();
+        assert!(err.message().contains("sslrootcert"));
+    }
+
+    #[test]
+    fn sanitize_allows_prefer_with_sslrootcert_in_url_form() {
+        // The require+sslrootcert auto-upgrade quirk is specific to
+        // `require` — `prefer` (and `allow`) never auto-upgrade even with a
+        // CA file present, so this combination must still just drop the
+        // unsupported `sslrootcert` param rather than erroring.
+        let sanitized =
+            sanitize_db_url("postgres://host/db?sslmode=prefer&sslrootcert=/etc/ca.pem").unwrap();
+        let config: tokio_postgres::Config = sanitized.parse().unwrap();
+        assert_eq!(
+            config.get_ssl_mode(),
+            tokio_postgres::config::SslMode::Prefer
+        );
     }
 
     #[test]
@@ -1146,7 +1209,9 @@ mod tests {
     #[test]
     fn sanitize_drops_unsupported_ssl_params_from_keyword_form() {
         // See the comment on `sanitize_drops_all_ssl_cert_params_from_url`
-        // for why this scopes away PGPASSWORD/PGPASSFILE.
+        // for why this scopes away PGPASSWORD/PGPASSFILE. `sslmode=prefer`
+        // (not `require`) so this stays a plain "unsupported param dropped"
+        // case rather than tripping the require+sslrootcert rejection.
         temp_env::with_vars(
             [
                 ("PGPASSWORD", None::<&str>),
@@ -1154,7 +1219,7 @@ mod tests {
             ],
             || {
                 let sanitized = sanitize_db_url(
-                    "host=localhost dbname=mydb sslmode=require sslrootcert=/etc/ca.pem",
+                    "host=localhost dbname=mydb sslmode=prefer sslrootcert=/etc/ca.pem",
                 )
                 .unwrap();
                 // Verify against tokio_postgres's *actual* parser, not just our
@@ -1163,7 +1228,7 @@ mod tests {
                 assert_eq!(config.get_dbname(), Some("mydb"));
                 assert_eq!(
                     config.get_ssl_mode(),
-                    tokio_postgres::config::SslMode::Require
+                    tokio_postgres::config::SslMode::Prefer
                 );
             },
         );
@@ -1176,9 +1241,20 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_rejects_require_with_sslrootcert_in_keyword_form() {
+        let err =
+            sanitize_db_url("host=localhost dbname=mydb sslmode=require sslrootcert=/etc/ca.pem")
+                .unwrap_err();
+        assert!(err.message().contains("sslrootcert"));
+        assert!(err.message().contains("require"));
+    }
+
+    #[test]
     fn sanitize_handles_quoted_values_in_keyword_form() {
         // See the comment on `sanitize_drops_all_ssl_cert_params_from_url`
-        // for why this scopes away PGPASSWORD/PGPASSFILE.
+        // for why this scopes away PGPASSWORD/PGPASSFILE. `sslmode=prefer`
+        // (not `require`) for the same reason as
+        // `sanitize_drops_unsupported_ssl_params_from_keyword_form` above.
         temp_env::with_vars(
             [
                 ("PGPASSWORD", None::<&str>),
@@ -1186,7 +1262,7 @@ mod tests {
             ],
             || {
                 let sanitized = sanitize_db_url(
-                    "host=localhost dbname='my db' sslmode=require sslrootcert=/etc/ca.pem",
+                    "host=localhost dbname='my db' sslmode=prefer sslrootcert=/etc/ca.pem",
                 )
                 .unwrap();
                 let config: tokio_postgres::Config = sanitized.parse().unwrap();
@@ -1625,11 +1701,14 @@ mod tests {
         // A service group can carry the exact same libpq-only TLS params an
         // inline connection string can — they must go through the same
         // filter/rejection, not reach `tokio_postgres` unfiltered.
+        // `sslmode=prefer` (not `require`) so this stays a plain "unsupported
+        // param dropped" case rather than tripping the require+sslrootcert
+        // rejection tested separately below.
         let dir = tempfile::tempdir().unwrap();
         let service_path = dir.path().join("pg_service.conf");
         std::fs::write(
             &service_path,
-            "[prod]\ndbname=svcdb\nsslmode=require\nsslrootcert=/ca.pem\n",
+            "[prod]\ndbname=svcdb\nsslmode=prefer\nsslrootcert=/ca.pem\n",
         )
         .unwrap();
         temp_env::with_vars(
@@ -1648,8 +1727,30 @@ mod tests {
                 assert_eq!(config.get_dbname(), Some("db"));
                 assert_eq!(
                     config.get_ssl_mode(),
-                    tokio_postgres::config::SslMode::Require
+                    tokio_postgres::config::SslMode::Prefer
                 );
+            },
+        );
+    }
+
+    #[test]
+    fn sanitize_rejects_require_with_sslrootcert_from_a_service_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let service_path = dir.path().join("pg_service.conf");
+        std::fs::write(
+            &service_path,
+            "[prod]\ndbname=svcdb\nsslmode=require\nsslrootcert=/ca.pem\n",
+        )
+        .unwrap();
+        temp_env::with_vars(
+            [
+                ("PGSERVICEFILE", Some(service_path.to_str().unwrap())),
+                ("PGPASSWORD", None::<&str>),
+                ("PGPASSFILE", Some("/nonexistent-pgpass-for-test")),
+            ],
+            || {
+                let err = sanitize_db_url("postgres://host/db?service=prod").unwrap_err();
+                assert!(err.message().contains("sslrootcert"));
             },
         );
     }
