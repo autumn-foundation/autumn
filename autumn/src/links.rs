@@ -401,11 +401,12 @@ pub fn button_to(label: &str, href: &str, method: Method, csrf_token: &str) -> m
 /// (must start with an ASCII letter, followed by ASCII alphanumerics, `-`,
 /// `_`, or `:`), when it collides (case-insensitively) with an attribute
 /// this helper already sets via a named option, or when it is one of the
-/// `<button>` submit-override attributes (`formaction`, `formmethod`,
-/// `formenctype`, `formnovalidate`, `formtarget`) — those would silently
-/// change which URL/method/CSRF-field the no-JS form actually submits to,
-/// defeating the CSRF/method-override guarantee this helper exists to
-/// provide. Also panics when `method` is not `GET`, `POST`, `PUT`, `PATCH`,
+/// `<button>` form-owner/submit-override attributes (`form`, `formaction`,
+/// `formmethod`, `formenctype`, `formnovalidate`, `formtarget`) — those
+/// would silently detach the button from the generated form (`form`) or
+/// change which URL/method it submits to, defeating the CSRF/method-override
+/// guarantee this helper exists to provide. Also panics when `method` is
+/// not `GET`, `POST`, `PUT`, `PATCH`,
 /// or `DELETE`, since a `<form>` cannot represent any other HTTP method and
 /// [`crate::form::method_input`] has no override for it — submitting would
 /// silently hit a plain `POST` at the same URL instead of the declared
@@ -471,6 +472,7 @@ pub fn button_to_with(
     for (name, value) in options.attrs {
         let is_reserved = name.eq_ignore_ascii_case("type")
             || name.eq_ignore_ascii_case("class")
+            || name.eq_ignore_ascii_case("form")
             || name.eq_ignore_ascii_case("formaction")
             || name.eq_ignore_ascii_case("formmethod")
             || name.eq_ignore_ascii_case("formenctype")
@@ -824,6 +826,16 @@ mod tests {
         // action for a no-JS submission, redirecting the CSRF token and
         // _method override to a different URL.
         let options = ButtonToOptions::new().attrs(&[("formaction", "/evil")]);
+        let _ = button_to_with("x", "/x", Method::DELETE, "tok", &options);
+    }
+
+    #[test]
+    #[should_panic(expected = "attrs cannot override the built-in \"form\" attribute")]
+    fn button_to_attrs_cannot_override_form_panics() {
+        // Regression: <button form="other-id"> detaches the button from the
+        // generated <form>, submitting whatever form owns that id instead —
+        // without the helper's _method/CSRF hidden inputs.
+        let options = ButtonToOptions::new().attrs(&[("form", "other-form")]);
         let _ = button_to_with("x", "/x", Method::DELETE, "tok", &options);
     }
 
