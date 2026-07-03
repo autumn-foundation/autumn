@@ -2046,6 +2046,60 @@ fn generate_scaffold_unique_field_avoids_name_collision_with_coincidentally_name
 }
 
 #[test]
+fn generate_migration_add_unique_field_avoids_collision_with_earlier_migrations_column() {
+    // Regression guard (issue #1032 review follow-up): the create-table
+    // collision fix above only sees the fields in a single `generate`
+    // invocation. This reproduces the cross-migration case Codex flagged: a
+    // table already has a plain-indexed `email_unique` column from an
+    // earlier `generate scaffold`, and a *later*, separate `generate
+    // migration AddEmailToUsers email:String:unique` call must still avoid
+    // colliding with it -- `src/schema.rs` (kept in sync by the scaffold
+    // generator) is what lets the migration generator see across that gap.
+    let (_tmp, project) = fresh_project("unique-cross-migration-app");
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "User",
+            "email_unique:String",
+            "--index",
+            "email_unique",
+        ],
+    );
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "migration",
+            "AddEmailToUsers",
+            "email:String:unique",
+        ],
+    );
+
+    let migration = fs::read_dir(project.join("migrations"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .ends_with("_add_email_to_users")
+        })
+        .expect("add_email_to_users migration should exist");
+    let up = fs::read_to_string(migration.path().join("up.sql")).unwrap();
+    assert!(
+        !up.contains("CREATE UNIQUE INDEX idx_users_email_unique ON users (email);"),
+        "must not collide with the pre-existing email_unique column's plain \
+         index (created by the earlier `generate scaffold` call); got:\n{up}"
+    );
+    assert!(
+        up.contains("CREATE UNIQUE INDEX idx_users_email_unique_"),
+        "the unique index must still exist, under a disambiguated name; \
+         got:\n{up}"
+    );
+}
+
+#[test]
 fn generate_scaffold_unique_attachment_field_is_skipped_in_smoke_test() {
     // A unique constraint on an always-nullable attachment blob is a
     // degenerate case (Postgres allows unlimited NULLs under a unique

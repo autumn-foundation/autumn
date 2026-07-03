@@ -88,8 +88,16 @@ pub fn plan_migration_with_options(
             // anywhere the generator can see — a self-reference here is left
             // unvalidated rather than guessed at.
             super::model::check_reference_targets(&mut plan, project_root, &fields, table, None)?;
+            // `src/schema.rs`'s current content, so a `unique` field being
+            // added here can't pick an index name that coincidentally
+            // collides with a plain index on some other, already-existing
+            // column from an earlier migration this one has no other way to
+            // see (issue #1032 review follow-up). Empty string (no
+            // collision-check widening) if the file doesn't exist yet.
+            let existing_schema =
+                std::fs::read_to_string(project_root.join("src/schema.rs")).unwrap_or_default();
             (
-                add_columns_up_sql(table, &fields),
+                add_columns_up_sql(table, &fields, &existing_schema),
                 add_columns_down_sql(table, &fields),
             )
         }
@@ -100,9 +108,11 @@ pub fn plan_migration_with_options(
             // target with a UUID primary key still produces a `down.sql`
             // that fails to apply on rollback.
             super::model::check_reference_targets(&mut plan, project_root, &fields, table, None)?;
+            let existing_schema =
+                std::fs::read_to_string(project_root.join("src/schema.rs")).unwrap_or_default();
             (
                 remove_columns_up_sql(table, &fields),
-                remove_columns_down_sql(table, &fields),
+                remove_columns_down_sql(table, &fields, &existing_schema),
             )
         }
         MigrationShape::EncryptColumns {

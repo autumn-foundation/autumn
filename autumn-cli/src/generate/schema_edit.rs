@@ -12,7 +12,7 @@ use std::fmt::Write as _;
 
 use sha2::{Digest, Sha256};
 
-use super::dsl::{Field, IdType};
+use super::dsl::{Field, FieldKind, IdType};
 
 /// Append a `pub mod <name>;` line to a `mod.rs` file, returning the new
 /// contents. Idempotent: a second call with the same name is a no-op.
@@ -91,6 +91,37 @@ fn has_table(existing: &str, table: &str) -> bool {
 #[must_use]
 pub fn schema_has_table(schema: &str, table: &str) -> bool {
     has_table(schema, table)
+}
+
+/// The column names already declared for `table` in `schema` (`src/schema.rs`
+/// as [`append_schema_table`] shapes it), or an empty `Vec` if `table` isn't
+/// declared there at all.
+///
+/// Used by [`add_columns_up_sql`]/[`remove_columns_down_sql`] (issue #1032
+/// review follow-up) to extend their unique-index collision check beyond the
+/// columns being added/removed in the current `AddXToY`/`RemoveXFromY`
+/// migration: a plain index on some *other*, already-existing column named
+/// `<field>_unique` would otherwise collide with a newly-added `unique`
+/// field's own index name with no way for `unique_index_name` to see it,
+/// since it only ever receives the fields touched by one `generate`
+/// invocation. This generator has no DB introspection, so `schema.rs` (which
+/// every model/scaffold generator keeps in sync with the migrations it
+/// writes) is the closest thing to a durable record of a table's existing
+/// columns across separate `generate` invocations — only as reliable as
+/// `schema.rs` staying in sync with the real database, the same assumption
+/// every other generator here already makes of it.
+fn existing_schema_columns(schema: &str, table: &str) -> Vec<String> {
+    let needle = format!("{table} (");
+    let Some(start) = schema.lines().position(|l| l.trim().starts_with(&needle)) else {
+        return Vec::new();
+    };
+    schema
+        .lines()
+        .skip(start + 1)
+        .take_while(|l| !l.trim().starts_with('}'))
+        .filter_map(|l| l.trim().trim_end_matches(',').split_once(" -> "))
+        .map(|(name, _)| name.to_owned())
+        .collect()
 }
 
 /// Build the full SQL for `up.sql` of a `CREATE TABLE` migration with optional
@@ -358,13 +389,45 @@ fn split_on_keyword(s: &str, keyword: &str) -> Option<(String, String)> {
     None
 }
 
+/// `fields`, extended with a placeholder [`Field`] per column `table`
+/// already declares in `existing_schema` (see [`existing_schema_columns`])
+/// that isn't already in `fields`. Only `name` is meaningful on the
+/// placeholders — [`unique_index_name`]'s collision check is the only thing
+/// that consumes this combined list, and it only ever looks at `.name`.
+fn fields_with_existing_schema_columns(
+    fields: &[Field],
+    existing_schema: &str,
+    table: &str,
+) -> Vec<Field> {
+    let mut combined = fields.to_vec();
+    for name in existing_schema_columns(existing_schema, table) {
+        if !combined.iter().any(|f| f.name == name) {
+            combined.push(Field {
+                name,
+                kind: FieldKind::String,
+                nullable: false,
+                variants: Vec::new(),
+                unique: false,
+            });
+        }
+    }
+    combined
+}
+
 /// SQL for adding columns to a table.
 ///
 /// Prepends an `autumn-safety` comment for `NOT NULL` columns that have no
 /// `DEFAULT` — those require a backfill or a default before the constraint can
 /// be added safely on a live table.
+///
+/// `existing_schema` is `src/schema.rs`'s current content (or `""` if
+/// unavailable) — passed through to [`fields_with_existing_schema_columns`]
+/// so a `unique` field's index name can't collide with a plain index on some
+/// other, already-existing column from an earlier migration (issue #1032
+/// review follow-up).
 #[must_use]
-pub fn add_columns_up_sql(table: &str, fields: &[Field]) -> String {
+pub fn add_columns_up_sql(table: &str, fields: &[Field], existing_schema: &str) -> String {
+    let collision_fields = fields_with_existing_schema_columns(fields, existing_schema, table);
     let mut out = String::new();
     for f in fields {
         if !f.nullable {
@@ -407,7 +470,7 @@ pub fn add_columns_up_sql(table: &str, fields: &[Field]) -> String {
             // Postgres auto-drops this index when the column is dropped,
             // same as the `references` auto-index above, so
             // `add_columns_down_sql` needs no change.
-            out.push_str(&unique_index_sql(table, &f.name, fields));
+            out.push_str(&unique_index_sql(table, &f.name, &collision_fields));
         }
     }
     out
@@ -607,8 +670,12 @@ pub fn remove_columns_up_sql(table: &str, fields: &[Field]) -> String {
 /// field's `CHECK` constraint (issue #1030), and a `unique` field's `CREATE
 /// UNIQUE INDEX` (issue #1032) — otherwise the closed set / uniqueness
 /// constraint would silently stop being enforced after a rollback.
+///
+/// `existing_schema` is `src/schema.rs`'s current content (or `""` if
+/// unavailable) — see [`add_columns_up_sql`]'s matching doc comment for why.
 #[must_use]
-pub fn remove_columns_down_sql(table: &str, fields: &[Field]) -> String {
+pub fn remove_columns_down_sql(table: &str, fields: &[Field], existing_schema: &str) -> String {
+    let collision_fields = fields_with_existing_schema_columns(fields, existing_schema, table);
     let mut out = String::new();
     for f in fields.iter().rev() {
         let _ = write!(
@@ -637,7 +704,7 @@ pub fn remove_columns_down_sql(table: &str, fields: &[Field]) -> String {
             );
         }
         if f.unique {
-            out.push_str(&unique_index_sql(table, &f.name, fields));
+            out.push_str(&unique_index_sql(table, &f.name, &collision_fields));
         }
     }
     out
@@ -3419,7 +3486,7 @@ mod tests {
 
     #[test]
     fn add_columns_up_sql_emits_unique_index() {
-        let sql = add_columns_up_sql("users", &fields(&["email:String:unique"]));
+        let sql = add_columns_up_sql("users", &fields(&["email:String:unique"]), "");
         assert!(
             sql.contains("ALTER TABLE users ADD COLUMN email TEXT NOT NULL;"),
             "got:\n{sql}"
@@ -3432,7 +3499,7 @@ mod tests {
 
     #[test]
     fn remove_columns_down_sql_restores_unique_index_for_unique_field() {
-        let sql = remove_columns_down_sql("users", &fields(&["email:String:unique"]));
+        let sql = remove_columns_down_sql("users", &fields(&["email:String:unique"]), "");
         assert!(
             sql.contains("ALTER TABLE users ADD COLUMN email TEXT NOT NULL"),
             "got:\n{sql}"
@@ -3454,7 +3521,7 @@ mod tests {
         // fully redundant since the unique index already covers the same
         // lookup. `create_table_sql_with_metadata_and_id` already dedupes
         // this for `CREATE TABLE`; `AddXToY` must match.
-        let sql = add_columns_up_sql("posts", &fields(&["author:references:unique"]));
+        let sql = add_columns_up_sql("posts", &fields(&["author:references:unique"]), "");
         assert!(
             sql.contains("CREATE UNIQUE INDEX idx_posts_author_id_unique ON posts (author_id);"),
             "got:\n{sql}"
@@ -3470,7 +3537,7 @@ mod tests {
     fn remove_columns_down_sql_unique_reference_skips_redundant_plain_index() {
         // `RemoveXFromY`'s rollback must restore the same shape `AddXToY`
         // would have created, not the redundant pre-fix pair.
-        let sql = remove_columns_down_sql("posts", &fields(&["author:references:unique"]));
+        let sql = remove_columns_down_sql("posts", &fields(&["author:references:unique"]), "");
         assert!(
             sql.contains("CREATE UNIQUE INDEX idx_posts_author_id_unique ON posts (author_id);"),
             "got:\n{sql}"
@@ -3615,8 +3682,71 @@ mod tests {
     }
 
     #[test]
+    fn existing_schema_columns_parses_declared_column_names() {
+        let schema = append_schema_table("", "users", &fields(&["email_unique:String"]));
+        let columns = existing_schema_columns(&schema, "users");
+        assert!(
+            columns.contains(&"email_unique".to_owned()),
+            "got: {columns:?}"
+        );
+        assert!(columns.contains(&"id".to_owned()), "got: {columns:?}");
+        assert!(
+            columns.contains(&"created_at".to_owned()),
+            "got: {columns:?}"
+        );
+    }
+
+    #[test]
+    fn existing_schema_columns_empty_for_unknown_table() {
+        let schema = append_schema_table("", "users", &fields(&["email:String"]));
+        assert!(existing_schema_columns(&schema, "posts").is_empty());
+    }
+
+    #[test]
+    fn add_columns_up_sql_avoids_name_collision_with_earlier_migrations_columns() {
+        // Regression guard (issue #1032 review follow-up): `add_columns_up_sql`
+        // only ever sees the columns being added in *this* `AddXToY`
+        // migration -- not a table's other, already-existing columns from an
+        // earlier, separately-run migration. A field named `email_unique`
+        // added back when the table was first created would otherwise still
+        // collide with a `unique` field named `email` added later, with no
+        // way for this call alone to know `email_unique` already exists.
+        // `src/schema.rs` (kept in sync by every model/scaffold generator) is
+        // what lets this call see across that gap.
+        let existing_schema = append_schema_table("", "users", &fields(&["email_unique:String"]));
+        let sql = add_columns_up_sql("users", &fields(&["email:String:unique"]), &existing_schema);
+        assert!(
+            !sql.contains("CREATE UNIQUE INDEX idx_users_email_unique ON users (email);"),
+            "must not collide with the pre-existing email_unique column's \
+             plain index name; got:\n{sql}"
+        );
+        assert!(
+            sql.contains("CREATE UNIQUE INDEX idx_users_email_unique_"),
+            "the unique index must still exist, under a disambiguated name; \
+             got:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn remove_columns_down_sql_avoids_name_collision_with_earlier_migrations_columns() {
+        // `RemoveXFromY`'s rollback must avoid the same coincidental
+        // collision `add_columns_up_sql` avoids above.
+        let existing_schema = append_schema_table("", "users", &fields(&["email_unique:String"]));
+        let sql =
+            remove_columns_down_sql("users", &fields(&["email:String:unique"]), &existing_schema);
+        assert!(
+            !sql.contains("CREATE UNIQUE INDEX idx_users_email_unique ON users (email);"),
+            "got:\n{sql}"
+        );
+        assert!(
+            sql.contains("CREATE UNIQUE INDEX idx_users_email_unique_"),
+            "got:\n{sql}"
+        );
+    }
+
+    #[test]
     fn add_columns_up_sql_emits_fk_constraint_and_index() {
-        let sql = add_columns_up_sql("comments", &fields(&["post:references"]));
+        let sql = add_columns_up_sql("comments", &fields(&["post:references"]), "");
         assert!(
             sql.contains(
                 "ALTER TABLE comments ADD COLUMN post_id BIGINT NOT NULL REFERENCES posts(id);"
@@ -3702,7 +3832,7 @@ mod tests {
     #[test]
     fn add_columns_up_sql_emits_alter_per_field() {
         let f = fields(&["title:String", "count:i32"]);
-        let sql = add_columns_up_sql("posts", &f);
+        let sql = add_columns_up_sql("posts", &f, "");
         assert!(sql.contains("ALTER TABLE posts ADD COLUMN title TEXT NOT NULL;"));
         assert!(sql.contains("ALTER TABLE posts ADD COLUMN count INTEGER NOT NULL;"));
     }
@@ -3710,7 +3840,7 @@ mod tests {
     #[test]
     fn add_columns_up_sql_includes_safety_comment_for_not_null() {
         let f = fields(&["title:String"]);
-        let sql = add_columns_up_sql("posts", &f);
+        let sql = add_columns_up_sql("posts", &f, "");
         assert!(
             sql.contains("autumn-safety: potentially-blocking"),
             "NOT NULL column must carry a safety comment; got:\n{sql}"
@@ -3720,7 +3850,7 @@ mod tests {
     #[test]
     fn add_columns_up_sql_no_safety_comment_for_nullable() {
         let f = fields(&["subtitle:Option<String>"]);
-        let sql = add_columns_up_sql("posts", &f);
+        let sql = add_columns_up_sql("posts", &f, "");
         assert!(
             !sql.contains("autumn-safety"),
             "nullable column must NOT carry a safety comment; got:\n{sql}"
@@ -3745,7 +3875,7 @@ mod tests {
         // otherwise the relationship and its lookup index silently vanish
         // on rollback (issue #1026).
         let f = fields(&["post:references"]);
-        let sql = remove_columns_down_sql("comments", &f);
+        let sql = remove_columns_down_sql("comments", &f, "");
         assert!(
             sql.contains(
                 "ALTER TABLE comments ADD COLUMN post_id BIGINT NOT NULL REFERENCES posts(id);"
@@ -3823,7 +3953,7 @@ mod tests {
     #[test]
     fn add_columns_emits_check_constraint_for_enum() {
         let f = fields(&["status:enum{draft,published,archived}"]);
-        let sql = add_columns_up_sql("posts", &f);
+        let sql = add_columns_up_sql("posts", &f, "");
         assert!(
             sql.contains(
                 "ALTER TABLE posts ADD COLUMN status TEXT NOT NULL CHECK (status IN ('draft', 'published', 'archived'));"
@@ -3858,7 +3988,7 @@ mod tests {
         // not just a bare TEXT column — otherwise the closed set silently
         // stops being enforced after a rollback.
         let f = fields(&["status:enum{draft,published,archived}"]);
-        let sql = remove_columns_down_sql("posts", &f);
+        let sql = remove_columns_down_sql("posts", &f, "");
         assert!(
             sql.contains(
                 "ALTER TABLE posts ADD COLUMN status TEXT NOT NULL CHECK (status IN ('draft', 'published', 'archived'));"
