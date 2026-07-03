@@ -535,6 +535,24 @@ fn fill_in_libpq_ssl_env_defaults(pairs: &mut Vec<(String, String)>) {
     {
         pairs.push(("sslrootcert".to_owned(), pgsslrootcert));
     }
+    // `sslcert`/`sslkey` themselves aren't implemented (see
+    // `filter_ssl_params`), but PostgreSQL documents `PGSSLCERT`/`PGSSLKEY`
+    // as behaving exactly like those inline parameters — an operator relying
+    // on client-certificate auth configured only through the environment
+    // deserves the same clear rejection as one who wrote `sslcert=` inline,
+    // not a silent connection attempt under `with_no_client_auth()`. Pulling
+    // these into `pairs` here (rather than a separate check) means the one
+    // rejection in `filter_ssl_params` covers every source uniformly.
+    if find_pair(pairs, "sslcert").is_none()
+        && let Ok(pgsslcert) = std::env::var("PGSSLCERT")
+    {
+        pairs.push(("sslcert".to_owned(), pgsslcert));
+    }
+    if find_pair(pairs, "sslkey").is_none()
+        && let Ok(pgsslkey) = std::env::var("PGSSLKEY")
+    {
+        pairs.push(("sslkey".to_owned(), pgsslkey));
+    }
 }
 
 /// Return the value of the first `(key, value)` pair matching `key`, if any.
@@ -1735,6 +1753,64 @@ mod tests {
             ],
             || {
                 let err = sanitize_db_url("postgres://host/db?service=prod").unwrap_err();
+                assert!(err.message().contains("sslcert"));
+            },
+        );
+    }
+
+    #[test]
+    fn sanitize_rejects_pgsslcert_env_var_in_url_form() {
+        // PostgreSQL documents PGSSLCERT/PGSSLKEY as behaving like
+        // sslcert/sslkey when supplied via the environment rather than
+        // inline or in a service file — they need the same rejection as
+        // `sanitize_rejects_sslcert_in_url_form_instead_of_silently_dropping`,
+        // not a silent no-op that leaves `tls_connector`'s
+        // `with_no_client_auth()` config in place.
+        temp_env::with_vars(
+            [
+                ("PGSSLMODE", None::<&str>),
+                ("PGSSLROOTCERT", None::<&str>),
+                ("PGSSLCERT", Some("/c.pem")),
+                ("PGSSLKEY", Some("/k.pem")),
+            ],
+            || {
+                let err = sanitize_db_url("postgres://host/db").unwrap_err();
+                assert!(err.message().contains("sslcert"));
+            },
+        );
+    }
+
+    #[test]
+    fn sanitize_rejects_pgsslkey_env_var_in_keyword_form() {
+        temp_env::with_vars(
+            [
+                ("PGSSLMODE", None::<&str>),
+                ("PGSSLROOTCERT", None::<&str>),
+                ("PGSSLCERT", None::<&str>),
+                ("PGSSLKEY", Some("/k.pem")),
+            ],
+            || {
+                let err = sanitize_db_url("host=host dbname=db").unwrap_err();
+                assert!(err.message().contains("sslkey"));
+            },
+        );
+    }
+
+    #[test]
+    fn sanitize_does_not_override_explicit_sslcert_rejection_message_source() {
+        // An inline sslcert= still triggers the same rejection when
+        // PGSSLCERT is *also* set — this just confirms the env fallback
+        // doesn't need to fire (and doesn't crash / double-push) when the
+        // parameter is already explicit.
+        temp_env::with_vars(
+            [
+                ("PGSSLMODE", None::<&str>),
+                ("PGSSLROOTCERT", None::<&str>),
+                ("PGSSLCERT", Some("/from-env.pem")),
+                ("PGSSLKEY", None::<&str>),
+            ],
+            || {
+                let err = sanitize_db_url("postgres://host/db?sslcert=/inline.pem").unwrap_err();
                 assert!(err.message().contains("sslcert"));
             },
         );
