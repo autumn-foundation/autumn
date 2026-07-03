@@ -5,8 +5,10 @@
 
 #![allow(dead_code)]
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
+
+use tempfile::TempDir;
 
 /// A distinctive password so tests can assert it never leaks into output.
 pub const SECRET_PW: &str = "s3cr3t_pw_do_not_leak";
@@ -19,8 +21,12 @@ pub const fn autumn_bin() -> &'static str {
 /// "program not found" instead of accidentally finding the system psql.
 /// This is the Windows-parity check available on this (Linux) CI host: the
 /// old psql-shelling implementation cannot function under this PATH.
-pub fn psql_free_path() -> PathBuf {
-    tempfile::tempdir().unwrap().keep()
+///
+/// Returns the `TempDir` guard itself (not just its path) so the caller
+/// keeps it alive only for as long as it's needed — dropping it cleans the
+/// directory up normally, rather than leaking it via `TempDir::keep()`.
+fn psql_free_path() -> TempDir {
+    tempfile::tempdir().unwrap()
 }
 
 /// Run the autumn binary with `args` and env overrides, with `PATH` pointed
@@ -34,10 +40,12 @@ pub fn run_autumn(
     let output = Command::new(autumn_bin())
         .args(args)
         .current_dir(dir)
-        .env("PATH", &empty_path)
+        .env("PATH", empty_path.path())
         .envs(envs.iter().copied())
         .output()
         .expect("failed to run autumn");
+    // `empty_path` is dropped here, after the subprocess has already
+    // exited, cleaning up the directory instead of leaking it.
     (
         String::from_utf8_lossy(&output.stdout).into_owned(),
         String::from_utf8_lossy(&output.stderr).into_owned(),
@@ -123,4 +131,28 @@ pub async fn query_one_text(
     });
     let rows = client.query(sql, params).await.expect("query failed");
     rows.first().map(|r| r.get::<_, String>(0))
+}
+
+/// Run a single parameterized statement (unlike `apply_sql`'s
+/// `batch_execute`, which only takes a bare SQL string with no bound
+/// parameters — fine for fixed DDL, but the wrong tool for inserting
+/// caller-supplied values, which must go through `$n` binding rather than
+/// string interpolation).
+pub async fn execute_params(
+    url: &str,
+    sql: &str,
+    params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
+) {
+    let (client, connection) = tokio_postgres::connect(url, tokio_postgres::NoTls)
+        .await
+        .expect("failed to connect to test Postgres database");
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("test fixture connection error: {e}");
+        }
+    });
+    client
+        .execute(sql, params)
+        .await
+        .unwrap_or_else(|e| panic!("failed to execute fixture SQL: {e}\nSQL: {sql}"));
 }

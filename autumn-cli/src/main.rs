@@ -36,6 +36,7 @@ mod setup;
 mod shard;
 mod starters;
 mod task;
+mod text_width;
 mod token;
 mod webhook;
 /// Subcommands for `autumn check`.

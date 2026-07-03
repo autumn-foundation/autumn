@@ -16,7 +16,8 @@
 //! autumn flags allow <key> <actor_id>     # add actor_id to the explicit allowlist
 //! ```
 
-use crate::pg;
+use crate::pg::{self, ResultExt as _};
+use tokio_postgres::types::ToSql;
 
 // ── Options ───────────────────────────────────────────────────────────────────
 
@@ -102,45 +103,38 @@ const FLAG_AUDIT_SQL: &str =
 /// Run `autumn flags list`.
 pub fn run_list(_opts: &ListOptions) {
     let db_url = resolve_database_url();
-    pg::block_on(async {
-        let client = pg::connect_or_die("flags list", &db_url).await;
-        let rows = client
-            .query(LIST_SQL, &[])
-            .await
-            .unwrap_or_else(|e| pg::die("flags list", e));
-        pg::print_table(
-            &[
-                "key",
-                "enabled",
-                "rollout",
-                "actor_allowlist",
-                "group_allowlist",
-                "updated_at",
-            ],
-            &rows.iter().map(pg::row_to_strings).collect::<Vec<_>>(),
-        );
+    let rows = pg::block_on_or_die("flags list", async {
+        let client = pg::connect("flags list", &db_url).await?;
+        client.query(LIST_SQL, &[]).await.pg()
     });
+    pg::print_table(
+        &[
+            "key",
+            "enabled",
+            "rollout",
+            "actor_allowlist",
+            "group_allowlist",
+            "updated_at",
+        ],
+        &rows.iter().map(pg::row_to_strings).collect::<Vec<_>>(),
+    );
 }
 
 /// Run `autumn flags enable <key>`.
 pub fn run_enable(opts: &EnableOptions) {
     let db_url = resolve_database_url();
     let actor = opts.actor.as_deref().unwrap_or("cli");
-    pg::block_on(async {
-        let mut client = pg::connect_or_die("flags enable", &db_url).await;
-        let txn = client
-            .transaction()
-            .await
-            .unwrap_or_else(|e| pg::die("flags enable", e));
-        txn.execute(ENABLE_SQL, &[&opts.key])
-            .await
-            .unwrap_or_else(|e| pg::die("flags enable", e));
-        txn.execute(FLAG_AUDIT_SQL, &[&opts.key, &"enabled", &actor])
-            .await
-            .unwrap_or_else(|e| pg::die("flags enable", e));
-        txn.commit()
-            .await
-            .unwrap_or_else(|e| pg::die("flags enable", e));
+    pg::block_on_or_die("flags enable", async {
+        let mut client = pg::connect("flags enable", &db_url).await?;
+        pg::execute_with_audit(
+            &mut client,
+            ENABLE_SQL,
+            &[&opts.key],
+            None,
+            FLAG_AUDIT_SQL,
+            &[&opts.key, &"enabled", &actor],
+        )
+        .await
     });
     println!("✓ Flag '{}' enabled globally.", opts.key);
 }
@@ -149,21 +143,17 @@ pub fn run_enable(opts: &EnableOptions) {
 pub fn run_disable(opts: &DisableOptions) {
     let db_url = resolve_database_url();
     let actor = opts.actor.as_deref().unwrap_or("cli");
-    pg::block_on(async {
-        let mut client = pg::connect_or_die("flags disable", &db_url).await;
-        let txn = client
-            .transaction()
-            .await
-            .unwrap_or_else(|e| pg::die("flags disable", e));
-        txn.execute(DISABLE_SQL, &[&opts.key])
-            .await
-            .unwrap_or_else(|e| pg::die("flags disable", e));
-        txn.execute(FLAG_AUDIT_SQL, &[&opts.key, &"disabled", &actor])
-            .await
-            .unwrap_or_else(|e| pg::die("flags disable", e));
-        txn.commit()
-            .await
-            .unwrap_or_else(|e| pg::die("flags disable", e));
+    pg::block_on_or_die("flags disable", async {
+        let mut client = pg::connect("flags disable", &db_url).await?;
+        pg::execute_with_audit(
+            &mut client,
+            DISABLE_SQL,
+            &[&opts.key],
+            None,
+            FLAG_AUDIT_SQL,
+            &[&opts.key, &"disabled", &actor],
+        )
+        .await
     });
     println!("✓ Flag '{}' disabled globally.", opts.key);
 }
@@ -174,21 +164,17 @@ pub fn run_set_rollout(opts: &SetRolloutOptions) {
     let actor = opts.actor.as_deref().unwrap_or("cli");
     let pct = i16::from(opts.pct);
     let mutation = format!("rollout={}", opts.pct);
-    pg::block_on(async {
-        let mut client = pg::connect_or_die("flags set-rollout", &db_url).await;
-        let txn = client
-            .transaction()
-            .await
-            .unwrap_or_else(|e| pg::die("flags set-rollout", e));
-        txn.execute(SET_ROLLOUT_SQL, &[&opts.key, &pct])
-            .await
-            .unwrap_or_else(|e| pg::die("flags set-rollout", e));
-        txn.execute(FLAG_AUDIT_SQL, &[&opts.key, &mutation, &actor])
-            .await
-            .unwrap_or_else(|e| pg::die("flags set-rollout", e));
-        txn.commit()
-            .await
-            .unwrap_or_else(|e| pg::die("flags set-rollout", e));
+    pg::block_on_or_die("flags set-rollout", async {
+        let mut client = pg::connect("flags set-rollout", &db_url).await?;
+        pg::execute_with_audit(
+            &mut client,
+            SET_ROLLOUT_SQL,
+            &[&opts.key, &pct],
+            None,
+            FLAG_AUDIT_SQL,
+            &[&opts.key, &mutation, &actor],
+        )
+        .await
     });
     println!("✓ Flag '{}' rollout set to {}%.", opts.key, opts.pct);
 }
@@ -198,24 +184,21 @@ pub fn run_allow(opts: &AllowOptions) {
     let db_url = resolve_database_url();
     let actor = opts.actor.as_deref().unwrap_or("cli");
     let mutation = format!("allowed_actor={}", opts.actor_id);
-    pg::block_on(async {
-        let mut client = pg::connect_or_die("flags allow", &db_url).await;
-        let txn = client
-            .transaction()
-            .await
-            .unwrap_or_else(|e| pg::die("flags allow", e));
-        txn.execute(ALLOW_UPSERT_SQL, &[&opts.key])
-            .await
-            .unwrap_or_else(|e| pg::die("flags allow", e));
-        txn.execute(ALLOW_UPDATE_SQL, &[&opts.actor_id, &opts.key])
-            .await
-            .unwrap_or_else(|e| pg::die("flags allow", e));
-        txn.execute(FLAG_AUDIT_SQL, &[&opts.key, &mutation, &actor])
-            .await
-            .unwrap_or_else(|e| pg::die("flags allow", e));
-        txn.commit()
-            .await
-            .unwrap_or_else(|e| pg::die("flags allow", e));
+    pg::block_on_or_die("flags allow", async {
+        let mut client = pg::connect("flags allow", &db_url).await?;
+        let upsert_params: &[&(dyn ToSql + Sync)] = &[&opts.key];
+        let update_params: &[&(dyn ToSql + Sync)] = &[&opts.actor_id, &opts.key];
+        pg::execute_many_with_audit(
+            &mut client,
+            &[
+                (ALLOW_UPSERT_SQL, upsert_params),
+                (ALLOW_UPDATE_SQL, update_params),
+            ],
+            None,
+            FLAG_AUDIT_SQL,
+            &[&opts.key, &mutation, &actor],
+        )
+        .await
     });
     println!(
         "✓ Actor '{}' added to allowlist for flag '{}'.",

@@ -17,7 +17,7 @@
 
 use autumn_web::config::{AutumnConfig, Env, OsEnv};
 
-use crate::pg;
+use crate::pg::{self, ResultExt as _};
 
 /// Options for `autumn config list`.
 pub struct ListOptions;
@@ -89,69 +89,57 @@ const CONFIG_HISTORY_SQL: &str = "SELECT id::text, key, old_value, new_value, ac
 /// Run `autumn config list`.
 pub fn run_list(_opts: &ListOptions) {
     let url = resolve_database_url();
-    pg::block_on(async {
-        let client = pg::connect_or_die("config list", &url).await;
-        let rows = client
-            .query(LIST_SQL, &[])
-            .await
-            .unwrap_or_else(|e| pg::die("config list", e));
-        pg::print_table(
-            &["key", "raw_value", "updated_at"],
-            &rows.iter().map(pg::row_to_strings).collect::<Vec<_>>(),
-        );
+    let rows = pg::block_on_or_die("config list", async {
+        let client = pg::connect("config list", &url).await?;
+        client.query(LIST_SQL, &[]).await.pg()
     });
+    pg::print_table(
+        &["key", "raw_value", "updated_at"],
+        &rows.iter().map(pg::row_to_strings).collect::<Vec<_>>(),
+    );
 }
 
 /// Run `autumn config get <key>`.
 pub fn run_get(opts: &GetOptions) {
     let url = resolve_database_url();
-    pg::block_on(async {
-        let client = pg::connect_or_die("config get", &url).await;
-        let rows = client
-            .query(GET_SQL, &[&opts.key])
-            .await
-            .unwrap_or_else(|e| pg::die("config get", e));
-        if rows.is_empty() {
-            eprintln!("\u{2717} Key '{}' has no active override.", opts.key);
-            std::process::exit(1);
-        }
-        pg::print_table(
-            &["key", "raw_value", "updated_at"],
-            &rows.iter().map(pg::row_to_strings).collect::<Vec<_>>(),
-        );
+    let rows = pg::block_on_or_die("config get", async {
+        let client = pg::connect("config get", &url).await?;
+        client.query(GET_SQL, &[&opts.key]).await.pg()
     });
+    if rows.is_empty() {
+        eprintln!("\u{2717} Key '{}' has no active override.", opts.key);
+        std::process::exit(1);
+    }
+    pg::print_table(
+        &["key", "raw_value", "updated_at"],
+        &rows.iter().map(pg::row_to_strings).collect::<Vec<_>>(),
+    );
 }
 
 /// Run `autumn config set <key> <value>`.
 pub fn run_set(opts: &SetOptions) {
     let url = resolve_database_url();
     let actor = opts.actor.as_deref().unwrap_or("cli");
-    pg::block_on(async {
-        let mut client = pg::connect_or_die("config set", &url).await;
-        let txn = client
-            .transaction()
-            .await
-            .unwrap_or_else(|e| pg::die("config set", e));
-        txn.execute(CONFIG_LOCK_SQL, &[&opts.key])
-            .await
-            .unwrap_or_else(|e| pg::die("config set", e));
-        let prior_rows = txn
-            .query(CONFIG_GET_PRIOR_SQL, &[&opts.key])
-            .await
-            .unwrap_or_else(|e| pg::die("config set", e));
+    pg::block_on_or_die("config set", async {
+        let mut client = pg::connect("config set", &url).await?;
+        let txn = client.transaction().await.pg()?;
+        // Acquire the per-key advisory lock before reading the prior value
+        // so concurrent writers on a brand-new key are serialised: T2 blocks
+        // here until T1 commits, and the next statement then sees T1's
+        // committed row under READ COMMITTED's per-statement snapshot.
+        txn.execute(CONFIG_LOCK_SQL, &[&opts.key]).await.pg()?;
+        let prior_rows = txn.query(CONFIG_GET_PRIOR_SQL, &[&opts.key]).await.pg()?;
         let old_value: Option<String> = prior_rows.first().map(|r| r.get::<_, String>(0));
         txn.execute(CONFIG_UPSERT_SQL, &[&opts.key, &opts.value])
             .await
-            .unwrap_or_else(|e| pg::die("config set", e));
+            .pg()?;
         txn.execute(
             CONFIG_SET_AUDIT_SQL,
             &[&opts.key, &old_value, &opts.value, &actor],
         )
         .await
-        .unwrap_or_else(|e| pg::die("config set", e));
-        txn.commit()
-            .await
-            .unwrap_or_else(|e| pg::die("config set", e));
+        .pg()?;
+        txn.commit().await.pg()
     });
 
     eprintln!(
@@ -165,28 +153,24 @@ pub fn run_set(opts: &SetOptions) {
 pub fn run_unset(opts: &UnsetOptions) {
     let url = resolve_database_url();
     let actor = opts.actor.as_deref().unwrap_or("cli");
-    pg::block_on(async {
-        let mut client = pg::connect_or_die("config unset", &url).await;
-        let txn = client
-            .transaction()
-            .await
-            .unwrap_or_else(|e| pg::die("config unset", e));
-        txn.execute(CONFIG_LOCK_SQL, &[&opts.key])
-            .await
-            .unwrap_or_else(|e| pg::die("config unset", e));
+    pg::block_on_or_die("config unset", async {
+        let mut client = pg::connect("config unset", &url).await?;
+        let txn = client.transaction().await.pg()?;
+        // Same per-key advisory lock as `set`, taken before the DELETE
+        // RETURNING captures old_value, keeping set/unset audit history
+        // ordered under concurrent writes.
+        txn.execute(CONFIG_LOCK_SQL, &[&opts.key]).await.pg()?;
         let removed = txn
             .query(CONFIG_UNSET_DELETE_SQL, &[&opts.key])
             .await
-            .unwrap_or_else(|e| pg::die("config unset", e));
+            .pg()?;
         if let Some(row) = removed.first() {
             let old_value: String = row.get(0);
             txn.execute(CONFIG_UNSET_AUDIT_SQL, &[&opts.key, &old_value, &actor])
                 .await
-                .unwrap_or_else(|e| pg::die("config unset", e));
+                .pg()?;
         }
-        txn.commit()
-            .await
-            .unwrap_or_else(|e| pg::die("config unset", e));
+        txn.commit().await.pg()
     });
     eprintln!(
         "\u{2713} Unset '{key}' (reverted to compile-time default)",
@@ -198,17 +182,17 @@ pub fn run_unset(opts: &UnsetOptions) {
 pub fn run_history(opts: &HistoryOptions) {
     let url = resolve_database_url();
     let limit = i64::try_from(opts.limit).unwrap_or(i64::MAX);
-    pg::block_on(async {
-        let client = pg::connect_or_die("config history", &url).await;
-        let rows = client
+    let rows = pg::block_on_or_die("config history", async {
+        let client = pg::connect("config history", &url).await?;
+        client
             .query(CONFIG_HISTORY_SQL, &[&opts.key, &limit])
             .await
-            .unwrap_or_else(|e| pg::die("config history", e));
-        pg::print_table(
-            &["id", "key", "old_value", "new_value", "actor", "changed_at"],
-            &rows.iter().map(pg::row_to_strings).collect::<Vec<_>>(),
-        );
+            .pg()
     });
+    pg::print_table(
+        &["id", "key", "old_value", "new_value", "actor", "changed_at"],
+        &rows.iter().map(pg::row_to_strings).collect::<Vec<_>>(),
+    );
 }
 
 // ── Database URL resolution (mirrors token.rs) ────────────────────────────────
