@@ -381,6 +381,7 @@ const ROUTES_FILE_RESERVED_NAMES: &[&str] = &[
     "AutumnResult",
     "Markup",
     "RunQueryDsl",
+    "ToString",
 ];
 
 /// Reject an `enum{…}` field whose generated type name collides with one of
@@ -2985,6 +2986,24 @@ async fn main() {
                 "expected '{field_name}' to be rejected"
             );
         }
+    }
+
+    #[test]
+    fn scaffold_enum_field_named_to_string_is_rejected() {
+        // `to_string:enum{a,b}` pascalizes to `ToString`, imported into
+        // routes.rs; a nullable field of that type renders its edit-form
+        // value via `row.to_string.as_ref().map(ToString::to_string)`, an
+        // unqualified path expression that resolves to the enum instead of
+        // the prelude trait and fails to compile.
+        let tmp = project_with_main(default_main());
+        let err = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["to_string:Option<enum{a,b}>".into()],
+            "20260427000000",
+        )
+        .unwrap_err();
+        assert!(matches!(err, GenerateError::InvalidField { .. }));
     }
 
     #[test]
