@@ -540,6 +540,7 @@ const SIMPLE_LIBPQ_ENV_FALLBACKS: &[(&str, &str)] = &[
     ("options", "PGOPTIONS"),
     ("application_name", "PGAPPNAME"),
     ("load_balance_hosts", "PGLOADBALANCEHOSTS"),
+    ("sslnegotiation", "PGSSLNEGOTIATION"),
 ];
 
 /// Fill in each of [`SIMPLE_LIBPQ_ENV_FALLBACKS`] from its environment
@@ -1004,15 +1005,25 @@ fn sanitize_url_form(mut url: url::Url) -> Result<String, CommandError> {
     let explicit_password = find_pair(&pairs, "password")
         .map(str::to_owned)
         .or_else(|| url.password().map(percent_decode));
-    let explicit_host = url
-        .host_str()
-        .filter(|h| !h.is_empty())
-        .map(percent_decode)
-        .or_else(|| find_pair(&pairs, "host").map(str::to_owned));
-    let explicit_port = url
-        .port()
-        .map(|p| p.to_string())
-        .or_else(|| find_pair(&pairs, "port").map(str::to_owned));
+    // `host`/`port` get the same query-pair-first precedence as
+    // `user`/`password`/`dbname` above, for the same underlying reason —
+    // just via a different mechanism. `host`/`port` are `Vec`s that
+    // *accumulate* rather than overwrite in `tokio_postgres::Config`, so a
+    // query `host=`/`port=` alongside a non-empty authority host doesn't
+    // actually override it the way query `user=` overrides userinfo; that's
+    // exactly the bug `needs_keyword_form` (below) rebuilds the connection
+    // string to work around, so that the *only* host/port that survives
+    // into the final keyword-form output is the query one, matching
+    // `libpq`'s own `PQconninfoParse` semantics (the named parameter is the
+    // sole effective host/port). `.pgpass` lookup must use that same
+    // effective value, not the authority snapshot, or it matches an entry
+    // keyed to a host/port the connection doesn't actually use.
+    let explicit_host = find_pair(&pairs, "host")
+        .map(str::to_owned)
+        .or_else(|| url.host_str().filter(|h| !h.is_empty()).map(percent_decode));
+    let explicit_port = find_pair(&pairs, "port")
+        .map(str::to_owned)
+        .or_else(|| url.port().map(|p| p.to_string()));
     let explicit_dbname = find_pair(&pairs, "dbname").map(str::to_owned).or_else(|| {
         Some(url.path())
             .filter(|p| p.len() > 1)
@@ -1924,6 +1935,71 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_uses_query_host_for_pgpass_lookup_not_url_authority() {
+        // Sibling of `sanitize_uses_query_user_for_pgpass_lookup_not_url_userinfo`,
+        // but for `host` instead of `user`: once `needs_keyword_form` forces
+        // a rebuild for a query `host=`
+        // that overrides a non-empty authority host, the final connection
+        // actually uses the query host (`actual-db`), not the authority
+        // placeholder — so `.pgpass` lookup must key off that same
+        // effective host, or a password entry for the real target gets
+        // missed.
+        let dir = tempfile::tempdir().unwrap();
+        let pgpass_path = dir.path().join(".pgpass");
+        std::fs::write(
+            &pgpass_path,
+            "placeholder:5432:app:postgres:wrong_password\n\
+             actual-db:5432:app:postgres:right_password\n",
+        )
+        .unwrap();
+        set_pgpass_permissions_safe(&pgpass_path);
+        temp_env::with_vars(
+            [
+                ("PGPASSWORD", None::<&str>),
+                ("PGPASSFILE", Some(pgpass_path.to_str().unwrap())),
+            ],
+            || {
+                let sanitized =
+                    sanitize_db_url("postgres://postgres@placeholder/app?host=actual-db").unwrap();
+                let config: tokio_postgres::Config = sanitized.parse().unwrap();
+                assert_eq!(
+                    config.get_hosts(),
+                    &[tokio_postgres::config::Host::Tcp("actual-db".to_owned())]
+                );
+                assert_eq!(config.get_password(), Some(b"right_password".as_slice()));
+            },
+        );
+    }
+
+    #[test]
+    fn sanitize_uses_query_port_for_pgpass_lookup_not_url_authority() {
+        // See `sanitize_uses_query_host_for_pgpass_lookup_not_url_authority`
+        // for the same issue, but for `port=` overriding an authority port.
+        let dir = tempfile::tempdir().unwrap();
+        let pgpass_path = dir.path().join(".pgpass");
+        std::fs::write(
+            &pgpass_path,
+            "db.internal:5432:app:postgres:wrong_password\n\
+             db.internal:6543:app:postgres:right_password\n",
+        )
+        .unwrap();
+        set_pgpass_permissions_safe(&pgpass_path);
+        temp_env::with_vars(
+            [
+                ("PGPASSWORD", None::<&str>),
+                ("PGPASSFILE", Some(pgpass_path.to_str().unwrap())),
+            ],
+            || {
+                let sanitized =
+                    sanitize_db_url("postgres://postgres@db.internal:5432/app?port=6543").unwrap();
+                let config: tokio_postgres::Config = sanitized.parse().unwrap();
+                assert_eq!(config.get_ports(), &[6543]);
+                assert_eq!(config.get_password(), Some(b"right_password".as_slice()));
+            },
+        );
+    }
+
+    #[test]
     fn sanitize_drops_ca_and_crl_ssl_params_from_url() {
         // This test asserts an *exact* pair count of zero, so unlike most
         // other tests here (which only need to scope away the handful of
@@ -2474,6 +2550,26 @@ mod tests {
                 assert_eq!(config.get_options(), Some("-c search_path=app+public"));
             },
         );
+    }
+
+    #[test]
+    fn sanitize_uses_pgsslnegotiation_env_var_when_url_omits_it() {
+        // `tokio_postgres` supports `sslnegotiation` as a connection
+        // parameter (postgres/direct) but never reads `PGSSLNEGOTIATION`
+        // itself (unlike `psql`, which honors it as a documented libpq
+        // environment variable, per libpq-envars.html: "PGSSLNEGOTIATION
+        // behaves the same as the sslnegotiation connection parameter") —
+        // a connection string relying on it for direct TLS negotiation
+        // would otherwise silently keep the default `postgres` negotiation,
+        // which can fail against endpoints/proxies expecting direct mode.
+        temp_env::with_var("PGSSLNEGOTIATION", Some("direct"), || {
+            let sanitized = sanitize_db_url("postgres://db.internal").unwrap();
+            let config: tokio_postgres::Config = sanitized.parse().unwrap();
+            assert_eq!(
+                config.get_ssl_negotiation(),
+                tokio_postgres::config::SslNegotiation::Direct
+            );
+        });
     }
 
     #[test]
