@@ -12,9 +12,12 @@
     }
   });
 
-  // Bulk-action submit: confirm if the selected action is marked as
-  // requiring confirmation (data-confirm="1" on the option) AND require
-  // at least one selected row.
+  // Bulk-action submit: require at least one selected row, and — if the
+  // selected action is marked as requiring confirmation (data-confirm="1"
+  // on the option) — show the server-rendered #admin-bulk-confirm <dialog>
+  // (autumn_web::widgets::modal) rather than a native browser confirm popup.
+  // Once the dialog's Confirm button is clicked, the submit is re-issued
+  // and allowed through (see the click handler below).
   document.addEventListener("submit", function (e) {
     var form = e.target;
     if (
@@ -32,21 +35,35 @@
       window.alert("Select at least one row first.");
       return;
     }
+    if (form.dataset.bulkConfirmed === "1") return;
     var sel = form.querySelector('select[name="action"]');
     if (!sel) return;
     var opt = sel.options[sel.selectedIndex];
-    if (
-      opt &&
-      opt.dataset.confirm === "1" &&
-      !window.confirm(
-        "Apply '" +
-          opt.text +
-          "' to " +
-          checked.length +
-          " record(s)?",
-      )
-    ) {
-      e.preventDefault();
+    if (!opt || opt.dataset.confirm !== "1") return;
+    var dialog = document.getElementById("admin-bulk-confirm");
+    if (!dialog || !dialog.showModal) return;
+    e.preventDefault();
+    var detail = dialog.querySelector("[data-bulk-confirm-detail]");
+    if (detail) {
+      detail.textContent =
+        "Apply '" + opt.text + "' to " + checked.length + " record(s)?";
+    }
+    dialog.autumnBulkForm = form;
+    dialog.showModal();
+  });
+
+  // Bulk-action confirm dialog: clicking [data-bulk-confirm] closes the
+  // dialog and re-submits the form it was opened for.
+  document.addEventListener("click", function (e) {
+    var confirmBtn = e.target.closest("[data-bulk-confirm]");
+    if (!confirmBtn) return;
+    var dialog = confirmBtn.closest("dialog");
+    if (!dialog) return;
+    var form = dialog.autumnBulkForm;
+    dialog.close();
+    if (form) {
+      form.dataset.bulkConfirmed = "1";
+      form.requestSubmit();
     }
   });
 

@@ -26,6 +26,13 @@
 //! | Plain `GET` form is sufficient | `axum::extract::Query` |
 //! | You need unusual htmx wiring | Hand-write `hx-*` attributes |
 //!
+//! # Modals & confirmation
+//!
+//! | Situation | Use |
+//! |-----------|-----|
+//! | Custom dialog content | `modal` |
+//! | Confirm a destructive action (delete, etc.) without `window.confirm()` | `confirm_action` |
+//!
 //! # Integration with the repository full-text search feature
 //!
 //! The widgets wire up the client side; your handler owns the Diesel query.
@@ -1771,18 +1778,25 @@ fn merge_class(base: &str, extra: Option<&str>) -> String {
 }
 
 /// Render `content` inside the `<h1>`–`<h6>` element selected by `level`, with
-/// `class` applied. Shared by every widget with a configurable heading level
-/// (`card`, `hero`, ...) so an `HeadingLevel` variant is matched in one place.
+/// `class` applied and an optional `id` (used by [`modal`] so `aria-labelledby`
+/// has a target). Shared by every widget with a configurable heading level
+/// (`card`, `hero`, `modal`, ...) so an `HeadingLevel` variant is matched in
+/// one place.
 #[cfg(feature = "maud")]
-fn heading(level: HeadingLevel, class: &str, content: &maud::Markup) -> maud::Markup {
+fn heading(
+    level: HeadingLevel,
+    id: Option<&str>,
+    class: &str,
+    content: &maud::Markup,
+) -> maud::Markup {
     maud::html! {
         @match level {
-            HeadingLevel::H1 => h1 class=(class) { (content) },
-            HeadingLevel::H2 => h2 class=(class) { (content) },
-            HeadingLevel::H3 => h3 class=(class) { (content) },
-            HeadingLevel::H4 => h4 class=(class) { (content) },
-            HeadingLevel::H5 => h5 class=(class) { (content) },
-            HeadingLevel::H6 => h6 class=(class) { (content) },
+            HeadingLevel::H1 => h1 id=[id] class=(class) { (content) },
+            HeadingLevel::H2 => h2 id=[id] class=(class) { (content) },
+            HeadingLevel::H3 => h3 id=[id] class=(class) { (content) },
+            HeadingLevel::H4 => h4 id=[id] class=(class) { (content) },
+            HeadingLevel::H5 => h5 id=[id] class=(class) { (content) },
+            HeadingLevel::H6 => h6 id=[id] class=(class) { (content) },
         }
     }
 }
@@ -1852,7 +1866,7 @@ pub fn card(body: &maud::Markup, config: &CardConfig<'_>) -> maud::Markup {
             @if has_header {
                 div class="card-header" {
                     @if let Some(title) = &config.title {
-                        (heading(config.level, "card-title", title))
+                        (heading(config.level, None, "card-title", title))
                     }
                     @if let Some(action) = &config.header_action {
                         (action)
@@ -2102,7 +2116,7 @@ pub fn hero(config: &HeroConfig) -> maud::Markup {
     let root_class = merge_class("autumn-hero", config.class.as_deref());
     maud::html! {
         section class=(root_class) {
-            (heading(config.level, "autumn-hero__title", &config.title))
+            (heading(config.level, None, "autumn-hero__title", &config.title))
             @if let Some(subtitle) = &config.subtitle {
                 p class="autumn-hero__subtitle" { (subtitle) }
             }
@@ -2120,6 +2134,450 @@ pub fn hero(config: &HeroConfig) -> maud::Markup {
                     }
                 }
             }
+        }
+    }
+}
+
+// ── modal / confirm_action ───────────────────────────────────────────────
+
+/// Configuration for a [`modal`] dialog.
+///
+/// Build with [`ModalConfig::new`] and chain builder methods for optional slots.
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_web::widgets::{ModalConfig, modal};
+/// use maud::html;
+///
+/// let body = html! { p { "Are you sure you want to continue?" } };
+/// let footer = html! { button { "OK" } };
+/// let config = ModalConfig::new().footer(footer);
+/// let dialog = modal("confirm-dialog", "Confirm", &body, &config);
+/// ```
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone, Default)]
+pub struct ModalConfig {
+    /// Optional footer content (e.g. action buttons) rendered in
+    /// `<div class="autumn-modal__footer">`.
+    footer: Option<maud::Markup>,
+    /// Heading level for the title element (default [`HeadingLevel::H2`]).
+    level: HeadingLevel,
+    /// Extra CSS class(es) appended to the root `autumn-modal` element.
+    class: Option<String>,
+    /// When `true`, emits `closedby="any"` so clicking the backdrop or
+    /// pressing Escape dismisses the dialog. Off by default so a
+    /// destructive confirm isn't accidentally dismissed by a stray click.
+    light_dismiss: bool,
+}
+
+#[cfg(feature = "maud")]
+impl ModalConfig {
+    /// Create a new modal configuration with no footer, `<h2>` title, and
+    /// light-dismiss disabled.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            footer: None,
+            level: HeadingLevel::H2,
+            class: None,
+            light_dismiss: false,
+        }
+    }
+
+    /// Set the footer content (e.g. action buttons) rendered in
+    /// `<div class="autumn-modal__footer">`.
+    #[must_use]
+    pub fn footer(mut self, footer: maud::Markup) -> Self {
+        self.footer = Some(footer);
+        self
+    }
+
+    /// Set the heading level for the title element (default [`HeadingLevel::H2`]).
+    #[must_use]
+    pub const fn level(mut self, level: HeadingLevel) -> Self {
+        self.level = level;
+        self
+    }
+
+    /// Add extra CSS class(es) to the root `autumn-modal` element.
+    #[must_use]
+    pub fn class(mut self, class: impl Into<String>) -> Self {
+        self.class = Some(class.into());
+        self
+    }
+
+    /// When `true`, emits `closedby="any"` on the `<dialog>` so the backdrop
+    /// and Escape dismiss it (default `false`).
+    #[must_use]
+    pub const fn light_dismiss(mut self, light_dismiss: bool) -> Self {
+        self.light_dismiss = light_dismiss;
+        self
+    }
+}
+
+/// Render a native `<dialog>` modal: an `id`, a labelled title, `aria-modal`,
+/// a body slot, and an optional footer/actions slot.
+///
+/// Opened via `showModal()` — either the native HTML Invoker Commands API
+/// (`command="show-modal"` / `commandfor`, see [`modal_trigger`]) or the
+/// framework-shipped fallback in `autumn-widgets.js` — the dialog gets ESC-close,
+/// a focus trap, focus-into-dialog on open, and focus-return-to-trigger on
+/// close for free from the browser: no app-authored JavaScript is required.
+///
+/// # CSS hooks
+///
+/// | Selector | Element |
+/// |---|---|
+/// | `.autumn-modal` | Root `<dialog>` |
+/// | `.autumn-modal__content` | Inner content wrapper |
+/// | `.autumn-modal__title` | Title heading |
+/// | `.autumn-modal__body` | Body wrapper |
+/// | `.autumn-modal__footer` | Footer wrapper (only present when configured) |
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_web::widgets::{ModalConfig, modal};
+/// use maud::html;
+///
+/// let body = html! { p { "This action cannot be undone." } };
+/// let html = modal("delete-confirm", "Delete this post?", &body, &ModalConfig::new())
+///     .into_string();
+/// assert!(html.contains("<dialog"));
+/// assert!(html.contains(r#"aria-labelledby="delete-confirm-title""#));
+/// assert!(html.contains(r#"aria-modal="true""#));
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn modal(id: &str, title: &str, body: &maud::Markup, config: &ModalConfig) -> maud::Markup {
+    let root_class = merge_class("autumn-modal", config.class.as_deref());
+    let title_id = format!("{id}-title");
+    let closedby = config.light_dismiss.then_some("any");
+    maud::html! {
+        dialog id=(id) class=(root_class) role="dialog" aria-modal="true"
+            aria-labelledby=(title_id) closedby=[closedby] {
+            div class="autumn-modal__content" {
+                (heading(config.level, Some(title_id.as_str()), "autumn-modal__title", &maud::html! { (title) }))
+                div class="autumn-modal__body" { (body) }
+                @if let Some(footer) = &config.footer {
+                    div class="autumn-modal__footer" { (footer) }
+                }
+            }
+        }
+    }
+}
+
+/// Render a `<button>` that opens the `<dialog>` identified by `dialog_id`.
+///
+/// Uses the native HTML Invoker Commands API (`command="show-modal"` +
+/// `commandfor`) with a `data-modal-open` fallback attribute wired by
+/// `autumn-widgets.js` for browsers that don't yet support it — no
+/// app-authored JavaScript is required either way.
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_web::widgets::modal_trigger;
+///
+/// let html = modal_trigger("Delete", "delete-confirm", Some("btn btn-danger")).into_string();
+/// assert!(html.contains(r#"commandfor="delete-confirm""#));
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn modal_trigger(label: &str, dialog_id: &str, class: Option<&str>) -> maud::Markup {
+    maud::html! {
+        button type="button" class=[class]
+            command="show-modal" commandfor=(dialog_id) data-modal-open=(dialog_id) {
+            (label)
+        }
+    }
+}
+
+/// Render a `<button>` that closes the `<dialog>` identified by `dialog_id`.
+///
+/// Uses the native HTML Invoker Commands API (`command="close"` +
+/// `commandfor`) with a `data-modal-close` fallback attribute wired by
+/// `autumn-widgets.js` for browsers that don't yet support it.
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_web::widgets::modal_close_button;
+///
+/// let html = modal_close_button("Cancel", "delete-confirm", None).into_string();
+/// assert!(html.contains(r#"command="close""#));
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn modal_close_button(label: &str, dialog_id: &str, class: Option<&str>) -> maud::Markup {
+    maud::html! {
+        button type="button" class=[class]
+            command="close" commandfor=(dialog_id) data-modal-close=(dialog_id) {
+            (label)
+        }
+    }
+}
+
+/// Configuration for a [`confirm_action`] confirmation dialog.
+///
+/// Build with [`ConfirmActionConfig::new`] and chain builder methods for
+/// optional overrides. `title` defaults to `"Are you sure?"`, `cancel_label`
+/// to `"Cancel"`, and `danger` (the confirm button's semantic styling) to
+/// `true`.
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_web::widgets::ConfirmActionConfig;
+/// use maud::html;
+///
+/// let config = ConfirmActionConfig::new()
+///     .title("Delete this post?")
+///     .message(html! { p { "This action cannot be undone." } })
+///     .trigger_class("btn btn-danger")
+///     .confirm_class("btn btn-danger");
+/// ```
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone)]
+pub struct ConfirmActionConfig<'a> {
+    /// Dialog title (default `"Are you sure?"`).
+    title: &'a str,
+    /// Optional body content rendered above the confirm/cancel actions.
+    message: Option<maud::Markup>,
+    /// Confirm button label; defaults to the trigger's label when unset.
+    confirm_label: Option<&'a str>,
+    /// Cancel button label (default `"Cancel"`).
+    cancel_label: &'a str,
+    /// `class` attribute for the trigger button that opens the dialog.
+    trigger_class: Option<&'a str>,
+    /// Extra `class`(es) appended to the confirm button, alongside
+    /// `autumn-modal__confirm` and (when [`ConfirmActionConfig::danger`] is
+    /// `true`) `autumn-modal__confirm--danger`.
+    confirm_class: Option<&'a str>,
+    /// Whether the confirm button carries the danger semantic class
+    /// (default `true` — most uses of `confirm_action` are destructive).
+    danger: bool,
+    /// CSRF form field name; defaults to `"_csrf"`. Pass the configured
+    /// [`CsrfFormField`](crate::security::CsrfFormField) value when
+    /// `security.csrf.form_field` is customized.
+    csrf_field: Option<&'a str>,
+    /// Extra attributes rendered on the confirm `<button>`, e.g. `hx-*`, `data-*`.
+    attrs: &'a [(&'a str, &'a str)],
+}
+
+#[cfg(feature = "maud")]
+impl<'a> ConfirmActionConfig<'a> {
+    /// Create a confirm-action configuration with default title ("Are you
+    /// sure?"), cancel label ("Cancel"), and `danger` styling enabled.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            title: "Are you sure?",
+            message: None,
+            confirm_label: None,
+            cancel_label: "Cancel",
+            trigger_class: None,
+            confirm_class: None,
+            danger: true,
+            csrf_field: None,
+            attrs: &[],
+        }
+    }
+
+    /// Set the dialog title (default `"Are you sure?"`).
+    #[must_use]
+    pub const fn title(mut self, title: &'a str) -> Self {
+        self.title = title;
+        self
+    }
+
+    /// Set optional body content rendered above the confirm/cancel actions.
+    #[must_use]
+    pub fn message(mut self, message: maud::Markup) -> Self {
+        self.message = Some(message);
+        self
+    }
+
+    /// Override the confirm button's label (defaults to the trigger's label).
+    #[must_use]
+    pub const fn confirm_label(mut self, label: &'a str) -> Self {
+        self.confirm_label = Some(label);
+        self
+    }
+
+    /// Set the cancel button's label (default `"Cancel"`).
+    #[must_use]
+    pub const fn cancel_label(mut self, label: &'a str) -> Self {
+        self.cancel_label = label;
+        self
+    }
+
+    /// Set the `class` attribute for the trigger button that opens the dialog.
+    #[must_use]
+    pub const fn trigger_class(mut self, class: &'a str) -> Self {
+        self.trigger_class = Some(class);
+        self
+    }
+
+    /// Add extra `class`(es) to the confirm button, alongside the built-in
+    /// `autumn-modal__confirm`(`--danger`) classes.
+    #[must_use]
+    pub const fn confirm_class(mut self, class: &'a str) -> Self {
+        self.confirm_class = Some(class);
+        self
+    }
+
+    /// Set whether the confirm button carries the danger semantic class
+    /// (default `true`).
+    #[must_use]
+    pub const fn danger(mut self, danger: bool) -> Self {
+        self.danger = danger;
+        self
+    }
+
+    /// Override the CSRF hidden-input field name (default `"_csrf"`).
+    #[must_use]
+    pub const fn csrf_field(mut self, csrf_field: &'a str) -> Self {
+        self.csrf_field = Some(csrf_field);
+        self
+    }
+
+    /// Set extra attributes rendered on the confirm `<button>` (e.g.
+    /// `hx-*`, `data-*`). Values are HTML-escaped; names must be valid
+    /// attribute names (see [`crate::links::button_to_with`] panics).
+    #[must_use]
+    pub const fn attrs(mut self, attrs: &'a [(&'a str, &'a str)]) -> Self {
+        self.attrs = attrs;
+        self
+    }
+}
+
+#[cfg(feature = "maud")]
+impl Default for ConfirmActionConfig<'_> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Render a trigger button plus a confirmation `<dialog>` for a
+/// state-changing action.
+///
+/// Opening the dialog requires no app-authored JavaScript
+/// ([`modal_trigger`]/[`modal_close_button`]), and the confirm
+/// button is a [`crate::links::button_to_with`] submit — the correct HTTP
+/// method (via the `_method` override) and CSRF token are always present.
+///
+/// This is the framework's answer to `window.confirm()` / htmx's
+/// `hx-confirm`: the whole confirmation UI is server-rendered, so a
+/// [`crate::test::TestClient`] test can assert the dialog, its title, and
+/// the confirm button's action/method/CSRF token — impossible with the
+/// native browser dialog.
+///
+/// # CSS hooks
+///
+/// | Selector | Element |
+/// |---|---|
+/// | `.autumn-confirm` | Root wrapper (trigger + dialog) |
+/// | `.autumn-modal__confirm-form` | The confirm `<form>` |
+/// | `.autumn-modal__confirm` | The confirm `<button>` |
+/// | `.autumn-modal__confirm--danger` | Added to the confirm button when [`ConfirmActionConfig::danger`] is `true` (the default) |
+/// | `.autumn-modal__cancel` | The cancel `<button>` |
+///
+/// # Example
+///
+/// Confirm-delete on a scaffolded resource — a `Post` detail page's delete
+/// button, with zero lines of app-authored JavaScript:
+///
+/// ```rust,ignore
+/// use autumn_web::prelude::*;
+/// use autumn_web::widgets::{ConfirmActionConfig, confirm_action};
+/// use http::Method;
+///
+/// #[get("/posts/{id}")]
+/// async fn show(Path(id): Path<i64>, csrf: CsrfToken, repo: PgPostRepository) -> AutumnResult<Markup> {
+///     let post = repo.find(id).await?;
+///     let action = format!("/posts/{id}");
+///     let config = ConfirmActionConfig::new()
+///         .title("Delete this post?")
+///         .message(html! { p { "This action cannot be undone." } })
+///         .trigger_class("btn btn-danger")
+///         .confirm_class("btn btn-danger");
+///     Ok(html! {
+///         h1 { (post.title) }
+///         (confirm_action("delete-post", "Delete", &action, Method::DELETE, csrf.token(), &config))
+///     })
+/// }
+/// ```
+///
+/// ```rust
+/// use autumn_web::widgets::{ConfirmActionConfig, confirm_action};
+/// use http::Method;
+///
+/// let html = confirm_action(
+///     "delete-post",
+///     "Delete",
+///     "/posts/42",
+///     Method::DELETE,
+///     "tok123",
+///     &ConfirmActionConfig::new()
+///         .title("Delete this post?")
+///         .trigger_class("btn btn-danger")
+///         .confirm_class("btn btn-danger"),
+/// )
+/// .into_string();
+/// assert!(html.contains(r#"<dialog id="delete-post""#));
+/// assert!(html.contains("Delete this post?"));
+/// assert!(html.contains(r#"<form action="/posts/42" method="post""#));
+/// assert!(html.contains(r#"name="_method" value="DELETE""#));
+/// assert!(html.contains(r#"name="_csrf" value="tok123""#));
+/// assert!(html.contains("autumn-modal__confirm--danger"));
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+#[allow(clippy::needless_pass_by_value)]
+pub fn confirm_action(
+    id: &str,
+    trigger_label: &str,
+    action: &str,
+    method: http::Method,
+    csrf_token: &str,
+    config: &ConfirmActionConfig<'_>,
+) -> maud::Markup {
+    let confirm_label = config.confirm_label.unwrap_or(trigger_label);
+
+    let mut confirm_class = String::from("autumn-modal__confirm");
+    if config.danger {
+        confirm_class.push_str(" autumn-modal__confirm--danger");
+    }
+    if let Some(extra) = config.confirm_class {
+        confirm_class.push(' ');
+        confirm_class.push_str(extra);
+    }
+
+    let mut button_options = crate::links::ButtonToOptions::new()
+        .class(confirm_class.as_str())
+        .form_class("autumn-modal__confirm-form")
+        .attrs(config.attrs);
+    if let Some(field) = config.csrf_field {
+        button_options = button_options.csrf_field(field);
+    }
+
+    let confirm_button =
+        crate::links::button_to_with(confirm_label, action, method, csrf_token, &button_options);
+
+    let footer = maud::html! {
+        (modal_close_button(config.cancel_label, id, Some("autumn-modal__cancel")))
+        (confirm_button)
+    };
+
+    let body = config.message.clone().unwrap_or_else(|| maud::html! {});
+    let modal_config = ModalConfig::new().footer(footer);
+
+    maud::html! {
+        div class="autumn-confirm" {
+            (modal_trigger(trigger_label, id, config.trigger_class))
+            (modal(id, config.title, &body, &modal_config))
         }
     }
 }

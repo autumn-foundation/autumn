@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **views:** `modal`/`confirm_action` widgets — an accessible, testable
+  confirm for destructive actions (#1233). `modal(id, title, body, config)`
+  renders a native `<dialog>` (`aria-modal="true"`, `aria-labelledby`, a body
+  slot, and an optional footer slot via `ModalConfig::footer`) with only
+  `autumn-modal*` BEM classes. `confirm_action(id, trigger_label, action,
+  method, csrf_token, config)` composes it with `link_to`/`button_to`'s
+  `button_to_with` (#1138) into a full confirm flow: a trigger button opens
+  the dialog, the cancel button closes it, and the confirm button is a real
+  `button_to_with` submit carrying the correct HTTP method (`_method`
+  override) and CSRF token, so a `TestClient` test can assert the dialog,
+  its title, and the confirm button's action/method/CSRF token — impossible
+  with the native `window.confirm()`/htmx `hx-confirm` it replaces. Opening
+  and closing require zero app-authored JavaScript: triggers use the native
+  `command`/`commandfor` HTML Invoker Commands API, with a `data-modal-open`/
+  `data-modal-close` fallback shipped in `autumn-widgets.js` for browsers
+  that don't support it yet. `showModal()` gives ESC-close, a focus trap,
+  and focus-into/-return-from the dialog for free from the browser in both
+  paths. The confirm button carries a danger semantic class
+  (`autumn-modal__confirm--danger`) by default (`ConfirmActionConfig::
+  danger(false)` to opt out). The admin plugin's detail-view delete button
+  and bulk-action confirm are migrated to `confirm_action`/`modal`,
+  dropping their `hx-confirm`/`window.confirm()` reliance entirely. Purely
+  additive; minor version bump.
 - **model:** many-to-many associations via `#[has_many(Target, through =
   join_table)]` (#1324). Extends the `belongs_to`/`has_many`/`has_one`
   associations from #835 with a join-table variant: join columns default to

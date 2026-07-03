@@ -677,6 +677,25 @@ mod tests {
         assert!(js.contains("Escape"), "{js}");
     }
 
+    #[test]
+    fn widgets_js_wires_modal() {
+        let js = std::str::from_utf8(AUTUMN_WIDGETS_JS)
+            .expect("autumn-widgets.js should be valid UTF-8");
+        // Fallback open/close wiring for browsers without the Invoker
+        // Commands API (command/commandfor), used by autumn_web::widgets::modal
+        // and confirm_action (issue #1233).
+        assert!(js.contains("data-modal-open"), "{js}");
+        assert!(js.contains("data-modal-close"), "{js}");
+        assert!(js.contains("showModal"), "{js}");
+        assert!(
+            js.contains("'command' in HTMLButtonElement.prototype"),
+            "{js}"
+        );
+        // The whole point of this widget is to replace the native
+        // window.confirm() dialog with a server-rendered, testable one.
+        assert!(!js.contains("window.confirm"), "{js}");
+    }
+
     #[tokio::test]
     async fn hx_request_extractor_parses_headers() -> Result<(), axum::http::Error> {
         let req = Request::builder()

@@ -8,12 +8,12 @@ use autumn_web::flash::{FlashMessage, flash_message_divs};
 use autumn_web::job::{
     JobAdminPage, JobAdminRecord, JobAdminSnapshot, JobAdminStatus, JobScheduleSummary,
 };
-use autumn_web::links::{ButtonToOptions, button_to_with};
 use autumn_web::pagination::Page;
 use autumn_web::runtime_config::{ConfigChangeRecord, ConfigEntry};
 use autumn_web::ui::pagination::{PagerOptions, pagination_nav};
 use autumn_web::widgets::{
-    CardConfig, NavBarConfig, NavBarLayout, NavItem, card, nav_bar, stat_card,
+    CardConfig, ConfirmActionConfig, ModalConfig, NavBarConfig, NavBarLayout, NavItem, card,
+    confirm_action, modal, modal_close_button, nav_bar, stat_card,
 };
 use http::Method;
 use maud::{DOCTYPE, Markup, PreEscaped, html};
@@ -1112,6 +1112,25 @@ pub fn model_list_page(
 
                 } // /form
 
+                // Shared confirm dialog for destructive bulk actions — rendered
+                // once per page when at least one declared action requires
+                // confirmation. admin.js intercepts the bulk form's submit,
+                // shows this dialog instead of window.confirm(), and fills in
+                // [data-bulk-confirm-detail] with the action/count description.
+                @if actions.iter().any(|a| a.confirm) {
+                    (modal(
+                        "admin-bulk-confirm",
+                        "Confirm bulk action",
+                        &html! { p data-bulk-confirm-detail {} },
+                        &ModalConfig::new().footer(html! {
+                            (modal_close_button("Cancel", "admin-bulk-confirm", Some("btn")))
+                            button type="button" class="btn btn-danger" data-bulk-confirm {
+                                "Confirm"
+                            }
+                        }),
+                    ))
+                }
+
                 // Pagination
                 @if result.total_pages() > 1 {
                     (render_pagination(result, model_slug, &search_enc, sort_by, sort_dir, &filters_enc, prefix))
@@ -1383,12 +1402,8 @@ pub fn model_detail_page(
 
         ({
             let delete_url = format!("{prefix}/{model_slug}/{id}");
-            let delete_confirm = format!("Are you sure you want to delete this {model_name}?");
-            let delete_attrs = [
-                ("hx-delete", delete_url.as_str()),
-                ("hx-confirm", delete_confirm.as_str()),
-                ("hx-target", "body"),
-            ];
+            let delete_dialog_id = format!("delete-confirm-{id}");
+            let delete_title = format!("Delete this {model_name}?");
             let header_action = html! {
                 div class="header-actions" {
                     @if has_history {
@@ -1399,15 +1414,18 @@ pub fn model_detail_page(
                     a href={ (prefix) "/" (model_slug) "/" (id) "/edit" }
                         class="btn btn-primary" { "Edit" }
                     " "
-                    (button_to_with(
+                    (confirm_action(
+                        &delete_dialog_id,
                         "Delete",
                         &delete_url,
                         Method::DELETE,
                         csrf_token,
-                        &ButtonToOptions::new()
-                            .class("btn btn-danger")
-                            .csrf_field(csrf_form_field)
-                            .attrs(&delete_attrs),
+                        &ConfirmActionConfig::new()
+                            .title(&delete_title)
+                            .message(html! { p { "This action cannot be undone." } })
+                            .trigger_class("btn btn-danger")
+                            .confirm_class("btn btn-danger")
+                            .csrf_field(csrf_form_field),
                     ))
                 }
             };
@@ -2924,15 +2942,15 @@ mod tests {
             "Edit link must use path id 42: {html}"
         );
         assert!(
-            html.contains(r#"hx-delete="/admin/widgets/42""#),
-            "Delete must target path id 42: {html}"
+            html.contains(r#"<form action="/admin/widgets/42" method="post""#),
+            "Delete confirm form must target path id 42: {html}"
         );
         assert!(
             !html.contains("widgets/99"),
             "payload id 99 must not route mutations: {html}"
         );
-        // The delete button is now rendered via button_to_with, so a no-JS
-        // form submission also works: POST + _method=DELETE + CSRF.
+        // The delete button is now rendered via confirm_action (a server-rendered
+        // <dialog>), so a no-JS form submission also works: POST + _method=DELETE + CSRF.
         assert!(
             html.contains(r#"name="_method" value="DELETE""#),
             "Delete form must carry a _method override: {html}"
@@ -2941,6 +2959,47 @@ mod tests {
             html.contains(r#"name="_csrf" value="t""#),
             "Delete form must carry the CSRF token: {html}"
         );
+    }
+
+    #[test]
+    fn detail_page_delete_uses_confirm_dialog_not_hx_confirm() {
+        // Issue #1233: the admin delete confirmation must be a server-rendered,
+        // testable <dialog> (autumn_web::widgets::confirm_action), not the
+        // native window.confirm() reached via hx-confirm.
+        let r = dummy_registry();
+        let fields = vec![AdminField::new("name", AdminFieldKind::Text)];
+        let record = serde_json::json!({"id": 42, "name": "x"});
+        let html = model_detail_page(
+            &r,
+            "widgets",
+            "Widget",
+            "Widgets",
+            &fields,
+            &record,
+            "#42",
+            42,
+            &[],
+            "t",
+            "_csrf",
+            "X-CSRF-Token",
+            "/admin",
+            "/actuator",
+            false,
+            false,
+        )
+        .into_string();
+        assert!(!html.contains("hx-confirm"), "{html}");
+        assert!(!html.contains("hx-delete"), "{html}");
+        assert!(html.contains("<dialog"), "{html}");
+        assert!(html.contains(r#"aria-modal="true""#), "{html}");
+        assert!(
+            html.contains("Widget"),
+            "confirm dialog title should mention the model name: {html}"
+        );
+        // The trigger button opens the dialog via the native invoker
+        // commands (with a JS-fallback data attribute) rather than hx-delete.
+        assert!(html.contains(r#"command="show-modal""#), "{html}");
+        assert!(html.contains("data-modal-open"), "{html}");
     }
 
     #[test]
@@ -3448,6 +3507,62 @@ mod tests {
             html.contains(r#"data-confirm="1""#),
             "destructive action should set data-confirm: {html}"
         );
+        // Issue #1233: a shared confirm <dialog> is rendered because at
+        // least one action (delete) requires confirmation. admin.js
+        // intercepts the bulk submit and shows this dialog instead of
+        // calling window.confirm().
+        assert!(
+            html.contains(r#"<dialog id="admin-bulk-confirm""#),
+            "list view with a confirm-requiring action must render the bulk confirm dialog: {html}"
+        );
+        assert!(html.contains("data-bulk-confirm-detail"), "{html}");
+        assert!(html.contains("data-bulk-confirm"), "{html}");
+        assert!(!html.contains("window.confirm"), "{html}");
+    }
+
+    #[test]
+    fn list_page_skips_bulk_confirm_dialog_when_no_action_requires_confirm() {
+        use crate::traits::{ActionStyle, ListResult};
+        let r = dummy_registry();
+        let fields = vec![AdminField::new("name", AdminFieldKind::Text)];
+        let actions = vec![AdminAction {
+            name: "archive",
+            label: "Archive".to_owned(),
+            style: ActionStyle::Default,
+            confirm: false,
+        }];
+        let result = ListResult {
+            records: vec![serde_json::json!({"id": 1, "name": "x"})],
+            total: 1,
+            page: 1,
+            per_page: 25,
+        };
+        let html = model_list_page(
+            &r,
+            "widgets",
+            "Widgets",
+            &fields,
+            &actions,
+            &result,
+            "",
+            None,
+            SortDirection::Asc,
+            &[],
+            &[],
+            "tok",
+            "admin_csrf",
+            "X-CSRF-Token",
+            "/admin",
+            "/actuator",
+            false,
+            false,
+            false,
+        )
+        .into_string();
+        assert!(
+            !html.contains("admin-bulk-confirm"),
+            "no action requires confirmation, so no dialog should render: {html}"
+        );
     }
 
     #[test]
@@ -3674,7 +3789,7 @@ mod tests {
 
     #[test]
     fn admin_js_does_not_contain_inline_event_handlers() {
-        // Sanity-check the shipped JS: has the two behaviours we expect.
+        // Sanity-check the shipped JS: has the behaviours we expect.
         let js = include_str!("admin.js");
         assert!(
             js.contains("select-all"),
@@ -3684,6 +3799,17 @@ mod tests {
             js.contains("removeAttribute(\"name\")"),
             "admin.js should strip blank password input names"
         );
+    }
+
+    #[test]
+    fn admin_js_uses_confirm_dialog_not_window_confirm() {
+        // Issue #1233: the bulk-action confirm must go through the
+        // server-rendered #admin-bulk-confirm <dialog> (autumn_web::widgets::modal),
+        // not the native window.confirm().
+        let js = include_str!("admin.js");
+        assert!(!js.contains("window.confirm"), "{js}");
+        assert!(js.contains("data-bulk-confirm"), "{js}");
+        assert!(js.contains("showModal"), "{js}");
     }
 
     #[test]

@@ -189,6 +189,31 @@
     });
   });
 
+  // ── modal / confirm_action ────────────────────────────────────────────────
+  // autumn_web::widgets::modal / confirm_action open and close their
+  // <dialog> via the native HTML Invoker Commands API (command="show-modal"
+  // / command="close" + commandfor) wherever it's supported — no JS needed
+  // there. This is the fallback for browsers that don't support it yet:
+  // one delegated click handler wired to the same data-modal-open /
+  // data-modal-close attributes the widget always emits. showModal()/close()
+  // give ESC-close, a focus trap, and focus-into/-return-from the dialog for
+  // free from the browser in both paths.
+  if (!('command' in HTMLButtonElement.prototype)) {
+    document.addEventListener('click', function (e) {
+      var opener = e.target.closest('[data-modal-open]');
+      if (opener) {
+        var toOpen = document.getElementById(opener.getAttribute('data-modal-open'));
+        if (toOpen && toOpen.showModal) toOpen.showModal();
+        return;
+      }
+      var closer = e.target.closest('[data-modal-close]');
+      if (closer) {
+        var toClose = document.getElementById(closer.getAttribute('data-modal-close'));
+        if (toClose && toClose.close) toClose.close();
+      }
+    });
+  }
+
   function initAll() {
     document.querySelectorAll('[data-ac-value-id]').forEach(initAutocomplete);
     document.querySelectorAll('[data-autumn-nav]').forEach(initNav);
