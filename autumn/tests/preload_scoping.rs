@@ -312,8 +312,8 @@ async fn keep_matches_retain_for_scoped_rows() {
     let kept_ids = CURRENT_TENANT
         .scope(Some("acme".to_string()), async {
             let mut kept_ids = Vec::new();
-            for row in &rows {
-                if ScopedItem::__autumn_preload_keep(row)? {
+            for row in rows {
+                if let Some(row) = ScopedItem::__autumn_preload_keep(row)? {
                     kept_ids.push(row.id);
                 }
             }
@@ -328,7 +328,7 @@ async fn keep_matches_retain_for_scoped_rows() {
 #[tokio::test]
 async fn keep_fails_closed_without_tenant_context_per_row() {
     let row = item(1, "acme", false);
-    let err = ScopedItem::__autumn_preload_keep(&row)
+    let err = ScopedItem::__autumn_preload_keep(row)
         .expect_err("must fail closed without tenant context");
     assert!(
         err.to_string().to_lowercase().contains("tenant"),
@@ -347,5 +347,9 @@ async fn keep_identity_for_leaf_models() {
     autumn_web::impl_preloadable_leaf!(LeafItem);
 
     let row = LeafItem { id: 1 };
-    assert!(LeafItem::__autumn_preload_keep(&row).expect("identity never fails"));
+    assert!(
+        LeafItem::__autumn_preload_keep(row)
+            .expect("identity never fails")
+            .is_some()
+    );
 }

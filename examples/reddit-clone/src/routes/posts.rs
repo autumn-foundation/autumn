@@ -1003,7 +1003,14 @@ async fn resolve_or_create_tag_ids(raw: &str, db: &mut Db) -> AutumnResult<Vec<i
         }
     }
 
-    Ok(slug_order.iter().map(|slug| id_by_slug[slug]).collect())
+    let mut ids = Vec::with_capacity(slug_order.len());
+    for slug in &slug_order {
+        let id = id_by_slug.get(slug).copied().ok_or_else(|| {
+            AutumnError::not_found_msg(format!("Tag slug '{slug}' not found after resolution"))
+        })?;
+        ids.push(id);
+    }
+    Ok(ids)
 }
 
 /// Replace a post's tags with the free-text `tags` field, creating any new

@@ -74,7 +74,7 @@ struct CountRow {
 /// throwaway testcontainers container, or nothing (an already-running
 /// external instance pointed to via `AUTUMN_TEST_PG_URL`).
 enum PgHandle {
-    Container(#[allow(dead_code)] ContainerAsync<Postgres>),
+    Container(#[allow(dead_code)] Box<ContainerAsync<Postgres>>),
     External,
 }
 
@@ -101,7 +101,7 @@ async fn start_postgres() -> (PgHandle, Pool<AsyncPgConnection>) {
         .max_size(4)
         .build()
         .expect("build pool");
-    (PgHandle::Container(container), pool)
+    (PgHandle::Container(Box::new(container)), pool)
 }
 
 async fn setup_schema(conn: &mut AsyncPgConnection) {

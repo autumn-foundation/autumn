@@ -637,7 +637,9 @@ fn emit_association_items(
                                 ::std::collections::HashMap::new();
                             let mut __links: ::std::vec::Vec<(i64, i64)> = ::std::vec::Vec::new();
                             for (__fk, __row) in __pairs {
-                                if #target::__autumn_preload_keep(&__row)? {
+                                if let ::core::option::Option::Some(__row) =
+                                    #target::__autumn_preload_keep(__row)?
+                                {
                                     let __id = __row.id;
                                     __links.push((__fk, __id));
                                     __unique_by_id.entry(__id).or_insert(__row);
@@ -666,7 +668,7 @@ fn emit_association_items(
                                 }
                             }
                             for __r in records.iter_mut() {
-                                let __v: #stored_ty = __groups.remove(&__r.id).unwrap_or_default();
+                                let __v: #stored_ty = __groups.get(&__r.id).cloned().unwrap_or_default();
                                 __r.associations_mut().insert::<#stored_ty>(#key, __v);
                             }
                         }
@@ -2340,16 +2342,18 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             /// identical scoping rules to a single row. Used by many-to-many
             /// (`through =`) preload loaders, which pair each child row with
             /// its parent key before grouping and so can't run a batch
-            /// `Vec<Self>::retain` without losing that pairing. Delegates to
+            /// `Vec<Self>::retain` without losing that pairing. Takes `row`
+            /// by value (no `Clone` bound needed) and hands it back on
+            /// `Some` when it passes scoping. Delegates to
             /// `__autumn_preload_retain` (a single-row batch) rather than
             /// re-deriving the soft-delete/tenant predicates, so the two
             /// can never drift apart.
             #[doc(hidden)]
-            pub fn __autumn_preload_keep(row: &Self) -> ::autumn_web::AutumnResult<bool> {
-                let __kept = <Self>::__autumn_preload_retain(
-                    ::std::vec![::core::clone::Clone::clone(row)]
-                )?;
-                ::core::result::Result::Ok(!__kept.is_empty())
+            pub fn __autumn_preload_keep(
+                row: Self,
+            ) -> ::autumn_web::AutumnResult<::core::option::Option<Self>> {
+                let mut __kept = <Self>::__autumn_preload_retain(::std::vec![row])?;
+                ::core::result::Result::Ok(__kept.pop())
             }
         }
     };
