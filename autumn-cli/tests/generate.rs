@@ -1733,10 +1733,10 @@ fn generate_scaffold_unique_enum_field_smoke_test_inserts_a_valid_variant() {
 fn generate_scaffold_unique_reference_field_smoke_test_uses_seeded_fk_value() {
     // Regression guard (issue #1032 review follow-up): `unique_sample_literal`
     // used to lump `references` in with plain integers and emit an arbitrary
-    // `424242` FK value. `render_reference_stub_tables_sql` only seeds a
-    // single row (id 1) into the stub target table, so that arbitrary id
-    // fails the FK constraint before the insert ever reaches the UNIQUE
-    // index this test exists to exercise.
+    // `424242` FK value. `render_reference_stub_tables_sql` seeds real rows
+    // (ids 1 and 2) into the stub target table, so that arbitrary id fails
+    // the FK constraint before the insert ever reaches the UNIQUE index this
+    // test exists to exercise.
     let (_tmp, project) = fresh_project("unique-reference-smoke-app");
     run_autumn(
         &project,
@@ -1763,6 +1763,65 @@ fn generate_scaffold_unique_reference_field_smoke_test_uses_seeded_fk_value() {
         test_file.contains("(profile_id) VALUES (1)"),
         "the target references field must be seeded with the stub table's \
          real row id; got:\n{test_file}"
+    );
+}
+
+#[test]
+fn generate_scaffold_multiple_unique_fields_smoke_test_isolates_the_target_field() {
+    // Regression guard (issue #1032 review follow-up): with more than one
+    // `unique` field, the duplicate-insert SQL used to fill every *other*
+    // required column (including other unique ones) with the same fixed
+    // literal on both inserts. Testing `username`'s duplicate would then
+    // *also* duplicate `email`, so Postgres could report `email`'s
+    // constraint first and the `assert_eq!(field, "username")` assertion
+    // would fail even though `username`'s constraint genuinely exists. The
+    // second (duplicate) insert must vary every *other* unique column's
+    // value so only the field under test actually collides.
+    let (_tmp, project) = fresh_project("unique-multi-field-smoke-app");
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "User",
+            "email:String:unique",
+            "username:String:unique",
+        ],
+    );
+
+    let test_file = fs::read_to_string(project.join("tests/user.rs")).unwrap();
+    let username_test_start = test_file
+        .find("async fn users_rejects_duplicate_username()")
+        .expect("users_rejects_duplicate_username test should exist");
+    let email_test_start = test_file
+        .find("async fn users_rejects_duplicate_email()")
+        .expect("users_rejects_duplicate_email test should exist");
+    // The two generated tests can appear in either order; slice from
+    // whichever comes first to the end so this doesn't depend on it.
+    let (test_body, other_field_name) = if username_test_start < email_test_start {
+        (&test_file[username_test_start..], "email")
+    } else {
+        (&test_file[email_test_start..], "username")
+    };
+    // Within a single duplicate-rejection test, the two `diesel::sql_query`
+    // calls (first insert, then the duplicate) must use different literals
+    // for the *other* unique field so it doesn't also collide.
+    let insert_calls: Vec<&str> = test_body
+        .lines()
+        .filter(|l| l.contains("diesel::sql_query(") && l.contains(other_field_name))
+        .take(2)
+        .collect();
+    assert_eq!(
+        insert_calls.len(),
+        2,
+        "expected two inserts referencing the non-target unique field \
+         {other_field_name}; got:\n{test_body}"
+    );
+    assert_ne!(
+        insert_calls[0], insert_calls[1],
+        "the first and duplicate inserts must give the non-target unique \
+         field {other_field_name} different values, or it would collide \
+         with itself the same way the target field is meant to; got:\n{test_body}"
     );
 }
 

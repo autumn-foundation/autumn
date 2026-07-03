@@ -2771,15 +2771,24 @@ fn render_reference_stub_tables_sql(fields: &[Field], own_table: &str) -> String
                 out,
                 "CREATE TABLE IF NOT EXISTS {target} (id BIGSERIAL PRIMARY KEY);"
             );
-            // Seed one row (id 1, since BIGSERIAL starts there) so a NOT NULL
-            // `references` column pointing at this stub has a real id to
-            // reference. Without this, any raw INSERT the smoke test issues
-            // against the table under test — e.g. the enum out-of-set
-            // rejection test's deliberately-invalid INSERT, see
+            // Seed two rows (ids 1 and 2, since BIGSERIAL starts there) so a
+            // NOT NULL `references` column pointing at this stub has a real
+            // id to reference. Without at least one row, any raw INSERT the
+            // smoke test issues against the table under test — e.g. the enum
+            // out-of-set rejection test's deliberately-invalid INSERT, see
             // `enum_rejection_insert_sql` — would fail on this FK constraint
             // regardless of the column it's actually trying to exercise,
-            // masking the real assertion behind an unrelated failure.
-            let _ = writeln!(out, "INSERT INTO {target} DEFAULT VALUES;");
+            // masking the real assertion behind an unrelated failure. The
+            // second row exists for `unique_sample_literal_variant`: a
+            // *non-target* `unique references` column in
+            // `unique_violation_insert_sql`'s duplicate insert needs a
+            // second real id, distinct from the target's own value, or it
+            // would collide with itself across the two inserts the same way
+            // the target column is meant to.
+            let _ = writeln!(
+                out,
+                "INSERT INTO {target} DEFAULT VALUES;\nINSERT INTO {target} DEFAULT VALUES;"
+            );
         }
     }
     out
@@ -3033,16 +3042,51 @@ const fn unique_sample_literal(kind: FieldKind) -> &'static str {
     }
 }
 
+/// A second, distinct deterministic literal for a `FieldKind` — distinct
+/// from both [`unique_sample_literal`] and [`sql_sample_literal`]'s value
+/// for the same kind. Used by [`unique_violation_insert_sql`] for a
+/// scaffold's *other* unique fields (not the one under test) when building
+/// the duplicate insert: if more than one field is `unique`, reusing the
+/// exact same value for a non-target unique column on both inserts would
+/// trip *that* column's own UNIQUE index too, racing against the target's
+/// to decide which violation Postgres actually reports.
+const fn unique_sample_literal_variant(kind: FieldKind) -> &'static str {
+    match kind {
+        FieldKind::String | FieldKind::Text | FieldKind::Enum => "'dup_value_2'",
+        FieldKind::I32 | FieldKind::I64 => "424243",
+        // The second stub row `render_reference_stub_tables_sql` seeds —
+        // distinct from `unique_sample_literal`'s "1" for the same reason
+        // that one must be a real seeded row's id, not an arbitrary literal.
+        FieldKind::References => "2",
+        FieldKind::Bool => "FALSE",
+        FieldKind::F32 | FieldKind::F64 => "2.5",
+        FieldKind::Uuid => "'00000000-0000-0000-0000-000000000002'::uuid",
+        FieldKind::NaiveDateTime => "'2024-01-02 00:00:00'::timestamp",
+        FieldKind::DateTime => "'2024-01-02 00:00:00+00'::timestamptz",
+        FieldKind::Bytea => "'\\xBEEFDEAD'::bytea",
+        FieldKind::Attachment => "NULL",
+    }
+}
+
 /// Build a raw `INSERT INTO <plural> (...)` statement that sets `target`'s
 /// unique column to a deterministic, repeatable value (see
 /// [`unique_sample_literal`]) and every other required (`NOT NULL`, no
 /// `DEFAULT`) column to a valid sample value — mirrors
 /// [`enum_rejection_insert_sql`]'s shape.
+///
+/// `is_duplicate_insert` selects which literal a *non-target* `unique`
+/// column gets: `false` (the first insert) uses the same
+/// [`sql_sample_literal`] every other required column gets; `true` (the
+/// second, colliding insert) switches those specific columns to
+/// [`unique_sample_literal_variant`] instead, so a scaffold with more than
+/// one `unique` field doesn't also duplicate a *different* column's value
+/// and race it against `target`'s for which violation Postgres reports.
 fn unique_violation_insert_sql(
     plural: &str,
     fields: &[Field],
     target: &Field,
     defaults: &BTreeMap<String, String>,
+    is_duplicate_insert: bool,
 ) -> String {
     let mut columns = Vec::new();
     let mut values = Vec::new();
@@ -3057,7 +3101,12 @@ fn unique_violation_insert_sql(
             values.push(value);
         } else if !f.nullable && !defaults.contains_key(&f.name) {
             columns.push(f.name.clone());
-            let value = if f.is_enum() {
+            let value = if is_duplicate_insert && f.unique && f.is_enum() {
+                let variant = f.variants.get(1).unwrap_or(&f.variants[0]);
+                format!("'{variant}'")
+            } else if is_duplicate_insert && f.unique {
+                unique_sample_literal_variant(f.kind).to_owned()
+            } else if f.is_enum() {
                 format!("'{}'", f.variants.first().expect("enum field has variants"))
             } else {
                 sql_sample_literal(f.kind).to_owned()
@@ -3125,8 +3174,20 @@ fn render_unique_violation_smoke_test(
             continue;
         }
         let field_name = &target.name;
-        let insert_sql = unique_violation_insert_sql(plural, fields, target, defaults);
+        let insert_sql = unique_violation_insert_sql(plural, fields, target, defaults, false);
         let escaped_insert = escape_sql_for_rust_literal(&insert_sql);
+        // A scaffold with more than one `unique` field needs a *second*,
+        // distinct insert for the DB-level duplicate-insert check below: if
+        // it reused `escaped_insert` verbatim, a non-target unique column
+        // would collide with itself too, racing against `target`'s own
+        // collision to decide which violation Postgres actually reports
+        // (issue #1032 review follow-up). Only that DB-level check gets the
+        // varied insert — the request-boundary stand-in handler below is a
+        // single compiled function invoked via two separate HTTP calls, so
+        // it has no way to distinguish "first call" from "second call" and
+        // keeps using `escaped_insert` for both, same as before.
+        let insert_sql_dup = unique_violation_insert_sql(plural, fields, target, defaults, true);
+        let escaped_insert_dup = escape_sql_for_rust_literal(&insert_sql_dup);
         let constraint_name = unique_index_name(plural, field_name);
 
         let request_boundary_check = if api {
@@ -3176,7 +3237,7 @@ fn render_unique_violation_smoke_test(
              \n\
              \x20\x20\x20\x20let mut conn = db.pool().get().await.expect(\"failed to get db connection\");\n\
              \x20\x20\x20\x20diesel::sql_query(\"{escaped_insert}\").execute(&mut *conn).await.expect(\"first insert must succeed\");\n\
-             \x20\x20\x20\x20let dup_result = diesel::sql_query(\"{escaped_insert}\").execute(&mut *conn).await;\n\
+             \x20\x20\x20\x20let dup_result = diesel::sql_query(\"{escaped_insert_dup}\").execute(&mut *conn).await;\n\
              \x20\x20\x20\x20let dup_err = dup_result.expect_err(\"a duplicate {field_name} must violate the UNIQUE index\");\n\
              \n\
              \x20\x20\x20\x20let mapped: AutumnResult<()> = Err(dup_err.into());\n\
@@ -5586,12 +5647,16 @@ async fn main() {
         // NOT NULL `references` column's sample literal ("1" — see
         // `sql_sample_literal`); without a seeded row, that INSERT would
         // fail on the FK constraint regardless of what it's actually trying
-        // to exercise.
+        // to exercise. Two rows are seeded (ids 1 and 2) — the second is for
+        // `unique_sample_literal_variant`'s "1" (target) vs. "2" (a
+        // non-target `unique references` column in the duplicate insert)
+        // distinction; see that function's doc comment.
         let fields = super::super::dsl::parse_fields(&["author:references".into()]).unwrap();
         let sql = render_reference_stub_tables_sql(&fields, "posts");
         assert_eq!(
             sql,
             "CREATE TABLE IF NOT EXISTS authors (id BIGSERIAL PRIMARY KEY);\n\
+             INSERT INTO authors DEFAULT VALUES;\n\
              INSERT INTO authors DEFAULT VALUES;\n",
             "got:\n{sql}"
         );
@@ -5617,8 +5682,14 @@ async fn main() {
         ];
         let sql = render_reference_stub_tables_sql(&fields, "unrelated_table");
         assert_eq!(
-            sql.matches("INSERT INTO authors DEFAULT VALUES;").count(),
+            sql.matches("CREATE TABLE IF NOT EXISTS authors").count(),
             1,
+            "two fields pointing at the same target must still only stub \
+             (and seed) that table once, not once per field; got:\n{sql}"
+        );
+        assert_eq!(
+            sql.matches("INSERT INTO authors DEFAULT VALUES;").count(),
+            2,
             "got:\n{sql}"
         );
     }
