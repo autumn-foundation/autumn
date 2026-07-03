@@ -1375,17 +1375,27 @@ enum GenerateCommands {
     /// Quote the token in bash/zsh — an unquoted `enum{a,b}` is brace-expanded
     /// by the shell before `autumn` ever sees it.
     ///
+    /// `field:Type:unique` (e.g. `email:String:unique`) scaffolds a `CREATE
+    /// UNIQUE INDEX` for the column, distinct from the plain, non-unique
+    /// `--index`/`--unique` output. `--unique FIELD` is the flag-based
+    /// equivalent, mirroring `--index`'s ergonomics.
+    ///
     /// Examples:
     ///
     ///   autumn generate model Post title:String body:Text published:bool
     ///   autumn generate model Comment body:Text post:references
     ///   autumn generate model Post 'status:enum{draft,published,archived}'
+    ///   autumn generate model User email:String:unique
     #[command(verbatim_doc_comment)]
     Model {
         /// Resource name (`PascalCase` or `snake_case`, e.g. `Post`).
         name: String,
         /// Field DSL tokens, each `name:Type`.
         fields: Vec<String>,
+        /// Add a `CREATE UNIQUE INDEX` for this field. Repeatable. Mirrors
+        /// the DSL's inline `:unique` modifier (`email:String:unique`).
+        #[arg(long, value_name = "FIELD")]
+        unique: Vec<String>,
         /// Add a `deleted_at` column and use soft-delete in the repository.
         #[arg(long)]
         soft_delete: bool,
@@ -1405,12 +1415,17 @@ enum GenerateCommands {
     /// `Remove<Field>From<Table>` convention, the generator emits the
     /// matching `ALTER TABLE` statements automatically. Accepts the same
     /// field DSL as `generate model`/`scaffold`, including `enum{a,b,c}`
-    /// (emits `TEXT` + a `CHECK` constraint) — quote the token in bash/zsh.
+    /// (emits `TEXT` + a `CHECK` constraint) and `:unique` (emits a `CREATE
+    /// UNIQUE INDEX`) — quote the token in bash/zsh.
     Migration {
         /// Migration name (`PascalCase` or `snake_case`).
         name: String,
         /// Field DSL tokens — only used for `Add…To…` / `Remove…From…` names.
         fields: Vec<String>,
+        /// Add a `CREATE UNIQUE INDEX` for this field. Repeatable. Mirrors
+        /// the DSL's inline `:unique` modifier (`email:String:unique`).
+        #[arg(long, value_name = "FIELD")]
+        unique: Vec<String>,
         /// Print the file plan and exit without writing anything.
         #[arg(long)]
         dry_run: bool,
@@ -1776,6 +1791,12 @@ enum GenerateCommands {
     /// enum, a `CHECK` constraint, a `<select>` form widget, and
     /// request-boundary validation that rejects an out-of-set value with a
     /// 400. Quote the token in bash/zsh (see `generate model --help`).
+    ///
+    /// `field:Type:unique` (e.g. `email:String:unique`) scaffolds a `CREATE
+    /// UNIQUE INDEX`, a derived `find_by_<field>` repository lookup, and a
+    /// create/update handler that renders a duplicate submission as an
+    /// inline "already exists" field error (HTTP 422) instead of a 500.
+    /// `--unique FIELD` is the flag-based equivalent.
     Scaffold {
         /// Resource name (`PascalCase` or `snake_case`, e.g. `Post`).
         name: String,
@@ -1784,6 +1805,11 @@ enum GenerateCommands {
         /// Add `#[indexed]` and a SQL index for this field. Repeatable.
         #[arg(long, value_name = "FIELD")]
         index: Vec<String>,
+        /// Add a `CREATE UNIQUE INDEX` and a derived `find_by_<field>`
+        /// repository lookup for this field. Repeatable. Mirrors the DSL's
+        /// inline `:unique` modifier (`email:String:unique`).
+        #[arg(long, value_name = "FIELD")]
+        unique: Vec<String>,
         /// Add a validator rule, e.g. `url=url` or `title=length:min=1,max=200`.
         #[arg(long, value_name = "FIELD=RULE")]
         validate: Vec<String>,
@@ -2550,6 +2576,7 @@ fn run_generate_command(cmd: GenerateCommands) {
         GenerateCommands::Model {
             name,
             fields,
+            unique,
             soft_delete,
             id,
             dry_run,
@@ -2585,6 +2612,7 @@ fn run_generate_command(cmd: GenerateCommands) {
                 },
             );
             let options = generate::model::ModelOptions {
+                uniques: unique,
                 soft_delete,
                 id_type,
                 ..Default::default()
@@ -2609,9 +2637,10 @@ fn run_generate_command(cmd: GenerateCommands) {
         GenerateCommands::Migration {
             name,
             fields,
+            unique,
             dry_run,
             force,
-        } => generate::migration::run(&name, &fields, generate::Flags { dry_run, force }),
+        } => generate::migration::run(&name, &fields, &unique, generate::Flags { dry_run, force }),
         GenerateCommands::Task {
             name,
             dry_run,
@@ -2720,6 +2749,7 @@ fn run_generate_command(cmd: GenerateCommands) {
             name,
             fields,
             index,
+            unique,
             validate,
             default,
             query,
@@ -2776,6 +2806,7 @@ fn run_generate_command(cmd: GenerateCommands) {
                 config_entry,
                 &fields,
                 &index,
+                &unique,
                 &validate,
                 &default,
                 &query,

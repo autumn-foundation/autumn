@@ -20,7 +20,7 @@ use super::emit::Plan;
 use super::model::ensure_cargo_dependencies;
 use super::naming::{pascal, pluralize, snake};
 use super::schema_edit::{
-    add_mod_declaration, append_schema_table, schema_has_table, update_main_rs,
+    add_mod_declaration, append_schema_table, schema_has_table, unique_index_sql, update_main_rs,
 };
 use super::{Flags, GenerateError, ensure_project_root, read_or_empty, timestamp_now};
 
@@ -1388,7 +1388,7 @@ fn render_migration_up(snake_name: &str, table: &str, totp: bool) -> String {
     let mut out = format!(
         "CREATE TABLE {table} (\n\
          \x20   id BIGSERIAL PRIMARY KEY,\n\
-         \x20   email TEXT NOT NULL UNIQUE,\n\
+         \x20   email TEXT NOT NULL,\n\
          \x20   time_zone TEXT NULL,\n\
          \x20   password_digest TEXT NOT NULL,\n\
          {totp_columns}\
@@ -1405,6 +1405,10 @@ fn render_migration_up(snake_name: &str, table: &str, totp: bool) -> String {
          \x20   created_at TIMESTAMP NOT NULL DEFAULT NOW()\n\
          );\n"
     );
+    // `email`'s uniqueness is expressed through the same shared primitive
+    // `field:String:unique` scaffolds elsewhere (issue #1032), rather than a
+    // parallel hand-rolled `UNIQUE` column constraint.
+    out.push_str(&unique_index_sql(table, "email"));
     if totp {
         out.push_str(
             "\n\

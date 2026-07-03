@@ -18,6 +18,11 @@ use super::{GenerateError, ensure_project_root, read_or_empty};
 pub struct ModelOptions {
     /// Field names that should receive `#[indexed]` and SQL indexes.
     pub indexes: Vec<String>,
+    /// Field names that should receive a `CREATE UNIQUE INDEX` (issue
+    /// #1032), mirroring `--index`'s ergonomics. Equivalent to marking the
+    /// field with the DSL's inline `:unique` modifier — both converge on
+    /// [`Field::unique`].
+    pub uniques: Vec<String>,
     /// Validation specs in `field=rule` form.
     pub validations: Vec<String>,
     /// Default specs in `field=value` form.
@@ -104,7 +109,8 @@ pub fn plan_model_with_options(
 ) -> Result<Plan, GenerateError> {
     ensure_project_root(project_root)?;
     validate_resource_name(name)?;
-    let fields = parse_fields(field_tokens)?;
+    let mut fields = parse_fields(field_tokens)?;
+    apply_unique_flags(&mut fields, &options.uniques)?;
     validate_field_names(&fields)?;
     let pascal_name = pascal(name);
     validate_enum_field_collisions(&pascal_name, &fields)?;
@@ -455,6 +461,7 @@ pub(super) fn augment_fields_for_soft_delete(
         kind: FieldKind::NaiveDateTime,
         nullable: true,
         variants: Vec::new(),
+        unique: false,
     });
     Ok(std::borrow::Cow::Owned(augmented))
 }
@@ -903,6 +910,26 @@ fn split_key_value(token: &str, sep: char) -> Result<(&str, &str), GenerateError
 
 pub fn field_by_name<'a>(fields: &'a [Field], name: &str) -> Option<&'a Field> {
     fields.iter().find(|field| field.name == name)
+}
+
+/// Apply `--unique FIELD` flags (issue #1032) to already-parsed fields,
+/// mirroring `--index`'s validate-then-apply shape. Unlike `--index`
+/// (tracked externally in `ModelMetadata.indexes`), `unique` is carried on
+/// the field itself ([`Field::unique`]) — the DSL's inline `:unique`
+/// modifier and this flag converge on the same bit, so every SQL-emission
+/// and repository-derive call site only ever needs to check `field.unique`.
+///
+/// # Errors
+/// Returns [`GenerateError::InvalidField`] for an unknown field name.
+pub fn apply_unique_flags(fields: &mut [Field], uniques: &[String]) -> Result<(), GenerateError> {
+    for unique in uniques {
+        let field_name = unique.trim();
+        validate_known_field(fields, field_name, unique)?;
+        if let Some(field) = fields.iter_mut().find(|f| f.name == field_name) {
+            field.unique = true;
+        }
+    }
+    Ok(())
 }
 
 fn validate_known_field(

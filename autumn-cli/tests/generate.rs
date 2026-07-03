@@ -1214,6 +1214,479 @@ fn generated_job_cargo_checks() {
     );
 }
 
+// ── `unique` field marker (issue #1032) ─────────────────────────────────────
+
+#[test]
+fn generate_model_unique_field_emits_unique_index() {
+    let (_tmp, project) = fresh_project("unique-app");
+    run_autumn(
+        &project,
+        &["generate", "model", "User", "email:String:unique"],
+    );
+
+    let migration = fs::read_dir(project.join("migrations"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|e| e.file_name().to_string_lossy().ends_with("_create_users"))
+        .expect("create_users migration should exist");
+    let up = fs::read_to_string(migration.path().join("up.sql")).unwrap();
+    assert!(
+        up.contains("CREATE UNIQUE INDEX idx_users_email_unique ON users (email);"),
+        "got:\n{up}"
+    );
+    assert!(
+        !up.contains("CREATE INDEX idx_users_email ON"),
+        "a unique field must not also emit a plain, non-unique index; got:\n{up}"
+    );
+}
+
+#[test]
+fn generate_model_unique_flag_marks_field_unique() {
+    let (_tmp, project) = fresh_project("unique-flag-app");
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "model",
+            "User",
+            "email:String",
+            "--unique",
+            "email",
+        ],
+    );
+
+    let migration = fs::read_dir(project.join("migrations"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|e| e.file_name().to_string_lossy().ends_with("_create_users"))
+        .expect("create_users migration should exist");
+    let up = fs::read_to_string(migration.path().join("up.sql")).unwrap();
+    assert!(
+        up.contains("CREATE UNIQUE INDEX idx_users_email_unique ON users (email);"),
+        "got:\n{up}"
+    );
+}
+
+#[test]
+fn generate_model_unique_flag_rejects_unknown_field() {
+    let (_tmp, project) = fresh_project("unique-flag-unknown-app");
+    let (_, stderr, code) = run_autumn_failing(
+        &project,
+        &[
+            "generate",
+            "model",
+            "User",
+            "email:String",
+            "--unique",
+            "bogus",
+        ],
+    );
+    assert_eq!(code, Some(1));
+    assert!(stderr.contains("bogus"), "got: {stderr}");
+}
+
+#[test]
+fn generate_migration_add_unique_column_emits_unique_index() {
+    let (_tmp, project) = fresh_project("unique-migration-app");
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "migration",
+            "AddEmailToUsers",
+            "email:String:unique",
+        ],
+    );
+
+    let migrations = fs::read_dir(project.join("migrations"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .ends_with("_add_email_to_users")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(migrations.len(), 1);
+    let up = fs::read_to_string(migrations[0].path().join("up.sql")).unwrap();
+    assert!(
+        up.contains("ALTER TABLE users ADD COLUMN email TEXT NOT NULL;"),
+        "got:\n{up}"
+    );
+    assert!(
+        up.contains("CREATE UNIQUE INDEX idx_users_email_unique ON users (email);"),
+        "got:\n{up}"
+    );
+}
+
+#[test]
+fn generate_migration_unique_flag_emits_unique_index() {
+    let (_tmp, project) = fresh_project("unique-migration-flag-app");
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "migration",
+            "AddEmailToUsers",
+            "email:String",
+            "--unique",
+            "email",
+        ],
+    );
+
+    let migrations = fs::read_dir(project.join("migrations"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .ends_with("_add_email_to_users")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(migrations.len(), 1);
+    let up = fs::read_to_string(migrations[0].path().join("up.sql")).unwrap();
+    assert!(
+        up.contains("CREATE UNIQUE INDEX idx_users_email_unique ON users (email);"),
+        "got:\n{up}"
+    );
+}
+
+#[test]
+fn generate_migration_remove_unique_column_rollback_restores_unique_index() {
+    let (_tmp, project) = fresh_project("unique-migration-remove-app");
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "migration",
+            "RemoveEmailFromUsers",
+            "email:String:unique",
+        ],
+    );
+
+    let migrations = fs::read_dir(project.join("migrations"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .ends_with("_remove_email_from_users")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(migrations.len(), 1);
+    let down = fs::read_to_string(migrations[0].path().join("down.sql")).unwrap();
+    assert!(
+        down.contains("CREATE UNIQUE INDEX idx_users_email_unique ON users (email);"),
+        "rollback must restore the UNIQUE index, not just the bare column; got:\n{down}"
+    );
+}
+
+#[test]
+fn generate_scaffold_unique_field_adds_find_by_query_to_repository() {
+    let (_tmp, project) = fresh_project("unique-scaffold-repo-app");
+    run_autumn(
+        &project,
+        &["generate", "scaffold", "User", "email:String:unique"],
+    );
+
+    let repo = fs::read_to_string(project.join("src/repositories/user.rs")).unwrap();
+    assert!(
+        repo.contains("fn find_by_email(email: String) -> Vec<User>;"),
+        "a unique field must get a derived find_by_ repository lookup for free; got:\n{repo}"
+    );
+}
+
+#[test]
+fn generate_scaffold_unique_flag_adds_find_by_query_to_repository() {
+    let (_tmp, project) = fresh_project("unique-scaffold-flag-repo-app");
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "User",
+            "email:String",
+            "--unique",
+            "email",
+        ],
+    );
+
+    let repo = fs::read_to_string(project.join("src/repositories/user.rs")).unwrap();
+    assert!(
+        repo.contains("fn find_by_email(email: String) -> Vec<User>;"),
+        "got:\n{repo}"
+    );
+}
+
+#[test]
+fn generate_scaffold_unique_field_does_not_duplicate_explicit_query() {
+    let (_tmp, project) = fresh_project("unique-scaffold-explicit-query-app");
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "User",
+            "email:String:unique",
+            "--query",
+            "find_by_email:email",
+        ],
+    );
+
+    let repo = fs::read_to_string(project.join("src/repositories/user.rs")).unwrap();
+    assert_eq!(
+        repo.matches("fn find_by_email(").count(),
+        1,
+        "an explicit --query and the automatic unique-field derivation for the \
+         same field must not produce two trait methods:\n{repo}"
+    );
+}
+
+#[test]
+fn generate_scaffold_unique_field_routes_handle_duplicate_with_inline_error() {
+    let (_tmp, project) = fresh_project("unique-scaffold-routes-app");
+    run_autumn(
+        &project,
+        &["generate", "scaffold", "User", "email:String:unique"],
+    );
+
+    let routes = fs::read_to_string(project.join("src/routes/users.rs")).unwrap();
+    assert!(routes.contains("UNIQUE_CONSTRAINTS"), "got:\n{routes}");
+    assert!(routes.contains("idx_users_email_unique"), "got:\n{routes}");
+    assert!(
+        routes.contains("autumn_web::error::unique_violation_field"),
+        "got:\n{routes}"
+    );
+    assert!(
+        routes.contains("StatusCode::UNPROCESSABLE_ENTITY"),
+        "got:\n{routes}"
+    );
+    assert!(
+        !routes.contains(
+            "pub async fn create(flash: Flash, mut db: Db, body: Bytes) -> AutumnResult<Markup>"
+        ),
+        "a scaffold with a unique field must not use the plain create signature \
+         that can only ever 500 on a duplicate; got:\n{routes}"
+    );
+}
+
+#[test]
+fn generate_scaffold_unique_field_emits_duplicate_rejection_smoke_test() {
+    let (_tmp, project) = fresh_project("unique-scaffold-smoke-app");
+    run_autumn(
+        &project,
+        &["generate", "scaffold", "User", "email:String:unique"],
+    );
+
+    let test_file = fs::read_to_string(project.join("tests/user.rs")).unwrap();
+    assert!(
+        test_file.contains("async fn users_rejects_duplicate_email()"),
+        "got:\n{test_file}"
+    );
+    assert!(
+        test_file.contains("idx_users_email_unique"),
+        "got:\n{test_file}"
+    );
+    assert!(
+        test_file.contains("autumn_web::error::unique_violation_field"),
+        "got:\n{test_file}"
+    );
+    // The DB-level check: a real duplicate INSERT must violate the UNIQUE
+    // index and be classified by field.
+    assert!(
+        test_file.contains("must violate the UNIQUE index"),
+        "got:\n{test_file}"
+    );
+    // The request-boundary check: a stand-in POST handler proves the full
+    // 422-with-inline-error path (issue #1032's success metric).
+    assert!(
+        test_file.contains(".assert_status(422)") && test_file.contains(".assert_status(200)"),
+        "got:\n{test_file}"
+    );
+}
+
+#[test]
+fn generate_scaffold_unique_attachment_field_is_skipped_in_smoke_test() {
+    // A unique constraint on an always-nullable attachment blob is a
+    // degenerate case (Postgres allows unlimited NULLs under a unique
+    // index) — no meaningful violation to provoke, so no smoke test should
+    // be emitted for it.
+    let (_tmp, project) = fresh_project("unique-attachment-smoke-app");
+    run_autumn(
+        &project,
+        &["generate", "scaffold", "Document", "file:Attachment:unique"],
+    );
+
+    let test_file = fs::read_to_string(project.join("tests/document.rs")).unwrap();
+    assert!(
+        !test_file.contains("rejects_duplicate_file"),
+        "got:\n{test_file}"
+    );
+}
+
+#[test]
+fn generate_scaffold_without_unique_field_keeps_plain_create_signature() {
+    // Regression guard: a scaffold with NO unique fields must emit
+    // byte-identical output to before this feature existed — no
+    // UNIQUE_CONSTRAINTS const, no Response-returning create/update.
+    let (_tmp, project) = fresh_project("no-unique-scaffold-routes-app");
+    run_autumn(&project, &["generate", "scaffold", "Post", "title:String"]);
+
+    let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
+    assert!(!routes.contains("UNIQUE_CONSTRAINTS"), "got:\n{routes}");
+    assert!(
+        routes.contains(
+            "pub async fn create(flash: Flash, mut db: Db, body: Bytes) -> AutumnResult<Markup>"
+        ),
+        "got:\n{routes}"
+    );
+}
+
+#[test]
+fn generate_model_help_documents_unique_field() {
+    let tmp = tempfile::tempdir().unwrap();
+    let autumn_bin = env!("CARGO_BIN_EXE_autumn");
+    let output = Command::new(autumn_bin)
+        .args(["generate", "model", "--help"])
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("unique"), "got:\n{stdout}");
+    assert!(stdout.contains("--unique"), "got:\n{stdout}");
+}
+
+#[test]
+fn generate_scaffold_help_documents_unique_field() {
+    let tmp = tempfile::tempdir().unwrap();
+    let autumn_bin = env!("CARGO_BIN_EXE_autumn");
+    let output = Command::new(autumn_bin)
+        .args(["generate", "scaffold", "--help"])
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("unique"), "got:\n{stdout}");
+    assert!(stdout.contains("--unique"), "got:\n{stdout}");
+}
+
+#[test]
+fn generate_migration_help_documents_unique_field() {
+    let tmp = tempfile::tempdir().unwrap();
+    let autumn_bin = env!("CARGO_BIN_EXE_autumn");
+    let output = Command::new(autumn_bin)
+        .args(["generate", "migration", "--help"])
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("unique"), "got:\n{stdout}");
+    assert!(stdout.contains("--unique"), "got:\n{stdout}");
+}
+
+#[test]
+fn generate_scaffold_with_unique_dry_run_lists_migration_file() {
+    let (_tmp, project) = fresh_project("unique-dryrun-app");
+    let (stdout, _stderr) = run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "User",
+            "email:String:unique",
+            "--dry-run",
+        ],
+    );
+    assert!(stdout.contains("Dry run"));
+    assert!(stdout.contains("src/models/user.rs"));
+    // The migration file (which will contain the UNIQUE index — see
+    // generate_model_unique_field_emits_unique_index for the SQL-level
+    // assertion) shows up in the dry-run's file plan like every other
+    // generated file.
+    assert!(
+        stdout.contains("_create_users") && stdout.contains("up.sql"),
+        "the migration file plan must be listed under --dry-run; got:\n{stdout}"
+    );
+    assert!(!project.join("src/models/user.rs").exists());
+}
+
+/// Slow end-to-end check: scaffold a `unique` field and `cargo check` the
+/// result. The generated `create`/`update` handlers (issue #1032) use a
+/// hand-templated `maud::html!` re-render on a constraint violation — this
+/// is the one test that actually compiles that generated code, catching any
+/// template/escaping mistake a string-content assertion alone would miss.
+///
+/// Ignored by default; run with `cargo test -p autumn-cli -- --ignored`.
+#[test]
+#[ignore = "slow: cargo-checks a fresh project — run with `cargo test -p autumn-cli -- --ignored`"]
+fn generated_unique_scaffold_cargo_checks() {
+    let (_tmp, project) = fresh_project("unique-scaffold-build");
+    patch_generated_cargo_toml(&project);
+
+    run_autumn(
+        &project,
+        &["generate", "scaffold", "User", "email:String:unique"],
+    );
+
+    let check = Command::new("cargo")
+        .args(["check", "--tests"])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "cargo check on generated unique scaffold failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr),
+    );
+}
+
+/// `--live` (SSE-backed repository writes) routes the insert/update through
+/// `repo.save`/`repo.update` instead of a bare `diesel::insert_into` — a
+/// different error-propagation path into `unique_violation_field` (see its
+/// doc comment on recovering the diesel error either way). This can't be a
+/// `cargo check` test like [`generated_unique_scaffold_cargo_checks`]:
+/// `--live` scaffolds fail to compile independent of `unique` (a pre-existing
+/// `<Model>DraftExt` import gap in `broadcasts = true` repositories,
+/// reproducible with zero unique fields — out of scope for issue #1032), so
+/// this only asserts the unique-aware codegen paths are wired correctly.
+#[test]
+fn generate_scaffold_unique_live_field_wires_repository_save_and_db_refetch() {
+    let (_tmp, project) = fresh_project("unique-live-scaffold-app");
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "User",
+            "email:String:unique",
+            "--live",
+        ],
+    );
+
+    let routes = fs::read_to_string(project.join("src/routes/users.rs")).unwrap();
+    assert!(
+        routes.contains("repo.save(&new).await?;"),
+        "the create failure branch must still route inserts through the \
+         repository on --live, not a bare diesel call; got:\n{routes}"
+    );
+    assert!(
+        routes.contains("repo.update(*id, &update_changes).await?;"),
+        "got:\n{routes}"
+    );
+    // The re-fetch on a unique-violation always uses direct DB access
+    // (mirroring `edit_form`'s own row-fetch), so `update`'s signature must
+    // carry `mut db` even though it also carries `repo` for the live path.
+    assert!(
+        routes.contains("mut db: Db") && routes.contains("repo: PgUserRepository"),
+        "got:\n{routes}"
+    );
+    assert!(
+        routes.contains("autumn_web::error::unique_violation_field"),
+        "got:\n{routes}"
+    );
+}
+
 // ── autumn generate channel integration tests ─────────────────────────────────
 
 #[test]

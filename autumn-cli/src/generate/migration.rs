@@ -38,15 +38,34 @@ fn collect_rs_files_recursive(dir: &Path, candidates: &mut Vec<std::path::PathBu
 ///
 /// # Errors
 /// Project layout, name, and DSL errors surface here.
+#[allow(dead_code)]
 pub fn plan_migration(
     project_root: &Path,
     name: &str,
     field_tokens: &[String],
     timestamp: &str,
 ) -> Result<Plan, GenerateError> {
+    plan_migration_with_options(project_root, name, field_tokens, timestamp, &[])
+}
+
+/// [`plan_migration`], plus `--unique FIELD` flags (issue #1032) — mirrors
+/// the DSL's inline `:unique` modifier, which already works via
+/// [`parse_fields`] alone (no options struct needed, unlike `generate
+/// model`/`scaffold`'s `ModelOptions`).
+///
+/// # Errors
+/// Project layout, name, DSL, and unknown-field errors surface here.
+pub fn plan_migration_with_options(
+    project_root: &Path,
+    name: &str,
+    field_tokens: &[String],
+    timestamp: &str,
+    uniques: &[String],
+) -> Result<Plan, GenerateError> {
     ensure_project_root(project_root)?;
     super::model::validate_resource_name(name)?;
-    let fields = parse_fields(field_tokens)?;
+    let mut fields = parse_fields(field_tokens)?;
+    super::model::apply_unique_flags(&mut fields, uniques)?;
 
     // The directory uses snake_case (`add_title_to_posts`) but the shape is
     // detected from the original PascalCase form because the keywords `To`
@@ -187,7 +206,7 @@ fn pascalish(name: &str) -> String {
 }
 
 /// CLI entry point.
-pub fn run(name: &str, field_tokens: &[String], flags: Flags) {
+pub fn run(name: &str, field_tokens: &[String], uniques: &[String], flags: Flags) {
     let cwd = match std::env::current_dir() {
         Ok(d) => d,
         Err(e) => {
@@ -196,7 +215,9 @@ pub fn run(name: &str, field_tokens: &[String], flags: Flags) {
         }
     };
     let timestamp = timestamp_now();
-    match plan_migration(&cwd, name, field_tokens, &timestamp).and_then(|p| p.execute(flags)) {
+    match plan_migration_with_options(&cwd, name, field_tokens, &timestamp, uniques)
+        .and_then(|p| p.execute(flags))
+    {
         Ok(()) => {}
         Err(e) => {
             eprintln!("Error: {e}");

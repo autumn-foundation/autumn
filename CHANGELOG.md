@@ -39,6 +39,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   MCP-invisible (documented follow-up). See the
   [MCP guide](docs/guide/mcp.md) §9–§10.
 
+- **cli:** `unique` field-DSL marker and `--unique FIELD` flag for `autumn
+  generate model`/`scaffold`/`migration` (#1032). `email:String:unique`
+  scaffolds a `CREATE UNIQUE INDEX idx_<table>_<field>_unique` in the
+  migration — a distinct name from the plain, non-unique `--index` output, so
+  the two never collide even on the same column — restored on `RemoveXFromY`
+  rollback (same precedent as `references`'/`enum`'s constraint restoration).
+  `--unique FIELD` is the flag-based equivalent, mirroring `--index`'s
+  ergonomics; both converge on the same `Field::unique` bit. A scaffolded
+  unique field also gets a derived `find_by_<field>` repository lookup for
+  free (no `--query` needed), and the generated HTML `create`/`update`
+  handlers catch a duplicate submission — mapped once, in `autumn-web`, from
+  Postgres SQLSTATE `23505` via the new `autumn_web::error::
+  unique_violation_field` — and re-render the form with an inline
+  "already exists" field error and `422`, instead of a generic `500`. The
+  auth generator's hand-rolled `email … UNIQUE` column now goes through the
+  same shared `unique_index_sql` primitive rather than a parallel raw-SQL
+  path. `--dry-run` lists the migration file in the plan and `--help`
+  documents the new token; single-column only (composite `UNIQUE(a, b)`,
+  case-insensitive uniqueness, and the `--api` JSON conflict response are out
+  of scope for this slice).
+
 - **model:** many-to-many associations via `#[has_many(Target, through =
   join_table)]` (#1324). Extends the `belongs_to`/`has_many`/`has_one`
   associations from #835 with a join-table variant: join columns default to

@@ -685,6 +685,57 @@ impl AutumnError {
     }
 }
 
+/// Checks whether `err`'s inner error is a Postgres unique-constraint
+/// violation (SQLSTATE `23505`) matching `mapping` (issue #1032).
+///
+/// If `err` is a unique-violation whose constraint name matches one of
+/// `mapping`'s entries, returns the offending field name and the message to
+/// surface inline. `mapping` pairs each unique index/constraint name (e.g.
+/// `idx_users_email_unique` — see `autumn generate`'s
+/// `schema_edit::unique_index_sql`) with the form field name and message to
+/// show when that constraint is violated.
+///
+/// Returns `None` for any other error, or for an unrecognized constraint
+/// name — both cases the caller should propagate normally (`?`/[`From`]),
+/// which falls through to the blanket `500` mapping. This is the single
+/// shared place this classification happens; generated `create`/`update`
+/// handlers call it instead of hand-rolling a `DatabaseErrorKind` match
+/// per scaffold.
+///
+/// Works whether `err` wraps a raw `diesel::result::Error` directly (a bare
+/// `.execute(...).await?`) or one already converted by a generated
+/// repository method (`repo.save(...).await?`) — both route the original
+/// diesel error through the `?` operator's blanket [`From`] impl, so
+/// [`AutumnError::downcast_ref`] recovers it either way.
+///
+/// # Examples
+///
+/// ```rust
+/// use autumn_web::error::{AutumnError, unique_violation_field};
+///
+/// let err = AutumnError::internal_server_error_msg("not a db error");
+/// assert_eq!(unique_violation_field(&err, &[("idx_users_email_unique", "email", "taken")]), None);
+/// ```
+#[cfg(feature = "db")]
+#[must_use]
+pub fn unique_violation_field<'a>(
+    err: &AutumnError,
+    mapping: &'a [(&str, &str, &str)],
+) -> Option<(&'a str, &'a str)> {
+    let diesel::result::Error::DatabaseError(
+        diesel::result::DatabaseErrorKind::UniqueViolation,
+        info,
+    ) = err.downcast_ref::<diesel::result::Error>()?
+    else {
+        return None;
+    };
+    let constraint = info.constraint_name()?;
+    mapping
+        .iter()
+        .find(|(c, _, _)| *c == constraint)
+        .map(|(_, field, message)| (*field, *message))
+}
+
 impl std::fmt::Display for AutumnError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.inner)
@@ -1226,5 +1277,109 @@ mod tests {
             .expect("HX-Trigger header present");
         assert_eq!(hx_trigger, r#"{"autumn:conflict":true}"#);
         Ok(())
+    }
+
+    // ── unique_violation_field (issue #1032) ────────────────────────────────
+
+    #[cfg(feature = "db")]
+    mod unique_violation_field_tests {
+        use super::*;
+        use crate::error::unique_violation_field;
+
+        #[derive(Debug)]
+        struct FakeDbErrorInfo {
+            constraint: Option<&'static str>,
+        }
+
+        impl diesel::result::DatabaseErrorInformation for FakeDbErrorInfo {
+            fn message(&self) -> &'static str {
+                "duplicate key value violates unique constraint"
+            }
+            fn details(&self) -> Option<&str> {
+                None
+            }
+            fn hint(&self) -> Option<&str> {
+                None
+            }
+            fn table_name(&self) -> Option<&str> {
+                None
+            }
+            fn column_name(&self) -> Option<&str> {
+                None
+            }
+            fn constraint_name(&self) -> Option<&str> {
+                self.constraint
+            }
+            fn statement_position(&self) -> Option<i32> {
+                None
+            }
+        }
+
+        fn unique_violation(constraint: Option<&'static str>) -> diesel::result::Error {
+            diesel::result::Error::DatabaseError(
+                diesel::result::DatabaseErrorKind::UniqueViolation,
+                Box::new(FakeDbErrorInfo { constraint }),
+            )
+        }
+
+        const MAPPING: &[(&str, &str, &str)] =
+            &[("idx_users_email_unique", "email", "has already been taken")];
+
+        #[test]
+        fn matches_constraint_name_to_field_and_message() {
+            let err: AutumnError = AutumnError::internal_server_error(unique_violation(Some(
+                "idx_users_email_unique",
+            )));
+            assert_eq!(
+                unique_violation_field(&err, MAPPING),
+                Some(("email", "has already been taken"))
+            );
+        }
+
+        #[test]
+        fn returns_none_for_unrecognized_constraint() {
+            let err: AutumnError =
+                AutumnError::internal_server_error(unique_violation(Some("some_other_constraint")));
+            assert_eq!(unique_violation_field(&err, MAPPING), None);
+        }
+
+        #[test]
+        fn returns_none_when_constraint_name_is_absent() {
+            let err: AutumnError = AutumnError::internal_server_error(unique_violation(None));
+            assert_eq!(unique_violation_field(&err, MAPPING), None);
+        }
+
+        #[test]
+        fn returns_none_for_non_unique_violation_db_errors() {
+            let err: AutumnError =
+                AutumnError::internal_server_error(diesel::result::Error::NotFound);
+            assert_eq!(unique_violation_field(&err, MAPPING), None);
+        }
+
+        #[test]
+        fn returns_none_for_non_db_errors() {
+            let err = AutumnError::internal_server_error_msg("plain string error");
+            assert_eq!(unique_violation_field(&err, MAPPING), None);
+        }
+
+        #[test]
+        fn recovers_diesel_error_through_repository_style_blanket_from() {
+            // Mirrors a generated repository method's `.execute(...).await?`
+            // -- the diesel error is converted to `AutumnError` via the
+            // blanket `From` impl before `unique_violation_field` ever sees
+            // it, same as `repo.save(...).await?`'s already-mapped error.
+            fn insert() -> Result<(), diesel::result::Error> {
+                Err(unique_violation(Some("idx_users_email_unique")))
+            }
+            fn handler() -> Result<(), AutumnError> {
+                insert()?;
+                Ok(())
+            }
+            let err = handler().unwrap_err();
+            assert_eq!(
+                unique_violation_field(&err, MAPPING),
+                Some(("email", "has already been taken"))
+            );
+        }
     }
 }

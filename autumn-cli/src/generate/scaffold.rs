@@ -108,7 +108,8 @@ pub fn plan_scaffold_with_options(
                 .to_owned(),
         ));
     }
-    let fields = parse_fields(field_tokens)?;
+    let mut fields = parse_fields(field_tokens)?;
+    super::model::apply_unique_flags(&mut fields, &options.model.uniques)?;
     if !options.api {
         validate_enum_field_names_against_routes_imports(&fields)?;
     }
@@ -465,6 +466,24 @@ fn parse_query_specs(
             field_name: field_name.to_owned(),
             rust_type: field.rust_type(),
         });
+    }
+    // Every `unique` field (issue #1032) gets a `find_by_<field>` repository
+    // lookup for free — no `--query` needed — mirroring how a `references`
+    // field auto-contributes to the migration's index set without an
+    // explicit `--index`. Skipped for a field already covered by an
+    // explicit `--query`, and for `enum` fields (same import-path
+    // limitation `--query` itself rejects above).
+    for field in fields {
+        if field.unique
+            && !field.is_enum()
+            && !parsed.iter().any(|spec| spec.field_name == field.name)
+        {
+            parsed.push(QuerySpec {
+                method: format!("find_by_{}", field.name),
+                field_name: field.name.clone(),
+                rust_type: field.rust_type(),
+            });
+        }
     }
     Ok(parsed)
 }
@@ -958,8 +977,27 @@ fn render_routes_file(
     let id_rust = id_type.rust_type();
     let validated_fields: Vec<&str> = validations.keys().map(String::as_str).collect();
     let create_inputs =
-        render_create_form_inputs(fields, live_validation, &validated_fields, plural);
-    let edit_inputs = render_edit_form_inputs(fields, live_validation, &validated_fields, plural);
+        render_create_form_inputs(fields, live_validation, &validated_fields, plural, false);
+    let edit_inputs =
+        render_edit_form_inputs(fields, live_validation, &validated_fields, plural, false);
+    // `unique` fields (issue #1032): a duplicate submission re-renders the
+    // same form with an inline field error instead of a generic 500 — see
+    // `render_unique_violation_create_handler`/`..._update_handler` below.
+    // These `_with_unique_error` variants are only spliced into that
+    // failure-path branch, never into `new_form`/`edit_form`'s normal
+    // (success) rendering, so a scaffold without `unique` fields emits byte-
+    // identical output to before this feature existed.
+    let unique_fields: Vec<&Field> = fields.iter().filter(|f| f.unique).collect();
+    let create_inputs_with_unique_error = if unique_fields.is_empty() {
+        String::new()
+    } else {
+        render_create_form_inputs(fields, live_validation, &validated_fields, plural, true)
+    };
+    let edit_inputs_with_unique_error = if unique_fields.is_empty() {
+        String::new()
+    } else {
+        render_edit_form_inputs(fields, live_validation, &validated_fields, plural, true)
+    };
     let update_columns = render_update_columns(plural, fields);
     let nullable_field_match = render_nullable_field_match(fields);
     let has_attachments = has_attachment_fields(fields);
@@ -1098,6 +1136,48 @@ fn render_routes_file(
         format!("mut db: {db_ty}")
     };
 
+    // A `unique` field's create/update handler re-renders the form on a
+    // constraint violation (issue #1032), which needs a CSRF token/field the
+    // same way `new_form`/`edit_form` already do — the plain create/update
+    // handlers otherwise only *consume* a submission, never render a form,
+    // so they don't carry these params. Inserted right after `flash: Flash`
+    // (NOT appended at the end) — axum's `Handler` trait requires the
+    // body-consuming `Bytes` extractor to stay the *last* parameter; every
+    // other extractor must come before it.
+    let create_signature = if unique_fields.is_empty() {
+        create_signature
+    } else {
+        create_signature.replacen(
+            "flash: Flash",
+            "flash: Flash, csrf: Option<CsrfToken>, csrf_field: Option<CsrfFormField>",
+            1,
+        )
+    };
+    let update_signature = if unique_fields.is_empty() {
+        update_signature
+    } else {
+        let with_csrf = update_signature.replacen(
+            "flash: Flash,",
+            "flash: Flash,\n    csrf: Option<CsrfToken>,\n    csrf_field: Option<CsrfFormField>,",
+            1,
+        );
+        // The `--live` signature uses `repo:` instead of `mut db: {db_ty}`,
+        // but the unique-violation re-fetch below always uses direct DB
+        // access (mirroring `edit_form`'s own row-fetch, which likewise
+        // never goes through the repository) — add it back when missing.
+        // Inserted before `body: Bytes,` (must stay last; see the
+        // `create_signature` comment above) rather than appended.
+        if with_csrf.contains("mut db:") {
+            with_csrf
+        } else {
+            with_csrf.replacen(
+                "body: Bytes,",
+                &format!("mut db: {db_ty},\n    body: Bytes,"),
+                1,
+            )
+        }
+    };
+
     let (decode_create_call, decode_update_call, decode_form_sig) = if has_attachments {
         (
             "decode_form(&state, body).await?".to_owned(),
@@ -1111,6 +1191,75 @@ fn render_routes_file(
             "decode_form(body)?".to_owned(),
             "decode_form(body)?".to_owned(),
             format!("fn decode_form(body: Bytes) -> AutumnResult<New{pascal_name}>"),
+        )
+    };
+
+    // `unique` fields (issue #1032): build the create/update handler bodies
+    // now that every input they need (`create_stmt`, `create_signature`,
+    // `decode_create_call`, …) is available. A scaffold with no `unique`
+    // fields gets byte-identical output to before this feature existed —
+    // `unique_constraints_const` is empty and `create_fn`/`update_fn` are the
+    // same plain templates previously inlined here.
+    let unique_constraints_const = if unique_fields.is_empty() {
+        String::new()
+    } else {
+        render_unique_constraints_const(plural, &unique_fields)
+    };
+    let create_fn = if unique_fields.is_empty() {
+        format!(
+            "/// `POST /{plural}` — accept a form submission and create a {snake_name}.\n\
+             #[secured]\n\
+             #[post(\"/{plural}\")]\n\
+             pub async fn create({create_signature}) -> AutumnResult<Markup> {{\n    \
+             let new = {decode_create_call};\n    \
+             {create_stmt}\n    \
+             flash.success(\"{pascal_name} created\").await;\n    \
+             Ok(redirect_to(\"/{plural}\"))\n\
+             }}\n"
+        )
+    } else {
+        render_unique_violation_create_handler(
+            pascal_name,
+            snake_name,
+            plural,
+            &create_signature,
+            &decode_create_call,
+            &create_stmt,
+            form_enctype,
+            &create_inputs_with_unique_error,
+        )
+    };
+    let update_fn = if unique_fields.is_empty() {
+        format!(
+            "/// `POST /{plural}/{{id}}/update` — apply form data to a row, then redirect\n\
+             /// to its show page. Uses column-by-column `diesel::update().set(...)` (same\n\
+             /// convention as `examples/todo-app`) so we don't need `AsChangeset` on the\n\
+             /// `New{pascal_name}` insert type.\n\
+             #[secured]\n\
+             #[post(\"/{plural}/{{id}}/update\")]\n\
+             pub async fn update(\n    \
+             {update_signature}\n\
+             ) -> AutumnResult<Markup> {{\n    \
+             let form = {decode_update_call};\n    \
+             {update_stmt}\n    \
+             if updated == 0 {{\n        \
+             return Err(AutumnError::not_found_msg(format!(\n            \
+             \"{pascal_name} with id {{}} not found\", *id\n        \
+             )));\n    \
+             }}\n    \
+             flash.success(\"{pascal_name} updated\").await;\n    \
+             Ok(redirect_to(&format!(\"/{plural}/{{}}\", *id)))\n\
+             }}\n"
+        )
+    } else {
+        render_unique_violation_update_handler(
+            pascal_name,
+            plural,
+            &update_signature,
+            &decode_update_call,
+            &update_stmt,
+            form_enctype,
+            &edit_inputs_with_unique_error,
         )
     };
 
@@ -1526,16 +1675,7 @@ pub async fn new_form(
     }}))
 }}
 
-/// `POST /{plural}` — accept a form submission and create a {snake_name}.
-#[secured]
-#[post("/{plural}")]
-pub async fn create({create_signature}) -> AutumnResult<Markup> {{
-    let new = {decode_create_call};
-    {create_stmt}
-    flash.success("{pascal_name} created").await;
-    Ok(redirect_to("/{plural}"))
-}}
-
+{unique_constraints_const}{create_fn}
 /// `GET /{plural}/{{id}}/edit` — render the edit form. Submission goes to
 /// the `update` handler below as a plain HTML POST (browsers can't submit
 /// PUT directly without JS); the auto-generated JSON `PUT /api/{plural}/{{id}}`
@@ -1570,26 +1710,7 @@ pub async fn edit_form(
     }}))
 }}
 
-/// `POST /{plural}/{{id}}/update` — apply form data to a row, then redirect
-/// to its show page. Uses column-by-column `diesel::update().set(...)` (same
-/// convention as `examples/todo-app`) so we don't need `AsChangeset` on the
-/// `New{pascal_name}` insert type.
-#[secured]
-#[post("/{plural}/{{id}}/update")]
-pub async fn update(
-    {update_signature}
-) -> AutumnResult<Markup> {{
-    let form = {decode_update_call};
-    {update_stmt}
-    if updated == 0 {{
-        return Err(AutumnError::not_found_msg(format!(
-            "{pascal_name} with id {{}} not found", *id
-        )));
-    }}
-    flash.success("{pascal_name} updated").await;
-    Ok(redirect_to(&format!("/{plural}/{{}}", *id)))
-}}
-
+{update_fn}
 /// `POST /{plural}/{{id}}/delete` — delete a row, then redirect to the list.
 /// Browsers can't submit `DELETE` without JS, so the show page's delete button
 /// posts here; the JSON `DELETE /api/{plural}/{{id}}` stays available for API
@@ -1660,6 +1781,132 @@ pub async fn events(
     } + &validate_handlers
 }
 
+/// The `UNIQUE_CONSTRAINTS` module-level const the generated `create`/
+/// `update` handlers pass to `autumn_web::error::unique_violation_field`
+/// (issue #1032) — one `(constraint_name, field_name, message)` triple per
+/// `unique` field, where `constraint_name` matches the name
+/// `schema_edit::unique_index_sql` gives the migration's `CREATE UNIQUE
+/// INDEX` (`idx_<table>_<field>_unique`).
+fn render_unique_constraints_const(plural: &str, unique_fields: &[&Field]) -> String {
+    use std::fmt::Write as _;
+    let mut entries = String::new();
+    for f in unique_fields {
+        let _ = write!(
+            entries,
+            "(\"idx_{plural}_{name}_unique\", \"{name}\", \"has already been taken\"),\n    ",
+            name = f.name
+        );
+    }
+    format!("const UNIQUE_CONSTRAINTS: &[(&str, &str, &str)] = &[\n    {entries}];\n")
+}
+
+/// Builds the `create` handler body for a scaffold with `unique` fields
+/// (issue #1032). The insert runs inside an inner `async` block so a
+/// `Result` is captured instead of propagating straight through `?`;
+/// `autumn_web::error::unique_violation_field` classifies a failure against
+/// `UNIQUE_CONSTRAINTS` and, on a match, re-renders the new-{snake_name} form
+/// with an inline field error and `422` instead of the generic `500` a bare
+/// `?` would otherwise produce. Any other error still propagates normally.
+#[allow(clippy::too_many_arguments)]
+fn render_unique_violation_create_handler(
+    pascal_name: &str,
+    snake_name: &str,
+    plural: &str,
+    create_signature: &str,
+    decode_create_call: &str,
+    create_stmt: &str,
+    form_enctype: &str,
+    create_inputs_with_unique_error: &str,
+) -> String {
+    format!(
+        "/// `POST /{plural}` — accept a form submission and create a {snake_name}.\n\
+         #[secured]\n\
+         #[post(\"/{plural}\")]\n\
+         pub async fn create({create_signature}) -> AutumnResult<autumn_web::reexports::axum::response::Response> {{\n    \
+         use autumn_web::reexports::axum::response::IntoResponse as _;\n    \
+         let new = {decode_create_call};\n    \
+         let result: AutumnResult<()> = async {{\n        \
+         {create_stmt}\n        \
+         Ok(())\n    \
+         }}.await;\n    \
+         if let Err(err) = result {{\n        \
+         if let Some((field, message)) = autumn_web::error::unique_violation_field(&err, UNIQUE_CONSTRAINTS) {{\n            \
+         return Ok((autumn_web::reexports::http::StatusCode::UNPROCESSABLE_ENTITY, layout(\"New {pascal_name}\", flash.render().await, html! {{\n                \
+         h1 {{ \"New {pascal_name}\" }}\n                \
+         form action=\"/{plural}\" method=\"post\"{form_enctype} {{\n                    \
+         (csrf_input(csrf.as_ref(), csrf_field.as_ref()))\n{create_inputs_with_unique_error}                    button type=\"submit\" {{ \"Create\" }}\n                \
+         }}\n            \
+         }})).into_response());\n        \
+         }}\n        \
+         return Err(err);\n    \
+         }}\n    \
+         flash.success(\"{pascal_name} created\").await;\n    \
+         Ok(redirect_to(\"/{plural}\").into_response())\n\
+         }}\n"
+    )
+}
+
+/// [`render_unique_violation_create_handler`]'s `update` counterpart. On a
+/// unique-constraint violation, re-fetches the row by `id` (its pre-update,
+/// still-valid values — not the rejected submission) and re-renders the
+/// edit form with an inline field error and `422`.
+#[allow(clippy::too_many_arguments)]
+fn render_unique_violation_update_handler(
+    pascal_name: &str,
+    plural: &str,
+    update_signature: &str,
+    decode_update_call: &str,
+    update_stmt: &str,
+    form_enctype: &str,
+    edit_inputs_with_unique_error: &str,
+) -> String {
+    format!(
+        "/// `POST /{plural}/{{id}}/update` — apply form data to a row, then redirect\n\
+         /// to its show page. Uses column-by-column `diesel::update().set(...)` (same\n\
+         /// convention as `examples/todo-app`) so we don't need `AsChangeset` on the\n\
+         /// `New{pascal_name}` insert type.\n\
+         #[secured]\n\
+         #[post(\"/{plural}/{{id}}/update\")]\n\
+         pub async fn update(\n    \
+         {update_signature}\n\
+         ) -> AutumnResult<autumn_web::reexports::axum::response::Response> {{\n    \
+         use autumn_web::reexports::axum::response::IntoResponse as _;\n    \
+         let form = {decode_update_call};\n    \
+         let result: AutumnResult<usize> = async {{\n        \
+         {update_stmt}\n        \
+         Ok(updated)\n    \
+         }}.await;\n    \
+         let updated = match result {{\n        \
+         Ok(updated) => updated,\n        \
+         Err(err) => {{\n            \
+         if let Some((field, message)) = autumn_web::error::unique_violation_field(&err, UNIQUE_CONSTRAINTS) {{\n                \
+         let row: {pascal_name} = {plural}::table\n                    \
+         .find(*id)\n                    \
+         .select({pascal_name}::as_select())\n                    \
+         .first(&mut *db)\n                    \
+         .await\n                    \
+         .map_err(AutumnError::not_found)?;\n                \
+         return Ok((autumn_web::reexports::http::StatusCode::UNPROCESSABLE_ENTITY, layout(&format!(\"Edit {pascal_name} #{{}}\", row.id), flash.render().await, html! {{\n                    \
+         h1 {{ \"Edit {pascal_name} #\" (row.id) }}\n                    \
+         form action=(format!(\"/{plural}/{{}}/update\", row.id)) method=\"post\"{form_enctype} {{\n                        \
+         (csrf_input(csrf.as_ref(), csrf_field.as_ref()))\n{edit_inputs_with_unique_error}                        button type=\"submit\" {{ \"Save\" }}\n                    \
+         }}\n                \
+         }})).into_response());\n            \
+         }}\n            \
+         return Err(err);\n        \
+         }}\n    \
+         }};\n    \
+         if updated == 0 {{\n        \
+         return Err(AutumnError::not_found_msg(format!(\n            \
+         \"{pascal_name} with id {{}} not found\", *id\n        \
+         )));\n    \
+         }}\n    \
+         flash.success(\"{pascal_name} updated\").await;\n    \
+         Ok(redirect_to(&format!(\"/{plural}/{{}}\", *id)).into_response())\n\
+         }}\n"
+    )
+}
+
 fn render_update_changeset_expr(pascal_name: &str, fields: &[Field]) -> String {
     use std::fmt::Write;
     let mut out = format!("Update{pascal_name} {{\n");
@@ -1703,6 +1950,7 @@ fn render_create_form_inputs(
     live_validation: bool,
     validated: &[&str],
     plural: &str,
+    unique_error_aware: bool,
 ) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
@@ -1804,12 +2052,27 @@ fn render_create_form_inputs(
                     hx_attrs = hx_attrs
                 ),
             };
+            // Only the `create` handler's failure-re-render branch passes
+            // `unique_error_aware = true` (see `render_unique_violation_create_handler`)
+            // — `field`/`message` are local variables in scope there,
+            // populated from `unique_violation_field` (issue #1032). The
+            // plain `new_form` handler never sets this, so its output is
+            // byte-identical to before this field existed.
+            let unique_error_span = if unique_error_aware && f.unique {
+                format!(
+                    "\n            @if field == \"{name}\" {{ span class=\"field-error\" {{ (message) }} }}",
+                    name = f.name
+                )
+            } else {
+                String::new()
+            };
             let _ = writeln!(
                 out,
-                "            label {{ \"{name}\" }} {input_tag};{error_span}",
+                "            label {{ \"{name}\" }} {input_tag};{error_span}{unique_error_span}",
                 name = f.name,
                 input_tag = input_tag,
-                error_span = error_span
+                error_span = error_span,
+                unique_error_span = unique_error_span
             );
         }
     }
@@ -1836,6 +2099,7 @@ fn render_edit_form_inputs(
     live_validation: bool,
     validated: &[&str],
     plural: &str,
+    unique_error_aware: bool,
 ) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
@@ -1947,12 +2211,21 @@ fn render_edit_form_inputs(
                     hx_attrs = hx_attrs
                 ),
             };
+            let unique_error_span = if unique_error_aware && f.unique {
+                format!(
+                    "\n            @if field == \"{name}\" {{ span class=\"field-error\" {{ (message) }} }}",
+                    name = f.name
+                )
+            } else {
+                String::new()
+            };
             let _ = writeln!(
                 out,
-                "            label {{ \"{name}\" }} {input_tag};{error_span}",
+                "            label {{ \"{name}\" }} {input_tag};{error_span}{unique_error_span}",
                 name = f.name,
                 input_tag = input_tag,
-                error_span = error_span
+                error_span = error_span,
+                unique_error_span = unique_error_span
             );
         }
     }
@@ -2447,10 +2720,24 @@ fn render_smoke_test(
         render_index_smoke_test(pascal_name, plural, id_schema_type, &setup_calls)
     };
 
-    if fields.iter().any(Field::is_enum) {
+    let base = if fields.iter().any(Field::is_enum) {
         base + &render_enum_rejection_smoke_test(plural, fields, defaults, &setup_calls, api)
     } else {
         base
+    };
+
+    let unique_fields: Vec<&Field> = fields.iter().filter(|f| f.unique).collect();
+    if unique_fields.is_empty() {
+        base
+    } else {
+        base + &render_unique_violation_smoke_test(
+            plural,
+            fields,
+            &unique_fields,
+            defaults,
+            &setup_calls,
+            api,
+        )
     }
 }
 
@@ -2616,6 +2903,181 @@ fn render_enum_rejection_smoke_test(
              \n\
              \x20\x20\x20\x20let count: i64 = {plural}::table.count().get_result(&mut *conn).await.unwrap();\n\
              \x20\x20\x20\x20assert_eq!(count, 0, \"the rejected row must not have been written\");\n\
+             }}\n",
+        );
+    }
+    out
+}
+
+/// A deterministic non-`NULL` literal for a `FieldKind`, used to seed and
+/// then re-insert the *same* value in [`render_unique_violation_smoke_test`]
+/// so the second insert reliably collides. Unlike [`sql_sample_literal`],
+/// this deliberately avoids non-deterministic SQL (`gen_random_uuid()`,
+/// `NOW()`) — two evaluations of either would almost certainly differ and
+/// the duplicate-insert assertion would never trip.
+const fn unique_sample_literal(kind: FieldKind) -> &'static str {
+    match kind {
+        FieldKind::String | FieldKind::Text | FieldKind::Enum => "'dup_value'",
+        FieldKind::I32 | FieldKind::I64 | FieldKind::References => "424242",
+        FieldKind::Bool => "TRUE",
+        FieldKind::F32 | FieldKind::F64 => "1.5",
+        FieldKind::Uuid => "'00000000-0000-0000-0000-000000000001'::uuid",
+        FieldKind::NaiveDateTime => "'2024-01-01 00:00:00'::timestamp",
+        FieldKind::DateTime => "'2024-01-01 00:00:00+00'::timestamptz",
+        FieldKind::Bytea => "'\\xDEADBEEF'::bytea",
+        FieldKind::Attachment => "NULL",
+    }
+}
+
+/// Build a raw `INSERT INTO <plural> (...)` statement that sets `target`'s
+/// unique column to a deterministic, repeatable value (see
+/// [`unique_sample_literal`]) and every other required (`NOT NULL`, no
+/// `DEFAULT`) column to a valid sample value — mirrors
+/// [`enum_rejection_insert_sql`]'s shape.
+fn unique_violation_insert_sql(
+    plural: &str,
+    fields: &[Field],
+    target: &Field,
+    defaults: &BTreeMap<String, String>,
+) -> String {
+    let mut columns = Vec::new();
+    let mut values = Vec::new();
+    for f in fields {
+        if f.name == target.name {
+            columns.push(f.name.clone());
+            values.push(unique_sample_literal(f.kind).to_owned());
+        } else if !f.nullable && !defaults.contains_key(&f.name) {
+            columns.push(f.name.clone());
+            let value = if f.is_enum() {
+                format!("'{}'", f.variants.first().expect("enum field has variants"))
+            } else {
+                sql_sample_literal(f.kind).to_owned()
+            };
+            values.push(value);
+        }
+    }
+    format!(
+        "INSERT INTO {plural} ({}) VALUES ({})",
+        columns.join(", "),
+        values.join(", ")
+    )
+}
+
+/// Render one `#[ignore]`d `#[tokio::test]` per `unique` field (issue #1032)
+/// that proves, against a real (throwaway) Postgres database:
+///
+/// 1. A raw duplicate `INSERT` (bypassing the app entirely) violates the
+///    migration's `CREATE UNIQUE INDEX` — the constraint is real, not just
+///    documented.
+/// 2. The resulting `diesel::result::Error`, converted to `AutumnError` via
+///    the same blanket `?`/`From` conversion the generated handler relies
+///    on, is correctly classified by `autumn_web::error::
+///    unique_violation_field` against the *real* Postgres constraint name —
+///    proving the `idx_<table>_<field>_unique` naming convention this
+///    generator and the runtime helper both assume actually round-trips
+///    through Postgres.
+/// 3. For an HTML (non-`--api`) scaffold, a stand-in `POST` handler — same
+///    convention as [`render_index_smoke_test`]'s stand-in `GET` handler —
+///    turns a duplicate submission into a `422` naming the field, proving
+///    the full request-boundary path (issue #1032's success metric: a
+///    second POST with the same value gets a field-level error, not a
+///    `500`).
+fn render_unique_violation_smoke_test(
+    plural: &str,
+    fields: &[Field],
+    unique_fields: &[&Field],
+    defaults: &BTreeMap<String, String>,
+    setup_calls: &str,
+    api: bool,
+) -> String {
+    // Same idempotency treatment as `render_enum_rejection_smoke_test` (see
+    // its comment) — this test's own setup must tolerate running alongside
+    // the base index/api smoke test and/or the enum-rejection smoke test in
+    // the same `TestDb::shared()` container.
+    let setup_calls = setup_calls.replacen(
+        &format!("CREATE TABLE {plural} ("),
+        &format!("CREATE TABLE IF NOT EXISTS {plural} ("),
+        1,
+    );
+    let setup_calls = setup_calls.replace("CREATE INDEX idx_", "CREATE INDEX IF NOT EXISTS idx_");
+    let setup_calls = setup_calls.replace(
+        "CREATE UNIQUE INDEX idx_",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_",
+    );
+    let setup_calls = setup_calls.as_str();
+
+    let mut out = String::new();
+    for target in unique_fields {
+        // A unique constraint on an always-`Option`-wrapped attachment blob
+        // is a degenerate case (Postgres permits unlimited `NULL`s under a
+        // unique index, so there's no violation to provoke) — skip it here,
+        // same as `unique`'s handling elsewhere never claims to cover it.
+        if target.kind.is_attachment() {
+            continue;
+        }
+        let field_name = &target.name;
+        let insert_sql = unique_violation_insert_sql(plural, fields, target, defaults);
+        let escaped_insert = escape_sql_for_rust_literal(&insert_sql);
+        let constraint_name = format!("idx_{plural}_{field_name}_unique");
+
+        let request_boundary_check = if api {
+            String::new()
+        } else {
+            format!(
+                "#[post(\"/{plural}\")]\n\
+                 async fn create(mut db: Db) -> AutumnResult<autumn_web::reexports::axum::response::Response> {{\n\
+                 \x20\x20\x20\x20use autumn_web::reexports::axum::response::IntoResponse as _;\n\
+                 \x20\x20\x20\x20let result: AutumnResult<()> = async {{\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20diesel::sql_query(\"{escaped_insert}\").execute(&mut *db).await?;\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20Ok(())\n\
+                 \x20\x20\x20\x20}}.await;\n\
+                 \x20\x20\x20\x20if let Err(err) = result {{\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20if let Some((field, message)) = autumn_web::error::unique_violation_field(\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20&err,\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20&[(\"{constraint_name}\", \"{field_name}\", \"has already been taken\")],\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20) {{\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20return Ok((\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20autumn_web::reexports::http::StatusCode::UNPROCESSABLE_ENTITY,\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20format!(\"{{field}}: {{message}}\"),\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20).into_response());\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20}}\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20return Err(err);\n\
+                 \x20\x20\x20\x20}}\n\
+                 \x20\x20\x20\x20Ok(autumn_web::reexports::http::StatusCode::OK.into_response())\n\
+                 }}\n\
+                 \n\
+                 \x20\x20\x20\x20let client: TestClient = TestApp::new().routes(routes![create]).with_db(db.pool()).build();\n\
+                 \n\
+                 \x20\x20\x20\x20client.post(\"/{plural}\").send().await.assert_status(200);\n\
+                 \x20\x20\x20\x20client.post(\"/{plural}\").send().await\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20.assert_status(422)\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20.assert_body_contains(\"{field_name}\");\n"
+            )
+        };
+
+        let _ = write!(
+            out,
+            "\n#[tokio::test]\n\
+             #[ignore = \"requires Docker (testcontainers) via TestDb; run `cargo test -- --ignored`\"]\n\
+             async fn {plural}_rejects_duplicate_{field_name}() {{\n\
+             \x20\x20\x20\x20let db = TestDb::shared().await;\n\
+             {setup_calls}\
+             \x20\x20\x20\x20db.execute_sql(\"TRUNCATE {plural} RESTART IDENTITY\").await;\n\
+             \n\
+             \x20\x20\x20\x20let mut conn = db.pool().get().await.expect(\"failed to get db connection\");\n\
+             \x20\x20\x20\x20diesel::sql_query(\"{escaped_insert}\").execute(&mut *conn).await.expect(\"first insert must succeed\");\n\
+             \x20\x20\x20\x20let dup_result = diesel::sql_query(\"{escaped_insert}\").execute(&mut *conn).await;\n\
+             \x20\x20\x20\x20let dup_err = dup_result.expect_err(\"a duplicate {field_name} must violate the UNIQUE index\");\n\
+             \n\
+             \x20\x20\x20\x20let mapped: AutumnResult<()> = Err(dup_err.into());\n\
+             \x20\x20\x20\x20let mapped_err = mapped.unwrap_err();\n\
+             \x20\x20\x20\x20let (field, _message) = autumn_web::error::unique_violation_field(\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20&mapped_err,\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20&[(\"{constraint_name}\", \"{field_name}\", \"has already been taken\")],\n\
+             \x20\x20\x20\x20).expect(\"a real Postgres unique_violation error must be classified by field\");\n\
+             \x20\x20\x20\x20assert_eq!(field, \"{field_name}\");\n\
+             \n\
+             {request_boundary_check}\
              }}\n",
         );
     }
@@ -4984,12 +5446,14 @@ async fn main() {
                 kind: FieldKind::References,
                 nullable: false,
                 variants: Vec::new(),
+                unique: false,
             },
             Field {
                 name: "author_id".to_string(),
                 kind: FieldKind::References,
                 nullable: true,
                 variants: Vec::new(),
+                unique: false,
             },
         ];
         assert_eq!(
@@ -5031,12 +5495,14 @@ async fn main() {
                 kind: FieldKind::References,
                 nullable: false,
                 variants: Vec::new(),
+                unique: false,
             },
             Field {
                 name: "author_id".to_string(),
                 kind: FieldKind::References,
                 nullable: true,
                 variants: Vec::new(),
+                unique: false,
             },
         ];
         let sql = render_reference_stub_tables_sql(&fields, "unrelated_table");

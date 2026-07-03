@@ -92,7 +92,9 @@ pub fn schema_has_table(schema: &str, table: &str) -> bool {
 }
 
 /// Build the full SQL for `up.sql` of a `CREATE TABLE` migration with optional
-/// defaults and non-unique indexes, honouring the caller-supplied `id_type`.
+/// defaults, plain (non-unique) `--index` columns, and `unique`-marked
+/// columns (their own `CREATE UNIQUE INDEX`, see [`unique_index_sql`]),
+/// honouring the caller-supplied `id_type`.
 /// For `Uuid`, prepends a comment documenting the index-locality trade-off and
 /// the `UUIDv7` upgrade path.
 #[must_use]
@@ -134,17 +136,32 @@ pub fn create_table_sql_with_metadata_and_id(
     // behaviour), in addition to any explicit `--index` fields. Merging into the
     // same sorted set keeps `CREATE INDEX` output deterministic and de-duplicates
     // a reference field that was *also* passed via `--index`.
+    let unique_fields: BTreeSet<&str> = fields
+        .iter()
+        .filter(|f| f.unique)
+        .map(|f| f.name.as_str())
+        .collect();
     let mut index_fields = indexes.clone();
     for f in fields {
         if f.kind.is_reference() {
             index_fields.insert(f.name.clone());
         }
     }
+    // A `unique` field's own `CREATE UNIQUE INDEX` (emitted below) already
+    // covers lookups on that column, so an explicit `--index` on the same
+    // field (or an auto-added `references` index, though `unique` +
+    // `references` together is an unusual combination) must not also emit a
+    // redundant plain index (issue #1032).
+    index_fields.retain(|name| !unique_fields.contains(name.as_str()));
     for field_name in &index_fields {
         let _ = writeln!(
             sql,
             "CREATE INDEX idx_{table}_{field_name} ON {table} ({field_name});"
         );
+    }
+    // `unique` fields get their own named `CREATE UNIQUE INDEX`.
+    for field_name in &unique_fields {
+        sql.push_str(&unique_index_sql(table, field_name));
     }
     sql
 }
@@ -153,6 +170,15 @@ pub fn create_table_sql_with_metadata_and_id(
 #[must_use]
 pub fn drop_table_sql(table: &str) -> String {
     format!("DROP TABLE {table};\n")
+}
+
+/// A `CREATE UNIQUE INDEX` statement enforcing single-column uniqueness on
+/// `field` (issue #1032) — distinct from the plain, non-unique `--index`
+/// output (`idx_<table>_<field>`, no `_unique` suffix), so a field that is
+/// both `--index`ed and `unique` doesn't collide on the index name.
+#[must_use]
+pub fn unique_index_sql(table: &str, field: &str) -> String {
+    format!("CREATE UNIQUE INDEX idx_{table}_{field}_unique ON {table} ({field});\n")
 }
 
 /// For an `enum{…}` field, the trailing ` CHECK (col IN ('a', 'b', …))`
@@ -321,6 +347,12 @@ pub fn add_columns_up_sql(table: &str, fields: &[Field]) -> String {
                 "CREATE INDEX idx_{table}_{} ON {table} ({});",
                 f.name, f.name
             );
+        }
+        if f.unique {
+            // Postgres auto-drops this index when the column is dropped,
+            // same as the `references` auto-index above, so
+            // `add_columns_down_sql` needs no change.
+            out.push_str(&unique_index_sql(table, &f.name));
         }
     }
     out
@@ -517,8 +549,9 @@ pub fn remove_columns_up_sql(table: &str, fields: &[Field]) -> String {
 /// [`create_table_sql_with_metadata_and_id`]/[`add_columns_up_sql`]) — a
 /// bare re-added column would silently drop the foreign-key relationship and
 /// its lookup index on rollback (issue #1026). Likewise restores an `enum{…}`
-/// field's `CHECK` constraint (issue #1030) — otherwise the closed set would
-/// silently stop being enforced after a rollback.
+/// field's `CHECK` constraint (issue #1030), and a `unique` field's `CREATE
+/// UNIQUE INDEX` (issue #1032) — otherwise the closed set / uniqueness
+/// constraint would silently stop being enforced after a rollback.
 #[must_use]
 pub fn remove_columns_down_sql(table: &str, fields: &[Field]) -> String {
     let mut out = String::new();
@@ -543,6 +576,9 @@ pub fn remove_columns_down_sql(table: &str, fields: &[Field]) -> String {
                 "CREATE INDEX idx_{table}_{} ON {table} ({});",
                 f.name, f.name
             );
+        }
+        if f.unique {
+            out.push_str(&unique_index_sql(table, &f.name));
         }
     }
     out
@@ -3244,6 +3280,116 @@ mod tests {
             1,
             "the FK index and an explicit --index on the same field must not \
              produce two CREATE INDEX statements:\n{sql}"
+        );
+    }
+
+    // ── unique field marker: CREATE UNIQUE INDEX (issue #1032) ──────────────
+
+    #[test]
+    fn create_table_sql_emits_unique_index_for_dsl_marker() {
+        let sql = create_table_sql_with_metadata_and_id(
+            "users",
+            &fields(&["email:String:unique"]),
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            IdType::BigSerial,
+        );
+        assert!(
+            sql.contains("CREATE UNIQUE INDEX idx_users_email_unique ON users (email);"),
+            "expected a unique index for the `:unique`-marked field; got:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn create_table_sql_unique_index_is_distinct_from_plain_index() {
+        // A `--index`-flagged field emits `idx_<table>_<field>` (no `_unique`
+        // suffix); a `unique`-marked field must use a distinct name so the
+        // two kinds of index never collide even on the same column.
+        let sql = create_table_sql_with_metadata_and_id(
+            "users",
+            &fields(&["email:String:unique"]),
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            IdType::BigSerial,
+        );
+        assert!(
+            !sql.contains("CREATE INDEX idx_users_email ON users (email);"),
+            "a unique field must not also emit a plain, non-unique index; got:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn create_table_sql_unique_field_not_duplicated_when_also_passed_via_index_flag() {
+        let mut explicit_indexes = BTreeSet::new();
+        explicit_indexes.insert("email".to_owned());
+        let sql = create_table_sql_with_metadata_and_id(
+            "users",
+            &fields(&["email:String:unique"]),
+            &explicit_indexes,
+            &BTreeMap::new(),
+            IdType::BigSerial,
+        );
+        assert_eq!(
+            sql.matches("CREATE UNIQUE INDEX idx_users_email_unique")
+                .count(),
+            1,
+            "got:\n{sql}"
+        );
+        assert!(
+            !sql.contains("CREATE INDEX idx_users_email ON"),
+            "the unique index already covers lookups; a redundant plain index \
+             must not also be emitted:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn create_table_sql_unique_nullable_field_keeps_null_and_unique_index() {
+        let sql = create_table_sql_with_metadata_and_id(
+            "users",
+            &fields(&["nickname:Option<String>:unique"]),
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            IdType::BigSerial,
+        );
+        assert!(sql.contains("nickname TEXT NULL"), "got:\n{sql}");
+        assert!(
+            sql.contains("CREATE UNIQUE INDEX idx_users_nickname_unique ON users (nickname);"),
+            "got:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn add_columns_up_sql_emits_unique_index() {
+        let sql = add_columns_up_sql("users", &fields(&["email:String:unique"]));
+        assert!(
+            sql.contains("ALTER TABLE users ADD COLUMN email TEXT NOT NULL;"),
+            "got:\n{sql}"
+        );
+        assert!(
+            sql.contains("CREATE UNIQUE INDEX idx_users_email_unique ON users (email);"),
+            "got:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn remove_columns_down_sql_restores_unique_index_for_unique_field() {
+        let sql = remove_columns_down_sql("users", &fields(&["email:String:unique"]));
+        assert!(
+            sql.contains("ALTER TABLE users ADD COLUMN email TEXT NOT NULL"),
+            "got:\n{sql}"
+        );
+        assert!(
+            sql.contains("CREATE UNIQUE INDEX idx_users_email_unique ON users (email);"),
+            "rollback of RemoveXFromY must restore the UNIQUE index, not just the \
+             bare column; got:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn unique_index_sql_names_index_with_unique_suffix() {
+        assert_eq!(
+            unique_index_sql("users", "email"),
+            "CREATE UNIQUE INDEX idx_users_email_unique ON users (email);\n"
         );
     }
 
