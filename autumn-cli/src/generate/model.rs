@@ -879,6 +879,27 @@ pub fn parse_model_metadata(
                 token: default.clone(),
                 reason: format!("unknown field '{field_name}'"),
             })?;
+        // `unique` + `--default` is rejected outright (issue #1032 review
+        // follow-up) rather than half-supported: a scaffold's `--default`
+        // fields are excluded from the generated HTML form (see
+        // `scaffold::plan_scaffold`'s `form_fields` filter), so a defaulted
+        // `unique` column would have no input to show a duplicate-value
+        // error against even if `UNIQUE_CONSTRAINTS` did list it. Worse, a
+        // *constant* default value collides with itself on every insert
+        // after the first, so the combination rarely means what it looks
+        // like it means.
+        if field.unique {
+            return Err(GenerateError::InvalidField {
+                token: default.clone(),
+                reason: format!(
+                    "field '{field_name}' cannot be both `unique` and have a `--default` \
+                     value — a defaulted unique column either only supports one row ever \
+                     (a constant default collides with itself on every later insert) or \
+                     has no form control to show a duplicate-value error against (the \
+                     generated form omits defaulted fields). Remove one of the two."
+                ),
+            });
+        }
         let sql =
             sql_default_literal(field, value).map_err(|reason| GenerateError::InvalidField {
                 token: default.clone(),
@@ -1668,6 +1689,49 @@ mod tests {
         assert!(msg.contains("draft"), "got: {msg}");
         assert!(msg.contains("published"), "got: {msg}");
         assert!(msg.contains("archived"), "got: {msg}");
+    }
+
+    #[test]
+    fn unique_field_with_default_is_rejected() {
+        // issue #1032 review follow-up: a `--default` field is excluded from
+        // the generated HTML form (see `scaffold::plan_scaffold`'s
+        // `form_fields` filter), so a `unique` column that also has a
+        // `--default` would have no `UNIQUE_CONSTRAINTS` entry (and, even if
+        // it did, no form input to show a duplicate-value error against).
+        // Reject the combination outright instead of silently emitting a
+        // scaffold whose duplicate handling doesn't work for that field.
+        let fields = parse_fields(&["email:String:unique".into()]).unwrap();
+        let err = parse_model_metadata(
+            &fields,
+            &ModelOptions {
+                defaults: vec!["email='a@b.com'".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("email"), "got: {msg}");
+        assert!(msg.contains("unique"), "got: {msg}");
+        assert!(msg.contains("default"), "got: {msg}");
+    }
+
+    #[test]
+    fn unique_flag_field_with_default_is_rejected() {
+        // Same rejection, but for the `--unique FIELD` flag path rather than
+        // the inline `:unique` DSL marker — `apply_unique_flags` must run
+        // before `parse_model_metadata` sees the `--default` token for this
+        // to catch it (it does, in `plan_model_with_options`).
+        let mut fields = parse_fields(&["email:String".into()]).unwrap();
+        apply_unique_flags(&mut fields, &["email".to_owned()]).unwrap();
+        let err = parse_model_metadata(
+            &fields,
+            &ModelOptions {
+                defaults: vec!["email='a@b.com'".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, GenerateError::InvalidField { .. }));
     }
 
     #[test]

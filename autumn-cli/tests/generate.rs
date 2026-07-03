@@ -503,6 +503,61 @@ fn generate_scaffold_rejects_bad_enum_default() {
 }
 
 #[test]
+fn generate_scaffold_rejects_unique_field_with_default() {
+    // Regression guard (issue #1032 review follow-up): a `--default` field
+    // is excluded from the generated HTML form, so a `unique` column that
+    // also has a `--default` would have no `UNIQUE_CONSTRAINTS` entry (and,
+    // even if it did, no form input to show a duplicate-value error
+    // against). Reject the combination outright at generation time.
+    let (_tmp, project) = fresh_project("unique-with-default-app");
+    let (_, stderr, code) = run_autumn_failing(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "User",
+            "email:String:unique",
+            "--default",
+            "email='a@b.com'",
+        ],
+    );
+
+    assert_eq!(code, Some(1));
+    assert!(stderr.contains("email"), "got stderr: {stderr}");
+    assert!(stderr.contains("unique"), "got stderr: {stderr}");
+    assert!(stderr.contains("default"), "got stderr: {stderr}");
+    assert!(!project.join("src/models/user.rs").exists());
+}
+
+#[test]
+fn generate_scaffold_rejects_unique_flag_field_with_default() {
+    // Same rejection via the `--unique FIELD` flag path instead of the
+    // inline `:unique` DSL marker. `--default` is only a `generate scaffold`
+    // flag (`generate model` has no `--default`), so this exercises the
+    // combination through the scaffold generator.
+    let (_tmp, project) = fresh_project("unique-flag-with-default-app");
+    let (_, stderr, code) = run_autumn_failing(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "User",
+            "email:String",
+            "--unique",
+            "email",
+            "--default",
+            "email='a@b.com'",
+        ],
+    );
+
+    assert_eq!(code, Some(1));
+    assert!(stderr.contains("email"), "got stderr: {stderr}");
+    assert!(stderr.contains("unique"), "got stderr: {stderr}");
+    assert!(stderr.contains("default"), "got stderr: {stderr}");
+    assert!(!project.join("src/models/user.rs").exists());
+}
+
+#[test]
 fn generate_scaffold_with_enum_dry_run_lists_files_and_then_collides_without_force() {
     let (_tmp, project) = fresh_project("enum-dryrun-app");
     let (stdout, _stderr) = run_autumn(
