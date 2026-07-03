@@ -10,6 +10,8 @@ use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
+use crate::text_width::display_width;
+
 /// Output format for `autumn routes`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OutputFormat {
@@ -199,7 +201,7 @@ pub fn format_table(routes: &[RouteInfo]) -> String {
 fn compute_column_widths(routes: &[RouteInfo], headers: &[&str; 7]) -> [usize; 7] {
     let mut widths = [0usize; 7];
     for (i, h) in headers.iter().enumerate() {
-        widths[i] = h.len();
+        widths[i] = display_width(h);
     }
     for route in routes {
         let middleware = if route.middleware.is_empty() {
@@ -210,13 +212,13 @@ fn compute_column_widths(routes: &[RouteInfo], headers: &[&str; 7]) -> [usize; 7
         let version = route.api_version.as_deref().unwrap_or("-");
         let status = route.status.as_deref().unwrap_or("-");
         let cols = [
-            route.method.len(),
-            route.path.len(),
-            route.handler.len(),
-            version.len(),
-            status.len(),
-            route.source.len(),
-            middleware.len(),
+            display_width(&route.method),
+            display_width(&route.path),
+            display_width(&route.handler),
+            display_width(version),
+            display_width(status),
+            display_width(&route.source),
+            display_width(&middleware),
         ];
         for (i, &w) in cols.iter().enumerate() {
             if w > widths[i] {

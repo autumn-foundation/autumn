@@ -24,6 +24,7 @@ mod migrate;
 mod monitor;
 mod new;
 mod paths;
+mod pg;
 mod plugin_check;
 mod process;
 mod release;
@@ -35,6 +36,7 @@ mod setup;
 mod shard;
 mod starters;
 mod task;
+mod text_width;
 mod token;
 mod webhook;
 /// Subcommands for `autumn check`.
