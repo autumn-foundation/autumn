@@ -12,6 +12,13 @@
     if (typeof form.requestSubmit === "function") {
       form.requestSubmit();
     } else {
+      // form.submit() bypasses the 'submit' event entirely (per spec), so
+      // the bulk-action submit handler's `bulkConfirmed` cleanup below
+      // never runs for this path — clear it here instead. Otherwise a
+      // bfcache-restored page (after navigating away via this fallback)
+      // would carry a stale "confirmed" flag into the next, unrelated
+      // bulk-action attempt and skip its confirmation dialog.
+      delete form.dataset.bulkConfirmed;
       form.submit();
     }
   }

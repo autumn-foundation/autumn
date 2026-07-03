@@ -3906,6 +3906,49 @@ mod tests {
     }
 
     #[test]
+    fn admin_js_clears_bulk_confirmed_before_fallback_submit() {
+        // PR review (chatgpt-codex-connector): form.submit() (the
+        // requestSubmit-unavailable fallback) bypasses the 'submit' event
+        // entirely, so the top-level submit handler's `bulkConfirmed`
+        // cleanup never runs for that path. Without an explicit clear here,
+        // a bfcache-restored page after that fallback submit would carry a
+        // stale "confirmed" flag into the next, unrelated bulk-action
+        // attempt and skip its confirmation dialog. The clear must happen
+        // in the same branch as (and before) the form.submit() fallback
+        // call, not just "somewhere in the file".
+        let js = include_str!("admin.js");
+        let fallback_idx = js
+            .find("form.submit();")
+            .unwrap_or_else(|| panic!("must keep a form.submit() fallback: {js}"));
+        // `find` (first occurrence), not `rfind`: the top-level submit-event
+        // handler has its own, unrelated "delete ...;" later in the file
+        // (its normal one-shot-flag consumption on a genuine event) — this
+        // must find the one inside submitForm() itself, which comes first.
+        let clear_idx = js
+            .find("delete form.dataset.bulkConfirmed;")
+            .unwrap_or_else(|| {
+                panic!("must clear bulkConfirmed before the form.submit() fallback: {js}")
+            });
+        assert!(
+            clear_idx < fallback_idx,
+            "bulkConfirmed must be cleared BEFORE the form.submit() fallback call \
+             (form.submit() bypasses the submit event, so clearing it after — or \
+             relying on the submit-event listener to clear it — never happens): {js}"
+        );
+        // Clearing must live inside submitForm() itself, not just at one of
+        // its call sites, so it applies regardless of which call site
+        // triggers the fallback path.
+        let submit_form_idx = js
+            .find("function submitForm(form)")
+            .unwrap_or_else(|| panic!("submitForm() helper must exist: {js}"));
+        assert!(
+            submit_form_idx < clear_idx && clear_idx < fallback_idx,
+            "the bulkConfirmed clear must be inside submitForm(), immediately \
+             guarding its form.submit() fallback: {js}"
+        );
+    }
+
+    #[test]
     fn pagination_range_start_underflow_protection() {
         // The start calculation could previously panic in debug mode if current was 0.
         let result = crate::traits::ListResult {
