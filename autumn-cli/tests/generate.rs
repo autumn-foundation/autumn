@@ -1526,6 +1526,68 @@ fn generate_scaffold_unique_field_create_violation_form_preserves_submitted_valu
 }
 
 #[test]
+fn generate_scaffold_unique_field_update_violation_form_preserves_submitted_values() {
+    // Regression guard (issue #1032 review follow-up): the update path's
+    // violation re-render used to always source field values from the
+    // stale, re-fetched `row` (its pre-update values), silently reverting
+    // every other field the user had changed in the same submission back to
+    // what was stored before — even though only the unique column actually
+    // collided. It must instead source from `form`, the just-decoded
+    // (otherwise valid) rejected submission, the same way the create path
+    // already does from `new`.
+    let (_tmp, project) = fresh_project("unique-update-preserve-app");
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "User",
+            "email:String:unique",
+            "age:i32",
+            "active:bool",
+            "status:enum{draft,published}",
+        ],
+    );
+
+    let routes = fs::read_to_string(project.join("src/routes/users.rs")).unwrap();
+    // The plain `edit_form` (shows the persisted row, no prior rejected
+    // submission) must stay untouched — every value still comes from `row`.
+    let edit_form_start = routes
+        .find("pub async fn edit_form")
+        .expect("edit_form handler");
+    let update_start = routes.find("pub async fn update(").expect("update handler");
+    let edit_form_body = &routes[edit_form_start..update_start];
+    assert!(
+        !edit_form_body.contains("form."),
+        "the plain edit_form must not reference `form`; got:\n{edit_form_body}"
+    );
+    assert!(
+        edit_form_body.contains("value=(row.age.to_string())"),
+        "got:\n{edit_form_body}"
+    );
+
+    // The violation-branch re-render (spliced into `update`) must restore
+    // every submitted value from `form`, not the stale `row`.
+    let update_body = &routes[update_start..];
+    assert!(
+        update_body.contains("value=(form.age.to_string())"),
+        "got:\n{update_body}"
+    );
+    assert!(
+        update_body.contains("checked[form.active]"),
+        "got:\n{update_body}"
+    );
+    assert!(
+        update_body.contains("selected[form.status == Status::Draft]"),
+        "got:\n{update_body}"
+    );
+    assert!(
+        update_body.contains("selected[form.status == Status::Published]"),
+        "got:\n{update_body}"
+    );
+}
+
+#[test]
 fn generate_scaffold_unique_field_emits_duplicate_rejection_smoke_test() {
     let (_tmp, project) = fresh_project("unique-scaffold-smoke-app");
     run_autumn(
@@ -1609,6 +1671,43 @@ fn generate_scaffold_unique_enum_field_smoke_test_inserts_a_valid_variant() {
         test_file.contains("(status) VALUES ('draft')"),
         "the target enum field must be seeded with its first declared \
          variant; got:\n{test_file}"
+    );
+}
+
+#[test]
+fn generate_scaffold_unique_reference_field_smoke_test_uses_seeded_fk_value() {
+    // Regression guard (issue #1032 review follow-up): `unique_sample_literal`
+    // used to lump `references` in with plain integers and emit an arbitrary
+    // `424242` FK value. `render_reference_stub_tables_sql` only seeds a
+    // single row (id 1) into the stub target table, so that arbitrary id
+    // fails the FK constraint before the insert ever reaches the UNIQUE
+    // index this test exists to exercise.
+    let (_tmp, project) = fresh_project("unique-reference-smoke-app");
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Membership",
+            "profile:references:unique",
+        ],
+    );
+
+    let test_file = fs::read_to_string(project.join("tests/membership.rs")).unwrap();
+    assert!(
+        test_file.contains("async fn memberships_rejects_duplicate_profile_id()"),
+        "got:\n{test_file}"
+    );
+    assert!(
+        !test_file.contains("424242"),
+        "a unique `references` field's smoke test must not insert an \
+         arbitrary FK id that doesn't exist in the seeded stub table; \
+         got:\n{test_file}"
+    );
+    assert!(
+        test_file.contains("(profile_id) VALUES (1)"),
+        "the target references field must be seeded with the stub table's \
+         real row id; got:\n{test_file}"
     );
 }
 

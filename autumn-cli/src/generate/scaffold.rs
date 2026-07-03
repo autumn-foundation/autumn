@@ -2175,6 +2175,22 @@ fn render_edit_form_inputs(
     unique_error_aware: bool,
 ) -> String {
     use std::fmt::Write as _;
+    // The plain `edit_form` GET (`unique_error_aware = false`) always shows
+    // the persisted row. The violation re-render (spliced into
+    // `render_unique_violation_update_handler`) instead sources every
+    // non-attachment field from `form: New{Pascal}` — the just-decoded,
+    // otherwise-valid submission that was rejected only for colliding on
+    // the unique column (issue #1032 review follow-up: the create path
+    // already preserves the rejected submission this way; update was
+    // silently reverting every other field back to its pre-edit value).
+    //
+    // Attachment fields are the one exception and always stay on `row`:
+    // `form.{name}` is `None` whenever the user didn't pick a new file
+    // (see `render_decoded_form`'s attachment mapping), so sourcing the
+    // hidden "keep this blob" key from `form` would drop the existing
+    // attachment from the re-rendered form even though the update itself
+    // never touched it.
+    let var = if unique_error_aware { "form" } else { "row" };
     let mut out = String::new();
     for f in fields {
         if f.kind.is_attachment() {
@@ -2208,11 +2224,11 @@ fn render_edit_form_inputs(
                 (FieldKind::Bool, false) => format!(
                     "input type=\"checkbox\" name=\"{name}\" value=\"true\" checked[{checked}]{hx_attrs}",
                     name = f.name,
-                    checked = edit_checked_expr(f, "row"),
+                    checked = edit_checked_expr(f, var),
                     hx_attrs = hx_attrs
                 ),
                 (FieldKind::Bool, true) => {
-                    let (unset, is_true, is_false) = edit_bool_select_selected_exprs(f, "row");
+                    let (unset, is_true, is_false) = edit_bool_select_selected_exprs(f, var);
                     format!(
                         "select name=\"{name}\"{hx_attrs} {{ \
                              option value=\"\" selected[{unset}] {{ \"— Unset —\" }} \
@@ -2227,14 +2243,14 @@ fn render_edit_form_inputs(
                     "input type=\"number\" name=\"{name}\" step=\"{step}\" value=({value}){required}{hx_attrs}",
                     name = f.name,
                     step = number_step(f.kind),
-                    value = edit_value_expr(f, "row"),
+                    value = edit_value_expr(f, var),
                     required = required,
                     hx_attrs = hx_attrs
                 ),
                 (FieldKind::NaiveDateTime | FieldKind::DateTime, _) => format!(
                     "input type=\"datetime-local\" name=\"{name}\" step=\"any\" value=({value}){required}{hx_attrs}",
                     name = f.name,
-                    value = edit_datetime_local_value_expr(f, "row"),
+                    value = edit_datetime_local_value_expr(f, var),
                     required = required,
                     hx_attrs = hx_attrs
                 ),
@@ -2245,7 +2261,7 @@ fn render_edit_form_inputs(
                         "— Select —"
                     };
                     let unset_selected = if f.nullable {
-                        format!("row.{}.is_none()", f.name)
+                        format!("{var}.{}.is_none()", f.name)
                     } else {
                         "false".to_owned()
                     };
@@ -2259,9 +2275,9 @@ fn render_edit_form_inputs(
                         let label = humanize_label(v);
                         let variant = pascal(v);
                         let selected_expr = if f.nullable {
-                            format!("row.{} == Some({enum_ty}::{variant})", f.name)
+                            format!("{var}.{} == Some({enum_ty}::{variant})", f.name)
                         } else {
-                            format!("row.{} == {enum_ty}::{variant}", f.name)
+                            format!("{var}.{} == {enum_ty}::{variant}", f.name)
                         };
                         let _ = write!(
                             options_body,
@@ -2279,7 +2295,7 @@ fn render_edit_form_inputs(
                 _ => format!(
                     "input type=\"text\" name=\"{name}\" value=({value}){required}{hx_attrs}",
                     name = f.name,
-                    value = edit_value_expr(f, "row"),
+                    value = edit_value_expr(f, var),
                     required = required,
                     hx_attrs = hx_attrs
                 ),
@@ -2998,7 +3014,15 @@ fn render_enum_rejection_smoke_test(
 const fn unique_sample_literal(kind: FieldKind) -> &'static str {
     match kind {
         FieldKind::String | FieldKind::Text | FieldKind::Enum => "'dup_value'",
-        FieldKind::I32 | FieldKind::I64 | FieldKind::References => "424242",
+        FieldKind::I32 | FieldKind::I64 => "424242",
+        // Must be a real seeded row's id, not an arbitrary literal — a
+        // `references` target column is FK-constrained against the stub
+        // table `render_reference_stub_tables_sql` seeds exactly one row
+        // (id 1) into. An arbitrary id like `424242` would fail on the FK
+        // constraint before the insert ever reaches the UNIQUE index this
+        // test exists to exercise. Matches `sql_sample_literal`'s existing
+        // convention for the same reason.
+        FieldKind::References => "1",
         FieldKind::Bool => "TRUE",
         FieldKind::F32 | FieldKind::F64 => "1.5",
         FieldKind::Uuid => "'00000000-0000-0000-0000-000000000001'::uuid",
