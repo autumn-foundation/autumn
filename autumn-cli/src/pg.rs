@@ -409,17 +409,21 @@ fn fill_in_libpq_env_defaults(
     pairs: &mut Vec<(String, String)>,
     explicit: &ExplicitFields,
 ) -> bool {
-    if !explicit.host && !explicit.hostaddr {
-        // Both may be set together — libpq connects via `PGHOSTADDR` while
-        // retaining `PGHOST` as the name used for other purposes (e.g.
-        // certificate/auth checks), so both are injected independently
-        // rather than treating them as mutually exclusive.
-        if let Ok(pghost) = std::env::var("PGHOST") {
-            pairs.push(("host".to_owned(), pghost));
-        }
-        if let Ok(pghostaddr) = std::env::var("PGHOSTADDR") {
-            pairs.push(("hostaddr".to_owned(), pghostaddr));
-        }
+    // `host` and `hostaddr` are independent per-parameter fallbacks, not a
+    // pair that's only filled in together — libpq lets either one be
+    // explicit while the other still falls back to its own env var (e.g. an
+    // explicit `host=db-name` with only `PGHOSTADDR` set connects via that
+    // address while retaining `db-name` as the name used for other purposes,
+    // such as certificate/auth checks).
+    if !explicit.host
+        && let Ok(pghost) = std::env::var("PGHOST")
+    {
+        pairs.push(("host".to_owned(), pghost));
+    }
+    if !explicit.hostaddr
+        && let Ok(pghostaddr) = std::env::var("PGHOSTADDR")
+    {
+        pairs.push(("hostaddr".to_owned(), pghostaddr));
     }
     let injected_port = if !explicit.port
         && let Ok(pgport) = std::env::var("PGPORT")
@@ -451,26 +455,25 @@ fn fill_in_libpq_env_defaults(
 /// connect under the default `sslmode=prefer` (no verification requested at
 /// all) instead.
 ///
-/// `explicit_sslrootcert` must be captured from the *original* connection
-/// string (or keyword pairs) before [`filter_ssl_params`] ever ran on it —
-/// that function unconditionally strips `sslrootcert` from `pairs`
-/// afterward (see [`UNSUPPORTED_SSL_PARAMS`]), so by the time this runs
-/// `pairs` itself can no longer distinguish "never set" from "set, but
-/// already dropped."
-///
-/// Unlike [`fill_in_libpq_env_defaults`], the values injected here still
-/// need to go through [`filter_ssl_params`]'s validation (the
+/// Must run before [`filter_ssl_params`] has had any chance to strip
+/// `sslrootcert` from `pairs` (see [`UNSUPPORTED_SSL_PARAMS`]) — callers
+/// call this while `pairs` still holds every source's raw, unfiltered
+/// values (this connection string's own, plus any merged-in service group),
+/// so `find_pair` here reliably distinguishes "no source set this" from
+/// "set, but not going to survive filtering." Callers must run
+/// [`filter_ssl_params`] over the fully-assembled `pairs` afterward — the
+/// values injected here still need its validation (the
 /// `verify-ca`/`verify-full`/`allow` rejection, and the
-/// `require`+`sslrootcert` rejection) — neither key was validated by the
-/// caller's earlier `filter_ssl_params` call, since neither was present yet.
-/// Callers must re-run `filter_ssl_params` over `pairs` after calling this.
-fn fill_in_libpq_ssl_env_defaults(pairs: &mut Vec<(String, String)>, explicit_sslrootcert: bool) {
+/// `require`+`sslrootcert` rejection) just as much as any other source's.
+fn fill_in_libpq_ssl_env_defaults(pairs: &mut Vec<(String, String)>) {
     if find_pair(pairs, "sslmode").is_none()
         && let Ok(pgsslmode) = std::env::var("PGSSLMODE")
     {
         pairs.push(("sslmode".to_owned(), pgsslmode));
     }
-    if !explicit_sslrootcert && let Ok(pgsslrootcert) = std::env::var("PGSSLROOTCERT") {
+    if find_pair(pairs, "sslrootcert").is_none()
+        && let Ok(pgsslrootcert) = std::env::var("PGSSLROOTCERT")
+    {
         pairs.push(("sslrootcert".to_owned(), pgsslrootcert));
     }
 }
@@ -784,12 +787,15 @@ fn sanitize_db_url(db_url: &str) -> Result<String, CommandError> {
 
 /// The URL-form half of [`sanitize_db_url`].
 fn sanitize_url_form(mut url: url::Url) -> Result<String, CommandError> {
-    let raw_pairs: Vec<(String, String)> = url
+    // [`filter_ssl_params`] isn't applied yet — see the comment where it
+    // finally runs, near the end of this function, for why: validating each
+    // source (this URL's own query string, then a merged-in service group)
+    // separately, as this used to do, can't see a `require`+`sslrootcert`
+    // combination split across two sources.
+    let mut pairs: Vec<(String, String)> = url
         .query_pairs()
         .map(|(k, v)| (k.into_owned(), v.into_owned()))
         .collect();
-    let explicit_sslrootcert = find_pair(&raw_pairs, "sslrootcert").is_some();
-    let mut pairs = filter_ssl_params(raw_pairs.into_iter())?;
 
     // Capture what the URL's own structure (as opposed to its query
     // string) already says explicitly, once, up front: `host`/`port`
@@ -847,7 +853,7 @@ fn sanitize_url_form(mut url: url::Url) -> Result<String, CommandError> {
 
     let service_name = take_pair(&mut pairs, "service").or_else(|| std::env::var("PGSERVICE").ok());
     if let Some(service_name) = service_name {
-        for (key, value) in filter_ssl_params(load_service(&service_name)?.into_iter())? {
+        for (key, value) in load_service(&service_name)? {
             if !is_explicit(&pairs, &key) {
                 needs_keyword_form |= key == "host" || key == "port";
                 pairs.push((key, value));
@@ -864,8 +870,7 @@ fn sanitize_url_form(mut url: url::Url) -> Result<String, CommandError> {
 
     let explicit_fields = explicit_fields(|key| is_explicit(&pairs, key));
     needs_keyword_form |= fill_in_libpq_env_defaults(&mut pairs, &explicit_fields);
-    fill_in_libpq_ssl_env_defaults(&mut pairs, explicit_sslrootcert);
-    pairs = filter_ssl_params(pairs.into_iter())?;
+    fill_in_libpq_ssl_env_defaults(&mut pairs);
 
     let is_explicit_password = is_explicit(&pairs, "password");
     fill_in_missing_password(
@@ -877,6 +882,13 @@ fn sanitize_url_form(mut url: url::Url) -> Result<String, CommandError> {
         explicit_dbname.as_deref(),
         passfile.as_deref(),
     );
+
+    // The single point where every source (this URL's own query string, a
+    // merged-in service group, and the `PGSSLMODE`/`PGSSLROOTCERT` env
+    // fallback above) has now contributed its `sslmode`/`sslrootcert`, so a
+    // `require`+`sslrootcert` combination split across sources is visible
+    // here even though it wasn't at any single earlier point.
+    pairs = filter_ssl_params(pairs.into_iter())?;
 
     if needs_keyword_form {
         // `tokio_postgres`'s URL-form parser bakes a default `port=5432`
@@ -923,13 +935,13 @@ fn sanitize_url_form(mut url: url::Url) -> Result<String, CommandError> {
 }
 
 /// The keyword/value-form half of [`sanitize_db_url`].
-fn sanitize_keyword_form(pairs: Vec<(String, String)>) -> Result<String, CommandError> {
-    let explicit_sslrootcert = find_pair(&pairs, "sslrootcert").is_some();
-    let mut pairs = filter_ssl_params(pairs.into_iter())?;
-
+fn sanitize_keyword_form(mut pairs: Vec<(String, String)>) -> Result<String, CommandError> {
+    // See the identical comment in `sanitize_url_form` — [`filter_ssl_params`]
+    // isn't applied until every source has contributed, near the end of
+    // this function.
     let service_name = take_pair(&mut pairs, "service").or_else(|| std::env::var("PGSERVICE").ok());
     if let Some(service_name) = service_name {
-        for (key, value) in filter_ssl_params(load_service(&service_name)?.into_iter())? {
+        for (key, value) in load_service(&service_name)? {
             if find_pair(&pairs, &key).is_none() {
                 pairs.push((key, value));
             }
@@ -942,7 +954,7 @@ fn sanitize_keyword_form(pairs: Vec<(String, String)>) -> Result<String, Command
 
     let explicit_fields = explicit_fields(|key| find_pair(&pairs, key).is_some());
     fill_in_libpq_env_defaults(&mut pairs, &explicit_fields);
-    fill_in_libpq_ssl_env_defaults(&mut pairs, explicit_sslrootcert);
+    fill_in_libpq_ssl_env_defaults(&mut pairs);
     let mut pairs = filter_ssl_params(pairs.into_iter())?;
 
     let is_explicit_password = find_pair(&pairs, "password").is_some();
@@ -1566,6 +1578,58 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_fills_in_pghostaddr_even_when_host_is_already_explicit() {
+        // `host`/`hostaddr` are independent per-parameter fallbacks, not a
+        // pair that only falls back together — an explicit `host` in the URL
+        // must not block `PGHOSTADDR` from still filling in the address, the
+        // way it would for a bare hostless connection string.
+        temp_env::with_var("PGHOSTADDR", Some("10.0.0.5"), || {
+            let sanitized = sanitize_db_url("postgres://db-name/app").unwrap();
+            let config: tokio_postgres::Config = sanitized.parse().unwrap();
+            assert_eq!(
+                config.get_hosts(),
+                &[tokio_postgres::config::Host::Tcp("db-name".to_owned())]
+            );
+            assert_eq!(
+                config.get_hostaddrs(),
+                &["10.0.0.5".parse::<std::net::IpAddr>().unwrap()]
+            );
+        });
+    }
+
+    #[test]
+    fn sanitize_fills_in_pghost_even_when_hostaddr_is_already_explicit() {
+        temp_env::with_var("PGHOST", Some("db-name"), || {
+            let sanitized = sanitize_db_url("postgres:///app?hostaddr=10.0.0.9").unwrap();
+            let config: tokio_postgres::Config = sanitized.parse().unwrap();
+            assert_eq!(
+                config.get_hosts(),
+                &[tokio_postgres::config::Host::Tcp("db-name".to_owned())]
+            );
+            assert_eq!(
+                config.get_hostaddrs(),
+                &["10.0.0.9".parse::<std::net::IpAddr>().unwrap()]
+            );
+        });
+    }
+
+    #[test]
+    fn sanitize_fills_in_pghostaddr_even_when_host_is_already_explicit_in_keyword_form() {
+        temp_env::with_var("PGHOSTADDR", Some("10.0.0.5"), || {
+            let sanitized = sanitize_db_url("host=db-name dbname=app").unwrap();
+            let config: tokio_postgres::Config = sanitized.parse().unwrap();
+            assert_eq!(
+                config.get_hosts(),
+                &[tokio_postgres::config::Host::Tcp("db-name".to_owned())]
+            );
+            assert_eq!(
+                config.get_hostaddrs(),
+                &["10.0.0.5".parse::<std::net::IpAddr>().unwrap()]
+            );
+        });
+    }
+
+    #[test]
     fn sanitize_fills_in_pgport_pguser_pgdatabase_when_url_omits_them() {
         // `tokio_postgres` never reads these on its own (unlike `psql`, which
         // honors them as documented libpq environment variables), so a URL
@@ -1997,6 +2061,72 @@ mod tests {
             ],
             || {
                 let err = sanitize_db_url("postgres://host/db?service=prod").unwrap_err();
+                assert!(err.message().contains("sslrootcert"));
+            },
+        );
+    }
+
+    #[test]
+    fn sanitize_rejects_require_from_url_combined_with_sslrootcert_from_service_group() {
+        // The require+sslrootcert combination must be caught even when
+        // split across sources — `sslmode=require` inline with the service
+        // group supplying only `sslrootcert` (no `sslmode` of its own) is
+        // just as much a "verify against this CA" request as having both in
+        // the same place, and must not silently drop the CA and connect
+        // unverified just because neither single source had both keys.
+        let dir = tempfile::tempdir().unwrap();
+        let service_path = dir.path().join("pg_service.conf");
+        std::fs::write(&service_path, "[prod]\nsslrootcert=/ca.pem\n").unwrap();
+        temp_env::with_vars(
+            [
+                ("PGSERVICEFILE", Some(service_path.to_str().unwrap())),
+                ("PGPASSWORD", None::<&str>),
+                ("PGPASSFILE", Some("/nonexistent-pgpass-for-test")),
+            ],
+            || {
+                let err =
+                    sanitize_db_url("postgres://host/db?sslmode=require&service=prod").unwrap_err();
+                assert!(err.message().contains("sslrootcert"));
+            },
+        );
+    }
+
+    #[test]
+    fn sanitize_rejects_sslrootcert_from_url_combined_with_require_from_service_group() {
+        // The reverse split: the URL supplies `sslrootcert` (silently
+        // dropped by itself, since nothing there says `require`) while the
+        // service group is what actually asks for `require`.
+        let dir = tempfile::tempdir().unwrap();
+        let service_path = dir.path().join("pg_service.conf");
+        std::fs::write(&service_path, "[prod]\nsslmode=require\n").unwrap();
+        temp_env::with_vars(
+            [
+                ("PGSERVICEFILE", Some(service_path.to_str().unwrap())),
+                ("PGPASSWORD", None::<&str>),
+                ("PGPASSFILE", Some("/nonexistent-pgpass-for-test")),
+            ],
+            || {
+                let err = sanitize_db_url("postgres://host/db?sslrootcert=/ca.pem&service=prod")
+                    .unwrap_err();
+                assert!(err.message().contains("sslrootcert"));
+            },
+        );
+    }
+
+    #[test]
+    fn sanitize_rejects_require_from_keyword_form_combined_with_sslrootcert_from_service_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let service_path = dir.path().join("pg_service.conf");
+        std::fs::write(&service_path, "[prod]\nsslrootcert=/ca.pem\n").unwrap();
+        temp_env::with_vars(
+            [
+                ("PGSERVICEFILE", Some(service_path.to_str().unwrap())),
+                ("PGPASSWORD", None::<&str>),
+                ("PGPASSFILE", Some("/nonexistent-pgpass-for-test")),
+            ],
+            || {
+                let err = sanitize_db_url("host=host dbname=db sslmode=require service=prod")
+                    .unwrap_err();
                 assert!(err.message().contains("sslrootcert"));
             },
         );
