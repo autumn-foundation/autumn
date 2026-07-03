@@ -1408,7 +1408,7 @@ fn render_migration_up(snake_name: &str, table: &str, totp: bool) -> String {
     // `email`'s uniqueness is expressed through the same shared primitive
     // `field:String:unique` scaffolds elsewhere (issue #1032), rather than a
     // parallel hand-rolled `UNIQUE` column constraint.
-    out.push_str(&unique_index_sql(table, "email"));
+    out.push_str(&unique_index_sql(table, "email", &[]));
     if totp {
         out.push_str(
             "\n\

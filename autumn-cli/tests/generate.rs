@@ -1986,6 +1986,66 @@ fn generate_scaffold_long_unique_field_name_agrees_across_migration_and_routes()
 }
 
 #[test]
+fn generate_scaffold_unique_field_avoids_name_collision_with_coincidentally_named_index() {
+    // Regression guard (issue #1032 review follow-up): a plain index always
+    // names itself after its own column (`idx_<table>_<name>`, no `_unique`
+    // suffix). A field literally named `<other_field>_unique` that also
+    // gets a plain index therefore claims the exact name
+    // `<other_field>:unique` would otherwise compute for itself
+    // (`idx_<table>_<other_field>_unique`), even though the two fields are
+    // otherwise unrelated. Without disambiguation the generated migration
+    // fails with "relation already exists" before the table is usable.
+    let (_tmp, project) = fresh_project("unique-collision-app");
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "User",
+            "email:String:unique",
+            "email_unique:String",
+            "--index",
+            "email_unique",
+        ],
+    );
+
+    let migration = fs::read_dir(project.join("migrations"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|e| e.file_name().to_string_lossy().ends_with("_create_users"))
+        .expect("create_users migration should exist");
+    let up = fs::read_to_string(migration.path().join("up.sql")).unwrap();
+    assert!(
+        up.contains("CREATE INDEX idx_users_email_unique ON users (email_unique);"),
+        "got:\n{up}"
+    );
+    assert!(
+        !up.contains("CREATE UNIQUE INDEX idx_users_email_unique ON users (email);"),
+        "the unique index must not collide with the plain index's exact \
+         name; got:\n{up}"
+    );
+
+    let disambiguated_line = up
+        .lines()
+        .find(|l| l.starts_with("CREATE UNIQUE INDEX") && l.contains(" (email);"))
+        .unwrap_or_else(|| panic!("expected a disambiguated unique index for email; got:\n{up}"));
+    let index_name = disambiguated_line
+        .strip_prefix("CREATE UNIQUE INDEX ")
+        .and_then(|rest| rest.split(' ').next())
+        .expect("index name token");
+    assert_ne!(index_name, "idx_users_email_unique");
+
+    // The generated routes' UNIQUE_CONSTRAINTS must reference the exact
+    // same disambiguated name, or a real duplicate submission would fall
+    // through to a 500 instead of the intended 422.
+    let routes = fs::read_to_string(project.join("src/routes/users.rs")).unwrap();
+    assert!(
+        routes.contains(&format!("\"{index_name}\"")),
+        "got:\n{routes}"
+    );
+}
+
+#[test]
 fn generate_scaffold_unique_attachment_field_is_skipped_in_smoke_test() {
     // A unique constraint on an always-nullable attachment blob is a
     // degenerate case (Postgres allows unlimited NULLs under a unique

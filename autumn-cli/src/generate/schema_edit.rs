@@ -163,7 +163,7 @@ pub fn create_table_sql_with_metadata_and_id(
     }
     // `unique` fields get their own named `CREATE UNIQUE INDEX`.
     for field_name in &unique_fields {
-        sql.push_str(&unique_index_sql(table, field_name));
+        sql.push_str(&unique_index_sql(table, field_name, fields));
     }
     sql
 }
@@ -186,32 +186,47 @@ pub fn drop_table_sql(table: &str) -> String {
 const POSTGRES_MAX_IDENTIFIER_LEN: usize = 63;
 
 /// The `CREATE UNIQUE INDEX` name for `table`/`field` (issue #1032),
-/// distinct from the plain, non-unique `--index` output (`idx_<table>_
-/// <field>`, no `_unique` suffix) so a field that is both `--index`ed and
-/// `unique` doesn't collide on the index name.
+/// distinct from the plain, non-unique `--index`/`references`-auto-index
+/// output (`idx_<table>_<field>`, no `_unique` suffix) so a field that is
+/// both `--index`ed and `unique` doesn't collide on the index name.
 ///
-/// When `idx_<table>_<field>_unique` fits Postgres's identifier limit it is
-/// used verbatim. When it doesn't, the name is truncated to fit and a
-/// `_`-prefixed 8-hex-char digest of the *full* untruncated name is
-/// appended, so two distinct long names that happen to truncate to the same
-/// prefix still don't collide with each other.
+/// `fields` is the full field list `field` belongs to (not just the unique
+/// ones) — passed so this can also detect the *coincidental-naming* case: a
+/// plain index always names itself after its own column
+/// (`idx_<table>_<other_field>`), so if some *other* field in the same
+/// table happens to be named `<field>_unique`, its plain index would
+/// collide with this one's unique index even though neither field's
+/// `unique`-ness is otherwise related to the other. Every caller that
+/// computes this name — the migration SQL and every generated caller that
+/// needs to match a real constraint name at runtime ([`super::scaffold`]'s
+/// `UNIQUE_CONSTRAINTS` const and its duplicate-violation smoke test) —
+/// passes the same field list so they agree byte-for-byte on the same
+/// (possibly disambiguated) name Postgres will actually store.
+///
+/// When `idx_<table>_<field>_unique` neither exceeds Postgres's identifier
+/// limit nor collides with another field's plain-index name, it's used
+/// verbatim. Otherwise, a `_`-prefixed 8-hex-char digest of the full
+/// (untruncated) name is appended — truncating first if it's also too long
+/// — so two names that would otherwise collide (on truncation or on a
+/// coincidental match) don't collide with each other either.
 #[must_use]
-pub fn unique_index_name(table: &str, field: &str) -> String {
+pub fn unique_index_name(table: &str, field: &str, fields: &[Field]) -> String {
     let full = format!("idx_{table}_{field}_unique");
-    if full.len() <= POSTGRES_MAX_IDENTIFIER_LEN {
+    let collides_with_plain_index = fields.iter().any(|f| f.name == format!("{field}_unique"));
+    if full.len() <= POSTGRES_MAX_IDENTIFIER_LEN && !collides_with_plain_index {
         return full;
     }
     let digest = hex::encode(Sha256::digest(full.as_bytes()));
     let suffix = format!("_{}", &digest[..8]);
-    let prefix_len = POSTGRES_MAX_IDENTIFIER_LEN - suffix.len();
+    let prefix_len = (POSTGRES_MAX_IDENTIFIER_LEN.saturating_sub(suffix.len())).min(full.len());
     format!("{}{suffix}", &full[..prefix_len])
 }
 
 /// A `CREATE UNIQUE INDEX` statement enforcing single-column uniqueness on
 /// `field` (issue #1032). See [`unique_index_name`] for the name it uses.
 #[must_use]
-pub fn unique_index_sql(table: &str, field: &str) -> String {
-    let name = unique_index_name(table, field);
+pub fn unique_index_sql(table: &str, field: &str, fields: &[Field]) -> String {
+    let name = unique_index_name(table, field, fields);
     format!("CREATE UNIQUE INDEX {name} ON {table} ({field});\n")
 }
 
@@ -392,7 +407,7 @@ pub fn add_columns_up_sql(table: &str, fields: &[Field]) -> String {
             // Postgres auto-drops this index when the column is dropped,
             // same as the `references` auto-index above, so
             // `add_columns_down_sql` needs no change.
-            out.push_str(&unique_index_sql(table, &f.name));
+            out.push_str(&unique_index_sql(table, &f.name, fields));
         }
     }
     out
@@ -622,7 +637,7 @@ pub fn remove_columns_down_sql(table: &str, fields: &[Field]) -> String {
             );
         }
         if f.unique {
-            out.push_str(&unique_index_sql(table, &f.name));
+            out.push_str(&unique_index_sql(table, &f.name, fields));
         }
     }
     out
@@ -3469,7 +3484,7 @@ mod tests {
     #[test]
     fn unique_index_sql_names_index_with_unique_suffix() {
         assert_eq!(
-            unique_index_sql("users", "email"),
+            unique_index_sql("users", "email", &[]),
             "CREATE UNIQUE INDEX idx_users_email_unique ON users (email);\n"
         );
     }
@@ -3477,7 +3492,7 @@ mod tests {
     #[test]
     fn unique_index_name_short_names_pass_through_unchanged() {
         assert_eq!(
-            unique_index_name("users", "email"),
+            unique_index_name("users", "email", &[]),
             "idx_users_email_unique"
         );
     }
@@ -3486,7 +3501,7 @@ mod tests {
     fn unique_index_name_truncates_long_names_to_fit_postgres_limit() {
         let table = "a_very_long_table_name_that_pushes_the_identifier_over_the_limit";
         let field = "an_equally_long_field_name_for_good_measure";
-        let name = unique_index_name(table, field);
+        let name = unique_index_name(table, field, &[]);
         assert!(
             name.len() <= 63,
             "index name must fit Postgres's identifier limit, got {} bytes: {name}",
@@ -3505,8 +3520,8 @@ mod tests {
         // follow-up) -- otherwise the runtime `unique_violation_field` match
         // would misclassify a violation on one field as the other.
         let table = "a_very_long_table_name_that_pushes_the_identifier_over_the_limit";
-        let name_a = unique_index_name(table, "an_equally_long_field_name_alpha_variant");
-        let name_b = unique_index_name(table, "an_equally_long_field_name_bravo_variant");
+        let name_a = unique_index_name(table, "an_equally_long_field_name_alpha_variant", &[]);
+        let name_b = unique_index_name(table, "an_equally_long_field_name_bravo_variant", &[]);
         assert_ne!(name_a, name_b);
     }
 
@@ -3515,8 +3530,8 @@ mod tests {
         let table = "a_very_long_table_name_that_pushes_the_identifier_over_the_limit";
         let field = "an_equally_long_field_name_for_good_measure";
         assert_eq!(
-            unique_index_name(table, field),
-            unique_index_name(table, field)
+            unique_index_name(table, field, &[]),
+            unique_index_name(table, field, &[])
         );
     }
 
@@ -3524,13 +3539,78 @@ mod tests {
     fn unique_index_sql_uses_truncated_name_for_long_identifiers() {
         let table = "a_very_long_table_name_that_pushes_the_identifier_over_the_limit";
         let field = "an_equally_long_field_name_for_good_measure";
-        let sql = unique_index_sql(table, field);
-        let expected_name = unique_index_name(table, field);
+        let sql = unique_index_sql(table, field, &[]);
+        let expected_name = unique_index_name(table, field, &[]);
         assert!(
             sql.contains(&format!(
                 "CREATE UNIQUE INDEX {expected_name} ON {table} ({field});"
             )),
             "got:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn unique_index_name_disambiguates_coincidental_collision_with_plain_index() {
+        // Regression guard (issue #1032 review follow-up): a plain index
+        // always names itself after its own column (`idx_<table>_<name>`),
+        // with no `_unique` suffix. If some *other* field in the same table
+        // happens to be literally named `<field>_unique`, that field's own
+        // plain index collides with `field`'s unique index name even though
+        // the two fields are otherwise unrelated (`email:unique` +
+        // `email_unique:String --index email_unique` both want
+        // `idx_users_email_unique`) -- the generated migration would fail
+        // with "relation already exists" before the table was ever usable.
+        let colliding_field = fields(&["email_unique:String"]);
+        let name = unique_index_name("users", "email", &colliding_field);
+        assert_ne!(
+            name, "idx_users_email_unique",
+            "must disambiguate away from the name a same-named plain index \
+             would already claim"
+        );
+        assert!(name.len() <= 63, "got {} bytes: {name}", name.len());
+    }
+
+    #[test]
+    fn unique_index_name_no_collision_stays_the_plain_name() {
+        // The disambiguation in the test above must not fire when there's
+        // nothing to collide with.
+        let unrelated_fields = fields(&["age:i32"]);
+        assert_eq!(
+            unique_index_name("users", "email", &unrelated_fields),
+            "idx_users_email_unique"
+        );
+    }
+
+    #[test]
+    fn create_table_sql_unique_field_avoids_name_collision_with_plain_index() {
+        let fields = fields(&["email:String:unique", "email_unique:String"]);
+        let indexes: BTreeSet<String> = std::iter::once("email_unique".to_owned()).collect();
+        let sql = create_table_sql_with_metadata_and_id(
+            "users",
+            &fields,
+            &indexes,
+            &BTreeMap::new(),
+            IdType::BigSerial,
+        );
+        assert!(
+            sql.contains("CREATE INDEX idx_users_email_unique ON users (email_unique);"),
+            "got:\n{sql}"
+        );
+        // The unique index must have been disambiguated away from the
+        // plain index's name above, not emitted as a second, colliding
+        // `CREATE UNIQUE INDEX idx_users_email_unique` (checked with the
+        // exact trailing ` ON users (email);` so the plain index's own
+        // line, which shares the same name as a prefix, doesn't also match).
+        assert!(
+            !sql.contains("CREATE UNIQUE INDEX idx_users_email_unique ON users (email);"),
+            "the unique index must not collide with the plain index's exact \
+             name; got:\n{sql}"
+        );
+        assert!(
+            sql.contains("CREATE UNIQUE INDEX idx_users_email_unique_")
+                && sql.contains(" ON users (email);"),
+            "the unique index must still exist, under a disambiguated name; \
+             got:\n{sql}"
         );
     }
 

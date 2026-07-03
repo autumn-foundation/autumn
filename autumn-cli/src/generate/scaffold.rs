@@ -1204,7 +1204,7 @@ fn render_routes_file(
     let unique_constraints_const = if unique_fields.is_empty() {
         String::new()
     } else {
-        render_unique_constraints_const(plural, &unique_fields)
+        render_unique_constraints_const(plural, &unique_fields, all_fields)
     };
     let create_fn = if unique_fields.is_empty() {
         format!(
@@ -1788,11 +1788,15 @@ pub async fn events(
 /// `unique` field, where `constraint_name` matches the name
 /// `schema_edit::unique_index_sql` gives the migration's `CREATE UNIQUE
 /// INDEX` (`idx_<table>_<field>_unique`).
-fn render_unique_constraints_const(plural: &str, unique_fields: &[&Field]) -> String {
+fn render_unique_constraints_const(
+    plural: &str,
+    unique_fields: &[&Field],
+    all_fields: &[Field],
+) -> String {
     use std::fmt::Write as _;
     let mut entries = String::new();
     for f in unique_fields {
-        let index_name = unique_index_name(plural, &f.name);
+        let index_name = unique_index_name(plural, &f.name, all_fields);
         let _ = write!(
             entries,
             "(\"{index_name}\", \"{name}\", \"has already been taken\"),\n    ",
@@ -3188,7 +3192,7 @@ fn render_unique_violation_smoke_test(
         // keeps using `escaped_insert` for both, same as before.
         let insert_sql_dup = unique_violation_insert_sql(plural, fields, target, defaults, true);
         let escaped_insert_dup = escape_sql_for_rust_literal(&insert_sql_dup);
-        let constraint_name = unique_index_name(plural, field_name);
+        let constraint_name = unique_index_name(plural, field_name, fields);
 
         let request_boundary_check = if api {
             String::new()
