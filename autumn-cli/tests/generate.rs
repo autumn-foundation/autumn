@@ -2290,13 +2290,25 @@ fn generate_scaffold_unique_live_field_wires_repository_save_and_db_refetch() {
         routes.contains("repo.update(*id, &update_changes).await?;"),
         "got:\n{routes}"
     );
-    // The re-fetch on a unique-violation always uses direct DB access
-    // (mirroring `edit_form`'s own row-fetch), so `update`'s signature must
-    // carry `mut db` even though it also carries `repo` for the live path.
+    // Regression guard (issue #1032 review follow-up): `update`'s signature
+    // must NOT carry a second `Db` extractor alongside `repo` — `Db` checks
+    // out and holds a pool connection for the whole handler scope, and
+    // `repo.update` (the live write path) checks out its own connection from
+    // the same pool, so holding both at once self-deadlocks/times out a pool
+    // sized for one connection per request. The unique-violation re-fetch
+    // must go through `repo.find_by_id` instead of a direct `db` query.
+    let update_start = routes.find("pub async fn update(").expect("update handler");
+    let update_body = &routes[update_start..];
     assert!(
-        routes.contains("mut db: Db") && routes.contains("repo: PgUserRepository"),
-        "got:\n{routes}"
+        !update_body.contains("mut db:"),
+        "the live update handler must not also take a `Db` extractor; \
+         got:\n{update_body}"
     );
+    assert!(
+        update_body.contains("repo.find_by_id(*id).await?"),
+        "got:\n{update_body}"
+    );
+    assert!(routes.contains("repo: PgUserRepository"), "got:\n{routes}");
     assert!(
         routes.contains("autumn_web::error::unique_violation_field"),
         "got:\n{routes}"

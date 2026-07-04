@@ -1157,26 +1157,21 @@ fn render_routes_file(
     let update_signature = if unique_fields.is_empty() {
         update_signature
     } else {
-        let with_csrf = update_signature.replacen(
+        update_signature.replacen(
             "flash: Flash,",
             "flash: Flash,\n    csrf: Option<CsrfToken>,\n    csrf_field: Option<CsrfFormField>,",
             1,
-        );
-        // The `--live` signature uses `repo:` instead of `mut db: {db_ty}`,
-        // but the unique-violation re-fetch below always uses direct DB
-        // access (mirroring `edit_form`'s own row-fetch, which likewise
-        // never goes through the repository) — add it back when missing.
-        // Inserted before `body: Bytes,` (must stay last; see the
-        // `create_signature` comment above) rather than appended.
-        if with_csrf.contains("mut db:") {
-            with_csrf
-        } else {
-            with_csrf.replacen(
-                "body: Bytes,",
-                &format!("mut db: {db_ty},\n    body: Bytes,"),
-                1,
-            )
-        }
+        )
+        // The `--live` (non-sharded) signature uses `repo:` instead of `mut
+        // db: {db_ty}` — the unique-violation re-fetch below goes through
+        // `repo.find_by_id` in that case (see
+        // `render_unique_violation_update_handler`) rather than adding a
+        // second `Db` extractor alongside `repo`. `Db` checks out and holds
+        // a pool connection for the whole handler scope, and `repo.update`
+        // (used by the live update path) checks out its own connection from
+        // the same pool — holding both at once self-deadlocks/times out a
+        // pool sized for one connection per request (issue #1032 review
+        // follow-up).
     };
 
     let (decode_create_call, decode_update_call, decode_form_sig) = if has_attachments {
@@ -1261,6 +1256,7 @@ fn render_routes_file(
             &update_stmt,
             form_enctype,
             &edit_inputs_with_unique_error,
+            live && !sharded,
         )
     };
 
@@ -1856,6 +1852,15 @@ fn render_unique_violation_create_handler(
 /// unique-constraint violation, re-fetches the row by `id` (its pre-update,
 /// still-valid values — not the rejected submission) and re-renders the
 /// edit form with an inline field error and `422`.
+///
+/// `live_not_sharded` selects how the re-fetch gets its connection: the
+/// non-sharded `--live` signature has `repo:` in place of `mut db: {db_ty}`
+/// (see `render_routes_file`'s `update_signature` construction), so the
+/// re-fetch goes through `repo.find_by_id` instead of a direct `db` query —
+/// adding a second `Db` extractor alongside `repo` would hold two pool
+/// connections for the same request (`Db` for the whole handler scope,
+/// `repo.update` for its own internal checkout), self-deadlocking a pool
+/// sized for one connection per request (issue #1032 review follow-up).
 #[allow(clippy::too_many_arguments)]
 fn render_unique_violation_update_handler(
     pascal_name: &str,
@@ -1865,7 +1870,22 @@ fn render_unique_violation_update_handler(
     update_stmt: &str,
     form_enctype: &str,
     edit_inputs_with_unique_error: &str,
+    live_not_sharded: bool,
 ) -> String {
+    let refetch_row = if live_not_sharded {
+        format!(
+            "let row: {pascal_name} = repo.find_by_id(*id).await?.ok_or_else(|| AutumnError::not_found_msg(format!(\"{pascal_name} with id {{}} not found\", *id)))?;"
+        )
+    } else {
+        format!(
+            "let row: {pascal_name} = {plural}::table\n                    \
+             .find(*id)\n                    \
+             .select({pascal_name}::as_select())\n                    \
+             .first(&mut *db)\n                    \
+             .await\n                    \
+             .map_err(AutumnError::not_found)?;"
+        )
+    };
     format!(
         "/// `POST /{plural}/{{id}}/update` — apply form data to a row, then redirect\n\
          /// to its show page. Uses column-by-column `diesel::update().set(...)` (same\n\
@@ -1886,12 +1906,7 @@ fn render_unique_violation_update_handler(
          Ok(updated) => updated,\n        \
          Err(err) => {{\n            \
          if let Some((field, message)) = autumn_web::error::unique_violation_field(&err, UNIQUE_CONSTRAINTS) {{\n                \
-         let row: {pascal_name} = {plural}::table\n                    \
-         .find(*id)\n                    \
-         .select({pascal_name}::as_select())\n                    \
-         .first(&mut *db)\n                    \
-         .await\n                    \
-         .map_err(AutumnError::not_found)?;\n                \
+         {refetch_row}\n                \
          return Ok((autumn_web::reexports::http::StatusCode::UNPROCESSABLE_ENTITY, layout(&format!(\"Edit {pascal_name} #{{}}\", row.id), flash.render().await, html! {{\n                    \
          h1 {{ \"Edit {pascal_name} #\" (row.id) }}\n                    \
          form action=(format!(\"/{plural}/{{}}/update\", row.id)) method=\"post\"{form_enctype} {{\n                        \
