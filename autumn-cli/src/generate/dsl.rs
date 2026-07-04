@@ -578,8 +578,14 @@ fn parse_enum_type(ty: &str) -> Result<Option<(Vec<String>, bool)>, String> {
     Ok(Some((variants, nullable)))
 }
 
-/// Postgres's documented maximum `NUMERIC` precision (total significant digits).
-const MAX_DECIMAL_PRECISION: u32 = 1000;
+/// The maximum `decimal` precision (total significant digits) this DSL
+/// accepts. Bounded by `rust_decimal::Decimal`'s own representable range —
+/// a 96-bit mantissa, guaranteeing at most 28 significant digits — not by
+/// Postgres's much larger `NUMERIC` limit (1000): a column declared wider
+/// than `rust_decimal` can hold would compile and migrate cleanly, then fail
+/// at runtime the first time a value actually needing that extra precision
+/// is deserialized into the generated `#[model]` field.
+const MAX_DECIMAL_PRECISION: u32 = 28;
 
 /// Parse a `decimal` (optionally `Option<decimal>`) type token, with an
 /// optional `{precision,scale}` modifier (`decimal{10,2}`). Accepts both
@@ -588,11 +594,12 @@ const MAX_DECIMAL_PRECISION: u32 = 1000;
 /// is omitted.
 ///
 /// Returns `Ok(None)` when `ty` isn't a decimal token at all, so the caller
-/// falls through to [`parse_type`]/[`atomic_type`] unchanged (e.g. a typo
-/// like `decimalize` still gets the general "unsupported type" error rather
-/// than a decimal-specific one). Returns `Err(reason)` when `ty` looks like a
-/// decimal token but is malformed (non-numeric precision/scale, scale
-/// exceeding precision, precision outside Postgres's `NUMERIC` range, …).
+/// falls through to [`parse_type`]/[`atomic_type`] unchanged. Returns
+/// `Err(reason)` when `ty` looks like a decimal token but is malformed
+/// (missing/unbalanced braces, non-numeric precision/scale, scale exceeding
+/// precision, precision outside `rust_decimal`'s representable range, …) —
+/// every reason is an actionable message, consistent with the field-name
+/// guarding above.
 ///
 /// # Errors
 /// See above.
@@ -614,10 +621,21 @@ fn parse_decimal_type(ty: &str) -> Result<Option<(u32, u32, bool)>, String> {
     }
 
     let Some(inner) = rest.strip_prefix('{') else {
-        // Doesn't actually look like a decimal token (e.g. a typo like
-        // `decimalize`) — fall through to the general "unsupported type"
-        // error rather than a decimal-specific one.
-        return Ok(None);
+        // Looks like a decimal token (starts with `decimal`/`Decimal` and
+        // has more text after it) but has no opening brace. As with
+        // `enum{...}`, the most common cause is bash/zsh brace-expanding an
+        // unquoted `decimal{10,2}` before the CLI ever sees it, turning
+        // `price:decimal{10,2}` into two separate arguments whose surviving
+        // fragments read like `price:decimal10` and `price:decimal2` — but
+        // `ty` could also just be an unrelated typo (e.g. `decimalize`), so
+        // the message covers both: the quoting hint for the shell-expansion
+        // case, and the full supported-types list for a genuine typo.
+        return Err(format!(
+            "expected decimal{{precision,scale}} (or bare `decimal` for the \
+             default NUMERIC(12,2)). If you typed this in bash or zsh, quote \
+             the token so the shell doesn't brace-expand it, e.g. \
+             'price:decimal{{10,2}}'. Supported: {SUPPORTED_TYPES}"
+        ));
     };
     let Some(body_inner) = inner.strip_suffix('}') else {
         return Err("expected decimal{precision,scale} (missing closing brace)".to_owned());
@@ -644,7 +662,7 @@ fn parse_decimal_type(ty: &str) -> Result<Option<(u32, u32, bool)>, String> {
     if precision == 0 || precision > MAX_DECIMAL_PRECISION {
         return Err(format!(
             "decimal precision must be between 1 and {MAX_DECIMAL_PRECISION} \
-             (Postgres's NUMERIC limit), got {precision}"
+             (rust_decimal's representable range), got {precision}"
         ));
     }
     if scale > precision {
@@ -1654,15 +1672,42 @@ mod tests {
     }
 
     #[test]
-    fn decimal_rejects_precision_over_postgres_max() {
-        let err = parse_field("price:decimal{1001,2}").unwrap_err();
+    fn decimal_rejects_precision_over_rust_decimal_max() {
+        // 29 exceeds rust_decimal::Decimal's 28-significant-digit range, even
+        // though Postgres's own NUMERIC would happily hold it — the DSL caps
+        // at what the generated struct field can actually represent, not
+        // what the column type technically permits.
+        let err = parse_field("price:decimal{29,2}").unwrap_err();
         assert!(err.to_string().contains("precision"));
+    }
+
+    #[test]
+    fn decimal_accepts_precision_at_rust_decimal_max() {
+        let f = parse_field("price:decimal{28,2}").unwrap();
+        assert_eq!(
+            f.kind,
+            FieldKind::Decimal {
+                precision: 28,
+                scale: 2
+            }
+        );
     }
 
     #[test]
     fn decimal_rejects_missing_closing_brace() {
         let err = parse_field("price:decimal{10,2").unwrap_err();
         assert!(err.to_string().contains("decimal{"));
+    }
+
+    #[test]
+    fn decimal_error_hints_about_shell_brace_expansion() {
+        // bash/zsh expand an unquoted `decimal{10,2}` into two separate
+        // words, so the token the CLI actually receives looks like
+        // `price:decimal10` — point the user at quoting, same as `enum{...}`.
+        let err = parse_field("price:decimal10").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("quote"), "must suggest quoting: {msg}");
+        assert!(msg.contains("Supported:"), "got: {msg}");
     }
 
     #[test]

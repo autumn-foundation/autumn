@@ -2203,16 +2203,32 @@ const fn number_step(kind: FieldKind) -> &'static str {
     }
 }
 
+/// A decimal literal at the given `scale`, formed from a single trailing
+/// significant `digit` (1-9) — e.g. `decimal_literal_at_scale(2, 1)` ==
+/// `"0.01"`, `decimal_literal_at_scale(0, 2)` == `"2"`. The magnitude never
+/// exceeds `9 * 10^-scale` (well under `1` for any `scale >= 1`, and under
+/// `10` for `scale == 0`), so the result fits any valid
+/// `decimal{precision,scale}` column (the DSL enforces `1 <= precision` and
+/// `scale <= precision`) regardless of how tight `precision` is — used both
+/// for the `<input step="...">` attribute ([`decimal_step`]) and the SQL
+/// sample/duplicate literals the enum-rejection/unique-violation smoke-test
+/// generators splice in below ([`sql_sample_literal`], [`unique_sample_literal`],
+/// [`unique_sample_literal_variant`]), where a fixed literal like `"1.0"`
+/// would overflow a tightly-scaled column such as `decimal{1,1}`.
+fn decimal_literal_at_scale(scale: u32, digit: u32) -> String {
+    if scale == 0 {
+        digit.to_string()
+    } else {
+        format!("0.{}{digit}", "0".repeat(scale as usize - 1))
+    }
+}
+
 /// The HTML `step` attribute value for a `decimal{precision,scale}` field,
 /// derived from its declared `scale` — `0` steps by whole numbers, `2`
 /// produces `"0.01"`, matching the column's actual smallest representable
 /// increment (unlike float fields, whose `step="any"` accepts any input).
 fn decimal_step(scale: u32) -> String {
-    if scale == 0 {
-        "1".to_owned()
-    } else {
-        format!("0.{}1", "0".repeat(scale as usize - 1))
-    }
+    decimal_literal_at_scale(scale, 1)
 }
 
 #[allow(
@@ -2914,22 +2930,26 @@ fn render_smoke_test(
 /// test needs *some* valid value so the `INSERT`'s failure is attributable to
 /// the target enum column's `CHECK` constraint rather than some other
 /// required column being left out.
-const fn sql_sample_literal(kind: FieldKind) -> &'static str {
+fn sql_sample_literal(kind: FieldKind) -> String {
     match kind {
         // `Enum`'s "'sample'" here is never actually used: `enum_rejection_insert_sql`
         // special-cases every enum column (the field under test gets the
         // deliberately out-of-set literal; any *other* required enum column
         // gets one of its own real variants instead — see that function).
-        FieldKind::String | FieldKind::Text | FieldKind::Enum => "'sample'",
-        FieldKind::I32 | FieldKind::I64 | FieldKind::References => "1",
-        FieldKind::Bool => "TRUE",
-        FieldKind::F32 | FieldKind::F64 | FieldKind::Decimal { .. } => "1.0",
-        FieldKind::Uuid => "gen_random_uuid()",
-        FieldKind::NaiveDateTime | FieldKind::DateTime => "NOW()",
-        FieldKind::Bytea => "'\\x00'::bytea",
+        FieldKind::String | FieldKind::Text | FieldKind::Enum => "'sample'".to_owned(),
+        FieldKind::I32 | FieldKind::I64 | FieldKind::References => "1".to_owned(),
+        FieldKind::Bool => "TRUE".to_owned(),
+        FieldKind::F32 | FieldKind::F64 => "1.0".to_owned(),
+        // Scale-derived rather than a fixed "1.0": a tightly-scaled column
+        // like `decimal{1,1}` (valid range `(-1,1)`) would reject a literal
+        // "1.0" with a numeric field overflow — see `decimal_literal_at_scale`.
+        FieldKind::Decimal { scale, .. } => decimal_literal_at_scale(scale, 1),
+        FieldKind::Uuid => "gen_random_uuid()".to_owned(),
+        FieldKind::NaiveDateTime | FieldKind::DateTime => "NOW()".to_owned(),
+        FieldKind::Bytea => "'\\x00'::bytea".to_owned(),
         // Always nullable (see `FieldKind::Attachment`'s doc comment), so it
         // never needs a sample literal to satisfy a `NOT NULL` constraint.
-        FieldKind::Attachment => "NULL",
+        FieldKind::Attachment => "NULL".to_owned(),
     }
 }
 
@@ -2959,7 +2979,7 @@ fn enum_rejection_insert_sql(
             let value = if f.is_enum() {
                 format!("'{}'", f.variants.first().expect("enum field has variants"))
             } else {
-                sql_sample_literal(f.kind).to_owned()
+                sql_sample_literal(f.kind)
             };
             values.push(value);
         }
@@ -3082,10 +3102,10 @@ fn render_enum_rejection_smoke_test(
 /// this deliberately avoids non-deterministic SQL (`gen_random_uuid()`,
 /// `NOW()`) — two evaluations of either would almost certainly differ and
 /// the duplicate-insert assertion would never trip.
-const fn unique_sample_literal(kind: FieldKind) -> &'static str {
+fn unique_sample_literal(kind: FieldKind) -> String {
     match kind {
-        FieldKind::String | FieldKind::Text | FieldKind::Enum => "'dup_value'",
-        FieldKind::I32 | FieldKind::I64 => "424242",
+        FieldKind::String | FieldKind::Text | FieldKind::Enum => "'dup_value'".to_owned(),
+        FieldKind::I32 | FieldKind::I64 => "424242".to_owned(),
         // Must be a real seeded row's id, not an arbitrary literal — a
         // `references` target column is FK-constrained against the stub
         // table `render_reference_stub_tables_sql` seeds exactly one row
@@ -3093,14 +3113,17 @@ const fn unique_sample_literal(kind: FieldKind) -> &'static str {
         // constraint before the insert ever reaches the UNIQUE index this
         // test exists to exercise. Matches `sql_sample_literal`'s existing
         // convention for the same reason.
-        FieldKind::References => "1",
-        FieldKind::Bool => "TRUE",
-        FieldKind::F32 | FieldKind::F64 | FieldKind::Decimal { .. } => "1.5",
-        FieldKind::Uuid => "'00000000-0000-0000-0000-000000000001'::uuid",
-        FieldKind::NaiveDateTime => "'2024-01-01 00:00:00'::timestamp",
-        FieldKind::DateTime => "'2024-01-01 00:00:00+00'::timestamptz",
-        FieldKind::Bytea => "'\\xDEADBEEF'::bytea",
-        FieldKind::Attachment => "NULL",
+        FieldKind::References => "1".to_owned(),
+        FieldKind::Bool => "TRUE".to_owned(),
+        FieldKind::F32 | FieldKind::F64 => "1.5".to_owned(),
+        // Scale-derived, distinct from `sql_sample_literal`'s digit-1 value
+        // for the same field — see `decimal_literal_at_scale`.
+        FieldKind::Decimal { scale, .. } => decimal_literal_at_scale(scale, 2),
+        FieldKind::Uuid => "'00000000-0000-0000-0000-000000000001'::uuid".to_owned(),
+        FieldKind::NaiveDateTime => "'2024-01-01 00:00:00'::timestamp".to_owned(),
+        FieldKind::DateTime => "'2024-01-01 00:00:00+00'::timestamptz".to_owned(),
+        FieldKind::Bytea => "'\\xDEADBEEF'::bytea".to_owned(),
+        FieldKind::Attachment => "NULL".to_owned(),
     }
 }
 
@@ -3112,21 +3135,25 @@ const fn unique_sample_literal(kind: FieldKind) -> &'static str {
 /// exact same value for a non-target unique column on both inserts would
 /// trip *that* column's own UNIQUE index too, racing against the target's
 /// to decide which violation Postgres actually reports.
-const fn unique_sample_literal_variant(kind: FieldKind) -> &'static str {
+fn unique_sample_literal_variant(kind: FieldKind) -> String {
     match kind {
-        FieldKind::String | FieldKind::Text | FieldKind::Enum => "'dup_value_2'",
-        FieldKind::I32 | FieldKind::I64 => "424243",
+        FieldKind::String | FieldKind::Text | FieldKind::Enum => "'dup_value_2'".to_owned(),
+        FieldKind::I32 | FieldKind::I64 => "424243".to_owned(),
         // The second stub row `render_reference_stub_tables_sql` seeds —
         // distinct from `unique_sample_literal`'s "1" for the same reason
         // that one must be a real seeded row's id, not an arbitrary literal.
-        FieldKind::References => "2",
-        FieldKind::Bool => "FALSE",
-        FieldKind::F32 | FieldKind::F64 | FieldKind::Decimal { .. } => "2.5",
-        FieldKind::Uuid => "'00000000-0000-0000-0000-000000000002'::uuid",
-        FieldKind::NaiveDateTime => "'2024-01-02 00:00:00'::timestamp",
-        FieldKind::DateTime => "'2024-01-02 00:00:00+00'::timestamptz",
-        FieldKind::Bytea => "'\\xBEEFDEAD'::bytea",
-        FieldKind::Attachment => "NULL",
+        FieldKind::References => "2".to_owned(),
+        FieldKind::Bool => "FALSE".to_owned(),
+        FieldKind::F32 | FieldKind::F64 => "2.5".to_owned(),
+        // Scale-derived, distinct from both `sql_sample_literal`'s digit-1
+        // and `unique_sample_literal`'s digit-2 value — see
+        // `decimal_literal_at_scale`.
+        FieldKind::Decimal { scale, .. } => decimal_literal_at_scale(scale, 3),
+        FieldKind::Uuid => "'00000000-0000-0000-0000-000000000002'::uuid".to_owned(),
+        FieldKind::NaiveDateTime => "'2024-01-02 00:00:00'::timestamp".to_owned(),
+        FieldKind::DateTime => "'2024-01-02 00:00:00+00'::timestamptz".to_owned(),
+        FieldKind::Bytea => "'\\xBEEFDEAD'::bytea".to_owned(),
+        FieldKind::Attachment => "NULL".to_owned(),
     }
 }
 
@@ -3158,7 +3185,7 @@ fn unique_violation_insert_sql(
             let value = if f.is_enum() {
                 format!("'{}'", f.variants.first().expect("enum field has variants"))
             } else {
-                unique_sample_literal(f.kind).to_owned()
+                unique_sample_literal(f.kind)
             };
             values.push(value);
         } else if !f.nullable && !defaults.contains_key(&f.name) {
@@ -3167,11 +3194,11 @@ fn unique_violation_insert_sql(
                 let variant = f.variants.get(1).unwrap_or(&f.variants[0]);
                 format!("'{variant}'")
             } else if is_duplicate_insert && f.unique {
-                unique_sample_literal_variant(f.kind).to_owned()
+                unique_sample_literal_variant(f.kind)
             } else if f.is_enum() {
                 format!("'{}'", f.variants.first().expect("enum field has variants"))
             } else {
-                sql_sample_literal(f.kind).to_owned()
+                sql_sample_literal(f.kind)
             };
             values.push(value);
         }
@@ -5801,5 +5828,76 @@ async fn main() {
             "a self-referential FK must not stub its own table before creating it for real: {test}"
         );
         assert!(test.contains("category_id BIGINT NOT NULL REFERENCES categories(id)"));
+    }
+
+    // ── decimal sample literals fit tightly-scaled columns (issue #1038) ────
+
+    #[test]
+    fn decimal_literal_at_scale_never_reaches_one() {
+        // Every sample literal must stay strictly under `1` for scale >= 1,
+        // so it fits even the tightest valid column (`decimal{scale,scale}`,
+        // whose range is `(-1,1)`) regardless of how large `precision` is.
+        for scale in 1..=6 {
+            for digit in [1, 2, 3] {
+                let literal = decimal_literal_at_scale(scale, digit);
+                let value: f64 = literal.parse().unwrap();
+                assert!(
+                    value.abs() < 1.0,
+                    "decimal_literal_at_scale({scale}, {digit}) = {literal} must be < 1"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn decimal_sample_literals_are_pairwise_distinct_at_every_scale() {
+        for scale in 0..=6 {
+            let a = sql_sample_literal(FieldKind::Decimal {
+                precision: scale.max(1) + 1,
+                scale,
+            });
+            let b = unique_sample_literal(FieldKind::Decimal {
+                precision: scale.max(1) + 1,
+                scale,
+            });
+            let c = unique_sample_literal_variant(FieldKind::Decimal {
+                precision: scale.max(1) + 1,
+                scale,
+            });
+            assert!(a != b && b != c && a != c, "scale {scale}: {a}, {b}, {c}");
+        }
+    }
+
+    #[test]
+    fn enum_rejection_insert_sql_fits_tightly_scaled_decimal_column() {
+        // Regression test: a `decimal{1,1}` column (valid range `(-1,1)`)
+        // combined with a required enum column used to get a fixed "1.0"
+        // sample literal from `sql_sample_literal`, which Postgres's
+        // `NUMERIC(1,1)` rejects as a numeric field overflow — breaking a
+        // generated test that has nothing to do with the enum behavior it's
+        // meant to exercise.
+        let status = Field {
+            name: "status".to_string(),
+            kind: FieldKind::Enum,
+            nullable: false,
+            variants: vec!["a".to_string(), "b".to_string()],
+            unique: false,
+        };
+        let weight = Field {
+            name: "weight".to_string(),
+            kind: FieldKind::Decimal {
+                precision: 1,
+                scale: 1,
+            },
+            nullable: false,
+            variants: Vec::new(),
+            unique: false,
+        };
+        let fields = vec![status.clone(), weight];
+        let sql = enum_rejection_insert_sql("items", &fields, &status, &BTreeMap::new());
+        assert!(
+            sql.contains("weight) VALUES ('__not_a_real_variant__', 0.1)"),
+            "expected a scale-fitting 0.1 literal for NUMERIC(1,1), got: {sql}"
+        );
     }
 }

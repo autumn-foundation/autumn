@@ -339,7 +339,7 @@ const fn admin_field_kind(field: &Field) -> &'static str {
         // explicit `--select` overrides this base kind today.
         // `Decimal` renders as plain text, not `AdminFieldKind::Float`: the
         // admin update handler coerces `Float` input through `f64` (see
-        // `parse_form_value` in `autumn-admin-plugin`), which would
+        // `coerce_form_value` in `autumn-admin-plugin`), which would
         // reintroduce the exact binary-float rounding this field type exists
         // to avoid. Routing it through `Text` leaves the raw decimal string
         // untouched for `rust_decimal`'s exact `FromStr`/`Deserialize`.
