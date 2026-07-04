@@ -340,3 +340,47 @@
     background-color: var(--autumn-danger-hover, #b91c1c);
     border-color: var(--autumn-danger-hover, #b91c1c);
 }
+
+/* ── Tabs (autumn-tabs) ──────────────────────────────────────────────────── */
+
+.autumn-tabs__list {
+    display: flex;
+    gap: 0.25rem;
+    border-bottom: 1px solid #e5e7eb;
+    margin-bottom: 1rem;
+}
+
+.autumn-tabs__tab {
+    padding: 0.5rem 1rem;
+    margin-bottom: -1px;
+    color: #6b7280;
+    font-weight: 500;
+    font-size: 0.9375rem;
+    text-decoration: none;
+    border-bottom: 2px solid transparent;
+}
+
+.autumn-tabs__tab:hover {
+    color: #111827;
+}
+
+.autumn-tabs__tab--active {
+    color: #111827;
+    border-bottom-color: var(--autumn-primary, #2563eb);
+}
+
+.autumn-tabs__panel {
+    display: none;
+}
+
+/* No-JS switching: a panel becomes visible when its id is the URL's
+   fragment (`:target`), so `#<tab-id>` deep-links a tab on page load. */
+.autumn-tabs__panel:target {
+    display: block;
+}
+
+/* Fallback: show the first panel when no fragment targets any panel in
+   this widget, so a panel is always visible. */
+.autumn-tabs:not(:has(.autumn-tabs__panel:target)) .autumn-tabs__panel--active {
+    display: block;
+}

@@ -16,6 +16,7 @@
 //! | `hero` | Landing-page banner: headline, optional subtitle, and CTAs |
 //! | `nav_link` | Navigation anchor, auto-marked active + `aria-current` |
 //! | `nav_bar` | Top-bar/sidebar `<nav>` landmark: brand, links, dropdowns, responsive toggle |
+//! | `tabs` | No-JS `tablist`/`tab`/`tabpanel` switcher with `:target` deep-linking |
 //!
 //! # Interactive / search widgets
 //!

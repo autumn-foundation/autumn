@@ -117,7 +117,10 @@ mod tabs_tests {
     fn panel_aria_labelledby_matches_tab_id() {
         let panels = [("security", "Security", html! { p { "a" } })];
         let html = tabs("settings-tabs", &panels).into_string();
-        assert!(html.contains(r#"id="settings-tabs-tab-security""#), "{html}");
+        assert!(
+            html.contains(r#"id="settings-tabs-tab-security""#),
+            "{html}"
+        );
         assert!(
             html.contains(r#"aria-labelledby="settings-tabs-tab-security""#),
             "{html}"
@@ -178,11 +181,7 @@ mod tabs_tests {
 
     #[test]
     fn label_html_is_escaped() {
-        let panels = [(
-            "overview",
-            "<script>alert(1)</script>",
-            html! { p { "a" } },
-        )];
+        let panels = [("overview", "<script>alert(1)</script>", html! { p { "a" } })];
         let html = tabs("post-tabs", &panels).into_string();
         assert!(html.contains("&lt;script&gt;"), "{html}");
         assert!(!html.contains("<script>alert"), "{html}");
@@ -193,7 +192,10 @@ mod tabs_tests {
         let panels = [("a\"b", "Label", html! { p { "x" } })];
         let html = tabs("post-tabs", &panels).into_string();
         assert!(!html.contains(r#"id="a"b""#), "{html}");
-        assert!(html.contains("a&quot;b") || html.contains("a%22b"), "{html}");
+        assert!(
+            html.contains("a&quot;b") || html.contains("a%22b"),
+            "{html}"
+        );
     }
 
     // ── empty list ──────────────────────────────────────────────────────
@@ -234,7 +236,11 @@ mod test_client_integration {
     #[get("/posts/{id}")]
     async fn show_post(Path(id): Path<i64>) -> Markup {
         let panels = [
-            ("overview", "Overview", html! { p { "Post " (id) " overview" } }),
+            (
+                "overview",
+                "Overview",
+                html! { p { "Post " (id) " overview" } },
+            ),
             ("comments", "Comments", html! { p { "Comments for " (id) } }),
             ("activity", "Activity", html! { p { "Activity for " (id) } }),
         ];
@@ -254,10 +260,6 @@ mod test_client_integration {
             .assert_selector(r#"[role="tablist"]"#)
             .assert_selector(r#"[role="tab"]"#)
             .assert_selector(r#"[role="tabpanel"]"#)
-            .assert_attr(
-                r##"a[href="#comments"]"##,
-                "aria-controls",
-                "comments",
-            );
+            .assert_attr(r##"a[href="#comments"]"##, "aria-controls", "comments");
     }
 }

@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **views:** `tabs` widget — a no-JavaScript panel switcher for detail and
+  settings views (#1316). `tabs(id, panels)` takes an ordered
+  `&[(id, label, maud::Markup)]` list and renders an `autumn-tabs` root with
+  a `role="tablist"` strip of `role="tab"` anchors (each linking to
+  `#panel-id`) and matching `role="tabpanel"` sections (`aria-labelledby`,
+  `tabindex="0"`). Switching is pure CSS: `input.css` shows the panel whose
+  `id` matches the URL's `:target` fragment, with a `:has()`-based fallback
+  that shows the first panel when nothing is targeted, so a 3-tab
+  detail/settings view needs zero hand-written JS or CSS and under 10 lines
+  of Maud. Tab/panel ids and labels are HTML-escaped by Maud; panel bodies
+  are pre-rendered `Markup` the caller owns, same as `card`'s `body`
+  parameter. See `docs/guide/tabs.md` for a full example.
+
 - **views:** `modal`/`confirm_action` widgets — an accessible, testable
   confirm for destructive actions (#1233). `modal(id, title, body, config)`
   renders a native `<dialog>` (`aria-modal="true"`, `aria-labelledby`, a body
