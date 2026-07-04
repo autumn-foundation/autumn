@@ -240,6 +240,22 @@ const POSTGRES_MAX_IDENTIFIER_LEN: usize = 63;
 /// (untruncated) name is appended — truncating first if it's also too long
 /// — so two names that would otherwise collide (on truncation or on a
 /// coincidental match) don't collide with each other either.
+///
+/// Known limitation: the coincidental-naming check above compares literal
+/// field names, not what Postgres actually ends up storing. A plain index's
+/// own name (`idx_<table>_<other_field>`) is never truncated or
+/// disambiguated by this generator the way a unique index's is — so a
+/// sufficiently long *other* field's plain index can itself be silently
+/// truncated by Postgres to 63 bytes and collide with this field's unique
+/// index even when their un-truncated names don't literally match (e.g. a
+/// unique field whose name makes `idx_<table>_<field>_unique` exactly 63
+/// bytes, plus an indexed field literally named `<field>_unique_extra`,
+/// whose own plain index Postgres truncates down to the same 63 bytes).
+/// Closing this fully would mean giving *every* plain index name the same
+/// truncate-on-63-bytes treatment this function already gives unique index
+/// names — a broader, pre-existing gap in plain-index naming generally
+/// (two long plain-indexed fields can already collide with *each other* the
+/// same way, with no `unique` field involved at all), out of scope here.
 #[must_use]
 pub fn unique_index_name(table: &str, field: &str, fields: &[Field]) -> String {
     let full = format!("idx_{table}_{field}_unique");

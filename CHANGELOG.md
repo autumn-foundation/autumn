@@ -58,7 +58,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   path. `--dry-run` lists the migration file in the plan and `--help`
   documents the new token; single-column only (composite `UNIQUE(a, b)`,
   case-insensitive uniqueness, and the `--api` JSON conflict response are out
-  of scope for this slice).
+  of scope for this slice). The generated unique index name is disambiguated
+  against Postgres's 63-byte identifier limit and against a coincidentally
+  same-named plain index, including one added by an earlier, separate
+  `generate` invocation (via `src/schema.rs`) — but not against a *plain*
+  index whose own long name Postgres silently truncates to the same stored
+  identifier, since plain index names carry no truncation handling of their
+  own here (a broader, pre-existing gap, not specific to `unique`).
 
 - **model:** many-to-many associations via `#[has_many(Target, through =
   join_table)]` (#1324). Extends the `belongs_to`/`has_many`/`has_one`
