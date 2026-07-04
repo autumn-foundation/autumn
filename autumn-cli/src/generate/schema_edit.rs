@@ -151,7 +151,7 @@ pub fn create_table_sql_with_metadata_and_id(
             sql,
             "    {} {} {}",
             f.name,
-            f.sql_type(),
+            f.sql_column_type(),
             f.sql_nullability()
         );
         if let Some(target) = f.reference_table() {
@@ -457,7 +457,7 @@ pub fn add_columns_up_sql(table: &str, fields: &[Field], existing_schema: &str) 
             out,
             "ALTER TABLE {table} ADD COLUMN {} {} {}",
             f.name,
-            f.sql_type(),
+            f.sql_column_type(),
             f.sql_nullability()
         );
         if let Some(target) = f.reference_table() {
@@ -698,7 +698,7 @@ pub fn remove_columns_down_sql(table: &str, fields: &[Field], existing_schema: &
             out,
             "ALTER TABLE {table} ADD COLUMN {} {} {}",
             f.name,
-            f.sql_type(),
+            f.sql_column_type(),
             f.sql_nullability()
         );
         if let Some(target) = f.reference_table() {

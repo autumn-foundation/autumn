@@ -197,6 +197,12 @@ pub fn plan_model_with_options(
             "{ version = \"0.20\", features = [\"derive\"] }",
         ));
     }
+    if schema_fields.iter().any(|f| f.kind.is_decimal()) {
+        deps.push((
+            "rust_decimal",
+            "{ version = \"1\", features = [\"db-diesel2-postgres\", \"serde\"] }",
+        ));
+    }
     plan_cargo_deps(&mut plan, project_root, &deps);
 
     Ok(plan)
@@ -1051,6 +1057,14 @@ fn sql_default_literal(field: &Field, value: &str) -> Result<String, String> {
             .parse::<f64>()
             .map(|_| value.to_owned())
             .map_err(|_| "float defaults must be valid numbers".to_owned()),
+        // Shape-validated the same way as F32/F64 (an `f64` parse is just a
+        // "does this look like a number" check) and emitted as the original
+        // string — `autumn-cli` doesn't depend on `rust_decimal` itself, and
+        // an unquoted numeric literal is valid Postgres `NUMERIC` SQL either way.
+        FieldKind::Decimal { .. } => value
+            .parse::<f64>()
+            .map(|_| value.to_owned())
+            .map_err(|_| "decimal defaults must be valid numbers".to_owned()),
         FieldKind::Uuid
         | FieldKind::NaiveDateTime
         | FieldKind::DateTime
@@ -1419,7 +1433,7 @@ mod tests {
         let err = plan_model(
             tmp.path(),
             "Post",
-            &["price:Decimal".into()],
+            &["price:Money".into()],
             "20260427000000",
         )
         .unwrap_err();

@@ -253,6 +253,12 @@ pub fn plan_scaffold_with_options(
             "{ version = \"0.20\", features = [\"derive\"] }",
         ));
     }
+    if fields.iter().any(|f| f.kind.is_decimal()) {
+        combined.push((
+            "rust_decimal",
+            "{ version = \"1\", features = [\"db-diesel2-postgres\", \"serde\"] }",
+        ));
+    }
     plan_cargo_deps(&mut plan, project_root, &combined);
 
     // --live requires `ws` (sse::stream), `maud` (LiveFragment/Markup), and `htmx`.
@@ -2075,6 +2081,23 @@ fn render_create_form_inputs(
                         hx_attrs = hx_attrs
                     )
                 }
+                // `inputmode="decimal"` hints a numeric-with-decimal-point
+                // keyboard on mobile; `step` matches the column's declared
+                // scale so the browser's stepper (and its "please match the
+                // requested format" validation) aligns with what the SQL
+                // column actually stores.
+                (FieldKind::Decimal { scale, .. }, _) => {
+                    let value_attr = submitted_var
+                        .map(|var| format!(" value=({})", edit_value_expr(f, var)))
+                        .unwrap_or_default();
+                    format!(
+                        "input type=\"number\" inputmode=\"decimal\" name=\"{name}\" step=\"{step}\"{value_attr}{required}{hx_attrs}",
+                        name = f.name,
+                        step = decimal_step(scale),
+                        required = required,
+                        hx_attrs = hx_attrs
+                    )
+                }
                 // `step="any"` lets the browser's picker show/accept
                 // seconds — see edit_datetime_local_value_expr for why a
                 // value with seconds must not be step-mismatch-rejected.
@@ -2180,6 +2203,18 @@ const fn number_step(kind: FieldKind) -> &'static str {
     }
 }
 
+/// The HTML `step` attribute value for a `decimal{precision,scale}` field,
+/// derived from its declared `scale` — `0` steps by whole numbers, `2`
+/// produces `"0.01"`, matching the column's actual smallest representable
+/// increment (unlike float fields, whose `step="any"` accepts any input).
+fn decimal_step(scale: u32) -> String {
+    if scale == 0 {
+        "1".to_owned()
+    } else {
+        format!("0.{}1", "0".repeat(scale as usize - 1))
+    }
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "One match arm per field-kind widget — splitting it produces less \
@@ -2262,6 +2297,14 @@ fn render_edit_form_inputs(
                     "input type=\"number\" name=\"{name}\" step=\"{step}\" value=({value}){required}{hx_attrs}",
                     name = f.name,
                     step = number_step(f.kind),
+                    value = edit_value_expr(f, var),
+                    required = required,
+                    hx_attrs = hx_attrs
+                ),
+                (FieldKind::Decimal { scale, .. }, _) => format!(
+                    "input type=\"number\" inputmode=\"decimal\" name=\"{name}\" step=\"{step}\" value=({value}){required}{hx_attrs}",
+                    name = f.name,
+                    step = decimal_step(scale),
                     value = edit_value_expr(f, var),
                     required = required,
                     hx_attrs = hx_attrs
@@ -2880,7 +2923,7 @@ const fn sql_sample_literal(kind: FieldKind) -> &'static str {
         FieldKind::String | FieldKind::Text | FieldKind::Enum => "'sample'",
         FieldKind::I32 | FieldKind::I64 | FieldKind::References => "1",
         FieldKind::Bool => "TRUE",
-        FieldKind::F32 | FieldKind::F64 => "1.0",
+        FieldKind::F32 | FieldKind::F64 | FieldKind::Decimal { .. } => "1.0",
         FieldKind::Uuid => "gen_random_uuid()",
         FieldKind::NaiveDateTime | FieldKind::DateTime => "NOW()",
         FieldKind::Bytea => "'\\x00'::bytea",
@@ -3052,7 +3095,7 @@ const fn unique_sample_literal(kind: FieldKind) -> &'static str {
         // convention for the same reason.
         FieldKind::References => "1",
         FieldKind::Bool => "TRUE",
-        FieldKind::F32 | FieldKind::F64 => "1.5",
+        FieldKind::F32 | FieldKind::F64 | FieldKind::Decimal { .. } => "1.5",
         FieldKind::Uuid => "'00000000-0000-0000-0000-000000000001'::uuid",
         FieldKind::NaiveDateTime => "'2024-01-01 00:00:00'::timestamp",
         FieldKind::DateTime => "'2024-01-01 00:00:00+00'::timestamptz",
@@ -3078,7 +3121,7 @@ const fn unique_sample_literal_variant(kind: FieldKind) -> &'static str {
         // that one must be a real seeded row's id, not an arbitrary literal.
         FieldKind::References => "2",
         FieldKind::Bool => "FALSE",
-        FieldKind::F32 | FieldKind::F64 => "2.5",
+        FieldKind::F32 | FieldKind::F64 | FieldKind::Decimal { .. } => "2.5",
         FieldKind::Uuid => "'00000000-0000-0000-0000-000000000002'::uuid",
         FieldKind::NaiveDateTime => "'2024-01-02 00:00:00'::timestamp",
         FieldKind::DateTime => "'2024-01-02 00:00:00+00'::timestamptz",

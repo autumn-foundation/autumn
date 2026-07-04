@@ -259,7 +259,7 @@ fn generate_model_force_overwrites() {
 fn generate_model_invalid_field_lists_supported_set() {
     let (_tmp, project) = fresh_project("badtype-app");
     let (_, stderr, code) =
-        run_autumn_failing(&project, &["generate", "model", "Post", "price:Decimal"]);
+        run_autumn_failing(&project, &["generate", "model", "Post", "price:Money"]);
     assert_eq!(code, Some(1));
     assert!(stderr.contains("unsupported type"));
     assert!(stderr.contains("Supported:"));
@@ -1161,6 +1161,22 @@ fn generate_help_documents_field_dsl() {
 }
 
 #[test]
+fn generate_help_documents_decimal_field_type() {
+    // AC4 (issue #1038): `decimal` must be discoverable from `--help`, not
+    // just accepted silently by the parser.
+    let tmp = tempfile::tempdir().unwrap();
+    let autumn_bin = env!("CARGO_BIN_EXE_autumn");
+    let output = Command::new(autumn_bin)
+        .args(["generate", "--help"])
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("decimal"), "got: {stdout}");
+    assert!(stdout.contains("NUMERIC"), "got: {stdout}");
+}
+
+#[test]
 fn generate_model_help_shows_example() {
     let tmp = tempfile::tempdir().unwrap();
     let autumn_bin = env!("CARGO_BIN_EXE_autumn");
@@ -1213,6 +1229,8 @@ fn generated_scaffold_cargo_checks() {
             "token:Option<Uuid>",
             "status:enum{draft,published,archived}",
             "mood:Option<enum{happy,sad}>",
+            "price:decimal{10,2}",
+            "balance:Option<decimal>",
         ],
     );
 
@@ -1227,6 +1245,7 @@ fn generated_scaffold_cargo_checks() {
         "serde_json",
         "serde_urlencoded",
         "url",
+        "rust_decimal",
     ] {
         assert!(
             cargo_toml_after.contains(&format!("{dep} =")),

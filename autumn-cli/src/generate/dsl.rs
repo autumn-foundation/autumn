@@ -75,6 +75,19 @@ impl Field {
         self.kind.sql_type()
     }
 
+    /// The SQL column type used in `CREATE TABLE`/`ADD COLUMN`, including any
+    /// type parameters. Identical to [`Field::sql_type`] for every kind
+    /// except [`FieldKind::Decimal`], whose `precision`/`scale` can't be
+    /// represented in `sql_type`'s `&'static str` return type — this method
+    /// renders the full `NUMERIC(precision,scale)` instead.
+    #[must_use]
+    pub fn sql_column_type(&self) -> String {
+        match self.kind {
+            FieldKind::Decimal { precision, scale } => format!("NUMERIC({precision},{scale})"),
+            _ => self.sql_type().to_owned(),
+        }
+    }
+
     /// `"NULL"` or `"NOT NULL"` to append in the migration.
     #[must_use]
     pub const fn sql_nullability(&self) -> &'static str {
@@ -147,6 +160,19 @@ pub enum FieldKind {
     /// [`Field::rust_type`] and [`Field::enum_type_name`], which override this
     /// storage-representation fallback with the real generated type name.
     Enum,
+    /// `decimal{precision,scale}` (default `{12,2}` when the modifier is
+    /// omitted) — an exact-precision `NUMERIC(precision,scale)` column.
+    /// Unlike `f32`/`f64`, this never introduces binary-float rounding error,
+    /// making it the correct choice for money and other exact-decimal values.
+    /// Rendered in the `#[model]` struct as `rust_decimal::Decimal` (see
+    /// [`FieldKind::rust_type`]) — the same decimal type the `autumn` runtime
+    /// crate already re-exports and uses for its `number_to_currency` helper.
+    Decimal {
+        /// Total number of significant digits (`NUMERIC(precision, _)`).
+        precision: u32,
+        /// Number of digits after the decimal point (`NUMERIC(_, scale)`).
+        scale: u32,
+    },
 }
 
 impl FieldKind {
@@ -172,6 +198,7 @@ impl FieldKind {
             Self::DateTime => "chrono::DateTime<chrono::Utc>",
             Self::Bytea => "Vec<u8>",
             Self::Attachment => "autumn_web::storage::Blob",
+            Self::Decimal { .. } => "rust_decimal::Decimal",
         }
     }
 
@@ -190,6 +217,7 @@ impl FieldKind {
             Self::DateTime => "Timestamptz",
             Self::Bytea => "Bytea",
             Self::Attachment => "Jsonb",
+            Self::Decimal { .. } => "Numeric",
         }
     }
 
@@ -208,6 +236,7 @@ impl FieldKind {
             Self::DateTime => "TIMESTAMPTZ",
             Self::Bytea => "BYTEA",
             Self::Attachment => "JSONB",
+            Self::Decimal { .. } => "NUMERIC",
         }
     }
 
@@ -230,6 +259,15 @@ impl FieldKind {
     #[must_use]
     pub const fn is_enum(self) -> bool {
         matches!(self, Self::Enum)
+    }
+
+    /// Returns `true` for an exact-precision `decimal` field.
+    ///
+    /// Used by the scaffold/model generators to know when the project needs
+    /// the `rust_decimal` dependency wired in.
+    #[must_use]
+    pub const fn is_decimal(self) -> bool {
+        matches!(self, Self::Decimal { .. })
     }
 }
 
@@ -311,7 +349,7 @@ impl IdType {
 /// Comma-separated list of supported types, for error messages and `--help`.
 pub const SUPPORTED_TYPES: &str = "String, Text, i32, i64, bool, f32, f64, \
     Uuid, NaiveDateTime, DateTime, Vec<u8>, Bytea, Attachment, references, \
-    enum{a,b,…}, Option<…>, :unique";
+    enum{a,b,…}, decimal{precision,scale}, Option<…>, :unique";
 
 /// Comma-separated list of supported Postgres column types (`udt_name`), for
 /// the `db pull` introspection error message.
@@ -420,6 +458,21 @@ pub fn parse_field(token: &str) -> Result<Field, GenerateError> {
         });
     }
 
+    if let Some((precision, scale, nullable)) =
+        parse_decimal_type(ty).map_err(|reason| GenerateError::InvalidField {
+            token: token.to_owned(),
+            reason,
+        })?
+    {
+        return Ok(Field {
+            name: name.to_owned(),
+            kind: FieldKind::Decimal { precision, scale },
+            nullable,
+            variants: Vec::new(),
+            unique,
+        });
+    }
+
     let (kind, nullable) = parse_type(ty).ok_or_else(|| GenerateError::InvalidField {
         token: token.to_owned(),
         reason: format!("unsupported type '{ty}'. Supported: {SUPPORTED_TYPES}"),
@@ -523,6 +576,84 @@ fn parse_enum_type(ty: &str) -> Result<Option<(Vec<String>, bool)>, String> {
     }
 
     Ok(Some((variants, nullable)))
+}
+
+/// Postgres's documented maximum `NUMERIC` precision (total significant digits).
+const MAX_DECIMAL_PRECISION: u32 = 1000;
+
+/// Parse a `decimal` (optionally `Option<decimal>`) type token, with an
+/// optional `{precision,scale}` modifier (`decimal{10,2}`). Accepts both
+/// `decimal`/`Decimal` casings, consistent with `Attachment`/`attachment`.
+/// Defaults to `{12,2}` — a money-shaped `NUMERIC(12,2)` — when the modifier
+/// is omitted.
+///
+/// Returns `Ok(None)` when `ty` isn't a decimal token at all, so the caller
+/// falls through to [`parse_type`]/[`atomic_type`] unchanged (e.g. a typo
+/// like `decimalize` still gets the general "unsupported type" error rather
+/// than a decimal-specific one). Returns `Err(reason)` when `ty` looks like a
+/// decimal token but is malformed (non-numeric precision/scale, scale
+/// exceeding precision, precision outside Postgres's `NUMERIC` range, …).
+///
+/// # Errors
+/// See above.
+fn parse_decimal_type(ty: &str) -> Result<Option<(u32, u32, bool)>, String> {
+    let (body, nullable) =
+        strip_wrapper(ty, "Option").map_or((ty, false), |inner| (inner.trim(), true));
+
+    let Some(rest) = body
+        .strip_prefix("decimal")
+        .or_else(|| body.strip_prefix("Decimal"))
+    else {
+        return Ok(None);
+    };
+    let rest = rest.trim_start();
+
+    if rest.is_empty() {
+        // Bare `decimal`/`Decimal`: default to a money-shaped NUMERIC(12,2).
+        return Ok(Some((12, 2, nullable)));
+    }
+
+    let Some(inner) = rest.strip_prefix('{') else {
+        // Doesn't actually look like a decimal token (e.g. a typo like
+        // `decimalize`) — fall through to the general "unsupported type"
+        // error rather than a decimal-specific one.
+        return Ok(None);
+    };
+    let Some(body_inner) = inner.strip_suffix('}') else {
+        return Err("expected decimal{precision,scale} (missing closing brace)".to_owned());
+    };
+
+    let parts: Vec<&str> = body_inner.split(',').map(str::trim).collect();
+    let [precision_str, scale_str] = parts.as_slice() else {
+        return Err(format!(
+            "expected decimal{{precision,scale}} (exactly two comma-separated numbers), \
+             got 'decimal{{{body_inner}}}'"
+        ));
+    };
+
+    let precision: u32 = precision_str.parse().map_err(|_| {
+        format!(
+            "'{precision_str}' is not a valid decimal precision \
+             (expected a positive integer)"
+        )
+    })?;
+    let scale: u32 = scale_str.parse().map_err(|_| {
+        format!("'{scale_str}' is not a valid decimal scale (expected a non-negative integer)")
+    })?;
+
+    if precision == 0 || precision > MAX_DECIMAL_PRECISION {
+        return Err(format!(
+            "decimal precision must be between 1 and {MAX_DECIMAL_PRECISION} \
+             (Postgres's NUMERIC limit), got {precision}"
+        ));
+    }
+    if scale > precision {
+        return Err(format!(
+            "decimal scale ({scale}) cannot be greater than precision ({precision})"
+        ));
+    }
+
+    Ok(Some((precision, scale, nullable)))
 }
 
 /// Parse a list of `name:Type` tokens.
@@ -727,9 +858,9 @@ mod tests {
 
     #[test]
     fn unknown_type_rejected() {
-        let err = parse_field("price:Decimal").unwrap_err();
+        let err = parse_field("price:Money").unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("Decimal"));
+        assert!(msg.contains("Money"));
         assert!(msg.contains("Supported:"));
     }
 
@@ -1388,5 +1519,185 @@ mod tests {
             SUPPORTED_TYPES.contains("unique"),
             "SUPPORTED_TYPES must document the :unique modifier"
         );
+    }
+
+    // ── decimal field kind (issue #1038) ────────────────────────────────────
+
+    #[test]
+    fn parse_decimal_field_lowercase() {
+        let f = parse_field("price:decimal").unwrap();
+        assert_eq!(f.name, "price");
+        assert_eq!(
+            f.kind,
+            FieldKind::Decimal {
+                precision: 12,
+                scale: 2
+            }
+        );
+        assert!(!f.nullable);
+    }
+
+    #[test]
+    fn parse_decimal_field_pascal_case() {
+        let f = parse_field("price:Decimal").unwrap();
+        assert_eq!(
+            f.kind,
+            FieldKind::Decimal {
+                precision: 12,
+                scale: 2
+            }
+        );
+    }
+
+    #[test]
+    fn decimal_defaults_to_precision_12_scale_2() {
+        let f = parse_field("price:decimal").unwrap();
+        assert_eq!(f.sql_column_type(), "NUMERIC(12,2)");
+    }
+
+    #[test]
+    fn decimal_custom_precision_and_scale() {
+        let f = parse_field("price:decimal{10,2}").unwrap();
+        assert_eq!(
+            f.kind,
+            FieldKind::Decimal {
+                precision: 10,
+                scale: 2
+            }
+        );
+        assert_eq!(f.sql_column_type(), "NUMERIC(10,2)");
+    }
+
+    #[test]
+    fn decimal_rust_type_is_rust_decimal() {
+        let f = parse_field("price:decimal").unwrap();
+        assert_eq!(f.rust_type(), "rust_decimal::Decimal");
+    }
+
+    #[test]
+    fn decimal_schema_type_is_numeric() {
+        let f = parse_field("price:decimal").unwrap();
+        assert_eq!(f.schema_type(), "Numeric");
+    }
+
+    #[test]
+    fn decimal_sql_type_is_numeric() {
+        let f = parse_field("price:decimal").unwrap();
+        assert_eq!(f.sql_type(), "NUMERIC");
+    }
+
+    #[test]
+    fn optional_decimal_parses() {
+        let f = parse_field("balance:Option<decimal>").unwrap();
+        assert_eq!(
+            f.kind,
+            FieldKind::Decimal {
+                precision: 12,
+                scale: 2
+            }
+        );
+        assert!(f.nullable);
+        assert_eq!(f.rust_type(), "Option<rust_decimal::Decimal>");
+        assert_eq!(f.schema_type(), "Nullable<Numeric>");
+        assert_eq!(f.sql_nullability(), "NULL");
+    }
+
+    #[test]
+    fn optional_decimal_with_precision_scale_parses() {
+        let f = parse_field("balance:Option<decimal{10,2}>").unwrap();
+        assert_eq!(
+            f.kind,
+            FieldKind::Decimal {
+                precision: 10,
+                scale: 2
+            }
+        );
+        assert!(f.nullable);
+        assert_eq!(f.sql_column_type(), "NUMERIC(10,2)");
+    }
+
+    #[test]
+    fn unique_decimal_field_parses() {
+        let f = parse_field("price:decimal:unique").unwrap();
+        assert_eq!(
+            f.kind,
+            FieldKind::Decimal {
+                precision: 12,
+                scale: 2
+            }
+        );
+        assert!(f.unique);
+    }
+
+    #[test]
+    fn decimal_rejects_non_numeric_precision() {
+        let err = parse_field("price:decimal{abc,2}").unwrap_err();
+        assert!(err.to_string().contains("precision"));
+    }
+
+    #[test]
+    fn decimal_rejects_non_numeric_scale() {
+        let err = parse_field("price:decimal{10,xyz}").unwrap_err();
+        assert!(err.to_string().contains("scale"));
+    }
+
+    #[test]
+    fn decimal_rejects_scale_greater_than_precision() {
+        let err = parse_field("price:decimal{2,10}").unwrap_err();
+        assert!(err.to_string().contains("scale"));
+    }
+
+    #[test]
+    fn decimal_rejects_zero_precision() {
+        let err = parse_field("price:decimal{0,0}").unwrap_err();
+        assert!(err.to_string().contains("precision"));
+    }
+
+    #[test]
+    fn decimal_rejects_precision_over_postgres_max() {
+        let err = parse_field("price:decimal{1001,2}").unwrap_err();
+        assert!(err.to_string().contains("precision"));
+    }
+
+    #[test]
+    fn decimal_rejects_missing_closing_brace() {
+        let err = parse_field("price:decimal{10,2").unwrap_err();
+        assert!(err.to_string().contains("decimal{"));
+    }
+
+    #[test]
+    fn decimal_rejects_wrong_number_of_brace_args() {
+        let err = parse_field("price:decimal{10}").unwrap_err();
+        assert!(err.to_string().contains("precision,scale"));
+    }
+
+    #[test]
+    fn decimal_appears_in_supported_types_constant() {
+        assert!(
+            SUPPORTED_TYPES.contains("decimal"),
+            "SUPPORTED_TYPES must list decimal{{p,s}}"
+        );
+    }
+
+    #[test]
+    fn decimal_in_list_of_fields() {
+        let tokens = vec!["title:String".into(), "price:decimal".into()];
+        let fields = parse_fields(&tokens).unwrap();
+        assert_eq!(fields.len(), 2);
+        assert_eq!(
+            fields[1].kind,
+            FieldKind::Decimal {
+                precision: 12,
+                scale: 2
+            }
+        );
+    }
+
+    #[test]
+    fn decimal_numeric_stays_unmapped_for_db_pull_inverse() {
+        // Precision/scale can't be reconstructed from `numeric` udt_name alone
+        // (same precedent as `jsonb`/Attachment), so `db pull` introspection
+        // deliberately leaves it unsupported rather than guessing.
+        assert!(sql_type_to_field_kind("numeric").is_none());
     }
 }
