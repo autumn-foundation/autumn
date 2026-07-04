@@ -4,7 +4,7 @@
 //!
 //! # Modules
 //!
-//! - [`csv`] — CSV schema trait, streaming export, row-by-row import with
+//! - `csv` — CSV schema trait, streaming export, row-by-row import with
 //!   structured error reporting.
 
 #[cfg(feature = "csv")]

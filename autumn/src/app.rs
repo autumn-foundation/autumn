@@ -324,9 +324,9 @@ pub struct AppBuilder {
     cache_backend: Option<Arc<dyn crate::cache::Cache>>,
     /// Error reporters registered via [`AppBuilder::with_error_reporter`].
     /// Installed onto `AppState` so the
-    /// [`ReportingLayer`](crate::reporting::ReportingLayer) delivers panic and
-    /// 5xx [`ErrorEvent`](crate::reporting::ErrorEvent)s to each. Empty means
-    /// the built-in [`LogReporter`](crate::reporting::LogReporter) is used.
+    /// `ReportingLayer` delivers panic and
+    /// 5xx `ErrorEvent`s to each. Empty means
+    /// the built-in `LogReporter` is used.
     #[cfg(feature = "reporting")]
     pub(crate) error_reporters: Vec<Arc<dyn crate::reporting::ErrorReporter>>,
     /// `OpenAPI` generation configuration. When `Some`, the router mounts
@@ -1809,18 +1809,18 @@ impl AppBuilder {
         self
     }
 
-    /// Register an [`ErrorReporter`](crate::reporting::ErrorReporter) for
+    /// Register an `ErrorReporter` for
     /// unhandled panics and 5xx responses.
     ///
     /// Reporters receive a structured
-    /// [`ErrorEvent`](crate::reporting::ErrorEvent) for every caught handler
+    /// `ErrorEvent` for every caught handler
     /// panic and every server-error response, carrying request context (route,
     /// method, request id, status) and — for panics — the panic payload and a
     /// backtrace (when `RUST_BACKTRACE` is set). Call this multiple times to
     /// chain reporters; each receives every event. When none are registered,
-    /// the built-in [`LogReporter`](crate::reporting::LogReporter) is used.
+    /// the built-in `LogReporter` is used.
     ///
-    /// Mirrors [`with_blob_store`](Self::with_blob_store) /
+    /// Mirrors `with_blob_store` /
     /// [`with_cache_backend`](Self::with_cache_backend).
     ///
     /// # Examples

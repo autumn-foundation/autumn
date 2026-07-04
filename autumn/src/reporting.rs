@@ -2,24 +2,24 @@
 //! route them to one or more configured reporters.
 //!
 //! When an Autumn handler panics or returns a server error, the failure is
-//! turned into a structured [`ErrorEvent`] and delivered to every registered
-//! [`ErrorReporter`]. This is the "where do my errors go?" seam: ship events to
+//! turned into a structured `ErrorEvent` and delivered to every registered
+//! `ErrorReporter`. This is the "where do my errors go?" seam: ship events to
 //! Sentry, Honeycomb, Slack, or a custom sink by implementing a single trait
 //! and wiring it once with
 //! [`AppBuilder::with_error_reporter`](crate::app::AppBuilder::with_error_reporter).
 //!
 //! The design mirrors Rails' [Error Reporter] and Autumn's other pluggable
-//! backends ([`BlobStore`](crate::storage::BlobStore),
-//! [`Cache`](crate::cache::Cache)): a built-in [`LogReporter`] (which uses
+//! backends (`BlobStore`,
+//! [`Cache`](crate::cache::Cache)): a built-in `LogReporter` (which uses
 //! `tracing`) ships as the default so the feature is useful with zero extra
 //! dependencies, and one builder call swaps in your own sink.
 //!
 //! # What gets reported
 //!
-//! - **Handler panics.** A [`ReportingLayer`] catches unwinding panics at the
+//! - **Handler panics.** A `ReportingLayer` catches unwinding panics at the
 //!   HTTP layer (so a single panicking handler can never abort the worker
 //!   task), converts them into a sanitized [`AutumnError`](crate::AutumnError)
-//!   `500` Problem Details response, and reports an [`ErrorEvent`] carrying the
+//!   `500` Problem Details response, and reports an `ErrorEvent` carrying the
 //!   panic payload and (when `RUST_BACKTRACE` is set) a backtrace.
 //! - **Server errors.** Any response with a `5xx` status is reported with its
 //!   status, message, and Problem Details type.
@@ -93,7 +93,7 @@ use crate::middleware::exception_filter::AutumnErrorInfo;
 /// The future returned by [`ErrorReporter::report`].
 ///
 /// A boxed, pinned future mirroring the shape of
-/// [`BlobFuture`](crate::storage::BlobFuture) so the trait stays object-safe
+/// `BlobFuture` so the trait stays object-safe
 /// while remaining async-friendly.
 pub type ReportFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 
@@ -134,7 +134,7 @@ pub struct PanicInfo {
     pub backtrace: Option<String>,
 }
 
-/// A sink for [`ErrorEvent`]s.
+/// A sink for `ErrorEvent`s.
 ///
 /// Implement this trait to ship unhandled panics and server errors to an
 /// external service. Register implementations with
@@ -145,7 +145,7 @@ pub struct PanicInfo {
 /// not block the client response. Any panic raised inside `report` is caught
 /// and logged — a misbehaving reporter never affects the response.
 pub trait ErrorReporter: Send + Sync + 'static {
-    /// Deliver an [`ErrorEvent`] to the sink.
+    /// Deliver an `ErrorEvent` to the sink.
     ///
     /// Implementations should swallow their own transport errors; returning is
     /// the only signal the framework needs.
@@ -189,7 +189,7 @@ impl ErrorReporter for LogReporter {
 
 /// Runtime holder for the registered reporters, installed on
 /// [`AppState`](crate::state::AppState) extensions so the
-/// [`ReportingLayer`] can pick them up at router-build time.
+/// `ReportingLayer` can pick them up at router-build time.
 #[derive(Clone, Default)]
 pub(crate) struct RegisteredReporters(pub(crate) Vec<Arc<dyn ErrorReporter>>);
 
@@ -298,7 +298,7 @@ struct CapturedPanic {
 static HOOK_INSTALLED: Once = Once::new();
 
 /// Install a panic hook (once) that records a backtrace for the panicking
-/// thread so the [`ReportingLayer`] can attach it to the [`ErrorEvent`] after
+/// thread so the `ReportingLayer` can attach it to the `ErrorEvent` after
 /// `catch_unwind` returns. The previous hook is preserved and still runs, so
 /// the default panic logging behavior is unchanged.
 fn ensure_panic_hook() {
@@ -340,7 +340,7 @@ struct RequestContext {
 }
 
 /// Tower [`Layer`] that catches handler panics and reports panics + 5xx
-/// responses to the registered [`ErrorReporter`]s.
+/// responses to the registered `ErrorReporter`s.
 ///
 /// Applied automatically by the framework inner to
 /// [`RequestIdLayer`](crate::middleware::RequestIdLayer) (so the request id is
@@ -353,7 +353,7 @@ pub struct ReportingLayer {
 impl ReportingLayer {
     /// Build a reporting layer from the registered reporters and config knobs.
     ///
-    /// When `reporters` is empty, the built-in [`LogReporter`] is installed so
+    /// When `reporters` is empty, the built-in `LogReporter` is installed so
     /// panics and server errors are still surfaced.
     #[must_use]
     pub(crate) fn new(
@@ -388,7 +388,7 @@ impl<S> Layer<S> for ReportingLayer {
     }
 }
 
-/// Tower [`Service`] produced by [`ReportingLayer`].
+/// Tower [`Service`] produced by `ReportingLayer`.
 #[derive(Clone)]
 pub struct ReportingService<S> {
     inner: S,

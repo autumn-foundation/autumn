@@ -713,7 +713,7 @@ impl TestApp {
     /// [`TestClient::probes`] will be in the default ready state; it is not
     /// connected to any handler in the supplied router.
     ///
-    /// **Note:** [`TestClient::sent_mail`] will always return an empty list for
+    /// **Note:** `TestClient::sent_mail` will always return an empty list for
     /// clients built this way.  The built-in mail recorder is wired in during
     /// [`TestApp::build`]; because `from_router` receives an already-constructed
     /// `AppState` (with the mailer already installed), the recorder cannot be
