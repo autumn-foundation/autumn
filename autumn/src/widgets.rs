@@ -2651,6 +2651,92 @@ pub fn confirm_action(
     }
 }
 
+// ── tabs ─────────────────────────────────────────────────────────────────
+
+/// Render a no-JavaScript tabs widget: a `tablist` strip plus its panels,
+/// from an ordered list of `(id, label, panel_body)` tuples.
+///
+/// Switching is pure CSS: each tab is an `<a href="#panel-id">` and each
+/// panel is targeted by `:target` in `autumn-tabs.css`, so URL fragments
+/// (`/settings#security`) select a tab with zero JavaScript. The first
+/// panel additionally carries `autumn-tabs__panel--active` so a panel is
+/// always visible even when no fragment is present.
+///
+/// # CSS hooks
+///
+/// | Selector | Element |
+/// |---|---|
+/// | `.autumn-tabs` | Root wrapper |
+/// | `.autumn-tabs__list` | Tab strip (`role="tablist"`) |
+/// | `.autumn-tabs__tab` | Individual tab link |
+/// | `.autumn-tabs__tab--active` | The initially-selected tab |
+/// | `.autumn-tabs__panel` | Individual panel |
+/// | `.autumn-tabs__panel--active` | The initially-visible panel |
+///
+/// # Accessibility
+///
+/// The tab strip carries `role="tablist"`; each tab carries `role="tab"`,
+/// `aria-controls` pointing at its panel's `id`, and `aria-selected`; each
+/// panel carries `role="tabpanel"`, `aria-labelledby` pointing at its tab's
+/// `id`, and `tabindex="0"` so it can receive keyboard focus directly.
+///
+/// # Panel `id`s
+///
+/// A panel's `id` is the raw id from its tuple (not namespaced by `id`) so
+/// it can be targeted directly by a URL fragment. Each tab's own element
+/// `id` is `"{id}-tab-{panel_id}"`. Duplicate panel ids are rendered as
+/// given — the caller is responsible for uniqueness if fragment targeting
+/// of a specific panel matters.
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_web::widgets::tabs;
+/// use maud::html;
+///
+/// let panels = [
+///     ("profile", "Profile", html! { p { "Profile settings" } }),
+///     ("security", "Security", html! { p { "Security settings" } }),
+///     ("billing", "Billing", html! { p { "Billing settings" } }),
+/// ];
+/// let widget = tabs("settings-tabs", &panels).into_string();
+/// assert!(widget.contains(r#"role="tablist""#));
+/// assert!(widget.contains(r#"aria-controls="security""#));
+/// assert!(widget.contains(r##"href="#billing""##));
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn tabs(id: &str, panels: &[(&str, &str, maud::Markup)]) -> maud::Markup {
+    maud::html! {
+        div id=(id) class="autumn-tabs" {
+            div class="autumn-tabs__list" role="tablist" {
+                @for (i, (panel_id, label, _)) in panels.iter().enumerate() {
+                    @let tab_id = format!("{id}-tab-{panel_id}");
+                    @let tab_class = merge_class(
+                        "autumn-tabs__tab",
+                        (i == 0).then_some("autumn-tabs__tab--active"),
+                    );
+                    a id=(tab_id) class=(tab_class) role="tab" href=(format!("#{panel_id}"))
+                        aria-controls=(panel_id) aria-selected=(if i == 0 { "true" } else { "false" }) {
+                        (label)
+                    }
+                }
+            }
+            @for (i, (panel_id, _, body)) in panels.iter().enumerate() {
+                @let tab_id = format!("{id}-tab-{panel_id}");
+                @let panel_class = merge_class(
+                    "autumn-tabs__panel",
+                    (i == 0).then_some("autumn-tabs__panel--active"),
+                );
+                section id=(panel_id) class=(panel_class) role="tabpanel"
+                    aria-labelledby=(tab_id) tabindex="0" {
+                    (body)
+                }
+            }
+        }
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(all(test, feature = "maud"))]
