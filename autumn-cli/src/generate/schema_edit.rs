@@ -10,7 +10,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
-use super::dsl::{Field, IdType};
+use sha2::{Digest, Sha256};
+
+use super::dsl::{Field, FieldKind, IdType};
 
 /// Append a `pub mod <name>;` line to a `mod.rs` file, returning the new
 /// contents. Idempotent: a second call with the same name is a no-op.
@@ -91,8 +93,41 @@ pub fn schema_has_table(schema: &str, table: &str) -> bool {
     has_table(schema, table)
 }
 
+/// The column names already declared for `table` in `schema` (`src/schema.rs`
+/// as [`append_schema_table`] shapes it), or an empty `Vec` if `table` isn't
+/// declared there at all.
+///
+/// Used by [`add_columns_up_sql`]/[`remove_columns_down_sql`] (issue #1032
+/// review follow-up) to extend their unique-index collision check beyond the
+/// columns being added/removed in the current `AddXToY`/`RemoveXFromY`
+/// migration: a plain index on some *other*, already-existing column named
+/// `<field>_unique` would otherwise collide with a newly-added `unique`
+/// field's own index name with no way for `unique_index_name` to see it,
+/// since it only ever receives the fields touched by one `generate`
+/// invocation. This generator has no DB introspection, so `schema.rs` (which
+/// every model/scaffold generator keeps in sync with the migrations it
+/// writes) is the closest thing to a durable record of a table's existing
+/// columns across separate `generate` invocations — only as reliable as
+/// `schema.rs` staying in sync with the real database, the same assumption
+/// every other generator here already makes of it.
+fn existing_schema_columns(schema: &str, table: &str) -> Vec<String> {
+    let needle = format!("{table} (");
+    let Some(start) = schema.lines().position(|l| l.trim().starts_with(&needle)) else {
+        return Vec::new();
+    };
+    schema
+        .lines()
+        .skip(start + 1)
+        .take_while(|l| !l.trim().starts_with('}'))
+        .filter_map(|l| l.trim().trim_end_matches(',').split_once(" -> "))
+        .map(|(name, _)| name.to_owned())
+        .collect()
+}
+
 /// Build the full SQL for `up.sql` of a `CREATE TABLE` migration with optional
-/// defaults and non-unique indexes, honouring the caller-supplied `id_type`.
+/// defaults, plain (non-unique) `--index` columns, and `unique`-marked
+/// columns (their own `CREATE UNIQUE INDEX`, see [`unique_index_sql`]),
+/// honouring the caller-supplied `id_type`.
 /// For `Uuid`, prepends a comment documenting the index-locality trade-off and
 /// the `UUIDv7` upgrade path.
 #[must_use]
@@ -134,17 +169,32 @@ pub fn create_table_sql_with_metadata_and_id(
     // behaviour), in addition to any explicit `--index` fields. Merging into the
     // same sorted set keeps `CREATE INDEX` output deterministic and de-duplicates
     // a reference field that was *also* passed via `--index`.
+    let unique_fields: BTreeSet<&str> = fields
+        .iter()
+        .filter(|f| f.unique)
+        .map(|f| f.name.as_str())
+        .collect();
     let mut index_fields = indexes.clone();
     for f in fields {
         if f.kind.is_reference() {
             index_fields.insert(f.name.clone());
         }
     }
+    // A `unique` field's own `CREATE UNIQUE INDEX` (emitted below) already
+    // covers lookups on that column, so an explicit `--index` on the same
+    // field (or an auto-added `references` index, though `unique` +
+    // `references` together is an unusual combination) must not also emit a
+    // redundant plain index (issue #1032).
+    index_fields.retain(|name| !unique_fields.contains(name.as_str()));
     for field_name in &index_fields {
         let _ = writeln!(
             sql,
             "CREATE INDEX idx_{table}_{field_name} ON {table} ({field_name});"
         );
+    }
+    // `unique` fields get their own named `CREATE UNIQUE INDEX`.
+    for field_name in &unique_fields {
+        sql.push_str(&unique_index_sql(table, field_name, fields));
     }
     sql
 }
@@ -153,6 +203,78 @@ pub fn create_table_sql_with_metadata_and_id(
 #[must_use]
 pub fn drop_table_sql(table: &str) -> String {
     format!("DROP TABLE {table};\n")
+}
+
+/// `PostgreSQL` silently truncates identifiers past `NAMEDATALEN - 1` bytes
+/// (63 in a stock build) rather than erroring, so an unbounded
+/// `idx_<table>_<field>_unique` can name-collide with what Postgres
+/// actually stores once `table`/`field` are long enough. This is the one
+/// place that name is computed — [`unique_index_sql`] and every generated
+/// caller that needs to match a real constraint name at runtime
+/// ([`super::scaffold`]'s `UNIQUE_CONSTRAINTS` const and its duplicate-
+/// violation smoke test) all call through here so they stay byte-for-byte
+/// in agreement with what Postgres will actually name the index.
+const POSTGRES_MAX_IDENTIFIER_LEN: usize = 63;
+
+/// The `CREATE UNIQUE INDEX` name for `table`/`field` (issue #1032),
+/// distinct from the plain, non-unique `--index`/`references`-auto-index
+/// output (`idx_<table>_<field>`, no `_unique` suffix) so a field that is
+/// both `--index`ed and `unique` doesn't collide on the index name.
+///
+/// `fields` is the full field list `field` belongs to (not just the unique
+/// ones) — passed so this can also detect the *coincidental-naming* case: a
+/// plain index always names itself after its own column
+/// (`idx_<table>_<other_field>`), so if some *other* field in the same
+/// table happens to be named `<field>_unique`, its plain index would
+/// collide with this one's unique index even though neither field's
+/// `unique`-ness is otherwise related to the other. Every caller that
+/// computes this name — the migration SQL and every generated caller that
+/// needs to match a real constraint name at runtime ([`super::scaffold`]'s
+/// `UNIQUE_CONSTRAINTS` const and its duplicate-violation smoke test) —
+/// passes the same field list so they agree byte-for-byte on the same
+/// (possibly disambiguated) name Postgres will actually store.
+///
+/// When `idx_<table>_<field>_unique` neither exceeds Postgres's identifier
+/// limit nor collides with another field's plain-index name, it's used
+/// verbatim. Otherwise, a `_`-prefixed 8-hex-char digest of the full
+/// (untruncated) name is appended — truncating first if it's also too long
+/// — so two names that would otherwise collide (on truncation or on a
+/// coincidental match) don't collide with each other either.
+///
+/// Known limitation: the coincidental-naming check above compares literal
+/// field names, not what Postgres actually ends up storing. A plain index's
+/// own name (`idx_<table>_<other_field>`) is never truncated or
+/// disambiguated by this generator the way a unique index's is — so a
+/// sufficiently long *other* field's plain index can itself be silently
+/// truncated by Postgres to 63 bytes and collide with this field's unique
+/// index even when their un-truncated names don't literally match (e.g. a
+/// unique field whose name makes `idx_<table>_<field>_unique` exactly 63
+/// bytes, plus an indexed field literally named `<field>_unique_extra`,
+/// whose own plain index Postgres truncates down to the same 63 bytes).
+/// Closing this fully would mean giving *every* plain index name the same
+/// truncate-on-63-bytes treatment this function already gives unique index
+/// names — a broader, pre-existing gap in plain-index naming generally
+/// (two long plain-indexed fields can already collide with *each other* the
+/// same way, with no `unique` field involved at all), out of scope here.
+#[must_use]
+pub fn unique_index_name(table: &str, field: &str, fields: &[Field]) -> String {
+    let full = format!("idx_{table}_{field}_unique");
+    let collides_with_plain_index = fields.iter().any(|f| f.name == format!("{field}_unique"));
+    if full.len() <= POSTGRES_MAX_IDENTIFIER_LEN && !collides_with_plain_index {
+        return full;
+    }
+    let digest = hex::encode(Sha256::digest(full.as_bytes()));
+    let suffix = format!("_{}", &digest[..8]);
+    let prefix_len = (POSTGRES_MAX_IDENTIFIER_LEN.saturating_sub(suffix.len())).min(full.len());
+    format!("{}{suffix}", &full[..prefix_len])
+}
+
+/// A `CREATE UNIQUE INDEX` statement enforcing single-column uniqueness on
+/// `field` (issue #1032). See [`unique_index_name`] for the name it uses.
+#[must_use]
+pub fn unique_index_sql(table: &str, field: &str, fields: &[Field]) -> String {
+    let name = unique_index_name(table, field, fields);
+    format!("CREATE UNIQUE INDEX {name} ON {table} ({field});\n")
 }
 
 /// For an `enum{…}` field, the trailing ` CHECK (col IN ('a', 'b', …))`
@@ -283,13 +405,45 @@ fn split_on_keyword(s: &str, keyword: &str) -> Option<(String, String)> {
     None
 }
 
+/// `fields`, extended with a placeholder [`Field`] per column `table`
+/// already declares in `existing_schema` (see [`existing_schema_columns`])
+/// that isn't already in `fields`. Only `name` is meaningful on the
+/// placeholders — [`unique_index_name`]'s collision check is the only thing
+/// that consumes this combined list, and it only ever looks at `.name`.
+fn fields_with_existing_schema_columns(
+    fields: &[Field],
+    existing_schema: &str,
+    table: &str,
+) -> Vec<Field> {
+    let mut combined = fields.to_vec();
+    for name in existing_schema_columns(existing_schema, table) {
+        if !combined.iter().any(|f| f.name == name) {
+            combined.push(Field {
+                name,
+                kind: FieldKind::String,
+                nullable: false,
+                variants: Vec::new(),
+                unique: false,
+            });
+        }
+    }
+    combined
+}
+
 /// SQL for adding columns to a table.
 ///
 /// Prepends an `autumn-safety` comment for `NOT NULL` columns that have no
 /// `DEFAULT` — those require a backfill or a default before the constraint can
 /// be added safely on a live table.
+///
+/// `existing_schema` is `src/schema.rs`'s current content (or `""` if
+/// unavailable) — passed through to [`fields_with_existing_schema_columns`]
+/// so a `unique` field's index name can't collide with a plain index on some
+/// other, already-existing column from an earlier migration (issue #1032
+/// review follow-up).
 #[must_use]
-pub fn add_columns_up_sql(table: &str, fields: &[Field]) -> String {
+pub fn add_columns_up_sql(table: &str, fields: &[Field], existing_schema: &str) -> String {
+    let collision_fields = fields_with_existing_schema_columns(fields, existing_schema, table);
     let mut out = String::new();
     for f in fields {
         if !f.nullable {
@@ -313,7 +467,13 @@ pub fn add_columns_up_sql(table: &str, fields: &[Field]) -> String {
             let _ = write!(out, " {check}");
         }
         out.push_str(";\n");
-        if f.kind.is_reference() {
+        // A `unique` field's own `CREATE UNIQUE INDEX` (emitted below)
+        // already covers lookups on that column, so a `references` field
+        // that is *also* `unique` must not get the plain auto-index too —
+        // same dedup `create_table_sql_with_metadata_and_id` already applies
+        // (issue #1032 review follow-up: this path emitted both, building
+        // and maintaining a redundant second btree index).
+        if f.kind.is_reference() && !f.unique {
             // Postgres auto-drops this index (and the FK constraint above) when
             // the column is dropped, so `add_columns_down_sql` needs no change.
             let _ = writeln!(
@@ -321,6 +481,12 @@ pub fn add_columns_up_sql(table: &str, fields: &[Field]) -> String {
                 "CREATE INDEX idx_{table}_{} ON {table} ({});",
                 f.name, f.name
             );
+        }
+        if f.unique {
+            // Postgres auto-drops this index when the column is dropped,
+            // same as the `references` auto-index above, so
+            // `add_columns_down_sql` needs no change.
+            out.push_str(&unique_index_sql(table, &f.name, &collision_fields));
         }
     }
     out
@@ -517,10 +683,15 @@ pub fn remove_columns_up_sql(table: &str, fields: &[Field]) -> String {
 /// [`create_table_sql_with_metadata_and_id`]/[`add_columns_up_sql`]) — a
 /// bare re-added column would silently drop the foreign-key relationship and
 /// its lookup index on rollback (issue #1026). Likewise restores an `enum{…}`
-/// field's `CHECK` constraint (issue #1030) — otherwise the closed set would
-/// silently stop being enforced after a rollback.
+/// field's `CHECK` constraint (issue #1030), and a `unique` field's `CREATE
+/// UNIQUE INDEX` (issue #1032) — otherwise the closed set / uniqueness
+/// constraint would silently stop being enforced after a rollback.
+///
+/// `existing_schema` is `src/schema.rs`'s current content (or `""` if
+/// unavailable) — see [`add_columns_up_sql`]'s matching doc comment for why.
 #[must_use]
-pub fn remove_columns_down_sql(table: &str, fields: &[Field]) -> String {
+pub fn remove_columns_down_sql(table: &str, fields: &[Field], existing_schema: &str) -> String {
+    let collision_fields = fields_with_existing_schema_columns(fields, existing_schema, table);
     let mut out = String::new();
     for f in fields.iter().rev() {
         let _ = write!(
@@ -537,12 +708,19 @@ pub fn remove_columns_down_sql(table: &str, fields: &[Field]) -> String {
             let _ = write!(out, " {check}");
         }
         out.push_str(";\n");
-        if f.kind.is_reference() {
+        // See `add_columns_up_sql`'s matching comment: a `unique` field's
+        // own `CREATE UNIQUE INDEX` already covers lookups, so a
+        // `references` field that is also `unique` must not get the plain
+        // auto-index restored too.
+        if f.kind.is_reference() && !f.unique {
             let _ = writeln!(
                 out,
                 "CREATE INDEX idx_{table}_{} ON {table} ({});",
                 f.name, f.name
             );
+        }
+        if f.unique {
+            out.push_str(&unique_index_sql(table, &f.name, &collision_fields));
         }
     }
     out
@@ -3247,9 +3425,344 @@ mod tests {
         );
     }
 
+    // ── unique field marker: CREATE UNIQUE INDEX (issue #1032) ──────────────
+
+    #[test]
+    fn create_table_sql_emits_unique_index_for_dsl_marker() {
+        let sql = create_table_sql_with_metadata_and_id(
+            "users",
+            &fields(&["email:String:unique"]),
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            IdType::BigSerial,
+        );
+        assert!(
+            sql.contains("CREATE UNIQUE INDEX idx_users_email_unique ON users (email);"),
+            "expected a unique index for the `:unique`-marked field; got:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn create_table_sql_unique_index_is_distinct_from_plain_index() {
+        // A `--index`-flagged field emits `idx_<table>_<field>` (no `_unique`
+        // suffix); a `unique`-marked field must use a distinct name so the
+        // two kinds of index never collide even on the same column.
+        let sql = create_table_sql_with_metadata_and_id(
+            "users",
+            &fields(&["email:String:unique"]),
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            IdType::BigSerial,
+        );
+        assert!(
+            !sql.contains("CREATE INDEX idx_users_email ON users (email);"),
+            "a unique field must not also emit a plain, non-unique index; got:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn create_table_sql_unique_field_not_duplicated_when_also_passed_via_index_flag() {
+        let mut explicit_indexes = BTreeSet::new();
+        explicit_indexes.insert("email".to_owned());
+        let sql = create_table_sql_with_metadata_and_id(
+            "users",
+            &fields(&["email:String:unique"]),
+            &explicit_indexes,
+            &BTreeMap::new(),
+            IdType::BigSerial,
+        );
+        assert_eq!(
+            sql.matches("CREATE UNIQUE INDEX idx_users_email_unique")
+                .count(),
+            1,
+            "got:\n{sql}"
+        );
+        assert!(
+            !sql.contains("CREATE INDEX idx_users_email ON"),
+            "the unique index already covers lookups; a redundant plain index \
+             must not also be emitted:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn create_table_sql_unique_nullable_field_keeps_null_and_unique_index() {
+        let sql = create_table_sql_with_metadata_and_id(
+            "users",
+            &fields(&["nickname:Option<String>:unique"]),
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            IdType::BigSerial,
+        );
+        assert!(sql.contains("nickname TEXT NULL"), "got:\n{sql}");
+        assert!(
+            sql.contains("CREATE UNIQUE INDEX idx_users_nickname_unique ON users (nickname);"),
+            "got:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn add_columns_up_sql_emits_unique_index() {
+        let sql = add_columns_up_sql("users", &fields(&["email:String:unique"]), "");
+        assert!(
+            sql.contains("ALTER TABLE users ADD COLUMN email TEXT NOT NULL;"),
+            "got:\n{sql}"
+        );
+        assert!(
+            sql.contains("CREATE UNIQUE INDEX idx_users_email_unique ON users (email);"),
+            "got:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn remove_columns_down_sql_restores_unique_index_for_unique_field() {
+        let sql = remove_columns_down_sql("users", &fields(&["email:String:unique"]), "");
+        assert!(
+            sql.contains("ALTER TABLE users ADD COLUMN email TEXT NOT NULL"),
+            "got:\n{sql}"
+        );
+        assert!(
+            sql.contains("CREATE UNIQUE INDEX idx_users_email_unique ON users (email);"),
+            "rollback of RemoveXFromY must restore the UNIQUE index, not just the \
+             bare column; got:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn add_columns_up_sql_unique_reference_skips_redundant_plain_index() {
+        // Regression guard (issue #1032 review follow-up): a `references`
+        // field's own auto-index and a `unique` field's `CREATE UNIQUE
+        // INDEX` were emitted unconditionally and independently here, so a
+        // field that is both (`author:references:unique`) got two
+        // overlapping btree indexes on the same column — the plain one is
+        // fully redundant since the unique index already covers the same
+        // lookup. `create_table_sql_with_metadata_and_id` already dedupes
+        // this for `CREATE TABLE`; `AddXToY` must match.
+        let sql = add_columns_up_sql("posts", &fields(&["author:references:unique"]), "");
+        assert!(
+            sql.contains("CREATE UNIQUE INDEX idx_posts_author_id_unique ON posts (author_id);"),
+            "got:\n{sql}"
+        );
+        assert!(
+            !sql.contains("CREATE INDEX idx_posts_author_id ON posts (author_id);"),
+            "a references field that is also unique must not get a redundant \
+             plain index alongside its unique index; got:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn remove_columns_down_sql_unique_reference_skips_redundant_plain_index() {
+        // `RemoveXFromY`'s rollback must restore the same shape `AddXToY`
+        // would have created, not the redundant pre-fix pair.
+        let sql = remove_columns_down_sql("posts", &fields(&["author:references:unique"]), "");
+        assert!(
+            sql.contains("CREATE UNIQUE INDEX idx_posts_author_id_unique ON posts (author_id);"),
+            "got:\n{sql}"
+        );
+        assert!(
+            !sql.contains("CREATE INDEX idx_posts_author_id ON posts (author_id);"),
+            "got:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn unique_index_sql_names_index_with_unique_suffix() {
+        assert_eq!(
+            unique_index_sql("users", "email", &[]),
+            "CREATE UNIQUE INDEX idx_users_email_unique ON users (email);\n"
+        );
+    }
+
+    #[test]
+    fn unique_index_name_short_names_pass_through_unchanged() {
+        assert_eq!(
+            unique_index_name("users", "email", &[]),
+            "idx_users_email_unique"
+        );
+    }
+
+    #[test]
+    fn unique_index_name_truncates_long_names_to_fit_postgres_limit() {
+        let table = "a_very_long_table_name_that_pushes_the_identifier_over_the_limit";
+        let field = "an_equally_long_field_name_for_good_measure";
+        let name = unique_index_name(table, field, &[]);
+        assert!(
+            name.len() <= 63,
+            "index name must fit Postgres's identifier limit, got {} bytes: {name}",
+            name.len()
+        );
+        assert!(
+            name.starts_with("idx_a_very_long_table_name"),
+            "got: {name}"
+        );
+    }
+
+    #[test]
+    fn unique_index_name_disambiguates_distinct_long_names_that_share_a_prefix() {
+        // Two different (table, field) pairs that truncate to the same
+        // prefix must still produce distinct index names (issue #1032 review
+        // follow-up) -- otherwise the runtime `unique_violation_field` match
+        // would misclassify a violation on one field as the other.
+        let table = "a_very_long_table_name_that_pushes_the_identifier_over_the_limit";
+        let name_a = unique_index_name(table, "an_equally_long_field_name_alpha_variant", &[]);
+        let name_b = unique_index_name(table, "an_equally_long_field_name_bravo_variant", &[]);
+        assert_ne!(name_a, name_b);
+    }
+
+    #[test]
+    fn unique_index_name_is_deterministic() {
+        let table = "a_very_long_table_name_that_pushes_the_identifier_over_the_limit";
+        let field = "an_equally_long_field_name_for_good_measure";
+        assert_eq!(
+            unique_index_name(table, field, &[]),
+            unique_index_name(table, field, &[])
+        );
+    }
+
+    #[test]
+    fn unique_index_sql_uses_truncated_name_for_long_identifiers() {
+        let table = "a_very_long_table_name_that_pushes_the_identifier_over_the_limit";
+        let field = "an_equally_long_field_name_for_good_measure";
+        let sql = unique_index_sql(table, field, &[]);
+        let expected_name = unique_index_name(table, field, &[]);
+        assert!(
+            sql.contains(&format!(
+                "CREATE UNIQUE INDEX {expected_name} ON {table} ({field});"
+            )),
+            "got:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn unique_index_name_disambiguates_coincidental_collision_with_plain_index() {
+        // Regression guard (issue #1032 review follow-up): a plain index
+        // always names itself after its own column (`idx_<table>_<name>`),
+        // with no `_unique` suffix. If some *other* field in the same table
+        // happens to be literally named `<field>_unique`, that field's own
+        // plain index collides with `field`'s unique index name even though
+        // the two fields are otherwise unrelated (`email:unique` +
+        // `email_unique:String --index email_unique` both want
+        // `idx_users_email_unique`) -- the generated migration would fail
+        // with "relation already exists" before the table was ever usable.
+        let colliding_field = fields(&["email_unique:String"]);
+        let name = unique_index_name("users", "email", &colliding_field);
+        assert_ne!(
+            name, "idx_users_email_unique",
+            "must disambiguate away from the name a same-named plain index \
+             would already claim"
+        );
+        assert!(name.len() <= 63, "got {} bytes: {name}", name.len());
+    }
+
+    #[test]
+    fn unique_index_name_no_collision_stays_the_plain_name() {
+        // The disambiguation in the test above must not fire when there's
+        // nothing to collide with.
+        let unrelated_fields = fields(&["age:i32"]);
+        assert_eq!(
+            unique_index_name("users", "email", &unrelated_fields),
+            "idx_users_email_unique"
+        );
+    }
+
+    #[test]
+    fn create_table_sql_unique_field_avoids_name_collision_with_plain_index() {
+        let fields = fields(&["email:String:unique", "email_unique:String"]);
+        let indexes: BTreeSet<String> = std::iter::once("email_unique".to_owned()).collect();
+        let sql = create_table_sql_with_metadata_and_id(
+            "users",
+            &fields,
+            &indexes,
+            &BTreeMap::new(),
+            IdType::BigSerial,
+        );
+        assert!(
+            sql.contains("CREATE INDEX idx_users_email_unique ON users (email_unique);"),
+            "got:\n{sql}"
+        );
+        // The unique index must have been disambiguated away from the
+        // plain index's name above, not emitted as a second, colliding
+        // `CREATE UNIQUE INDEX idx_users_email_unique` (checked with the
+        // exact trailing ` ON users (email);` so the plain index's own
+        // line, which shares the same name as a prefix, doesn't also match).
+        assert!(
+            !sql.contains("CREATE UNIQUE INDEX idx_users_email_unique ON users (email);"),
+            "the unique index must not collide with the plain index's exact \
+             name; got:\n{sql}"
+        );
+        assert!(
+            sql.contains("CREATE UNIQUE INDEX idx_users_email_unique_")
+                && sql.contains(" ON users (email);"),
+            "the unique index must still exist, under a disambiguated name; \
+             got:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn existing_schema_columns_parses_declared_column_names() {
+        let schema = append_schema_table("", "users", &fields(&["email_unique:String"]));
+        let columns = existing_schema_columns(&schema, "users");
+        assert!(
+            columns.contains(&"email_unique".to_owned()),
+            "got: {columns:?}"
+        );
+        assert!(columns.contains(&"id".to_owned()), "got: {columns:?}");
+        assert!(
+            columns.contains(&"created_at".to_owned()),
+            "got: {columns:?}"
+        );
+    }
+
+    #[test]
+    fn existing_schema_columns_empty_for_unknown_table() {
+        let schema = append_schema_table("", "users", &fields(&["email:String"]));
+        assert!(existing_schema_columns(&schema, "posts").is_empty());
+    }
+
+    #[test]
+    fn add_columns_up_sql_avoids_name_collision_with_earlier_migrations_columns() {
+        // Regression guard (issue #1032 review follow-up): `add_columns_up_sql`
+        // only ever sees the columns being added in *this* `AddXToY`
+        // migration -- not a table's other, already-existing columns from an
+        // earlier, separately-run migration. A field named `email_unique`
+        // added back when the table was first created would otherwise still
+        // collide with a `unique` field named `email` added later, with no
+        // way for this call alone to know `email_unique` already exists.
+        // `src/schema.rs` (kept in sync by every model/scaffold generator) is
+        // what lets this call see across that gap.
+        let existing_schema = append_schema_table("", "users", &fields(&["email_unique:String"]));
+        let sql = add_columns_up_sql("users", &fields(&["email:String:unique"]), &existing_schema);
+        assert!(
+            !sql.contains("CREATE UNIQUE INDEX idx_users_email_unique ON users (email);"),
+            "must not collide with the pre-existing email_unique column's \
+             plain index name; got:\n{sql}"
+        );
+        assert!(
+            sql.contains("CREATE UNIQUE INDEX idx_users_email_unique_"),
+            "the unique index must still exist, under a disambiguated name; \
+             got:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn remove_columns_down_sql_avoids_name_collision_with_earlier_migrations_columns() {
+        // `RemoveXFromY`'s rollback must avoid the same coincidental
+        // collision `add_columns_up_sql` avoids above.
+        let existing_schema = append_schema_table("", "users", &fields(&["email_unique:String"]));
+        let sql =
+            remove_columns_down_sql("users", &fields(&["email:String:unique"]), &existing_schema);
+        assert!(
+            !sql.contains("CREATE UNIQUE INDEX idx_users_email_unique ON users (email);"),
+            "got:\n{sql}"
+        );
+        assert!(
+            sql.contains("CREATE UNIQUE INDEX idx_users_email_unique_"),
+            "got:\n{sql}"
+        );
+    }
+
     #[test]
     fn add_columns_up_sql_emits_fk_constraint_and_index() {
-        let sql = add_columns_up_sql("comments", &fields(&["post:references"]));
+        let sql = add_columns_up_sql("comments", &fields(&["post:references"]), "");
         assert!(
             sql.contains(
                 "ALTER TABLE comments ADD COLUMN post_id BIGINT NOT NULL REFERENCES posts(id);"
@@ -3335,7 +3848,7 @@ mod tests {
     #[test]
     fn add_columns_up_sql_emits_alter_per_field() {
         let f = fields(&["title:String", "count:i32"]);
-        let sql = add_columns_up_sql("posts", &f);
+        let sql = add_columns_up_sql("posts", &f, "");
         assert!(sql.contains("ALTER TABLE posts ADD COLUMN title TEXT NOT NULL;"));
         assert!(sql.contains("ALTER TABLE posts ADD COLUMN count INTEGER NOT NULL;"));
     }
@@ -3343,7 +3856,7 @@ mod tests {
     #[test]
     fn add_columns_up_sql_includes_safety_comment_for_not_null() {
         let f = fields(&["title:String"]);
-        let sql = add_columns_up_sql("posts", &f);
+        let sql = add_columns_up_sql("posts", &f, "");
         assert!(
             sql.contains("autumn-safety: potentially-blocking"),
             "NOT NULL column must carry a safety comment; got:\n{sql}"
@@ -3353,7 +3866,7 @@ mod tests {
     #[test]
     fn add_columns_up_sql_no_safety_comment_for_nullable() {
         let f = fields(&["subtitle:Option<String>"]);
-        let sql = add_columns_up_sql("posts", &f);
+        let sql = add_columns_up_sql("posts", &f, "");
         assert!(
             !sql.contains("autumn-safety"),
             "nullable column must NOT carry a safety comment; got:\n{sql}"
@@ -3378,7 +3891,7 @@ mod tests {
         // otherwise the relationship and its lookup index silently vanish
         // on rollback (issue #1026).
         let f = fields(&["post:references"]);
-        let sql = remove_columns_down_sql("comments", &f);
+        let sql = remove_columns_down_sql("comments", &f, "");
         assert!(
             sql.contains(
                 "ALTER TABLE comments ADD COLUMN post_id BIGINT NOT NULL REFERENCES posts(id);"
@@ -3456,7 +3969,7 @@ mod tests {
     #[test]
     fn add_columns_emits_check_constraint_for_enum() {
         let f = fields(&["status:enum{draft,published,archived}"]);
-        let sql = add_columns_up_sql("posts", &f);
+        let sql = add_columns_up_sql("posts", &f, "");
         assert!(
             sql.contains(
                 "ALTER TABLE posts ADD COLUMN status TEXT NOT NULL CHECK (status IN ('draft', 'published', 'archived'));"
@@ -3491,7 +4004,7 @@ mod tests {
         // not just a bare TEXT column — otherwise the closed set silently
         // stops being enforced after a rollback.
         let f = fields(&["status:enum{draft,published,archived}"]);
-        let sql = remove_columns_down_sql("posts", &f);
+        let sql = remove_columns_down_sql("posts", &f, "");
         assert!(
             sql.contains(
                 "ALTER TABLE posts ADD COLUMN status TEXT NOT NULL CHECK (status IN ('draft', 'published', 'archived'));"

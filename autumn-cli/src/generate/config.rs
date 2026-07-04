@@ -47,6 +47,8 @@ pub struct ScaffoldConfigEntry {
     #[serde(default)]
     pub indexes: Vec<String>,
     #[serde(default)]
+    pub uniques: Vec<String>,
+    #[serde(default)]
     pub validations: Vec<String>,
     #[serde(default)]
     pub defaults: Vec<String>,
@@ -277,6 +279,7 @@ pub fn merge_config_with_cli(
     config: ScaffoldConfigEntry,
     cli_fields: &[String],
     cli_indexes: &[String],
+    cli_uniques: &[String],
     cli_validations: &[String],
     cli_defaults: &[String],
     cli_queries: &[String],
@@ -293,6 +296,7 @@ pub fn merge_config_with_cli(
     };
     let fields = pick(cli_fields, config.fields);
     let indexes = pick(cli_indexes, config.indexes);
+    let uniques = pick(cli_uniques, config.uniques);
     let validations = pick(cli_validations, config.validations);
     let defaults = pick(cli_defaults, config.defaults);
     let queries = pick(cli_queries, config.queries);
@@ -316,6 +320,7 @@ pub fn merge_config_with_cli(
         ScaffoldOptions {
             model: ModelOptions {
                 indexes,
+                uniques,
                 validations,
                 defaults,
                 soft_delete,
@@ -610,6 +615,7 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
         ScaffoldConfigEntry {
             fields: vec!["url:String".into(), "tag:String".into()],
             indexes: vec!["url".into()],
+            uniques: vec![],
             validations: vec!["url=url".into()],
             defaults: vec![],
             queries: vec!["find_by_url:url".into()],
@@ -626,6 +632,7 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
     fn merge(entry: ScaffoldConfigEntry) -> (Vec<String>, ScaffoldOptions) {
         merge_config_with_cli(
             entry,
+            &[],
             &[],
             &[],
             &[],
@@ -661,6 +668,7 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             &[],
             &[],
             &[],
+            &[],
             false,
             false,
             false,
@@ -682,6 +690,7 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             &[],
             &[],
             &[],
+            &[],
             false,
             false,
             false,
@@ -698,6 +707,7 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
     fn merge_cli_validations_override_toml_validations() {
         let (_, opts) = merge_config_with_cli(
             bookmark_entry(),
+            &[],
             &[],
             &[],
             &["url=email".into()],
@@ -724,6 +734,7 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             &[],
             &[],
             &[],
+            &[],
             &["tag=general".into()],
             &[],
             false,
@@ -742,6 +753,7 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
     fn merge_cli_queries_override_toml_queries() {
         let (_, opts) = merge_config_with_cli(
             bookmark_entry(),
+            &[],
             &[],
             &[],
             &[],
@@ -769,6 +781,7 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             &[],
             &[],
             &[],
+            &[],
             false,
             false,
             false,
@@ -789,6 +802,7 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
     fn merge_cli_soft_delete_flag_wins() {
         let (_, opts) = merge_config_with_cli(
             bookmark_entry(),
+            &[],
             &[],
             &[],
             &[],
@@ -854,6 +868,7 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             &[],
             &[],
             &[],
+            &[],
             false,
             true,
             false,
@@ -899,6 +914,7 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             &[],
             &[],
             &[],
+            &[],
             false,
             false,
             true,
@@ -931,6 +947,7 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
         entry.shard_key = Some("tenant_id".into());
         let (_, opts) = merge_config_with_cli(
             entry,
+            &[],
             &[],
             &[],
             &[],
@@ -996,6 +1013,7 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             &[],
             &[],
             &[],
+            &[],
             false,
             false,
             false,
@@ -1035,6 +1053,7 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             &[],
             &[],
             &[],
+            &[],
             false,
             false,
             false,
@@ -1065,6 +1084,7 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
     fn merge_cli_bad_id_returns_error() {
         let err = merge_config_with_cli(
             bookmark_entry(),
+            &[],
             &[],
             &[],
             &[],

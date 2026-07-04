@@ -38,15 +38,34 @@ fn collect_rs_files_recursive(dir: &Path, candidates: &mut Vec<std::path::PathBu
 ///
 /// # Errors
 /// Project layout, name, and DSL errors surface here.
+#[allow(dead_code)]
 pub fn plan_migration(
     project_root: &Path,
     name: &str,
     field_tokens: &[String],
     timestamp: &str,
 ) -> Result<Plan, GenerateError> {
+    plan_migration_with_options(project_root, name, field_tokens, timestamp, &[])
+}
+
+/// [`plan_migration`], plus `--unique FIELD` flags (issue #1032) — mirrors
+/// the DSL's inline `:unique` modifier, which already works via
+/// [`parse_fields`] alone (no options struct needed, unlike `generate
+/// model`/`scaffold`'s `ModelOptions`).
+///
+/// # Errors
+/// Project layout, name, DSL, and unknown-field errors surface here.
+pub fn plan_migration_with_options(
+    project_root: &Path,
+    name: &str,
+    field_tokens: &[String],
+    timestamp: &str,
+    uniques: &[String],
+) -> Result<Plan, GenerateError> {
     ensure_project_root(project_root)?;
     super::model::validate_resource_name(name)?;
-    let fields = parse_fields(field_tokens)?;
+    let mut fields = parse_fields(field_tokens)?;
+    super::model::apply_unique_flags(&mut fields, uniques)?;
 
     // The directory uses snake_case (`add_title_to_posts`) but the shape is
     // detected from the original PascalCase form because the keywords `To`
@@ -69,8 +88,16 @@ pub fn plan_migration(
             // anywhere the generator can see — a self-reference here is left
             // unvalidated rather than guessed at.
             super::model::check_reference_targets(&mut plan, project_root, &fields, table, None)?;
+            // `src/schema.rs`'s current content, so a `unique` field being
+            // added here can't pick an index name that coincidentally
+            // collides with a plain index on some other, already-existing
+            // column from an earlier migration this one has no other way to
+            // see (issue #1032 review follow-up). Empty string (no
+            // collision-check widening) if the file doesn't exist yet.
+            let existing_schema =
+                std::fs::read_to_string(project_root.join("src/schema.rs")).unwrap_or_default();
             (
-                add_columns_up_sql(table, &fields),
+                add_columns_up_sql(table, &fields, &existing_schema),
                 add_columns_down_sql(table, &fields),
             )
         }
@@ -81,9 +108,11 @@ pub fn plan_migration(
             // target with a UUID primary key still produces a `down.sql`
             // that fails to apply on rollback.
             super::model::check_reference_targets(&mut plan, project_root, &fields, table, None)?;
+            let existing_schema =
+                std::fs::read_to_string(project_root.join("src/schema.rs")).unwrap_or_default();
             (
                 remove_columns_up_sql(table, &fields),
-                remove_columns_down_sql(table, &fields),
+                remove_columns_down_sql(table, &fields, &existing_schema),
             )
         }
         MigrationShape::EncryptColumns {
@@ -187,7 +216,7 @@ fn pascalish(name: &str) -> String {
 }
 
 /// CLI entry point.
-pub fn run(name: &str, field_tokens: &[String], flags: Flags) {
+pub fn run(name: &str, field_tokens: &[String], uniques: &[String], flags: Flags) {
     let cwd = match std::env::current_dir() {
         Ok(d) => d,
         Err(e) => {
@@ -196,7 +225,9 @@ pub fn run(name: &str, field_tokens: &[String], flags: Flags) {
         }
     };
     let timestamp = timestamp_now();
-    match plan_migration(&cwd, name, field_tokens, &timestamp).and_then(|p| p.execute(flags)) {
+    match plan_migration_with_options(&cwd, name, field_tokens, &timestamp, uniques)
+        .and_then(|p| p.execute(flags))
+    {
         Ok(()) => {}
         Err(e) => {
             eprintln!("Error: {e}");

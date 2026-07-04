@@ -19,6 +19,12 @@ pub struct Field {
     /// The declared variant tokens (`snake_case`) for [`FieldKind::Enum`]
     /// fields, in declaration order. Empty for every other kind.
     pub variants: Vec<String>,
+    /// True when the field was given a trailing `:unique` modifier
+    /// (`email:String:unique`), or was later marked unique via `--unique`
+    /// (see [`super::model::apply_unique_flags`]). Emits a `CREATE UNIQUE
+    /// INDEX` in the migration instead of the plain, non-unique `--index`
+    /// output (see [`super::schema_edit::unique_index_sql`]).
+    pub unique: bool,
 }
 
 impl Field {
@@ -305,7 +311,7 @@ impl IdType {
 /// Comma-separated list of supported types, for error messages and `--help`.
 pub const SUPPORTED_TYPES: &str = "String, Text, i32, i64, bool, f32, f64, \
     Uuid, NaiveDateTime, DateTime, Vec<u8>, Bytea, Attachment, references, \
-    enum{a,b,…}, Option<…>";
+    enum{a,b,…}, Option<…>, :unique";
 
 /// Comma-separated list of supported Postgres column types (`udt_name`), for
 /// the `db pull` introspection error message.
@@ -354,7 +360,7 @@ pub fn sql_type_to_field_kind(udt_name: &str) -> Option<FieldKind> {
 /// Returns [`GenerateError::InvalidField`] if the token is malformed or the
 /// type is not in the supported set.
 pub fn parse_field(token: &str) -> Result<Field, GenerateError> {
-    let (name, ty) = token
+    let (name, rest) = token
         .split_once(':')
         .ok_or_else(|| GenerateError::InvalidField {
             token: token.to_owned(),
@@ -362,7 +368,23 @@ pub fn parse_field(token: &str) -> Result<Field, GenerateError> {
         })?;
 
     let name = name.trim();
-    let ty = ty.trim();
+    // A trailing `:unique` modifier marks the column for a `CREATE UNIQUE
+    // INDEX` in the migration (issue #1032), e.g. `email:String:unique`.
+    // None of the DSL's type tokens contain a literal colon, so splitting
+    // once more off the end is unambiguous.
+    let (ty, unique) = match rest.rsplit_once(':') {
+        Some((ty, modifier)) if modifier.trim() == "unique" => (ty.trim(), true),
+        Some((_, modifier)) => {
+            return Err(GenerateError::InvalidField {
+                token: token.to_owned(),
+                reason: format!(
+                    "unknown field modifier '{}'; the only supported modifier is 'unique'",
+                    modifier.trim()
+                ),
+            });
+        }
+        None => (rest.trim(), false),
+    };
 
     if name.is_empty() {
         return Err(GenerateError::InvalidField {
@@ -394,6 +416,7 @@ pub fn parse_field(token: &str) -> Result<Field, GenerateError> {
             kind: FieldKind::Enum,
             nullable,
             variants,
+            unique,
         });
     }
 
@@ -416,6 +439,7 @@ pub fn parse_field(token: &str) -> Result<Field, GenerateError> {
         kind,
         nullable,
         variants: Vec::new(),
+        unique,
     })
 }
 
@@ -1294,6 +1318,75 @@ mod tests {
         assert!(
             SUPPORTED_TYPES.contains("enum{"),
             "SUPPORTED_TYPES must list enum{{…}}"
+        );
+    }
+
+    // ── `unique` field modifier (issue #1032) ───────────────────────────────
+
+    #[test]
+    fn parse_unique_string_field() {
+        let f = parse_field("email:String:unique").unwrap();
+        assert_eq!(f.name, "email");
+        assert_eq!(f.kind, FieldKind::String);
+        assert!(f.unique);
+        assert!(!f.nullable);
+    }
+
+    #[test]
+    fn parse_non_unique_field_defaults_to_false() {
+        let f = parse_field("title:String").unwrap();
+        assert!(!f.unique);
+    }
+
+    #[test]
+    fn parse_unique_option_field_keeps_nullable_and_unique() {
+        let f = parse_field("nickname:Option<String>:unique").unwrap();
+        assert!(f.nullable);
+        assert!(f.unique);
+    }
+
+    #[test]
+    fn parse_unique_i64_field() {
+        let f = parse_field("external_id:i64:unique").unwrap();
+        assert_eq!(f.kind, FieldKind::I64);
+        assert!(f.unique);
+    }
+
+    #[test]
+    fn parse_unique_enum_field() {
+        let f = parse_field("slug:enum{a,b}:unique").unwrap();
+        assert_eq!(f.kind, FieldKind::Enum);
+        assert!(f.unique);
+    }
+
+    #[test]
+    fn parse_unique_references_field() {
+        let f = parse_field("profile:references:unique").unwrap();
+        assert_eq!(f.name, "profile_id");
+        assert_eq!(f.kind, FieldKind::References);
+        assert!(f.unique);
+    }
+
+    #[test]
+    fn parse_unknown_modifier_is_rejected() {
+        let err = parse_field("email:String:bogus").unwrap_err();
+        assert!(
+            err.to_string().contains("bogus") && err.to_string().contains("unique"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_unique_trims_whitespace_around_modifier() {
+        let f = parse_field("email:String: unique ").unwrap();
+        assert!(f.unique);
+    }
+
+    #[test]
+    fn unique_appears_in_supported_types_constant() {
+        assert!(
+            SUPPORTED_TYPES.contains("unique"),
+            "SUPPORTED_TYPES must document the :unique modifier"
         );
     }
 }

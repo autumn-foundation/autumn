@@ -21,7 +21,8 @@ use super::model::{
 use super::naming::{humanize_label, pascal, pluralize, snake};
 use super::schema_edit::{
     add_mod_declaration, create_table_sql_with_metadata_and_id, ensure_autumn_web_feature,
-    ensure_dev_dependency_test_support, ensure_dev_dependency_tokio_test_features, update_main_rs,
+    ensure_dev_dependency_test_support, ensure_dev_dependency_tokio_test_features,
+    unique_index_name, update_main_rs,
 };
 use super::{Flags, GenerateError, ensure_project_root, read_or_empty, timestamp_now};
 
@@ -108,7 +109,8 @@ pub fn plan_scaffold_with_options(
                 .to_owned(),
         ));
     }
-    let fields = parse_fields(field_tokens)?;
+    let mut fields = parse_fields(field_tokens)?;
+    super::model::apply_unique_flags(&mut fields, &options.model.uniques)?;
     if !options.api {
         validate_enum_field_names_against_routes_imports(&fields)?;
     }
@@ -465,6 +467,24 @@ fn parse_query_specs(
             field_name: field_name.to_owned(),
             rust_type: field.rust_type(),
         });
+    }
+    // Every `unique` field (issue #1032) gets a `find_by_<field>` repository
+    // lookup for free — no `--query` needed — mirroring how a `references`
+    // field auto-contributes to the migration's index set without an
+    // explicit `--index`. Skipped for a field already covered by an
+    // explicit `--query`, and for `enum` fields (same import-path
+    // limitation `--query` itself rejects above).
+    for field in fields {
+        if field.unique
+            && !field.is_enum()
+            && !parsed.iter().any(|spec| spec.field_name == field.name)
+        {
+            parsed.push(QuerySpec {
+                method: format!("find_by_{}", field.name),
+                field_name: field.name.clone(),
+                rust_type: field.rust_type(),
+            });
+        }
     }
     Ok(parsed)
 }
@@ -958,8 +978,27 @@ fn render_routes_file(
     let id_rust = id_type.rust_type();
     let validated_fields: Vec<&str> = validations.keys().map(String::as_str).collect();
     let create_inputs =
-        render_create_form_inputs(fields, live_validation, &validated_fields, plural);
-    let edit_inputs = render_edit_form_inputs(fields, live_validation, &validated_fields, plural);
+        render_create_form_inputs(fields, live_validation, &validated_fields, plural, false);
+    let edit_inputs =
+        render_edit_form_inputs(fields, live_validation, &validated_fields, plural, false);
+    // `unique` fields (issue #1032): a duplicate submission re-renders the
+    // same form with an inline field error instead of a generic 500 — see
+    // `render_unique_violation_create_handler`/`..._update_handler` below.
+    // These `_with_unique_error` variants are only spliced into that
+    // failure-path branch, never into `new_form`/`edit_form`'s normal
+    // (success) rendering, so a scaffold without `unique` fields emits byte-
+    // identical output to before this feature existed.
+    let unique_fields: Vec<&Field> = fields.iter().filter(|f| f.unique).collect();
+    let create_inputs_with_unique_error = if unique_fields.is_empty() {
+        String::new()
+    } else {
+        render_create_form_inputs(fields, live_validation, &validated_fields, plural, true)
+    };
+    let edit_inputs_with_unique_error = if unique_fields.is_empty() {
+        String::new()
+    } else {
+        render_edit_form_inputs(fields, live_validation, &validated_fields, plural, true)
+    };
     let update_columns = render_update_columns(plural, fields);
     let nullable_field_match = render_nullable_field_match(fields);
     let has_attachments = has_attachment_fields(fields);
@@ -1098,6 +1137,43 @@ fn render_routes_file(
         format!("mut db: {db_ty}")
     };
 
+    // A `unique` field's create/update handler re-renders the form on a
+    // constraint violation (issue #1032), which needs a CSRF token/field the
+    // same way `new_form`/`edit_form` already do — the plain create/update
+    // handlers otherwise only *consume* a submission, never render a form,
+    // so they don't carry these params. Inserted right after `flash: Flash`
+    // (NOT appended at the end) — axum's `Handler` trait requires the
+    // body-consuming `Bytes` extractor to stay the *last* parameter; every
+    // other extractor must come before it.
+    let create_signature = if unique_fields.is_empty() {
+        create_signature
+    } else {
+        create_signature.replacen(
+            "flash: Flash",
+            "flash: Flash, csrf: Option<CsrfToken>, csrf_field: Option<CsrfFormField>",
+            1,
+        )
+    };
+    let update_signature = if unique_fields.is_empty() {
+        update_signature
+    } else {
+        update_signature.replacen(
+            "flash: Flash,",
+            "flash: Flash,\n    csrf: Option<CsrfToken>,\n    csrf_field: Option<CsrfFormField>,",
+            1,
+        )
+        // The `--live` (non-sharded) signature uses `repo:` instead of `mut
+        // db: {db_ty}` — the unique-violation re-fetch below goes through
+        // `repo.find_by_id` in that case (see
+        // `render_unique_violation_update_handler`) rather than adding a
+        // second `Db` extractor alongside `repo`. `Db` checks out and holds
+        // a pool connection for the whole handler scope, and `repo.update`
+        // (used by the live update path) checks out its own connection from
+        // the same pool — holding both at once self-deadlocks/times out a
+        // pool sized for one connection per request (issue #1032 review
+        // follow-up).
+    };
+
     let (decode_create_call, decode_update_call, decode_form_sig) = if has_attachments {
         (
             "decode_form(&state, body).await?".to_owned(),
@@ -1111,6 +1187,76 @@ fn render_routes_file(
             "decode_form(body)?".to_owned(),
             "decode_form(body)?".to_owned(),
             format!("fn decode_form(body: Bytes) -> AutumnResult<New{pascal_name}>"),
+        )
+    };
+
+    // `unique` fields (issue #1032): build the create/update handler bodies
+    // now that every input they need (`create_stmt`, `create_signature`,
+    // `decode_create_call`, …) is available. A scaffold with no `unique`
+    // fields gets byte-identical output to before this feature existed —
+    // `unique_constraints_const` is empty and `create_fn`/`update_fn` are the
+    // same plain templates previously inlined here.
+    let unique_constraints_const = if unique_fields.is_empty() {
+        String::new()
+    } else {
+        render_unique_constraints_const(plural, &unique_fields, all_fields)
+    };
+    let create_fn = if unique_fields.is_empty() {
+        format!(
+            "/// `POST /{plural}` — accept a form submission and create a {snake_name}.\n\
+             #[secured]\n\
+             #[post(\"/{plural}\")]\n\
+             pub async fn create({create_signature}) -> AutumnResult<Markup> {{\n    \
+             let new = {decode_create_call};\n    \
+             {create_stmt}\n    \
+             flash.success(\"{pascal_name} created\").await;\n    \
+             Ok(redirect_to(\"/{plural}\"))\n\
+             }}\n"
+        )
+    } else {
+        render_unique_violation_create_handler(
+            pascal_name,
+            snake_name,
+            plural,
+            &create_signature,
+            &decode_create_call,
+            &create_stmt,
+            form_enctype,
+            &create_inputs_with_unique_error,
+        )
+    };
+    let update_fn = if unique_fields.is_empty() {
+        format!(
+            "/// `POST /{plural}/{{id}}/update` — apply form data to a row, then redirect\n\
+             /// to its show page. Uses column-by-column `diesel::update().set(...)` (same\n\
+             /// convention as `examples/todo-app`) so we don't need `AsChangeset` on the\n\
+             /// `New{pascal_name}` insert type.\n\
+             #[secured]\n\
+             #[post(\"/{plural}/{{id}}/update\")]\n\
+             pub async fn update(\n    \
+             {update_signature}\n\
+             ) -> AutumnResult<Markup> {{\n    \
+             let form = {decode_update_call};\n    \
+             {update_stmt}\n    \
+             if updated == 0 {{\n        \
+             return Err(AutumnError::not_found_msg(format!(\n            \
+             \"{pascal_name} with id {{}} not found\", *id\n        \
+             )));\n    \
+             }}\n    \
+             flash.success(\"{pascal_name} updated\").await;\n    \
+             Ok(redirect_to(&format!(\"/{plural}/{{}}\", *id)))\n\
+             }}\n"
+        )
+    } else {
+        render_unique_violation_update_handler(
+            pascal_name,
+            plural,
+            &update_signature,
+            &decode_update_call,
+            &update_stmt,
+            form_enctype,
+            &edit_inputs_with_unique_error,
+            live && !sharded,
         )
     };
 
@@ -1526,16 +1672,7 @@ pub async fn new_form(
     }}))
 }}
 
-/// `POST /{plural}` — accept a form submission and create a {snake_name}.
-#[secured]
-#[post("/{plural}")]
-pub async fn create({create_signature}) -> AutumnResult<Markup> {{
-    let new = {decode_create_call};
-    {create_stmt}
-    flash.success("{pascal_name} created").await;
-    Ok(redirect_to("/{plural}"))
-}}
-
+{unique_constraints_const}{create_fn}
 /// `GET /{plural}/{{id}}/edit` — render the edit form. Submission goes to
 /// the `update` handler below as a plain HTML POST (browsers can't submit
 /// PUT directly without JS); the auto-generated JSON `PUT /api/{plural}/{{id}}`
@@ -1570,26 +1707,7 @@ pub async fn edit_form(
     }}))
 }}
 
-/// `POST /{plural}/{{id}}/update` — apply form data to a row, then redirect
-/// to its show page. Uses column-by-column `diesel::update().set(...)` (same
-/// convention as `examples/todo-app`) so we don't need `AsChangeset` on the
-/// `New{pascal_name}` insert type.
-#[secured]
-#[post("/{plural}/{{id}}/update")]
-pub async fn update(
-    {update_signature}
-) -> AutumnResult<Markup> {{
-    let form = {decode_update_call};
-    {update_stmt}
-    if updated == 0 {{
-        return Err(AutumnError::not_found_msg(format!(
-            "{pascal_name} with id {{}} not found", *id
-        )));
-    }}
-    flash.success("{pascal_name} updated").await;
-    Ok(redirect_to(&format!("/{plural}/{{}}", *id)))
-}}
-
+{update_fn}
 /// `POST /{plural}/{{id}}/delete` — delete a row, then redirect to the list.
 /// Browsers can't submit `DELETE` without JS, so the show page's delete button
 /// posts here; the JSON `DELETE /api/{plural}/{{id}}` stays available for API
@@ -1660,6 +1778,156 @@ pub async fn events(
     } + &validate_handlers
 }
 
+/// The `UNIQUE_CONSTRAINTS` module-level const the generated `create`/
+/// `update` handlers pass to `autumn_web::error::unique_violation_field`
+/// (issue #1032) — one `(constraint_name, field_name, message)` triple per
+/// `unique` field, where `constraint_name` matches the name
+/// `schema_edit::unique_index_sql` gives the migration's `CREATE UNIQUE
+/// INDEX` (`idx_<table>_<field>_unique`).
+fn render_unique_constraints_const(
+    plural: &str,
+    unique_fields: &[&Field],
+    all_fields: &[Field],
+) -> String {
+    use std::fmt::Write as _;
+    let mut entries = String::new();
+    for f in unique_fields {
+        let index_name = unique_index_name(plural, &f.name, all_fields);
+        let _ = write!(
+            entries,
+            "(\"{index_name}\", \"{name}\", \"has already been taken\"),\n    ",
+            name = f.name
+        );
+    }
+    format!("const UNIQUE_CONSTRAINTS: &[(&str, &str, &str)] = &[\n    {entries}];\n")
+}
+
+/// Builds the `create` handler body for a scaffold with `unique` fields
+/// (issue #1032). The insert runs inside an inner `async` block so a
+/// `Result` is captured instead of propagating straight through `?`;
+/// `autumn_web::error::unique_violation_field` classifies a failure against
+/// `UNIQUE_CONSTRAINTS` and, on a match, re-renders the new-{snake_name} form
+/// with an inline field error and `422` instead of the generic `500` a bare
+/// `?` would otherwise produce. Any other error still propagates normally.
+#[allow(clippy::too_many_arguments)]
+fn render_unique_violation_create_handler(
+    pascal_name: &str,
+    snake_name: &str,
+    plural: &str,
+    create_signature: &str,
+    decode_create_call: &str,
+    create_stmt: &str,
+    form_enctype: &str,
+    create_inputs_with_unique_error: &str,
+) -> String {
+    format!(
+        "/// `POST /{plural}` — accept a form submission and create a {snake_name}.\n\
+         #[secured]\n\
+         #[post(\"/{plural}\")]\n\
+         pub async fn create({create_signature}) -> AutumnResult<autumn_web::reexports::axum::response::Response> {{\n    \
+         use autumn_web::reexports::axum::response::IntoResponse as _;\n    \
+         let new = {decode_create_call};\n    \
+         let result: AutumnResult<()> = async {{\n        \
+         {create_stmt}\n        \
+         Ok(())\n    \
+         }}.await;\n    \
+         if let Err(err) = result {{\n        \
+         if let Some((field, message)) = autumn_web::error::unique_violation_field(&err, UNIQUE_CONSTRAINTS) {{\n            \
+         return Ok((autumn_web::reexports::http::StatusCode::UNPROCESSABLE_ENTITY, layout(\"New {pascal_name}\", flash.render().await, html! {{\n                \
+         h1 {{ \"New {pascal_name}\" }}\n                \
+         form action=\"/{plural}\" method=\"post\"{form_enctype} {{\n                    \
+         (csrf_input(csrf.as_ref(), csrf_field.as_ref()))\n{create_inputs_with_unique_error}                    button type=\"submit\" {{ \"Create\" }}\n                \
+         }}\n            \
+         }})).into_response());\n        \
+         }}\n        \
+         return Err(err);\n    \
+         }}\n    \
+         flash.success(\"{pascal_name} created\").await;\n    \
+         Ok(redirect_to(\"/{plural}\").into_response())\n\
+         }}\n"
+    )
+}
+
+/// [`render_unique_violation_create_handler`]'s `update` counterpart. On a
+/// unique-constraint violation, re-fetches the row by `id` (its pre-update,
+/// still-valid values — not the rejected submission) and re-renders the
+/// edit form with an inline field error and `422`.
+///
+/// `live_not_sharded` selects how the re-fetch gets its connection: the
+/// non-sharded `--live` signature has `repo:` in place of `mut db: {db_ty}`
+/// (see `render_routes_file`'s `update_signature` construction), so the
+/// re-fetch goes through `repo.find_by_id` instead of a direct `db` query —
+/// adding a second `Db` extractor alongside `repo` would hold two pool
+/// connections for the same request (`Db` for the whole handler scope,
+/// `repo.update` for its own internal checkout), self-deadlocking a pool
+/// sized for one connection per request (issue #1032 review follow-up).
+#[allow(clippy::too_many_arguments)]
+fn render_unique_violation_update_handler(
+    pascal_name: &str,
+    plural: &str,
+    update_signature: &str,
+    decode_update_call: &str,
+    update_stmt: &str,
+    form_enctype: &str,
+    edit_inputs_with_unique_error: &str,
+    live_not_sharded: bool,
+) -> String {
+    let refetch_row = if live_not_sharded {
+        format!(
+            "let row: {pascal_name} = repo.find_by_id(*id).await?.ok_or_else(|| AutumnError::not_found_msg(format!(\"{pascal_name} with id {{}} not found\", *id)))?;"
+        )
+    } else {
+        format!(
+            "let row: {pascal_name} = {plural}::table\n                    \
+             .find(*id)\n                    \
+             .select({pascal_name}::as_select())\n                    \
+             .first(&mut *db)\n                    \
+             .await\n                    \
+             .map_err(AutumnError::not_found)?;"
+        )
+    };
+    format!(
+        "/// `POST /{plural}/{{id}}/update` — apply form data to a row, then redirect\n\
+         /// to its show page. Uses column-by-column `diesel::update().set(...)` (same\n\
+         /// convention as `examples/todo-app`) so we don't need `AsChangeset` on the\n\
+         /// `New{pascal_name}` insert type.\n\
+         #[secured]\n\
+         #[post(\"/{plural}/{{id}}/update\")]\n\
+         pub async fn update(\n    \
+         {update_signature}\n\
+         ) -> AutumnResult<autumn_web::reexports::axum::response::Response> {{\n    \
+         use autumn_web::reexports::axum::response::IntoResponse as _;\n    \
+         let form = {decode_update_call};\n    \
+         let result: AutumnResult<usize> = async {{\n        \
+         {update_stmt}\n        \
+         Ok(updated)\n    \
+         }}.await;\n    \
+         let updated = match result {{\n        \
+         Ok(updated) => updated,\n        \
+         Err(err) => {{\n            \
+         if let Some((field, message)) = autumn_web::error::unique_violation_field(&err, UNIQUE_CONSTRAINTS) {{\n                \
+         {refetch_row}\n                \
+         return Ok((autumn_web::reexports::http::StatusCode::UNPROCESSABLE_ENTITY, layout(&format!(\"Edit {pascal_name} #{{}}\", row.id), flash.render().await, html! {{\n                    \
+         h1 {{ \"Edit {pascal_name} #\" (row.id) }}\n                    \
+         form action=(format!(\"/{plural}/{{}}/update\", row.id)) method=\"post\"{form_enctype} {{\n                        \
+         (csrf_input(csrf.as_ref(), csrf_field.as_ref()))\n{edit_inputs_with_unique_error}                        button type=\"submit\" {{ \"Save\" }}\n                    \
+         }}\n                \
+         }})).into_response());\n            \
+         }}\n            \
+         return Err(err);\n        \
+         }}\n    \
+         }};\n    \
+         if updated == 0 {{\n        \
+         return Err(AutumnError::not_found_msg(format!(\n            \
+         \"{pascal_name} with id {{}} not found\", *id\n        \
+         )));\n    \
+         }}\n    \
+         flash.success(\"{pascal_name} updated\").await;\n    \
+         Ok(redirect_to(&format!(\"/{plural}/{{}}\", *id)).into_response())\n\
+         }}\n"
+    )
+}
+
 fn render_update_changeset_expr(pascal_name: &str, fields: &[Field]) -> String {
     use std::fmt::Write;
     let mut out = format!("Update{pascal_name} {{\n");
@@ -1698,13 +1966,30 @@ fn has_attachment_fields(fields: &[Field]) -> bool {
 //     `step="any"` for floats.
 //   - `NaiveDateTime`/`DateTime`: `type="datetime-local"`, decoded via a
 //     `%.f`-tolerant parser (see `DESERIALIZE_*_DATETIME_LOCAL_FN` below).
+#[allow(
+    clippy::too_many_lines,
+    reason = "One match arm per field-kind widget — splitting it produces less \
+              readable output, not more. See render_edit_form_inputs's \
+              module-level comment for the shared invariants across both."
+)]
 fn render_create_form_inputs(
     fields: &[Field],
     live_validation: bool,
     validated: &[&str],
     plural: &str,
+    unique_error_aware: bool,
 ) -> String {
     use std::fmt::Write as _;
+    // Only the `unique_error_aware` re-render (a unique-constraint violation
+    // on `create`, see `render_unique_violation_create_handler`) has a prior
+    // submission to restore — `new: New{Pascal}` is in scope there, holding
+    // the just-decoded, otherwise-valid values that were rejected only for
+    // colliding on the unique column. The plain `new_form` GET always passes
+    // `unique_error_aware = false` (issue #1032 review follow-up: without
+    // this, a duplicate submission wiped every field, not just the one that
+    // collided), so its output stays byte-identical to before this feature
+    // existed.
+    let submitted_var = unique_error_aware.then_some("new");
     let mut out = String::new();
     for f in fields {
         if f.kind.is_attachment() {
@@ -1742,39 +2027,68 @@ fn render_create_form_inputs(
                 // every checked submission would 400. `#[serde(default)]` on
                 // the DecodedForm field (see render_decoded_form) recovers
                 // `false` from the key's *absence* when unchecked instead.
-                (FieldKind::Bool, false) => format!(
-                    "input type=\"checkbox\" name=\"{name}\" value=\"true\"{hx_attrs}",
-                    name = f.name,
-                    hx_attrs = hx_attrs
-                ),
+                (FieldKind::Bool, false) => {
+                    let checked_attr = submitted_var
+                        .map(|var| format!(" checked[{}]", edit_checked_expr(f, var)))
+                        .unwrap_or_default();
+                    format!(
+                        "input type=\"checkbox\" name=\"{name}\" value=\"true\"{checked_attr}{hx_attrs}",
+                        name = f.name,
+                        hx_attrs = hx_attrs
+                    )
+                }
                 // A checkbox can't losslessly represent a nullable bool (no
                 // way to distinguish "leave false" from "set to null" when
                 // unchecked) — a 3-option select keeps NULL reachable.
-                (FieldKind::Bool, true) => format!(
-                    "select name=\"{name}\"{hx_attrs} {{ \
-                         option value=\"\" {{ \"— Unset —\" }} \
-                         option value=\"true\" {{ \"Yes\" }} \
-                         option value=\"false\" {{ \"No\" }} \
-                     }}",
-                    name = f.name,
-                    hx_attrs = hx_attrs
-                ),
-                (FieldKind::I32 | FieldKind::I64 | FieldKind::F32 | FieldKind::F64, _) => format!(
-                    "input type=\"number\" name=\"{name}\" step=\"{step}\"{required}{hx_attrs}",
-                    name = f.name,
-                    step = number_step(f.kind),
-                    required = required,
-                    hx_attrs = hx_attrs
-                ),
+                (FieldKind::Bool, true) => {
+                    let (unset_attr, true_attr, false_attr) = submitted_var.map_or_else(
+                        || (String::new(), String::new(), String::new()),
+                        |var| {
+                            let (unset, is_true, is_false) =
+                                edit_bool_select_selected_exprs(f, var);
+                            (
+                                format!(" selected[{unset}]"),
+                                format!(" selected[{is_true}]"),
+                                format!(" selected[{is_false}]"),
+                            )
+                        },
+                    );
+                    format!(
+                        "select name=\"{name}\"{hx_attrs} {{ \
+                             option value=\"\"{unset_attr} {{ \"— Unset —\" }} \
+                             option value=\"true\"{true_attr} {{ \"Yes\" }} \
+                             option value=\"false\"{false_attr} {{ \"No\" }} \
+                         }}",
+                        name = f.name,
+                        hx_attrs = hx_attrs
+                    )
+                }
+                (FieldKind::I32 | FieldKind::I64 | FieldKind::F32 | FieldKind::F64, _) => {
+                    let value_attr = submitted_var
+                        .map(|var| format!(" value=({})", edit_value_expr(f, var)))
+                        .unwrap_or_default();
+                    format!(
+                        "input type=\"number\" name=\"{name}\" step=\"{step}\"{value_attr}{required}{hx_attrs}",
+                        name = f.name,
+                        step = number_step(f.kind),
+                        required = required,
+                        hx_attrs = hx_attrs
+                    )
+                }
                 // `step="any"` lets the browser's picker show/accept
                 // seconds — see edit_datetime_local_value_expr for why a
                 // value with seconds must not be step-mismatch-rejected.
-                (FieldKind::NaiveDateTime | FieldKind::DateTime, _) => format!(
-                    "input type=\"datetime-local\" name=\"{name}\" step=\"any\"{required}{hx_attrs}",
-                    name = f.name,
-                    required = required,
-                    hx_attrs = hx_attrs
-                ),
+                (FieldKind::NaiveDateTime | FieldKind::DateTime, _) => {
+                    let value_attr = submitted_var
+                        .map(|var| format!(" value=({})", edit_datetime_local_value_expr(f, var)))
+                        .unwrap_or_default();
+                    format!(
+                        "input type=\"datetime-local\" name=\"{name}\" step=\"any\"{value_attr}{required}{hx_attrs}",
+                        name = f.name,
+                        required = required,
+                        hx_attrs = hx_attrs
+                    )
+                }
                 // A closed-set field always renders as a `<select>` — one
                 // `<option>` per variant, matching the admin generator's
                 // `--select` widget output (see `admin::render_select_kind`).
@@ -1784,10 +2098,31 @@ fn render_create_form_inputs(
                     } else {
                         "— Select —"
                     };
-                    let mut options_body = format!("option value=\"\" {{ \"{placeholder}\" }}");
+                    let enum_ty = f
+                        .enum_type_name()
+                        .expect("FieldKind::Enum always has an enum_type_name");
+                    let unset_attr = match submitted_var {
+                        Some(var) if f.nullable => format!(" selected[{var}.{}.is_none()]", f.name),
+                        _ => String::new(),
+                    };
+                    let mut options_body =
+                        format!("option value=\"\"{unset_attr} {{ \"{placeholder}\" }}");
                     for v in &f.variants {
                         let label = humanize_label(v);
-                        let _ = write!(options_body, " option value=\"{v}\" {{ \"{label}\" }}");
+                        let variant = pascal(v);
+                        let selected_attr = match submitted_var {
+                            Some(var) if f.nullable => {
+                                format!(" selected[{var}.{} == Some({enum_ty}::{variant})]", f.name)
+                            }
+                            Some(var) => {
+                                format!(" selected[{var}.{} == {enum_ty}::{variant}]", f.name)
+                            }
+                            None => String::new(),
+                        };
+                        let _ = write!(
+                            options_body,
+                            " option value=\"{v}\"{selected_attr} {{ \"{label}\" }}"
+                        );
                     }
                     format!(
                         "select name=\"{name}\"{required}{hx_attrs} {{ {options_body} }}",
@@ -1797,19 +2132,39 @@ fn render_create_form_inputs(
                         options_body = options_body
                     )
                 }
-                _ => format!(
-                    "input type=\"text\" name=\"{name}\"{required}{hx_attrs}",
-                    name = f.name,
-                    required = required,
-                    hx_attrs = hx_attrs
-                ),
+                _ => {
+                    let value_attr = submitted_var
+                        .map(|var| format!(" value=({})", edit_value_expr(f, var)))
+                        .unwrap_or_default();
+                    format!(
+                        "input type=\"text\" name=\"{name}\"{value_attr}{required}{hx_attrs}",
+                        name = f.name,
+                        required = required,
+                        hx_attrs = hx_attrs
+                    )
+                }
+            };
+            // Only the `create` handler's failure-re-render branch passes
+            // `unique_error_aware = true` (see `render_unique_violation_create_handler`)
+            // — `field`/`message` are local variables in scope there,
+            // populated from `unique_violation_field` (issue #1032). The
+            // plain `new_form` handler never sets this, so its output is
+            // byte-identical to before this field existed.
+            let unique_error_span = if unique_error_aware && f.unique {
+                format!(
+                    "\n            @if field == \"{name}\" {{ span class=\"field-error\" {{ (message) }} }}",
+                    name = f.name
+                )
+            } else {
+                String::new()
             };
             let _ = writeln!(
                 out,
-                "            label {{ \"{name}\" }} {input_tag};{error_span}",
+                "            label {{ \"{name}\" }} {input_tag};{error_span}{unique_error_span}",
                 name = f.name,
                 input_tag = input_tag,
-                error_span = error_span
+                error_span = error_span,
+                unique_error_span = unique_error_span
             );
         }
     }
@@ -1836,8 +2191,25 @@ fn render_edit_form_inputs(
     live_validation: bool,
     validated: &[&str],
     plural: &str,
+    unique_error_aware: bool,
 ) -> String {
     use std::fmt::Write as _;
+    // The plain `edit_form` GET (`unique_error_aware = false`) always shows
+    // the persisted row. The violation re-render (spliced into
+    // `render_unique_violation_update_handler`) instead sources every
+    // non-attachment field from `form: New{Pascal}` — the just-decoded,
+    // otherwise-valid submission that was rejected only for colliding on
+    // the unique column (issue #1032 review follow-up: the create path
+    // already preserves the rejected submission this way; update was
+    // silently reverting every other field back to its pre-edit value).
+    //
+    // Attachment fields are the one exception and always stay on `row`:
+    // `form.{name}` is `None` whenever the user didn't pick a new file
+    // (see `render_decoded_form`'s attachment mapping), so sourcing the
+    // hidden "keep this blob" key from `form` would drop the existing
+    // attachment from the re-rendered form even though the update itself
+    // never touched it.
+    let var = if unique_error_aware { "form" } else { "row" };
     let mut out = String::new();
     for f in fields {
         if f.kind.is_attachment() {
@@ -1871,11 +2243,11 @@ fn render_edit_form_inputs(
                 (FieldKind::Bool, false) => format!(
                     "input type=\"checkbox\" name=\"{name}\" value=\"true\" checked[{checked}]{hx_attrs}",
                     name = f.name,
-                    checked = edit_checked_expr(f),
+                    checked = edit_checked_expr(f, var),
                     hx_attrs = hx_attrs
                 ),
                 (FieldKind::Bool, true) => {
-                    let (unset, is_true, is_false) = edit_bool_select_selected_exprs(f);
+                    let (unset, is_true, is_false) = edit_bool_select_selected_exprs(f, var);
                     format!(
                         "select name=\"{name}\"{hx_attrs} {{ \
                              option value=\"\" selected[{unset}] {{ \"— Unset —\" }} \
@@ -1890,14 +2262,14 @@ fn render_edit_form_inputs(
                     "input type=\"number\" name=\"{name}\" step=\"{step}\" value=({value}){required}{hx_attrs}",
                     name = f.name,
                     step = number_step(f.kind),
-                    value = edit_value_expr(f),
+                    value = edit_value_expr(f, var),
                     required = required,
                     hx_attrs = hx_attrs
                 ),
                 (FieldKind::NaiveDateTime | FieldKind::DateTime, _) => format!(
                     "input type=\"datetime-local\" name=\"{name}\" step=\"any\" value=({value}){required}{hx_attrs}",
                     name = f.name,
-                    value = edit_datetime_local_value_expr(f),
+                    value = edit_datetime_local_value_expr(f, var),
                     required = required,
                     hx_attrs = hx_attrs
                 ),
@@ -1908,7 +2280,7 @@ fn render_edit_form_inputs(
                         "— Select —"
                     };
                     let unset_selected = if f.nullable {
-                        format!("row.{}.is_none()", f.name)
+                        format!("{var}.{}.is_none()", f.name)
                     } else {
                         "false".to_owned()
                     };
@@ -1922,9 +2294,9 @@ fn render_edit_form_inputs(
                         let label = humanize_label(v);
                         let variant = pascal(v);
                         let selected_expr = if f.nullable {
-                            format!("row.{} == Some({enum_ty}::{variant})", f.name)
+                            format!("{var}.{} == Some({enum_ty}::{variant})", f.name)
                         } else {
-                            format!("row.{} == {enum_ty}::{variant}", f.name)
+                            format!("{var}.{} == {enum_ty}::{variant}", f.name)
                         };
                         let _ = write!(
                             options_body,
@@ -1942,17 +2314,26 @@ fn render_edit_form_inputs(
                 _ => format!(
                     "input type=\"text\" name=\"{name}\" value=({value}){required}{hx_attrs}",
                     name = f.name,
-                    value = edit_value_expr(f),
+                    value = edit_value_expr(f, var),
                     required = required,
                     hx_attrs = hx_attrs
                 ),
             };
+            let unique_error_span = if unique_error_aware && f.unique {
+                format!(
+                    "\n            @if field == \"{name}\" {{ span class=\"field-error\" {{ (message) }} }}",
+                    name = f.name
+                )
+            } else {
+                String::new()
+            };
             let _ = writeln!(
                 out,
-                "            label {{ \"{name}\" }} {input_tag};{error_span}",
+                "            label {{ \"{name}\" }} {input_tag};{error_span}{unique_error_span}",
                 name = f.name,
                 input_tag = input_tag,
-                error_span = error_span
+                error_span = error_span,
+                unique_error_span = unique_error_span
             );
         }
     }
@@ -1963,7 +2344,13 @@ const fn required_attr(field: &Field) -> &'static str {
     if field.nullable { "" } else { " required" }
 }
 
-fn edit_value_expr(field: &Field) -> String {
+/// A value-attribute expression sourcing `field`'s current value off of
+/// `var` (a variable of the model's row/insert type in scope where the
+/// expression is spliced) — `var = "row"` for [`render_edit_form_inputs`]'s
+/// existing-row pre-population, `var = "new"` for
+/// [`render_create_form_inputs`]'s re-submitted-value pre-population on a
+/// unique-constraint violation (issue #1032).
+fn edit_value_expr(field: &Field, var: &str) -> String {
     let name = &field.name;
     match (field.nullable, field.kind) {
         // Attachment fields don't render a value in text inputs — they have
@@ -1971,7 +2358,7 @@ fn edit_value_expr(field: &Field) -> String {
         (_, FieldKind::Attachment) => String::new(),
         (true, FieldKind::Bytea) => {
             format!(
-                "row.{name}.as_ref().map(|value| String::from_utf8_lossy(value).to_string()).unwrap_or_default()"
+                "{var}.{name}.as_ref().map(|value| String::from_utf8_lossy(value).to_string()).unwrap_or_default()"
             )
         }
         // f32/f64 Display renders NaN/Infinity as "NaN"/"inf"/"-inf", none of
@@ -1980,45 +2367,46 @@ fn edit_value_expr(field: &Field) -> String {
         // value for non-finite floats instead of an invalid one.
         (true, FieldKind::F32 | FieldKind::F64) => {
             format!(
-                "row.{name}.as_ref().filter(|value| value.is_finite()).map(ToString::to_string).unwrap_or_default()"
+                "{var}.{name}.as_ref().filter(|value| value.is_finite()).map(ToString::to_string).unwrap_or_default()"
             )
         }
         (false, FieldKind::F32 | FieldKind::F64) => {
             format!(
-                "if row.{name}.is_finite() {{ row.{name}.to_string() }} else {{ String::new() }}"
+                "if {var}.{name}.is_finite() {{ {var}.{name}.to_string() }} else {{ String::new() }}"
             )
         }
         (true, _) => {
-            format!("row.{name}.as_ref().map(ToString::to_string).unwrap_or_default()")
+            format!("{var}.{name}.as_ref().map(ToString::to_string).unwrap_or_default()")
         }
         (false, FieldKind::Bytea) => {
-            format!("String::from_utf8_lossy(&row.{name}).to_string()")
+            format!("String::from_utf8_lossy(&{var}.{name}).to_string()")
         }
-        (false, _) => format!("row.{name}.to_string()"),
+        (false, _) => format!("{var}.{name}.to_string()"),
     }
 }
 
-/// Boolean expression for the `checked[...]` attribute of an edit-form
-/// checkbox. Only called for non-nullable `bool` fields — nullable
-/// `Option<bool>` fields render as a 3-option select instead (see
-/// [`edit_bool_select_selected_exprs`]), so there is no `Option<bool>` case
-/// to unwrap here.
-fn edit_checked_expr(field: &Field) -> String {
-    format!("row.{}", field.name)
+/// Boolean expression for the `checked[...]` attribute of a checkbox
+/// (`var.field`, see [`edit_value_expr`] for what `var` is). Only called for
+/// non-nullable `bool` fields — nullable `Option<bool>` fields render as a
+/// 3-option select instead (see [`edit_bool_select_selected_exprs`]), so
+/// there is no `Option<bool>` case to unwrap here.
+fn edit_checked_expr(field: &Field, var: &str) -> String {
+    format!("{var}.{}", field.name)
 }
 
 /// The three `selected[...]` boolean expressions (unset / true / false) for
-/// an edit-form `<select>` rendering a nullable `Option<bool>` field.
+/// a `<select>` rendering a nullable `Option<bool>` field (`var.field`, see
+/// [`edit_value_expr`] for what `var` is).
 ///
 /// A checkbox cannot losslessly represent a nullable bool (no way to
 /// distinguish "leave false" from "set to null" when unchecked), so nullable
 /// `Bool` fields render as this 3-option select instead of a checkbox.
-fn edit_bool_select_selected_exprs(field: &Field) -> (String, String, String) {
+fn edit_bool_select_selected_exprs(field: &Field, var: &str) -> (String, String, String) {
     let name = &field.name;
     (
-        format!("row.{name}.is_none()"),
-        format!("row.{name} == Some(true)"),
-        format!("row.{name} == Some(false)"),
+        format!("{var}.{name}.is_none()"),
+        format!("{var}.{name} == Some(true)"),
+        format!("{var}.{name} == Some(false)"),
     )
 }
 
@@ -2038,14 +2426,14 @@ fn edit_bool_select_selected_exprs(field: &Field) -> (String, String, String) {
 /// this field. Pair with `step="any"` on the input (see
 /// `render_edit_form_inputs`) so a value with seconds doesn't fail the
 /// browser's step constraint validation.
-fn edit_datetime_local_value_expr(field: &Field) -> String {
+fn edit_datetime_local_value_expr(field: &Field, var: &str) -> String {
     let name = &field.name;
     if field.nullable {
         format!(
-            "row.{name}.as_ref().map(|value| value.format(\"%Y-%m-%dT%H:%M:%S%.f\").to_string()).unwrap_or_default()"
+            "{var}.{name}.as_ref().map(|value| value.format(\"%Y-%m-%dT%H:%M:%S%.f\").to_string()).unwrap_or_default()"
         )
     } else {
-        format!("row.{name}.format(\"%Y-%m-%dT%H:%M:%S%.f\").to_string()")
+        format!("{var}.{name}.format(\"%Y-%m-%dT%H:%M:%S%.f\").to_string()")
     }
 }
 
@@ -2402,15 +2790,24 @@ fn render_reference_stub_tables_sql(fields: &[Field], own_table: &str) -> String
                 out,
                 "CREATE TABLE IF NOT EXISTS {target} (id BIGSERIAL PRIMARY KEY);"
             );
-            // Seed one row (id 1, since BIGSERIAL starts there) so a NOT NULL
-            // `references` column pointing at this stub has a real id to
-            // reference. Without this, any raw INSERT the smoke test issues
-            // against the table under test — e.g. the enum out-of-set
-            // rejection test's deliberately-invalid INSERT, see
+            // Seed two rows (ids 1 and 2, since BIGSERIAL starts there) so a
+            // NOT NULL `references` column pointing at this stub has a real
+            // id to reference. Without at least one row, any raw INSERT the
+            // smoke test issues against the table under test — e.g. the enum
+            // out-of-set rejection test's deliberately-invalid INSERT, see
             // `enum_rejection_insert_sql` — would fail on this FK constraint
             // regardless of the column it's actually trying to exercise,
-            // masking the real assertion behind an unrelated failure.
-            let _ = writeln!(out, "INSERT INTO {target} DEFAULT VALUES;");
+            // masking the real assertion behind an unrelated failure. The
+            // second row exists for `unique_sample_literal_variant`: a
+            // *non-target* `unique references` column in
+            // `unique_violation_insert_sql`'s duplicate insert needs a
+            // second real id, distinct from the target's own value, or it
+            // would collide with itself across the two inserts the same way
+            // the target column is meant to.
+            let _ = writeln!(
+                out,
+                "INSERT INTO {target} DEFAULT VALUES;\nINSERT INTO {target} DEFAULT VALUES;"
+            );
         }
     }
     out
@@ -2447,10 +2844,24 @@ fn render_smoke_test(
         render_index_smoke_test(pascal_name, plural, id_schema_type, &setup_calls)
     };
 
-    if fields.iter().any(Field::is_enum) {
+    let base = if fields.iter().any(Field::is_enum) {
         base + &render_enum_rejection_smoke_test(plural, fields, defaults, &setup_calls, api)
     } else {
         base
+    };
+
+    let unique_fields: Vec<&Field> = fields.iter().filter(|f| f.unique).collect();
+    if unique_fields.is_empty() {
+        base
+    } else {
+        base + &render_unique_violation_smoke_test(
+            plural,
+            fields,
+            &unique_fields,
+            defaults,
+            &setup_calls,
+            api,
+        )
     }
 }
 
@@ -2616,6 +3027,261 @@ fn render_enum_rejection_smoke_test(
              \n\
              \x20\x20\x20\x20let count: i64 = {plural}::table.count().get_result(&mut *conn).await.unwrap();\n\
              \x20\x20\x20\x20assert_eq!(count, 0, \"the rejected row must not have been written\");\n\
+             }}\n",
+        );
+    }
+    out
+}
+
+/// A deterministic non-`NULL` literal for a `FieldKind`, used to seed and
+/// then re-insert the *same* value in [`render_unique_violation_smoke_test`]
+/// so the second insert reliably collides. Unlike [`sql_sample_literal`],
+/// this deliberately avoids non-deterministic SQL (`gen_random_uuid()`,
+/// `NOW()`) — two evaluations of either would almost certainly differ and
+/// the duplicate-insert assertion would never trip.
+const fn unique_sample_literal(kind: FieldKind) -> &'static str {
+    match kind {
+        FieldKind::String | FieldKind::Text | FieldKind::Enum => "'dup_value'",
+        FieldKind::I32 | FieldKind::I64 => "424242",
+        // Must be a real seeded row's id, not an arbitrary literal — a
+        // `references` target column is FK-constrained against the stub
+        // table `render_reference_stub_tables_sql` seeds exactly one row
+        // (id 1) into. An arbitrary id like `424242` would fail on the FK
+        // constraint before the insert ever reaches the UNIQUE index this
+        // test exists to exercise. Matches `sql_sample_literal`'s existing
+        // convention for the same reason.
+        FieldKind::References => "1",
+        FieldKind::Bool => "TRUE",
+        FieldKind::F32 | FieldKind::F64 => "1.5",
+        FieldKind::Uuid => "'00000000-0000-0000-0000-000000000001'::uuid",
+        FieldKind::NaiveDateTime => "'2024-01-01 00:00:00'::timestamp",
+        FieldKind::DateTime => "'2024-01-01 00:00:00+00'::timestamptz",
+        FieldKind::Bytea => "'\\xDEADBEEF'::bytea",
+        FieldKind::Attachment => "NULL",
+    }
+}
+
+/// A second, distinct deterministic literal for a `FieldKind` — distinct
+/// from both [`unique_sample_literal`] and [`sql_sample_literal`]'s value
+/// for the same kind. Used by [`unique_violation_insert_sql`] for a
+/// scaffold's *other* unique fields (not the one under test) when building
+/// the duplicate insert: if more than one field is `unique`, reusing the
+/// exact same value for a non-target unique column on both inserts would
+/// trip *that* column's own UNIQUE index too, racing against the target's
+/// to decide which violation Postgres actually reports.
+const fn unique_sample_literal_variant(kind: FieldKind) -> &'static str {
+    match kind {
+        FieldKind::String | FieldKind::Text | FieldKind::Enum => "'dup_value_2'",
+        FieldKind::I32 | FieldKind::I64 => "424243",
+        // The second stub row `render_reference_stub_tables_sql` seeds —
+        // distinct from `unique_sample_literal`'s "1" for the same reason
+        // that one must be a real seeded row's id, not an arbitrary literal.
+        FieldKind::References => "2",
+        FieldKind::Bool => "FALSE",
+        FieldKind::F32 | FieldKind::F64 => "2.5",
+        FieldKind::Uuid => "'00000000-0000-0000-0000-000000000002'::uuid",
+        FieldKind::NaiveDateTime => "'2024-01-02 00:00:00'::timestamp",
+        FieldKind::DateTime => "'2024-01-02 00:00:00+00'::timestamptz",
+        FieldKind::Bytea => "'\\xBEEFDEAD'::bytea",
+        FieldKind::Attachment => "NULL",
+    }
+}
+
+/// Build a raw `INSERT INTO <plural> (...)` statement that sets `target`'s
+/// unique column to a deterministic, repeatable value (see
+/// [`unique_sample_literal`]) and every other required (`NOT NULL`, no
+/// `DEFAULT`) column to a valid sample value — mirrors
+/// [`enum_rejection_insert_sql`]'s shape.
+///
+/// `is_duplicate_insert` selects which literal a *non-target* `unique`
+/// column gets: `false` (the first insert) uses the same
+/// [`sql_sample_literal`] every other required column gets; `true` (the
+/// second, colliding insert) switches those specific columns to
+/// [`unique_sample_literal_variant`] instead, so a scaffold with more than
+/// one `unique` field doesn't also duplicate a *different* column's value
+/// and race it against `target`'s for which violation Postgres reports.
+fn unique_violation_insert_sql(
+    plural: &str,
+    fields: &[Field],
+    target: &Field,
+    defaults: &BTreeMap<String, String>,
+    is_duplicate_insert: bool,
+) -> String {
+    let mut columns = Vec::new();
+    let mut values = Vec::new();
+    for f in fields {
+        if f.name == target.name {
+            columns.push(f.name.clone());
+            let value = if f.is_enum() {
+                format!("'{}'", f.variants.first().expect("enum field has variants"))
+            } else {
+                unique_sample_literal(f.kind).to_owned()
+            };
+            values.push(value);
+        } else if !f.nullable && !defaults.contains_key(&f.name) {
+            columns.push(f.name.clone());
+            let value = if is_duplicate_insert && f.unique && f.is_enum() {
+                let variant = f.variants.get(1).unwrap_or(&f.variants[0]);
+                format!("'{variant}'")
+            } else if is_duplicate_insert && f.unique {
+                unique_sample_literal_variant(f.kind).to_owned()
+            } else if f.is_enum() {
+                format!("'{}'", f.variants.first().expect("enum field has variants"))
+            } else {
+                sql_sample_literal(f.kind).to_owned()
+            };
+            values.push(value);
+        }
+    }
+    format!(
+        "INSERT INTO {plural} ({}) VALUES ({})",
+        columns.join(", "),
+        values.join(", ")
+    )
+}
+
+/// Render one `#[ignore]`d `#[tokio::test]` per `unique` field (issue #1032)
+/// that proves, against a real (throwaway) Postgres database:
+///
+/// 1. A raw duplicate `INSERT` (bypassing the app entirely) violates the
+///    migration's `CREATE UNIQUE INDEX` — the constraint is real, not just
+///    documented.
+/// 2. The resulting `diesel::result::Error`, converted to `AutumnError` via
+///    the same blanket `?`/`From` conversion the generated handler relies
+///    on, is correctly classified by `autumn_web::error::
+///    unique_violation_field` against the *real* Postgres constraint name —
+///    proving the `idx_<table>_<field>_unique` naming convention this
+///    generator and the runtime helper both assume actually round-trips
+///    through Postgres.
+/// 3. For an HTML (non-`--api`) scaffold, a stand-in `POST` handler — same
+///    convention as [`render_index_smoke_test`]'s stand-in `GET` handler —
+///    turns a duplicate submission into a `422` naming the field, proving
+///    the full request-boundary path (issue #1032's success metric: a
+///    second POST with the same value gets a field-level error, not a
+///    `500`).
+fn render_unique_violation_smoke_test(
+    plural: &str,
+    fields: &[Field],
+    unique_fields: &[&Field],
+    defaults: &BTreeMap<String, String>,
+    setup_calls: &str,
+    api: bool,
+) -> String {
+    // Same idempotency treatment as `render_enum_rejection_smoke_test` (see
+    // its comment) — this test's own setup must tolerate running alongside
+    // the base index/api smoke test and/or the enum-rejection smoke test in
+    // the same `TestDb::shared()` container.
+    let setup_calls = setup_calls.replacen(
+        &format!("CREATE TABLE {plural} ("),
+        &format!("CREATE TABLE IF NOT EXISTS {plural} ("),
+        1,
+    );
+    let setup_calls = setup_calls.replace("CREATE INDEX idx_", "CREATE INDEX IF NOT EXISTS idx_");
+    let setup_calls = setup_calls.replace(
+        "CREATE UNIQUE INDEX idx_",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_",
+    );
+    let setup_calls = setup_calls.as_str();
+
+    let mut out = String::new();
+    for target in unique_fields {
+        // A unique constraint on an always-`Option`-wrapped attachment blob
+        // is a degenerate case (Postgres permits unlimited `NULL`s under a
+        // unique index, so there's no violation to provoke) — skip it here,
+        // same as `unique`'s handling elsewhere never claims to cover it.
+        if target.kind.is_attachment() {
+            continue;
+        }
+        let field_name = &target.name;
+        let insert_sql = unique_violation_insert_sql(plural, fields, target, defaults, false);
+        let escaped_insert = escape_sql_for_rust_literal(&insert_sql);
+        // A scaffold with more than one `unique` field needs a *second*,
+        // distinct insert for the DB-level duplicate-insert check below: if
+        // it reused `escaped_insert` verbatim, a non-target unique column
+        // would collide with itself too, racing against `target`'s own
+        // collision to decide which violation Postgres actually reports
+        // (issue #1032 review follow-up). Only that DB-level check gets the
+        // varied insert — the request-boundary stand-in handler below is a
+        // single compiled function invoked via two separate HTTP calls, so
+        // it has no way to distinguish "first call" from "second call" and
+        // keeps using `escaped_insert` for both, same as before.
+        let insert_sql_dup = unique_violation_insert_sql(plural, fields, target, defaults, true);
+        let escaped_insert_dup = escape_sql_for_rust_literal(&insert_sql_dup);
+        let constraint_name = unique_index_name(plural, field_name, fields);
+
+        let request_boundary_check = if api {
+            String::new()
+        } else {
+            format!(
+                "#[post(\"/{plural}\")]\n\
+                 async fn create(mut db: Db) -> AutumnResult<autumn_web::reexports::axum::response::Response> {{\n\
+                 \x20\x20\x20\x20use autumn_web::reexports::axum::response::IntoResponse as _;\n\
+                 \x20\x20\x20\x20let result: AutumnResult<()> = async {{\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20// The client sends this same request twice (see below) to prove\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20// the 200-then-422 path — this one compiled handler runs for both\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20// calls, so it can't statically bake in \"first insert\" vs.\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20// \"duplicate insert\" the way the DB-level check above does.\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20// Reading the row count instead tells the two calls apart at\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20// runtime: 0 means this is the first (must succeed) call, so\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20// every unique column gets its plain sample value; any other\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20// count means this is the second (must collide) call, so\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20// non-target unique columns switch to their distinct variant —\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20// otherwise a scaffold with more than one unique field would\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20// duplicate a *different* column too and Postgres could report\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20// that one instead of {field_name}'s.\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20let existing: i64 = {plural}::table.count().get_result(&mut *db).await?;\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20let insert_sql = if existing == 0 {{ \"{escaped_insert}\" }} else {{ \"{escaped_insert_dup}\" }};\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20diesel::sql_query(insert_sql).execute(&mut *db).await?;\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20Ok(())\n\
+                 \x20\x20\x20\x20}}.await;\n\
+                 \x20\x20\x20\x20if let Err(err) = result {{\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20if let Some((field, message)) = autumn_web::error::unique_violation_field(\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20&err,\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20&[(\"{constraint_name}\", \"{field_name}\", \"has already been taken\")],\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20) {{\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20return Ok((\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20autumn_web::reexports::http::StatusCode::UNPROCESSABLE_ENTITY,\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20format!(\"{{field}}: {{message}}\"),\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20).into_response());\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20}}\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20return Err(err);\n\
+                 \x20\x20\x20\x20}}\n\
+                 \x20\x20\x20\x20Ok(autumn_web::reexports::http::StatusCode::OK.into_response())\n\
+                 }}\n\
+                 \n\
+                 \x20\x20\x20\x20db.execute_sql(\"TRUNCATE {plural} RESTART IDENTITY\").await;\n\
+                 \x20\x20\x20\x20let client: TestClient = TestApp::new().routes(routes![create]).with_db(db.pool()).build();\n\
+                 \n\
+                 \x20\x20\x20\x20client.post(\"/{plural}\").send().await.assert_status(200);\n\
+                 \x20\x20\x20\x20client.post(\"/{plural}\").send().await\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20.assert_status(422)\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20.assert_body_contains(\"{field_name}\");\n"
+            )
+        };
+
+        let _ = write!(
+            out,
+            "\n#[tokio::test]\n\
+             #[ignore = \"requires Docker (testcontainers) via TestDb; run `cargo test -- --ignored`\"]\n\
+             async fn {plural}_rejects_duplicate_{field_name}() {{\n\
+             \x20\x20\x20\x20let db = TestDb::shared().await;\n\
+             {setup_calls}\
+             \x20\x20\x20\x20db.execute_sql(\"TRUNCATE {plural} RESTART IDENTITY\").await;\n\
+             \n\
+             \x20\x20\x20\x20let mut conn = db.pool().get().await.expect(\"failed to get db connection\");\n\
+             \x20\x20\x20\x20diesel::sql_query(\"{escaped_insert}\").execute(&mut *conn).await.expect(\"first insert must succeed\");\n\
+             \x20\x20\x20\x20let dup_result = diesel::sql_query(\"{escaped_insert_dup}\").execute(&mut *conn).await;\n\
+             \x20\x20\x20\x20let dup_err = dup_result.expect_err(\"a duplicate {field_name} must violate the UNIQUE index\");\n\
+             \n\
+             \x20\x20\x20\x20let mapped: AutumnResult<()> = Err(dup_err.into());\n\
+             \x20\x20\x20\x20let mapped_err = mapped.unwrap_err();\n\
+             \x20\x20\x20\x20let (field, _message) = autumn_web::error::unique_violation_field(\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20&mapped_err,\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20&[(\"{constraint_name}\", \"{field_name}\", \"has already been taken\")],\n\
+             \x20\x20\x20\x20).expect(\"a real Postgres unique_violation error must be classified by field\");\n\
+             \x20\x20\x20\x20assert_eq!(field, \"{field_name}\");\n\
+             \n\
+             {request_boundary_check}\
              }}\n",
         );
     }
@@ -4984,12 +5650,14 @@ async fn main() {
                 kind: FieldKind::References,
                 nullable: false,
                 variants: Vec::new(),
+                unique: false,
             },
             Field {
                 name: "author_id".to_string(),
                 kind: FieldKind::References,
                 nullable: true,
                 variants: Vec::new(),
+                unique: false,
             },
         ];
         assert_eq!(
@@ -5012,12 +5680,16 @@ async fn main() {
         // NOT NULL `references` column's sample literal ("1" — see
         // `sql_sample_literal`); without a seeded row, that INSERT would
         // fail on the FK constraint regardless of what it's actually trying
-        // to exercise.
+        // to exercise. Two rows are seeded (ids 1 and 2) — the second is for
+        // `unique_sample_literal_variant`'s "1" (target) vs. "2" (a
+        // non-target `unique references` column in the duplicate insert)
+        // distinction; see that function's doc comment.
         let fields = super::super::dsl::parse_fields(&["author:references".into()]).unwrap();
         let sql = render_reference_stub_tables_sql(&fields, "posts");
         assert_eq!(
             sql,
             "CREATE TABLE IF NOT EXISTS authors (id BIGSERIAL PRIMARY KEY);\n\
+             INSERT INTO authors DEFAULT VALUES;\n\
              INSERT INTO authors DEFAULT VALUES;\n",
             "got:\n{sql}"
         );
@@ -5031,18 +5703,26 @@ async fn main() {
                 kind: FieldKind::References,
                 nullable: false,
                 variants: Vec::new(),
+                unique: false,
             },
             Field {
                 name: "author_id".to_string(),
                 kind: FieldKind::References,
                 nullable: true,
                 variants: Vec::new(),
+                unique: false,
             },
         ];
         let sql = render_reference_stub_tables_sql(&fields, "unrelated_table");
         assert_eq!(
-            sql.matches("INSERT INTO authors DEFAULT VALUES;").count(),
+            sql.matches("CREATE TABLE IF NOT EXISTS authors").count(),
             1,
+            "two fields pointing at the same target must still only stub \
+             (and seed) that table once, not once per field; got:\n{sql}"
+        );
+        assert_eq!(
+            sql.matches("INSERT INTO authors DEFAULT VALUES;").count(),
+            2,
             "got:\n{sql}"
         );
     }
