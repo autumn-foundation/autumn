@@ -410,6 +410,7 @@ fn escape_attribute(w: &mut String, s: &str) {
         match c {
             '&' => w.push_str("&amp;"),
             '"' => w.push_str("&quot;"),
+            '\'' => w.push_str("&#39;"),
             '<' => w.push_str("&lt;"),
             '>' => w.push_str("&gt;"),
             _ => w.push(c),
