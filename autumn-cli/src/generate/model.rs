@@ -197,6 +197,19 @@ pub fn plan_model_with_options(
             "{ version = \"0.20\", features = [\"derive\"] }",
         ));
     }
+    if schema_fields.iter().any(|f| f.kind.is_decimal()) {
+        deps.push((
+            "rust_decimal",
+            "{ version = \"1\", features = [\"db-diesel2-postgres\", \"serde\"] }",
+        ));
+        let existing_cargo_toml = read_or_empty(&project_root.join("Cargo.toml"));
+        warn_if_existing_dep_missing_features(
+            &mut plan,
+            &existing_cargo_toml,
+            "rust_decimal",
+            &["db-diesel2-postgres", "serde"],
+        );
+    }
     plan_cargo_deps(&mut plan, project_root, &deps);
 
     Ok(plan)
@@ -679,6 +692,103 @@ fn dep_section_has(dep_section: &[&str], crate_name: &str) -> bool {
     })
 }
 
+/// `true` if `existing` Cargo.toml text already declares `crate_name` as a
+/// dependency, but that existing declaration doesn't (as far as this
+/// string-only check can tell) already list `feature`.
+///
+/// [`ensure_cargo_dependencies`] skips any crate name it finds already
+/// present — regardless of that entry's version or features — so a project
+/// that added `crate_name` for its own reasons (or inherited it from a
+/// workspace) before ever running a generator that needs `feature` would
+/// otherwise silently get code that fails to compile with no indication why
+/// (PR review, issue #1038: `rust_decimal = "1"` without
+/// `db-diesel2-postgres` lacks the Diesel `ToSql`/`FromSql` impls a
+/// generated `decimal` field's `#[model]` struct needs).
+///
+/// Checks the common single-line shorthand form (`crate = "1"` or
+/// `crate = { version = "1", features = [...] }`) and the
+/// `[dependencies.crate]` subtable form. Doesn't attempt to resolve
+/// `{ workspace = true }` inheritance or a `features` array split across
+/// multiple lines — those are rarer shapes this heuristic can't see through
+/// from Cargo.toml text alone, so it may occasionally warn when the feature
+/// is in fact present; a false-positive warning is far cheaper than the
+/// silent compile failure this check exists to catch.
+fn existing_dep_declared_without_feature(existing: &str, crate_name: &str, feature: &str) -> bool {
+    let lines: Vec<&str> = existing.lines().collect();
+    let Some(deps_idx) = lines
+        .iter()
+        .position(|l| is_table_header(l, "dependencies"))
+    else {
+        return false;
+    };
+    let scan_end = lines[deps_idx + 1..]
+        .iter()
+        .position(|l| is_any_table_header(l) && !is_dep_subtable_boundary_marker(l))
+        .map_or(lines.len(), |off| deps_idx + 1 + off);
+    let dep_section = &lines[deps_idx + 1..scan_end];
+
+    if let Some(sub_idx) = dep_section
+        .iter()
+        .position(|l| dep_subtable_crate_name(l) == Some(crate_name))
+    {
+        let sub_body_end = dep_section[sub_idx + 1..]
+            .iter()
+            .position(|l| is_any_table_header(l))
+            .map_or(dep_section.len(), |off| sub_idx + 1 + off);
+        let sub_body = dep_section[sub_idx + 1..sub_body_end].join("\n");
+        return !sub_body.contains(feature);
+    }
+
+    dep_section
+        .iter()
+        .find(|l| {
+            let t = l.trim_start();
+            !t.starts_with('#')
+                && t.split_once('=')
+                    .is_some_and(|(name, _)| name.trim() == crate_name)
+        })
+        .is_some_and(|line| !line.contains(feature))
+}
+
+/// If `existing` Cargo.toml text already declares `crate_name` without one
+/// or more of `features`, record a single `plan` warning naming exactly
+/// which ones to add by hand. See [`existing_dep_declared_without_feature`]
+/// for why this check exists.
+///
+/// Checked against the *full* feature set a generator needs — not just one
+/// of them — because `ensure_cargo_dependencies` only ever gets one shot at
+/// a crate name: once it's present, no generator will ever revisit it again.
+/// A partial check (e.g. only `db-diesel2-postgres`, missing `serde`) would
+/// pass a project that already added `rust_decimal` with *some* but not all
+/// of the required features, still leaving the generated code unable to
+/// compile.
+pub(super) fn warn_if_existing_dep_missing_features(
+    plan: &mut Plan,
+    existing_cargo_toml: &str,
+    crate_name: &str,
+    features: &[&str],
+) {
+    let missing: Vec<&str> = features
+        .iter()
+        .copied()
+        .filter(|feature| {
+            existing_dep_declared_without_feature(existing_cargo_toml, crate_name, feature)
+        })
+        .collect();
+    if !missing.is_empty() {
+        let feature_list = missing
+            .iter()
+            .map(|f| format!("\"{f}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        plan.warn(format!(
+            "Cargo.toml already declares '{crate_name}' without the generated code's \
+             required feature(s) — add {feature_list} to its `features` list by hand \
+             or the generated code may fail to compile."
+        ));
+    }
+}
+
 /// Reserved resource names whose snake-case form would collide with a special
 /// file in the generated layout (e.g. `mod` → `src/models/mod.rs`).
 const RESERVED_RESOURCE_NAMES: &[&str] = &["main", "lib"];
@@ -1028,6 +1138,45 @@ fn unquote_default_value(value: &str) -> &str {
         .unwrap_or(value)
 }
 
+/// Check that a `--default` value's *significant* digits fit a
+/// `NUMERIC(precision,scale)` column, so a decimal default never generates a
+/// migration that fails at apply time with a Postgres "numeric field
+/// overflow" (integer part too wide) — or silently gets rounded away
+/// (fractional part too precise), which would defeat the entire point of a
+/// field type that exists to avoid silent precision loss.
+///
+/// `value` is assumed to already be a plain (non-scientific-notation),
+/// finite numeric string — the caller checks that first. Trailing/leading
+/// zeros are trimmed before counting: `"1.500"` has one significant
+/// fractional digit (5), not three, and `"007"` has one significant integer
+/// digit, matching Postgres's own `NUMERIC` digit-counting semantics.
+fn validate_decimal_default_fits(value: &str, precision: u32, scale: u32) -> Result<(), String> {
+    let unsigned = value
+        .strip_prefix('-')
+        .or_else(|| value.strip_prefix('+'))
+        .unwrap_or(value);
+    let (int_part, frac_part) = unsigned.split_once('.').unwrap_or((unsigned, ""));
+
+    let frac_digits = frac_part.trim_end_matches('0').len();
+    if frac_digits > scale as usize {
+        return Err(format!(
+            "decimal default '{value}' has {frac_digits} fractional digit(s), but \
+             decimal{{{precision},{scale}}} only allows {scale}"
+        ));
+    }
+
+    let int_digits = int_part.trim_start_matches('0').len();
+    let max_int_digits = precision - scale;
+    if int_digits > max_int_digits as usize {
+        return Err(format!(
+            "decimal default '{value}' has {int_digits} integer digit(s), but \
+             decimal{{{precision},{scale}}} only allows {max_int_digits}"
+        ));
+    }
+
+    Ok(())
+}
+
 fn sql_default_literal(field: &Field, value: &str) -> Result<String, String> {
     match field.kind {
         FieldKind::Bool => match value.to_ascii_lowercase().as_str() {
@@ -1051,6 +1200,28 @@ fn sql_default_literal(field: &Field, value: &str) -> Result<String, String> {
             .parse::<f64>()
             .map(|_| value.to_owned())
             .map_err(|_| "float defaults must be valid numbers".to_owned()),
+        FieldKind::Decimal { precision, scale } => {
+            let parsed: f64 = value
+                .parse()
+                .map_err(|_| "decimal defaults must be valid numbers".to_owned())?;
+            if !parsed.is_finite() {
+                return Err("decimal defaults must be finite numbers (not NaN/infinity)".to_owned());
+            }
+            if value.contains(['e', 'E']) {
+                return Err(
+                    "decimal defaults must be written in plain notation (e.g. '19.99'), \
+                     not scientific notation"
+                        .to_owned(),
+                );
+            }
+            validate_decimal_default_fits(value, precision, scale)?;
+            // Emitted as the original string, not `parsed.to_string()` —
+            // `autumn-cli` doesn't depend on `rust_decimal` itself, and an
+            // unquoted numeric literal is valid Postgres `NUMERIC` SQL
+            // whether or not it round-trips exactly through `f64` (this arm
+            // only used `f64` to reject non-numeric garbage above).
+            Ok(value.to_owned())
+        }
         FieldKind::Uuid
         | FieldKind::NaiveDateTime
         | FieldKind::DateTime
@@ -1419,7 +1590,7 @@ mod tests {
         let err = plan_model(
             tmp.path(),
             "Post",
-            &["price:Decimal".into()],
+            &["price:Money".into()],
             "20260427000000",
         )
         .unwrap_err();
@@ -1630,6 +1801,247 @@ mod tests {
                 "expected '{field_name}' to be rejected"
             );
         }
+    }
+
+    // ── decimal field: --default (issue #1038 PR review) ────────────────────
+
+    #[test]
+    fn decimal_default_within_precision_and_scale_is_accepted() {
+        let fields = parse_fields(&["price:decimal{12,2}".into()]).unwrap();
+        let metadata = parse_model_metadata(
+            &fields,
+            &ModelOptions {
+                defaults: vec!["price=19.99".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            metadata.defaults().get("price").map(String::as_str),
+            Some("19.99")
+        );
+    }
+
+    #[test]
+    fn decimal_default_rejected_when_integer_part_overflows_precision() {
+        // decimal{2,2} has 0 integer digits of budget (precision - scale ==
+        // 0), so any value with magnitude >= 1 must be rejected rather than
+        // generating a migration Postgres fails at apply time with a
+        // "numeric field overflow".
+        let fields = parse_fields(&["amount:decimal{2,2}".into()]).unwrap();
+        let err = parse_model_metadata(
+            &fields,
+            &ModelOptions {
+                defaults: vec!["amount=1".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("integer digit"), "got: {msg}");
+    }
+
+    #[test]
+    fn decimal_default_rejected_when_fractional_part_exceeds_scale() {
+        // decimal{3,2} only allows 2 fractional digits; a third significant
+        // digit would silently round away rather than storing exactly.
+        let fields = parse_fields(&["amount:decimal{3,2}".into()]).unwrap();
+        let err = parse_model_metadata(
+            &fields,
+            &ModelOptions {
+                defaults: vec!["amount=1.999".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("fractional digit"), "got: {msg}");
+    }
+
+    #[test]
+    fn decimal_default_tolerates_insignificant_trailing_zeros() {
+        // "1.500" has one significant fractional digit (5), not three — it
+        // must not be rejected for a scale-2 column just because the source
+        // string happens to have an extra trailing zero.
+        let fields = parse_fields(&["amount:decimal{4,2}".into()]).unwrap();
+        let metadata = parse_model_metadata(
+            &fields,
+            &ModelOptions {
+                defaults: vec!["amount=1.500".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            metadata.defaults().get("amount").map(String::as_str),
+            Some("1.500")
+        );
+    }
+
+    #[test]
+    fn decimal_default_tolerates_leading_zeros_in_integer_part() {
+        let fields = parse_fields(&["amount:decimal{2,2}".into()]).unwrap();
+        let metadata = parse_model_metadata(
+            &fields,
+            &ModelOptions {
+                defaults: vec!["amount=0.5".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            metadata.defaults().get("amount").map(String::as_str),
+            Some("0.5")
+        );
+    }
+
+    #[test]
+    fn decimal_default_accepts_negative_value_within_range() {
+        let fields = parse_fields(&["amount:decimal{2,2}".into()]).unwrap();
+        let metadata = parse_model_metadata(
+            &fields,
+            &ModelOptions {
+                defaults: vec!["amount=-0.75".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            metadata.defaults().get("amount").map(String::as_str),
+            Some("-0.75")
+        );
+    }
+
+    #[test]
+    fn decimal_default_rejects_non_numeric_value() {
+        let fields = parse_fields(&["price:decimal".into()]).unwrap();
+        let err = parse_model_metadata(
+            &fields,
+            &ModelOptions {
+                defaults: vec!["price=abc".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("valid numbers"));
+    }
+
+    #[test]
+    fn decimal_default_rejects_scientific_notation() {
+        let fields = parse_fields(&["price:decimal".into()]).unwrap();
+        let err = parse_model_metadata(
+            &fields,
+            &ModelOptions {
+                defaults: vec!["price=1e2".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("scientific notation"));
+    }
+
+    #[test]
+    fn decimal_default_rejects_nan_and_infinity() {
+        let fields = parse_fields(&["price:decimal".into()]).unwrap();
+        for bad in ["nan", "inf", "infinity"] {
+            let err = parse_model_metadata(
+                &fields,
+                &ModelOptions {
+                    defaults: vec![format!("price={bad}")],
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("finite"),
+                "'{bad}' should be rejected as non-finite: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn decimal_field_warns_when_existing_rust_decimal_dep_lacks_diesel_feature() {
+        // Regression test (PR review, issue #1038): `ensure_cargo_dependencies`
+        // skips a crate that's already declared, regardless of its features —
+        // so a project that already had `rust_decimal = "1"` (e.g. for its own
+        // business logic) before ever using a `decimal` field would silently
+        // keep that feature-less entry, and the generated `#[model]` field's
+        // Diesel `ToSql`/`FromSql` impls (behind `db-diesel2-postgres`) would
+        // be missing, failing to compile with no indication why.
+        let tmp = project();
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname=\"x\"\n\n[dependencies]\nrust_decimal = \"1\"\n",
+        )
+        .unwrap();
+        let plan = plan_model(
+            tmp.path(),
+            "Product",
+            &["price:decimal".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        assert_eq!(plan.warnings.len(), 1, "warnings: {:?}", plan.warnings);
+        assert!(plan.warnings[0].contains("rust_decimal"));
+        assert!(plan.warnings[0].contains("db-diesel2-postgres"));
+    }
+
+    #[test]
+    fn decimal_field_no_warning_when_existing_rust_decimal_dep_already_has_feature() {
+        let tmp = project();
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname=\"x\"\n\n[dependencies]\n\
+             rust_decimal = { version = \"1\", features = [\"db-diesel2-postgres\", \"serde\"] }\n",
+        )
+        .unwrap();
+        let plan = plan_model(
+            tmp.path(),
+            "Product",
+            &["price:decimal".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        assert!(plan.warnings.is_empty(), "warnings: {:?}", plan.warnings);
+    }
+
+    #[test]
+    fn decimal_field_warns_naming_only_the_missing_feature() {
+        // Regression test (PR review, issue #1038): the earlier version of
+        // this check only verified `db-diesel2-postgres`, missing that the
+        // generated `#[model]` struct also derives Serialize/Deserialize and
+        // so needs `serde` too — a project with `rust_decimal` already
+        // declared with `db-diesel2-postgres` but not `serde` would pass the
+        // old single-feature check and still fail to compile.
+        let tmp = project();
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname=\"x\"\n\n[dependencies]\n\
+             rust_decimal = { version = \"1\", features = [\"db-diesel2-postgres\"] }\n",
+        )
+        .unwrap();
+        let plan = plan_model(
+            tmp.path(),
+            "Product",
+            &["price:decimal".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        assert_eq!(plan.warnings.len(), 1, "warnings: {:?}", plan.warnings);
+        assert!(plan.warnings[0].contains("serde"));
+    }
+
+    #[test]
+    fn decimal_field_no_warning_when_rust_decimal_not_already_declared() {
+        let tmp = project();
+        let plan = plan_model(
+            tmp.path(),
+            "Product",
+            &["price:decimal".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        assert!(plan.warnings.is_empty(), "warnings: {:?}", plan.warnings);
     }
 
     // ── enum field: --default (issue #1030) ─────────────────────────────────

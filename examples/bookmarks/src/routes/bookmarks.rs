@@ -280,10 +280,11 @@ pub async fn create(
     if !changeset.is_valid() {
         return Ok((StatusCode::UNPROCESSABLE_ENTITY, new_bookmark_form(&changeset)).into_response());
     }
+    let data = changeset.into_inner();
     let new = NewBookmark {
-        url: changeset.data().url.clone(),
-        title: changeset.data().title.clone(),
-        tag: changeset.data().tag.clone(),
+        url: data.url,
+        title: data.title,
+        tag: data.tag,
     };
     repo.save(&new).await?;
     Ok(Redirect::to("/bookmarks").into_response())
@@ -333,12 +334,12 @@ pub async fn update(
             (StatusCode::UNPROCESSABLE_ENTITY, edit_bookmark_form(*id, &changeset)).into_response(),
         );
     }
-    let data = changeset.data();
+    let data = changeset.into_inner();
     let updated = diesel::update(bookmarks::table.find(*id))
         .set((
-            bookmarks::url.eq(data.url.clone()),
-            bookmarks::title.eq(data.title.clone()),
-            bookmarks::tag.eq(data.tag.clone()),
+            bookmarks::url.eq(data.url),
+            bookmarks::title.eq(data.title),
+            bookmarks::tag.eq(data.tag),
         ))
         .execute(&mut *db)
         .await?;

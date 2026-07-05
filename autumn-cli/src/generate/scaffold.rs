@@ -257,6 +257,18 @@ pub fn plan_scaffold_with_options(
             "{ version = \"0.20\", features = [\"derive\"] }",
         ));
     }
+    // Not re-checked for missing features here: `plan` above *is* the
+    // `plan_model_with_options` plan (reused, not merged), and that call
+    // already ran `warn_if_existing_dep_missing_features` for `rust_decimal`
+    // when it built its own decimal-conditional dep — re-running the same
+    // check against the same (still on-disk, pre-`execute()`) Cargo.toml
+    // here would just duplicate the warning.
+    if fields.iter().any(|f| f.kind.is_decimal()) {
+        combined.push((
+            "rust_decimal",
+            "{ version = \"1\", features = [\"db-diesel2-postgres\", \"serde\"] }",
+        ));
+    }
     plan_cargo_deps(&mut plan, project_root, &combined);
 
     // The generated HTML routes render through `autumn_web::form::*` helpers
@@ -723,11 +735,17 @@ fn render_repository_queries(pascal_name: &str, queries: &[QuerySpec]) -> String
 /// into a `chrono::NaiveDateTime`. Emitted only when the model has a
 /// `NaiveDateTime`/`DateTime` field.
 const PARSE_LOCAL_DATETIME_FN: &str = r#"
-/// Parse a browser `datetime-local` value (`YYYY-MM-DDTHH:MM`, with seconds
-/// optional) into a `NaiveDateTime`. A malformed value is a 400 (undecodable
-/// input) rather than a field validation error.
+/// Parse a browser `datetime-local` value (`YYYY-MM-DDTHH:MM`, seconds and
+/// fractional seconds optional) into a `NaiveDateTime`. A malformed value is
+/// a 400 (undecodable input) rather than a field validation error.
+///
+/// Accepts a trailing `%.f` so a value pre-filled from a stored row (see the
+/// generated `From<&Row>` impl, which formats with fractional seconds) round-
+/// trips exactly on a no-op resubmit instead of being silently truncated to
+/// whole seconds — the generated `update` handler writes every column back
+/// unconditionally, so any precision lost here would corrupt the stored value.
 fn parse_local_datetime(value: &str) -> AutumnResult<chrono::NaiveDateTime> {
-    chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S")
+    chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S%.f")
         .or_else(|_| chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M"))
         .map_err(|err| AutumnError::bad_request_msg(format!("invalid datetime: {err}")))
 }
@@ -832,7 +850,7 @@ fn render_model_form(
                 );
                 let _ = writeln!(
                     from_row,
-                    "            {name}: row.{name}.as_ref().map(|dt| dt.format(\"%Y-%m-%dT%H:%M:%S\").to_string()),"
+                    "            {name}: row.{name}.as_ref().map(|dt| dt.format(\"%Y-%m-%dT%H:%M:%S%.f\").to_string()),"
                 );
             } else {
                 let _ = writeln!(struct_fields, "    pub {name}: String,");
@@ -842,7 +860,7 @@ fn render_model_form(
                 );
                 let _ = writeln!(
                     from_row,
-                    "            {name}: row.{name}.format(\"%Y-%m-%dT%H:%M:%S\").to_string(),"
+                    "            {name}: row.{name}.format(\"%Y-%m-%dT%H:%M:%S%.f\").to_string(),"
                 );
             }
         } else if let Some(enum_ty) = f.enum_type_name() {
@@ -877,8 +895,38 @@ fn render_model_form(
                     "            {name}: match &row.{name} {{ {arms}}},"
                 );
             }
+        } else if !f.nullable
+            && matches!(
+                f.kind,
+                FieldKind::I32
+                    | FieldKind::I64
+                    | FieldKind::F32
+                    | FieldKind::F64
+                    | FieldKind::Uuid
+                    | FieldKind::Decimal { .. }
+            )
+        {
+            // Represented as a `String` on the form, exactly like a required
+            // enum/datetime field: `T::default()` for these kinds (`0`, the nil
+            // UUID, …) is a real, plausible-looking value, not "blank" — with a
+            // native-typed field, the new-form's changeset would render it as
+            // the input's pre-filled value (issue #1124 review), silently
+            // accepting a value the user never typed instead of forcing
+            // deliberate input the way the old hand-rolled (no `value` at all
+            // when blank) form did. A nullable field of the same kind doesn't
+            // need this: `Option<T>::default()` is already `None`, which
+            // serializes to `null` and renders blank via `field_value`.
+            let rust_type = f.rust_type();
+            let _ = writeln!(struct_fields, "    pub {name}: String,");
+            let _ = writeln!(
+                into_new,
+                "        {name}: form.{name}.parse::<{rust_type}>()\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20.map_err(|err| autumn_web::AutumnError::bad_request_msg(format!(\"{name}: {{err}}\")))?,"
+            );
+            let _ = writeln!(from_row, "            {name}: row.{name}.to_string(),");
         } else {
-            // Plain scalars (String/Text/Uuid/numerics) keep their native type.
+            // Plain scalars (String/Text, and any nullable numeric/Uuid/Decimal)
+            // keep their native type — `Option<T>::default()` is already blank.
             let _ = writeln!(
                 struct_fields,
                 "    pub {name}: {rust_type},",
@@ -1888,6 +1936,13 @@ fn render_changeset_form_inputs(
                 (FieldKind::F32 | FieldKind::F64, _) => format!(
                     "(autumn_web::form::number_input(&{cv}, \"{name}\", \"{label}\", Some(\"any\")))"
                 ),
+                // `step` matches the column's declared scale, so the browser's
+                // stepper (and its "please match the requested format"
+                // validation) aligns with what the SQL column actually stores.
+                (FieldKind::Decimal { scale, .. }, _) => format!(
+                    "(autumn_web::form::number_input(&{cv}, \"{name}\", \"{label}\", Some(\"{step}\")))",
+                    step = decimal_step(scale)
+                ),
                 (FieldKind::NaiveDateTime | FieldKind::DateTime, _) => {
                     format!("(autumn_web::form::datetime_input(&{cv}, \"{name}\", \"{label}\"))")
                 }
@@ -1921,6 +1976,34 @@ fn render_changeset_form_inputs(
         let _ = writeln!(out, "            {line}");
     }
     out
+}
+
+/// A decimal literal at the given `scale`, formed from a single trailing
+/// significant `digit` (1-9) — e.g. `decimal_literal_at_scale(2, 1)` ==
+/// `"0.01"`, `decimal_literal_at_scale(0, 2)` == `"2"`. The magnitude never
+/// exceeds `9 * 10^-scale` (well under `1` for any `scale >= 1`, and under
+/// `10` for `scale == 0`), so the result fits any valid
+/// `decimal{precision,scale}` column (the DSL enforces `1 <= precision` and
+/// `scale <= precision`) regardless of how tight `precision` is — used both
+/// for the `<input step="...">` attribute ([`decimal_step`]) and the SQL
+/// sample/duplicate literals the enum-rejection/unique-violation smoke-test
+/// generators splice in below ([`sql_sample_literal`], [`unique_sample_literal`],
+/// [`unique_sample_literal_variant`]), where a fixed literal like `"1.0"`
+/// would overflow a tightly-scaled column such as `decimal{1,1}`.
+fn decimal_literal_at_scale(scale: u32, digit: u32) -> String {
+    if scale == 0 {
+        digit.to_string()
+    } else {
+        format!("0.{}{digit}", "0".repeat(scale as usize - 1))
+    }
+}
+
+/// The HTML `step` attribute value for a `decimal{precision,scale}` field,
+/// derived from its declared `scale` — `0` steps by whole numbers, `2`
+/// produces `"0.01"`, matching the column's actual smallest representable
+/// increment (unlike float fields, whose `step="any"` accepts any input).
+fn decimal_step(scale: u32) -> String {
+    decimal_literal_at_scale(scale, 1)
 }
 
 /// Produce the cell-body expression for a `data_table` column closure.
@@ -2390,6 +2473,41 @@ fn invalid_value_violating_rule(rule: &str) -> String {
     String::new()
 }
 
+/// A value that *satisfies* a `--validate` rule string — the counterpart to
+/// [`invalid_value_violating_rule`], used to build the successful submission
+/// in [`render_validation_rejection_smoke_test`]. A fixed literal like `"a
+/// valid value"` isn't valid for every rule (e.g. it's neither a URL/email,
+/// nor within a tight `length:max=5` or `length:min=20` bound), so this
+/// derives a value that actually fits the declared rule instead.
+fn valid_value_satisfying_rule(rule: &str) -> String {
+    if rule == "url" {
+        return "https://example.com".to_owned();
+    }
+    if rule == "email" {
+        return "person@example.com".to_owned();
+    }
+    if let Some(args) = rule.strip_prefix("length(").and_then(|s| s.strip_suffix(')')) {
+        let mut min: Option<u64> = None;
+        let mut max: Option<u64> = None;
+        for part in args.split(',') {
+            let part = part.trim();
+            if let Some(n) = part.strip_prefix("min = ") {
+                min = n.trim().parse().ok();
+            } else if let Some(n) = part.strip_prefix("max = ") {
+                max = n.trim().parse().ok();
+            }
+        }
+        let len = match (min, max) {
+            (Some(min), Some(max)) => min.max(1).min(max),
+            (Some(min), None) => min.max(1),
+            (None, Some(max)) => max,
+            (None, None) => 1,
+        };
+        return "a".repeat(len as usize);
+    }
+    "a valid value".to_owned()
+}
+
 /// Render a `#[tokio::test]` proving issue #1124's core guarantee: a
 /// submission that violates a declared `--validate` rule gets HTTP 422 with
 /// the *other* submitted field preserved and an inline `role="alert"` error
@@ -2415,6 +2533,7 @@ fn render_validation_rejection_smoke_test(
     };
     let rule = rules.first().cloned().unwrap_or_default();
     let invalid_value = invalid_value_violating_rule(&rule);
+    let valid_value = valid_value_satisfying_rule(&rule);
     let witness_value = "preserved-witness-value";
 
     format!(
@@ -2456,7 +2575,7 @@ fn render_validation_rejection_smoke_test(
          \x20\x20\x20\x20\x20\x20\x20\x20.assert_body_contains(\"role=\\\"alert\\\"\");\n\
          \n\
          \x20\x20\x20\x20// A fully valid submission still succeeds (AC5).\n\
-         \x20\x20\x20\x20let valid_body = format!(\"{target_name}=a+valid+value&other_field={witness_value}\");\n\
+         \x20\x20\x20\x20let valid_body = format!(\"{target_name}={valid_value}&other_field={witness_value}\");\n\
          \x20\x20\x20\x20client.post(\"/{plural}\").form(&valid_body).send().await\n\
          \x20\x20\x20\x20\x20\x20\x20\x20.assert_status(200);\n\
          }}\n"
@@ -2469,22 +2588,26 @@ fn render_validation_rejection_smoke_test(
 /// test needs *some* valid value so the `INSERT`'s failure is attributable to
 /// the target enum column's `CHECK` constraint rather than some other
 /// required column being left out.
-const fn sql_sample_literal(kind: FieldKind) -> &'static str {
+fn sql_sample_literal(kind: FieldKind) -> String {
     match kind {
         // `Enum`'s "'sample'" here is never actually used: `enum_rejection_insert_sql`
         // special-cases every enum column (the field under test gets the
         // deliberately out-of-set literal; any *other* required enum column
         // gets one of its own real variants instead — see that function).
-        FieldKind::String | FieldKind::Text | FieldKind::Enum => "'sample'",
-        FieldKind::I32 | FieldKind::I64 | FieldKind::References => "1",
-        FieldKind::Bool => "TRUE",
-        FieldKind::F32 | FieldKind::F64 => "1.0",
-        FieldKind::Uuid => "gen_random_uuid()",
-        FieldKind::NaiveDateTime | FieldKind::DateTime => "NOW()",
-        FieldKind::Bytea => "'\\x00'::bytea",
+        FieldKind::String | FieldKind::Text | FieldKind::Enum => "'sample'".to_owned(),
+        FieldKind::I32 | FieldKind::I64 | FieldKind::References => "1".to_owned(),
+        FieldKind::Bool => "TRUE".to_owned(),
+        FieldKind::F32 | FieldKind::F64 => "1.0".to_owned(),
+        // Scale-derived rather than a fixed "1.0": a tightly-scaled column
+        // like `decimal{1,1}` (valid range `(-1,1)`) would reject a literal
+        // "1.0" with a numeric field overflow — see `decimal_literal_at_scale`.
+        FieldKind::Decimal { scale, .. } => decimal_literal_at_scale(scale, 1),
+        FieldKind::Uuid => "gen_random_uuid()".to_owned(),
+        FieldKind::NaiveDateTime | FieldKind::DateTime => "NOW()".to_owned(),
+        FieldKind::Bytea => "'\\x00'::bytea".to_owned(),
         // Always nullable (see `FieldKind::Attachment`'s doc comment), so it
         // never needs a sample literal to satisfy a `NOT NULL` constraint.
-        FieldKind::Attachment => "NULL",
+        FieldKind::Attachment => "NULL".to_owned(),
     }
 }
 
@@ -2514,7 +2637,7 @@ fn enum_rejection_insert_sql(
             let value = if f.is_enum() {
                 format!("'{}'", f.variants.first().expect("enum field has variants"))
             } else {
-                sql_sample_literal(f.kind).to_owned()
+                sql_sample_literal(f.kind)
             };
             values.push(value);
         }
@@ -2637,10 +2760,10 @@ fn render_enum_rejection_smoke_test(
 /// this deliberately avoids non-deterministic SQL (`gen_random_uuid()`,
 /// `NOW()`) — two evaluations of either would almost certainly differ and
 /// the duplicate-insert assertion would never trip.
-const fn unique_sample_literal(kind: FieldKind) -> &'static str {
+fn unique_sample_literal(kind: FieldKind) -> String {
     match kind {
-        FieldKind::String | FieldKind::Text | FieldKind::Enum => "'dup_value'",
-        FieldKind::I32 | FieldKind::I64 => "424242",
+        FieldKind::String | FieldKind::Text | FieldKind::Enum => "'dup_value'".to_owned(),
+        FieldKind::I32 | FieldKind::I64 => "424242".to_owned(),
         // Must be a real seeded row's id, not an arbitrary literal — a
         // `references` target column is FK-constrained against the stub
         // table `render_reference_stub_tables_sql` seeds exactly one row
@@ -2648,14 +2771,17 @@ const fn unique_sample_literal(kind: FieldKind) -> &'static str {
         // constraint before the insert ever reaches the UNIQUE index this
         // test exists to exercise. Matches `sql_sample_literal`'s existing
         // convention for the same reason.
-        FieldKind::References => "1",
-        FieldKind::Bool => "TRUE",
-        FieldKind::F32 | FieldKind::F64 => "1.5",
-        FieldKind::Uuid => "'00000000-0000-0000-0000-000000000001'::uuid",
-        FieldKind::NaiveDateTime => "'2024-01-01 00:00:00'::timestamp",
-        FieldKind::DateTime => "'2024-01-01 00:00:00+00'::timestamptz",
-        FieldKind::Bytea => "'\\xDEADBEEF'::bytea",
-        FieldKind::Attachment => "NULL",
+        FieldKind::References => "1".to_owned(),
+        FieldKind::Bool => "TRUE".to_owned(),
+        FieldKind::F32 | FieldKind::F64 => "1.5".to_owned(),
+        // Scale-derived, distinct from `sql_sample_literal`'s digit-1 value
+        // for the same field — see `decimal_literal_at_scale`.
+        FieldKind::Decimal { scale, .. } => decimal_literal_at_scale(scale, 2),
+        FieldKind::Uuid => "'00000000-0000-0000-0000-000000000001'::uuid".to_owned(),
+        FieldKind::NaiveDateTime => "'2024-01-01 00:00:00'::timestamp".to_owned(),
+        FieldKind::DateTime => "'2024-01-01 00:00:00+00'::timestamptz".to_owned(),
+        FieldKind::Bytea => "'\\xDEADBEEF'::bytea".to_owned(),
+        FieldKind::Attachment => "NULL".to_owned(),
     }
 }
 
@@ -2667,21 +2793,25 @@ const fn unique_sample_literal(kind: FieldKind) -> &'static str {
 /// exact same value for a non-target unique column on both inserts would
 /// trip *that* column's own UNIQUE index too, racing against the target's
 /// to decide which violation Postgres actually reports.
-const fn unique_sample_literal_variant(kind: FieldKind) -> &'static str {
+fn unique_sample_literal_variant(kind: FieldKind) -> String {
     match kind {
-        FieldKind::String | FieldKind::Text | FieldKind::Enum => "'dup_value_2'",
-        FieldKind::I32 | FieldKind::I64 => "424243",
+        FieldKind::String | FieldKind::Text | FieldKind::Enum => "'dup_value_2'".to_owned(),
+        FieldKind::I32 | FieldKind::I64 => "424243".to_owned(),
         // The second stub row `render_reference_stub_tables_sql` seeds —
         // distinct from `unique_sample_literal`'s "1" for the same reason
         // that one must be a real seeded row's id, not an arbitrary literal.
-        FieldKind::References => "2",
-        FieldKind::Bool => "FALSE",
-        FieldKind::F32 | FieldKind::F64 => "2.5",
-        FieldKind::Uuid => "'00000000-0000-0000-0000-000000000002'::uuid",
-        FieldKind::NaiveDateTime => "'2024-01-02 00:00:00'::timestamp",
-        FieldKind::DateTime => "'2024-01-02 00:00:00+00'::timestamptz",
-        FieldKind::Bytea => "'\\xBEEFDEAD'::bytea",
-        FieldKind::Attachment => "NULL",
+        FieldKind::References => "2".to_owned(),
+        FieldKind::Bool => "FALSE".to_owned(),
+        FieldKind::F32 | FieldKind::F64 => "2.5".to_owned(),
+        // Scale-derived, distinct from both `sql_sample_literal`'s digit-1
+        // and `unique_sample_literal`'s digit-2 value — see
+        // `decimal_literal_at_scale`.
+        FieldKind::Decimal { scale, .. } => decimal_literal_at_scale(scale, 3),
+        FieldKind::Uuid => "'00000000-0000-0000-0000-000000000002'::uuid".to_owned(),
+        FieldKind::NaiveDateTime => "'2024-01-02 00:00:00'::timestamp".to_owned(),
+        FieldKind::DateTime => "'2024-01-02 00:00:00+00'::timestamptz".to_owned(),
+        FieldKind::Bytea => "'\\xBEEFDEAD'::bytea".to_owned(),
+        FieldKind::Attachment => "NULL".to_owned(),
     }
 }
 
@@ -2713,7 +2843,7 @@ fn unique_violation_insert_sql(
             let value = if f.is_enum() {
                 format!("'{}'", f.variants.first().expect("enum field has variants"))
             } else {
-                unique_sample_literal(f.kind).to_owned()
+                unique_sample_literal(f.kind)
             };
             values.push(value);
         } else if !f.nullable && !defaults.contains_key(&f.name) {
@@ -2722,11 +2852,11 @@ fn unique_violation_insert_sql(
                 let variant = f.variants.get(1).unwrap_or(&f.variants[0]);
                 format!("'{variant}'")
             } else if is_duplicate_insert && f.unique {
-                unique_sample_literal_variant(f.kind).to_owned()
+                unique_sample_literal_variant(f.kind)
             } else if f.is_enum() {
                 format!("'{}'", f.variants.first().expect("enum field has variants"))
             } else {
-                sql_sample_literal(f.kind).to_owned()
+                sql_sample_literal(f.kind)
             };
             values.push(value);
         }
@@ -4228,10 +4358,12 @@ async fn main() {
 
     #[test]
     fn execute_writes_number_input_reads_value_from_changeset() {
-        // Non-finite floats (NaN/Inf) can't be JSON-serialized, so
-        // `Changeset::field_value` returns `None` and the input blanks — the
-        // finite guard the hand-rolled path needed now lives in the framework
-        // helper (issue #1124).
+        // A required numeric field is represented as a `String` on the form
+        // (issue #1124 review): `f64::default()` is `0.0`, a real value, not
+        // "blank" — a native-typed field would render `0` as the blank
+        // new-form's pre-filled value instead of leaving the input empty.
+        // `into_new` parses it back, and a bad value is a 400 (undecodable
+        // input), matching the enum/datetime convention.
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold(
             tmp.path(),
@@ -4251,10 +4383,20 @@ async fn main() {
             routes.contains("autumn_web::form::number_input(&changeset, \"price\", \"Price\", Some(\"any\"))"),
             "{routes}"
         );
+        assert!(routes.contains("pub price: String,"), "{routes}");
         assert!(
-            routes.contains("price: row.price.clone(),"),
+            routes.contains(
+                "price: form.price.parse::<f64>()\n        .map_err(|err| autumn_web::AutumnError::bad_request_msg(format!(\"price: {err}\")))?,"
+            ),
+            "{routes}"
+        );
+        assert!(
+            routes.contains("price: row.price.to_string(),"),
             "the edit-form seed copies the float from the row: {routes}"
         );
+        // A nullable float of the same kind keeps its native Option<T> type —
+        // `None` is already blank, no String indirection needed.
+        assert!(routes.contains("pub weight: Option<f32>,"), "{routes}");
     }
 
     #[test]
@@ -4276,7 +4418,7 @@ async fn main() {
             routes.contains("autumn_web::form::number_input(&changeset, \"views\", \"Views\", Some(\"1\"))"),
             "{routes}"
         );
-        assert!(routes.contains("views: row.views.clone(),"), "{routes}");
+        assert!(routes.contains("views: row.views.to_string(),"), "{routes}");
     }
 
     #[test]
@@ -4310,10 +4452,12 @@ async fn main() {
             "{routes}"
         );
         // The edit-form seed formats the row's timestamp for the datetime-local
-        // control (round-trips seconds precision).
+        // control, preserving fractional seconds so a no-op resubmit doesn't
+        // truncate the stored value (the update handler writes every column
+        // back unconditionally).
         assert!(
             routes.contains(
-                "published_at: row.published_at.format(\"%Y-%m-%dT%H:%M:%S\").to_string(),"
+                "published_at: row.published_at.format(\"%Y-%m-%dT%H:%M:%S%.f\").to_string(),"
             ),
             "{routes}"
         );
@@ -5414,5 +5558,96 @@ async fn main() {
             "a self-referential FK must not stub its own table before creating it for real: {test}"
         );
         assert!(test.contains("category_id BIGINT NOT NULL REFERENCES categories(id)"));
+    }
+
+    // ── decimal sample literals fit tightly-scaled columns (issue #1038) ────
+
+    #[test]
+    fn decimal_literal_at_scale_never_reaches_one() {
+        // Every sample literal must stay strictly under `1` for scale >= 1,
+        // so it fits even the tightest valid column (`decimal{scale,scale}`,
+        // whose range is `(-1,1)`) regardless of how large `precision` is.
+        for scale in 1..=6 {
+            for digit in [1, 2, 3] {
+                let literal = decimal_literal_at_scale(scale, digit);
+                let value: f64 = literal.parse().unwrap();
+                assert!(
+                    value.abs() < 1.0,
+                    "decimal_literal_at_scale({scale}, {digit}) = {literal} must be < 1"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn decimal_sample_literals_are_pairwise_distinct_at_every_scale() {
+        for scale in 0..=6 {
+            let a = sql_sample_literal(FieldKind::Decimal {
+                precision: scale.max(1) + 1,
+                scale,
+            });
+            let b = unique_sample_literal(FieldKind::Decimal {
+                precision: scale.max(1) + 1,
+                scale,
+            });
+            let c = unique_sample_literal_variant(FieldKind::Decimal {
+                precision: scale.max(1) + 1,
+                scale,
+            });
+            assert!(a != b && b != c && a != c, "scale {scale}: {a}, {b}, {c}");
+        }
+    }
+
+    #[test]
+    fn enum_rejection_insert_sql_fits_tightly_scaled_decimal_column() {
+        // Regression test: a `decimal{1,1}` column (valid range `(-1,1)`)
+        // combined with a required enum column used to get a fixed "1.0"
+        // sample literal from `sql_sample_literal`, which Postgres's
+        // `NUMERIC(1,1)` rejects as a numeric field overflow — breaking a
+        // generated test that has nothing to do with the enum behavior it's
+        // meant to exercise.
+        let status = Field {
+            name: "status".to_string(),
+            kind: FieldKind::Enum,
+            nullable: false,
+            variants: vec!["a".to_string(), "b".to_string()],
+            unique: false,
+        };
+        let weight = Field {
+            name: "weight".to_string(),
+            kind: FieldKind::Decimal {
+                precision: 1,
+                scale: 1,
+            },
+            nullable: false,
+            variants: Vec::new(),
+            unique: false,
+        };
+        let fields = vec![status.clone(), weight];
+        let sql = enum_rejection_insert_sql("items", &fields, &status, &BTreeMap::new());
+        assert!(
+            sql.contains("weight) VALUES ('__not_a_real_variant__', 0.1)"),
+            "expected a scale-fitting 0.1 literal for NUMERIC(1,1), got: {sql}"
+        );
+    }
+
+    #[test]
+    fn scaffold_decimal_field_warns_when_existing_rust_decimal_dep_lacks_diesel_feature() {
+        let tmp = project_with_main(default_main());
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname=\"x\"\n\n[dependencies]\nrust_decimal = \"1\"\n",
+        )
+        .unwrap();
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Product",
+            &["price:decimal".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        assert_eq!(plan.warnings.len(), 1, "warnings: {:?}", plan.warnings);
+        assert!(plan.warnings[0].contains("rust_decimal"));
+        assert!(plan.warnings[0].contains("db-diesel2-postgres"));
     }
 }

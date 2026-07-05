@@ -25,6 +25,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   renderer instead of its own hand-rolled path. `examples/bookmarks`
   demonstrates the round-trip.
 
+- **generate:** `decimal` scaffold field type (#1038) — `price:decimal`
+  (default `NUMERIC(12,2)`) or `price:decimal{10,2}` for an explicit
+  precision/scale now generates an exact-precision Postgres `NUMERIC` column,
+  a `rust_decimal::Decimal` `#[model]` field, and a `Numeric`/`Nullable<Numeric>`
+  Diesel schema token, so money-shaped fields no longer have to fall back to
+  `f64` and its binary-float rounding. Both `decimal`/`Decimal` casings are
+  accepted (consistent with `Attachment`/`attachment`), it composes with
+  `Option<…>` and `:unique`, and the generated `new`/`edit` form renders
+  through the changeset-aware `number_input` helper, sized to the column's
+  scale. The `rust_decimal` dependency (with the `db-diesel2-postgres` and
+  `serde` features) is added to the generated app's `Cargo.toml` only when a
+  `decimal` field is present.
 - **views:** `tabs` widget — a no-JavaScript panel switcher for detail and
   settings views (#1316). `tabs(id, panels)` takes an ordered
   `&[(id, label, maud::Markup)]` list and renders an `autumn-tabs` root with
