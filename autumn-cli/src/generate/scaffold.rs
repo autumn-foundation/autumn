@@ -421,6 +421,8 @@ const ROUTES_FILE_RESERVED_NAMES: &[&str] = &[
     "Markup",
     "RunQueryDsl",
     "ToString",
+    "Changeset",
+    "IntoChangeset",
 ];
 
 /// Reject an `enum{…}` field whose generated type name collides with one of
@@ -777,6 +779,12 @@ struct ModelFormParts {
 /// declared `#[validate(...)]` rules then decide validity, and the fallible
 /// `into_new` performs the enum/datetime/attachment parsing on the success
 /// path (those remain 400s — undecodable input, not validation failures).
+#[allow(
+    clippy::too_many_lines,
+    reason = "One match arm per field-kind widget — splitting it produces less \
+              readable output, not more. See render_changeset_form_inputs's \
+              module-level comment for the shared invariants."
+)]
 fn render_model_form(
     pascal_name: &str,
     fields: &[Field],
@@ -907,6 +915,7 @@ fn render_model_form(
                     | FieldKind::F64
                     | FieldKind::Uuid
                     | FieldKind::Decimal { .. }
+                    | FieldKind::References
             )
         {
             // Represented as a `String` on the form, exactly like a required
@@ -1896,7 +1905,7 @@ fn has_attachment_fields(fields: &[Field]) -> bool {
 /// `Changeset<{Pascal}Form>` bound to `changeset_var` in the calling handler,
 /// so preserved input and per-field error messages (`aria-invalid` +
 /// `role="alert"`) come for free — and the identical markup is emitted by
-/// `new_form`, `edit_form`, and both 422 re-render branches. FieldKind maps to
+/// `new_form`, `edit_form`, and both 422 re-render branches. `FieldKind` maps to
 /// the matching helper (`text_input`, `number_input`, `datetime_input`,
 /// `checkbox_input`, `select_input`); attachments stay a plain `<input
 /// type="file">` (a file input can't be repopulated).
@@ -2468,16 +2477,25 @@ fn invalid_value_violating_rule(rule: &str) -> String {
         .strip_prefix("length(")
         .and_then(|s| s.strip_suffix(')'))
     {
-        let min: Option<u64> = args.split(',').find_map(|part| {
-            part.trim()
-                .strip_prefix("min = ")
-                .and_then(|n| n.trim().parse().ok())
-        });
-        return match min {
+        let mut min: Option<u64> = None;
+        let mut max: Option<u64> = None;
+        for part in args.split(',') {
+            let part = part.trim();
+            if let Some(n) = part.strip_prefix("min = ") {
+                min = n.trim().parse().ok();
+            } else if let Some(n) = part.strip_prefix("max = ") {
+                max = n.trim().parse().ok();
+            }
+        }
+        return match (min, max) {
             // A `min` bound is violated by submitting nothing at all.
-            Some(min) if min > 0 => String::new(),
-            // A `max`-only bound is violated by exceeding it.
-            _ => "x".repeat(1000),
+            (Some(min), _) if min > 0 => String::new(),
+            // A `max`-only bound is violated by exceeding it by one character
+            // — a fixed-size literal (e.g. 1000 `x`s) would itself satisfy a
+            // looser `max` (say 2000), silently turning the "invalid"
+            // submission valid and failing the smoke test's own 422 premise.
+            (_, Some(max)) => "x".repeat(usize::try_from(max + 1).unwrap_or(usize::MAX)),
+            _ => String::new(),
         };
     }
     String::new()
@@ -2516,7 +2534,7 @@ fn valid_value_satisfying_rule(rule: &str) -> String {
             (None, Some(max)) => max,
             (None, None) => 1,
         };
-        return "a".repeat(len as usize);
+        return "a".repeat(usize::try_from(len).unwrap_or(usize::MAX));
     }
     "a valid value".to_owned()
 }
@@ -3387,6 +3405,29 @@ async fn main() {
         )
         .unwrap_err();
         assert!(matches!(err, GenerateError::InvalidField { .. }));
+    }
+
+    #[test]
+    fn scaffold_enum_field_named_changeset_is_rejected() {
+        // `changeset:enum{a,b}` pascalizes to `Changeset`, colliding with the
+        // `use autumn_web::form::{Changeset, IntoChangeset};` import every
+        // non-`--api` scaffold's routes file now carries (issue #1124) — a
+        // duplicate `Changeset`/`IntoChangeset` import fails with E0252,
+        // exactly like the pre-existing `Path`/`ToString` collisions above.
+        for field_name in ["changeset", "into_changeset"] {
+            let tmp = project_with_main(default_main());
+            let err = plan_scaffold(
+                tmp.path(),
+                "Post",
+                &[format!("{field_name}:enum{{a,b}}")],
+                "20260427000000",
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, GenerateError::InvalidField { .. }),
+                "expected '{field_name}' to be rejected"
+            );
+        }
     }
 
     #[test]
@@ -4425,6 +4466,37 @@ async fn main() {
     }
 
     #[test]
+    fn execute_writes_required_references_field_as_string_on_form() {
+        // A required `references` (foreign key) field is `i64` at the model
+        // layer, same as any other required integer — it needs the same
+        // String-wire treatment as I32/I64/Uuid/Decimal (issue #1124 review):
+        // `i64::default()` is `0`, a real (and likely invalid) foreign key
+        // value, not "blank".
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Comment",
+            &["body:String".into(), "post:references".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/comments.rs")).unwrap();
+        assert!(routes.contains("pub post_id: String,"), "{routes}");
+        assert!(
+            routes.contains(
+                "post_id: form.post_id.parse::<i64>()\n        .map_err(|err| autumn_web::AutumnError::bad_request_msg(format!(\"post_id: {err}\")))?,"
+            ),
+            "{routes}"
+        );
+        assert!(
+            routes.contains("post_id: row.post_id.to_string(),"),
+            "{routes}"
+        );
+    }
+
+    #[test]
     fn execute_writes_number_input_value_on_edit_form() {
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold(
@@ -5316,6 +5388,61 @@ async fn main() {
         assert!(
             !test.contains("rejects_out_of_set"),
             "no enum field means no rejection test: {test}"
+        );
+    }
+
+    #[test]
+    fn scaffold_validation_smoke_test_max_only_rule_exceeds_bound() {
+        // Regression guard: a fixed-size "invalid" literal (e.g. 1000 `x`s)
+        // would itself satisfy a looser `max` bound like 2000, silently
+        // turning the smoke test's "invalid" submission valid and failing its
+        // own `.assert_status(422)` premise. The generated invalid value must
+        // scale with the declared `max` (here, more than 5 characters), and
+        // the generated valid value must stay within it (at most 5).
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+            &ScaffoldOptions {
+                model: ModelOptions {
+                    validations: vec!["title=length:max=5".into()],
+                    ..ModelOptions::default()
+                },
+                ..ScaffoldOptions::default()
+            },
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let test = fs::read_to_string(tmp.path().join("tests/post.rs")).unwrap();
+        let invalid_line = test
+            .lines()
+            .find(|l| l.contains("let invalid_body"))
+            .expect("invalid_body line present");
+        let invalid_title = invalid_line
+            .split("title=")
+            .nth(1)
+            .and_then(|s| s.split('&').next())
+            .expect("title value in invalid_body");
+        assert!(
+            invalid_title.len() > 5,
+            "invalid value must exceed the declared max=5 bound: {invalid_line}"
+        );
+
+        let valid_line = test
+            .lines()
+            .find(|l| l.contains("let valid_body"))
+            .expect("valid_body line present");
+        let valid_title = valid_line
+            .split("title=")
+            .nth(1)
+            .and_then(|s| s.split('&').next())
+            .expect("title value in valid_body");
+        assert!(
+            valid_title.len() <= 5,
+            "valid value must satisfy the declared max=5 bound: {valid_line}"
         );
     }
 
