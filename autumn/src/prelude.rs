@@ -186,7 +186,7 @@ pub use crate::widgets::{
     active_search_empty_state, active_search_input, active_search_results,
     autocomplete_empty_state, autocomplete_input, autocomplete_option, breadcrumb, card,
     confirm_action, data_table, hero, modal, modal_close_button, modal_trigger, nav_bar, nav_link,
-    nav_link_matched, property_list, stat_card,
+    nav_link_matched, property_list, stat_card, tabs,
 };
 
 // ── Link helpers ─────────────────────────────────────────────────
