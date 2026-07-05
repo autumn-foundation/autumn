@@ -253,9 +253,9 @@ pub fn plan_scaffold_with_options(
             "{ version = \"0.20\", features = [\"derive\"] }",
         ));
     }
-    // Not re-checked for a missing Diesel feature here: `plan` above *is*
-    // the `plan_model_with_options` plan (reused, not merged), and that call
-    // already ran `warn_if_existing_dep_missing_feature` for `rust_decimal`
+    // Not re-checked for missing features here: `plan` above *is* the
+    // `plan_model_with_options` plan (reused, not merged), and that call
+    // already ran `warn_if_existing_dep_missing_features` for `rust_decimal`
     // when it built its own decimal-conditional dep — re-running the same
     // check against the same (still on-disk, pre-`execute()`) Cargo.toml
     // here would just duplicate the warning.

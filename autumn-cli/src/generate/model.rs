@@ -203,11 +203,11 @@ pub fn plan_model_with_options(
             "{ version = \"1\", features = [\"db-diesel2-postgres\", \"serde\"] }",
         ));
         let existing_cargo_toml = read_or_empty(&project_root.join("Cargo.toml"));
-        warn_if_existing_dep_missing_feature(
+        warn_if_existing_dep_missing_features(
             &mut plan,
             &existing_cargo_toml,
             "rust_decimal",
-            "db-diesel2-postgres",
+            &["db-diesel2-postgres", "serde"],
         );
     }
     plan_cargo_deps(&mut plan, project_root, &deps);
@@ -750,19 +750,40 @@ fn existing_dep_declared_without_feature(existing: &str, crate_name: &str, featu
         .is_some_and(|line| !line.contains(feature))
 }
 
-/// If `existing` Cargo.toml text already declares `crate_name` without
-/// `feature`, record a `plan` warning naming exactly what to add by hand.
-/// See [`existing_dep_declared_without_feature`] for why this check exists.
-pub(super) fn warn_if_existing_dep_missing_feature(
+/// If `existing` Cargo.toml text already declares `crate_name` without one
+/// or more of `features`, record a single `plan` warning naming exactly
+/// which ones to add by hand. See [`existing_dep_declared_without_feature`]
+/// for why this check exists.
+///
+/// Checked against the *full* feature set a generator needs — not just one
+/// of them — because `ensure_cargo_dependencies` only ever gets one shot at
+/// a crate name: once it's present, no generator will ever revisit it again.
+/// A partial check (e.g. only `db-diesel2-postgres`, missing `serde`) would
+/// pass a project that already added `rust_decimal` with *some* but not all
+/// of the required features, still leaving the generated code unable to
+/// compile.
+pub(super) fn warn_if_existing_dep_missing_features(
     plan: &mut Plan,
     existing_cargo_toml: &str,
     crate_name: &str,
-    feature: &str,
+    features: &[&str],
 ) {
-    if existing_dep_declared_without_feature(existing_cargo_toml, crate_name, feature) {
+    let missing: Vec<&str> = features
+        .iter()
+        .copied()
+        .filter(|feature| {
+            existing_dep_declared_without_feature(existing_cargo_toml, crate_name, feature)
+        })
+        .collect();
+    if !missing.is_empty() {
+        let feature_list = missing
+            .iter()
+            .map(|f| format!("\"{f}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
         plan.warn(format!(
-            "Cargo.toml already declares '{crate_name}' without the '{feature}' feature \
-             the generated code needs — add it by hand (e.g. `features = [\"{feature}\", ...]`) \
+            "Cargo.toml already declares '{crate_name}' without the generated code's \
+             required feature(s) — add {feature_list} to its `features` list by hand \
              or the generated code may fail to compile."
         ));
     }
@@ -1971,7 +1992,7 @@ mod tests {
         fs::write(
             tmp.path().join("Cargo.toml"),
             "[package]\nname=\"x\"\n\n[dependencies]\n\
-             rust_decimal = { version = \"1\", features = [\"db-diesel2-postgres\"] }\n",
+             rust_decimal = { version = \"1\", features = [\"db-diesel2-postgres\", \"serde\"] }\n",
         )
         .unwrap();
         let plan = plan_model(
@@ -1982,6 +2003,32 @@ mod tests {
         )
         .unwrap();
         assert!(plan.warnings.is_empty(), "warnings: {:?}", plan.warnings);
+    }
+
+    #[test]
+    fn decimal_field_warns_naming_only_the_missing_feature() {
+        // Regression test (PR review, issue #1038): the earlier version of
+        // this check only verified `db-diesel2-postgres`, missing that the
+        // generated `#[model]` struct also derives Serialize/Deserialize and
+        // so needs `serde` too — a project with `rust_decimal` already
+        // declared with `db-diesel2-postgres` but not `serde` would pass the
+        // old single-feature check and still fail to compile.
+        let tmp = project();
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname=\"x\"\n\n[dependencies]\n\
+             rust_decimal = { version = \"1\", features = [\"db-diesel2-postgres\"] }\n",
+        )
+        .unwrap();
+        let plan = plan_model(
+            tmp.path(),
+            "Product",
+            &["price:decimal".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        assert_eq!(plan.warnings.len(), 1, "warnings: {:?}", plan.warnings);
+        assert!(plan.warnings[0].contains("serde"));
     }
 
     #[test]

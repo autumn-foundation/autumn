@@ -132,11 +132,17 @@ pub fn plan_job(project_root: &Path, name: &str, fields: &[String]) -> Result<Pl
     // ── Cargo.toml: ensure serde (always) plus uuid/chrono/decimal if used ──
     if parsed_fields.iter().any(|f| f.kind.is_decimal()) {
         let existing_cargo_toml = read_or_empty(&project_root.join("Cargo.toml"));
-        super::model::warn_if_existing_dep_missing_feature(
+        // Job args structs only derive Serialize/Deserialize (no Diesel
+        // Queryable/Insertable), so strictly only need `serde` — but
+        // JOB_DEPS_DECIMAL below requests the same feature set as
+        // MODEL_DEPS's rust_decimal entry for consistency (a project using
+        // both `generate job` and `generate model`/`scaffold` shares one
+        // `rust_decimal` dep line), so this warning checks the same set.
+        super::model::warn_if_existing_dep_missing_features(
             &mut plan,
             &existing_cargo_toml,
             "rust_decimal",
-            "db-diesel2-postgres",
+            &["db-diesel2-postgres", "serde"],
         );
     }
     super::model::plan_cargo_deps(&mut plan, project_root, &job_deps(&parsed_fields));
