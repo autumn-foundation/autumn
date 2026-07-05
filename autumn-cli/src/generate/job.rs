@@ -823,14 +823,10 @@ async fn main() {
         // special-cased `Uuid`/chrono and silently omitted `rust_decimal`,
         // producing a job args struct that failed to compile.
         let tmp = project_with_main(default_main());
-        plan_job(
-            tmp.path(),
-            "ProcessRefund",
-            &["amount:decimal".to_string()],
-        )
-        .unwrap()
-        .execute(Flags::default())
-        .unwrap();
+        plan_job(tmp.path(), "ProcessRefund", &["amount:decimal".to_string()])
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
 
         let cargo = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
         assert!(
