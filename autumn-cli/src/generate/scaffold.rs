@@ -112,7 +112,7 @@ pub fn plan_scaffold_with_options(
     let mut fields = parse_fields(field_tokens)?;
     super::model::apply_unique_flags(&mut fields, &options.model.uniques)?;
     if !options.api {
-        validate_enum_field_names_against_routes_imports(&fields)?;
+        validate_enum_field_names_against_routes_imports(&fields, &pascal(name))?;
     }
     // Resolve shard key before planning the model (propagates to model render).
     let resolved_shard_key = resolve_shard_key(&fields, &options.model)?;
@@ -426,10 +426,15 @@ const ROUTES_FILE_RESERVED_NAMES: &[&str] = &[
 ];
 
 /// Reject an `enum{…}` field whose generated type name collides with one of
-/// [`ROUTES_FILE_RESERVED_NAMES`]. Only relevant when `generate scaffold`
-/// will actually emit `src/routes/<plural>.rs` (i.e. not `--api`, which
-/// skips that file entirely).
-fn validate_enum_field_names_against_routes_imports(fields: &[Field]) -> Result<(), GenerateError> {
+/// [`ROUTES_FILE_RESERVED_NAMES`], or with the scaffold's own generated
+/// `{pascal_name}Form` changeset struct (`render_model_form`). Only relevant
+/// when `generate scaffold` will actually emit `src/routes/<plural>.rs`
+/// (i.e. not `--api`, which skips that file entirely).
+fn validate_enum_field_names_against_routes_imports(
+    fields: &[Field],
+    pascal_name: &str,
+) -> Result<(), GenerateError> {
+    let form_ty = format!("{pascal_name}Form");
     for f in fields {
         let Some(enum_ty) = f.enum_type_name() else {
             continue;
@@ -440,6 +445,15 @@ fn validate_enum_field_names_against_routes_imports(fields: &[Field]) -> Result<
                 reason: format!(
                     "the generated enum type '{enum_ty}' collides with a name the scaffold's \
                      routes file always imports; rename the field"
+                ),
+            });
+        }
+        if enum_ty == form_ty {
+            return Err(GenerateError::InvalidField {
+                token: format!("{}:enum{{...}}", f.name),
+                reason: format!(
+                    "the generated enum type '{enum_ty}' collides with the scaffold's own \
+                     generated '{form_ty}' changeset form struct; rename the field"
                 ),
             });
         }
@@ -1516,115 +1530,46 @@ pub async fn index(
             .to_owned()
     };
 
-    // When `--live-validation`, emit one inline-validation handler per validated field.
-    // Each handler runs the actual declared validation rule(s) at runtime, not just
-    // an empty-check stub.
+    // When `--live-validation`, emit one inline-validation handler per validated
+    // field. Each handler decodes the *whole* submitted form (htmx's
+    // `hx-include="closest form"` posts every field, not just the one that
+    // changed) via the same `decode_form` used by `create`/`update`, builds a
+    // `Changeset<{pascal_name}Form>` through the struct's derived
+    // `#[validate(...)]` rules, and returns `text_input_htmx`'s full field
+    // wrapper (label + input + inline error) for that one field. Sharing the
+    // changeset/validator machinery with `create`/`update` means there is only
+    // one place the validation rules live, and the returned markup matches
+    // `text_input_htmx`'s `hx-swap="outerHTML"` contract — swapping in a bare
+    // `<span>` would delete the input it's supposed to replace.
     let validate_handlers = if live_validation {
         let mut vh = String::new();
         for (field_name, rules) in validations {
             let rule_comment = rules.join(", ");
-            // Build the error chain: start with an empty-value check, then
-            // append one branch per declared rule (url, email, length).
-            // Nullable fields are not required — leave them empty → None.
-            let is_required = fields
-                .iter()
-                .find(|f| f.name == *field_name)
-                .is_none_or(|f| !f.nullable);
-            let mut error_chain = if is_required {
-                String::from("if value.is_empty() {\n        Some(\"required\")\n    }")
-            } else {
-                String::from("if value.is_empty() {\n        None\n    }")
-            };
-            for rule in rules {
-                if rule == "url" {
-                    error_chain.push_str(
-                        " else if url::Url::parse(&value).is_err() {\n        Some(\"must be a valid URL\")\n    }",
-                    );
-                } else if rule == "email" {
-                    error_chain.push_str(
-                        " else if !value.contains('@')\n            || value.split_once('@').map_or(true, |(_, d)| !d.contains('.')) {\n        Some(\"must be a valid email address\")\n    }",
-                    );
-                } else if let Some(args_str) = rule
-                    .strip_prefix("length(")
-                    .and_then(|s| s.strip_suffix(")"))
-                {
-                    let mut min: Option<u64> = None;
-                    let mut max: Option<u64> = None;
-                    for part in args_str.split(',') {
-                        let part = part.trim();
-                        if let Some(n_str) = part.strip_prefix("min = ") {
-                            if let Ok(n) = n_str.trim().parse::<u64>() {
-                                min = Some(n);
-                            }
-                        } else if let Some(n_str) = part.strip_prefix("max = ")
-                            && let Ok(n) = n_str.trim().parse::<u64>()
-                        {
-                            max = Some(n);
-                        }
-                    }
-                    if min.is_none() && max.is_none() {
-                        continue;
-                    }
-                    let cond = match (min, max) {
-                        (Some(mn), Some(mx)) => {
-                            format!("value.chars().count() < {mn} || value.chars().count() > {mx}")
-                        }
-                        (Some(mn), None) => format!("value.chars().count() < {mn}"),
-                        (None, Some(mx)) => format!("value.chars().count() > {mx}"),
-                        (None, None) => unreachable!(),
-                    };
-                    let msg = match (min, max) {
-                        (Some(mn), Some(mx)) => {
-                            format!("must be between {mn} and {mx} characters")
-                        }
-                        (Some(mn), None) => format!("must be at least {mn} characters"),
-                        (None, Some(mx)) => format!("must be at most {mx} characters"),
-                        (None, None) => unreachable!(),
-                    };
-                    let _ = write!(
-                        error_chain,
-                        " else if {cond} {{\n        Some(\"{msg}\")\n    }}"
-                    );
-                }
-            }
-            error_chain.push_str(" else {\n        None\n    }");
-
-            // Build the handler string via push_str to avoid brace-escaping issues
-            // between the format! template and the generated Rust { } delimiters.
+            let label = humanize_label(field_name);
             let _ = write!(
                 vh,
                 "\n\n/// `POST /{plural}/validate/{field_name}` — inline validation fragment.\n"
             );
-            let _ = write!(
-                vh,
-                "///\n/// Returns an `<span id=\"{field_name}-error\">` OOB fragment with an error\n"
-            );
             let _ = writeln!(
                 vh,
-                "/// message when the value fails the `{rule_comment}` rule, or an empty span"
-            );
-            vh.push_str(
-                "/// when it passes. Consumed by htmx `hx-swap=\"outerHTML\"` on `hx-trigger=\"change\"`.\n",
+                "///\n/// Decodes the full submitted form, validates it against the `{rule_comment}`\n\
+                 /// rule declared on `{pascal_name}Form`, and returns the `{field_name}` field's\n\
+                 /// wrapper (input + inline error) for htmx's `hx-swap=\"outerHTML\"` on\n\
+                 /// `hx-trigger=\"change\"` to swap in place."
             );
             let _ = writeln!(vh, "#[post(\"/{plural}/validate/{field_name}\")]");
             let _ = writeln!(
                 vh,
                 "pub async fn validate_{field_name}(body: autumn_web::reexports::axum::body::Bytes) -> autumn_web::Markup {{"
             );
-            let _ = write!(
+            vh.push_str("    let Ok(form) = decode_form(body) else {\n");
+            vh.push_str("        return autumn_web::html! {};\n");
+            vh.push_str("    };\n");
+            vh.push_str("    let changeset = form.into_changeset();\n");
+            let _ = writeln!(
                 vh,
-                "    let value = url::form_urlencoded::parse(body.as_ref())\n        .find(|(k, _)| k == \"{field_name}\")\n"
+                "    autumn_web::form::text_input_htmx(&changeset, \"{field_name}\", \"{label}\", \"/{plural}/validate/{field_name}\")"
             );
-            vh.push_str("        .map(|(_, v)| v.to_string())\n");
-            vh.push_str("        .unwrap_or_default();\n");
-            let _ = writeln!(vh, "    let error: Option<&str> = {error_chain};");
-            vh.push_str("    autumn_web::html! {\n");
-            let _ = writeln!(vh, "        span id=\"{field_name}-error\" {{");
-            vh.push_str("            @if let Some(msg) = error {\n");
-            vh.push_str("                span style=\"color:red\" { (msg) }\n");
-            vh.push_str("            }\n");
-            vh.push_str("        }\n");
-            vh.push_str("    }\n");
             vh.push_str("}\n");
         }
         vh
@@ -3530,6 +3475,24 @@ async fn main() {
                 "expected '{field_name}' to be rejected"
             );
         }
+    }
+
+    #[test]
+    fn scaffold_enum_field_colliding_with_generated_form_struct_is_rejected() {
+        // `post_form:enum{a,b}` on model `Post` pascalizes to `PostForm`,
+        // colliding with the scaffold's own generated `pub struct PostForm`
+        // changeset form (`render_model_form`, issue #1124) — a duplicate
+        // `PostForm` definition fails to compile, exactly like the
+        // fixed-name collisions above.
+        let tmp = project_with_main(default_main());
+        let err = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["post_form:enum{a,b}".into()],
+            "20260427000000",
+        )
+        .unwrap_err();
+        assert!(matches!(err, GenerateError::InvalidField { .. }));
     }
 
     #[test]

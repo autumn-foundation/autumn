@@ -1234,7 +1234,24 @@ fn generated_scaffold_cargo_checks() {
             "mood:Option<enum{happy,sad}>",
             "price:decimal{10,2}",
             "balance:Option<decimal>",
+            "--validate",
+            "title=length:min=1,max=200",
+            "--live-validation",
         ],
+    );
+
+    // The `--live-validation` inline-validation handler must compile against
+    // the real framework too (issue #1124 follow-up: it now decodes the full
+    // form via `decode_form` and renders through `text_input_htmx`, rather
+    // than a hand-rolled per-rule check returning a bare error span).
+    let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
+    assert!(
+        routes.contains("pub async fn validate_title("),
+        "expected a validate_title handler:\n{routes}"
+    );
+    assert!(
+        routes.contains("autumn_web::form::text_input_htmx(&changeset, \"title\""),
+        "validate_title must return the full text_input_htmx wrapper:\n{routes}"
     );
 
     // The generator must have added every dep its emitted code needs.
@@ -4394,8 +4411,11 @@ fn live_validation_emits_hx_post_and_error_slot() {
     );
 }
 
-/// `--live-validation` emits a `validate_{field}` route handler that actually
-/// checks the declared rule (length, url, email) — not just the empty check.
+/// `--live-validation` emits a `validate_{field}` route handler that decodes
+/// the full form, validates through the same `{Pascal}Form`/`Changeset`
+/// machinery as `create`/`update` (issue #1124 follow-up), and returns
+/// `text_input_htmx`'s full field wrapper — never a bare error span, which
+/// would delete the input on htmx's `hx-swap="outerHTML"`.
 #[test]
 fn live_validation_emits_validate_handler_with_real_rules() {
     let (_tmp, project) = fresh_project("lv-validate-handler");
@@ -4420,98 +4440,33 @@ fn live_validation_emits_validate_handler_with_real_rules() {
 
     let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
 
-    // length-validated field checks the length bounds
-    assert!(
-        routes.contains("validate_title"),
-        "routes must contain validate_title handler:\n{routes}"
+    for field in ["title", "site", "email"] {
+        assert!(
+            routes.contains(&format!("pub async fn validate_{field}(")),
+            "routes must contain a validate_{field} handler:\n{routes}"
+        );
+        assert!(
+            routes.contains(&format!(
+                "autumn_web::form::text_input_htmx(&changeset, \"{field}\""
+            )),
+            "validate_{field} must return the full text_input_htmx wrapper, \
+             not a bare error span:\n{routes}"
+        );
+    }
+    // Each handler decodes the whole form (htmx posts the entire form via
+    // `hx-include="closest form"`) and validates through the derived
+    // `#[validate(...)]` rules on `PostForm` — one rule implementation, not a
+    // hand-rolled duplicate per field.
+    assert_eq!(
+        routes
+            .matches("let Ok(form) = decode_form(body) else")
+            .count(),
+        3,
+        "every validate_{{field}} handler must decode via the shared decode_form:\n{routes}"
     );
     assert!(
-        routes.contains("value.chars().count() < 1 || value.chars().count() > 200"),
-        "validate_title must check length bounds:\n{routes}"
-    );
-
-    // url-validated field checks with url::Url::parse
-    assert!(
-        routes.contains("validate_site"),
-        "routes must contain validate_site handler:\n{routes}"
-    );
-    assert!(
-        routes.contains("url::Url::parse(&value).is_err()"),
-        "validate_site must check with url::Url::parse:\n{routes}"
-    );
-
-    // email-validated field checks for @ and domain dot
-    assert!(
-        routes.contains("validate_email"),
-        "routes must contain validate_email handler:\n{routes}"
-    );
-    assert!(
-        routes.contains("!value.contains('@')"),
-        "validate_email must check for @ character:\n{routes}"
-    );
-}
-
-/// `--validate field=length:min=N` (no max) generates the min-only length check.
-#[test]
-fn live_validation_length_min_only() {
-    let (_tmp, project) = fresh_project("lv-min-only");
-    run_autumn(
-        &project,
-        &[
-            "generate",
-            "scaffold",
-            "Post",
-            "title:String",
-            "--validate",
-            "title=length:min=3",
-            "--live-validation",
-        ],
-    );
-
-    let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
-    assert!(
-        routes.contains("value.chars().count() < 3"),
-        "min-only length check must guard count < min:\n{routes}"
-    );
-    assert!(
-        routes.contains("must be at least 3 characters"),
-        "min-only error message must say 'at least':\n{routes}"
-    );
-    assert!(
-        !routes.contains("value.chars().count() >"),
-        "min-only rule must not emit an upper-bound check:\n{routes}"
-    );
-}
-
-/// `--validate field=length:max=N` (no min) generates the max-only length check.
-#[test]
-fn live_validation_length_max_only() {
-    let (_tmp, project) = fresh_project("lv-max-only");
-    run_autumn(
-        &project,
-        &[
-            "generate",
-            "scaffold",
-            "Post",
-            "title:String",
-            "--validate",
-            "title=length:max=50",
-            "--live-validation",
-        ],
-    );
-
-    let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
-    assert!(
-        routes.contains("value.chars().count() > 50"),
-        "max-only length check must guard count > max:\n{routes}"
-    );
-    assert!(
-        routes.contains("must be at most 50 characters"),
-        "max-only error message must say 'at most':\n{routes}"
-    );
-    assert!(
-        !routes.contains("value.chars().count() <"),
-        "max-only rule must not emit a lower-bound check:\n{routes}"
+        routes.contains("#[validate(length(min = 1, max = 200))]\n    pub title: String"),
+        "PostForm must carry the length rule for validator::Validate to enforce:\n{routes}"
     );
 }
 
