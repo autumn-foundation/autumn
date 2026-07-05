@@ -482,44 +482,57 @@ where
         }
     }
 
-    // Buffer the body so a failed first attempt can be retried against a
-    // reconstructed request — `Form::from_request` consumes its request, so
-    // it can't be called twice on the same one.
+    // Buffer the body through axum's own `Bytes` extractor so the configured
+    // `DefaultBodyLimit` is enforced exactly as it would be for a single-shot
+    // `Form` extraction (a bare `to_bytes(.., usize::MAX)` would accept an
+    // unbounded body and defeat that protection).
     let (parts, body) = req.into_parts();
-    let bytes = axum::body::to_bytes(body, usize::MAX)
+    let bytes_req = Request::from_parts(parts, body);
+    let bytes = axum::body::Bytes::from_request(bytes_req, state)
         .await
-        .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e.to_string()).into_response())?;
+        .map_err(IntoResponse::into_response)?;
 
-    let first_req = Request::from_parts(parts.clone(), axum::body::Body::from(bytes.clone()));
-    match axum::extract::Form::<T>::from_request(first_req, state).await {
-        Ok(axum::extract::Form(data)) => Ok(data),
-        Err(first_err) => {
-            // A blank optional field (a number/date/uuid input the user left
-            // empty) submits `field=`, which `serde_urlencoded` rejects
-            // outright for non-string `Option<T>` fields instead of falling
-            // back to `None` — an empty string is not a valid `i32`/`Uuid`/
-            // etc., so it never gets the chance to become "missing" and
-            // deserialize as `None`. Retry with every blank-valued pair
-            // dropped so a genuinely unfilled optional field round-trips
-            // instead of hard-failing before a `Changeset` is ever built.
-            // Required fields are unaffected: an empty string already
-            // deserializes fine for `String`, so the first attempt above
-            // already succeeded for those.
-            let mut any_blank = false;
-            let filtered = url::form_urlencoded::Serializer::new(String::new())
-                .extend_pairs(url::form_urlencoded::parse(&bytes).filter(|(_, v)| {
-                    let keep = !v.is_empty();
-                    any_blank |= !keep;
-                    keep
-                }))
-                .finish();
-            if !any_blank {
-                return Err(first_err.into_response());
-            }
-            let retry_req = Request::from_parts(parts, axum::body::Body::from(filtered));
-            match axum::extract::Form::<T>::from_request(retry_req, state).await {
-                Ok(axum::extract::Form(data)) => Ok(data),
-                Err(_) => Err(first_err.into_response()),
+    decode_urlencoded_dropping_blank_optional_fields::<T>(&bytes)
+        .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e.to_string()).into_response())
+}
+
+/// Deserialize `T` from `application/x-www-form-urlencoded` bytes, tolerating
+/// blank values for non-string `Option<T>` fields (a number/date/uuid input
+/// the user left empty submits `field=`, which `serde_urlencoded` otherwise
+/// rejects outright — an empty string is not a valid `i32`/`Uuid`/etc., so it
+/// never gets the chance to become "missing" and deserialize as `None`).
+///
+/// [`serde_path_to_error`] pinpoints exactly which field a decode failure
+/// came from; if that field's submitted value is blank, drop just that one
+/// pair and retry. This converges within (number of blank fields) iterations
+/// and never touches a field that decoded successfully — critically, it
+/// leaves a blank *required* `String` field's pair alone (an empty string
+/// already deserializes fine for `String`, so that field never appears as
+/// the error path), letting it flow into the `Changeset` as a real
+/// validation error instead of being dropped into a spurious "missing
+/// field" decode failure. A genuinely malformed (non-blank) value still
+/// fails immediately, matching the "undecodable body is a hard 400" contract.
+fn decode_urlencoded_dropping_blank_optional_fields<T: serde::de::DeserializeOwned>(
+    bytes: &[u8],
+) -> Result<T, serde_path_to_error::Error<serde_urlencoded::de::Error>> {
+    let mut pairs: Vec<(String, String)> = url::form_urlencoded::parse(bytes)
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+
+    loop {
+        let encoded = url::form_urlencoded::Serializer::new(String::new())
+            .extend_pairs(pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .finish();
+        let deserializer =
+            serde_urlencoded::Deserializer::new(url::form_urlencoded::parse(encoded.as_bytes()));
+        match serde_path_to_error::deserialize(deserializer) {
+            Ok(data) => return Ok(data),
+            Err(err) => {
+                let field = err.path().to_string();
+                let Some(pos) = pairs.iter().position(|(k, v)| *k == field && v.is_empty()) else {
+                    return Err(err);
+                };
+                pairs.remove(pos);
             }
         }
     }
@@ -3386,6 +3399,56 @@ mod tests {
                 .await
                 .unwrap();
             assert_ne!(resp.status(), axum::http::StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn blank_required_string_survives_alongside_blank_optional_numeric() {
+            // A submission with *both* a blank optional numeric field and a
+            // blank required/validated `String` field (`name=&age=`) must not
+            // have the blank-optional-field retry drop the string pair too —
+            // that would turn a real validation error (name too short) into a
+            // spurious decode failure. `name` must reach the Changeset as an
+            // empty string so `is_valid()` reports the actual length-rule
+            // violation, not a 400/422 that hides it.
+            async fn handler(form: ChangesetForm<OptionalNumericForm>) -> String {
+                format!(
+                    "valid={} name={:?} age={:?}",
+                    form.is_valid(),
+                    form.data().name,
+                    form.data().age
+                )
+            }
+            let resp = Router::new()
+                .route("/test", post(handler))
+                .oneshot(urlencoded_req("/test", "name=&age="))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), axum::http::StatusCode::OK);
+            assert_body(resp, "valid=false name=\"\" age=None").await;
+        }
+
+        #[tokio::test]
+        async fn oversized_body_is_rejected_not_fully_buffered() {
+            // The blank-optional-field retry must not come at the cost of
+            // bypassing axum's `DefaultBodyLimit` (2MB by default) — a body
+            // larger than the configured limit must still be rejected rather
+            // than fully buffered into memory.
+            async fn handler(_form: ChangesetForm<TestForm>) -> String {
+                "unreachable".to_string()
+            }
+            let oversized = format!("name={}", "a".repeat(3 * 1024 * 1024));
+            let req = axum::http::Request::builder()
+                .method("POST")
+                .uri("/test")
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .body(Body::from(oversized))
+                .unwrap();
+            let resp = Router::new()
+                .route("/test", post(handler))
+                .oneshot(req)
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
         }
 
         #[tokio::test]
