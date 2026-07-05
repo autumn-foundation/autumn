@@ -278,7 +278,11 @@ pub async fn create(
 ) -> AutumnResult<autumn_web::reexports::axum::response::Response> {
     let changeset = form.into_changeset();
     if !changeset.is_valid() {
-        return Ok((StatusCode::UNPROCESSABLE_ENTITY, new_bookmark_form(&changeset)).into_response());
+        return Ok((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            new_bookmark_form(&changeset),
+        )
+            .into_response());
     }
     let data = changeset.into_inner();
     let new = NewBookmark {
@@ -319,7 +323,10 @@ pub async fn edit_form(id: Path<i64>, mut db: Db) -> AutumnResult<Markup> {
         .await
         .map_err(AutumnError::not_found)?;
 
-    Ok(edit_bookmark_form(row.id, &Changeset::new(BookmarkForm::from(&row))))
+    Ok(edit_bookmark_form(
+        row.id,
+        &Changeset::new(BookmarkForm::from(&row)),
+    ))
 }
 
 #[post("/bookmarks/{id}/update")]
@@ -330,9 +337,11 @@ pub async fn update(
 ) -> AutumnResult<autumn_web::reexports::axum::response::Response> {
     let changeset = form.into_changeset();
     if !changeset.is_valid() {
-        return Ok(
-            (StatusCode::UNPROCESSABLE_ENTITY, edit_bookmark_form(*id, &changeset)).into_response(),
-        );
+        return Ok((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            edit_bookmark_form(*id, &changeset),
+        )
+            .into_response());
     }
     let data = changeset.into_inner();
     let updated = diesel::update(bookmarks::table.find(*id))

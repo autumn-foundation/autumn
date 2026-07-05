@@ -826,7 +826,10 @@ fn render_model_form(
             if f.nullable {
                 let _ = writeln!(struct_fields, "    pub {name}: Option<bool>,");
             } else {
-                let _ = writeln!(struct_fields, "    #[serde(default)]\n    pub {name}: bool,");
+                let _ = writeln!(
+                    struct_fields,
+                    "    #[serde(default)]\n    pub {name}: bool,"
+                );
             }
             let _ = writeln!(into_new, "        {name}: form.{name},");
             let _ = writeln!(from_row, "            {name}: row.{name},");
@@ -1947,7 +1950,11 @@ fn render_changeset_form_inputs(
                     format!("(autumn_web::form::datetime_input(&{cv}, \"{name}\", \"{label}\"))")
                 }
                 (FieldKind::Enum, _) => {
-                    let placeholder = if f.nullable { "— Unset —" } else { "— Select —" };
+                    let placeholder = if f.nullable {
+                        "— Unset —"
+                    } else {
+                        "— Select —"
+                    };
                     let mut options = format!("(\"\", \"{placeholder}\")");
                     for v in &f.variants {
                         let vlabel = humanize_label(v);
@@ -2457,7 +2464,10 @@ fn invalid_value_violating_rule(rule: &str) -> String {
     if rule == "email" {
         return "not-an-email".to_owned();
     }
-    if let Some(args) = rule.strip_prefix("length(").and_then(|s| s.strip_suffix(')')) {
+    if let Some(args) = rule
+        .strip_prefix("length(")
+        .and_then(|s| s.strip_suffix(')'))
+    {
         let min: Option<u64> = args.split(',').find_map(|part| {
             part.trim()
                 .strip_prefix("min = ")
@@ -2486,7 +2496,10 @@ fn valid_value_satisfying_rule(rule: &str) -> String {
     if rule == "email" {
         return "person@example.com".to_owned();
     }
-    if let Some(args) = rule.strip_prefix("length(").and_then(|s| s.strip_suffix(')')) {
+    if let Some(args) = rule
+        .strip_prefix("length(")
+        .and_then(|s| s.strip_suffix(')'))
+    {
         let mut min: Option<u64> = None;
         let mut max: Option<u64> = None;
         for part in args.split(',') {
@@ -3669,7 +3682,9 @@ async fn main() {
         );
         // Both new and edit render the numeric field via the number helper.
         assert!(
-            routes.contains("autumn_web::form::number_input(&changeset, \"views\", \"Views\", Some(\"1\"))"),
+            routes.contains(
+                "autumn_web::form::number_input(&changeset, \"views\", \"Views\", Some(\"1\"))"
+            ),
             "nullable numeric fields render via number_input: {routes}"
         );
     }
@@ -4315,11 +4330,15 @@ async fn main() {
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
 
         assert!(
-            routes.contains("autumn_web::form::number_input(&changeset, \"views\", \"Views\", Some(\"1\"))"),
+            routes.contains(
+                "autumn_web::form::number_input(&changeset, \"views\", \"Views\", Some(\"1\"))"
+            ),
             "{routes}"
         );
         assert!(
-            routes.contains("autumn_web::form::number_input(&changeset, \"rank\", \"Rank\", Some(\"1\"))"),
+            routes.contains(
+                "autumn_web::form::number_input(&changeset, \"rank\", \"Rank\", Some(\"1\"))"
+            ),
             "{routes}"
         );
         assert!(
@@ -4347,11 +4366,15 @@ async fn main() {
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
 
         assert!(
-            routes.contains("autumn_web::form::number_input(&changeset, \"price\", \"Price\", Some(\"any\"))"),
+            routes.contains(
+                "autumn_web::form::number_input(&changeset, \"price\", \"Price\", Some(\"any\"))"
+            ),
             "{routes}"
         );
         assert!(
-            routes.contains("autumn_web::form::number_input(&changeset, \"weight\", \"Weight\", Some(\"any\"))"),
+            routes.contains(
+                "autumn_web::form::number_input(&changeset, \"weight\", \"Weight\", Some(\"any\"))"
+            ),
             "{routes}"
         );
     }
@@ -4380,7 +4403,9 @@ async fn main() {
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
         assert!(
-            routes.contains("autumn_web::form::number_input(&changeset, \"price\", \"Price\", Some(\"any\"))"),
+            routes.contains(
+                "autumn_web::form::number_input(&changeset, \"price\", \"Price\", Some(\"any\"))"
+            ),
             "{routes}"
         );
         assert!(routes.contains("pub price: String,"), "{routes}");
@@ -4415,7 +4440,9 @@ async fn main() {
         // The edit form seeds the changeset from the row; `number_input` reads
         // the value back (issue #1124).
         assert!(
-            routes.contains("autumn_web::form::number_input(&changeset, \"views\", \"Views\", Some(\"1\"))"),
+            routes.contains(
+                "autumn_web::form::number_input(&changeset, \"views\", \"Views\", Some(\"1\"))"
+            ),
             "{routes}"
         );
         assert!(routes.contains("views: row.views.to_string(),"), "{routes}");
@@ -4437,7 +4464,9 @@ async fn main() {
 
         // Datetime fields render via the `datetime_input` helper (issue #1124).
         assert!(
-            routes.contains("autumn_web::form::datetime_input(&changeset, \"published_at\", \"Published At\")"),
+            routes.contains(
+                "autumn_web::form::datetime_input(&changeset, \"published_at\", \"Published At\")"
+            ),
             "{routes}"
         );
         assert!(
@@ -4478,7 +4507,9 @@ async fn main() {
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
 
         assert!(
-            routes.contains("autumn_web::form::datetime_input(&changeset, \"scheduled_at\", \"Scheduled At\")"),
+            routes.contains(
+                "autumn_web::form::datetime_input(&changeset, \"scheduled_at\", \"Scheduled At\")"
+            ),
             "{routes}"
         );
         assert!(routes.contains("pub scheduled_at: String,"), "{routes}");
@@ -4564,9 +4595,18 @@ async fn main() {
             "{routes}"
         );
         // No hand-rolled bare text inputs remain for the non-string fields.
-        assert!(!routes.contains("input type=\"text\" name=\"active\""), "{routes}");
-        assert!(!routes.contains("input type=\"text\" name=\"views\""), "{routes}");
-        assert!(!routes.contains("input type=\"text\" name=\"published_at\""), "{routes}");
+        assert!(
+            !routes.contains("input type=\"text\" name=\"active\""),
+            "{routes}"
+        );
+        assert!(
+            !routes.contains("input type=\"text\" name=\"views\""),
+            "{routes}"
+        );
+        assert!(
+            !routes.contains("input type=\"text\" name=\"published_at\""),
+            "{routes}"
+        );
     }
 
     #[test]
