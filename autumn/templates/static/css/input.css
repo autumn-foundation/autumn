@@ -380,8 +380,13 @@
 }
 
 /* Fallback: show the first panel when no fragment targets any panel in
-   this widget, so a panel is always visible. */
-.autumn-tabs:not(:has(.autumn-tabs__panel:target)) .autumn-tabs__panel--active {
+   this widget, so a panel is always visible. Scoped to direct children
+   (`>`) throughout so a nested `tabs()` widget inside one of this widget's
+   own panels doesn't leak its `:target` state up to this `:has()` check —
+   without the `>` combinators, an inner tabs() widget's targeted panel
+   would make the outer widget think one of ITS OWN panels is targeted,
+   hiding the outer widget's default panel entirely. */
+.autumn-tabs:not(:has(> .autumn-tabs__panel:target)) > .autumn-tabs__panel--active {
     display: block;
 }
 
@@ -393,7 +398,7 @@
    browsers, navigating to a different panel's fragment may show that
    panel alongside the first rather than replacing it. */
 @supports not selector(:has(a)) {
-    .autumn-tabs__panel--active {
+    .autumn-tabs > .autumn-tabs__panel--active {
         display: block;
     }
 }
@@ -403,18 +408,21 @@
    stylesheet can't match them by value — match by position instead, for
    the first 6 tabs. Widgets with more tabs keep switching panels
    correctly; only the active-tab highlight past the 6th degrades to
-   showing no tab as active. */
-.autumn-tabs:has(.autumn-tabs__panel:target) .autumn-tabs__tab--active {
+   showing no tab as active. Scoped to direct children (`>`) throughout,
+   same reasoning as the fallback above: keeps a nested `tabs()` widget's
+   `:target` state from leaking into this widget's own tab highlighting,
+   and vice versa. */
+.autumn-tabs:has(> .autumn-tabs__panel:target) > .autumn-tabs__list > .autumn-tabs__tab--active {
     color: var(--autumn-text-muted, #6b7280);
     border-bottom-color: transparent;
 }
 
-.autumn-tabs:has(.autumn-tabs__panel:nth-of-type(1):target) .autumn-tabs__list .autumn-tabs__tab:nth-child(1),
-.autumn-tabs:has(.autumn-tabs__panel:nth-of-type(2):target) .autumn-tabs__list .autumn-tabs__tab:nth-child(2),
-.autumn-tabs:has(.autumn-tabs__panel:nth-of-type(3):target) .autumn-tabs__list .autumn-tabs__tab:nth-child(3),
-.autumn-tabs:has(.autumn-tabs__panel:nth-of-type(4):target) .autumn-tabs__list .autumn-tabs__tab:nth-child(4),
-.autumn-tabs:has(.autumn-tabs__panel:nth-of-type(5):target) .autumn-tabs__list .autumn-tabs__tab:nth-child(5),
-.autumn-tabs:has(.autumn-tabs__panel:nth-of-type(6):target) .autumn-tabs__list .autumn-tabs__tab:nth-child(6) {
+.autumn-tabs:has(> .autumn-tabs__panel:nth-of-type(1):target) > .autumn-tabs__list > .autumn-tabs__tab:nth-child(1),
+.autumn-tabs:has(> .autumn-tabs__panel:nth-of-type(2):target) > .autumn-tabs__list > .autumn-tabs__tab:nth-child(2),
+.autumn-tabs:has(> .autumn-tabs__panel:nth-of-type(3):target) > .autumn-tabs__list > .autumn-tabs__tab:nth-child(3),
+.autumn-tabs:has(> .autumn-tabs__panel:nth-of-type(4):target) > .autumn-tabs__list > .autumn-tabs__tab:nth-child(4),
+.autumn-tabs:has(> .autumn-tabs__panel:nth-of-type(5):target) > .autumn-tabs__list > .autumn-tabs__tab:nth-child(5),
+.autumn-tabs:has(> .autumn-tabs__panel:nth-of-type(6):target) > .autumn-tabs__list > .autumn-tabs__tab:nth-child(6) {
     color: var(--autumn-text, #111827);
     border-bottom-color: var(--autumn-primary, #2563eb);
 }
