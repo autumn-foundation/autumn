@@ -309,6 +309,7 @@ enum Commands {
     ///   Uuid                         (UUID)
     ///   `NaiveDateTime`, `DateTime`      (TIMESTAMP, TIMESTAMPTZ)
     ///   `Vec<u8>`, Bytea               (BYTEA)
+    ///   decimal{precision,scale}     (NUMERIC, default {12,2})
     ///   Option<...>                  (any of the above, nullable)
     ///
     /// # Example

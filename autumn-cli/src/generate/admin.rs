@@ -337,7 +337,15 @@ const fn admin_field_kind(field: &Field) -> &'static str {
         // `render_fields_vec` always overrides an enum field with an explicit
         // `AdminFieldKind::Select(...)` (issue #1030), the same way an
         // explicit `--select` overrides this base kind today.
-        FieldKind::String | FieldKind::Uuid | FieldKind::Enum => "AdminFieldKind::Text",
+        // `Decimal` renders as plain text, not `AdminFieldKind::Float`: the
+        // admin update handler coerces `Float` input through `f64` (see
+        // `coerce_form_value` in `autumn-admin-plugin`), which would
+        // reintroduce the exact binary-float rounding this field type exists
+        // to avoid. Routing it through `Text` leaves the raw decimal string
+        // untouched for `rust_decimal`'s exact `FromStr`/`Deserialize`.
+        FieldKind::String | FieldKind::Uuid | FieldKind::Enum | FieldKind::Decimal { .. } => {
+            "AdminFieldKind::Text"
+        }
         FieldKind::Text => "AdminFieldKind::TextArea",
         // A foreign-key id renders the same as any other integer column.
         FieldKind::I32 | FieldKind::I64 | FieldKind::References => "AdminFieldKind::Integer",
