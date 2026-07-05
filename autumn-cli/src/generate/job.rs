@@ -129,7 +129,16 @@ pub fn plan_job(project_root: &Path, name: &str, fields: &[String]) -> Result<Pl
     let updated_main = add_jobs_registration_to_app(&with_mod);
     plan.modify(main_path, updated_main);
 
-    // ── Cargo.toml: ensure serde (always) plus uuid/chrono if used ───────
+    // ── Cargo.toml: ensure serde (always) plus uuid/chrono/decimal if used ──
+    if parsed_fields.iter().any(|f| f.kind.is_decimal()) {
+        let existing_cargo_toml = read_or_empty(&project_root.join("Cargo.toml"));
+        super::model::warn_if_existing_dep_missing_feature(
+            &mut plan,
+            &existing_cargo_toml,
+            "rust_decimal",
+            "db-diesel2-postgres",
+        );
+    }
     super::model::plan_cargo_deps(&mut plan, project_root, &job_deps(&parsed_fields));
 
     Ok(plan)
@@ -858,5 +867,19 @@ async fn main() {
             !cargo.contains("rust_decimal"),
             "Cargo.toml must not include rust_decimal for primitive fields"
         );
+    }
+
+    #[test]
+    fn decimal_field_warns_when_existing_rust_decimal_dep_lacks_diesel_feature() {
+        let tmp = project_with_main(default_main());
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname=\"x\"\n\n[dependencies]\nrust_decimal = \"1\"\n",
+        )
+        .unwrap();
+        let plan = plan_job(tmp.path(), "ProcessRefund", &["amount:decimal".to_string()]).unwrap();
+        assert_eq!(plan.warnings.len(), 1, "warnings: {:?}", plan.warnings);
+        assert!(plan.warnings[0].contains("rust_decimal"));
+        assert!(plan.warnings[0].contains("db-diesel2-postgres"));
     }
 }

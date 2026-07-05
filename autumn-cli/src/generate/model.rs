@@ -202,6 +202,13 @@ pub fn plan_model_with_options(
             "rust_decimal",
             "{ version = \"1\", features = [\"db-diesel2-postgres\", \"serde\"] }",
         ));
+        let existing_cargo_toml = read_or_empty(&project_root.join("Cargo.toml"));
+        warn_if_existing_dep_missing_feature(
+            &mut plan,
+            &existing_cargo_toml,
+            "rust_decimal",
+            "db-diesel2-postgres",
+        );
     }
     plan_cargo_deps(&mut plan, project_root, &deps);
 
@@ -683,6 +690,82 @@ fn dep_section_has(dep_section: &[&str], crate_name: &str) -> bool {
         t.split_once('=')
             .is_some_and(|(name, _)| name.trim() == crate_name)
     })
+}
+
+/// `true` if `existing` Cargo.toml text already declares `crate_name` as a
+/// dependency, but that existing declaration doesn't (as far as this
+/// string-only check can tell) already list `feature`.
+///
+/// [`ensure_cargo_dependencies`] skips any crate name it finds already
+/// present — regardless of that entry's version or features — so a project
+/// that added `crate_name` for its own reasons (or inherited it from a
+/// workspace) before ever running a generator that needs `feature` would
+/// otherwise silently get code that fails to compile with no indication why
+/// (PR review, issue #1038: `rust_decimal = "1"` without
+/// `db-diesel2-postgres` lacks the Diesel `ToSql`/`FromSql` impls a
+/// generated `decimal` field's `#[model]` struct needs).
+///
+/// Checks the common single-line shorthand form (`crate = "1"` or
+/// `crate = { version = "1", features = [...] }`) and the
+/// `[dependencies.crate]` subtable form. Doesn't attempt to resolve
+/// `{ workspace = true }` inheritance or a `features` array split across
+/// multiple lines — those are rarer shapes this heuristic can't see through
+/// from Cargo.toml text alone, so it may occasionally warn when the feature
+/// is in fact present; a false-positive warning is far cheaper than the
+/// silent compile failure this check exists to catch.
+fn existing_dep_declared_without_feature(existing: &str, crate_name: &str, feature: &str) -> bool {
+    let lines: Vec<&str> = existing.lines().collect();
+    let Some(deps_idx) = lines
+        .iter()
+        .position(|l| is_table_header(l, "dependencies"))
+    else {
+        return false;
+    };
+    let scan_end = lines[deps_idx + 1..]
+        .iter()
+        .position(|l| is_any_table_header(l) && !is_dep_subtable_boundary_marker(l))
+        .map_or(lines.len(), |off| deps_idx + 1 + off);
+    let dep_section = &lines[deps_idx + 1..scan_end];
+
+    if let Some(sub_idx) = dep_section
+        .iter()
+        .position(|l| dep_subtable_crate_name(l) == Some(crate_name))
+    {
+        let sub_body_end = dep_section[sub_idx + 1..]
+            .iter()
+            .position(|l| is_any_table_header(l))
+            .map_or(dep_section.len(), |off| sub_idx + 1 + off);
+        let sub_body = dep_section[sub_idx + 1..sub_body_end].join("\n");
+        return !sub_body.contains(feature);
+    }
+
+    dep_section
+        .iter()
+        .find(|l| {
+            let t = l.trim_start();
+            !t.starts_with('#')
+                && t.split_once('=')
+                    .is_some_and(|(name, _)| name.trim() == crate_name)
+        })
+        .is_some_and(|line| !line.contains(feature))
+}
+
+/// If `existing` Cargo.toml text already declares `crate_name` without
+/// `feature`, record a `plan` warning naming exactly what to add by hand.
+/// See [`existing_dep_declared_without_feature`] for why this check exists.
+pub(super) fn warn_if_existing_dep_missing_feature(
+    plan: &mut Plan,
+    existing_cargo_toml: &str,
+    crate_name: &str,
+    feature: &str,
+) {
+    if existing_dep_declared_without_feature(existing_cargo_toml, crate_name, feature) {
+        plan.warn(format!(
+            "Cargo.toml already declares '{crate_name}' without the '{feature}' feature \
+             the generated code needs — add it by hand (e.g. `features = [\"{feature}\", ...]`) \
+             or the generated code may fail to compile."
+        ));
+    }
 }
 
 /// Reserved resource names whose snake-case form would collide with a special
@@ -1853,6 +1936,65 @@ mod tests {
                 "'{bad}' should be rejected as non-finite: {err}"
             );
         }
+    }
+
+    #[test]
+    fn decimal_field_warns_when_existing_rust_decimal_dep_lacks_diesel_feature() {
+        // Regression test (PR review, issue #1038): `ensure_cargo_dependencies`
+        // skips a crate that's already declared, regardless of its features —
+        // so a project that already had `rust_decimal = "1"` (e.g. for its own
+        // business logic) before ever using a `decimal` field would silently
+        // keep that feature-less entry, and the generated `#[model]` field's
+        // Diesel `ToSql`/`FromSql` impls (behind `db-diesel2-postgres`) would
+        // be missing, failing to compile with no indication why.
+        let tmp = project();
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname=\"x\"\n\n[dependencies]\nrust_decimal = \"1\"\n",
+        )
+        .unwrap();
+        let plan = plan_model(
+            tmp.path(),
+            "Product",
+            &["price:decimal".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        assert_eq!(plan.warnings.len(), 1, "warnings: {:?}", plan.warnings);
+        assert!(plan.warnings[0].contains("rust_decimal"));
+        assert!(plan.warnings[0].contains("db-diesel2-postgres"));
+    }
+
+    #[test]
+    fn decimal_field_no_warning_when_existing_rust_decimal_dep_already_has_feature() {
+        let tmp = project();
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname=\"x\"\n\n[dependencies]\n\
+             rust_decimal = { version = \"1\", features = [\"db-diesel2-postgres\"] }\n",
+        )
+        .unwrap();
+        let plan = plan_model(
+            tmp.path(),
+            "Product",
+            &["price:decimal".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        assert!(plan.warnings.is_empty(), "warnings: {:?}", plan.warnings);
+    }
+
+    #[test]
+    fn decimal_field_no_warning_when_rust_decimal_not_already_declared() {
+        let tmp = project();
+        let plan = plan_model(
+            tmp.path(),
+            "Product",
+            &["price:decimal".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        assert!(plan.warnings.is_empty(), "warnings: {:?}", plan.warnings);
     }
 
     // ── enum field: --default (issue #1030) ─────────────────────────────────

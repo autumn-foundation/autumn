@@ -253,6 +253,12 @@ pub fn plan_scaffold_with_options(
             "{ version = \"0.20\", features = [\"derive\"] }",
         ));
     }
+    // Not re-checked for a missing Diesel feature here: `plan` above *is*
+    // the `plan_model_with_options` plan (reused, not merged), and that call
+    // already ran `warn_if_existing_dep_missing_feature` for `rust_decimal`
+    // when it built its own decimal-conditional dep — re-running the same
+    // check against the same (still on-disk, pre-`execute()`) Cargo.toml
+    // here would just duplicate the warning.
     if fields.iter().any(|f| f.kind.is_decimal()) {
         combined.push((
             "rust_decimal",
@@ -5899,5 +5905,25 @@ async fn main() {
             sql.contains("weight) VALUES ('__not_a_real_variant__', 0.1)"),
             "expected a scale-fitting 0.1 literal for NUMERIC(1,1), got: {sql}"
         );
+    }
+
+    #[test]
+    fn scaffold_decimal_field_warns_when_existing_rust_decimal_dep_lacks_diesel_feature() {
+        let tmp = project_with_main(default_main());
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname=\"x\"\n\n[dependencies]\nrust_decimal = \"1\"\n",
+        )
+        .unwrap();
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Product",
+            &["price:decimal".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        assert_eq!(plan.warnings.len(), 1, "warnings: {:?}", plan.warnings);
+        assert!(plan.warnings[0].contains("rust_decimal"));
+        assert!(plan.warnings[0].contains("db-diesel2-postgres"));
     }
 }
