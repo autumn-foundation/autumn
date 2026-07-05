@@ -387,20 +387,28 @@
     display: block;
 }
 
-/* Fallback: show the first panel only when NONE of this widget's OWN
-   panels are already effectively shown — i.e. no panel anywhere in this
-   widget's subtree (its own panels, or a nested tabs() widget's panels) is
-   itself `:target`. The `:has()` argument here is intentionally UNSCOPED
-   (no `>`, checked at any depth): CSS forbids nesting `:has()` inside
-   another `:has()`, so the `:has(:target)` half of the rule above can't be
-   tested from inside this `:has()` directly — but any `:target` anywhere
-   in the subtree, direct or nested, is exactly the signal that some panel
-   is already shown by one half of the rule above or the other, so testing
+/* Fallback: show the first panel only when NOTHING inside this widget is
+   currently targeted — checked as bare `:target` (any element at all, not
+   just `.autumn-tabs__panel`), since the fragment can target an arbitrary
+   element inside a panel's body (a heading, an anchor) and not just a
+   panel or a nested tabs() widget's panel; any such target means some
+   panel of ours is already shown by the rule above, so the default must
+   be suppressed. (An earlier version checked only
+   `.autumn-tabs__panel:target`, which missed body-anchor targets: the
+   panel containing the anchor would correctly show via `:has(:target)`
+   above, but this fallback wouldn't detect anything was targeted and
+   would show the default panel *too* — two panels visible for one
+   deep link.) The `:has()` argument here is intentionally UNSCOPED (no
+   `>`, checked at any depth): CSS forbids nesting `:has()` inside another
+   `:has()`, so the `:has(:target)` half of the rule above can't be tested
+   from inside this `:has()` directly — but any `:target` anywhere in the
+   subtree, direct or nested, is exactly the signal that some panel is
+   already shown by one half of the rule above or the other, so testing
    for plain `:target` gives the same answer without needing to nest. The
    *consequent* (`> .autumn-tabs__panel--active`) IS scoped to direct
    children, so this rule only ever reveals THIS widget's own default
    panel, never a nested widget's. */
-.autumn-tabs:not(:has(.autumn-tabs__panel:target)) > .autumn-tabs__panel--active {
+.autumn-tabs:not(:has(:target)) > .autumn-tabs__panel--active {
     display: block;
 }
 
@@ -422,15 +430,18 @@
    match them by value — match by position instead, for the first 6 tabs.
    Widgets with more tabs keep switching panels correctly; only the
    active-tab highlight past the 6th degrades to showing no tab as active.
-   The suppression rule below uses the same unscoped-argument /
-   scoped-consequent pattern as the panel fallback above, for the same
-   :has()-can't-nest-in-:has() reason. The per-tab rules that follow can
-   only match a panel that is ITSELF the direct `:target` — a panel
-   revealed only because it *contains* a nested target can't be attributed
-   to a specific tab position without nesting `:has()` inside `:has()`,
-   which CSS disallows, so in that case no tab gets highlighted (a graceful
-   degrade: no tab looks active, rather than the wrong one). */
-.autumn-tabs:has(.autumn-tabs__panel:target) > .autumn-tabs__list > .autumn-tabs__tab--active {
+   The suppression rule below checks bare `:target` (any element, matching
+   the panel-fallback reasoning above — the fragment can target an
+   arbitrary element inside a panel body, not just a panel), with the same
+   unscoped-argument / scoped-consequent pattern as the panel fallback,
+   for the same :has()-can't-nest-in-:has() reason. The per-tab rules that
+   follow can only match a panel that is ITSELF the direct `:target` — a
+   panel shown only because it *contains* a target (nested widget or plain
+   body anchor) can't be attributed to a specific tab position without
+   nesting `:has()` inside `:has()`, which CSS disallows, so in that case
+   no tab gets highlighted (a graceful degrade: no tab looks active,
+   rather than the wrong one). */
+.autumn-tabs:has(:target) > .autumn-tabs__list > .autumn-tabs__tab--active {
     color: var(--autumn-text-muted, #6b7280);
     border-bottom-color: transparent;
 }
