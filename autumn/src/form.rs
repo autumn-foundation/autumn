@@ -1062,6 +1062,50 @@ pub fn number_input<T: Serialize>(
     }
 }
 
+/// Render a labeled `<input type="number">` for a required numeric field.
+///
+/// Identical to [`number_input`] but adds `aria-required="true"` and the HTML
+/// `required` attribute, giving both AT users and browser-native validation
+/// the required-field signal without relying solely on color.
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn required_number_input<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+    step: Option<&str>,
+) -> maud::Markup {
+    let errors = changeset.errors_for(field);
+    let has_errors = !errors.is_empty();
+    let value = changeset.field_value(field).unwrap_or_default();
+    let error_id = format!("{field}-error");
+    let wrapper_id = format!("{field}-field");
+
+    maud::html! {
+        div id=(wrapper_id) class="autumn-field" {
+            label for=(field) class="autumn-field__label" { (label) }
+            input
+                type="number"
+                id=(field)
+                name=(field)
+                value=(value)
+                step=[step]
+                required
+                aria-required="true"
+                class=(if has_errors { "autumn-field__input autumn-field__input--invalid" } else { "autumn-field__input" })
+                aria-invalid=(if has_errors { "true" } else { "false" })
+                aria-describedby=(if has_errors { error_id.as_str() } else { "" });
+            @if has_errors {
+                div id=(error_id) role="alert" class="autumn-field__errors" {
+                    @for error in errors {
+                        p class="autumn-field__error" { (error) }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Normalize a stored date/datetime string into `YYYY-MM-DD`, the shape the
 /// HTML `<input type="date">` control requires.
 ///
@@ -1375,6 +1419,49 @@ pub fn datetime_input<T: Serialize>(
     }
 }
 
+/// Render a labeled `<input type="datetime-local">` for a required field.
+///
+/// Identical to [`datetime_input`] but adds `aria-required="true"` and the
+/// HTML `required` attribute, giving both AT users and browser-native
+/// validation the required-field signal without relying solely on color.
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn required_datetime_input<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+) -> maud::Markup {
+    let errors = changeset.errors_for(field);
+    let has_errors = !errors.is_empty();
+    let value = normalize_datetime_local_value(&changeset.field_value(field).unwrap_or_default());
+    let error_id = format!("{field}-error");
+    let wrapper_id = format!("{field}-field");
+
+    maud::html! {
+        div id=(wrapper_id) class="autumn-field" {
+            label for=(field) class="autumn-field__label" { (label) }
+            input
+                type="datetime-local"
+                id=(field)
+                name=(field)
+                value=(value)
+                step="any"
+                required
+                aria-required="true"
+                class=(if has_errors { "autumn-field__input autumn-field__input--invalid" } else { "autumn-field__input" })
+                aria-invalid=(if has_errors { "true" } else { "false" })
+                aria-describedby=(if has_errors { error_id.as_str() } else { "" });
+            @if has_errors {
+                div id=(error_id) role="alert" class="autumn-field__errors" {
+                    @for error in errors {
+                        p class="autumn-field__error" { (error) }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Render a labeled `<select>` tied to a closed-set changeset field, with
 /// `options` given as `(value, label)` pairs.
 ///
@@ -1408,6 +1495,53 @@ pub fn select_input<T: Serialize>(
             select
                 id=(field)
                 name=(field)
+                class=(if has_errors { "autumn-field__input autumn-field__input--invalid" } else { "autumn-field__input" })
+                aria-invalid=(if has_errors { "true" } else { "false" })
+                aria-describedby=(if has_errors { error_id.as_str() } else { "" }) {
+                @for (option_value, option_label) in options {
+                    option value=(option_value) selected[*option_value == current] { (option_label) }
+                }
+            }
+            @if has_errors {
+                div id=(error_id) role="alert" class="autumn-field__errors" {
+                    @for error in errors {
+                        p class="autumn-field__error" { (error) }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Render a labeled `<select>` for a required closed-set field.
+///
+/// Identical to [`select_input`] but adds `aria-required="true"` and the HTML
+/// `required` attribute — combined with a blank placeholder option (an empty
+/// `value=""`), this blocks submission until the user picks a real option,
+/// giving both AT users and browser-native validation the required-field
+/// signal without relying solely on color.
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn required_select_input<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+    options: &[(&str, &str)],
+) -> maud::Markup {
+    let errors = changeset.errors_for(field);
+    let has_errors = !errors.is_empty();
+    let current = changeset.field_value(field).unwrap_or_default();
+    let error_id = format!("{field}-error");
+    let wrapper_id = format!("{field}-field");
+
+    maud::html! {
+        div id=(wrapper_id) class="autumn-field" {
+            label for=(field) class="autumn-field__label" { (label) }
+            select
+                id=(field)
+                name=(field)
+                required
+                aria-required="true"
                 class=(if has_errors { "autumn-field__input autumn-field__input--invalid" } else { "autumn-field__input" })
                 aria-invalid=(if has_errors { "true" } else { "false" })
                 aria-describedby=(if has_errors { error_id.as_str() } else { "" }) {
@@ -2195,6 +2329,97 @@ mod tests {
         });
         let html = required_text_input(&cs, "name", "Name").into_string();
         assert!(html.contains(r#"id="name-field""#), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn required_number_input_emits_aria_required() {
+        #[derive(serde::Serialize)]
+        struct F {
+            age: i32,
+        }
+        let cs = Changeset::new(F { age: 30 });
+        let html = required_number_input(&cs, "age", "Age", Some("1")).into_string();
+        assert!(html.contains(r#"aria-required="true""#), "{html}");
+        assert!(html.contains("required"), "{html}");
+        assert!(html.contains(r#"type="number""#), "{html}");
+        assert!(html.contains(r#"name="age""#), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn required_number_input_preserves_error_handling() {
+        #[derive(serde::Serialize)]
+        struct F {
+            age: i32,
+        }
+        let mut errors = HashMap::new();
+        errors.insert("age".to_string(), vec!["must be positive".to_string()]);
+        let cs = Changeset::from_errors(F { age: -1 }, errors);
+        let html = required_number_input(&cs, "age", "Age", Some("1")).into_string();
+        assert!(html.contains(r#"aria-invalid="true""#), "{html}");
+        assert!(html.contains(r#"role="alert""#), "{html}");
+        assert!(html.contains("must be positive"), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn required_datetime_input_emits_aria_required() {
+        #[derive(serde::Serialize)]
+        struct F {
+            scheduled_at: String,
+        }
+        let cs = Changeset::new(F {
+            scheduled_at: "2026-01-01T12:00:00".into(),
+        });
+        let html = required_datetime_input(&cs, "scheduled_at", "Scheduled at").into_string();
+        assert!(html.contains(r#"aria-required="true""#), "{html}");
+        assert!(html.contains("required"), "{html}");
+        assert!(html.contains(r#"type="datetime-local""#), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn required_select_input_emits_aria_required() {
+        #[derive(serde::Serialize)]
+        struct F {
+            status: String,
+        }
+        let cs = Changeset::new(F {
+            status: "draft".into(),
+        });
+        let html = required_select_input(
+            &cs,
+            "status",
+            "Status",
+            &[("draft", "Draft"), ("published", "Published")],
+        )
+        .into_string();
+        assert!(html.contains(r#"aria-required="true""#), "{html}");
+        assert!(html.contains("required"), "{html}");
+        assert!(html.contains("<select"), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn required_select_input_preserves_error_handling() {
+        #[derive(serde::Serialize)]
+        struct F {
+            status: String,
+        }
+        let mut errors = HashMap::new();
+        errors.insert("status".to_string(), vec!["is required".to_string()]);
+        let cs = Changeset::from_errors(
+            F {
+                status: String::new(),
+            },
+            errors,
+        );
+        let html =
+            required_select_input(&cs, "status", "Status", &[("draft", "Draft")]).into_string();
+        assert!(html.contains(r#"aria-invalid="true""#), "{html}");
+        assert!(html.contains(r#"role="alert""#), "{html}");
+        assert!(html.contains("is required"), "{html}");
     }
 
     // ── AC2 + AC3: text_input_htmx ────────────────────────────────

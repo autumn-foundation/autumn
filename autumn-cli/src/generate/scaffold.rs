@@ -1932,6 +1932,12 @@ fn render_changeset_form_inputs(
                  input type=\"hidden\" name=\"{name}\" value=({cv}.field_value(\"{name}\").unwrap_or_default());"
             )
         } else {
+            // A required (non-nullable) field uses the framework's
+            // `required_*` sibling helper — `required` + `aria-required="true"`
+            // — matching the pre-#1124 generator's unconditional `required`
+            // attribute on every non-nullable input. Nullable fields get the
+            // plain helper: leaving them blank is valid, so no browser-native
+            // "please fill out this field" prompt should block submission.
             match (f.kind, f.nullable) {
                 (FieldKind::Bool, false) => {
                     format!("(autumn_web::form::checkbox_input(&{cv}, \"{name}\", \"{label}\"))")
@@ -1942,20 +1948,33 @@ fn render_changeset_form_inputs(
                     "(autumn_web::form::select_input(&{cv}, \"{name}\", \"{label}\", \
                      &[(\"\", \"— Unset —\"), (\"true\", \"Yes\"), (\"false\", \"No\")]))"
                 ),
-                (FieldKind::I32 | FieldKind::I64, _) => format!(
+                (FieldKind::I32 | FieldKind::I64, false) => format!(
+                    "(autumn_web::form::required_number_input(&{cv}, \"{name}\", \"{label}\", Some(\"1\")))"
+                ),
+                (FieldKind::I32 | FieldKind::I64, true) => format!(
                     "(autumn_web::form::number_input(&{cv}, \"{name}\", \"{label}\", Some(\"1\")))"
                 ),
-                (FieldKind::F32 | FieldKind::F64, _) => format!(
+                (FieldKind::F32 | FieldKind::F64, false) => format!(
+                    "(autumn_web::form::required_number_input(&{cv}, \"{name}\", \"{label}\", Some(\"any\")))"
+                ),
+                (FieldKind::F32 | FieldKind::F64, true) => format!(
                     "(autumn_web::form::number_input(&{cv}, \"{name}\", \"{label}\", Some(\"any\")))"
                 ),
                 // `step` matches the column's declared scale, so the browser's
                 // stepper (and its "please match the requested format"
                 // validation) aligns with what the SQL column actually stores.
-                (FieldKind::Decimal { scale, .. }, _) => format!(
+                (FieldKind::Decimal { scale, .. }, false) => format!(
+                    "(autumn_web::form::required_number_input(&{cv}, \"{name}\", \"{label}\", Some(\"{step}\")))",
+                    step = decimal_step(scale)
+                ),
+                (FieldKind::Decimal { scale, .. }, true) => format!(
                     "(autumn_web::form::number_input(&{cv}, \"{name}\", \"{label}\", Some(\"{step}\")))",
                     step = decimal_step(scale)
                 ),
-                (FieldKind::NaiveDateTime | FieldKind::DateTime, _) => {
+                (FieldKind::NaiveDateTime | FieldKind::DateTime, false) => format!(
+                    "(autumn_web::form::required_datetime_input(&{cv}, \"{name}\", \"{label}\"))"
+                ),
+                (FieldKind::NaiveDateTime | FieldKind::DateTime, true) => {
                     format!("(autumn_web::form::datetime_input(&{cv}, \"{name}\", \"{label}\"))")
                 }
                 (FieldKind::Enum, _) => {
@@ -1969,22 +1988,34 @@ fn render_changeset_form_inputs(
                         let vlabel = humanize_label(v);
                         let _ = write!(options, ", (\"{v}\", \"{vlabel}\")");
                     }
+                    let helper = if f.nullable {
+                        "select_input"
+                    } else {
+                        "required_select_input"
+                    };
                     format!(
-                        "(autumn_web::form::select_input(&{cv}, \"{name}\", \"{label}\", &[{options}]))"
+                        "(autumn_web::form::{helper}(&{cv}, \"{name}\", \"{label}\", &[{options}]))"
                     )
                 }
                 _ => {
-                    // String / Text / Uuid / numerics fall through to a text
+                    // String / Text / Uuid / references fall through to a text
                     // input. `--live-validation` on a validated text field wires
                     // the htmx inline-validation variant (no-JS falls back to the
-                    // full-form 422 re-render, which works for every kind).
+                    // full-form 422 re-render, which works for every kind) — the
+                    // framework has no required+htmx combination helper, so a
+                    // required live-validated field keeps the htmx variant
+                    // (server-side validation still applies either way).
                     if live_validation && validated.contains(&name.as_str()) {
                         format!(
                             "(autumn_web::form::text_input_htmx(&{cv}, \"{name}\", \"{label}\", \
                              \"/{plural}/validate/{name}\"))"
                         )
-                    } else {
+                    } else if f.nullable {
                         format!("(autumn_web::form::text_input(&{cv}, \"{name}\", \"{label}\"))")
+                    } else {
+                        format!(
+                            "(autumn_web::form::required_text_input(&{cv}, \"{name}\", \"{label}\"))"
+                        )
                     }
                 }
             }
@@ -2501,6 +2532,41 @@ fn invalid_value_violating_rule(rule: &str) -> String {
     String::new()
 }
 
+/// Upper bound (in characters) on the sample literals
+/// [`invalid_value_violating_rule`]/[`valid_value_satisfying_rule`] generate
+/// for [`render_validation_rejection_smoke_test`]'s request bodies.
+///
+/// A declared `length:min=N`/`length:max=N` bound is an arbitrary
+/// user-supplied `u64` with no upper limit enforced by the DSL parser — a
+/// scaffold like `--validate title=length:min=1000000000` would otherwise
+/// have the *generator* (not the generated app) allocate a multi-GB string
+/// while rendering the smoke test, before a single file is even written.
+/// [`length_bound_exceeds_sample_cap`] gates smoke-test emission on this
+/// instead of silently truncating the sample (a truncated sample would
+/// satisfy neither a huge `min` — too short — nor accurately violate a huge
+/// `max`, making the generated test assert something false).
+const MAX_GENERATED_VALIDATION_SAMPLE_LEN: u64 = 4096;
+
+/// Whether a `length(...)` validation rule's declared bound(s) exceed
+/// [`MAX_GENERATED_VALIDATION_SAMPLE_LEN`] — see that constant's doc comment.
+/// Always `false` for non-length rules (`url`/`email` samples are small,
+/// fixed-size literals).
+fn length_bound_exceeds_sample_cap(rule: &str) -> bool {
+    let Some(args) = rule
+        .strip_prefix("length(")
+        .and_then(|s| s.strip_suffix(')'))
+    else {
+        return false;
+    };
+    args.split(',').any(|part| {
+        let part = part.trim();
+        part.strip_prefix("min = ")
+            .or_else(|| part.strip_prefix("max = "))
+            .and_then(|n| n.trim().parse::<u64>().ok())
+            .is_some_and(|bound| bound > MAX_GENERATED_VALIDATION_SAMPLE_LEN)
+    })
+}
+
 /// A value that *satisfies* a `--validate` rule string — the counterpart to
 /// [`invalid_value_violating_rule`], used to build the successful submission
 /// in [`render_validation_rejection_smoke_test`]. A fixed literal like `"a
@@ -2563,6 +2629,12 @@ fn render_validation_rejection_smoke_test(
         return String::new();
     };
     let rule = rules.first().cloned().unwrap_or_default();
+    // See MAX_GENERATED_VALIDATION_SAMPLE_LEN's doc comment: an absurdly large
+    // declared bound has no cheap, correct sample to generate, so this test
+    // is skipped rather than risking a multi-GB allocation in the CLI itself.
+    if length_bound_exceeds_sample_cap(&rule) {
+        return String::new();
+    }
     let invalid_value = invalid_value_violating_rule(&rule);
     let valid_value = valid_value_satisfying_rule(&rule);
     let witness_value = "preserved-witness-value";
@@ -3174,6 +3246,35 @@ async fn main() {
     }
 
     #[test]
+    fn execute_writes_required_attribute_for_unvalidated_required_text_field() {
+        // Regression guard (issue #1124 review): the pre-#1124 generator added
+        // the HTML `required` attribute to every non-nullable field
+        // unconditionally, independent of whether a `--validate` rule was
+        // declared. `autumn generate scaffold Post title:String` (no
+        // `--validate` at all) must still mark `title` `required` — otherwise
+        // a blank browser submission is treated as valid and inserts `title =
+        // ""`, silently accepting empty required data.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        assert!(
+            routes.contains(
+                "autumn_web::form::required_text_input(&changeset, \"title\", \"Title\")"
+            ),
+            "an unvalidated but required field must still render via \
+             required_text_input: {routes}"
+        );
+    }
+
+    #[test]
     fn execute_writes_a_routes_file_referencing_model() {
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold(
@@ -3251,9 +3352,10 @@ async fn main() {
         // (issue #1124), with one `(value, label)` option per variant plus a
         // leading placeholder. The selected option is chosen by the helper from
         // the changeset's current value, not a hand-rolled `selected[...]`.
+        // Required (non-nullable), so the `required_select_input` sibling.
         assert!(
             routes.contains(
-                "autumn_web::form::select_input(&changeset, \"status\", \"Status\", &[(\"\", \"— Select —\"), (\"draft\", \"Draft\"), (\"published\", \"Published\"), (\"archived\", \"Archived\")])"
+                "autumn_web::form::required_select_input(&changeset, \"status\", \"Status\", &[(\"\", \"— Select —\"), (\"draft\", \"Draft\"), (\"published\", \"Published\"), (\"archived\", \"Archived\")])"
             ),
             "got:\n{routes}"
         );
@@ -3662,21 +3764,24 @@ async fn main() {
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
         // AC6: new/edit render through the changeset-aware input helpers.
+        // Every field here is required (non-nullable), so each uses its
+        // `required_*` sibling helper (issue #1124 review).
         assert!(
-            routes.contains("autumn_web::form::text_input(&changeset, \"title\""),
-            "string fields must render via text_input: {routes}"
+            routes.contains("autumn_web::form::required_text_input(&changeset, \"title\""),
+            "string fields must render via required_text_input: {routes}"
         );
         assert!(
-            routes.contains("autumn_web::form::number_input(&changeset, \"rank\""),
-            "numeric fields must render via number_input: {routes}"
+            routes.contains("autumn_web::form::required_number_input(&changeset, \"rank\""),
+            "numeric fields must render via required_number_input: {routes}"
         );
         assert!(
             routes.contains("autumn_web::form::checkbox_input(&changeset, \"published\""),
             "bool fields must render via checkbox_input: {routes}"
         );
         assert!(
-            routes.contains("autumn_web::form::datetime_input(&changeset, \"published_at\""),
-            "datetime fields must render via datetime_input: {routes}"
+            routes
+                .contains("autumn_web::form::required_datetime_input(&changeset, \"published_at\""),
+            "datetime fields must render via required_datetime_input: {routes}"
         );
         // The old hand-rolled bare-HTML text input must be gone for standard fields.
         assert!(
@@ -4370,15 +4475,17 @@ async fn main() {
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
 
+        // Both fields are required (non-nullable), so both use
+        // `required_number_input` (issue #1124 review).
         assert!(
             routes.contains(
-                "autumn_web::form::number_input(&changeset, \"views\", \"Views\", Some(\"1\"))"
+                "autumn_web::form::required_number_input(&changeset, \"views\", \"Views\", Some(\"1\"))"
             ),
             "{routes}"
         );
         assert!(
             routes.contains(
-                "autumn_web::form::number_input(&changeset, \"rank\", \"Rank\", Some(\"1\"))"
+                "autumn_web::form::required_number_input(&changeset, \"rank\", \"Rank\", Some(\"1\"))"
             ),
             "{routes}"
         );
@@ -4406,15 +4513,17 @@ async fn main() {
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
 
+        // Both fields are required (non-nullable), so both use
+        // `required_number_input` (issue #1124 review).
         assert!(
             routes.contains(
-                "autumn_web::form::number_input(&changeset, \"price\", \"Price\", Some(\"any\"))"
+                "autumn_web::form::required_number_input(&changeset, \"price\", \"Price\", Some(\"any\"))"
             ),
             "{routes}"
         );
         assert!(
             routes.contains(
-                "autumn_web::form::number_input(&changeset, \"weight\", \"Weight\", Some(\"any\"))"
+                "autumn_web::form::required_number_input(&changeset, \"weight\", \"Weight\", Some(\"any\"))"
             ),
             "{routes}"
         );
@@ -4445,7 +4554,7 @@ async fn main() {
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
         assert!(
             routes.contains(
-                "autumn_web::form::number_input(&changeset, \"price\", \"Price\", Some(\"any\"))"
+                "autumn_web::form::required_number_input(&changeset, \"price\", \"Price\", Some(\"any\"))"
             ),
             "{routes}"
         );
@@ -4509,11 +4618,11 @@ async fn main() {
         plan.execute(Flags::default()).unwrap();
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
-        // The edit form seeds the changeset from the row; `number_input` reads
-        // the value back (issue #1124).
+        // The edit form seeds the changeset from the row; `required_number_input`
+        // (required, non-nullable field) reads the value back (issue #1124).
         assert!(
             routes.contains(
-                "autumn_web::form::number_input(&changeset, \"views\", \"Views\", Some(\"1\"))"
+                "autumn_web::form::required_number_input(&changeset, \"views\", \"Views\", Some(\"1\"))"
             ),
             "{routes}"
         );
@@ -4534,10 +4643,11 @@ async fn main() {
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
 
-        // Datetime fields render via the `datetime_input` helper (issue #1124).
+        // Datetime fields render via the `datetime_input` helper (issue #1124);
+        // required (non-nullable), so the `required_datetime_input` sibling.
         assert!(
             routes.contains(
-                "autumn_web::form::datetime_input(&changeset, \"published_at\", \"Published At\")"
+                "autumn_web::form::required_datetime_input(&changeset, \"published_at\", \"Published At\")"
             ),
             "{routes}"
         );
@@ -4578,9 +4688,10 @@ async fn main() {
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
 
+        // Required (non-nullable), so the `required_datetime_input` sibling.
         assert!(
             routes.contains(
-                "autumn_web::form::datetime_input(&changeset, \"scheduled_at\", \"Scheduled At\")"
+                "autumn_web::form::required_datetime_input(&changeset, \"scheduled_at\", \"Scheduled At\")"
             ),
             "{routes}"
         );
@@ -4645,13 +4756,17 @@ async fn main() {
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
         // Genuine string fields (String/Text) render via `text_input`; every
-        // other kind uses its own changeset-aware helper (issue #1124).
+        // other kind uses its own changeset-aware helper (issue #1124). Every
+        // field here is required, so each uses its `required_*` sibling.
         assert!(
-            routes.contains("autumn_web::form::text_input(&changeset, \"title\", \"Title\")"),
+            routes.contains(
+                "autumn_web::form::required_text_input(&changeset, \"title\", \"Title\")"
+            ),
             "{routes}"
         );
         assert!(
-            routes.contains("autumn_web::form::text_input(&changeset, \"body\", \"Body\")"),
+            routes
+                .contains("autumn_web::form::required_text_input(&changeset, \"body\", \"Body\")"),
             "{routes}"
         );
         assert!(
@@ -4659,11 +4774,12 @@ async fn main() {
             "{routes}"
         );
         assert!(
-            routes.contains("autumn_web::form::number_input(&changeset, \"views\""),
+            routes.contains("autumn_web::form::required_number_input(&changeset, \"views\""),
             "{routes}"
         );
         assert!(
-            routes.contains("autumn_web::form::datetime_input(&changeset, \"published_at\""),
+            routes
+                .contains("autumn_web::form::required_datetime_input(&changeset, \"published_at\""),
             "{routes}"
         );
         // No hand-rolled bare text inputs remain for the non-string fields.
@@ -5443,6 +5559,38 @@ async fn main() {
         assert!(
             valid_title.len() <= 5,
             "valid value must satisfy the declared max=5 bound: {valid_line}"
+        );
+    }
+
+    #[test]
+    fn scaffold_validation_smoke_test_skips_absurdly_large_bound() {
+        // Regression guard (issue #1124 review): a declared bound like
+        // `length:min=1000000000` has no cheap, correct sample to generate —
+        // capping the sample length would either fail to violate a huge `max`
+        // or fail to satisfy a huge `min`, asserting something false. The
+        // generator must skip emitting this smoke test entirely rather than
+        // allocating a multi-GB string in the CLI process itself.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+            &ScaffoldOptions {
+                model: ModelOptions {
+                    validations: vec!["title=length:min=1000000000".into()],
+                    ..ModelOptions::default()
+                },
+                ..ScaffoldOptions::default()
+            },
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let test = fs::read_to_string(tmp.path().join("tests/post.rs")).unwrap();
+        assert!(
+            !test.contains("rejects_invalid_title_and_preserves_input"),
+            "an absurdly large bound must not generate a smoke test: {test}"
         );
     }
 

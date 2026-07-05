@@ -238,11 +238,15 @@ pub async fn by_tag(Path(tag): Path<String>, repo: PgBookmarkRepository) -> Autu
 /// form with every field preserved and an inline error next to the offending
 /// input, using the shipped changeset-aware `text_input` helper.
 fn new_bookmark_form(changeset: &Changeset<BookmarkForm>) -> Markup {
+    // Seed the widget from the changeset so a rejected submission (invalid
+    // url/title) doesn't silently drop a tag the user already typed.
+    let tag_value = changeset.field_value("tag").unwrap_or_default();
     let tag_ac =
         autumn_web::widgets::AutocompleteConfig::new("/bookmarks/tags/autocomplete", "tag")
             .placeholder("Search existing tags…")
             .min_length(1)
-            .free_text(); // tags are plain strings; allow typing a new tag
+            .free_text() // tags are plain strings; allow typing a new tag
+            .initial_value(&tag_value);
 
     layout(
         "Add Bookmark",

@@ -946,10 +946,11 @@ fn generate_scaffold_accepts_metadata_flags() {
     assert!(repo.contains("fn find_by_alive(alive: bool) -> Vec<Bookmark>;"));
 
     let routes = fs::read_to_string(project.join("src/routes/bookmarks.rs")).unwrap();
-    // Fields render through the changeset-aware helpers (issue #1124).
-    assert!(routes.contains("autumn_web::form::text_input(&changeset, \"url\""));
-    assert!(routes.contains("autumn_web::form::text_input(&changeset, \"title\""));
-    assert!(routes.contains("autumn_web::form::text_input(&changeset, \"tag\""));
+    // Fields render through the changeset-aware helpers (issue #1124); all
+    // three are required (non-nullable), so each uses `required_text_input`.
+    assert!(routes.contains("autumn_web::form::required_text_input(&changeset, \"url\""));
+    assert!(routes.contains("autumn_web::form::required_text_input(&changeset, \"title\""));
+    assert!(routes.contains("autumn_web::form::required_text_input(&changeset, \"tag\""));
     // `alive` is defaulted → excluded from the form entirely.
     assert!(!routes.contains("\"alive\""));
     assert!(routes.contains("bookmarks::tag.eq(new.tag.clone())"));
@@ -1696,7 +1697,7 @@ fn generate_scaffold_unique_field_create_violation_form_preserves_submitted_valu
         "got:\n{create_body}"
     );
     assert!(
-        create_body.contains("autumn_web::form::number_input(&changeset, \"age\""),
+        create_body.contains("autumn_web::form::required_number_input(&changeset, \"age\""),
         "got:\n{create_body}"
     );
     assert!(
@@ -1704,7 +1705,7 @@ fn generate_scaffold_unique_field_create_violation_form_preserves_submitted_valu
         "got:\n{create_body}"
     );
     assert!(
-        create_body.contains("autumn_web::form::select_input(&changeset, \"status\""),
+        create_body.contains("autumn_web::form::required_select_input(&changeset, \"status\""),
         "got:\n{create_body}"
     );
 }
@@ -1754,11 +1755,11 @@ fn generate_scaffold_unique_field_update_violation_form_preserves_submitted_valu
         "got:\n{update_body}"
     );
     assert!(
-        update_body.contains("autumn_web::form::number_input(&changeset, \"age\""),
+        update_body.contains("autumn_web::form::required_number_input(&changeset, \"age\""),
         "got:\n{update_body}"
     );
     assert!(
-        update_body.contains("autumn_web::form::select_input(&changeset, \"status\""),
+        update_body.contains("autumn_web::form::required_select_input(&changeset, \"status\""),
         "got:\n{update_body}"
     );
     assert!(
@@ -4382,10 +4383,10 @@ fn live_validation_emits_hx_post_and_error_slot() {
         ),
         "create form must render the validated title input via text_input_htmx:\n{routes}"
     );
-    // body field (not validated) must use the plain text_input helper.
+    // body field (not validated, but required) must use required_text_input.
     assert!(
-        routes.contains("autumn_web::form::text_input(&changeset, \"body\", \"Body\")"),
-        "unvalidated body input must use the plain text_input helper:\n{routes}"
+        routes.contains("autumn_web::form::required_text_input(&changeset, \"body\", \"Body\")"),
+        "unvalidated required body input must use required_text_input:\n{routes}"
     );
     assert!(
         !routes.contains("autumn_web::form::text_input_htmx(&changeset, \"body\""),
