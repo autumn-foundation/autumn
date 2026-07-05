@@ -1,0 +1,17 @@
+{
+  "version": "1",
+  "assets": {
+    "htmx": {
+      "version": "2.0.4",
+      "source": "https://cdn.jsdelivr.net/npm/htmx.org@2.0.4/dist/htmx.min.js",
+      "file": "js/htmx.min.js",
+      "integrity": "sha384-HGfztofotfshcF7+8n44JQL2oJmowVChPTg48S+jvZoztPfvwD79OC/LTtG6dMp+"
+    },
+    "htmx-ext-sse": {
+      "version": "2.2.2",
+      "source": "https://unpkg.com/htmx-ext-sse@2.2.2/sse.js",
+      "file": "js/htmx-ext-sse.min.js",
+      "integrity": "sha384-fw+eTlCc7suMV/1w/7fr2/PmwElUIt5i82bi+qTiLXvjRXZ2/FkiTNA/w0MhXnGI"
+    }
+  }
+}

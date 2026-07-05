@@ -1,0 +1,25 @@
+[package]
+name = "my-app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Enable optional subsystems later by switching to:
+# autumn-web = { version = "0.6.0", features = ["redis", "mail"] }
+autumn-web = "0.6.0"
+maud = { version = "0.27", features = ["axum"] }
+diesel_migrations = "2"
+
+[features]
+# Flash messages are on by default — the scaffold wires Flash into every handler.
+default = ["flash"]
+flash = ["autumn-web/flash"]
+# Enable single-binary asset embedding (autumn build --embed / autumn generate tauri).
+# Active only when explicitly requested; dev builds serve static/ from disk.
+embed-assets = ["autumn-web/embed-assets"]
+
+[dev-dependencies]
+# tokio runtime macros are needed for #[tokio::test] in integration tests.
+tokio = { version = "1", features = ["rt", "macros"] }
+
+[workspace]
