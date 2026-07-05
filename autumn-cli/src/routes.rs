@@ -17,6 +17,7 @@ use crate::text_width::display_width;
 pub enum OutputFormat {
     Table,
     Json,
+    Postman,
 }
 
 impl std::str::FromStr for OutputFormat {
@@ -26,8 +27,9 @@ impl std::str::FromStr for OutputFormat {
         match s.to_lowercase().as_str() {
             "table" => Ok(Self::Table),
             "json" => Ok(Self::Json),
+            "postman" => Ok(Self::Postman),
             other => Err(format!(
-                "unknown format '{other}'; expected 'table' or 'json'"
+                "unknown format '{other}'; expected 'table', 'json', or 'postman'"
             )),
         }
     }
@@ -97,6 +99,7 @@ pub fn run(opts: &RoutesOptions<'_>) {
     match &opts.format {
         OutputFormat::Table => print_table(&routes),
         OutputFormat::Json => print_json(&routes),
+        OutputFormat::Postman => print_postman(&routes),
     }
 }
 
@@ -250,6 +253,60 @@ fn format_row(cells: &[String; 7], widths: &[usize; 7]) -> String {
 pub fn print_json(routes: &[RouteInfo]) {
     let json =
         serde_json::to_string_pretty(routes).unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"));
+    println!("{json}");
+}
+
+/// Print routes as a Postman Collection v2.1.0 JSON.
+/// Build a Postman Collection v2.1.0 JSON representation of the routes.
+pub fn build_postman_collection(routes: &[RouteInfo]) -> serde_json::Value {
+    let mut item = Vec::new();
+
+    for route in routes {
+        // Convert Axum path parameters like `/users/{id}` to Postman format `/users/:id`
+        // We only do a naive replacement if they are well-formed single segment braces.
+        let mut postman_path = String::new();
+
+        for c in route.path.chars() {
+            if c == '{' {
+                postman_path.push(':');
+            } else if c == '}' {
+                // Ignore closing braces in path
+            } else {
+                postman_path.push(c);
+            }
+        }
+
+        let path_segments: Vec<&str> = postman_path.trim_matches('/').split('/').collect();
+
+        let req = serde_json::json!({
+            "name": route.handler,
+            "request": {
+                "method": route.method,
+                "url": {
+                    "raw": format!("{{{{base_url}}}}{postman_path}"),
+                    "host": ["{{base_url}}"],
+                    "path": path_segments
+                }
+            }
+        });
+
+        item.push(req);
+    }
+
+    serde_json::json!({
+        "info": {
+            "name": "Autumn Routes Export",
+            "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+        },
+        "item": item
+    })
+}
+
+/// Print routes as a Postman Collection v2.1.0 JSON.
+pub fn print_postman(routes: &[RouteInfo]) {
+    let collection = build_postman_collection(routes);
+    let json = serde_json::to_string_pretty(&collection)
+        .unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"));
     println!("{json}");
 }
 
@@ -461,6 +518,12 @@ mod tests {
     }
 
     #[test]
+    fn parse_format_postman() {
+        let f: OutputFormat = "postman".parse().unwrap();
+        assert_eq!(f, OutputFormat::Postman);
+    }
+
+    #[test]
     fn parse_format_unknown_is_error() {
         let result: Result<OutputFormat, _> = "xml".parse();
         assert!(result.is_err());
@@ -638,6 +701,32 @@ mod tests {
         let json_str = serde_json::to_string_pretty(&routes).unwrap();
         let parsed: Vec<RouteInfo> = serde_json::from_str(&json_str).unwrap();
         assert_eq!(parsed.len(), routes.len());
+    }
+
+    // ── build_postman_collection ───────────────────────────────────────────
+
+    #[test]
+    fn print_postman_produces_valid_collection() {
+        let routes = sample_routes();
+        let collection = build_postman_collection(&routes);
+
+        assert_eq!(collection["info"]["name"], "Autumn Routes Export");
+        assert_eq!(collection["item"].as_array().unwrap().len(), routes.len());
+
+        // Verify path parameter translation works (e.g. /posts/{id} -> /posts/:id)
+        let post_route = collection["item"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["name"] == "posts_{id}_handler")
+            .unwrap();
+        assert_eq!(
+            post_route["request"]["url"]["raw"],
+            "{{base_url}}/posts/:id"
+        );
+        let segments = post_route["request"]["url"]["path"].as_array().unwrap();
+        assert_eq!(segments[0], "posts");
+        assert_eq!(segments[1], ":id");
     }
 
     // ── resolve_binary_from_metadata ──────────────────────────────────────
