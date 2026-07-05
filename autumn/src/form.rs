@@ -469,17 +469,29 @@ where
     T: serde::de::DeserializeOwned + validator::Validate + Send,
     S: Send + Sync,
 {
+    let content_type = req
+        .headers()
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+
     #[cfg(feature = "multipart")]
-    {
-        let content_type = req
-            .headers()
-            .get(http::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or_default()
-            .to_string();
-        if content_type.starts_with("multipart/form-data") {
-            return decode_multipart(req, state).await;
-        }
+    if content_type.starts_with("multipart/form-data") {
+        return decode_multipart(req, state).await;
+    }
+
+    // Same content-type gate axum's own `Form`/`RawForm` extractors apply: a
+    // POST whose Content-Type isn't (or doesn't start with) the form-urlencoded
+    // mime type is rejected outright, rather than being decoded anyway. `Bytes`
+    // alone has no opinion on Content-Type, so this must be checked explicitly
+    // now that we no longer route through `axum::extract::Form`.
+    if !content_type.starts_with("application/x-www-form-urlencoded") {
+        return Err((
+            axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "Form requests must have `Content-Type: application/x-www-form-urlencoded`",
+        )
+            .into_response());
     }
 
     // Buffer the body through axum's own `Bytes` extractor so the configured
@@ -3449,6 +3461,53 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(resp.status(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+        }
+
+        #[tokio::test]
+        async fn wrong_content_type_is_rejected_not_decoded_anyway() {
+            // `Bytes` alone has no opinion on Content-Type, so a `text/plain`
+            // (or missing-Content-Type) POST whose body happens to look like
+            // `name=Alice` must still be rejected outright — matching axum's
+            // own `Form`/`RawForm` extractors — rather than silently decoded.
+            async fn handler(_form: ChangesetForm<TestForm>) -> String {
+                "unreachable".to_string()
+            }
+            let req = axum::http::Request::builder()
+                .method("POST")
+                .uri("/test")
+                .header("Content-Type", "text/plain")
+                .body(Body::from("name=Alice"))
+                .unwrap();
+            let resp = Router::new()
+                .route("/test", post(handler))
+                .oneshot(req)
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE
+            );
+        }
+
+        #[tokio::test]
+        async fn missing_content_type_is_rejected_not_decoded_anyway() {
+            async fn handler(_form: ChangesetForm<TestForm>) -> String {
+                "unreachable".to_string()
+            }
+            let req = axum::http::Request::builder()
+                .method("POST")
+                .uri("/test")
+                .body(Body::from("name=Alice"))
+                .unwrap();
+            let resp = Router::new()
+                .route("/test", post(handler))
+                .oneshot(req)
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE
+            );
         }
 
         #[tokio::test]
