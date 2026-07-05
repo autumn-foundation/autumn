@@ -16,11 +16,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `#panel-id`) and matching `role="tabpanel"` sections (`aria-labelledby`,
   `tabindex="0"`). Switching is pure CSS: `input.css` shows the panel whose
   `id` matches the URL's `:target` fragment, with a `:has()`-based fallback
-  that shows the first panel when nothing is targeted, so a 3-tab
-  detail/settings view needs zero hand-written JS or CSS and under 10 lines
-  of Maud. Tab/panel ids and labels are HTML-escaped by Maud; panel bodies
-  are pre-rendered `Markup` the caller owns, same as `card`'s `body`
-  parameter. See `docs/guide/tabs.md` for a full example.
+  that shows the first panel when nothing is targeted (and an
+  `@supports not selector(:has(a))` rule so browsers without `:has()`
+  degrade to "first panel always shown" instead of a blank widget), so a
+  3-tab detail/settings view needs zero hand-written JS or CSS and under 10
+  lines of Maud. The active-tab highlight also tracks whichever panel is
+  actually `:target`-ed, via position-based `:has()`/`:nth-child()` CSS
+  (covering the first 6 tabs). Tab/panel ids and labels are HTML-escaped by
+  Maud; panel bodies are pre-rendered `Markup` the caller owns, same as
+  `card`'s `body` parameter. Panel ids must be unique across the whole page
+  if more than one `tabs()` widget is rendered; `aria-selected` reflects
+  only the server's default selection, since the server never sees the URL
+  fragment. See `docs/guide/tabs.md` for a full example and these caveats.
 
 - **views:** `modal`/`confirm_action` widgets — an accessible, testable
   confirm for destructive actions (#1233). `modal(id, title, body, config)`

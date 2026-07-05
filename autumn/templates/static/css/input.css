@@ -346,14 +346,14 @@
 .autumn-tabs__list {
     display: flex;
     gap: 0.25rem;
-    border-bottom: 1px solid #e5e7eb;
+    border-bottom: 1px solid var(--autumn-border, #e5e7eb);
     margin-bottom: 1rem;
 }
 
 .autumn-tabs__tab {
     padding: 0.5rem 1rem;
     margin-bottom: -1px;
-    color: #6b7280;
+    color: var(--autumn-text-muted, #6b7280);
     font-weight: 500;
     font-size: 0.9375rem;
     text-decoration: none;
@@ -361,11 +361,11 @@
 }
 
 .autumn-tabs__tab:hover {
-    color: #111827;
+    color: var(--autumn-text, #111827);
 }
 
 .autumn-tabs__tab--active {
-    color: #111827;
+    color: var(--autumn-text, #111827);
     border-bottom-color: var(--autumn-primary, #2563eb);
 }
 
@@ -383,4 +383,38 @@
    this widget, so a panel is always visible. */
 .autumn-tabs:not(:has(.autumn-tabs__panel:target)) .autumn-tabs__panel--active {
     display: block;
+}
+
+/* Graceful degradation for browsers that support `:target` (universal)
+   but not `:has()` (narrower support): the `:not(:has(...))` fallback
+   above never applies, so without this rule every panel would stay
+   `display: none` on first load. Unconditionally showing the first panel
+   here is a strictly better failure mode than a blank widget — in these
+   browsers, navigating to a different panel's fragment may show that
+   panel alongside the first rather than replacing it. */
+@supports not selector(:has(a)) {
+    .autumn-tabs__panel--active {
+        display: block;
+    }
+}
+
+/* Sync the active-tab highlight with whichever panel is actually
+   `:target`-ed. Panel/tab ids are arbitrary caller strings, so a shared
+   stylesheet can't match them by value — match by position instead, for
+   the first 6 tabs. Widgets with more tabs keep switching panels
+   correctly; only the active-tab highlight past the 6th degrades to
+   showing no tab as active. */
+.autumn-tabs:has(.autumn-tabs__panel:target) .autumn-tabs__tab--active {
+    color: var(--autumn-text-muted, #6b7280);
+    border-bottom-color: transparent;
+}
+
+.autumn-tabs:has(.autumn-tabs__panel:nth-of-type(1):target) .autumn-tabs__list .autumn-tabs__tab:nth-child(1),
+.autumn-tabs:has(.autumn-tabs__panel:nth-of-type(2):target) .autumn-tabs__list .autumn-tabs__tab:nth-child(2),
+.autumn-tabs:has(.autumn-tabs__panel:nth-of-type(3):target) .autumn-tabs__list .autumn-tabs__tab:nth-child(3),
+.autumn-tabs:has(.autumn-tabs__panel:nth-of-type(4):target) .autumn-tabs__list .autumn-tabs__tab:nth-child(4),
+.autumn-tabs:has(.autumn-tabs__panel:nth-of-type(5):target) .autumn-tabs__list .autumn-tabs__tab:nth-child(5),
+.autumn-tabs:has(.autumn-tabs__panel:nth-of-type(6):target) .autumn-tabs__list .autumn-tabs__tab:nth-child(6) {
+    color: var(--autumn-text, #111827);
+    border-bottom-color: var(--autumn-primary, #2563eb);
 }

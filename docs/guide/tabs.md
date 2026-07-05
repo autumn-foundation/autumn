@@ -55,6 +55,13 @@ Each tuple is `(panel_id, label, body)`, in display order. `panel_id` and
   always visible even before any fragment is present.
 - An empty `panels` slice renders the empty `autumn-tabs` container without
   panicking.
+- **Rendering more than one `tabs()` widget on the same page:** panel ids
+  must be unique across the *entire page*, not just within one call. Two
+  `tabs()` calls that both use a panel id like `"overview"` emit two
+  elements with `id="overview"` — invalid duplicate-id HTML that makes
+  `:target`/`aria-controls`/`aria-labelledby` lookups ambiguous. Prefix
+  panel ids per widget instance (e.g. `"post-overview"`,
+  `"related-overview"`) if more than one `tabs()` appears on a page.
 
 ## CSS hooks
 
@@ -76,6 +83,12 @@ Each tuple is `(panel_id, label, body)`, in display order. `panel_id` and
   `id`), and `aria-selected`.
 - Each panel carries `role="tabpanel"`, `aria-labelledby` (pointing at its
   tab's `id`), and `tabindex="0"` so it can receive keyboard focus directly.
+- **Known limitation:** `aria-selected` reflects the server's default
+  selection (the first tab) only. The server never sees the URL fragment,
+  so it can't know which tab a client-side `:target` navigation actually
+  landed on — fixing this would require JavaScript, which this widget
+  deliberately has none of. A screen reader always hears the first tab
+  announced as "selected", even when a different panel is what's shown.
 
 ## No-JavaScript switching
 
@@ -84,3 +97,17 @@ targets `.autumn-tabs__panel:target` to show the panel matching the URL
 fragment, with a `:has()`-based fallback that shows the first (`--active`)
 panel when no fragment targets any panel in the widget. No `<script>`,
 inline event handler, or `hx-*` attribute is emitted or required.
+
+The active-tab *visual highlight* also tracks whichever panel is actually
+`:target`-ed, using position-based `:has()`/`:nth-child()` CSS (ids are
+arbitrary caller strings, so a shared stylesheet can only match them by
+position, not value) — this covers the first 6 tabs; widgets with more tabs
+keep switching panels correctly, but the highlight itself stops updating
+past the 6th.
+
+`:has()` has narrower browser support than `:target`. In a browser that
+supports `:target` but not `:has()`, the tabs widget degrades gracefully
+rather than breaking: an `@supports not selector(:has(a))` rule
+unconditionally shows the first panel, so the widget is never blank — a
+fragment link to a different panel in such a browser may show that panel
+*alongside* the first rather than replacing it.

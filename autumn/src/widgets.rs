@@ -2658,10 +2658,13 @@ pub fn confirm_action(
 /// from an ordered list of `(id, label, panel_body)` tuples.
 ///
 /// Switching is pure CSS: each tab is an `<a href="#panel-id">` and each
-/// panel is targeted by `:target` in `autumn-tabs.css`, so URL fragments
+/// panel is targeted by `:target` in `input.css`, so URL fragments
 /// (`/settings#security`) select a tab with zero JavaScript. The first
 /// panel additionally carries `autumn-tabs__panel--active` so a panel is
-/// always visible even when no fragment is present.
+/// always visible even when no fragment is present, and the active-tab
+/// highlight tracks the actually-`:target`ed panel by position for up to
+/// the first 6 tabs (see `input.css` — ids are arbitrary caller strings, so
+/// this can only be done positionally in a shared stylesheet).
 ///
 /// # CSS hooks
 ///
@@ -2681,13 +2684,30 @@ pub fn confirm_action(
 /// panel carries `role="tabpanel"`, `aria-labelledby` pointing at its tab's
 /// `id`, and `tabindex="0"` so it can receive keyboard focus directly.
 ///
+/// `aria-selected` reflects the *server's default selection* (the first
+/// tab) only. The server never sees the URL fragment (fragments aren't
+/// sent in HTTP requests), so it cannot know which tab a client-side
+/// `:target` navigation actually landed on — correcting `aria-selected` on
+/// navigation would require JavaScript, which this widget deliberately has
+/// none of. This is a known, accepted limitation of fragment-based no-JS
+/// tabs: a screen reader always hears the first tab announced as
+/// "selected", even when a different panel is what's visually shown.
+///
 /// # Panel `id`s
 ///
 /// A panel's `id` is the raw id from its tuple (not namespaced by `id`) so
 /// it can be targeted directly by a URL fragment. Each tab's own element
-/// `id` is `"{id}-tab-{panel_id}"`. Duplicate panel ids are rendered as
-/// given — the caller is responsible for uniqueness if fragment targeting
-/// of a specific panel matters.
+/// `id` is `"{id}-tab-{panel_id}"`. Duplicate panel ids within one call are
+/// rendered as given — the caller is responsible for uniqueness if
+/// fragment targeting of a specific panel matters.
+///
+/// **Rendering more than one `tabs()` widget on the same page:** panel ids
+/// must be unique across the *entire page*, not just within one call —
+/// two different `tabs()` calls that both use a panel id like `"overview"`
+/// will emit two elements with `id="overview"`, which is invalid duplicate-id
+/// HTML and makes `:target`/`aria-controls`/`aria-labelledby` lookups
+/// ambiguous. Prefix panel ids per widget instance (e.g. `"post-overview"`,
+/// `"related-overview"`) if more than one `tabs()` appears on a page.
 ///
 /// # Example
 ///
@@ -2708,29 +2728,31 @@ pub fn confirm_action(
 #[cfg(feature = "maud")]
 #[must_use]
 pub fn tabs(id: &str, panels: &[(&str, &str, maud::Markup)]) -> maud::Markup {
+    let tab_ids: Vec<String> = panels
+        .iter()
+        .map(|(panel_id, _, _)| format!("{id}-tab-{panel_id}"))
+        .collect();
     maud::html! {
         div id=(id) class="autumn-tabs" {
             div class="autumn-tabs__list" role="tablist" {
                 @for (i, (panel_id, label, _)) in panels.iter().enumerate() {
-                    @let tab_id = format!("{id}-tab-{panel_id}");
                     @let tab_class = merge_class(
                         "autumn-tabs__tab",
                         (i == 0).then_some("autumn-tabs__tab--active"),
                     );
-                    a id=(tab_id) class=(tab_class) role="tab" href=(format!("#{panel_id}"))
+                    a id=(tab_ids[i]) class=(tab_class) role="tab" href=(format!("#{panel_id}"))
                         aria-controls=(panel_id) aria-selected=(if i == 0 { "true" } else { "false" }) {
                         (label)
                     }
                 }
             }
             @for (i, (panel_id, _, body)) in panels.iter().enumerate() {
-                @let tab_id = format!("{id}-tab-{panel_id}");
                 @let panel_class = merge_class(
                     "autumn-tabs__panel",
                     (i == 0).then_some("autumn-tabs__panel--active"),
                 );
                 section id=(panel_id) class=(panel_class) role="tabpanel"
-                    aria-labelledby=(tab_id) tabindex="0" {
+                    aria-labelledby=(tab_ids[i]) tabindex="0" {
                     (body)
                 }
             }
