@@ -899,6 +899,58 @@ pub fn text_input_htmx<T: Serialize>(
     }
 }
 
+/// Like [`text_input_htmx`] but for a required field: adds `required` and
+/// `aria-required="true"` on the `<input>`, exactly like
+/// [`required_text_input`] does for the non-htmx variant.
+///
+/// Without this, a required field wired up with `text_input_htmx` has no
+/// client-side "must fill this in" signal, and a server-side rule that
+/// happens to permit an empty string (e.g. a max-only `length` rule) would
+/// let a blank required field through silently.
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn required_text_input_htmx<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+    validate_url: &str,
+) -> maud::Markup {
+    let errors = changeset.errors_for(field);
+    let has_errors = !errors.is_empty();
+    let value = changeset.field_value(field).unwrap_or_default();
+    let error_id = format!("{field}-error");
+    let wrapper_id = format!("{field}-field");
+    let target = "closest [data-autumn-field-wrapper]";
+
+    maud::html! {
+        div id=(wrapper_id) class="autumn-field" data-autumn-field-wrapper=(field) {
+            label for=(field) class="autumn-field__label" { (label) }
+            input
+                type="text"
+                id=(field)
+                name=(field)
+                value=(value)
+                required
+                aria-required="true"
+                class=(if has_errors { "autumn-field__input autumn-field__input--invalid" } else { "autumn-field__input" })
+                aria-invalid=(if has_errors { "true" } else { "false" })
+                aria-describedby=(if has_errors { error_id.as_str() } else { "" })
+                hx-post=(validate_url)
+                hx-trigger="change"
+                hx-target=(target)
+                hx-swap="outerHTML"
+                hx-include="closest form";
+            @if has_errors {
+                div id=(error_id) role="alert" class="autumn-field__errors" {
+                    @for error in errors {
+                        p class="autumn-field__error" { (error) }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Render a `<button type="submit">` with `label`.
 #[cfg(feature = "maud")]
 #[must_use]
@@ -2500,6 +2552,68 @@ mod tests {
         );
         let html =
             required_select_input(&cs, "status", "Status", &[("draft", "Draft")]).into_string();
+        assert!(html.contains(r#"aria-invalid="true""#), "{html}");
+        assert!(html.contains(r#"role="alert""#), "{html}");
+        assert!(html.contains("is required"), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn required_text_input_htmx_emits_aria_required() {
+        #[derive(serde::Serialize)]
+        struct F {
+            title: String,
+        }
+        let cs = Changeset::new(F {
+            title: "Hello".into(),
+        });
+        let html =
+            required_text_input_htmx(&cs, "title", "Title", "/posts/validate/title").into_string();
+        assert!(html.contains(r#"aria-required="true""#), "{html}");
+        assert!(html.contains("required"), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn required_text_input_htmx_preserves_htmx_attributes() {
+        #[derive(serde::Serialize)]
+        struct F {
+            title: String,
+        }
+        let cs = Changeset::new(F {
+            title: String::new(),
+        });
+        let html =
+            required_text_input_htmx(&cs, "title", "Title", "/posts/validate/title").into_string();
+        assert!(
+            html.contains(r#"hx-post="/posts/validate/title""#),
+            "{html}"
+        );
+        assert!(html.contains(r#"hx-trigger="change""#), "{html}");
+        assert!(
+            html.contains(r#"hx-target="closest [data-autumn-field-wrapper]""#),
+            "{html}"
+        );
+        assert!(html.contains(r#"hx-swap="outerHTML""#), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn required_text_input_htmx_preserves_error_handling() {
+        #[derive(serde::Serialize)]
+        struct F {
+            title: String,
+        }
+        let mut errors = HashMap::new();
+        errors.insert("title".to_string(), vec!["is required".to_string()]);
+        let cs = Changeset::from_errors(
+            F {
+                title: String::new(),
+            },
+            errors,
+        );
+        let html =
+            required_text_input_htmx(&cs, "title", "Title", "/posts/validate/title").into_string();
         assert!(html.contains(r#"aria-invalid="true""#), "{html}");
         assert!(html.contains(r#"role="alert""#), "{html}");
         assert!(html.contains("is required"), "{html}");

@@ -1243,15 +1243,16 @@ fn generated_scaffold_cargo_checks() {
     // The `--live-validation` inline-validation handler must compile against
     // the real framework too (issue #1124 follow-up: it now decodes the full
     // form via `decode_form` and renders through `text_input_htmx`, rather
-    // than a hand-rolled per-rule check returning a bare error span).
+    // than a hand-rolled per-rule check returning a bare error span). `title`
+    // is non-nullable, so it keeps the `required` htmx variant.
     let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
     assert!(
         routes.contains("pub async fn validate_title("),
         "expected a validate_title handler:\n{routes}"
     );
     assert!(
-        routes.contains("autumn_web::form::text_input_htmx(&changeset, \"title\""),
-        "validate_title must return the full text_input_htmx wrapper:\n{routes}"
+        routes.contains("autumn_web::form::required_text_input_htmx(&changeset, \"title\""),
+        "validate_title must return the full required_text_input_htmx wrapper:\n{routes}"
     );
 
     // The generator must have added every dep its emitted code needs.
@@ -4393,12 +4394,14 @@ fn live_validation_emits_hx_post_and_error_slot() {
     // A validated text field on `--live-validation` renders via the
     // changeset-aware `text_input_htmx` helper (issue #1124), which wires up
     // its own hx-post/hx-trigger/hx-target/hx-swap and inline error block —
-    // the generator no longer hand-rolls these attributes.
+    // the generator no longer hand-rolls these attributes. `title` is
+    // non-nullable, so it keeps `required`/`aria-required` via the
+    // `required_text_input_htmx` variant.
     assert!(
         routes.contains(
-            "autumn_web::form::text_input_htmx(&changeset, \"title\", \"Title\", \"/posts/validate/title\")"
+            "autumn_web::form::required_text_input_htmx(&changeset, \"title\", \"Title\", \"/posts/validate/title\")"
         ),
-        "create form must render the validated title input via text_input_htmx:\n{routes}"
+        "create form must render the validated title input via required_text_input_htmx:\n{routes}"
     );
     // body field (not validated, but required) must use required_text_input.
     assert!(
@@ -4445,11 +4448,13 @@ fn live_validation_emits_validate_handler_with_real_rules() {
             routes.contains(&format!("pub async fn validate_{field}(")),
             "routes must contain a validate_{field} handler:\n{routes}"
         );
+        // All three fields are non-nullable, so the required htmx variant
+        // keeps the `required`/`aria-required` signal through the swap too.
         assert!(
             routes.contains(&format!(
-                "autumn_web::form::text_input_htmx(&changeset, \"{field}\""
+                "autumn_web::form::required_text_input_htmx(&changeset, \"{field}\""
             )),
-            "validate_{field} must return the full text_input_htmx wrapper, \
+            "validate_{field} must return the full required_text_input_htmx wrapper, \
              not a bare error span:\n{routes}"
         );
     }

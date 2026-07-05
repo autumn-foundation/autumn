@@ -1546,6 +1546,19 @@ pub async fn index(
         for (field_name, rules) in validations {
             let rule_comment = rules.join(", ");
             let label = humanize_label(field_name);
+            // Match `render_changeset_form_inputs`'s helper choice: a
+            // non-nullable field keeps `required`/`aria-required` through the
+            // htmx round-trip too, otherwise the attribute would vanish from
+            // the DOM the moment the field's wrapper gets swapped in.
+            let is_nullable = fields
+                .iter()
+                .find(|f| f.name == *field_name)
+                .is_some_and(|f| f.nullable);
+            let helper = if is_nullable {
+                "text_input_htmx"
+            } else {
+                "required_text_input_htmx"
+            };
             let _ = write!(
                 vh,
                 "\n\n/// `POST /{plural}/validate/{field_name}` — inline validation fragment.\n"
@@ -1568,7 +1581,7 @@ pub async fn index(
             vh.push_str("    let changeset = form.into_changeset();\n");
             let _ = writeln!(
                 vh,
-                "    autumn_web::form::text_input_htmx(&changeset, \"{field_name}\", \"{label}\", \"/{plural}/validate/{field_name}\")"
+                "    autumn_web::form::{helper}(&changeset, \"{field_name}\", \"{label}\", \"/{plural}/validate/{field_name}\")"
             );
             vh.push_str("}\n");
         }
@@ -1946,13 +1959,20 @@ fn render_changeset_form_inputs(
                     // String / Text / Uuid / references fall through to a text
                     // input. `--live-validation` on a validated text field wires
                     // the htmx inline-validation variant (no-JS falls back to the
-                    // full-form 422 re-render, which works for every kind) — the
-                    // framework has no required+htmx combination helper, so a
-                    // required live-validated field keeps the htmx variant
-                    // (server-side validation still applies either way).
+                    // full-form 422 re-render, which works for every kind); a
+                    // non-nullable field keeps the `required`/`aria-required`
+                    // signal via `required_text_input_htmx` so a validator rule
+                    // that happens to permit an empty string (e.g. a max-only
+                    // `length` rule) doesn't leave a blank required field with
+                    // no client-side guard at all.
                     if live_validation && validated.contains(&name.as_str()) {
+                        let helper = if f.nullable {
+                            "text_input_htmx"
+                        } else {
+                            "required_text_input_htmx"
+                        };
                         format!(
-                            "(autumn_web::form::text_input_htmx(&{cv}, \"{name}\", \"{label}\", \
+                            "(autumn_web::form::{helper}(&{cv}, \"{name}\", \"{label}\", \
                              \"/{plural}/validate/{name}\"))"
                         )
                     } else if f.nullable {
@@ -2442,12 +2462,18 @@ fn render_smoke_test(
 /// `model::render_validation_attr`, e.g. `"length(min = 1, max = 200)"`,
 /// `"url"`, `"email"`) — used to build the deliberately-rejected submission in
 /// [`render_validation_rejection_smoke_test`].
-fn invalid_value_violating_rule(rule: &str) -> String {
+///
+/// Returns `None` when the rule accepts *every* string, including blank — a
+/// `length` rule with no `max` and either no `min` or `min = 0` (e.g.
+/// `--validate title=length:min=0`) is a no-op that nothing can violate. The
+/// caller must fall back to a different validated field rather than submit a
+/// value that the real server would happily accept and assert a 422 anyway.
+fn invalid_value_violating_rule(rule: &str) -> Option<String> {
     if rule == "url" {
-        return "not a valid url".to_owned();
+        return Some("not a valid url".to_owned());
     }
     if rule == "email" {
-        return "not-an-email".to_owned();
+        return Some("not-an-email".to_owned());
     }
     if let Some(args) = rule
         .strip_prefix("length(")
@@ -2465,16 +2491,19 @@ fn invalid_value_violating_rule(rule: &str) -> String {
         }
         return match (min, max) {
             // A `min` bound is violated by submitting nothing at all.
-            (Some(min), _) if min > 0 => String::new(),
+            (Some(min), _) if min > 0 => Some(String::new()),
             // A `max`-only bound is violated by exceeding it by one character
             // — a fixed-size literal (e.g. 1000 `x`s) would itself satisfy a
             // looser `max` (say 2000), silently turning the "invalid"
             // submission valid and failing the smoke test's own 422 premise.
-            (_, Some(max)) => "x".repeat(usize::try_from(max + 1).unwrap_or(usize::MAX)),
-            _ => String::new(),
+            (_, Some(max)) => Some("x".repeat(usize::try_from(max + 1).unwrap_or(usize::MAX))),
+            // No `max`, and `min` is either absent or 0 — every string
+            // (including blank) satisfies this rule; there is nothing to
+            // violate.
+            _ => None,
         };
     }
-    String::new()
+    None
 }
 
 /// Upper bound (in characters) on the sample literals
@@ -2570,17 +2599,23 @@ fn render_validation_rejection_smoke_test(
     plural: &str,
     validations: &BTreeMap<String, Vec<String>>,
 ) -> String {
-    let Some((target_name, rules)) = validations.iter().next() else {
+    // Pick the first validated field whose declared rule actually has a
+    // violating value: a no-op rule (e.g. `length:min=0` with no `max`
+    // accepts every string, including blank) or one whose bound exceeds
+    // `MAX_GENERATED_VALIDATION_SAMPLE_LEN` (see that constant's doc comment)
+    // can't build a real "rejected" submission, so it's skipped in favor of
+    // another validated field rather than asserting a 422 the real server
+    // would never return.
+    let Some((target_name, rule, invalid_value)) = validations.iter().find_map(|(name, rules)| {
+        let rule = rules.first().cloned().unwrap_or_default();
+        if length_bound_exceeds_sample_cap(&rule) {
+            return None;
+        }
+        let invalid_value = invalid_value_violating_rule(&rule)?;
+        Some((name, rule, invalid_value))
+    }) else {
         return String::new();
     };
-    let rule = rules.first().cloned().unwrap_or_default();
-    // See MAX_GENERATED_VALIDATION_SAMPLE_LEN's doc comment: an absurdly large
-    // declared bound has no cheap, correct sample to generate, so this test
-    // is skipped rather than risking a multi-GB allocation in the CLI itself.
-    if length_bound_exceeds_sample_cap(&rule) {
-        return String::new();
-    }
-    let invalid_value = invalid_value_violating_rule(&rule);
     let valid_value = valid_value_satisfying_rule(&rule);
     let witness_value = "preserved-witness-value";
 
@@ -5554,6 +5589,73 @@ async fn main() {
         assert!(
             !test.contains("rejects_invalid_title_and_preserves_input"),
             "an absurdly large bound must not generate a smoke test: {test}"
+        );
+    }
+
+    #[test]
+    fn scaffold_validation_smoke_test_skips_noop_min_zero_rule() {
+        // Regression guard (issue #1124 review): `length:min=0` with no `max`
+        // is a no-op — every string, including blank, already satisfies it.
+        // Emitting a smoke test that submits a value and asserts 422 anyway
+        // would fail against the real server. The generator must skip the
+        // test entirely when this is the only validated field.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+            &ScaffoldOptions {
+                model: ModelOptions {
+                    validations: vec!["title=length:min=0".into()],
+                    ..ModelOptions::default()
+                },
+                ..ScaffoldOptions::default()
+            },
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let test = fs::read_to_string(tmp.path().join("tests/post.rs")).unwrap();
+        assert!(
+            !test.contains("rejects_invalid_title_and_preserves_input"),
+            "a no-op length:min=0 rule must not generate a smoke test: {test}"
+        );
+    }
+
+    #[test]
+    fn scaffold_validation_smoke_test_falls_back_past_noop_rule() {
+        // When one validated field's rule is a no-op (`length:min=0`) but
+        // another has a genuinely violatable rule, the smoke test must be
+        // built around the violatable field instead of skipping entirely.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "body:String".into()],
+            "20260427000000",
+            &ScaffoldOptions {
+                model: ModelOptions {
+                    validations: vec![
+                        "title=length:min=0".into(),
+                        "body=length:min=1,max=200".into(),
+                    ],
+                    ..ModelOptions::default()
+                },
+                ..ScaffoldOptions::default()
+            },
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let test = fs::read_to_string(tmp.path().join("tests/post.rs")).unwrap();
+        assert!(
+            test.contains("rejects_invalid_body_and_preserves_input"),
+            "the violatable body rule must be used instead of the no-op title rule: {test}"
+        );
+        assert!(
+            !test.contains("rejects_invalid_title_and_preserves_input"),
+            "the no-op title rule must not be used for the smoke test: {test}"
         );
     }
 
