@@ -2709,6 +2709,20 @@ pub fn confirm_action(
 /// ambiguous. Prefix panel ids per widget instance (e.g. `"post-overview"`,
 /// `"related-overview"`) if more than one `tabs()` appears on a page.
 ///
+/// # Nesting a `tabs()` widget inside another `tabs()` panel
+///
+/// This is supported for panel *visibility*: `input.css` reveals the whole
+/// ancestor chain down to a deep-linked inner panel, so content nested
+/// inside any outer panel (not just the outer widget's default one) is
+/// reachable via its own fragment. The outer widget's *active-tab visual
+/// highlight*, however, can only be synced when the shown outer panel is
+/// itself the direct `:target` — CSS forbids nesting `:has()` inside
+/// another `:has()`, so a panel that's shown only because it *contains* a
+/// nested target (rather than being the target itself) can't be
+/// attributed to a specific outer tab position. In that case no outer tab
+/// is highlighted as active (a graceful degrade — no tab looks active,
+/// rather than the wrong one looking active).
+///
 /// # Example
 ///
 /// ```rust

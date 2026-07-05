@@ -374,19 +374,33 @@
 }
 
 /* No-JS switching: a panel becomes visible when its id is the URL's
-   fragment (`:target`), so `#<tab-id>` deep-links a tab on page load. */
-.autumn-tabs__panel:target {
+   fragment (`:target`), OR when it contains — at any depth — a currently
+   `:target`-ed element. The second half reveals the whole ancestor chain
+   down to a panel deep-linked inside a *nested* `tabs()` widget (one
+   `tabs()` call rendered inside another's panel body): without it, the
+   ancestor panel that merely contains the nested widget would stay
+   `display: none` and hide the correctly-targeted inner panel along with
+   it, even though the inner panel's own `:target` rule matched. This half
+   is deliberately unscoped (no `>`) since the target may be arbitrarily
+   deep. */
+.autumn-tabs__panel:is(:target, :has(:target)) {
     display: block;
 }
 
-/* Fallback: show the first panel when no fragment targets any panel in
-   this widget, so a panel is always visible. Scoped to direct children
-   (`>`) throughout so a nested `tabs()` widget inside one of this widget's
-   own panels doesn't leak its `:target` state up to this `:has()` check —
-   without the `>` combinators, an inner tabs() widget's targeted panel
-   would make the outer widget think one of ITS OWN panels is targeted,
-   hiding the outer widget's default panel entirely. */
-.autumn-tabs:not(:has(> .autumn-tabs__panel:target)) > .autumn-tabs__panel--active {
+/* Fallback: show the first panel only when NONE of this widget's OWN
+   panels are already effectively shown — i.e. no panel anywhere in this
+   widget's subtree (its own panels, or a nested tabs() widget's panels) is
+   itself `:target`. The `:has()` argument here is intentionally UNSCOPED
+   (no `>`, checked at any depth): CSS forbids nesting `:has()` inside
+   another `:has()`, so the `:has(:target)` half of the rule above can't be
+   tested from inside this `:has()` directly — but any `:target` anywhere
+   in the subtree, direct or nested, is exactly the signal that some panel
+   is already shown by one half of the rule above or the other, so testing
+   for plain `:target` gives the same answer without needing to nest. The
+   *consequent* (`> .autumn-tabs__panel--active`) IS scoped to direct
+   children, so this rule only ever reveals THIS widget's own default
+   panel, never a nested widget's. */
+.autumn-tabs:not(:has(.autumn-tabs__panel:target)) > .autumn-tabs__panel--active {
     display: block;
 }
 
@@ -403,16 +417,20 @@
     }
 }
 
-/* Sync the active-tab highlight with whichever panel is actually
-   `:target`-ed. Panel/tab ids are arbitrary caller strings, so a shared
-   stylesheet can't match them by value — match by position instead, for
-   the first 6 tabs. Widgets with more tabs keep switching panels
-   correctly; only the active-tab highlight past the 6th degrades to
-   showing no tab as active. Scoped to direct children (`>`) throughout,
-   same reasoning as the fallback above: keeps a nested `tabs()` widget's
-   `:target` state from leaking into this widget's own tab highlighting,
-   and vice versa. */
-.autumn-tabs:has(> .autumn-tabs__panel:target) > .autumn-tabs__list > .autumn-tabs__tab--active {
+/* Sync the active-tab highlight with whichever panel is actually shown.
+   Panel/tab ids are arbitrary caller strings, so a shared stylesheet can't
+   match them by value — match by position instead, for the first 6 tabs.
+   Widgets with more tabs keep switching panels correctly; only the
+   active-tab highlight past the 6th degrades to showing no tab as active.
+   The suppression rule below uses the same unscoped-argument /
+   scoped-consequent pattern as the panel fallback above, for the same
+   :has()-can't-nest-in-:has() reason. The per-tab rules that follow can
+   only match a panel that is ITSELF the direct `:target` — a panel
+   revealed only because it *contains* a nested target can't be attributed
+   to a specific tab position without nesting `:has()` inside `:has()`,
+   which CSS disallows, so in that case no tab gets highlighted (a graceful
+   degrade: no tab looks active, rather than the wrong one). */
+.autumn-tabs:has(.autumn-tabs__panel:target) > .autumn-tabs__list > .autumn-tabs__tab--active {
     color: var(--autumn-text-muted, #6b7280);
     border-bottom-color: transparent;
 }

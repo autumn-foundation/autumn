@@ -62,6 +62,15 @@ Each tuple is `(panel_id, label, body)`, in display order. `panel_id` and
   `:target`/`aria-controls`/`aria-labelledby` lookups ambiguous. Prefix
   panel ids per widget instance (e.g. `"post-overview"`,
   `"related-overview"`) if more than one `tabs()` appears on a page.
+- **Nesting a `tabs()` widget inside another `tabs()` panel:** panel
+  *visibility* handles this — `input.css` reveals the whole ancestor chain
+  down to a deep-linked inner panel, so nested content is reachable no
+  matter which outer panel it lives in. The outer widget's *active-tab
+  highlight* can only sync when the shown outer panel is itself the direct
+  target, though — CSS forbids nesting `:has()` inside `:has()`, so a panel
+  shown only because it contains a nested target can't be tied back to a
+  specific outer tab position. No outer tab is highlighted in that case,
+  rather than the wrong one being highlighted.
 
 ## CSS hooks
 
