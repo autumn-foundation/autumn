@@ -606,6 +606,12 @@ const MAX_DECIMAL_PRECISION: u32 = 28;
 fn parse_decimal_type(ty: &str) -> Result<Option<(u32, u32, bool)>, String> {
     let (body, nullable) =
         strip_wrapper(ty, "Option").map_or((ty, false), |inner| (inner.trim(), true));
+    // Defensive: every caller of `parse_field` already trims the outer `ty`
+    // before it reaches here, but trimming `body` again costs nothing and
+    // guards against a caller that doesn't (e.g. a direct unit-test call, or
+    // future refactor) — see the shell-brace-expansion hint below, which
+    // depends on `body` ending exactly at `}` with no trailing whitespace.
+    let body = body.trim();
 
     let Some(rest) = body
         .strip_prefix("decimal")
@@ -1714,6 +1720,35 @@ mod tests {
     fn decimal_rejects_wrong_number_of_brace_args() {
         let err = parse_field("price:decimal{10}").unwrap_err();
         assert!(err.to_string().contains("precision,scale"));
+    }
+
+    #[test]
+    fn decimal_prefixed_typo_still_lists_supported_types() {
+        // A type name that happens to start with `decimal` but isn't a
+        // genuine shell-mangled decimal token (e.g. a typo like
+        // `decimalize`) must still see the full supported-types list, not
+        // just the brace-expansion hint — mirrors enum's
+        // `enum_prefixed_typo_still_lists_supported_types` precedent.
+        let err = parse_field("price:decimalize").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("quote"), "got: {msg}");
+        assert!(msg.contains("Supported:"), "got: {msg}");
+        assert!(msg.contains("String"), "got: {msg}");
+    }
+
+    #[test]
+    fn parse_decimal_type_tolerates_untrimmed_input() {
+        // Defensive-in-depth (PR review, gemini-code-assist): `parse_field`
+        // already trims `ty` before any type parser sees it, so this isn't
+        // reachable through the public `parse_field` API today — but
+        // `parse_decimal_type` re-trims `body` itself too, so a direct call
+        // (or a future caller that doesn't pre-trim) with trailing
+        // whitespace after the closing brace still parses instead of
+        // failing `strip_suffix('}')`.
+        assert_eq!(
+            parse_decimal_type("decimal{10,2} ").unwrap(),
+            Some((10, 2, false))
+        );
     }
 
     #[test]

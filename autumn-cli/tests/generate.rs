@@ -1285,14 +1285,22 @@ fn generated_job_cargo_checks() {
             "SendWelcomeEmail",
             "user_id:i64",
             "email:String",
+            "amount:decimal",
         ],
     );
 
-    // The generated Cargo.toml must include serde.
+    // The generated Cargo.toml must include serde and — since a `decimal`
+    // field is present — rust_decimal (issue #1038 PR review: job_deps
+    // previously omitted it, so the generated args struct referenced
+    // rust_decimal::Decimal without the crate ever being declared).
     let cargo_toml = fs::read_to_string(project.join("Cargo.toml")).unwrap();
     assert!(
         cargo_toml.contains("serde"),
         "Cargo.toml must include serde after generate job"
+    );
+    assert!(
+        cargo_toml.contains("rust_decimal"),
+        "Cargo.toml must include rust_decimal after generate job with a decimal field"
     );
 
     // The generator must have created the expected files.

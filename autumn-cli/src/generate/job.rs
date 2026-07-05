@@ -29,6 +29,16 @@ const JOB_DEPS_UUID: (&str, &str) = ("uuid", "{ version = \"1\", features = [\"s
 /// Extra deps needed when the args struct uses `chrono` date/time fields.
 const JOB_DEPS_CHRONO: (&str, &str) = ("chrono", "{ version = \"0.4\", features = [\"serde\"] }");
 
+/// Extra dep needed when the args struct uses a `decimal` field — mirrors
+/// `model.rs`'s `MODEL_DEPS`/`plan_model` conditional so `render_fields`'s
+/// `f.rust_type()` (`"rust_decimal::Decimal"`) always has a matching
+/// Cargo.toml entry, the same way `JOB_DEPS_UUID`/`JOB_DEPS_CHRONO` already
+/// do for `uuid::Uuid`/`chrono` fields.
+const JOB_DEPS_DECIMAL: (&str, &str) = (
+    "rust_decimal",
+    "{ version = \"1\", features = [\"db-diesel2-postgres\", \"serde\"] }",
+);
+
 /// Build the complete dep list for a job based on which field types are used.
 fn job_deps(fields: &[Field]) -> Vec<(&'static str, &'static str)> {
     let mut deps: Vec<(&str, &str)> = JOB_DEPS_BASE.to_vec();
@@ -40,6 +50,9 @@ fn job_deps(fields: &[Field]) -> Vec<(&'static str, &'static str)> {
         .any(|f| matches!(f.kind, FieldKind::NaiveDateTime | FieldKind::DateTime))
     {
         deps.push(JOB_DEPS_CHRONO);
+    }
+    if fields.iter().any(|f| f.kind.is_decimal()) {
+        deps.push(JOB_DEPS_DECIMAL);
     }
     deps
 }
@@ -798,6 +811,56 @@ async fn main() {
         assert!(
             !cargo.contains("chrono"),
             "Cargo.toml must not include chrono for primitive fields"
+        );
+    }
+
+    #[test]
+    fn decimal_field_adds_rust_decimal_dep_to_cargo_toml() {
+        // Regression test (issue #1038 PR review): `render_fields` emits
+        // `f.rust_type()` ("rust_decimal::Decimal") into the args struct for
+        // any `decimal` field, so the generated Cargo.toml must declare the
+        // crate — job.rs previously had its own `job_deps` list that only
+        // special-cased `Uuid`/chrono and silently omitted `rust_decimal`,
+        // producing a job args struct that failed to compile.
+        let tmp = project_with_main(default_main());
+        plan_job(
+            tmp.path(),
+            "ProcessRefund",
+            &["amount:decimal".to_string()],
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+
+        let cargo = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+        assert!(
+            cargo.contains("rust_decimal"),
+            "Cargo.toml must include rust_decimal: {cargo}"
+        );
+
+        let job_file = fs::read_to_string(tmp.path().join("src/jobs/process_refund.rs")).unwrap();
+        assert!(
+            job_file.contains("pub amount: rust_decimal::Decimal,"),
+            "job args struct must declare the decimal field: {job_file}"
+        );
+    }
+
+    #[test]
+    fn primitive_fields_do_not_add_rust_decimal() {
+        let tmp = project_with_main(default_main());
+        plan_job(
+            tmp.path(),
+            "SendWelcomeEmail",
+            &["user_id:i64".to_string(), "email:String".to_string()],
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+
+        let cargo = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+        assert!(
+            !cargo.contains("rust_decimal"),
+            "Cargo.toml must not include rust_decimal for primitive fields"
         );
     }
 }

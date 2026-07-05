@@ -1034,6 +1034,45 @@ fn unquote_default_value(value: &str) -> &str {
         .unwrap_or(value)
 }
 
+/// Check that a `--default` value's *significant* digits fit a
+/// `NUMERIC(precision,scale)` column, so a decimal default never generates a
+/// migration that fails at apply time with a Postgres "numeric field
+/// overflow" (integer part too wide) — or silently gets rounded away
+/// (fractional part too precise), which would defeat the entire point of a
+/// field type that exists to avoid silent precision loss.
+///
+/// `value` is assumed to already be a plain (non-scientific-notation),
+/// finite numeric string — the caller checks that first. Trailing/leading
+/// zeros are trimmed before counting: `"1.500"` has one significant
+/// fractional digit (5), not three, and `"007"` has one significant integer
+/// digit, matching Postgres's own `NUMERIC` digit-counting semantics.
+fn validate_decimal_default_fits(value: &str, precision: u32, scale: u32) -> Result<(), String> {
+    let unsigned = value
+        .strip_prefix('-')
+        .or_else(|| value.strip_prefix('+'))
+        .unwrap_or(value);
+    let (int_part, frac_part) = unsigned.split_once('.').unwrap_or((unsigned, ""));
+
+    let frac_digits = frac_part.trim_end_matches('0').len();
+    if frac_digits > scale as usize {
+        return Err(format!(
+            "decimal default '{value}' has {frac_digits} fractional digit(s), but \
+             decimal{{{precision},{scale}}} only allows {scale}"
+        ));
+    }
+
+    let int_digits = int_part.trim_start_matches('0').len();
+    let max_int_digits = precision - scale;
+    if int_digits > max_int_digits as usize {
+        return Err(format!(
+            "decimal default '{value}' has {int_digits} integer digit(s), but \
+             decimal{{{precision},{scale}}} only allows {max_int_digits}"
+        ));
+    }
+
+    Ok(())
+}
+
 fn sql_default_literal(field: &Field, value: &str) -> Result<String, String> {
     match field.kind {
         FieldKind::Bool => match value.to_ascii_lowercase().as_str() {
@@ -1057,14 +1096,28 @@ fn sql_default_literal(field: &Field, value: &str) -> Result<String, String> {
             .parse::<f64>()
             .map(|_| value.to_owned())
             .map_err(|_| "float defaults must be valid numbers".to_owned()),
-        // Shape-validated the same way as F32/F64 (an `f64` parse is just a
-        // "does this look like a number" check) and emitted as the original
-        // string — `autumn-cli` doesn't depend on `rust_decimal` itself, and
-        // an unquoted numeric literal is valid Postgres `NUMERIC` SQL either way.
-        FieldKind::Decimal { .. } => value
-            .parse::<f64>()
-            .map(|_| value.to_owned())
-            .map_err(|_| "decimal defaults must be valid numbers".to_owned()),
+        FieldKind::Decimal { precision, scale } => {
+            let parsed: f64 = value
+                .parse()
+                .map_err(|_| "decimal defaults must be valid numbers".to_owned())?;
+            if !parsed.is_finite() {
+                return Err("decimal defaults must be finite numbers (not NaN/infinity)".to_owned());
+            }
+            if value.contains(['e', 'E']) {
+                return Err(
+                    "decimal defaults must be written in plain notation (e.g. '19.99'), \
+                     not scientific notation"
+                        .to_owned(),
+                );
+            }
+            validate_decimal_default_fits(value, precision, scale)?;
+            // Emitted as the original string, not `parsed.to_string()` —
+            // `autumn-cli` doesn't depend on `rust_decimal` itself, and an
+            // unquoted numeric literal is valid Postgres `NUMERIC` SQL
+            // whether or not it round-trips exactly through `f64` (this arm
+            // only used `f64` to reject non-numeric garbage above).
+            Ok(value.to_owned())
+        }
         FieldKind::Uuid
         | FieldKind::NaiveDateTime
         | FieldKind::DateTime
@@ -1642,6 +1695,162 @@ mod tests {
             assert!(
                 matches!(err, GenerateError::InvalidField { .. }),
                 "expected '{field_name}' to be rejected"
+            );
+        }
+    }
+
+    // ── decimal field: --default (issue #1038 PR review) ────────────────────
+
+    #[test]
+    fn decimal_default_within_precision_and_scale_is_accepted() {
+        let fields = parse_fields(&["price:decimal{12,2}".into()]).unwrap();
+        let metadata = parse_model_metadata(
+            &fields,
+            &ModelOptions {
+                defaults: vec!["price=19.99".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            metadata.defaults().get("price").map(String::as_str),
+            Some("19.99")
+        );
+    }
+
+    #[test]
+    fn decimal_default_rejected_when_integer_part_overflows_precision() {
+        // decimal{2,2} has 0 integer digits of budget (precision - scale ==
+        // 0), so any value with magnitude >= 1 must be rejected rather than
+        // generating a migration Postgres fails at apply time with a
+        // "numeric field overflow".
+        let fields = parse_fields(&["amount:decimal{2,2}".into()]).unwrap();
+        let err = parse_model_metadata(
+            &fields,
+            &ModelOptions {
+                defaults: vec!["amount=1".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("integer digit"), "got: {msg}");
+    }
+
+    #[test]
+    fn decimal_default_rejected_when_fractional_part_exceeds_scale() {
+        // decimal{3,2} only allows 2 fractional digits; a third significant
+        // digit would silently round away rather than storing exactly.
+        let fields = parse_fields(&["amount:decimal{3,2}".into()]).unwrap();
+        let err = parse_model_metadata(
+            &fields,
+            &ModelOptions {
+                defaults: vec!["amount=1.999".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("fractional digit"), "got: {msg}");
+    }
+
+    #[test]
+    fn decimal_default_tolerates_insignificant_trailing_zeros() {
+        // "1.500" has one significant fractional digit (5), not three — it
+        // must not be rejected for a scale-2 column just because the source
+        // string happens to have an extra trailing zero.
+        let fields = parse_fields(&["amount:decimal{4,2}".into()]).unwrap();
+        let metadata = parse_model_metadata(
+            &fields,
+            &ModelOptions {
+                defaults: vec!["amount=1.500".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            metadata.defaults().get("amount").map(String::as_str),
+            Some("1.500")
+        );
+    }
+
+    #[test]
+    fn decimal_default_tolerates_leading_zeros_in_integer_part() {
+        let fields = parse_fields(&["amount:decimal{2,2}".into()]).unwrap();
+        let metadata = parse_model_metadata(
+            &fields,
+            &ModelOptions {
+                defaults: vec!["amount=0.5".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            metadata.defaults().get("amount").map(String::as_str),
+            Some("0.5")
+        );
+    }
+
+    #[test]
+    fn decimal_default_accepts_negative_value_within_range() {
+        let fields = parse_fields(&["amount:decimal{2,2}".into()]).unwrap();
+        let metadata = parse_model_metadata(
+            &fields,
+            &ModelOptions {
+                defaults: vec!["amount=-0.75".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            metadata.defaults().get("amount").map(String::as_str),
+            Some("-0.75")
+        );
+    }
+
+    #[test]
+    fn decimal_default_rejects_non_numeric_value() {
+        let fields = parse_fields(&["price:decimal".into()]).unwrap();
+        let err = parse_model_metadata(
+            &fields,
+            &ModelOptions {
+                defaults: vec!["price=abc".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("valid numbers"));
+    }
+
+    #[test]
+    fn decimal_default_rejects_scientific_notation() {
+        let fields = parse_fields(&["price:decimal".into()]).unwrap();
+        let err = parse_model_metadata(
+            &fields,
+            &ModelOptions {
+                defaults: vec!["price=1e2".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("scientific notation"));
+    }
+
+    #[test]
+    fn decimal_default_rejects_nan_and_infinity() {
+        let fields = parse_fields(&["price:decimal".into()]).unwrap();
+        for bad in ["nan", "inf", "infinity"] {
+            let err = parse_model_metadata(
+                &fields,
+                &ModelOptions {
+                    defaults: vec![format!("price={bad}")],
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("finite"),
+                "'{bad}' should be rejected as non-finite: {err}"
             );
         }
     }
