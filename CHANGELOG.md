@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **generator:** `autumn generate scaffold`'s `create`/`update` handlers now
+  build a `Changeset` from the submission and re-render the `new`/`edit`
+  form on a rejected submission (issue #1124). A failed submission responds
+  **422** (not the old 400 error page) and re-renders through the shipped,
+  accessible `autumn_web::form::{text_input, number_input, datetime_input,
+  checkbox_input, select_input}` helpers — every submitted field value is
+  preserved and per-field error messages appear inline (`aria-invalid` +
+  `role="alert"`). Success behavior is unchanged: insert/update then
+  redirect. The generator promotes its internal decode struct to a public,
+  validating `{Model}Form` (derives `Serialize`/`validator::Validate`/
+  `Default`, carries any `--validate` rules, and gets a generated
+  `From<&Model>` to seed the edit form). The pre-existing `unique`-field
+  duplicate-value re-render (#1032) now goes through the same changeset
+  renderer instead of its own hand-rolled path. `examples/bookmarks`
+  demonstrates the round-trip.
+
 - **views:** `tabs` widget — a no-JavaScript panel switcher for detail and
   settings views (#1316). `tabs(id, panels)` takes an ordered
   `&[(id, label, maud::Markup)]` list and renders an `autumn-tabs` root with

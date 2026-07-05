@@ -946,13 +946,15 @@ fn generate_scaffold_accepts_metadata_flags() {
     assert!(repo.contains("fn find_by_alive(alive: bool) -> Vec<Bookmark>;"));
 
     let routes = fs::read_to_string(project.join("src/routes/bookmarks.rs")).unwrap();
-    assert!(routes.contains("name=\"url\""));
-    assert!(routes.contains("name=\"title\""));
-    assert!(routes.contains("name=\"tag\""));
-    assert!(!routes.contains("name=\"alive\""));
-    assert!(routes.contains("bookmarks::tag.eq(form.tag.clone())"));
-    assert!(!routes.contains("bookmarks::alive.eq(form.alive.clone())"));
-    assert!(!routes.contains("form.alive"));
+    // Fields render through the changeset-aware helpers (issue #1124).
+    assert!(routes.contains("autumn_web::form::text_input(&changeset, \"url\""));
+    assert!(routes.contains("autumn_web::form::text_input(&changeset, \"title\""));
+    assert!(routes.contains("autumn_web::form::text_input(&changeset, \"tag\""));
+    // `alive` is defaulted → excluded from the form entirely.
+    assert!(!routes.contains("\"alive\""));
+    assert!(routes.contains("bookmarks::tag.eq(new.tag.clone())"));
+    assert!(!routes.contains("bookmarks::alive.eq("));
+    assert!(!routes.contains("new.alive"));
 
     let migration = fs::read_dir(project.join("migrations"))
         .unwrap()
@@ -1244,6 +1246,65 @@ fn generated_scaffold_cargo_checks() {
         "cargo check on generated scaffold failed:\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&check.stdout),
         String::from_utf8_lossy(&check.stderr),
+    );
+}
+
+/// Slow end-to-end check (issue #1124): scaffold a model with a `--validate`
+/// rule and prove the generated changeset round-trip actually compiles *and*
+/// runs — a rejected submission gets 422 with the other field preserved and
+/// an inline error, a valid one still succeeds (AC1-AC5, AC7). Runs the
+/// generated `tests/<snake>.rs` changeset smoke test directly (it needs no
+/// Docker/Postgres — see `render_validation_rejection_smoke_test`), not just
+/// `cargo check`.
+///
+/// Ignored by default; run with `cargo test -p autumn-cli -- --ignored`.
+#[test]
+#[ignore = "slow: cargo-builds and runs a fresh project's test suite — run with `cargo test -p autumn-cli -- --ignored`"]
+fn generated_validated_scaffold_round_trip_test_passes() {
+    let (_tmp, project) = fresh_project("scaffold-validation-build");
+    patch_generated_cargo_toml(&project);
+
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Post",
+            "title:String",
+            "body:String",
+            "--validate",
+            "title=length:min=1,max=200",
+        ],
+    );
+
+    let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
+    assert!(routes.contains("pub struct PostForm"));
+    assert!(routes.contains("into_changeset()"));
+    assert!(routes.contains("StatusCode::UNPROCESSABLE_ENTITY"));
+
+    let test_file = fs::read_to_string(project.join("tests/post.rs")).unwrap();
+    assert!(test_file.contains("posts_rejects_invalid_title_and_preserves_input"));
+
+    let output = Command::new("cargo")
+        .args([
+            "test",
+            "--test",
+            "post",
+            "posts_rejects_invalid_title_and_preserves_input",
+        ])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "the generated changeset round-trip test failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("test result: ok"),
+        "expected the generated test to pass:\n{stdout}"
     );
 }
 
@@ -1598,23 +1659,25 @@ fn generate_scaffold_unique_field_create_violation_form_preserves_submitted_valu
         "the blank new_form must not reference `new`; got:\n{new_form_body}"
     );
 
-    // The violation-branch re-render (spliced into `create`) must restore
-    // every submitted value from `new`.
+    // The violation-branch re-render (spliced into `create`) rebuilds the
+    // changeset with the duplicate error via `Changeset::from_errors` and
+    // re-renders through the same changeset-aware helpers, so every submitted
+    // value is preserved (issue #1124 unifies the unique path with validation).
     let create_body = &routes[create_start..];
     assert!(
-        create_body.contains("value=(new.age.to_string())"),
+        create_body.contains("Changeset::from_errors(changeset.into_inner(), errors)"),
         "got:\n{create_body}"
     );
     assert!(
-        create_body.contains("checked[new.active]"),
+        create_body.contains("autumn_web::form::number_input(&changeset, \"age\""),
         "got:\n{create_body}"
     );
     assert!(
-        create_body.contains("selected[new.status == Status::Draft]"),
+        create_body.contains("autumn_web::form::checkbox_input(&changeset, \"active\""),
         "got:\n{create_body}"
     );
     assert!(
-        create_body.contains("selected[new.status == Status::Published]"),
+        create_body.contains("autumn_web::form::select_input(&changeset, \"status\""),
         "got:\n{create_body}"
     );
 }
@@ -1644,40 +1707,36 @@ fn generate_scaffold_unique_field_update_violation_form_preserves_submitted_valu
     );
 
     let routes = fs::read_to_string(project.join("src/routes/users.rs")).unwrap();
-    // The plain `edit_form` (shows the persisted row, no prior rejected
-    // submission) must stay untouched — every value still comes from `row`.
+    // The plain `edit_form` seeds its changeset from the persisted row.
     let edit_form_start = routes
         .find("pub async fn edit_form")
         .expect("edit_form handler");
     let update_start = routes.find("pub async fn update(").expect("update handler");
     let edit_form_body = &routes[edit_form_start..update_start];
     assert!(
-        !edit_form_body.contains("form."),
-        "the plain edit_form must not reference `form`; got:\n{edit_form_body}"
-    );
-    assert!(
-        edit_form_body.contains("value=(row.age.to_string())"),
-        "got:\n{edit_form_body}"
+        edit_form_body.contains("Changeset::new(UserForm::from(&row))"),
+        "the edit_form seeds a changeset from the loaded row; got:\n{edit_form_body}"
     );
 
-    // The violation-branch re-render (spliced into `update`) must restore
-    // every submitted value from `form`, not the stale `row`.
+    // The violation-branch re-render (spliced into `update`) preserves the
+    // *submitted* edits by rebuilding the changeset from the decoded form via
+    // `Changeset::from_errors` — no stale `row` refetch (issue #1124).
     let update_body = &routes[update_start..];
     assert!(
-        update_body.contains("value=(form.age.to_string())"),
+        update_body.contains("Changeset::from_errors(changeset.into_inner(), errors)"),
         "got:\n{update_body}"
     );
     assert!(
-        update_body.contains("checked[form.active]"),
+        update_body.contains("autumn_web::form::number_input(&changeset, \"age\""),
         "got:\n{update_body}"
     );
     assert!(
-        update_body.contains("selected[form.status == Status::Draft]"),
+        update_body.contains("autumn_web::form::select_input(&changeset, \"status\""),
         "got:\n{update_body}"
     );
     assert!(
-        update_body.contains("selected[form.status == Status::Published]"),
-        "got:\n{update_body}"
+        !update_body.contains(".first(&mut *db)"),
+        "the update violation path must not re-fetch the row; got:\n{update_body}"
     );
 }
 
@@ -2119,10 +2178,10 @@ fn generate_scaffold_unique_attachment_field_is_skipped_in_smoke_test() {
 }
 
 #[test]
-fn generate_scaffold_without_unique_field_keeps_plain_create_signature() {
-    // Regression guard: a scaffold with NO unique fields must emit
-    // byte-identical output to before this feature existed — no
-    // UNIQUE_CONSTRAINTS const, no Response-returning create/update.
+fn generate_scaffold_without_unique_field_omits_unique_constraints() {
+    // A scaffold with NO unique fields emits no UNIQUE_CONSTRAINTS const, but
+    // (issue #1124) every scaffold now uses the changeset round-trip: create
+    // returns a Response and carries the CSRF params for the 422 re-render.
     let (_tmp, project) = fresh_project("no-unique-scaffold-routes-app");
     run_autumn(&project, &["generate", "scaffold", "Post", "title:String"]);
 
@@ -2130,10 +2189,11 @@ fn generate_scaffold_without_unique_field_keeps_plain_create_signature() {
     assert!(!routes.contains("UNIQUE_CONSTRAINTS"), "got:\n{routes}");
     assert!(
         routes.contains(
-            "pub async fn create(flash: Flash, mut db: Db, body: Bytes) -> AutumnResult<Markup>"
+            "pub async fn create(flash: Flash, csrf: Option<CsrfToken>, csrf_field: Option<CsrfFormField>, mut db: Db, body: Bytes) -> AutumnResult<autumn_web::reexports::axum::response::Response>"
         ),
         "got:\n{routes}"
     );
+    assert!(routes.contains("form.into_changeset()"), "got:\n{routes}");
 }
 
 #[test]
@@ -2291,12 +2351,11 @@ fn generate_scaffold_unique_live_field_wires_repository_save_and_db_refetch() {
         "got:\n{routes}"
     );
     // Regression guard (issue #1032 review follow-up): `update`'s signature
-    // must NOT carry a second `Db` extractor alongside `repo` — `Db` checks
-    // out and holds a pool connection for the whole handler scope, and
-    // `repo.update` (the live write path) checks out its own connection from
-    // the same pool, so holding both at once self-deadlocks/times out a pool
-    // sized for one connection per request. The unique-violation re-fetch
-    // must go through `repo.find_by_id` instead of a direct `db` query.
+    // must NOT carry a second `Db` extractor alongside `repo` — holding both a
+    // `Db` and `repo`'s own checkout at once self-deadlocks a pool sized for
+    // one connection per request. Issue #1124 drops the unique-violation
+    // row-refetch entirely (the 422 re-renders the submitted changeset), so the
+    // live update path no longer needs any refetch connection at all.
     let update_start = routes.find("pub async fn update(").expect("update handler");
     let update_body = &routes[update_start..];
     assert!(
@@ -2305,8 +2364,8 @@ fn generate_scaffold_unique_live_field_wires_repository_save_and_db_refetch() {
          got:\n{update_body}"
     );
     assert!(
-        update_body.contains("repo.find_by_id(*id).await?"),
-        "got:\n{update_body}"
+        update_body.contains("Changeset::from_errors(changeset.into_inner(), errors)"),
+        "the update violation path re-renders the submitted changeset; got:\n{update_body}"
     );
     assert!(routes.contains("repo: PgUserRepository"), "got:\n{routes}");
     assert!(
@@ -4286,33 +4345,24 @@ fn live_validation_emits_hx_post_and_error_slot() {
 
     let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
 
-    // hx-post attr on the title input in the create form
+    // A validated text field on `--live-validation` renders via the
+    // changeset-aware `text_input_htmx` helper (issue #1124), which wires up
+    // its own hx-post/hx-trigger/hx-target/hx-swap and inline error block —
+    // the generator no longer hand-rolls these attributes.
     assert!(
-        routes.contains("hx-post=\"/posts/validate/title\""),
-        "create form must have hx-post on validated title input:\n{routes}"
+        routes.contains(
+            "autumn_web::form::text_input_htmx(&changeset, \"title\", \"Title\", \"/posts/validate/title\")"
+        ),
+        "create form must render the validated title input via text_input_htmx:\n{routes}"
     );
-    // hx-trigger, hx-target, hx-swap attrs
+    // body field (not validated) must use the plain text_input helper.
     assert!(
-        routes.contains("hx-trigger=\"change\""),
-        "create form must have hx-trigger=\"change\":\n{routes}"
+        routes.contains("autumn_web::form::text_input(&changeset, \"body\", \"Body\")"),
+        "unvalidated body input must use the plain text_input helper:\n{routes}"
     );
     assert!(
-        routes.contains("hx-target=\"#title-error\""),
-        "create form must have hx-target pointing at the error slot:\n{routes}"
-    );
-    assert!(
-        routes.contains("hx-swap=\"outerHTML\""),
-        "create form must have hx-swap=\"outerHTML\":\n{routes}"
-    );
-    // error span emitted after the input
-    assert!(
-        routes.contains("span id=\"title-error\""),
-        "create form must have a companion error span:\n{routes}"
-    );
-    // body field (not validated) must NOT have hx-post
-    assert!(
-        !routes.contains("hx-post=\"/posts/validate/body\""),
-        "unvalidated body input must not have hx-post:\n{routes}"
+        !routes.contains("autumn_web::form::text_input_htmx(&changeset, \"body\""),
+        "unvalidated body input must not use text_input_htmx:\n{routes}"
     );
 }
 
