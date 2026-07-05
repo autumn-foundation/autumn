@@ -438,7 +438,7 @@ impl<T: Serialize> ChangesetForm<T> {
 impl<S, T> FromRequest<S> for ChangesetForm<T>
 where
     S: Send + Sync,
-    T: serde::de::DeserializeOwned + validator::Validate,
+    T: serde::de::DeserializeOwned + validator::Validate + Send,
 {
     type Rejection = axum::response::Response;
 
@@ -466,7 +466,7 @@ where
 /// Decode a form body — URL-encoded always, multipart when that feature is on.
 async fn decode_form_body<T, S>(req: Request, state: &S) -> Result<T, axum::response::Response>
 where
-    T: serde::de::DeserializeOwned + validator::Validate,
+    T: serde::de::DeserializeOwned + validator::Validate + Send,
     S: Send + Sync,
 {
     #[cfg(feature = "multipart")]
@@ -482,10 +482,47 @@ where
         }
     }
 
-    let axum::extract::Form(data) = axum::extract::Form::<T>::from_request(req, state)
+    // Buffer the body so a failed first attempt can be retried against a
+    // reconstructed request — `Form::from_request` consumes its request, so
+    // it can't be called twice on the same one.
+    let (parts, body) = req.into_parts();
+    let bytes = axum::body::to_bytes(body, usize::MAX)
         .await
-        .map_err(IntoResponse::into_response)?;
-    Ok(data)
+        .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e.to_string()).into_response())?;
+
+    let first_req = Request::from_parts(parts.clone(), axum::body::Body::from(bytes.clone()));
+    match axum::extract::Form::<T>::from_request(first_req, state).await {
+        Ok(axum::extract::Form(data)) => Ok(data),
+        Err(first_err) => {
+            // A blank optional field (a number/date/uuid input the user left
+            // empty) submits `field=`, which `serde_urlencoded` rejects
+            // outright for non-string `Option<T>` fields instead of falling
+            // back to `None` — an empty string is not a valid `i32`/`Uuid`/
+            // etc., so it never gets the chance to become "missing" and
+            // deserialize as `None`. Retry with every blank-valued pair
+            // dropped so a genuinely unfilled optional field round-trips
+            // instead of hard-failing before a `Changeset` is ever built.
+            // Required fields are unaffected: an empty string already
+            // deserializes fine for `String`, so the first attempt above
+            // already succeeded for those.
+            let mut any_blank = false;
+            let filtered = url::form_urlencoded::Serializer::new(String::new())
+                .extend_pairs(url::form_urlencoded::parse(&bytes).filter(|(_, v)| {
+                    let keep = !v.is_empty();
+                    any_blank |= !keep;
+                    keep
+                }))
+                .finish();
+            if !any_blank {
+                return Err(first_err.into_response());
+            }
+            let retry_req = Request::from_parts(parts, axum::body::Body::from(filtered));
+            match axum::extract::Form::<T>::from_request(retry_req, state).await {
+                Ok(axum::extract::Form(data)) => Ok(data),
+                Err(_) => Err(first_err.into_response()),
+            }
+        }
+    }
 }
 
 /// Decode `multipart/form-data` text fields and deserialize into `T`.
@@ -537,8 +574,29 @@ where
         .extend_pairs(pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .finish();
 
-    serde_urlencoded::from_str::<T>(&encoded)
-        .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e.to_string()).into_response())
+    match serde_urlencoded::from_str::<T>(&encoded) {
+        Ok(data) => Ok(data),
+        Err(first_err) => {
+            // Same blank-optional-field accommodation as `decode_form_body`:
+            // a number/date/uuid field left empty submits an empty text
+            // value, which `serde_urlencoded` rejects for non-string
+            // `Option<T>` fields — retry with those fields dropped entirely
+            // so they deserialize as `None`.
+            let (blank, non_blank): (Vec<_>, Vec<_>) =
+                pairs.iter().partition(|(_, v)| v.is_empty());
+            if blank.is_empty() {
+                return Err(
+                    (axum::http::StatusCode::BAD_REQUEST, first_err.to_string()).into_response()
+                );
+            }
+            let filtered = url::form_urlencoded::Serializer::new(String::new())
+                .extend_pairs(non_blank.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+                .finish();
+            serde_urlencoded::from_str::<T>(&filtered).map_err(|_| {
+                (axum::http::StatusCode::BAD_REQUEST, first_err.to_string()).into_response()
+            })
+        }
+    }
 }
 
 // ── Internal helpers ───────────────────────────────────────────────
@@ -3275,6 +3333,61 @@ mod tests {
             assert_ne!(resp.status(), axum::http::StatusCode::OK);
         }
 
+        #[derive(serde::Deserialize, validator::Validate)]
+        struct OptionalNumericForm {
+            #[validate(length(min = 3))]
+            name: String,
+            age: Option<i32>,
+        }
+
+        #[tokio::test]
+        async fn blank_optional_numeric_field_decodes_as_none_not_400() {
+            // A number input the user left empty submits `age=` — an empty
+            // string is not a valid `i32`, so `serde_urlencoded` rejects it
+            // outright unless the extractor retries with the blank pair
+            // dropped (falling back to `None`) instead of surfacing a
+            // spurious decode failure that bypasses the Changeset entirely.
+            async fn handler(form: ChangesetForm<OptionalNumericForm>) -> String {
+                format!("valid={} age={:?}", form.is_valid(), form.data().age)
+            }
+            let resp = Router::new()
+                .route("/test", post(handler))
+                .oneshot(urlencoded_req("/test", "name=Alice&age="))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), axum::http::StatusCode::OK);
+            assert_body(resp, "valid=true age=None").await;
+        }
+
+        #[tokio::test]
+        async fn filled_optional_numeric_field_still_decodes() {
+            async fn handler(form: ChangesetForm<OptionalNumericForm>) -> String {
+                format!("valid={} age={:?}", form.is_valid(), form.data().age)
+            }
+            let resp = Router::new()
+                .route("/test", post(handler))
+                .oneshot(urlencoded_req("/test", "name=Alice&age=30"))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), axum::http::StatusCode::OK);
+            assert_body(resp, "valid=true age=Some(30)").await;
+        }
+
+        #[tokio::test]
+        async fn garbage_numeric_field_still_fails_decode() {
+            // A genuinely undecodable value (not blank) must still 400/422 —
+            // the blank-retry accommodation must not paper over real garbage.
+            async fn handler(_form: ChangesetForm<OptionalNumericForm>) -> String {
+                "unreachable".to_string()
+            }
+            let resp = Router::new()
+                .route("/test", post(handler))
+                .oneshot(urlencoded_req("/test", "name=Alice&age=not-a-number"))
+                .await
+                .unwrap();
+            assert_ne!(resp.status(), axum::http::StatusCode::OK);
+        }
+
         #[tokio::test]
         async fn csrf_token_is_none_without_csrf_middleware() {
             async fn handler(form: ChangesetForm<TestForm>) -> String {
@@ -3322,6 +3435,24 @@ mod tests {
                 .await
                 .unwrap();
             assert_body(resp, "valid=true name=Alice").await;
+        }
+
+        #[cfg(feature = "multipart")]
+        #[tokio::test]
+        async fn multipart_blank_optional_numeric_field_decodes_as_none_not_400() {
+            async fn handler(form: ChangesetForm<OptionalNumericForm>) -> String {
+                format!("valid={} age={:?}", form.is_valid(), form.data().age)
+            }
+            let resp = Router::new()
+                .route("/test", post(handler))
+                .oneshot(multipart_req_multi(
+                    "/test",
+                    &[("name", "Alice"), ("age", "")],
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), axum::http::StatusCode::OK);
+            assert_body(resp, "valid=true age=None").await;
         }
 
         #[cfg(feature = "multipart")]
@@ -3467,13 +3598,24 @@ mod tests {
 
         #[cfg(feature = "multipart")]
         fn multipart_req(uri: &str, field: &str, value: &str) -> axum::http::Request<Body> {
+            multipart_req_multi(uri, &[(field, value)])
+        }
+
+        #[cfg(feature = "multipart")]
+        fn multipart_req_multi(uri: &str, fields: &[(&str, &str)]) -> axum::http::Request<Body> {
+            use std::fmt::Write as _;
+
             let boundary = "----FormBoundary7MA4YWxkTrZu0gW";
-            let body = format!(
-                "--{boundary}\r\n\
-                 Content-Disposition: form-data; name=\"{field}\"\r\n\r\n\
-                 {value}\r\n\
-                 --{boundary}--\r\n"
-            );
+            let mut body = String::new();
+            for (field, value) in fields {
+                let _ = write!(
+                    body,
+                    "--{boundary}\r\n\
+                     Content-Disposition: form-data; name=\"{field}\"\r\n\r\n\
+                     {value}\r\n"
+                );
+            }
+            let _ = write!(body, "--{boundary}--\r\n");
             axum::http::Request::builder()
                 .method("POST")
                 .uri(uri)
