@@ -577,7 +577,7 @@ pub fn autocomplete_input(id: &str, label: &str, config: &AutocompleteConfig<'_>
                     option value="" { "— select —" }
                     @if let Some(opts) = config.fallback_options {
                         @for (val, lbl) in opts {
-                            option value=(val) { (lbl) }
+                            option value=(val) selected[config.initial_value == Some(*val)] { (lbl) }
                         }
                     }
                 }
@@ -3273,6 +3273,26 @@ mod tests {
         assert!(html.contains("Beta"), "{html}");
         assert!(html.contains(r#"value="1""#), "{html}");
         assert!(html.contains(r#"value="2""#), "{html}");
+    }
+
+    #[test]
+    fn autocomplete_noscript_select_marks_initial_value_selected() {
+        // ID-mode (default, non-free-text): a prior selection seeded via
+        // `initial_value` must survive a no-JS resubmission too, not just the
+        // JS-driven hidden-input path.
+        let opts: &[(&str, &str)] = &[("1", "Alpha"), ("2", "Beta")];
+        let config = AutocompleteConfig::new("/ac", "value_field")
+            .fallback_options(opts)
+            .initial_value("2");
+        let html = autocomplete_input("x", "Label", &config).into_string();
+        assert!(
+            html.contains(r#"value="2" selected"#),
+            "the option matching initial_value must be marked selected: {html}"
+        );
+        assert!(
+            !html.contains(r#"value="1" selected"#),
+            "only the matching option should be selected: {html}"
+        );
     }
 
     #[test]

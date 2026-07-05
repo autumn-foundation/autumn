@@ -52,6 +52,14 @@
     // This preserves any default value set on the hidden input in the HTML.
     if (freeText) {
       getHidden().name = valueName;
+    } else if (getHidden().value) {
+      // ID mode: a non-empty hidden value at init means a prior selection was
+      // seeded server-side (an edit-form GET, or a 422 re-render preserving a
+      // previous pick) — assign the name now so it round-trips on submit even
+      // if the user never touches this field again. The 'input' listener
+      // below still clears the name the moment the user edits the query,
+      // same as it already does for a live-session selection.
+      getHidden().name = valueName;
     }
 
     function selectOption(opt) {
