@@ -1,3 +1,48 @@
+//! Traits for intercepting and inspecting system operations.
+//!
+//! Interceptors provide a hook mechanism for testing, instrumentation, and observability.
+//! By implementing these traits and registering them during application startup (e.g., via
+//! `TestApp::with_db_interceptor`), you can spy on or mutate operations like database
+//! queries, background jobs, and outbound emails before they are executed.
+//!
+//! # Examples
+//!
+//! ```rust
+//! use autumn_web::interceptor::JobInterceptor;
+//! use autumn_web::AutumnResult;
+//!
+//! #[derive(Clone)]
+//! struct JobSpy;
+//!
+//! impl JobInterceptor for JobSpy {
+//!     fn intercept_enqueue<'a>(
+//!         &'a self,
+//!         name: &'a str,
+//!         payload: &'a serde_json::Value,
+//!         next: std::pin::Pin<
+//!             Box<dyn std::future::Future<Output = AutumnResult<()>> + Send + 'a>,
+//!         >,
+//!     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = AutumnResult<()>> + Send + 'a>> {
+//!         println!("Intercepted enqueue of job {}", name);
+//!         next
+//!     }
+//!
+//!     fn intercept_execute<'a>(
+//!         &'a self,
+//!         name: &'a str,
+//!         payload: &'a serde_json::Value,
+//!         next: std::pin::Pin<
+//!             Box<dyn std::future::Future<Output = AutumnResult<()>> + Send + 'a>,
+//!         >,
+//!     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = AutumnResult<()>> + Send + 'a>> {
+//!         Box::pin(async move {
+//!             println!("Intercepted execute of job {}", name);
+//!             next.await
+//!         })
+//!     }
+//! }
+//! ```
+
 #[cfg(feature = "oauth2")]
 use std::sync::Arc;
 

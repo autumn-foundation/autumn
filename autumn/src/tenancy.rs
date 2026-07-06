@@ -1,3 +1,28 @@
+//! Multi-tenancy logic and data isolation.
+//!
+//! This module provides tools for building multi-tenant applications, including a task-local
+//! `CURRENT_TENANT` variable and an Axum `Tenant` extractor. These allow you to seamlessly
+//! resolve and access the current tenant ID from incoming requests without cluttering your
+//! business logic with boilerplate tenant resolution code.
+//!
+//! # Examples
+//!
+//! ```rust
+//! use autumn_web::tenancy::{Tenant, CURRENT_TENANT};
+//! use axum::routing::get;
+//! use axum::Router;
+//!
+//! async fn my_handler(Tenant(tenant_id): Tenant) -> String {
+//!     // You can access the tenant ID directly from the extractor
+//!     format!("Handling request for tenant: {}", tenant_id)
+//! }
+//!
+//! # fn setup() {
+//! let app = Router::new()
+//!     .route("/data", get(my_handler));
+//! # }
+//! ```
+
 use axum::{
     extract::State,
     http::Request,

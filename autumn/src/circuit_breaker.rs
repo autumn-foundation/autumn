@@ -1,3 +1,39 @@
+//! Circuit breaker pattern for protecting upstream services and databases from cascading failures.
+//!
+//! A circuit breaker acts as a state machine that monitors the failure rate of a service.
+//! When the failure rate exceeds a certain threshold, the circuit "opens", causing subsequent calls
+//! to fail fast without actually executing the underlying operation. This gives the failing
+//! service time to recover.
+//!
+//! # Examples
+//!
+//! ```rust
+//! use autumn_web::circuit_breaker::{CircuitBreaker, CircuitBreakerPolicy};
+//! use std::time::Duration;
+//!
+//! # #[tokio::main]
+//! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let policy = CircuitBreakerPolicy {
+//!     failure_ratio_threshold: 0.5,
+//!     sample_window: Duration::from_secs(10),
+//!     minimum_sample_count: 5,
+//!     open_duration: Duration::from_secs(60),
+//!     half_open_trial_count: 2,
+//! };
+//!
+//! let breaker = CircuitBreaker::new("payment_gateway", policy);
+//!
+//! // Run a potentially failing operation through the breaker
+//! let result = breaker.run(async {
+//!     // Try to call external service...
+//!     Ok::<_, &'static str>("Success!")
+//! }).await;
+//!
+//! assert!(result.is_ok());
+//! # Ok(())
+//! # }
+//! ```
+
 #![allow(
     clippy::missing_panics_doc,
     clippy::missing_errors_doc,

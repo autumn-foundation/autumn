@@ -1,3 +1,27 @@
+//! Idempotency layer to prevent accidental double-execution of HTTP requests.
+//!
+//! This module provides the `IdempotencyLayer` middleware, which intercepts incoming
+//! requests checking for an idempotency key (typically the `Idempotency-Key` header).
+//! If a key is present and a response is already cached for that key, the cached
+//! response is returned, and the request is not processed further. This allows
+//! non-idempotent operations (like creating resources or charging payments) to be
+//! safely retried if a network error occurs before the client receives the response.
+//!
+//! # Examples
+//!
+//! ```rust
+//! use autumn_web::idempotency::IdempotencyLayer;
+//! use autumn_web::cache::RedisCache;
+//! use axum::{Router, routing::post};
+//!
+//! # fn setup() {
+//! # let cache_store = RedisCache::new(redis::Client::open("redis://127.0.0.1").unwrap());
+//! let app = Router::new()
+//!     .route("/payments", post(|| async { "Payment charged" }))
+//!     .layer(IdempotencyLayer::new(cache_store));
+//! # }
+//! ```
+
 use bytes::Bytes;
 use futures::StreamExt as FuturesStreamExt;
 
