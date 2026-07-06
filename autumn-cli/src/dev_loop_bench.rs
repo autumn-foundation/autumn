@@ -828,16 +828,33 @@ pub struct OverloadStats {
     /// Admitted-request latency samples (ms) at offered load == ceiling (no
     /// shedding expected).
     pub baseline_samples_ms: Vec<u64>,
+    /// Number of baseline-phase requests that were *not* admitted (shed or
+    /// transport-failed) despite offered load == ceiling. The baseline
+    /// measurement assumes this never happens; a nonzero count means the
+    /// baseline p99 itself is unreliable (some latency it should have
+    /// captured went missing instead), so it's surfaced rather than silently
+    /// discarded.
+    pub baseline_shed_count: u64,
     /// Admitted-request latency samples (ms) at offered load == ceiling ×
     /// multiplier.
     pub admitted_samples_ms: Vec<u64>,
-    /// Shed-response (503) latency samples (ms) at offered load == ceiling ×
-    /// multiplier.
+    /// Genuine shed-response (`503`) latency samples (ms) at offered load ==
+    /// ceiling × multiplier — transport errors are tracked separately (see
+    /// `transport_error_samples_ms`) so they cannot corrupt the shed-latency
+    /// budget with unrelated connection/timeout latency.
     pub shed_samples_ms: Vec<u64>,
-    /// Number of requests shed (503) during the overload phase.
+    /// Number of requests shed with a genuine `503` during the overload phase.
     pub shed_count: u64,
-    /// Number of requests admitted (non-503) during the overload phase.
+    /// Number of requests admitted (2xx) during the overload phase.
     pub admitted_count: u64,
+    /// Latency samples (ms) for requests that failed at the transport level
+    /// (connection refused, reset, timed out) during the overload phase,
+    /// rather than receiving a genuine `503` from the load-shed gate. A
+    /// hung/crashed benchmark host surfaces here, not as inflated shed
+    /// latency.
+    pub transport_error_samples_ms: Vec<u64>,
+    /// Number of transport-level failures during the overload phase.
+    pub transport_error_count: u64,
     /// Child process RSS samples (KB) taken periodically during the overload
     /// phase. Empty on platforms where RSS sampling isn't implemented (see
     /// [`crate::overload_driver::sample_rss_kb`]) — the RSS-bounded check is
@@ -868,6 +885,17 @@ pub struct OverloadCheckResult {
     pub rss_skipped: bool,
     pub shed_count: u64,
     pub admitted_count: u64,
+    /// See [`OverloadStats::baseline_shed_count`]. Does not gate `passed` —
+    /// it's a data-quality warning about the baseline, not a budget the
+    /// server is expected to meet — but is surfaced in the diagnosis and the
+    /// human report rather than silently discarded.
+    pub baseline_shed_count: u64,
+    /// See [`OverloadStats::transport_error_count`]. Does not gate
+    /// `shed_fast_enough` (that budget only ever measures genuine `503`
+    /// latency) but is surfaced as a data-quality warning: a nonzero count
+    /// means the benchmark host itself struggled to keep up with the
+    /// requested concurrency.
+    pub transport_error_count: u64,
     pub diagnosis: String,
 }
 
@@ -959,6 +987,22 @@ pub fn check_overload_budget(
     if !rss_ok {
         diagnosis.push_str("RSS grew unboundedly during the overload phase. ");
     }
+    if stats.baseline_shed_count > 0 {
+        let _ = write!(
+            diagnosis,
+            "WARNING: {} baseline-phase request(s) were not admitted even though offered \
+             load == ceiling; the baseline p99 above may be unreliable. ",
+            stats.baseline_shed_count
+        );
+    }
+    if stats.transport_error_count > 0 {
+        let _ = write!(
+            diagnosis,
+            "WARNING: {} request(s) failed at the transport level (not a genuine 503) \
+             during the overload phase; the benchmark host may be overwhelmed. ",
+            stats.transport_error_count
+        );
+    }
     if passed {
         diagnosis.push_str("Admitted-request latency stayed within budget, shedding was fast, and RSS stayed bounded.");
     }
@@ -976,6 +1020,8 @@ pub fn check_overload_budget(
         rss_skipped,
         shed_count: stats.shed_count,
         admitted_count: stats.admitted_count,
+        baseline_shed_count: stats.baseline_shed_count,
+        transport_error_count: stats.transport_error_count,
         diagnosis: diagnosis.trim_end().to_string(),
     }
 }
@@ -1085,6 +1131,14 @@ pub fn format_overload_human(report: &OverloadReport) -> String {
 
     let r = &report.result;
     writeln!(out, "Baseline p99:  {} ms", r.baseline_p99_ms).unwrap();
+    if r.baseline_shed_count > 0 {
+        writeln!(
+            out,
+            "  ⚠ {} baseline request(s) were not admitted (offered load == ceiling should never shed) — baseline p99 may be unreliable",
+            r.baseline_shed_count
+        )
+        .unwrap();
+    }
     writeln!(
         out,
         "Admitted p99:  {} ms ({:.0}% of baseline) — {}",
@@ -1105,6 +1159,14 @@ pub fn format_overload_human(report: &OverloadReport) -> String {
         if r.shed_fast_enough { "PASS" } else { "FAIL" }
     )
     .unwrap();
+    if r.transport_error_count > 0 {
+        writeln!(
+            out,
+            "  ⚠ {} request(s) failed at the transport level (excluded from shed latency above) — benchmark host may be overwhelmed",
+            r.transport_error_count
+        )
+        .unwrap();
+    }
     if r.rss_skipped {
         writeln!(
             out,
@@ -2051,10 +2113,13 @@ mod tests {
     fn passing_overload_stats() -> OverloadStats {
         OverloadStats {
             baseline_samples_ms: vec![200, 205, 210, 202, 208],
+            baseline_shed_count: 0,
             admitted_samples_ms: vec![205, 210, 215, 208, 212],
             shed_samples_ms: vec![1, 2, 1, 2, 1],
             shed_count: 5,
             admitted_count: 5,
+            transport_error_samples_ms: vec![],
+            transport_error_count: 0,
             rss_samples_kb: vec![10_000, 10_100, 10_050, 10_200, 10_150, 10_100],
         }
     }
@@ -2095,6 +2160,24 @@ mod tests {
             "p99 budget is independent"
         );
         assert!(result.diagnosis.contains("shed responses"));
+    }
+
+    #[test]
+    fn overload_budget_check_transport_errors_do_not_corrupt_shed_fast_enough() {
+        // A hung/timed-out connection's multi-second latency must not be
+        // conflated with genuine 503 shed latency — only `shed_samples_ms`
+        // (real 503s) gates `shed_fast_enough`.
+        let mut stats = passing_overload_stats();
+        stats.transport_error_samples_ms = vec![5000, 6000];
+        stats.transport_error_count = 2;
+        let result = check_overload_budget(&stats, &overload_budget());
+        assert!(
+            result.shed_fast_enough,
+            "transport-error latency must not gate the shed-latency budget"
+        );
+        assert_eq!(result.transport_error_count, 2);
+        assert!(result.diagnosis.contains("WARNING"));
+        assert!(result.diagnosis.contains("transport level"));
     }
 
     #[test]
@@ -2177,6 +2260,41 @@ mod tests {
         assert!(human.contains("Baseline p99"));
         assert!(human.contains("Admitted p99"));
         assert!(human.contains("Shed requests"));
+    }
+
+    #[test]
+    fn format_overload_human_warns_on_nonzero_baseline_shed_count() {
+        let mut stats = passing_overload_stats();
+        stats.baseline_shed_count = 2;
+        let report = build_overload_report(64, 200, 2, &stats);
+        let human = format_overload_human(&report);
+        assert!(
+            human.contains("2 baseline request(s) were not admitted"),
+            "must not silently discard a shed/failed baseline request:\n{human}"
+        );
+        assert!(report.result.diagnosis.contains("WARNING"));
+    }
+
+    #[test]
+    fn format_overload_human_is_silent_when_baseline_never_sheds() {
+        let report = build_overload_report(64, 200, 2, &passing_overload_stats());
+        let human = format_overload_human(&report);
+        assert!(!human.contains("were not admitted"));
+    }
+
+    #[test]
+    fn format_overload_human_shows_transport_error_count_distinctly_from_shed() {
+        let mut stats = passing_overload_stats();
+        stats.transport_error_samples_ms = vec![5000];
+        stats.transport_error_count = 1;
+        let report = build_overload_report(64, 200, 2, &stats);
+        let human = format_overload_human(&report);
+        assert!(
+            human.contains("1 request(s) failed at the transport level"),
+            "transport errors must be surfaced distinctly, not folded into 'Shed requests':\n{human}"
+        );
+        // The genuine shed count (from `passing_overload_stats`) must be unaffected.
+        assert!(human.contains("Shed requests: 5"));
     }
 
     #[test]

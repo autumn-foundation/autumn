@@ -130,13 +130,36 @@ fn build_app(project_dir: &Path, bin_name: &str) -> Result<PathBuf, String> {
     })
 }
 
+/// How one fired request resolved.
+///
+/// A transport error (connection refused, timeout, reset) and a genuine `503`
+/// are both "not admitted", but they are not the same thing: a transport
+/// error's latency reflects the client's own timeout or the OS's connection
+/// machinery, not how fast the server's admission gate rejected the request.
+/// Conflating them would let a hung/crashed benchmark host's multi-second
+/// transport-error latency masquerade as (and corrupt) the shed-latency
+/// budget (see `docs/guide/dev-loop-latency.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Classification {
+    /// Any 2xx response.
+    Admitted,
+    /// A genuine `503 Service Unavailable` from the load-shed gate.
+    Shed,
+    /// A connection-level failure, or any other unexpected status.
+    TransportError,
+}
+
 /// Outcome of one HTTP request fired during load generation.
 #[derive(Debug)]
 struct RequestOutcome {
-    /// `true` for any 2xx response, `false` for a `503` (or a transport
-    /// error, treated conservatively as "not admitted").
-    admitted: bool,
+    classification: Classification,
     elapsed_ms: u64,
+}
+
+impl RequestOutcome {
+    fn admitted(&self) -> bool {
+        self.classification == Classification::Admitted
+    }
 }
 
 /// Fire `count` requests to `url` as close to simultaneously as possible
@@ -175,9 +198,15 @@ fn fire_concurrent(
                 let start = Instant::now();
                 let resp = client.get(&url).send();
                 let elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-                let admitted = matches!(&resp, Ok(r) if r.status().is_success());
+                let classification = match &resp {
+                    Ok(r) if r.status().is_success() => Classification::Admitted,
+                    Ok(r) if r.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE => {
+                        Classification::Shed
+                    }
+                    _ => Classification::TransportError,
+                };
                 results.lock().unwrap().push(RequestOutcome {
-                    admitted,
+                    classification,
                     elapsed_ms,
                 });
             })
@@ -213,6 +242,32 @@ fn sample_rss_kb(_pid: u32) -> Option<u64> {
     None
 }
 
+/// Whether this platform's [`sample_rss_kb`] can ever return `Some` at all.
+/// Gates the dead-process liveness check below: on an unsupported platform
+/// every sample is unconditionally `None`, which must not be misread as "the
+/// process died" (see [`rss_liveness_exhausted`]).
+#[cfg(target_os = "linux")]
+const fn rss_sampling_supported() -> bool {
+    true
+}
+
+#[cfg(not(target_os = "linux"))]
+const fn rss_sampling_supported() -> bool {
+    false
+}
+
+/// After how many consecutive missed RSS samples the scaffolded server is
+/// treated as likely dead (crashed or exited), rather than the sampler
+/// grinding through the remaining `--runs` cycles against a process that's no
+/// longer there. At the sampler's 30ms cadence, 3 misses is ~90ms of a
+/// missing PID — long enough to rule out a single transient
+/// `/proc/<pid>/status` read hiccup, short enough to stop quickly.
+const RSS_LIVENESS_MISS_THRESHOLD: u32 = 3;
+
+const fn rss_liveness_exhausted(consecutive_misses: u32) -> bool {
+    consecutive_misses >= RSS_LIVENESS_MISS_THRESHOLD
+}
+
 /// Poll `/live` until it reports ready or the deadline elapses.
 fn wait_until_ready(
     client: &reqwest::blocking::Client,
@@ -239,7 +294,11 @@ fn wait_until_ready(
 }
 
 /// Run one baseline+overload measurement cycle against an already-running
-/// server, appending samples into `stats`.
+/// server, appending samples into `stats`. Returns `true` when the RSS
+/// sampler saw enough consecutive missed samples to conclude the server
+/// process has likely died mid-measurement (see
+/// [`rss_liveness_exhausted`]) — the caller should stop repeating cycles
+/// rather than grinding through the remaining `--runs` against a dead PID.
 fn measure_one_cycle(
     client: &reqwest::blocking::Client,
     url_block: &str,
@@ -247,23 +306,43 @@ fn measure_one_cycle(
     ceiling: usize,
     load_multiplier: u32,
     stats: &mut OverloadStats,
-) {
-    // Baseline: offered load == ceiling, no shedding expected.
+) -> bool {
+    // Baseline: offered load == ceiling, no shedding expected. A shed/failed
+    // outcome here would otherwise vanish with no trace, silently corrupting
+    // the "offered load == ceiling never sheds" assumption the baseline p99
+    // depends on — count it instead (see `OverloadStats::baseline_shed_count`).
     let baseline = fire_concurrent(client, url_block, ceiling);
-    stats
-        .baseline_samples_ms
-        .extend(baseline.iter().filter(|o| o.admitted).map(|o| o.elapsed_ms));
+    stats.baseline_samples_ms.extend(
+        baseline
+            .iter()
+            .filter(|o| o.admitted())
+            .map(|o| o.elapsed_ms),
+    );
+    stats.baseline_shed_count += baseline.iter().filter(|o| !o.admitted()).count() as u64;
 
     // Sample RSS on a background thread for the duration of the overload burst.
     let rss_samples = Arc::new(Mutex::new(Vec::new()));
     let sampling = Arc::new(AtomicBool::new(true));
+    let process_likely_dead = Arc::new(AtomicBool::new(false));
     let sampler = {
         let rss_samples = Arc::clone(&rss_samples);
         let sampling = Arc::clone(&sampling);
+        let process_likely_dead = Arc::clone(&process_likely_dead);
         std::thread::spawn(move || {
+            let mut consecutive_misses = 0u32;
             while sampling.load(Ordering::Relaxed) {
-                if let Some(kb) = sample_rss_kb(pid) {
-                    rss_samples.lock().unwrap().push(kb);
+                match sample_rss_kb(pid) {
+                    Some(kb) => {
+                        consecutive_misses = 0;
+                        rss_samples.lock().unwrap().push(kb);
+                    }
+                    None if rss_sampling_supported() => {
+                        consecutive_misses += 1;
+                        if rss_liveness_exhausted(consecutive_misses) {
+                            process_likely_dead.store(true, Ordering::Relaxed);
+                        }
+                    }
+                    None => {}
                 }
                 std::thread::sleep(Duration::from_millis(30));
             }
@@ -278,17 +357,26 @@ fn measure_one_cycle(
     let _ = sampler.join();
 
     for outcome in &overload {
-        if outcome.admitted {
-            stats.admitted_samples_ms.push(outcome.elapsed_ms);
-            stats.admitted_count += 1;
-        } else {
-            stats.shed_samples_ms.push(outcome.elapsed_ms);
-            stats.shed_count += 1;
+        match outcome.classification {
+            Classification::Admitted => {
+                stats.admitted_samples_ms.push(outcome.elapsed_ms);
+                stats.admitted_count += 1;
+            }
+            Classification::Shed => {
+                stats.shed_samples_ms.push(outcome.elapsed_ms);
+                stats.shed_count += 1;
+            }
+            Classification::TransportError => {
+                stats.transport_error_samples_ms.push(outcome.elapsed_ms);
+                stats.transport_error_count += 1;
+            }
         }
     }
     stats
         .rss_samples_kb
         .extend(rss_samples.lock().unwrap().iter().copied());
+
+    process_likely_dead.load(Ordering::Relaxed)
 }
 
 /// Scaffold, build, boot, and measure the overload benchmark `runs` times
@@ -358,7 +446,7 @@ fn measure_overload(
 
     for i in 1..=runs {
         eprintln!("  overload run {i}/{runs}…");
-        measure_one_cycle(
+        let process_likely_dead = measure_one_cycle(
             &client,
             &url_block,
             pid,
@@ -366,6 +454,14 @@ fn measure_overload(
             load_multiplier,
             &mut stats,
         );
+        if process_likely_dead {
+            eprintln!(
+                "Warning: the scaffolded server's RSS could not be sampled for \
+                 {RSS_LIVENESS_MISS_THRESHOLD} consecutive checks — it may have crashed \
+                 or exited. Stopping early after {i}/{runs} run(s)."
+            );
+            break;
+        }
     }
 
     stop_child(&mut child);
@@ -403,6 +499,10 @@ pub fn run_overload(
     }
     if ceiling == 0 {
         eprintln!("Error: --ceiling must be at least 1.");
+        return 1;
+    }
+    if load_multiplier == 0 {
+        eprintln!("Error: --load-multiplier must be at least 1.");
         return 1;
     }
 
@@ -474,6 +574,15 @@ mod tests {
     }
 
     #[test]
+    fn run_overload_rejects_zero_load_multiplier() {
+        // A multiplier of 0 offers zero requests, so every run reports
+        // shed_count == 0 and silently PASSes the "sheds under overload"
+        // check without ever exercising the ceiling.
+        let exit = run_overload(64, 200, 0, 1, None, false, false, false);
+        assert_eq!(exit, 1, "zero load_multiplier must be rejected");
+    }
+
+    #[test]
     fn run_overload_dry_run_ignores_invalid_params() {
         // Dry-run never measures, so a zero runs/ceiling is harmless there.
         assert_eq!(run_overload(0, 200, 2, 0, None, false, false, true), 0);
@@ -491,9 +600,20 @@ mod tests {
     }
 
     #[test]
+    fn rss_liveness_exhausted_requires_the_configured_consecutive_misses() {
+        assert!(!rss_liveness_exhausted(0));
+        assert!(!rss_liveness_exhausted(1));
+        assert!(!rss_liveness_exhausted(RSS_LIVENESS_MISS_THRESHOLD - 1));
+        assert!(rss_liveness_exhausted(RSS_LIVENESS_MISS_THRESHOLD));
+        assert!(rss_liveness_exhausted(RSS_LIVENESS_MISS_THRESHOLD + 5));
+    }
+
+    #[test]
     fn fire_concurrent_reports_transport_errors_as_not_admitted() {
         // Nothing is listening on this reserved-but-unused port, so every
-        // request should fail to connect and be classified as not admitted.
+        // request should fail to connect and be classified as not admitted —
+        // and, specifically, as a transport error rather than a genuine 503
+        // shed (there is no server here to shed anything).
         let port = reserve_free_port().expect("reserve a free port");
         let url = format!("http://127.0.0.1:{port}/nope");
         let client = reqwest::blocking::Client::builder()
@@ -502,7 +622,14 @@ mod tests {
             .expect("build http client");
         let outcomes = fire_concurrent(&client, &url, 3);
         assert_eq!(outcomes.len(), 3);
-        assert!(outcomes.iter().all(|o| !o.admitted));
+        assert!(outcomes.iter().all(|o| !o.admitted()));
+        assert!(
+            outcomes
+                .iter()
+                .all(|o| o.classification == Classification::TransportError),
+            "a connection failure must be classified as a transport error, \
+             not conflated with a genuine 503 shed"
+        );
     }
 
     // ── live driver (slow: compiles and runs a throwaway project) ──────────

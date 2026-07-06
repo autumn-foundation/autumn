@@ -32,6 +32,7 @@ use pin_project_lite::pin_project;
 use tower::{Layer, Service};
 
 use crate::middleware::MetricsCollector;
+use crate::middleware::maintenance::{health_prefix_matches, prefix_with_trailing_slash};
 
 /// `Retry-After` value (seconds) sent on every shed `503`. Kept short so a
 /// client or load balancer retries fast (or fails over to another replica)
@@ -48,7 +49,9 @@ pub struct LoadShedLayer {
     in_flight: Arc<AtomicUsize>,
     metrics: MetricsCollector,
     health_prefix: String,
+    health_prefix_slash: String,
     probe_paths: Vec<String>,
+    cors: Option<Arc<crate::config::CorsConfig>>,
 }
 
 impl LoadShedLayer {
@@ -66,7 +69,9 @@ impl LoadShedLayer {
             in_flight: Arc::new(AtomicUsize::new(0)),
             metrics,
             health_prefix: String::new(),
+            health_prefix_slash: String::new(),
             probe_paths: Vec::new(),
+            cors: None,
         }
     }
 
@@ -75,6 +80,7 @@ impl LoadShedLayer {
     #[must_use]
     pub fn with_health_prefix(mut self, prefix: impl Into<String>) -> Self {
         self.health_prefix = prefix.into();
+        self.health_prefix_slash = prefix_with_trailing_slash(&self.health_prefix);
         self
     }
 
@@ -83,6 +89,21 @@ impl LoadShedLayer {
     #[must_use]
     pub fn with_probe_paths(mut self, paths: Vec<String>) -> Self {
         self.probe_paths = paths;
+        self
+    }
+
+    /// CORS config to mirror onto a shed `503`'s headers.
+    ///
+    /// This layer sits outside `CorsLayer` in the main ingress stack (see
+    /// `apply_middleware`), so a shed response never flows back through it;
+    /// without mirroring, a cross-origin browser client would see an opaque
+    /// CORS failure instead of a readable `503`. `None` (the default) skips
+    /// mirroring — harmless when this layer's other application site (the
+    /// `/mcp` envelope) sits *inside* its own `CorsLayer`, which then
+    /// overwrites these headers with its own regardless.
+    #[must_use]
+    pub fn with_cors(mut self, cors: Option<Arc<crate::config::CorsConfig>>) -> Self {
+        self.cors = cors;
         self
     }
 }
@@ -109,21 +130,11 @@ impl<S> LoadShedService<S> {
     /// Whether `req` bypasses admission control entirely (probes/actuator).
     fn is_exempt<B>(&self, req: &Request<B>) -> bool {
         let path = req.uri().path();
-
-        let prefix = &self.layer.health_prefix;
-        let prefix_matched = if prefix.is_empty() {
-            false
-        } else if prefix == "/" {
-            path == "/"
-        } else {
-            path == prefix || {
-                let mut prefix_slash = prefix.clone();
-                if !prefix_slash.ends_with('/') {
-                    prefix_slash.push('/');
-                }
-                path.starts_with(&prefix_slash)
-            }
-        };
+        let prefix_matched = health_prefix_matches(
+            path,
+            &self.layer.health_prefix,
+            &self.layer.health_prefix_slash,
+        );
         prefix_matched || self.layer.probe_paths.iter().any(|probe| probe == path)
     }
 }
@@ -153,8 +164,18 @@ where
         loop {
             if current >= self.layer.limit {
                 self.layer.metrics.record_request_shed();
+                // Capture the request Origin before it's dropped, so a
+                // mirrored CORS response can echo it back (see with_cors).
+                let cors_origin = self
+                    .layer
+                    .cors
+                    .as_ref()
+                    .and_then(|_| req.headers().get(http::header::ORIGIN).cloned());
                 return LoadShedFuture::ShortCircuit {
-                    response: Some(build_shed_response()),
+                    response: Some(build_shed_response(
+                        self.layer.cors.as_deref(),
+                        cors_origin.as_ref(),
+                    )),
                 };
             }
             match in_flight.compare_exchange_weak(
@@ -200,8 +221,18 @@ impl Drop for InFlightGuard {
 /// framework's styled HTML error page for browsers with an `Accept: text/html`
 /// preference (negotiated by the outer `ErrorPageContext`/`ExceptionFilter`
 /// layers, which preserve headers already on the response — including the
-/// `Retry-After` set here).
-fn build_shed_response() -> Response<Body> {
+/// `Retry-After` and any mirrored CORS headers set here).
+///
+/// When `cors` is configured (see [`LoadShedLayer::with_cors`]), the
+/// `Access-Control-*` headers a real `CorsLayer` would have added are
+/// mirrored directly onto this response — this layer sits outside
+/// `CorsLayer` in the main ingress stack, so without this a cross-origin
+/// browser client would see an opaque CORS failure instead of a readable
+/// `503`.
+fn build_shed_response(
+    cors: Option<&crate::config::CorsConfig>,
+    origin: Option<&HeaderValue>,
+) -> Response<Body> {
     let mut response = crate::error::AutumnError::service_unavailable_msg(
         "Too many concurrent requests; try again shortly.",
     )
@@ -209,6 +240,9 @@ fn build_shed_response() -> Response<Body> {
     response
         .headers_mut()
         .insert(RETRY_AFTER, HeaderValue::from_static(RETRY_AFTER_SECS));
+    if let Some(cors) = cors {
+        crate::router::mirror_cors_headers(cors, origin, &mut response);
+    }
     response
 }
 
@@ -311,6 +345,7 @@ mod tests {
                 "/block",
                 get(move || blocking_handler(gate.clone(), entered.clone())),
             )
+            .route("/", get(|| async { "root" }))
             .route("/actuator/health", get(|| async { "healthy" }))
             .route("/live", get(|| async { "live" }))
             .layer(layer)
@@ -454,6 +489,100 @@ mod tests {
     }
 
     // ── Probe / actuator exemption ────────────────────────────────────────
+
+    /// An empty `health_prefix` (reachable via `actuator.prefix = ""`) must be
+    /// treated the same as `"/"` — matching `MaintenanceService::gate_request`'s
+    /// behavior exactly — so the two admission-style gates never disagree on
+    /// whether the root path is exempt.
+    #[tokio::test]
+    async fn empty_health_prefix_exempts_root_path_like_maintenance_does() {
+        let metrics = MetricsCollector::new();
+        let layer = LoadShedLayer::new(1, metrics)
+            .with_health_prefix("")
+            .with_probe_paths(vec![]);
+        let gate = Arc::new(Notify::new());
+        let entered = Arc::new(StdAtomicUsize::new(0));
+        let app = make_blocking_app(layer, gate.clone(), entered.clone());
+
+        let held = {
+            let app = app.clone();
+            tokio::spawn(async move {
+                app.oneshot(
+                    Request::builder()
+                        .uri("/block")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+            })
+        };
+        wait_for_entered(&entered, 1).await;
+
+        // The single slot is occupied, but "/" is exempt via the empty prefix.
+        assert_eq!(status(app.clone(), "/").await, axum::http::StatusCode::OK);
+
+        gate.notify_waiters();
+        assert_eq!(held.await.unwrap(), axum::http::StatusCode::OK);
+    }
+
+    // ── CORS headers mirrored onto a shed 503 ─────────────────────────────
+
+    /// This layer sits outside `CorsLayer` on the main stack, so without
+    /// mirroring, a cross-origin browser client would see an opaque CORS
+    /// failure instead of a readable 503 (see `with_cors`'s doc comment).
+    #[tokio::test]
+    async fn shed_503_carries_cors_headers_when_configured() {
+        let metrics = MetricsCollector::new();
+        let cors = crate::config::CorsConfig {
+            allowed_origins: vec!["http://other.example".to_owned()],
+            ..Default::default()
+        };
+        let layer = LoadShedLayer::new(1, metrics).with_cors(Some(Arc::new(cors)));
+        let gate = Arc::new(Notify::new());
+        let entered = Arc::new(StdAtomicUsize::new(0));
+        let app = make_blocking_app(layer, gate.clone(), entered.clone());
+
+        let held = {
+            let app = app.clone();
+            tokio::spawn(async move {
+                app.oneshot(
+                    Request::builder()
+                        .uri("/block")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+            })
+        };
+        wait_for_entered(&entered, 1).await;
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/block")
+                    .header(http::header::ORIGIN, "http://other.example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers()
+                .get(http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|v| v.to_str().ok()),
+            Some("http://other.example"),
+            "shed 503 must mirror the matching CORS origin"
+        );
+
+        gate.notify_waiters();
+        assert_eq!(held.await.unwrap(), axum::http::StatusCode::OK);
+    }
 
     #[tokio::test]
     async fn actuator_health_bypasses_ceiling() {

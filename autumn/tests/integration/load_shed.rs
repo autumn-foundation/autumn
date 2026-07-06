@@ -282,3 +282,56 @@ async fn default_config_never_sheds() {
         client.get("/ping").send().await.assert_ok();
     }
 }
+
+// ── /mcp envelope must also be shed (the ceiling must not have a bypass) ──
+
+#[cfg(feature = "mcp")]
+mod mcp_admission {
+    use super::*;
+
+    static GATE_MCP: LazyLock<Notify> = LazyLock::new(Notify::new);
+    static ENTERED_MCP: AtomicUsize = AtomicUsize::new(0);
+
+    #[get("/block")]
+    async fn block_mcp() -> &'static str {
+        ENTERED_MCP.fetch_add(1, Ordering::SeqCst);
+        GATE_MCP.notified().await;
+        "released"
+    }
+
+    /// The late-mounted `/mcp` envelope router is merged after
+    /// `apply_middleware`, so every admission-style gate applied there
+    /// (maintenance mode, rate limiting, body limit, timeout, security
+    /// headers) is explicitly re-applied to it. Load shedding must be too —
+    /// otherwise MCP traffic (`initialize`/`tools/list`/`tools/call`) bypasses
+    /// `server.max_concurrent_requests` entirely, defeating the ceiling for
+    /// that ingress surface.
+    #[tokio::test]
+    async fn mcp_envelope_is_shed_when_ceiling_is_saturated() {
+        let client = Arc::new(
+            TestApp::new()
+                .config(config_with_ceiling(1))
+                .routes(routes![block_mcp])
+                .mount_mcp("/mcp")
+                .build(),
+        );
+
+        let held = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.get("/block").send().await })
+        };
+        wait_for_entered(&ENTERED_MCP, 1).await;
+
+        // The single slot is occupied by `/block`; a `tools/list` call to the
+        // MCP envelope must also be shed, not silently bypass the ceiling.
+        let resp = client
+            .post("/mcp")
+            .json(&serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}))
+            .send()
+            .await;
+        resp.assert_status(503);
+
+        GATE_MCP.notify_waiters();
+        held.await.unwrap().assert_ok();
+    }
+}
