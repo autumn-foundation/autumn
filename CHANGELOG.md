@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **generator:** `autumn generate scaffold`'s `create`/`update` handlers now
+  build a `Changeset` from the submission and re-render the `new`/`edit`
+  form on a rejected submission (issue #1124). A failed submission responds
+  **422** (not the old 400 error page) and re-renders through the shipped,
+  accessible `autumn_web::form::{text_input, number_input, datetime_input,
+  checkbox_input, select_input}` helpers — every submitted field value is
+  preserved and per-field error messages appear inline (`aria-invalid` +
+  `role="alert"`). Success behavior is unchanged: insert/update then
+  redirect. The generator promotes its internal decode struct to a public,
+  validating `{Model}Form` (derives `Serialize`/`validator::Validate`/
+  `Default`, carries any `--validate` rules, and gets a generated
+  `From<&Model>` to seed the edit form). The pre-existing `unique`-field
+  duplicate-value re-render (#1032) now goes through the same changeset
+  renderer instead of its own hand-rolled path. `examples/bookmarks`
+  demonstrates the round-trip.
+
 - **generate:** `decimal` scaffold field type (#1038) — `price:decimal`
   (default `NUMERIC(12,2)`) or `price:decimal{10,2}` for an explicit
   precision/scale now generates an exact-precision Postgres `NUMERIC` column,
@@ -17,7 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `f64` and its binary-float rounding. Both `decimal`/`Decimal` casings are
   accepted (consistent with `Attachment`/`attachment`), it composes with
   `Option<…>` and `:unique`, and the generated `new`/`edit` form renders
-  `input type="number" inputmode="decimal" step="…"` sized to the column's
+  through the changeset-aware `number_input` helper, sized to the column's
   scale. The `rust_decimal` dependency (with the `db-diesel2-postgres` and
   `serde` features) is added to the generated app's `Cargo.toml` only when a
   `decimal` field is present.

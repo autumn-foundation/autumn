@@ -291,6 +291,27 @@ mod active_search_tests {
     }
 
     #[test]
+    fn autocomplete_seeds_initial_value_into_visible_and_hidden_inputs() {
+        // Re-rendering the widget after a validation error (e.g. a free-text
+        // tag field on a rejected changeset submission) must not silently
+        // drop what the user already typed.
+        let config = AutocompleteConfig::new("/autocomplete", "tag_id")
+            .free_text()
+            .initial_value("my-tag");
+        let html = autocomplete_input("tag", "Tag", &config).into_string();
+        assert_eq!(
+            html.matches(r#"value="my-tag""#).count(),
+            2,
+            "both the visible query input and the hidden field must carry \
+             the previously submitted value: {html}"
+        );
+        assert!(
+            html.contains(r#"id="tag-value" value="my-tag""#),
+            "hidden field must carry the previously submitted value: {html}"
+        );
+    }
+
+    #[test]
     fn autocomplete_has_listbox_container() {
         let config = AutocompleteConfig::new("/autocomplete", "tag_id");
         let html = autocomplete_input("tag", "Tag", &config).into_string();

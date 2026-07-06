@@ -166,6 +166,7 @@ croner = "3.0.1"
 testcontainers = { workspace = true, optional = true }
 testcontainers-modules = { workspace = true, optional = true }
 serde_urlencoded = "0.7"
+serde_path_to_error = "0.1"
 serde_yaml = { version = "0.9", optional = true }
 pulldown-cmark = { workspace = true, optional = true }
 subtle = "2.6.1"

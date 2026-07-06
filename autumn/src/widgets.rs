@@ -232,6 +232,12 @@ pub struct AutocompleteConfig<'a> {
     /// `false` (the default) for ID-based lookups where the hidden field should
     /// only carry a value selected from the option list.
     pub free_text: bool,
+    /// Pre-fill the widget from a previous submission (e.g. re-rendering a
+    /// form after a validation error), so free-text input the user already
+    /// typed isn't silently dropped. Seeds both the visible query input's
+    /// `value` and the hidden field's `value`. Leave unset (the default) for a
+    /// blank widget.
+    pub initial_value: Option<&'a str>,
 }
 
 impl<'a> AutocompleteConfig<'a> {
@@ -251,6 +257,7 @@ impl<'a> AutocompleteConfig<'a> {
             placeholder: None,
             fallback_options: None,
             free_text: false,
+            initial_value: None,
         }
     }
 
@@ -306,6 +313,14 @@ impl<'a> AutocompleteConfig<'a> {
     #[must_use]
     pub const fn free_text(mut self) -> Self {
         self.free_text = true;
+        self
+    }
+
+    /// Pre-fill the widget from a previous submission (e.g. re-rendering after
+    /// a validation error), so already-typed input isn't silently dropped.
+    #[must_use]
+    pub const fn initial_value(mut self, value: &'a str) -> Self {
+        self.initial_value = Some(value);
         self
     }
 }
@@ -481,6 +496,10 @@ pub fn active_search_empty_state(message: &str) -> maud::Markup {
 /// - A `<div role="listbox">` where the server renders option partials.
 /// - A `<noscript>` fallback `<select>`.
 ///
+/// Set [`AutocompleteConfig::initial_value`] to pre-fill both inputs — e.g.
+/// re-rendering a form with this widget after a validation error, so text the
+/// user already typed isn't silently dropped.
+///
 /// Use [`autocomplete_option`] and [`autocomplete_empty_state`] to render
 /// option partials returned by your handler.
 ///
@@ -534,6 +553,7 @@ pub fn autocomplete_input(id: &str, label: &str, config: &AutocompleteConfig<'_>
                 aria-expanded="false"
                 aria-autocomplete="list"
                 aria-controls=(options_id)
+                value=(config.initial_value.unwrap_or(""))
                 placeholder=[config.placeholder]
                 class="autumn-autocomplete__input"
                 data-ac-query
@@ -545,7 +565,7 @@ pub fn autocomplete_input(id: &str, label: &str, config: &AutocompleteConfig<'_>
             input
                 type="hidden"
                 id=(value_id)
-                value="";
+                value=(config.initial_value.unwrap_or(""));
             div
                 id=(options_id)
                 role="listbox"
@@ -557,7 +577,7 @@ pub fn autocomplete_input(id: &str, label: &str, config: &AutocompleteConfig<'_>
                     option value="" { "— select —" }
                     @if let Some(opts) = config.fallback_options {
                         @for (val, lbl) in opts {
-                            option value=(val) { (lbl) }
+                            option value=(val) selected[config.initial_value == Some(*val)] { (lbl) }
                         }
                     }
                 }
@@ -3253,6 +3273,26 @@ mod tests {
         assert!(html.contains("Beta"), "{html}");
         assert!(html.contains(r#"value="1""#), "{html}");
         assert!(html.contains(r#"value="2""#), "{html}");
+    }
+
+    #[test]
+    fn autocomplete_noscript_select_marks_initial_value_selected() {
+        // ID-mode (default, non-free-text): a prior selection seeded via
+        // `initial_value` must survive a no-JS resubmission too, not just the
+        // JS-driven hidden-input path.
+        let opts: &[(&str, &str)] = &[("1", "Alpha"), ("2", "Beta")];
+        let config = AutocompleteConfig::new("/ac", "value_field")
+            .fallback_options(opts)
+            .initial_value("2");
+        let html = autocomplete_input("x", "Label", &config).into_string();
+        assert!(
+            html.contains(r#"value="2" selected"#),
+            "the option matching initial_value must be marked selected: {html}"
+        );
+        assert!(
+            !html.contains(r#"value="1" selected"#),
+            "only the matching option should be selected: {html}"
+        );
     }
 
     #[test]

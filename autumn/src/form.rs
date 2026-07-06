@@ -438,7 +438,7 @@ impl<T: Serialize> ChangesetForm<T> {
 impl<S, T> FromRequest<S> for ChangesetForm<T>
 where
     S: Send + Sync,
-    T: serde::de::DeserializeOwned + validator::Validate,
+    T: serde::de::DeserializeOwned + validator::Validate + Send,
 {
     type Rejection = axum::response::Response;
 
@@ -466,26 +466,105 @@ where
 /// Decode a form body — URL-encoded always, multipart when that feature is on.
 async fn decode_form_body<T, S>(req: Request, state: &S) -> Result<T, axum::response::Response>
 where
-    T: serde::de::DeserializeOwned + validator::Validate,
+    T: serde::de::DeserializeOwned + validator::Validate + Send,
     S: Send + Sync,
 {
+    let content_type = req
+        .headers()
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+
     #[cfg(feature = "multipart")]
-    {
-        let content_type = req
-            .headers()
-            .get(http::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or_default()
-            .to_string();
-        if content_type.starts_with("multipart/form-data") {
-            return decode_multipart(req, state).await;
-        }
+    if content_type.starts_with("multipart/form-data") {
+        return decode_multipart(req, state).await;
     }
 
-    let axum::extract::Form(data) = axum::extract::Form::<T>::from_request(req, state)
+    // Same content-type gate axum's own `Form`/`RawForm` extractors apply: a
+    // POST whose Content-Type isn't (or doesn't start with) the form-urlencoded
+    // mime type is rejected outright, rather than being decoded anyway. `Bytes`
+    // alone has no opinion on Content-Type, so this must be checked explicitly
+    // now that we no longer route through `axum::extract::Form`.
+    if !content_type.starts_with("application/x-www-form-urlencoded") {
+        return Err((
+            axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "Form requests must have `Content-Type: application/x-www-form-urlencoded`",
+        )
+            .into_response());
+    }
+
+    // Buffer the body through axum's own `Bytes` extractor so the configured
+    // `DefaultBodyLimit` is enforced exactly as it would be for a single-shot
+    // `Form` extraction (a bare `to_bytes(.., usize::MAX)` would accept an
+    // unbounded body and defeat that protection).
+    let (parts, body) = req.into_parts();
+    let bytes_req = Request::from_parts(parts, body);
+    let bytes = axum::body::Bytes::from_request(bytes_req, state)
         .await
         .map_err(IntoResponse::into_response)?;
-    Ok(data)
+
+    decode_urlencoded_dropping_blank_optional_fields::<T>(&bytes)
+        .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e.to_string()).into_response())
+}
+
+/// Deserialize `T` from `application/x-www-form-urlencoded` bytes, tolerating
+/// blank values for non-string `Option<T>` fields (a number/date/uuid input
+/// the user left empty submits `field=`, which `serde_urlencoded` otherwise
+/// rejects outright — an empty string is not a valid `i32`/`Uuid`/etc., so it
+/// never gets the chance to become "missing" and deserialize as `None`).
+///
+/// [`serde_path_to_error`] pinpoints exactly which field a decode failure
+/// came from; if that field's submitted value is blank, drop just that one
+/// pair and retry. This converges within (number of blank fields) iterations
+/// and never touches a field that decoded successfully — critically, it
+/// leaves a blank *required* `String` field's pair alone (an empty string
+/// already deserializes fine for `String`, so that field never appears as
+/// the error path), letting it flow into the `Changeset` as a real
+/// validation error instead of being dropped into a spurious "missing
+/// field" decode failure. A genuinely malformed (non-blank) value still
+/// fails immediately, matching the "undecodable body is a hard 400" contract.
+///
+/// # Scope: any field that already tolerates a missing key
+///
+/// This helper can only observe "decoding this field's blank value failed,
+/// and removing the key fixes it" — it cannot see the target type, so it
+/// cannot distinguish `Option<T>` from a required `#[serde(default)]` field
+/// (e.g. [`checkbox_input`]'s documented `#[serde(default)] published: bool`
+/// convention for an unchecked box). Dropping the key makes both resolve to
+/// whatever that field already treats a *missing* key as — `None` or the
+/// `#[serde(default)]` value respectively. This is intentionally consistent
+/// rather than a leak: a field with no such tolerance (no `Option`, no
+/// `#[serde(default)]`) still hard-fails, because removing its key surfaces
+/// a *missing field* error next iteration instead of resolving — see
+/// `blank_required_field_without_default_still_fails_to_decode` for the
+/// guarantee. And nothing new is reachable through this leniency: a client
+/// that wants a `#[serde(default)]` field to take its default value could
+/// already get that by omitting the key entirely.
+fn decode_urlencoded_dropping_blank_optional_fields<T: serde::de::DeserializeOwned>(
+    bytes: &[u8],
+) -> Result<T, serde_path_to_error::Error<serde_urlencoded::de::Error>> {
+    let mut pairs: Vec<(String, String)> = url::form_urlencoded::parse(bytes)
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+
+    loop {
+        let encoded = url::form_urlencoded::Serializer::new(String::new())
+            .extend_pairs(pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .finish();
+        let deserializer =
+            serde_urlencoded::Deserializer::new(url::form_urlencoded::parse(encoded.as_bytes()));
+        match serde_path_to_error::deserialize(deserializer) {
+            Ok(data) => return Ok(data),
+            Err(err) => {
+                let field = err.path().to_string();
+                let Some(pos) = pairs.iter().position(|(k, v)| *k == field && v.is_empty()) else {
+                    return Err(err);
+                };
+                pairs.remove(pos);
+            }
+        }
+    }
 }
 
 /// Decode `multipart/form-data` text fields and deserialize into `T`.
@@ -537,8 +616,29 @@ where
         .extend_pairs(pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .finish();
 
-    serde_urlencoded::from_str::<T>(&encoded)
-        .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e.to_string()).into_response())
+    match serde_urlencoded::from_str::<T>(&encoded) {
+        Ok(data) => Ok(data),
+        Err(first_err) => {
+            // Same blank-optional-field accommodation as `decode_form_body`:
+            // a number/date/uuid field left empty submits an empty text
+            // value, which `serde_urlencoded` rejects for non-string
+            // `Option<T>` fields — retry with those fields dropped entirely
+            // so they deserialize as `None`.
+            let (blank, non_blank): (Vec<_>, Vec<_>) =
+                pairs.iter().partition(|(_, v)| v.is_empty());
+            if blank.is_empty() {
+                return Err(
+                    (axum::http::StatusCode::BAD_REQUEST, first_err.to_string()).into_response()
+                );
+            }
+            let filtered = url::form_urlencoded::Serializer::new(String::new())
+                .extend_pairs(non_blank.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+                .finish();
+            serde_urlencoded::from_str::<T>(&filtered).map_err(|_| {
+                (axum::http::StatusCode::BAD_REQUEST, first_err.to_string()).into_response()
+            })
+        }
+    }
 }
 
 // ── Internal helpers ───────────────────────────────────────────────
@@ -816,6 +916,58 @@ pub fn text_input_htmx<T: Serialize>(
     }
 }
 
+/// Like [`text_input_htmx`] but for a required field: adds `required` and
+/// `aria-required="true"` on the `<input>`, exactly like
+/// [`required_text_input`] does for the non-htmx variant.
+///
+/// Without this, a required field wired up with `text_input_htmx` has no
+/// client-side "must fill this in" signal, and a server-side rule that
+/// happens to permit an empty string (e.g. a max-only `length` rule) would
+/// let a blank required field through silently.
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn required_text_input_htmx<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+    validate_url: &str,
+) -> maud::Markup {
+    let errors = changeset.errors_for(field);
+    let has_errors = !errors.is_empty();
+    let value = changeset.field_value(field).unwrap_or_default();
+    let error_id = format!("{field}-error");
+    let wrapper_id = format!("{field}-field");
+    let target = "closest [data-autumn-field-wrapper]";
+
+    maud::html! {
+        div id=(wrapper_id) class="autumn-field" data-autumn-field-wrapper=(field) {
+            label for=(field) class="autumn-field__label" { (label) }
+            input
+                type="text"
+                id=(field)
+                name=(field)
+                value=(value)
+                required
+                aria-required="true"
+                class=(if has_errors { "autumn-field__input autumn-field__input--invalid" } else { "autumn-field__input" })
+                aria-invalid=(if has_errors { "true" } else { "false" })
+                aria-describedby=(if has_errors { error_id.as_str() } else { "" })
+                hx-post=(validate_url)
+                hx-trigger="change"
+                hx-target=(target)
+                hx-swap="outerHTML"
+                hx-include="closest form";
+            @if has_errors {
+                div id=(error_id) role="alert" class="autumn-field__errors" {
+                    @for error in errors {
+                        p class="autumn-field__error" { (error) }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Render a `<button type="submit">` with `label`.
 #[cfg(feature = "maud")]
 #[must_use]
@@ -1048,6 +1200,50 @@ pub fn number_input<T: Serialize>(
                 name=(field)
                 value=(value)
                 step=[step]
+                class=(if has_errors { "autumn-field__input autumn-field__input--invalid" } else { "autumn-field__input" })
+                aria-invalid=(if has_errors { "true" } else { "false" })
+                aria-describedby=(if has_errors { error_id.as_str() } else { "" });
+            @if has_errors {
+                div id=(error_id) role="alert" class="autumn-field__errors" {
+                    @for error in errors {
+                        p class="autumn-field__error" { (error) }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Render a labeled `<input type="number">` for a required numeric field.
+///
+/// Identical to [`number_input`] but adds `aria-required="true"` and the HTML
+/// `required` attribute, giving both AT users and browser-native validation
+/// the required-field signal without relying solely on color.
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn required_number_input<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+    step: Option<&str>,
+) -> maud::Markup {
+    let errors = changeset.errors_for(field);
+    let has_errors = !errors.is_empty();
+    let value = changeset.field_value(field).unwrap_or_default();
+    let error_id = format!("{field}-error");
+    let wrapper_id = format!("{field}-field");
+
+    maud::html! {
+        div id=(wrapper_id) class="autumn-field" {
+            label for=(field) class="autumn-field__label" { (label) }
+            input
+                type="number"
+                id=(field)
+                name=(field)
+                value=(value)
+                step=[step]
+                required
+                aria-required="true"
                 class=(if has_errors { "autumn-field__input autumn-field__input--invalid" } else { "autumn-field__input" })
                 aria-invalid=(if has_errors { "true" } else { "false" })
                 aria-describedby=(if has_errors { error_id.as_str() } else { "" });
@@ -1375,6 +1571,49 @@ pub fn datetime_input<T: Serialize>(
     }
 }
 
+/// Render a labeled `<input type="datetime-local">` for a required field.
+///
+/// Identical to [`datetime_input`] but adds `aria-required="true"` and the
+/// HTML `required` attribute, giving both AT users and browser-native
+/// validation the required-field signal without relying solely on color.
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn required_datetime_input<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+) -> maud::Markup {
+    let errors = changeset.errors_for(field);
+    let has_errors = !errors.is_empty();
+    let value = normalize_datetime_local_value(&changeset.field_value(field).unwrap_or_default());
+    let error_id = format!("{field}-error");
+    let wrapper_id = format!("{field}-field");
+
+    maud::html! {
+        div id=(wrapper_id) class="autumn-field" {
+            label for=(field) class="autumn-field__label" { (label) }
+            input
+                type="datetime-local"
+                id=(field)
+                name=(field)
+                value=(value)
+                step="any"
+                required
+                aria-required="true"
+                class=(if has_errors { "autumn-field__input autumn-field__input--invalid" } else { "autumn-field__input" })
+                aria-invalid=(if has_errors { "true" } else { "false" })
+                aria-describedby=(if has_errors { error_id.as_str() } else { "" });
+            @if has_errors {
+                div id=(error_id) role="alert" class="autumn-field__errors" {
+                    @for error in errors {
+                        p class="autumn-field__error" { (error) }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Render a labeled `<select>` tied to a closed-set changeset field, with
 /// `options` given as `(value, label)` pairs.
 ///
@@ -1408,6 +1647,53 @@ pub fn select_input<T: Serialize>(
             select
                 id=(field)
                 name=(field)
+                class=(if has_errors { "autumn-field__input autumn-field__input--invalid" } else { "autumn-field__input" })
+                aria-invalid=(if has_errors { "true" } else { "false" })
+                aria-describedby=(if has_errors { error_id.as_str() } else { "" }) {
+                @for (option_value, option_label) in options {
+                    option value=(option_value) selected[*option_value == current] { (option_label) }
+                }
+            }
+            @if has_errors {
+                div id=(error_id) role="alert" class="autumn-field__errors" {
+                    @for error in errors {
+                        p class="autumn-field__error" { (error) }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Render a labeled `<select>` for a required closed-set field.
+///
+/// Identical to [`select_input`] but adds `aria-required="true"` and the HTML
+/// `required` attribute — combined with a blank placeholder option (an empty
+/// `value=""`), this blocks submission until the user picks a real option,
+/// giving both AT users and browser-native validation the required-field
+/// signal without relying solely on color.
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn required_select_input<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+    options: &[(&str, &str)],
+) -> maud::Markup {
+    let errors = changeset.errors_for(field);
+    let has_errors = !errors.is_empty();
+    let current = changeset.field_value(field).unwrap_or_default();
+    let error_id = format!("{field}-error");
+    let wrapper_id = format!("{field}-field");
+
+    maud::html! {
+        div id=(wrapper_id) class="autumn-field" {
+            label for=(field) class="autumn-field__label" { (label) }
+            select
+                id=(field)
+                name=(field)
+                required
+                aria-required="true"
                 class=(if has_errors { "autumn-field__input autumn-field__input--invalid" } else { "autumn-field__input" })
                 aria-invalid=(if has_errors { "true" } else { "false" })
                 aria-describedby=(if has_errors { error_id.as_str() } else { "" }) {
@@ -2195,6 +2481,159 @@ mod tests {
         });
         let html = required_text_input(&cs, "name", "Name").into_string();
         assert!(html.contains(r#"id="name-field""#), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn required_number_input_emits_aria_required() {
+        #[derive(serde::Serialize)]
+        struct F {
+            age: i32,
+        }
+        let cs = Changeset::new(F { age: 30 });
+        let html = required_number_input(&cs, "age", "Age", Some("1")).into_string();
+        assert!(html.contains(r#"aria-required="true""#), "{html}");
+        assert!(html.contains("required"), "{html}");
+        assert!(html.contains(r#"type="number""#), "{html}");
+        assert!(html.contains(r#"name="age""#), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn required_number_input_preserves_error_handling() {
+        #[derive(serde::Serialize)]
+        struct F {
+            age: i32,
+        }
+        let mut errors = HashMap::new();
+        errors.insert("age".to_string(), vec!["must be positive".to_string()]);
+        let cs = Changeset::from_errors(F { age: -1 }, errors);
+        let html = required_number_input(&cs, "age", "Age", Some("1")).into_string();
+        assert!(html.contains(r#"aria-invalid="true""#), "{html}");
+        assert!(html.contains(r#"role="alert""#), "{html}");
+        assert!(html.contains("must be positive"), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn required_datetime_input_emits_aria_required() {
+        #[derive(serde::Serialize)]
+        struct F {
+            scheduled_at: String,
+        }
+        let cs = Changeset::new(F {
+            scheduled_at: "2026-01-01T12:00:00".into(),
+        });
+        let html = required_datetime_input(&cs, "scheduled_at", "Scheduled at").into_string();
+        assert!(html.contains(r#"aria-required="true""#), "{html}");
+        assert!(html.contains("required"), "{html}");
+        assert!(html.contains(r#"type="datetime-local""#), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn required_select_input_emits_aria_required() {
+        #[derive(serde::Serialize)]
+        struct F {
+            status: String,
+        }
+        let cs = Changeset::new(F {
+            status: "draft".into(),
+        });
+        let html = required_select_input(
+            &cs,
+            "status",
+            "Status",
+            &[("draft", "Draft"), ("published", "Published")],
+        )
+        .into_string();
+        assert!(html.contains(r#"aria-required="true""#), "{html}");
+        assert!(html.contains("required"), "{html}");
+        assert!(html.contains("<select"), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn required_select_input_preserves_error_handling() {
+        #[derive(serde::Serialize)]
+        struct F {
+            status: String,
+        }
+        let mut errors = HashMap::new();
+        errors.insert("status".to_string(), vec!["is required".to_string()]);
+        let cs = Changeset::from_errors(
+            F {
+                status: String::new(),
+            },
+            errors,
+        );
+        let html =
+            required_select_input(&cs, "status", "Status", &[("draft", "Draft")]).into_string();
+        assert!(html.contains(r#"aria-invalid="true""#), "{html}");
+        assert!(html.contains(r#"role="alert""#), "{html}");
+        assert!(html.contains("is required"), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn required_text_input_htmx_emits_aria_required() {
+        #[derive(serde::Serialize)]
+        struct F {
+            title: String,
+        }
+        let cs = Changeset::new(F {
+            title: "Hello".into(),
+        });
+        let html =
+            required_text_input_htmx(&cs, "title", "Title", "/posts/validate/title").into_string();
+        assert!(html.contains(r#"aria-required="true""#), "{html}");
+        assert!(html.contains("required"), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn required_text_input_htmx_preserves_htmx_attributes() {
+        #[derive(serde::Serialize)]
+        struct F {
+            title: String,
+        }
+        let cs = Changeset::new(F {
+            title: String::new(),
+        });
+        let html =
+            required_text_input_htmx(&cs, "title", "Title", "/posts/validate/title").into_string();
+        assert!(
+            html.contains(r#"hx-post="/posts/validate/title""#),
+            "{html}"
+        );
+        assert!(html.contains(r#"hx-trigger="change""#), "{html}");
+        assert!(
+            html.contains(r#"hx-target="closest [data-autumn-field-wrapper]""#),
+            "{html}"
+        );
+        assert!(html.contains(r#"hx-swap="outerHTML""#), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn required_text_input_htmx_preserves_error_handling() {
+        #[derive(serde::Serialize)]
+        struct F {
+            title: String,
+        }
+        let mut errors = HashMap::new();
+        errors.insert("title".to_string(), vec!["is required".to_string()]);
+        let cs = Changeset::from_errors(
+            F {
+                title: String::new(),
+            },
+            errors,
+        );
+        let html =
+            required_text_input_htmx(&cs, "title", "Title", "/posts/validate/title").into_string();
+        assert!(html.contains(r#"aria-invalid="true""#), "{html}");
+        assert!(html.contains(r#"role="alert""#), "{html}");
+        assert!(html.contains("is required"), "{html}");
     }
 
     // ── AC2 + AC3: text_input_htmx ────────────────────────────────
@@ -3050,6 +3489,216 @@ mod tests {
             assert_ne!(resp.status(), axum::http::StatusCode::OK);
         }
 
+        #[derive(serde::Deserialize, validator::Validate)]
+        struct OptionalNumericForm {
+            #[validate(length(min = 3))]
+            name: String,
+            age: Option<i32>,
+        }
+
+        #[tokio::test]
+        async fn blank_optional_numeric_field_decodes_as_none_not_400() {
+            // A number input the user left empty submits `age=` — an empty
+            // string is not a valid `i32`, so `serde_urlencoded` rejects it
+            // outright unless the extractor retries with the blank pair
+            // dropped (falling back to `None`) instead of surfacing a
+            // spurious decode failure that bypasses the Changeset entirely.
+            async fn handler(form: ChangesetForm<OptionalNumericForm>) -> String {
+                format!("valid={} age={:?}", form.is_valid(), form.data().age)
+            }
+            let resp = Router::new()
+                .route("/test", post(handler))
+                .oneshot(urlencoded_req("/test", "name=Alice&age="))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), axum::http::StatusCode::OK);
+            assert_body(resp, "valid=true age=None").await;
+        }
+
+        #[tokio::test]
+        async fn filled_optional_numeric_field_still_decodes() {
+            async fn handler(form: ChangesetForm<OptionalNumericForm>) -> String {
+                format!("valid={} age={:?}", form.is_valid(), form.data().age)
+            }
+            let resp = Router::new()
+                .route("/test", post(handler))
+                .oneshot(urlencoded_req("/test", "name=Alice&age=30"))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), axum::http::StatusCode::OK);
+            assert_body(resp, "valid=true age=Some(30)").await;
+        }
+
+        #[tokio::test]
+        async fn garbage_numeric_field_still_fails_decode() {
+            // A genuinely undecodable value (not blank) must still 400/422 —
+            // the blank-retry accommodation must not paper over real garbage.
+            async fn handler(_form: ChangesetForm<OptionalNumericForm>) -> String {
+                "unreachable".to_string()
+            }
+            let resp = Router::new()
+                .route("/test", post(handler))
+                .oneshot(urlencoded_req("/test", "name=Alice&age=not-a-number"))
+                .await
+                .unwrap();
+            assert_ne!(resp.status(), axum::http::StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn blank_required_string_survives_alongside_blank_optional_numeric() {
+            // A submission with *both* a blank optional numeric field and a
+            // blank required/validated `String` field (`name=&age=`) must not
+            // have the blank-optional-field retry drop the string pair too —
+            // that would turn a real validation error (name too short) into a
+            // spurious decode failure. `name` must reach the Changeset as an
+            // empty string so `is_valid()` reports the actual length-rule
+            // violation, not a 400/422 that hides it.
+            async fn handler(form: ChangesetForm<OptionalNumericForm>) -> String {
+                format!(
+                    "valid={} name={:?} age={:?}",
+                    form.is_valid(),
+                    form.data().name,
+                    form.data().age
+                )
+            }
+            let resp = Router::new()
+                .route("/test", post(handler))
+                .oneshot(urlencoded_req("/test", "name=&age="))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), axum::http::StatusCode::OK);
+            assert_body(resp, "valid=false name=\"\" age=None").await;
+        }
+
+        #[derive(serde::Deserialize, validator::Validate)]
+        struct CheckboxForm {
+            #[serde(default)]
+            published: bool,
+        }
+
+        #[tokio::test]
+        async fn blank_defaulted_checkbox_field_decodes_to_its_default() {
+            // Documented, intended behavior (see
+            // `decode_urlencoded_dropping_blank_optional_fields`'s "Scope"
+            // doc section): a `#[serde(default)] bool` field explicitly
+            // submitted blank (as opposed to omitted, which is what a real
+            // unchecked `<input type="checkbox">` actually sends) resolves
+            // to the same default a client could already get by omitting
+            // the key entirely — no new capability, just consistent with
+            // the field's own declared tolerance for a missing key.
+            async fn handler(form: ChangesetForm<CheckboxForm>) -> String {
+                format!("published={}", form.data().published)
+            }
+            let resp = Router::new()
+                .route("/test", post(handler))
+                .oneshot(urlencoded_req("/test", "published="))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), axum::http::StatusCode::OK);
+            assert_body(resp, "published=false").await;
+        }
+
+        #[derive(serde::Deserialize, validator::Validate)]
+        struct RequiredBoolForm {
+            #[allow(
+                dead_code,
+                reason = "decode is expected to fail before this is ever read"
+            )]
+            accepted_terms: bool,
+        }
+
+        #[tokio::test]
+        async fn blank_required_field_without_default_still_fails_to_decode() {
+            // The boundary the "Scope" doc section on
+            // `decode_urlencoded_dropping_blank_optional_fields` promises:
+            // a field with *no* tolerance for a missing key at all (no
+            // `Option`, no `#[serde(default)]`) must still hard-fail on a
+            // blank submission — dropping its key surfaces a "missing
+            // field" error on the next attempt instead of resolving, so
+            // the function gives up and returns that error rather than
+            // silently accepting a bogus value.
+            async fn handler(_form: ChangesetForm<RequiredBoolForm>) -> String {
+                "unreachable".to_string()
+            }
+            let resp = Router::new()
+                .route("/test", post(handler))
+                .oneshot(urlencoded_req("/test", "accepted_terms="))
+                .await
+                .unwrap();
+            assert_ne!(resp.status(), axum::http::StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn oversized_body_is_rejected_not_fully_buffered() {
+            // The blank-optional-field retry must not come at the cost of
+            // bypassing axum's `DefaultBodyLimit` (2MB by default) — a body
+            // larger than the configured limit must still be rejected rather
+            // than fully buffered into memory.
+            async fn handler(_form: ChangesetForm<TestForm>) -> String {
+                "unreachable".to_string()
+            }
+            let oversized = format!("name={}", "a".repeat(3 * 1024 * 1024));
+            let req = axum::http::Request::builder()
+                .method("POST")
+                .uri("/test")
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .body(Body::from(oversized))
+                .unwrap();
+            let resp = Router::new()
+                .route("/test", post(handler))
+                .oneshot(req)
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+        }
+
+        #[tokio::test]
+        async fn wrong_content_type_is_rejected_not_decoded_anyway() {
+            // `Bytes` alone has no opinion on Content-Type, so a `text/plain`
+            // (or missing-Content-Type) POST whose body happens to look like
+            // `name=Alice` must still be rejected outright — matching axum's
+            // own `Form`/`RawForm` extractors — rather than silently decoded.
+            async fn handler(_form: ChangesetForm<TestForm>) -> String {
+                "unreachable".to_string()
+            }
+            let req = axum::http::Request::builder()
+                .method("POST")
+                .uri("/test")
+                .header("Content-Type", "text/plain")
+                .body(Body::from("name=Alice"))
+                .unwrap();
+            let resp = Router::new()
+                .route("/test", post(handler))
+                .oneshot(req)
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE
+            );
+        }
+
+        #[tokio::test]
+        async fn missing_content_type_is_rejected_not_decoded_anyway() {
+            async fn handler(_form: ChangesetForm<TestForm>) -> String {
+                "unreachable".to_string()
+            }
+            let req = axum::http::Request::builder()
+                .method("POST")
+                .uri("/test")
+                .body(Body::from("name=Alice"))
+                .unwrap();
+            let resp = Router::new()
+                .route("/test", post(handler))
+                .oneshot(req)
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE
+            );
+        }
+
         #[tokio::test]
         async fn csrf_token_is_none_without_csrf_middleware() {
             async fn handler(form: ChangesetForm<TestForm>) -> String {
@@ -3097,6 +3746,24 @@ mod tests {
                 .await
                 .unwrap();
             assert_body(resp, "valid=true name=Alice").await;
+        }
+
+        #[cfg(feature = "multipart")]
+        #[tokio::test]
+        async fn multipart_blank_optional_numeric_field_decodes_as_none_not_400() {
+            async fn handler(form: ChangesetForm<OptionalNumericForm>) -> String {
+                format!("valid={} age={:?}", form.is_valid(), form.data().age)
+            }
+            let resp = Router::new()
+                .route("/test", post(handler))
+                .oneshot(multipart_req_multi(
+                    "/test",
+                    &[("name", "Alice"), ("age", "")],
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), axum::http::StatusCode::OK);
+            assert_body(resp, "valid=true age=None").await;
         }
 
         #[cfg(feature = "multipart")]
@@ -3242,13 +3909,24 @@ mod tests {
 
         #[cfg(feature = "multipart")]
         fn multipart_req(uri: &str, field: &str, value: &str) -> axum::http::Request<Body> {
+            multipart_req_multi(uri, &[(field, value)])
+        }
+
+        #[cfg(feature = "multipart")]
+        fn multipart_req_multi(uri: &str, fields: &[(&str, &str)]) -> axum::http::Request<Body> {
+            use std::fmt::Write as _;
+
             let boundary = "----FormBoundary7MA4YWxkTrZu0gW";
-            let body = format!(
-                "--{boundary}\r\n\
-                 Content-Disposition: form-data; name=\"{field}\"\r\n\r\n\
-                 {value}\r\n\
-                 --{boundary}--\r\n"
-            );
+            let mut body = String::new();
+            for (field, value) in fields {
+                let _ = write!(
+                    body,
+                    "--{boundary}\r\n\
+                     Content-Disposition: form-data; name=\"{field}\"\r\n\r\n\
+                     {value}\r\n"
+                );
+            }
+            let _ = write!(body, "--{boundary}--\r\n");
             axum::http::Request::builder()
                 .method("POST")
                 .uri(uri)

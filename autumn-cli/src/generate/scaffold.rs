@@ -112,7 +112,7 @@ pub fn plan_scaffold_with_options(
     let mut fields = parse_fields(field_tokens)?;
     super::model::apply_unique_flags(&mut fields, &options.model.uniques)?;
     if !options.api {
-        validate_enum_field_names_against_routes_imports(&fields)?;
+        validate_enum_field_names_against_routes_imports(&fields, &pascal(name))?;
     }
     // Resolve shard key before planning the model (propagates to model render).
     let resolved_shard_key = resolve_shard_key(&fields, &options.model)?;
@@ -206,6 +206,7 @@ pub fn plan_scaffold_with_options(
             options_with_key.model.id_type,
             metadata.indexes(),
             metadata.defaults(),
+            metadata.validations(),
         ),
     );
 
@@ -247,7 +248,10 @@ pub fn plan_scaffold_with_options(
         .copied()
         .chain(SCAFFOLD_EXTRA_DEPS.iter().copied())
         .collect();
-    if metadata.has_validator_rules() {
+    // `validator` is needed whenever a routes file is emitted (issue #1124: the
+    // generated `{Pascal}Form` always derives `validator::Validate`), and also
+    // whenever the model itself carries `#[validate]` rules.
+    if !options_with_key.api || metadata.has_validator_rules() {
         combined.push((
             "validator",
             "{ version = \"0.20\", features = [\"derive\"] }",
@@ -266,6 +270,27 @@ pub fn plan_scaffold_with_options(
         ));
     }
     plan_cargo_deps(&mut plan, project_root, &combined);
+
+    // The generated HTML routes render through `autumn_web::form::*` helpers
+    // (issue #1124), which are gated behind autumn-web's `maud` feature — enable
+    // it whenever a routes file is emitted.
+    if !options_with_key.api {
+        let cargo_path = project_root.join("Cargo.toml");
+        let base = plan
+            .actions
+            .iter()
+            .rev()
+            .find_map(|a| match a {
+                Action::Modify { path, contents } if path == &cargo_path => Some(contents.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| read_or_empty(&cargo_path));
+        let updated = ensure_autumn_web_feature(&base, "maud");
+        if updated != base {
+            plan.actions.retain(|a| a.path() != cargo_path);
+            plan.modify(cargo_path, updated);
+        }
+    }
 
     // --live requires `ws` (sse::stream), `maud` (LiveFragment/Markup), and `htmx`.
     // --live-validation alone also emits Markup-returning validate handlers and
@@ -396,13 +421,20 @@ const ROUTES_FILE_RESERVED_NAMES: &[&str] = &[
     "Markup",
     "RunQueryDsl",
     "ToString",
+    "Changeset",
+    "IntoChangeset",
 ];
 
 /// Reject an `enum{…}` field whose generated type name collides with one of
-/// [`ROUTES_FILE_RESERVED_NAMES`]. Only relevant when `generate scaffold`
-/// will actually emit `src/routes/<plural>.rs` (i.e. not `--api`, which
-/// skips that file entirely).
-fn validate_enum_field_names_against_routes_imports(fields: &[Field]) -> Result<(), GenerateError> {
+/// [`ROUTES_FILE_RESERVED_NAMES`], or with the scaffold's own generated
+/// `{pascal_name}Form` changeset struct (`render_model_form`). Only relevant
+/// when `generate scaffold` will actually emit `src/routes/<plural>.rs`
+/// (i.e. not `--api`, which skips that file entirely).
+fn validate_enum_field_names_against_routes_imports(
+    fields: &[Field],
+    pascal_name: &str,
+) -> Result<(), GenerateError> {
+    let form_ty = format!("{pascal_name}Form");
     for f in fields {
         let Some(enum_ty) = f.enum_type_name() else {
             continue;
@@ -413,6 +445,15 @@ fn validate_enum_field_names_against_routes_imports(fields: &[Field]) -> Result<
                 reason: format!(
                     "the generated enum type '{enum_ty}' collides with a name the scaffold's \
                      routes file always imports; rename the field"
+                ),
+            });
+        }
+        if enum_ty == form_ty {
+            return Err(GenerateError::InvalidField {
+                token: format!("{}:enum{{...}}", f.name),
+                reason: format!(
+                    "the generated enum type '{enum_ty}' collides with the scaffold's own \
+                     generated '{form_ty}' changeset form struct; rename the field"
                 ),
             });
         }
@@ -705,170 +746,83 @@ fn render_repository_queries(pascal_name: &str, queries: &[QuerySpec]) -> String
     out
 }
 
-/// Normalizes an HTML `datetime-local` value (`YYYY-MM-DDTHH:MM`, seconds
-/// omitted by the browser at minute granularity) into the
-/// `YYYY-MM-DDTHH:MM:SS` shape chrono's parser expects at minimum. Callers
-/// parse with the `%.f` format specifier, so fractional seconds (submitted
-/// when a finer-grained `step` is used) are accepted whether or not this
-/// function's padding runs.
-const NORMALIZE_DATETIME_LOCAL_FN: &str = r#"
-fn normalize_datetime_local(raw: &str) -> String {
-    if raw.chars().count() == 16 {
-        format!("{raw}:00")
-    } else {
-        raw.to_string()
-    }
-}
-"#;
-
-const DESERIALIZE_NAIVE_DATETIME_LOCAL_FN: &str = r#"
-fn deserialize_naive_datetime_local<'de, D>(deserializer: D) -> Result<chrono::NaiveDateTime, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let raw = <String as serde::Deserialize>::deserialize(deserializer)?;
-    chrono::NaiveDateTime::parse_from_str(&normalize_datetime_local(&raw), "%Y-%m-%dT%H:%M:%S%.f")
-        .map_err(serde::de::Error::custom)
-}
-"#;
-
-const DESERIALIZE_OPTION_NAIVE_DATETIME_LOCAL_FN: &str = r#"
-fn deserialize_option_naive_datetime_local<'de, D>(
-    deserializer: D,
-) -> Result<Option<chrono::NaiveDateTime>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let raw = <Option<String> as serde::Deserialize>::deserialize(deserializer)?;
-    match raw {
-        Some(s) if !s.is_empty() => {
-            chrono::NaiveDateTime::parse_from_str(&normalize_datetime_local(&s), "%Y-%m-%dT%H:%M:%S%.f")
-                .map(Some)
-                .map_err(serde::de::Error::custom)
-        }
-        _ => Ok(None),
-    }
-}
-"#;
-
-const DESERIALIZE_UTC_DATETIME_LOCAL_FN: &str = r#"
-fn deserialize_utc_datetime_local<'de, D>(
-    deserializer: D,
-) -> Result<chrono::DateTime<chrono::Utc>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let raw = <String as serde::Deserialize>::deserialize(deserializer)?;
-    chrono::NaiveDateTime::parse_from_str(&normalize_datetime_local(&raw), "%Y-%m-%dT%H:%M:%S%.f")
-        .map(|ndt| ndt.and_utc())
-        .map_err(serde::de::Error::custom)
-}
-"#;
-
-const DESERIALIZE_OPTION_UTC_DATETIME_LOCAL_FN: &str = r#"
-fn deserialize_option_utc_datetime_local<'de, D>(
-    deserializer: D,
-) -> Result<Option<chrono::DateTime<chrono::Utc>>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let raw = <Option<String> as serde::Deserialize>::deserialize(deserializer)?;
-    match raw {
-        Some(s) if !s.is_empty() => {
-            chrono::NaiveDateTime::parse_from_str(&normalize_datetime_local(&s), "%Y-%m-%dT%H:%M:%S%.f")
-                .map(|ndt| Some(ndt.and_utc()))
-                .map_err(serde::de::Error::custom)
-        }
-        _ => Ok(None),
-    }
-}
-"#;
-
-/// Tracks which `datetime-local` deserialize helpers a `DecodedForm` actually
-/// references, so [`datetime_helper_fns`] emits only what's used — an unused
-/// helper would be dead code in the generated project.
-#[derive(Default)]
-#[allow(clippy::struct_excessive_bools)] // orthogonal flags on a plain tally, not a state machine
-struct DatetimeHelpersNeeded {
-    naive_scalar: bool,
-    naive_option: bool,
-    utc_scalar: bool,
-    utc_option: bool,
-}
-
-/// The `#[serde(...)]` attribute + struct-field line for a `NaiveDateTime`/
-/// `DateTime` field, recording which shared deserialize helper it needs.
-fn datetime_struct_field_line(f: &Field, needed: &mut DatetimeHelpersNeeded) -> String {
-    let attr = match (f.kind, f.nullable) {
-        (FieldKind::NaiveDateTime, false) => {
-            needed.naive_scalar = true;
-            "#[serde(deserialize_with = \"deserialize_naive_datetime_local\")]"
-        }
-        (FieldKind::NaiveDateTime, true) => {
-            needed.naive_option = true;
-            "#[serde(default, deserialize_with = \"deserialize_option_naive_datetime_local\")]"
-        }
-        (FieldKind::DateTime, false) => {
-            needed.utc_scalar = true;
-            "#[serde(deserialize_with = \"deserialize_utc_datetime_local\")]"
-        }
-        (FieldKind::DateTime, true) => {
-            needed.utc_option = true;
-            "#[serde(default, deserialize_with = \"deserialize_option_utc_datetime_local\")]"
-        }
-        _ => unreachable!("called only for NaiveDateTime | DateTime fields"),
-    };
-    format!(
-        "    {attr}\n    pub {name}: {rust_type},\n",
-        name = f.name,
-        rust_type = f.rust_type()
-    )
-}
-
-/// Assemble just the shared helper functions a `DecodedForm` needs, per
-/// [`DatetimeHelpersNeeded`].
-fn datetime_helper_fns(needed: &DatetimeHelpersNeeded) -> String {
-    let mut helper_fns = String::new();
-    if needed.naive_scalar || needed.naive_option || needed.utc_scalar || needed.utc_option {
-        helper_fns.push_str(NORMALIZE_DATETIME_LOCAL_FN);
-    }
-    if needed.naive_scalar {
-        helper_fns.push_str(DESERIALIZE_NAIVE_DATETIME_LOCAL_FN);
-    }
-    if needed.naive_option {
-        helper_fns.push_str(DESERIALIZE_OPTION_NAIVE_DATETIME_LOCAL_FN);
-    }
-    if needed.utc_scalar {
-        helper_fns.push_str(DESERIALIZE_UTC_DATETIME_LOCAL_FN);
-    }
-    if needed.utc_option {
-        helper_fns.push_str(DESERIALIZE_OPTION_UTC_DATETIME_LOCAL_FN);
-    }
-    helper_fns
-}
-
-/// Emit the `DecodedForm` struct, its field-by-field mapping into
-/// `New{Pascal}`, and any shared helper functions its `#[serde(...)]`
-/// attributes reference (currently just the `datetime-local` deserializers).
+/// The `parse_local_datetime` helper the generated `into_new` uses to turn a
+/// browser `datetime-local` string (`YYYY-MM-DDTHH:MM`, seconds optional) back
+/// into a `chrono::NaiveDateTime`. Emitted only when the model has a
+/// `NaiveDateTime`/`DateTime` field.
+const PARSE_LOCAL_DATETIME_FN: &str = r#"
+/// Parse a browser `datetime-local` value (`YYYY-MM-DDTHH:MM`, seconds and
+/// fractional seconds optional) into a `NaiveDateTime`. A malformed value is
+/// a 400 (undecodable input) rather than a field validation error.
 ///
-/// Returns `(decoded_struct, mapping_fields, helper_fns)`. `helper_fns` is
-/// empty unless a `NaiveDateTime`/`DateTime` field is present.
-fn render_decoded_form(_pascal_name: &str, fields: &[Field]) -> (String, String, String) {
+/// Accepts a trailing `%.f` so a value pre-filled from a stored row (see the
+/// generated `From<&Row>` impl, which formats with fractional seconds) round-
+/// trips exactly on a no-op resubmit instead of being silently truncated to
+/// whole seconds — the generated `update` handler writes every column back
+/// unconditionally, so any precision lost here would corrupt the stored value.
+fn parse_local_datetime(value: &str) -> AutumnResult<chrono::NaiveDateTime> {
+    chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S%.f")
+        .or_else(|_| chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M"))
+        .map_err(|err| AutumnError::bad_request_msg(format!("invalid datetime: {err}")))
+}
+"#;
+
+/// The generated pieces backing the changeset round-trip (issue #1124): the
+/// public, validating `{Pascal}Form` struct, its fallible conversion into
+/// `New{Pascal}` (the success branch), the `From<&{Pascal}>` used to seed the
+/// edit-form changeset, and — when a datetime field is present — the shared
+/// `parse_local_datetime` helper.
+struct ModelFormParts {
+    /// `#[derive(...)] pub struct {Pascal}Form { ... }`
+    form_struct: String,
+    /// The complete `into_new` function (async + `&state` when attachments).
+    into_new_fn: String,
+    /// `impl From<&{Pascal}> for {Pascal}Form { ... }`
+    from_row_impl: String,
+    /// `parse_local_datetime` (empty unless a datetime field exists).
+    datetime_helper: String,
+}
+
+/// Emit the validating form struct, its `New{Pascal}` conversion, and the
+/// `From<&{Pascal}>` seed used by the edit form — the substrate for the
+/// changeset round-trip (issue #1124).
+///
+/// The form struct deliberately mirrors the browser's wire shape (strings for
+/// enums and datetimes, `#[serde(default)]` bools, `Option<String>` attachment
+/// keys, native numerics) so a submission always *decodes* losslessly; the
+/// declared `#[validate(...)]` rules then decide validity, and the fallible
+/// `into_new` performs the enum/datetime/attachment parsing on the success
+/// path (those remain 400s — undecodable input, not validation failures).
+#[allow(
+    clippy::too_many_lines,
+    reason = "One match arm per field-kind widget — splitting it produces less \
+              readable output, not more. See render_changeset_form_inputs's \
+              module-level comment for the shared invariants."
+)]
+fn render_model_form(
+    pascal_name: &str,
+    fields: &[Field],
+    validations: &BTreeMap<String, Vec<String>>,
+) -> ModelFormParts {
     use std::fmt::Write;
     let mut struct_fields = String::new();
-    let mut mapping_fields = String::new();
-    let mut needed = DatetimeHelpersNeeded::default();
+    let mut into_new = String::new();
+    let mut from_row = String::new();
+    let mut needs_datetime = false;
+    let has_attachments = has_attachment_fields(fields);
 
     for f in fields {
+        let name = &f.name;
+        if let Some(rules) = validations.get(name) {
+            for rule in rules {
+                let _ = writeln!(struct_fields, "    #[validate({rule})]");
+            }
+        }
         if f.kind.is_attachment() {
+            let _ = writeln!(struct_fields, "    pub {name}: Option<String>,");
             let _ = writeln!(
-                struct_fields,
-                "    pub {name}: Option<String>,",
-                name = f.name
-            );
-            let _ = writeln!(
-                mapping_fields,
-                "        {name}: if let Some(ref key) = decoded.{name} {{\n\
+                into_new,
+                "        {name}: if let Some(ref key) = form.{name} {{\n\
                      if key.is_empty() {{\n\
                          None\n\
                      }} else {{\n\
@@ -881,91 +835,219 @@ fn render_decoded_form(_pascal_name: &str, fields: &[Field]) -> (String, String,
                      }}\n\
                  }} else {{\n\
                      None\n\
-                 }},",
-                name = f.name
+                 }},"
+            );
+            let _ = writeln!(
+                from_row,
+                "            {name}: row.{name}.as_ref().map(|blob| blob.key.clone()),"
             );
         } else if f.kind == FieldKind::Bool {
             // Unchecked checkboxes are absent from submitted form data;
             // `#[serde(default)]` maps that absence to `false` instead of a
             // "missing field" 400.
-            let _ = writeln!(
-                struct_fields,
-                "    #[serde(default)]\n    pub {name}: {rust_type},",
-                name = f.name,
-                rust_type = f.rust_type()
-            );
-            let _ = writeln!(
-                mapping_fields,
-                "        {name}: decoded.{name},",
-                name = f.name
-            );
-        } else if matches!(f.kind, FieldKind::NaiveDateTime | FieldKind::DateTime) {
-            struct_fields.push_str(&datetime_struct_field_line(f, &mut needed));
-            let _ = writeln!(
-                mapping_fields,
-                "        {name}: decoded.{name},",
-                name = f.name
-            );
-        } else if let Some(enum_ty) = f.enum_type_name() {
-            // Decoded as a plain `String` (not `serde`-deserialized straight
-            // into the generated enum — `serde_urlencoded`'s support for
-            // unit-variant enums is unreliable and its error wouldn't name
-            // the field), then parsed via the enum's `FromStr`. An
-            // out-of-set value yields a 400 naming the field, not a 500 or a
-            // silently-coerced/dropped value.
             if f.nullable {
-                // A blank nullable field is already filtered out of the
-                // encoded pairs above (`is_nullable_form_field`), and
-                // `serde_urlencoded` treats a wholly-absent key as `None` for
-                // an `Option<…>` field — the same convention every other
-                // nullable field kind relies on in the `else` branch below.
+                let _ = writeln!(struct_fields, "    pub {name}: Option<bool>,");
+            } else {
                 let _ = writeln!(
                     struct_fields,
-                    "    pub {name}: Option<String>,",
-                    name = f.name
-                );
-                let _ = writeln!(
-                    mapping_fields,
-                    "        {name}: decoded.{name}\n\
-                         \x20\x20\x20\x20\x20\x20\x20\x20.map(|v| v.parse::<{enum_ty}>())\n\
-                         \x20\x20\x20\x20\x20\x20\x20\x20.transpose()\n\
-                         \x20\x20\x20\x20\x20\x20\x20\x20.map_err(|err| autumn_web::AutumnError::bad_request_msg(format!(\"{name}: {{err}}\")))?,",
-                    name = f.name,
-                    enum_ty = enum_ty
-                );
-            } else {
-                let _ = writeln!(struct_fields, "    pub {name}: String,", name = f.name);
-                let _ = writeln!(
-                    mapping_fields,
-                    "        {name}: decoded.{name}.parse::<{enum_ty}>()\n\
-                         \x20\x20\x20\x20\x20\x20\x20\x20.map_err(|err| autumn_web::AutumnError::bad_request_msg(format!(\"{name}: {{err}}\")))?,",
-                    name = f.name,
-                    enum_ty = enum_ty
+                    "    #[serde(default)]\n    pub {name}: bool,"
                 );
             }
+            let _ = writeln!(into_new, "        {name}: form.{name},");
+            let _ = writeln!(from_row, "            {name}: row.{name},");
+        } else if f.kind == FieldKind::Bytea {
+            // `Vec<u8>` cannot deserialize from a single url-encoded value at
+            // all: `serde_urlencoded` hands each field's value to `serde` as
+            // a plain string, and `Vec<u8>`'s `Deserialize` impl expects a
+            // sequence — so a native-typed Bytea field would fail to decode
+            // *any* submission, not just an untouched one. There is no raw-
+            // bytes HTML input widget anyway, so it's represented as a
+            // lossy-UTF8 `String` on the form (matching what the old
+            // hand-rolled edit form already showed via
+            // `String::from_utf8_lossy`), converted back to bytes in
+            // `into_new`.
+            if f.nullable {
+                let _ = writeln!(struct_fields, "    pub {name}: Option<String>,");
+                let _ = writeln!(
+                    into_new,
+                    "        {name}: form.{name}.as_ref().map(|value| value.clone().into_bytes()),"
+                );
+                let _ = writeln!(
+                    from_row,
+                    "            {name}: row.{name}.as_ref().map(|value| String::from_utf8_lossy(value).into_owned()),"
+                );
+            } else {
+                let _ = writeln!(struct_fields, "    pub {name}: String,");
+                let _ = writeln!(
+                    into_new,
+                    "        {name}: form.{name}.clone().into_bytes(),"
+                );
+                let _ = writeln!(
+                    from_row,
+                    "            {name}: String::from_utf8_lossy(&row.{name}).into_owned(),"
+                );
+            }
+        } else if matches!(f.kind, FieldKind::NaiveDateTime | FieldKind::DateTime) {
+            // Represented as a `String` on the form (the browser's wire shape),
+            // so it always decodes and serializes cleanly for repopulation; the
+            // conversion parses it back to the model's datetime type.
+            needs_datetime = true;
+            let to_utc = if f.kind == FieldKind::DateTime {
+                ".and_utc()"
+            } else {
+                ""
+            };
+            if f.nullable {
+                let _ = writeln!(struct_fields, "    pub {name}: Option<String>,");
+                let _ = writeln!(
+                    into_new,
+                    "        {name}: form.{name}.as_deref().filter(|value| !value.is_empty())\n\
+                     \x20\x20\x20\x20\x20\x20\x20\x20.map(|value| parse_local_datetime(value).map(|dt| dt{to_utc}))\n\
+                     \x20\x20\x20\x20\x20\x20\x20\x20.transpose()?,"
+                );
+                let _ = writeln!(
+                    from_row,
+                    "            {name}: row.{name}.as_ref().map(|dt| dt.format(\"%Y-%m-%dT%H:%M:%S%.f\").to_string()),"
+                );
+            } else {
+                let _ = writeln!(struct_fields, "    pub {name}: String,");
+                let _ = writeln!(
+                    into_new,
+                    "        {name}: parse_local_datetime(&form.{name})?{to_utc},"
+                );
+                let _ = writeln!(
+                    from_row,
+                    "            {name}: row.{name}.format(\"%Y-%m-%dT%H:%M:%S%.f\").to_string(),"
+                );
+            }
+        } else if let Some(enum_ty) = f.enum_type_name() {
+            // Decoded as a plain `String` then parsed via the enum's `FromStr`
+            // in `into_new` (an out-of-set value yields a 400 naming the field).
+            let mut arms = String::new();
+            for v in &f.variants {
+                let _ = write!(arms, "{enum_ty}::{} => \"{v}\".to_string(), ", pascal(v));
+            }
+            if f.nullable {
+                let _ = writeln!(struct_fields, "    pub {name}: Option<String>,");
+                let _ = writeln!(
+                    into_new,
+                    "        {name}: form.{name}.as_deref()\n\
+                     \x20\x20\x20\x20\x20\x20\x20\x20.map(|value| value.parse::<{enum_ty}>())\n\
+                     \x20\x20\x20\x20\x20\x20\x20\x20.transpose()\n\
+                     \x20\x20\x20\x20\x20\x20\x20\x20.map_err(|err| autumn_web::AutumnError::bad_request_msg(format!(\"{name}: {{err}}\")))?,"
+                );
+                let _ = writeln!(
+                    from_row,
+                    "            {name}: row.{name}.as_ref().map(|value| match value {{ {arms}}}),"
+                );
+            } else {
+                let _ = writeln!(struct_fields, "    pub {name}: String,");
+                let _ = writeln!(
+                    into_new,
+                    "        {name}: form.{name}.parse::<{enum_ty}>()\n\
+                     \x20\x20\x20\x20\x20\x20\x20\x20.map_err(|err| autumn_web::AutumnError::bad_request_msg(format!(\"{name}: {{err}}\")))?,"
+                );
+                let _ = writeln!(
+                    from_row,
+                    "            {name}: match &row.{name} {{ {arms}}},"
+                );
+            }
+        } else if !f.nullable
+            && matches!(
+                f.kind,
+                FieldKind::I32
+                    | FieldKind::I64
+                    | FieldKind::F32
+                    | FieldKind::F64
+                    | FieldKind::Uuid
+                    | FieldKind::Decimal { .. }
+                    | FieldKind::References
+            )
+        {
+            // Represented as a `String` on the form, exactly like a required
+            // enum/datetime field: `T::default()` for these kinds (`0`, the nil
+            // UUID, …) is a real, plausible-looking value, not "blank" — with a
+            // native-typed field, the new-form's changeset would render it as
+            // the input's pre-filled value (issue #1124 review), silently
+            // accepting a value the user never typed instead of forcing
+            // deliberate input the way the old hand-rolled (no `value` at all
+            // when blank) form did. A nullable field of the same kind doesn't
+            // need this: `Option<T>::default()` is already `None`, which
+            // serializes to `null` and renders blank via `field_value`.
+            let rust_type = f.rust_type();
+            let _ = writeln!(struct_fields, "    pub {name}: String,");
+            let _ = writeln!(
+                into_new,
+                "        {name}: form.{name}.parse::<{rust_type}>()\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20.map_err(|err| autumn_web::AutumnError::bad_request_msg(format!(\"{name}: {{err}}\")))?,"
+            );
+            let _ = writeln!(from_row, "            {name}: row.{name}.to_string(),");
         } else {
+            // Plain scalars (String/Text, and any nullable numeric/Uuid/Decimal)
+            // keep their native type — `Option<T>::default()` is already blank.
             let _ = writeln!(
                 struct_fields,
                 "    pub {name}: {rust_type},",
-                name = f.name,
                 rust_type = f.rust_type()
             );
-            let _ = writeln!(
-                mapping_fields,
-                "        {name}: decoded.{name},",
-                name = f.name
-            );
+            let _ = writeln!(into_new, "        {name}: form.{name}.clone(),");
+            let _ = writeln!(from_row, "            {name}: row.{name}.clone(),");
         }
     }
 
-    let decoded_struct = format!(
-        "#[derive(serde::Deserialize)]\n\
-         struct DecodedForm {{\n\
-         {struct_fields}\
+    let form_struct = format!(
+        "#[derive(serde::Deserialize, serde::Serialize, Default, validator::Validate)]\n\
+         pub struct {pascal_name}Form {{\n\
+         {struct_fields}}}"
+    );
+
+    let into_new_fn = if has_attachments {
+        format!(
+            "/// Convert the validated form into `New{pascal_name}` on the success\n\
+             /// path. Enum/attachment parsing lives here (a bad value is a 400,\n\
+             /// not a validation error — see `{pascal_name}Form`).\n\
+             async fn into_new(\n    \
+             state: &autumn_web::AppState,\n    \
+             form: &{pascal_name}Form,\n\
+             ) -> AutumnResult<New{pascal_name}> {{\n    \
+             Ok(New{pascal_name} {{\n\
+             {into_new}    }})\n\
+             }}"
+        )
+    } else {
+        format!(
+            "/// Convert the validated form into `New{pascal_name}` on the success\n\
+             /// path. Enum/datetime parsing lives here (a bad value is a 400,\n\
+             /// not a validation error — see `{pascal_name}Form`).\n\
+             fn into_new(form: &{pascal_name}Form) -> AutumnResult<New{pascal_name}> {{\n    \
+             Ok(New{pascal_name} {{\n\
+             {into_new}    }})\n\
+             }}"
+        )
+    };
+
+    let from_row_impl = format!(
+        "/// Seed a form changeset from a persisted row (edit-form GET).\n\
+         impl From<&{pascal_name}> for {pascal_name}Form {{\n    \
+         fn from(row: &{pascal_name}) -> Self {{\n        \
+         Self {{\n\
+         {from_row}        }}\n    \
+         }}\n\
          }}"
     );
 
-    (decoded_struct, mapping_fields, datetime_helper_fns(&needed))
+    let datetime_helper = if needs_datetime {
+        PARSE_LOCAL_DATETIME_FN.to_owned()
+    } else {
+        String::new()
+    };
+
+    ModelFormParts {
+        form_struct,
+        into_new_fn,
+        from_row_impl,
+        datetime_helper,
+    }
 }
 
 #[allow(
@@ -989,37 +1071,26 @@ fn render_routes_file(
 ) -> String {
     let id_rust = id_type.rust_type();
     let validated_fields: Vec<&str> = validations.keys().map(String::as_str).collect();
-    let create_inputs =
-        render_create_form_inputs(fields, live_validation, &validated_fields, plural, false);
-    let edit_inputs =
-        render_edit_form_inputs(fields, live_validation, &validated_fields, plural, false);
-    // `unique` fields (issue #1032): a duplicate submission re-renders the
-    // same form with an inline field error instead of a generic 500 — see
-    // `render_unique_violation_create_handler`/`..._update_handler` below.
-    // These `_with_unique_error` variants are only spliced into that
-    // failure-path branch, never into `new_form`/`edit_form`'s normal
-    // (success) rendering, so a scaffold without `unique` fields emits byte-
-    // identical output to before this feature existed.
+    // Issue #1124: `new_form`, `edit_form`, and both 422 re-render branches
+    // render the same inputs from a `Changeset<{Pascal}Form>` variable named
+    // `changeset`, so one renderer serves every site and the markup can never
+    // drift between them. Preserved values and inline errors come from the
+    // changeset via the shipped `autumn_web::form` helpers.
+    let changeset_inputs = render_changeset_form_inputs(
+        fields,
+        "changeset",
+        plural,
+        live_validation,
+        &validated_fields,
+    );
     let unique_fields: Vec<&Field> = fields.iter().filter(|f| f.unique).collect();
-    let create_inputs_with_unique_error = if unique_fields.is_empty() {
-        String::new()
-    } else {
-        render_create_form_inputs(fields, live_validation, &validated_fields, plural, true)
-    };
-    let edit_inputs_with_unique_error = if unique_fields.is_empty() {
-        String::new()
-    } else {
-        render_edit_form_inputs(fields, live_validation, &validated_fields, plural, true)
-    };
     let update_columns = render_update_columns(plural, fields);
     let nullable_field_match = render_nullable_field_match(fields);
     let has_attachments = has_attachment_fields(fields);
-    let (decoded_form_struct, decoded_form_mapping, datetime_helper_fns) =
-        render_decoded_form(pascal_name, fields);
-    // Enum fields need their generated Rust type in scope here — the
-    // `DecodedForm` mapping parses into it (see `render_decoded_form`) and
-    // the edit form's `selected[...]` expressions compare against its
-    // variants (see the `FieldKind::Enum` arm of `render_edit_form_inputs`).
+    let model_form = render_model_form(pascal_name, fields, validations);
+    // Enum fields need their generated Rust type in scope here — `into_new`
+    // parses into it and the `From<&Row>` seed matches against its variants
+    // (see `render_model_form`).
     let enum_import_suffix: String =
         fields
             .iter()
@@ -1149,128 +1220,178 @@ fn render_routes_file(
         format!("mut db: {db_ty}")
     };
 
-    // A `unique` field's create/update handler re-renders the form on a
-    // constraint violation (issue #1032), which needs a CSRF token/field the
-    // same way `new_form`/`edit_form` already do — the plain create/update
-    // handlers otherwise only *consume* a submission, never render a form,
-    // so they don't carry these params. Inserted right after `flash: Flash`
-    // (NOT appended at the end) — axum's `Handler` trait requires the
-    // body-consuming `Bytes` extractor to stay the *last* parameter; every
-    // other extractor must come before it.
-    let create_signature = if unique_fields.is_empty() {
-        create_signature
+    // Issue #1124: every scaffold's create/update now re-renders the form on a
+    // rejected submission, so both handlers carry a CSRF token/field the same
+    // way `new_form`/`edit_form` do. Inserted right after `flash: Flash` (NOT
+    // appended at the end) — axum's `Handler` trait requires the body-consuming
+    // `Bytes` extractor to stay the *last* parameter; every other extractor
+    // must come before it.
+    let create_signature = create_signature.replacen(
+        "flash: Flash",
+        "flash: Flash, csrf: Option<CsrfToken>, csrf_field: Option<CsrfFormField>",
+        1,
+    );
+    let update_signature = update_signature.replacen(
+        "flash: Flash,",
+        "flash: Flash,\n    csrf: Option<CsrfToken>,\n    csrf_field: Option<CsrfFormField>,",
+        1,
+    );
+
+    // `decode_form` always returns the `{Pascal}Form` (sync — attachment blob
+    // resolution moved into `into_new`, which needs `&state`). `into_new`
+    // converts the validated form into `New{Pascal}` on the success path.
+    let decode_call = "decode_form(body)?".to_owned();
+    let decode_form_sig = format!("fn decode_form(body: Bytes) -> AutumnResult<{pascal_name}Form>");
+    let into_new_call = if has_attachments {
+        "into_new(&state, changeset.data()).await?".to_owned()
     } else {
-        create_signature.replacen(
-            "flash: Flash",
-            "flash: Flash, csrf: Option<CsrfToken>, csrf_field: Option<CsrfFormField>",
-            1,
-        )
-    };
-    let update_signature = if unique_fields.is_empty() {
-        update_signature
-    } else {
-        update_signature.replacen(
-            "flash: Flash,",
-            "flash: Flash,\n    csrf: Option<CsrfToken>,\n    csrf_field: Option<CsrfFormField>,",
-            1,
-        )
-        // The `--live` (non-sharded) signature uses `repo:` instead of `mut
-        // db: {db_ty}` — the unique-violation re-fetch below goes through
-        // `repo.find_by_id` in that case (see
-        // `render_unique_violation_update_handler`) rather than adding a
-        // second `Db` extractor alongside `repo`. `Db` checks out and holds
-        // a pool connection for the whole handler scope, and `repo.update`
-        // (used by the live update path) checks out its own connection from
-        // the same pool — holding both at once self-deadlocks/times out a
-        // pool sized for one connection per request (issue #1032 review
-        // follow-up).
+        "into_new(changeset.data())?".to_owned()
     };
 
-    let (decode_create_call, decode_update_call, decode_form_sig) = if has_attachments {
-        (
-            "decode_form(&state, body).await?".to_owned(),
-            "decode_form(&state, body).await?".to_owned(),
-            format!(
-                "async fn decode_form(state: &autumn_web::AppState, body: Bytes) -> AutumnResult<New{pascal_name}>"
-            ),
-        )
-    } else {
-        (
-            "decode_form(body)?".to_owned(),
-            "decode_form(body)?".to_owned(),
-            format!("fn decode_form(body: Bytes) -> AutumnResult<New{pascal_name}>"),
-        )
-    };
+    // Shared re-render bodies: the same `layout(...)` markup the GET handlers
+    // emit, reused verbatim by the 422 branches so the form can't drift. Both
+    // read from a `Changeset<{Pascal}Form>` named `changeset` and the CSRF
+    // params now present on every create/update signature.
+    let new_form_body = format!(
+        "layout(\"New {pascal_name}\", flash.render().await, html! {{\n        \
+         h1 {{ \"New {pascal_name}\" }}\n        \
+         form action=\"/{plural}\" method=\"post\"{form_enctype} {{\n            \
+         (csrf_input(csrf.as_ref(), csrf_field.as_ref()))\n{changeset_inputs}            \
+         button type=\"submit\" {{ \"Create\" }}\n        \
+         }}\n    \
+         }})"
+    );
+    let edit_form_body = format!(
+        "layout(&format!(\"Edit {pascal_name} #{{}}\", *id), flash.render().await, html! {{\n        \
+         h1 {{ \"Edit {pascal_name} #\" (*id) }}\n        \
+         form action=(format!(\"/{plural}/{{}}/update\", *id)) method=\"post\"{form_enctype} {{\n            \
+         (csrf_input(csrf.as_ref(), csrf_field.as_ref()))\n{changeset_inputs}            \
+         button type=\"submit\" {{ \"Save\" }}\n        \
+         }}\n        \
+         form action=(format!(\"/{plural}/{{}}/delete\", *id)) method=\"post\" {{\n            \
+         (csrf_input(csrf.as_ref(), csrf_field.as_ref()))\n            \
+         button type=\"submit\" onclick=\"return confirm('Delete this {pascal_name}?')\" {{ \"Delete\" }}\n        \
+         }}\n    \
+         }})"
+    );
 
-    // `unique` fields (issue #1032): build the create/update handler bodies
-    // now that every input they need (`create_stmt`, `create_signature`,
-    // `decode_create_call`, …) is available. A scaffold with no `unique`
-    // fields gets byte-identical output to before this feature existed —
-    // `unique_constraints_const` is empty and `create_fn`/`update_fn` are the
-    // same plain templates previously inlined here.
+    // `unique` fields (issue #1032) still classify DB constraint violations,
+    // but now feed the error into the *same* changeset renderer via
+    // `Changeset::from_errors`, so a duplicate value shows an inline error
+    // through the shipped helpers just like a validation failure.
     let unique_constraints_const = if unique_fields.is_empty() {
         String::new()
     } else {
         render_unique_constraints_const(plural, &unique_fields, all_fields)
     };
-    let create_fn = if unique_fields.is_empty() {
+
+    let create_insert_block = if unique_fields.is_empty() {
         format!(
-            "/// `POST /{plural}` — accept a form submission and create a {snake_name}.\n\
-             #[secured]\n\
-             #[post(\"/{plural}\")]\n\
-             pub async fn create({create_signature}) -> AutumnResult<Markup> {{\n    \
-             let new = {decode_create_call};\n    \
-             {create_stmt}\n    \
+            "{create_stmt}\n    \
              flash.success(\"{pascal_name} created\").await;\n    \
-             Ok(redirect_to(\"/{plural}\"))\n\
-             }}\n"
+             Ok(redirect_to(\"/{plural}\").into_response())"
         )
     } else {
-        render_unique_violation_create_handler(
-            pascal_name,
-            snake_name,
-            plural,
-            &create_signature,
-            &decode_create_call,
-            &create_stmt,
-            form_enctype,
-            &create_inputs_with_unique_error,
+        format!(
+            "let result: AutumnResult<()> = async {{\n        \
+             {create_stmt}\n        \
+             Ok(())\n    \
+             }}.await;\n    \
+             if let Err(err) = result {{\n        \
+             if let Some((field, message)) = autumn_web::error::unique_violation_field(&err, UNIQUE_CONSTRAINTS) {{\n            \
+             let mut errors = std::collections::HashMap::new();\n            \
+             errors.insert(field.to_string(), vec![message.to_string()]);\n            \
+             let changeset = Changeset::from_errors(changeset.into_inner(), errors);\n            \
+             return Ok((autumn_web::reexports::http::StatusCode::UNPROCESSABLE_ENTITY, {new_form_body}).into_response());\n        \
+             }}\n        \
+             return Err(err);\n    \
+             }}\n    \
+             flash.success(\"{pascal_name} created\").await;\n    \
+             Ok(redirect_to(\"/{plural}\").into_response())"
         )
     };
-    let update_fn = if unique_fields.is_empty() {
+    let create_fn = format!(
+        "/// `POST /{plural}` — validate the submission and create a {snake_name},\n\
+         /// or re-render the form at 422 with inline errors and preserved input.\n\
+         #[secured]\n\
+         #[post(\"/{plural}\")]\n\
+         pub async fn create({create_signature}) -> AutumnResult<autumn_web::reexports::axum::response::Response> {{\n    \
+         use autumn_web::reexports::axum::response::IntoResponse as _;\n    \
+         let form = {decode_call};\n    \
+         let changeset = form.into_changeset();\n    \
+         if !changeset.is_valid() {{\n        \
+         return Ok((autumn_web::reexports::http::StatusCode::UNPROCESSABLE_ENTITY, {new_form_body}).into_response());\n    \
+         }}\n    \
+         let new = {into_new_call};\n    \
+         {create_insert_block}\n\
+         }}\n"
+    );
+
+    let update_apply_block = if unique_fields.is_empty() {
         format!(
-            "/// `POST /{plural}/{{id}}/update` — apply form data to a row, then redirect\n\
-             /// to its show page. Uses column-by-column `diesel::update().set(...)` (same\n\
-             /// convention as `examples/todo-app`) so we don't need `AsChangeset` on the\n\
-             /// `New{pascal_name}` insert type.\n\
-             #[secured]\n\
-             #[post(\"/{plural}/{{id}}/update\")]\n\
-             pub async fn update(\n    \
-             {update_signature}\n\
-             ) -> AutumnResult<Markup> {{\n    \
-             let form = {decode_update_call};\n    \
-             {update_stmt}\n    \
+            "{update_stmt}\n    \
              if updated == 0 {{\n        \
              return Err(AutumnError::not_found_msg(format!(\n            \
              \"{pascal_name} with id {{}} not found\", *id\n        \
              )));\n    \
              }}\n    \
              flash.success(\"{pascal_name} updated\").await;\n    \
-             Ok(redirect_to(&format!(\"/{plural}/{{}}\", *id)))\n\
-             }}\n"
+             Ok(redirect_to(&format!(\"/{plural}/{{}}\", *id)).into_response())"
         )
     } else {
-        render_unique_violation_update_handler(
-            pascal_name,
-            plural,
-            &update_signature,
-            &decode_update_call,
-            &update_stmt,
-            form_enctype,
-            &edit_inputs_with_unique_error,
-            live && !sharded,
+        format!(
+            "let result: AutumnResult<usize> = async {{\n        \
+             {update_stmt}\n        \
+             Ok(updated)\n    \
+             }}.await;\n    \
+             let updated = match result {{\n        \
+             Ok(updated) => updated,\n        \
+             Err(err) => {{\n            \
+             if let Some((field, message)) = autumn_web::error::unique_violation_field(&err, UNIQUE_CONSTRAINTS) {{\n                \
+             let mut errors = std::collections::HashMap::new();\n                \
+             errors.insert(field.to_string(), vec![message.to_string()]);\n                \
+             let changeset = Changeset::from_errors(changeset.into_inner(), errors);\n                \
+             return Ok((autumn_web::reexports::http::StatusCode::UNPROCESSABLE_ENTITY, {edit_form_body}).into_response());\n            \
+             }}\n            \
+             return Err(err);\n        \
+             }}\n    \
+             }};\n    \
+             if updated == 0 {{\n        \
+             return Err(AutumnError::not_found_msg(format!(\n            \
+             \"{pascal_name} with id {{}} not found\", *id\n        \
+             )));\n    \
+             }}\n    \
+             flash.success(\"{pascal_name} updated\").await;\n    \
+             Ok(redirect_to(&format!(\"/{plural}/{{}}\", *id)).into_response())"
         )
     };
+    let update_fn = format!(
+        "/// `POST /{plural}/{{id}}/update` — validate and apply form data to a row,\n\
+         /// or re-render the edit form at 422 with inline errors and preserved input.\n\
+         /// Uses column-by-column `diesel::update().set(...)` (same convention as\n\
+         /// `examples/todo-app`) so we don't need `AsChangeset` on `New{pascal_name}`.\n\
+         #[secured]\n\
+         #[post(\"/{plural}/{{id}}/update\")]\n\
+         pub async fn update(\n    \
+         {update_signature}\n\
+         ) -> AutumnResult<autumn_web::reexports::axum::response::Response> {{\n    \
+         use autumn_web::reexports::axum::response::IntoResponse as _;\n    \
+         let form = {decode_call};\n    \
+         let changeset = form.into_changeset();\n    \
+         if !changeset.is_valid() {{\n        \
+         return Ok((autumn_web::reexports::http::StatusCode::UNPROCESSABLE_ENTITY, {edit_form_body}).into_response());\n    \
+         }}\n    \
+         let new = {into_new_call};\n    \
+         {update_apply_block}\n\
+         }}\n"
+    );
+
+    // Template splice bindings for the generated form struct, its conversion,
+    // the edit-form seed, and (when present) the datetime parse helper.
+    let form_struct = &model_form.form_struct;
+    let into_new_fn = &model_form.into_new_fn;
+    let from_row_impl = &model_form.from_row_impl;
+    let parse_datetime_helper = &model_form.datetime_helper;
 
     // The `index` handler: when sharded, use from_shard explicitly so the
     // generated code shows the canonical sharding pattern.
@@ -1430,124 +1551,70 @@ pub async fn index(
     // import is needed.
     let db_import = if sharded {
         "use autumn_web::flash::Flash;\n\
+         use autumn_web::form::{Changeset, IntoChangeset};\n\
          use autumn_web::sharding::ShardedDb;\n\
          use autumn_web::{AutumnError, AutumnResult, Markup, get, html, post, secured};"
             .to_owned()
     } else {
         "use autumn_web::flash::Flash;\n\
+         use autumn_web::form::{Changeset, IntoChangeset};\n\
          use autumn_web::{AutumnError, AutumnResult, Db, Markup, get, html, post, secured};"
             .to_owned()
     };
 
-    // When `--live-validation`, emit one inline-validation handler per validated field.
-    // Each handler runs the actual declared validation rule(s) at runtime, not just
-    // an empty-check stub.
+    // When `--live-validation`, emit one inline-validation handler per validated
+    // field. Each handler decodes the *whole* submitted form (htmx's
+    // `hx-include="closest form"` posts every field, not just the one that
+    // changed) via the same `decode_form` used by `create`/`update`, builds a
+    // `Changeset<{pascal_name}Form>` through the struct's derived
+    // `#[validate(...)]` rules, and returns `text_input_htmx`'s full field
+    // wrapper (label + input + inline error) for that one field. Sharing the
+    // changeset/validator machinery with `create`/`update` means there is only
+    // one place the validation rules live, and the returned markup matches
+    // `text_input_htmx`'s `hx-swap="outerHTML"` contract — swapping in a bare
+    // `<span>` would delete the input it's supposed to replace.
     let validate_handlers = if live_validation {
         let mut vh = String::new();
         for (field_name, rules) in validations {
             let rule_comment = rules.join(", ");
-            // Build the error chain: start with an empty-value check, then
-            // append one branch per declared rule (url, email, length).
-            // Nullable fields are not required — leave them empty → None.
-            let is_required = fields
+            let label = humanize_label(field_name);
+            // Match `render_changeset_form_inputs`'s helper choice: a
+            // non-nullable field keeps `required`/`aria-required` through the
+            // htmx round-trip too, otherwise the attribute would vanish from
+            // the DOM the moment the field's wrapper gets swapped in.
+            let is_nullable = fields
                 .iter()
                 .find(|f| f.name == *field_name)
-                .is_none_or(|f| !f.nullable);
-            let mut error_chain = if is_required {
-                String::from("if value.is_empty() {\n        Some(\"required\")\n    }")
+                .is_some_and(|f| f.nullable);
+            let helper = if is_nullable {
+                "text_input_htmx"
             } else {
-                String::from("if value.is_empty() {\n        None\n    }")
+                "required_text_input_htmx"
             };
-            for rule in rules {
-                if rule == "url" {
-                    error_chain.push_str(
-                        " else if url::Url::parse(&value).is_err() {\n        Some(\"must be a valid URL\")\n    }",
-                    );
-                } else if rule == "email" {
-                    error_chain.push_str(
-                        " else if !value.contains('@')\n            || value.split_once('@').map_or(true, |(_, d)| !d.contains('.')) {\n        Some(\"must be a valid email address\")\n    }",
-                    );
-                } else if let Some(args_str) = rule
-                    .strip_prefix("length(")
-                    .and_then(|s| s.strip_suffix(")"))
-                {
-                    let mut min: Option<u64> = None;
-                    let mut max: Option<u64> = None;
-                    for part in args_str.split(',') {
-                        let part = part.trim();
-                        if let Some(n_str) = part.strip_prefix("min = ") {
-                            if let Ok(n) = n_str.trim().parse::<u64>() {
-                                min = Some(n);
-                            }
-                        } else if let Some(n_str) = part.strip_prefix("max = ")
-                            && let Ok(n) = n_str.trim().parse::<u64>()
-                        {
-                            max = Some(n);
-                        }
-                    }
-                    if min.is_none() && max.is_none() {
-                        continue;
-                    }
-                    let cond = match (min, max) {
-                        (Some(mn), Some(mx)) => {
-                            format!("value.chars().count() < {mn} || value.chars().count() > {mx}")
-                        }
-                        (Some(mn), None) => format!("value.chars().count() < {mn}"),
-                        (None, Some(mx)) => format!("value.chars().count() > {mx}"),
-                        (None, None) => unreachable!(),
-                    };
-                    let msg = match (min, max) {
-                        (Some(mn), Some(mx)) => {
-                            format!("must be between {mn} and {mx} characters")
-                        }
-                        (Some(mn), None) => format!("must be at least {mn} characters"),
-                        (None, Some(mx)) => format!("must be at most {mx} characters"),
-                        (None, None) => unreachable!(),
-                    };
-                    let _ = write!(
-                        error_chain,
-                        " else if {cond} {{\n        Some(\"{msg}\")\n    }}"
-                    );
-                }
-            }
-            error_chain.push_str(" else {\n        None\n    }");
-
-            // Build the handler string via push_str to avoid brace-escaping issues
-            // between the format! template and the generated Rust { } delimiters.
             let _ = write!(
                 vh,
                 "\n\n/// `POST /{plural}/validate/{field_name}` — inline validation fragment.\n"
             );
-            let _ = write!(
-                vh,
-                "///\n/// Returns an `<span id=\"{field_name}-error\">` OOB fragment with an error\n"
-            );
             let _ = writeln!(
                 vh,
-                "/// message when the value fails the `{rule_comment}` rule, or an empty span"
-            );
-            vh.push_str(
-                "/// when it passes. Consumed by htmx `hx-swap=\"outerHTML\"` on `hx-trigger=\"change\"`.\n",
+                "///\n/// Decodes the full submitted form, validates it against the `{rule_comment}`\n\
+                 /// rule declared on `{pascal_name}Form`, and returns the `{field_name}` field's\n\
+                 /// wrapper (input + inline error) for htmx's `hx-swap=\"outerHTML\"` on\n\
+                 /// `hx-trigger=\"change\"` to swap in place."
             );
             let _ = writeln!(vh, "#[post(\"/{plural}/validate/{field_name}\")]");
             let _ = writeln!(
                 vh,
                 "pub async fn validate_{field_name}(body: autumn_web::reexports::axum::body::Bytes) -> autumn_web::Markup {{"
             );
-            let _ = write!(
+            vh.push_str("    let Ok(form) = decode_form(body) else {\n");
+            vh.push_str("        return autumn_web::html! {};\n");
+            vh.push_str("    };\n");
+            vh.push_str("    let changeset = form.into_changeset();\n");
+            let _ = writeln!(
                 vh,
-                "    let value = url::form_urlencoded::parse(body.as_ref())\n        .find(|(k, _)| k == \"{field_name}\")\n"
+                "    autumn_web::form::{helper}(&changeset, \"{field_name}\", \"{label}\", \"/{plural}/validate/{field_name}\")"
             );
-            vh.push_str("        .map(|(_, v)| v.to_string())\n");
-            vh.push_str("        .unwrap_or_default();\n");
-            let _ = writeln!(vh, "    let error: Option<&str> = {error_chain};");
-            vh.push_str("    autumn_web::html! {\n");
-            let _ = writeln!(vh, "        span id=\"{field_name}-error\" {{");
-            vh.push_str("            @if let Some(msg) = error {\n");
-            vh.push_str("                span style=\"color:red\" { (msg) }\n");
-            vh.push_str("            }\n");
-            vh.push_str("        }\n");
-            vh.push_str("    }\n");
             vh.push_str("}\n");
         }
         vh
@@ -1675,13 +1742,8 @@ pub async fn new_form(
     csrf: Option<CsrfToken>,
     csrf_field: Option<CsrfFormField>,
 ) -> AutumnResult<Markup> {{
-    Ok(layout("New {pascal_name}", flash.render().await, html! {{
-        h1 {{ "New {pascal_name}" }}
-        form action="/{plural}" method="post"{form_enctype} {{
-            (csrf_input(csrf.as_ref(), csrf_field.as_ref()))
-{create_inputs}            button type="submit" {{ "Create" }}
-        }}
-    }}))
+    let changeset = Changeset::new({pascal_name}Form::default());
+    Ok({new_form_body})
 }}
 
 {unique_constraints_const}{create_fn}
@@ -1704,19 +1766,8 @@ pub async fn edit_form(
         .first(&mut *db)
         .await
         .map_err(AutumnError::not_found)?;
-    Ok(layout(&format!("Edit {pascal_name} #{{}}", row.id), flash.render().await, html! {{
-        h1 {{ "Edit {pascal_name} #" (row.id) }}
-        form action=(format!("/{plural}/{{}}/update", row.id)) method="post"{form_enctype} {{
-            (csrf_input(csrf.as_ref(), csrf_field.as_ref()))
-{edit_inputs}            button type="submit" {{ "Save" }}
-        }}
-        // Delete lives on this secured page (the public show page must not
-        // expose a control that anonymous users can't use).
-        form action=(format!("/{plural}/{{}}/delete", row.id)) method="post" {{
-            (csrf_input(csrf.as_ref(), csrf_field.as_ref()))
-            button type="submit" onclick="return confirm('Delete this {pascal_name}?')" {{ "Delete" }}
-        }}
-    }}))
+    let changeset = Changeset::new({pascal_name}Form::from(&row));
+    Ok({edit_form_body})
 }}
 
 {update_fn}
@@ -1742,8 +1793,12 @@ pub async fn destroy(
     Ok(redirect_to("/{plural}"))
 }}
 
-{decoded_form_struct}
-{datetime_helper_fns}
+{form_struct}
+{parse_datetime_helper}
+{into_new_fn}
+
+{from_row_impl}
+
 {decode_form_sig} {{
     let pairs: Vec<_> = url::form_urlencoded::parse(body.as_ref())
         .filter(|(key, value)| !(value.is_empty() && is_nullable_form_field(key)))
@@ -1752,11 +1807,10 @@ pub async fn destroy(
         .extend_pairs(pairs.iter().map(|(key, value)| (key.as_ref(), value.as_ref())))
         .finish();
 
-    let decoded: DecodedForm = serde_urlencoded::from_str(&encoded)
+    let form: {pascal_name}Form = serde_urlencoded::from_str(&encoded)
         .map_err(|err| AutumnError::bad_request_msg(format!("invalid form submission: {{err}}")))?;
 
-    Ok(New{pascal_name} {{
-{decoded_form_mapping}    }})
+    Ok(form)
 }}
 
 fn is_nullable_form_field(name: &str) -> bool {{
@@ -1814,132 +1868,6 @@ fn render_unique_constraints_const(
     format!("const UNIQUE_CONSTRAINTS: &[(&str, &str, &str)] = &[\n    {entries}];\n")
 }
 
-/// Builds the `create` handler body for a scaffold with `unique` fields
-/// (issue #1032). The insert runs inside an inner `async` block so a
-/// `Result` is captured instead of propagating straight through `?`;
-/// `autumn_web::error::unique_violation_field` classifies a failure against
-/// `UNIQUE_CONSTRAINTS` and, on a match, re-renders the new-{snake_name} form
-/// with an inline field error and `422` instead of the generic `500` a bare
-/// `?` would otherwise produce. Any other error still propagates normally.
-#[allow(clippy::too_many_arguments)]
-fn render_unique_violation_create_handler(
-    pascal_name: &str,
-    snake_name: &str,
-    plural: &str,
-    create_signature: &str,
-    decode_create_call: &str,
-    create_stmt: &str,
-    form_enctype: &str,
-    create_inputs_with_unique_error: &str,
-) -> String {
-    format!(
-        "/// `POST /{plural}` — accept a form submission and create a {snake_name}.\n\
-         #[secured]\n\
-         #[post(\"/{plural}\")]\n\
-         pub async fn create({create_signature}) -> AutumnResult<autumn_web::reexports::axum::response::Response> {{\n    \
-         use autumn_web::reexports::axum::response::IntoResponse as _;\n    \
-         let new = {decode_create_call};\n    \
-         let result: AutumnResult<()> = async {{\n        \
-         {create_stmt}\n        \
-         Ok(())\n    \
-         }}.await;\n    \
-         if let Err(err) = result {{\n        \
-         if let Some((field, message)) = autumn_web::error::unique_violation_field(&err, UNIQUE_CONSTRAINTS) {{\n            \
-         return Ok((autumn_web::reexports::http::StatusCode::UNPROCESSABLE_ENTITY, layout(\"New {pascal_name}\", flash.render().await, html! {{\n                \
-         h1 {{ \"New {pascal_name}\" }}\n                \
-         form action=\"/{plural}\" method=\"post\"{form_enctype} {{\n                    \
-         (csrf_input(csrf.as_ref(), csrf_field.as_ref()))\n{create_inputs_with_unique_error}                    button type=\"submit\" {{ \"Create\" }}\n                \
-         }}\n            \
-         }})).into_response());\n        \
-         }}\n        \
-         return Err(err);\n    \
-         }}\n    \
-         flash.success(\"{pascal_name} created\").await;\n    \
-         Ok(redirect_to(\"/{plural}\").into_response())\n\
-         }}\n"
-    )
-}
-
-/// [`render_unique_violation_create_handler`]'s `update` counterpart. On a
-/// unique-constraint violation, re-fetches the row by `id` (its pre-update,
-/// still-valid values — not the rejected submission) and re-renders the
-/// edit form with an inline field error and `422`.
-///
-/// `live_not_sharded` selects how the re-fetch gets its connection: the
-/// non-sharded `--live` signature has `repo:` in place of `mut db: {db_ty}`
-/// (see `render_routes_file`'s `update_signature` construction), so the
-/// re-fetch goes through `repo.find_by_id` instead of a direct `db` query —
-/// adding a second `Db` extractor alongside `repo` would hold two pool
-/// connections for the same request (`Db` for the whole handler scope,
-/// `repo.update` for its own internal checkout), self-deadlocking a pool
-/// sized for one connection per request (issue #1032 review follow-up).
-#[allow(clippy::too_many_arguments)]
-fn render_unique_violation_update_handler(
-    pascal_name: &str,
-    plural: &str,
-    update_signature: &str,
-    decode_update_call: &str,
-    update_stmt: &str,
-    form_enctype: &str,
-    edit_inputs_with_unique_error: &str,
-    live_not_sharded: bool,
-) -> String {
-    let refetch_row = if live_not_sharded {
-        format!(
-            "let row: {pascal_name} = repo.find_by_id(*id).await?.ok_or_else(|| AutumnError::not_found_msg(format!(\"{pascal_name} with id {{}} not found\", *id)))?;"
-        )
-    } else {
-        format!(
-            "let row: {pascal_name} = {plural}::table\n                    \
-             .find(*id)\n                    \
-             .select({pascal_name}::as_select())\n                    \
-             .first(&mut *db)\n                    \
-             .await\n                    \
-             .map_err(AutumnError::not_found)?;"
-        )
-    };
-    format!(
-        "/// `POST /{plural}/{{id}}/update` — apply form data to a row, then redirect\n\
-         /// to its show page. Uses column-by-column `diesel::update().set(...)` (same\n\
-         /// convention as `examples/todo-app`) so we don't need `AsChangeset` on the\n\
-         /// `New{pascal_name}` insert type.\n\
-         #[secured]\n\
-         #[post(\"/{plural}/{{id}}/update\")]\n\
-         pub async fn update(\n    \
-         {update_signature}\n\
-         ) -> AutumnResult<autumn_web::reexports::axum::response::Response> {{\n    \
-         use autumn_web::reexports::axum::response::IntoResponse as _;\n    \
-         let form = {decode_update_call};\n    \
-         let result: AutumnResult<usize> = async {{\n        \
-         {update_stmt}\n        \
-         Ok(updated)\n    \
-         }}.await;\n    \
-         let updated = match result {{\n        \
-         Ok(updated) => updated,\n        \
-         Err(err) => {{\n            \
-         if let Some((field, message)) = autumn_web::error::unique_violation_field(&err, UNIQUE_CONSTRAINTS) {{\n                \
-         {refetch_row}\n                \
-         return Ok((autumn_web::reexports::http::StatusCode::UNPROCESSABLE_ENTITY, layout(&format!(\"Edit {pascal_name} #{{}}\", row.id), flash.render().await, html! {{\n                    \
-         h1 {{ \"Edit {pascal_name} #\" (row.id) }}\n                    \
-         form action=(format!(\"/{plural}/{{}}/update\", row.id)) method=\"post\"{form_enctype} {{\n                        \
-         (csrf_input(csrf.as_ref(), csrf_field.as_ref()))\n{edit_inputs_with_unique_error}                        button type=\"submit\" {{ \"Save\" }}\n                    \
-         }}\n                \
-         }})).into_response());\n            \
-         }}\n            \
-         return Err(err);\n        \
-         }}\n    \
-         }};\n    \
-         if updated == 0 {{\n        \
-         return Err(AutumnError::not_found_msg(format!(\n            \
-         \"{pascal_name} with id {{}} not found\", *id\n        \
-         )));\n    \
-         }}\n    \
-         flash.success(\"{pascal_name} updated\").await;\n    \
-         Ok(redirect_to(&format!(\"/{plural}/{{}}\", *id)).into_response())\n\
-         }}\n"
-    )
-}
-
 fn render_update_changeset_expr(pascal_name: &str, fields: &[Field]) -> String {
     use std::fmt::Write;
     let mut out = format!("Update{pascal_name} {{\n");
@@ -1947,7 +1875,7 @@ fn render_update_changeset_expr(pascal_name: &str, fields: &[Field]) -> String {
         let name = &f.name;
         writeln!(
             out,
-            "        {name}: autumn_web::hooks::Patch::Set(form.{name}.clone()),"
+            "        {name}: autumn_web::hooks::Patch::Set(new.{name}.clone()),"
         )
         .unwrap();
     }
@@ -1960,253 +1888,138 @@ fn has_attachment_fields(fields: &[Field]) -> bool {
     fields.iter().any(|f| f.kind.is_attachment())
 }
 
-// `render_create_form_inputs` and `render_edit_form_inputs` below hand-roll
-// bare HTML (no `Changeset`/`ChangesetForm`, no `autumn-field` wrapper divs
-// or ARIA wiring) rather than calling `autumn_web::form::{checkbox_input,
-// number_input, date_input, datetime_input, select_input}` — consistent
-// with how every other field kind (including plain `String`) has always
-// been emitted here, not a pattern introduced for these widgets. That means
-// the two are independently maintained and can drift; at minimum, keep
-// these invariants in sync with the `autumn_web::form` helpers of the same
-// name when either changes:
-//   - `Bool` (non-nullable): a bare `<input type="checkbox">`, **no** hidden
-//     `value="false"` sibling sharing the `name` — see `checkbox_input`'s
-//     doc comment for why (duplicate-key 400 on every checked submission).
-//   - `Bool` (nullable): a 3-option `<select>` (unset/true/false), never a
-//     checkbox — a checkbox can't represent a `None` distinct from `false`.
-//   - `I32`/`I64`/`F32`/`F64`: `type="number"` with `step="1"` for integers,
-//     `step="any"` for floats.
-//   - `NaiveDateTime`/`DateTime`: `type="datetime-local"`, decoded via a
-//     `%.f`-tolerant parser (see `DESERIALIZE_*_DATETIME_LOCAL_FN` below).
-#[allow(
-    clippy::too_many_lines,
-    reason = "One match arm per field-kind widget — splitting it produces less \
-              readable output, not more. See render_edit_form_inputs's \
-              module-level comment for the shared invariants across both."
-)]
-fn render_create_form_inputs(
+/// Render the form inputs for a scaffold's new/edit/re-render views through
+/// the shipped, changeset-aware `autumn_web::form` helpers (issue #1124).
+///
+/// Every helper reads its value and any inline errors from the
+/// `Changeset<{Pascal}Form>` bound to `changeset_var` in the calling handler,
+/// so preserved input and per-field error messages (`aria-invalid` +
+/// `role="alert"`) come for free — and the identical markup is emitted by
+/// `new_form`, `edit_form`, and both 422 re-render branches. `FieldKind` maps to
+/// the matching helper (`text_input`, `number_input`, `datetime_input`,
+/// `checkbox_input`, `select_input`); attachments stay a plain `<input
+/// type="file">` (a file input can't be repopulated).
+fn render_changeset_form_inputs(
     fields: &[Field],
+    changeset_var: &str,
+    plural: &str,
     live_validation: bool,
     validated: &[&str],
-    plural: &str,
-    unique_error_aware: bool,
 ) -> String {
     use std::fmt::Write as _;
-    // Only the `unique_error_aware` re-render (a unique-constraint violation
-    // on `create`, see `render_unique_violation_create_handler`) has a prior
-    // submission to restore — `new: New{Pascal}` is in scope there, holding
-    // the just-decoded, otherwise-valid values that were rejected only for
-    // colliding on the unique column. The plain `new_form` GET always passes
-    // `unique_error_aware = false` (issue #1032 review follow-up: without
-    // this, a duplicate submission wiped every field, not just the one that
-    // collided), so its output stays byte-identical to before this feature
-    // existed.
-    let submitted_var = unique_error_aware.then_some("new");
+    let cv = changeset_var;
     let mut out = String::new();
     for f in fields {
-        if f.kind.is_attachment() {
-            // Attachment fields render as file inputs; the form must use
-            // enctype="multipart/form-data" (set by render_routes_file when
-            // attachment fields are present). Upload logic (storage backend
-            // + blob binding) requires the `autumn-web` `storage` and
-            // `multipart` features and is left for the app author to wire.
-            let _ = writeln!(
-                out,
-                "            label {{ \"{name}\" }} input type=\"file\" name=\"{name}\";",
-                name = f.name
-            );
+        let name = &f.name;
+        let label = humanize_label(name);
+        let line = if f.kind.is_attachment() {
+            // Attachment fields render a plain file input plus a hidden field
+            // carrying the existing blob key (from the changeset), so an edit
+            // that doesn't re-upload keeps the current attachment. A file input
+            // itself can't be repopulated — browser security.
+            format!(
+                "label {{ \"{label}\" }} input type=\"file\" name=\"{name}\"; \
+                 input type=\"hidden\" name=\"{name}\" value=({cv}.field_value(\"{name}\").unwrap_or_default());"
+            )
         } else {
-            let required = required_attr(f);
-            let hx_attrs = if live_validation && validated.contains(&f.name.as_str()) {
-                format!(
-                    " hx-post=\"/{plural}/validate/{name}\" hx-trigger=\"change\" hx-target=\"#{name}-error\" hx-swap=\"outerHTML\"",
-                    plural = plural,
-                    name = f.name
-                )
-            } else {
-                String::new()
-            };
-            let error_span = if live_validation && validated.contains(&f.name.as_str()) {
-                format!("\n            span id=\"{name}-error\" {{}}", name = f.name)
-            } else {
-                String::new()
-            };
-            let input_tag = match (f.kind, f.nullable) {
-                // No hidden `false` fallback: a checked box would then submit
-                // the key twice (`field=false` from the hidden input,
-                // `field=true` from the checkbox), and serde_urlencoded
-                // rejects duplicate keys instead of taking the last value —
-                // every checked submission would 400. `#[serde(default)]` on
-                // the DecodedForm field (see render_decoded_form) recovers
-                // `false` from the key's *absence* when unchecked instead.
+            // A required (non-nullable) field uses the framework's
+            // `required_*` sibling helper — `required` + `aria-required="true"`
+            // — matching the pre-#1124 generator's unconditional `required`
+            // attribute on every non-nullable input. Nullable fields get the
+            // plain helper: leaving them blank is valid, so no browser-native
+            // "please fill out this field" prompt should block submission.
+            match (f.kind, f.nullable) {
                 (FieldKind::Bool, false) => {
-                    let checked_attr = submitted_var
-                        .map(|var| format!(" checked[{}]", edit_checked_expr(f, var)))
-                        .unwrap_or_default();
-                    format!(
-                        "input type=\"checkbox\" name=\"{name}\" value=\"true\"{checked_attr}{hx_attrs}",
-                        name = f.name,
-                        hx_attrs = hx_attrs
-                    )
+                    format!("(autumn_web::form::checkbox_input(&{cv}, \"{name}\", \"{label}\"))")
                 }
-                // A checkbox can't losslessly represent a nullable bool (no
-                // way to distinguish "leave false" from "set to null" when
-                // unchecked) — a 3-option select keeps NULL reachable.
-                (FieldKind::Bool, true) => {
-                    let (unset_attr, true_attr, false_attr) = submitted_var.map_or_else(
-                        || (String::new(), String::new(), String::new()),
-                        |var| {
-                            let (unset, is_true, is_false) =
-                                edit_bool_select_selected_exprs(f, var);
-                            (
-                                format!(" selected[{unset}]"),
-                                format!(" selected[{is_true}]"),
-                                format!(" selected[{is_false}]"),
-                            )
-                        },
-                    );
-                    format!(
-                        "select name=\"{name}\"{hx_attrs} {{ \
-                             option value=\"\"{unset_attr} {{ \"— Unset —\" }} \
-                             option value=\"true\"{true_attr} {{ \"Yes\" }} \
-                             option value=\"false\"{false_attr} {{ \"No\" }} \
-                         }}",
-                        name = f.name,
-                        hx_attrs = hx_attrs
-                    )
+                // A checkbox can't distinguish "leave false" from "set null", so
+                // a nullable bool renders a 3-option select keeping NULL reachable.
+                (FieldKind::Bool, true) => format!(
+                    "(autumn_web::form::select_input(&{cv}, \"{name}\", \"{label}\", \
+                     &[(\"\", \"— Unset —\"), (\"true\", \"Yes\"), (\"false\", \"No\")]))"
+                ),
+                (FieldKind::I32 | FieldKind::I64, false) => format!(
+                    "(autumn_web::form::required_number_input(&{cv}, \"{name}\", \"{label}\", Some(\"1\")))"
+                ),
+                (FieldKind::I32 | FieldKind::I64, true) => format!(
+                    "(autumn_web::form::number_input(&{cv}, \"{name}\", \"{label}\", Some(\"1\")))"
+                ),
+                (FieldKind::F32 | FieldKind::F64, false) => format!(
+                    "(autumn_web::form::required_number_input(&{cv}, \"{name}\", \"{label}\", Some(\"any\")))"
+                ),
+                (FieldKind::F32 | FieldKind::F64, true) => format!(
+                    "(autumn_web::form::number_input(&{cv}, \"{name}\", \"{label}\", Some(\"any\")))"
+                ),
+                // `step` matches the column's declared scale, so the browser's
+                // stepper (and its "please match the requested format"
+                // validation) aligns with what the SQL column actually stores.
+                (FieldKind::Decimal { scale, .. }, false) => format!(
+                    "(autumn_web::form::required_number_input(&{cv}, \"{name}\", \"{label}\", Some(\"{step}\")))",
+                    step = decimal_step(scale)
+                ),
+                (FieldKind::Decimal { scale, .. }, true) => format!(
+                    "(autumn_web::form::number_input(&{cv}, \"{name}\", \"{label}\", Some(\"{step}\")))",
+                    step = decimal_step(scale)
+                ),
+                (FieldKind::NaiveDateTime | FieldKind::DateTime, false) => format!(
+                    "(autumn_web::form::required_datetime_input(&{cv}, \"{name}\", \"{label}\"))"
+                ),
+                (FieldKind::NaiveDateTime | FieldKind::DateTime, true) => {
+                    format!("(autumn_web::form::datetime_input(&{cv}, \"{name}\", \"{label}\"))")
                 }
-                (FieldKind::I32 | FieldKind::I64 | FieldKind::F32 | FieldKind::F64, _) => {
-                    let value_attr = submitted_var
-                        .map(|var| format!(" value=({})", edit_value_expr(f, var)))
-                        .unwrap_or_default();
-                    format!(
-                        "input type=\"number\" name=\"{name}\" step=\"{step}\"{value_attr}{required}{hx_attrs}",
-                        name = f.name,
-                        step = number_step(f.kind),
-                        required = required,
-                        hx_attrs = hx_attrs
-                    )
-                }
-                // `inputmode="decimal"` hints a numeric-with-decimal-point
-                // keyboard on mobile; `step` matches the column's declared
-                // scale so the browser's stepper (and its "please match the
-                // requested format" validation) aligns with what the SQL
-                // column actually stores.
-                (FieldKind::Decimal { scale, .. }, _) => {
-                    let value_attr = submitted_var
-                        .map(|var| format!(" value=({})", edit_value_expr(f, var)))
-                        .unwrap_or_default();
-                    format!(
-                        "input type=\"number\" inputmode=\"decimal\" name=\"{name}\" step=\"{step}\"{value_attr}{required}{hx_attrs}",
-                        name = f.name,
-                        step = decimal_step(scale),
-                        required = required,
-                        hx_attrs = hx_attrs
-                    )
-                }
-                // `step="any"` lets the browser's picker show/accept
-                // seconds — see edit_datetime_local_value_expr for why a
-                // value with seconds must not be step-mismatch-rejected.
-                (FieldKind::NaiveDateTime | FieldKind::DateTime, _) => {
-                    let value_attr = submitted_var
-                        .map(|var| format!(" value=({})", edit_datetime_local_value_expr(f, var)))
-                        .unwrap_or_default();
-                    format!(
-                        "input type=\"datetime-local\" name=\"{name}\" step=\"any\"{value_attr}{required}{hx_attrs}",
-                        name = f.name,
-                        required = required,
-                        hx_attrs = hx_attrs
-                    )
-                }
-                // A closed-set field always renders as a `<select>` — one
-                // `<option>` per variant, matching the admin generator's
-                // `--select` widget output (see `admin::render_select_kind`).
                 (FieldKind::Enum, _) => {
                     let placeholder = if f.nullable {
                         "— Unset —"
                     } else {
                         "— Select —"
                     };
-                    let enum_ty = f
-                        .enum_type_name()
-                        .expect("FieldKind::Enum always has an enum_type_name");
-                    let unset_attr = match submitted_var {
-                        Some(var) if f.nullable => format!(" selected[{var}.{}.is_none()]", f.name),
-                        _ => String::new(),
-                    };
-                    let mut options_body =
-                        format!("option value=\"\"{unset_attr} {{ \"{placeholder}\" }}");
+                    let mut options = format!("(\"\", \"{placeholder}\")");
                     for v in &f.variants {
-                        let label = humanize_label(v);
-                        let variant = pascal(v);
-                        let selected_attr = match submitted_var {
-                            Some(var) if f.nullable => {
-                                format!(" selected[{var}.{} == Some({enum_ty}::{variant})]", f.name)
-                            }
-                            Some(var) => {
-                                format!(" selected[{var}.{} == {enum_ty}::{variant}]", f.name)
-                            }
-                            None => String::new(),
-                        };
-                        let _ = write!(
-                            options_body,
-                            " option value=\"{v}\"{selected_attr} {{ \"{label}\" }}"
-                        );
+                        let vlabel = humanize_label(v);
+                        let _ = write!(options, ", (\"{v}\", \"{vlabel}\")");
                     }
+                    let helper = if f.nullable {
+                        "select_input"
+                    } else {
+                        "required_select_input"
+                    };
                     format!(
-                        "select name=\"{name}\"{required}{hx_attrs} {{ {options_body} }}",
-                        name = f.name,
-                        required = required,
-                        hx_attrs = hx_attrs,
-                        options_body = options_body
+                        "(autumn_web::form::{helper}(&{cv}, \"{name}\", \"{label}\", &[{options}]))"
                     )
                 }
                 _ => {
-                    let value_attr = submitted_var
-                        .map(|var| format!(" value=({})", edit_value_expr(f, var)))
-                        .unwrap_or_default();
-                    format!(
-                        "input type=\"text\" name=\"{name}\"{value_attr}{required}{hx_attrs}",
-                        name = f.name,
-                        required = required,
-                        hx_attrs = hx_attrs
-                    )
+                    // String / Text / Uuid / references fall through to a text
+                    // input. `--live-validation` on a validated text field wires
+                    // the htmx inline-validation variant (no-JS falls back to the
+                    // full-form 422 re-render, which works for every kind); a
+                    // non-nullable field keeps the `required`/`aria-required`
+                    // signal via `required_text_input_htmx` so a validator rule
+                    // that happens to permit an empty string (e.g. a max-only
+                    // `length` rule) doesn't leave a blank required field with
+                    // no client-side guard at all.
+                    if live_validation && validated.contains(&name.as_str()) {
+                        let helper = if f.nullable {
+                            "text_input_htmx"
+                        } else {
+                            "required_text_input_htmx"
+                        };
+                        format!(
+                            "(autumn_web::form::{helper}(&{cv}, \"{name}\", \"{label}\", \
+                             \"/{plural}/validate/{name}\"))"
+                        )
+                    } else if f.nullable {
+                        format!("(autumn_web::form::text_input(&{cv}, \"{name}\", \"{label}\"))")
+                    } else {
+                        format!(
+                            "(autumn_web::form::required_text_input(&{cv}, \"{name}\", \"{label}\"))"
+                        )
+                    }
                 }
-            };
-            // Only the `create` handler's failure-re-render branch passes
-            // `unique_error_aware = true` (see `render_unique_violation_create_handler`)
-            // — `field`/`message` are local variables in scope there,
-            // populated from `unique_violation_field` (issue #1032). The
-            // plain `new_form` handler never sets this, so its output is
-            // byte-identical to before this field existed.
-            let unique_error_span = if unique_error_aware && f.unique {
-                format!(
-                    "\n            @if field == \"{name}\" {{ span class=\"field-error\" {{ (message) }} }}",
-                    name = f.name
-                )
-            } else {
-                String::new()
-            };
-            let _ = writeln!(
-                out,
-                "            label {{ \"{name}\" }} {input_tag};{error_span}{unique_error_span}",
-                name = f.name,
-                input_tag = input_tag,
-                error_span = error_span,
-                unique_error_span = unique_error_span
-            );
-        }
+            }
+        };
+        let _ = writeln!(out, "            {line}");
     }
     out
-}
-
-/// The HTML `step` attribute value for a `number_input`-shaped `FieldKind`.
-/// Integers step by whole numbers; floating-point fields allow any value.
-const fn number_step(kind: FieldKind) -> &'static str {
-    match kind {
-        FieldKind::F32 | FieldKind::F64 => "any",
-        _ => "1",
-    }
 }
 
 /// A decimal literal at the given `scale`, formed from a single trailing
@@ -2235,271 +2048,6 @@ fn decimal_literal_at_scale(scale: u32, digit: u32) -> String {
 /// increment (unlike float fields, whose `step="any"` accepts any input).
 fn decimal_step(scale: u32) -> String {
     decimal_literal_at_scale(scale, 1)
-}
-
-#[allow(
-    clippy::too_many_lines,
-    reason = "One match arm per field-kind widget — splitting it produces less \
-              readable output, not more. See render_create_form_inputs's \
-              module-level comment for the shared invariants across both."
-)]
-fn render_edit_form_inputs(
-    fields: &[Field],
-    live_validation: bool,
-    validated: &[&str],
-    plural: &str,
-    unique_error_aware: bool,
-) -> String {
-    use std::fmt::Write as _;
-    // The plain `edit_form` GET (`unique_error_aware = false`) always shows
-    // the persisted row. The violation re-render (spliced into
-    // `render_unique_violation_update_handler`) instead sources every
-    // non-attachment field from `form: New{Pascal}` — the just-decoded,
-    // otherwise-valid submission that was rejected only for colliding on
-    // the unique column (issue #1032 review follow-up: the create path
-    // already preserves the rejected submission this way; update was
-    // silently reverting every other field back to its pre-edit value).
-    //
-    // Attachment fields are the one exception and always stay on `row`:
-    // `form.{name}` is `None` whenever the user didn't pick a new file
-    // (see `render_decoded_form`'s attachment mapping), so sourcing the
-    // hidden "keep this blob" key from `form` would drop the existing
-    // attachment from the re-rendered form even though the update itself
-    // never touched it.
-    let var = if unique_error_aware { "form" } else { "row" };
-    let mut out = String::new();
-    for f in fields {
-        if f.kind.is_attachment() {
-            let _ = writeln!(
-                out,
-                "            label {{ \"{name}\" }} input type=\"file\" name=\"{name}\";\n\
-                 @if let Some(ref blob) = row.{name} {{\n\
-                     input type=\"hidden\" name=\"{name}\" value=(blob.key);\n\
-                 }}",
-                name = f.name
-            );
-        } else {
-            let required = required_attr(f);
-            let hx_attrs = if live_validation && validated.contains(&f.name.as_str()) {
-                format!(
-                    " hx-post=\"/{plural}/validate/{name}\" hx-trigger=\"change\" hx-target=\"#{name}-error\" hx-swap=\"outerHTML\"",
-                    plural = plural,
-                    name = f.name
-                )
-            } else {
-                String::new()
-            };
-            let error_span = if live_validation && validated.contains(&f.name.as_str()) {
-                format!("\n            span id=\"{name}-error\" {{}}", name = f.name)
-            } else {
-                String::new()
-            };
-            let input_tag = match (f.kind, f.nullable) {
-                // See render_create_form_inputs for why there is no hidden
-                // `false` fallback sibling here.
-                (FieldKind::Bool, false) => format!(
-                    "input type=\"checkbox\" name=\"{name}\" value=\"true\" checked[{checked}]{hx_attrs}",
-                    name = f.name,
-                    checked = edit_checked_expr(f, var),
-                    hx_attrs = hx_attrs
-                ),
-                (FieldKind::Bool, true) => {
-                    let (unset, is_true, is_false) = edit_bool_select_selected_exprs(f, var);
-                    format!(
-                        "select name=\"{name}\"{hx_attrs} {{ \
-                             option value=\"\" selected[{unset}] {{ \"— Unset —\" }} \
-                             option value=\"true\" selected[{is_true}] {{ \"Yes\" }} \
-                             option value=\"false\" selected[{is_false}] {{ \"No\" }} \
-                         }}",
-                        name = f.name,
-                        hx_attrs = hx_attrs
-                    )
-                }
-                (FieldKind::I32 | FieldKind::I64 | FieldKind::F32 | FieldKind::F64, _) => format!(
-                    "input type=\"number\" name=\"{name}\" step=\"{step}\" value=({value}){required}{hx_attrs}",
-                    name = f.name,
-                    step = number_step(f.kind),
-                    value = edit_value_expr(f, var),
-                    required = required,
-                    hx_attrs = hx_attrs
-                ),
-                (FieldKind::Decimal { scale, .. }, _) => format!(
-                    "input type=\"number\" inputmode=\"decimal\" name=\"{name}\" step=\"{step}\" value=({value}){required}{hx_attrs}",
-                    name = f.name,
-                    step = decimal_step(scale),
-                    value = edit_value_expr(f, var),
-                    required = required,
-                    hx_attrs = hx_attrs
-                ),
-                (FieldKind::NaiveDateTime | FieldKind::DateTime, _) => format!(
-                    "input type=\"datetime-local\" name=\"{name}\" step=\"any\" value=({value}){required}{hx_attrs}",
-                    name = f.name,
-                    value = edit_datetime_local_value_expr(f, var),
-                    required = required,
-                    hx_attrs = hx_attrs
-                ),
-                (FieldKind::Enum, _) => {
-                    let placeholder = if f.nullable {
-                        "— Unset —"
-                    } else {
-                        "— Select —"
-                    };
-                    let unset_selected = if f.nullable {
-                        format!("{var}.{}.is_none()", f.name)
-                    } else {
-                        "false".to_owned()
-                    };
-                    let mut options_body = format!(
-                        "option value=\"\" selected[{unset_selected}] {{ \"{placeholder}\" }}"
-                    );
-                    let enum_ty = f
-                        .enum_type_name()
-                        .expect("FieldKind::Enum always has an enum_type_name");
-                    for v in &f.variants {
-                        let label = humanize_label(v);
-                        let variant = pascal(v);
-                        let selected_expr = if f.nullable {
-                            format!("{var}.{} == Some({enum_ty}::{variant})", f.name)
-                        } else {
-                            format!("{var}.{} == {enum_ty}::{variant}", f.name)
-                        };
-                        let _ = write!(
-                            options_body,
-                            " option value=\"{v}\" selected[{selected_expr}] {{ \"{label}\" }}"
-                        );
-                    }
-                    format!(
-                        "select name=\"{name}\"{required}{hx_attrs} {{ {options_body} }}",
-                        name = f.name,
-                        required = required,
-                        hx_attrs = hx_attrs,
-                        options_body = options_body
-                    )
-                }
-                _ => format!(
-                    "input type=\"text\" name=\"{name}\" value=({value}){required}{hx_attrs}",
-                    name = f.name,
-                    value = edit_value_expr(f, var),
-                    required = required,
-                    hx_attrs = hx_attrs
-                ),
-            };
-            let unique_error_span = if unique_error_aware && f.unique {
-                format!(
-                    "\n            @if field == \"{name}\" {{ span class=\"field-error\" {{ (message) }} }}",
-                    name = f.name
-                )
-            } else {
-                String::new()
-            };
-            let _ = writeln!(
-                out,
-                "            label {{ \"{name}\" }} {input_tag};{error_span}{unique_error_span}",
-                name = f.name,
-                input_tag = input_tag,
-                error_span = error_span,
-                unique_error_span = unique_error_span
-            );
-        }
-    }
-    out
-}
-
-const fn required_attr(field: &Field) -> &'static str {
-    if field.nullable { "" } else { " required" }
-}
-
-/// A value-attribute expression sourcing `field`'s current value off of
-/// `var` (a variable of the model's row/insert type in scope where the
-/// expression is spliced) — `var = "row"` for [`render_edit_form_inputs`]'s
-/// existing-row pre-population, `var = "new"` for
-/// [`render_create_form_inputs`]'s re-submitted-value pre-population on a
-/// unique-constraint violation (issue #1032).
-fn edit_value_expr(field: &Field, var: &str) -> String {
-    let name = &field.name;
-    match (field.nullable, field.kind) {
-        // Attachment fields don't render a value in text inputs — they have
-        // their own <input type="file"> generated by render_edit_form_inputs.
-        (_, FieldKind::Attachment) => String::new(),
-        (true, FieldKind::Bytea) => {
-            format!(
-                "{var}.{name}.as_ref().map(|value| String::from_utf8_lossy(value).to_string()).unwrap_or_default()"
-            )
-        }
-        // f32/f64 Display renders NaN/Infinity as "NaN"/"inf"/"-inf", none of
-        // which satisfy HTML5's <input type="number"> value grammar — the
-        // browser would silently blank the field. Render an explicit empty
-        // value for non-finite floats instead of an invalid one.
-        (true, FieldKind::F32 | FieldKind::F64) => {
-            format!(
-                "{var}.{name}.as_ref().filter(|value| value.is_finite()).map(ToString::to_string).unwrap_or_default()"
-            )
-        }
-        (false, FieldKind::F32 | FieldKind::F64) => {
-            format!(
-                "if {var}.{name}.is_finite() {{ {var}.{name}.to_string() }} else {{ String::new() }}"
-            )
-        }
-        (true, _) => {
-            format!("{var}.{name}.as_ref().map(ToString::to_string).unwrap_or_default()")
-        }
-        (false, FieldKind::Bytea) => {
-            format!("String::from_utf8_lossy(&{var}.{name}).to_string()")
-        }
-        (false, _) => format!("{var}.{name}.to_string()"),
-    }
-}
-
-/// Boolean expression for the `checked[...]` attribute of a checkbox
-/// (`var.field`, see [`edit_value_expr`] for what `var` is). Only called for
-/// non-nullable `bool` fields — nullable `Option<bool>` fields render as a
-/// 3-option select instead (see [`edit_bool_select_selected_exprs`]), so
-/// there is no `Option<bool>` case to unwrap here.
-fn edit_checked_expr(field: &Field, var: &str) -> String {
-    format!("{var}.{}", field.name)
-}
-
-/// The three `selected[...]` boolean expressions (unset / true / false) for
-/// a `<select>` rendering a nullable `Option<bool>` field (`var.field`, see
-/// [`edit_value_expr`] for what `var` is).
-///
-/// A checkbox cannot losslessly represent a nullable bool (no way to
-/// distinguish "leave false" from "set to null" when unchecked), so nullable
-/// `Bool` fields render as this 3-option select instead of a checkbox.
-fn edit_bool_select_selected_exprs(field: &Field, var: &str) -> (String, String, String) {
-    let name = &field.name;
-    (
-        format!("{var}.{name}.is_none()"),
-        format!("{var}.{name} == Some(true)"),
-        format!("{var}.{name} == Some(false)"),
-    )
-}
-
-/// Value expression for an edit-form `datetime-local` input. Unlike
-/// [`edit_value_expr`]'s `.to_string()` (which relies on `Display`, e.g.
-/// `"2024-01-15 10:30:00 UTC"` for `DateTime<Utc>` — a shape browsers
-/// reject), this formats explicitly as `YYYY-MM-DDTHH:MM[:SS[.fff]]`, the
-/// value shape `<input type="datetime-local">` accepts.
-///
-/// Seconds/fractional-seconds are included when present (`%.f` omits them
-/// entirely when zero) rather than truncated to `YYYY-MM-DDTHH:MM`: a
-/// minute-only value round-trips back through the generated project's
-/// `normalize_datetime_local` (see `NORMALIZE_DATETIME_LOCAL_FN` below) as
-/// `:00` seconds, and the generated `update` handler writes every column
-/// unconditionally — a stored `12:34:56.789` would otherwise be silently
-/// overwritten as `12:34:00` by re-submitting the form without touching
-/// this field. Pair with `step="any"` on the input (see
-/// `render_edit_form_inputs`) so a value with seconds doesn't fail the
-/// browser's step constraint validation.
-fn edit_datetime_local_value_expr(field: &Field, var: &str) -> String {
-    let name = &field.name;
-    if field.nullable {
-        format!(
-            "{var}.{name}.as_ref().map(|value| value.format(\"%Y-%m-%dT%H:%M:%S%.f\").to_string()).unwrap_or_default()"
-        )
-    } else {
-        format!("{var}.{name}.format(\"%Y-%m-%dT%H:%M:%S%.f\").to_string()")
-    }
 }
 
 /// Produce the cell-body expression for a `data_table` column closure.
@@ -2649,7 +2197,7 @@ fn render_update_columns(plural: &str, fields: &[Field]) -> String {
         }
         write!(
             out,
-            "{plural}::{name}.eq(form.{name}.clone())",
+            "{plural}::{name}.eq(new.{name}.clone())",
             name = f.name
         )
         .unwrap();
@@ -2887,6 +2435,7 @@ fn render_reference_stub_tables_sql(fields: &[Field], own_table: &str) -> String
 /// test creates in `TestDb` matches the real schema. Any `references` field
 /// also gets a stub target table created first — see
 /// [`render_reference_stub_tables_sql`].
+#[allow(clippy::too_many_arguments)]
 fn render_smoke_test(
     pascal_name: &str,
     plural: &str,
@@ -2895,6 +2444,7 @@ fn render_smoke_test(
     id_type: IdType,
     indexes: &BTreeSet<String>,
     defaults: &BTreeMap<String, String>,
+    validations: &BTreeMap<String, Vec<String>>,
 ) -> String {
     let stub_tables_sql = render_reference_stub_tables_sql(fields, plural);
     let create_table_sql =
@@ -2916,7 +2466,7 @@ fn render_smoke_test(
     };
 
     let unique_fields: Vec<&Field> = fields.iter().filter(|f| f.unique).collect();
-    if unique_fields.is_empty() {
+    let base = if unique_fields.is_empty() {
         base
     } else {
         base + &render_unique_violation_smoke_test(
@@ -2927,7 +2477,224 @@ fn render_smoke_test(
             &setup_calls,
             api,
         )
+    };
+
+    // Issue #1124: prove the changeset round-trip on a real request — a
+    // rejected submission gets 422 with the other field preserved and an
+    // inline error, not a 400 dead-end. HTML scaffolds only; the `--api` JSON
+    // path is out of scope (Problem Details already covers it, issue #598).
+    if !api && !validations.is_empty() {
+        base + &render_validation_rejection_smoke_test(plural, validations)
+    } else {
+        base
     }
+}
+
+/// A value that violates a `--validate` rule string (as rendered by
+/// `model::render_validation_attr`, e.g. `"length(min = 1, max = 200)"`,
+/// `"url"`, `"email"`) — used to build the deliberately-rejected submission in
+/// [`render_validation_rejection_smoke_test`].
+///
+/// Returns `None` when the rule accepts *every* string, including blank — a
+/// `length` rule with no `max` and either no `min` or `min = 0` (e.g.
+/// `--validate title=length:min=0`) is a no-op that nothing can violate. The
+/// caller must fall back to a different validated field rather than submit a
+/// value that the real server would happily accept and assert a 422 anyway.
+fn invalid_value_violating_rule(rule: &str) -> Option<String> {
+    if rule == "url" {
+        return Some("not a valid url".to_owned());
+    }
+    if rule == "email" {
+        return Some("not-an-email".to_owned());
+    }
+    if let Some(args) = rule
+        .strip_prefix("length(")
+        .and_then(|s| s.strip_suffix(')'))
+    {
+        let mut min: Option<u64> = None;
+        let mut max: Option<u64> = None;
+        for part in args.split(',') {
+            let part = part.trim();
+            if let Some(n) = part.strip_prefix("min = ") {
+                min = n.trim().parse().ok();
+            } else if let Some(n) = part.strip_prefix("max = ") {
+                max = n.trim().parse().ok();
+            }
+        }
+        return match (min, max) {
+            // A `min` bound is violated by submitting nothing at all.
+            (Some(min), _) if min > 0 => Some(String::new()),
+            // A `max`-only bound is violated by exceeding it by one character
+            // — a fixed-size literal (e.g. 1000 `x`s) would itself satisfy a
+            // looser `max` (say 2000), silently turning the "invalid"
+            // submission valid and failing the smoke test's own 422 premise.
+            (_, Some(max)) => Some("x".repeat(usize::try_from(max + 1).unwrap_or(usize::MAX))),
+            // No `max`, and `min` is either absent or 0 — every string
+            // (including blank) satisfies this rule; there is nothing to
+            // violate.
+            _ => None,
+        };
+    }
+    None
+}
+
+/// Upper bound (in characters) on the sample literals
+/// [`invalid_value_violating_rule`]/[`valid_value_satisfying_rule`] generate
+/// for [`render_validation_rejection_smoke_test`]'s request bodies.
+///
+/// A declared `length:min=N`/`length:max=N` bound is an arbitrary
+/// user-supplied `u64` with no upper limit enforced by the DSL parser — a
+/// scaffold like `--validate title=length:min=1000000000` would otherwise
+/// have the *generator* (not the generated app) allocate a multi-GB string
+/// while rendering the smoke test, before a single file is even written.
+/// [`length_bound_exceeds_sample_cap`] gates smoke-test emission on this
+/// instead of silently truncating the sample (a truncated sample would
+/// satisfy neither a huge `min` — too short — nor accurately violate a huge
+/// `max`, making the generated test assert something false).
+const MAX_GENERATED_VALIDATION_SAMPLE_LEN: u64 = 4096;
+
+/// Whether a `length(...)` validation rule's declared bound(s) exceed
+/// [`MAX_GENERATED_VALIDATION_SAMPLE_LEN`] — see that constant's doc comment.
+/// Always `false` for non-length rules (`url`/`email` samples are small,
+/// fixed-size literals).
+fn length_bound_exceeds_sample_cap(rule: &str) -> bool {
+    let Some(args) = rule
+        .strip_prefix("length(")
+        .and_then(|s| s.strip_suffix(')'))
+    else {
+        return false;
+    };
+    args.split(',').any(|part| {
+        let part = part.trim();
+        part.strip_prefix("min = ")
+            .or_else(|| part.strip_prefix("max = "))
+            .and_then(|n| n.trim().parse::<u64>().ok())
+            .is_some_and(|bound| bound > MAX_GENERATED_VALIDATION_SAMPLE_LEN)
+    })
+}
+
+/// A value that *satisfies* a `--validate` rule string — the counterpart to
+/// [`invalid_value_violating_rule`], used to build the successful submission
+/// in [`render_validation_rejection_smoke_test`]. A fixed literal like `"a
+/// valid value"` isn't valid for every rule (e.g. it's neither a URL/email,
+/// nor within a tight `length:max=5` or `length:min=20` bound), so this
+/// derives a value that actually fits the declared rule instead.
+fn valid_value_satisfying_rule(rule: &str) -> String {
+    if rule == "url" {
+        return "https://example.com".to_owned();
+    }
+    if rule == "email" {
+        return "person@example.com".to_owned();
+    }
+    if let Some(args) = rule
+        .strip_prefix("length(")
+        .and_then(|s| s.strip_suffix(')'))
+    {
+        let mut min: Option<u64> = None;
+        let mut max: Option<u64> = None;
+        for part in args.split(',') {
+            let part = part.trim();
+            if let Some(n) = part.strip_prefix("min = ") {
+                min = n.trim().parse().ok();
+            } else if let Some(n) = part.strip_prefix("max = ") {
+                max = n.trim().parse().ok();
+            }
+        }
+        let len = match (min, max) {
+            (Some(min), Some(max)) => min.max(1).min(max),
+            (Some(min), None) => min.max(1),
+            (None, Some(max)) => max,
+            (None, None) => 1,
+        };
+        return "a".repeat(usize::try_from(len).unwrap_or(usize::MAX));
+    }
+    "a valid value".to_owned()
+}
+
+/// Render a `#[tokio::test]` proving issue #1124's core guarantee: a
+/// submission that violates a declared `--validate` rule gets HTTP 422 with
+/// the *other* submitted field preserved and an inline `role="alert"` error
+/// message — not a 400 dead-end with input lost — and a fully valid
+/// submission still succeeds.
+///
+/// Like [`render_unique_violation_smoke_test`]'s request-boundary check, this
+/// redeclares a stand-in handler rather than importing the project's own code
+/// (a `tests/*.rs` integration binary can't import a binary crate's modules —
+/// see `docs/guide/tutorial/11-testing.md`). Unlike that raw-SQL stand-in,
+/// this one uses the real, shipped `ChangesetForm`/`Changeset` extractor and
+/// `text_input` helper directly — the exact mechanism the generated
+/// `create`/`update` handlers are built on — so it needs no database at all;
+/// it proves the round-trip mechanism itself, independent of the specific
+/// scaffolded model's other field kinds (already exercised by the other
+/// generated smoke tests).
+fn render_validation_rejection_smoke_test(
+    plural: &str,
+    validations: &BTreeMap<String, Vec<String>>,
+) -> String {
+    // Pick the first validated field whose declared rule actually has a
+    // violating value: a no-op rule (e.g. `length:min=0` with no `max`
+    // accepts every string, including blank) or one whose bound exceeds
+    // `MAX_GENERATED_VALIDATION_SAMPLE_LEN` (see that constant's doc comment)
+    // can't build a real "rejected" submission, so it's skipped in favor of
+    // another validated field rather than asserting a 422 the real server
+    // would never return.
+    let Some((target_name, rule, invalid_value)) = validations.iter().find_map(|(name, rules)| {
+        let rule = rules.first().cloned().unwrap_or_default();
+        if length_bound_exceeds_sample_cap(&rule) {
+            return None;
+        }
+        let invalid_value = invalid_value_violating_rule(&rule)?;
+        Some((name, rule, invalid_value))
+    }) else {
+        return String::new();
+    };
+    let valid_value = valid_value_satisfying_rule(&rule);
+    let witness_value = "preserved-witness-value";
+
+    format!(
+        "\n#[tokio::test]\n\
+         async fn {plural}_rejects_invalid_{target_name}_and_preserves_input() {{\n\
+         \x20\x20\x20\x20use autumn_web::form::ChangesetForm;\n\
+         \x20\x20\x20\x20use autumn_web::test::{{TestApp, TestClient}};\n\
+         \n\
+         \x20\x20\x20\x20#[derive(serde::Deserialize, serde::Serialize, Default, validator::Validate, Clone)]\n\
+         \x20\x20\x20\x20struct Form {{\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20#[validate({rule})]\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20{target_name}: String,\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20other_field: String,\n\
+         \x20\x20\x20\x20}}\n\
+         \n\
+         \x20\x20\x20\x20#[post(\"/{plural}\")]\n\
+         \x20\x20\x20\x20async fn create(form: ChangesetForm<Form>) -> impl IntoResponse {{\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20match form.into_valid() {{\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20Ok(_) => StatusCode::OK.into_response(),\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20Err(form) => (\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20StatusCode::UNPROCESSABLE_ENTITY,\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20html! {{\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20(autumn_web::form::text_input(&form.changeset, \"{target_name}\", \"{target_name}\"))\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20(autumn_web::form::text_input(&form.changeset, \"other_field\", \"other_field\"))\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20}},\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20).into_response(),\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20}}\n\
+         \x20\x20\x20\x20}}\n\
+         \n\
+         \x20\x20\x20\x20let client: TestClient = TestApp::new().routes(routes![create]).build();\n\
+         \n\
+         \x20\x20\x20\x20// A submission violating the declared rule must respond 422, echo the\n\
+         \x20\x20\x20\x20// *other* field's submitted value (input is preserved, not lost), and\n\
+         \x20\x20\x20\x20// carry an inline, accessible error message (AC2, AC3, AC4).\n\
+         \x20\x20\x20\x20let invalid_body = format!(\"{target_name}={invalid_value}&other_field={witness_value}\");\n\
+         \x20\x20\x20\x20client.post(\"/{plural}\").form(&invalid_body).send().await\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20.assert_status(422)\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20.assert_body_contains(\"{witness_value}\")\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20.assert_body_contains(\"role=\\\"alert\\\"\");\n\
+         \n\
+         \x20\x20\x20\x20// A fully valid submission still succeeds (AC5).\n\
+         \x20\x20\x20\x20let valid_body = format!(\"{target_name}={valid_value}&other_field={witness_value}\");\n\
+         \x20\x20\x20\x20client.post(\"/{plural}\").form(&valid_body).send().await\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20.assert_status(200);\n\
+         }}\n"
+    )
 }
 
 /// A representative non-`NULL` literal for a `FieldKind`, used to fill in the
@@ -3491,6 +3258,35 @@ async fn main() {
     }
 
     #[test]
+    fn execute_writes_required_attribute_for_unvalidated_required_text_field() {
+        // Regression guard (issue #1124 review): the pre-#1124 generator added
+        // the HTML `required` attribute to every non-nullable field
+        // unconditionally, independent of whether a `--validate` rule was
+        // declared. `autumn generate scaffold Post title:String` (no
+        // `--validate` at all) must still mark `title` `required` — otherwise
+        // a blank browser submission is treated as valid and inserts `title =
+        // ""`, silently accepting empty required data.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        assert!(
+            routes.contains(
+                "autumn_web::form::required_text_input(&changeset, \"title\", \"Title\")"
+            ),
+            "an unvalidated but required field must still render via \
+             required_text_input: {routes}"
+        );
+    }
+
+    #[test]
     fn execute_writes_a_routes_file_referencing_model() {
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold(
@@ -3522,8 +3318,8 @@ async fn main() {
         // remains available via the auto-generated repository handler.
         assert!(routes.contains("#[post(\"/posts/{id}/update\")]"));
         assert!(routes.contains("pub async fn new_form("));
-        assert!(routes.contains("Ok(layout(\"New Post\""));
-        assert!(routes.contains("posts::title.eq(form.title.clone())"));
+        assert!(routes.contains("layout(\"New Post\""));
+        assert!(routes.contains("posts::title.eq(new.title.clone())"));
         // `execute()` returns the affected row count — `Ok(0)` means the id
         // didn't exist, and we must return 404 instead of redirecting as if
         // the save succeeded. DB errors stay distinct from "not found".
@@ -3564,76 +3360,49 @@ async fn main() {
         plan_and_execute_post_scaffold_with_status_enum(&tmp);
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
 
+        // Enum fields render through the changeset-aware `select_input` helper
+        // (issue #1124), with one `(value, label)` option per variant plus a
+        // leading placeholder. The selected option is chosen by the helper from
+        // the changeset's current value, not a hand-rolled `selected[...]`.
+        // Required (non-nullable), so the `required_select_input` sibling.
         assert!(
-            routes.contains("select name=\"status\"") && routes.contains("required"),
-            "got:\n{routes}"
-        );
-        assert!(
-            routes.contains("option value=\"\" { \"— Select —\" }"),
-            "got:\n{routes}"
-        );
-        assert!(
-            routes.contains("option value=\"draft\" { \"Draft\" }"),
-            "got:\n{routes}"
-        );
-        assert!(
-            routes.contains("option value=\"published\" { \"Published\" }"),
-            "got:\n{routes}"
-        );
-        assert!(
-            routes.contains("option value=\"archived\" { \"Archived\" }"),
+            routes.contains(
+                "autumn_web::form::required_select_input(&changeset, \"status\", \"Status\", &[(\"\", \"— Select —\"), (\"draft\", \"Draft\"), (\"published\", \"Published\"), (\"archived\", \"Archived\")])"
+            ),
             "got:\n{routes}"
         );
     }
 
     #[test]
     fn scaffold_edit_form_marks_current_enum_variant_selected() {
+        // The `From<&Post>` seed maps the persisted variant to its wire token,
+        // which `select_input` then marks selected in the edit form (issue
+        // #1124 — selection lives in the framework helper, not the template).
         let tmp = project_with_main(default_main());
         plan_and_execute_post_scaffold_with_status_enum(&tmp);
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
 
         assert!(
-            routes.contains(
-                "option value=\"draft\" selected[row.status == Status::Draft] { \"Draft\" }"
-            ),
+            routes.contains("Status::Draft => \"draft\".to_string()"),
             "got:\n{routes}"
         );
         assert!(
-            routes.contains(
-                "option value=\"published\" selected[row.status == Status::Published] { \"Published\" }"
-            ),
+            routes.contains("Status::Published => \"published\".to_string()"),
             "got:\n{routes}"
         );
     }
 
     #[test]
-    fn scaffold_edit_form_required_enum_select_carries_required_attr() {
-        // Regression test: a required (non-nullable) enum field's edit-form
-        // `<select>` must carry `required`, matching the create form's own
-        // enum select and every other non-nullable field kind's edit input.
-        let tmp = project_with_main(default_main());
-        plan_and_execute_post_scaffold_with_status_enum(&tmp);
-        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
-
-        let select_line = routes
-            .lines()
-            .find(|l| l.contains("select name=\"status\""))
-            .unwrap_or_else(|| panic!("no status select found in:\n{routes}"));
-        assert!(
-            select_line.contains("select name=\"status\" required"),
-            "required enum field's edit select must carry `required`: {select_line}"
-        );
-    }
-
-    #[test]
-    fn scaffold_decoded_form_parses_enum_with_field_error() {
+    fn scaffold_form_parses_enum_with_field_error() {
+        // The enum field is a `String` on `PostForm`, parsed into the enum in
+        // `into_new` with a 400 naming the field on an out-of-set value.
         let tmp = project_with_main(default_main());
         plan_and_execute_post_scaffold_with_status_enum(&tmp);
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
 
         assert!(routes.contains("pub status: String,"), "got:\n{routes}");
         assert!(
-            routes.contains("decoded.status.parse::<Status>()"),
+            routes.contains("form.status.parse::<Status>()"),
             "got:\n{routes}"
         );
         assert!(
@@ -3661,7 +3430,7 @@ async fn main() {
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
 
         assert!(
-            routes.contains("posts::status.eq(form.status.clone())"),
+            routes.contains("posts::status.eq(new.status.clone())"),
             "got:\n{routes}"
         );
     }
@@ -3753,6 +3522,47 @@ async fn main() {
     }
 
     #[test]
+    fn scaffold_enum_field_named_changeset_is_rejected() {
+        // `changeset:enum{a,b}` pascalizes to `Changeset`, colliding with the
+        // `use autumn_web::form::{Changeset, IntoChangeset};` import every
+        // non-`--api` scaffold's routes file now carries (issue #1124) — a
+        // duplicate `Changeset`/`IntoChangeset` import fails with E0252,
+        // exactly like the pre-existing `Path`/`ToString` collisions above.
+        for field_name in ["changeset", "into_changeset"] {
+            let tmp = project_with_main(default_main());
+            let err = plan_scaffold(
+                tmp.path(),
+                "Post",
+                &[format!("{field_name}:enum{{a,b}}")],
+                "20260427000000",
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, GenerateError::InvalidField { .. }),
+                "expected '{field_name}' to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn scaffold_enum_field_colliding_with_generated_form_struct_is_rejected() {
+        // `post_form:enum{a,b}` on model `Post` pascalizes to `PostForm`,
+        // colliding with the scaffold's own generated `pub struct PostForm`
+        // changeset form (`render_model_form`, issue #1124) — a duplicate
+        // `PostForm` definition fails to compile, exactly like the
+        // fixed-name collisions above.
+        let tmp = project_with_main(default_main());
+        let err = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["post_form:enum{a,b}".into()],
+            "20260427000000",
+        )
+        .unwrap_err();
+        assert!(matches!(err, GenerateError::InvalidField { .. }));
+    }
+
+    #[test]
     fn scaffold_enum_field_colliding_with_routes_import_is_accepted_for_api_only() {
         // `--api` scaffolds never emit `src/routes/<plural>.rs`, so the
         // routes-file reserved names don't apply.
@@ -3787,48 +3597,39 @@ async fn main() {
     }
 
     #[test]
-    fn scaffold_nullable_enum_create_form_has_no_required_attr_and_unset_placeholder() {
+    fn scaffold_nullable_enum_create_form_has_unset_placeholder() {
+        // A nullable enum renders through `select_input` with an "— Unset —"
+        // placeholder as its blank option (issue #1124).
         let tmp = project_with_main(default_main());
         plan_and_execute_post_scaffold_with_nullable_status_enum(&tmp);
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
 
-        assert!(
-            routes.contains("option value=\"\" { \"— Unset —\" }"),
-            "got:\n{routes}"
-        );
-        // The select for `status` itself must not carry ` required` — check
-        // the specific select tag rather than the whole file (title's own
-        // `required` text input is expected to remain required).
-        let select_line = routes
-            .lines()
-            .find(|l| l.contains("select name=\"status\""))
-            .unwrap_or_else(|| panic!("no status select found in:\n{routes}"));
-        assert!(
-            !select_line.contains("required"),
-            "nullable enum select must not be required: {select_line}"
-        );
-    }
-
-    #[test]
-    fn scaffold_nullable_enum_edit_form_selected_exprs_wrap_in_some() {
-        let tmp = project_with_main(default_main());
-        plan_and_execute_post_scaffold_with_nullable_status_enum(&tmp);
-        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
-
-        assert!(
-            routes.contains("option value=\"\" selected[row.status.is_none()] { \"— Unset —\" }"),
-            "got:\n{routes}"
-        );
         assert!(
             routes.contains(
-                "option value=\"draft\" selected[row.status == Some(Status::Draft)] { \"Draft\" }"
+                "autumn_web::form::select_input(&changeset, \"status\", \"Status\", &[(\"\", \"— Unset —\"), (\"draft\", \"Draft\"), (\"published\", \"Published\")])"
             ),
             "got:\n{routes}"
         );
     }
 
     #[test]
-    fn scaffold_nullable_enum_decoded_form_is_option_string_with_transpose() {
+    fn scaffold_nullable_enum_edit_form_seed_maps_option_variant() {
+        // The `From<&Post>` seed maps `Option<Status>` to an `Option<String>`
+        // token; `select_input` then marks the matching option (issue #1124).
+        let tmp = project_with_main(default_main());
+        plan_and_execute_post_scaffold_with_nullable_status_enum(&tmp);
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+
+        assert!(
+            routes.contains(
+                "status: row.status.as_ref().map(|value| match value { Status::Draft => \"draft\".to_string(), Status::Published => \"published\".to_string(), }),"
+            ),
+            "got:\n{routes}"
+        );
+    }
+
+    #[test]
+    fn scaffold_nullable_enum_form_is_option_string_with_transpose() {
         let tmp = project_with_main(default_main());
         plan_and_execute_post_scaffold_with_nullable_status_enum(&tmp);
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
@@ -3838,7 +3639,7 @@ async fn main() {
             "got:\n{routes}"
         );
         assert!(
-            routes.contains("decoded.status") && routes.contains(".transpose()"),
+            routes.contains("form.status.as_deref()") && routes.contains(".transpose()"),
             "got:\n{routes}"
         );
     }
@@ -3867,6 +3668,158 @@ async fn main() {
         assert!(routes.contains("pub async fn edit_form("));
     }
 
+    // ── Changeset validation round-trip (issue #1124) ──────────────────
+    //
+    // A rejected submission must re-render the same form at HTTP 422 with the
+    // user's input preserved and per-field errors shown inline, instead of the
+    // old decode-and-insert path that landed on a 400 error page with input
+    // lost. The generator promotes the internal decode struct to a public,
+    // validating `{Pascal}Form` (derives Serialize + validator::Validate +
+    // Default), and the handlers build a `Changeset` from it.
+
+    #[test]
+    fn execute_writes_model_form_struct() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "body:String".into()],
+            "20260427000000",
+            &ScaffoldOptions {
+                model: ModelOptions {
+                    validations: vec!["title=length:min=1".into()],
+                    ..ModelOptions::default()
+                },
+                ..ScaffoldOptions::default()
+            },
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        assert!(
+            routes.contains("pub struct PostForm"),
+            "generator must emit a named, public form struct: {routes}"
+        );
+        assert!(
+            routes.contains("serde::Serialize"),
+            "PostForm must derive Serialize so Changeset::field_value can \
+             repopulate inputs: {routes}"
+        );
+        assert!(
+            routes.contains("validator::Validate"),
+            "PostForm must derive Validate so into_changeset() validates: {routes}"
+        );
+        assert!(
+            routes.contains("Default"),
+            "PostForm must derive Default for the blank new-form changeset: {routes}"
+        );
+        assert!(
+            routes.contains("#[validate(length(min = 1))]"),
+            "PostForm must echo the declared validation rule: {routes}"
+        );
+        assert!(
+            routes.contains("impl From<&Post> for PostForm"),
+            "generator must emit a From<&Row> to seed the edit-form changeset: {routes}"
+        );
+    }
+
+    #[test]
+    fn execute_writes_changeset_validated_create_handler() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+            &ScaffoldOptions {
+                model: ModelOptions {
+                    validations: vec!["title=length:min=1".into()],
+                    ..ModelOptions::default()
+                },
+                ..ScaffoldOptions::default()
+            },
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        // AC1: handlers build a changeset from the submitted body.
+        assert!(
+            routes.contains("into_changeset()"),
+            "create/update must build a changeset from the submission: {routes}"
+        );
+        assert!(
+            routes.contains("is_valid()"),
+            "handler must branch on changeset validity: {routes}"
+        );
+        // AC2: failed submission re-renders at 422, not a 400 error page.
+        assert!(
+            routes.contains("StatusCode::UNPROCESSABLE_ENTITY"),
+            "handler must respond 422 on a rejected submission: {routes}"
+        );
+        // AC7: the create/update handlers re-render at 422 rather than
+        // dead-ending on a rejected submission. (A truly undecodable body still
+        // 400s in `decode_form`, matching ChangesetForm's own contract — the
+        // 422 path is exclusively for validator-rule failures.)
+        assert!(
+            routes.contains("into_response()"),
+            "the changeset re-render returns a Response, not a bare Markup 400: {routes}"
+        );
+    }
+
+    #[test]
+    fn execute_new_and_edit_forms_use_changeset_helpers() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &[
+                "title:String".into(),
+                "rank:i32".into(),
+                "published:bool".into(),
+                "published_at:NaiveDateTime".into(),
+            ],
+            "20260427000000",
+            &ScaffoldOptions {
+                model: ModelOptions {
+                    validations: vec!["title=length:min=1".into()],
+                    ..ModelOptions::default()
+                },
+                ..ScaffoldOptions::default()
+            },
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        // AC6: new/edit render through the changeset-aware input helpers.
+        // Every field here is required (non-nullable), so each uses its
+        // `required_*` sibling helper (issue #1124 review).
+        assert!(
+            routes.contains("autumn_web::form::required_text_input(&changeset, \"title\""),
+            "string fields must render via required_text_input: {routes}"
+        );
+        assert!(
+            routes.contains("autumn_web::form::required_number_input(&changeset, \"rank\""),
+            "numeric fields must render via required_number_input: {routes}"
+        );
+        assert!(
+            routes.contains("autumn_web::form::checkbox_input(&changeset, \"published\""),
+            "bool fields must render via checkbox_input: {routes}"
+        );
+        assert!(
+            routes
+                .contains("autumn_web::form::required_datetime_input(&changeset, \"published_at\""),
+            "datetime fields must render via required_datetime_input: {routes}"
+        );
+        // The old hand-rolled bare-HTML text input must be gone for standard fields.
+        assert!(
+            !routes.contains(r#"input type="text" name="title""#),
+            "standard fields must no longer be hand-rolled: {routes}"
+        );
+    }
+
     #[test]
     fn execute_writes_edit_form_with_prefilled_values_and_nullable_optional_inputs() {
         let tmp = project_with_main(default_main());
@@ -3884,31 +3837,31 @@ async fn main() {
         plan.execute(Flags::default()).unwrap();
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        // Prefilling on the edit form now flows through the changeset: the
+        // `From<&Post>` seed copies each row value into the form, and the
+        // changeset-aware helpers repopulate the `value` (issue #1124).
+        assert!(
+            routes.contains("impl From<&Post> for PostForm"),
+            "edit form must seed a changeset from the loaded row: {routes}"
+        );
+        assert!(
+            routes.contains("title: row.title.clone(),"),
+            "seed must copy required fields from the loaded row: {routes}"
+        );
+        assert!(
+            routes.contains("subtitle: row.subtitle.clone(),"),
+            "seed must copy nullable text fields from the loaded row: {routes}"
+        );
+        assert!(
+            routes.contains("views: row.views.clone(),"),
+            "seed must copy nullable numeric fields from the loaded row: {routes}"
+        );
+        // Both new and edit render the numeric field via the number helper.
         assert!(
             routes.contains(
-                r#"label { "title" } input type="text" name="title" value=(row.title.to_string()) required;"#
+                "autumn_web::form::number_input(&changeset, \"views\", \"Views\", Some(\"1\"))"
             ),
-            "edit form must prefill required fields from the loaded row: {routes}"
-        );
-        assert!(
-            routes.contains(
-                r#"label { "subtitle" } input type="text" name="subtitle" value=(row.subtitle.as_ref().map(ToString::to_string).unwrap_or_default());"#
-            ),
-            "edit form must prefill nullable text fields from the loaded row: {routes}"
-        );
-        assert!(
-            routes.contains(
-                r#"label { "views" } input type="number" name="views" step="1" value=(row.views.as_ref().map(ToString::to_string).unwrap_or_default());"#
-            ),
-            "edit form must prefill nullable numeric fields from the loaded row as a number input (issue #1131): {routes}"
-        );
-        assert!(
-            routes.contains(r#"label { "subtitle" } input type="text" name="subtitle";"#),
-            "new form must not mark nullable fields required: {routes}"
-        );
-        assert!(
-            routes.contains(r#"label { "views" } input type="number" name="views" step="1";"#),
-            "new form must not mark nullable numeric fields required: {routes}"
+            "nullable numeric fields render via number_input: {routes}"
         );
     }
 
@@ -3936,22 +3889,20 @@ async fn main() {
             "generated routes must be able to inspect raw form bytes: {routes}"
         );
         assert!(
-            routes.contains("pub async fn create(flash: Flash, mut db: Db, body: Bytes)"),
+            routes.contains("pub async fn create(flash: Flash, csrf: Option<CsrfToken>, csrf_field: Option<CsrfFormField>, mut db: Db, body: Bytes)"),
             "create must decode after blank nullable normalization: {routes}"
         );
         assert!(
             routes.contains(
-                "pub async fn update(\n    flash: Flash,\n    id: Path<i64>,\n    mut db: Db,\n    body: Bytes,\n)"
+                "pub async fn update(\n    flash: Flash,\n    csrf: Option<CsrfToken>,\n    csrf_field: Option<CsrfFormField>,\n    id: Path<i64>,\n    mut db: Db,\n    body: Bytes,\n)"
             ),
             "update must decode after blank nullable normalization: {routes}"
         );
-        assert!(
-            routes.contains("let new = decode_form(body)?;"),
-            "create handler must use the generated decoder: {routes}"
-        );
+        // Both handlers decode to the form via the generated decoder, then
+        // validate through a changeset (issue #1124).
         assert!(
             routes.contains("let form = decode_form(body)?;"),
-            "update handler must use the generated decoder: {routes}"
+            "handlers must use the generated decoder: {routes}"
         );
         assert!(
             routes.contains(r#"matches!(name, "nickname" | "views" | "published_at" | "token")"#),
@@ -4457,13 +4408,19 @@ async fn main() {
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
 
-        // Assert edit form contains input type="file" AND the hidden input for existing avatar
+        // Attachment fields keep a hand-rolled file input plus a hidden field
+        // carrying the existing blob key from the changeset (issue #1124).
         assert!(routes.contains("input type=\"file\" name=\"avatar\""));
-        assert!(routes.contains("input type=\"hidden\" name=\"avatar\" value=(blob.key)"));
+        assert!(routes.contains(
+            "input type=\"hidden\" name=\"avatar\" value=(changeset.field_value(\"avatar\").unwrap_or_default())"
+        ));
 
-        // Assert decode_form contains DecodedForm struct
-        assert!(routes.contains("struct DecodedForm"));
+        // The form struct carries the attachment key as an Option<String>.
+        assert!(routes.contains("pub struct PostForm"));
         assert!(routes.contains("pub avatar: Option<String>"));
+        // The blob is resolved from the key in `into_new` (async, needs &state).
+        assert!(routes.contains("async fn into_new("));
+        assert!(routes.contains("avatar: row.avatar.as_ref().map(|blob| blob.key.clone()),"));
     }
 
     // ── Typed form-input widgets (issue #1131) ──────────────────────
@@ -4482,34 +4439,18 @@ async fn main() {
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
 
-        // Both create and edit forms must render a real checkbox for `active`,
-        // never a text box.
+        // Bool fields render through the changeset-aware `checkbox_input`
+        // helper (issue #1124), which reflects the value and emits exactly one
+        // `name="active"` input — no duplicate-key hidden fallback.
         assert!(
-            routes.contains("input type=\"checkbox\" name=\"active\""),
+            routes.contains("autumn_web::form::checkbox_input(&changeset, \"active\", \"Active\")"),
             "{routes}"
         );
         assert!(
             !routes.contains("input type=\"text\" name=\"active\""),
             "bool field must not render input type=\"text\": {routes}"
         );
-        // No hidden "false" fallback sharing the checkbox's name: a checked
-        // box would then submit the key twice (active=false&active=true),
-        // and serde_urlencoded rejects duplicate keys — every checked
-        // submission would 400 (issue #1131 follow-up fix). Exactly one
-        // `name="active"` input must exist per form.
-        assert!(
-            !routes.contains("input type=\"hidden\" name=\"active\" value=\"false\""),
-            "{routes}"
-        );
-        assert_eq!(
-            routes.matches("name=\"active\"").count(),
-            2,
-            "expected exactly one `name=\"active\"` input in each of the \
-             create and edit forms (no duplicate-key hidden fallback): {routes}"
-        );
-        // Edit form must reflect the current value via `checked[...]`.
-        assert!(routes.contains("checked[row.active]"), "{routes}");
-        // DecodedForm must default the field so an unchecked submission
+        // The form struct must default the bool so an unchecked submission
         // (missing key) doesn't 400.
         assert!(
             routes.contains("#[serde(default)]\n    pub active: bool,"),
@@ -4538,23 +4479,16 @@ async fn main() {
             !routes.contains("input type=\"checkbox\" name=\"archived\""),
             "nullable bool must not render a checkbox: {routes}"
         );
-        assert!(routes.contains("select name=\"archived\""), "{routes}");
-        assert!(routes.contains("option value=\"\""), "{routes}");
-        assert!(routes.contains("option value=\"true\""), "{routes}");
-        assert!(routes.contains("option value=\"false\""), "{routes}");
-        // Edit form must reflect the current tri-state value.
+        // A nullable bool renders a 3-option `select_input` (unset/true/false);
+        // the changeset picks the current option (issue #1124).
         assert!(
-            routes.contains("selected[row.archived.is_none()]"),
+            routes.contains(
+                "autumn_web::form::select_input(&changeset, \"archived\", \"Archived\", &[(\"\", \"— Unset —\"), (\"true\", \"Yes\"), (\"false\", \"No\")])"
+            ),
             "{routes}"
         );
-        assert!(
-            routes.contains("selected[row.archived == Some(true)]"),
-            "{routes}"
-        );
-        assert!(
-            routes.contains("selected[row.archived == Some(false)]"),
-            "{routes}"
-        );
+        // The form field is an Option<bool> so a blank submission stays None.
+        assert!(routes.contains("pub archived: Option<bool>,"), "{routes}");
     }
 
     #[test]
@@ -4571,12 +4505,18 @@ async fn main() {
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
 
+        // Both fields are required (non-nullable), so both use
+        // `required_number_input` (issue #1124 review).
         assert!(
-            routes.contains("input type=\"number\" name=\"views\" step=\"1\""),
+            routes.contains(
+                "autumn_web::form::required_number_input(&changeset, \"views\", \"Views\", Some(\"1\"))"
+            ),
             "{routes}"
         );
         assert!(
-            routes.contains("input type=\"number\" name=\"rank\" step=\"1\""),
+            routes.contains(
+                "autumn_web::form::required_number_input(&changeset, \"rank\", \"Rank\", Some(\"1\"))"
+            ),
             "{routes}"
         );
         assert!(
@@ -4603,23 +4543,30 @@ async fn main() {
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
 
+        // Both fields are required (non-nullable), so both use
+        // `required_number_input` (issue #1124 review).
         assert!(
-            routes.contains("input type=\"number\" name=\"price\" step=\"any\""),
+            routes.contains(
+                "autumn_web::form::required_number_input(&changeset, \"price\", \"Price\", Some(\"any\"))"
+            ),
             "{routes}"
         );
         assert!(
-            routes.contains("input type=\"number\" name=\"weight\" step=\"any\""),
+            routes.contains(
+                "autumn_web::form::required_number_input(&changeset, \"weight\", \"Weight\", Some(\"any\"))"
+            ),
             "{routes}"
         );
     }
 
     #[test]
-    fn execute_writes_finite_guard_for_float_edit_form_value() {
-        // f32/f64 Display renders NaN/Infinity as "NaN"/"inf"/"-inf", none
-        // of which satisfy HTML5's <input type="number"> value grammar —
-        // the browser would silently blank the field. The generated value
-        // expression must guard with is_finite() instead of a bare
-        // .to_string() for float fields.
+    fn execute_writes_number_input_reads_value_from_changeset() {
+        // A required numeric field is represented as a `String` on the form
+        // (issue #1124 review): `f64::default()` is `0.0`, a real value, not
+        // "blank" — a native-typed field would render `0` as the blank
+        // new-form's pre-filled value instead of leaving the input empty.
+        // `into_new` parses it back, and a bad value is a 400 (undecodable
+        // input), matching the enum/datetime convention.
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold(
             tmp.path(),
@@ -4637,13 +4584,109 @@ async fn main() {
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
         assert!(
             routes.contains(
-                "value=(if row.price.is_finite() { row.price.to_string() } else { String::new() })"
+                "autumn_web::form::required_number_input(&changeset, \"price\", \"Price\", Some(\"any\"))"
+            ),
+            "{routes}"
+        );
+        assert!(routes.contains("pub price: String,"), "{routes}");
+        assert!(
+            routes.contains(
+                "price: form.price.parse::<f64>()\n        .map_err(|err| autumn_web::AutumnError::bad_request_msg(format!(\"price: {err}\")))?,"
+            ),
+            "{routes}"
+        );
+        assert!(
+            routes.contains("price: row.price.to_string(),"),
+            "the edit-form seed copies the float from the row: {routes}"
+        );
+        // A nullable float of the same kind keeps its native Option<T> type —
+        // `None` is already blank, no String indirection needed.
+        assert!(routes.contains("pub weight: Option<f32>,"), "{routes}");
+    }
+
+    #[test]
+    fn execute_writes_required_references_field_as_string_on_form() {
+        // A required `references` (foreign key) field is `i64` at the model
+        // layer, same as any other required integer — it needs the same
+        // String-wire treatment as I32/I64/Uuid/Decimal (issue #1124 review):
+        // `i64::default()` is `0`, a real (and likely invalid) foreign key
+        // value, not "blank".
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Comment",
+            &["body:String".into(), "post:references".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/comments.rs")).unwrap();
+        assert!(routes.contains("pub post_id: String,"), "{routes}");
+        assert!(
+            routes.contains(
+                "post_id: form.post_id.parse::<i64>()\n        .map_err(|err| autumn_web::AutumnError::bad_request_msg(format!(\"post_id: {err}\")))?,"
+            ),
+            "{routes}"
+        );
+        assert!(
+            routes.contains("post_id: row.post_id.to_string(),"),
+            "{routes}"
+        );
+    }
+
+    #[test]
+    fn execute_writes_required_bytea_field_as_string_on_form() {
+        // `Vec<u8>` cannot deserialize from a single url-encoded value at all
+        // (issue #1124 review) — represented as a lossy-UTF8 `String` on the
+        // form instead, matching what the old hand-rolled edit form already
+        // displayed via `String::from_utf8_lossy`, and converted back with
+        // `.into_bytes()` on the success path.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "payload:Bytea".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        assert!(routes.contains("pub payload: String,"), "{routes}");
+        assert!(
+            routes.contains("payload: form.payload.clone().into_bytes(),"),
+            "{routes}"
+        );
+        assert!(
+            routes.contains("payload: String::from_utf8_lossy(&row.payload).into_owned(),"),
+            "{routes}"
+        );
+    }
+
+    #[test]
+    fn execute_writes_nullable_bytea_field_as_option_string_on_form() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "payload:Option<Bytea>".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        assert!(routes.contains("pub payload: Option<String>,"), "{routes}");
+        assert!(
+            routes.contains(
+                "payload: form.payload.as_ref().map(|value| value.clone().into_bytes()),"
             ),
             "{routes}"
         );
         assert!(
             routes.contains(
-                "value=(row.weight.as_ref().filter(|value| value.is_finite()).map(ToString::to_string).unwrap_or_default())"
+                "payload: row.payload.as_ref().map(|value| String::from_utf8_lossy(value).into_owned()),"
             ),
             "{routes}"
         );
@@ -4662,12 +4705,15 @@ async fn main() {
         plan.execute(Flags::default()).unwrap();
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        // The edit form seeds the changeset from the row; `required_number_input`
+        // (required, non-nullable field) reads the value back (issue #1124).
         assert!(
             routes.contains(
-                "input type=\"number\" name=\"views\" step=\"1\" value=(row.views.to_string())"
+                "autumn_web::form::required_number_input(&changeset, \"views\", \"Views\", Some(\"1\"))"
             ),
             "{routes}"
         );
+        assert!(routes.contains("views: row.views.to_string(),"), "{routes}");
     }
 
     #[test]
@@ -4684,55 +4730,33 @@ async fn main() {
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
 
+        // Datetime fields render via the `datetime_input` helper (issue #1124);
+        // required (non-nullable), so the `required_datetime_input` sibling.
         assert!(
-            routes.contains("input type=\"datetime-local\" name=\"published_at\""),
+            routes.contains(
+                "autumn_web::form::required_datetime_input(&changeset, \"published_at\", \"Published At\")"
+            ),
             "{routes}"
         );
         assert!(
             !routes.contains("input type=\"text\" name=\"published_at\""),
             "{routes}"
         );
-        // DecodedForm must use the local-shape-aware deserializer so a
-        // browser-submitted `YYYY-MM-DDTHH:MM` value parses without a
-        // hand-edit.
+        // On the form the field is a String (the browser wire shape); it's
+        // parsed back into the model type in `into_new`.
+        assert!(routes.contains("pub published_at: String,"), "{routes}");
+        assert!(
+            routes.contains("published_at: parse_local_datetime(&form.published_at)?,"),
+            "{routes}"
+        );
+        // The edit-form seed formats the row's timestamp for the datetime-local
+        // control, preserving fractional seconds so a no-op resubmit doesn't
+        // truncate the stored value (the update handler writes every column
+        // back unconditionally).
         assert!(
             routes.contains(
-                "#[serde(deserialize_with = \"deserialize_naive_datetime_local\")]\n    pub published_at: chrono::NaiveDateTime,"
+                "published_at: row.published_at.format(\"%Y-%m-%dT%H:%M:%S%.f\").to_string(),"
             ),
-            "{routes}"
-        );
-        assert!(
-            routes.contains("fn deserialize_naive_datetime_local"),
-            "{routes}"
-        );
-        assert!(routes.contains("fn normalize_datetime_local"), "{routes}");
-        // No DateTime<Utc> field present — the tz-aware helper must not be
-        // emitted as dead code.
-        assert!(
-            !routes.contains("fn deserialize_utc_datetime_local"),
-            "{routes}"
-        );
-        // The parse format must accept optional fractional seconds
-        // (`%.f`) — without it, a datetime-local value submitted with
-        // milliseconds (e.g. from a finer-grained `step`) fails to parse.
-        assert!(routes.contains("\"%Y-%m-%dT%H:%M:%S%.f\")"), "{routes}");
-        // Regression test: the edit form's value must preserve seconds/
-        // fractional precision, not truncate to minutes. A minute-only
-        // value round-trips as `:00` seconds via normalize_datetime_local,
-        // and the generated update handler writes every column
-        // unconditionally — a no-op re-submit of a row with non-zero
-        // seconds would otherwise silently corrupt the stored timestamp
-        // (e.g. `12:34:56` -> `12:34:00`).
-        assert!(
-            routes
-                .contains("value=(row.published_at.format(\"%Y-%m-%dT%H:%M:%S%.f\").to_string())"),
-            "{routes}"
-        );
-        // `step="any"` so a value carrying seconds/fractional seconds
-        // doesn't fail the browser's step-mismatch constraint validation
-        // (default step is minute-granularity) and block submission.
-        assert!(
-            routes.contains("input type=\"datetime-local\" name=\"published_at\" step=\"any\""),
             "{routes}"
         );
     }
@@ -4751,22 +4775,17 @@ async fn main() {
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
 
-        assert!(
-            routes.contains("input type=\"datetime-local\" name=\"scheduled_at\""),
-            "{routes}"
-        );
+        // Required (non-nullable), so the `required_datetime_input` sibling.
         assert!(
             routes.contains(
-                "#[serde(deserialize_with = \"deserialize_utc_datetime_local\")]\n    pub scheduled_at: chrono::DateTime<chrono::Utc>,"
+                "autumn_web::form::required_datetime_input(&changeset, \"scheduled_at\", \"Scheduled At\")"
             ),
             "{routes}"
         );
+        assert!(routes.contains("pub scheduled_at: String,"), "{routes}");
+        // A tz-aware field parses to naive-local then attaches UTC.
         assert!(
-            routes.contains("fn deserialize_utc_datetime_local"),
-            "{routes}"
-        );
-        assert!(
-            !routes.contains("fn deserialize_naive_datetime_local"),
+            routes.contains("scheduled_at: parse_local_datetime(&form.scheduled_at)?.and_utc(),"),
             "{routes}"
         );
     }
@@ -4787,19 +4806,19 @@ async fn main() {
         plan.execute(Flags::default()).unwrap();
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        // Nullable datetime is an Option<String> on the form, parsed only when
+        // non-empty in `into_new` (issue #1124).
         assert!(
-            routes.contains(
-                "#[serde(default, deserialize_with = \"deserialize_option_naive_datetime_local\")]\n    pub published_at: Option<chrono::NaiveDateTime>,"
-            ),
+            routes.contains("pub published_at: Option<String>,"),
             "{routes}"
         );
         assert!(
-            routes.contains("fn deserialize_option_naive_datetime_local"),
+            routes.contains("form.published_at.as_deref().filter(|value| !value.is_empty())"),
             "{routes}"
         );
-        // Scalar variant must not be emitted when only the nullable form is used.
+        // The old serde deserialize-with helpers are no longer needed.
         assert!(
-            !routes.contains("fn deserialize_naive_datetime_local<'de, D>(deserializer: D) -> Result<chrono::NaiveDateTime, D::Error>"),
+            !routes.contains("fn deserialize_option_naive_datetime_local"),
             "{routes}"
         );
     }
@@ -4823,14 +4842,34 @@ async fn main() {
         plan.execute(Flags::default()).unwrap();
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        // Genuine string fields (String/Text) render via `text_input`; every
+        // other kind uses its own changeset-aware helper (issue #1124). Every
+        // field here is required, so each uses its `required_*` sibling.
         assert!(
-            routes.contains("input type=\"text\" name=\"title\""),
+            routes.contains(
+                "autumn_web::form::required_text_input(&changeset, \"title\", \"Title\")"
+            ),
             "{routes}"
         );
         assert!(
-            routes.contains("input type=\"text\" name=\"body\""),
+            routes
+                .contains("autumn_web::form::required_text_input(&changeset, \"body\", \"Body\")"),
             "{routes}"
         );
+        assert!(
+            routes.contains("autumn_web::form::checkbox_input(&changeset, \"active\""),
+            "{routes}"
+        );
+        assert!(
+            routes.contains("autumn_web::form::required_number_input(&changeset, \"views\""),
+            "{routes}"
+        );
+        assert!(
+            routes
+                .contains("autumn_web::form::required_datetime_input(&changeset, \"published_at\""),
+            "{routes}"
+        );
+        // No hand-rolled bare text inputs remain for the non-string fields.
         assert!(
             !routes.contains("input type=\"text\" name=\"active\""),
             "{routes}"
@@ -5242,7 +5281,7 @@ async fn main() {
         assert!(routes.contains("hx-swap=\"none\""));
         assert!(routes.contains("autumn_web::htmx::HTMX_JS_PATH"));
         assert!(routes.contains("autumn_web::htmx::HTMX_SSE_JS_PATH"));
-        assert!(routes.contains("title: autumn_web::hooks::Patch::Set(form.title.clone())"));
+        assert!(routes.contains("title: autumn_web::hooks::Patch::Set(new.title.clone())"));
 
         let main_rs = fs::read_to_string(tmp.path().join("src/main.rs")).unwrap();
         assert!(main_rs.contains("routes::posts::events"));
@@ -5552,6 +5591,188 @@ async fn main() {
         assert!(
             !test.contains("rejects_out_of_set"),
             "no enum field means no rejection test: {test}"
+        );
+    }
+
+    #[test]
+    fn scaffold_validation_smoke_test_max_only_rule_exceeds_bound() {
+        // Regression guard: a fixed-size "invalid" literal (e.g. 1000 `x`s)
+        // would itself satisfy a looser `max` bound like 2000, silently
+        // turning the smoke test's "invalid" submission valid and failing its
+        // own `.assert_status(422)` premise. The generated invalid value must
+        // scale with the declared `max` (here, more than 5 characters), and
+        // the generated valid value must stay within it (at most 5).
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+            &ScaffoldOptions {
+                model: ModelOptions {
+                    validations: vec!["title=length:max=5".into()],
+                    ..ModelOptions::default()
+                },
+                ..ScaffoldOptions::default()
+            },
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let test = fs::read_to_string(tmp.path().join("tests/post.rs")).unwrap();
+        let invalid_line = test
+            .lines()
+            .find(|l| l.contains("let invalid_body"))
+            .expect("invalid_body line present");
+        let invalid_title = invalid_line
+            .split("title=")
+            .nth(1)
+            .and_then(|s| s.split('&').next())
+            .expect("title value in invalid_body");
+        assert!(
+            invalid_title.len() > 5,
+            "invalid value must exceed the declared max=5 bound: {invalid_line}"
+        );
+
+        let valid_line = test
+            .lines()
+            .find(|l| l.contains("let valid_body"))
+            .expect("valid_body line present");
+        let valid_title = valid_line
+            .split("title=")
+            .nth(1)
+            .and_then(|s| s.split('&').next())
+            .expect("title value in valid_body");
+        assert!(
+            valid_title.len() <= 5,
+            "valid value must satisfy the declared max=5 bound: {valid_line}"
+        );
+    }
+
+    #[test]
+    fn scaffold_validation_smoke_test_skips_absurdly_large_bound() {
+        // Regression guard (issue #1124 review): a declared bound like
+        // `length:min=1000000000` has no cheap, correct sample to generate —
+        // capping the sample length would either fail to violate a huge `max`
+        // or fail to satisfy a huge `min`, asserting something false. The
+        // generator must skip emitting this smoke test entirely rather than
+        // allocating a multi-GB string in the CLI process itself.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+            &ScaffoldOptions {
+                model: ModelOptions {
+                    validations: vec!["title=length:min=1000000000".into()],
+                    ..ModelOptions::default()
+                },
+                ..ScaffoldOptions::default()
+            },
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let test = fs::read_to_string(tmp.path().join("tests/post.rs")).unwrap();
+        assert!(
+            !test.contains("rejects_invalid_title_and_preserves_input"),
+            "an absurdly large bound must not generate a smoke test: {test}"
+        );
+    }
+
+    #[test]
+    fn scaffold_validation_smoke_test_skips_noop_min_zero_rule() {
+        // Regression guard (issue #1124 review): `length:min=0` with no `max`
+        // is a no-op — every string, including blank, already satisfies it.
+        // Emitting a smoke test that submits a value and asserts 422 anyway
+        // would fail against the real server. The generator must skip the
+        // test entirely when this is the only validated field.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+            &ScaffoldOptions {
+                model: ModelOptions {
+                    validations: vec!["title=length:min=0".into()],
+                    ..ModelOptions::default()
+                },
+                ..ScaffoldOptions::default()
+            },
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let test = fs::read_to_string(tmp.path().join("tests/post.rs")).unwrap();
+        assert!(
+            !test.contains("rejects_invalid_title_and_preserves_input"),
+            "a no-op length:min=0 rule must not generate a smoke test: {test}"
+        );
+    }
+
+    #[test]
+    fn scaffold_validation_smoke_test_falls_back_past_noop_rule() {
+        // When one validated field's rule is a no-op (`length:min=0`) but
+        // another has a genuinely violatable rule, the smoke test must be
+        // built around the violatable field instead of skipping entirely.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "body:String".into()],
+            "20260427000000",
+            &ScaffoldOptions {
+                model: ModelOptions {
+                    validations: vec![
+                        "title=length:min=0".into(),
+                        "body=length:min=1,max=200".into(),
+                    ],
+                    ..ModelOptions::default()
+                },
+                ..ScaffoldOptions::default()
+            },
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let test = fs::read_to_string(tmp.path().join("tests/post.rs")).unwrap();
+        assert!(
+            test.contains("rejects_invalid_body_and_preserves_input"),
+            "the violatable body rule must be used instead of the no-op title rule: {test}"
+        );
+        assert!(
+            !test.contains("rejects_invalid_title_and_preserves_input"),
+            "the no-op title rule must not be used for the smoke test: {test}"
+        );
+    }
+
+    #[test]
+    fn scaffold_validation_rejects_min_greater_than_max() {
+        // Regression guard (issue #1124 review): `length:min=5,max=3` is a
+        // self-contradictory rule no string can ever satisfy — accepting it
+        // would generate a field that's permanently invalid and a smoke test
+        // whose "valid submission" assertion is always false. It must be
+        // rejected at generate-time instead.
+        let tmp = project_with_main(default_main());
+        let err = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+            &ScaffoldOptions {
+                model: ModelOptions {
+                    validations: vec!["title=length:min=5,max=3".into()],
+                    ..ModelOptions::default()
+                },
+                ..ScaffoldOptions::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, GenerateError::InvalidField { .. }),
+            "expected min > max to be rejected, got {err:?}"
         );
     }
 

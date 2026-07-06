@@ -18,6 +18,7 @@
 //! (data_table, active_search, autocomplete_input, property_list).
 
 use autumn_web::extract::{Form, Path};
+use autumn_web::form::Changeset;
 use autumn_web::prelude::*;
 use autumn_web::widgets::{Column, DataTableConfig, data_table, property_list};
 use diesel::prelude::*;
@@ -26,6 +27,31 @@ use diesel_async::RunQueryDsl;
 use crate::models::bookmark::{Bookmark, NewBookmark};
 use crate::repositories::bookmark::{BookmarkRepository, PgBookmarkRepository};
 use crate::schema::bookmarks;
+
+/// Mirrors [`Bookmark`]'s validated fields (`url`, `title`) plus `tag` — the
+/// form shape submitted by the new/edit pages. Deriving `Validate` runs the
+/// same `#[validate(url)]`/`#[validate(length(...))]` rules declared on the
+/// model (issue #1124): a rejected submission re-renders the same form at
+/// `422` with every field preserved and an inline error next to the
+/// offending input, instead of a 400 dead-end with the user's input lost.
+#[derive(serde::Deserialize, serde::Serialize, Default, validator::Validate, Clone)]
+pub struct BookmarkForm {
+    #[validate(url)]
+    pub url: String,
+    #[validate(length(min = 1, max = 200))]
+    pub title: String,
+    pub tag: String,
+}
+
+impl From<&Bookmark> for BookmarkForm {
+    fn from(row: &Bookmark) -> Self {
+        Self {
+            url: row.url.clone(),
+            title: row.title.clone(),
+            tag: row.tag.clone(),
+        }
+    }
+}
 
 fn layout(title: &str, content: Markup) -> Markup {
     html! {
@@ -206,31 +232,29 @@ pub async fn by_tag(Path(tag): Path<String>, repo: PgBookmarkRepository) -> Autu
     ))
 }
 
-#[get("/bookmarks/new")]
-pub async fn new_form() -> AutumnResult<Markup> {
+/// Shared new-bookmark form body (issue #1124): rendered both by the plain
+/// `GET /bookmarks/new` and by `create`'s `422` re-render, from a
+/// `Changeset<BookmarkForm>` — so a rejected submission shows the exact same
+/// form with every field preserved and an inline error next to the offending
+/// input, using the shipped changeset-aware `text_input` helper.
+fn new_bookmark_form(changeset: &Changeset<BookmarkForm>) -> Markup {
+    // Seed the widget from the changeset so a rejected submission (invalid
+    // url/title) doesn't silently drop a tag the user already typed.
+    let tag_value = changeset.field_value("tag").unwrap_or_default();
     let tag_ac =
         autumn_web::widgets::AutocompleteConfig::new("/bookmarks/tags/autocomplete", "tag")
             .placeholder("Search existing tags…")
             .min_length(1)
-            .free_text(); // tags are plain strings; allow typing a new tag
+            .free_text() // tags are plain strings; allow typing a new tag
+            .initial_value(&tag_value);
 
-    Ok(layout(
+    layout(
         "Add Bookmark",
         html! {
             h1 class="text-2xl font-bold mb-6" { "Add Bookmark" }
             form action="/bookmarks" method="post" class="space-y-4" {
-                div {
-                    label for="url" class="block text-sm font-medium" { "URL" }
-                    input type="url" id="url" name="url" required
-                          placeholder="https://example.com"
-                          class="w-full border rounded p-2 mt-1";
-                }
-                div {
-                    label for="title" class="block text-sm font-medium" { "Title" }
-                    input type="text" id="title" name="title" required
-                          placeholder="My favorite site"
-                          class="w-full border rounded p-2 mt-1";
-                }
+                (autumn_web::form::text_input(changeset, "url", "URL"))
+                (autumn_web::form::text_input(changeset, "title", "Title"))
                 // ── Tag autocomplete ──────────────────────────────────────
                 // The widget renders a hidden <input name="tag"> for the selected
                 // value and a <noscript><select name="tag"> for the no-JS path.
@@ -243,16 +267,55 @@ pub async fn new_form() -> AutumnResult<Markup> {
                 }
             }
         },
-    ))
+    )
+}
+
+#[get("/bookmarks/new")]
+pub async fn new_form() -> AutumnResult<Markup> {
+    Ok(new_bookmark_form(&Changeset::new(BookmarkForm::default())))
 }
 
 #[post("/bookmarks")]
 pub async fn create(
     repo: PgBookmarkRepository,
-    Form(new): Form<NewBookmark>,
-) -> AutumnResult<Redirect> {
+    Form(form): Form<BookmarkForm>,
+) -> AutumnResult<autumn_web::reexports::axum::response::Response> {
+    let changeset = form.into_changeset();
+    if !changeset.is_valid() {
+        return Ok((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            new_bookmark_form(&changeset),
+        )
+            .into_response());
+    }
+    let data = changeset.into_inner();
+    let new = NewBookmark {
+        url: data.url,
+        title: data.title,
+        tag: data.tag,
+    };
     repo.save(&new).await?;
-    Ok(Redirect::to("/bookmarks"))
+    Ok(Redirect::to("/bookmarks").into_response())
+}
+
+/// Shared edit-bookmark form body — see [`new_bookmark_form`]'s doc comment;
+/// the same reasoning applies to `update`'s `422` re-render.
+fn edit_bookmark_form(id: i64, changeset: &Changeset<BookmarkForm>) -> Markup {
+    layout(
+        &format!("Edit Bookmark #{id}"),
+        html! {
+            h1 class="text-2xl font-bold mb-6" { "Edit Bookmark" }
+            form action=(format!("/bookmarks/{id}/update")) method="post" class="space-y-4" {
+                (autumn_web::form::text_input(changeset, "url", "URL"))
+                (autumn_web::form::text_input(changeset, "title", "Title"))
+                (autumn_web::form::text_input(changeset, "tag", "Tag"))
+                button type="submit"
+                       class="bg-indigo-600 text-white px-6 py-2 rounded hover:bg-indigo-700" {
+                    "Save"
+                }
+            }
+        },
+    )
 }
 
 #[get("/bookmarks/{id}/edit")]
@@ -264,35 +327,9 @@ pub async fn edit_form(id: Path<i64>, mut db: Db) -> AutumnResult<Markup> {
         .await
         .map_err(AutumnError::not_found)?;
 
-    Ok(layout(
-        &format!("Edit Bookmark #{}", row.id),
-        html! {
-            h1 class="text-2xl font-bold mb-6" { "Edit Bookmark" }
-            form action=(format!("/bookmarks/{}/update", row.id)) method="post" class="space-y-4" {
-                div {
-                    label for="url" class="block text-sm font-medium" { "URL" }
-                    input type="url" id="url" name="url" required
-                          value=(row.url)
-                          class="w-full border rounded p-2 mt-1";
-                }
-                div {
-                    label for="title" class="block text-sm font-medium" { "Title" }
-                    input type="text" id="title" name="title" required
-                          value=(row.title)
-                          class="w-full border rounded p-2 mt-1";
-                }
-                div {
-                    label for="tag" class="block text-sm font-medium" { "Tag" }
-                    input type="text" id="tag" name="tag" required
-                          value=(row.tag)
-                          class="w-full border rounded p-2 mt-1";
-                }
-                button type="submit"
-                       class="bg-indigo-600 text-white px-6 py-2 rounded hover:bg-indigo-700" {
-                    "Save"
-                }
-            }
-        },
+    Ok(edit_bookmark_form(
+        row.id,
+        &Changeset::new(BookmarkForm::from(&row)),
     ))
 }
 
@@ -300,13 +337,22 @@ pub async fn edit_form(id: Path<i64>, mut db: Db) -> AutumnResult<Markup> {
 pub async fn update(
     id: Path<i64>,
     mut db: Db,
-    Form(form): Form<NewBookmark>,
-) -> AutumnResult<Redirect> {
+    Form(form): Form<BookmarkForm>,
+) -> AutumnResult<autumn_web::reexports::axum::response::Response> {
+    let changeset = form.into_changeset();
+    if !changeset.is_valid() {
+        return Ok((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            edit_bookmark_form(*id, &changeset),
+        )
+            .into_response());
+    }
+    let data = changeset.into_inner();
     let updated = diesel::update(bookmarks::table.find(*id))
         .set((
-            bookmarks::url.eq(form.url.clone()),
-            bookmarks::title.eq(form.title.clone()),
-            bookmarks::tag.eq(form.tag.clone()),
+            bookmarks::url.eq(data.url),
+            bookmarks::title.eq(data.title),
+            bookmarks::tag.eq(data.tag),
         ))
         .execute(&mut *db)
         .await?;
@@ -318,7 +364,7 @@ pub async fn update(
         )));
     }
 
-    Ok(Redirect::to(&format!("/bookmarks/{}", *id)))
+    Ok(Redirect::to(&format!("/bookmarks/{}", *id)).into_response())
 }
 
 // ── Active search handler ─────────────────────────────────────────────────────
