@@ -23,6 +23,7 @@ mod maintenance;
 mod migrate;
 mod monitor;
 mod new;
+mod overload_driver;
 mod paths;
 mod pg;
 mod plugin_check;
@@ -630,6 +631,24 @@ enum Commands {
         /// Only used with `--scaling`.
         #[arg(long, value_name = "PATH")]
         baseline: Option<String>,
+        /// Measure the overload / load-shedding Success Metric (issue #1006):
+        /// offered load = `--load-multiplier` x `--ceiling` against handlers
+        /// that block `--block-ms`, asserting admitted-request p99 stays
+        /// within budget, shedding is fast, and RSS stays bounded.
+        #[arg(long)]
+        overload: bool,
+        /// Concurrent in-flight ceiling (`server.max_concurrent_requests`)
+        /// configured on the scaffolded app. Only used with `--overload`.
+        #[arg(long, default_value = "64")]
+        ceiling: usize,
+        /// How long (ms) the scaffolded app's benchmark handler blocks.
+        /// Only used with `--overload`.
+        #[arg(long, default_value = "200")]
+        block_ms: u64,
+        /// Offered load during the overload phase, as a multiple of
+        /// `--ceiling`. Only used with `--overload`.
+        #[arg(long, default_value = "2")]
+        load_multiplier: u32,
     },
 }
 
@@ -2363,8 +2382,23 @@ fn run_command(command: Commands) {
             scaling,
             sizes,
             baseline,
+            overload,
+            ceiling,
+            block_ms,
+            load_multiplier,
         } => {
-            let exit_code = if scaling {
+            let exit_code = if overload {
+                overload_driver::run_overload(
+                    ceiling,
+                    block_ms,
+                    load_multiplier,
+                    runs,
+                    output.as_deref(),
+                    json,
+                    fail_on_regression,
+                    dry_run,
+                )
+            } else if scaling {
                 scaling_driver::run_scaling(
                     &sizes,
                     runs,
@@ -5255,6 +5289,10 @@ mod tests {
             scaling,
             sizes,
             baseline,
+            overload,
+            ceiling,
+            block_ms,
+            load_multiplier,
         } = cli.command
         else {
             panic!("expected dev-loop-bench");
@@ -5270,6 +5308,10 @@ mod tests {
         assert!(!scaling);
         assert_eq!(sizes, crate::dev_loop_scaling::DEFAULT_SIZES);
         assert!(baseline.is_none());
+        assert!(!overload);
+        assert_eq!(ceiling, 64);
+        assert_eq!(block_ms, 200);
+        assert_eq!(load_multiplier, 2);
     }
 
     #[test]
@@ -5394,6 +5436,36 @@ mod tests {
             baseline.as_deref(),
             Some("benchmarks/dev-loop-scaling/baseline.json")
         );
+    }
+
+    #[test]
+    fn parse_dev_loop_bench_overload_flags() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "dev-loop-bench",
+            "--overload",
+            "--ceiling",
+            "32",
+            "--block-ms",
+            "150",
+            "--load-multiplier",
+            "3",
+        ])
+        .unwrap();
+        let Commands::DevLoopBench {
+            overload,
+            ceiling,
+            block_ms,
+            load_multiplier,
+            ..
+        } = cli.command
+        else {
+            panic!("expected dev-loop-bench");
+        };
+        assert!(overload);
+        assert_eq!(ceiling, 32);
+        assert_eq!(block_ms, 150);
+        assert_eq!(load_multiplier, 3);
     }
 
     // ── autumn config tests ────────────────────────────────────────────────────

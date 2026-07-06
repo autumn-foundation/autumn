@@ -42,6 +42,7 @@
 //! | `AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS` | `server.shutdown_timeout_secs` | `u64` |
 //! | `AUTUMN_SERVER__PRESTOP_GRACE_SECS` | `server.prestop_grace_secs` | `u64` |
 //! | `AUTUMN_SERVER__TIMEOUTS__REQUEST_TIMEOUT_MS` | `server.timeouts.request_timeout_ms` | `u64` |
+//! | `AUTUMN_SERVER__MAX_CONCURRENT_REQUESTS` | `server.max_concurrent_requests` | `usize` |
 //! | `AUTUMN_DATABASE__URL` | `database.url` | `String` |
 //! | `AUTUMN_DATABASE__PRIMARY_URL` | `database.primary_url` | `String` |
 //! | `AUTUMN_DATABASE__REPLICA_URL` | `database.replica_url` | `String` |
@@ -2682,6 +2683,11 @@ impl AutumnConfig {
             "AUTUMN_SERVER__UNIX_SOCKET",
             &mut self.server.unix_socket,
         );
+        parse_env_option(
+            env,
+            "AUTUMN_SERVER__MAX_CONCURRENT_REQUESTS",
+            &mut self.server.max_concurrent_requests,
+        );
     }
 
     fn apply_database_env_overrides_with_env(&mut self, env: &dyn Env) {
@@ -3669,6 +3675,32 @@ pub struct ServerConfig {
     /// Configured via `AUTUMN_SERVER__UNIX_SOCKET`. Default: `None` (TCP).
     #[serde(default)]
     pub unix_socket: Option<String>,
+
+    /// Ceiling on concurrent in-flight requests (admission control / load
+    /// shedding). `None` or `0` (the default) disables the ceiling — today's
+    /// unlimited behavior — so no existing application silently changes
+    /// throughput.
+    ///
+    /// Once this many requests are admitted and still in flight, additional
+    /// requests receive an immediate `503 Service Unavailable` with a
+    /// `Retry-After` header, before the handler runs or the request body is
+    /// read. This bounds total concurrent work (and therefore memory) under
+    /// a traffic spike or a slow dependency, trading a fast, clean "try
+    /// another replica" signal for the alternative — admitted requests
+    /// piling up unbounded until the process is OOM-killed.
+    ///
+    /// Liveness/readiness/health probe routes (`health.*` paths and the
+    /// actuator prefix) are never shed, so a merely-busy replica is not
+    /// killed by its orchestrator.
+    ///
+    /// A reasonable starting point is the number of worker threads times a
+    /// small multiple (e.g. 2-4x), sized to keep admitted-request tail
+    /// latency stable under the expected peak concurrency; tune based on
+    /// observed `autumn_requests_shed_total` and per-route latency.
+    ///
+    /// Configured via `AUTUMN_SERVER__MAX_CONCURRENT_REQUESTS`.
+    #[serde(default)]
+    pub max_concurrent_requests: Option<usize>,
 }
 
 /// Behavior when a configured read replica is unavailable or stale.
@@ -4983,6 +5015,7 @@ impl Default for ServerConfig {
             prestop_grace_secs: default_prestop_grace(),
             timeouts: RequestTimeoutsConfig::default(),
             unix_socket: None,
+            max_concurrent_requests: None,
         }
     }
 }
@@ -7557,6 +7590,54 @@ path = "/healthz"
             config.server.unix_socket.as_deref(),
             Some("/tmp/autumn.sock")
         );
+    }
+
+    // ── server.max_concurrent_requests (#1006) ────────────────────
+
+    #[test]
+    fn server_config_defaults_max_concurrent_requests_none() {
+        // Default must preserve today's unlimited behavior — no existing app
+        // silently changes throughput.
+        let config = AutumnConfig::default();
+        assert!(config.server.max_concurrent_requests.is_none());
+    }
+
+    #[test]
+    fn max_concurrent_requests_parses_from_toml() {
+        let config: AutumnConfig = toml::from_str(
+            r"
+            [server]
+            max_concurrent_requests = 64
+            ",
+        )
+        .expect("config with server.max_concurrent_requests should parse");
+        assert_eq!(config.server.max_concurrent_requests, Some(64));
+    }
+
+    #[test]
+    fn env_override_server_max_concurrent_requests() {
+        let env = MockEnv::new().with("AUTUMN_SERVER__MAX_CONCURRENT_REQUESTS", "128");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.server.max_concurrent_requests, Some(128));
+    }
+
+    #[test]
+    fn env_override_invalid_max_concurrent_requests_ignored() {
+        let env = MockEnv::new().with("AUTUMN_SERVER__MAX_CONCURRENT_REQUESTS", "not_a_number");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert!(config.server.max_concurrent_requests.is_none());
+    }
+
+    #[test]
+    fn env_override_empty_max_concurrent_requests_clears_to_none() {
+        // parse_env_option's documented convention: empty string clears to None.
+        let env = MockEnv::new().with("AUTUMN_SERVER__MAX_CONCURRENT_REQUESTS", "");
+        let mut config = AutumnConfig::default();
+        config.server.max_concurrent_requests = Some(64);
+        config.apply_env_overrides_with_env(&env);
+        assert!(config.server.max_concurrent_requests.is_none());
     }
 
     // ── Log env override tests ───────────────────────────────────

@@ -1940,6 +1940,22 @@ where
     ))
 }
 
+/// Exact-match health/probe paths that must always bypass admission-style
+/// gates (maintenance mode, the startup barrier, load shedding): the
+/// compat health endpoint plus the `/live`, `/ready`, `/startup` lifecycle
+/// probes and the actuator's own `/health` alias. Callers additionally
+/// exempt the whole actuator prefix (`with_health_prefix`), since these
+/// gates are keyed on exact paths, not prefixes.
+fn probe_bypass_paths(config: &AutumnConfig) -> Vec<String> {
+    vec![
+        config.health.path.clone(),
+        config.health.live_path.clone(),
+        config.health.ready_path.clone(),
+        config.health.startup_path.clone(),
+        crate::actuator::actuator_route_path(&config.actuator.prefix, "/health"),
+    ]
+}
+
 /// Build the [`MaintenanceLayer`](crate::middleware::maintenance::MaintenanceLayer)
 /// from config + state, with the health/probe paths that always bypass the gate.
 ///
@@ -1956,16 +1972,28 @@ fn build_maintenance_layer(
         .extension::<crate::maintenance::MaintenanceState>()
         .map(|s| (*s).clone())
         .unwrap_or_default();
-    let bypass_paths = vec![
-        config.health.path.clone(),
-        config.health.live_path.clone(),
-        config.health.ready_path.clone(),
-        config.health.startup_path.clone(),
-        crate::actuator::actuator_route_path(&config.actuator.prefix, "/health"),
-    ];
     crate::middleware::maintenance::MaintenanceLayer::new(maintenance_state)
         .with_health_prefix(config.actuator.prefix.clone())
-        .with_probe_paths(bypass_paths)
+        .with_probe_paths(probe_bypass_paths(config))
+}
+
+/// Build the admission-control ([`LoadShedLayer`](crate::middleware::LoadShedLayer))
+/// layer from config, or `None` when `server.max_concurrent_requests` is unset
+/// or `0` — the default, preserving today's unlimited behavior with zero
+/// overhead (the layer is simply never applied; see [`apply_middleware`]).
+///
+/// Reuses the same probe/actuator bypass list as [`build_maintenance_layer`]
+/// so health/liveness/readiness probes are never shed under load (#1006).
+fn build_load_shed_layer(
+    config: &AutumnConfig,
+    state: &AppState,
+) -> Option<crate::middleware::LoadShedLayer> {
+    let limit = config.server.max_concurrent_requests.filter(|&n| n > 0)?;
+    Some(
+        crate::middleware::LoadShedLayer::new(limit, state.metrics.clone())
+            .with_health_prefix(config.actuator.prefix.clone())
+            .with_probe_paths(probe_bypass_paths(config)),
+    )
 }
 
 /// Per-route timeout lookup table, keyed by the fully-qualified route template
@@ -2353,6 +2381,15 @@ fn apply_middleware(
     // Register MaintenanceLayer automatically (shared construction with the
     // late-mounted `/mcp` envelope — see `build_maintenance_layer`).
     router = router.layer(build_maintenance_layer(config, state));
+
+    // Admission control / load shedding (#1006). Outer to MaintenanceLayer so
+    // the cheap in-flight-count check runs before maintenance mode's
+    // bypass-header/IP-allowlist evaluation. `None` (the default — no
+    // `server.max_concurrent_requests` configured) applies no layer at all,
+    // so there is no overhead when the feature is unused.
+    if let Some(load_shed) = build_load_shed_layer(config, state) {
+        router = router.layer(load_shed);
+    }
 
     router = router.layer(axum::middleware::from_fn(
         crate::webhook::webhook_replay_cleanup_middleware,
