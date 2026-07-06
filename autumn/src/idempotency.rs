@@ -464,10 +464,13 @@ impl IdempotencyStore for MemoryIdempotencyStore {
     }
 
     fn set(&self, key: &str, record: IdempotencyRecord, body_hash: Vec<u8>, ttl: Duration) {
+        let now = Instant::now();
         let entry = IdempotencyEntry {
             record,
             body_hash,
-            expires_at: Instant::now() + ttl,
+            expires_at: now
+                .checked_add(ttl)
+                .unwrap_or_else(|| now + Duration::from_secs(31_536_000)),
         };
         let mut entries = self.entries.write().unwrap();
         entries.insert(key.to_owned(), entry);
@@ -504,7 +507,9 @@ impl IdempotencyStore for MemoryIdempotencyStore {
             key.to_owned(),
             MemoryInFlightLock {
                 owner: owner.to_owned(),
-                expires_at: now + ttl,
+                expires_at: now
+                    .checked_add(ttl)
+                    .unwrap_or_else(|| now + Duration::from_secs(31_536_000)),
             },
         );
         true

@@ -155,3 +155,4 @@ mod widgets_modal;
 mod widgets_tabs;
 #[cfg(feature = "ws")]
 mod ws_integration;
+mod chaos_idempotency_fuzz;
