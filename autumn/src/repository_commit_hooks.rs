@@ -1396,6 +1396,13 @@ pub fn set_global_channels(channels: crate::channels::Channels) {
 }
 
 #[cfg(feature = "ws")]
+pub fn clear_global_channels() {
+    if let Ok(mut lock) = GLOBAL_CHANNELS.write() {
+        *lock = None;
+    }
+}
+
+#[cfg(feature = "ws")]
 #[must_use]
 pub fn get_global_channels() -> Option<crate::channels::Channels> {
     CURRENT_CHANNELS
@@ -1436,6 +1443,9 @@ impl DummyBroadcast {
 #[cfg(not(feature = "ws"))]
 #[allow(clippy::missing_const_for_fn)]
 pub fn set_global_channels(_channels: Channels) {}
+
+#[cfg(not(feature = "ws"))]
+pub fn clear_global_channels() {}
 
 #[cfg(not(feature = "ws"))]
 #[must_use]

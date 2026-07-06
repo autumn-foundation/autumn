@@ -81,8 +81,11 @@ fn missing_keys_fail_fast_naming_the_credential_path() {
         err.contains("active_record_encryption.primary_key"),
         "diagnostic must name the missing credential path: {err}"
     );
+    // Since this runs in a consolidated binary where other tests register their own
+    // encrypted columns (e.g. secrets.api_token or secrets.email), any of them could
+    // be validated first. We check that it names the offending column generically.
     assert!(
-        err.contains("vault_entries"),
+        err.contains("Encrypted column") && err.contains("requires a master key"),
         "diagnostic must name the column: {err}"
     );
 }

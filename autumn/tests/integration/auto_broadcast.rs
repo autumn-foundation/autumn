@@ -172,6 +172,14 @@ mod tests {
 
     // ── Tests ──────────────────────────────────────────────────
 
+    struct ChannelsCleanupGuard;
+
+    impl Drop for ChannelsCleanupGuard {
+        fn drop(&mut self) {
+            autumn_web::__private::clear_global_channels();
+        }
+    }
+
     #[tokio::test]
     #[ignore = "requires Docker (testcontainers)"]
     #[allow(clippy::too_many_lines)]
@@ -186,6 +194,7 @@ mod tests {
         let channels = state.channels().clone();
         // Register channels globally in the worker
         autumn_web::__private::set_global_channels(channels.clone());
+        let _guard = ChannelsCleanupGuard;
 
         // Subscribe to basic and custom topics
         let mut basic_sub = channels.subscribe("broadcast_posts");

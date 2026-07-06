@@ -92,6 +92,7 @@ pub struct NewZeroColRecord {
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[allow(dead_code)]
 pub struct UpdateZeroColRecord {
     #[serde(default)]
     pub dummy: ::autumn_web::hooks::Patch<String>,
@@ -138,12 +139,13 @@ impl ::autumn_web::tenancy::ModelTenantIdMeta for NewZeroColRecord {
 }
 
 impl ZeroColRecord {
+    #[allow(clippy::unused_self)]
     pub fn __autumn_lock_version_actual(&self) -> ::core::option::Option<i64> {
         None
     }
 
     pub fn __autumn_upsert_set() -> impl ::autumn_web::reexports::diesel::query_builder::AsChangeset<
-        Target = crate::test_zero_col_records::table,
+        Target = self::test_zero_col_records::table,
         Changeset = impl ::autumn_web::reexports::diesel::query_builder::QueryFragment<
             ::autumn_web::reexports::diesel::pg::Pg,
         > + ::core::marker::Send
@@ -152,7 +154,7 @@ impl ZeroColRecord {
     > + ::core::marker::Send
     + ::core::marker::Sync
     + 'static {
-        use crate::test_zero_col_records::dsl::*;
+        use self::test_zero_col_records::dsl::*;
         use ::autumn_web::reexports::diesel::ExpressionMethods as _;
         (dummy.eq(::autumn_web::reexports::diesel::pg::upsert::excluded(dummy)),)
     }

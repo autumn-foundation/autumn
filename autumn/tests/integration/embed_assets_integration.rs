@@ -67,8 +67,23 @@ async fn get_path(app: &axum::Router, uri: &str) -> axum::response::Response {
         .unwrap()
 }
 
+struct RestoreDirGuard {
+    original: std::path::PathBuf,
+}
+
+impl Drop for RestoreDirGuard {
+    fn drop(&mut self) {
+        if let Err(err) = std::env::set_current_dir(&self.original) {
+            eprintln!("Failed to restore working directory: {err}");
+        }
+    }
+}
+
 #[tokio::test]
 async fn single_binary_serves_styled_localized_pages_from_empty_dir() {
+    let original = std::env::current_dir().unwrap();
+    let _guard = RestoreDirGuard { original };
+
     // Register the embedded static tree as the process-wide asset source.
     autumn_web::assets::register_embedded_static(autumn_web::assets::EmbeddedStaticDir(&STATIC));
 

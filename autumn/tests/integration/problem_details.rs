@@ -330,7 +330,7 @@ async fn csrf_failures_honor_json_accept_quality_over_html() {
 #[test]
 fn problem_details_schema_fixture_defines_contract_keys() {
     let schema: serde_json::Value = serde_json::from_str(include_str!(
-        "../../docs/schemas/problem-details.schema.json"
+        "../../../docs/schemas/problem-details.schema.json"
     ))
     .expect("problem-details schema must be valid JSON");
     let required = schema["required"].as_array().expect("required array");
