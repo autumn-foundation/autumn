@@ -9,10 +9,8 @@ mod authorization_integration;
 mod auto_broadcast;
 mod bot_protection_pipeline;
 mod boundary_hooks_integration;
-mod cache_global_integration;
 #[cfg(feature = "cache-moka")]
 mod cache_stampede;
-mod cached_global_backend;
 #[cfg(feature = "ws")]
 mod chaos_channels;
 #[cfg(feature = "ws")]

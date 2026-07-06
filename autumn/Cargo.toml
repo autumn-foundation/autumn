@@ -263,5 +263,13 @@ path = "tests/feature_flags_pg_integration.rs"
 name = "scoped_tokens_db"
 path = "tests/scoped_tokens_db.rs"
 
+[[test]]
+name = "cache_global_integration"
+path = "tests/cache_global_integration.rs"
+
+[[test]]
+name = "cached_global_backend"
+path = "tests/cached_global_backend.rs"
+
 [lints]
 workspace = true
