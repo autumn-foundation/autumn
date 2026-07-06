@@ -855,6 +855,38 @@ fn render_model_form(
             }
             let _ = writeln!(into_new, "        {name}: form.{name},");
             let _ = writeln!(from_row, "            {name}: row.{name},");
+        } else if f.kind == FieldKind::Bytea {
+            // `Vec<u8>` cannot deserialize from a single url-encoded value at
+            // all: `serde_urlencoded` hands each field's value to `serde` as
+            // a plain string, and `Vec<u8>`'s `Deserialize` impl expects a
+            // sequence — so a native-typed Bytea field would fail to decode
+            // *any* submission, not just an untouched one. There is no raw-
+            // bytes HTML input widget anyway, so it's represented as a
+            // lossy-UTF8 `String` on the form (matching what the old
+            // hand-rolled edit form already showed via
+            // `String::from_utf8_lossy`), converted back to bytes in
+            // `into_new`.
+            if f.nullable {
+                let _ = writeln!(struct_fields, "    pub {name}: Option<String>,");
+                let _ = writeln!(
+                    into_new,
+                    "        {name}: form.{name}.as_ref().map(|value| value.clone().into_bytes()),"
+                );
+                let _ = writeln!(
+                    from_row,
+                    "            {name}: row.{name}.as_ref().map(|value| String::from_utf8_lossy(value).into_owned()),"
+                );
+            } else {
+                let _ = writeln!(struct_fields, "    pub {name}: String,");
+                let _ = writeln!(
+                    into_new,
+                    "        {name}: form.{name}.clone().into_bytes(),"
+                );
+                let _ = writeln!(
+                    from_row,
+                    "            {name}: String::from_utf8_lossy(&row.{name}).into_owned(),"
+                );
+            }
         } else if matches!(f.kind, FieldKind::NaiveDateTime | FieldKind::DateTime) {
             // Represented as a `String` on the form (the browser's wire shape),
             // so it always decodes and serializes cleanly for repopulation; the
@@ -4599,6 +4631,63 @@ async fn main() {
         );
         assert!(
             routes.contains("post_id: row.post_id.to_string(),"),
+            "{routes}"
+        );
+    }
+
+    #[test]
+    fn execute_writes_required_bytea_field_as_string_on_form() {
+        // `Vec<u8>` cannot deserialize from a single url-encoded value at all
+        // (issue #1124 review) — represented as a lossy-UTF8 `String` on the
+        // form instead, matching what the old hand-rolled edit form already
+        // displayed via `String::from_utf8_lossy`, and converted back with
+        // `.into_bytes()` on the success path.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "payload:Bytea".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        assert!(routes.contains("pub payload: String,"), "{routes}");
+        assert!(
+            routes.contains("payload: form.payload.clone().into_bytes(),"),
+            "{routes}"
+        );
+        assert!(
+            routes.contains("payload: String::from_utf8_lossy(&row.payload).into_owned(),"),
+            "{routes}"
+        );
+    }
+
+    #[test]
+    fn execute_writes_nullable_bytea_field_as_option_string_on_form() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "payload:Option<Bytea>".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        assert!(routes.contains("pub payload: Option<String>,"), "{routes}");
+        assert!(
+            routes.contains(
+                "payload: form.payload.as_ref().map(|value| value.clone().into_bytes()),"
+            ),
+            "{routes}"
+        );
+        assert!(
+            routes.contains(
+                "payload: row.payload.as_ref().map(|value| String::from_utf8_lossy(value).into_owned()),"
+            ),
             "{routes}"
         );
     }

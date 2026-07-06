@@ -1234,10 +1234,26 @@ fn generated_scaffold_cargo_checks() {
             "mood:Option<enum{happy,sad}>",
             "price:decimal{10,2}",
             "balance:Option<decimal>",
+            "payload:Bytea",
+            "nickname:Option<Bytea>",
             "--validate",
             "title=length:min=1,max=200",
             "--live-validation",
         ],
+    );
+
+    // A `Bytea` field's `{Pascal}Form` representation must actually round-trip:
+    // `Vec<u8>` cannot deserialize from a single url-encoded value at all
+    // (issue #1124 review), so both nullable and non-nullable Bytea fields
+    // are represented as `String`/`Option<String>` on the form.
+    let routes_bytea = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
+    assert!(
+        routes_bytea.contains("pub payload: String,"),
+        "{routes_bytea}"
+    );
+    assert!(
+        routes_bytea.contains("pub nickname: Option<String>,"),
+        "{routes_bytea}"
     );
 
     // The `--live-validation` inline-validation handler must compile against
