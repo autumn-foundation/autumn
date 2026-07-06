@@ -38,7 +38,6 @@ mod compression_middleware;
 mod config_deprecation;
 mod config_runtime_drift;
 mod custom_layer;
-mod db_hooks_lifecycle;
 mod db_telemetry_tests;
 #[cfg(feature = "db")]
 mod directory_shard_router;
@@ -55,8 +54,6 @@ mod experiments_pg_integration;
 mod extractors;
 mod factory_integration;
 mod feature_flags_integration;
-#[cfg(all(feature = "db", not(windows)))]
-mod feature_flags_pg_integration;
 mod form_search_widgets;
 #[cfg(all(feature = "maud", feature = "cache-moka"))]
 mod fragment_cache_integration;
@@ -127,16 +124,12 @@ mod repository_replica_routing;
 mod repository_scope_meta;
 #[cfg(feature = "db")]
 mod repository_search;
-#[cfg(feature = "db")]
-mod repository_shard_replica_routing;
 mod request_timeout;
 mod route_macro;
 mod routes_macro;
 mod scheduled_coordination;
 mod schema_drift_guard;
 mod scoped_tokens;
-#[cfg(feature = "db")]
-mod scoped_tokens_db;
 mod security;
 mod seo;
 #[cfg(feature = "db")]

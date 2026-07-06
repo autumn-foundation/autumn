@@ -69,3 +69,23 @@ workspace = true
 [[test]]
 name = "cli_tests"
 path = "tests/cli_tests.rs"
+
+[[test]]
+name = "flags"
+path = "tests/flags.rs"
+
+[[test]]
+name = "config"
+path = "tests/config.rs"
+
+[[test]]
+name = "experiments"
+path = "tests/experiments.rs"
+
+[[test]]
+name = "e2e"
+path = "tests/e2e.rs"
+
+[[test]]
+name = "generate"
+path = "tests/generate.rs"

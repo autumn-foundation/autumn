@@ -10,12 +10,12 @@
 //! Run with:
 //!   cargo test -p autumn-cli --test experiments -- --ignored --nocapture
 
-use crate::integration::common;
+mod common;
 
 use common::{apply_sql, execute_params, run_autumn_fail, run_autumn_ok, start_postgres};
 
 const EXPERIMENTS_DDL: &str =
-    include_str!("../../../autumn/migrations/20260530300000_create_experiments/up.sql");
+    include_str!("../../autumn/migrations/20260530300000_create_experiments/up.sql");
 
 async fn start_experiments_db() -> (
     testcontainers::ContainerAsync<testcontainers_modules::postgres::Postgres>,

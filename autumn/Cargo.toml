@@ -247,5 +247,21 @@ harness = false
 name = "integration_tests"
 path = "tests/integration_tests.rs"
 
+[[test]]
+name = "db_hooks_lifecycle"
+path = "tests/db_hooks_lifecycle.rs"
+
+[[test]]
+name = "repository_shard_replica_routing"
+path = "tests/repository_shard_replica_routing.rs"
+
+[[test]]
+name = "feature_flags_pg_integration"
+path = "tests/feature_flags_pg_integration.rs"
+
+[[test]]
+name = "scoped_tokens_db"
+path = "tests/scoped_tokens_db.rs"
+
 [lints]
 workspace = true
