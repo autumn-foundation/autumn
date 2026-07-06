@@ -92,7 +92,7 @@ jobs:
       # no extra setup.
       - name: Install Chromium
         id: setup-chrome
-        uses: browser-actions/setup-chrome@v1
+        uses: browser-actions/setup-chrome@v2
 
       # Every example's layout references its Tailwind-compiled
       # `/static/css/autumn.css`. Without this, each example's build.rs finds
