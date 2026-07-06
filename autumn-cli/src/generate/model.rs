@@ -1111,6 +1111,17 @@ fn render_validation_attr(field: &Field, rule: &str) -> Result<String, String> {
     if min.is_none() && max.is_none() {
         return Err("length validation needs at least min=N or max=N".to_owned());
     }
+    // A `min` greater than `max` is a self-contradictory rule that no string
+    // can ever satisfy: not a mistake to silently accept and generate an
+    // always-invalid field, one for which the generated smoke test's own
+    // "valid submission" would fail (issue #1124 review).
+    if let (Some(min), Some(max)) = (min, max)
+        && min > max
+    {
+        return Err(format!(
+            "length validation's min ({min}) cannot be greater than its max ({max})"
+        ));
+    }
 
     let mut args = Vec::new();
     if let Some(min) = min {

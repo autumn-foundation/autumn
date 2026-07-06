@@ -5749,6 +5749,34 @@ async fn main() {
     }
 
     #[test]
+    fn scaffold_validation_rejects_min_greater_than_max() {
+        // Regression guard (issue #1124 review): `length:min=5,max=3` is a
+        // self-contradictory rule no string can ever satisfy — accepting it
+        // would generate a field that's permanently invalid and a smoke test
+        // whose "valid submission" assertion is always false. It must be
+        // rejected at generate-time instead.
+        let tmp = project_with_main(default_main());
+        let err = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+            &ScaffoldOptions {
+                model: ModelOptions {
+                    validations: vec!["title=length:min=5,max=3".into()],
+                    ..ModelOptions::default()
+                },
+                ..ScaffoldOptions::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, GenerateError::InvalidField { .. }),
+            "expected min > max to be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
     fn scaffold_multiple_enum_fields_each_use_own_variant_as_other_columns_sample() {
         // A second required enum column's raw-INSERT sample value must be one
         // of *its own* variants, not the generic `'sample'` placeholder —
