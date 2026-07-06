@@ -9,3 +9,7 @@
 #[cfg(feature = "maud")]
 pub mod pagination;
 pub mod tokens;
+/// Framework-owned widget component CSS — see [`widgets_css`] for docs.
+mod widgets_css;
+
+pub use widgets_css::{WIDGETS_COMPONENT_CSS, WIDGETS_CSS, WIDGETS_CSS_PATH};

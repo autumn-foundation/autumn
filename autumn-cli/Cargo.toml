@@ -17,7 +17,7 @@ name = "autumn"
 path = "src/main.rs"
 
 [dependencies]
-autumn-web = { version = "0.6.0", path = "../autumn", default-features = false, features = [
+autumn-web = { version = "0.7.0", path = "../autumn", default-features = false, features = [
     "db", "htmx", "maud", "mail", "storage", "i18n", "telemetry-otlp", "redis", "cache-moka", "http-client", "reporting"
 ] }
 base64 = "0.22"

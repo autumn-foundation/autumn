@@ -328,6 +328,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `telemetry-otlp`) — so downstream apps building with a trimmed feature set
   can't silently break between releases (#982).
 
+## [0.7.0] - 2026-07-06
+
+### Added
+
+- **ui:** Framework-owned widget stylesheet (issue #1215) — every semantic
+  `autumn-*` class emitted by form fields, the submit button, active
+  search/autocomplete, the nav bar, breadcrumbs, hero banners, modals, tabs,
+  pagination, property lists, direct-to-storage upload, and job status is now
+  backed by one shipped, token-themeable stylesheet (`autumn_web::ui::WIDGETS_CSS`,
+  served at `autumn_web::ui::WIDGETS_CSS_PATH`) instead of a ~264-line block
+  copy-pasted into every app's `input.css`. Plain CSS (no Tailwind build
+  required), embeddable in single-binary release builds (#1004), and
+  re-themed by overriding the existing `ui::tokens` design tokens rather than
+  forking the component CSS. The `autumn new` template and every example's
+  `input.css` no longer inline the widget CSS; a coverage test
+  (`widget_css_coverage`) fails the build if a widget ever emits an `autumn-*`
+  class with no backing rule. Additive; no breaking change; minor version
+  bump. See [Widget styling](docs/guide/widget-styling.md).
+
 ## [0.6.0] - 2026-06-30
 
 ### Added

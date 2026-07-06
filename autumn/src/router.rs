@@ -1480,6 +1480,23 @@ fn mount_framework_routes(
         );
     }
 
+    // Framework-provided widget stylesheet (#1215). Backs every `autumn-*`
+    // class emitted by form/widgets/wizard/pagination/storage/job-tracking so
+    // widgets render styled without an app-authored copy — Tailwind or not.
+    #[cfg(feature = "maud")]
+    {
+        router = router.route(
+            crate::ui::WIDGETS_CSS_PATH,
+            axum::routing::get(widgets_css_handler),
+        );
+        tracing::debug!(
+            method = "GET",
+            path = crate::ui::WIDGETS_CSS_PATH,
+            name = "autumn widget stylesheet",
+            "Mounted route"
+        );
+    }
+
     if dev_reload_enabled {
         router = router.route(
             dev::LIVE_RELOAD_PATH,
@@ -3257,6 +3274,24 @@ pub async fn flash_css_handler() -> axum::response::Response {
         .into_response()
 }
 
+/// Serves the framework's widget stylesheet ([`crate::ui::WIDGETS_CSS`]) at
+/// [`crate::ui::WIDGETS_CSS_PATH`] (#1215).
+#[cfg(feature = "maud")]
+pub async fn widgets_css_handler() -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (
+        [
+            (http::header::CONTENT_TYPE, "text/css; charset=utf-8"),
+            (
+                http::header::CACHE_CONTROL,
+                "public, max-age=31536000, immutable",
+            ),
+        ],
+        crate::ui::WIDGETS_CSS,
+    )
+        .into_response()
+}
+
 #[cfg(feature = "htmx")]
 pub async fn htmx_csrf_handler() -> axum::response::Response {
     use axum::response::IntoResponse;
@@ -3555,6 +3590,42 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(legacy.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// The framework-owned widget stylesheet (#1215) is served the same way
+    /// as the flash stylesheet: a same-origin, immutably-cached asset — not
+    /// inline styles — so a strict `style-src 'self'` CSP still works and the
+    /// asset is embeddable in the single binary (#1004) with no loose files.
+    #[cfg(feature = "maud")]
+    #[tokio::test]
+    async fn widgets_css_route_serves_the_shared_stylesheet() {
+        let app = build_router(Vec::new(), &AutumnConfig::default(), test_state());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(crate::ui::WIDGETS_CSS_PATH)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let content_type = response
+            .headers()
+            .get(http::header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(content_type.contains("text/css"), "{content_type}");
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains(".autumn-field"), "{body}");
+        assert!(body.contains(":root"), "{body}");
     }
 
     /// Pins the production access-log wiring (#999): the layer is applied in

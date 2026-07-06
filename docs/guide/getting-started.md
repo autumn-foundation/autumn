@@ -39,7 +39,7 @@ Autumn ships a small CLI for project scaffolding and tooling setup. Install the
 published CLI from crates.io:
 
 ```bash
-cargo install autumn-cli --version 0.6.0
+cargo install autumn-cli --version 0.7.0
 ```
 
 For local development only, from an Autumn source checkout, install the CLI you
@@ -239,7 +239,7 @@ Probe endpoints are also available at `/live`, `/ready`, and `/startup`.
 The `/health` response looks like:
 
 ```json
-{ "status": "ok", "version": "0.6.0" }
+{ "status": "ok", "version": "0.7.0" }
 ```
 
 Press **Ctrl+C** to stop the server (graceful shutdown with a configurable
@@ -471,7 +471,7 @@ Add the required dependencies to `Cargo.toml`:
 
 ```toml
 [dependencies]
-autumn-web = "0.6"
+autumn-web = "0.7"
 chrono = { version = "0.4", features = ["serde"] }
 diesel = { version = "2", features = ["postgres", "chrono"] }
 diesel-async = { version = "0.8", features = ["postgres"] }
