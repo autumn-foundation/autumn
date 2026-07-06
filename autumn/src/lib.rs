@@ -376,7 +376,9 @@ pub mod __private {
         start_repository_commit_hook_worker,
     };
     #[cfg(feature = "db")]
-    pub use crate::repository_commit_hooks::{clear_global_channels, get_global_channels, set_global_channels};
+    pub use crate::repository_commit_hooks::{
+        clear_global_channels, get_global_channels, set_global_channels,
+    };
     #[cfg(feature = "db")]
     pub use crate::version_history::VersionedRepositoryDescriptor;
 
