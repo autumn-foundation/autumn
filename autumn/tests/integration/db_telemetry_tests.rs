@@ -3,6 +3,7 @@
 //! **Requires Docker** to be running.
 
 #[cfg(feature = "db")]
+#[allow(clippy::module_inception)]
 mod db_telemetry_tests {
     use autumn_web::db::StatementTimeout;
     use autumn_web::prelude::*;

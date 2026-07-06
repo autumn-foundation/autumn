@@ -92,6 +92,7 @@ pub struct NewZeroColRecord {
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[allow(dead_code)]
 pub struct UpdateZeroColRecord {
     #[serde(default)]
     pub dummy: ::autumn_web::hooks::Patch<String>,
@@ -138,6 +139,7 @@ impl ::autumn_web::tenancy::ModelTenantIdMeta for NewZeroColRecord {
 }
 
 impl ZeroColRecord {
+    #[allow(clippy::unused_self)]
     pub fn __autumn_lock_version_actual(&self) -> ::core::option::Option<i64> {
         None
     }
