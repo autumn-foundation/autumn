@@ -524,6 +524,23 @@ where
 /// validation error instead of being dropped into a spurious "missing
 /// field" decode failure. A genuinely malformed (non-blank) value still
 /// fails immediately, matching the "undecodable body is a hard 400" contract.
+///
+/// # Scope: any field that already tolerates a missing key
+///
+/// This helper can only observe "decoding this field's blank value failed,
+/// and removing the key fixes it" — it cannot see the target type, so it
+/// cannot distinguish `Option<T>` from a required `#[serde(default)]` field
+/// (e.g. [`checkbox_input`]'s documented `#[serde(default)] published: bool`
+/// convention for an unchecked box). Dropping the key makes both resolve to
+/// whatever that field already treats a *missing* key as — `None` or the
+/// `#[serde(default)]` value respectively. This is intentionally consistent
+/// rather than a leak: a field with no such tolerance (no `Option`, no
+/// `#[serde(default)]`) still hard-fails, because removing its key surfaces
+/// a *missing field* error next iteration instead of resolving — see
+/// `blank_required_field_without_default_still_fails_to_decode` for the
+/// guarantee. And nothing new is reachable through this leniency: a client
+/// that wants a `#[serde(default)]` field to take its default value could
+/// already get that by omitting the key entirely.
 fn decode_urlencoded_dropping_blank_optional_fields<T: serde::de::DeserializeOwned>(
     bytes: &[u8],
 ) -> Result<T, serde_path_to_error::Error<serde_urlencoded::de::Error>> {
@@ -3551,6 +3568,64 @@ mod tests {
                 .unwrap();
             assert_eq!(resp.status(), axum::http::StatusCode::OK);
             assert_body(resp, "valid=false name=\"\" age=None").await;
+        }
+
+        #[derive(serde::Deserialize, validator::Validate)]
+        struct CheckboxForm {
+            #[serde(default)]
+            published: bool,
+        }
+
+        #[tokio::test]
+        async fn blank_defaulted_checkbox_field_decodes_to_its_default() {
+            // Documented, intended behavior (see
+            // `decode_urlencoded_dropping_blank_optional_fields`'s "Scope"
+            // doc section): a `#[serde(default)] bool` field explicitly
+            // submitted blank (as opposed to omitted, which is what a real
+            // unchecked `<input type="checkbox">` actually sends) resolves
+            // to the same default a client could already get by omitting
+            // the key entirely — no new capability, just consistent with
+            // the field's own declared tolerance for a missing key.
+            async fn handler(form: ChangesetForm<CheckboxForm>) -> String {
+                format!("published={}", form.data().published)
+            }
+            let resp = Router::new()
+                .route("/test", post(handler))
+                .oneshot(urlencoded_req("/test", "published="))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), axum::http::StatusCode::OK);
+            assert_body(resp, "published=false").await;
+        }
+
+        #[derive(serde::Deserialize, validator::Validate)]
+        struct RequiredBoolForm {
+            #[allow(
+                dead_code,
+                reason = "decode is expected to fail before this is ever read"
+            )]
+            accepted_terms: bool,
+        }
+
+        #[tokio::test]
+        async fn blank_required_field_without_default_still_fails_to_decode() {
+            // The boundary the "Scope" doc section on
+            // `decode_urlencoded_dropping_blank_optional_fields` promises:
+            // a field with *no* tolerance for a missing key at all (no
+            // `Option`, no `#[serde(default)]`) must still hard-fail on a
+            // blank submission — dropping its key surfaces a "missing
+            // field" error on the next attempt instead of resolving, so
+            // the function gives up and returns that error rather than
+            // silently accepting a bogus value.
+            async fn handler(_form: ChangesetForm<RequiredBoolForm>) -> String {
+                "unreachable".to_string()
+            }
+            let resp = Router::new()
+                .route("/test", post(handler))
+                .oneshot(urlencoded_req("/test", "accepted_terms="))
+                .await
+                .unwrap();
+            assert_ne!(resp.status(), axum::http::StatusCode::OK);
         }
 
         #[tokio::test]
