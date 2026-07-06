@@ -103,17 +103,17 @@ jobs:
 
       - name: generated_project_compiles_runs_and_serves
         run: |
-          cargo test -p autumn-cli --test e2e \
+          cargo test -p autumn-cli --test cli_tests \
             generated_project_compiles_runs_and_serves -- --ignored --exact
 
       - name: generated_scaffold_cargo_checks
         run: |
-          cargo test -p autumn-cli --test generate \
+          cargo test -p autumn-cli --test cli_tests \
             generated_scaffold_cargo_checks -- --ignored --exact
 
       - name: generated_scaffold_config_cargo_checks
         run: |
-          cargo test -p autumn-cli --test generate \
+          cargo test -p autumn-cli --test cli_tests \
             generated_scaffold_config_cargo_checks -- --ignored --exact
 
       - name: Pre-fetch TOTP deps (absent from workspace Cargo.lock)
@@ -137,27 +137,27 @@ jobs:
 
       - name: generated_auth_totp_cargo_checks
         run: |
-          cargo test -p autumn-cli --test generate \
+          cargo test -p autumn-cli --test cli_tests \
             generated_auth_totp_cargo_checks -- --ignored --exact
 
       - name: generated_job_cargo_checks
         run: |
-          cargo test -p autumn-cli --test generate \
+          cargo test -p autumn-cli --test cli_tests \
             generated_job_cargo_checks -- --ignored --exact
 
       - name: generated_channel_cargo_checks
         run: |
-          cargo test -p autumn-cli --test generate \
+          cargo test -p autumn-cli --test cli_tests \
             generated_channel_cargo_checks -- --ignored --exact
 
       - name: generated_channel_ws_cargo_checks
         run: |
-          cargo test -p autumn-cli --test generate \
+          cargo test -p autumn-cli --test cli_tests \
             generated_channel_ws_cargo_checks -- --ignored --exact
 
       - name: generated_channel_smoke_test_passes
         run: |
-          cargo test -p autumn-cli --test generate \
+          cargo test -p autumn-cli --test cli_tests \
             generated_channel_smoke_test_passes -- --ignored --exact
 
   # ── Postgres e2e gate ────────────────────────────────────────────────────────
@@ -198,5 +198,5 @@ jobs:
 
       - name: generated_scaffold_serves_posts_index_and_json_api
         run: |
-          cargo test -p autumn-cli --test generate \
+          cargo test -p autumn-cli --test cli_tests \
             generated_scaffold_serves_posts_index_and_json_api -- --ignored --exact

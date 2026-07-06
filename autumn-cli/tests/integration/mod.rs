@@ -1,5 +1,5 @@
-pub mod common;
 mod cloud_native_scaffold;
+pub mod common;
 mod config;
 mod db;
 mod db_pull;
