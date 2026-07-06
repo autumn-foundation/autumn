@@ -10,6 +10,7 @@ homepage = "https://github.com/madmax983/autumn"
 readme = "../README.md"
 keywords = ["web", "composable", "axum", "htmx", "fullstack"]
 categories = ["web-programming", "web-programming::http-server"]
+autotests = false
 
 [features]
 default = ["maud", "htmx", "tailwind", "db", "cache-moka", "http-client", "reporting", "flash"]
@@ -241,6 +242,10 @@ harness = false
 [[bench]]
 name = "inspector"
 harness = false
+
+[[test]]
+name = "integration_tests"
+path = "tests/integration_tests.rs"
 
 [lints]
 workspace = true

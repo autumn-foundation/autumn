@@ -22,7 +22,7 @@ use testcontainers_modules::postgres::Postgres;
 /// Run the feature-flag migration SQL on a fresh connection to create the
 /// required tables, indexes, and trigger function.
 const MIGRATION_SQL: &str =
-    include_str!("../migrations/20260530200000_create_feature_flags/up.sql");
+    include_str!("../../migrations/20260530200000_create_feature_flags/up.sql");
 
 async fn setup_pg_store() -> (PgFlagStore, testcontainers::ContainerAsync<Postgres>) {
     let container = Postgres::default()

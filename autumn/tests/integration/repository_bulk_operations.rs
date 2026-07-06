@@ -143,7 +143,7 @@ impl ZeroColRecord {
     }
 
     pub fn __autumn_upsert_set() -> impl ::autumn_web::reexports::diesel::query_builder::AsChangeset<
-        Target = crate::test_zero_col_records::table,
+        Target = self::test_zero_col_records::table,
         Changeset = impl ::autumn_web::reexports::diesel::query_builder::QueryFragment<
             ::autumn_web::reexports::diesel::pg::Pg,
         > + ::core::marker::Send
@@ -152,7 +152,7 @@ impl ZeroColRecord {
     > + ::core::marker::Send
     + ::core::marker::Sync
     + 'static {
-        use crate::test_zero_col_records::dsl::*;
+        use self::test_zero_col_records::dsl::*;
         use ::autumn_web::reexports::diesel::ExpressionMethods as _;
         (dummy.eq(::autumn_web::reexports::diesel::pg::upsert::excluded(dummy)),)
     }

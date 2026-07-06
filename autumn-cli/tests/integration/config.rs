@@ -10,12 +10,12 @@
 //! Run with:
 //!   cargo test -p autumn-cli --test config -- --ignored --nocapture
 
-mod common;
+use crate::integration::common;
 
 use common::{apply_sql, run_autumn_fail, run_autumn_ok, start_postgres};
 
 const RUNTIME_CONFIG_DDL: &str =
-    include_str!("../../autumn/migrations/20260530000000_create_runtime_config/up.sql");
+    include_str!("../../../autumn/migrations/20260530000000_create_runtime_config/up.sql");
 
 async fn start_config_db() -> (
     testcontainers::ContainerAsync<testcontainers_modules::postgres::Postgres>,

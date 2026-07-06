@@ -76,7 +76,7 @@ async fn delete_directory_row(db: &TestDb, tenant_key: &str) {
 async fn directory_pins_tenant_then_invalidate_falls_back_to_hash() {
     let db = TestDb::shared().await;
     db.execute_sql(include_str!(
-        "../migrations/20260612000000_create_shard_directory/up.sql"
+        "../../migrations/20260612000000_create_shard_directory/up.sql"
     ))
     .await;
 

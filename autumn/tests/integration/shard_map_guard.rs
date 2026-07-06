@@ -80,7 +80,7 @@ async fn read_stored_map(db: &TestDb) -> Vec<(String, String)> {
 async fn shard_map_guard_persists_on_first_boot_and_reboot_is_ok() {
     let db = TestDb::shared().await;
     db.execute_sql(include_str!(
-        "../migrations/20260627000000_create_shard_map/up.sql"
+        "../../migrations/20260627000000_create_shard_map/up.sql"
     ))
     .await;
 
@@ -116,7 +116,7 @@ async fn shard_map_guard_persists_on_first_boot_and_reboot_is_ok() {
 async fn shard_map_guard_refuses_when_topology_changes() {
     let db = TestDb::shared().await;
     db.execute_sql(include_str!(
-        "../migrations/20260627000000_create_shard_map/up.sql"
+        "../../migrations/20260627000000_create_shard_map/up.sql"
     ))
     .await;
 
@@ -175,7 +175,7 @@ async fn shard_map_guard_refuses_when_topology_changes() {
 async fn shard_map_guard_inert_in_explicit_slot_mode() {
     let db = TestDb::shared().await;
     db.execute_sql(include_str!(
-        "../migrations/20260627000000_create_shard_map/up.sql"
+        "../../migrations/20260627000000_create_shard_map/up.sql"
     ))
     .await;
 

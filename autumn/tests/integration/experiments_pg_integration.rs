@@ -15,7 +15,7 @@ use diesel::prelude::*;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
 
-const MIGRATION_SQL: &str = include_str!("../migrations/20260530300000_create_experiments/up.sql");
+const MIGRATION_SQL: &str = include_str!("../../migrations/20260530300000_create_experiments/up.sql");
 
 async fn setup_pg_store() -> (
     PgExperimentStore,

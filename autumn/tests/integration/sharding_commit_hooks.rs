@@ -34,9 +34,9 @@ mod sharding_commit_hook_tests {
     // The real framework migration SQL applied to the shard, so the test
     // exercises exactly the schema Section 5a ships to shard targets.
     const VERSION_HISTORY_UP: &str =
-        include_str!("../version_history_migrations/20260526000000_create_version_history/up.sql");
+        include_str!("../../version_history_migrations/20260526000000_create_version_history/up.sql");
     const COMMIT_HOOK_UP: &str = include_str!(
-        "../repository_commit_hook_migrations/20260515000000_create_repository_commit_hook_queue/up.sql"
+        "../../repository_commit_hook_migrations/20260515000000_create_repository_commit_hook_queue/up.sql"
     );
 
     // ── Schema ─────────────────────────────────────────────────

@@ -126,9 +126,9 @@ async fn postgres_backend_persists_tracked_job_and_expires_it() {
     use testcontainers_modules::postgres::Postgres;
 
     const CREATE_AUTUMN_JOBS: &str =
-        include_str!("../migrations/20260513000000_create_job_queue/up.sql");
+        include_str!("../../migrations/20260513000000_create_job_queue/up.sql");
     const CREATE_JOB_TRACKING: &str =
-        include_str!("../migrations/20260702000000_create_job_tracking/up.sql");
+        include_str!("../../migrations/20260702000000_create_job_tracking/up.sql");
 
     #[derive(diesel::QueryableByName)]
     struct RecordRow {

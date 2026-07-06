@@ -10,12 +10,12 @@
 //! Run with:
 //!   cargo test -p autumn-cli --test flags -- --ignored --nocapture
 
-mod common;
+use crate::integration::common;
 
 use common::{apply_sql, run_autumn_fail, run_autumn_ok, start_postgres};
 
 const FEATURE_FLAGS_DDL: &str =
-    include_str!("../../autumn/migrations/20260530200000_create_feature_flags/up.sql");
+    include_str!("../../../autumn/migrations/20260530200000_create_feature_flags/up.sql");
 
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers); run with -- --ignored"]
