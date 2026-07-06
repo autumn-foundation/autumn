@@ -135,6 +135,7 @@ fn app_with(listeners: Vec<autumn_web::events::ListenerInfo>) -> autumn_web::tes
 
 #[tokio::test]
 async fn publishing_runs_sync_listeners_with_panic_isolation() {
+    let _job_lock = autumn_web::job::global_job_runtime_test_lock().lock().await;
     let client = app_with(all_listeners());
 
     client.get("/signup").send().await.assert_ok();
@@ -150,6 +151,7 @@ async fn publishing_runs_sync_listeners_with_panic_isolation() {
 
 #[tokio::test]
 async fn durable_listener_runs_via_the_job_runtime() {
+    let _job_lock = autumn_web::job::global_job_runtime_test_lock().lock().await;
     // Durable dispatch uses this app's own JobClient, so registering the durable
     // listener here is safe even though other parallel tests do the same.
     let client = app_with(all_listeners());
@@ -171,6 +173,7 @@ async fn durable_listener_runs_via_the_job_runtime() {
 
 #[tokio::test]
 async fn test_recorder_captures_published_events() {
+    let _job_lock = autumn_web::job::global_job_runtime_test_lock().lock().await;
     let client = app_with(all_listeners());
 
     client.get("/signup").send().await.assert_ok();
@@ -183,6 +186,7 @@ async fn test_recorder_captures_published_events() {
 
 #[tokio::test]
 async fn event_with_no_listeners_is_a_noop() {
+    let _job_lock = autumn_web::job::global_job_runtime_test_lock().lock().await;
     // No listeners registered at all.
     let client = app_with(Vec::new());
     // Publishing an event nobody listens to must succeed, not error.
@@ -193,6 +197,7 @@ async fn event_with_no_listeners_is_a_noop() {
 
 #[tokio::test]
 async fn adding_a_listener_needs_zero_emitter_edits() {
+    let _job_lock = autumn_web::job::global_job_runtime_test_lock().lock().await;
     // The emitter (`signup`) is identical here; we register only one listener.
     // This is the "+1 file, 0 emitter edits" property: registration is the only
     // thing that changes when a reaction is added.
@@ -206,6 +211,7 @@ async fn adding_a_listener_needs_zero_emitter_edits() {
 
 #[tokio::test]
 async fn free_publisher_dispatches_to_the_current_app() {
+    let _job_lock = autumn_web::job::global_job_runtime_test_lock().lock().await;
     // A handler using the module-level `events::publish` (not the extractor)
     // must still reach this app's listeners and recorder via the ambient context.
     let client = app_with(all_listeners());
@@ -222,6 +228,7 @@ async fn free_publisher_dispatches_to_the_current_app() {
 
 #[tokio::test]
 async fn sync_listener_can_publish_a_followup_event() {
+    let _job_lock = autumn_web::job::global_job_runtime_test_lock().lock().await;
     // The sync listener runs on the request's task and calls the free publisher;
     // the ambient app context must carry through so the follow-up is recorded
     // against this app (it would be lost if listeners were detached via spawn).
@@ -242,6 +249,7 @@ async fn sync_listener_can_publish_a_followup_event() {
 
 #[tokio::test]
 async fn free_publisher_is_isolated_across_parallel_apps() {
+    let _job_lock = autumn_web::job::global_job_runtime_test_lock().lock().await;
     // Two apps live at once. Publishing through the free function on app A must
     // not leak into app B's recorder — proving the path is app-scoped, not global.
     let app_a = app_with(all_listeners());
