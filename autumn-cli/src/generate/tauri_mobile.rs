@@ -684,7 +684,17 @@ const PLACEHOLDER_ICNS: &[u8] = &[
 mod tests {
     use tempfile::TempDir;
 
+    use super::super::emit::Action;
     use super::*;
+
+    /// Find the planned action targeting the APP crate's `src/<name>` —
+    /// as opposed to the shell's `src-tauri/src/<name>`.
+    fn app_src_action<'p>(plan: &'p Plan, name: &str) -> Option<&'p Action> {
+        plan.actions.iter().find(|a| {
+            a.path().ends_with(format!("src/{name}"))
+                && !a.path().to_string_lossy().contains("src-tauri")
+        })
+    }
 
     fn app_dir(name: &str) -> TempDir {
         let tmp = TempDir::new().unwrap();
@@ -763,23 +773,17 @@ mod tests {
 
         let plan = plan_tauri_mobile(tmp.path()).unwrap();
 
-        let lib_action = plan
-            .actions
-            .iter()
-            .find(|a| a.path().ends_with("src/lib.rs") && !a.path().to_string_lossy().contains("src-tauri"))
-            .expect("plan must create the app src/lib.rs");
-        let super::super::emit::Action::CreateIfAbsent { contents, .. } = lib_action else {
+        let lib_action =
+            app_src_action(&plan, "lib.rs").expect("plan must create the app src/lib.rs");
+        let Action::CreateIfAbsent { contents, .. } = lib_action else {
             panic!("app lib.rs must be a CreateIfAbsent action, got {lib_action:?}");
         };
         assert!(contents.contains("pub async fn serve()"));
         assert!(!contents.contains("async fn main()"));
 
-        let main_action = plan
-            .actions
-            .iter()
-            .find(|a| a.path().ends_with("src/main.rs") && !a.path().to_string_lossy().contains("src-tauri"))
-            .expect("plan must rewrite the app src/main.rs");
-        let super::super::emit::Action::Modify { contents, .. } = main_action else {
+        let main_action =
+            app_src_action(&plan, "main.rs").expect("plan must rewrite the app src/main.rs");
+        let Action::Modify { contents, .. } = main_action else {
             panic!("app main.rs must be a Modify action, got {main_action:?}");
         };
         assert!(contents.contains("my_app::serve().await;"));
@@ -798,9 +802,7 @@ mod tests {
         let plan = plan_tauri_mobile(tmp.path()).unwrap();
 
         assert!(
-            !plan.actions.iter().any(|a| {
-                a.path().ends_with("src/lib.rs") && !a.path().to_string_lossy().contains("src-tauri")
-            }),
+            app_src_action(&plan, "lib.rs").is_none(),
             "no app lib.rs may be planned when the anchor is missing"
         );
         assert!(
@@ -824,9 +826,7 @@ mod tests {
 
         let plan = plan_tauri_mobile(tmp.path()).unwrap();
         assert!(plan.warnings.is_empty());
-        assert!(!plan.actions.iter().any(|a| {
-            a.path().ends_with("src/main.rs") && !a.path().to_string_lossy().contains("src-tauri")
-        }));
+        assert!(app_src_action(&plan, "main.rs").is_none());
     }
 
     #[test]

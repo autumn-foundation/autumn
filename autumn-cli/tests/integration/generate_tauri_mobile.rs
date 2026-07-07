@@ -53,8 +53,7 @@ fn run_autumn(project_dir: &Path, args: &[&str]) -> Output {
 }
 
 fn read(path: &Path) -> String {
-    fs::read_to_string(path)
-        .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
+    fs::read_to_string(path).unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
 }
 
 #[test]
@@ -323,7 +322,10 @@ fn docs_page_covers_sandboxing_pool_and_app_store() {
     let page = read(&docs_dir.join("tauri-mobile-in-process.md"));
 
     // AC1: mobile sandboxing restrictions — no process spawning / sidecars.
-    assert!(page.contains("sandbox"), "docs must cover mobile sandboxing");
+    assert!(
+        page.contains("sandbox"),
+        "docs must cover mobile sandboxing"
+    );
     assert!(
         page.contains("sidecar"),
         "docs must explain why the desktop sidecar model cannot ship on mobile"
@@ -348,7 +350,10 @@ fn docs_page_covers_sandboxing_pool_and_app_store() {
 
     // AC4: App Store Guideline compliance for hybrid native-web apps.
     assert!(page.contains("4.2"), "docs must cover Apple guideline 4.2");
-    assert!(page.contains("2.5.2"), "docs must cover Apple guideline 2.5.2");
+    assert!(
+        page.contains("2.5.2"),
+        "docs must cover Apple guideline 2.5.2"
+    );
     assert!(
         page.contains("Google Play"),
         "docs must cover the Google Play equivalent"

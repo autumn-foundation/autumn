@@ -1819,8 +1819,8 @@ enum GenerateCommands {
     ///   - `src-tauri/`                 — standalone Tauri mobile shell crate
     ///     (staticlib/cdylib; no externalBin, no sidecar, no staging scripts)
     ///   - `src-tauri/src/lib.rs`       — spawns the server thread inside
-    ///     tauri::Builder::default().setup(...), polls /health, then opens the
-    ///     webview at http://127.0.0.1:<port>
+    ///     `tauri::Builder::default().setup(...)`, polls /health, then opens the
+    ///     webview at `http://127.0.0.1:<port>`
     ///   - `src-tauri/icons/`           — placeholder icons for immediate buildability
     ///
     /// See docs/guide/tauri-mobile-in-process.md for mobile sandboxing restrictions,
@@ -6069,8 +6069,7 @@ mod tests {
 
     #[test]
     fn parse_generate_tauri_mobile_dry_run() {
-        let cli =
-            Cli::try_parse_from(["autumn", "generate", "tauri-mobile", "--dry-run"]).unwrap();
+        let cli = Cli::try_parse_from(["autumn", "generate", "tauri-mobile", "--dry-run"]).unwrap();
         let Commands::Generate(GenerateCommands::TauriMobile { dry_run, force }) = cli.command
         else {
             panic!("expected TauriMobile variant");
