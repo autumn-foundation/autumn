@@ -352,34 +352,79 @@ fn find_after_routes_call(src: &str) -> Option<usize> {
 /// Inverse of the chaining performed by [`add_inbound_mail_router_to_app`]
 /// (`autumn destroy`, issue #1048).
 ///
-/// Both insertion paths in `add_inbound_mail_router_to_app` keep the whole
-/// `.inbound_mail_router(...)` call (and any chained `.handler(...)` calls)
-/// on one unbroken text line, so removal is line-based: strip exactly
-/// `.handler(<handler_module_path>())` from the line containing it; if that
-/// leaves other `.handler(...)` calls chained on, splice the shortened line
-/// back in, otherwise this was the only handler and the whole line (the
-/// `.inbound_mail_router(...)` call) is removed.
+/// `generate` always inserts the `.inbound_mail_router(...)` call (and any
+/// chained `.handler(...)` calls) on one unbroken text line, but a project
+/// that runs `rustfmt` afterward commonly wraps this particular call across
+/// several lines — it's long, carrying an `.endpoint(...)` config with a
+/// path and an env-var lookup. Line-based removal would then strip only the
+/// line holding `.handler(...)`, leaving the rest of the (now handler-less)
+/// `.inbound_mail_router(...)` call behind (issue #1048 PR review). So this
+/// locates the WHOLE call by balanced-paren scan — regardless of how many
+/// lines it spans — and removes exactly `.handler(<handler_module_path>())`
+/// from within it; if other `.handler(...)` calls remain chained on, the
+/// shortened call is spliced back in place, otherwise this was the only
+/// handler and every full line the call spans is removed.
 ///
 /// A no-op if `handler_module_path` isn't currently registered.
 pub(super) fn remove_inbound_mail_handler(existing: &str, handler_module_path: &str) -> String {
+    const ROUTER_CALL: &str = ".inbound_mail_router(";
     let handler_snippet = format!(".handler({handler_module_path}())");
     if !existing.contains(&handler_snippet) {
         return existing.to_owned();
     }
-    let lines: Vec<&str> = existing.lines().collect();
-    let Some(idx) = lines.iter().position(|l| l.contains(&handler_snippet)) else {
+    let Some(router_pos) = existing.find(ROUTER_CALL) else {
         return existing.to_owned();
     };
-    let without_handler = lines[idx].replacen(&handler_snippet, "", 1);
-    if without_handler.contains(".handler(") {
-        return super::schema_edit::splice_single_line(
-            &lines,
-            idx,
-            &without_handler,
-            existing.ends_with('\n'),
-        );
+    let Some(call_end) = find_balanced_close_paren(existing, router_pos + ROUTER_CALL.len()) else {
+        return existing.to_owned();
+    };
+    let call_text = &existing[router_pos..call_end];
+    if !call_text.contains(&handler_snippet) {
+        return existing.to_owned();
     }
-    super::schema_edit::remove_single_line(&lines, idx, existing.ends_with('\n'))
+    let without_handler = call_text.replacen(handler_snippet.as_str(), "", 1);
+    if without_handler.contains(".handler(") {
+        let mut out = String::with_capacity(existing.len());
+        out.push_str(&existing[..router_pos]);
+        out.push_str(&without_handler);
+        out.push_str(&existing[call_end..]);
+        return out;
+    }
+
+    // No handlers left — remove every full line the call spans, whether
+    // `generate` left it on one line or `rustfmt` later wrapped it.
+    let start_line = existing[..router_pos].rfind('\n').map_or(0, |i| i + 1);
+    let end_line = existing[call_end..]
+        .find('\n')
+        .map_or(existing.len(), |i| call_end + i + 1);
+    let mut out = String::with_capacity(existing.len());
+    out.push_str(&existing[..start_line]);
+    out.push_str(&existing[end_line..]);
+    out
+}
+
+/// Scan forward from `start` (the byte position just after an already-open
+/// `(`, i.e. depth 1) for the matching closing paren, returning the index
+/// just past it. `None` if the parens never balance (malformed/truncated
+/// input — destroy never guesses).
+fn find_balanced_close_paren(src: &str, start: usize) -> Option<usize> {
+    let bytes = src.as_bytes();
+    let mut depth = 1usize;
+    let mut i = start;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 #[cfg(test)]
@@ -646,6 +691,49 @@ async fn main() {
         assert!(
             updated.contains("support_handler_info()"),
             "must chain new handler, got:\n{updated}"
+        );
+    }
+
+    #[test]
+    fn remove_inbound_mail_handler_removes_a_rustfmt_wrapped_router_call() {
+        // rustfmt commonly wraps this call across several lines (it's long:
+        // an .endpoint(...) config with a path and an env-var lookup).
+        // Line-based removal would strip only the `.handler(...)` line and
+        // leave the rest of the (now handler-less) call behind — issue
+        // #1048 PR review.
+        let src = "fn main() {\n    App::new()\n        .routes(routes![index])\n        .inbound_mail_router(\n            ::autumn_web::inbound_mail::InboundMailRouter::new()\n                .endpoint(::autumn_web::inbound_mail::InboundMailEndpointConfig::mailgun(\n                    \"/inbound/mailgun\",\n                    std::env::var(\"MAILGUN_SIGNING_KEY\").unwrap_or_default(),\n                ))\n                .handler(inbound_mailers::replies::replies_handler_info()),\n        )\n        .run()\n}\n";
+        let updated =
+            remove_inbound_mail_handler(src, "inbound_mailers::replies::replies_handler_info");
+        assert!(
+            !updated.contains(".inbound_mail_router("),
+            "the whole call must be removed once its only handler is gone, got:\n{updated}"
+        );
+        assert!(
+            !updated.contains(".handler("),
+            "no dangling .handler( fragment may remain, got:\n{updated}"
+        );
+        assert_eq!(
+            updated,
+            "fn main() {\n    App::new()\n        .routes(routes![index])\n        .run()\n}\n"
+        );
+    }
+
+    #[test]
+    fn remove_inbound_mail_handler_keeps_other_handler_in_a_rustfmt_wrapped_call() {
+        let src = "fn main() {\n    App::new()\n        .inbound_mail_router(\n            ::autumn_web::inbound_mail::InboundMailRouter::new()\n                .endpoint(::autumn_web::inbound_mail::InboundMailEndpointConfig::mailgun(\n                    \"/inbound/mailgun\",\n                    std::env::var(\"MAILGUN_SIGNING_KEY\").unwrap_or_default(),\n                ))\n                .handler(inbound_mailers::replies::replies_handler_info())\n                .handler(inbound_mailers::bounces::bounces_handler_info()),\n        )\n        .run()\n}\n";
+        let updated =
+            remove_inbound_mail_handler(src, "inbound_mailers::replies::replies_handler_info");
+        assert!(
+            updated.contains(".inbound_mail_router("),
+            "the router call must survive while another handler remains, got:\n{updated}"
+        );
+        assert!(
+            updated.contains("bounces_handler_info"),
+            "the other handler must survive, got:\n{updated}"
+        );
+        assert!(
+            !updated.contains("replies_handler_info"),
+            "the destroyed handler must be gone, got:\n{updated}"
         );
     }
 

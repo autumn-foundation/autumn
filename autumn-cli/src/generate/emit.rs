@@ -982,7 +982,9 @@ enum MigrationOutcome {
     Diverged(PathBuf),
     /// The migration appears to be applied to a configured database (or the
     /// database couldn't be reached, which is treated conservatively the
-    /// same way) — never removed except with `--force`.
+    /// same way) — never removed, not even with `--force`: deleting the
+    /// files backing an applied migration would leave the database unable
+    /// to reconstruct or roll back that step.
     Applied(PathBuf),
     /// More than one on-disk migration directory normalizes to the same
     /// suffix (e.g. a `model`-generated migration and an independently
@@ -1103,10 +1105,13 @@ fn resolve_migration_removal(
         return MigrationOutcome::StillNeededElsewhere(real_dir);
     }
 
-    if force {
-        return MigrationOutcome::Remove(real_dir);
-    }
-
+    // Deliberately NOT gated on `force`: `--force` bypasses content
+    // divergence and the sibling-resource "still needed elsewhere" caution,
+    // but never the applied-migration check (issue #1048 PR review) —
+    // removing files backing a migration the database already recorded as
+    // applied would leave that database unable to reconstruct or roll back
+    // the step, which is a data-safety concern `--force`'s documented
+    // purpose (bypassing content mismatches) was never meant to cover.
     let real_dir_name = real_dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
     let (version, _) = split_migration_dir_name(real_dir_name);
     match migration_applied_status(version, migrations_root) {
@@ -1615,6 +1620,51 @@ mod tests {
             assert!(matches!(err, GenerateError::Diverged(_)));
             assert!(real_dir.exists());
         });
+    }
+
+    #[test]
+    fn revert_never_removes_a_migration_with_an_unreachable_database_even_with_force() {
+        // A configured but unreachable database is treated the same as
+        // "applied" (conservative: destroy can't confirm it's safe). Even
+        // `--force` must not remove the migration files in that case
+        // (issue #1048 PR review) — `--force` bypasses content divergence
+        // and shared-resource caution, never the applied-migration guard,
+        // since deleting files backing a migration the database might
+        // already record as applied would leave it unable to reconstruct
+        // or roll back that step.
+        temp_env::with_vars(
+            [
+                ("AUTUMN_DATABASE__PRIMARY_URL", None::<&str>),
+                (
+                    "AUTUMN_DATABASE__URL",
+                    Some("postgres://postgres:x@127.0.0.1:1/nope"),
+                ),
+                ("DATABASE_URL", None::<&str>),
+            ],
+            || {
+                let (tmp, mut plan) = fixture();
+                fs::create_dir_all(tmp.path().join("migrations")).unwrap();
+                let plan_dir = tmp.path().join("migrations/99999999999999_create_posts");
+                let real_dir = tmp.path().join("migrations/20260101000000_create_posts");
+                fs::create_dir_all(&real_dir).unwrap();
+                fs::write(real_dir.join("up.sql"), "CREATE TABLE posts ();\n").unwrap();
+                fs::write(real_dir.join("down.sql"), "DROP TABLE posts;\n").unwrap();
+
+                plan.create(plan_dir.join("up.sql"), "CREATE TABLE posts ();\n");
+                plan.create(plan_dir.join("down.sql"), "DROP TABLE posts;\n");
+
+                plan.revert(Flags {
+                    force: true,
+                    dry_run: false,
+                })
+                .unwrap();
+
+                assert!(
+                    real_dir.exists(),
+                    "migration must survive even with --force when the database is unreachable"
+                );
+            },
+        );
     }
 
     #[test]
