@@ -151,6 +151,7 @@ mod test_app_integration;
 mod test_db_integration;
 mod time_zone_integration;
 mod transactional_test_integration;
+mod tx_isolation_retry_integration;
 mod webhook_outbound;
 #[cfg(feature = "maud")]
 mod widget_css_coverage;
