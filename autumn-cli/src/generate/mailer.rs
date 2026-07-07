@@ -870,6 +870,54 @@ async fn main() {
         );
     }
 
+    #[test]
+    fn destroying_one_of_two_list_unsubscribe_mailers_keeps_the_shared_migration() {
+        let tmp = project_with_main(default_main());
+        let migrations_dir = tmp.path().join("migrations");
+        let migration_dir_exists = || {
+            fs::read_dir(&migrations_dir)
+                .map(|mut d| d.next().is_some())
+                .unwrap_or(false)
+        };
+
+        plan_mailer(tmp.path(), "WeeklyDigest", Some("weekly_digest"), false)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+        plan_mailer(tmp.path(), "ProductUpdates", Some("product_updates"), false)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+        assert!(migration_dir_exists());
+
+        // Destroying WeeklyDigest alone must NOT remove the shared
+        // mail_unsubscribes migration — ProductUpdates still opts into
+        // --list-unsubscribe and needs the suppression table.
+        plan_mailer(tmp.path(), "WeeklyDigest", Some("weekly_digest"), false)
+            .unwrap()
+            .revert(Flags::default())
+            .unwrap();
+
+        assert!(!tmp.path().join("src/mailers/weekly_digest.rs").exists());
+        assert!(tmp.path().join("src/mailers/product_updates.rs").exists());
+        assert!(
+            migration_dir_exists(),
+            "shared mail_unsubscribes migration must survive — ProductUpdates still needs it"
+        );
+
+        // Now destroy the last remaining list-unsubscribe mailer — the
+        // migration must finally go too.
+        plan_mailer(tmp.path(), "ProductUpdates", Some("product_updates"), false)
+            .unwrap()
+            .revert(Flags::default())
+            .unwrap();
+        assert!(!tmp.path().join("src/mailers/product_updates.rs").exists());
+        assert!(
+            !migration_dir_exists(),
+            "mail_unsubscribes migration must be removed once no mailer uses list_unsubscribe anymore"
+        );
+    }
+
     // ── GREEN: execute and inspect written content ────────────────────────
 
     #[test]

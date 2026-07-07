@@ -858,6 +858,14 @@ fn snapshot_tree(root: &Path) -> Vec<(String, Vec<u8>)> {
     fn walk(dir: &Path, root: &Path, out: &mut Vec<(String, Vec<u8>)>) {
         for entry in fs::read_dir(dir).expect("read_dir").filter_map(Result::ok) {
             let path = entry.path();
+            if path.file_name().is_some_and(|n| n == ".git") {
+                // Never compare git's own internals — its background
+                // maintenance can create/remove transient files (e.g.
+                // `.git/objects/maintenance.lock`) between snapshots,
+                // producing spurious diffs unrelated to anything
+                // generate/destroy touched.
+                continue;
+            }
             if path.is_dir() {
                 walk(&path, root, out);
             } else {

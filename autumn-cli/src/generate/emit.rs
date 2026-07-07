@@ -97,8 +97,16 @@ pub enum Revert {
     /// `registered_jobs()` function if it was the only entry.
     JobEntry { path: PathBuf, entry: String },
     /// Remove the `.jobs(jobs::registered_jobs())` call from the
-    /// `AppBuilder` chain in `path` (`src/main.rs`).
-    JobsRegistration { path: PathBuf },
+    /// `AppBuilder` chain in `path` (`src/main.rs`) — but only once
+    /// `owner_dir` (`src/jobs`) has no other job file left in it, so a
+    /// sibling job that's still registered in the SAME shared
+    /// `jobs![...]` list doesn't lose its only path to actually running
+    /// (unlike [`Revert::MailPreview`]/[`Revert::InboundMailHandler`],
+    /// whose entry-removal already collapses their own wrapper call only
+    /// when their own list empties, this call lives in a *different* file
+    /// than the `jobs![...]` list it depends on, so it needs the same
+    /// directory-sibling check [`Revert::CargoDeps`] uses instead).
+    JobsRegistration { path: PathBuf, owner_dir: PathBuf },
     /// Remove `mailer_type` from the `mail_previews![...]` list in `path`
     /// (`src/main.rs`), dropping the whole freshly-inserted
     /// `.mail_previews(...)` call if it was the only entry.
@@ -141,7 +149,7 @@ impl Revert {
             | Self::CargoAutumnWebFeature { path, .. }
             | Self::CargoAutumnWebDevFeature { path, .. }
             | Self::JobEntry { path, .. }
-            | Self::JobsRegistration { path }
+            | Self::JobsRegistration { path, .. }
             | Self::MailPreview { path, .. }
             | Self::InboundMailHandler { path, .. }
             | Self::SystemTestCargoPatch { path, .. }
@@ -159,14 +167,15 @@ impl Revert {
     /// where the pushing generator has no single owning directory).
     fn owner_dir(&self) -> Option<&Path> {
         match self {
-            Self::CargoDeps { owner_dir, .. } => Some(owner_dir),
+            Self::CargoDeps { owner_dir, .. } | Self::JobsRegistration { owner_dir, .. } => {
+                Some(owner_dir)
+            }
             Self::CargoAutumnWebFeature { owner_dir, .. }
             | Self::CargoAutumnWebDevFeature { owner_dir, .. } => owner_dir.as_deref(),
             Self::ModDecl { .. }
             | Self::RoutesEntries { .. }
             | Self::SchemaTable { .. }
             | Self::JobEntry { .. }
-            | Self::JobsRegistration { .. }
             | Self::MailPreview { .. }
             | Self::InboundMailHandler { .. }
             | Self::SystemTestCargoPatch { .. }
@@ -654,7 +663,14 @@ impl Plan {
         let mut migrations_to_remove = Vec::new();
         let mut warnings = Vec::new();
         for (dir, actions) in &migration_groups {
-            match resolve_migration_removal(dir, actions, &migrations_root, force) {
+            match resolve_migration_removal(
+                dir,
+                actions,
+                &migrations_root,
+                force,
+                &self.project_root,
+                &files_to_remove,
+            ) {
                 MigrationOutcome::Remove(real_dir) => migrations_to_remove.push(real_dir),
                 MigrationOutcome::Diverged(path) => diverged.push(path),
                 MigrationOutcome::Applied(real_dir) => warnings.push(format!(
@@ -665,6 +681,11 @@ impl Plan {
                 MigrationOutcome::Ambiguous(suffix) => warnings.push(format!(
                     "multiple migrations directories match the expected suffix '{suffix}'; \
                      skipping — remove the correct one manually."
+                )),
+                MigrationOutcome::StillNeededElsewhere(real_dir) => warnings.push(format!(
+                    "migration {} is still needed by another mailer's --list-unsubscribe; \
+                     skipping — pass --force to remove it anyway.",
+                    relative_display(&real_dir, &self.project_root),
                 )),
                 MigrationOutcome::NotFound => {}
             }
@@ -796,6 +817,13 @@ enum MigrationOutcome {
     /// comparison couldn't tell them apart either — never guess which one
     /// to delete.
     Ambiguous(String),
+    /// This is the `mail_unsubscribes` suppression migration (the one
+    /// migration in the codebase reused across multiple resources of the
+    /// same generator, via `create_if_absent` — see
+    /// `mailer::plan_unsubscribe_migration`) and another mailer file besides
+    /// the ones this destroy is itself removing still opts into
+    /// `--list-unsubscribe` — never removed except with `--force`.
+    StillNeededElsewhere(PathBuf),
     /// No on-disk directory matches this suffix — already destroyed, or
     /// never generated.
     NotFound,
@@ -839,6 +867,8 @@ fn resolve_migration_removal(
     actions: &[&Action],
     migrations_root: &Path,
     force: bool,
+    project_root: &Path,
+    excluding: &[PathBuf],
 ) -> MigrationOutcome {
     let Some(plan_dir_name) = plan_dir.file_name().and_then(|n| n.to_str()) else {
         return MigrationOutcome::NotFound;
@@ -894,6 +924,12 @@ fn resolve_migration_removal(
         }
     }
 
+    if !force
+        && mail_unsubscribes_migration_still_needed_elsewhere(&real_dir, project_root, excluding)
+    {
+        return MigrationOutcome::StillNeededElsewhere(real_dir);
+    }
+
     if force {
         return MigrationOutcome::Remove(real_dir);
     }
@@ -906,6 +942,37 @@ fn resolve_migration_removal(
             MigrationOutcome::Remove(real_dir)
         }
     }
+}
+
+/// Whether `real_dir` is the `mail_unsubscribes` suppression migration and
+/// another mailer file (besides ones this same destroy is itself removing)
+/// still opts into `--list-unsubscribe` — the one migration in the codebase
+/// reused across multiple resources of the same generator via
+/// `create_if_absent` (see `mailer::plan_unsubscribe_migration`), so it
+/// needs its own sibling check rather than the generic `owner_dir`
+/// mechanism `Revert::CargoDeps` and friends use.
+fn mail_unsubscribes_migration_still_needed_elsewhere(
+    real_dir: &Path,
+    project_root: &Path,
+    excluding: &[PathBuf],
+) -> bool {
+    let is_unsubscribes_migration = real_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|name| split_migration_dir_name(name).1 == "create_mail_unsubscribes");
+    if !is_unsubscribes_migration {
+        return false;
+    }
+    let Ok(entries) = fs::read_dir(project_root.join("src").join("mailers")) else {
+        return false;
+    };
+    entries.filter_map(Result::ok).any(|entry| {
+        let path = entry.path();
+        path.extension().is_some_and(|ext| ext == "rs")
+            && !excluding.contains(&path)
+            && fs::read_to_string(&path)
+                .is_ok_and(|content| content.contains("list_unsubscribe = "))
+    })
 }
 
 /// Best-effort classification of whether a migration has already been

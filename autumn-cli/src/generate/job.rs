@@ -138,8 +138,12 @@ pub fn plan_job(project_root: &Path, name: &str, fields: &[String]) -> Result<Pl
     plan.modify(main_path.clone(), updated_main);
     // `mod jobs;` is a shared infrastructure declaration (see
     // `emit::sync_main_rs_mod_declarations`) — only the `.jobs(...)` call is
-    // reverted here.
-    plan.push_revert(crate::generate::emit::Revert::JobsRegistration { path: main_path });
+    // reverted here, and only once no other job file remains (a sibling job
+    // still listed in the shared `jobs![...]` needs this call to actually run).
+    plan.push_revert(crate::generate::emit::Revert::JobsRegistration {
+        path: main_path,
+        owner_dir: project_root.join("src").join("jobs"),
+    });
 
     // ── Cargo.toml: ensure serde (always) plus uuid/chrono/decimal if used ──
     if parsed_fields.iter().any(|f| f.kind.is_decimal()) {
@@ -297,6 +301,51 @@ async fn main() {
         assert!(!tmp.path().join("src/jobs/mod.rs").exists());
         assert_eq!(fs::read_to_string(&main_path).unwrap(), original_main);
         assert_eq!(fs::read_to_string(&cargo_path).unwrap(), original_cargo);
+    }
+
+    #[test]
+    fn destroying_one_of_two_jobs_keeps_the_jobs_registration_call() {
+        let tmp = project_with_main(default_main());
+        let main_path = tmp.path().join("src/main.rs");
+
+        plan_job(tmp.path(), "SendWelcomeEmail", &[])
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+        plan_job(tmp.path(), "SendGoodbyeEmail", &[])
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+        assert!(fs::read_to_string(&main_path).unwrap().contains(".jobs("));
+
+        // Destroying one job alone must NOT strip the `.jobs(...)` call —
+        // the surviving job's `jobs![...]` entry still needs it to actually run.
+        plan_job(tmp.path(), "SendWelcomeEmail", &[])
+            .unwrap()
+            .revert(Flags::default())
+            .unwrap();
+
+        assert!(!tmp.path().join("src/jobs/send_welcome_email.rs").exists());
+        assert!(tmp.path().join("src/jobs/send_goodbye_email.rs").exists());
+        let main_after = fs::read_to_string(&main_path).unwrap();
+        assert!(
+            main_after.contains(".jobs(jobs::registered_jobs())"),
+            "the .jobs(...) call must survive — the surviving job still needs it to run: {main_after}"
+        );
+        let mod_after = fs::read_to_string(tmp.path().join("src/jobs/mod.rs")).unwrap();
+        assert!(mod_after.contains("send_goodbye_email"));
+        assert!(!mod_after.contains("send_welcome_email"));
+
+        // Now destroy the last remaining job — the call must finally go too.
+        plan_job(tmp.path(), "SendGoodbyeEmail", &[])
+            .unwrap()
+            .revert(Flags::default())
+            .unwrap();
+        assert!(!tmp.path().join("src/jobs/send_goodbye_email.rs").exists());
+        assert!(
+            !fs::read_to_string(&main_path).unwrap().contains(".jobs("),
+            "the .jobs(...) call must be removed once no job needs it anymore"
+        );
     }
 
     // ── RED: plan assertions ─────────────────────────────────────────────
