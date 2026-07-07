@@ -7769,6 +7769,120 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         (quote! {}, quote! {})
     };
 
+    // ── Batched iteration (find_in_batches / find_each), issue #1395 ─────────
+    //
+    // Generated for EVERY repository (not gated on cursor_key): a primary-key
+    // ascending keyset walk that streams the whole table in bounded-memory
+    // chunks. Each batch is `WHERE id > last ORDER BY id ASC LIMIT batch_size`
+    // (no id predicate on the first batch), reusing the same soft-delete
+    // filter, tenant scoping and read-routing as `find_all`/`cursor_page`, so
+    // those semantics come for free.
+    //
+    // The generic driver + handle types live in `autumn_web::batches`; the
+    // macro only emits a thin per-repo `BatchSource` impl (the keyset query)
+    // plus two inherent constructors. Sharded repos mirror `cursor_page`:
+    // cross-shard `across_tenants` iteration is rejected (shard fan-out is out
+    // of scope per #1395); a single routed shard iterates normally.
+    let batch_cross_shard_guard = if config.sharded && config.tenant_scoped {
+        quote! {
+            if self.across_tenants {
+                if self.__autumn_shards.is_some() {
+                    return ::core::result::Result::Err(
+                        ::autumn_web::AutumnError::bad_request_msg(
+                            "cross-shard batched iteration is not supported: \
+                             use find_all() with across_tenants() on a \
+                             sharded repository instead"
+                        )
+                    );
+                }
+            }
+        }
+    } else {
+        quote! {}
+    };
+
+    let batch_source_impl = quote! {
+        impl ::autumn_web::batches::BatchSource for #pg_name {
+            type Model = #model_name;
+
+            async fn fetch_batch_after(
+                &self,
+                after_id: ::core::option::Option<i64>,
+                limit: i64,
+            ) -> ::autumn_web::AutumnResult<::std::vec::Vec<#model_name>> {
+                #batch_cross_shard_guard
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                let mut conn = self.__autumn_acquire_read_conn().await?;
+                let mut query = #table_ident::table.into_boxed();
+                #tenant_query_filter
+                if let ::core::option::Option::Some(after) = after_id {
+                    query = query.filter(#table_ident::id.gt(after));
+                }
+                // Apply soft-delete filter when enabled.
+                #[allow(unused_mut)]
+                let mut query = query #sd_filter;
+                query
+                    .order(#table_ident::id.asc())
+                    .limit(limit)
+                    .select(#model_name::as_select())
+                    .load::<#model_name>(&mut conn)
+                    .await
+                    .map_err(::autumn_web::AutumnError::from)
+            }
+
+            fn batch_key(model: &#model_name) -> i64 {
+                model.id
+            }
+        }
+    };
+
+    let find_in_batches_methods = quote! {
+        /// Iterate the whole table in bounded-memory chunks of at most
+        /// `batch_size` rows, using a primary-key keyset cursor (not
+        /// `LIMIT`/`OFFSET`), so deep iteration stays flat and is stable under
+        /// concurrent inserts of rows ordered after the current position.
+        ///
+        /// Soft-delete filtering, tenant scoping and read routing match
+        /// `find_all`. Drive the returned handle with `next_batch()` in a
+        /// `while let` loop; drop each chunk before requesting the next to hold
+        /// at most `batch_size` models at a time.
+        ///
+        /// A `batch_size` of `0` yields an error on the first `next_batch()`.
+        ///
+        /// ```rust,ignore
+        /// let mut batches = repo.find_in_batches(1_000);
+        /// while let Some(chunk) = batches.next_batch().await? {
+        ///     repo.save_many(&recompute(chunk)).await?;
+        /// }
+        /// ```
+        #[must_use]
+        pub fn find_in_batches(
+            &self,
+            batch_size: usize,
+        ) -> ::autumn_web::batches::FindInBatches<'_, Self> {
+            ::autumn_web::batches::FindInBatches::new(self, batch_size)
+        }
+
+        /// Iterate the whole table one model at a time while still fetching in
+        /// bounded `batch_size` chunks — a convenience over
+        /// [`find_in_batches`](Self::find_in_batches).
+        ///
+        /// ```rust,ignore
+        /// let mut each = repo.find_each(500);
+        /// while let Some(row) = each.next().await? {
+        ///     repo.update(row.id, &patch).await?;
+        /// }
+        /// ```
+        #[must_use]
+        pub fn find_each(
+            &self,
+            batch_size: usize,
+        ) -> ::autumn_web::batches::FindEach<'_, Self> {
+            ::autumn_web::batches::FindEach::new(self, batch_size)
+        }
+    };
+
     let tenant_scoped_traits = if config.tenant_scoped {
         quote! {
             impl ::autumn_web::tenancy::HasTenantIdColumn for #table_ident::table {
@@ -10171,6 +10285,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         #clone_impl
 
+        // Bounded-memory batched iteration (find_in_batches / find_each, #1395).
+        #batch_source_impl
+
         #[allow(clippy::useless_let_if_seq)]
         impl #trait_name for #pg_name {
             async fn find_by_id(&self, id: i64) -> ::autumn_web::AutumnResult<Option<#model_name>> {
@@ -10272,6 +10389,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 repo.__autumn_read_route = ::autumn_web::repository::ReadRoute::Primary;
                 repo
             }
+
+            #find_in_batches_methods
 
             /// Eager-load associations for records returned by a finder.
             ///

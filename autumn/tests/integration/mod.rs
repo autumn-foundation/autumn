@@ -114,6 +114,8 @@ mod repository_authorization;
 #[cfg(feature = "db")]
 mod repository_bulk_operations;
 #[cfg(feature = "db")]
+mod repository_find_in_batches;
+#[cfg(feature = "db")]
 mod repository_from_shard;
 #[cfg(all(feature = "db", feature = "openapi"))]
 mod repository_openapi;

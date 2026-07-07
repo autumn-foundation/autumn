@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **repository:** bounded-memory batched iteration (#1395) — every
+  `#[repository]` now generates `find_in_batches(batch_size)` (yielding
+  successive `Vec<Model>` chunks of at most `batch_size`) and
+  `find_each(batch_size)` (yielding one `Model` at a time), the read-side
+  companion to the bulk writes from #841. Iteration is primary-key keyset-based
+  (`WHERE id > last ORDER BY id ASC LIMIT batch_size`), not `LIMIT`/`OFFSET`, so
+  walking a million-row table in a `#[autumn_web::task]`, job, or sweep holds
+  `O(batch_size)` models — never `O(table)` — and stays stable under concurrent
+  inserts. Unlike a `cursor_page` request, `batch_size` is not clamped to
+  `MAX_PAGE_SIZE`. The iterators reuse the same soft-delete filter and read
+  routing as `find_all`/`cursor_page` (trashed rows are skipped; a
+  replica-routed repo iterates off the replica), an error mid-iteration surfaces
+  on the failing batch and stops iteration without swallowing progress, a
+  `batch_size` of `0` errors rather than spinning, and sharded repositories
+  reject cross-shard `across_tenants()` iteration exactly as `cursor_page` does.
+  The generic handle types live in `autumn_web::batches`
+  (`FindInBatches`, `FindEach`, `BatchSource`). See the "Batched iteration"
+  section of the pagination guide.
+
 - **generator:** `autumn generate scaffold`'s `create`/`update` handlers now
   build a `Changeset` from the submission and re-render the `new`/`edit`
   form on a rejected submission (issue #1124). A failed submission responds
