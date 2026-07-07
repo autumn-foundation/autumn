@@ -534,18 +534,25 @@ fn build_router_pre_state(
     // counter. See `apply_middleware`'s `load_shed_layer` parameter doc.
     let load_shed_layer = build_load_shed_layer(config, state);
 
-    router = apply_middleware(
-        router,
-        config,
-        state,
-        ctx.exception_filters,
-        ctx.custom_layers,
-        #[cfg(feature = "maud")]
-        ctx.error_page_renderer,
-        ctx.session_store,
-        route_timeouts,
-        load_shed_layer.clone(),
-    )?;
+    // The clone is only *reused* further down inside the `feature = "mcp"`
+    // block (the `/mcp` envelope shares the same in-flight counter); with the
+    // feature off it looks redundant to clippy, but keeping it unconditional
+    // avoids cfg-splitting this call site.
+    #[allow(clippy::redundant_clone)]
+    {
+        router = apply_middleware(
+            router,
+            config,
+            state,
+            ctx.exception_filters,
+            ctx.custom_layers,
+            #[cfg(feature = "maud")]
+            ctx.error_page_renderer,
+            ctx.session_store,
+            route_timeouts,
+            load_shed_layer.clone(),
+        )?;
+    }
 
     if dev_reload_enabled {
         router = router
