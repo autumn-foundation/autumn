@@ -1017,22 +1017,36 @@ fn retry_backoff_delay(initial: Duration, max: Duration, attempt: u32) -> Durati
 /// arbitrary error's displayed message: a `diesel::result::Error` anywhere in
 /// `err`'s source chain (not just the top-level wrapped error — a custom `E`
 /// that wraps a diesel error via `#[source]`/`#[from]` is still found) is
-/// classified by its `DatabaseErrorKind`. diesel maps `40001` to
-/// `SerializationFailure`; any *other* kind (e.g. `UniqueViolation`) is trusted
-/// as non-retryable outright — it is never string-matched, so a constraint
-/// name or key value that happens to contain `"40001"` cannot misclassify it.
-/// `40P01` has no dedicated kind and surfaces as `Unknown`; for that one kind,
-/// the source chain's `SqlState` is checked first (locale-independent) and an
-/// English-locale message match is used only as a last resort.
+/// classified by its `DatabaseErrorKind`. `diesel-async`'s Postgres backend
+/// maps `40001` to `SerializationFailure` directly from the real SQLSTATE (see
+/// `diesel_async::pg::error_helper::from_tokio_postgres_error`) — fully
+/// reliable, no message inspection involved. Any *other* kind (e.g.
+/// `UniqueViolation`) is trusted as non-retryable outright — never
+/// string-matched, so a constraint name or key value that happens to contain
+/// `"40001"` cannot misclassify it.
+///
+/// `40P01` (deadlock) has no dedicated `DatabaseErrorKind` and always surfaces
+/// as `Unknown`. Worse: the wrapper type diesel-async uses to carry Postgres's
+/// error fields for an `Unknown`-kind error (`PostgresDbErrorWrapper`, private
+/// to diesel-async) implements only `DatabaseErrorInformation`, not
+/// `std::error::Error` — so [`source_chain_has_sqlstate`]'s downcast walk can
+/// **never** reach the real SQLSTATE for it; there is no structural path to a
+/// deadlock's code at all through this crate boundary. The only signal
+/// available is the message, so this checks it — but with an **exact**
+/// match, not a substring: Postgres's deadlock detector always raises the
+/// primary message as precisely `"deadlock detected"` with nothing else (the
+/// context lives in DETAIL/HINT, not here), so an app's own `RAISE EXCEPTION`
+/// would have to reproduce that exact string as its *entire* message to
+/// collide — unlike a substring check, which a longer business message
+/// merely mentioning the phrase would already trip.
 ///
 /// When no `diesel::result::Error` is found anywhere in the chain, this checks
 /// for a raw `tokio_postgres` SQLSTATE directly (a custom `E` that bypasses
 /// diesel). If neither is found, the error is **not** retried — there is
-/// deliberately no generic message-substring fallback beyond structured
-/// signals: retrying based on bare text risks misclassifying an unrelated
-/// domain/validation error (e.g. an order id that happens to be `40001`) as a
-/// transient conflict, silently re-running a non-idempotent closure and
-/// delaying the response.
+/// deliberately no generic message-substring fallback beyond the one exact
+/// match above: retrying based on bare text risks misclassifying an unrelated
+/// domain/validation error as a transient conflict, silently re-running a
+/// non-idempotent closure and delaying the response.
 fn is_retryable_txn_error(err: &AutumnError) -> bool {
     use tokio_postgres::error::SqlState;
 
@@ -1042,30 +1056,29 @@ fn is_retryable_txn_error(err: &AutumnError) -> bool {
 
     if let Some(diesel_err) = err.downcast_chain_ref::<diesel::result::Error>() {
         return match diesel_err {
-            // Fast path: diesel maps 40001 to SerializationFailure.
+            // Fast path: diesel-async maps 40001 to SerializationFailure from
+            // the real SQLSTATE. Fully structural, no message involved.
             diesel::result::Error::DatabaseError(
                 diesel::result::DatabaseErrorKind::SerializationFailure,
                 _,
             ) => true,
-            // 40P01 (deadlock) — and, on some paths, 40001 too — has no
-            // dedicated `DatabaseErrorKind` and surfaces as `Unknown`: check
-            // the chain first (locale-independent), then this kind's own
-            // message as a last resort. Scoped to `Unknown` only so an
-            // unrelated kind's message (e.g. a unique-violation's constraint
-            // name) can never trigger a false positive.
+            // 40P01 (deadlock) has no dedicated kind and surfaces as Unknown.
+            // The chain walk is kept for forward-compatibility (a future
+            // diesel/diesel-async release, or another backend, could start
+            // exposing the real SQLSTATE through the source chain) but is
+            // currently unreachable for diesel-async's own Postgres backend
+            // — see the doc comment above. The message check that follows is
+            // therefore the only thing that actually fires deadlock retries
+            // today, hence the exact (not substring) match.
             diesel::result::Error::DatabaseError(
                 diesel::result::DatabaseErrorKind::Unknown,
                 info,
             ) => {
-                if source_chain_has_sqlstate(diesel_err, is_retryable_sqlstate) {
-                    return true;
-                }
-                let message = info.message().to_lowercase();
-                message.contains("40001")
-                    || message.contains("40p01")
-                    || message.contains("could not serialize access")
-                    || message.contains("deadlock detected")
-                    || message.contains("serialization failure")
+                source_chain_has_sqlstate(diesel_err, is_retryable_sqlstate)
+                    || info
+                        .message()
+                        .trim()
+                        .eq_ignore_ascii_case("deadlock detected")
             }
             // Any other kind (UniqueViolation, NotNullViolation, ...) is
             // authoritatively non-retryable — no string matching against its
@@ -2756,8 +2769,9 @@ mod tests {
 
     #[test]
     fn deadlock_is_retryable() {
-        // Postgres 40P01 is not mapped to a dedicated DatabaseErrorKind, so it is
-        // caught via the message/SQLSTATE fallback.
+        // Postgres 40P01 is not mapped to a dedicated DatabaseErrorKind, so it
+        // is caught via an exact match against Postgres's own invariant
+        // primary message for this condition.
         let err: AutumnError = AutumnError::internal_server_error(diesel_db_error(
             diesel::result::DatabaseErrorKind::Unknown,
             "deadlock detected",
@@ -2766,12 +2780,40 @@ mod tests {
     }
 
     #[test]
-    fn sqlstate_40001_string_is_retryable() {
+    fn deadlock_message_is_matched_case_and_whitespace_insensitively() {
+        let err: AutumnError = AutumnError::internal_server_error(diesel_db_error(
+            diesel::result::DatabaseErrorKind::Unknown,
+            "  Deadlock Detected  ",
+        ));
+        assert!(is_retryable_txn_error(&err));
+    }
+
+    #[test]
+    fn unknown_kind_message_merely_mentioning_deadlock_is_not_retryable() {
+        // Regression (PR #1581 review, round 2): an `Unknown`-kind Postgres
+        // error from application SQL (e.g. `RAISE EXCEPTION`) whose message
+        // merely *mentions* "deadlock detected" or "40001" as part of a
+        // longer business message must not be retried -- only an exact match
+        // against Postgres's own invariant primary message counts.
+        let err: AutumnError = AutumnError::internal_server_error(diesel_db_error(
+            diesel::result::DatabaseErrorKind::Unknown,
+            "order 40001 could not be processed: deadlock detected in workflow",
+        ));
+        assert!(!is_retryable_txn_error(&err));
+    }
+
+    #[test]
+    fn unknown_kind_40001_text_alone_is_not_retryable() {
+        // A bare "40001" in an Unknown-kind message is no longer treated as a
+        // retry signal -- genuine 40001s are already reliably classified via
+        // the DatabaseErrorKind::SerializationFailure fast path (diesel-async
+        // maps the real SQLSTATE), so this text pattern is dead weight that
+        // only added false-positive risk.
         let err: AutumnError = AutumnError::internal_server_error(diesel_db_error(
             diesel::result::DatabaseErrorKind::Unknown,
             "ERROR: 40001: could not serialize access",
         ));
-        assert!(is_retryable_txn_error(&err));
+        assert!(!is_retryable_txn_error(&err));
     }
 
     #[test]
