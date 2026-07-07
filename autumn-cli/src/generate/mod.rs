@@ -6,8 +6,8 @@
 //!
 //! Three subcommands live here:
 //! - [`model::plan_model_with_options`] — model + migration + schema entry
-//! - [`migration::run`] — migration only (with optional add/remove DSL)
-//! - [`scaffold::run`] — model + repository + HTML routes + smoke test +
+//! - [`migration::plan_migration_with_options`] — migration only (with optional add/remove DSL)
+//! - [`scaffold::plan_scaffold_with_options`] — model + repository + HTML routes + smoke test +
 //!   `routes![]` registration
 
 pub mod admin;
@@ -65,6 +65,15 @@ pub enum GenerateError {
     /// Generator config file is invalid or missing a required section.
     #[error("{0}")]
     Config(String),
+
+    /// `autumn destroy` refuses to remove file(s) whose content has diverged
+    /// from what the matching `generate` invocation would have produced
+    /// (issue #1048) — pass `--force` to override.
+    #[error(
+        "refusing to destroy — file(s) diverged from generated content, pass --force to override:\n{}",
+        format_collisions(.0)
+    )]
+    Diverged(Vec<PathBuf>),
 }
 
 /// ⚡ Bolt optimization: Formats collision paths directly into a pre-allocated

@@ -829,6 +829,282 @@ fn generate_scaffold_full_e2e_post() {
     }
 }
 
+// ── `autumn destroy` (issue #1048) ─────────────────────────────────────────
+
+/// Spawn the system `git` binary in `dir` (NOT the `autumn` binary — see
+/// [`run_autumn`]), asserting success, and return its stdout.
+fn run_git(dir: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("failed to run git");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        output.status.success(),
+        "git {args:?} failed (exit={:?})\nstdout: {stdout}\nstderr: {stderr}",
+        output.status.code(),
+    );
+    stdout
+}
+
+/// Recursively collect every file under `root` as `(relative_path, contents)`,
+/// sorted for deterministic comparison. Used to assert a project's working
+/// tree is byte-for-byte identical before/after a `generate`+`destroy`
+/// round-trip — a filesystem-level equivalent of `git status` being clean
+/// that doesn't require a `git` binary in the test sandbox.
+fn snapshot_tree(root: &Path) -> Vec<(String, Vec<u8>)> {
+    fn walk(dir: &Path, root: &Path, out: &mut Vec<(String, Vec<u8>)>) {
+        for entry in fs::read_dir(dir).expect("read_dir").filter_map(Result::ok) {
+            let path = entry.path();
+            if path.file_name().is_some_and(|n| n == ".git") {
+                // Never compare git's own internals — its background
+                // maintenance can create/remove transient files (e.g.
+                // `.git/objects/maintenance.lock`) between snapshots,
+                // producing spurious diffs unrelated to anything
+                // generate/destroy touched.
+                continue;
+            }
+            if path.is_dir() {
+                walk(&path, root, out);
+            } else {
+                let rel = path
+                    .strip_prefix(root)
+                    .unwrap()
+                    .display()
+                    .to_string()
+                    .replace('\\', "/");
+                let contents = fs::read(&path).expect("read file");
+                out.push((rel, contents));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// The headline acceptance test (issue #1048's success metric): `autumn
+/// generate scaffold Post title:String` immediately followed by `autumn
+/// destroy scaffold Post title:String` returns the project's working tree
+/// byte-for-byte identical to its pre-generate state — both via a
+/// filesystem snapshot comparison and via `git status --porcelain` being
+/// empty against a real commit, exactly the round-trip the issue describes.
+#[test]
+fn generate_then_destroy_scaffold_round_trips_git_clean() {
+    let (_tmp, project) = fresh_project("destroy-scaffold-app");
+
+    run_git(&project, &["init"]);
+    run_git(&project, &["add", "-A"]);
+    run_git(
+        &project,
+        &[
+            "-c",
+            "user.email=t@t.com",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-m",
+            "base",
+        ],
+    );
+
+    let before = snapshot_tree(&project);
+
+    run_autumn(&project, &["generate", "scaffold", "Post", "title:String"]);
+    assert!(project.join("src/models/post.rs").is_file());
+    assert!(project.join("src/routes/posts.rs").is_file());
+    assert!(project.join("src/repositories/post.rs").is_file());
+
+    run_autumn(&project, &["destroy", "scaffold", "Post", "title:String"]);
+
+    let after = snapshot_tree(&project);
+    assert_eq!(
+        before, after,
+        "working tree must be byte-identical after generate+destroy"
+    );
+
+    let status_stdout = run_git(&project, &["status", "--porcelain"]);
+    assert!(
+        status_stdout.trim().is_empty(),
+        "git status must be clean after generate+destroy, got:\n{status_stdout}"
+    );
+}
+
+#[test]
+fn generate_then_destroy_model_round_trips_git_clean() {
+    let (_tmp, project) = fresh_project("destroy-model-app");
+    run_git(&project, &["init"]);
+    run_git(&project, &["add", "-A"]);
+    run_git(
+        &project,
+        &[
+            "-c",
+            "user.email=t@t.com",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-m",
+            "base",
+        ],
+    );
+
+    let before = snapshot_tree(&project);
+    run_autumn(&project, &["generate", "model", "Post", "title:String"]);
+    run_autumn(&project, &["destroy", "model", "Post", "title:String"]);
+    let after = snapshot_tree(&project);
+    assert_eq!(before, after);
+
+    let status_stdout = run_git(&project, &["status", "--porcelain"]);
+    assert!(status_stdout.trim().is_empty());
+}
+
+#[test]
+fn generate_then_destroy_migration_round_trips_git_clean() {
+    let (_tmp, project) = fresh_project("destroy-migration-app");
+    run_autumn(&project, &["generate", "model", "Post", "title:String"]);
+    run_git(&project, &["init"]);
+    run_git(&project, &["add", "-A"]);
+    run_git(
+        &project,
+        &[
+            "-c",
+            "user.email=t@t.com",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-m",
+            "base",
+        ],
+    );
+
+    let before = snapshot_tree(&project);
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "migration",
+            "AddSubtitleToPosts",
+            "subtitle:String",
+        ],
+    );
+    run_autumn(
+        &project,
+        &[
+            "destroy",
+            "migration",
+            "AddSubtitleToPosts",
+            "subtitle:String",
+        ],
+    );
+    let after = snapshot_tree(&project);
+    assert_eq!(before, after);
+
+    let status_stdout = run_git(&project, &["status", "--porcelain"]);
+    assert!(status_stdout.trim().is_empty());
+}
+
+#[test]
+fn generate_then_destroy_plugin_round_trips_git_clean() {
+    // Regression test (issue #1048 PR review): `plan_plugin` refuses a
+    // non-empty target directory unless `--force` — a generate-time
+    // collision guard. Without special-casing destroy mode, `autumn destroy
+    // plugin Foo` would always hit that same guard (the plugin directory
+    // legitimately exists, holding the files this destroy is about to
+    // remove) and fail before ever reaching `Plan::revert`, even with no
+    // `--force` flag and no actual divergence.
+    let (_tmp, project) = fresh_project("destroy-plugin-app");
+
+    run_git(&project, &["init"]);
+    run_git(&project, &["add", "-A"]);
+    run_git(
+        &project,
+        &[
+            "-c",
+            "user.email=t@t.com",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-m",
+            "base",
+        ],
+    );
+
+    let before = snapshot_tree(&project);
+
+    run_autumn(&project, &["generate", "plugin", "Foo"]);
+    assert!(project.join("autumn-foo-plugin/Cargo.toml").is_file());
+
+    run_autumn(&project, &["destroy", "plugin", "Foo"]);
+    assert!(!project.join("autumn-foo-plugin").exists());
+
+    let after = snapshot_tree(&project);
+    assert_eq!(
+        before, after,
+        "working tree must be byte-identical after generate+destroy"
+    );
+
+    let status_stdout = run_git(&project, &["status", "--porcelain"]);
+    assert!(
+        status_stdout.trim().is_empty(),
+        "git status must be clean after generate+destroy, got:\n{status_stdout}"
+    );
+}
+
+/// AC5: `destroy --dry-run` prints a plan and exits 0 without touching disk.
+#[test]
+fn destroy_dry_run_writes_nothing() {
+    let (_tmp, project) = fresh_project("destroy-dry-run-app");
+    run_autumn(&project, &["generate", "scaffold", "Post", "title:String"]);
+    let before = snapshot_tree(&project);
+
+    let (stdout, _) = run_autumn(
+        &project,
+        &["destroy", "scaffold", "Post", "title:String", "--dry-run"],
+    );
+    assert!(stdout.contains("Dry run"));
+    assert!(stdout.contains("Would remove") || stdout.contains("Would revert"));
+
+    let after = snapshot_tree(&project);
+    assert_eq!(before, after, "--dry-run must not touch disk");
+}
+
+/// AC7: destroy refuses on diverged content unless `--force`, and never
+/// deletes the hand-edited file in that case.
+#[test]
+fn destroy_refuses_on_diverged_file_without_force() {
+    let (_tmp, project) = fresh_project("destroy-diverged-app");
+    run_autumn(&project, &["generate", "scaffold", "Post", "title:String"]);
+
+    let model_path = project.join("src/models/post.rs");
+    let mut content = fs::read_to_string(&model_path).unwrap();
+    content.push_str("\n// hand-edited by the user\n");
+    fs::write(&model_path, &content).unwrap();
+
+    let (_, stderr, code) =
+        run_autumn_failing(&project, &["destroy", "scaffold", "Post", "title:String"]);
+    assert_eq!(code, Some(1));
+    assert!(
+        stderr.contains("diverged") || stderr.contains("Diverged"),
+        "expected a divergence error, got stderr: {stderr}"
+    );
+    assert!(model_path.is_file(), "diverged file must not be deleted");
+    assert!(
+        fs::read_to_string(&model_path)
+            .unwrap()
+            .contains("hand-edited")
+    );
+
+    // --force overrides the guard and proceeds with the destroy.
+    run_autumn(
+        &project,
+        &["destroy", "scaffold", "Post", "title:String", "--force"],
+    );
+    assert!(!model_path.exists());
+}
+
 #[test]
 fn generate_scaffold_api_only() {
     let (_tmp, project) = fresh_project("scaffold-api-app");
@@ -1043,6 +1319,39 @@ fn generate_scaffold_rejects_i32_default_outside_sql_integer_range() {
         stderr.contains("count=9223372036854775807")
             && stderr.contains("i32 defaults must fit the SQL INTEGER range"),
         "expected i32 default range validation error; got stderr: {stderr}"
+    );
+}
+
+/// Issue #1048's success metric, verified end-to-end: `autumn generate
+/// scaffold Post title:String` immediately followed by `autumn destroy
+/// scaffold Post title:String` leaves `cargo check` green on the
+/// round-tripped project — not just a clean working tree (already covered by
+/// [`generate_then_destroy_scaffold_round_trips_git_clean`]), but a project
+/// that still *compiles*, proving destroy never leaves a dangling `mod`
+/// declaration, `routes![]` entry, or Cargo.toml dependency behind.
+///
+/// Ignored by default; slow (compiles the full `autumn-web` dependency
+/// tree) and requires network access to fetch crates. Run with:
+/// `cargo test -p autumn-cli --test generate destroy_scaffold_round_trip_leaves_cargo_check_green -- --ignored --exact`
+#[test]
+#[ignore = "slow: compiles the generated project with cargo check"]
+fn destroy_scaffold_round_trip_leaves_cargo_check_green() {
+    let (_tmp, project) = fresh_project("destroy-scaffold-check-app");
+    patch_generated_cargo_toml(&project);
+
+    run_autumn(&project, &["generate", "scaffold", "Post", "title:String"]);
+    run_autumn(&project, &["destroy", "scaffold", "Post", "title:String"]);
+
+    let check = Command::new("cargo")
+        .args(["check", "--all-targets"])
+        .current_dir(&project)
+        .output()
+        .expect("failed to run cargo check");
+    assert!(
+        check.status.success(),
+        "cargo check failed on the round-tripped project:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr),
     );
 }
 
