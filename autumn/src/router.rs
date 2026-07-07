@@ -661,6 +661,12 @@ fn build_router_pre_state(
             // when so, a tools/call is counted there and its replay is exempted
             // from the dispatch pipeline's limiter (avoiding double-counting).
             envelope_rate_limited: config.security.rate_limit.enabled,
+            // `dispatch` above is cloned from `router`, which already carries
+            // `load_shed_layer` (applied inside `apply_middleware`) — so when
+            // the envelope below is ALSO wrapped with that same shared layer,
+            // a tools/call must mark its replay exempt (avoiding double-
+            // counting against the same in-flight counter).
+            envelope_load_shed: load_shed_layer.is_some(),
         };
         let mut mcp_router =
             crate::mcp::build_mcp_router(&mount_path, tools, dispatch, wiring, endpoint_layer);
@@ -3988,6 +3994,7 @@ mod tests {
             tenant_header: None,
             csrf_header: "x-csrf-token".to_owned(),
             envelope_rate_limited: false,
+            envelope_load_shed: false,
         };
         let mcp_router =
             crate::mcp::build_mcp_router("/mcp", Vec::new(), axum::Router::new(), wiring, None);

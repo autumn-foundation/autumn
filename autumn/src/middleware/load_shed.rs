@@ -11,8 +11,9 @@
 //!
 //! Disabled entirely when no ceiling is configured
 //! (`server.max_concurrent_requests` unset or `0`) — see
-//! [`crate::router::build_load_shed_layer`], which returns `None` in that
-//! case so this layer is never applied and there is no overhead.
+//! `build_load_shed_layer` (in `router.rs`, private to the crate), which
+//! returns `None` in that case so this layer is never applied and there is
+//! no overhead.
 //!
 //! The admission gauge is a dedicated counter, independent of
 //! [`crate::middleware::MetricsCollector`]'s `requests_active` and the
@@ -39,6 +40,23 @@ use crate::middleware::maintenance::{health_prefix_matches, prefix_with_trailing
 /// rather than piling onto the already-loaded process.
 const RETRY_AFTER_SECS: &str = "1";
 
+/// Request-extension marker that exempts a request from load-shed admission
+/// accounting.
+///
+/// Set on requests that have already been counted by an upstream
+/// `LoadShedLayer` so a shared-counter replay doesn't double-count them. The
+/// MCP endpoint uses this: `/mcp`'s outer envelope and its `tools/call`
+/// dispatch replay share the same `LoadShedLayer` instance (same `Arc`
+/// counter, see `crate::router::build_load_shed_layer`); without this marker
+/// a single `tools/call` would acquire one slot at the envelope and a second
+/// at the replay, silently halving the effective ceiling for MCP traffic (at
+/// `max_concurrent_requests = 1` a solo `tools/call` would even shed itself).
+/// The marker keeps the replay from consuming a second slot for the same
+/// logical request. It is only ever set internally — external requests
+/// cannot carry it, since extensions are not derived from headers.
+#[derive(Clone, Copy, Debug)]
+pub struct LoadShedExempt;
+
 /// Tower [`Layer`] that caps concurrent in-flight requests and sheds the
 /// excess with an immediate `503 Service Unavailable`.
 ///
@@ -59,9 +77,9 @@ impl LoadShedLayer {
     ///
     /// A `limit` of `0` disables shedding entirely (every request is
     /// forwarded, uncounted) — callers should prefer not constructing this
-    /// layer at all when the ceiling is unset (see
-    /// [`crate::router::build_load_shed_layer`]), but `0` is handled safely
-    /// here too so a misconfigured value never wedges every request shut.
+    /// layer at all when the ceiling is unset (see `build_load_shed_layer`
+    /// in `router.rs`), but `0` is handled safely here too so a
+    /// misconfigured value never wedges every request shut.
     #[must_use]
     pub fn new(limit: usize, metrics: MetricsCollector) -> Self {
         Self {
@@ -135,7 +153,9 @@ impl<S> LoadShedService<S> {
             &self.layer.health_prefix,
             &self.layer.health_prefix_slash,
         );
-        prefix_matched || self.layer.probe_paths.iter().any(|probe| probe == path)
+        prefix_matched
+            || self.layer.probe_paths.iter().any(|probe| probe == path)
+            || req.extensions().get::<LoadShedExempt>().is_some()
     }
 }
 
@@ -155,7 +175,7 @@ where
         if self.layer.limit == 0 || self.is_exempt(&req) {
             return LoadShedFuture::Forward {
                 inner: self.inner.call(req),
-                _guard: None,
+                guard: None,
             };
         }
 
@@ -191,7 +211,7 @@ where
 
         LoadShedFuture::Forward {
             inner: self.inner.call(req),
-            _guard: Some(InFlightGuard {
+            guard: Some(InFlightGuard {
                 counter: Arc::clone(in_flight),
             }),
         }
@@ -258,7 +278,7 @@ pin_project! {
         Forward {
             #[pin]
             inner: F,
-            _guard: Option<InFlightGuard>,
+            guard: Option<InFlightGuard>,
         },
     }
 }
@@ -274,7 +294,17 @@ where
             LoadShedFutureProj::ShortCircuit { response } => Poll::Ready(Ok(response
                 .take()
                 .expect("LoadShedFuture polled after completion"))),
-            LoadShedFutureProj::Forward { inner, .. } => inner.poll(cx),
+            LoadShedFutureProj::Forward { inner, guard } => {
+                let output = std::task::ready!(inner.poll(cx));
+                // Release the slot as soon as the inner future resolves,
+                // rather than waiting for this whole future to be dropped —
+                // if a caller (middleware combinator, logging, post-
+                // processing) holds onto the resolved future, the slot would
+                // otherwise stay occupied longer than the request is
+                // actually in flight.
+                guard.take();
+                Poll::Ready(output)
+            }
         }
     }
 }
@@ -486,6 +516,88 @@ mod tests {
         drop(fut);
 
         assert_eq!(layer.in_flight.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn guard_is_released_as_soon_as_inner_future_resolves() {
+        // A completed `LoadShedFuture` releases its slot immediately when
+        // polled to `Poll::Ready`, rather than waiting for the whole future to
+        // be dropped — a caller that holds onto the resolved future (a
+        // combinator, logging, post-processing) must not keep the slot
+        // occupied any longer than the request was actually in flight.
+        let metrics = MetricsCollector::new();
+        let layer = LoadShedLayer::new(1, metrics);
+        let app = make_app(layer.clone());
+
+        let mut fut =
+            Box::pin(app.oneshot(Request::builder().uri("/").body(Body::empty()).unwrap()));
+        let resp = std::future::poll_fn(|cx| Pin::new(&mut fut).poll(cx)).await;
+        assert_eq!(resp.unwrap().status(), axum::http::StatusCode::OK);
+
+        // The slot must already be free here, before `fut` is dropped.
+        assert_eq!(
+            layer.in_flight.load(Ordering::Acquire),
+            0,
+            "slot must be released on Poll::Ready, not deferred until drop"
+        );
+    }
+
+    // ── MCP replay exemption (avoids double-counting a tools/call) ────────
+
+    #[tokio::test]
+    async fn load_shed_exempt_marker_bypasses_the_ceiling() {
+        // A request carrying the `LoadShedExempt` marker must pass through
+        // uncounted, even with the single slot already occupied — this is
+        // how a `tools/call` replay avoids consuming a second slot for the
+        // same logical request already counted at the `/mcp` envelope.
+        let metrics = MetricsCollector::new();
+        let layer = LoadShedLayer::new(1, metrics);
+        let gate = Arc::new(Notify::new());
+        let entered = Arc::new(StdAtomicUsize::new(0));
+        let app = make_blocking_app(layer, gate.clone(), entered.clone());
+
+        let held = {
+            let app = app.clone();
+            tokio::spawn(async move {
+                app.oneshot(
+                    Request::builder()
+                        .uri("/block")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+            })
+        };
+        wait_for_entered(&entered, 1).await;
+
+        // The single shared slot is occupied: an ordinary (non-exempt)
+        // request to the same route is shed...
+        assert_eq!(
+            status(app.clone(), "/block").await,
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "sanity: the ceiling is actually saturated"
+        );
+
+        // ...but a request marked exempt is admitted regardless (proves the
+        // marker bypasses accounting rather than merely reserving another
+        // slot — this would otherwise deadlock, since the layer's one slot
+        // is already held by `held`).
+        let mut exempt_req = Request::builder()
+            .uri("/block")
+            .body(Body::empty())
+            .unwrap();
+        exempt_req.extensions_mut().insert(LoadShedExempt);
+        let exempt_fut = {
+            let app = app.clone();
+            tokio::spawn(async move { app.oneshot(exempt_req).await.unwrap().status() })
+        };
+        wait_for_entered(&entered, 2).await;
+
+        gate.notify_waiters();
+        assert_eq!(exempt_fut.await.unwrap(), axum::http::StatusCode::OK);
+        assert_eq!(held.await.unwrap(), axum::http::StatusCode::OK);
     }
 
     // ── Probe / actuator exemption ────────────────────────────────────────

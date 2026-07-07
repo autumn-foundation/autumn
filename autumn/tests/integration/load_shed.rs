@@ -334,4 +334,41 @@ mod mcp_admission {
         GATE_MCP.notify_waiters();
         held.await.unwrap().assert_ok();
     }
+
+    #[autumn_web::api_doc(mcp, summary = "Ping (MCP double-count regression, #1577)")]
+    #[get("/mcp-ping")]
+    async fn mcp_ping() -> autumn_web::Json<serde_json::Value> {
+        autumn_web::Json(serde_json::json!({"ok": true}))
+    }
+
+    /// A `tools/call` replays the request through the same shared
+    /// `LoadShedLayer` instance the `/mcp` envelope itself is wrapped with
+    /// (see `build_router_pre_state`'s `load_shed_layer`/`envelope_load_shed`
+    /// wiring). Without exempting that replay, a single solo `tools/call`
+    /// consumes two slots for one logical request — at `ceiling = 1` it would
+    /// shed itself even with no other traffic in flight at all.
+    #[tokio::test]
+    async fn tools_call_does_not_double_count_against_its_own_envelope_slot() {
+        let client = TestApp::new()
+            .config(config_with_ceiling(1))
+            .routes(routes![mcp_ping])
+            .mount_mcp("/mcp")
+            .build();
+
+        let resp = client
+            .post("/mcp")
+            .json(&serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": "mcp_ping", "arguments": {}}
+            }))
+            .send()
+            .await;
+        resp.assert_ok();
+        let body: serde_json::Value = resp.json();
+        assert_ne!(
+            body["result"]["isError"], true,
+            "a solo tools/call at ceiling=1 must not shed itself via a double-counted \
+             replay; got: {body}"
+        );
+    }
 }

@@ -35,7 +35,7 @@ pub use access_log::{
     ACCESS_LOG_TARGET, AccessLogEmitted, AccessLogLayer, AccessLogService, UNMATCHED_ROUTE,
 };
 pub use exception_filter::{AutumnErrorInfo, ExceptionFilter, ExceptionFilterLayer};
-pub use load_shed::{LoadShedLayer, LoadShedService};
+pub use load_shed::{LoadShedExempt, LoadShedLayer, LoadShedService};
 pub use log_context::{LogContextLayer, LogContextService};
 pub use maintenance::{DEFAULT_HEALTH_PREFIX, MaintenanceLayer, MaintenanceService};
 pub use method_override::{
