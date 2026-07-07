@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **ci:** README-quickstart gate against the published crates (issue #1586) —
+  `.github/workflows/quickstart-gate.yml` + `scripts/check-quickstart.sh`
+  install the README-pinned `autumn-cli` from crates.io (never the local
+  workspace), run `autumn new` / `autumn setup` / build / serve and assert a
+  200 from `GET /`, then run the README's
+  `autumn generate scaffold Post title:String body:Text published:bool` path
+  through build, `autumn migrate`, and a 200 from `GET /posts`. Runs on every
+  push to `trunk-dev`, on a daily schedule (catches upstream dependency
+  releases), and via `workflow_dispatch` with a `cli-version` input for gating
+  a freshly published release candidate (post-publish, pre-announce — see
+  `docs/release-checklist.md`). Each phase is a named CI step that emits
+  `::error::` on failure so a red run names the broken quickstart step, and
+  the job summary records the tracked install→first-200 funnel time.
+
 - **generator:** `autumn generate scaffold`'s `create`/`update` handlers now
   build a `Changeset` from the submission and re-render the `new`/`edit`
   form on a rejected submission (issue #1124). A failed submission responds

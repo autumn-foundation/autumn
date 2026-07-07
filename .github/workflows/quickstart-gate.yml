@@ -1,0 +1,117 @@
+name: Quickstart Gate
+
+# Runs the README quickstart end-to-end against the PUBLISHED crates
+# (issue #1586): install autumn-cli from crates.io, `autumn new`,
+# `autumn setup`, build, serve, first 200 from `GET /` — then the README's
+# scaffold path (`autumn generate scaffold Post ...` → build → migrate →
+# `GET /posts` responds). Each phase is its own step, so a red run names the
+# quickstart step that broke in the Actions UI without log spelunking, and
+# the job summary records the tracked funnel number (install → first 200).
+#
+# Trigger semantics — read this before blaming a commit:
+#   * A push-triggered run validates the README at that commit against
+#     whatever is on crates.io. It does NOT exercise the pushed code — the
+#     workspace [patch.crates-io] override means nothing in this repo's other
+#     CI ever builds against the published autumn-web, which is exactly the
+#     blind spot this gate covers. A red run on push means "a new user
+#     following the README today is broken", not "this commit is broken".
+#   * The daily schedule catches breakage caused by upstream dependency
+#     releases and crates.io-side skew, with no commit involved.
+#   * workflow_dispatch takes a `cli-version` input so a release candidate
+#     that was just published to crates.io can be gated explicitly —
+#     docs/release-checklist.md requires a green dispatched run against the
+#     candidate version before the release is announced.
+#
+# Deliberately NO Rust build caching on the quickstart phases: the gate's
+# tracked number is the fresh-user funnel (cold `cargo install` → first 200),
+# and a warmed cache would corrupt it. Only diesel_cli (a migrate
+# prerequisite that sits outside the funnel) is installed ahead of time.
+
+on:
+  push:
+    branches: [trunk-dev]
+  schedule:
+    # Daily at 05:23 UTC — catches upstream dependency releases that break
+    # the quickstart with no commit to this repo.
+    - cron: "23 5 * * *"
+  workflow_dispatch:
+    inputs:
+      cli-version:
+        description: >-
+          autumn-cli version to install from crates.io (release-candidate
+          gating). Leave empty to use the version pinned in the README
+          quickstart.
+        required: false
+        default: ""
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  QUICKSTART_CLI_VERSION: ${{ inputs.cli-version }}
+  DATABASE_URL: postgres://autumn:autumn@localhost:5432/quickstart
+
+jobs:
+  quickstart:
+    name: README quickstart vs published crates
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: autumn
+          POSTGRES_PASSWORD: autumn
+          POSTGRES_DB: quickstart
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U autumn"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android \
+                      /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install diesel_cli (autumn migrate prerequisite, outside the funnel)
+        run: cargo install diesel_cli --version "=2.2.0" --no-default-features --features postgres --locked
+
+      - name: "Quickstart: install (cargo install autumn-cli)"
+        run: ./scripts/check-quickstart.sh install
+
+      - name: "Quickstart: new (autumn new my-app)"
+        run: ./scripts/check-quickstart.sh new
+
+      - name: "Quickstart: setup (autumn setup)"
+        run: ./scripts/check-quickstart.sh setup
+
+      - name: "Quickstart: build (cargo build, published autumn-web)"
+        run: ./scripts/check-quickstart.sh build
+
+      - name: "Quickstart: first request (GET / → 200, funnel number)"
+        run: ./scripts/check-quickstart.sh serve
+
+      - name: "Scaffold: generate (autumn generate scaffold Post ...)"
+        run: ./scripts/check-quickstart.sh scaffold
+
+      - name: "Scaffold: build"
+        run: ./scripts/check-quickstart.sh scaffold-build
+
+      - name: "Scaffold: migrate (autumn migrate)"
+        run: ./scripts/check-quickstart.sh scaffold-migrate
+
+      - name: "Scaffold: first request (GET /posts → 200)"
+        run: ./scripts/check-quickstart.sh scaffold-serve
