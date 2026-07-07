@@ -737,4 +737,155 @@ mod tests {
             "empty state must explain how to register stories: {page}"
         );
     }
+
+    // ── Strict balanced-HTML check over the gallery chrome ──────────────
+    //
+    // The integration harness (tests/integration/stories.rs) runs this
+    // discipline over each story *fragment*; the full index/detail pages can
+    // only be rendered here (`render_story_*` are private), so a minimal
+    // copy of the strict checker lives in this module too. Unlike the
+    // lenient `crate::test_html` parser, it refuses auto-closing.
+
+    /// Panics when `html` is not well-formed (mismatched, unclosed, or
+    /// stray-closed tags).
+    fn assert_balanced_html(html: &str, context: &str) {
+        const VOID_ELEMENTS: &[&str] = &[
+            "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param",
+            "source", "track", "wbr",
+        ];
+        const RAW_TEXT_ELEMENTS: &[&str] = &["script", "style", "textarea", "title"];
+
+        let bytes = html.as_bytes();
+        let mut stack: Vec<String> = Vec::new();
+        let mut i = 0;
+
+        while i < bytes.len() {
+            if bytes[i] != b'<' {
+                i += 1;
+                continue;
+            }
+            if html[i..].starts_with("<!--") {
+                let end = html[i + 4..]
+                    .find("-->")
+                    .unwrap_or_else(|| panic!("unterminated comment in {context}:\n{html}"));
+                i += 4 + end + 3;
+                continue;
+            }
+            if html[i..].starts_with("<!") {
+                // Doctype or other declaration.
+                let end = html[i..]
+                    .find('>')
+                    .unwrap_or_else(|| panic!("unterminated declaration in {context}:\n{html}"));
+                i += end + 1;
+                continue;
+            }
+
+            let closing = html[i..].starts_with("</");
+            let name_start = i + if closing { 2 } else { 1 };
+            let name_len = html[name_start..]
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+                .unwrap_or(html.len() - name_start);
+            let name = html[name_start..name_start + name_len].to_ascii_lowercase();
+            assert!(
+                !name.is_empty(),
+                "malformed tag at byte {i} in {context}:\n{html}"
+            );
+
+            // Find the true end of the tag, skipping `>` inside quoted attrs.
+            let mut j = name_start + name_len;
+            let mut quote: Option<u8> = None;
+            while j < bytes.len() {
+                match (quote, bytes[j]) {
+                    (Some(q), c) if c == q => quote = None,
+                    (None, b'"') => quote = Some(b'"'),
+                    (None, b'\'') => quote = Some(b'\''),
+                    (None, b'>') => break,
+                    _ => {}
+                }
+                j += 1;
+            }
+            assert!(
+                j < bytes.len(),
+                "unterminated tag <{name} in {context}:\n{html}"
+            );
+            let self_closing = j > 0 && bytes[j - 1] == b'/';
+
+            if closing {
+                let open = stack.pop().unwrap_or_else(|| {
+                    panic!("closing </{name}> with no open tag in {context}:\n{html}")
+                });
+                assert_eq!(
+                    open, name,
+                    "mismatched close tag in {context}: expected </{open}>, found </{name}>:\n{html}"
+                );
+                i = j + 1;
+                continue;
+            }
+
+            if !self_closing && !VOID_ELEMENTS.contains(&name.as_str()) {
+                if RAW_TEXT_ELEMENTS.contains(&name.as_str()) {
+                    // Skip raw content up to the matching close tag.
+                    let close = format!("</{name}");
+                    let rest_start = j + 1;
+                    let end = html[rest_start..]
+                        .to_ascii_lowercase()
+                        .find(&close)
+                        .unwrap_or_else(|| {
+                            panic!("unclosed raw-text element <{name}> in {context}:\n{html}")
+                        });
+                    let close_gt = html[rest_start + end..]
+                        .find('>')
+                        .unwrap_or_else(|| panic!("unterminated </{name}> in {context}:\n{html}"));
+                    i = rest_start + end + close_gt + 1;
+                    continue;
+                }
+                stack.push(name);
+            }
+            i = j + 1;
+        }
+
+        assert!(
+            stack.is_empty(),
+            "unclosed tags {stack:?} in {context}:\n{html}"
+        );
+    }
+
+    // Guard the duplicated checker itself: a broken checker must not
+    // green-light rotten gallery chrome.
+    #[test]
+    fn balanced_html_checker_rejects_malformed_markup() {
+        assert_balanced_html(
+            r#"<!DOCTYPE html><div class="a > b"><p>ok<br></p></div>"#,
+            "self-test",
+        );
+        for bad in ["<div><p></div>", "<div>", "</div>"] {
+            let result = std::panic::catch_unwind(|| assert_balanced_html(bad, "self-test"));
+            assert!(result.is_err(), "checker should reject {bad}");
+        }
+    }
+
+    // U9 (AC4/AC8): the gallery chrome itself — grouped index, empty-state
+    // index, and every builtin detail page — is strictly balanced HTML, not
+    // just the story fragments the integration harness checks.
+    #[test]
+    fn gallery_index_and_detail_pages_render_balanced_html() {
+        let registry = builtin();
+        assert_balanced_html(
+            &render_story_index(&registry).into_string(),
+            "story index page",
+        );
+        assert_balanced_html(
+            &render_story_index(&StoryRegistry::default()).into_string(),
+            "empty-state index page",
+        );
+        for story in registry.stories() {
+            let rendered = story
+                .render()
+                .unwrap_or_else(|err| panic!("builtin story `{}` failed: {err}", story.slug()));
+            assert_balanced_html(
+                &render_story_detail(story, &rendered).into_string(),
+                &format!("detail page for `{}`", story.slug()),
+            );
+        }
+    }
 }

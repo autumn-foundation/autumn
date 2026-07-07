@@ -259,6 +259,46 @@ fn story_coverage_inventory_matches_registry() {
 
 // ── T11 (AC9, R1): coverage gate part 2 — fn-name scan of widgets.rs ─────
 
+/// True when `needle` occurs in `haystack` as a standalone identifier — i.e.
+/// not merely as a substring of a longer identifier (`card` inside
+/// `stat_card`, `search` inside `active_search`). Both neighbouring bytes
+/// must be non-identifier chars (`[^A-Za-z0-9_]`) or the string edge.
+fn contains_identifier(haystack: &str, needle: &str) -> bool {
+    let is_ident_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let bytes = haystack.as_bytes();
+    let mut from = 0;
+    while let Some(offset) = haystack[from..].find(needle) {
+        let start = from + offset;
+        let end = start + needle.len();
+        let boundary_before = start == 0 || !is_ident_byte(bytes[start - 1]);
+        let boundary_after = end == bytes.len() || !is_ident_byte(bytes[end]);
+        if boundary_before && boundary_after {
+            return true;
+        }
+        from = start + 1;
+    }
+    false
+}
+
+#[test]
+fn contains_identifier_requires_identifier_boundaries() {
+    // Positive: true identifier occurrences (call sites, imports).
+    assert!(contains_identifier("let x = card(&config);", "card"));
+    assert!(contains_identifier(
+        "use autumn_web::widgets::{tabs};",
+        "tabs"
+    ));
+    assert!(contains_identifier("card", "card"));
+    // Negative: substrings of longer identifiers must NOT count — these are
+    // exactly the false-positive channels of a raw `contains` gate.
+    assert!(!contains_identifier("stat_card(&config)", "card"));
+    assert!(!contains_identifier("CardConfig::new()", "card"));
+    assert!(!contains_identifier("active_search(&config)", "search"));
+    assert!(!contains_identifier("modal_close_button(..)", "modal"));
+    assert!(!contains_identifier("nav_link_matched(..)", "nav_link"));
+    assert!(!contains_identifier("data_table(&config)", "table"));
+}
+
 #[test]
 fn every_public_widget_fn_is_exercised_by_a_story() {
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -295,7 +335,7 @@ fn every_public_widget_fn_is_exercised_by_a_story() {
 
     let missing: Vec<&String> = widget_fns
         .iter()
-        .filter(|name| !all_sources.contains(name.as_str()))
+        .filter(|name| !contains_identifier(&all_sources, name))
         .collect();
     assert!(
         missing.is_empty(),

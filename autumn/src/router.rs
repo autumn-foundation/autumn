@@ -1108,6 +1108,16 @@ fn collect_claimed_get_paths(
         claimed.insert("/_autumn/mail/messages/{message_id}".to_owned());
         claimed.insert("/_autumn/mail/previews/{mailer}/{method}".to_owned());
     }
+    // The widget story gallery merges GETs at `/_stories` and
+    // `/_stories/{slug}` when `stories.enabled` resolves true, before the
+    // late-merged OpenAPI/MCP routers — reserve them so a colliding
+    // configured mount path surfaces the typed collision error instead of
+    // panicking in `router.merge`.
+    #[cfg(feature = "maud")]
+    if config.stories.enabled {
+        claimed.insert(crate::stories::STORIES_PATH.to_owned());
+        claimed.insert("/_stories/{slug}".to_owned());
+    }
     // The default unsubscribe endpoint merges a GET (+POST) at `UNSUBSCRIBE_PATH`
     // before the late-merged OpenAPI/MCP routers, so reserve it too — otherwise an
     // OpenAPI/MCP mount configured at `/_autumn/unsubscribe` passes this preflight
@@ -5618,6 +5628,42 @@ enabled = true
                 field: "openapi_json_path",
                 ref path,
             } if path == crate::job_tracking::JOB_STATUS_ROUTE_PATH
+        ));
+    }
+
+    #[cfg(all(feature = "openapi", feature = "maud"))]
+    #[tokio::test]
+    async fn try_build_router_rejects_openapi_path_on_story_gallery() {
+        // The story gallery merges GETs at `/_stories` (+ `/_stories/{slug}`)
+        // when `stories.enabled` resolves true, before the late-merged
+        // OpenAPI router, so the collision preflight must reserve it —
+        // otherwise mounting OpenAPI there panics in `router.merge` instead
+        // of surfacing the typed collision.
+        let mut config = AutumnConfig::default();
+        config.stories.enabled = true;
+        let openapi = crate::openapi::OpenApiConfig::new("Demo", "1.0.0")
+            .openapi_json_path(crate::stories::STORIES_PATH);
+        let ctx = RouterContext {
+            exception_filters: Vec::new(),
+            scoped_groups: Vec::new(),
+            merge_routers: Vec::new(),
+            nest_routers: Vec::new(),
+            custom_layers: Vec::new(),
+            static_gate_layers: Vec::new(),
+            error_page_renderer: None,
+            session_store: None,
+            openapi: Some(openapi),
+            #[cfg(feature = "mcp")]
+            mcp: None,
+        };
+        let err = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx)
+            .expect_err("story gallery path should be reserved while stories are enabled");
+        assert!(matches!(
+            err,
+            RouterBuildError::OpenApiPathCollision {
+                field: "openapi_json_path",
+                ref path,
+            } if path == crate::stories::STORIES_PATH
         ));
     }
 

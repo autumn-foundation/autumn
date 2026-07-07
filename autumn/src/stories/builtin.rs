@@ -234,10 +234,13 @@ pub(super) fn builtin_stories() -> Vec<Story> {
                     .title("Delete this post?")
                     .message(maud::html! { p { "This permanently removes the post." } })
                     .confirm_label("Delete post");
+                // The rendered form is live, so this demo points it at a
+                // synthetic target (nothing is mounted there — submitting on
+                // a served gallery is a 404 no-op) with a fake CSRF token.
                 confirm_action(
                     "delete-post",
                     "Delete…",
-                    "/posts/42",
+                    "/_stories/demo/delete-post",
                     http::Method::DELETE,
                     "demo-csrf-token",
                     &config,

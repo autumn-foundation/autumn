@@ -22,7 +22,7 @@ use autumn_web::prelude::*;
 
 #[autumn_web::main]
 async fn main() {
-    App::new()
+    autumn_web::app()
         .with_story_gallery(StoryGallery::builtin())
         .routes(routes![/* ... */])
         .run()
@@ -107,7 +107,9 @@ name with no alphanumeric characters panics at construction.
 
 A story that panics while rendering does not take the gallery down: the index
 never executes render functions, and the detail page returns a 500 error page
-naming the story.
+naming the story. Note that the caught panic still runs the process panic hook,
+so each view of a broken story's detail page emits a panic report to the logs —
+worth keeping in mind when exposing a gallery with custom stories publicly.
 
 ## Registering custom app widgets
 
@@ -130,10 +132,10 @@ fn app_stories() -> Vec<Story> {
 
 // Built-ins plus your own — your stories appear under their group ("App")
 // in the same sidebar:
-App::new().with_story_gallery(StoryGallery::builtin().extend(app_stories()));
+autumn_web::app().with_story_gallery(StoryGallery::builtin().extend(app_stories()));
 
 // Or an app-only gallery with no framework stories:
-App::new().with_story_gallery(StoryGallery::new().extend(app_stories()));
+autumn_web::app().with_story_gallery(StoryGallery::new().extend(app_stories()));
 ```
 
 `StoryGallery::routes()` returns the underlying sub-router if you need to
@@ -173,6 +175,6 @@ Configuration:
 |-----|---------|---------|
 | `stories.enabled` | `false` | Mount the gallery routes (any profile; `AUTUMN_STORIES__ENABLED` overrides) |
 
-Related: the dev mail preview (`/_autumn/mail`, see the mail guide) follows
+Related: the dev mail preview (`/_autumn/mail`, see the [mail guide](mail.md)) follows
 the same registry-plus-config pattern but is hardwired dev-only; the story
 gallery is profile-agnostic by design.

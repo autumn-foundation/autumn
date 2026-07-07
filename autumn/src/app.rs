@@ -2974,9 +2974,7 @@ impl AppBuilder {
         #[cfg(feature = "mail")]
         state.insert_extension(crate::mail::MailPreviewRegistry::new(mail_previews));
         #[cfg(feature = "maud")]
-        if let Some(gallery) = story_gallery {
-            state.insert_extension(gallery.into_registry());
-        }
+        install_story_registry(&state, story_gallery);
         if let Some(logger) = audit_logger {
             state.insert_extension::<crate::audit::AuditLogger>((*logger).clone());
         }
@@ -3902,9 +3900,7 @@ impl AppBuilder {
         #[cfg(feature = "mail")]
         state.insert_extension(crate::mail::MailPreviewRegistry::new(mail_previews));
         #[cfg(feature = "maud")]
-        if let Some(gallery) = story_gallery {
-            state.insert_extension(gallery.into_registry());
-        }
+        install_story_registry(&state, story_gallery);
         // run_build_mode used ProbeState::default(), which does not start as pending
         state.probes = crate::probe::ProbeState::default();
 
@@ -7238,6 +7234,17 @@ mod validate_repository_api_policies_tests {
             collect_unregistered_repository_handlers(&[], std::slice::from_ref(&group), &registry);
         assert_eq!(missing.len(), 1);
         assert_eq!(missing[0].0, "TestPost");
+    }
+}
+
+/// Publish the builder's story gallery (if any) as the [`StoryRegistry`]
+/// (`crate::stories::StoryRegistry`) `AppState` extension read by the
+/// `/_stories` handlers. Shared by the `run()` and build/SSG
+/// state-construction paths so the two stay in lockstep.
+#[cfg(feature = "maud")]
+fn install_story_registry(state: &AppState, story_gallery: Option<crate::stories::StoryGallery>) {
+    if let Some(gallery) = story_gallery {
+        state.insert_extension(gallery.into_registry());
     }
 }
 
@@ -10939,6 +10946,60 @@ mod tests {
                 .extension::<crate::http_client::SharedReqwestClient>()
                 .is_some(),
             "build_state must register a SharedReqwestClient for connection-pool sharing"
+        );
+    }
+
+    // AC5 plumbing (#1526): `with_story_gallery` stores the gallery on the
+    // builder, and `install_story_registry` — the single install step shared
+    // by both the run and build/SSG state-construction paths — publishes it
+    // as the StoryRegistry extension the `/_stories` handlers read.
+    #[cfg(feature = "maud")]
+    #[test]
+    fn with_story_gallery_installs_story_registry_extension() {
+        let builder = crate::app().with_story_gallery(crate::stories::StoryGallery::builtin());
+        let gallery = builder
+            .story_gallery
+            .expect("with_story_gallery must store the gallery on the builder");
+        let expected_count = gallery.stories().len();
+        assert!(expected_count > 0, "builtin gallery must not be empty");
+
+        let config = AutumnConfig::default();
+        let state = build_state(
+            &config,
+            #[cfg(feature = "db")]
+            None,
+            #[cfg(feature = "db")]
+            None,
+            #[cfg(feature = "ws")]
+            None,
+        );
+        install_story_registry(&state, Some(gallery));
+        let registry = state
+            .extension::<crate::stories::StoryRegistry>()
+            .expect("install_story_registry must publish the StoryRegistry extension");
+        assert_eq!(
+            registry.stories().len(),
+            expected_count,
+            "every registered story must reach the state extension"
+        );
+
+        // Without a registered gallery no extension is installed: the
+        // handlers fall back to the empty default and serve the empty state.
+        let bare_state = build_state(
+            &config,
+            #[cfg(feature = "db")]
+            None,
+            #[cfg(feature = "db")]
+            None,
+            #[cfg(feature = "ws")]
+            None,
+        );
+        install_story_registry(&bare_state, None);
+        assert!(
+            bare_state
+                .extension::<crate::stories::StoryRegistry>()
+                .is_none(),
+            "no gallery registered must mean no StoryRegistry extension"
         );
     }
 }

@@ -26,12 +26,6 @@
 pub use crate::Redirect;
 /// Typed path helper extension trait (`.with_query()`).
 pub use crate::paths::PathExt;
-/// Widget story gallery types (registered via `AppBuilder::with_story_gallery`).
-#[cfg(feature = "maud")]
-pub use crate::stories::{Story, StoryGallery, StoryRegistry};
-/// Widget story macro for the `/_stories` gallery: `story!{ "Group", "Name", { ... } }`.
-#[cfg(feature = "maud")]
-pub use autumn_macros::story;
 /// WebSocket route macro.
 #[cfg(feature = "ws")]
 pub use autumn_macros::ws;
@@ -194,6 +188,17 @@ pub use crate::widgets::{
     confirm_action, data_table, hero, modal, modal_close_button, modal_trigger, nav_bar, nav_link,
     nav_link_matched, property_list, stat_card, tabs,
 };
+
+// ── Widget stories ───────────────────────────────────────────────
+/// Widget story macro for the `/_stories` gallery: `story!{ "Group", "Name", { ... } }`.
+#[cfg(feature = "maud")]
+pub use crate::stories::story;
+/// Widget story gallery types (registered via `AppBuilder::with_story_gallery`)
+/// and the error returned by `Story::render`.
+///
+/// See [`crate::stories`] for the full API.
+#[cfg(feature = "maud")]
+pub use crate::stories::{Story, StoryGallery, StoryRegistry, StoryRenderError};
 
 // ── Link helpers ─────────────────────────────────────────────────
 /// Safe, method-aware `<a>`/`<form>` link helpers: [`crate::links::link_to`]

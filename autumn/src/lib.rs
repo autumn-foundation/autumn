@@ -597,6 +597,12 @@ pub use autumn_macros::mailer_preview;
 /// }
 /// ```
 pub use autumn_macros::main;
+/// Author a widget story for the `/_stories` gallery:
+/// `story!{ "Group", "Name", { ... } }`.
+///
+/// Also available as [`stories::story`], the macro's module home.
+#[cfg(feature = "maud")]
+pub use autumn_macros::story;
 
 /// Derive Diesel and Serde traits for a database model struct.
 ///
