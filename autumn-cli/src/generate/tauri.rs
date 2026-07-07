@@ -1383,9 +1383,9 @@ Required prerequisites for `cargo tauri build`:\n\
 /// # Errors
 /// Returns [`GenerateError::NotInProject`] when not at a project root, or
 /// [`GenerateError::Config`] when `remote_url` is not an acceptable HTTPS URL
-/// (plain `http` is allowed only for `localhost` / `127.0.0.1` / `::1` dev
-/// servers; URLs with embedded userinfo are rejected) or when `Cargo.toml`
-/// is missing `[package].name`.
+/// (plain `http` is allowed only for `localhost` / `127.0.0.1` / `::1` /
+/// `10.0.2.2` dev servers; URLs with embedded userinfo are rejected) or when
+/// `Cargo.toml` is missing `[package].name`.
 pub fn plan_tauri_thin_client(
     project_root: &Path,
     remote_url: &str,
@@ -1394,9 +1394,14 @@ pub fn plan_tauri_thin_client(
     let validated = validate_remote_url(remote_url)?;
     // The capability grant is scoped to the URL's *origin* (scheme://host[:port],
     // no path, no trailing slash) — the exact form Tauri matches remote pages
-    // against. The webview itself loads the URL as given, so a path component
+    // against. The webview itself loads the full URL, so a path component
     // (e.g. https://example.com/app) still lands on the right page.
     let remote_origin = validated.origin().ascii_serialization();
+    // Everywhere the URL lands in generated source, embed the parser's
+    // normalized serialization — it percent-encodes quotes/braces/spaces and
+    // strips newlines, so it is always safe inside a Rust string literal or
+    // doc comment. The raw flag value is not.
+    let normalized_url = validated.as_str();
 
     let (package_name, package_version, _bin_name, _has_embed_assets, _dep_key) =
         read_package_meta(project_root)?;
@@ -1420,7 +1425,7 @@ pub fn plan_tauri_thin_client(
     );
     plan.create(
         tauri.join("src").join("lib.rs"),
-        render_thin_client_lib_rs(&package_name, remote_url),
+        render_thin_client_lib_rs(&package_name, normalized_url),
     );
 
     // Capability grant: pages served from the remote origin may invoke the
@@ -1450,7 +1455,8 @@ pub fn plan_tauri_thin_client(
 }
 
 /// Validate a `--remote-url` value: require `https`, allow `http` only for
-/// loopback dev hosts (`localhost`, `127.0.0.1`, `::1`), and reject URLs
+/// dev hosts (`localhost`, `127.0.0.1`, `::1`, and `10.0.2.2` — the Android
+/// emulator's alias for the host machine's loopback), and reject URLs
 /// carrying embedded userinfo (`https://user:pass@…`).
 fn validate_remote_url(raw: &str) -> Result<url::Url, GenerateError> {
     let parsed = url::Url::parse(raw).map_err(|e| {
@@ -1458,6 +1464,22 @@ fn validate_remote_url(raw: &str) -> Result<url::Url, GenerateError> {
             "--remote-url must be an https:// URL (got '{raw}'): {e}"
         ))
     })?;
+    // Belt and braces: the serialization is interpolated into generated Rust
+    // source, so refuse anything the parser somehow leaves unsafe there. The
+    // WHATWG serialization percent-encodes quotes and strips control
+    // characters, so this should be unreachable — but a parser upgrade must
+    // never silently turn into generated-code injection.
+    if parsed
+        .as_str()
+        .chars()
+        .any(|c| c == '"' || c == '\\' || c.is_ascii_control())
+    {
+        return Err(GenerateError::Config(format!(
+            "--remote-url contains characters that cannot be embedded in generated \
+             code (got '{}')",
+            raw.escape_debug()
+        )));
+    }
     if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err(GenerateError::Config(format!(
             "--remote-url must not embed userinfo (got '{raw}'): credentials do not \
@@ -1470,13 +1492,17 @@ fn validate_remote_url(raw: &str) -> Result<url::Url, GenerateError> {
         "http" => {
             // Plain http is only acceptable against a local dev server —
             // a shipped mobile app must talk TLS to its remote origin.
+            // `Url::host_str` always returns IPv6 hosts bracketed, so only
+            // the `[::1]` form can occur. `10.0.2.2` is how an Android
+            // emulator reaches the host machine's loopback.
             let host = parsed.host_str().unwrap_or("");
-            if matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "::1") {
+            if matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "10.0.2.2") {
                 Ok(parsed)
             } else {
                 Err(GenerateError::Config(format!(
                     "--remote-url must be an https:// URL (got '{raw}'): plain http is \
-                     allowed only for localhost / 127.0.0.1 / ::1 dev servers"
+                     allowed only for localhost / 127.0.0.1 / ::1 / 10.0.2.2 \
+                     (Android emulator) dev servers"
                 )))
             }
         }
@@ -1492,14 +1518,31 @@ fn mobile_lib_name(package_name: &str) -> String {
     package_name.replace('-', "_") + "_mobile"
 }
 
+/// Bundle identifier for the mobile thin client: reverse-DNS with `-` and `_`
+/// stripped from the package name (`demo-app` → `com.example.demoapp`).
+///
+/// Unlike the desktop derivation ([`derive_identifier`], which hyphenates for
+/// Apple), the mobile identifier must satisfy *both* stores: Android forbids
+/// hyphens in application ids — `cargo tauri android init` panics on them
+/// (tauri-apps/tauri#9707) — and Apple forbids underscores. Alphanumeric
+/// segments are valid on both. Users should replace the `com.example.*`
+/// placeholder with their real identifier before running `android`/`ios init`.
+fn derive_mobile_identifier(package_name: &str) -> String {
+    format!("com.example.{}", package_name.replace(['-', '_'], ""))
+}
+
 /// `tauri.conf.json` for the thin client: productName/version/identifier and
 /// bundle icons only — no `externalBin` (no sidecar binary) and no `resources`
 /// (config files live on the remote server, not in the app bundle).
 ///
+/// `withGlobalTauri` is enabled because the pages come from a server-rendered
+/// Autumn app with no npm bundler: the injected `window.__TAURI__` global is
+/// how those remote pages call the granted plugins.
+///
 /// `csp` stays `null`: the webview renders remote pages, which carry the
 /// server's own Content-Security-Policy headers.
 fn render_thin_client_tauri_conf(package_name: &str, version: &str) -> String {
-    let identifier = derive_identifier(package_name);
+    let identifier = derive_mobile_identifier(package_name);
     let title = derive_title(package_name);
     format!(
         r#"{{
@@ -1520,6 +1563,7 @@ fn render_thin_client_tauri_conf(package_name: &str, version: &str) -> String {
     ]
   }},
   "app": {{
+    "withGlobalTauri": true,
     "security": {{
       "csp": null
     }}
@@ -1641,6 +1685,10 @@ pub fn run() {{
 /// `remote_origin` access to the core APIs and the notification, biometric,
 /// and store plugin commands. Never emit a wildcard here: any page the
 /// listed origins serve can invoke these device APIs.
+///
+/// `core:default` is kept (rather than a narrower core subset) because the
+/// injected `window.__TAURI__` API relies on the core event/window plumbing
+/// it permits; prune it only after verifying the trimmed set on a device.
 fn render_thin_client_capability(remote_origin: &str) -> String {
     format!(
         r#"{{
@@ -1682,6 +1730,11 @@ fn render_thin_client_ios_plist(package_name: &str) -> String {
 /// Human-readable prerequisites message printed after a successful
 /// thin-client scaffold (`autumn generate tauri --remote-url <URL>`).
 pub fn render_thin_client_prerequisites(remote_url: &str) -> String {
+    // Echo the normalized serialization — the form actually embedded in the
+    // scaffold — rather than the raw flag value (which may differ in case or
+    // percent-encoding). The URL was already validated at plan time.
+    let remote_url =
+        url::Url::parse(remote_url).map_or_else(|_| remote_url.to_owned(), |u| u.to_string());
     format!(
         "\
 Next steps for the mobile thin client (webview → {remote_url}):\n\
@@ -1695,8 +1748,9 @@ Next steps for the mobile thin client (webview → {remote_url}):\n\
        iOS:     rustup target add aarch64-apple-ios aarch64-apple-ios-sim\n\
      (Android also needs the Android SDK/NDK; iOS needs Xcode on macOS.)\n\
 \n\
-  3. Initialise the mobile projects (writes into src-tauri/gen/, which is\n\
-     .gitignore'd):\n\
+  3. Set your real reverse-DNS bundle identifier in src-tauri/tauri.conf.json\n\
+     (the scaffold derives a com.example.* placeholder), then initialise the\n\
+     mobile projects (writes into src-tauri/gen/, which is .gitignore'd):\n\
        cd src-tauri && cargo tauri android init\n\
        cd src-tauri && cargo tauri ios init\n\
 \n\
@@ -4858,19 +4912,43 @@ mod tests {
         assert_eq!(parsed["version"].as_str(), Some("0.1.0"));
         assert_eq!(
             parsed["identifier"].as_str(),
-            Some("com.example.my-app"),
-            "identifier must keep the underscore→hyphen derivation rule"
+            Some("com.example.myapp"),
+            "mobile identifier must contain no hyphens (they break \
+             `cargo tauri android init` — tauri-apps/tauri#9707)"
         );
+    }
 
-        // Underscored package names must still hyphenate in the identifier.
-        let tmp = project("my_cool_app");
-        let plan = plan_tauri_thin_client(tmp.path(), "https://app.example.com").unwrap();
+    #[test]
+    fn thin_client_identifier_strips_hyphens_and_underscores() {
+        // Hyphens in the bundle identifier make `cargo tauri android init`
+        // panic (tauri-apps/tauri#9707) and Apple forbids underscores — the
+        // mobile identifier must keep only alphanumeric segments.
+        for (package, expected) in [
+            ("demo-app", "com.example.demoapp"),
+            ("my_cool_app", "com.example.mycoolapp"),
+        ] {
+            let tmp = project(package);
+            let plan = plan_tauri_thin_client(tmp.path(), "https://app.example.com").unwrap();
+            let conf = created_str(&plan, "tauri.conf.json");
+            let parsed: serde_json::Value = serde_json::from_str(conf).unwrap();
+            assert_eq!(
+                parsed["identifier"].as_str(),
+                Some(expected),
+                "'{package}' must derive an identifier valid on both Android and iOS"
+            );
+        }
+    }
+
+    #[test]
+    fn thin_client_conf_enables_global_tauri() {
+        let (_tmp, plan) = thin_plan("https://app.example.com");
         let conf = created_str(&plan, "tauri.conf.json");
         let parsed: serde_json::Value = serde_json::from_str(conf).unwrap();
         assert_eq!(
-            parsed["identifier"].as_str(),
-            Some("com.example.my-cool-app"),
-            "Apple forbids underscores in bundle identifiers"
+            parsed["app"]["withGlobalTauri"],
+            serde_json::json!(true),
+            "remote server-rendered pages have no bundler — they call the \
+             plugins via the injected window.__TAURI__ global:\n{conf}"
         );
     }
 
@@ -4980,7 +5058,13 @@ mod tests {
     #[test]
     fn thin_client_allows_http_localhost_for_dev() {
         let tmp = project("my-app");
-        for url in ["http://localhost:3000", "http://127.0.0.1:8080"] {
+        // 10.0.2.2 is the Android emulator's alias for the host machine's
+        // loopback — the standard Android dev-loop target.
+        for url in [
+            "http://localhost:3000",
+            "http://127.0.0.1:8080",
+            "http://10.0.2.2:3000",
+        ] {
             assert!(
                 plan_tauri_thin_client(tmp.path(), url).is_ok(),
                 "loopback http URL '{url}' must be accepted for dev"
@@ -5003,6 +5087,70 @@ mod tests {
     }
 
     #[test]
+    fn thin_client_capability_scopes_grant_to_origin_not_full_url() {
+        // The capability grant must be the path-free origin, while the
+        // webview still loads the full URL including its path.
+        let (_tmp, plan) = thin_plan("https://app.example.com:8443/base/");
+        let cap = created_str(&plan, "capabilities/remote-app.json");
+        let parsed: serde_json::Value = serde_json::from_str(cap).unwrap();
+        assert_eq!(
+            parsed["remote"]["urls"],
+            serde_json::json!(["https://app.example.com:8443"]),
+            "capability must grant the origin only — no path, no trailing slash"
+        );
+        let lib = created_str(&plan, "src/lib.rs");
+        assert!(
+            lib.contains("https://app.example.com:8443/base/"),
+            "webview must load the full URL including its path:\n{lib}"
+        );
+    }
+
+    #[test]
+    fn thin_client_lib_rs_embeds_normalized_url_for_adversarial_inputs() {
+        // `url::Url::parse` accepts inputs whose *raw* form is unsafe inside
+        // a Rust string literal or `//!` doc comment (quotes, backslashes,
+        // raw newlines — the parser percent-encodes or strips them only in
+        // its own serialization). The generator must embed that normalized
+        // serialization, never the raw input — or reject the URL outright.
+        for raw in [
+            "https://app.example.com/pa\"th",
+            "https://app.example.com/x\\admin",
+            "https://app.example.com/a\nfn evil(){}//",
+            "https://app.example.com/{id}/x",
+            "HTTPS://App.Example.COM/Path",
+        ] {
+            let tmp = project("my-app");
+            let Ok(plan) = plan_tauri_thin_client(tmp.path(), raw) else {
+                continue; // clean rejection is equally acceptable
+            };
+            let lib = created_str(&plan, "src/lib.rs");
+            let normalized = url::Url::parse(raw)
+                .expect("an accepted URL must reparse")
+                .to_string();
+            assert!(
+                lib.contains(&normalized),
+                "lib.rs must embed the normalized serialization '{normalized}' \
+                 for raw input {raw:?}:\n{lib}"
+            );
+            if raw != normalized {
+                assert!(
+                    !lib.contains(raw),
+                    "lib.rs must not embed the raw input {raw:?}:\n{lib}"
+                );
+            }
+            assert!(
+                !lib.contains('\\'),
+                "generated lib.rs must contain no backslash (raw input {raw:?}):\n{lib}"
+            );
+            assert!(
+                !lib.contains("fn evil"),
+                "a raw newline in the URL must never break out of the doc \
+                 comment into top-level source:\n{lib}"
+            );
+        }
+    }
+
+    #[test]
     fn thin_client_prerequisites_mention_mobile_init() {
         let text = render_thin_client_prerequisites("https://app.example.com");
         for anchor in [
@@ -5016,6 +5164,13 @@ mod tests {
                 "thin-client prerequisites must mention '{anchor}':\n{text}"
             );
         }
+        // The echoed URL must be the normalized form actually granted in the
+        // capability file, not the raw flag value.
+        let echoed = render_thin_client_prerequisites("HTTPS://App.Example.COM");
+        assert!(
+            echoed.contains("https://app.example.com/"),
+            "prerequisites must echo the normalized URL:\n{echoed}"
+        );
     }
 
     #[test]

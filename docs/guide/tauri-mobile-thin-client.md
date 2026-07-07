@@ -43,14 +43,15 @@ autumn generate tauri --remote-url https://app.example.com
 ```
 
 The URL must be `https://`; plain `http://` is accepted only for
-`localhost` / `127.0.0.1` / `::1` dev servers, and URLs with embedded userinfo
-(`https://user:pass@…`) are rejected outright. `--dry-run` prints the file plan
-without writing, `--force` overwrites collisions, and
+`localhost` / `127.0.0.1` / `::1` / `10.0.2.2` dev servers (the last is the
+Android emulator's alias for the host machine's loopback), and URLs with
+embedded userinfo (`https://user:pass@…`) are rejected outright. `--dry-run`
+prints the file plan without writing, `--force` overwrites collisions, and
 `autumn destroy tauri --remote-url <URL>` reverts the scaffold.
 
 ```
 src-tauri/
-  tauri.conf.json              — productName, identifier, version, bundle icons
+  tauri.conf.json              — productName, identifier, withGlobalTauri, icons
   Cargo.toml                   — "{app}-mobile" crate; staticlib/cdylib for android/ios init
   build.rs                     — calls tauri_build::build()
   Info.ios.plist               — NSFaceIDUsageDescription for Face ID
@@ -79,6 +80,31 @@ cargo tauri android init && cargo tauri android dev
 cargo tauri ios init && cargo tauri ios dev
 ```
 
+> **Before `android init` / `ios init`:** the scaffold derives a placeholder
+> bundle identifier by stripping `-`/`_` from your package name
+> (`demo-app` → `com.example.demoapp`) — Android forbids hyphens in
+> application ids and Apple forbids underscores. Replace the placeholder with
+> your real reverse-DNS identifier in `tauri.conf.json` *before* running the
+> init commands, because the generated mobile projects bake it in.
+
+### Developing against a local server on Android
+
+Inside the app, `localhost` is the *phone*, not your workstation. Two dev
+routes reach a server running on the host machine:
+
+- **Emulator:** scaffold with `--remote-url http://10.0.2.2:3000` — the
+  emulator's built-in alias for the host's loopback, accepted by the
+  generator's http dev exception.
+- **Physical device:** run `adb reverse tcp:3000 tcp:3000`, then a
+  `--remote-url http://localhost:3000` scaffold works as-is — the device's
+  own `localhost:3000` is forwarded to the host.
+
+Either way, Android blocks cleartext (plain-http) traffic by default on API
+28+: for an http dev URL, set `android:usesCleartextTraffic="true"` (or a
+network-security-config scoped to your dev host) on the `<application>`
+element under `src-tauri/gen/android/`, and remove it before shipping.
+Release builds should always point at the `https://` production URL.
+
 ## Routing the webview to a remote HTTPS domain
 
 The generated `src/lib.rs` opens the main window directly on your server using
@@ -89,7 +115,7 @@ tauri::WebviewWindowBuilder::new(
     app,
     "main",
     tauri::WebviewUrl::External(
-        "https://app.example.com"
+        "https://app.example.com/"
             .parse()
             .expect("remote URL was validated at generate time"),
     ),
@@ -171,26 +197,31 @@ bundled local pages):
   wildcard: every origin listed here can drive the device APIs.
 - `permissions` — the default permission set of each plugin plus Tauri's core
   APIs (`core:default`, `notification:default`, `biometric:default`,
-  `store:default`).
+  `store:default`). `core:default` is kept because the injected
+  `window.__TAURI__` API relies on the core event/window plumbing it permits;
+  prune it to a narrower core subset only after verifying the trimmed set on
+  a device.
 
 > **Caveat:** on Linux and Android, Tauri cannot distinguish an embedded
 > iframe from the window itself — a page your app embeds from another origin
 > could be treated as the remote origin. Avoid third-party iframes on pages
 > served to the mobile shell.
 
-Your server pages call the plugins through the `@tauri-apps/api` npm packages
-— or, simplest for a server-rendered Maud/htmx app, via the global that Tauri
-injects when `app.withGlobalTauri` is enabled, or a small bundled script. The
-samples below use the plugin packages; they run *on your remote Autumn pages*,
-which is exactly what the `remote.urls` grant enables.
+The generated `tauri.conf.json` sets `"withGlobalTauri": true`, so Tauri
+injects its API — including the registered plugins' bindings — into pages
+served by the granted origin as the `window.__TAURI__` global. That global is
+the natural form for a server-rendered Maud/htmx app: no npm packages, no
+bundler. The samples below use it; they run *on your remote Autumn pages*,
+which is exactly what the `remote.urls` grant enables. (If your front end
+does have a bundler, the same APIs ship as the `@tauri-apps/plugin-notification`,
+`@tauri-apps/plugin-biometric`, and `@tauri-apps/plugin-store` npm packages —
+`import { … } from '@tauri-apps/plugin-…'` instead of reading the global.)
 
 Detect the shell first, so the same pages degrade gracefully in an ordinary
-browser:
+browser, where the global does not exist:
 
 ```js
-import { isTauri } from '@tauri-apps/api/core';
-
-if (isTauri()) {
+if (window.__TAURI__) {
   // running inside the mobile shell — native plugins are available
 } else {
   // plain browser — fall back to web APIs or hide native-only UI
@@ -200,11 +231,8 @@ if (isTauri()) {
 ### Notifications
 
 ```js
-import {
-  isPermissionGranted,
-  requestPermission,
-  sendNotification,
-} from '@tauri-apps/plugin-notification';
+const { isPermissionGranted, requestPermission, sendNotification } =
+  window.__TAURI__.notification;
 
 let granted = await isPermissionGranted();
 if (!granted) {
@@ -224,7 +252,7 @@ shell still builds on desktop for local smoke-testing. On iOS the generated
 the first Face ID prompt kills the app.
 
 ```js
-import { authenticate } from '@tauri-apps/plugin-biometric';
+const { authenticate } = window.__TAURI__.biometric;
 
 try {
   await authenticate('Unlock your account', {
@@ -239,7 +267,7 @@ try {
 ### Device storage
 
 ```js
-import { load } from '@tauri-apps/plugin-store';
+const { load } = window.__TAURI__.store;
 
 const store = await load('app-data.json');
 await store.set('draft', { body: 'unsent message…' });
@@ -267,16 +295,29 @@ cookie. Requirements and caveats specific to a *remote HTTPS origin inside a
 mobile shell*:
 
 - **`Secure` is mandatory.** Set `session.secure = true`
-  (`AUTUMN_SESSION__SECURE=true`) in production. Cookies without `Secure` over
-  HTTPS are increasingly dropped by mobile webviews.
+  (`AUTUMN_SESSION__SECURE=true`) in production. `SameSite=None` — which any
+  cross-context request below needs — is rejected outright without `Secure`,
+  the `__Secure-`/`__Host-` cookie-name prefixes require it, and it
+  guarantees the session cookie never transits plaintext HTTP.
 - **Set `SameSite` explicitly.** Since your pages, form posts, and htmx
   requests all originate from your own origin, `SameSite=Lax` (Autumn's
-  sensible default) works for normal navigation. But iOS 18+ WKWebView treats
-  cookies with *no* `SameSite` attribute inconsistently (historically `None`,
-  now effectively `Lax`), so never rely on the unset default. If a request to
+  sensible default; the `session.same_site` knob,
+  `AUTUMN_SESSION__SAME_SITE`) works for normal navigation. Never rely on the
+  *unset* default, though: iOS 18.0 briefly changed WKWebView's
+  unset-`SameSite` default from `None` to `Lax` — reverted in iOS 18.0.1
+  ([WebKit bug 279153](https://bugs.webkit.org/show_bug.cgi?id=279153)) —
+  breaking every app that leaned on the implicit behavior. If a request to
   your server originates from a *different* context (a plugin webview, an
   OAuth popup, an embedded page), the cookie must be `SameSite=None; Secure`
   to be attached cross-site.
+- **CSRF protection keeps working — leave it on.** Autumn's CSRF middleware
+  (`security.csrf`, enabled by the `prod` profile's smart defaults) is
+  double-submit: it sets an `autumn-csrf` cookie and expects the token echoed
+  back in the `X-CSRF-Token` header or `_csrf` form field on mutating
+  requests. Pages and htmx posts rendered by your server carry it exactly as
+  they do in a browser, so cookie mode needs no changes. And if you do relax
+  a cookie to `SameSite=None`, the browser-side CSRF mitigation is gone — the
+  middleware is then your only line of defence.
 - **Persistence is flaky on iOS.** WKWebView's cookie persistence interacts
   badly with Intelligent Tracking Prevention and has long-standing
   synchronization bugs (see WebKit bug 213510): a session cookie can survive a
@@ -286,7 +327,8 @@ mobile shell*:
   re-authentication fallback — the token handoff below is a good one — so a
   dropped cookie degrades to a background token refresh instead of a login
   screen.
-- Autumn knobs that matter here: `session.secure`, the signing secret
+- Autumn knobs that matter here: `session.secure`, `session.same_site`, the
+  CSRF settings (`security.csrf`), the signing secret
   (`AUTUMN_SECURITY__SIGNING_SECRET`), and trusted hosts
   (`AUTUMN_SECURITY__TRUSTED_HOSTS__HOSTS`).
 
@@ -297,7 +339,7 @@ store it natively via the store plugin. On successful login your page stores
 the token:
 
 ```js
-import { load } from '@tauri-apps/plugin-store';
+const { load } = window.__TAURI__.store;
 
 // after POST /login succeeds and returns { token }
 const store = await load('auth.json');
@@ -321,12 +363,19 @@ Issue short-lived access tokens and rotate them server-side (a refresh
 endpoint the shell calls when a request comes back `401`); revoke on logout by
 deleting the store entry *and* invalidating server-side.
 
+**CSRF interplay:** Autumn's CSRF middleware validates *all* mutating
+requests, including bearer-token `fetch` posts like the one above. Either
+attach the token too (read the `autumn-csrf` cookie into the `X-CSRF-Token`
+header), or register your token-authenticated API paths under
+`security.csrf.exempt_paths` (prefix match, e.g. `"/api/"`) — that knob
+exists precisely for endpoints that authenticate with non-cookie credentials.
+
 **Biometric-gated token release** ties the two plugin integrations together —
 require Face ID / fingerprint before the stored token is read:
 
 ```js
-import { authenticate } from '@tauri-apps/plugin-biometric';
-import { load } from '@tauri-apps/plugin-store';
+const { authenticate } = window.__TAURI__.biometric;
+const { load } = window.__TAURI__.store;
 
 async function unlockToken() {
   await authenticate('Unlock your account'); // throws if cancelled/unavailable
