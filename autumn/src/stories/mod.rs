@@ -382,25 +382,26 @@ fn story_detail_response(state: &AppState, slug: &str) -> Response {
         return (http::StatusCode::NOT_FOUND, Html(page.into_string())).into_response();
     };
 
-    if let Err(error) = story.render() {
-        let page = story_page(
-            "Story failed to render",
-            &maud::html! {
-                main class="story-content" {
-                    h1 { "Story failed to render" }
-                    p { (error.to_string()) }
-                    p { a href=(STORIES_PATH) { "Back to the gallery" } }
-                }
-            },
-        );
-        return (
-            http::StatusCode::INTERNAL_SERVER_ERROR,
-            Html(page.into_string()),
-        )
-            .into_response();
+    match story.render() {
+        Ok(rendered) => Html(render_story_detail(story, &rendered).into_string()).into_response(),
+        Err(error) => {
+            let page = story_page(
+                "Story failed to render",
+                &maud::html! {
+                    main class="story-content" {
+                        h1 { "Story failed to render" }
+                        p { (error.to_string()) }
+                        p { a href=(STORIES_PATH) { "Back to the gallery" } }
+                    }
+                },
+            );
+            (
+                http::StatusCode::INTERNAL_SERVER_ERROR,
+                Html(page.into_string()),
+            )
+                .into_response()
+        }
     }
-
-    Html(render_story_detail(story).into_string()).into_response()
 }
 
 /// Minimal gallery chrome layered on top of the framework widget stylesheet.
@@ -482,10 +483,11 @@ fn render_story_index(registry: &StoryRegistry) -> maud::Markup {
 
 /// Render a single story's detail page: live render above Source and
 /// Rendered HTML tabs (dogfooding the [`crate::widgets::tabs`] widget).
-fn render_story_detail(story: &Story) -> maud::Markup {
-    let rendered = story.render().unwrap_or_else(|error| {
-        maud::html! { p class="story-render-error" { (error.to_string()) } }
-    });
+///
+/// `rendered` is the story's markup, rendered exactly once by the caller
+/// (which also owns the render-failure response), so the preview and the
+/// Rendered HTML tab always show the same output.
+fn render_story_detail(story: &Story, rendered: &maud::Markup) -> maud::Markup {
     let rendered_html = rendered.clone().into_string();
     story_page(
         story.name(),
@@ -693,7 +695,8 @@ mod tests {
                 maud::html! { p class="proof-marker" { "live proof" } }
             }
         };
-        let page = render_story_detail(&story).into_string();
+        let rendered = story.render().expect("proof story renders");
+        let page = render_story_detail(&story, &rendered).into_string();
         let dom = crate::test_html::parse(&page);
 
         let preview = crate::test_html::SelectorList::parse(".story-preview .proof-marker")
