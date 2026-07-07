@@ -1074,6 +1074,15 @@ fn collect_claimed_get_paths(
         claimed.insert(crate::htmx::IDIOMORPH_JS_PATH.to_owned());
         claimed.insert(crate::htmx::HTMX_SSE_JS_PATH.to_owned());
     }
+    // Framework CSS routes (flash/widget stylesheets) merge a GET
+    // unconditionally whenever their feature is on, before the late-merged
+    // OpenAPI/MCP routers — reserve them so a colliding configured path
+    // surfaces the typed collision error instead of panicking in
+    // `router.merge`.
+    #[cfg(feature = "flash")]
+    claimed.insert(crate::flash::FLASH_CSS_PATH.to_owned());
+    #[cfg(feature = "maud")]
+    claimed.insert(crate::ui::WIDGETS_CSS_PATH.to_owned());
     // Dev live-reload endpoints are only mounted when the env vars
     // that enable them are set, but reserving the paths regardless
     // makes the error message deterministic across dev/prod.
@@ -1502,6 +1511,23 @@ fn mount_framework_routes(
             method = "GET",
             path = crate::flash::FLASH_CSS_PATH,
             name = "autumn flash stylesheet",
+            "Mounted route"
+        );
+    }
+
+    // Framework-provided widget stylesheet (#1215). Backs every `autumn-*`
+    // class emitted by form/widgets/wizard/pagination/storage/job-tracking so
+    // widgets render styled without an app-authored copy — Tailwind or not.
+    #[cfg(feature = "maud")]
+    {
+        router = router.route(
+            crate::ui::WIDGETS_CSS_PATH,
+            axum::routing::get(widgets_css_handler),
+        );
+        tracing::debug!(
+            method = "GET",
+            path = crate::ui::WIDGETS_CSS_PATH,
+            name = "autumn widget stylesheet",
             "Mounted route"
         );
     }
@@ -3319,22 +3345,149 @@ pub async fn htmx_handler() -> axum::response::Response {
         .into_response()
 }
 
+/// Gzip/brotli encodings of a compile-time-constant CSS body, computed once
+/// per process (via a call-site-owned [`std::sync::OnceLock`], see
+/// [`flash_css_handler`]/[`widgets_css_handler`]) rather than redone on every
+/// request — the bytes never change, so recompressing them per-request would
+/// burn CPU for a byte-identical result each time.
+#[cfg(any(feature = "flash", feature = "maud"))]
+struct PrecompressedCss {
+    gzip: bytes::Bytes,
+    brotli: bytes::Bytes,
+}
+
+#[cfg(any(feature = "flash", feature = "maud"))]
+impl PrecompressedCss {
+    fn compute(body: &'static str) -> Self {
+        use std::io::Write as _;
+
+        let mut gzip_encoder =
+            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gzip_encoder
+            .write_all(body.as_bytes())
+            .expect("in-memory gzip encoding cannot fail");
+        let gzip = gzip_encoder
+            .finish()
+            .expect("in-memory gzip encoding cannot fail");
+
+        let mut brotli_writer = brotli::CompressorWriter::new(Vec::new(), 4096, 11, 22);
+        brotli_writer
+            .write_all(body.as_bytes())
+            .expect("in-memory brotli encoding cannot fail");
+        let brotli = brotli_writer.into_inner();
+
+        Self {
+            gzip: gzip.into(),
+            brotli: brotli.into(),
+        }
+    }
+}
+
+/// `true` when the request's `Accept-Encoding` header accepts `coding`
+/// (case-insensitive, comma-separated, honoring an explicit `q=0` opt-out
+/// per RFC 7231 §5.3.4). A minimal parser rather than a full content-
+/// negotiation crate, since only `gzip`/`br` ever need checking here.
+#[cfg(any(feature = "flash", feature = "maud"))]
+fn accepts_encoding(headers: &http::HeaderMap, coding: &str) -> bool {
+    let Some(value) = headers
+        .get(http::header::ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return false;
+    };
+    value.split(',').any(|part| {
+        let mut segments = part.split(';');
+        let name = segments.next().unwrap_or("").trim();
+        name.eq_ignore_ascii_case(coding)
+            && segments
+                .find_map(|q| q.trim().strip_prefix("q="))
+                .and_then(|q| q.parse::<f32>().ok())
+                .is_none_or(|q| q > 0.0)
+    })
+}
+
+/// Serves a framework-owned, compile-time-constant CSS asset: same-origin,
+/// immutably cached, conditional-GET aware (a strong `ETag` hashed from
+/// `body`, so a revalidating client gets a bodyless `304` instead of the
+/// full asset), and served pre-compressed from `precompressed` when the
+/// client's `Accept-Encoding` allows it — computed once per process, not
+/// per request. Shared by every framework CSS route ([`flash_css_handler`],
+/// [`widgets_css_handler`]) so the caching/content-type/compression policy
+/// lives in one place.
+#[cfg(any(feature = "flash", feature = "maud"))]
+fn static_css_response(
+    headers: &http::HeaderMap,
+    body: &'static str,
+    precompressed: &'static PrecompressedCss,
+) -> axum::response::Response {
+    use crate::etag::IntoETag as _;
+    use axum::response::IntoResponse;
+
+    let (encoded_body, content_encoding): (axum::body::Body, Option<&'static str>) =
+        if accepts_encoding(headers, "br") {
+            (precompressed.brotli.clone().into(), Some("br"))
+        } else if accepts_encoding(headers, "gzip") {
+            (precompressed.gzip.clone().into(), Some("gzip"))
+        } else {
+            (body.into(), None)
+        };
+
+    let mut response_headers = http::HeaderMap::new();
+    response_headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("text/css; charset=utf-8"),
+    );
+    response_headers.insert(
+        http::header::CACHE_CONTROL,
+        http::HeaderValue::from_static("public, max-age=31536000, immutable"),
+    );
+    // Cache intermediaries must key on the request's Accept-Encoding since
+    // the body served for this same URL differs (plain/gzip/br).
+    response_headers.insert(
+        http::header::VARY,
+        http::HeaderValue::from_static("Accept-Encoding"),
+    );
+    if let Some(encoding) = content_encoding {
+        response_headers.insert(
+            http::header::CONTENT_ENCODING,
+            http::HeaderValue::from_static(encoding),
+        );
+    }
+
+    // A weak validator: the identity/gzip/br byte streams served for this
+    // one logical resource are not byte-identical, so a strong ETag (which
+    // asserts byte-for-byte equivalence — see `ETag::strong`) would be
+    // incorrect here, even though `Vary: Accept-Encoding` already keeps
+    // cache entries for different encodings distinct.
+    let etag = crate::etag::ETag::weak(body.into_etag().tag().to_owned());
+
+    crate::etag::fresh_when(headers, etag)
+        .or((response_headers, encoded_body))
+        .into_response()
+}
+
 /// Serves the framework's default flash-message stylesheet
 /// ([`crate::flash::FLASH_CSS`]) at [`crate::flash::FLASH_CSS_PATH`].
 #[cfg(feature = "flash")]
-pub async fn flash_css_handler() -> axum::response::Response {
-    use axum::response::IntoResponse;
-    (
-        [
-            (http::header::CONTENT_TYPE, "text/css; charset=utf-8"),
-            (
-                http::header::CACHE_CONTROL,
-                "public, max-age=31536000, immutable",
-            ),
-        ],
+pub async fn flash_css_handler(headers: http::HeaderMap) -> axum::response::Response {
+    static PRECOMPRESSED: std::sync::OnceLock<PrecompressedCss> = std::sync::OnceLock::new();
+    static_css_response(
+        &headers,
         crate::flash::FLASH_CSS,
+        PRECOMPRESSED.get_or_init(|| PrecompressedCss::compute(crate::flash::FLASH_CSS)),
     )
-        .into_response()
+}
+
+/// Serves the framework's widget stylesheet ([`crate::ui::WIDGETS_CSS`]) at
+/// [`crate::ui::WIDGETS_CSS_PATH`] (#1215).
+#[cfg(feature = "maud")]
+pub async fn widgets_css_handler(headers: http::HeaderMap) -> axum::response::Response {
+    static PRECOMPRESSED: std::sync::OnceLock<PrecompressedCss> = std::sync::OnceLock::new();
+    static_css_response(
+        &headers,
+        crate::ui::WIDGETS_CSS,
+        PRECOMPRESSED.get_or_init(|| PrecompressedCss::compute(crate::ui::WIDGETS_CSS)),
+    )
 }
 
 #[cfg(feature = "htmx")]
@@ -3635,6 +3788,250 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(legacy.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// The framework-owned widget stylesheet (#1215) is served the same way
+    /// as the flash stylesheet: a same-origin, immutably-cached asset — not
+    /// inline styles — so a strict `style-src 'self'` CSP still works and the
+    /// asset is embeddable in the single binary (#1004) with no loose files.
+    #[cfg(feature = "maud")]
+    #[tokio::test]
+    async fn widgets_css_route_serves_the_shared_stylesheet() {
+        let app = build_router(Vec::new(), &AutumnConfig::default(), test_state());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(crate::ui::WIDGETS_CSS_PATH)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let content_type = response
+            .headers()
+            .get(http::header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(content_type.contains("text/css"), "{content_type}");
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains(".autumn-field"), "{body}");
+        assert!(body.contains(":root"), "{body}");
+    }
+
+    /// The widget stylesheet is conditional-GET aware (shared `static_css_response`
+    /// helper): a revalidating client sends back the `ETag` it was given and gets
+    /// a bodyless `304`, instead of re-downloading the full asset every time the
+    /// far-future `Cache-Control` gets bypassed (hard refresh, a CDN stripping
+    /// cache headers, etc.).
+    #[cfg(feature = "maud")]
+    #[tokio::test]
+    async fn widgets_css_route_supports_conditional_get() {
+        let app = build_router(Vec::new(), &AutumnConfig::default(), test_state());
+
+        let first = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(crate::ui::WIDGETS_CSS_PATH)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let etag = first
+            .headers()
+            .get(http::header::ETAG)
+            .expect("widget stylesheet response should carry an ETag")
+            .clone();
+
+        let revalidated = app
+            .oneshot(
+                Request::builder()
+                    .uri(crate::ui::WIDGETS_CSS_PATH)
+                    .header(http::header::IF_NONE_MATCH, etag)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(revalidated.status(), StatusCode::NOT_MODIFIED);
+        let revalidated_body = axum::body::to_bytes(revalidated.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(revalidated_body.is_empty());
+    }
+
+    /// The widget stylesheet's `ETag` must be weak (`W/"..."`), not strong:
+    /// the identity/gzip/br byte streams served under it are not
+    /// byte-identical, and a strong `ETag` asserts exactly that (RFC 7232
+    /// §2.1).
+    #[cfg(feature = "maud")]
+    #[tokio::test]
+    async fn widgets_css_route_etag_is_weak_not_strong() {
+        let app = build_router(Vec::new(), &AutumnConfig::default(), test_state());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(crate::ui::WIDGETS_CSS_PATH)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let etag = response
+            .headers()
+            .get(http::header::ETAG)
+            .expect("widget stylesheet response should carry an ETag")
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert!(
+            etag.starts_with("W/\""),
+            "ETag must be weak since encoded variants aren't byte-identical: {etag}"
+        );
+    }
+
+    /// A client that sends `Accept-Encoding: br` gets the pre-computed brotli
+    /// encoding straight back (`Content-Encoding: br`), not a plain body that
+    /// the outer `CompressionLayer` then has to compress on the fly.
+    #[cfg(feature = "maud")]
+    #[tokio::test]
+    async fn widgets_css_route_serves_precompressed_brotli_when_accepted() {
+        let app = build_router(Vec::new(), &AutumnConfig::default(), test_state());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(crate::ui::WIDGETS_CSS_PATH)
+                    .header(http::header::ACCEPT_ENCODING, "br")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_ENCODING)
+                .unwrap(),
+            "br"
+        );
+        assert_eq!(
+            response.headers().get(http::header::VARY).unwrap(),
+            "Accept-Encoding"
+        );
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let mut decoded = Vec::new();
+        brotli::BrotliDecompress(&mut std::io::Cursor::new(body.as_ref()), &mut decoded)
+            .expect("response body must be valid brotli");
+        assert_eq!(String::from_utf8(decoded).unwrap(), crate::ui::WIDGETS_CSS);
+    }
+
+    /// Same as the brotli case, for a `gzip`-only client.
+    #[cfg(feature = "maud")]
+    #[tokio::test]
+    async fn widgets_css_route_serves_precompressed_gzip_when_accepted() {
+        let app = build_router(Vec::new(), &AutumnConfig::default(), test_state());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(crate::ui::WIDGETS_CSS_PATH)
+                    .header(http::header::ACCEPT_ENCODING, "gzip")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_ENCODING)
+                .unwrap(),
+            "gzip"
+        );
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let mut gz = flate2::read::GzDecoder::new(body.as_ref());
+        let mut output = String::new();
+        std::io::Read::read_to_string(&mut gz, &mut output)
+            .expect("response body must be valid gzip");
+        assert_eq!(output, crate::ui::WIDGETS_CSS);
+    }
+
+    /// `q=0` is an explicit opt-out (RFC 7231 §5.3.4): a client that lists
+    /// `br` but disqualifies it must fall back to the identity encoding
+    /// rather than being served brotli anyway.
+    #[cfg(feature = "maud")]
+    #[tokio::test]
+    async fn widgets_css_route_honors_q_zero_opt_out() {
+        let app = build_router(Vec::new(), &AutumnConfig::default(), test_state());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(crate::ui::WIDGETS_CSS_PATH)
+                    .header(http::header::ACCEPT_ENCODING, "br;q=0, gzip")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_ENCODING)
+                .unwrap(),
+            "gzip"
+        );
+    }
+
+    /// No `Accept-Encoding` header at all means identity — no
+    /// `Content-Encoding` header, plain-text body (matches the existing
+    /// `widgets_css_route_serves_the_shared_stylesheet` assertions).
+    #[cfg(feature = "maud")]
+    #[tokio::test]
+    async fn widgets_css_route_serves_identity_with_no_accept_encoding() {
+        let app = build_router(Vec::new(), &AutumnConfig::default(), test_state());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(crate::ui::WIDGETS_CSS_PATH)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            !response
+                .headers()
+                .contains_key(http::header::CONTENT_ENCODING)
+        );
     }
 
     /// Pins the production access-log wiring (#999): the layer is applied in
@@ -4343,6 +4740,81 @@ mod tests {
         };
         let err = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx)
             .expect_err("scope '/api' + child '/' should collide with openapi path '/api'");
+        assert!(matches!(
+            err,
+            RouterBuildError::OpenApiPathCollision {
+                field: "openapi_json_path",
+                ..
+            }
+        ));
+    }
+
+    /// The widget stylesheet route merges a GET unconditionally whenever
+    /// `maud` is on, before the late-merged `OpenAPI` router — an
+    /// `openapi_json_path` configured to the same path must be rejected by
+    /// the preflight, not panic in `router.merge`.
+    #[cfg(all(feature = "openapi", feature = "maud"))]
+    #[test]
+    fn try_build_router_detects_widgets_css_path_collision() {
+        use crate::openapi::OpenApiConfig;
+
+        let openapi =
+            OpenApiConfig::new("Demo", "1.0.0").openapi_json_path(crate::ui::WIDGETS_CSS_PATH);
+        let config = AutumnConfig::default();
+        let ctx = RouterContext {
+            exception_filters: Vec::new(),
+            scoped_groups: Vec::new(),
+            merge_routers: Vec::new(),
+            nest_routers: Vec::new(),
+            custom_layers: Vec::new(),
+            static_gate_layers: Vec::new(),
+            #[cfg(feature = "maud")]
+            error_page_renderer: None,
+            session_store: None,
+            openapi: Some(openapi),
+            #[cfg(feature = "mcp")]
+            mcp: None,
+        };
+        let err = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx).expect_err(
+            "openapi_json_path colliding with the widget stylesheet route should be rejected",
+        );
+        assert!(matches!(
+            err,
+            RouterBuildError::OpenApiPathCollision {
+                field: "openapi_json_path",
+                ..
+            }
+        ));
+    }
+
+    /// Same as above for the flash stylesheet route (pre-existing gap, same
+    /// class of bug: the flash CSS route was also missing from
+    /// `collect_claimed_get_paths`).
+    #[cfg(all(feature = "openapi", feature = "flash"))]
+    #[test]
+    fn try_build_router_detects_flash_css_path_collision() {
+        use crate::openapi::OpenApiConfig;
+
+        let openapi =
+            OpenApiConfig::new("Demo", "1.0.0").openapi_json_path(crate::flash::FLASH_CSS_PATH);
+        let config = AutumnConfig::default();
+        let ctx = RouterContext {
+            exception_filters: Vec::new(),
+            scoped_groups: Vec::new(),
+            merge_routers: Vec::new(),
+            nest_routers: Vec::new(),
+            custom_layers: Vec::new(),
+            static_gate_layers: Vec::new(),
+            #[cfg(feature = "maud")]
+            error_page_renderer: None,
+            session_store: None,
+            openapi: Some(openapi),
+            #[cfg(feature = "mcp")]
+            mcp: None,
+        };
+        let err = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx).expect_err(
+            "openapi_json_path colliding with the flash stylesheet route should be rejected",
+        );
         assert!(matches!(
             err,
             RouterBuildError::OpenApiPathCollision {
