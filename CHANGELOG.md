@@ -344,8 +344,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   forking the component CSS. The `autumn new` template and every example's
   `input.css` no longer inline the widget CSS; a coverage test
   (`widget_css_coverage`) fails the build if a widget ever emits an `autumn-*`
-  class with no backing rule. Additive; no breaking change; minor version
-  bump. See [Widget styling](docs/guide/widget-styling.md).
+  class with no backing rule. Additive API surface; minor version bump. **Visual
+  change:** the previous per-app copy hardcoded an indigo accent (`#4f46e5`)
+  independent of `ui::tokens`; the shipped stylesheet instead references
+  `var(--primary)`, so widgets now pick up the framework's existing brand
+  token (violet, `#7c3aed`) by default. Apps that want the old accent back can
+  set `--primary: #4f46e5;` (and friends) on `:root` in their own stylesheet,
+  loaded after the widget one. See [Widget styling](docs/guide/widget-styling.md).
 
 ## [0.6.0] - 2026-06-30
 

@@ -85,6 +85,18 @@
     font-weight: 600;
 }
 
+/* Same as the unmodified .wizard-step__number/__label defaults — stated
+   explicitly so every state the widget emits has a rule, per the coverage
+   test in tests/integration/widget_css_coverage.rs. */
+.wizard-step--upcoming .wizard-step__number {
+    background-color: var(--border);
+    color: var(--text-muted);
+}
+
+.wizard-step--upcoming .wizard-step__label {
+    color: var(--text-muted);
+}
+
 .wizard-progress__summary {
     font-size: 0.75rem;
     color: var(--text-muted);
@@ -397,6 +409,7 @@
 
 .autumn-breadcrumb {
     font-size: 0.875rem;
+    margin-bottom: 1rem;
 }
 
 .autumn-breadcrumb__list {

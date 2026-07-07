@@ -7,3 +7,16 @@
  */
 
 @import "tailwindcss";
+
+/*
+ * Wiki's emerald breadcrumb link — overrides the shared widget default
+ * (autumn_web::ui::WIDGETS_CSS_PATH, linked before this stylesheet in
+ * pages.rs's layout) to match wiki's emerald theme.
+ */
+.autumn-breadcrumb__link {
+    color: #059669;
+}
+
+.autumn-breadcrumb__link:hover {
+    color: #059669;
+}

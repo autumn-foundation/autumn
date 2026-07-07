@@ -7,3 +7,36 @@
  */
 
 @import "tailwindcss";
+
+/*
+ * Blog's hero theme: left-aligned, stone/amber accent — overrides the
+ * shared widget defaults (autumn_web::ui::WIDGETS_CSS_PATH, linked before
+ * this stylesheet in posts.rs's layout) rather than forking the widget CSS.
+ */
+.autumn-hero {
+    padding: 0;
+    text-align: left;
+    margin-bottom: 2.5rem;
+}
+
+.autumn-hero__title {
+    color: #1c1917;
+}
+
+.autumn-hero__subtitle {
+    color: #57534e;
+}
+
+.autumn-hero__actions {
+    justify-content: flex-start;
+}
+
+.autumn-hero__cta--primary {
+    background-color: #b45309;
+    border-color: #b45309;
+}
+
+.autumn-hero__cta--primary:hover {
+    background-color: #92400e;
+    border-color: #92400e;
+}

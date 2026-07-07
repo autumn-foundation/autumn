@@ -3256,40 +3256,41 @@ pub async fn htmx_handler() -> axum::response::Response {
         .into_response()
 }
 
+/// Serves a framework-owned, compile-time-constant CSS asset: same-origin,
+/// immutably cached, and conditional-GET aware (a strong `ETag` hashed from
+/// `body`, so a revalidating client gets a bodyless `304` instead of the
+/// full asset). Shared by every framework CSS route ([`flash_css_handler`],
+/// [`widgets_css_handler`]) so the caching/content-type policy lives in one
+/// place.
+#[cfg(any(feature = "flash", feature = "maud"))]
+fn static_css_response(headers: &http::HeaderMap, body: &'static str) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    crate::etag::fresh_when(headers, body)
+        .or((
+            [
+                (http::header::CONTENT_TYPE, "text/css; charset=utf-8"),
+                (
+                    http::header::CACHE_CONTROL,
+                    "public, max-age=31536000, immutable",
+                ),
+            ],
+            body,
+        ))
+        .into_response()
+}
+
 /// Serves the framework's default flash-message stylesheet
 /// ([`crate::flash::FLASH_CSS`]) at [`crate::flash::FLASH_CSS_PATH`].
 #[cfg(feature = "flash")]
-pub async fn flash_css_handler() -> axum::response::Response {
-    use axum::response::IntoResponse;
-    (
-        [
-            (http::header::CONTENT_TYPE, "text/css; charset=utf-8"),
-            (
-                http::header::CACHE_CONTROL,
-                "public, max-age=31536000, immutable",
-            ),
-        ],
-        crate::flash::FLASH_CSS,
-    )
-        .into_response()
+pub async fn flash_css_handler(headers: http::HeaderMap) -> axum::response::Response {
+    static_css_response(&headers, crate::flash::FLASH_CSS)
 }
 
 /// Serves the framework's widget stylesheet ([`crate::ui::WIDGETS_CSS`]) at
 /// [`crate::ui::WIDGETS_CSS_PATH`] (#1215).
 #[cfg(feature = "maud")]
-pub async fn widgets_css_handler() -> axum::response::Response {
-    use axum::response::IntoResponse;
-    (
-        [
-            (http::header::CONTENT_TYPE, "text/css; charset=utf-8"),
-            (
-                http::header::CACHE_CONTROL,
-                "public, max-age=31536000, immutable",
-            ),
-        ],
-        crate::ui::WIDGETS_CSS,
-    )
-        .into_response()
+pub async fn widgets_css_handler(headers: http::HeaderMap) -> axum::response::Response {
+    static_css_response(&headers, crate::ui::WIDGETS_CSS)
 }
 
 #[cfg(feature = "htmx")]
@@ -3626,6 +3627,50 @@ mod tests {
         let body = String::from_utf8(body.to_vec()).unwrap();
         assert!(body.contains(".autumn-field"), "{body}");
         assert!(body.contains(":root"), "{body}");
+    }
+
+    /// The widget stylesheet is conditional-GET aware (shared `static_css_response`
+    /// helper): a revalidating client sends back the `ETag` it was given and gets
+    /// a bodyless `304`, instead of re-downloading the full asset every time the
+    /// far-future `Cache-Control` gets bypassed (hard refresh, a CDN stripping
+    /// cache headers, etc.).
+    #[cfg(feature = "maud")]
+    #[tokio::test]
+    async fn widgets_css_route_supports_conditional_get() {
+        let app = build_router(Vec::new(), &AutumnConfig::default(), test_state());
+
+        let first = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(crate::ui::WIDGETS_CSS_PATH)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let etag = first
+            .headers()
+            .get(http::header::ETAG)
+            .expect("widget stylesheet response should carry an ETag")
+            .clone();
+
+        let revalidated = app
+            .oneshot(
+                Request::builder()
+                    .uri(crate::ui::WIDGETS_CSS_PATH)
+                    .header(http::header::IF_NONE_MATCH, etag)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(revalidated.status(), StatusCode::NOT_MODIFIED);
+        let revalidated_body = axum::body::to_bytes(revalidated.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(revalidated_body.is_empty());
     }
 
     /// Pins the production access-log wiring (#999): the layer is applied in

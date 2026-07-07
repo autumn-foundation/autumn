@@ -58,6 +58,23 @@ you would override a third-party component library:
 ## Coverage
 
 A build-time test (`autumn/tests/integration/widget_css_coverage.rs`) scans
-every widget source file for emitted `autumn-*` classes and asserts each has a
-backing rule in the shipped stylesheet — so a new widget class can't ship
-unstyled without failing the build.
+every widget source file for emitted `autumn-*`/`wizard-*` classes and asserts
+each has a backing rule in the shipped stylesheet — so a new widget class
+can't ship unstyled without failing the build.
+
+## Migrating from a per-app `input.css` (pre-0.7)
+
+If your app's `input.css` had its own `@layer components` block styling
+`autumn-*` classes (the pattern `autumn new` generated before 0.7), delete it —
+the shipped stylesheet replaces it. Two things to check afterward:
+
+- **Accent color**: the old copy-pasted block hardcoded an indigo accent
+  (`#4f46e5`) independent of `ui::tokens`. The shipped stylesheet instead
+  reads `var(--primary)`, so widgets now pick up whatever `--primary` your app
+  (or the framework default, violet `#7c3aed`) resolves to. Restore the old
+  accent by setting `--primary: #4f46e5;` (and `--primary-hover`,
+  `--primary-light`) on `:root` in your own stylesheet.
+- **App-specific overrides**: if your old block also carried bespoke colors or
+  layout for one widget (a themed hero banner, a differently-colored
+  breadcrumb link), re-add just those declarations to your own stylesheet,
+  loaded after the widget one — see "Override a specific widget" above.

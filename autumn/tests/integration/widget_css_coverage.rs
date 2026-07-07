@@ -11,8 +11,8 @@
 
 use std::path::Path;
 
-/// Widget source files that emit `autumn-*` classes meant to be styled by the
-/// shared framework stylesheet. Deliberately excludes:
+/// Widget source files that emit `autumn-*`/`wizard-*` classes meant to be
+/// styled by the shared framework stylesheet. Deliberately excludes:
 /// - `src/error_pages/dev_badge.rs` — ships its own inline `<style>`;
 ///   `autumn-dev-*` classes are self-styled, not part of the shared sheet.
 /// - `src/flash.rs` — uses the `.flash` / `.flash-<level>` convention, not
@@ -20,46 +20,49 @@ use std::path::Path;
 const WIDGET_SOURCES: &[&str] = &[
     "src/form.rs",
     "src/widgets.rs",
+    "src/wizard.rs",
     "src/ui/pagination.rs",
     "src/storage/form_helper.rs",
     "src/job_tracking.rs",
 ];
 
-/// Extracts every `autumn-*` token emitted as a CSS class by the production
-/// code in `source` (as opposed to a `data-*` attribute name, doc-comment
-/// prose, or a test-only fixture string).
+/// Class-name prefixes the shared stylesheet backs — `autumn-` for
+/// form/nav/modal/etc., `wizard-` for the wizard progress stepper.
+const CLASS_PREFIXES: &[&str] = &["autumn-", "wizard-"];
+
+/// Extracts every `autumn-*`/`wizard-*` token emitted as a CSS class by the
+/// production code in `source` (as opposed to a `data-*` attribute name,
+/// doc-comment prose, or a test-only fixture string).
 fn emitted_classes(source: &str) -> Vec<String> {
     // Every file here ends in a single `#[cfg(test)] mod tests { ... }` block
     // whose fixtures assert against literal ids (e.g. `"autumn-nav-menu-1"`)
     // that aren't CSS classes. Every real class is also exercised by the
-    // render code above it, so truncating before the test module loses no
-    // coverage while dropping that noise.
-    let production_code = source
-        .find("\nmod tests {")
-        .map_or(source, |idx| &source[..idx]);
+    // render code above it, so stopping at the test module loses no coverage
+    // while dropping that noise.
+    let production_lines = source
+        .lines()
+        .take_while(|line| line.trim() != "mod tests {");
 
     let mut classes = Vec::new();
-    for line in production_code.lines() {
+    for line in production_lines {
         // Strip `//`/`///` comments so prose mentions of the JS runtime
         // asset (`autumn-widgets.js`) aren't mistaken for a CSS class.
         let code = line.split("//").next().unwrap_or("");
         let bytes = code.as_bytes();
-        let mut i = 0;
-        while let Some(rel) = code[i..].find("autumn-") {
-            let start = i + rel;
-            // Skip `data-autumn-*` attribute names — not a CSS class.
-            if start > 0 && bytes[start - 1] == b'-' {
-                i = start + "autumn-".len();
-                continue;
+        for prefix in CLASS_PREFIXES {
+            for (start, _) in code.match_indices(prefix) {
+                // Skip `data-autumn-*`/`data-wizard-*` attribute names — not a CSS class.
+                if start > 0 && bytes[start - 1] == b'-' {
+                    continue;
+                }
+                let end = code[start..]
+                    .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+                    .map_or(code.len(), |rel_end| start + rel_end);
+                let token = code[start..end].trim_end_matches('-');
+                if !token.is_empty() {
+                    classes.push(token.to_string());
+                }
             }
-            let end = code[start..]
-                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
-                .map_or(code.len(), |rel_end| start + rel_end);
-            let token = code[start..end].trim_end_matches('-');
-            if !token.is_empty() {
-                classes.push(token.to_string());
-            }
-            i = end;
         }
     }
     classes
@@ -141,6 +144,8 @@ fn widgets_css_path_and_selectors_are_stable() {
         ".autumn-property-list",
         ".autumn-direct-upload",
         ".autumn-job-status",
+        ".wizard-progress",
+        ".wizard-step",
     ] {
         assert!(
             autumn_web::ui::WIDGETS_COMPONENT_CSS.contains(selector),
