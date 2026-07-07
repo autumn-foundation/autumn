@@ -1866,10 +1866,10 @@ fn resolve_autumn_web_dep_key(existing: &str, section: &str) -> &'static str {
         let Some((key, val)) = after_ws.split_once('=') else {
             continue;
         };
-        let alias = key
-            .trim()
+        let key_trimmed = key.trim();
+        let alias = key_trimmed
             .split_once('.')
-            .map_or(key.trim(), |(base, _)| base);
+            .map_or(key_trimmed, |(base, _)| base);
         if alias.replace('-', "_") == "autumn_web" && declares_package(val, "autumn-web") {
             return "autumn_web";
         }
