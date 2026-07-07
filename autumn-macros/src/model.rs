@@ -1445,6 +1445,116 @@ fn type_name_str(ty: &syn::Type) -> String {
     crate::api_doc::last_segment_name(ty).unwrap_or_else(|| "unknown".to_owned())
 }
 
+/// Humanize a snake_case field name into a `<label>`-friendly title
+/// (e.g. `published_at` -> `"Published At"`). Mirrors the scaffold's
+/// `humanize_label` so a derived form and a hand-written one read alike.
+fn humanize_field_label(name: &str) -> String {
+    let name = name.strip_prefix("r#").unwrap_or(name);
+    name.split('_')
+        .filter(|word| !word.is_empty())
+        .map(|word| {
+            let mut chars = word.chars();
+            chars.next().map_or_else(String::new, |c| {
+                c.to_uppercase().to_string() + &chars.collect::<String>()
+            })
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Emit the `::autumn_web::form::FieldControl` expression for a model field,
+/// derived from its (Option-unwrapped) Rust type. `nullable` is `true` for
+/// `Option<...>` fields.
+///
+/// The mapping mirrors the scaffold's `render_changeset_form_inputs` control
+/// selection (#1131): strings/UUID -> text, integers -> stepped number,
+/// floats/decimals -> free-step number, `bool` -> checkbox (nullable `bool` ->
+/// a tri-state select so `NULL` stays reachable), dates/datetimes -> the
+/// corresponding pickers. Unrecognized types (e.g. user enums) fall back to a
+/// plain text control; callers can promote them to a `Select` via
+/// `FormFor::override_field` (which is exactly what the scaffold does for enum
+/// columns, whose variants it knows statically).
+fn form_control_tokens(inner_ty: &syn::Type, nullable: bool) -> TokenStream {
+    let name = type_name_str(inner_ty);
+    match name.as_str() {
+        "String" | "str" | "Uuid" => quote! { ::autumn_web::form::FieldControl::Text },
+        "bool" => {
+            if nullable {
+                quote! {
+                    ::autumn_web::form::FieldControl::Select {
+                        options: ::std::vec![
+                            (::std::string::String::from(""), ::std::string::String::from("— Unset —")),
+                            (::std::string::String::from("true"), ::std::string::String::from("Yes")),
+                            (::std::string::String::from("false"), ::std::string::String::from("No")),
+                        ],
+                    }
+                }
+            } else {
+                quote! { ::autumn_web::form::FieldControl::Checkbox }
+            }
+        }
+        "i8" | "i16" | "i32" | "i64" | "i128" | "isize" | "u8" | "u16" | "u32" | "u64" | "u128"
+        | "usize" => quote! {
+            ::autumn_web::form::FieldControl::Number {
+                step: ::core::option::Option::Some(::std::string::String::from("1")),
+            }
+        },
+        "f32" | "f64" | "Decimal" | "BigDecimal" => quote! {
+            ::autumn_web::form::FieldControl::Number {
+                step: ::core::option::Option::Some(::std::string::String::from("any")),
+            }
+        },
+        "NaiveDate" => quote! { ::autumn_web::form::FieldControl::Date },
+        "NaiveDateTime" | "DateTime" => quote! { ::autumn_web::form::FieldControl::DateTime },
+        // Unknown types (user enums, JSON, custom newtypes) -> text by default;
+        // promote via `.override_field(...)` where a richer control is known.
+        _ => quote! { ::autumn_web::form::FieldControl::Text },
+    }
+}
+
+/// Emit `impl ::autumn_web::form::FormModel for #name` (issue #1135), listing
+/// one `FormField` descriptor per user-editable column (the same
+/// `fields_for_new` set the insertable `NewX` struct uses -- i.e. excluding the
+/// primary key, `#[default]`, and `#[lock_version]` columns).
+///
+/// This is what lets `form_for::<T>(...)` render a whole form in one call: the
+/// descriptor carries each field's serialized name, humanized label,
+/// type-appropriate control, and `required` flag (derived from non-`Option`).
+fn emit_form_model_impl(name: &syn::Ident, fields_for_new: &[&&Field]) -> TokenStream {
+    let field_exprs: Vec<TokenStream> = fields_for_new
+        .iter()
+        .filter_map(|f| {
+            let ident = f.ident.as_ref()?;
+            let field_name = ident.to_string();
+            let field_name = field_name.strip_prefix("r#").unwrap_or(&field_name);
+            let label = humanize_field_label(field_name);
+            let nullable = is_option_type(&f.ty);
+            let inner = crate::api_doc::unwrap_single_generic(&f.ty, "Option")
+                .unwrap_or_else(|| f.ty.clone());
+            let control = form_control_tokens(&inner, nullable);
+            let required = !nullable;
+            Some(quote! {
+                ::autumn_web::form::FormField::new(
+                    #field_name,
+                    #label,
+                    #control,
+                    #required,
+                )
+            })
+        })
+        .collect();
+
+    quote! {
+        impl ::autumn_web::form::FormModel for #name {
+            fn form_fields() -> ::std::vec::Vec<::autumn_web::form::FormField> {
+                ::std::vec![
+                    #(#field_exprs),*
+                ]
+            }
+        }
+    }
+}
+
 /// Emit a `TokenStream` that evaluates (at runtime) to a `serde_json::Value`
 /// representing the JSON Schema for the given Rust type.
 ///
@@ -3109,6 +3219,10 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! { where #(#commit_hook_deserialize_bounds,)* }
     };
 
+    // `impl FormModel for #name` (issue #1135) -- one descriptor per editable
+    // column, driving the single-call `form_for::<#name>(...)` builder.
+    let form_model_impl = emit_form_model_impl(name, &fields_for_new);
+
     quote! {
         #encrypted_use
 
@@ -3120,6 +3234,8 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             #(#query_fields,)*
         }
         #name_debug_impl
+
+        #form_model_impl
 
         #[derive(#new_debug_derive Clone, ::diesel::Insertable)]
         #[derive(::serde::Serialize, ::serde::Deserialize)]

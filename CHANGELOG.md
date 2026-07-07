@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **form:** `autumn_web::form::form_for` — a model-driven form builder that
+  renders a complete form in one call (issue #1135): opening `<form>` (hidden
+  `_method` override for `PUT`/`PATCH`/`DELETE` + auto-injected CSRF, via the
+  same audited path as `form_tag`), one type-appropriate control per field with
+  values pre-filled and inline per-field errors, and a submit button. Controls
+  come from a new `#[model]`-derived `FormModel`/`FormField`/`FieldControl`
+  descriptor, reusing the #1131 typed inputs — no per-field control selection in
+  caller code. Escape hatches: `.exclude`, `.override_field`, `.override_label`,
+  `.append`, `.submit_label`, `.multipart`. Plain no-JS HTML; htmx stays opt-in.
+  Public API addition (minor bump); existing helpers unchanged.
+
 - **generator:** `autumn generate scaffold`'s `create`/`update` handlers now
   build a `Changeset` from the submission and re-render the `new`/`edit`
   form on a rejected submission (issue #1124). A failed submission responds

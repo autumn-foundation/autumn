@@ -1761,6 +1761,379 @@ pub fn skip_link(target: &str, label: &str) -> maud::Markup {
     }
 }
 
+// ── form_for (issue #1135 phase 2) ──────────────────────────────────
+
+/// The HTML control a model field renders as inside [`form_for`].
+///
+/// This is plain data (no `maud` dependency) so the `#[model]`-derived
+/// [`FormModel`] implementation is always available; only the rendering side
+/// ([`form_for`]) is gated behind the `maud` feature.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FieldControl {
+    /// `<input type="text">`.
+    Text,
+    /// `<textarea>`.
+    Textarea,
+    /// `<input type="password">`.
+    Password,
+    /// `<input type="number">`, with an optional HTML `step` attribute.
+    Number {
+        /// The HTML `step` attribute, e.g. `Some("0.01")`, or `None` to use
+        /// the browser default.
+        step: Option<String>,
+    },
+    /// `<input type="checkbox">`.
+    Checkbox,
+    /// `<input type="date">`.
+    Date,
+    /// `<input type="datetime-local">`.
+    DateTime,
+    /// `<select>` with `(value, label)` option pairs, e.g. enum variants or
+    /// a nullable-bool tri-state.
+    Select {
+        /// The `(value, label)` option pairs rendered as `<option>` elements.
+        options: Vec<(String, String)>,
+    },
+    /// `<input type="file">`. The presence of any `File` field makes
+    /// [`FormFor::render`] emit `enctype="multipart/form-data"`.
+    File,
+}
+
+/// One field descriptor consumed by [`form_for`].
+///
+/// Typically produced by a `#[model]`-derived [`FormModel::form_fields`]
+/// implementation, one entry per persisted column that should render as a
+/// form control.
+#[derive(Debug, Clone)]
+pub struct FormField {
+    /// The field's `name`/`id` attribute — must match the changeset's
+    /// serialized field name.
+    pub name: String,
+    /// The human-readable `<label>` text.
+    pub label: String,
+    /// Which HTML control renders this field.
+    pub control: FieldControl,
+    /// Whether the rendered control should be marked required (`required`
+    /// attribute + `aria-required="true"`), where a required variant of the
+    /// control exists.
+    pub required: bool,
+}
+
+impl FormField {
+    /// Construct a new field descriptor.
+    #[must_use]
+    pub fn new(
+        name: impl Into<String>,
+        label: impl Into<String>,
+        control: FieldControl,
+        required: bool,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            label: label.into(),
+            control,
+            required,
+        }
+    }
+}
+
+/// Implemented by model types (typically via `#[model]`) to drive
+/// [`form_for`].
+///
+/// Returns the ordered list of fields to render — one [`FormField`] per
+/// column that should appear as a control in the generated form.
+pub trait FormModel {
+    /// The ordered list of fields [`form_for`] should render.
+    fn form_fields() -> Vec<FormField>;
+}
+
+/// Render a full `<form>` for `T` from `changeset`, deriving one control per
+/// [`FormModel::form_fields`] entry.
+///
+/// This is the "one call renders the whole form" counterpart to composing
+/// the individual typed-input helpers (e.g. [`text_input`], [`select_input`])
+/// by hand: `form_for` walks `T::form_fields()`, dispatches each field to the
+/// matching helper based on its [`FieldControl`], and wraps the result in a
+/// `<form>` via the same audited CSRF/method-override path as [`form_tag`].
+///
+/// Use the [`FormFor`] builder methods to exclude fields, override a field's
+/// control or label, inject a CSRF token, append extra markup before the
+/// submit button, or force a `multipart/form-data` encoding.
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_web::form::{Changeset, FieldControl, FormField, FormModel, form_for};
+/// use serde::Serialize;
+///
+/// #[derive(Serialize)]
+/// struct Post {
+///     title: String,
+///     views: i32,
+///     published: bool,
+/// }
+///
+/// impl FormModel for Post {
+///     fn form_fields() -> Vec<FormField> {
+///         vec![
+///             FormField::new("title", "Title", FieldControl::Text, true),
+///             FormField::new("views", "Views", FieldControl::Number { step: None }, false),
+///             FormField::new("published", "Published", FieldControl::Checkbox, false),
+///         ]
+///     }
+/// }
+///
+/// let changeset = Changeset::new(Post { title: "Hello".into(), views: 0, published: false });
+/// let html = form_for(&changeset, "/posts", "post")
+///     .csrf("tok")
+///     .render()
+///     .into_string();
+///
+/// assert!(html.contains("<form"));
+/// assert!(html.contains(r#"name="_csrf""#));
+/// assert!(html.contains(r#"name="title""#));
+/// assert!(html.contains(r#"name="views""#));
+/// assert!(html.contains(r#"name="published""#));
+/// assert!(html.contains(r#"type="submit""#));
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn form_for<'a, T>(
+    changeset: &'a Changeset<T>,
+    action: impl Into<String>,
+    method: impl Into<String>,
+) -> FormFor<'a, T>
+where
+    T: Serialize + FormModel,
+{
+    FormFor {
+        changeset,
+        action: action.into(),
+        method: method.into(),
+        csrf_token: None,
+        csrf_field_name: "_csrf".to_string(),
+        excluded: Vec::new(),
+        field_overrides: Vec::new(),
+        label_overrides: Vec::new(),
+        appended: Vec::new(),
+        submit_label: "Save".to_string(),
+        force_multipart: false,
+    }
+}
+
+/// Builder returned by [`form_for`]; call [`FormFor::render`] to produce the
+/// final `<form>` markup.
+#[cfg(feature = "maud")]
+pub struct FormFor<'a, T: Serialize + FormModel> {
+    changeset: &'a Changeset<T>,
+    action: String,
+    method: String,
+    csrf_token: Option<String>,
+    csrf_field_name: String,
+    excluded: Vec<String>,
+    field_overrides: Vec<(String, FieldControl)>,
+    label_overrides: Vec<(String, String)>,
+    appended: Vec<maud::Markup>,
+    submit_label: String,
+    force_multipart: bool,
+}
+
+#[cfg(feature = "maud")]
+impl<'a, T: Serialize + FormModel> FormFor<'a, T> {
+    /// Inject a hidden CSRF input carrying `token`.
+    #[must_use]
+    pub fn csrf(mut self, token: impl Into<String>) -> Self {
+        self.csrf_token = Some(token.into());
+        self
+    }
+
+    /// Override the hidden CSRF field name (default `"_csrf"`).
+    #[must_use]
+    pub fn csrf_field_name(mut self, name: impl Into<String>) -> Self {
+        self.csrf_field_name = name.into();
+        self
+    }
+
+    /// Drop `field` from the rendered form.
+    #[must_use]
+    pub fn exclude(mut self, field: impl Into<String>) -> Self {
+        self.excluded.push(field.into());
+        self
+    }
+
+    /// Replace the derived control for `field`.
+    #[must_use]
+    pub fn override_field(mut self, field: impl Into<String>, control: FieldControl) -> Self {
+        self.field_overrides.push((field.into(), control));
+        self
+    }
+
+    /// Replace the label for `field`.
+    #[must_use]
+    pub fn override_label(mut self, field: impl Into<String>, label: impl Into<String>) -> Self {
+        self.label_overrides.push((field.into(), label.into()));
+        self
+    }
+
+    /// Insert extra markup before the submit button.
+    #[must_use]
+    pub fn append(mut self, markup: maud::Markup) -> Self {
+        self.appended.push(markup);
+        self
+    }
+
+    /// Override the submit button label (default `"Save"`).
+    #[must_use]
+    pub fn submit_label(mut self, label: impl Into<String>) -> Self {
+        self.submit_label = label.into();
+        self
+    }
+
+    /// Force `enctype="multipart/form-data"` even when no field is a
+    /// [`FieldControl::File`].
+    #[must_use]
+    pub fn multipart(mut self) -> Self {
+        self.force_multipart = true;
+        self
+    }
+
+    /// Render the full `<form>` markup.
+    #[must_use]
+    pub fn render(self) -> maud::Markup {
+        let Self {
+            changeset,
+            action,
+            method,
+            csrf_token,
+            csrf_field_name,
+            excluded,
+            field_overrides,
+            label_overrides,
+            appended,
+            submit_label,
+            force_multipart,
+        } = self;
+
+        let fields = effective_form_fields::<T>(&excluded, &field_overrides, &label_overrides);
+        let is_multipart = force_multipart
+            || fields
+                .iter()
+                .any(|f| matches!(f.control, FieldControl::File));
+
+        let inner = maud::html! {
+            @for field in &fields {
+                (render_form_field(changeset, field))
+            }
+            @for markup in appended {
+                (markup)
+            }
+            button type="submit" { (submit_label) }
+        };
+
+        if is_multipart {
+            let (browser_method, override_value) = browser_method_and_override(&method);
+            maud::html! {
+                form action=(action) method=(browser_method) enctype="multipart/form-data" {
+                    @if let Some(override_method) = override_value {
+                        input
+                            type="hidden"
+                            name=(crate::middleware::DEFAULT_METHOD_OVERRIDE_FIELD)
+                            value=(override_method);
+                    }
+                    @if let Some(token) = csrf_token.as_deref() {
+                        input type="hidden" name=(csrf_field_name) value=(token);
+                    }
+                    (inner)
+                }
+            }
+        } else {
+            form_tag_inner(
+                &action,
+                &method,
+                &csrf_field_name,
+                csrf_token.as_deref(),
+                inner,
+            )
+        }
+    }
+}
+
+/// Compute the effective field list for a [`FormFor::render`] call: start
+/// from `T::form_fields()`, drop excluded fields, then apply control/label
+/// overrides in place.
+#[cfg(feature = "maud")]
+fn effective_form_fields<T: FormModel>(
+    excluded: &[String],
+    field_overrides: &[(String, FieldControl)],
+    label_overrides: &[(String, String)],
+) -> Vec<FormField> {
+    T::form_fields()
+        .into_iter()
+        .filter(|field| !excluded.contains(&field.name))
+        .map(|mut field| {
+            if let Some((_, control)) = field_overrides.iter().find(|(name, _)| *name == field.name)
+            {
+                field.control = control.clone();
+            }
+            if let Some((_, label)) = label_overrides.iter().find(|(name, _)| *name == field.name) {
+                field.label = label.clone();
+            }
+            field
+        })
+        .collect()
+}
+
+/// Dispatch a single [`FormField`] to the matching typed-input helper.
+#[cfg(feature = "maud")]
+fn render_form_field<T: Serialize>(changeset: &Changeset<T>, field: &FormField) -> maud::Markup {
+    match &field.control {
+        FieldControl::Text => {
+            if field.required {
+                required_text_input(changeset, &field.name, &field.label)
+            } else {
+                text_input(changeset, &field.name, &field.label)
+            }
+        }
+        FieldControl::Textarea => textarea_input(changeset, &field.name, &field.label),
+        FieldControl::Password => password_input(changeset, &field.name, &field.label),
+        FieldControl::Number { step } => {
+            if field.required {
+                required_number_input(changeset, &field.name, &field.label, step.as_deref())
+            } else {
+                number_input(changeset, &field.name, &field.label, step.as_deref())
+            }
+        }
+        FieldControl::Checkbox => checkbox_input(changeset, &field.name, &field.label),
+        FieldControl::Date => date_input(changeset, &field.name, &field.label),
+        FieldControl::DateTime => {
+            if field.required {
+                required_datetime_input(changeset, &field.name, &field.label)
+            } else {
+                datetime_input(changeset, &field.name, &field.label)
+            }
+        }
+        FieldControl::Select { options } => {
+            let opts: Vec<(&str, &str)> = options
+                .iter()
+                .map(|(v, l)| (v.as_str(), l.as_str()))
+                .collect();
+            if field.required {
+                required_select_input(changeset, &field.name, &field.label, &opts)
+            } else {
+                select_input(changeset, &field.name, &field.label, &opts)
+            }
+        }
+        FieldControl::File => {
+            maud::html! {
+                div class="autumn-field" {
+                    label for=(field.name) class="autumn-field__label" { (field.label) }
+                    input type="file" id=(field.name) name=(field.name);
+                }
+            }
+        }
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -3421,6 +3794,161 @@ mod tests {
         let options = [("draft", "Draft"), ("published", "Published")];
         let html = select_input(&cs, "status", "Status", &options).into_string();
         assert!(html.contains(r#"id="status-field""#), "{html}");
+    }
+
+    // ── form_for (issue #1135 phase 2) ──────────────────────────────
+
+    #[cfg(feature = "maud")]
+    #[derive(serde::Serialize)]
+    struct FormForTestModel {
+        title: String,
+        views: i32,
+        published: bool,
+    }
+
+    #[cfg(feature = "maud")]
+    impl FormModel for FormForTestModel {
+        fn form_fields() -> Vec<FormField> {
+            vec![
+                FormField::new("title", "Title", FieldControl::Text, true),
+                FormField::new("views", "Views", FieldControl::Number { step: None }, false),
+                FormField::new("published", "Published", FieldControl::Checkbox, false),
+            ]
+        }
+    }
+
+    #[cfg(feature = "maud")]
+    fn blank_form_for_model() -> FormForTestModel {
+        FormForTestModel {
+            title: String::new(),
+            views: 0,
+            published: false,
+        }
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn form_for_renders_form_tag_csrf_and_submit() {
+        let cs = Changeset::new(blank_form_for_model());
+        let html = form_for(&cs, "/posts", "post")
+            .csrf("tok123")
+            .render()
+            .into_string();
+        assert!(html.contains("<form"), "{html}");
+        assert!(html.contains(r#"name="_csrf""#), "{html}");
+        assert!(html.contains(r#"value="tok123""#), "{html}");
+        assert!(html.contains(r#"type="submit""#), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn form_for_method_override_emits_hidden_input() {
+        let cs = Changeset::new(blank_form_for_model());
+        let html = form_for(&cs, "/posts/1", "PUT").render().into_string();
+        assert!(html.contains(r#"name="_method""#), "{html}");
+        assert!(html.contains(r#"value="PUT""#), "{html}");
+        assert!(html.contains(r#"method="post""#), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn form_for_renders_one_control_per_field() {
+        let cs = Changeset::new(blank_form_for_model());
+        let html = form_for(&cs, "/posts", "post").render().into_string();
+        assert!(html.contains(r#"name="title""#), "{html}");
+        assert!(html.contains(r#"name="views""#), "{html}");
+        assert!(html.contains(r#"name="published""#), "{html}");
+        assert!(html.contains(r#"type="checkbox""#), "{html}");
+        assert!(html.contains(r#"type="number""#), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn form_for_prefills_values() {
+        let cs = Changeset::new(FormForTestModel {
+            title: "Hello".into(),
+            ..blank_form_for_model()
+        });
+        let html = form_for(&cs, "/posts", "post").render().into_string();
+        assert!(html.contains(r#"value="Hello""#), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn form_for_renders_inline_error_adjacent() {
+        let mut errors = HashMap::new();
+        errors.insert("title".to_string(), vec!["can't be blank".to_string()]);
+        let cs = Changeset::from_errors(blank_form_for_model(), errors);
+        let html = form_for(&cs, "/posts", "post").render().into_string();
+        assert!(html.contains("can't be blank"), "{html}");
+        assert!(html.contains(r#"role="alert""#), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn form_for_exclude_drops_field() {
+        let cs = Changeset::new(blank_form_for_model());
+        let html = form_for(&cs, "/posts", "post")
+            .exclude("published")
+            .render()
+            .into_string();
+        assert!(!html.contains(r#"name="published""#), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn form_for_override_field_changes_control() {
+        let cs = Changeset::new(blank_form_for_model());
+        let html = form_for(&cs, "/posts", "post")
+            .override_field(
+                "title",
+                FieldControl::Select {
+                    options: vec![("a".into(), "A".into())],
+                },
+            )
+            .render()
+            .into_string();
+        assert!(html.contains("<select"), "{html}");
+        assert!(html.contains(r#"name="title""#), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn form_for_override_label() {
+        let cs = Changeset::new(blank_form_for_model());
+        let html = form_for(&cs, "/posts", "post")
+            .override_label("title", "Headline")
+            .render()
+            .into_string();
+        assert!(html.contains("Headline"), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn form_for_append_inserts_before_submit() {
+        let cs = Changeset::new(blank_form_for_model());
+        let html = form_for(&cs, "/posts", "post")
+            .append(maud::html! { input type="password" name="confirm"; })
+            .render()
+            .into_string();
+        let append_idx = html
+            .find(r#"name="confirm""#)
+            .expect("append markup missing");
+        let submit_idx = html
+            .find(r#"type="submit""#)
+            .expect("submit button missing");
+        assert!(append_idx < submit_idx, "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn form_for_file_field_sets_multipart() {
+        let cs = Changeset::new(blank_form_for_model());
+        let html = form_for(&cs, "/posts", "post")
+            .override_field("title", FieldControl::File)
+            .render()
+            .into_string();
+        assert!(html.contains(r#"enctype="multipart/form-data""#), "{html}");
     }
 
     // ── ChangesetForm extractor (axum integration) ─────────────────
