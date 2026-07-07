@@ -352,6 +352,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Accept-Encoding` accepts them, instead of relying solely on the
   general-purpose compression middleware to redo that work on every request.
 
+- **generate:** `autumn generate tauri-mobile` — Tauri v2 **mobile** scaffold
+  (iOS/Android) that runs the Autumn Axum server **in-process** on a
+  background thread against a remote Postgres database (issue #1507,
+  Option B). Mobile sandboxes forbid sidecar processes, so the shell crate
+  builds as staticlib/cdylib, links the app crate directly, spawns the server
+  from `tauri::Builder::default().setup(...)`, health-polls `/health`, and
+  opens the webview at `http://127.0.0.1:<port>`; conservative pool defaults
+  (`AUTUMN_DATABASE__POOL_SIZE=2`, `AUTUMN_DATABASE__CONNECT_TIMEOUT_SECS=5`)
+  are pinned for flaky mobile networks. The generator also extracts the stock
+  `src/main.rs` into `src/lib.rs::serve()` (anchored; skipped with a warning
+  when customised). Docs: mobile sandboxing restrictions, flaky-network pool
+  behavior, and App Store / Google Play guideline compliance in
+  [docs/guide/tauri-mobile-in-process.md](docs/guide/tauri-mobile-in-process.md).
+
 ## [0.6.0] - 2026-06-30
 
 ### Added
