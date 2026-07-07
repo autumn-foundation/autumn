@@ -21,7 +21,7 @@
 //!
 //! Use `--no-layout` to opt out of the shared layout for a specific mailer.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::emit::Plan;
 use super::model::validate_resource_name;
@@ -179,6 +179,7 @@ pub fn plan_mailer(
     plan.push_revert(crate::generate::emit::Revert::CargoAutumnWebFeature {
         path: cargo_path,
         feature: "mail".to_owned(),
+        owner_dir: Some(project_root.join("src").join("mailers")),
     });
 
     // ── migrations/<ts>_create_mail_unsubscribes (opt-in, idempotent) ──────
@@ -211,28 +212,37 @@ fn validate_list_unsubscribe_scope(scope: &str) -> Result<(), GenerateError> {
     Ok(())
 }
 
-/// Add the `mail_unsubscribes` suppression migration unless one already exists.
+/// Add the `mail_unsubscribes` suppression migration, reusing the existing
+/// one (by its real on-disk path) if a prior mailer already created it.
+///
+/// The old design skipped pushing any action at all once a
+/// `*_create_mail_unsubscribes` directory existed — correct for `generate`,
+/// but it meant a second `--list-unsubscribe` mailer's plan carried no
+/// migration action, so `autumn destroy` recomputing that same plan could
+/// never locate (and thus never remove) the suppression migration. Instead,
+/// always push `create_if_absent` actions, targeting the *existing*
+/// directory's real path when one is already on disk (so `generate` is
+/// still a silent no-op there) and a fresh timestamp only when none exists
+/// yet. Either way the action is present for `autumn destroy`'s
+/// suffix-based migration matching (`resolve_migration_removal`) to find.
 fn plan_unsubscribe_migration(project_root: &Path, plan: &mut Plan) {
     let migrations_dir = project_root.join("migrations");
-    if migration_already_present(&migrations_dir) {
-        return;
-    }
-    let timestamp = timestamp_now();
-    let dir = migrations_dir.join(format!("{timestamp}_create_mail_unsubscribes"));
-    plan.create(dir.join("up.sql"), UNSUBSCRIBE_MIGRATION_UP.to_owned());
-    plan.create(dir.join("down.sql"), UNSUBSCRIBE_MIGRATION_DOWN.to_owned());
+    let dir = existing_mail_unsubscribes_dir(&migrations_dir).unwrap_or_else(|| {
+        migrations_dir.join(format!("{}_create_mail_unsubscribes", timestamp_now()))
+    });
+    plan.create_if_absent(dir.join("up.sql"), UNSUBSCRIBE_MIGRATION_UP.to_owned());
+    plan.create_if_absent(dir.join("down.sql"), UNSUBSCRIBE_MIGRATION_DOWN.to_owned());
 }
 
-/// Whether a `*_create_mail_unsubscribes` migration already exists on disk.
-fn migration_already_present(migrations_dir: &Path) -> bool {
-    let Ok(entries) = std::fs::read_dir(migrations_dir) else {
-        return false;
-    };
-    entries.filter_map(Result::ok).any(|entry| {
-        entry
-            .file_name()
-            .to_str()
-            .is_some_and(|name| name.ends_with("_create_mail_unsubscribes"))
+/// The real on-disk `*_create_mail_unsubscribes` migration directory, if one
+/// already exists (from a previous `--list-unsubscribe` mailer).
+fn existing_mail_unsubscribes_dir(migrations_dir: &Path) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(migrations_dir).ok()?;
+    entries.filter_map(Result::ok).map(|e| e.path()).find(|p| {
+        p.is_dir()
+            && p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|name| name.ends_with("_create_mail_unsubscribes"))
     })
 }
 
@@ -534,6 +544,54 @@ async fn main() {
         assert_eq!(fs::read_to_string(&cargo_path).unwrap(), original_cargo);
     }
 
+    #[test]
+    fn destroying_one_of_two_mailers_keeps_shared_mail_feature_the_other_still_needs() {
+        let tmp = project_with_main(default_main());
+        let cargo_path = tmp.path().join("Cargo.toml");
+
+        plan_mailer(tmp.path(), "Welcome", None, false)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+        plan_mailer(tmp.path(), "Goodbye", None, false)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+        assert!(
+            fs::read_to_string(&cargo_path)
+                .unwrap()
+                .contains("\"mail\"")
+        );
+
+        // Destroying Welcome alone must NOT strip the "mail" feature —
+        // Goodbye's mailer still needs it.
+        plan_mailer(tmp.path(), "Welcome", None, false)
+            .unwrap()
+            .revert(Flags::default())
+            .unwrap();
+
+        assert!(!tmp.path().join("src/mailers/welcome.rs").exists());
+        assert!(tmp.path().join("src/mailers/goodbye.rs").exists());
+        let cargo_after = fs::read_to_string(&cargo_path).unwrap();
+        assert!(
+            cargo_after.contains("\"mail\""),
+            "mail feature must survive — Goodbye's mailer still uses it: {cargo_after}"
+        );
+
+        // Now destroy the last remaining mailer — the feature must finally go.
+        plan_mailer(tmp.path(), "Goodbye", None, false)
+            .unwrap()
+            .revert(Flags::default())
+            .unwrap();
+        assert!(!tmp.path().join("src/mailers/goodbye.rs").exists());
+        assert!(
+            !fs::read_to_string(&cargo_path)
+                .unwrap()
+                .contains("\"mail\""),
+            "mail feature must be removed once no mailer uses it anymore"
+        );
+    }
+
     // ── RED: file plan assertions ─────────────────────────────────────────
 
     #[test]
@@ -709,15 +767,53 @@ async fn main() {
             .unwrap()
             .execute(Flags::default())
             .unwrap();
-        // A second list mailer must reuse the existing suppression table.
+        let migrations_dir = tmp.path().join("migrations");
+        let existing_dirs = || {
+            fs::read_dir(&migrations_dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .map(|e| e.path())
+                .filter(|p| p.is_dir())
+                .count()
+        };
+        assert_eq!(existing_dirs(), 1, "first mailer creates one migration dir");
+        let original_dir = fs::read_dir(&migrations_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .find(|p| p.is_dir())
+            .unwrap();
+
+        // A second list mailer must reuse the existing suppression table:
+        // its plan still carries the migration's actions (so `autumn
+        // destroy` can find it later), but they all target the SAME
+        // already-existing directory, and executing must not create a
+        // second migration directory or error.
         let second =
             plan_mailer(tmp.path(), "ProductUpdates", Some("product_updates"), false).unwrap();
+        let migration_paths: Vec<_> = second
+            .actions
+            .iter()
+            .map(super::super::emit::Action::path)
+            .filter(|p| p.to_string_lossy().contains("mail_unsubscribes"))
+            .collect();
         assert!(
-            !second
-                .actions
-                .iter()
-                .any(|a| a.path().to_string_lossy().contains("mail_unsubscribes")),
-            "must not plan a duplicate suppression migration"
+            !migration_paths.is_empty(),
+            "the plan must still carry the migration's actions so `autumn destroy` can find it"
+        );
+        for path in &migration_paths {
+            assert_eq!(
+                path.parent().unwrap(),
+                original_dir,
+                "migration action must target the existing on-disk directory, not a fresh timestamp"
+            );
+        }
+
+        second.execute(Flags::default()).unwrap();
+        assert_eq!(
+            existing_dirs(),
+            1,
+            "must not plan or create a duplicate suppression migration"
         );
     }
 

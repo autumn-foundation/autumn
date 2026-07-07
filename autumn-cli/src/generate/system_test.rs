@@ -85,8 +85,16 @@ pub fn plan_system_test(project_root: &Path, name: &str) -> Result<Plan, Generat
 
     let patched = patch_cargo_toml(&existing, &snake_name);
     if patched != existing {
-        plan.modify(cargo_path, patched);
+        plan.modify(cargo_path.clone(), patched);
     }
+    // Pushed unconditionally — see `plan_cargo_deps`'s matching comment in
+    // model.rs: destroy recomputes this plan against the already-generated
+    // Cargo.toml, where the `[[test]]` entry is by definition already
+    // present.
+    plan.push_revert(crate::generate::emit::Revert::SystemTestCargoPatch {
+        path: cargo_path,
+        snake_name,
+    });
 
     Ok(plan)
 }
@@ -365,6 +373,78 @@ pub(super) fn patch_cargo_toml(existing: &str, snake_name: &str) -> String {
     out
 }
 
+/// Inverse of [`patch_cargo_toml`] (`autumn destroy`, issue #1048).
+///
+/// Removes this test's own `[[test]]` entry — the exact block
+/// `patch_cargo_toml` appends for `snake_name` — then removes the shared
+/// `system-tests` feature declaration too, but only if no OTHER
+/// `tests/system/*.rs` entry remains, mirroring the "shared while still
+/// needed" rule `emit::SHARED_MAIN_MODULE_NAMES` applies to `src/main.rs`
+/// module declarations (multiple system-test resources, and `generate pwa`'s
+/// own smoke test, all share this one feature declaration).
+///
+/// A no-op if this test's `[[test]]` entry isn't present.
+pub(super) fn remove_cargo_toml_patch(existing: &str, snake_name: &str) -> String {
+    let test_block =
+        format!("\n[[test]]\nname = \"{snake_name}\"\npath = \"tests/system/{snake_name}.rs\"\n");
+    let Some(pos) = existing.find(&test_block) else {
+        return existing.to_owned();
+    };
+    let mut without_test_entry = String::with_capacity(existing.len() - test_block.len());
+    without_test_entry.push_str(&existing[..pos]);
+    without_test_entry.push_str(&existing[pos + test_block.len()..]);
+
+    if without_test_entry.contains("tests/system/") {
+        return without_test_entry;
+    }
+
+    let dep_key = resolve_autumn_web_dep_key(&without_test_entry);
+    let feature_line = format!("system-tests = [\"{dep_key}/system-tests\"]\n");
+    let Some(fpos) = without_test_entry.find(&feature_line) else {
+        return without_test_entry;
+    };
+    let mut without_feature = String::with_capacity(without_test_entry.len() - feature_line.len());
+    without_feature.push_str(&without_test_entry[..fpos]);
+    without_feature.push_str(&without_test_entry[fpos + feature_line.len()..]);
+    strip_empty_features_header(&without_feature)
+}
+
+/// If removing the `system-tests` feature line left the `[features]` table
+/// with no other keys, remove the header (plus one preceding blank
+/// separator line) too — mirroring `patch_cargo_toml`'s "create a brand new
+/// `[features]` section from scratch" branch, so a project that never had
+/// one before `generate system-test`/`generate pwa` ends up with none after
+/// `destroy`, byte-identical to its pre-generate state. A pre-existing
+/// `[features]` table with other keys is left untouched.
+fn strip_empty_features_header(existing: &str) -> String {
+    let lines: Vec<&str> = existing.lines().collect();
+    let Some(header_idx) = lines.iter().position(|l| is_features_header(l.trim())) else {
+        return existing.to_owned();
+    };
+    let section_end = lines[header_idx + 1..]
+        .iter()
+        .position(|l| l.trim_start().starts_with('['))
+        .map_or(lines.len(), |off| header_idx + 1 + off);
+    if lines[header_idx + 1..section_end]
+        .iter()
+        .any(|l| !l.trim().is_empty())
+    {
+        return existing.to_owned();
+    }
+    let mut start = header_idx;
+    if start > 0 && lines[start - 1].trim().is_empty() {
+        start -= 1;
+    }
+    let mut new_lines: Vec<&str> = Vec::with_capacity(lines.len());
+    new_lines.extend_from_slice(&lines[..start]);
+    new_lines.extend_from_slice(&lines[section_end..]);
+    let mut out = new_lines.join("\n");
+    if existing.ends_with('\n') && !new_lines.is_empty() {
+        out.push('\n');
+    }
+    out
+}
+
 fn render_system_test_file(snake_name: &str, pascal_name: &str, dep_crate: &str) -> String {
     format!(
         r#"//! System test: {pascal_name}
@@ -452,6 +532,74 @@ mod tests {
             content.contains("#[ignore"),
             "test must be #[ignore] by default (requires Chromium)"
         );
+    }
+
+    #[test]
+    fn generate_then_destroy_round_trips_to_original_cargo_toml() {
+        let tmp = temp_project();
+        let cargo_path = tmp.path().join("Cargo.toml");
+        let original_cargo = fs::read_to_string(&cargo_path).unwrap();
+
+        let plan = plan_system_test(tmp.path(), "TodoFlow").unwrap();
+        plan.execute(Flags::default()).unwrap();
+        assert!(
+            fs::read_to_string(&cargo_path)
+                .unwrap()
+                .contains("system-tests")
+        );
+
+        let destroy_plan = plan_system_test(tmp.path(), "TodoFlow").unwrap();
+        destroy_plan.revert(Flags::default()).unwrap();
+
+        assert!(
+            !tmp.path()
+                .join("tests")
+                .join("system")
+                .join("todo_flow.rs")
+                .exists()
+        );
+        assert_eq!(fs::read_to_string(&cargo_path).unwrap(), original_cargo);
+    }
+
+    #[test]
+    fn destroying_one_of_two_system_tests_keeps_the_others_feature_and_entry() {
+        let tmp = temp_project();
+        plan_system_test(tmp.path(), "TodoFlow")
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+        plan_system_test(tmp.path(), "CheckoutFlow")
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+        let cargo_path = tmp.path().join("Cargo.toml");
+
+        plan_system_test(tmp.path(), "TodoFlow")
+            .unwrap()
+            .revert(Flags::default())
+            .unwrap();
+
+        assert!(
+            !tmp.path()
+                .join("tests")
+                .join("system")
+                .join("todo_flow.rs")
+                .exists()
+        );
+        assert!(
+            tmp.path()
+                .join("tests")
+                .join("system")
+                .join("checkout_flow.rs")
+                .exists()
+        );
+        let cargo_after = fs::read_to_string(&cargo_path).unwrap();
+        assert!(
+            cargo_after.contains("system-tests"),
+            "the shared feature must survive — the other system test still needs it"
+        );
+        assert!(cargo_after.contains("checkout_flow"));
+        assert!(!cargo_after.contains("todo_flow"));
     }
 
     #[test]

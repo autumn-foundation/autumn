@@ -157,7 +157,12 @@ pub fn plan_job(project_root: &Path, name: &str, fields: &[String]) -> Result<Pl
             &["db-diesel2-postgres", "serde"],
         );
     }
-    super::model::plan_cargo_deps(&mut plan, project_root, &job_deps(&parsed_fields));
+    super::model::plan_cargo_deps(
+        &mut plan,
+        project_root,
+        &job_deps(&parsed_fields),
+        &project_root.join("src/jobs"),
+    );
 
     Ok(plan)
 }

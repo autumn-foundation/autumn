@@ -151,16 +151,19 @@ pub fn plan_channel(
         .filter(|name| !super::model::TEMPLATE_SHIPPED_CARGO_DEPS.contains(name))
         .map(str::to_owned)
         .collect();
+    let channels_dir = project_root.join("src").join("channels");
     if !dep_names.is_empty() {
         plan.push_revert(crate::generate::emit::Revert::CargoDeps {
             path: cargo_path.clone(),
             names: dep_names,
+            owner_dir: channels_dir.clone(),
         });
     }
     for feature in autumn_web_features {
         plan.push_revert(crate::generate::emit::Revert::CargoAutumnWebFeature {
             path: cargo_path.clone(),
             feature: (*feature).to_owned(),
+            owner_dir: Some(channels_dir.clone()),
         });
     }
 

@@ -83,8 +83,23 @@ pub fn plan_pwa(project_root: &Path) -> Result<Plan, GenerateError> {
     // src/main.rs: inject PWA meta tags + route handlers (idempotent)
     let updated_main = inject_pwa_into_main(&main_existing);
     if updated_main != main_existing {
-        plan.modify(main_path, updated_main);
+        plan.modify(main_path.clone(), updated_main);
     }
+    // Pushed unconditionally — see `plan_cargo_deps`'s matching comment in
+    // model.rs: destroy recomputes this plan against the already-generated
+    // main.rs, where these edits are by definition already present.
+    plan.push_revert(crate::generate::emit::Revert::PwaMainRsInjection {
+        path: main_path.clone(),
+    });
+    plan.push_revert(crate::generate::emit::Revert::RoutesEntries {
+        path: main_path,
+        entries: vec![
+            "pwa_manifest".to_owned(),
+            "pwa_service_worker".to_owned(),
+            "pwa_register_js".to_owned(),
+            "pwa_offline".to_owned(),
+        ],
+    });
 
     // System test
     let system_test_path = project_root
@@ -98,8 +113,12 @@ pub fn plan_pwa(project_root: &Path) -> Result<Plan, GenerateError> {
     let cargo_existing = std::fs::read_to_string(&cargo_path).map_err(GenerateError::Io)?;
     let patched_cargo = patch_system_test_cargo_toml(&cargo_existing, "pwa_smoke");
     if patched_cargo != cargo_existing {
-        plan.modify(cargo_path, patched_cargo);
+        plan.modify(cargo_path.clone(), patched_cargo);
     }
+    plan.push_revert(crate::generate::emit::Revert::SystemTestCargoPatch {
+        path: cargo_path,
+        snake_name: "pwa_smoke".to_owned(),
+    });
 
     Ok(plan)
 }
@@ -489,12 +508,7 @@ fn count_top_level_commas(s: &str) -> usize {
 /// Append `pwa_manifest`, `pwa_service_worker`, `pwa_register_js`, and `pwa_offline`
 /// handler functions just before `#[autumn_web::main]`.  Idempotent — skipped when
 /// `pwa_manifest` is already defined.
-fn inject_pwa_handlers(source: &str) -> String {
-    if source.contains("async fn pwa_manifest()") {
-        return source.to_owned();
-    }
-
-    let handlers = "\
+const PWA_HANDLERS_BLOCK: &str = "\
 #[get(\"/manifest.webmanifest\")]\n\
 async fn pwa_manifest() -> impl IntoResponse {\n\
     (\n\
@@ -543,6 +557,11 @@ async fn pwa_offline(flash: Flash, path: CurrentPath) -> maud::Markup {\n\
 }\n\
 \n";
 
+fn inject_pwa_handlers(source: &str) -> String {
+    if source.contains("async fn pwa_manifest()") {
+        return source.to_owned();
+    }
+
     // Insert before `#[autumn_web::main]`, or append at end as fallback.
     source.find("#[autumn_web::main]").map_or_else(
         || {
@@ -551,13 +570,13 @@ async fn pwa_offline(flash: Flash, path: CurrentPath) -> maud::Markup {\n\
                 result.push('\n');
             }
             result.push('\n');
-            result.push_str(handlers);
+            result.push_str(PWA_HANDLERS_BLOCK);
             result
         },
         |pos| {
-            let mut result = String::with_capacity(source.len() + handlers.len());
+            let mut result = String::with_capacity(source.len() + PWA_HANDLERS_BLOCK.len());
             result.push_str(&source[..pos]);
-            result.push_str(handlers);
+            result.push_str(PWA_HANDLERS_BLOCK);
             result.push_str(&source[pos..]);
             result
         },
@@ -566,6 +585,72 @@ async fn pwa_offline(flash: Flash, path: CurrentPath) -> maud::Markup {\n\
 
 fn indent_count(line: &str) -> usize {
     line.len() - line.trim_start().len()
+}
+
+/// Inverse of [`inject_pwa_into_main`] (`autumn destroy`, issue #1048).
+///
+/// Removes the PWA `<link>`/`<meta>` tags from the `head {}` block and the
+/// `pwa_manifest`/`pwa_service_worker`/`pwa_register_js`/`pwa_offline`
+/// handler functions this generator injected. A no-op wherever its target
+/// isn't present (already destroyed, or hand-edited away).
+pub(super) fn remove_pwa_injection(existing: &str) -> String {
+    let without_handlers = remove_pwa_handlers(existing);
+    remove_pwa_meta_from_head(&without_handlers)
+}
+
+/// Inverse of [`inject_pwa_meta_into_head`]. Removes exactly the four lines
+/// that function inserts (three tag lines + the register-script line),
+/// identified by the unique `/pwa-register.js` script line together with the
+/// three lines immediately preceding it matching the known tag text
+/// (ignoring indentation) — restoring the `head {}` block byte-identically.
+///
+/// A no-op if the script line isn't present, or the three preceding lines
+/// don't match (hand-edited — never guesses at a partial match).
+fn remove_pwa_meta_from_head(existing: &str) -> String {
+    const SCRIPT_LINE: &str = "script src=\"/pwa-register.js\" {}";
+    const PRECEDING_LINES: [&str; 3] = [
+        "link rel=\"manifest\" href=\"/manifest.webmanifest\";",
+        "meta name=\"theme-color\" content=\"#ffffff\";",
+        "link rel=\"apple-touch-icon\" href=\"/static/icons/icon.svg\";",
+    ];
+    let lines: Vec<&str> = existing.lines().collect();
+    let Some(script_idx) = lines.iter().position(|l| l.trim() == SCRIPT_LINE) else {
+        return existing.to_owned();
+    };
+    if script_idx < PRECEDING_LINES.len() {
+        return existing.to_owned();
+    }
+    let start = script_idx - PRECEDING_LINES.len();
+    let matches = PRECEDING_LINES
+        .iter()
+        .enumerate()
+        .all(|(offset, expected)| lines[start + offset].trim() == *expected);
+    if !matches {
+        return existing.to_owned();
+    }
+    let mut new_lines: Vec<&str> = Vec::with_capacity(lines.len());
+    new_lines.extend_from_slice(&lines[..start]);
+    new_lines.extend_from_slice(&lines[script_idx + 1..]);
+    let mut out = new_lines.join("\n");
+    if existing.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+/// Inverse of [`inject_pwa_handlers`]. Removes the exact
+/// [`PWA_HANDLERS_BLOCK`] text that function inserts verbatim.
+///
+/// A no-op if the block isn't present (already destroyed, or hand-edited
+/// away).
+fn remove_pwa_handlers(existing: &str) -> String {
+    let Some(pos) = existing.find(PWA_HANDLERS_BLOCK) else {
+        return existing.to_owned();
+    };
+    let mut out = String::with_capacity(existing.len() - PWA_HANDLERS_BLOCK.len());
+    out.push_str(&existing[..pos]);
+    out.push_str(&existing[pos + PWA_HANDLERS_BLOCK.len()..]);
+    out
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1217,6 +1302,42 @@ async fn main() {
         assert!(main_rs.contains("async fn pwa_service_worker()"));
         assert!(main_rs.contains("async fn pwa_register_js()"));
         assert!(main_rs.contains("async fn pwa_offline("));
+    }
+
+    #[test]
+    fn generate_then_destroy_pwa_round_trips_to_original_project_state() {
+        let tmp = project_with_main(DEFAULT_MAIN);
+        let cargo_path = tmp.path().join("Cargo.toml");
+        let main_path = tmp.path().join("src/main.rs");
+        let original_cargo = fs::read_to_string(&cargo_path).unwrap();
+        let original_main = fs::read_to_string(&main_path).unwrap();
+
+        plan_pwa(tmp.path())
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+        assert!(tmp.path().join("static/manifest.webmanifest").exists());
+        assert!(
+            fs::read_to_string(&main_path)
+                .unwrap()
+                .contains("async fn pwa_manifest()")
+        );
+        assert!(
+            fs::read_to_string(&cargo_path)
+                .unwrap()
+                .contains("system-tests")
+        );
+
+        plan_pwa(tmp.path())
+            .unwrap()
+            .revert(Flags::default())
+            .unwrap();
+
+        assert!(!tmp.path().join("static/manifest.webmanifest").exists());
+        assert!(!tmp.path().join("static").exists());
+        assert!(!tmp.path().join("tests/system/pwa_smoke.rs").exists());
+        assert_eq!(fs::read_to_string(&main_path).unwrap(), original_main);
+        assert_eq!(fs::read_to_string(&cargo_path).unwrap(), original_cargo);
     }
 
     #[test]

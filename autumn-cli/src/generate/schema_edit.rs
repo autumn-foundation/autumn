@@ -42,22 +42,11 @@ pub fn add_mod_declaration(existing: &str, name: &str) -> String {
 #[must_use]
 pub fn remove_mod_declaration(existing: &str, name: &str) -> String {
     let line = format!("pub mod {name};");
-    let Some(idx) = existing.lines().position(|l| l.trim() == line) else {
+    let lines: Vec<&str> = existing.lines().collect();
+    let Some(idx) = lines.iter().position(|l| l.trim() == line) else {
         return existing.to_owned();
     };
-    let lines: Vec<&str> = existing.lines().collect();
-    let mut out = String::with_capacity(existing.len());
-    for (i, l) in lines.iter().enumerate() {
-        if i == idx {
-            continue;
-        }
-        out.push_str(l);
-        out.push('\n');
-    }
-    if !existing.ends_with('\n') && out.ends_with('\n') {
-        out.pop();
-    }
-    out
+    remove_single_line(&lines, idx, existing.ends_with('\n'))
 }
 
 /// Build a new `diesel::table!` block for the given table, emitting the `id`
@@ -1070,9 +1059,22 @@ pub fn remove_routes_entries(existing: &str, entries: &[String]) -> String {
     // entry begins. Strip the separator (`,`/whitespace/newline) forward
     // added right after the original content to see whether that ORIGINAL
     // content itself spanned multiple lines.
+    //
+    // Locate that point via each entry's actual token span (from the same
+    // comma/newline split `present_entries` was built from), not a raw
+    // substring search — `body.find(e)` would also match `e` occurring
+    // inside a *different*, kept entry that has it as a textual prefix
+    // (e.g. removing `routes::posts::index` while `routes::posts::index_all`
+    // is kept), misdetecting where the original layout ends.
+    let spans = entry_spans(body);
     let first_removed_at = entries
         .iter()
-        .filter_map(|e| body.find(e.as_str()))
+        .filter_map(|e| {
+            spans
+                .iter()
+                .find(|(_, _, text)| text == e)
+                .map(|(start, ..)| *start)
+        })
         .min()
         .unwrap_or(body.len());
     let original_segment = &body[..first_removed_at];
@@ -1100,6 +1102,29 @@ pub fn remove_routes_entries(existing: &str, entries: &[String]) -> String {
     out.push_str(&new_body);
     out.push_str(&existing[body_end..]);
     out
+}
+
+/// Parse `body` into `(start, end, trimmed_text)` byte spans of each
+/// comma/newline-delimited entry, so callers can locate an entry's actual
+/// token occurrence rather than a raw substring search (which can match
+/// inside a different, unrelated entry that has it as a textual prefix).
+fn entry_spans(body: &str) -> Vec<(usize, usize, &str)> {
+    let mut spans = Vec::new();
+    let mut offset = 0usize;
+    for piece in body.split_inclusive([',', '\n']) {
+        let piece_start = offset;
+        offset += piece.len();
+        let trimmed = piece.trim_matches([',', '\n', ' ', '\t', '\r']);
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Some(inner_offset) = piece.find(trimmed) else {
+            continue;
+        };
+        let start = piece_start + inner_offset;
+        spans.push((start, start + trimmed.len(), trimmed));
+    }
+    spans
 }
 
 fn augment_routes_body(body: &str, entries: &[String]) -> String {
@@ -1266,31 +1291,13 @@ fn insert_mail_previews_call(existing: &str, mailer_type: &str) -> String {
 #[must_use]
 pub fn remove_mail_preview_from_app(existing: &str, mailer_type: &str) -> String {
     const PREVIEW_MACRO: &str = "mail_previews![";
-    let Some(macro_start) = existing.find(PREVIEW_MACRO) else {
+    let Some((spliced, now_empty)) =
+        remove_entry_from_bracketed_list(existing, PREVIEW_MACRO, mailer_type)
+    else {
         return existing.to_owned();
     };
-    let body_start = macro_start + PREVIEW_MACRO.len();
-    let rest = &existing[body_start..];
-    let Some(end_offset) = rest.find(']') else {
-        return existing.to_owned();
-    };
-    let body = &rest[..end_offset];
-    let items: Vec<&str> = body
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .collect();
-    if !items.contains(&mailer_type) {
-        return existing.to_owned();
-    }
-    let remaining: Vec<&str> = items.into_iter().filter(|s| *s != mailer_type).collect();
-    if !remaining.is_empty() {
-        let new_body = remaining.join(", ");
-        let mut out = String::with_capacity(existing.len());
-        out.push_str(&existing[..body_start]);
-        out.push_str(&new_body);
-        out.push_str(&existing[body_start + end_offset..]);
-        return out;
+    if !now_empty {
+        return spliced;
     }
     // Only entry -- remove the whole freshly-inserted line.
     let lines: Vec<&str> = existing.lines().collect();
@@ -1300,18 +1307,48 @@ pub fn remove_mail_preview_from_app(existing: &str, mailer_type: &str) -> String
     else {
         return existing.to_owned();
     };
+    remove_single_line(&lines, line_idx, existing.ends_with('\n'))
+}
+
+/// Shared bracket-list-entry removal behind [`remove_job_entry`] and
+/// [`remove_mail_preview_from_app`]: locate `macro_literal` (e.g.
+/// `"jobs!["`), remove `entry` from its comma-separated body, and rejoin.
+///
+/// Returns `None` if the macro isn't present or `entry` isn't currently
+/// listed (destroy never guesses at a partial match). Otherwise returns
+/// `Some((new_content, list_is_now_empty))` — callers that need to collapse
+/// or remove a now-meaningless surrounding call/function when the list
+/// empties out (which one text becomes home to.. differs — `jobs![]`
+/// removes a whole `fn`, `mail_previews![]` removes a call line) check the
+/// `bool` and discard `new_content` in that case, matching
+/// [`remove_dep_feature_in_section`]'s `collapse_to_bare` pattern for the
+/// analogous Cargo-feature-list case.
+fn remove_entry_from_bracketed_list(
+    existing: &str,
+    macro_literal: &str,
+    entry: &str,
+) -> Option<(String, bool)> {
+    let macro_start = existing.find(macro_literal)?;
+    let body_start = macro_start + macro_literal.len();
+    let rest = &existing[body_start..];
+    let end_offset = rest.find(']')?;
+    let body = &rest[..end_offset];
+    let items: Vec<&str> = body
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if !items.contains(&entry) {
+        return None;
+    }
+    let remaining: Vec<&str> = items.into_iter().filter(|s| s != &entry).collect();
+    let now_empty = remaining.is_empty();
+    let new_body = remaining.join(", ");
     let mut out = String::with_capacity(existing.len());
-    for (i, l) in lines.iter().enumerate() {
-        if i == line_idx {
-            continue;
-        }
-        out.push_str(l);
-        out.push('\n');
-    }
-    if !existing.ends_with('\n') && out.ends_with('\n') {
-        out.pop();
-    }
-    out
+    out.push_str(&existing[..body_start]);
+    out.push_str(&new_body);
+    out.push_str(&existing[body_start + end_offset..]);
+    Some((out, now_empty))
 }
 
 // ── Job registration helpers ──────────────────────────────────────────────
@@ -1378,33 +1415,15 @@ fn splice_jobs_list(existing: &str, body_start: usize, entry: &str) -> String {
 #[must_use]
 pub fn remove_job_entry(existing: &str, entry: &str) -> String {
     const JOBS_MACRO: &str = "jobs![";
-    let Some(macro_start) = existing.find(JOBS_MACRO) else {
+    let Some((spliced, now_empty)) = remove_entry_from_bracketed_list(existing, JOBS_MACRO, entry)
+    else {
         return existing.to_owned();
     };
-    let body_start = macro_start + JOBS_MACRO.len();
-    let rest = &existing[body_start..];
-    let Some(end_offset) = rest.find(']') else {
-        return existing.to_owned();
-    };
-    let body = &rest[..end_offset];
-    let items: Vec<&str> = body
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .collect();
-    if !items.contains(&entry) {
-        return existing.to_owned();
+    if now_empty {
+        remove_registered_jobs_fn(existing)
+    } else {
+        spliced
     }
-    let remaining: Vec<&str> = items.into_iter().filter(|s| *s != entry).collect();
-    if remaining.is_empty() {
-        return remove_registered_jobs_fn(existing);
-    }
-    let new_body = remaining.join(", ");
-    let mut out = String::with_capacity(existing.len());
-    out.push_str(&existing[..body_start]);
-    out.push_str(&new_body);
-    out.push_str(&existing[body_start + end_offset..]);
-    out
 }
 
 /// Remove the whole `registered_jobs()` function [`augment_registered_jobs`]
@@ -1456,18 +1475,7 @@ pub fn remove_jobs_registration_from_app(existing: &str) -> String {
     let Some(idx) = lines.iter().position(|l| l.trim() == JOBS_CALL) else {
         return existing.to_owned();
     };
-    let mut out = String::with_capacity(existing.len());
-    for (i, l) in lines.iter().enumerate() {
-        if i == idx {
-            continue;
-        }
-        out.push_str(l);
-        out.push('\n');
-    }
-    if !existing.ends_with('\n') && out.ends_with('\n') {
-        out.pop();
-    }
-    out
+    remove_single_line(&lines, idx, existing.ends_with('\n'))
 }
 
 // ── Cargo.toml: feature injection ────────────────────────────────────────
@@ -1884,7 +1892,7 @@ fn parse_feature_removal(
 }
 
 /// Replace line `idx` with `new_line`, preserving the file's trailing-newline status.
-fn splice_single_line(
+pub(super) fn splice_single_line(
     lines: &[&str],
     idx: usize,
     new_line: &str,
@@ -1902,7 +1910,7 @@ fn splice_single_line(
 }
 
 /// Remove line `idx` entirely, preserving the file's trailing-newline status.
-fn remove_single_line(lines: &[&str], idx: usize, ends_with_newline: bool) -> String {
+pub(super) fn remove_single_line(lines: &[&str], idx: usize, ends_with_newline: bool) -> String {
     let mut out = String::with_capacity(lines.len() * 24);
     for (i, &l) in lines.iter().enumerate() {
         if i == idx {
@@ -6847,6 +6855,23 @@ pub struct Comment {
         assert!(reverted.contains("routes::comments::show"));
         assert!(!reverted.contains("routes::posts::index"));
         assert!(!reverted.contains("routes::posts::show"));
+    }
+
+    #[test]
+    fn remove_routes_entries_not_confused_by_kept_entry_sharing_a_prefix() {
+        // `routes::posts::index` is a textual PREFIX of the kept
+        // `routes::posts::index_all` entry that appears earlier in the body.
+        // A raw substring search for the removed entry would match inside
+        // the kept one and misdetect the original single-line layout as
+        // multi-line.
+        let base = "fn main() {\n    App::new()\n        .routes(routes![index, routes::posts::index_all, routes::posts::index])\n        .run()\n}\n";
+        let removed = vec!["routes::posts::index".to_owned()];
+        let reverted = remove_routes_entries(base, &removed);
+        assert_eq!(
+            reverted,
+            "fn main() {\n    App::new()\n        .routes(routes![index, routes::posts::index_all])\n        .run()\n}\n",
+            "must restore the original single-line layout byte-identically, not collapse/reformat it"
+        );
     }
 
     #[test]

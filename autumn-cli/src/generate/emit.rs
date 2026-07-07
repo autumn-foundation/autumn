@@ -62,16 +62,36 @@ pub enum Revert {
     /// (`src/schema.rs`).
     SchemaTable { path: PathBuf, table: String },
     /// Remove the named crates' shorthand `[dependencies]` lines from `path`
-    /// (`Cargo.toml`).
-    CargoDeps { path: PathBuf, names: Vec<String> },
+    /// (`Cargo.toml`) — but only once `owner_dir` (e.g. `src/models`) has no
+    /// other resource file left in it, so a sibling resource of the same
+    /// generator that still needs this dependency (e.g. a second `model`
+    /// also using `uuid`) survives destroying just one of them.
+    CargoDeps {
+        path: PathBuf,
+        names: Vec<String>,
+        owner_dir: PathBuf,
+    },
     /// Remove `feature` from `autumn-web`'s `[dependencies]` features list
     /// in `path` (`Cargo.toml`), collapsing to a bare version string if that
-    /// empties it.
-    CargoAutumnWebFeature { path: PathBuf, feature: String },
+    /// empties it — but only once `owner_dir` has no other resource file
+    /// left in it (see [`Revert::CargoDeps`]); `None` when the generator
+    /// pushing this revert has no single clean owning directory to check
+    /// (falls back to the old always-remove behavior for that generator).
+    CargoAutumnWebFeature {
+        path: PathBuf,
+        feature: String,
+        owner_dir: Option<PathBuf>,
+    },
     /// Remove `feature` from `autumn-web`'s `[dev-dependencies]` features
     /// list in `path` (`Cargo.toml`), deleting the whole line if that
-    /// empties it (that entry was always freshly inserted, never pre-existing).
-    CargoAutumnWebDevFeature { path: PathBuf, feature: String },
+    /// empties it (that entry was always freshly inserted, never
+    /// pre-existing) — but only once `owner_dir` has no other resource file
+    /// left in it (see [`Revert::CargoDeps`]).
+    CargoAutumnWebDevFeature {
+        path: PathBuf,
+        feature: String,
+        owner_dir: Option<PathBuf>,
+    },
     /// Remove `entry` from the `jobs![...]` list in `path`
     /// (`src/jobs/mod.rs`), dropping the whole freshly-generated
     /// `registered_jobs()` function if it was the only entry.
@@ -83,6 +103,30 @@ pub enum Revert {
     /// (`src/main.rs`), dropping the whole freshly-inserted
     /// `.mail_previews(...)` call if it was the only entry.
     MailPreview { path: PathBuf, mailer_type: String },
+    /// Remove `.handler(<handler_module_path>())` from the
+    /// `.inbound_mail_router(...)` chain in `path` (`src/main.rs`), dropping
+    /// the whole freshly-inserted `.inbound_mail_router(...)` call if it was
+    /// the only handler registered.
+    InboundMailHandler {
+        path: PathBuf,
+        handler_module_path: String,
+    },
+    /// Remove `snake_name`'s `[[test]]` entry from `path` (`Cargo.toml`),
+    /// plus the shared `system-tests` feature declaration too if no other
+    /// `tests/system/*.rs` entry still needs it.
+    SystemTestCargoPatch { path: PathBuf, snake_name: String },
+    /// Remove the PWA `<link>`/`<meta>` tags and route-handler functions
+    /// `autumn generate pwa` injected into `path` (`src/main.rs`).
+    PwaMainRsInjection { path: PathBuf },
+    /// Remove each `[auth.oauth2.<provider>]` stub block `autumn generate
+    /// auth --oauth` appended to `path` (`autumn.toml`).
+    AuthOAuthProviderStubs {
+        path: PathBuf,
+        providers: Vec<String>,
+    },
+    /// Remove the `[auth.webauthn]` stub block `autumn generate auth
+    /// --passkeys` appended to `path` (`autumn.toml`).
+    AuthWebauthnStub { path: PathBuf },
 }
 
 impl Revert {
@@ -98,7 +142,37 @@ impl Revert {
             | Self::CargoAutumnWebDevFeature { path, .. }
             | Self::JobEntry { path, .. }
             | Self::JobsRegistration { path }
-            | Self::MailPreview { path, .. } => path,
+            | Self::MailPreview { path, .. }
+            | Self::InboundMailHandler { path, .. }
+            | Self::SystemTestCargoPatch { path, .. }
+            | Self::PwaMainRsInjection { path }
+            | Self::AuthOAuthProviderStubs { path, .. }
+            | Self::AuthWebauthnStub { path } => path,
+        }
+    }
+
+    /// The directory whose continued occupancy (by any file other than
+    /// this same destroy's own deletions) means this revert must NOT be
+    /// applied yet — a sibling resource of the same generator may still
+    /// need the dependency/feature. `None` means always apply (every
+    /// variant except the three Cargo-editing ones, plus the Cargo ones
+    /// where the pushing generator has no single owning directory).
+    fn owner_dir(&self) -> Option<&Path> {
+        match self {
+            Self::CargoDeps { owner_dir, .. } => Some(owner_dir),
+            Self::CargoAutumnWebFeature { owner_dir, .. }
+            | Self::CargoAutumnWebDevFeature { owner_dir, .. } => owner_dir.as_deref(),
+            Self::ModDecl { .. }
+            | Self::RoutesEntries { .. }
+            | Self::SchemaTable { .. }
+            | Self::JobEntry { .. }
+            | Self::JobsRegistration { .. }
+            | Self::MailPreview { .. }
+            | Self::InboundMailHandler { .. }
+            | Self::SystemTestCargoPatch { .. }
+            | Self::PwaMainRsInjection { .. }
+            | Self::AuthOAuthProviderStubs { .. }
+            | Self::AuthWebauthnStub { .. } => None,
         }
     }
 
@@ -106,6 +180,7 @@ impl Revert {
     /// underlying transform is idempotent — a revert whose target is
     /// already absent returns `content` unchanged.
     fn apply(&self, content: &str) -> String {
+        use super::inbound_mail::remove_inbound_mail_handler;
         use super::schema_edit::{
             remove_autumn_web_dev_dependency_feature, remove_autumn_web_feature, remove_job_entry,
             remove_jobs_registration_from_app, remove_mail_preview_from_app,
@@ -130,6 +205,18 @@ impl Revert {
             Self::MailPreview { mailer_type, .. } => {
                 remove_mail_preview_from_app(content, mailer_type)
             }
+            Self::InboundMailHandler {
+                handler_module_path,
+                ..
+            } => remove_inbound_mail_handler(content, handler_module_path),
+            Self::SystemTestCargoPatch { snake_name, .. } => {
+                super::system_test::remove_cargo_toml_patch(content, snake_name)
+            }
+            Self::PwaMainRsInjection { .. } => super::pwa::remove_pwa_injection(content),
+            Self::AuthOAuthProviderStubs { providers, .. } => {
+                super::auth::remove_oauth_provider_stubs(content, providers)
+            }
+            Self::AuthWebauthnStub { .. } => super::auth::remove_webauthn_stub(content),
         }
     }
 }
@@ -388,6 +475,20 @@ impl Plan {
                 };
                 println!("  {label} {}", relative_display(path, &self.project_root));
             }
+            if !plan.diverged.is_empty() {
+                println!(
+                    "  A real run would refuse (without --force) — content has diverged from what generate produced:"
+                );
+                for path in &plan.diverged {
+                    println!(
+                        "    Diverged {}",
+                        relative_display(path, &self.project_root)
+                    );
+                }
+            }
+            for warning in &plan.warnings {
+                eprintln!("Warning: {warning}");
+            }
             return Ok(());
         }
 
@@ -511,6 +612,10 @@ impl Plan {
                      — write a down-migration instead. destroy never touches the database.",
                     relative_display(&real_dir, &self.project_root),
                 )),
+                MigrationOutcome::Ambiguous(suffix) => warnings.push(format!(
+                    "multiple migrations directories match the expected suffix '{suffix}'; \
+                     skipping — remove the correct one manually."
+                )),
                 MigrationOutcome::NotFound => {}
             }
         }
@@ -525,6 +630,14 @@ impl Plan {
             };
             let mut content = original.clone();
             for revert in &reverts {
+                if let Some(dir) = revert.owner_dir()
+                    && resource_dir_has_other_files(dir, &files_to_remove)
+                {
+                    // A sibling resource of the same generator still lives
+                    // in `owner_dir` and may still need this dependency or
+                    // feature — leave the Cargo.toml edit in place.
+                    continue;
+                }
                 content = revert.apply(&content);
             }
             if content == original {
@@ -591,6 +704,30 @@ fn prune_empty_ancestors(mut dir: PathBuf, project_root: &Path) {
     }
 }
 
+/// Whether `dir` contains any regular file other than the ones this same
+/// destroy operation is itself about to delete (`excluding` — the
+/// already-computed `files_to_remove`). Used to gate
+/// [`Revert::CargoDeps`]/[`Revert::CargoAutumnWebFeature`]/[`Revert::CargoAutumnWebDevFeature`]:
+/// a dependency or feature shared by multiple resources of the same
+/// generator (e.g. two `model`s both using `uuid`, two `mailer`s both using
+/// the `mail` feature) must survive destroying just one of them. A missing
+/// or unreadable `dir` counts as "no other files" (nothing left to protect).
+fn resource_dir_has_other_files(dir: &Path, excluding: &[PathBuf]) -> bool {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return false;
+    };
+    entries.filter_map(Result::ok).any(|entry| {
+        let path = entry.path();
+        // `mod.rs` is the shared aggregator every one of these directories
+        // has (declaring `pub mod <resource>;` per file) — it is not itself
+        // a resource, so its mere presence must never count as "a sibling
+        // resource still needs this dependency/feature".
+        path.is_file()
+            && path.file_name() != Some(std::ffi::OsStr::new("mod.rs"))
+            && !excluding.contains(&path)
+    })
+}
+
 /// Outcome of matching one plan-time migration directory (built with a
 /// fresh, destroy-time timestamp) against what's actually on disk.
 enum MigrationOutcome {
@@ -603,9 +740,33 @@ enum MigrationOutcome {
     /// database couldn't be reached, which is treated conservatively the
     /// same way) — never removed except with `--force`.
     Applied(PathBuf),
+    /// More than one on-disk migration directory normalizes to the same
+    /// suffix (e.g. a `model`-generated migration and an independently
+    /// hand-run `generate migration` for the same resource) and content
+    /// comparison couldn't tell them apart either — never guess which one
+    /// to delete.
+    Ambiguous(String),
     /// No on-disk directory matches this suffix — already destroyed, or
     /// never generated.
     NotFound,
+}
+
+/// Whether every `Create`/`CreateIfAbsent` action's expected content
+/// exactly matches the corresponding file in `dir` — used only to
+/// disambiguate between multiple same-suffix migration directories, so it
+/// never honours `--force` (a loose match here would let `--force` guess
+/// wrong on top of bypassing safety, rather than just bypassing safety).
+fn migration_dir_matches_actions(dir: &Path, actions: &[&Action]) -> bool {
+    actions.iter().all(|action| {
+        let Some(file_name) = action.path().file_name() else {
+            return true;
+        };
+        let expected: &str = match action {
+            Action::Create { contents, .. } | Action::CreateIfAbsent { contents, .. } => contents,
+            Action::CreateBytes { .. } | Action::Modify { .. } => return true,
+        };
+        fs::read_to_string(dir.join(file_name)).is_ok_and(|actual| actual == *expected)
+    })
 }
 
 /// Split a migration directory name into its leading numeric timestamp
@@ -634,14 +795,35 @@ fn resolve_migration_removal(
     let Ok(entries) = fs::read_dir(migrations_root) else {
         return MigrationOutcome::NotFound;
     };
-    let real_dir = entries.filter_map(Result::ok).map(|e| e.path()).find(|p| {
-        p.is_dir()
-            && p.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|name| split_migration_dir_name(name).1 == suffix)
-    });
-    let Some(real_dir) = real_dir else {
-        return MigrationOutcome::NotFound;
+    let mut candidates: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_dir()
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|name| split_migration_dir_name(name).1 == suffix)
+        })
+        .collect();
+    candidates.sort();
+
+    let real_dir = match candidates.len() {
+        0 => return MigrationOutcome::NotFound,
+        1 => candidates.into_iter().next().expect("len checked above"),
+        _ => {
+            // Multiple on-disk directories share this suffix — disambiguate
+            // by exact content match rather than guessing (filesystem read
+            // order is unspecified, so picking the first would be
+            // non-deterministic).
+            let mut matching: Vec<PathBuf> = candidates
+                .into_iter()
+                .filter(|dir| migration_dir_matches_actions(dir, actions))
+                .collect();
+            if matching.len() != 1 {
+                return MigrationOutcome::Ambiguous(suffix.to_owned());
+            }
+            matching.remove(0)
+        }
     };
 
     for action in actions {
@@ -691,7 +873,13 @@ enum MigrationStatus {
 }
 
 fn migration_applied_status(version: &str, migrations_dir: &Path) -> MigrationStatus {
-    let table = crate::migrate::read_autumn_toml_table();
+    // Resolve the same profile/overlay `autumn migrate` would (see
+    // `migrate::resolve_targets`), not just the bare base `autumn.toml` — a
+    // project that only configures its database via `[profile.prod.database]`
+    // or an `autumn-prod.toml` overlay must not look "NotConfigured" here,
+    // which would defeat the applied-migration safety guard below.
+    let profile = crate::migrate::effective_profile(None);
+    let table = crate::migrate::read_autumn_toml_table_with_profile(Some(&profile));
     let Some(url) = crate::migrate::resolve_primary_database_url_from_sources(
         |k| std::env::var(k),
         table.as_ref(),
@@ -724,6 +912,7 @@ const SHARED_MAIN_MODULE_NAMES: &[&str] = &[
     "channels",
     "jobs",
     "mailers",
+    "inbound_mailers",
 ];
 
 /// Whether `name`'s backing module still exists on disk — either as
@@ -799,6 +988,7 @@ fn sync_mod_declarations_in(dir: &Path, shared_names: &[&str], project_root: &Pa
     if updated.trim().is_empty() {
         if fs::remove_file(&mod_path).is_ok() {
             println!("  Removed {}", relative_display(&mod_path, project_root));
+            prune_empty_ancestors(dir.to_path_buf(), project_root);
         }
     } else if fs::write(&mod_path, &updated).is_ok() {
         println!("  Reverted {}", relative_display(&mod_path, project_root));
@@ -1146,5 +1336,111 @@ mod tests {
             // No matching real directory on disk at all — nothing to do.
             plan.revert(Flags::default()).unwrap();
         });
+    }
+
+    #[test]
+    fn revert_refuses_to_guess_between_two_migrations_sharing_a_suffix() {
+        no_db_env(|| {
+            let (tmp, mut plan) = fixture();
+            fs::create_dir_all(tmp.path().join("migrations")).unwrap();
+            let plan_dir = tmp.path().join("migrations/99999999999999_create_posts");
+            // Two independently-created directories normalize to the same
+            // suffix (e.g. a `model`-generated one and a hand-run `generate
+            // migration` for the same resource), and BOTH have content that
+            // exactly matches what this plan expects — content-based
+            // disambiguation genuinely can't tell them apart either.
+            let first = tmp.path().join("migrations/20260101000000_create_posts");
+            let second = tmp.path().join("migrations/20260201000000_create_posts");
+            fs::create_dir_all(&first).unwrap();
+            fs::write(first.join("up.sql"), "CREATE TABLE posts ();\n").unwrap();
+            fs::write(first.join("down.sql"), "DROP TABLE posts;\n").unwrap();
+            fs::create_dir_all(&second).unwrap();
+            fs::write(second.join("up.sql"), "CREATE TABLE posts ();\n").unwrap();
+            fs::write(second.join("down.sql"), "DROP TABLE posts;\n").unwrap();
+
+            plan.create(plan_dir.join("up.sql"), "CREATE TABLE posts ();\n");
+            plan.create(plan_dir.join("down.sql"), "DROP TABLE posts;\n");
+
+            // Refuses to guess, even without --force: neither directory is removed.
+            plan.revert(Flags::default()).unwrap();
+            assert!(
+                first.exists(),
+                "ambiguous suffix must not delete either dir"
+            );
+            assert!(
+                second.exists(),
+                "ambiguous suffix must not delete either dir"
+            );
+        });
+    }
+
+    #[test]
+    fn revert_disambiguates_shared_suffix_migrations_by_exact_content_match() {
+        no_db_env(|| {
+            let (tmp, mut plan) = fixture();
+            fs::create_dir_all(tmp.path().join("migrations")).unwrap();
+            let plan_dir = tmp.path().join("migrations/99999999999999_create_posts");
+            // Two directories share a suffix, but only one has content that
+            // exactly matches what this plan would have produced — that one
+            // (and only that one) should be identified and removed.
+            let matching = tmp.path().join("migrations/20260101000000_create_posts");
+            let other = tmp.path().join("migrations/20260201000000_create_posts");
+            fs::create_dir_all(&matching).unwrap();
+            fs::write(matching.join("up.sql"), "CREATE TABLE posts ();\n").unwrap();
+            fs::write(matching.join("down.sql"), "DROP TABLE posts;\n").unwrap();
+            fs::create_dir_all(&other).unwrap();
+            fs::write(other.join("up.sql"), "CREATE TABLE posts (extra INT);\n").unwrap();
+            fs::write(other.join("down.sql"), "DROP TABLE posts;\n").unwrap();
+
+            plan.create(plan_dir.join("up.sql"), "CREATE TABLE posts ();\n");
+            plan.create(plan_dir.join("down.sql"), "DROP TABLE posts;\n");
+
+            plan.revert(Flags::default()).unwrap();
+
+            assert!(
+                !matching.exists(),
+                "the content-matching directory must be removed"
+            );
+            assert!(
+                other.exists(),
+                "the non-matching directory must be left alone"
+            );
+        });
+    }
+
+    #[test]
+    fn revert_prunes_now_empty_directory_after_shared_submodule_deletion() {
+        // A single mailer's `src/mailers/previews/mod.rs` empties down to
+        // nothing (deleted + pruned by the ordinary Modify-turned-empty
+        // path), which then orphans `pub mod previews;` in
+        // `src/mailers/mod.rs` — cleaned up by `sync_mod_declarations_in`.
+        // That leaves `src/mailers/` itself empty; it must be pruned too,
+        // exactly like every other now-empty generated directory.
+        let tmp = tempfile::TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = \"0.6\"\n",
+        )
+        .unwrap();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(
+            tmp.path().join("src/main.rs"),
+            "use autumn_web::prelude::*;\n\n#[autumn_web::main]\nasync fn main() {\n    \
+             autumn_web::app().routes(routes![]).run().await;\n}\n",
+        )
+        .unwrap();
+
+        let plan =
+            crate::generate::mailer::plan_mailer(tmp.path(), "Welcome", None, false).unwrap();
+        plan.execute(Flags::default()).unwrap();
+        assert!(tmp.path().join("src/mailers/mod.rs").exists());
+
+        plan.revert(Flags::default()).unwrap();
+
+        assert!(
+            !tmp.path().join("src/mailers").exists(),
+            "src/mailers/ must be fully pruned once mod.rs and every file under it are gone, \
+             just like every other now-empty generated directory"
+        );
     }
 }

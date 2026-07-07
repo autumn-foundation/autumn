@@ -24,7 +24,12 @@ pub fn plan_task(project_root: &Path, name: &str) -> Result<Plan, GenerateError>
         project_root.join("tasks").join(format!("{snake_name}.rs")),
         render_task_file(&snake_name, &pascal_name),
     );
-    plan_cargo_deps(&mut plan, project_root, TASK_DEPS);
+    plan_cargo_deps(
+        &mut plan,
+        project_root,
+        TASK_DEPS,
+        &project_root.join("tasks"),
+    );
     Ok(plan)
 }
 

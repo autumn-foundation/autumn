@@ -286,7 +286,12 @@ pub fn plan_scaffold_with_options(
             "{ version = \"1\", features = [\"db-diesel2-postgres\", \"serde\"] }",
         ));
     }
-    plan_cargo_deps(&mut plan, project_root, &combined);
+    plan_cargo_deps(
+        &mut plan,
+        project_root,
+        &combined,
+        &project_root.join("src/models"),
+    );
 
     // The generated HTML routes render through `autumn_web::form::*` helpers
     // (issue #1124), which are gated behind autumn-web's `maud` feature — enable
@@ -314,6 +319,7 @@ pub fn plan_scaffold_with_options(
         plan.push_revert(Revert::CargoAutumnWebFeature {
             path: cargo_path,
             feature: "maud".to_owned(),
+            owner_dir: Some(project_root.join("src").join("routes")),
         });
     }
 
@@ -345,10 +351,12 @@ pub fn plan_scaffold_with_options(
             plan.modify(cargo_path.clone(), updated);
         }
         // Pushed unconditionally — see `plan_cargo_deps`'s matching comment.
+        let routes_dir = project_root.join("src").join("routes");
         for feat in feats {
             plan.push_revert(Revert::CargoAutumnWebFeature {
                 path: cargo_path.clone(),
                 feature: (*feat).to_owned(),
+                owner_dir: Some(routes_dir.clone()),
             });
         }
     }
@@ -376,9 +384,13 @@ pub fn plan_scaffold_with_options(
             plan.modify(cargo_path.clone(), updated);
         }
         // Pushed unconditionally — see `plan_cargo_deps`'s matching comment.
+        // `owner_dir` is `src/models` (not `src/routes`) because the smoke
+        // test — and thus `test-support` — is generated for EVERY scaffold,
+        // including `--api`-only ones that never get a routes file.
         plan.push_revert(Revert::CargoAutumnWebDevFeature {
             path: cargo_path,
             feature: "test-support".to_owned(),
+            owner_dir: Some(project_root.join("src").join("models")),
         });
     }
 

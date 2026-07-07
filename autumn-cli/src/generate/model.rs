@@ -221,7 +221,12 @@ pub fn plan_model_with_options(
             &["db-diesel2-postgres", "serde"],
         );
     }
-    plan_cargo_deps(&mut plan, project_root, &deps);
+    plan_cargo_deps(
+        &mut plan,
+        project_root,
+        &deps,
+        &project_root.join("src/models"),
+    );
 
     Ok(plan)
 }
@@ -514,7 +519,18 @@ pub(super) const MODEL_DEPS: &[(&str, &str)] = &[
 /// Append a `Modify` action to `plan` that ensures every `(crate, version_spec)`
 /// in `deps` is present under `[dependencies]` in the project's `Cargo.toml`.
 /// Existing entries are left untouched.
-pub(super) fn plan_cargo_deps(plan: &mut Plan, project_root: &Path, deps: &[(&str, &str)]) {
+///
+/// `owner_dir` is the directory this call's resource files live in (e.g.
+/// `src/models`, `src/jobs`) — `autumn destroy` only removes these deps once
+/// no OTHER file remains in `owner_dir`, so a sibling resource of the same
+/// generator that still needs one of `deps` (e.g. a second `model` also
+/// using `uuid`) survives destroying just one of them.
+pub(super) fn plan_cargo_deps(
+    plan: &mut Plan,
+    project_root: &Path,
+    deps: &[(&str, &str)],
+    owner_dir: &Path,
+) {
     let cargo_toml_path = project_root.join("Cargo.toml");
     let existing = read_or_empty(&cargo_toml_path);
     let updated = ensure_cargo_dependencies(&existing, deps);
@@ -553,6 +569,7 @@ pub(super) fn plan_cargo_deps(plan: &mut Plan, project_root: &Path, deps: &[(&st
         plan.push_revert(crate::generate::emit::Revert::CargoDeps {
             path: cargo_toml_path,
             names,
+            owner_dir: owner_dir.to_path_buf(),
         });
     }
 }
@@ -1729,6 +1746,63 @@ mod tests {
             "migration directory must be removed"
         );
         assert_eq!(fs::read_to_string(&cargo_path).unwrap(), original_cargo);
+    }
+
+    #[test]
+    fn destroying_one_of_two_models_keeps_shared_dep_the_other_still_needs() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"x\"\n\n[dependencies]\nautumn-web = \"0.6.0\"\ndiesel_migrations = \"2\"\n",
+        )
+        .unwrap();
+        let cargo_path = tmp.path().join("Cargo.toml");
+
+        plan_model(tmp.path(), "Post", &["owner:Uuid".into()], "20260427000000")
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+        plan_model(
+            tmp.path(),
+            "Comment",
+            &["owner:Uuid".into()],
+            "20260427000001",
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+        assert!(fs::read_to_string(&cargo_path).unwrap().contains("uuid"));
+
+        // Destroying Post alone must NOT strip `uuid` — Comment's model file
+        // still uses it.
+        plan_model(tmp.path(), "Post", &["owner:Uuid".into()], "99999999999999")
+            .unwrap()
+            .revert(Flags::default())
+            .unwrap();
+
+        assert!(!tmp.path().join("src/models/post.rs").exists());
+        assert!(tmp.path().join("src/models/comment.rs").exists());
+        let cargo_after = fs::read_to_string(&cargo_path).unwrap();
+        assert!(
+            cargo_after.contains("uuid"),
+            "uuid must survive — Comment's model still uses it: {cargo_after}"
+        );
+
+        // Now destroy the last remaining model — `uuid` must finally go.
+        plan_model(
+            tmp.path(),
+            "Comment",
+            &["owner:Uuid".into()],
+            "99999999999998",
+        )
+        .unwrap()
+        .revert(Flags::default())
+        .unwrap();
+        assert!(!tmp.path().join("src/models/comment.rs").exists());
+        assert!(
+            !fs::read_to_string(&cargo_path).unwrap().contains("uuid"),
+            "uuid must be removed once no model uses it anymore"
+        );
     }
 
     #[test]

@@ -3804,6 +3804,39 @@ mod tests {
     // ── additive (does not touch app's src/main.rs or root Cargo.toml) ───────
 
     #[test]
+    fn generate_then_destroy_tauri_round_trips_to_original_project_state() {
+        // `plan_tauri` never pushes a `Modify` action (see
+        // `plan_does_not_modify_app_main_rs`/`plan_does_not_modify_root_cargo_toml`
+        // below) — everything it emits lives under the freshly-created
+        // `src-tauri/` directory, so `Plan::revert`'s generic
+        // Create-deletion + empty-directory pruning should already restore
+        // the project exactly, with no per-generator `Revert` wiring needed.
+        let tmp = project("my-app");
+        let cargo_path = tmp.path().join("Cargo.toml");
+        let main_path = tmp.path().join("src/main.rs");
+        let original_cargo = fs::read_to_string(&cargo_path).unwrap();
+        let original_main = fs::read_to_string(&main_path).unwrap();
+
+        plan_tauri(tmp.path())
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+        assert!(tmp.path().join("src-tauri").exists());
+
+        plan_tauri(tmp.path())
+            .unwrap()
+            .revert(Flags::default())
+            .unwrap();
+
+        assert!(
+            !tmp.path().join("src-tauri").exists(),
+            "src-tauri/ must be fully removed and pruned"
+        );
+        assert_eq!(fs::read_to_string(&main_path).unwrap(), original_main);
+        assert_eq!(fs::read_to_string(&cargo_path).unwrap(), original_cargo);
+    }
+
+    #[test]
     fn plan_does_not_modify_app_main_rs() {
         let tmp = project("my-app");
         let plan = plan_tauri(tmp.path()).unwrap();
