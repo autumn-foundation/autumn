@@ -4190,6 +4190,42 @@ async fn main() {
     }
 
     #[test]
+    fn destroying_the_only_scaffold_keeps_pre_existing_test_support_another_test_still_uses() {
+        // issue #1048 PR review: a project may already have `autumn-web`
+        // under `[dev-dependencies]` with `test-support` enabled for its
+        // OWN hand-written tests, independent of any scaffold.
+        // `ensure_dev_dependency_test_support` makes no Cargo.toml edit in
+        // that case, but the revert is still recorded unconditionally —
+        // must not strip `test-support` out from under that unrelated test
+        // when destroying the only scaffold.
+        let tmp = project_with_main(default_main());
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname=\"x\"\n\n[dev-dependencies]\nautumn-web = { version = \"0.6\", features = [\"test-support\"] }\n",
+        )
+        .unwrap();
+        fs::create_dir_all(tmp.path().join("tests")).unwrap();
+        fs::write(
+            tmp.path().join("tests/hand_written.rs"),
+            "#[tokio::test]\nasync fn it_works() {\n    let _db = autumn_web::test::TestDb::shared().await;\n}\n",
+        )
+        .unwrap();
+
+        let plan = plan_scaffold(tmp.path(), "Post", &[], "20260427000000").unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let destroy_plan = plan_scaffold(tmp.path(), "Post", &[], "99999999999999").unwrap();
+        destroy_plan.revert(Flags::default()).unwrap();
+
+        let cargo_after = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+        assert!(
+            cargo_after.contains("test-support"),
+            "pre-existing test-support must survive — the hand-written test still uses \
+             TestDb: {cargo_after}"
+        );
+    }
+
+    #[test]
     fn smoke_test_wires_dev_dependency_tokio_test_features() {
         // Regression test (Codex review, issue #1023): the generated smoke
         // test uses `#[tokio::test]`, which needs the `rt` and `macros`

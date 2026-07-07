@@ -2805,7 +2805,18 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
             apply_plan(plan, generate::Flags { dry_run, force }, mode);
         }
         GenerateCommands::Pwa { dry_run, force } => {
-            let plan = generate::pwa::plan_pwa(&resolve_cwd());
+            let project_root = resolve_cwd();
+            // `plan_pwa` validates `src/main.rs`'s `layout()` arity — needed
+            // so a fresh generate never emits a call with the wrong shape,
+            // but irrelevant to destroy (which never consults that arity)
+            // and can wrongly block cleanup if `main.rs` no longer matches
+            // (issue #1048 PR review). Always use the destroy-only fallback
+            // for `ApplyMode::Destroy`; it produces the identical plan for
+            // every other case.
+            let plan = match mode {
+                ApplyMode::Generate => generate::pwa::plan_pwa(&project_root),
+                ApplyMode::Destroy => generate::pwa::plan_pwa_destroy_fallback(&project_root),
+            };
             apply_plan(plan, generate::Flags { dry_run, force }, mode);
         }
         GenerateCommands::Tauri { dry_run, force } => {
