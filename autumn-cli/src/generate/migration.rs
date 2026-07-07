@@ -323,6 +323,71 @@ mod tests {
     }
 
     #[test]
+    fn destroy_migration_refuses_directory_with_unplanned_file_unless_forced() {
+        // issue #1048 PR review: a developer may drop a README.md or an
+        // auxiliary fixture alongside the generated up.sql/down.sql. Destroy
+        // must treat that extra file as divergence rather than silently
+        // sweeping it up with `remove_dir_all`.
+        temp_env::with_vars(
+            [
+                ("AUTUMN_DATABASE__PRIMARY_URL", None::<&str>),
+                ("AUTUMN_DATABASE__URL", None::<&str>),
+                ("DATABASE_URL", None::<&str>),
+            ],
+            || {
+                let tmp = project();
+                let plan = plan_migration(
+                    tmp.path(),
+                    "AddTitleToPosts",
+                    &["title:String".into()],
+                    "20260427000000",
+                )
+                .unwrap();
+                plan.execute(Flags::default()).unwrap();
+                let dir = tmp
+                    .path()
+                    .join("migrations/20260427000000_add_title_to_posts");
+                assert!(dir.exists());
+                fs::write(dir.join("README.md"), "hand-authored notes\n").unwrap();
+
+                let destroy_plan = plan_migration(
+                    tmp.path(),
+                    "AddTitleToPosts",
+                    &["title:String".into()],
+                    "99999999999999",
+                )
+                .unwrap();
+                let err = destroy_plan
+                    .revert(Flags {
+                        dry_run: false,
+                        force: false,
+                    })
+                    .unwrap_err();
+                assert!(matches!(err, GenerateError::Diverged(_)));
+                assert!(
+                    dir.join("README.md").exists(),
+                    "hand-authored file must survive without --force"
+                );
+
+                let destroy_plan = plan_migration(
+                    tmp.path(),
+                    "AddTitleToPosts",
+                    &["title:String".into()],
+                    "99999999999999",
+                )
+                .unwrap();
+                destroy_plan
+                    .revert(Flags {
+                        dry_run: false,
+                        force: true,
+                    })
+                    .unwrap();
+                assert!(!dir.exists(), "--force must still remove the directory");
+            },
+        );
+    }
+
+    #[test]
     fn add_columns_migration_emits_alter() {
         let tmp = project();
         let plan = plan_migration(

@@ -1235,6 +1235,24 @@ fn resolve_migration_removal(
         }
     }
 
+    // Refuse to sweep up files this generator never planned — a hand-added
+    // `README.md` or an auxiliary fixture living alongside `up.sql`/
+    // `down.sql` — unless `--force` is passed (issue #1048 PR review).
+    // Without this, `remove_dir_all` below would silently delete
+    // hand-authored content just because it happens to share a directory
+    // with the generated migration files.
+    if !force && let Ok(entries) = fs::read_dir(&real_dir) {
+        for entry in entries.filter_map(Result::ok) {
+            let name = entry.file_name();
+            let planned = actions
+                .iter()
+                .any(|action| action.path().file_name() == Some(name.as_os_str()));
+            if !planned {
+                return MigrationOutcome::Diverged(entry.path());
+            }
+        }
+    }
+
     if !force
         && mail_unsubscribes_migration_still_needed_elsewhere(&real_dir, project_root, excluding)
     {

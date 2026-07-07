@@ -1796,12 +1796,16 @@ pub fn ensure_autumn_web_feature(existing: &str, feature: &str) -> String {
 /// structure may predate `generate` entirely and destroy never restructures
 /// content it didn't itself add.
 ///
-/// A no-op for a renamed/aliased `autumn-web` dependency, or an entry
-/// `feature` doesn't currently list — destroy only reverses what `generate`
-/// itself would have written.
+/// A no-op for an entry `feature` doesn't currently list — destroy only
+/// reverses what `generate` itself would have written. A renamed/aliased
+/// `autumn-web` dependency (`autumn_web = { package = "autumn-web", ... }` or
+/// `[dependencies.autumn_web]`) is resolved to its actual key first (issue
+/// #1048 PR review) — [`ensure_autumn_web_feature_status_in_section`] adds
+/// features there too, so destroy must look under the same key it did.
 #[must_use]
 pub fn remove_autumn_web_feature(existing: &str, feature: &str) -> String {
-    remove_dep_feature_in_section(existing, "autumn-web", feature, "dependencies", true)
+    let dep_key = resolve_autumn_web_dep_key(existing, "dependencies");
+    remove_dep_feature_in_section(existing, dep_key, feature, "dependencies", true)
 }
 
 /// Inverse of [`ensure_dev_dependency_test_support`] (`autumn destroy`,
@@ -1817,7 +1821,73 @@ pub fn remove_autumn_web_feature(existing: &str, feature: &str) -> String {
 /// [`remove_autumn_web_feature`].
 #[must_use]
 pub fn remove_autumn_web_dev_dependency_feature(existing: &str, feature: &str) -> String {
-    remove_dep_feature_in_section(existing, "autumn-web", feature, "dev-dependencies", false)
+    let dep_key = resolve_autumn_web_dep_key(existing, "dev-dependencies");
+    remove_dep_feature_in_section(existing, dep_key, feature, "dev-dependencies", false)
+}
+
+/// Which literal identifier `autumn-web`'s dependency entry uses in
+/// `section` — either the plain crate name, or an importable alias declared
+/// with an explicit `package = "autumn-web"` (mirrors the alias detection in
+/// [`ensure_autumn_web_feature_status_in_section`], whose Pass 1 "else"
+/// branch and Pass 2b add features under exactly these two alias shapes:
+/// `autumn_web = { package = "autumn-web", ... }` and
+/// `[<section>.autumn_web]` with `package = "autumn-web"` inside).
+///
+/// [`remove_dep_feature_in_section`] previously always searched for the
+/// literal `"autumn-web"` key, so a project using either alias shape kept
+/// its generator-added feature forever — `destroy` located no matching line
+/// and silently made no edit (issue #1048 PR review).
+///
+/// Falls back to the literal key when no dependency entry is found at all —
+/// `remove_dep_feature_in_section` is already a no-op in that case.
+fn resolve_autumn_web_dep_key(existing: &str, section: &str) -> &'static str {
+    let lines: Vec<&str> = existing.lines().collect();
+    let mut in_section = false;
+    for &line in &lines {
+        let trimmed = line.trim();
+        if is_section_header(trimmed, section) {
+            in_section = true;
+            continue;
+        }
+        if in_section && is_section_boundary(trimmed, section) {
+            in_section = false;
+            continue;
+        }
+        if !in_section || trimmed.starts_with('#') {
+            continue;
+        }
+        let after_ws = line.trim_start();
+        if let Some(rest) = after_ws.strip_prefix("autumn-web") {
+            if rest.starts_with('.') || rest.trim_start().starts_with('=') {
+                return "autumn-web";
+            }
+            continue;
+        }
+        let Some((key, val)) = after_ws.split_once('=') else {
+            continue;
+        };
+        let alias = key
+            .trim()
+            .split_once('.')
+            .map_or(key.trim(), |(base, _)| base);
+        if alias.replace('-', "_") == "autumn_web" && declares_package(val, "autumn-web") {
+            return "autumn_web";
+        }
+    }
+
+    let literal_subtable_key = format!("[{section}.autumn-web]");
+    if lines
+        .iter()
+        .any(|l| l.trim().split('#').next().unwrap_or("").trim() == literal_subtable_key)
+    {
+        return "autumn-web";
+    }
+    let renamed_subtable_key = format!("[{section}.autumn_web]");
+    if find_section_start_with_autumn_web_package(&lines, &renamed_subtable_key).is_some() {
+        return "autumn_web";
+    }
+
+    "autumn-web"
 }
 
 /// How a single-line dependency declaration should be rewritten once a
@@ -2113,13 +2183,24 @@ fn parse_feature_removal(
         if !after_list.is_empty() {
             return FeatureRemovalEdit::Unchanged;
         }
-        return before_features
+        if let Some(v) = before_features
             .strip_prefix("version")
             .map(str::trim_start)
             .and_then(|r| r.strip_prefix('='))
-            .map_or(FeatureRemovalEdit::Unchanged, |v| {
-                FeatureRemovalEdit::Replace(format!("{indent}{dep_name} = {}", v.trim()))
-            });
+        {
+            return FeatureRemovalEdit::Replace(format!("{indent}{dep_name} = {}", v.trim()));
+        }
+        // Some other key remains besides the now-empty `features` array —
+        // e.g. a renamed dep's `package = "autumn-web"` (issue #1048 PR
+        // review), or `default-features = false`. Collapsing to a bare
+        // string would silently drop that key, so just remove the
+        // `features` key and keep the rest of the inline table intact.
+        if before_features.is_empty() {
+            return FeatureRemovalEdit::Unchanged;
+        }
+        return FeatureRemovalEdit::Replace(format!(
+            "{indent}{dep_name} = {{ {before_features} }}"
+        ));
     }
 
     FeatureRemovalEdit::Delete
@@ -7288,6 +7369,29 @@ pub struct Comment {
             "an emptied subtable features key must be removed outright, leaving \
              `version` and the header untouched: {reverted}"
         );
+    }
+
+    #[test]
+    fn remove_autumn_web_feature_reverts_renamed_inline_alias() {
+        // issue #1048 PR review: `ensure_autumn_web_feature_status_in_section`
+        // adds features to an importable rename like
+        // `autumn_web = { package = "autumn-web", ... }` too, but the old
+        // remover always searched for the literal `"autumn-web"` key and
+        // silently left the feature behind on this shape.
+        let base =
+            "[dependencies]\nautumn_web = { package = \"autumn-web\", version = \"0.6.0\" }\n";
+        let with_mail = ensure_autumn_web_feature(base, "mail");
+        assert_ne!(with_mail, base);
+        assert!(with_mail.contains("autumn_web"));
+        assert_eq!(remove_autumn_web_feature(&with_mail, "mail"), base);
+    }
+
+    #[test]
+    fn remove_autumn_web_feature_reverts_renamed_subtable_alias() {
+        let base = "[dependencies.autumn_web]\npackage = \"autumn-web\"\nversion = \"0.6.0\"\nfeatures = [\"db\"]\n\n[dev-dependencies]\n";
+        let with_mail = ensure_autumn_web_feature(base, "mail");
+        assert_ne!(with_mail, base);
+        assert_eq!(remove_autumn_web_feature(&with_mail, "mail"), base);
     }
 
     #[test]
