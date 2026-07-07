@@ -1306,22 +1306,45 @@ fn migration_applied_status(version: &str, migrations_dir: &Path) -> MigrationSt
     // which would defeat the applied-migration safety guard below.
     let profile = crate::migrate::effective_profile(None);
     let table = crate::migrate::read_autumn_toml_table_with_profile(Some(&profile));
-    let Some(url) = crate::migrate::resolve_primary_database_url_from_sources(
+    let control_url = crate::migrate::resolve_primary_database_url_from_sources(
         |k| std::env::var(k),
         table.as_ref(),
-    ) else {
+    );
+    // `autumn migrate run --shard <name>` applies user migrations to shard
+    // databases too, independently of the control database (issue #1048 PR
+    // review) — a sharded project checking only the control URL could
+    // delete a migration's files while a shard still records it as applied,
+    // leaving that shard unable to reconstruct or roll back the step.
+    let shard_urls = crate::migrate::resolve_shard_database_urls_from_sources(
+        |k| std::env::var(k),
+        table.as_ref(),
+    );
+    let urls: Vec<String> = control_url
+        .into_iter()
+        .chain(shard_urls.into_iter().map(|(_, url)| url))
+        .collect();
+    if urls.is_empty() {
         return MigrationStatus::NotConfigured;
-    };
-    autumn_web::migrate::applied_user_migrations(&url, migrations_dir).map_or(
-        MigrationStatus::Unknown,
-        |applied| {
-            if applied.iter().any(|m| m.version == version) {
-                MigrationStatus::Applied
-            } else {
-                MigrationStatus::NotApplied
+    }
+    // Applied on ANY target (control or a shard) blocks removal outright;
+    // otherwise an unreachable target is treated the same as "applied"
+    // (conservative: never delete migration files destroy can't confirm are
+    // safe to remove on every configured database).
+    let mut any_unreachable = false;
+    for url in urls {
+        match autumn_web::migrate::applied_user_migrations(&url, migrations_dir) {
+            Ok(applied) if applied.iter().any(|m| m.version == version) => {
+                return MigrationStatus::Applied;
             }
-        },
-    )
+            Ok(_) => {}
+            Err(_) => any_unreachable = true,
+        }
+    }
+    if any_unreachable {
+        MigrationStatus::Unknown
+    } else {
+        MigrationStatus::NotApplied
+    }
 }
 
 /// Shared, infrastructure-only module names any generator's `update_main_rs`
@@ -1896,6 +1919,52 @@ mod tests {
                 assert!(
                     real_dir.exists(),
                     "migration must survive even with --force when the database is unreachable"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn revert_never_removes_a_migration_when_only_an_unreachable_shard_is_configured() {
+        // A shard-only deployment (no control database role) is a valid
+        // shape (issue #1048 PR review): `autumn migrate run --shard
+        // <name>` applies user migrations to shard databases independently
+        // of any control URL. Checking only the control URL would see "no
+        // database configured" and happily delete migration files a shard
+        // still needs.
+        temp_env::with_vars(
+            [
+                ("AUTUMN_DATABASE__PRIMARY_URL", None::<&str>),
+                ("AUTUMN_DATABASE__URL", None::<&str>),
+                ("DATABASE_URL", None::<&str>),
+                ("AUTUMN_DATABASE__SHARDS__0__NAME", Some("shard0")),
+                (
+                    "AUTUMN_DATABASE__SHARDS__0__PRIMARY_URL",
+                    Some("postgres://postgres:x@127.0.0.1:1/nope"),
+                ),
+            ],
+            || {
+                let (tmp, mut plan) = fixture();
+                fs::create_dir_all(tmp.path().join("migrations")).unwrap();
+                let plan_dir = tmp.path().join("migrations/99999999999999_create_posts");
+                let real_dir = tmp.path().join("migrations/20260101000000_create_posts");
+                fs::create_dir_all(&real_dir).unwrap();
+                fs::write(real_dir.join("up.sql"), "CREATE TABLE posts ();\n").unwrap();
+                fs::write(real_dir.join("down.sql"), "DROP TABLE posts;\n").unwrap();
+
+                plan.create(plan_dir.join("up.sql"), "CREATE TABLE posts ();\n");
+                plan.create(plan_dir.join("down.sql"), "DROP TABLE posts;\n");
+
+                plan.revert(Flags {
+                    force: true,
+                    dry_run: false,
+                })
+                .unwrap();
+
+                assert!(
+                    real_dir.exists(),
+                    "migration must survive when a shard is configured but unreachable, \
+                     even with no control database URL and even with --force"
                 );
             },
         );

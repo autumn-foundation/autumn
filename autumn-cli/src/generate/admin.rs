@@ -220,9 +220,16 @@ pub fn plan_admin_with_options(
 /// depended on the model's content.
 ///
 /// # Errors
-/// Returns [`GenerateError`] when `project_root` isn't a valid project.
+/// Returns [`GenerateError`] when `project_root` isn't a valid project, or
+/// `name` fails validation.
 pub fn plan_admin_destroy_fallback(project_root: &Path, name: &str) -> Result<Plan, GenerateError> {
     ensure_project_root(project_root)?;
+    // Unlike `plan_admin_with_options`, this path has no model-file-exists
+    // check to incidentally narrow what `name` can be — it's reached
+    // precisely because that file is gone — so an invalid name (path
+    // separators, `..`) must be rejected explicitly before it's used to
+    // build filesystem paths (issue #1048 PR review).
+    super::model::validate_resource_name(name)?;
 
     let snake_name = snake(name);
     let mut plan = Plan::new(project_root);
@@ -2113,5 +2120,21 @@ pub struct Account {
         let tmp = TempDir::new().unwrap();
         let err = plan_admin_destroy_fallback(tmp.path(), "Post").unwrap_err();
         assert!(matches!(err, GenerateError::NotInProject));
+    }
+
+    #[test]
+    fn plan_admin_destroy_fallback_rejects_path_traversal_in_name() {
+        // issue #1048 PR review: unlike `plan_admin_with_options`, this
+        // fallback has no model-file-exists check to incidentally narrow
+        // `name` — it's reached precisely because that file is gone — so a
+        // name containing path separators must be rejected explicitly
+        // before it's used to build filesystem paths for deletion.
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
+        let err = plan_admin_destroy_fallback(tmp.path(), "../../foo").unwrap_err();
+        assert!(
+            matches!(err, GenerateError::InvalidName(..)),
+            "expected InvalidName, got {err:?}"
+        );
     }
 }
