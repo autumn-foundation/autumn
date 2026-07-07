@@ -1740,17 +1740,21 @@ pub fn ensure_autumn_web_feature(existing: &str, feature: &str) -> String {
 /// Inverse of [`ensure_autumn_web_feature`] (`autumn destroy`, issue #1048),
 /// scoped to `[dependencies]`.
 ///
-/// Removes `feature` from `autumn-web`'s single-line inline-table
-/// `features = [...]` list — the shape [`ensure_autumn_web_feature`] produces
-/// when it upgrades a bare-string dependency (`autumn-web = "x.y.z"` →
-/// `autumn-web = { version = "x.y.z", features = ["maud"] }`). If removing
-/// `feature` empties the list and `version` is the only other key, the whole
-/// entry collapses back to that bare string, restoring the pre-generate
-/// declaration byte-for-byte.
+/// Removes `feature` from `autumn-web`'s `features = [...]` list, in
+/// whichever of the four shapes [`ensure_autumn_web_feature`] can add it to:
+/// single-line inline table, dotted key (`autumn-web.features = [...]`),
+/// multiline inline table, or a `[dependencies.autumn-web]` subtable. Only
+/// the single-line inline-table case can collapse: when removing `feature`
+/// empties the list and `version` is the only other key, the whole entry
+/// collapses back to a bare string, restoring the pre-generate declaration
+/// byte-for-byte — the other three shapes only ever lose the one list entry
+/// (or the now-empty `features` line/key), since their surrounding
+/// structure may predate `generate` entirely and destroy never restructures
+/// content it didn't itself add.
 ///
-/// A no-op for any other declaration shape (dotted keys, multiline
-/// subtables, an entry `feature` doesn't currently list) — destroy only
-/// reverses what `generate` itself would have written.
+/// A no-op for a renamed/aliased `autumn-web` dependency, or an entry
+/// `feature` doesn't currently list — destroy only reverses what `generate`
+/// itself would have written.
 #[must_use]
 pub fn remove_autumn_web_feature(existing: &str, feature: &str) -> String {
     remove_dep_feature_in_section(existing, "autumn-web", feature, "dependencies", true)
@@ -1787,6 +1791,18 @@ enum FeatureRemovalEdit {
 /// Shared implementation behind [`remove_autumn_web_feature`] and
 /// [`remove_autumn_web_dev_dependency_feature`]. See their docs for the two
 /// `collapse_to_bare` behaviours.
+///
+/// Beyond the single-line inline-table shape [`parse_feature_removal`]
+/// handles, this also inverts the dotted-key (`<dep_name>.features =
+/// [...]`), multiline inline-table, and `[<section>.<dep_name>]` subtable
+/// forms [`ensure_autumn_web_feature_status_in_section`] can add a feature
+/// to (issue #1048 PR review) — `generate mailer`/`channel --ws` otherwise
+/// left the feature behind forever in a hand-maintained `Cargo.toml` using
+/// one of those shapes. Each of those three only ever edits the `features`
+/// line itself, never collapsing or restructuring the surrounding
+/// declaration — unlike the single-line case, that structure may predate
+/// `generate` entirely, so only what `generate` itself would have inserted
+/// (an entry in the list) is reverted.
 fn remove_dep_feature_in_section(
     existing: &str,
     dep_name: &str,
@@ -1796,6 +1812,7 @@ fn remove_dep_feature_in_section(
 ) -> String {
     let feature_quoted = format!("\"{feature}\"");
     let lines: Vec<&str> = existing.lines().collect();
+    let dotted_features_key = format!("{dep_name}.features");
     let mut in_section = false;
     for (i, &line) in lines.iter().enumerate() {
         let trimmed = line.trim();
@@ -1810,16 +1827,154 @@ fn remove_dep_feature_in_section(
         if !in_section {
             continue;
         }
-        let edit = parse_feature_removal(line, dep_name, &feature_quoted, collapse_to_bare);
-        return match edit {
-            FeatureRemovalEdit::Replace(new_line) => {
+
+        if line.trim_start().starts_with(&dotted_features_key)
+            && let Some((new_line, now_empty)) =
+                remove_feature_from_features_line(line, &feature_quoted)
+        {
+            return if now_empty {
+                remove_single_line(&lines, i, existing.ends_with('\n'))
+            } else {
                 splice_single_line(&lines, i, &new_line, existing.ends_with('\n'))
+            };
+        }
+
+        let edit = parse_feature_removal(line, dep_name, &feature_quoted, collapse_to_bare);
+        match edit {
+            FeatureRemovalEdit::Replace(new_line) => {
+                return splice_single_line(&lines, i, &new_line, existing.ends_with('\n'));
             }
-            FeatureRemovalEdit::Delete => remove_single_line(&lines, i, existing.ends_with('\n')),
-            FeatureRemovalEdit::Unchanged => continue,
-        };
+            FeatureRemovalEdit::Delete => {
+                return remove_single_line(&lines, i, existing.ends_with('\n'));
+            }
+            FeatureRemovalEdit::Unchanged => {
+                if let Some(result) = remove_feature_from_open_multiline_inline_table(
+                    &lines,
+                    i,
+                    existing,
+                    dep_name,
+                    &feature_quoted,
+                ) {
+                    return result;
+                }
+            }
+        }
     }
+
+    // Pass 2: multiline subtable form `[<section>.<dep_name>]`.
+    let subtable_key = format!("[{section}.{dep_name}]");
+    for (i, &line) in lines.iter().enumerate() {
+        let key_part = line.trim().split('#').next().unwrap_or("").trim();
+        if key_part != subtable_key {
+            continue;
+        }
+        let section_start = i + 1;
+        let section_end = lines[section_start..]
+            .iter()
+            .position(|l| {
+                let t = l.trim();
+                t.starts_with('[') && !t.is_empty()
+            })
+            .map_or(lines.len(), |p| section_start + p);
+        if let Some(result) = remove_feature_from_deps_section(
+            &lines,
+            section_start,
+            section_end,
+            existing,
+            &feature_quoted,
+        ) {
+            return result;
+        }
+    }
+
     existing.to_owned()
+}
+
+/// Remove `feature_quoted` from a standalone `key = [...]` TOML line
+/// (inverse of [`rewrite_features_line`]). `None` if the line has no
+/// bracketed array, or it doesn't list `feature_quoted`. Otherwise returns
+/// the rewritten line and whether the array is now empty.
+fn remove_feature_from_features_line(line: &str, feature_quoted: &str) -> Option<(String, bool)> {
+    let open = line.find('[')?;
+    let close_rel = line[open..].find(']')?;
+    let abs_end = open + close_rel;
+    let body = &line[open + 1..abs_end];
+    let items: Vec<&str> = body
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if !items.contains(&feature_quoted) {
+        return None;
+    }
+    let remaining: Vec<&str> = items
+        .into_iter()
+        .filter(|it| *it != feature_quoted)
+        .collect();
+    let now_empty = remaining.is_empty();
+    let new_line = format!(
+        "{}{}{}",
+        &line[..=open],
+        remaining.join(", "),
+        &line[abs_end..]
+    );
+    Some((new_line, now_empty))
+}
+
+/// If `lines[open_idx]` opens a multiline inline-table declaration for
+/// `dep_name` (`<dep_name> = {` with no closing `}` on the same line),
+/// removes `feature_quoted` from its `features = [...]` entry — inverse of
+/// [`add_feature_to_multiline_inline_table`]. Only edits the `features`
+/// line; never collapses the surrounding table, since it may predate
+/// `generate` entirely. `None` if `lines[open_idx]` isn't that opening
+/// shape, no closing `}` is found, no `features` line exists inside the
+/// block, or that line doesn't list `feature_quoted`.
+fn remove_feature_from_open_multiline_inline_table(
+    lines: &[&str],
+    open_idx: usize,
+    existing: &str,
+    dep_name: &str,
+    feature_quoted: &str,
+) -> Option<String> {
+    let after_ws = lines[open_idx].trim_start();
+    let rest = after_ws.strip_prefix(dep_name)?;
+    let rest = rest.trim_start().strip_prefix('=')?;
+    let rest = rest.trim_start().strip_prefix('{')?;
+    if rest.contains('}') {
+        return None; // closes on the same line -- not the multiline form.
+    }
+    let close_idx = lines[open_idx + 1..]
+        .iter()
+        .position(|l| l.trim_start().starts_with('}'))
+        .map(|p| open_idx + 1 + p)?;
+    remove_feature_from_deps_section(lines, open_idx + 1, close_idx, existing, feature_quoted)
+}
+
+/// Remove `feature_quoted` from a `features = [...]` line found inside
+/// `lines[section_start..section_end)` (a multiline inline-table body or a
+/// `[<section>.<dep_name>]` subtable body). Only that one line is ever
+/// changed — every other key in the span is left untouched. `None` if no
+/// `features` line is found there, or it doesn't list `feature_quoted`.
+fn remove_feature_from_deps_section(
+    lines: &[&str],
+    section_start: usize,
+    section_end: usize,
+    existing: &str,
+    feature_quoted: &str,
+) -> Option<String> {
+    for (j, &sect_line) in lines[section_start..section_end].iter().enumerate() {
+        if !sect_line.trim_start().starts_with("features") {
+            continue;
+        }
+        let idx = section_start + j;
+        let (new_line, now_empty) = remove_feature_from_features_line(sect_line, feature_quoted)?;
+        return Some(if now_empty {
+            remove_single_line(lines, idx, existing.ends_with('\n'))
+        } else {
+            splice_single_line(lines, idx, &new_line, existing.ends_with('\n'))
+        });
+    }
+    None
 }
 
 /// Parse `line` as `{indent}{dep_name} = { ...features = [...] ... }` and
@@ -6940,6 +7095,66 @@ pub struct Comment {
     fn remove_autumn_web_feature_is_idempotent_when_absent() {
         let base = "[dependencies]\nautumn-web = \"0.6.0\"\n";
         assert_eq!(remove_autumn_web_feature(base, "maud"), base);
+    }
+
+    #[test]
+    fn remove_autumn_web_feature_reverts_dotted_key_form() {
+        // issue #1048 PR review: `ensure_autumn_web_feature` can add a
+        // feature to a pre-existing dotted-key declaration; destroy must be
+        // able to remove it again, not leave it behind forever.
+        let base =
+            "[dependencies]\nautumn-web.version = \"0.6.0\"\nautumn-web.features = [\"db\"]\n";
+        let with_mail = ensure_autumn_web_feature(base, "mail");
+        assert_ne!(with_mail, base);
+        assert_eq!(remove_autumn_web_feature(&with_mail, "mail"), base);
+    }
+
+    #[test]
+    fn remove_autumn_web_feature_deletes_dotted_features_key_when_emptied() {
+        let base =
+            "[dependencies]\nautumn-web.version = \"0.6.0\"\nautumn-web.features = [\"mail\"]\n";
+        let reverted = remove_autumn_web_feature(base, "mail");
+        assert_eq!(
+            reverted, "[dependencies]\nautumn-web.version = \"0.6.0\"\n",
+            "an emptied dotted features key must be removed outright: {reverted}"
+        );
+    }
+
+    #[test]
+    fn remove_autumn_web_feature_reverts_multiline_inline_table_form() {
+        let base = "[dependencies]\nautumn-web = {\n    version = \"0.6.0\",\n    features = [\"db\"],\n}\n";
+        let with_mail = ensure_autumn_web_feature(base, "mail");
+        assert_ne!(with_mail, base);
+        assert!(with_mail.contains("\"mail\""));
+        let reverted = remove_autumn_web_feature(&with_mail, "mail");
+        assert_eq!(
+            reverted, base,
+            "must remove only the added feature from the features line, restoring the \
+             original multiline table: {reverted}"
+        );
+    }
+
+    #[test]
+    fn remove_autumn_web_feature_reverts_subtable_form() {
+        // issue #1048 PR review: `[dependencies.autumn-web]` with a
+        // separate `features` key is a shape `ensure_autumn_web_feature`
+        // supports adding to, but the old remover only handled single-line
+        // inline tables.
+        let base = "[dependencies.autumn-web]\nversion = \"0.6.0\"\nfeatures = [\"db\"]\n\n[dev-dependencies]\n";
+        let with_mail = ensure_autumn_web_feature(base, "mail");
+        assert_ne!(with_mail, base);
+        assert_eq!(remove_autumn_web_feature(&with_mail, "mail"), base);
+    }
+
+    #[test]
+    fn remove_autumn_web_feature_deletes_subtable_features_key_when_emptied() {
+        let base = "[dependencies.autumn-web]\nversion = \"0.6.0\"\nfeatures = [\"mail\"]\n";
+        let reverted = remove_autumn_web_feature(base, "mail");
+        assert_eq!(
+            reverted, "[dependencies.autumn-web]\nversion = \"0.6.0\"\n",
+            "an emptied subtable features key must be removed outright, leaving \
+             `version` and the header untouched: {reverted}"
+        );
     }
 
     #[test]

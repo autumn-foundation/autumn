@@ -2852,8 +2852,25 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
                 // Encrypted-column flags are auto-detected from the model source.
                 ..Default::default()
             };
-            let plan =
-                generate::admin::plan_admin_with_options(&resolve_cwd(), &name, &fields, &options);
+            let project_root = resolve_cwd();
+            // `plan_admin_with_options` reads `src/models/<name>.rs` to
+            // detect fields/encrypted columns for rendering — meaningless
+            // (and an error) once the model is gone. A common cleanup order
+            // like `destroy model Post` then `destroy admin Post` would
+            // otherwise fail before ever reaching `Plan::revert`, stranding
+            // `src/admin/post.rs` (issue #1048 PR review). Fall back to a
+            // model-independent plan in that specific case.
+            let model_missing = mode == ApplyMode::Destroy
+                && !project_root
+                    .join("src")
+                    .join("models")
+                    .join(format!("{}.rs", generate::naming::snake(&name)))
+                    .exists();
+            let plan = if model_missing {
+                generate::admin::plan_admin_destroy_fallback(&project_root, &name)
+            } else {
+                generate::admin::plan_admin_with_options(&project_root, &name, &fields, &options)
+            };
             apply_plan(plan, generate::Flags { dry_run, force }, mode);
         }
         GenerateCommands::Wizard {

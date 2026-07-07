@@ -481,10 +481,15 @@ impl Plan {
     /// Undo this plan — the deterministic inverse of [`Plan::execute`]
     /// driving `autumn destroy` (issue #1048).
     ///
-    /// For each `Create`/`CreateBytes`/`CreateIfAbsent` action, deletes the
-    /// target file (refusing when its on-disk content has diverged from what
-    /// `generate` would have produced, unless `--force`), then prunes any
-    /// now-empty generated directories. For each [`Revert`] recorded via
+    /// For each `Create`/`CreateBytes` action, deletes the target file
+    /// (refusing when its on-disk content has diverged from what `generate`
+    /// would have produced, unless `--force`). A `CreateIfAbsent` target
+    /// (a file shared across resources that `generate` only ever writes
+    /// once) is deleted only when its content still matches exactly —
+    /// divergence there is left alone with a warning instead, never
+    /// force-deleted, since it may predate this resource entirely rather
+    /// than being this destroy's own edit gone stale. Either way, prunes any
+    /// now-empty generated directories afterward. For each [`Revert`] recorded via
     /// [`Plan::push_revert`], removes exactly the lines/entries `generate`
     /// inserted from the current file — never touching content this plan
     /// didn't itself add. A file emptied down to nothing by its reverts is
@@ -650,6 +655,7 @@ impl Plan {
 
         let mut files_to_remove = Vec::new();
         let mut diverged = Vec::new();
+        let mut warnings = Vec::new();
         for action in normal_actions {
             let path = action.path();
             if !path.exists() {
@@ -697,15 +703,29 @@ impl Plan {
                 unreachable!("filtered to CreateIfAbsent above");
             };
             let matches = fs::read_to_string(path).is_ok_and(|d| &d == contents);
-            if matches || force {
+            if matches {
                 files_to_remove.push(path.to_path_buf());
             } else {
-                diverged.push(path.to_path_buf());
+                // Unlike an owned `Create`, a `CreateIfAbsent` target may
+                // have pre-existed before ANY generator ever ran (`generate`
+                // silently skips writing to it either way) — e.g. a
+                // hand-rolled `templates/mailers/_layout.html`. Divergence
+                // here can't be attributed to "this destroy's own edit gone
+                // stale" the way it can for an owned `Create`, so it's never
+                // treated as a blocking error and never force-deleted
+                // (issue #1048 PR review): guessing wrong would destroy
+                // real, pre-existing project content this destroy never
+                // touched. Just leave it and say why.
+                warnings.push(format!(
+                    "{} doesn't match what this generator produces; leaving it in \
+                     place since it may predate this resource — remove it by hand \
+                     if it's actually orphaned.",
+                    relative_display(path, &self.project_root),
+                ));
             }
         }
 
         let mut migrations_to_remove = Vec::new();
-        let mut warnings = Vec::new();
         for (dir, actions) in &migration_groups {
             match resolve_migration_removal(
                 dir,
@@ -1572,6 +1592,51 @@ mod tests {
         assert!(!tmp.path().join("templates/posts").exists());
         assert!(tmp.path().join("templates").exists());
         assert!(tmp.path().join("templates/other/keep.tmpl").exists());
+    }
+
+    #[test]
+    fn revert_never_deletes_a_diverged_create_if_absent_file_even_with_force() {
+        // A `CreateIfAbsent` target (e.g. a shared mailer layout) may
+        // pre-exist before ANY generator ever wrote to it — `generate`
+        // silently skips it either way, so content divergence here can't be
+        // attributed to "this destroy's own edit gone stale" the way it can
+        // for an owned `Create`. `--force` must never delete it (issue
+        // #1048 PR review): guessing wrong would destroy real, pre-existing
+        // project content this destroy never touched.
+        let (tmp, mut plan) = fixture();
+        let layout = tmp.path().join("templates/mailers/_layout.html");
+        fs::create_dir_all(layout.parent().unwrap()).unwrap();
+        fs::write(&layout, "hand-rolled layout, predates any mailer").unwrap();
+        plan.create_if_absent(layout.clone(), "generated default layout");
+
+        plan.revert(Flags {
+            force: true,
+            dry_run: false,
+        })
+        .unwrap();
+
+        assert!(
+            layout.exists(),
+            "pre-existing content diverging from the generated default must survive \
+             even with --force"
+        );
+        assert_eq!(
+            fs::read_to_string(&layout).unwrap(),
+            "hand-rolled layout, predates any mailer"
+        );
+    }
+
+    #[test]
+    fn revert_deletes_a_create_if_absent_file_when_content_matches_the_generated_default() {
+        let (tmp, mut plan) = fixture();
+        let layout = tmp.path().join("templates/mailers/_layout.html");
+        fs::create_dir_all(layout.parent().unwrap()).unwrap();
+        plan.create_if_absent(layout.clone(), "generated default layout");
+        plan.execute(Flags::default()).unwrap();
+
+        plan.revert(Flags::default()).unwrap();
+
+        assert!(!layout.exists());
     }
 
     #[test]

@@ -204,6 +204,48 @@ pub fn plan_admin_with_options(
     Ok(plan)
 }
 
+/// Fallback destroy-only plan for `autumn destroy admin <name>` when the
+/// backing model file no longer exists — e.g. `autumn destroy model <name>`
+/// already ran first (issue #1048 PR review). `plan_admin_with_options`
+/// needs the model source to detect fields/lock-version/encrypted columns
+/// for rendering, which is meaningless (and impossible) once the model is
+/// gone, so it can't be reused here.
+///
+/// The two generated files' expected content is unknowable without the
+/// model, so they're recorded with an empty placeholder — real content
+/// (never empty) always counts as diverged, so they're only removed with
+/// `--force`, exactly like any other file destroy can't confirm is safe to
+/// delete. The `src/admin/mod.rs` declaration removal is unaffected: it's a
+/// pure text edit ([`crate::generate::emit::Revert::ModDecl`]) that never
+/// depended on the model's content.
+///
+/// # Errors
+/// Returns [`GenerateError`] when `project_root` isn't a valid project.
+pub fn plan_admin_destroy_fallback(project_root: &Path, name: &str) -> Result<Plan, GenerateError> {
+    ensure_project_root(project_root)?;
+
+    let snake_name = snake(name);
+    let mut plan = Plan::new(project_root);
+
+    let admin_dir = project_root.join("src").join("admin");
+    plan.create(admin_dir.join(format!("{snake_name}.rs")), String::new());
+
+    let admin_mod_path = admin_dir.join("mod.rs");
+    plan.push_revert(crate::generate::emit::Revert::ModDecl {
+        path: admin_mod_path,
+        name: snake_name.clone(),
+    });
+
+    plan.create(
+        project_root
+            .join("tests")
+            .join(format!("{snake_name}_admin.rs")),
+        String::new(),
+    );
+
+    Ok(plan)
+}
+
 /// Returns true if the model struct `pascal_name` has a primary-key field `id`
 /// whose type is a UUID, written either fully-qualified (`uuid::Uuid`) or bare
 /// (`Uuid`). Parses the model AST (like [`detect_lock_version_field`]) so it is
@@ -2017,5 +2059,59 @@ pub struct Account {
             !admin.contains(".ilike("),
             "no ilike when there are no searchable fields"
         );
+    }
+
+    // ── `plan_admin_destroy_fallback` (issue #1048 PR review) ───────────────
+
+    #[test]
+    fn destroy_admin_after_model_already_destroyed_still_removes_admin_outputs() {
+        // A common cleanup order — `destroy model Post` then `destroy admin
+        // Post` — must not strand `src/admin/post.rs`, its mod declaration,
+        // and its smoke test just because `plan_admin_with_options` can no
+        // longer read the (now-gone) model file.
+        let tmp = project_with_model("post");
+        let plan = plan_admin(tmp.path(), "Post", &["title:String".into()]).unwrap();
+        plan.execute(Flags::default()).unwrap();
+        assert!(tmp.path().join("src/admin/post.rs").exists());
+        assert!(tmp.path().join("tests/post_admin.rs").exists());
+
+        // Simulate `autumn destroy model Post` having already run.
+        fs::remove_file(tmp.path().join("src/models/post.rs")).unwrap();
+        assert!(plan_admin(tmp.path(), "Post", &["title:String".into()]).is_err());
+
+        let fallback_plan = plan_admin_destroy_fallback(tmp.path(), "Post").unwrap();
+        // Without --force: content is unverifiable (the model is gone), so
+        // it's treated as diverged and left in place rather than guessed at.
+        let err = fallback_plan
+            .revert(Flags {
+                dry_run: false,
+                force: false,
+            })
+            .unwrap_err();
+        assert!(matches!(err, GenerateError::Diverged(_)));
+        assert!(tmp.path().join("src/admin/post.rs").exists());
+
+        let fallback_plan = plan_admin_destroy_fallback(tmp.path(), "Post").unwrap();
+        fallback_plan
+            .revert(Flags {
+                dry_run: false,
+                force: true,
+            })
+            .unwrap();
+        assert!(!tmp.path().join("src/admin/post.rs").exists());
+        assert!(!tmp.path().join("tests/post_admin.rs").exists());
+        assert!(
+            !fs::read_to_string(tmp.path().join("src/admin/mod.rs"))
+                .unwrap_or_default()
+                .contains("post"),
+            "the mod declaration removal doesn't depend on the model and must succeed too"
+        );
+    }
+
+    #[test]
+    fn plan_admin_destroy_fallback_fails_outside_project() {
+        let tmp = TempDir::new().unwrap();
+        let err = plan_admin_destroy_fallback(tmp.path(), "Post").unwrap_err();
+        assert!(matches!(err, GenerateError::NotInProject));
     }
 }
