@@ -857,8 +857,9 @@ pub struct OverloadStats {
     pub transport_error_count: u64,
     /// Child process RSS samples (KB) taken periodically during the overload
     /// phase. Empty on platforms where RSS sampling isn't implemented (see
-    /// [`crate::overload_driver::sample_rss_kb`]) — the RSS-bounded check is
-    /// then vacuously true and the report notes it was skipped.
+    /// `sample_rss_kb` in `overload_driver.rs`, private to the crate) — the
+    /// RSS-bounded check is then vacuously true and the report notes it was
+    /// skipped.
     pub rss_samples_kb: Vec<u64>,
 }
 
