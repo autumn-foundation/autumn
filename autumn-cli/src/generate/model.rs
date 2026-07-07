@@ -154,7 +154,14 @@ pub fn plan_model_with_options(
 
     let mod_path = models_dir.join("mod.rs");
     let mod_existing = read_or_empty(&mod_path);
-    plan.modify(mod_path, add_mod_declaration(&mod_existing, &snake_name));
+    plan.modify(
+        mod_path.clone(),
+        add_mod_declaration(&mod_existing, &snake_name),
+    );
+    plan.push_revert(crate::generate::emit::Revert::ModDecl {
+        path: mod_path,
+        name: snake_name.clone(),
+    });
 
     // (b) Diesel migration
     let migration_dir_name = format!("{timestamp}_create_{table}");
@@ -183,9 +190,13 @@ pub fn plan_model_with_options(
     let schema_path = project_root.join("src").join("schema.rs");
     let schema_existing = read_or_empty(&schema_path);
     plan.modify(
-        schema_path,
+        schema_path.clone(),
         append_schema_table_with_id(&schema_existing, &table, &schema_fields, options.id_type),
     );
+    plan.push_revert(crate::generate::emit::Revert::SchemaTable {
+        path: schema_path,
+        table: table.clone(),
+    });
 
     // (d) `Cargo.toml` deps — `#[autumn_web::model]` expands to references
     // for `diesel`, `serde`, `serde_json`, `chrono`, and supported field crates
@@ -508,9 +519,52 @@ pub(super) fn plan_cargo_deps(plan: &mut Plan, project_root: &Path, deps: &[(&st
     let existing = read_or_empty(&cargo_toml_path);
     let updated = ensure_cargo_dependencies(&existing, deps);
     if updated != existing {
-        plan.modify(cargo_toml_path, updated);
+        plan.modify(cargo_toml_path.clone(), updated);
+    }
+    // Recorded unconditionally — mirroring every other `push_revert` call in
+    // this module — so `autumn destroy` (issue #1048), which recomputes
+    // this same plan against the *already-generated* Cargo.toml (where
+    // these deps are, by definition, already present), still knows to
+    // remove them. Gating this on "did the Modify actually change
+    // anything" would make it a no-op at destroy time, since re-running
+    // this same idempotent transform against post-generate disk never
+    // produces a diff.
+    //
+    // `TEMPLATE_SHIPPED_CARGO_DEPS` names are excluded: `autumn new`'s own
+    // template already declares them (see `templates/Cargo.toml.tmpl`), so
+    // `ensure_cargo_dependencies` never actually adds them for a real
+    // project — they're only in `MODEL_DEPS`/`SCAFFOLD_EXTRA_DEPS` as a
+    // safety net for a hand-rolled Cargo.toml missing them. Reverting them
+    // unconditionally would strip a framework dependency the project needs
+    // regardless of any generated resource.
+    //
+    // Known limitation (documented, out of scope per issue #1048): for any
+    // *other* name, if a *different* resource's generator also depends on
+    // it, destroying this resource still removes it — reverting a shared
+    // dependency across multiple generated resources needs the multi-step
+    // undo history the issue explicitly scopes out.
+    let names: Vec<String> = deps
+        .iter()
+        .map(|(name, _)| *name)
+        .filter(|name| !TEMPLATE_SHIPPED_CARGO_DEPS.contains(name))
+        .map(str::to_owned)
+        .collect();
+    if !names.is_empty() {
+        plan.push_revert(crate::generate::emit::Revert::CargoDeps {
+            path: cargo_toml_path,
+            names,
+        });
     }
 }
+
+/// Crate dependencies `autumn new`'s own template already declares (see
+/// `templates/Cargo.toml.tmpl`) that also happen to appear in
+/// [`MODEL_DEPS`]/[`super::scaffold::SCAFFOLD_EXTRA_DEPS`] as a safety net
+/// for a hand-rolled project missing them. [`plan_cargo_deps`] never
+/// includes these in a `Revert::CargoDeps`, since a real project needs them
+/// regardless of whether any resource was ever generated.
+pub(super) const TEMPLATE_SHIPPED_CARGO_DEPS: &[&str] =
+    &["autumn-web", "maud", "diesel_migrations"];
 
 /// Insert each `(crate, version_spec)` pair at the end of the `[dependencies]`
 /// section, skipping entries already present. Pure string transformation —
@@ -603,6 +657,71 @@ pub(super) fn ensure_cargo_dependencies(existing: &str, deps: &[(&str, &str)]) -
     // Preserve whether the original file ended with a newline.
     if !existing.ends_with('\n') {
         out.pop();
+    }
+    out
+}
+
+/// Inverse of [`ensure_cargo_dependencies`] (`autumn destroy`, issue #1048).
+///
+/// Removes the exact `<name> = <spec>` shorthand line for each crate in
+/// `names` from `[dependencies]`, leaving every other entry (and the rest of
+/// the file) byte-for-byte intact. A no-op for any crate not present in that
+/// exact shorthand form — already destroyed, hand-edited into a subtable, or
+/// never added by this generator — destroy only reverses lines `generate`
+/// itself would have written.
+#[must_use]
+pub(super) fn remove_cargo_dependencies(existing: &str, names: &[&str]) -> String {
+    let mut lines: Vec<&str> = existing.lines().collect();
+    let Some(deps_idx) = lines
+        .iter()
+        .position(|l| is_table_header(l, "dependencies"))
+    else {
+        return existing.to_owned();
+    };
+    let mut scan_end = lines[deps_idx + 1..]
+        .iter()
+        .position(|l| is_any_table_header(l) && !is_dep_subtable_boundary_marker(l))
+        .map_or(lines.len(), |off| deps_idx + 1 + off);
+
+    let mut removed_any = false;
+    let mut i = deps_idx + 1;
+    while i < scan_end {
+        let trimmed = lines[i].trim_start();
+        let is_target = names.iter().any(|name| {
+            trimmed
+                .strip_prefix(name)
+                .is_some_and(|rest| rest.trim_start().starts_with('='))
+        });
+        if is_target {
+            lines.remove(i);
+            scan_end -= 1;
+            removed_any = true;
+            continue;
+        }
+        i += 1;
+    }
+    if !removed_any {
+        return existing.to_owned();
+    }
+    // If removing these deps emptied the whole `[dependencies]` section
+    // (allowing for a residual blank line — e.g. the separator a later
+    // `[dev-dependencies]` insertion added right after the last real entry),
+    // drop the header, every blank line in its now-empty body, and the
+    // blank separator line before it, if any — restoring the file to what
+    // it looked like before `ensure_cargo_dependencies` ever created this
+    // section from scratch.
+    if lines[deps_idx + 1..scan_end]
+        .iter()
+        .all(|l| l.trim().is_empty())
+    {
+        lines.drain(deps_idx..scan_end);
+        if deps_idx > 0 && lines[deps_idx - 1].trim().is_empty() {
+            lines.remove(deps_idx - 1);
+        }
+    }
+    let mut out = lines.join("\n");
+    if existing.ends_with('\n') && !out.is_empty() {
+        out.push('\n');
     }
     out
 }
@@ -1538,6 +1657,81 @@ mod tests {
     }
 
     #[test]
+    fn plan_records_reverts_for_mod_decl_schema_table_and_cargo_deps() {
+        let tmp = project();
+        let plan = plan_model(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        assert!(plan.reverts.iter().any(|r| matches!(
+            r,
+            crate::generate::emit::Revert::ModDecl { name, .. } if name == "post"
+        )));
+        assert!(plan.reverts.iter().any(|r| matches!(
+            r,
+            crate::generate::emit::Revert::SchemaTable { table, .. } if table == "posts"
+        )));
+        assert!(plan.reverts.iter().any(|r| matches!(
+            r,
+            crate::generate::emit::Revert::CargoDeps { names, .. } if names.iter().any(|n| n == "diesel")
+        )));
+    }
+
+    #[test]
+    fn generate_then_destroy_model_round_trips_to_original_project_state() {
+        // Mirrors a real `autumn new` project's Cargo.toml: `[dependencies]`
+        // already exists (autumn-web, diesel_migrations) before any
+        // generator runs — `diesel_migrations` is template-shipped (see
+        // `TEMPLATE_SHIPPED_CARGO_DEPS`) so `Revert::CargoDeps` never
+        // targets it, matching a real project where it always predates
+        // any `generate` call.
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"x\"\n\n[dependencies]\nautumn-web = \"0.6.0\"\ndiesel_migrations = \"2\"\n",
+        )
+        .unwrap();
+        let cargo_path = tmp.path().join("Cargo.toml");
+        let original_cargo = fs::read_to_string(&cargo_path).unwrap();
+
+        let plan = plan_model(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+        assert!(tmp.path().join("src/models/post.rs").exists());
+
+        // Destroy recomputes the plan from the same params (a fresh
+        // timestamp doesn't matter here since the migration dir is matched
+        // by suffix), then reverts it.
+        let destroy_plan = plan_model(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "99999999999999",
+        )
+        .unwrap();
+        destroy_plan.revert(Flags::default()).unwrap();
+
+        assert!(!tmp.path().join("src/models/post.rs").exists());
+        assert!(!tmp.path().join("src/models/mod.rs").exists());
+        assert!(!tmp.path().join("src/schema.rs").exists());
+        assert!(
+            fs::read_dir(tmp.path().join("migrations"))
+                .map(|mut d| d.next().is_none())
+                .unwrap_or(true),
+            "migration directory must be removed"
+        );
+        assert_eq!(fs::read_to_string(&cargo_path).unwrap(), original_cargo);
+    }
+
+    #[test]
     fn plan_rejects_lowercase_first_char() {
         let tmp = project();
         let err = plan_model(tmp.path(), "123Bad", &[], "20260427000000").unwrap_err();
@@ -2354,6 +2548,53 @@ autumn-web = \"0.3\"\n";
         assert!(updated.contains("autumn-web = \"0.3\""));
         assert!(updated.contains("chrono = \"0.4\""));
         assert_eq!(updated.matches("autumn-web =").count(), 1);
+    }
+
+    #[test]
+    fn remove_cargo_dependencies_restores_original() {
+        let original = "[package]\n\
+name = \"x\"\n\
+\n\
+[dependencies]\n\
+autumn-web = \"0.3\"\n";
+        let updated = ensure_cargo_dependencies(original, &[("chrono", "\"0.4\"")]);
+        assert_ne!(updated, original);
+        let reverted = remove_cargo_dependencies(&updated, &["chrono"]);
+        assert_eq!(reverted, original);
+    }
+
+    #[test]
+    fn remove_cargo_dependencies_removes_only_named_crates() {
+        let original = "[dependencies]\nautumn-web = \"0.3\"\n";
+        let updated =
+            ensure_cargo_dependencies(original, &[("chrono", "\"0.4\""), ("serde", "\"1\"")]);
+        let reverted = remove_cargo_dependencies(&updated, &["chrono"]);
+        assert!(!reverted.contains("chrono"));
+        assert!(reverted.contains("serde = \"1\""));
+        assert!(reverted.contains("autumn-web = \"0.3\""));
+    }
+
+    #[test]
+    fn remove_cargo_dependencies_is_idempotent_when_absent() {
+        let original = "[dependencies]\nautumn-web = \"0.3\"\n";
+        assert_eq!(remove_cargo_dependencies(original, &["chrono"]), original);
+    }
+
+    #[test]
+    fn remove_cargo_dependencies_does_not_touch_prefix_sharing_crate() {
+        let original = "[dependencies]\ndiesel-async = \"0.8\"\n";
+        assert_eq!(remove_cargo_dependencies(original, &["diesel"]), original);
+    }
+
+    #[test]
+    fn remove_cargo_dependencies_collapses_now_empty_section_created_from_scratch() {
+        // Mirrors `ensure_cargo_dependencies`'s "no [dependencies] section
+        // yet" branch: a minimal project with none at all.
+        let original = "[package]\nname = \"x\"\n";
+        let updated = ensure_cargo_dependencies(original, &[("chrono", "\"0.4\"")]);
+        assert_ne!(updated, original);
+        let reverted = remove_cargo_dependencies(&updated, &["chrono"]);
+        assert_eq!(reverted, original);
     }
 
     #[test]

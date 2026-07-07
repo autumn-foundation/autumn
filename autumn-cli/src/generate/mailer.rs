@@ -29,7 +29,7 @@ use super::naming::{pascal, snake};
 use super::schema_edit::{
     add_mail_preview_to_app, add_mod_declaration, ensure_autumn_web_feature, update_main_rs,
 };
-use super::{Flags, GenerateError, ensure_project_root, read_or_empty, timestamp_now};
+use super::{GenerateError, ensure_project_root, read_or_empty, timestamp_now};
 
 /// Compute the file actions for `autumn generate mailer`.
 ///
@@ -134,12 +134,24 @@ pub fn plan_mailer(
         previews_mod_path.clone(),
         add_mod_declaration(&read_or_empty(&previews_mod_path), &snake_name),
     );
+    plan.push_revert(crate::generate::emit::Revert::ModDecl {
+        path: previews_mod_path,
+        name: snake_name.clone(),
+    });
 
     // ── src/mailers/mod.rs (create or update) ──────────────────────────────
+    // The "previews" sub-module declared here is shared by every generated
+    // mailer, not owned by this one — `emit::sync_mod_declarations_in`
+    // removes it once `src/mailers/previews/mod.rs` no longer exists, so no
+    // static revert is pushed for it here.
     let mod_path = project_root.join("src").join("mailers").join("mod.rs");
     let with_mailer_mod = add_mod_declaration(&read_or_empty(&mod_path), &snake_name);
     let with_both_mods = add_mod_declaration(&with_mailer_mod, "previews");
-    plan.modify(mod_path, with_both_mods);
+    plan.modify(mod_path.clone(), with_both_mods);
+    plan.push_revert(crate::generate::emit::Revert::ModDecl {
+        path: mod_path,
+        name: snake_name.clone(),
+    });
 
     // ── src/main.rs: add mod mailers; and .mail_previews(…) ────────────────
     let main_path = project_root.join("src").join("main.rs");
@@ -151,15 +163,23 @@ pub fn plan_mailer(
     })?;
     let with_mods = update_main_rs(&main_existing, &["mailers"], &[]);
     let updated_main = add_mail_preview_to_app(&with_mods, &mailer_type);
-    plan.modify(main_path, updated_main);
+    plan.modify(main_path.clone(), updated_main);
+    plan.push_revert(crate::generate::emit::Revert::MailPreview {
+        path: main_path,
+        mailer_type,
+    });
 
     // ── Cargo.toml: ensure autumn-web has the "mail" feature ───────────────
     let cargo_path = project_root.join("Cargo.toml");
     let cargo_existing = read_or_empty(&cargo_path);
     let updated_cargo = ensure_autumn_web_feature(&cargo_existing, "mail");
     if updated_cargo != cargo_existing {
-        plan.modify(cargo_path, updated_cargo);
+        plan.modify(cargo_path.clone(), updated_cargo);
     }
+    plan.push_revert(crate::generate::emit::Revert::CargoAutumnWebFeature {
+        path: cargo_path,
+        feature: "mail".to_owned(),
+    });
 
     // ── migrations/<ts>_create_mail_unsubscribes (opt-in, idempotent) ──────
     if list_unsubscribe.is_some() {
@@ -447,27 +467,10 @@ fn render_smoke_test(struct_name: &str, snake_name: &str, no_layout: bool) -> St
     )
 }
 
-/// CLI entry point.
-pub fn run(name: &str, list_unsubscribe: Option<&str>, no_layout: bool, flags: Flags) {
-    let cwd = match std::env::current_dir() {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("Error: cannot determine current directory: {e}");
-            std::process::exit(1);
-        }
-    };
-    match plan_mailer(&cwd, name, list_unsubscribe, no_layout).and_then(|p| p.execute(flags)) {
-        Ok(()) => {}
-        Err(e) => {
-            eprintln!("Error: {e}");
-            std::process::exit(1);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::generate::Flags;
     use std::fs;
     use tempfile::TempDir;
 
@@ -497,6 +500,38 @@ async fn main() {
         .await;
 }
 "#
+    }
+
+    #[test]
+    fn generate_then_destroy_mailer_round_trips_to_original_project_state() {
+        let tmp = project_with_main(default_main());
+        let cargo_path = tmp.path().join("Cargo.toml");
+        let main_path = tmp.path().join("src/main.rs");
+        let original_cargo = fs::read_to_string(&cargo_path).unwrap();
+        let original_main = fs::read_to_string(&main_path).unwrap();
+
+        let plan = plan_mailer(tmp.path(), "Welcome", None, false).unwrap();
+        plan.execute(Flags::default()).unwrap();
+        assert!(tmp.path().join("src/mailers/welcome.rs").exists());
+        assert!(
+            fs::read_to_string(&main_path)
+                .unwrap()
+                .contains("mail_previews!")
+        );
+        assert!(
+            fs::read_to_string(&cargo_path)
+                .unwrap()
+                .contains("\"mail\"")
+        );
+
+        let destroy_plan = plan_mailer(tmp.path(), "Welcome", None, false).unwrap();
+        destroy_plan.revert(Flags::default()).unwrap();
+
+        assert!(!tmp.path().join("src/mailers/welcome.rs").exists());
+        assert!(!tmp.path().join("src/mailers/mod.rs").exists());
+        assert!(!tmp.path().join("src/mailers/previews").exists());
+        assert_eq!(fs::read_to_string(&main_path).unwrap(), original_main);
+        assert_eq!(fs::read_to_string(&cargo_path).unwrap(), original_cargo);
     }
 
     // ── RED: file plan assertions ─────────────────────────────────────────

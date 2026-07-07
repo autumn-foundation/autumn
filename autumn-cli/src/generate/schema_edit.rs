@@ -32,6 +32,34 @@ pub fn add_mod_declaration(existing: &str, name: &str) -> String {
     format!("{trimmed}\n{line}\n")
 }
 
+/// Inverse of [`add_mod_declaration`] (`autumn destroy`, issue #1048).
+///
+/// Removes the exact `pub mod <name>;` line [`add_mod_declaration`] would
+/// have inserted. A no-op (returns `existing` unchanged) if that line isn't
+/// present — either because it was already destroyed, or because the module
+/// pre-existed as a bare `mod <name>;` that `add_mod_declaration` itself
+/// never touches (and destroy must not touch either).
+#[must_use]
+pub fn remove_mod_declaration(existing: &str, name: &str) -> String {
+    let line = format!("pub mod {name};");
+    let Some(idx) = existing.lines().position(|l| l.trim() == line) else {
+        return existing.to_owned();
+    };
+    let lines: Vec<&str> = existing.lines().collect();
+    let mut out = String::with_capacity(existing.len());
+    for (i, l) in lines.iter().enumerate() {
+        if i == idx {
+            continue;
+        }
+        out.push_str(l);
+        out.push('\n');
+    }
+    if !existing.ends_with('\n') && out.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
 /// Build a new `diesel::table!` block for the given table, emitting the `id`
 /// column with the caller-supplied `id_type`.
 #[must_use]
@@ -82,6 +110,67 @@ pub fn append_schema_table_with_id(
 fn has_table(existing: &str, table: &str) -> bool {
     let needle = format!("{table} (");
     existing.lines().any(|l| l.trim().starts_with(&needle))
+}
+
+/// Inverse of [`append_schema_table_with_id`]/[`append_schema_table`]
+/// (`autumn destroy`, issue #1048).
+///
+/// Removes the whole `diesel::table! { <table> (...) { ... } }` block for
+/// `table`, plus the single blank separator line
+/// [`append_schema_table_with_id`] inserts before it when appending to a
+/// non-empty file — so removing the last table restores the file byte-for-
+/// byte to whatever preceded it (including becoming empty, in which case the
+/// caller deletes the file rather than leaving a blank `src/schema.rs`).
+///
+/// A no-op (returns `existing` unchanged) if `table` isn't declared, or if
+/// the block's shape doesn't match what `append_schema_table_with_id` would
+/// have produced (hand-edited/malformed) — destroy never corrupts a file it
+/// can't confidently reverse.
+#[must_use]
+pub fn remove_schema_table(existing: &str, table: &str) -> String {
+    if !has_table(existing, table) {
+        return existing.to_owned();
+    }
+    let lines: Vec<&str> = existing.lines().collect();
+    let needle = format!("{table} (");
+    let Some(table_line_idx) = lines.iter().position(|l| l.trim().starts_with(&needle)) else {
+        return existing.to_owned();
+    };
+    if table_line_idx == 0 || lines[table_line_idx - 1].trim() != "diesel::table! {" {
+        return existing.to_owned();
+    }
+    let open_idx = table_line_idx - 1;
+    let Some(inner_close_offset) = lines[table_line_idx + 1..]
+        .iter()
+        .position(|l| l.trim() == "}")
+    else {
+        return existing.to_owned();
+    };
+    let inner_close_idx = table_line_idx + 1 + inner_close_offset;
+    let Some(outer_close_line) = lines.get(inner_close_idx + 1) else {
+        return existing.to_owned();
+    };
+    if outer_close_line.trim() != "}" {
+        return existing.to_owned();
+    }
+    let outer_close_idx = inner_close_idx + 1;
+
+    // Also consume one preceding blank separator line, if present.
+    let mut start = open_idx;
+    if start > 0 && lines[start - 1].trim().is_empty() {
+        start -= 1;
+    }
+
+    let mut new_lines: Vec<&str> = Vec::with_capacity(lines.len());
+    new_lines.extend_from_slice(&lines[..start]);
+    if outer_close_idx + 1 < lines.len() {
+        new_lines.extend_from_slice(&lines[outer_close_idx + 1..]);
+    }
+    let mut out = new_lines.join("\n");
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out
 }
 
 /// Public predicate: whether `schema` already declares a `<table>` block.
@@ -810,6 +899,47 @@ fn has_mod_declaration(existing: &str, name: &str) -> bool {
         .any(|line| needles.iter().any(|n| line == n))
 }
 
+/// Inverse of [`ensure_mods`] (`autumn destroy`, issue #1048).
+///
+/// Removes each `mod <name>;` line (the bare, private form `ensure_mods`
+/// inserts) for a name in `names`, then collapses any run of blank lines the
+/// removal leaves behind down to at most one, and drops a leading blank line
+/// at the very start of the file — restoring the file exactly as it was
+/// before any of those declarations were added.
+///
+/// Unlike [`remove_mod_declaration`] (a resource's own `pub mod` entry in
+/// `src/models/mod.rs`), this targets `src/main.rs`'s shared infrastructure
+/// module names (`models`, `schema`, `repositories`, `routes`, …). The
+/// caller is responsible for only passing names whose backing module no
+/// longer exists on disk — these declarations are shared by every
+/// generated resource, not owned by one.
+#[must_use]
+pub fn remove_main_mod_declarations(existing: &str, names: &[&str]) -> String {
+    let lines: Vec<&str> = existing.lines().collect();
+    let matches_any = |line: &str| names.iter().any(|n| line.trim() == format!("mod {n};"));
+    if !lines.iter().any(|l| matches_any(l)) {
+        return existing.to_owned();
+    }
+    let kept: Vec<&str> = lines.into_iter().filter(|l| !matches_any(l)).collect();
+
+    let mut collapsed: Vec<&str> = Vec::with_capacity(kept.len());
+    for line in kept {
+        if line.trim().is_empty() && collapsed.last().is_some_and(|l: &&str| l.trim().is_empty()) {
+            continue;
+        }
+        collapsed.push(line);
+    }
+    while collapsed.first().is_some_and(|l| l.trim().is_empty()) {
+        collapsed.remove(0);
+    }
+
+    let mut out = collapsed.join("\n");
+    if existing.ends_with('\n') && !out.is_empty() {
+        out.push('\n');
+    }
+    out
+}
+
 /// Locate the body span (byte offsets, exclusive of the enclosing
 /// `routes![`/`]`) of the *first* `routes![ ... ]` macro invocation in
 /// `existing`. Returns `None` if there is no `routes![` or its brackets are
@@ -893,6 +1023,78 @@ pub fn remove_routes_entries_with_prefix(existing: &str, prefix: &str) -> String
         new_body.push_str(entry);
         new_body.push_str(",\n");
     }
+    let mut out = String::with_capacity(existing.len());
+    out.push_str(&existing[..body_start]);
+    out.push_str(&new_body);
+    out.push_str(&existing[body_end..]);
+    out
+}
+
+/// Inverse of [`augment_routes_body`] (`autumn destroy`, issue #1048).
+///
+/// Removes exactly `entries` from the first `routes![ ... ]` invocation and
+/// restores the pre-existing entries' original layout — byte-identically
+/// when they were on one line (the common case: a fresh `autumn new`
+/// project's `routes![index, hello, hello_name]`), since `augment_routes_body`
+/// only ever *appends* after existing content and never reformats it, so the
+/// text preceding the first entry being removed is exactly what preceded
+/// this generate call.
+///
+/// A no-op (returns `existing` unchanged) if there's no `routes![...]`, or if
+/// any of `entries` is no longer present (already destroyed, or the routes
+/// list was hand-edited) — destroy never guesses at a partial match.
+#[must_use]
+pub fn remove_routes_entries(existing: &str, entries: &[String]) -> String {
+    if entries.is_empty() {
+        return existing.to_owned();
+    }
+    let Some((body_start, body_end)) = find_routes_body_range(existing) else {
+        return existing.to_owned();
+    };
+    let body = &existing[body_start..body_end];
+    let present_entries: Vec<String> = body
+        .split([',', '\n'])
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if !entries.iter().all(|e| present_entries.contains(e)) {
+        return existing.to_owned();
+    }
+    let kept: Vec<&String> = present_entries
+        .iter()
+        .filter(|e| !entries.contains(e))
+        .collect();
+
+    // The pre-existing entries' original formatting survives untouched in
+    // the current body, up to the point where this call's first removed
+    // entry begins. Strip the separator (`,`/whitespace/newline) forward
+    // added right after the original content to see whether that ORIGINAL
+    // content itself spanned multiple lines.
+    let first_removed_at = entries
+        .iter()
+        .filter_map(|e| body.find(e.as_str()))
+        .min()
+        .unwrap_or(body.len());
+    let original_segment = &body[..first_removed_at];
+    let original_core = original_segment.trim_end_matches([' ', '\t', '\n', ',']);
+    let multiline = original_core.contains('\n');
+
+    let new_body = if multiline {
+        let indent = leading_indent(body);
+        let mut out = String::with_capacity(body.len());
+        for entry in &kept {
+            out.push_str(&indent);
+            out.push_str(entry);
+            out.push_str(",\n");
+        }
+        out
+    } else {
+        kept.iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
     let mut out = String::with_capacity(existing.len());
     out.push_str(&existing[..body_start]);
     out.push_str(&new_body);
@@ -1052,6 +1254,66 @@ fn insert_mail_previews_call(existing: &str, mailer_type: &str) -> String {
     )
 }
 
+/// Inverse of [`add_mail_preview_to_app`] (`autumn destroy`, issue #1048).
+///
+/// Removes `mailer_type` from the `mail_previews![...]` list. If it was the
+/// only entry, the whole freshly-inserted
+/// `.mail_previews(mail_previews![...])` line is removed too, rather than
+/// leaving an empty `mail_previews![]` call behind.
+///
+/// A no-op if there's no `mail_previews![...]`, or `mailer_type` isn't
+/// currently listed.
+#[must_use]
+pub fn remove_mail_preview_from_app(existing: &str, mailer_type: &str) -> String {
+    const PREVIEW_MACRO: &str = "mail_previews![";
+    let Some(macro_start) = existing.find(PREVIEW_MACRO) else {
+        return existing.to_owned();
+    };
+    let body_start = macro_start + PREVIEW_MACRO.len();
+    let rest = &existing[body_start..];
+    let Some(end_offset) = rest.find(']') else {
+        return existing.to_owned();
+    };
+    let body = &rest[..end_offset];
+    let items: Vec<&str> = body
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if !items.contains(&mailer_type) {
+        return existing.to_owned();
+    }
+    let remaining: Vec<&str> = items.into_iter().filter(|s| *s != mailer_type).collect();
+    if !remaining.is_empty() {
+        let new_body = remaining.join(", ");
+        let mut out = String::with_capacity(existing.len());
+        out.push_str(&existing[..body_start]);
+        out.push_str(&new_body);
+        out.push_str(&existing[body_start + end_offset..]);
+        return out;
+    }
+    // Only entry -- remove the whole freshly-inserted line.
+    let lines: Vec<&str> = existing.lines().collect();
+    let Some(line_idx) = lines
+        .iter()
+        .position(|l| l.trim_start().starts_with(".mail_previews(mail_previews!["))
+    else {
+        return existing.to_owned();
+    };
+    let mut out = String::with_capacity(existing.len());
+    for (i, l) in lines.iter().enumerate() {
+        if i == line_idx {
+            continue;
+        }
+        out.push_str(l);
+        out.push('\n');
+    }
+    if !existing.ends_with('\n') && out.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
 // ── Job registration helpers ──────────────────────────────────────────────
 
 /// Inject `.jobs(jobs::registered_jobs())` into the `AppBuilder` chain in
@@ -1103,6 +1365,109 @@ pub fn augment_registered_jobs(existing: &str, entry: &str) -> String {
 /// Splice `entry` into an already-present `jobs![...]` body.
 fn splice_jobs_list(existing: &str, body_start: usize, entry: &str) -> String {
     splice_into_macro_body(existing, body_start, entry)
+}
+
+/// Inverse of [`augment_registered_jobs`] (`autumn destroy`, issue #1048).
+///
+/// Removes `entry` from the `jobs![...]` list. If it was the only entry, the
+/// whole freshly-generated `registered_jobs()` function (plus its
+/// `#[must_use]` attribute and the blank separator line before it) is
+/// removed too, rather than leaving an empty `jobs![]` behind.
+///
+/// A no-op if there's no `jobs![...]`, or `entry` isn't currently listed.
+#[must_use]
+pub fn remove_job_entry(existing: &str, entry: &str) -> String {
+    const JOBS_MACRO: &str = "jobs![";
+    let Some(macro_start) = existing.find(JOBS_MACRO) else {
+        return existing.to_owned();
+    };
+    let body_start = macro_start + JOBS_MACRO.len();
+    let rest = &existing[body_start..];
+    let Some(end_offset) = rest.find(']') else {
+        return existing.to_owned();
+    };
+    let body = &rest[..end_offset];
+    let items: Vec<&str> = body
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if !items.contains(&entry) {
+        return existing.to_owned();
+    }
+    let remaining: Vec<&str> = items.into_iter().filter(|s| *s != entry).collect();
+    if remaining.is_empty() {
+        return remove_registered_jobs_fn(existing);
+    }
+    let new_body = remaining.join(", ");
+    let mut out = String::with_capacity(existing.len());
+    out.push_str(&existing[..body_start]);
+    out.push_str(&new_body);
+    out.push_str(&existing[body_start + end_offset..]);
+    out
+}
+
+/// Remove the whole `registered_jobs()` function [`augment_registered_jobs`]
+/// generates when it creates one from scratch, plus its `#[must_use]`
+/// attribute and one preceding blank separator line.
+fn remove_registered_jobs_fn(existing: &str) -> String {
+    let lines: Vec<&str> = existing.lines().collect();
+    let Some(fn_line_idx) = lines
+        .iter()
+        .position(|l| l.trim_start().starts_with("pub fn registered_jobs("))
+    else {
+        return existing.to_owned();
+    };
+    let start = if fn_line_idx > 0 && lines[fn_line_idx - 1].trim() == "#[must_use]" {
+        fn_line_idx - 1
+    } else {
+        fn_line_idx
+    };
+    let Some(close_offset) = lines[fn_line_idx..].iter().position(|l| l.trim() == "}") else {
+        return existing.to_owned();
+    };
+    let end = fn_line_idx + close_offset;
+
+    let mut effective_start = start;
+    if effective_start > 0 && lines[effective_start - 1].trim().is_empty() {
+        effective_start -= 1;
+    }
+
+    let mut new_lines: Vec<&str> = Vec::with_capacity(lines.len());
+    new_lines.extend_from_slice(&lines[..effective_start]);
+    if end + 1 < lines.len() {
+        new_lines.extend_from_slice(&lines[end + 1..]);
+    }
+    let mut out = new_lines.join("\n");
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out
+}
+
+/// Inverse of [`add_jobs_registration_to_app`] (`autumn destroy`, issue #1048).
+///
+/// Removes the `.jobs(jobs::registered_jobs())` line from the `AppBuilder`
+/// chain. A no-op if it isn't present.
+#[must_use]
+pub fn remove_jobs_registration_from_app(existing: &str) -> String {
+    const JOBS_CALL: &str = ".jobs(jobs::registered_jobs())";
+    let lines: Vec<&str> = existing.lines().collect();
+    let Some(idx) = lines.iter().position(|l| l.trim() == JOBS_CALL) else {
+        return existing.to_owned();
+    };
+    let mut out = String::with_capacity(existing.len());
+    for (i, l) in lines.iter().enumerate() {
+        if i == idx {
+            continue;
+        }
+        out.push_str(l);
+        out.push('\n');
+    }
+    if !existing.ends_with('\n') && out.ends_with('\n') {
+        out.pop();
+    }
+    out
 }
 
 // ── Cargo.toml: feature injection ────────────────────────────────────────
@@ -1352,6 +1717,204 @@ fn patch_dotted_dep(
 #[must_use]
 pub fn ensure_autumn_web_feature(existing: &str, feature: &str) -> String {
     ensure_autumn_web_feature_status(existing, feature).0
+}
+
+/// Inverse of [`ensure_autumn_web_feature`] (`autumn destroy`, issue #1048),
+/// scoped to `[dependencies]`.
+///
+/// Removes `feature` from `autumn-web`'s single-line inline-table
+/// `features = [...]` list — the shape [`ensure_autumn_web_feature`] produces
+/// when it upgrades a bare-string dependency (`autumn-web = "x.y.z"` →
+/// `autumn-web = { version = "x.y.z", features = ["maud"] }`). If removing
+/// `feature` empties the list and `version` is the only other key, the whole
+/// entry collapses back to that bare string, restoring the pre-generate
+/// declaration byte-for-byte.
+///
+/// A no-op for any other declaration shape (dotted keys, multiline
+/// subtables, an entry `feature` doesn't currently list) — destroy only
+/// reverses what `generate` itself would have written.
+#[must_use]
+pub fn remove_autumn_web_feature(existing: &str, feature: &str) -> String {
+    remove_dep_feature_in_section(existing, "autumn-web", feature, "dependencies", true)
+}
+
+/// Inverse of [`ensure_dev_dependency_test_support`] (`autumn destroy`,
+/// issue #1048), scoped to `[dev-dependencies]`.
+///
+/// Unlike [`remove_autumn_web_feature`], a fresh project's
+/// `[dev-dependencies]` never has a prior `autumn-web` entry —
+/// [`ensure_dev_dependency_test_support`] always *inserts* a brand-new line.
+/// So when removing `feature` empties its features list, the whole line is
+/// deleted outright rather than collapsed to a bare string.
+///
+/// A no-op for any other declaration shape, mirroring
+/// [`remove_autumn_web_feature`].
+#[must_use]
+pub fn remove_autumn_web_dev_dependency_feature(existing: &str, feature: &str) -> String {
+    remove_dep_feature_in_section(existing, "autumn-web", feature, "dev-dependencies", false)
+}
+
+/// How a single-line dependency declaration should be rewritten once a
+/// feature has been removed from its `features = [...]` array.
+enum FeatureRemovalEdit {
+    /// Keep the line, with this new full text.
+    Replace(String),
+    /// Delete the line entirely.
+    Delete,
+    /// Leave the file completely unchanged — either `feature` wasn't found,
+    /// or the shape doesn't confidently invert.
+    Unchanged,
+}
+
+/// Shared implementation behind [`remove_autumn_web_feature`] and
+/// [`remove_autumn_web_dev_dependency_feature`]. See their docs for the two
+/// `collapse_to_bare` behaviours.
+fn remove_dep_feature_in_section(
+    existing: &str,
+    dep_name: &str,
+    feature: &str,
+    section: &str,
+    collapse_to_bare: bool,
+) -> String {
+    let feature_quoted = format!("\"{feature}\"");
+    let lines: Vec<&str> = existing.lines().collect();
+    let mut in_section = false;
+    for (i, &line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if is_section_header(trimmed, section) {
+            in_section = true;
+            continue;
+        }
+        if in_section && is_section_boundary(trimmed, section) {
+            in_section = false;
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        let edit = parse_feature_removal(line, dep_name, &feature_quoted, collapse_to_bare);
+        return match edit {
+            FeatureRemovalEdit::Replace(new_line) => {
+                splice_single_line(&lines, i, &new_line, existing.ends_with('\n'))
+            }
+            FeatureRemovalEdit::Delete => remove_single_line(&lines, i, existing.ends_with('\n')),
+            FeatureRemovalEdit::Unchanged => continue,
+        };
+    }
+    existing.to_owned()
+}
+
+/// Parse `line` as `{indent}{dep_name} = { ...features = [...] ... }` and
+/// decide how to rewrite it once `feature_quoted` is removed from the
+/// features array. Returns [`FeatureRemovalEdit::Unchanged`] whenever the
+/// line doesn't match that exact single-line inline-table shape, or doesn't
+/// currently list the feature.
+fn parse_feature_removal(
+    line: &str,
+    dep_name: &str,
+    feature_quoted: &str,
+    collapse_to_bare: bool,
+) -> FeatureRemovalEdit {
+    let after_ws = line.trim_start();
+    let indent = &line[..line.len() - after_ws.len()];
+    let Some(rest) = after_ws.strip_prefix(dep_name) else {
+        return FeatureRemovalEdit::Unchanged;
+    };
+    let Some(rest) = rest.trim_start().strip_prefix('=') else {
+        return FeatureRemovalEdit::Unchanged;
+    };
+    let Some(rest) = rest.trim_start().strip_prefix('{') else {
+        return FeatureRemovalEdit::Unchanged;
+    };
+    let Some(body_end) = rest.rfind('}') else {
+        return FeatureRemovalEdit::Unchanged;
+    };
+    let body = rest[..body_end].trim();
+    let Some(features_kw) = body.find("features") else {
+        return FeatureRemovalEdit::Unchanged;
+    };
+    let before_features = body[..features_kw].trim().trim_end_matches(',').trim();
+    let after_kw = &body[features_kw + "features".len()..];
+    let Some(bracket_open) = after_kw.find('[') else {
+        return FeatureRemovalEdit::Unchanged;
+    };
+    let Some(bracket_close) = after_kw.find(']') else {
+        return FeatureRemovalEdit::Unchanged;
+    };
+    if bracket_close < bracket_open {
+        return FeatureRemovalEdit::Unchanged;
+    }
+    let list_body = &after_kw[bracket_open + 1..bracket_close];
+    let after_list = after_kw[bracket_close + 1..]
+        .trim()
+        .trim_start_matches(',')
+        .trim();
+    let items: Vec<&str> = list_body
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if !items.contains(&feature_quoted) {
+        return FeatureRemovalEdit::Unchanged;
+    }
+    let remaining: Vec<&str> = items.into_iter().filter(|s| *s != feature_quoted).collect();
+
+    if !remaining.is_empty() {
+        let sep = if before_features.is_empty() { "" } else { ", " };
+        return FeatureRemovalEdit::Replace(format!(
+            "{indent}{dep_name} = {{ {before_features}{sep}features = [{}] }}",
+            remaining.join(", "),
+        ));
+    }
+
+    if collapse_to_bare {
+        if !after_list.is_empty() {
+            return FeatureRemovalEdit::Unchanged;
+        }
+        return before_features
+            .strip_prefix("version")
+            .map(str::trim_start)
+            .and_then(|r| r.strip_prefix('='))
+            .map_or(FeatureRemovalEdit::Unchanged, |v| {
+                FeatureRemovalEdit::Replace(format!("{indent}{dep_name} = {}", v.trim()))
+            });
+    }
+
+    FeatureRemovalEdit::Delete
+}
+
+/// Replace line `idx` with `new_line`, preserving the file's trailing-newline status.
+fn splice_single_line(
+    lines: &[&str],
+    idx: usize,
+    new_line: &str,
+    ends_with_newline: bool,
+) -> String {
+    let mut out = String::with_capacity(lines.len() * 24 + new_line.len());
+    for (i, &l) in lines.iter().enumerate() {
+        out.push_str(if i == idx { new_line } else { l });
+        out.push('\n');
+    }
+    if !ends_with_newline {
+        out.pop();
+    }
+    out
+}
+
+/// Remove line `idx` entirely, preserving the file's trailing-newline status.
+fn remove_single_line(lines: &[&str], idx: usize, ends_with_newline: bool) -> String {
+    let mut out = String::with_capacity(lines.len() * 24);
+    for (i, &l) in lines.iter().enumerate() {
+        if i == idx {
+            continue;
+        }
+        out.push_str(l);
+        out.push('\n');
+    }
+    if !ends_with_newline && out.ends_with('\n') {
+        out.pop();
+    }
+    out
 }
 
 /// Like [`ensure_autumn_web_feature`], but also reports whether the `autumn-web`
@@ -4345,6 +4908,76 @@ async fn main() {\n\
         assert!(updated.contains("jobs![foo::foo]"));
     }
 
+    // ── remove_job_entry / remove_jobs_registration_from_app (destroy, #1048) ──
+
+    #[test]
+    fn remove_job_entry_restores_original_when_it_was_the_only_one() {
+        let base = "pub mod send_welcome_email;\n";
+        let after_add = augment_registered_jobs(base, "send_welcome_email::send_welcome_email");
+        assert_ne!(after_add, base);
+        assert_eq!(
+            remove_job_entry(&after_add, "send_welcome_email::send_welcome_email"),
+            base
+        );
+    }
+
+    #[test]
+    fn remove_job_entry_keeps_other_entries() {
+        let base = "pub mod send_welcome_email;\n";
+        let with_one = augment_registered_jobs(base, "send_welcome_email::send_welcome_email");
+        let with_both = augment_registered_jobs(&with_one, "post_notification::post_notification");
+        let reverted = remove_job_entry(&with_both, "post_notification::post_notification");
+        assert!(reverted.contains("send_welcome_email::send_welcome_email"));
+        assert!(!reverted.contains("post_notification::post_notification"));
+    }
+
+    #[test]
+    fn remove_job_entry_is_idempotent_when_absent() {
+        let base = "pub mod send_welcome_email;\n";
+        assert_eq!(remove_job_entry(base, "nonexistent::nonexistent"), base);
+    }
+
+    #[test]
+    fn remove_jobs_registration_from_app_restores_original() {
+        let base = "fn main() {\n    App::new()\n        .run()\n}\n";
+        let after_add = add_jobs_registration_to_app(base);
+        assert_ne!(after_add, base);
+        assert_eq!(remove_jobs_registration_from_app(&after_add), base);
+    }
+
+    #[test]
+    fn remove_jobs_registration_from_app_is_idempotent_when_absent() {
+        let base = "fn main() {\n    App::new()\n        .run()\n}\n";
+        assert_eq!(remove_jobs_registration_from_app(base), base);
+    }
+
+    #[test]
+    fn remove_mail_preview_from_app_restores_original_when_only_entry() {
+        let base = "fn main() {\n    App::new()\n        .run()\n}\n";
+        let after_add = add_mail_preview_to_app(base, "WelcomeMailer");
+        assert_ne!(after_add, base);
+        assert_eq!(
+            remove_mail_preview_from_app(&after_add, "WelcomeMailer"),
+            base
+        );
+    }
+
+    #[test]
+    fn remove_mail_preview_from_app_keeps_other_entries() {
+        let base = "fn main() {\n    App::new()\n        .run()\n}\n";
+        let with_one = add_mail_preview_to_app(base, "WelcomeMailer");
+        let with_both = add_mail_preview_to_app(&with_one, "ReceiptMailer");
+        let reverted = remove_mail_preview_from_app(&with_both, "ReceiptMailer");
+        assert!(reverted.contains("WelcomeMailer"));
+        assert!(!reverted.contains("ReceiptMailer"));
+    }
+
+    #[test]
+    fn remove_mail_preview_from_app_is_idempotent_when_absent() {
+        let base = "fn main() {\n    App::new()\n        .run()\n}\n";
+        assert_eq!(remove_mail_preview_from_app(base, "WelcomeMailer"), base);
+    }
+
     // ── ensure_autumn_web_feature ─────────────────────────────────────────
 
     #[test]
@@ -6111,5 +6744,181 @@ pub struct Comment {
         let fs = fields(&["title:String"]);
         let schema = append_schema_table_with_id("", "posts", &fs, IdType::Uuid);
         assert!(schema.contains("id -> Uuid,"));
+    }
+
+    // ── `autumn destroy` inverse helpers (issue #1048) ─────────────────────
+    //
+    // Each inverse is tested for byte-identical round-tripping:
+    // `inverse(forward(base)) == base`.
+
+    #[test]
+    fn remove_mod_declaration_restores_empty_file() {
+        let after_add = add_mod_declaration("", "post");
+        assert_eq!(remove_mod_declaration(&after_add, "post"), "");
+    }
+
+    #[test]
+    fn remove_mod_declaration_restores_original_with_other_mods() {
+        let base = "pub mod user;\n";
+        let after_add = add_mod_declaration(base, "post");
+        assert_eq!(remove_mod_declaration(&after_add, "post"), base);
+    }
+
+    #[test]
+    fn remove_mod_declaration_is_idempotent_when_absent() {
+        let base = "pub mod user;\n";
+        assert_eq!(remove_mod_declaration(base, "post"), base);
+    }
+
+    #[test]
+    fn remove_mod_declaration_leaves_private_mod_untouched() {
+        // `add_mod_declaration` treats a bare `mod post;` as already-present and
+        // never writes `pub mod post;` in that case — so destroy must not
+        // remove a private `mod post;` it didn't add.
+        let base = "mod post;\n";
+        assert_eq!(remove_mod_declaration(base, "post"), base);
+    }
+
+    #[test]
+    fn remove_schema_table_restores_empty_file() {
+        let f = fields(&["title:String"]);
+        let after_add = append_schema_table("", "posts", &f);
+        assert_eq!(remove_schema_table(&after_add, "posts"), "");
+    }
+
+    #[test]
+    fn remove_schema_table_restores_original_with_other_tables() {
+        let f1 = fields(&["title:String"]);
+        let f2 = fields(&["name:String"]);
+        let base = append_schema_table("", "users", &f2);
+        let after_add = append_schema_table(&base, "posts", &f1);
+        assert_eq!(remove_schema_table(&after_add, "posts"), base);
+    }
+
+    #[test]
+    fn remove_schema_table_is_idempotent_when_absent() {
+        let f = fields(&["name:String"]);
+        let base = append_schema_table("", "users", &f);
+        assert_eq!(remove_schema_table(&base, "posts"), base);
+    }
+
+    #[test]
+    fn remove_routes_entries_restores_single_line_template_body() {
+        // Mirrors the `autumn new` template's `.routes(routes![index, hello, hello_name])`.
+        let base = "fn main() {\n    App::new()\n        .routes(routes![index, hello, hello_name])\n        .run()\n}\n";
+        let appended = vec![
+            "routes::posts::index".to_owned(),
+            "routes::posts::show".to_owned(),
+        ];
+        let after_add = ensure_routes_entries(base, &appended);
+        assert_ne!(
+            after_add, base,
+            "test setup: append must actually change the body"
+        );
+        let reverted = remove_routes_entries(&after_add, &appended);
+        assert_eq!(reverted, base);
+    }
+
+    #[test]
+    fn remove_routes_entries_is_idempotent_when_absent() {
+        let base =
+            "fn main() {\n    App::new()\n        .routes(routes![index])\n        .run()\n}\n";
+        let appended = vec!["routes::posts::index".to_owned()];
+        assert_eq!(remove_routes_entries(base, &appended), base);
+    }
+
+    #[test]
+    fn remove_routes_entries_preserves_other_resources_multiline() {
+        let base =
+            "fn main() {\n    App::new()\n        .routes(routes![index])\n        .run()\n}\n";
+        let comments_entries = vec![
+            "routes::comments::index".to_owned(),
+            "routes::comments::show".to_owned(),
+        ];
+        let after_comments = ensure_routes_entries(base, &comments_entries);
+        let posts_entries = vec![
+            "routes::posts::index".to_owned(),
+            "routes::posts::show".to_owned(),
+        ];
+        let after_posts = ensure_routes_entries(&after_comments, &posts_entries);
+        let reverted = remove_routes_entries(&after_posts, &posts_entries);
+        // Comments entries must survive destroying posts.
+        assert!(reverted.contains("routes::comments::index"));
+        assert!(reverted.contains("routes::comments::show"));
+        assert!(!reverted.contains("routes::posts::index"));
+        assert!(!reverted.contains("routes::posts::show"));
+    }
+
+    #[test]
+    fn remove_autumn_web_feature_collapses_to_bare_string() {
+        let base = "[dependencies]\nautumn-web = \"0.6.0\"\n";
+        let after_add = ensure_autumn_web_feature(base, "maud");
+        assert_ne!(after_add, base);
+        assert_eq!(remove_autumn_web_feature(&after_add, "maud"), base);
+    }
+
+    #[test]
+    fn remove_autumn_web_feature_keeps_other_features() {
+        let base = "[dependencies]\nautumn-web = \"0.6.0\"\n";
+        let with_maud = ensure_autumn_web_feature(base, "maud");
+        let with_both = ensure_autumn_web_feature(&with_maud, "htmx");
+        let reverted = remove_autumn_web_feature(&with_both, "htmx");
+        assert_eq!(reverted, with_maud);
+    }
+
+    #[test]
+    fn remove_autumn_web_feature_is_idempotent_when_absent() {
+        let base = "[dependencies]\nautumn-web = \"0.6.0\"\n";
+        assert_eq!(remove_autumn_web_feature(base, "maud"), base);
+    }
+
+    #[test]
+    fn remove_autumn_web_dev_dependency_feature_deletes_freshly_inserted_line() {
+        let base =
+            "[dev-dependencies]\ntokio = { version = \"1\", features = [\"rt\", \"macros\"] }\n";
+        let after_add = ensure_dev_dependency_test_support(base, "0.6.0");
+        assert_ne!(after_add, base);
+        assert_eq!(
+            remove_autumn_web_dev_dependency_feature(&after_add, "test-support"),
+            base
+        );
+    }
+
+    #[test]
+    fn remove_autumn_web_dev_dependency_feature_is_idempotent_when_absent() {
+        let base = "[dev-dependencies]\ntokio = { version = \"1\" }\n";
+        assert_eq!(
+            remove_autumn_web_dev_dependency_feature(base, "test-support"),
+            base
+        );
+    }
+
+    #[test]
+    fn remove_main_mod_declarations_restores_original_with_no_leading_attributes() {
+        // Mirrors `autumn new`'s template main.rs, which has no leading
+        // `//!`/`#![` lines at all.
+        let base = "use autumn_web::prelude::*;\n\nfn main() {}\n";
+        let after_add = ensure_mods(base, &["models", "repositories", "routes", "schema"]);
+        assert_ne!(after_add, base);
+        let reverted = remove_main_mod_declarations(
+            &after_add,
+            &["models", "repositories", "routes", "schema"],
+        );
+        assert_eq!(reverted, base);
+    }
+
+    #[test]
+    fn remove_main_mod_declarations_leaves_other_shared_mods_when_only_some_missing() {
+        let base = "fn main() {}\n";
+        let after_add = ensure_mods(base, &["models", "jobs"]);
+        let reverted = remove_main_mod_declarations(&after_add, &["jobs"]);
+        assert!(reverted.contains("mod models;"));
+        assert!(!reverted.contains("mod jobs;"));
+    }
+
+    #[test]
+    fn remove_main_mod_declarations_is_idempotent_when_absent() {
+        let base = "fn main() {}\n";
+        assert_eq!(remove_main_mod_declarations(base, &["models"]), base);
     }
 }

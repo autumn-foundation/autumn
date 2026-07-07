@@ -15,7 +15,7 @@ use std::path::Path;
 use super::emit::Plan;
 use super::model::validate_resource_name;
 use super::naming::{pascal, snake};
-use super::{Flags, GenerateError, ensure_project_root};
+use super::{GenerateError, ensure_project_root};
 
 /// Returns `true` if `trimmed` is a TOML section header matching `name`,
 /// with or without a trailing inline comment (e.g. `[workspace] # root`).
@@ -417,27 +417,10 @@ async fn {snake_name}_index_renders() {{
     )
 }
 
-/// CLI entry point.
-pub fn run(name: &str, flags: Flags) {
-    let cwd = match std::env::current_dir() {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("Error: cannot determine current directory: {e}");
-            std::process::exit(1);
-        }
-    };
-    match plan_system_test(&cwd, name).and_then(|p| p.execute(flags)) {
-        Ok(()) => {}
-        Err(e) => {
-            eprintln!("Error: {e}");
-            std::process::exit(1);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::generate::Flags;
     use std::fs;
     use tempfile::TempDir;
 

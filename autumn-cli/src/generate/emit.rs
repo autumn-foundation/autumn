@@ -42,6 +42,98 @@ impl Action {
     }
 }
 
+/// One in-place edit `generate` made to a shared file, recorded so `autumn
+/// destroy` (issue #1048) can remove exactly that edit later — the
+/// per-generator "revoke" hook the issue calls for.
+///
+/// Lives on [`Plan`] rather than on the [`Action::Modify`] it accompanies:
+/// some generators (e.g. `scaffold`) collapse several `Modify` actions
+/// targeting the same file (`Cargo.toml`) into one via
+/// `plan.actions.retain(...)` + re-push, which would silently drop
+/// per-action metadata. A plan-level list survives that.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Revert {
+    /// Remove a `pub mod <name>;` declaration from a `mod.rs`-style file.
+    ModDecl { path: PathBuf, name: String },
+    /// Remove `entries` from the first `routes![...]` invocation in `path`
+    /// (`src/main.rs`).
+    RoutesEntries { path: PathBuf, entries: Vec<String> },
+    /// Remove the `diesel::table! { <table> ... }` block from `path`
+    /// (`src/schema.rs`).
+    SchemaTable { path: PathBuf, table: String },
+    /// Remove the named crates' shorthand `[dependencies]` lines from `path`
+    /// (`Cargo.toml`).
+    CargoDeps { path: PathBuf, names: Vec<String> },
+    /// Remove `feature` from `autumn-web`'s `[dependencies]` features list
+    /// in `path` (`Cargo.toml`), collapsing to a bare version string if that
+    /// empties it.
+    CargoAutumnWebFeature { path: PathBuf, feature: String },
+    /// Remove `feature` from `autumn-web`'s `[dev-dependencies]` features
+    /// list in `path` (`Cargo.toml`), deleting the whole line if that
+    /// empties it (that entry was always freshly inserted, never pre-existing).
+    CargoAutumnWebDevFeature { path: PathBuf, feature: String },
+    /// Remove `entry` from the `jobs![...]` list in `path`
+    /// (`src/jobs/mod.rs`), dropping the whole freshly-generated
+    /// `registered_jobs()` function if it was the only entry.
+    JobEntry { path: PathBuf, entry: String },
+    /// Remove the `.jobs(jobs::registered_jobs())` call from the
+    /// `AppBuilder` chain in `path` (`src/main.rs`).
+    JobsRegistration { path: PathBuf },
+    /// Remove `mailer_type` from the `mail_previews![...]` list in `path`
+    /// (`src/main.rs`), dropping the whole freshly-inserted
+    /// `.mail_previews(...)` call if it was the only entry.
+    MailPreview { path: PathBuf, mailer_type: String },
+}
+
+impl Revert {
+    /// The path this revert targets.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        match self {
+            Self::ModDecl { path, .. }
+            | Self::RoutesEntries { path, .. }
+            | Self::SchemaTable { path, .. }
+            | Self::CargoDeps { path, .. }
+            | Self::CargoAutumnWebFeature { path, .. }
+            | Self::CargoAutumnWebDevFeature { path, .. }
+            | Self::JobEntry { path, .. }
+            | Self::JobsRegistration { path }
+            | Self::MailPreview { path, .. } => path,
+        }
+    }
+
+    /// Apply this revert to `content`, returning the new content. Every
+    /// underlying transform is idempotent — a revert whose target is
+    /// already absent returns `content` unchanged.
+    fn apply(&self, content: &str) -> String {
+        use super::schema_edit::{
+            remove_autumn_web_dev_dependency_feature, remove_autumn_web_feature, remove_job_entry,
+            remove_jobs_registration_from_app, remove_mail_preview_from_app,
+            remove_mod_declaration, remove_routes_entries, remove_schema_table,
+        };
+        match self {
+            Self::ModDecl { name, .. } => remove_mod_declaration(content, name),
+            Self::RoutesEntries { entries, .. } => remove_routes_entries(content, entries),
+            Self::SchemaTable { table, .. } => remove_schema_table(content, table),
+            Self::CargoDeps { names, .. } => {
+                let names: Vec<&str> = names.iter().map(String::as_str).collect();
+                super::model::remove_cargo_dependencies(content, &names)
+            }
+            Self::CargoAutumnWebFeature { feature, .. } => {
+                remove_autumn_web_feature(content, feature)
+            }
+            Self::CargoAutumnWebDevFeature { feature, .. } => {
+                remove_autumn_web_dev_dependency_feature(content, feature)
+            }
+            Self::JobEntry { entry, .. } => remove_job_entry(content, entry),
+            Self::JobsRegistration { .. } => remove_jobs_registration_from_app(content),
+            Self::MailPreview { mailer_type, .. } => {
+                remove_mail_preview_from_app(content, mailer_type)
+            }
+        }
+    }
+}
+
 /// A complete generator plan — a sequence of actions plus the project root
 /// they are anchored against.
 #[derive(Debug, Default)]
@@ -54,6 +146,10 @@ pub struct Plan {
     /// `--dry-run` and a real run), without failing the generator — e.g. a
     /// `references` field whose target model doesn't exist yet.
     pub warnings: Vec<String>,
+    /// In-place edits recorded alongside [`Action::Modify`]s, so
+    /// [`Plan::revert`] (`autumn destroy`, issue #1048) can remove exactly
+    /// what this plan would have inserted into a shared file.
+    pub reverts: Vec<Revert>,
 }
 
 impl Plan {
@@ -64,6 +160,7 @@ impl Plan {
             project_root: project_root.into(),
             actions: Vec::new(),
             warnings: Vec::new(),
+            reverts: Vec::new(),
         }
     }
 
@@ -71,6 +168,13 @@ impl Plan {
     /// fatal to the plan.
     pub fn warn(&mut self, message: impl Into<String>) {
         self.warnings.push(message.into());
+    }
+
+    /// Record a [`Revert`] describing how to undo an in-place edit this plan
+    /// makes elsewhere via [`Plan::modify`]. Used by `autumn destroy`
+    /// (issue #1048) — irrelevant to a normal `generate` run.
+    pub fn push_revert(&mut self, revert: Revert) {
+        self.reverts.push(revert);
     }
 
     /// Push a [`Action::Create`] action.
@@ -233,6 +337,472 @@ impl Plan {
             );
         }
     }
+
+    /// Undo this plan — the deterministic inverse of [`Plan::execute`]
+    /// driving `autumn destroy` (issue #1048).
+    ///
+    /// For each `Create`/`CreateBytes`/`CreateIfAbsent` action, deletes the
+    /// target file (refusing when its on-disk content has diverged from what
+    /// `generate` would have produced, unless `--force`), then prunes any
+    /// now-empty generated directories. For each [`Revert`] recorded via
+    /// [`Plan::push_revert`], removes exactly the lines/entries `generate`
+    /// inserted from the current file — never touching content this plan
+    /// didn't itself add. A file emptied down to nothing by its reverts is
+    /// deleted outright (e.g. a `schema.rs`/`mod.rs` that only ever held
+    /// this resource's single entry).
+    ///
+    /// Migration directories are matched by resource-name suffix, since
+    /// destroy recomputes the plan with a fresh timestamp that won't match
+    /// the original directory, and are removed only when not yet applied to
+    /// a configured database — destroy never touches the database itself.
+    ///
+    /// Honours `--dry-run` (prints a `Removed:`/`Reverted:` plan, touches
+    /// nothing) exactly like [`Plan::execute`].
+    ///
+    /// # Errors
+    /// Returns [`GenerateError::Diverged`] when any targeted file's content
+    /// no longer matches what `generate` would have produced and `--force`
+    /// was not given; or [`GenerateError::Io`] for filesystem failures.
+    pub fn revert(&self, flags: Flags) -> Result<(), GenerateError> {
+        let plan = self.compute_revert_plan(flags.force);
+
+        if flags.dry_run {
+            println!("Dry run — no files removed.");
+            for path in &plan.files_to_remove {
+                println!(
+                    "  Would remove {}",
+                    relative_display(path, &self.project_root)
+                );
+            }
+            for dir in &plan.migrations_to_remove {
+                println!(
+                    "  Would remove {}",
+                    relative_display(dir, &self.project_root)
+                );
+            }
+            for (path, new_content) in &plan.modifies {
+                let label = if new_content.is_none() {
+                    "Would remove"
+                } else {
+                    "Would revert"
+                };
+                println!("  {label} {}", relative_display(path, &self.project_root));
+            }
+            return Ok(());
+        }
+
+        if !plan.diverged.is_empty() && !flags.force {
+            return Err(GenerateError::Diverged(plan.diverged));
+        }
+
+        for warning in &plan.warnings {
+            eprintln!("Warning: {warning}");
+        }
+
+        let mut touched_dirs: Vec<PathBuf> = Vec::new();
+
+        for path in &plan.files_to_remove {
+            fs::remove_file(path)?;
+            println!("  Removed {}", relative_display(path, &self.project_root));
+            if let Some(parent) = path.parent() {
+                touched_dirs.push(parent.to_path_buf());
+            }
+        }
+
+        for dir in &plan.migrations_to_remove {
+            fs::remove_dir_all(dir)?;
+            println!("  Removed {}", relative_display(dir, &self.project_root));
+            touched_dirs.push(self.project_root.join("migrations"));
+        }
+
+        for (path, new_content) in &plan.modifies {
+            match new_content {
+                Some(content) => {
+                    fs::write(path, content)?;
+                    println!("  Reverted {}", relative_display(path, &self.project_root));
+                }
+                None => {
+                    fs::remove_file(path)?;
+                    println!("  Removed {}", relative_display(path, &self.project_root));
+                    if let Some(parent) = path.parent() {
+                        touched_dirs.push(parent.to_path_buf());
+                    }
+                }
+            }
+        }
+
+        for dir in touched_dirs {
+            prune_empty_ancestors(dir, &self.project_root);
+        }
+
+        // Nested sub-module declarations (e.g. `src/mailers/mod.rs`'s
+        // `pub mod previews;`) must be synced BEFORE `src/main.rs`'s, so a
+        // now-empty-and-deleted `src/mailers/mod.rs` is already gone by the
+        // time the `mod mailers;` orphan check runs.
+        sync_mod_declarations_in(
+            &self.project_root.join("src").join("mailers"),
+            &["previews"],
+            &self.project_root,
+        );
+        sync_main_rs_mod_declarations(&self.project_root);
+
+        Ok(())
+    }
+
+    /// Compute what [`Plan::revert`] would do, without touching disk except
+    /// to read files for divergence comparison. Shared by the `--dry-run`
+    /// and real-run paths of `revert` so they can never disagree.
+    fn compute_revert_plan(&self, force: bool) -> RevertPlan {
+        let migrations_root = self.project_root.join("migrations");
+
+        // `Create`/`CreateBytes`/`CreateIfAbsent` actions living directly
+        // under `migrations/<dir>/` need suffix-based matching (see
+        // `resolve_migration_removal`); everything else is a normal,
+        // path-stable file to check-and-delete.
+        let mut migration_groups: Vec<(PathBuf, Vec<&Action>)> = Vec::new();
+        let mut normal_actions: Vec<&Action> = Vec::new();
+        for action in &self.actions {
+            if matches!(action, Action::Modify { .. }) {
+                continue;
+            }
+            let path = action.path();
+            if let Some(dir) = path.parent()
+                && dir.parent() == Some(migrations_root.as_path())
+            {
+                if let Some(entry) = migration_groups.iter_mut().find(|(d, _)| d == dir) {
+                    entry.1.push(action);
+                } else {
+                    migration_groups.push((dir.to_path_buf(), vec![action]));
+                }
+                continue;
+            }
+            normal_actions.push(action);
+        }
+
+        let mut files_to_remove = Vec::new();
+        let mut diverged = Vec::new();
+        for action in normal_actions {
+            let path = action.path();
+            if !path.exists() {
+                continue; // already gone — idempotent skip.
+            }
+            let matches = match action {
+                Action::Create { contents, .. } | Action::CreateIfAbsent { contents, .. } => {
+                    fs::read_to_string(path).is_ok_and(|d| &d == contents)
+                }
+                Action::CreateBytes { bytes, .. } => fs::read(path).is_ok_and(|d| &d == bytes),
+                Action::Modify { .. } => unreachable!("filtered out above"),
+            };
+            if matches || force {
+                files_to_remove.push(path.to_path_buf());
+            } else {
+                diverged.push(path.to_path_buf());
+            }
+        }
+
+        let mut migrations_to_remove = Vec::new();
+        let mut warnings = Vec::new();
+        for (dir, actions) in &migration_groups {
+            match resolve_migration_removal(dir, actions, &migrations_root, force) {
+                MigrationOutcome::Remove(real_dir) => migrations_to_remove.push(real_dir),
+                MigrationOutcome::Diverged(path) => diverged.push(path),
+                MigrationOutcome::Applied(real_dir) => warnings.push(format!(
+                    "migration {} appears to be applied to the database; skipping it \
+                     — write a down-migration instead. destroy never touches the database.",
+                    relative_display(&real_dir, &self.project_root),
+                )),
+                MigrationOutcome::NotFound => {}
+            }
+        }
+
+        let mut modifies = Vec::new();
+        for (path, reverts) in group_reverts_by_path(&self.reverts) {
+            if !path.exists() {
+                continue;
+            }
+            let Ok(original) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let mut content = original.clone();
+            for revert in &reverts {
+                content = revert.apply(&content);
+            }
+            if content == original {
+                continue;
+            }
+            if content.trim().is_empty() {
+                modifies.push((path, None));
+            } else {
+                modifies.push((path, Some(content)));
+            }
+        }
+
+        RevertPlan {
+            files_to_remove,
+            migrations_to_remove,
+            modifies,
+            diverged,
+            warnings,
+        }
+    }
+}
+
+/// The concrete result of [`Plan::compute_revert_plan`] — everything
+/// [`Plan::revert`] needs to either print (`--dry-run`) or perform (a real
+/// run), computed exactly once so the two paths can't disagree.
+struct RevertPlan {
+    files_to_remove: Vec<PathBuf>,
+    migrations_to_remove: Vec<PathBuf>,
+    /// `(path, new_content)`; `None` means the file should be deleted
+    /// (its reverts emptied it down to nothing).
+    modifies: Vec<(PathBuf, Option<String>)>,
+    diverged: Vec<PathBuf>,
+    warnings: Vec<String>,
+}
+
+/// Group `reverts` by target path, preserving push order both across groups
+/// and within each group.
+fn group_reverts_by_path(reverts: &[Revert]) -> Vec<(PathBuf, Vec<&Revert>)> {
+    let mut groups: Vec<(PathBuf, Vec<&Revert>)> = Vec::new();
+    for revert in reverts {
+        let path = revert.path().to_path_buf();
+        if let Some(entry) = groups.iter_mut().find(|(p, _)| p == &path) {
+            entry.1.push(revert);
+        } else {
+            groups.push((path, vec![revert]));
+        }
+    }
+    groups
+}
+
+/// Remove `dir` and walk up removing each now-empty ancestor, stopping at
+/// the first non-empty directory (or `project_root`). `fs::remove_dir`
+/// fails harmlessly on a non-empty or already-missing directory, which is
+/// exactly the stopping condition we want.
+fn prune_empty_ancestors(mut dir: PathBuf, project_root: &Path) {
+    while dir != *project_root && dir.starts_with(project_root) {
+        if fs::remove_dir(&dir).is_err() {
+            break;
+        }
+        match dir.parent() {
+            Some(parent) => dir = parent.to_path_buf(),
+            None => break,
+        }
+    }
+}
+
+/// Outcome of matching one plan-time migration directory (built with a
+/// fresh, destroy-time timestamp) against what's actually on disk.
+enum MigrationOutcome {
+    /// Safe to remove — content matched (or `--force`) and it is not applied.
+    Remove(PathBuf),
+    /// The real directory's content no longer matches what `generate` would
+    /// have produced.
+    Diverged(PathBuf),
+    /// The migration appears to be applied to a configured database (or the
+    /// database couldn't be reached, which is treated conservatively the
+    /// same way) — never removed except with `--force`.
+    Applied(PathBuf),
+    /// No on-disk directory matches this suffix — already destroyed, or
+    /// never generated.
+    NotFound,
+}
+
+/// Split a migration directory name into its leading numeric timestamp
+/// ("version") and the remaining suffix, e.g.
+/// `"20260706120000_create_posts"` → `("20260706120000", "create_posts")`.
+fn split_migration_dir_name(name: &str) -> (&str, &str) {
+    let digit_len = name.chars().take_while(char::is_ascii_digit).count();
+    let (version, rest) = name.split_at(digit_len);
+    (version, rest.strip_prefix('_').unwrap_or(rest))
+}
+
+/// Resolve one migration-directory group from the (destroy-time,
+/// fresh-timestamp) plan against the real on-disk `migrations/` directory,
+/// matched by suffix, and decide whether it's safe to remove.
+fn resolve_migration_removal(
+    plan_dir: &Path,
+    actions: &[&Action],
+    migrations_root: &Path,
+    force: bool,
+) -> MigrationOutcome {
+    let Some(plan_dir_name) = plan_dir.file_name().and_then(|n| n.to_str()) else {
+        return MigrationOutcome::NotFound;
+    };
+    let (_, suffix) = split_migration_dir_name(plan_dir_name);
+
+    let Ok(entries) = fs::read_dir(migrations_root) else {
+        return MigrationOutcome::NotFound;
+    };
+    let real_dir = entries.filter_map(Result::ok).map(|e| e.path()).find(|p| {
+        p.is_dir()
+            && p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|name| split_migration_dir_name(name).1 == suffix)
+    });
+    let Some(real_dir) = real_dir else {
+        return MigrationOutcome::NotFound;
+    };
+
+    for action in actions {
+        let Some(file_name) = action.path().file_name() else {
+            continue;
+        };
+        let expected: &str = match action {
+            Action::Create { contents, .. } | Action::CreateIfAbsent { contents, .. } => contents,
+            Action::CreateBytes { .. } | Action::Modify { .. } => continue,
+        };
+        let real_file = real_dir.join(file_name);
+        let matches = fs::read_to_string(&real_file).is_ok_and(|actual| actual == *expected);
+        if !matches && !force {
+            return MigrationOutcome::Diverged(real_file);
+        }
+    }
+
+    if force {
+        return MigrationOutcome::Remove(real_dir);
+    }
+
+    let real_dir_name = real_dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let (version, _) = split_migration_dir_name(real_dir_name);
+    match migration_applied_status(version, migrations_root) {
+        MigrationStatus::Applied | MigrationStatus::Unknown => MigrationOutcome::Applied(real_dir),
+        MigrationStatus::NotApplied | MigrationStatus::NotConfigured => {
+            MigrationOutcome::Remove(real_dir)
+        }
+    }
+}
+
+/// Best-effort classification of whether a migration has already been
+/// applied to a database.
+enum MigrationStatus {
+    /// No database URL is configured — this project has never run
+    /// migrations against a real database, so the just-generated migration
+    /// cannot be applied either.
+    NotConfigured,
+    /// A live database check confirmed it has not been applied.
+    NotApplied,
+    /// A live database check confirmed it has been applied.
+    Applied,
+    /// A database URL is configured but couldn't be reached/queried —
+    /// treated the same as `Applied` (conservative: never delete migration
+    /// files destroy can't confirm are safe to remove).
+    Unknown,
+}
+
+fn migration_applied_status(version: &str, migrations_dir: &Path) -> MigrationStatus {
+    let table = crate::migrate::read_autumn_toml_table();
+    let Some(url) = crate::migrate::resolve_primary_database_url_from_sources(
+        |k| std::env::var(k),
+        table.as_ref(),
+    ) else {
+        return MigrationStatus::NotConfigured;
+    };
+    match autumn_web::migrate::applied_user_migrations(&url, migrations_dir) {
+        Ok(applied) => {
+            if applied.iter().any(|m| m.version == version) {
+                MigrationStatus::Applied
+            } else {
+                MigrationStatus::NotApplied
+            }
+        }
+        Err(_) => MigrationStatus::Unknown,
+    }
+}
+
+/// Shared, infrastructure-only module names any generator's `update_main_rs`
+/// call might declare in `src/main.rs` — never resource-specific. Destroy
+/// only ever removes one of these once its backing file/directory no longer
+/// exists, so a project with a second resource still using it is untouched
+/// (issue #1048's "never remove shared declarations" guarantee, made
+/// precise: shared while still needed, removed once genuinely orphaned).
+const SHARED_MAIN_MODULE_NAMES: &[&str] = &[
+    "models",
+    "schema",
+    "repositories",
+    "routes",
+    "channels",
+    "jobs",
+    "mailers",
+];
+
+/// Whether `name`'s backing module still exists on disk — either as
+/// `src/<name>.rs` (the shape `schema` and a single-file resource module
+/// use) or `src/<name>/mod.rs` (a directory of per-resource files).
+fn shared_module_backing_path_exists(project_root: &Path, name: &str) -> bool {
+    let src = project_root.join("src");
+    src.join(format!("{name}.rs")).is_file() || src.join(name).join("mod.rs").is_file()
+}
+
+/// After a real (non-dry-run) `Plan::revert`, strip any [`SHARED_MAIN_MODULE_NAMES`]
+/// declaration from `src/main.rs` whose backing module no longer exists —
+/// the corresponding directory/file was just emptied and deleted by this
+/// same `revert` call. A no-op if `src/main.rs` is missing or nothing
+/// qualifies.
+fn sync_main_rs_mod_declarations(project_root: &Path) {
+    let main_path = project_root.join("src").join("main.rs");
+    let Ok(content) = fs::read_to_string(&main_path) else {
+        return;
+    };
+    let orphaned: Vec<&str> = SHARED_MAIN_MODULE_NAMES
+        .iter()
+        .copied()
+        .filter(|name| {
+            content.lines().any(|l| l.trim() == format!("mod {name};"))
+                && !shared_module_backing_path_exists(project_root, name)
+        })
+        .collect();
+    if orphaned.is_empty() {
+        return;
+    }
+    let updated = super::schema_edit::remove_main_mod_declarations(&content, &orphaned);
+    if updated != content && fs::write(&main_path, &updated).is_ok() {
+        println!("  Reverted {}", relative_display(&main_path, project_root));
+    }
+}
+
+/// Strip a `pub mod <name>;` declaration from `<dir>/mod.rs` for any `name`
+/// in `shared_names` whose backing file/directory no longer exists — the
+/// same "shared while still needed, removed once orphaned" rule
+/// [`sync_main_rs_mod_declarations`] applies to `src/main.rs`, but for a
+/// nested shared sub-module declared in some *other* generated `mod.rs`
+/// (e.g. `src/mailers/mod.rs`'s `pub mod previews;`, shared by every
+/// generated mailer, not owned by one). A no-op if `<dir>/mod.rs` is missing
+/// or nothing qualifies. If removing every orphaned declaration empties the
+/// file, it is deleted instead of left blank.
+fn sync_mod_declarations_in(dir: &Path, shared_names: &[&str], project_root: &Path) {
+    let mod_path = dir.join("mod.rs");
+    let Ok(content) = fs::read_to_string(&mod_path) else {
+        return;
+    };
+    let orphaned: Vec<&str> = shared_names
+        .iter()
+        .copied()
+        .filter(|name| {
+            content
+                .lines()
+                .any(|l| l.trim() == format!("pub mod {name};"))
+                && !dir.join(format!("{name}.rs")).is_file()
+                && !dir.join(name).join("mod.rs").is_file()
+        })
+        .collect();
+    if orphaned.is_empty() {
+        return;
+    }
+    let mut updated = content.clone();
+    for name in orphaned {
+        updated = super::schema_edit::remove_mod_declaration(&updated, name);
+    }
+    if updated == content {
+        return;
+    }
+    if updated.trim().is_empty() {
+        if fs::remove_file(&mod_path).is_ok() {
+            println!("  Removed {}", relative_display(&mod_path, project_root));
+        }
+    } else if fs::write(&mod_path, &updated).is_ok() {
+        println!("  Reverted {}", relative_display(&mod_path, project_root));
+    }
 }
 
 fn relative_display(path: &Path, root: &Path) -> String {
@@ -384,5 +954,197 @@ mod tests {
         // assertion needs to match that form (Windows uses `\` natively).
         assert!(msg.contains(a.display().to_string().replace('\\', "/").as_str()));
         assert!(msg.contains(b.display().to_string().replace('\\', "/").as_str()));
+    }
+
+    // ── `Plan::revert` — the inverse of `Plan::execute` (issue #1048) ──────
+
+    fn no_db_env<R>(f: impl FnOnce() -> R) -> R {
+        temp_env::with_vars(
+            [
+                ("AUTUMN_DATABASE__PRIMARY_URL", None::<&str>),
+                ("AUTUMN_DATABASE__URL", None::<&str>),
+                ("DATABASE_URL", None::<&str>),
+            ],
+            f,
+        )
+    }
+
+    #[test]
+    fn revert_removes_create_action_file() {
+        let (tmp, mut plan) = fixture();
+        let target = tmp.path().join("out.txt");
+        plan.create(target.clone(), "hello");
+        plan.execute(Flags::default()).unwrap();
+        assert!(target.exists());
+        plan.revert(Flags::default()).unwrap();
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn revert_is_idempotent_when_file_already_missing() {
+        let (tmp, mut plan) = fixture();
+        let target = tmp.path().join("out.txt");
+        plan.create(target.clone(), "hello");
+        // Never executed — file was never created.
+        plan.revert(Flags::default()).unwrap();
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn revert_refuses_on_diverged_content_without_force() {
+        let (tmp, mut plan) = fixture();
+        let target = tmp.path().join("out.txt");
+        plan.create(target.clone(), "hello");
+        plan.execute(Flags::default()).unwrap();
+        fs::write(&target, "hand-edited by user").unwrap();
+        let err = plan.revert(Flags::default()).unwrap_err();
+        assert!(matches!(err, GenerateError::Diverged(_)));
+        assert!(target.exists(), "diverged file must not be deleted");
+    }
+
+    #[test]
+    fn revert_with_force_deletes_diverged_file() {
+        let (tmp, mut plan) = fixture();
+        let target = tmp.path().join("out.txt");
+        plan.create(target.clone(), "hello");
+        plan.execute(Flags::default()).unwrap();
+        fs::write(&target, "hand-edited by user").unwrap();
+        plan.revert(Flags {
+            force: true,
+            dry_run: false,
+        })
+        .unwrap();
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn revert_dry_run_does_not_touch_disk() {
+        let (tmp, mut plan) = fixture();
+        let target = tmp.path().join("out.txt");
+        plan.create(target.clone(), "hello");
+        plan.execute(Flags::default()).unwrap();
+        plan.revert(Flags {
+            dry_run: true,
+            force: false,
+        })
+        .unwrap();
+        assert!(target.exists());
+    }
+
+    #[test]
+    fn revert_applies_mod_decl_revert_and_deletes_now_empty_file() {
+        let (tmp, mut plan) = fixture();
+        let mod_path = tmp.path().join("mod.rs");
+        plan.modify(
+            mod_path.clone(),
+            crate::generate::schema_edit::add_mod_declaration("", "post"),
+        );
+        plan.push_revert(Revert::ModDecl {
+            path: mod_path.clone(),
+            name: "post".to_owned(),
+        });
+        plan.execute(Flags::default()).unwrap();
+        assert!(mod_path.exists());
+        plan.revert(Flags::default()).unwrap();
+        assert!(!mod_path.exists());
+    }
+
+    #[test]
+    fn revert_applies_mod_decl_revert_preserving_other_mods() {
+        let (tmp, mut plan) = fixture();
+        let mod_path = tmp.path().join("mod.rs");
+        fs::write(&mod_path, "pub mod user;\n").unwrap();
+        plan.modify(
+            mod_path.clone(),
+            crate::generate::schema_edit::add_mod_declaration("pub mod user;\n", "post"),
+        );
+        plan.push_revert(Revert::ModDecl {
+            path: mod_path.clone(),
+            name: "post".to_owned(),
+        });
+        plan.execute(Flags::default()).unwrap();
+        plan.revert(Flags::default()).unwrap();
+        assert!(mod_path.exists());
+        assert_eq!(fs::read_to_string(&mod_path).unwrap(), "pub mod user;\n");
+    }
+
+    #[test]
+    fn revert_prunes_now_empty_generated_directory_but_not_sibling_content() {
+        let (tmp, mut plan) = fixture();
+        let posts_tmpl = tmp.path().join("templates/posts/index.html.tmpl");
+        plan.create(posts_tmpl.clone(), "content");
+        plan.execute(Flags::default()).unwrap();
+        // A sibling directory under `templates/` must survive pruning.
+        fs::create_dir_all(tmp.path().join("templates/other")).unwrap();
+        fs::write(tmp.path().join("templates/other/keep.tmpl"), "keep").unwrap();
+
+        plan.revert(Flags::default()).unwrap();
+
+        assert!(!posts_tmpl.exists());
+        assert!(!tmp.path().join("templates/posts").exists());
+        assert!(tmp.path().join("templates").exists());
+        assert!(tmp.path().join("templates/other/keep.tmpl").exists());
+    }
+
+    #[test]
+    fn revert_removes_unapplied_migration_matched_by_suffix() {
+        no_db_env(|| {
+            let (tmp, mut plan) = fixture();
+            fs::create_dir_all(tmp.path().join("migrations")).unwrap();
+            // Destroy recomputes the plan with a FRESH timestamp, which won't
+            // match the real, already-generated directory on disk.
+            let plan_dir = tmp.path().join("migrations/99999999999999_create_posts");
+            let real_dir = tmp.path().join("migrations/20260101000000_create_posts");
+            fs::create_dir_all(&real_dir).unwrap();
+            fs::write(real_dir.join("up.sql"), "CREATE TABLE posts ();\n").unwrap();
+            fs::write(real_dir.join("down.sql"), "DROP TABLE posts;\n").unwrap();
+
+            plan.create(plan_dir.join("up.sql"), "CREATE TABLE posts ();\n");
+            plan.create(plan_dir.join("down.sql"), "DROP TABLE posts;\n");
+            // Not executing this plan (it would create the wrong-timestamp
+            // dir) — the point is that revert must find `real_dir` by suffix.
+
+            plan.revert(Flags::default()).unwrap();
+
+            assert!(!real_dir.exists());
+        });
+    }
+
+    #[test]
+    fn revert_refuses_diverged_migration_sql_without_force() {
+        no_db_env(|| {
+            let (tmp, mut plan) = fixture();
+            fs::create_dir_all(tmp.path().join("migrations")).unwrap();
+            let plan_dir = tmp.path().join("migrations/99999999999999_create_posts");
+            let real_dir = tmp.path().join("migrations/20260101000000_create_posts");
+            fs::create_dir_all(&real_dir).unwrap();
+            fs::write(
+                real_dir.join("up.sql"),
+                "CREATE TABLE posts (extra_col INT);\n",
+            )
+            .unwrap();
+            fs::write(real_dir.join("down.sql"), "DROP TABLE posts;\n").unwrap();
+
+            plan.create(plan_dir.join("up.sql"), "CREATE TABLE posts ();\n");
+            plan.create(plan_dir.join("down.sql"), "DROP TABLE posts;\n");
+
+            let err = plan.revert(Flags::default()).unwrap_err();
+            assert!(matches!(err, GenerateError::Diverged(_)));
+            assert!(real_dir.exists());
+        });
+    }
+
+    #[test]
+    fn revert_is_idempotent_when_migration_dir_missing() {
+        no_db_env(|| {
+            let (tmp, mut plan) = fixture();
+            fs::create_dir_all(tmp.path().join("migrations")).unwrap();
+            let plan_dir = tmp.path().join("migrations/99999999999999_create_posts");
+            plan.create(plan_dir.join("up.sql"), "CREATE TABLE posts ();\n");
+            plan.create(plan_dir.join("down.sql"), "DROP TABLE posts;\n");
+
+            // No matching real directory on disk at all — nothing to do.
+            plan.revert(Flags::default()).unwrap();
+        });
     }
 }

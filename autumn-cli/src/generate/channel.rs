@@ -25,7 +25,7 @@ use super::schema_edit::{
     add_mod_declaration, ensure_autumn_web_feature, ensure_dev_dependency_tokio_test_features,
     remove_routes_entries_with_prefix, update_main_rs,
 };
-use super::{Flags, GenerateError, ensure_project_root, read_or_empty};
+use super::{GenerateError, ensure_project_root, read_or_empty};
 
 /// Which transport a generated channel uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,6 +75,10 @@ pub fn plan_channel(
         mod_path.clone(),
         add_mod_declaration(&read_or_empty(&mod_path), &snake_name),
     );
+    plan.push_revert(crate::generate::emit::Revert::ModDecl {
+        path: mod_path,
+        name: snake_name.clone(),
+    });
 
     // ── src/main.rs: add mod channels; and route entries ────────────────────
     let main_path = project_root.join("src").join("main.rs");
@@ -93,7 +97,14 @@ pub fn plan_channel(
         remove_routes_entries_with_prefix(&main_existing, &format!("channels::{snake_name}::"));
     let route_entries = route_entries(&snake_name, transport);
     let updated_main = update_main_rs(&main_existing, &["channels"], &route_entries);
-    plan.modify(main_path, updated_main);
+    plan.modify(main_path.clone(), updated_main);
+    // `mod channels;` is a shared infrastructure declaration (see
+    // `emit::sync_main_rs_mod_declarations`) — only this channel's own
+    // route entries are reverted here.
+    plan.push_revert(crate::generate::emit::Revert::RoutesEntries {
+        path: main_path,
+        entries: route_entries,
+    });
 
     // ── tests/<snake>_channel.rs ──────────────────────────────────────────
     plan.create(
@@ -127,7 +138,30 @@ pub fn plan_channel(
     updated_cargo = ensure_cargo_dependencies(&updated_cargo, &deps);
     updated_cargo = ensure_dev_dependency_tokio_test_features(&updated_cargo);
     if updated_cargo != cargo_existing {
-        plan.modify(cargo_path, updated_cargo);
+        plan.modify(cargo_path.clone(), updated_cargo);
+    }
+    // Pushed unconditionally — see `plan_cargo_deps`'s matching comment in
+    // model.rs: destroy recomputes this plan against the already-generated
+    // Cargo.toml, where these entries are by definition already present.
+    // `maud` is excluded: `autumn new`'s own template already ships it as a
+    // direct dependency (see `TEMPLATE_SHIPPED_CARGO_DEPS`).
+    let dep_names: Vec<String> = deps
+        .iter()
+        .map(|(name, _)| *name)
+        .filter(|name| !super::model::TEMPLATE_SHIPPED_CARGO_DEPS.contains(name))
+        .map(str::to_owned)
+        .collect();
+    if !dep_names.is_empty() {
+        plan.push_revert(crate::generate::emit::Revert::CargoDeps {
+            path: cargo_path.clone(),
+            names: dep_names,
+        });
+    }
+    for feature in autumn_web_features {
+        plan.push_revert(crate::generate::emit::Revert::CargoAutumnWebFeature {
+            path: cargo_path.clone(),
+            feature: (*feature).to_owned(),
+        });
     }
 
     Ok(plan)
@@ -419,27 +453,10 @@ async fn {snake_name}_channel_delivers_published_message_to_subscriber() {{
     )
 }
 
-/// CLI entry point.
-pub fn run(name: &str, transport: Transport, flags: Flags) {
-    let cwd = match std::env::current_dir() {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("Error: cannot determine current directory: {e}");
-            std::process::exit(1);
-        }
-    };
-    match plan_channel(&cwd, name, transport).and_then(|p| p.execute(flags)) {
-        Ok(()) => {}
-        Err(e) => {
-            eprintln!("Error: {e}");
-            std::process::exit(1);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::generate::Flags;
     use std::fs;
     use tempfile::TempDir;
 
@@ -469,6 +486,39 @@ async fn main() {
         .await;
 }
 "#
+    }
+
+    #[test]
+    fn generate_then_destroy_channel_ws_round_trips_to_original_project_state() {
+        let tmp = project_with_main(default_main());
+        // Mirrors a real `autumn new` project's Cargo.toml: a `tokio`
+        // dev-dependency with `rt`/`macros` already present, so
+        // `ensure_dev_dependency_tokio_test_features` (which has no destroy
+        // wiring yet — a documented gap) is a no-op here, matching reality.
+        let cargo_path = tmp.path().join("Cargo.toml");
+        fs::write(
+            &cargo_path,
+            "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = \"0.6\"\n\n\
+             [dev-dependencies]\ntokio = { version = \"1\", features = [\"rt\", \"macros\"] }\n",
+        )
+        .unwrap();
+        let main_path = tmp.path().join("src/main.rs");
+        let original_cargo = fs::read_to_string(&cargo_path).unwrap();
+        let original_main = fs::read_to_string(&main_path).unwrap();
+
+        let plan = plan_channel(tmp.path(), "Chat", Transport::Ws).unwrap();
+        plan.execute(Flags::default()).unwrap();
+        assert!(tmp.path().join("src/channels/chat.rs").exists());
+        assert!(fs::read_to_string(&main_path).unwrap().contains("chat_ws"));
+
+        let destroy_plan = plan_channel(tmp.path(), "Chat", Transport::Ws).unwrap();
+        destroy_plan.revert(Flags::default()).unwrap();
+
+        assert!(!tmp.path().join("src/channels/chat.rs").exists());
+        assert!(!tmp.path().join("src/channels/mod.rs").exists());
+        assert!(!tmp.path().join("tests/chat_channel.rs").exists());
+        assert_eq!(fs::read_to_string(&main_path).unwrap(), original_main);
+        assert_eq!(fs::read_to_string(&cargo_path).unwrap(), original_cargo);
     }
 
     // ── RED: file plan assertions ─────────────────────────────────────────

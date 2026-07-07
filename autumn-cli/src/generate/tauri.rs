@@ -42,7 +42,7 @@
 use std::path::Path;
 
 use super::emit::Plan;
-use super::{Flags, GenerateError, ensure_project_root};
+use super::{GenerateError, ensure_project_root};
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
@@ -124,28 +124,6 @@ pub fn plan_tauri(project_root: &Path) -> Result<Plan, GenerateError> {
     plan.create(tauri.join(".gitignore"), render_gitignore());
 
     Ok(plan)
-}
-
-/// CLI entry point — executes the plan and prints required prerequisites.
-pub fn run(flags: Flags) {
-    let cwd = match std::env::current_dir() {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("Error: cannot determine current directory: {e}");
-            std::process::exit(1);
-        }
-    };
-    match plan_tauri(&cwd).and_then(|p| p.execute(flags)) {
-        Ok(()) => {
-            if !flags.dry_run {
-                println!("\n{}", render_prerequisites());
-            }
-        }
-        Err(e) => {
-            eprintln!("Error: {e}");
-            std::process::exit(1);
-        }
-    }
 }
 
 // ── Package metadata helper ───────────────────────────────────────────────────

@@ -16,7 +16,7 @@ use super::emit::Plan;
 use super::model::validate_resource_name;
 use super::naming::{pascal, snake};
 use super::schema_edit::{add_mod_declaration, ensure_autumn_web_feature, update_main_rs};
-use super::{Flags, GenerateError, ensure_project_root, read_or_empty};
+use super::{GenerateError, ensure_project_root, read_or_empty};
 
 /// Compute the file actions for `autumn generate inbound_mail <name>`.
 ///
@@ -328,24 +328,6 @@ fn find_after_routes_call(src: &str) -> Option<usize> {
         pos += 1;
     }
     None
-}
-
-/// CLI entry point for `autumn generate inbound_mail <name>`.
-pub fn run(name: &str, flags: Flags) {
-    let cwd = match std::env::current_dir() {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("Error: cannot determine current directory: {e}");
-            std::process::exit(1);
-        }
-    };
-    match plan_inbound_mail(&cwd, name).and_then(|p| p.execute(flags)) {
-        Ok(()) => {}
-        Err(e) => {
-            eprintln!("Error: {e}");
-            std::process::exit(1);
-        }
-    }
 }
 
 #[cfg(test)]

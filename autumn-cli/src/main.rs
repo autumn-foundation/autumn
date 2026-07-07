@@ -318,6 +318,33 @@ enum Commands {
     #[command(subcommand, verbatim_doc_comment)]
     Generate(GenerateCommands),
 
+    /// Cleanly reverse a matching `autumn generate` invocation (issue #1048).
+    ///
+    /// Deletes every file that invocation would have created (refusing when
+    /// a targeted file's content has diverged from what `generate` would
+    /// produce, unless `--force`), removes exactly the lines it inserted
+    /// into shared files (`mod` declarations, `routes![]` entries,
+    /// `Cargo.toml` deps/features, `schema.rs` table blocks), and prunes any
+    /// now-empty generated directories.
+    ///
+    /// Takes the same subcommand and positional arguments as the matching
+    /// `autumn generate` call — pass the identical resource name, fields,
+    /// and flags (`--api`, `--live`, `--id`, `--soft-delete`, ...) so the
+    /// recomputed plan matches what was originally generated.
+    ///
+    /// A migration directory is matched by resource-name suffix (a fresh
+    /// timestamp won't match the original) and removed only when it is not
+    /// yet applied to a configured database — `destroy` never touches the
+    /// database itself.
+    ///
+    /// # Examples
+    ///
+    ///   autumn generate scaffold Post title:String
+    ///   autumn destroy scaffold Post title:String
+    ///   autumn destroy model Post title:String --dry-run
+    #[command(subcommand, verbatim_doc_comment)]
+    Destroy(GenerateCommands),
+
     /// Scaffold production deployment artifacts (Dockerfile, .dockerignore,
     /// runtime config template, and optional target-specific files).
     ///
@@ -2262,7 +2289,8 @@ fn run_command(command: Commands) {
                 &format,
             );
         }
-        Commands::Generate(cmd) => run_generate_command(cmd),
+        Commands::Generate(cmd) => run_generate_command(cmd, ApplyMode::Generate),
+        Commands::Destroy(cmd) => run_generate_command(cmd, ApplyMode::Destroy),
         Commands::Credentials(cmd) => match cmd {
             CredentialsCommands::Edit { env } => {
                 if let Err(e) = credentials::run_edit(&credentials::EditOptions { env }) {
@@ -2578,7 +2606,44 @@ fn run_release_command(cmd: ReleaseCommands) {
 }
 
 #[allow(clippy::too_many_lines)]
-fn run_generate_command(cmd: GenerateCommands) {
+/// Whether a [`GenerateCommands`] invocation should apply its plan forward
+/// (`autumn generate`) or in reverse (`autumn destroy`, issue #1048). Both
+/// subcommands share the same argument parsing and plan-building code —
+/// `destroy` recomputes the identical [`generate::emit::Plan`] a matching
+/// `generate` call would have built, then interprets it in reverse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApplyMode {
+    Generate,
+    Destroy,
+}
+
+/// Resolve the current working directory, or print an error and exit(1).
+fn resolve_cwd() -> std::path::PathBuf {
+    std::env::current_dir().unwrap_or_else(|e| {
+        eprintln!("Error: cannot determine current directory: {e}");
+        std::process::exit(1);
+    })
+}
+
+/// Execute or revert `plan` depending on `mode`, printing `Error: ...` and
+/// exiting non-zero on failure — the shared tail every `generate`/`destroy`
+/// subcommand arm ends with.
+fn apply_plan(
+    plan: Result<generate::emit::Plan, generate::GenerateError>,
+    flags: generate::Flags,
+    mode: ApplyMode,
+) {
+    let result = plan.and_then(|p| match mode {
+        ApplyMode::Generate => p.execute(flags),
+        ApplyMode::Destroy => p.revert(flags),
+    });
+    if let Err(e) = result {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
+    }
+}
+
+fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
     match cmd {
         GenerateCommands::Model {
             name,
@@ -2625,21 +2690,14 @@ fn run_generate_command(cmd: GenerateCommands) {
                 ..Default::default()
             };
             let timestamp = generate::timestamp_now();
-            match generate::model::plan_model_with_options(
+            let plan = generate::model::plan_model_with_options(
                 &std::env::current_dir().unwrap_or_default(),
                 &name,
                 &fields,
                 &timestamp,
                 &options,
-            )
-            .and_then(|p| p.execute(generate::Flags { dry_run, force }))
-            {
-                Ok(()) => {}
-                Err(e) => {
-                    eprintln!("Error: {e}");
-                    std::process::exit(1);
-                }
-            }
+            );
+            apply_plan(plan, generate::Flags { dry_run, force }, mode);
         }
         GenerateCommands::Migration {
             name,
@@ -2647,30 +2705,49 @@ fn run_generate_command(cmd: GenerateCommands) {
             unique,
             dry_run,
             force,
-        } => generate::migration::run(&name, &fields, &unique, generate::Flags { dry_run, force }),
+        } => {
+            let timestamp = generate::timestamp_now();
+            let plan = generate::migration::plan_migration_with_options(
+                &resolve_cwd(),
+                &name,
+                &fields,
+                &timestamp,
+                &unique,
+            );
+            apply_plan(plan, generate::Flags { dry_run, force }, mode);
+        }
         GenerateCommands::Task {
             name,
             dry_run,
             force,
-        } => generate::task::run(&name, generate::Flags { dry_run, force }),
+        } => {
+            let plan = generate::task::plan_task(&resolve_cwd(), &name);
+            apply_plan(plan, generate::Flags { dry_run, force }, mode);
+        }
         GenerateCommands::Job {
             name,
             fields,
             dry_run,
             force,
-        } => generate::job::run(&name, &fields, generate::Flags { dry_run, force }),
+        } => {
+            let plan = generate::job::plan_job(&resolve_cwd(), &name, &fields);
+            apply_plan(plan, generate::Flags { dry_run, force }, mode);
+        }
         GenerateCommands::Mailer {
             name,
             list_unsubscribe,
             no_layout,
             dry_run,
             force,
-        } => generate::mailer::run(
-            &name,
-            list_unsubscribe.as_deref(),
-            no_layout,
-            generate::Flags { dry_run, force },
-        ),
+        } => {
+            let plan = generate::mailer::plan_mailer(
+                &resolve_cwd(),
+                &name,
+                list_unsubscribe.as_deref(),
+                no_layout,
+            );
+            apply_plan(plan, generate::Flags { dry_run, force }, mode);
+        }
         GenerateCommands::Channel {
             name,
             sse: _,
@@ -2683,23 +2760,47 @@ fn run_generate_command(cmd: GenerateCommands) {
             } else {
                 generate::channel::Transport::Sse
             };
-            generate::channel::run(&name, transport, generate::Flags { dry_run, force });
+            let plan = generate::channel::plan_channel(&resolve_cwd(), &name, transport);
+            apply_plan(plan, generate::Flags { dry_run, force }, mode);
         }
         GenerateCommands::InboundMail {
             name,
             dry_run,
             force,
-        } => generate::inbound_mail::run(&name, generate::Flags { dry_run, force }),
+        } => {
+            let plan = generate::inbound_mail::plan_inbound_mail(&resolve_cwd(), &name);
+            apply_plan(plan, generate::Flags { dry_run, force }, mode);
+        }
         GenerateCommands::SystemTest {
             name,
             dry_run,
             force,
-        } => generate::system_test::run(&name, generate::Flags { dry_run, force }),
+        } => {
+            let plan = generate::system_test::plan_system_test(&resolve_cwd(), &name);
+            apply_plan(plan, generate::Flags { dry_run, force }, mode);
+        }
         GenerateCommands::Pwa { dry_run, force } => {
-            generate::pwa::run(generate::Flags { dry_run, force });
+            let plan = generate::pwa::plan_pwa(&resolve_cwd());
+            apply_plan(plan, generate::Flags { dry_run, force }, mode);
         }
         GenerateCommands::Tauri { dry_run, force } => {
-            generate::tauri::run(generate::Flags { dry_run, force });
+            let flags = generate::Flags { dry_run, force };
+            let plan = generate::tauri::plan_tauri(&resolve_cwd());
+            let result = plan.and_then(|p| match mode {
+                ApplyMode::Generate => p.execute(flags),
+                ApplyMode::Destroy => p.revert(flags),
+            });
+            match result {
+                Ok(()) => {
+                    if mode == ApplyMode::Generate && !dry_run {
+                        println!("\n{}", generate::tauri::render_prerequisites());
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+            }
         }
         GenerateCommands::Auth {
             name,
@@ -2710,13 +2811,16 @@ fn run_generate_command(cmd: GenerateCommands) {
             force,
         } => {
             let oauth_options = generate::auth::AuthOAuthOptions { providers: oauth };
-            generate::auth::run_with_options(
+            let timestamp = generate::timestamp_now();
+            let plan = generate::auth::plan_auth_full_ex(
+                &resolve_cwd(),
                 &name,
-                generate::Flags { dry_run, force },
+                &timestamp,
                 &oauth_options,
                 totp,
                 passkeys,
             );
+            apply_plan(plan, generate::Flags { dry_run, force }, mode);
         }
         GenerateCommands::Admin {
             name,
@@ -2742,7 +2846,9 @@ fn run_generate_command(cmd: GenerateCommands) {
                 // Encrypted-column flags are auto-detected from the model source.
                 ..Default::default()
             };
-            generate::admin::run(&name, &fields, generate::Flags { dry_run, force }, &options);
+            let plan =
+                generate::admin::plan_admin_with_options(&resolve_cwd(), &name, &fields, &options);
+            apply_plan(plan, generate::Flags { dry_run, force }, mode);
         }
         GenerateCommands::Wizard {
             name,
@@ -2750,7 +2856,8 @@ fn run_generate_command(cmd: GenerateCommands) {
             dry_run,
             force,
         } => {
-            generate::wizard::run(&name, &steps, generate::Flags { dry_run, force });
+            let plan = generate::wizard::plan_wizard(&resolve_cwd(), &name, &steps);
+            apply_plan(plan, generate::Flags { dry_run, force }, mode);
         }
         GenerateCommands::Scaffold {
             name,
@@ -2831,7 +2938,15 @@ fn run_generate_command(cmd: GenerateCommands) {
                     std::process::exit(1);
                 }
             };
-            generate::scaffold::run(&name, &fields, generate::Flags { dry_run, force }, &options);
+            let timestamp = generate::timestamp_now();
+            let plan = generate::scaffold::plan_scaffold_with_options(
+                &resolve_cwd(),
+                &name,
+                &fields,
+                &timestamp,
+                &options,
+            );
+            apply_plan(plan, generate::Flags { dry_run, force }, mode);
         }
         GenerateCommands::Plugin {
             name,
@@ -2839,23 +2954,22 @@ fn run_generate_command(cmd: GenerateCommands) {
             dry_run,
             force,
         } => {
-            let cwd = match std::env::current_dir() {
-                Ok(d) => d,
-                Err(e) => {
-                    eprintln!("Error: cannot determine current directory: {e}");
-                    std::process::exit(1);
-                }
-            };
+            let cwd = resolve_cwd();
+            let flags = generate::Flags { dry_run, force };
             match generate::plugin::plan_plugin(
                 &cwd,
                 &name,
                 path.as_deref().map(std::path::Path::new),
-                generate::Flags { dry_run, force },
+                flags,
             ) {
                 Ok(plugin_plan) => {
-                    match plugin_plan.plan.execute(generate::Flags { dry_run, force }) {
+                    let result = match mode {
+                        ApplyMode::Generate => plugin_plan.plan.execute(flags),
+                        ApplyMode::Destroy => plugin_plan.plan.revert(flags),
+                    };
+                    match result {
                         Ok(()) => {
-                            if !dry_run {
+                            if mode == ApplyMode::Generate && !dry_run {
                                 println!("\nNext steps:");
                                 println!(
                                     "  1. Add the plugin to your workspace members in `Cargo.toml`:"

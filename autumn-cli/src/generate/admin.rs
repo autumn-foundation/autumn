@@ -18,7 +18,7 @@ use super::dsl::{Field, FieldKind, parse_fields};
 use super::emit::Plan;
 use super::naming::{humanize_label, pascal, pluralize, snake};
 use super::schema_edit::add_mod_declaration;
-use super::{Flags, GenerateError, ensure_project_root, read_or_empty};
+use super::{GenerateError, ensure_project_root, read_or_empty};
 
 /// A parsed `--select FIELD=val1,val2,...` spec.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -181,6 +181,10 @@ pub fn plan_admin_with_options(
         admin_mod_path.clone(),
         add_mod_declaration(&read_or_empty(&admin_mod_path), &snake_name),
     );
+    plan.push_revert(crate::generate::emit::Revert::ModDecl {
+        path: admin_mod_path,
+        name: snake_name.clone(),
+    });
 
     // Smoke test: `tests/<snake>_admin.rs`
     plan.create(
@@ -198,25 +202,6 @@ pub fn plan_admin_with_options(
     );
 
     Ok(plan)
-}
-
-/// CLI entry point for `autumn generate admin`.
-pub fn run(name: &str, field_tokens: &[String], flags: Flags, options: &AdminOptions) {
-    let cwd = match std::env::current_dir() {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("Error: cannot determine current directory: {e}");
-            std::process::exit(1);
-        }
-    };
-    let plan = plan_admin_with_options(&cwd, name, field_tokens, options);
-    match plan.and_then(|p| p.execute(flags)) {
-        Ok(()) => {}
-        Err(e) => {
-            eprintln!("Error: {e}");
-            std::process::exit(1);
-        }
-    }
 }
 
 /// Returns true if the model struct `pascal_name` has a primary-key field `id`
@@ -1120,6 +1105,7 @@ fn render_admin_smoke_test(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::generate::Flags;
     use std::fs;
     use tempfile::TempDir;
 

@@ -17,7 +17,7 @@ use std::path::Path;
 use super::emit::Plan;
 use super::schema_edit::update_main_rs;
 use super::system_test::patch_cargo_toml as patch_system_test_cargo_toml;
-use super::{Flags, GenerateError, ensure_project_root};
+use super::{GenerateError, ensure_project_root};
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
@@ -102,24 +102,6 @@ pub fn plan_pwa(project_root: &Path) -> Result<Plan, GenerateError> {
     }
 
     Ok(plan)
-}
-
-/// CLI entry point.
-pub fn run(flags: Flags) {
-    let cwd = match std::env::current_dir() {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("Error: cannot determine current directory: {e}");
-            std::process::exit(1);
-        }
-    };
-    match plan_pwa(&cwd).and_then(|p| p.execute(flags)) {
-        Ok(()) => {}
-        Err(e) => {
-            eprintln!("Error: {e}");
-            std::process::exit(1);
-        }
-    }
 }
 
 // ── Content renderers ─────────────────────────────────────────────────────────

@@ -13,7 +13,7 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 use super::dsl::{Field, FieldKind, IdType, parse_fields};
-use super::emit::{Action, Plan};
+use super::emit::{Action, Plan, Revert};
 use super::model::{
     ModelOptions, augment_fields_for_soft_delete, field_by_name, parse_model_metadata,
     plan_cargo_deps, plan_model_with_options,
@@ -24,7 +24,7 @@ use super::schema_edit::{
     ensure_dev_dependency_test_support, ensure_dev_dependency_tokio_test_features,
     unique_index_name, update_main_rs,
 };
-use super::{Flags, GenerateError, ensure_project_root, read_or_empty, timestamp_now};
+use super::{GenerateError, ensure_project_root, read_or_empty};
 
 /// Extra dependencies the *scaffold* generator's output requires on top of
 /// [`super::model::MODEL_DEPS`] — `maud` for HTML rendering and URL-encoded
@@ -164,6 +164,10 @@ pub fn plan_scaffold_with_options(
         repo_mod_path.clone(),
         add_mod_declaration(&read_or_empty(&repo_mod_path), &snake_name),
     );
+    plan.push_revert(Revert::ModDecl {
+        path: repo_mod_path,
+        name: snake_name.clone(),
+    });
 
     // Route file under `src/routes/<plural>.rs`
     if !options_with_key.api {
@@ -189,6 +193,10 @@ pub fn plan_scaffold_with_options(
             route_mod_path.clone(),
             add_mod_declaration(&read_or_empty(&route_mod_path), &plural),
         );
+        plan.push_revert(Revert::ModDecl {
+            path: route_mod_path,
+            name: plural.clone(),
+        });
     }
 
     // Smoke test under `tests/<snake>.rs`. Uses the same soft-delete-augmented
@@ -235,7 +243,16 @@ pub fn plan_scaffold_with_options(
         mods.push("routes");
     }
     let updated = update_main_rs(&main_existing, &mods, &route_entries);
-    plan.modify(main_path, updated);
+    plan.modify(main_path.clone(), updated);
+    // `mod models;`/`mod schema;`/`mod repositories;`/`mod routes;` are
+    // shared infrastructure declarations, not owned by this resource — see
+    // `emit::sync_main_rs_mod_declarations`, which removes one only once its
+    // backing module no longer exists on disk. Only this resource's own
+    // `routes![]` entries are reverted here.
+    plan.push_revert(Revert::RoutesEntries {
+        path: main_path,
+        entries: route_entries,
+    });
 
     // The Maud `html!` macro pulls in a direct `maud` dep on top of the
     // model's deps. Both modify actions target Cargo.toml, so we combine
@@ -288,8 +305,16 @@ pub fn plan_scaffold_with_options(
         let updated = ensure_autumn_web_feature(&base, "maud");
         if updated != base {
             plan.actions.retain(|a| a.path() != cargo_path);
-            plan.modify(cargo_path, updated);
+            plan.modify(cargo_path.clone(), updated);
         }
+        // Pushed unconditionally — see `plan_cargo_deps`'s matching comment:
+        // at `destroy` time this same call recomputes the plan against the
+        // already-generated Cargo.toml, where "maud" is by definition
+        // already present, so `updated != base` above would never be true.
+        plan.push_revert(Revert::CargoAutumnWebFeature {
+            path: cargo_path,
+            feature: "maud".to_owned(),
+        });
     }
 
     // --live requires `ws` (sse::stream), `maud` (LiveFragment/Markup), and `htmx`.
@@ -317,7 +342,14 @@ pub fn plan_scaffold_with_options(
         }
         if updated != base {
             plan.actions.retain(|a| a.path() != cargo_path);
-            plan.modify(cargo_path, updated);
+            plan.modify(cargo_path.clone(), updated);
+        }
+        // Pushed unconditionally — see `plan_cargo_deps`'s matching comment.
+        for feat in feats {
+            plan.push_revert(Revert::CargoAutumnWebFeature {
+                path: cargo_path.clone(),
+                feature: (*feat).to_owned(),
+            });
         }
     }
 
@@ -341,8 +373,13 @@ pub fn plan_scaffold_with_options(
         let updated = ensure_dev_dependency_test_support(&base, env!("CARGO_PKG_VERSION"));
         if updated != base {
             plan.actions.retain(|a| a.path() != cargo_path);
-            plan.modify(cargo_path, updated);
+            plan.modify(cargo_path.clone(), updated);
         }
+        // Pushed unconditionally — see `plan_cargo_deps`'s matching comment.
+        plan.push_revert(Revert::CargoAutumnWebDevFeature {
+            path: cargo_path,
+            feature: "test-support".to_owned(),
+        });
     }
 
     // The generated smoke test also uses `#[tokio::test]`, which needs the
@@ -370,26 +407,6 @@ pub fn plan_scaffold_with_options(
     }
 
     Ok(plan)
-}
-
-/// CLI entry point.
-pub fn run(name: &str, field_tokens: &[String], flags: Flags, options: &ScaffoldOptions) {
-    let cwd = match std::env::current_dir() {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("Error: cannot determine current directory: {e}");
-            std::process::exit(1);
-        }
-    };
-    let timestamp = timestamp_now();
-    let plan = plan_scaffold_with_options(&cwd, name, field_tokens, &timestamp, options);
-    match plan.and_then(|p| p.execute(flags)) {
-        Ok(()) => {}
-        Err(e) => {
-            eprintln!("Error: {e}");
-            std::process::exit(1);
-        }
-    }
 }
 
 /// Fixed, unconditional (non-`--live`, non-attachment-gated) names the
@@ -3175,6 +3192,7 @@ fn main_route_entries(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::generate::Flags;
     use std::fs;
     use tempfile::TempDir;
 
@@ -3247,6 +3265,80 @@ async fn main() {
                 "missing expected action for {expected}; got {paths:?}"
             );
         }
+    }
+
+    #[test]
+    fn generate_then_destroy_scaffold_round_trips_to_original_project_state() {
+        temp_env::with_vars(
+            [
+                ("AUTUMN_DATABASE__PRIMARY_URL", None::<&str>),
+                ("AUTUMN_DATABASE__URL", None::<&str>),
+                ("DATABASE_URL", None::<&str>),
+            ],
+            || {
+                let tmp = project_with_main(default_main());
+                // Mirrors `autumn new`'s real template Cargo.toml (see
+                // `templates/Cargo.toml.tmpl`): `autumn-web`/`maud`/
+                // `diesel_migrations` and a `tokio` dev-dep with `rt`+`macros`
+                // already present, since a fresh project always ships them.
+                let cargo_path = tmp.path().join("Cargo.toml");
+                fs::write(
+                    &cargo_path,
+                    "[package]\nname = \"x\"\n\n\
+                     [dependencies]\n\
+                     autumn-web = \"0.6.0\"\n\
+                     maud = { version = \"0.27\", features = [\"axum\"] }\n\
+                     diesel_migrations = \"2\"\n\n\
+                     [dev-dependencies]\n\
+                     tokio = { version = \"1\", features = [\"rt\", \"macros\"] }\n",
+                )
+                .unwrap();
+                let main_path = tmp.path().join("src/main.rs");
+                let original_cargo = fs::read_to_string(&cargo_path).unwrap();
+                let original_main = fs::read_to_string(&main_path).unwrap();
+
+                let plan = plan_scaffold(
+                    tmp.path(),
+                    "Post",
+                    &["title:String".into()],
+                    "20260427000000",
+                )
+                .unwrap();
+                plan.execute(Flags::default()).unwrap();
+                assert!(tmp.path().join("src/models/post.rs").exists());
+                assert!(tmp.path().join("src/routes/posts.rs").exists());
+
+                let destroy_plan = plan_scaffold(
+                    tmp.path(),
+                    "Post",
+                    &["title:String".into()],
+                    "99999999999999",
+                )
+                .unwrap();
+                destroy_plan.revert(Flags::default()).unwrap();
+
+                for gone in [
+                    "src/models/post.rs",
+                    "src/models/mod.rs",
+                    "src/schema.rs",
+                    "src/repositories/post.rs",
+                    "src/repositories/mod.rs",
+                    "src/routes/posts.rs",
+                    "src/routes/mod.rs",
+                    "tests/post.rs",
+                ] {
+                    assert!(!tmp.path().join(gone).exists(), "{gone} should be removed");
+                }
+                assert!(
+                    fs::read_dir(tmp.path().join("migrations"))
+                        .map(|mut d| d.next().is_none())
+                        .unwrap_or(true),
+                    "migration directory must be removed"
+                );
+                assert_eq!(fs::read_to_string(&main_path).unwrap(), original_main);
+                assert_eq!(fs::read_to_string(&cargo_path).unwrap(), original_cargo);
+            },
+        );
     }
 
     #[test]

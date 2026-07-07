@@ -16,7 +16,7 @@ use super::schema_edit::{
     parse_model_search_config_for_table, remove_columns_down_sql, remove_columns_up_sql,
     singularize,
 };
-use super::{Flags, GenerateError, ensure_project_root, timestamp_now};
+use super::{GenerateError, ensure_project_root};
 
 fn collect_rs_files_recursive(dir: &Path, candidates: &mut Vec<std::path::PathBuf>) {
     if let Ok(entries) = std::fs::read_dir(dir) {
@@ -215,30 +215,10 @@ fn pascalish(name: &str) -> String {
     }
 }
 
-/// CLI entry point.
-pub fn run(name: &str, field_tokens: &[String], uniques: &[String], flags: Flags) {
-    let cwd = match std::env::current_dir() {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("Error: cannot determine current directory: {e}");
-            std::process::exit(1);
-        }
-    };
-    let timestamp = timestamp_now();
-    match plan_migration_with_options(&cwd, name, field_tokens, &timestamp, uniques)
-        .and_then(|p| p.execute(flags))
-    {
-        Ok(()) => {}
-        Err(e) => {
-            eprintln!("Error: {e}");
-            std::process::exit(1);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::generate::Flags;
     use std::fs;
     use tempfile::TempDir;
 
@@ -260,6 +240,50 @@ mod tests {
         let down = fs::read_to_string(dir.join("down.sql")).unwrap();
         assert!(up.is_empty());
         assert!(down.is_empty());
+    }
+
+    #[test]
+    fn generate_then_destroy_migration_round_trips_to_original_project_state() {
+        temp_env::with_vars(
+            [
+                ("AUTUMN_DATABASE__PRIMARY_URL", None::<&str>),
+                ("AUTUMN_DATABASE__URL", None::<&str>),
+                ("DATABASE_URL", None::<&str>),
+            ],
+            || {
+                let tmp = project();
+                let plan = plan_migration(
+                    tmp.path(),
+                    "AddTitleToPosts",
+                    &["title:String".into()],
+                    "20260427000000",
+                )
+                .unwrap();
+                plan.execute(Flags::default()).unwrap();
+                let dir = tmp
+                    .path()
+                    .join("migrations/20260427000000_add_title_to_posts");
+                assert!(dir.exists());
+
+                // Destroy recomputes the plan with a FRESH timestamp; the
+                // real on-disk directory must still be found by suffix.
+                let destroy_plan = plan_migration(
+                    tmp.path(),
+                    "AddTitleToPosts",
+                    &["title:String".into()],
+                    "99999999999999",
+                )
+                .unwrap();
+                destroy_plan.revert(Flags::default()).unwrap();
+
+                assert!(!dir.exists());
+                assert!(
+                    fs::read_dir(tmp.path().join("migrations"))
+                        .map(|mut d| d.next().is_none())
+                        .unwrap_or(true)
+                );
+            },
+        );
     }
 
     #[test]
