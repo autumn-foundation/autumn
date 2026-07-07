@@ -126,15 +126,24 @@ mod tx_isolation_retry_tests {
         // barrier, its partner would otherwise block on `barrier.wait()`
         // forever. Bound the whole race so an unexpected failure surfaces as a
         // clean test failure instead of an indefinite CI hang.
-        tokio::time::timeout(std::time::Duration::from_secs(30), async {
-            let _ = t1.await.expect("task1 join");
-            let _ = t2.await.expect("task2 join");
+        let (r1, r2) = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let r1 = t1.await.expect("task1 join");
+            let r2 = t2.await.expect("task2 join");
+            (r1, r2)
         })
         .await
         .expect(
             "write-skew race did not complete within 30s — likely one participant hit a \
              non-retryable error before reaching the barrier, leaving its partner blocked",
         );
+
+        // Both participants must actually commit. If `tx_with` exhausted its
+        // retry budget instead of transparently succeeding (e.g. a regression
+        // in the retry/backoff logic), the later count/retry-counter
+        // assertions could still incidentally pass — so assert directly here
+        // rather than silently discarding either result.
+        r1.expect("participant 1 (doctor id=1) failed to commit its transaction");
+        r2.expect("participant 2 (doctor id=2) failed to commit its transaction");
     }
 
     // ── The falsifiable success-metric test ────────────────────
