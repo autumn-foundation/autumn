@@ -18,7 +18,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   descriptor, reusing the #1131 typed inputs — no per-field control selection in
   caller code. Escape hatches: `.exclude`, `.override_field`, `.override_label`,
   `.append`, `.submit_label`, `.multipart`. Plain no-JS HTML; htmx stays opt-in.
-  Public API addition (minor bump); existing helpers unchanged.
+  A required `FieldControl::Date` field now renders via a new
+  `required_date_input` helper (`required` + `aria-required="true"`), matching
+  the other `required_*` siblings. Public API addition (minor bump); existing
+  helpers unchanged.
+  `autumn generate scaffold` now consumes it: the generated create/edit views
+  (and both 422 re-render branches) render through one shared
+  `{snake}_form_for` helper instead of hand-emitting one input per column —
+  the generated `{Model}Form` delegates `FormModel` to the `#[model]`-derived
+  descriptors, enum columns get a `.override_field(...)` `Select` with their
+  variants, decimal columns pin the browser `step` to the declared scale, and
+  attachment columns stay a hand-rolled file input (appended before the submit
+  button, so attachment fields now always render at the end of the form
+  regardless of their declared column position, and the form remains
+  URL-encoded). `references` columns render as a `<select>` of the referenced
+  table's ids (AC "enum/references→select"): the generated handlers load the
+  ids via a per-column `{column}_select_options` loader and thread them into
+  the shared form helper — option labels are the raw id (which column makes a
+  human-friendly label is a display decision the generator can't know; the
+  generated loader's doc comment says where to swap one in). This requires
+  the referenced resource's `src/schema.rs` entry to exist, i.e. generate the
+  referenced model first — the same ordering the FOREIGN KEY already imposes.
+  Adding a column no longer requires any view edits.
+  `--live-validation` scaffolds keep the per-field emission (their htmx
+  inline-validation inputs have no `FieldControl` equivalent).
+  `FieldControl` is `#[non_exhaustive]` (new control kinds won't be
+  semver-major); duplicate `.override_field`/`.override_label` calls on the
+  same field now resolve last-wins; `FieldControl::File` renders the same
+  inline-error/ARIA/required skeleton as the other controls; and the
+  multipart render path now flows through the same audited CSRF/
+  method-override code as every other form (`enctype` is threaded, not
+  duplicated).
 
 - **generator:** `autumn generate scaffold`'s `create`/`update` handlers now
   build a `Changeset` from the submission and re-render the `new`/`edit`

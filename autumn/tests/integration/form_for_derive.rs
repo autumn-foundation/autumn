@@ -11,6 +11,11 @@
 //! (same convention as `encryption_columns.rs`).
 
 #![cfg(all(feature = "db", feature = "maud"))]
+// `Article`'s `f64` column makes the `#[model]` expansion (change tracking
+// uses strict equality) trip clippy's `float_cmp`; that generated comparison
+// is the macro's concern, not this test's, and an item-level allow can't
+// reach the macro-emitted impls.
+#![allow(clippy::float_cmp)]
 
 use autumn_web::form::{Changeset, FieldControl, FormModel, form_for};
 

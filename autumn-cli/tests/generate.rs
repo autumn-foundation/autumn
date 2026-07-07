@@ -946,11 +946,14 @@ fn generate_scaffold_accepts_metadata_flags() {
     assert!(repo.contains("fn find_by_alive(alive: bool) -> Vec<Bookmark>;"));
 
     let routes = fs::read_to_string(project.join("src/routes/bookmarks.rs")).unwrap();
-    // Fields render through the changeset-aware helpers (issue #1124); all
-    // three are required (non-nullable), so each uses `required_text_input`.
-    assert!(routes.contains("autumn_web::form::required_text_input(&changeset, \"url\""));
-    assert!(routes.contains("autumn_web::form::required_text_input(&changeset, \"title\""));
-    assert!(routes.contains("autumn_web::form::required_text_input(&changeset, \"tag\""));
+    // The views render through one `form_for` call (issue #1135): the
+    // per-field controls (including the required signal for the three
+    // non-nullable strings) come from the `#[model]`-derived `FormModel`
+    // descriptors, delegated to from the generated form struct.
+    assert!(routes.contains("impl autumn_web::form::FormModel for BookmarkForm"));
+    assert!(routes.contains("<Bookmark as autumn_web::form::FormModel>::form_fields()"));
+    assert!(routes.contains("autumn_web::form::form_for(changeset, action, \"post\")"));
+    assert!(!routes.contains("autumn_web::form::required_text_input(&changeset"));
     // `alive` is defaulted → excluded from the form entirely.
     assert!(!routes.contains("\"alive\""));
     assert!(routes.contains("bookmarks::tag.eq(new.tag.clone())"));
@@ -1730,17 +1733,16 @@ fn generate_scaffold_unique_field_create_violation_form_preserves_submitted_valu
         create_body.contains("Changeset::from_errors(changeset.into_inner(), errors)"),
         "got:\n{create_body}"
     );
+    // The re-render goes through the same shared `form_for` helper as the GET
+    // views (issue #1135) — every submitted value is preserved because the
+    // controls all read from the rebuilt changeset.
     assert!(
-        create_body.contains("autumn_web::form::required_number_input(&changeset, \"age\""),
+        create_body.contains("user_form_for(&changeset"),
         "got:\n{create_body}"
     );
     assert!(
-        create_body.contains("autumn_web::form::checkbox_input(&changeset, \"active\""),
-        "got:\n{create_body}"
-    );
-    assert!(
-        create_body.contains("autumn_web::form::required_select_input(&changeset, \"status\""),
-        "got:\n{create_body}"
+        routes.contains(".override_field(\"status\", autumn_web::form::FieldControl::Select"),
+        "got:\n{routes}"
     );
 }
 
@@ -1788,12 +1790,10 @@ fn generate_scaffold_unique_field_update_violation_form_preserves_submitted_valu
         update_body.contains("Changeset::from_errors(changeset.into_inner(), errors)"),
         "got:\n{update_body}"
     );
+    // Same shared `form_for` helper as the GET views (issue #1135): the
+    // rebuilt changeset carries the submitted values into every control.
     assert!(
-        update_body.contains("autumn_web::form::required_number_input(&changeset, \"age\""),
-        "got:\n{update_body}"
-    );
-    assert!(
-        update_body.contains("autumn_web::form::required_select_input(&changeset, \"status\""),
+        update_body.contains("user_form_for(&changeset"),
         "got:\n{update_body}"
     );
     assert!(

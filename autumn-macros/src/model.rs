@@ -1445,7 +1445,7 @@ fn type_name_str(ty: &syn::Type) -> String {
     crate::api_doc::last_segment_name(ty).unwrap_or_else(|| "unknown".to_owned())
 }
 
-/// Humanize a snake_case field name into a `<label>`-friendly title
+/// Humanize a `snake_case` field name into a `<label>`-friendly title
 /// (e.g. `published_at` -> `"Published At"`). Mirrors the scaffold's
 /// `humanize_label` so a derived form and a hand-written one read alike.
 fn humanize_field_label(name: &str) -> String {
@@ -1477,7 +1477,6 @@ fn humanize_field_label(name: &str) -> String {
 fn form_control_tokens(inner_ty: &syn::Type, nullable: bool) -> TokenStream {
     let name = type_name_str(inner_ty);
     match name.as_str() {
-        "String" | "str" | "Uuid" => quote! { ::autumn_web::form::FieldControl::Text },
         "bool" => {
             if nullable {
                 quote! {
@@ -1506,8 +1505,9 @@ fn form_control_tokens(inner_ty: &syn::Type, nullable: bool) -> TokenStream {
         },
         "NaiveDate" => quote! { ::autumn_web::form::FieldControl::Date },
         "NaiveDateTime" | "DateTime" => quote! { ::autumn_web::form::FieldControl::DateTime },
-        // Unknown types (user enums, JSON, custom newtypes) -> text by default;
-        // promote via `.override_field(...)` where a richer control is known.
+        // `String`/`str`/`Uuid` render as text, and so do unknown types
+        // (user enums, JSON, custom newtypes) as a safe fallback; promote
+        // via `.override_field(...)` where a richer control is known.
         _ => quote! { ::autumn_web::form::FieldControl::Text },
     }
 }

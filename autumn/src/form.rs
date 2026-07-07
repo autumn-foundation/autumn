@@ -411,6 +411,7 @@ impl<T: Serialize> ChangesetForm<T> {
             method,
             &self.csrf_field,
             self.csrf_token.as_deref(),
+            None,
             content,
         )
     }
@@ -708,7 +709,7 @@ pub fn form_tag(
     csrf_token: Option<&str>,
     content: maud::Markup,
 ) -> maud::Markup {
-    form_tag_inner(action, method, "_csrf", csrf_token, content)
+    form_tag_inner(action, method, "_csrf", csrf_token, None, content)
 }
 
 /// Internal: render a `<form>` element using an explicit CSRF field name.
@@ -720,6 +721,11 @@ pub fn form_tag(
 /// rewrite the request back to the declared method before route matching.
 /// This lets server-rendered HTML target `#[put]` / `#[patch]` /
 /// `#[delete]` routes without any client JavaScript.
+///
+/// `enctype` is emitted verbatim when `Some` (e.g.
+/// `Some("multipart/form-data")` for [`FormFor`] forms containing a file
+/// input) so every `<form>` — whatever its encoding — flows through this one
+/// audited CSRF/method-override path.
 #[cfg(feature = "maud")]
 #[allow(clippy::needless_pass_by_value)]
 fn form_tag_inner(
@@ -727,11 +733,12 @@ fn form_tag_inner(
     method: &str,
     csrf_field: &str,
     csrf_token: Option<&str>,
+    enctype: Option<&str>,
     content: maud::Markup,
 ) -> maud::Markup {
     let (browser_method, override_value) = browser_method_and_override(method);
     maud::html! {
-        form action=(action) method=(browser_method) {
+        form action=(action) method=(browser_method) enctype=[enctype] {
             @if let Some(override_method) = override_value {
                 input
                     type="hidden"
@@ -1506,6 +1513,48 @@ pub fn date_input<T: Serialize>(
     }
 }
 
+/// Render a labeled `<input type="date">` for a required field.
+///
+/// Identical to [`date_input`] but adds `aria-required="true"` and the HTML
+/// `required` attribute, giving both AT users and browser-native validation
+/// the required-field signal without relying solely on color.
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn required_date_input<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+) -> maud::Markup {
+    let errors = changeset.errors_for(field);
+    let has_errors = !errors.is_empty();
+    let value = normalize_date_value(&changeset.field_value(field).unwrap_or_default());
+    let error_id = format!("{field}-error");
+    let wrapper_id = format!("{field}-field");
+
+    maud::html! {
+        div id=(wrapper_id) class="autumn-field" {
+            label for=(field) class="autumn-field__label" { (label) }
+            input
+                type="date"
+                id=(field)
+                name=(field)
+                value=(value)
+                required
+                aria-required="true"
+                class=(if has_errors { "autumn-field__input autumn-field__input--invalid" } else { "autumn-field__input" })
+                aria-invalid=(if has_errors { "true" } else { "false" })
+                aria-describedby=(if has_errors { error_id.as_str() } else { "" });
+            @if has_errors {
+                div id=(error_id) role="alert" class="autumn-field__errors" {
+                    @for error in errors {
+                        p class="autumn-field__error" { (error) }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Render a labeled `<input type="datetime-local">` tied to a changeset
 /// field (`NaiveDateTime` or `DateTime`).
 ///
@@ -1768,7 +1817,11 @@ pub fn skip_link(target: &str, label: &str) -> maud::Markup {
 /// This is plain data (no `maud` dependency) so the `#[model]`-derived
 /// [`FormModel`] implementation is always available; only the rendering side
 /// ([`form_for`]) is gated behind the `maud` feature.
+/// The enum is `#[non_exhaustive]`: new control kinds will be added without
+/// a semver-major bump, so external `match`es need a wildcard arm. All
+/// existing variants remain freely constructible.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FieldControl {
     /// `<input type="text">`.
     Text,
@@ -1898,11 +1951,11 @@ pub trait FormModel {
 /// ```
 #[cfg(feature = "maud")]
 #[must_use]
-pub fn form_for<'a, T>(
-    changeset: &'a Changeset<T>,
+pub fn form_for<T>(
+    changeset: &Changeset<T>,
     action: impl Into<String>,
     method: impl Into<String>,
-) -> FormFor<'a, T>
+) -> FormFor<'_, T>
 where
     T: Serialize + FormModel,
 {
@@ -1939,7 +1992,7 @@ pub struct FormFor<'a, T: Serialize + FormModel> {
 }
 
 #[cfg(feature = "maud")]
-impl<'a, T: Serialize + FormModel> FormFor<'a, T> {
+impl<T: Serialize + FormModel> FormFor<'_, T> {
     /// Inject a hidden CSRF input carrying `token`.
     #[must_use]
     pub fn csrf(mut self, token: impl Into<String>) -> Self {
@@ -1961,14 +2014,16 @@ impl<'a, T: Serialize + FormModel> FormFor<'a, T> {
         self
     }
 
-    /// Replace the derived control for `field`.
+    /// Replace the derived control for `field`. Calling this again for the
+    /// same field replaces the earlier override (last call wins).
     #[must_use]
     pub fn override_field(mut self, field: impl Into<String>, control: FieldControl) -> Self {
         self.field_overrides.push((field.into(), control));
         self
     }
 
-    /// Replace the label for `field`.
+    /// Replace the label for `field`. Calling this again for the same field
+    /// replaces the earlier override (last call wins).
     #[must_use]
     pub fn override_label(mut self, field: impl Into<String>, label: impl Into<String>) -> Self {
         self.label_overrides.push((field.into(), label.into()));
@@ -1992,7 +2047,7 @@ impl<'a, T: Serialize + FormModel> FormFor<'a, T> {
     /// Force `enctype="multipart/form-data"` even when no field is a
     /// [`FieldControl::File`].
     #[must_use]
-    pub fn multipart(mut self) -> Self {
+    pub const fn multipart(mut self) -> Self {
         self.force_multipart = true;
         self
     }
@@ -2030,37 +2085,22 @@ impl<'a, T: Serialize + FormModel> FormFor<'a, T> {
             button type="submit" { (submit_label) }
         };
 
-        if is_multipart {
-            let (browser_method, override_value) = browser_method_and_override(&method);
-            maud::html! {
-                form action=(action) method=(browser_method) enctype="multipart/form-data" {
-                    @if let Some(override_method) = override_value {
-                        input
-                            type="hidden"
-                            name=(crate::middleware::DEFAULT_METHOD_OVERRIDE_FIELD)
-                            value=(override_method);
-                    }
-                    @if let Some(token) = csrf_token.as_deref() {
-                        input type="hidden" name=(csrf_field_name) value=(token);
-                    }
-                    (inner)
-                }
-            }
-        } else {
-            form_tag_inner(
-                &action,
-                &method,
-                &csrf_field_name,
-                csrf_token.as_deref(),
-                inner,
-            )
-        }
+        form_tag_inner(
+            &action,
+            &method,
+            &csrf_field_name,
+            csrf_token.as_deref(),
+            is_multipart.then_some("multipart/form-data"),
+            inner,
+        )
     }
 }
 
 /// Compute the effective field list for a [`FormFor::render`] call: start
 /// from `T::form_fields()`, drop excluded fields, then apply control/label
-/// overrides in place.
+/// overrides in place. Overrides apply in registration order, so when the
+/// same field is overridden twice the **last** call wins — conventional
+/// builder semantics.
 #[cfg(feature = "maud")]
 fn effective_form_fields<T: FormModel>(
     excluded: &[String],
@@ -2071,11 +2111,18 @@ fn effective_form_fields<T: FormModel>(
         .into_iter()
         .filter(|field| !excluded.contains(&field.name))
         .map(|mut field| {
-            if let Some((_, control)) = field_overrides.iter().find(|(name, _)| *name == field.name)
+            if let Some((_, control)) = field_overrides
+                .iter()
+                .rev()
+                .find(|(name, _)| *name == field.name)
             {
                 field.control = control.clone();
             }
-            if let Some((_, label)) = label_overrides.iter().find(|(name, _)| *name == field.name) {
+            if let Some((_, label)) = label_overrides
+                .iter()
+                .rev()
+                .find(|(name, _)| *name == field.name)
+            {
                 field.label = label.clone();
             }
             field
@@ -2104,7 +2151,13 @@ fn render_form_field<T: Serialize>(changeset: &Changeset<T>, field: &FormField) 
             }
         }
         FieldControl::Checkbox => checkbox_input(changeset, &field.name, &field.label),
-        FieldControl::Date => date_input(changeset, &field.name, &field.label),
+        FieldControl::Date => {
+            if field.required {
+                required_date_input(changeset, &field.name, &field.label)
+            } else {
+                date_input(changeset, &field.name, &field.label)
+            }
+        }
         FieldControl::DateTime => {
             if field.required {
                 required_datetime_input(changeset, &field.name, &field.label)
@@ -2124,10 +2177,33 @@ fn render_form_field<T: Serialize>(changeset: &Changeset<T>, field: &FormField) 
             }
         }
         FieldControl::File => {
+            // No dedicated file helper exists upstream, so this arm renders
+            // the same inline-error/ARIA/wrapper skeleton the changeset-aware
+            // helpers emit (a file input can't be value-prefilled — browser
+            // security — so only the value attribute is omitted).
+            let errors = changeset.errors_for(&field.name);
+            let has_errors = !errors.is_empty();
+            let error_id = format!("{}-error", field.name);
+            let wrapper_id = format!("{}-field", field.name);
             maud::html! {
-                div class="autumn-field" {
+                div id=(wrapper_id) class="autumn-field" {
                     label for=(field.name) class="autumn-field__label" { (field.label) }
-                    input type="file" id=(field.name) name=(field.name);
+                    input
+                        type="file"
+                        id=(field.name)
+                        name=(field.name)
+                        required[field.required]
+                        aria-required=[field.required.then_some("true")]
+                        class=(if has_errors { "autumn-field__input autumn-field__input--invalid" } else { "autumn-field__input" })
+                        aria-invalid=(if has_errors { "true" } else { "false" })
+                        aria-describedby=(if has_errors { error_id.as_str() } else { "" });
+                    @if has_errors {
+                        div id=(error_id) role="alert" class="autumn-field__errors" {
+                            @for error in errors {
+                                p class="autumn-field__error" { (error) }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -3942,6 +4018,21 @@ mod tests {
 
     #[cfg(feature = "maud")]
     #[test]
+    fn form_for_required_date_field_renders_required_attribute() {
+        let cs = Changeset::new(blank_form_for_model());
+        // `title` is a required field; promoted to a Date control it must
+        // keep the required signal (issue #1135 audit: `required` used to be
+        // silently dropped for `FieldControl::Date`).
+        let html = form_for(&cs, "/posts", "post")
+            .override_field("title", FieldControl::Date)
+            .render()
+            .into_string();
+        assert!(html.contains(r#"type="date""#), "{html}");
+        assert!(html.contains(r#"aria-required="true""#), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
     fn form_for_file_field_sets_multipart() {
         let cs = Changeset::new(blank_form_for_model());
         let html = form_for(&cs, "/posts", "post")
@@ -3949,6 +4040,94 @@ mod tests {
             .render()
             .into_string();
         assert!(html.contains(r#"enctype="multipart/form-data""#), "{html}");
+    }
+
+    /// A multipart `PUT` form must carry the method-override hidden input,
+    /// the CSRF hidden input, AND the `enctype` in the *same* rendered output
+    /// — the multipart path flows through the same audited `form_tag_inner`
+    /// as every other form, so none of the three can drift apart.
+    #[cfg(feature = "maud")]
+    #[test]
+    fn form_for_multipart_put_emits_method_override_and_csrf_together() {
+        let cs = Changeset::new(blank_form_for_model());
+        let html = form_for(&cs, "/posts/1", "PUT")
+            .csrf("tok456")
+            .multipart()
+            .render()
+            .into_string();
+        assert!(html.contains(r#"enctype="multipart/form-data""#), "{html}");
+        assert!(html.contains(r#"method="post""#), "{html}");
+        assert!(html.contains(r#"name="_method""#), "{html}");
+        assert!(html.contains(r#"value="PUT""#), "{html}");
+        assert!(html.contains(r#"name="_csrf""#), "{html}");
+        assert!(html.contains(r#"value="tok456""#), "{html}");
+
+        // The non-multipart sibling keeps the same combined contract.
+        let cs = Changeset::new(blank_form_for_model());
+        let html = form_for(&cs, "/posts/1", "PUT")
+            .csrf("tok456")
+            .render()
+            .into_string();
+        assert!(!html.contains("enctype"), "{html}");
+        assert!(html.contains(r#"name="_method""#), "{html}");
+        assert!(html.contains(r#"name="_csrf""#), "{html}");
+    }
+
+    /// `FieldControl::File` renders the same inline-error/ARIA/wrapper
+    /// skeleton as the changeset-aware helpers: `{field}-field` wrapper id,
+    /// `aria-invalid`/`aria-describedby`, a `role="alert"` error block, and
+    /// the required signal.
+    #[cfg(feature = "maud")]
+    #[test]
+    fn form_for_file_field_renders_errors_aria_and_required() {
+        let mut errors = HashMap::new();
+        errors.insert("title".to_string(), vec!["must be a PDF".to_string()]);
+        let cs = Changeset::from_errors(blank_form_for_model(), errors);
+        // `title` is required in the test model.
+        let html = form_for(&cs, "/posts", "post")
+            .override_field("title", FieldControl::File)
+            .render()
+            .into_string();
+        assert!(html.contains(r#"type="file""#), "{html}");
+        assert!(html.contains(r#"id="title-field""#), "{html}");
+        assert!(html.contains(r#"aria-invalid="true""#), "{html}");
+        assert!(html.contains(r#"aria-describedby="title-error""#), "{html}");
+        assert!(html.contains(r#"role="alert""#), "{html}");
+        assert!(html.contains("must be a PDF"), "{html}");
+        assert!(html.contains(r#"aria-required="true""#), "{html}");
+        assert!(html.contains("required"), "{html}");
+
+        // Error-free, non-required file field: no required signal, no alert.
+        // (`title` — the only required field — is excluded so any
+        // `aria-required` in the output could only come from the file arm.)
+        let cs = Changeset::new(blank_form_for_model());
+        let html = form_for(&cs, "/posts", "post")
+            .exclude("title")
+            .override_field("published", FieldControl::File)
+            .render()
+            .into_string();
+        assert!(html.contains(r#"id="published-field""#), "{html}");
+        assert!(html.contains(r#"aria-invalid="false""#), "{html}");
+        assert!(!html.contains(r#"aria-required="true""#), "{html}");
+    }
+
+    /// Duplicate `.override_field`/`.override_label` calls on the same field
+    /// resolve last-wins (conventional builder semantics).
+    #[cfg(feature = "maud")]
+    #[test]
+    fn form_for_duplicate_overrides_last_wins() {
+        let cs = Changeset::new(blank_form_for_model());
+        let html = form_for(&cs, "/posts", "post")
+            .override_field("title", FieldControl::Date)
+            .override_field("title", FieldControl::Textarea)
+            .override_label("title", "First")
+            .override_label("title", "Second")
+            .render()
+            .into_string();
+        assert!(html.contains("<textarea"), "{html}");
+        assert!(!html.contains(r#"type="date""#), "{html}");
+        assert!(html.contains("Second"), "{html}");
+        assert!(!html.contains("First"), "{html}");
     }
 
     // ── ChangesetForm extractor (axum integration) ─────────────────
