@@ -21,7 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `MAX_PAGE_SIZE`. The iterators reuse the same soft-delete filter and read
   routing as `find_all`/`cursor_page` (trashed rows are skipped; a
   replica-routed repo iterates off the replica), an error mid-iteration surfaces
-  on the failing batch and stops iteration without swallowing progress, a
+  on the failing batch and is retryable (the keyset cursor only advances on
+  success, so a retry resumes with no duplicated or skipped rows — `Ok(None)`
+  always means completion), a
   `batch_size` of `0` errors rather than spinning, and sharded repositories
   reject cross-shard `across_tenants()` iteration exactly as `cursor_page` does.
   The generic handle types live in `autumn_web::batches`

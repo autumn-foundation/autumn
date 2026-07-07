@@ -212,8 +212,14 @@ Batched iteration inherits the repository's soft-delete filter (trashed rows
 are skipped, matching `find_all`) and its read routing (a replica-routed repo
 iterates off the replica, a `primary_reads` repo off the primary), so backfills
 read off a replica with no extra ceremony. An error mid-iteration surfaces as
-an `AutumnResult` error on the failing batch and stops the iterator; progress
-already yielded is not swallowed.
+an `AutumnResult` error on the failing batch, and errors are **retryable**:
+the keyset cursor only advances on success, so calling `next_batch()` again
+retries the same batch with no duplicated or skipped rows — `Ok(None)` always
+means the table is exhausted, never a swallowed failure.
+
+Iteration ends at the first short batch (fewer than `batch_size` rows); rows
+inserted after that point are not seen by the current handle — start a new
+iteration to pick them up (matching Rails' `find_each`).
 
 ### `find_each` in a task — per-row update
 
@@ -239,11 +245,13 @@ pub async fn backfill_slugs(repo: PgPostRepository) -> AutumnResult<()> {
 Register it with `.one_off_tasks(one_off_tasks![tasks::backfill_slugs])` and run
 `autumn task backfill-slugs` (see the [tasks guide](./tasks.md)).
 
-### `find_in_batches` + `save_many` — recompute loop
+### `find_in_batches` + `upsert_many` — recompute loop
 
 Pair batched reads with the bulk writes from
-[`save_many`](./repositories.md) to recompute a whole table with flat memory on
-both the read and write side:
+[`upsert_many`](./repositories.md) to recompute a whole table with flat memory
+on both the read and write side (`upsert_many` takes existing `&[Model]`
+values and writes them back; `save_many` takes `&[NewModel]` and would insert
+duplicates here):
 
 ```rust
 let mut batches = repo.find_in_batches(1_000);
@@ -255,13 +263,16 @@ while let Some(chunk) = batches.next_batch().await? {
             account
         })
         .collect();
-    repo.save_many(&recomputed).await?; // O(batch_size) memory, not O(table)
+    repo.upsert_many(&recomputed).await?; // O(batch_size) memory, not O(table)
 }
 ```
 
-A `batch_size` of `0` returns an error on the first call rather than spinning.
-On a **sharded** repository, cross-shard `across_tenants()` iteration is
-rejected (mirroring `cursor_page`); iterate a single routed shard instead.
+Note: `upsert_many` is not generated on repositories with hooks configured —
+use per-row `update` there.
+
+A `batch_size` of `0` returns an error rather than spinning. On a **sharded**
+repository, cross-shard `across_tenants()` iteration is rejected (mirroring
+`cursor_page`); iterate each shard separately via `from_shard(...)` instead.
 
 ---
 

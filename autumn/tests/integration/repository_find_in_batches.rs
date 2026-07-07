@@ -63,6 +63,28 @@ pub struct BatchSoftRecord {
 #[autumn_web::repository(BatchSoftRecord, table = "test_batch_soft_records", soft_delete)]
 pub trait BatchSoftRecordRepository {}
 
+// ── Tenant-scoped model ───────────────────────────────────────────────────────
+
+diesel::table! {
+    test_batch_tenant_records (id) {
+        id -> Int8,
+        name -> Text,
+        tenant_id -> Text,
+    }
+}
+
+#[autumn_web::model(table = "test_batch_tenant_records")]
+pub struct BatchTenantRecord {
+    #[id]
+    pub id: i64,
+    pub name: String,
+    #[default]
+    pub tenant_id: String,
+}
+
+#[autumn_web::repository(BatchTenantRecord, table = "test_batch_tenant_records", tenant_scoped)]
+pub trait BatchTenantRecordRepository {}
+
 // ── Setup & helpers ───────────────────────────────────────────────────────────
 
 async fn setup_pool() -> (
@@ -94,6 +116,12 @@ async fn setup_pool() -> (
     .execute(&mut conn)
     .await
     .expect("create test_batch_soft_records");
+    diesel::sql_query(
+        "CREATE TABLE IF NOT EXISTS test_batch_tenant_records (id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL, tenant_id TEXT NOT NULL)",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("create test_batch_tenant_records");
 
     (pool, container)
 }
@@ -111,6 +139,17 @@ const fn build_batch_repo(pool: Pool<AsyncPgConnection>) -> PgBatchRecordReposit
 const fn build_soft_repo(pool: Pool<AsyncPgConnection>) -> PgBatchSoftRecordRepository {
     PgBatchSoftRecordRepository {
         pool,
+        __autumn_read_route: ReadRoute::Primary,
+        __autumn_statement_timeout_ms: 0,
+        __autumn_slow_threshold: std::time::Duration::from_millis(500),
+        __autumn_route: None,
+    }
+}
+
+const fn build_tenant_repo(pool: Pool<AsyncPgConnection>) -> PgBatchTenantRecordRepository {
+    PgBatchTenantRecordRepository {
+        pool,
+        across_tenants: false,
         __autumn_read_route: ReadRoute::Primary,
         __autumn_statement_timeout_ms: 0,
         __autumn_slow_threshold: std::time::Duration::from_millis(500),
@@ -276,33 +315,44 @@ async fn find_in_batches_empty_table() {
     assert!(each.next().await.expect("empty each").is_none());
 }
 
-/// AC6-adjacent: `batch_size == 0` returns an error rather than spinning.
+/// AC6-adjacent: `batch_size == 0` is a programmer error — it surfaces as an
+/// internal-server-error kind on **every** call rather than spinning or
+/// turning into a "completed" `Ok(None)`.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn find_in_batches_batch_size_zero() {
+    use autumn_web::reexports::http::StatusCode;
+
     let (pool, _container) = setup_pool().await;
     let repo = build_batch_repo(pool);
     seed_records(&repo, 5).await;
 
     let mut batches = repo.find_in_batches(0);
-    let err = batches
-        .next_batch()
-        .await
-        .expect_err("batch_size 0 must error");
-    assert!(
-        err.to_string().to_lowercase().contains("batch_size"),
-        "error should mention batch_size, got: {err}"
-    );
-    // Stays ended (no silent success) after the error.
-    assert!(batches.next_batch().await.expect("stays ended").is_none());
+    for _ in 0..2 {
+        let err = batches
+            .next_batch()
+            .await
+            .expect_err("batch_size 0 must error on every call, never Ok(None)");
+        assert!(
+            err.to_string().to_lowercase().contains("batch_size"),
+            "error should mention batch_size, got: {err}"
+        );
+        assert_eq!(
+            err.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "batch_size == 0 is task/job programmer error, not client input"
+        );
+    }
 }
 
-/// AC6: an error mid-iteration surfaces on the failing batch, stops iteration,
-/// and does not silently resume. We drop the table between batches to force a
-/// DB error on the next fetch.
+/// AC6: an error mid-iteration surfaces on the failing batch and keeps
+/// surfacing on subsequent calls while the failure persists — it is never
+/// fused into `Ok(None)`, so a retrying backfill can't mistake a failed run
+/// for a completed one. We drop the table between batches to force a DB error
+/// on the next fetch.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
-async fn find_in_batches_error_mid_iteration_stops() {
+async fn find_in_batches_error_mid_iteration_surfaces_and_is_retryable() {
     const N: usize = 100;
     const B: usize = 10;
 
@@ -333,10 +383,128 @@ async fn find_in_batches_error_mid_iteration_stops() {
         .expect_err("dropped table must surface an error");
     assert!(!err.to_string().is_empty());
 
-    // Once errored it stays ended: no silent success on the next call.
+    // Errors are retryable, never fused into completion: while the failure
+    // persists, every retry surfaces Err again — never Ok(None).
+    batches
+        .next_batch()
+        .await
+        .expect_err("retry against a persistent failure must error again, never Ok(None)");
+}
+
+/// Regression guard against `LIMIT`/`OFFSET` creeping back in: on a static
+/// table, OFFSET and keyset are indistinguishable, so this test mutates the
+/// table mid-iteration. Hard-deleting the already-visited batch would make an
+/// OFFSET-based iterator skip `B` unvisited rows; the keyset cursor continues
+/// from the last-seen id and still visits every remaining row exactly once.
+/// Rows inserted ahead of the cursor (higher ids) are picked up too.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn find_in_batches_keyset_survives_mid_iteration_mutation() {
+    const N: usize = 100;
+    const B: usize = 10;
+
+    let (pool, _container) = setup_pool().await;
+    let repo = build_batch_repo(pool);
+    let seeded = seed_records(&repo, N).await;
+
+    let mut batches = repo.find_in_batches(B);
+    let first = batches
+        .next_batch()
+        .await
+        .expect("first batch ok")
+        .expect("first batch present");
+    let first_ids: Vec<i64> = first.iter().map(|r| r.id).collect();
+    assert_eq!(first_ids.len(), B);
+
+    // Hard-delete the rows already visited. Under OFFSET, the next page
+    // (OFFSET B) would now skip B unvisited rows; keyset does not.
+    repo.delete_many(&first_ids)
+        .await
+        .expect("hard delete batch 1");
+
+    let second = batches
+        .next_batch()
+        .await
+        .expect("second batch ok")
+        .expect("second batch present");
+    let mut seen: Vec<i64> = first_ids;
+    seen.extend(second.iter().map(|r| r.id));
+
+    // Insert rows ahead of the cursor mid-iteration: BIGSERIAL assigns ids
+    // above the current position, so keyset iteration must reach them.
+    let inserted_late = seed_records(&repo, 15).await;
+
+    while let Some(chunk) = batches.next_batch().await.expect("batch fetch") {
+        seen.extend(chunk.iter().map(|r| r.id));
+    }
+
+    let mut expected = seeded;
+    expected.extend(inserted_late);
+    expected.sort_unstable();
+    seen.sort_unstable();
+    assert_eq!(
+        seen, expected,
+        "every row visited exactly once despite mid-iteration delete + insert \
+         (OFFSET would have skipped {B} rows)"
+    );
+}
+
+/// Tenant scoping: iteration only visits the routed tenant's rows, matching
+/// `find_all` on a tenant-scoped repository.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn find_in_batches_is_tenant_scoped() {
+    use autumn_web::tenancy::with_tenant;
+
+    let (pool, _container) = setup_pool().await;
+    let repo = build_tenant_repo(pool);
+
+    let mut a_ids: Vec<i64> = with_tenant("tenant-a".to_string(), async {
+        let new: Vec<NewBatchTenantRecord> = (0..12)
+            .map(|i| NewBatchTenantRecord {
+                name: format!("a-{i}"),
+            })
+            .collect();
+        repo.save_many(&new)
+            .await
+            .expect("seed tenant-a rows")
+            .into_iter()
+            .map(|r| r.id)
+            .collect()
+    })
+    .await;
+    with_tenant("tenant-b".to_string(), async {
+        let new: Vec<NewBatchTenantRecord> = (0..8)
+            .map(|i| NewBatchTenantRecord {
+                name: format!("b-{i}"),
+            })
+            .collect();
+        repo.save_many(&new).await.expect("seed tenant-b rows");
+    })
+    .await;
+
+    let seen: Vec<(i64, String)> = with_tenant("tenant-a".to_string(), async {
+        let mut seen = Vec::new();
+        let mut batches = repo.find_in_batches(5);
+        while let Some(chunk) = batches.next_batch().await.expect("batch fetch") {
+            for row in chunk {
+                seen.push((row.id, row.tenant_id));
+            }
+        }
+        seen
+    })
+    .await;
+
     assert!(
-        batches.next_batch().await.expect("stays ended").is_none(),
-        "iterator must not resume after an error"
+        seen.iter().all(|(_, tenant)| tenant == "tenant-a"),
+        "no foreign-tenant row may be visited"
+    );
+    let mut seen_ids: Vec<i64> = seen.into_iter().map(|(id, _)| id).collect();
+    seen_ids.sort_unstable();
+    a_ids.sort_unstable();
+    assert_eq!(
+        seen_ids, a_ids,
+        "iteration visits exactly the routed tenant's rows"
     );
 }
 

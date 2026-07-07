@@ -7790,8 +7790,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     return ::core::result::Result::Err(
                         ::autumn_web::AutumnError::bad_request_msg(
                             "cross-shard batched iteration is not supported: \
-                             use find_all() with across_tenants() on a \
-                             sharded repository instead"
+                             across_tenants() cannot fan find_in_batches/\
+                             find_each out across shards; iterate each shard \
+                             separately via from_shard(...) instead"
                         )
                     );
                 }
@@ -7848,14 +7849,21 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         /// `while let` loop; drop each chunk before requesting the next to hold
         /// at most `batch_size` models at a time.
         ///
-        /// A `batch_size` of `0` yields an error on the first `next_batch()`.
+        /// Iteration ends at the first short batch; rows inserted after that
+        /// point require a new iteration. Errors are retryable: the cursor
+        /// only advances on success, so calling `next_batch()` again after an
+        /// `Err` retries the same batch (`Ok(None)` always means completion).
+        /// A `batch_size` of `0` yields an error on every `next_batch()`.
         ///
         /// ```rust,ignore
         /// let mut batches = repo.find_in_batches(1_000);
         /// while let Some(chunk) = batches.next_batch().await? {
-        ///     repo.save_many(&recompute(chunk)).await?;
+        ///     repo.upsert_many(&recompute(chunk)).await?;
         /// }
         /// ```
+        ///
+        /// (`upsert_many` is not generated on repositories with hooks
+        /// configured; use per-row `update` there.)
         #[must_use]
         pub fn find_in_batches(
             &self,

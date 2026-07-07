@@ -72,6 +72,11 @@ pub mod assets;
 pub mod audit;
 pub mod auth;
 pub mod authorization;
+/// Bounded-memory, keyset-based iteration over an entire table.
+///
+/// See [`batches`] for [`batches::FindInBatches`], [`batches::FindEach`], and
+/// the [`batches::BatchSource`] trait that generated repositories implement.
+pub mod batches;
 pub mod cache;
 #[cfg(feature = "ws")]
 pub mod channels;
@@ -243,11 +248,6 @@ pub mod etag;
 pub mod http_client;
 #[cfg(feature = "http-client")]
 pub use http_client as http;
-/// Bounded-memory, keyset-based iteration over an entire table.
-///
-/// See [`batches`] for [`batches::FindInBatches`], [`batches::FindEach`], and
-/// the [`batches::BatchSource`] trait that generated repositories implement.
-pub mod batches;
 #[cfg(feature = "flash")]
 pub mod flash;
 #[cfg(feature = "htmx")]
