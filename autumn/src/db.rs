@@ -661,7 +661,21 @@ fn build_pool(
     connect_timeout_secs: u64,
 ) -> Result<Pool<AsyncPgConnection>, PoolError> {
     let timeout = Duration::from_secs(connect_timeout_secs);
-    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url);
+    // When the URL's `sslmode` asks for TLS, plug a rustls-backed connector
+    // into the pool via a custom setup callback — diesel-async's default
+    // establish path hardcodes `NoTls`, which cannot satisfy
+    // `sslmode=require` at all. `sslmode` absent/`disable`/`prefer` keeps the
+    // default (NoTls) path, so existing configurations behave exactly as
+    // before. See [`tls`] for the full posture table.
+    let manager = match tls::TlsPosture::from_database_url(url) {
+        tls::TlsPosture::Off => AsyncDieselConnectionManager::<AsyncPgConnection>::new(url),
+        posture => {
+            let mut config =
+                diesel_async::pooled_connection::ManagerConfig::<AsyncPgConnection>::default();
+            config.custom_setup = tls::setup_callback(posture);
+            AsyncDieselConnectionManager::<AsyncPgConnection>::new_with_config(url, config)
+        }
+    };
     Pool::builder(manager)
         .max_size(pool_size.max(1))
         .wait_timeout(Some(timeout))
@@ -1965,5 +1979,445 @@ mod tests {
         assert_eq!(super::scrub_sql("SELECT 1_000.5_0"), "SELECT ?");
         assert_eq!(super::scrub_sql("SELECT col_5_val"), "SELECT col_5_val");
         assert_eq!(super::scrub_sql("SELECT col_5"), "SELECT col_5");
+    }
+}
+
+// ── Postgres TLS (sslmode) support ───────────────────────────────────────────
+
+/// TLS support for the Postgres pool, driven by `sslmode` in the database URL.
+///
+/// diesel-async's default `AsyncPgConnection::establish` hardcodes
+/// `tokio_postgres::NoTls`, which makes `sslmode=require` fail on every
+/// connection with "no TLS implementation configured". This module plugs a
+/// rustls-backed connector into the pool via
+/// [`diesel_async::pooled_connection::ManagerConfig::custom_setup`] when the
+/// URL asks for TLS. Both URL (`postgres://…?sslmode=require`) and
+/// keyword/value (`host=… sslmode=require`) connection strings are
+/// recognized.
+///
+/// | `sslmode`                     | behavior |
+/// | ----------------------------- | -------- |
+/// | absent, `disable`, `prefer`   | unchanged: the default `NoTls` path (plaintext), exactly as before this module existed |
+/// | `require`                     | TLS. The connection is encrypted and the handshake signatures are verified, but the server's certificate **chain/identity is not** — matching what `libpq`/`psql` do for `require` (self-signed and private-CA servers work) |
+/// | `verify-full`                 | TLS with full chain **and** hostname verification against the Mozilla root store (`webpki-roots`), plus any `sslrootcert=<PEM file>` from the URL |
+/// | `verify-ca`                   | rejected with guidance: chain-only verification is not implemented; use `verify-full` (stricter) or `require` |
+///
+/// `require` combined with `sslrootcert` is also rejected rather than
+/// silently ignoring the CA file: `libpq` documents that combination as
+/// upgrading to certificate verification, so dropping the file would
+/// silently weaken what the operator asked for.
+mod tls {
+    use std::sync::Arc;
+
+    use diesel::{ConnectionError, ConnectionResult};
+    use diesel_async::pooled_connection::SetupCallback;
+    use diesel_async::{AsyncConnection as _, AsyncPgConnection};
+    use futures::FutureExt as _;
+    use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+    use rustls::crypto::CryptoProvider;
+    use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+    use rustls::{DigitallySignedStruct, SignatureScheme};
+    use tokio_postgres_rustls::MakeRustlsConnect;
+
+    /// TLS posture derived from the connection string's `sslmode` (and
+    /// `sslrootcert`). See the [module docs](self) for the full table.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(super) enum TlsPosture {
+        /// No TLS machinery: keep diesel-async's default `NoTls` setup path.
+        Off,
+        /// Encrypt without verifying the server certificate chain
+        /// (`libpq` parity for `sslmode=require`).
+        Require,
+        /// Encrypt and fully verify the certificate chain + hostname.
+        VerifyFull {
+            /// Optional `sslrootcert` PEM file to trust in addition to the
+            /// Mozilla root store.
+            root_cert: Option<String>,
+        },
+        /// A recognized-but-unsupported combination; every connection attempt
+        /// fails loudly with this reason instead of silently downgrading.
+        Unsupported { reason: String },
+    }
+
+    impl TlsPosture {
+        /// Classify a database URL / keyword-value connection string.
+        pub(super) fn from_database_url(database_url: &str) -> Self {
+            let params = ssl_params(database_url);
+            // Last occurrence wins, matching libpq/tokio-postgres semantics.
+            let get = |key: &str| {
+                params
+                    .iter()
+                    .rev()
+                    .find(|(k, _)| k == key)
+                    .map(|(_, v)| v.as_str())
+            };
+            let root_cert = get("sslrootcert").map(str::to_owned);
+            match get("sslmode") {
+                Some("require") => {
+                    if root_cert.is_some() {
+                        Self::Unsupported {
+                            reason: "sslmode=require with sslrootcert is not supported: \
+                                     PostgreSQL treats that combination as requiring \
+                                     certificate verification against the CA file, which \
+                                     this pool implements only for sslmode=verify-full. \
+                                     Use sslmode=verify-full to verify the certificate, or \
+                                     sslmode=require without sslrootcert to encrypt without \
+                                     verifying it."
+                                .to_owned(),
+                        }
+                    } else {
+                        Self::Require
+                    }
+                }
+                Some("verify-full") => Self::VerifyFull { root_cert },
+                Some("verify-ca") => Self::Unsupported {
+                    reason: "sslmode=verify-ca is not supported: chain-only verification \
+                             (without hostname checking) is not implemented. Use \
+                             sslmode=verify-full (stricter) or sslmode=require (encrypts \
+                             without verifying the certificate)."
+                        .to_owned(),
+                },
+                // Absent, `disable`, `prefer`, or anything unrecognized:
+                // preserve the pre-TLS behavior exactly (including the error
+                // tokio-postgres itself raises for invalid values).
+                _ => Self::Off,
+            }
+        }
+    }
+
+    /// Build the pool's custom connection-setup callback for a TLS posture.
+    pub(super) fn setup_callback(posture: TlsPosture) -> SetupCallback<AsyncPgConnection> {
+        Box::new(move |url: &str| {
+            let posture = posture.clone();
+            let url = url.to_owned();
+            async move {
+                match posture {
+                    // Defensive: `build_pool` never installs the callback for
+                    // `Off`, but fall back to the stock path if it ever does.
+                    TlsPosture::Off => AsyncPgConnection::establish(&url).await,
+                    TlsPosture::Require => connect_with(&url, relaxed_connector()?).await,
+                    TlsPosture::VerifyFull { root_cert } => {
+                        // tokio-postgres's own connection-string parser
+                        // rejects `verify-*` and `sslrootcert`, so hand it a
+                        // sanitized string; the real verification lives in
+                        // the rustls config.
+                        let sanitized = sanitize_for_verify_full(&url);
+                        connect_with(&sanitized, verifying_connector(root_cert.as_deref())?).await
+                    }
+                    TlsPosture::Unsupported { reason } => {
+                        Err(ConnectionError::InvalidConnectionUrl(reason))
+                    }
+                }
+            }
+            .boxed()
+        })
+    }
+
+    async fn connect_with(
+        url: &str,
+        tls: MakeRustlsConnect,
+    ) -> ConnectionResult<AsyncPgConnection> {
+        let (client, connection) = tokio_postgres::connect(url, tls).await.map_err(|e| {
+            // tokio_postgres's Display gives only the error kind ("error
+            // performing TLS handshake"); append the source so operators see
+            // the actionable cause ("server does not support TLS", a
+            // certificate verification failure, …).
+            let msg = std::error::Error::source(&e)
+                .map_or_else(|| e.to_string(), |source| format!("{e}: {source}"));
+            ConnectionError::BadConnection(msg)
+        })?;
+        AsyncPgConnection::try_from_client_and_connection(client, connection).await
+    }
+
+    /// Encrypt-only connector for `sslmode=require`: handshake signatures are
+    /// verified but the certificate chain/identity is not, mirroring
+    /// `libpq`/`psql` behavior for `require` (which self-signed and
+    /// private-CA deployments rely on).
+    fn relaxed_connector() -> Result<MakeRustlsConnect, ConnectionError> {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let config = rustls::ClientConfig::builder_with_provider(provider.clone())
+            .with_safe_default_protocol_versions()
+            .map_err(|e| {
+                ConnectionError::BadConnection(format!("failed to build TLS config: {e}"))
+            })?
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoServerCertVerification(
+                (*provider).clone(),
+            )))
+            .with_no_client_auth();
+        Ok(MakeRustlsConnect::new(config))
+    }
+
+    /// Fully verifying connector for `sslmode=verify-full`: certificate chain
+    /// and hostname are checked against the Mozilla root store plus any
+    /// `sslrootcert` PEM file from the connection string. `webpki-roots` is
+    /// used (rather than the platform store) so behavior is deterministic on
+    /// every target, including mobile, where no native store is reachable.
+    fn verifying_connector(root_cert: Option<&str>) -> Result<MakeRustlsConnect, ConnectionError> {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        if let Some(path) = root_cert {
+            use rustls_pki_types::pem::PemObject as _;
+            let certs = CertificateDer::pem_file_iter(path).map_err(|e| {
+                ConnectionError::BadConnection(format!("failed to read sslrootcert {path}: {e}"))
+            })?;
+            for cert in certs {
+                let cert = cert.map_err(|e| {
+                    ConnectionError::BadConnection(format!(
+                        "failed to parse sslrootcert {path}: {e}"
+                    ))
+                })?;
+                roots.add(cert).map_err(|e| {
+                    ConnectionError::BadConnection(format!(
+                        "failed to trust sslrootcert {path}: {e}"
+                    ))
+                })?;
+            }
+        }
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let config = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .map_err(|e| {
+                ConnectionError::BadConnection(format!("failed to build TLS config: {e}"))
+            })?
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        Ok(MakeRustlsConnect::new(config))
+    }
+
+    /// Extract query/keyword parameters relevant to TLS from either a
+    /// `postgres://…` URL or a `key=value …` connection string.
+    fn ssl_params(database_url: &str) -> Vec<(String, String)> {
+        if database_url.contains("://") {
+            url::Url::parse(database_url)
+                .map(|u| {
+                    u.query_pairs()
+                        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            database_url
+                .split_whitespace()
+                .filter_map(|token| token.split_once('='))
+                .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                .collect()
+        }
+    }
+
+    /// Rewrite a `verify-full` connection string into one tokio-postgres can
+    /// parse: `sslmode` downgraded to `require` (the handshake decision), and
+    /// `sslrootcert` removed (consumed by [`verifying_connector`] instead).
+    fn sanitize_for_verify_full(database_url: &str) -> String {
+        if database_url.contains("://") {
+            let Ok(mut parsed) = url::Url::parse(database_url) else {
+                return database_url.to_owned();
+            };
+            let pairs: Vec<(String, String)> = parsed
+                .query_pairs()
+                .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                .collect();
+            {
+                let mut editor = parsed.query_pairs_mut();
+                editor.clear();
+                for (k, v) in pairs {
+                    match k.as_str() {
+                        "sslmode" => {
+                            editor.append_pair("sslmode", "require");
+                        }
+                        "sslrootcert" => {}
+                        _ => {
+                            editor.append_pair(&k, &v);
+                        }
+                    }
+                }
+            }
+            if parsed.query() == Some("") {
+                parsed.set_query(None);
+            }
+            parsed.to_string()
+        } else {
+            database_url
+                .split_whitespace()
+                .filter_map(|token| match token.split_once('=') {
+                    Some(("sslmode", _)) => Some("sslmode=require".to_owned()),
+                    Some(("sslrootcert", _)) => None,
+                    _ => Some(token.to_owned()),
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+    }
+
+    /// Accepts any server certificate without validating its chain or
+    /// hostname, while still cryptographically verifying the TLS handshake
+    /// signatures (the connection is genuinely encrypted to *some* holder of
+    /// the presented key — "no identity check", not "no security"). This is
+    /// exactly `libpq`/`psql`'s posture for `sslmode=require`; identity
+    /// verification is `sslmode=verify-full`'s job.
+    #[derive(Debug)]
+    struct NoServerCertVerification(CryptoProvider);
+
+    impl ServerCertVerifier for NoServerCertVerification {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _server_name: &ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: UnixTime,
+        ) -> Result<ServerCertVerified, rustls::Error> {
+            Ok(ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls12_signature(
+                message,
+                cert,
+                dss,
+                &self.0.signature_verification_algorithms,
+            )
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls13_signature(
+                message,
+                cert,
+                dss,
+                &self.0.signature_verification_algorithms,
+            )
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            self.0.signature_verification_algorithms.supported_schemes()
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn absent_disable_and_prefer_keep_the_default_notls_path() {
+            for url in [
+                "postgres://user:pass@db.example.com:5432/app",
+                "postgres://user:pass@db.example.com:5432/app?sslmode=disable",
+                "postgres://user:pass@db.example.com:5432/app?sslmode=prefer",
+                "host=db.example.com user=user",
+                "host=db.example.com user=user sslmode=disable",
+            ] {
+                assert_eq!(
+                    TlsPosture::from_database_url(url),
+                    TlsPosture::Off,
+                    "{url} must keep the default NoTls path"
+                );
+            }
+        }
+
+        #[test]
+        fn unrecognized_sslmode_values_keep_the_default_path_and_its_errors() {
+            // tokio-postgres itself rejects these at connect time; the pool
+            // must not mask that with a different TLS decision.
+            assert_eq!(
+                TlsPosture::from_database_url("postgres://u@h/db?sslmode=allow"),
+                TlsPosture::Off
+            );
+            assert_eq!(
+                TlsPosture::from_database_url("postgres://u@h/db?sslmode=bogus"),
+                TlsPosture::Off
+            );
+        }
+
+        #[test]
+        fn require_selects_the_relaxed_tls_connector() {
+            assert_eq!(
+                TlsPosture::from_database_url(
+                    "postgres://user:pass@db.example.com:5432/app?sslmode=require"
+                ),
+                TlsPosture::Require
+            );
+            assert_eq!(
+                TlsPosture::from_database_url("host=db.example.com sslmode=require"),
+                TlsPosture::Require
+            );
+        }
+
+        #[test]
+        fn verify_full_selects_the_verifying_connector_with_optional_root() {
+            assert_eq!(
+                TlsPosture::from_database_url("postgres://u@h/db?sslmode=verify-full"),
+                TlsPosture::VerifyFull { root_cert: None }
+            );
+            assert_eq!(
+                TlsPosture::from_database_url(
+                    "postgres://u@h/db?sslmode=verify-full&sslrootcert=/etc/ca.pem"
+                ),
+                TlsPosture::VerifyFull {
+                    root_cert: Some("/etc/ca.pem".to_owned())
+                }
+            );
+        }
+
+        #[test]
+        fn verify_ca_and_require_with_rootcert_fail_loudly() {
+            assert!(matches!(
+                TlsPosture::from_database_url("postgres://u@h/db?sslmode=verify-ca"),
+                TlsPosture::Unsupported { .. }
+            ));
+            assert!(matches!(
+                TlsPosture::from_database_url(
+                    "postgres://u@h/db?sslmode=require&sslrootcert=/etc/ca.pem"
+                ),
+                TlsPosture::Unsupported { .. }
+            ));
+        }
+
+        #[test]
+        fn last_sslmode_occurrence_wins() {
+            assert_eq!(
+                TlsPosture::from_database_url("postgres://u@h/db?sslmode=disable&sslmode=require"),
+                TlsPosture::Require
+            );
+        }
+
+        #[test]
+        fn sanitize_rewrites_verify_full_and_drops_sslrootcert() {
+            let sanitized = sanitize_for_verify_full(
+                "postgres://u@h:5432/db?application_name=app&sslmode=verify-full&sslrootcert=/etc/ca.pem",
+            );
+            assert!(sanitized.contains("sslmode=require"), "{sanitized}");
+            assert!(!sanitized.contains("verify-full"), "{sanitized}");
+            assert!(!sanitized.contains("sslrootcert"), "{sanitized}");
+            assert!(sanitized.contains("application_name=app"), "{sanitized}");
+
+            let kv = sanitize_for_verify_full(
+                "host=h user=u sslmode=verify-full sslrootcert=/etc/ca.pem dbname=db",
+            );
+            assert_eq!(kv, "host=h user=u sslmode=require dbname=db");
+        }
+
+        #[test]
+        fn verifying_connector_builds_with_and_without_root_cert_file() {
+            assert!(verifying_connector(None).is_ok());
+            assert!(
+                verifying_connector(Some("/nonexistent/ca.pem")).is_err(),
+                "an unreadable sslrootcert must fail loudly"
+            );
+        }
+
+        #[test]
+        fn relaxed_connector_builds() {
+            assert!(relaxed_connector().is_ok());
+        }
     }
 }

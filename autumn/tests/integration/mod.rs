@@ -100,6 +100,8 @@ mod openapi;
 mod pagination;
 mod path_helpers;
 #[cfg(feature = "db")]
+mod pg_tls;
+#[cfg(feature = "db")]
 mod preload_scoping;
 mod problem_details;
 mod rate_limit_pipeline;
