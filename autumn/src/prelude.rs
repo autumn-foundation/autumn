@@ -57,6 +57,9 @@ pub use crate::canary::CanaryRoute;
 /// Database connection extractor.
 #[cfg(feature = "db")]
 pub use crate::db::Db;
+/// Transaction isolation levels and retry options for [`crate::db::Db::tx_with`].
+#[cfg(feature = "db")]
+pub use crate::db::{IsolationLevel, TxOptions};
 /// Typed domain event bus publisher extractor. The `Event` trait it works with
 /// lives at [`crate::events::Event`] (kept out of the prelude to avoid clashing
 /// with [`crate::sse::Event`]).

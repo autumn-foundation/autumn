@@ -426,6 +426,11 @@ pub use app::{ApiVersion, RegisteredApiVersions};
 #[cfg(feature = "db")]
 pub use db::Db;
 
+/// Transaction options (isolation level + retry policy) and the savepoint
+/// helper for [`Db::tx_with`]. See [`db::TxOptions`].
+#[cfg(feature = "db")]
+pub use db::{IsolationLevel, TxOptions, savepoint};
+
 /// Framework error type and result alias.
 ///
 /// [`AutumnError`] wraps any `Error + Send + Sync` with an HTTP status code.
