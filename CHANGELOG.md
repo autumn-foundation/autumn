@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **generator:** `autumn generate tauri --remote-url <URL>` scaffolds a
+  **mobile thin-client** Tauri shell (issue #1506): the webview loads your
+  remote HTTPS Autumn server directly (https enforced; `localhost`/`127.0.0.1`/
+  `::1` exempt for dev, embedded userinfo rejected), a
+  `capabilities/remote-app.json` grants exactly that origin access to native
+  device APIs, and `tauri-plugin-notification`/`tauri-plugin-biometric`
+  (target-gated to Android/iOS, with a generated `Info.ios.plist` carrying
+  `NSFaceIDUsageDescription`)/`tauri-plugin-store` are pre-registered to
+  satisfy App Store Guideline 4.2 (Minimum Functionality). The shell crate is
+  named `{package}-mobile` with `staticlib`/`cdylib` crate types for
+  `cargo tauri android/ios init`; no sidecar, staging scripts, or per-OS
+  overlay confs are emitted, and `autumn destroy tauri --remote-url <URL>`
+  reverts the scaffold. Desktop `autumn generate tauri` output is unchanged.
+  See `docs/guide/tauri-mobile-thin-client.md` for routing, capability, and
+  cookie/`Authorization`-token session-handoff guidance.
+
 - **generator:** `autumn generate scaffold`'s `create`/`update` handlers now
   build a `Changeset` from the submission and re-render the `new`/`edit`
   form on a rejected submission (issue #1124). A failed submission responds

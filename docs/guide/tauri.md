@@ -7,6 +7,8 @@ child process and the webview loads the app from a loopback port chosen at
 runtime. Your existing routes, Maud/htmx templates, and sessions run entirely
 unmodified — the generator is purely additive and never rewrites your app code.
 
+> **See also:** building for **mobile (Android/iOS)** as a thin client against a remote server — [Mobile thin-client apps with Tauri](tauri-mobile-thin-client.md) (`autumn generate tauri --remote-url <URL>`).
+
 ## Prerequisites
 
 ### External toolchain

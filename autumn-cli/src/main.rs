@@ -1801,6 +1801,7 @@ enum GenerateCommands {
     ///   autumn generate tauri
     ///   autumn generate tauri --dry-run
     ///   autumn generate tauri --remote-url https://app.example.com
+    #[allow(clippy::doc_markdown)]
     #[command(verbatim_doc_comment)]
     Tauri {
         /// Print the file plan and exit without writing anything.
@@ -2870,10 +2871,10 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
         } => {
             let flags = generate::Flags { dry_run, force };
             let project_root = resolve_cwd();
-            let plan = match &remote_url {
-                Some(url) => generate::tauri::plan_tauri_thin_client(&project_root, url),
-                None => generate::tauri::plan_tauri(&project_root),
-            };
+            let plan = remote_url.as_ref().map_or_else(
+                || generate::tauri::plan_tauri(&project_root),
+                |url| generate::tauri::plan_tauri_thin_client(&project_root, url),
+            );
             let result = plan.and_then(|p| match mode {
                 ApplyMode::Generate => p.execute(flags),
                 ApplyMode::Destroy => p.revert(flags),

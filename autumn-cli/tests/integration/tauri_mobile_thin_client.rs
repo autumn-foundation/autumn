@@ -9,7 +9,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-fn autumn_bin() -> &'static str {
+const fn autumn_bin() -> &'static str {
     env!("CARGO_BIN_EXE_autumn")
 }
 
