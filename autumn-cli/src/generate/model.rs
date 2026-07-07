@@ -100,6 +100,11 @@ pub fn plan_model(
 ///
 /// # Errors
 /// Surfaces project-layout, DSL, naming, and metadata errors before any file is written.
+#[allow(
+    clippy::too_many_lines,
+    reason = "linear sequence of independent file/revert steps mirroring the files this \
+              generator emits; splitting it up would not make any single step clearer"
+)]
 pub fn plan_model_with_options(
     project_root: &Path,
     name: &str,
@@ -160,7 +165,7 @@ pub fn plan_model_with_options(
     );
     plan.push_revert(crate::generate::emit::Revert::ModDecl {
         path: mod_path,
-        name: snake_name.clone(),
+        name: snake_name,
     });
 
     // (b) Diesel migration
@@ -1740,9 +1745,7 @@ mod tests {
         assert!(!tmp.path().join("src/models/mod.rs").exists());
         assert!(!tmp.path().join("src/schema.rs").exists());
         assert!(
-            fs::read_dir(tmp.path().join("migrations"))
-                .map(|mut d| d.next().is_none())
-                .unwrap_or(true),
+            fs::read_dir(tmp.path().join("migrations")).map_or(true, |mut d| d.next().is_none()),
             "migration directory must be removed"
         );
         assert_eq!(fs::read_to_string(&cargo_path).unwrap(), original_cargo);

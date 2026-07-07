@@ -46,6 +46,11 @@ use super::{GenerateError, ensure_project_root, read_or_empty, timestamp_now};
 ///
 /// # Errors
 /// Project layout and name validation errors surface here.
+#[allow(
+    clippy::too_many_lines,
+    reason = "linear sequence of independent file/revert steps mirroring the files this \
+              generator emits; splitting it up would not make any single step clearer"
+)]
 pub fn plan_mailer(
     project_root: &Path,
     name: &str,
@@ -150,7 +155,7 @@ pub fn plan_mailer(
     plan.modify(mod_path.clone(), with_both_mods);
     plan.push_revert(crate::generate::emit::Revert::ModDecl {
         path: mod_path,
-        name: snake_name.clone(),
+        name: snake_name,
     });
 
     // ── src/main.rs: add mod mailers; and .mail_previews(…) ────────────────
@@ -590,6 +595,54 @@ async fn main() {
                 .contains("\"mail\""),
             "mail feature must be removed once no mailer uses it anymore"
         );
+    }
+
+    #[test]
+    fn destroying_one_of_two_mailers_keeps_shared_layout_the_other_still_includes() {
+        let tmp = project_with_main(default_main());
+        let layout_html = tmp.path().join("templates/mailers/_layout.html");
+        let layout_txt = tmp.path().join("templates/mailers/_layout.txt");
+
+        // Welcome creates the shared layout files (create_if_absent);
+        // Goodbye's own plan carries the SAME create_if_absent actions
+        // (they're silently skipped at execute time since the files already
+        // exist), so both mailers' plans mention them.
+        plan_mailer(tmp.path(), "Welcome", None, false)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+        plan_mailer(tmp.path(), "Goodbye", None, false)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+        assert!(layout_html.exists());
+        assert!(layout_txt.exists());
+
+        // Destroying Welcome alone must NOT delete the shared layout —
+        // Goodbye's mailer/preview files still `include_str!` it.
+        plan_mailer(tmp.path(), "Welcome", None, false)
+            .unwrap()
+            .revert(Flags::default())
+            .unwrap();
+
+        assert!(!tmp.path().join("src/mailers/welcome.rs").exists());
+        assert!(
+            layout_html.exists(),
+            "shared _layout.html must survive — Goodbye's mailer still includes it"
+        );
+        assert!(
+            layout_txt.exists(),
+            "shared _layout.txt must survive — Goodbye's mailer still includes it"
+        );
+
+        // Now destroy the last remaining mailer — the shared layout must
+        // finally go too.
+        plan_mailer(tmp.path(), "Goodbye", None, false)
+            .unwrap()
+            .revert(Flags::default())
+            .unwrap();
+        assert!(!layout_html.exists());
+        assert!(!layout_txt.exists());
     }
 
     // ── RED: file plan assertions ─────────────────────────────────────────

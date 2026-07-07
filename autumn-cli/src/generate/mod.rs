@@ -6,8 +6,8 @@
 //!
 //! Three subcommands live here:
 //! - [`model::plan_model_with_options`] — model + migration + schema entry
-//! - [`migration::run`] — migration only (with optional add/remove DSL)
-//! - [`scaffold::run`] — model + repository + HTML routes + smoke test +
+//! - [`migration::plan_migration_with_options`] — migration only (with optional add/remove DSL)
+//! - [`scaffold::plan_scaffold_with_options`] — model + repository + HTML routes + smoke test +
 //!   `routes![]` registration
 
 pub mod admin;

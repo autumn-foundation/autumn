@@ -279,8 +279,7 @@ mod tests {
                 assert!(!dir.exists());
                 assert!(
                     fs::read_dir(tmp.path().join("migrations"))
-                        .map(|mut d| d.next().is_none())
-                        .unwrap_or(true)
+                        .map_or(true, |mut d| d.next().is_none())
                 );
             },
         );

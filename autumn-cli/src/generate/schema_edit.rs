@@ -905,7 +905,8 @@ fn has_mod_declaration(existing: &str, name: &str) -> bool {
 #[must_use]
 pub fn remove_main_mod_declarations(existing: &str, names: &[&str]) -> String {
     let lines: Vec<&str> = existing.lines().collect();
-    let matches_any = |line: &str| names.iter().any(|n| line.trim() == format!("mod {n};"));
+    let patterns: Vec<String> = names.iter().map(|n| format!("mod {n};")).collect();
+    let matches_any = |line: &str| patterns.iter().any(|p| line.trim() == p);
     if !lines.iter().any(|l| matches_any(l)) {
         return existing.to_owned();
     }
@@ -1869,8 +1870,9 @@ fn parse_feature_removal(
 
     if !remaining.is_empty() {
         let sep = if before_features.is_empty() { "" } else { ", " };
+        let after_sep = if after_list.is_empty() { "" } else { ", " };
         return FeatureRemovalEdit::Replace(format!(
-            "{indent}{dep_name} = {{ {before_features}{sep}features = [{}] }}",
+            "{indent}{dep_name} = {{ {before_features}{sep}features = [{}]{after_sep}{after_list} }}",
             remaining.join(", "),
         ));
     }
@@ -6889,6 +6891,21 @@ pub struct Comment {
         let with_both = ensure_autumn_web_feature(&with_maud, "htmx");
         let reverted = remove_autumn_web_feature(&with_both, "htmx");
         assert_eq!(reverted, with_maud);
+    }
+
+    #[test]
+    fn remove_autumn_web_feature_preserves_keys_after_the_features_array() {
+        // A hand-edited (or otherwise pre-existing) dependency line can carry
+        // keys after `features = [...]`, e.g. `default-features = false`.
+        // Removing one feature while others remain must not silently drop
+        // those trailing keys.
+        let base = "[dependencies]\nautumn-web = { version = \"0.6.0\", features = [\"maud\", \"htmx\"], default-features = false }\n";
+        let reverted = remove_autumn_web_feature(base, "htmx");
+        assert_eq!(
+            reverted,
+            "[dependencies]\nautumn-web = { version = \"0.6.0\", features = [\"maud\"], default-features = false }\n",
+            "trailing keys after the features array must survive: {reverted}"
+        );
     }
 
     #[test]

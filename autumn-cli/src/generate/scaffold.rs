@@ -29,7 +29,7 @@ use super::{GenerateError, ensure_project_root, read_or_empty};
 /// Extra dependencies the *scaffold* generator's output requires on top of
 /// [`super::model::MODEL_DEPS`] — `maud` for HTML rendering and URL-encoded
 /// form helpers for blank nullable-field normalization.
-const SCAFFOLD_EXTRA_DEPS: &[(&str, &str)] = &[
+pub(super) const SCAFFOLD_EXTRA_DEPS: &[(&str, &str)] = &[
     ("maud", "{ version = \"0.27\", features = [\"axum\"] }"),
     ("serde_urlencoded", "\"0.7\""),
     ("url", "\"2\""),
@@ -3343,8 +3343,7 @@ async fn main() {
                 }
                 assert!(
                     fs::read_dir(tmp.path().join("migrations"))
-                        .map(|mut d| d.next().is_none())
-                        .unwrap_or(true),
+                        .map_or(true, |mut d| d.next().is_none()),
                     "migration directory must be removed"
                 );
                 assert_eq!(fs::read_to_string(&main_path).unwrap(), original_main);

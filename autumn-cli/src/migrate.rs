@@ -625,7 +625,7 @@ where
     std::process::exit(1);
 }
 
-pub(crate) fn read_autumn_toml_table() -> Option<toml::Table> {
+pub fn read_autumn_toml_table() -> Option<toml::Table> {
     let config_path = Path::new("autumn.toml");
     if !config_path.exists() {
         return None;

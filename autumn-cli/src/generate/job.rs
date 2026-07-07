@@ -118,7 +118,7 @@ pub fn plan_job(project_root: &Path, name: &str, fields: &[String]) -> Result<Pl
     plan.modify(mod_path.clone(), with_aggregator);
     plan.push_revert(crate::generate::emit::Revert::ModDecl {
         path: mod_path.clone(),
-        name: snake_name.clone(),
+        name: snake_name,
     });
     plan.push_revert(crate::generate::emit::Revert::JobEntry {
         path: mod_path,

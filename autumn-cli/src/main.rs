@@ -2643,6 +2643,12 @@ fn apply_plan(
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one match arm per GenerateCommands variant, each a short, independent \
+              plan-then-apply dispatch — splitting the match itself would not make any \
+              single arm clearer"
+)]
 fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
     match cmd {
         GenerateCommands::Model {

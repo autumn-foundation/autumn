@@ -517,17 +517,14 @@ impl Plan {
         }
 
         for (path, new_content) in &plan.modifies {
-            match new_content {
-                Some(content) => {
-                    fs::write(path, content)?;
-                    println!("  Reverted {}", relative_display(path, &self.project_root));
-                }
-                None => {
-                    fs::remove_file(path)?;
-                    println!("  Removed {}", relative_display(path, &self.project_root));
-                    if let Some(parent) = path.parent() {
-                        touched_dirs.push(parent.to_path_buf());
-                    }
+            if let Some(content) = new_content {
+                fs::write(path, content)?;
+                println!("  Reverted {}", relative_display(path, &self.project_root));
+            } else {
+                fs::remove_file(path)?;
+                println!("  Removed {}", relative_display(path, &self.project_root));
+                if let Some(parent) = path.parent() {
+                    touched_dirs.push(parent.to_path_buf());
                 }
             }
         }
@@ -553,6 +550,13 @@ impl Plan {
     /// Compute what [`Plan::revert`] would do, without touching disk except
     /// to read files for divergence comparison. Shared by the `--dry-run`
     /// and real-run paths of `revert` so they can never disagree.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "a linear sequence of independent passes (normal files, migrations, \
+                  create-if-absent shared files, modify reverts) that share the \
+                  files_to_remove/diverged accumulators — splitting it up would just \
+                  move the same state-threading around, not simplify it"
+    )]
     fn compute_revert_plan(&self, force: bool) -> RevertPlan {
         let migrations_root = self.project_root.join("migrations");
 
@@ -562,6 +566,13 @@ impl Plan {
         // path-stable file to check-and-delete.
         let mut migration_groups: Vec<(PathBuf, Vec<&Action>)> = Vec::new();
         let mut normal_actions: Vec<&Action> = Vec::new();
+        // `CreateIfAbsent` actions for a *shared* file (e.g. a mailer's
+        // `templates/mailers/_layout.html`) are deferred to their own pass
+        // below — unlike an owned `Create`, a later resource's `generate`
+        // call silently skips writing to it once an earlier resource's call
+        // already created it, so the action being present in THIS resource's
+        // plan doesn't mean this resource is the only one still using it.
+        let mut create_if_absent_actions: Vec<&Action> = Vec::new();
         for action in &self.actions {
             if matches!(action, Action::Modify { .. }) {
                 continue;
@@ -577,7 +588,11 @@ impl Plan {
                 }
                 continue;
             }
-            normal_actions.push(action);
+            if matches!(action, Action::CreateIfAbsent { .. }) {
+                create_if_absent_actions.push(action);
+            } else {
+                normal_actions.push(action);
+            }
         }
 
         let mut files_to_remove = Vec::new();
@@ -588,12 +603,47 @@ impl Plan {
                 continue; // already gone — idempotent skip.
             }
             let matches = match action {
-                Action::Create { contents, .. } | Action::CreateIfAbsent { contents, .. } => {
+                Action::Create { contents, .. } => {
                     fs::read_to_string(path).is_ok_and(|d| &d == contents)
                 }
                 Action::CreateBytes { bytes, .. } => fs::read(path).is_ok_and(|d| &d == bytes),
-                Action::Modify { .. } => unreachable!("filtered out above"),
+                Action::CreateIfAbsent { .. } | Action::Modify { .. } => {
+                    unreachable!("filtered out above")
+                }
             };
+            if matches || force {
+                files_to_remove.push(path.to_path_buf());
+            } else {
+                diverged.push(path.to_path_buf());
+            }
+        }
+
+        // Now resolve the deferred `CreateIfAbsent` actions: only remove a
+        // shared file once its directory holds no other file this destroy
+        // isn't itself already removing — including sibling `CreateIfAbsent`
+        // files from the SAME batch (excluded up front, so whichever one is
+        // checked first doesn't see the other, still-unprocessed one as
+        // false evidence that the directory is still occupied).
+        let create_if_absent_paths: Vec<PathBuf> = create_if_absent_actions
+            .iter()
+            .map(|a| a.path().to_path_buf())
+            .collect();
+        for action in create_if_absent_actions {
+            let path = action.path();
+            if !path.exists() {
+                continue;
+            }
+            if let Some(dir) = path.parent() {
+                let mut excluding = files_to_remove.clone();
+                excluding.extend(create_if_absent_paths.iter().cloned());
+                if resource_dir_has_other_files(dir, &excluding) {
+                    continue; // a sibling resource's file still lives here — keep it.
+                }
+            }
+            let Action::CreateIfAbsent { contents, .. } = action else {
+                unreachable!("filtered to CreateIfAbsent above");
+            };
+            let matches = fs::read_to_string(path).is_ok_and(|d| &d == contents);
             if matches || force {
                 files_to_remove.push(path.to_path_buf());
             } else {
@@ -773,7 +823,10 @@ fn migration_dir_matches_actions(dir: &Path, actions: &[&Action]) -> bool {
 /// ("version") and the remaining suffix, e.g.
 /// `"20260706120000_create_posts"` → `("20260706120000", "create_posts")`.
 fn split_migration_dir_name(name: &str) -> (&str, &str) {
-    let digit_len = name.chars().take_while(char::is_ascii_digit).count();
+    let digit_len = name
+        .bytes()
+        .position(|b| !b.is_ascii_digit())
+        .unwrap_or(name.len());
     let (version, rest) = name.split_at(digit_len);
     (version, rest.strip_prefix('_').unwrap_or(rest))
 }
@@ -886,16 +939,16 @@ fn migration_applied_status(version: &str, migrations_dir: &Path) -> MigrationSt
     ) else {
         return MigrationStatus::NotConfigured;
     };
-    match autumn_web::migrate::applied_user_migrations(&url, migrations_dir) {
-        Ok(applied) => {
+    autumn_web::migrate::applied_user_migrations(&url, migrations_dir).map_or(
+        MigrationStatus::Unknown,
+        |applied| {
             if applied.iter().any(|m| m.version == version) {
                 MigrationStatus::Applied
             } else {
                 MigrationStatus::NotApplied
             }
-        }
-        Err(_) => MigrationStatus::Unknown,
-    }
+        },
+    )
 }
 
 /// Shared, infrastructure-only module names any generator's `update_main_rs`
