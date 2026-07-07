@@ -1013,19 +1013,26 @@ fn retry_backoff_delay(initial: Duration, max: Duration, attempt: u32) -> Durati
 /// (`40P01`) — the two transient errors that are safe to retry by re-running
 /// the whole transaction.
 ///
-/// When `err` preserves a `diesel::result::Error`, classification is
-/// structural and authoritative: diesel maps `40001` to
-/// `DatabaseErrorKind::SerializationFailure`, and any *other* `DatabaseErrorKind`
-/// (e.g. `UniqueViolation`) is trusted as non-retryable outright — it is never
-/// string-matched, so a constraint name or key value that happens to contain
-/// `"40001"` cannot misclassify it. `40P01` has no dedicated
-/// `DatabaseErrorKind` and surfaces as `Unknown`; for that one kind, the source
-/// chain's `SqlState` is checked first (locale-independent) and an
+/// Classification is structural and authoritative, never based on scanning an
+/// arbitrary error's displayed message: a `diesel::result::Error` anywhere in
+/// `err`'s source chain (not just the top-level wrapped error — a custom `E`
+/// that wraps a diesel error via `#[source]`/`#[from]` is still found) is
+/// classified by its `DatabaseErrorKind`. diesel maps `40001` to
+/// `SerializationFailure`; any *other* kind (e.g. `UniqueViolation`) is trusted
+/// as non-retryable outright — it is never string-matched, so a constraint
+/// name or key value that happens to contain `"40001"` cannot misclassify it.
+/// `40P01` has no dedicated kind and surfaces as `Unknown`; for that one kind,
+/// the source chain's `SqlState` is checked first (locale-independent) and an
 /// English-locale message match is used only as a last resort.
 ///
-/// Only when `err` does **not** preserve a `diesel::result::Error` at all (a
-/// custom `E` that only kept the message) does this fall back to scanning the
-/// displayed message and source chain for the two SQLSTATEs.
+/// When no `diesel::result::Error` is found anywhere in the chain, this checks
+/// for a raw `tokio_postgres` SQLSTATE directly (a custom `E` that bypasses
+/// diesel). If neither is found, the error is **not** retried — there is
+/// deliberately no generic message-substring fallback beyond structured
+/// signals: retrying based on bare text risks misclassifying an unrelated
+/// domain/validation error (e.g. an order id that happens to be `40001`) as a
+/// transient conflict, silently re-running a non-idempotent closure and
+/// delaying the response.
 fn is_retryable_txn_error(err: &AutumnError) -> bool {
     use tokio_postgres::error::SqlState;
 
@@ -1033,7 +1040,7 @@ fn is_retryable_txn_error(err: &AutumnError) -> bool {
         *state == SqlState::T_R_SERIALIZATION_FAILURE || *state == SqlState::T_R_DEADLOCK_DETECTED
     }
 
-    if let Some(diesel_err) = err.downcast_ref::<diesel::result::Error>() {
+    if let Some(diesel_err) = err.downcast_chain_ref::<diesel::result::Error>() {
         return match diesel_err {
             // Fast path: diesel maps 40001 to SerializationFailure.
             diesel::result::Error::DatabaseError(
@@ -1067,18 +1074,15 @@ fn is_retryable_txn_error(err: &AutumnError) -> bool {
         };
     }
 
-    // Fallback: `E` didn't preserve a `diesel::result::Error` at all — scan the
-    // displayed message and source chain for the two SQLSTATEs.
-    let mut haystack = err.to_string().to_lowercase();
-    for source in err.source_chain() {
-        haystack.push('\n');
-        haystack.push_str(&source.to_lowercase());
-    }
-    haystack.contains("40001")
-        || haystack.contains("40p01")
-        || haystack.contains("could not serialize access")
-        || haystack.contains("deadlock detected")
-        || haystack.contains("serialization failure")
+    // No `diesel::result::Error` anywhere in the chain — check for a raw
+    // `tokio_postgres` SQLSTATE directly. No text-based fallback beyond this;
+    // see the doc comment above for why.
+    err.downcast_chain_ref::<tokio_postgres::Error>()
+        .and_then(tokio_postgres::Error::code)
+        .is_some_and(is_retryable_sqlstate)
+        || err
+            .downcast_chain_ref::<tokio_postgres::error::DbError>()
+            .is_some_and(|db| is_retryable_sqlstate(db.code()))
 }
 
 /// Run `f` inside a Postgres `SAVEPOINT` on a connection already inside a
@@ -2794,6 +2798,46 @@ mod tests {
     #[test]
     fn plain_internal_error_is_not_retryable() {
         let err = AutumnError::internal_server_error_msg("something unrelated broke");
+        assert!(!is_retryable_txn_error(&err));
+    }
+
+    #[test]
+    fn domain_error_with_magic_substring_and_no_db_error_is_not_retryable() {
+        // Regression (PR #1581 review): a plain domain/validation error — no
+        // diesel::result::Error or tokio_postgres error anywhere in its
+        // chain — must never be retried just because its message happens to
+        // contain a magic substring like "40001" or "deadlock detected".
+        // Retry requires a structured signal, never bare text.
+        let err = AutumnError::bad_request_msg(
+            "order 40001 could not be processed: deadlock detected in workflow",
+        );
+        assert!(!is_retryable_txn_error(&err));
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("app error")]
+    struct WrappedDbError(#[source] diesel::result::Error);
+
+    #[test]
+    fn serialization_failure_wrapped_in_custom_error_is_retryable() {
+        // A custom `E` (e.g. an app error enum with a `#[from] diesel::result::Error`
+        // variant) is not itself a `diesel::result::Error`, so it isn't found by
+        // a top-level-only downcast. `downcast_chain_ref` walks `source()` to
+        // find it, so wrapped diesel errors are still classified structurally
+        // — no need to fall back to message scanning for this common case.
+        let err: AutumnError = AutumnError::internal_server_error(WrappedDbError(diesel_db_error(
+            diesel::result::DatabaseErrorKind::SerializationFailure,
+            "could not serialize access due to read/write dependencies among transactions",
+        )));
+        assert!(is_retryable_txn_error(&err));
+    }
+
+    #[test]
+    fn unique_violation_wrapped_in_custom_error_is_not_retryable() {
+        let err: AutumnError = AutumnError::internal_server_error(WrappedDbError(diesel_db_error(
+            diesel::result::DatabaseErrorKind::UniqueViolation,
+            "duplicate key value violates unique constraint",
+        )));
         assert!(!is_retryable_txn_error(&err));
     }
 
