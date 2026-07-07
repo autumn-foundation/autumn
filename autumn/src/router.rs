@@ -544,7 +544,7 @@ fn build_router_pre_state(
         ctx.error_page_renderer,
         ctx.session_store,
         route_timeouts,
-        load_shed_layer.clone(),
+        load_shed_layer,
     )?;
 
     if dev_reload_enabled {

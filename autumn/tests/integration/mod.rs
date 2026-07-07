@@ -21,6 +21,7 @@ mod chaos_channels_loom;
 mod chaos_channels_proptest;
 #[cfg(feature = "ws")]
 mod chaos_channels_subscribe_loom;
+mod chaos_idempotency_ttl_crash;
 mod chaos_metrics_compute_percentiles_proptest;
 mod chaos_metrics_leak;
 mod chaos_metrics_leak_loom;
