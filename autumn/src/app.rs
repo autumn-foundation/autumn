@@ -131,6 +131,8 @@ pub fn app() -> AppBuilder {
         mount_unsubscribe_endpoint: false,
         #[cfg(feature = "mail")]
         mail_previews: Vec::new(),
+        #[cfg(feature = "maud")]
+        story_gallery: None,
         declared_routes: Vec::new(),
         idempotency_enabled: false,
         #[cfg(feature = "mail")]
@@ -386,6 +388,9 @@ pub struct AppBuilder {
     /// Mail template previews registered for the dev preview UI.
     #[cfg(feature = "mail")]
     mail_previews: Vec<crate::mail::MailPreview>,
+    /// Widget story gallery registered for the `/_stories` UI (#1526).
+    #[cfg(feature = "maud")]
+    story_gallery: Option<crate::stories::StoryGallery>,
     /// Routes explicitly declared by plugins for listing purposes, to complement
     /// opaque `nest_routers`. Included in `autumn routes` output even though
     /// the underlying Axum router is not enumerable.
@@ -2151,6 +2156,21 @@ impl AppBuilder {
         self
     }
 
+    /// Register the widget story gallery served at `/_stories` (#1526).
+    ///
+    /// Routes mount only when the resolved config has `[stories] enabled =
+    /// true` (off by default, opt-in per profile). Start from
+    /// [`StoryGallery::builtin`](crate::stories::StoryGallery::builtin) for
+    /// the framework widget set and
+    /// [`extend`](crate::stories::StoryGallery::extend) it with your app's
+    /// own `story!{...}` entries. See `docs/guide/stories.md`.
+    #[cfg(feature = "maud")]
+    #[must_use]
+    pub fn with_story_gallery(mut self, gallery: crate::stories::StoryGallery) -> Self {
+        self.story_gallery = Some(gallery);
+        self
+    }
+
     /// Register an additional audit sink for structured audit events.
     ///
     /// Multiple calls accumulate sinks. Logged events are fanned out to all
@@ -2578,6 +2598,8 @@ impl AppBuilder {
             mount_unsubscribe_endpoint,
             #[cfg(feature = "mail")]
             mail_previews,
+            #[cfg(feature = "maud")]
+            story_gallery,
             declared_routes: _,
             idempotency_enabled,
             #[cfg(feature = "mail")]
@@ -2951,6 +2973,10 @@ impl AppBuilder {
         });
         #[cfg(feature = "mail")]
         state.insert_extension(crate::mail::MailPreviewRegistry::new(mail_previews));
+        #[cfg(feature = "maud")]
+        if let Some(gallery) = story_gallery {
+            state.insert_extension(gallery.into_registry());
+        }
         if let Some(logger) = audit_logger {
             state.insert_extension::<crate::audit::AuditLogger>((*logger).clone());
         }
@@ -3643,6 +3669,8 @@ impl AppBuilder {
             mount_unsubscribe_endpoint,
             #[cfg(feature = "mail")]
             mail_previews,
+            #[cfg(feature = "maud")]
+            story_gallery,
             declared_routes: _,
             idempotency_enabled,
             #[cfg(feature = "mail")]
@@ -3873,6 +3901,10 @@ impl AppBuilder {
         });
         #[cfg(feature = "mail")]
         state.insert_extension(crate::mail::MailPreviewRegistry::new(mail_previews));
+        #[cfg(feature = "maud")]
+        if let Some(gallery) = story_gallery {
+            state.insert_extension(gallery.into_registry());
+        }
         // run_build_mode used ProbeState::default(), which does not start as pending
         state.probes = crate::probe::ProbeState::default();
 

@@ -292,6 +292,27 @@ pub(crate) fn append_framework_routes(
         }
     }
 
+    // Widget story gallery routes (#1526), listed iff the resolved config
+    // enables them (same gating condition as the router mount).
+    #[cfg(feature = "maud")]
+    if config.stories.enabled {
+        for (path, handler) in [
+            (crate::stories::STORIES_PATH, "story_gallery_index"),
+            ("/_stories/{slug}", "story_gallery_story"),
+        ] {
+            infos.push(RouteInfo {
+                method: "GET".to_owned(),
+                path: path.to_owned(),
+                handler: handler.to_owned(),
+                source: RouteSource::Framework,
+                middleware: Vec::new(),
+                api_version: None,
+                status: None,
+                sunset_opt_out: None,
+            });
+        }
+    }
+
     // Dev request inspector routes.
     if matches!(config.profile.as_deref(), Some("dev" | "development")) {
         let inspector_path = &config.dev.inspector_path;

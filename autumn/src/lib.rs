@@ -330,6 +330,7 @@ pub mod runtime_config;
 pub mod seed;
 /// Widget story gallery: browsable `/_stories` UI plus a CI anti-rot
 /// registry of zero-arg widget render examples (issue #1526).
+///
 #[cfg(feature = "maud")]
 pub mod stories;
 pub mod task;

@@ -26,6 +26,12 @@
 pub use crate::Redirect;
 /// Typed path helper extension trait (`.with_query()`).
 pub use crate::paths::PathExt;
+/// Widget story gallery types (registered via `AppBuilder::with_story_gallery`).
+#[cfg(feature = "maud")]
+pub use crate::stories::{Story, StoryGallery, StoryRegistry};
+/// Widget story macro for the `/_stories` gallery: `story!{ "Group", "Name", { ... } }`.
+#[cfg(feature = "maud")]
+pub use autumn_macros::story;
 /// WebSocket route macro.
 #[cfg(feature = "ws")]
 pub use autumn_macros::ws;

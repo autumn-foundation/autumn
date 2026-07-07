@@ -19,6 +19,153 @@
 //! `AppState`, request data) is a compile error — stories are zero-arg pure
 //! functions by construction.
 
+use proc_macro2::{Delimiter, Group, Span, TokenStream, TokenTree};
+use quote::quote;
+
+/// Expand `story!{ group, name, { ... } }` into a
+/// `::autumn_web::stories::Story::new(...)` constructor call.
+pub fn story_macro(input: TokenStream) -> TokenStream {
+    match expand(input) {
+        Ok(expanded) => expanded,
+        Err(error) => error.to_compile_error(),
+    }
+}
+
+fn expand(input: TokenStream) -> syn::Result<TokenStream> {
+    let mut tokens = input.into_iter();
+
+    let group_lit = parse_string_literal(tokens.next(), "group")?;
+    expect_comma(tokens.next(), "the story group")?;
+    let name_lit = parse_string_literal(tokens.next(), "name")?;
+    expect_comma(tokens.next(), "the story name")?;
+    let block_group = parse_block_group(tokens.next())?;
+
+    // Allow one trailing comma, then reject anything else.
+    match tokens.next() {
+        None => {}
+        Some(TokenTree::Punct(punct)) if punct.as_char() == ',' => {
+            if let Some(extra) = tokens.next() {
+                return Err(syn::Error::new(
+                    extra.span(),
+                    "unexpected tokens after the story block: \
+                     story!{ \"Group\", \"Name\", { ... } } takes exactly three arguments",
+                ));
+            }
+        }
+        Some(extra) => {
+            return Err(syn::Error::new(
+                extra.span(),
+                "unexpected tokens after the story block: \
+                 story!{ \"Group\", \"Name\", { ... } } takes exactly three arguments",
+            ));
+        }
+    }
+
+    // Validate the block parses as a real Rust block so authors get a
+    // span-correct error here instead of a confusing downstream one.
+    let block: syn::Block = syn::parse2(TokenStream::from(TokenTree::Group(block_group.clone())))?;
+
+    // Source capture: byte-faithful `Span::source_text()` on the brace group
+    // (comments and formatting survive), falling back to the token-stream
+    // rendering when source text is unavailable (proc-macro2 fallback spans).
+    let source = block_group.span().source_text().map_or_else(
+        || block_group.stream().to_string(),
+        |text| dedent_block_source(&text),
+    );
+    let source_lit = proc_macro2::Literal::string(&source);
+
+    // `|| #block` is coerced to a plain `fn() -> maud::Markup` pointer by
+    // `Story::new`, so any environment capture is a compile error.
+    Ok(quote! {
+        ::autumn_web::stories::Story::new(#group_lit, #name_lit, || #block, #source_lit)
+    })
+}
+
+fn parse_string_literal(token: Option<TokenTree>, what: &str) -> syn::Result<syn::LitStr> {
+    let Some(token) = token else {
+        return Err(syn::Error::new(
+            Span::call_site(),
+            format!(
+                "expected a string literal for the story {what}: story!{{ \"Group\", \"Name\", {{ ... }} }}"
+            ),
+        ));
+    };
+    let span = token.span();
+    syn::parse2::<syn::LitStr>(TokenStream::from(token)).map_err(|_| {
+        syn::Error::new(
+            span,
+            format!("expected a string literal for the story {what}: story!{{ \"Group\", \"Name\", {{ ... }} }}"),
+        )
+    })
+}
+
+fn expect_comma(token: Option<TokenTree>, after: &str) -> syn::Result<()> {
+    match token {
+        Some(TokenTree::Punct(punct)) if punct.as_char() == ',' => Ok(()),
+        Some(other) => Err(syn::Error::new(
+            other.span(),
+            format!("expected `,` after {after}"),
+        )),
+        None => Err(syn::Error::new(
+            Span::call_site(),
+            format!("expected `,` after {after}, then a brace-delimited block"),
+        )),
+    }
+}
+
+fn parse_block_group(token: Option<TokenTree>) -> syn::Result<Group> {
+    match token {
+        Some(TokenTree::Group(group)) if group.delimiter() == Delimiter::Brace => Ok(group),
+        Some(other) => Err(syn::Error::new(
+            other.span(),
+            "expected a brace-delimited block as the story body: \
+             story!{ \"Group\", \"Name\", { ... } }",
+        )),
+        None => Err(syn::Error::new(
+            Span::call_site(),
+            "missing the story body: expected a brace-delimited block as the third \
+             argument, story!{ \"Group\", \"Name\", { ... } }",
+        )),
+    }
+}
+
+/// Turn the captured `{ ... }` source text into a display-ready snippet:
+/// strip the outer braces, drop blank leading/trailing lines, and remove the
+/// common leading indentation so the snippet reads as top-level code.
+fn dedent_block_source(text: &str) -> String {
+    let inner = text.trim();
+    let inner = inner.strip_prefix('{').unwrap_or(inner);
+    let inner = inner.strip_suffix('}').unwrap_or(inner);
+
+    let lines: Vec<&str> = inner.lines().collect();
+    let first = lines.iter().position(|line| !line.trim().is_empty());
+    let Some(first) = first else {
+        return inner.trim().to_owned();
+    };
+    let last = lines
+        .iter()
+        .rposition(|line| !line.trim().is_empty())
+        .unwrap_or(first);
+    let lines = &lines[first..=last];
+
+    if lines.len() == 1 {
+        return lines[0].trim().to_owned();
+    }
+
+    let indent = lines
+        .iter()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| line.len() - line.trim_start().len())
+        .min()
+        .unwrap_or(0);
+
+    lines
+        .iter()
+        .map(|line| line.get(indent..).unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::story_macro;

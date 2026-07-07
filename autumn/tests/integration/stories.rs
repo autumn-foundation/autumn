@@ -71,11 +71,10 @@ fn assert_balanced_html(html: &str, context: &str) {
         while j < bytes.len() {
             match (quote, bytes[j]) {
                 (Some(q), c) if c == q => quote = None,
-                (Some(_), _) => {}
                 (None, b'"') => quote = Some(b'"'),
                 (None, b'\'') => quote = Some(b'\''),
                 (None, b'>') => break,
-                (None, _) => {}
+                _ => {}
             }
             j += 1;
         }
@@ -240,7 +239,7 @@ const EXPECTED_STORY_SLUGS: &[&str] = &[
 fn story_coverage_inventory_matches_registry() {
     let registry = stories::builtin();
     let actual: std::collections::BTreeSet<&str> =
-        registry.stories().iter().map(|s| s.slug()).collect();
+        registry.stories().iter().map(Story::slug).collect();
 
     for expected in EXPECTED_STORY_SLUGS {
         assert!(
@@ -290,7 +289,7 @@ fn every_public_widget_fn_is_exercised_by_a_story() {
     let all_sources: String = stories::builtin()
         .stories()
         .iter()
-        .map(|s| s.source())
+        .map(Story::source)
         .collect::<Vec<_>>()
         .join("\n");
 
@@ -342,13 +341,13 @@ fn stories_config_defaults_off_and_layers_by_profile() {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::write(
         dir.path().join("autumn.toml"),
-        r#"
+        r"
 [stories]
 enabled = false
 
 [profile.dev.stories]
 enabled = true
-"#,
+",
     )
     .expect("write autumn.toml");
     let manifest_dir = dir.path().to_str().unwrap();

@@ -533,6 +533,8 @@ fn build_router_pre_state(
     // ceiling instead of each getting its own independent (never-shared)
     // counter. See `apply_middleware`'s `load_shed_layer` parameter doc.
     let load_shed_layer = build_load_shed_layer(config, state);
+    #[cfg(feature = "mcp")]
+    let mcp_load_shed_layer = load_shed_layer.clone();
 
     router = apply_middleware(
         router,
@@ -544,7 +546,7 @@ fn build_router_pre_state(
         ctx.error_page_renderer,
         ctx.session_store,
         route_timeouts,
-        load_shed_layer.clone(),
+        load_shed_layer,
     )?;
 
     if dev_reload_enabled {
@@ -666,7 +668,7 @@ fn build_router_pre_state(
             // the envelope below is ALSO wrapped with that same shared layer,
             // a tools/call must mark its replay exempt (avoiding double-
             // counting against the same in-flight counter).
-            envelope_load_shed: load_shed_layer.is_some(),
+            envelope_load_shed: mcp_load_shed_layer.is_some(),
         };
         let mut mcp_router =
             crate::mcp::build_mcp_router(&mount_path, tools, dispatch, wiring, endpoint_layer);
@@ -695,7 +697,7 @@ fn build_router_pre_state(
         // (cloned, sharing its `Arc` in-flight counter) rather than building
         // a second, independently-counting layer — see that call site's
         // comment. `None` (the default) is a no-op, matching direct routes.
-        if let Some(load_shed) = load_shed_layer {
+        if let Some(load_shed) = mcp_load_shed_layer {
             mcp_router = mcp_router.layer(load_shed);
         }
         // Stamp `ResolvedClientIdentity` on the *outer* `/mcp` request too. The
@@ -1559,6 +1561,19 @@ fn mount_framework_routes(
         tracing::debug!(
             path = crate::mail::MAIL_PREVIEW_PATH,
             "Mounted dev mail preview endpoints"
+        );
+    }
+
+    // Widget story gallery (#1526) — off by default, opt-in in ANY profile
+    // via `[stories] enabled = true` (profile-layered). Handlers read the
+    // StoryRegistry from the AppState extension installed by
+    // `AppBuilder::with_story_gallery`.
+    #[cfg(feature = "maud")]
+    if config.stories.enabled {
+        router = router.merge(crate::stories::story_router());
+        tracing::debug!(
+            path = crate::stories::STORIES_PATH,
+            "Mounted story gallery endpoints"
         );
     }
 
@@ -4748,13 +4763,13 @@ mod tests {
     #[tokio::test]
     async fn story_routes_mount_iff_resolved_profile_flag() {
         // Private app: dev-only gallery, absent in prod.
-        let dev_only = r#"
+        let dev_only = r"
 [stories]
 enabled = false
 
 [profile.dev.stories]
 enabled = true
-"#;
+";
         assert_eq!(
             stories_status_for_layered_profile(dev_only, "dev").await,
             StatusCode::OK,
@@ -4767,13 +4782,13 @@ enabled = true
         );
 
         // Public showcase: enabled in prod, absent in dev.
-        let public_showcase = r#"
+        let public_showcase = r"
 [stories]
 enabled = false
 
 [profile.prod.stories]
 enabled = true
-"#;
+";
         assert_eq!(
             stories_status_for_layered_profile(public_showcase, "prod").await,
             StatusCode::OK,
