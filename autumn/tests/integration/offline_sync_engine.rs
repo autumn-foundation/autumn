@@ -1,4 +1,4 @@
-//! End-to-end tests for the offline sync engine: a real SQLite
+//! End-to-end tests for the offline sync engine: a real `SQLite`
 //! `SyncStore` syncing through a real axum sync router backed by
 //! `MemorySyncBackend`, bound on an ephemeral loopback port.
 
@@ -85,7 +85,11 @@ async fn offline_writes_replay_to_server_on_sync() {
     let by_pk = |pk: &str| rows.iter().find(|r| r.pk == pk).expect("row");
     assert!(!by_pk("n1").deleted);
     assert_eq!(
-        by_pk("n2").payload.as_ref().and_then(|p| p.get("title")).and_then(|v| v.as_str()),
+        by_pk("n2")
+            .payload
+            .as_ref()
+            .and_then(|p| p.get("title"))
+            .and_then(|v| v.as_str()),
         Some("two")
     );
     assert!(by_pk("n3").deleted, "the offline delete became a tombstone");
@@ -116,7 +120,10 @@ async fn push_retry_is_idempotent() {
         async move {
             let response = client.post(url).json(&req).send().await.expect("send push");
             assert!(response.status().is_success(), "push should be 2xx");
-            response.json::<PushResponse>().await.expect("push response json")
+            response
+                .json::<PushResponse>()
+                .await
+                .expect("push response json")
         }
     };
 
@@ -150,8 +157,12 @@ async fn pull_applies_remote_changes_and_advances_cursor() {
     // Device A creates two rows, then deletes one.
     let store_a = open_store(&dir, "a.db");
     let engine_a = engine_for(&store_a, &url);
-    store_a.put("notes", "n1", &note("keep me")).expect("put n1");
-    store_a.put("notes", "n2", &note("delete me")).expect("put n2");
+    store_a
+        .put("notes", "n1", &note("keep me"))
+        .expect("put n1");
+    store_a
+        .put("notes", "n2", &note("delete me"))
+        .expect("put n2");
     engine_a.sync_once().await.expect("a sync 1");
     store_a.delete("notes", "n2").expect("delete n2");
     engine_a.sync_once().await.expect("a sync 2");
@@ -193,7 +204,9 @@ async fn conflict_default_lww_converges_both_devices() {
     engine_b.sync_once().await.expect("b seed sync");
 
     // Concurrent edits: B writes first, A writes later (the LWW winner).
-    store_b.put("notes", "n1", &note("b-early")).expect("b edit");
+    store_b
+        .put("notes", "n1", &note("b-early"))
+        .expect("b edit");
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     store_a.put("notes", "n1", &note("a-late")).expect("a edit");
 
@@ -230,7 +243,10 @@ async fn custom_conflict_resolver_merges_payloads() {
             let mut merged = server.payload.clone().unwrap_or_else(|| json!({}));
             if let (Some(target), Some(source)) = (
                 merged.as_object_mut(),
-                client.payload.as_ref().and_then(serde_json::Value::as_object),
+                client
+                    .payload
+                    .as_ref()
+                    .and_then(serde_json::Value::as_object),
             ) {
                 for (key, value) in source {
                     target.insert(key.clone(), value.clone());
@@ -269,8 +285,16 @@ async fn custom_conflict_resolver_merges_payloads() {
 
     let expect_merged = |value: Option<serde_json::Value>, device: &str| {
         let value = value.unwrap_or_else(|| panic!("{device} row missing"));
-        assert_eq!(value.get("from_a"), Some(&json!(1)), "{device} kept A's field");
-        assert_eq!(value.get("from_b"), Some(&json!(2)), "{device} kept B's field");
+        assert_eq!(
+            value.get("from_a"),
+            Some(&json!(1)),
+            "{device} kept A's field"
+        );
+        assert_eq!(
+            value.get("from_b"),
+            Some(&json!(2)),
+            "{device} kept B's field"
+        );
     };
     expect_merged(store_a.get("docs", "d1").expect("a get"), "device A");
     expect_merged(store_b.get("docs", "d1").expect("b get"), "device B");
@@ -278,7 +302,10 @@ async fn custom_conflict_resolver_merges_payloads() {
     // The merged row exists server-side with a new version.
     let rows = backend_rows(backend.as_ref());
     let row = rows.iter().find(|r| r.pk == "d1").expect("server row");
-    assert_eq!(row.payload.as_ref().and_then(|p| p.get("from_b")), Some(&json!(2)));
+    assert_eq!(
+        row.payload.as_ref().and_then(|p| p.get("from_b")),
+        Some(&json!(2))
+    );
 }
 
 #[tokio::test]
@@ -293,7 +320,9 @@ async fn gc_horizon_forces_full_resync_preserving_pending() {
     let engine_b = engine_for(&store_b, &url);
 
     // A creates a row; B syncs it (B's cursor is now > 0 but will go stale).
-    store_a.put("notes", "one", &note("first")).expect("put one");
+    store_a
+        .put("notes", "one", &note("first"))
+        .expect("put one");
     engine_a.sync_once().await.expect("a sync 1");
     engine_b.sync_once().await.expect("b sync 1");
     let stale_cursor = store_b.cursor().expect("b cursor");
@@ -301,7 +330,9 @@ async fn gc_horizon_forces_full_resync_preserving_pending() {
 
     // A deletes "one" and adds "two"; then the server GCs tombstones.
     store_a.delete("notes", "one").expect("delete one");
-    store_a.put("notes", "two", &note("second")).expect("put two");
+    store_a
+        .put("notes", "two", &note("second"))
+        .expect("put two");
     engine_a.sync_once().await.expect("a sync 2");
     let latest = backend.latest_version().expect("latest");
     let removed = backend.gc_tombstones(latest).expect("gc");
@@ -309,18 +340,33 @@ async fn gc_horizon_forces_full_resync_preserving_pending() {
     assert!(store_b.cursor().expect("b cursor") < backend.tombstone_horizon().expect("horizon"));
 
     // B queues an offline write BEFORE discovering it needs a full resync.
-    store_b.put("notes", "b-note", &note("from b")).expect("b put");
+    store_b
+        .put("notes", "b-note", &note("from b"))
+        .expect("b put");
 
     let report = engine_b.sync_once().await.expect("b resync");
-    assert!(report.full_resync, "stale cursor must trigger a full resync");
-    assert_eq!(store_b.pending_count().expect("b pending"), 0, "pending replayed");
+    assert!(
+        report.full_resync,
+        "stale cursor must trigger a full resync"
+    );
+    assert_eq!(
+        store_b.pending_count().expect("b pending"),
+        0,
+        "pending replayed"
+    );
 
     // B converged on post-GC reality, and its own write survived the resync.
     let listed: Vec<(String, Note)> = store_b.list("notes").expect("b list");
     let pks: Vec<&str> = listed.iter().map(|(pk, _)| pk.as_str()).collect();
     assert!(pks.contains(&"two"), "b has A's newer row: {pks:?}");
-    assert!(pks.contains(&"b-note"), "b's own pending write survived: {pks:?}");
-    assert!(!pks.contains(&"one"), "the GC'd delete stays deleted: {pks:?}");
+    assert!(
+        pks.contains(&"b-note"),
+        "b's own pending write survived: {pks:?}"
+    );
+    assert!(
+        !pks.contains(&"one"),
+        "the GC'd delete stays deleted: {pks:?}"
+    );
 
     // ... and the server received B's preserved pending change.
     let rows = backend_rows(backend.as_ref());
@@ -338,7 +384,9 @@ async fn sync_once_fails_cleanly_when_server_unreachable() {
 
     let dir = tempfile::tempdir().expect("tempdir");
     let store = open_store(&dir, "a.db");
-    store.put("notes", "n1", &note("offline write")).expect("put");
+    store
+        .put("notes", "n1", &note("offline write"))
+        .expect("put");
 
     let engine = engine_for(&store, &format!("http://{addr}/sync"));
     let err = engine.sync_once().await.expect_err("server is down");

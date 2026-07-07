@@ -52,7 +52,7 @@ pub use store::SyncStore;
 /// Errors produced by the sync store, engine, and server backends.
 #[derive(Debug, thiserror::Error)]
 pub enum SyncError {
-    /// A local SQLite store operation failed.
+    /// A local `SQLite` store operation failed.
     #[error("sync store error: {0}")]
     Store(String),
     /// A payload could not be serialized or deserialized.

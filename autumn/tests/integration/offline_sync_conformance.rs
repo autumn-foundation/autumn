@@ -33,6 +33,7 @@ fn push(device: &str, changes: Vec<Change>) -> PushRequest {
 }
 
 /// Assert the full backend contract. `backend` must be empty (fresh).
+#[allow(clippy::too_many_lines)] // one linear conformance script, clearest unsplit
 pub fn run_backend_conformance(backend: &dyn SyncBackend) {
     let resolver = LwwResolver;
 
@@ -44,8 +45,18 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
     let seed = push(
         "device-a",
         vec![
-            change("00000000-0000-4000-8000-000000000001", "n1", Op::Upsert, Some(json!({"title": "one"}))),
-            change("00000000-0000-4000-8000-000000000002", "n2", Op::Upsert, Some(json!({"title": "two"}))),
+            change(
+                "00000000-0000-4000-8000-000000000001",
+                "n1",
+                Op::Upsert,
+                Some(json!({"title": "one"})),
+            ),
+            change(
+                "00000000-0000-4000-8000-000000000002",
+                "n2",
+                Op::Upsert,
+                Some(json!({"title": "two"})),
+            ),
         ],
     );
     let response = backend.apply_push(&seed, &resolver).expect("seed push");
@@ -73,8 +84,11 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
     assert_eq!(backend.latest_version().expect("latest"), versions[1]);
 
     // ── Pull pages by version and honors the cursor ──────────────────────
-    let PullResponse::Ok { rows, next_cursor, tombstone_horizon } =
-        backend.pull_since(0, 100).expect("pull all")
+    let PullResponse::Ok {
+        rows,
+        next_cursor,
+        tombstone_horizon,
+    } = backend.pull_since(0, 100).expect("pull all")
     else {
         panic!("cursor 0 never requires a resync");
     };
@@ -83,8 +97,11 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
     assert_eq!(next_cursor, versions[1]);
     assert_eq!(tombstone_horizon, 0);
 
-    let PullResponse::Ok { rows, next_cursor, .. } =
-        backend.pull_since(versions[1], 100).expect("pull caught-up")
+    let PullResponse::Ok {
+        rows, next_cursor, ..
+    } = backend
+        .pull_since(versions[1], 100)
+        .expect("pull caught-up")
     else {
         panic!("caught-up cursor never requires a resync");
     };
@@ -109,11 +126,17 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
         .apply_push(&push("device-b", vec![winner]), &resolver)
         .expect("conflict push");
     let ChangeOutcome::Resolved { row } = &response.outcomes[0] else {
-        panic!("stale base_version must resolve, got {:?}", response.outcomes[0]);
+        panic!(
+            "stale base_version must resolve, got {:?}",
+            response.outcomes[0]
+        );
     };
     assert!(row.version > versions[1], "resolved rows get a NEW version");
     assert_eq!(
-        row.payload.as_ref().and_then(|p| p.get("title")).and_then(|v| v.as_str()),
+        row.payload
+            .as_ref()
+            .and_then(|p| p.get("title"))
+            .and_then(|v| v.as_str()),
         Some("one-b"),
         "newer client write wins LWW"
     );
@@ -132,22 +155,39 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
         .apply_push(&push("device-c", vec![loser]), &resolver)
         .expect("losing conflict push");
     let ChangeOutcome::Resolved { row } = &response.outcomes[0] else {
-        panic!("stale base_version must resolve, got {:?}", response.outcomes[0]);
+        panic!(
+            "stale base_version must resolve, got {:?}",
+            response.outcomes[0]
+        );
     };
-    assert!(row.version > winner_version, "even KeepServer re-versions the row");
+    assert!(
+        row.version > winner_version,
+        "even KeepServer re-versions the row"
+    );
     assert_eq!(
-        row.payload.as_ref().and_then(|p| p.get("title")).and_then(|v| v.as_str()),
+        row.payload
+            .as_ref()
+            .and_then(|p| p.get("title"))
+            .and_then(|v| v.as_str()),
         Some("one-b"),
         "server content survives a losing push"
     );
 
     // ── Deletes are tombstones, visible in pull ──────────────────────────
-    let mut delete = change("00000000-0000-4000-8000-000000000005", "n2", Op::Delete, None);
+    let mut delete = change(
+        "00000000-0000-4000-8000-000000000005",
+        "n2",
+        Op::Delete,
+        None,
+    );
     delete.base_version = versions[1];
     let response = backend
         .apply_push(&push("device-a", vec![delete]), &resolver)
         .expect("delete push");
-    assert!(matches!(response.outcomes[0], ChangeOutcome::Applied { .. }));
+    assert!(matches!(
+        response.outcomes[0],
+        ChangeOutcome::Applied { .. }
+    ));
     let PullResponse::Ok { rows, .. } = backend.pull_since(0, 100).expect("pull with tombstone")
     else {
         panic!("cursor 0 never requires a resync");

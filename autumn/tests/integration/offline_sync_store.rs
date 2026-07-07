@@ -1,5 +1,5 @@
 //! Integration tests for `autumn_web::sync::SyncStore` — the local
-//! offline SQLite store with write-through change journaling.
+//! offline `SQLite` store with write-through change journaling.
 
 #![cfg(feature = "offline-sync")]
 
@@ -55,7 +55,9 @@ fn put_get_list_roundtrip_typed_payloads() {
     let dir = tempfile::tempdir().expect("tempdir");
     let store = SyncStore::open(dir.path().join("sync.db")).expect("open store");
 
-    store.put("notes", "b", &note("b", "second")).expect("put b");
+    store
+        .put("notes", "b", &note("b", "second"))
+        .expect("put b");
     store.put("notes", "a", &note("a", "first")).expect("put a");
     store
         .put("todos", "t1", &note("t1", "other collection"))
@@ -65,7 +67,9 @@ fn put_get_list_roundtrip_typed_payloads() {
     assert_eq!(got, Some(note("a", "first")));
 
     // Update in place.
-    store.put("notes", "a", &note("a", "first-edited")).expect("re-put a");
+    store
+        .put("notes", "a", &note("a", "first-edited"))
+        .expect("re-put a");
     let got: Option<Note> = store.get("notes", "a").expect("get after edit");
     assert_eq!(got, Some(note("a", "first-edited")));
 
@@ -91,7 +95,9 @@ fn delete_records_tombstone_and_pending_delete() {
     let dir = tempfile::tempdir().expect("tempdir");
     let store = SyncStore::open(dir.path().join("sync.db")).expect("open store");
 
-    store.put("notes", "n1", &note("n1", "doomed")).expect("put");
+    store
+        .put("notes", "n1", &note("n1", "doomed"))
+        .expect("put");
     store.delete("notes", "n1").expect("delete");
 
     let got: Option<Note> = store.get("notes", "n1").expect("get");
@@ -136,7 +142,9 @@ fn writes_journal_pending_changes_atomically() {
     );
 
     // A different pk is a separate journal entry.
-    store.put("notes", "n2", &note("n2", "other")).expect("put n2");
+    store
+        .put("notes", "n2", &note("n2", "other"))
+        .expect("put n2");
     assert_eq!(store.pending_count().expect("count"), 2);
 
     // Deleting a pending-upsert pk coalesces it into a single delete.
@@ -154,8 +162,12 @@ fn reads_reflect_local_writes_before_any_sync() {
 
     // Fully offline: no server exists anywhere. Writes must be readable
     // immediately and queue up for later.
-    store.put("notes", "n1", &note("n1", "offline one")).expect("put");
-    store.put("notes", "n2", &note("n2", "offline two")).expect("put");
+    store
+        .put("notes", "n1", &note("n1", "offline one"))
+        .expect("put");
+    store
+        .put("notes", "n2", &note("n2", "offline two"))
+        .expect("put");
 
     let got: Option<Note> = store.get("notes", "n1").expect("get");
     assert_eq!(got, Some(note("n1", "offline one")));

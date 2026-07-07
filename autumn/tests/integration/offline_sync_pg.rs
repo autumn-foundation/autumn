@@ -24,7 +24,9 @@ async fn pg_backend_passes_conformance() {
     let backend = PgSyncBackend::new(url);
     backend.ensure_schema().expect("ensure schema");
     // The DDL is CREATE-IF-NOT-EXISTS all the way down.
-    backend.ensure_schema().expect("ensure schema twice (idempotent)");
+    backend
+        .ensure_schema()
+        .expect("ensure schema twice (idempotent)");
 
     tokio::task::spawn_blocking(move || {
         super::offline_sync_conformance::run_backend_conformance(&backend);

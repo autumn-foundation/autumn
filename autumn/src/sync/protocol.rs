@@ -25,7 +25,7 @@ pub enum Op {
 }
 
 /// One journaled local write, pushed to the server.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Change {
     /// Client-generated unique id (UUID v4 string) used for at-least-once
     /// dedup on the server.
@@ -50,7 +50,7 @@ pub struct Change {
 }
 
 /// Body of `POST <base>/push`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PushRequest {
     /// Stable per-device id (UUID v4 string, generated on first store open).
     pub device_id: String,
@@ -60,7 +60,7 @@ pub struct PushRequest {
 
 /// A server-side row (or tombstone) as returned by pull and conflict
 /// resolutions.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteRow {
     /// Namespace for the row.
     pub collection: String,
@@ -80,7 +80,7 @@ pub struct RemoteRow {
 }
 
 /// Per-change result inside a [`PushResponse`], same order as the request.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum ChangeOutcome {
     /// The change applied cleanly and was assigned `version`.
@@ -101,7 +101,7 @@ pub enum ChangeOutcome {
 }
 
 /// Body of the `POST <base>/push` response.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PushResponse {
     /// One outcome per pushed change, in request order.
     pub outcomes: Vec<ChangeOutcome>,
@@ -132,7 +132,7 @@ impl Default for PullQuery {
 }
 
 /// Body of the `GET <base>/pull` response.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum PullResponse {
     /// A page of rows newer than the requested cursor.
@@ -153,4 +153,95 @@ pub enum PullResponse {
         /// The server's current tombstone GC horizon.
         tombstone_horizon: Version,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn sample_change() -> Change {
+        Change {
+            change_id: "11111111-1111-4111-8111-111111111111".into(),
+            collection: "notes".into(),
+            pk: "n1".into(),
+            op: Op::Upsert,
+            payload: Some(serde_json::json!({"title": "hi"})),
+            base_version: 3,
+            updated_at: Utc.with_ymd_and_hms(2026, 7, 7, 12, 0, 0).unwrap(),
+        }
+    }
+
+    #[test]
+    fn push_request_round_trips() {
+        let request = PushRequest {
+            device_id: "device-a".into(),
+            changes: vec![sample_change()],
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        let back: PushRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, request);
+        assert!(json.contains(r#""op":"upsert""#), "snake_case ops: {json}");
+    }
+
+    #[test]
+    fn delete_change_omits_payload() {
+        let mut change = sample_change();
+        change.op = Op::Delete;
+        change.payload = None;
+        let json = serde_json::to_string(&change).unwrap();
+        assert!(
+            !json.contains("payload"),
+            "no payload key for deletes: {json}"
+        );
+        let back: Change = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, change);
+    }
+
+    #[test]
+    fn change_outcomes_are_status_tagged() {
+        let applied = serde_json::to_value(ChangeOutcome::Applied { version: 7 }).unwrap();
+        assert_eq!(applied["status"], "applied");
+        assert_eq!(applied["version"], 7);
+        let deduped = serde_json::to_value(ChangeOutcome::AlreadyApplied).unwrap();
+        assert_eq!(deduped["status"], "already_applied");
+    }
+
+    #[test]
+    fn pull_response_round_trips_both_variants() {
+        let ok = PullResponse::Ok {
+            rows: vec![RemoteRow {
+                collection: "notes".into(),
+                pk: "n1".into(),
+                payload: None,
+                version: 9,
+                deleted: true,
+                updated_at: Utc.with_ymd_and_hms(2026, 7, 7, 12, 0, 0).unwrap(),
+                device_id: "device-a".into(),
+            }],
+            next_cursor: 9,
+            tombstone_horizon: 4,
+        };
+        let json = serde_json::to_string(&ok).unwrap();
+        assert!(json.contains(r#""status":"ok""#));
+        assert_eq!(serde_json::from_str::<PullResponse>(&json).unwrap(), ok);
+
+        let resync = PullResponse::FullResyncRequired {
+            tombstone_horizon: 4,
+        };
+        let json = serde_json::to_string(&resync).unwrap();
+        assert!(json.contains(r#""status":"full_resync_required""#));
+        assert_eq!(serde_json::from_str::<PullResponse>(&json).unwrap(), resync);
+    }
+
+    #[test]
+    fn pull_query_defaults() {
+        let query: PullQuery = serde_urlencoded::from_str("").unwrap();
+        assert_eq!(query, PullQuery::default());
+        assert_eq!(query.cursor, 0);
+        assert_eq!(query.limit, 500);
+        let query: PullQuery = serde_urlencoded::from_str("cursor=12&limit=50").unwrap();
+        assert_eq!(query.cursor, 12);
+        assert_eq!(query.limit, 50);
+    }
 }
