@@ -224,10 +224,18 @@ impl Revert {
                 }
             }
             Self::CargoAutumnWebFeature { feature, .. } => {
-                remove_autumn_web_feature(content, feature)
+                if autumn_web_feature_still_needed_elsewhere(feature, project_root, excluding) {
+                    content.to_owned()
+                } else {
+                    remove_autumn_web_feature(content, feature)
+                }
             }
             Self::CargoAutumnWebDevFeature { feature, .. } => {
-                remove_autumn_web_dev_dependency_feature(content, feature)
+                if autumn_web_feature_still_needed_elsewhere(feature, project_root, excluding) {
+                    content.to_owned()
+                } else {
+                    remove_autumn_web_dev_dependency_feature(content, feature)
+                }
             }
             Self::JobEntry { entry, .. } => remove_job_entry(content, entry),
             Self::JobsRegistration { .. } => remove_jobs_registration_from_app(content),
@@ -851,6 +859,56 @@ fn crate_referenced_elsewhere_in_project(
 ) -> bool {
     let ident = crate_name.replace('-', "_");
     let markers = [format!("{ident}::"), format!("use {ident}")];
+    ["src", "tests", "benches"]
+        .iter()
+        .any(|dir| rs_tree_contains_marker(&project_root.join(dir), &markers, excluding))
+}
+
+/// A text marker that reliably indicates `feature`'s autumn-web API surface
+/// is in use somewhere in the project — used as a whole-project supplement
+/// to the same-generator `owner_dir` sibling check for
+/// [`Revert::CargoAutumnWebFeature`]/[`Revert::CargoAutumnWebDevFeature`],
+/// since a feature can be needed by a COMPLETELY DIFFERENT generator kind
+/// than the one being destroyed (e.g. `generate auth` and `generate mailer`
+/// both need `"mail"` — destroying the only mailer must not strip it while
+/// auth's routes still call `Mail::builder()`). `None` for a feature with no
+/// single reliable marker — falls back to the `owner_dir` check alone.
+fn autumn_web_feature_marker(feature: &str) -> Option<&'static str> {
+    match feature {
+        // `maud`/`htmx` are in autumn-web's own `default = [...]` feature
+        // set (see `autumn/Cargo.toml`) — a project's default-features
+        // dependency already carries them regardless of any generator, so
+        // removing the *explicit* `features = [...]` entry never actually
+        // disables the capability, and a project-wide marker check would
+        // wrongly treat autumn's own default-feature boilerplate (e.g.
+        // `src/main.rs`'s stock `layout()`, which always calls
+        // `maud::html!`) as "still needed" in every project. No check
+        // needed — fall through to the `owner_dir` check alone.
+        "mail" => Some("Mail::builder("),
+        "oauth2" => Some("OAuth2"),
+        "webauthn" => Some("Webauthn"),
+        "ws" => Some("#[ws]"),
+        // `TestDb::` (not bare `TestDb`) so a doc comment merely mentioning
+        // the type (e.g. the template-shipped `tests/integration_test.rs`'s
+        // "Add DB-backed tests with `TestDb`...") doesn't count as usage.
+        "test-support" => Some("TestDb::"),
+        _ => None,
+    }
+}
+
+/// Whether `feature` is still referenced anywhere under `project_root`'s
+/// `src/`, `tests/`, or `benches/` trees, other than in `excluding` — see
+/// [`autumn_web_feature_marker`]. Always `false` (never blocks removal) for
+/// a feature with no known marker.
+fn autumn_web_feature_still_needed_elsewhere(
+    feature: &str,
+    project_root: &Path,
+    excluding: &[PathBuf],
+) -> bool {
+    let Some(marker) = autumn_web_feature_marker(feature) else {
+        return false;
+    };
+    let markers = [marker.to_owned()];
     ["src", "tests", "benches"]
         .iter()
         .any(|dir| rs_tree_contains_marker(&project_root.join(dir), &markers, excluding))

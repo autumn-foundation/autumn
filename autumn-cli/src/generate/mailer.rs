@@ -915,6 +915,45 @@ async fn main() {
         );
     }
 
+    #[test]
+    fn destroying_the_only_mailer_keeps_mail_feature_auth_still_needs() {
+        // Codex PR review (issue #1048): "mail" is needed by BOTH `generate
+        // auth` (password reset/confirmation emails) and `generate mailer` —
+        // two entirely different generators, so the mailer's own
+        // `src/mailers` owner_dir sibling check alone can't see that auth
+        // still needs the feature.
+        let tmp = project_with_main(default_main());
+        let cargo_path = tmp.path().join("Cargo.toml");
+
+        crate::generate::auth::plan_auth(tmp.path(), "User", "20260508000000")
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+        plan_mailer(tmp.path(), "Welcome", None, false)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+        assert!(
+            fs::read_to_string(&cargo_path)
+                .unwrap()
+                .contains("\"mail\"")
+        );
+
+        // Destroying the only mailer must NOT strip "mail" — auth's routes
+        // still call `Mail::builder()`.
+        plan_mailer(tmp.path(), "Welcome", None, false)
+            .unwrap()
+            .revert(Flags::default())
+            .unwrap();
+
+        assert!(!tmp.path().join("src/mailers/welcome.rs").exists());
+        let cargo_after = fs::read_to_string(&cargo_path).unwrap();
+        assert!(
+            cargo_after.contains("\"mail\""),
+            "mail feature must survive — auth still uses Mail::builder(): {cargo_after}"
+        );
+    }
+
     // ── GREEN: execute and inspect written content ────────────────────────
 
     #[test]

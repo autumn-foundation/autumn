@@ -1448,10 +1448,22 @@ fn append_oauth_stubs_to_toml(existing: &str, providers: &[String]) -> String {
         if out.contains(&header) {
             continue;
         }
-        let preset = match name.as_str() {
-            "github" => {
-                r#"
-[auth.oauth2.github]
+        out.push('\n');
+        out.push_str(&oauth_provider_stub_block(name));
+    }
+    out.push('\n');
+    out
+}
+
+/// The exact `[auth.oauth2.<name>]` stub block [`append_oauth_stubs_to_toml`]
+/// inserts for a known or unknown provider name. Shared with
+/// `remove_oauth_provider_stubs` (via [`toml_table_block_matches`]) so
+/// `autumn destroy` can verify a block is still byte-identical to this stub
+/// — never hand-filled with real credentials, and never a pre-existing
+/// block `generate` left untouched — before removing it.
+fn oauth_provider_stub_block(name: &str) -> String {
+    match name {
+        "github" => r#"[auth.oauth2.github]
 client_id = ""
 client_secret = ""
 authorize_url = "https://github.com/login/oauth/authorize"
@@ -1460,10 +1472,8 @@ userinfo_url = "https://api.github.com/user"
 redirect_uri = "http://localhost:3000/auth/github/callback"
 scope = "read:user user:email"
 "#
-            }
-            "google" => {
-                r#"
-[auth.oauth2.google]
+        .to_owned(),
+        "google" => r#"[auth.oauth2.google]
 client_id = ""
 client_secret = ""
 authorize_url = "https://accounts.google.com/o/oauth2/v2/auth"
@@ -1475,10 +1485,8 @@ issuer = "https://accounts.google.com"
 jwks_url = "https://www.googleapis.com/oauth2/v3/certs"
 discovery_url = "https://accounts.google.com"
 "#
-            }
-            "microsoft" => {
-                r#"
-[auth.oauth2.microsoft]
+        .to_owned(),
+        "microsoft" => r#"[auth.oauth2.microsoft]
 client_id = ""
 client_secret = ""
 authorize_url = "https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
@@ -1489,10 +1497,9 @@ issuer = "https://login.microsoftonline.com/common/v2.0"
 jwks_url = "https://login.microsoftonline.com/common/discovery/v2.0/keys"
 discovery_url = "https://login.microsoftonline.com/common/v2.0"
 "#
-            }
-            _ => &format!(
-                r#"
-[auth.oauth2.{name}]
+        .to_owned(),
+        _ => format!(
+            r#"[auth.oauth2.{name}]
 client_id = ""
 client_secret = ""
 authorize_url = "https://example.com/oauth/authorize"
@@ -1500,13 +1507,8 @@ token_url = "https://example.com/oauth/token"
 redirect_uri = "http://localhost:3000/auth/{name}/callback"
 scope = "openid profile email"
 "#
-            ),
-        };
-        out.push('\n');
-        out.push_str(preset.trim_start());
+        ),
     }
-    out.push('\n');
-    out
 }
 
 // ── Template rendering ────────────────────────────────────────────────────────
@@ -7899,23 +7901,65 @@ fn append_webauthn_stub_to_toml(
 
 /// Inverse of [`append_oauth_stubs_to_toml`] (`autumn destroy`, issue #1048).
 ///
-/// Removes each `[auth.oauth2.<provider>]` stub block for `providers`, in
-/// order. A no-op for any provider whose header isn't present (already
-/// destroyed, or hand-edited away).
+/// Removes each `[auth.oauth2.<provider>]` stub block for `providers`, but
+/// only when its current content is still byte-identical to the stub
+/// `append_oauth_stubs_to_toml` would have inserted — never a block that
+/// pre-existed before this `generate` call (real credentials `generate`
+/// never touched), and never one the user has since filled in. A no-op for
+/// any provider whose header isn't present, or whose content no longer
+/// matches (already destroyed, hand-edited, or a pre-existing real config).
 pub(super) fn remove_oauth_provider_stubs(existing: &str, providers: &[String]) -> String {
     let mut content = existing.to_owned();
     for name in providers {
-        content = remove_toml_table_block(&content, &format!("[auth.oauth2.{name}]"));
+        let header = format!("[auth.oauth2.{name}]");
+        if toml_table_block_matches(&content, &header, &oauth_provider_stub_block(name)) {
+            content = remove_toml_table_block(&content, &header);
+        }
     }
     content
 }
 
 /// Inverse of [`append_webauthn_stub_to_toml`] (`autumn destroy`, issue #1048).
 ///
-/// A no-op if `[auth.webauthn]` isn't present (already destroyed, or
-/// hand-edited away).
+/// A no-op if `[auth.webauthn]` isn't present, or if its content no longer
+/// matches exactly what `append_webauthn_stub_to_toml` always inserts (the
+/// same "never touch a pre-existing or since-edited block" guard as
+/// [`remove_oauth_provider_stubs`]).
 pub(super) fn remove_webauthn_stub(existing: &str) -> String {
-    remove_toml_table_block(existing, "[auth.webauthn]")
+    const HEADER: &str = "[auth.webauthn]";
+    let expected = "[auth.webauthn]\n\
+                     rp_id = \"localhost\"\n\
+                     rp_name = \"My App\"\n\
+                     rp_origin = \"http://localhost:3000\"\n";
+    if toml_table_block_matches(existing, HEADER, expected) {
+        remove_toml_table_block(existing, HEADER)
+    } else {
+        existing.to_owned()
+    }
+}
+
+/// The `(start, end)` line-index span of a top-level `[header]` TOML table —
+/// the header line through the last line before the next top-level `[...]`
+/// header or EOF. `None` if `header` isn't present.
+fn toml_table_block_range(lines: &[&str], header: &str) -> Option<(usize, usize)> {
+    let start = lines.iter().position(|l| l.trim() == header)?;
+    let end = lines[start + 1..]
+        .iter()
+        .position(|l| l.trim_start().starts_with('['))
+        .map_or(lines.len(), |rel| start + 1 + rel);
+    Some((start, end))
+}
+
+/// Whether `[header]`'s current block content is byte-identical (ignoring a
+/// trailing-newline difference) to `expected_block` — used to verify a stub
+/// hasn't been hand-filled with real values, or didn't pre-exist before
+/// `generate` ever ran, before `autumn destroy` removes it.
+fn toml_table_block_matches(existing: &str, header: &str, expected_block: &str) -> bool {
+    let lines: Vec<&str> = existing.lines().collect();
+    let Some((start, end)) = toml_table_block_range(&lines, header) else {
+        return false;
+    };
+    lines[start..end].join("\n").trim_end() == expected_block.trim_end()
 }
 
 /// Remove a top-level `[header]` TOML table — the header line and every line
@@ -7931,13 +7975,9 @@ pub(super) fn remove_webauthn_stub(existing: &str) -> String {
 /// `header` isn't present.
 fn remove_toml_table_block(existing: &str, header: &str) -> String {
     let lines: Vec<&str> = existing.lines().collect();
-    let Some(start) = lines.iter().position(|l| l.trim() == header) else {
+    let Some((start, end)) = toml_table_block_range(&lines, header) else {
         return existing.to_owned();
     };
-    let end = lines[start + 1..]
-        .iter()
-        .position(|l| l.trim_start().starts_with('['))
-        .map_or(lines.len(), |rel| start + 1 + rel);
 
     let mut block_start = start;
     if block_start > 0 && lines[block_start - 1].trim().is_empty() {
@@ -8112,6 +8152,57 @@ mod tests {
         assert_eq!(
             fs::read_to_string(&autumn_toml_path).unwrap(),
             original_toml
+        );
+    }
+
+    #[test]
+    fn destroy_never_removes_a_pre_existing_oauth_provider_block_with_real_credentials() {
+        let tmp = project_with_main();
+        fs::write(tmp.path().join("Cargo.toml"), template_shipped_cargo_toml()).unwrap();
+        let autumn_toml_path = tmp.path().join("autumn.toml");
+        let real_github_block = "[server]\nport = 3000\n\n[auth.oauth2.github]\n\
+             client_id = \"real-client-id\"\n\
+             client_secret = \"real-client-secret\"\n\
+             authorize_url = \"https://github.com/login/oauth/authorize\"\n\
+             token_url = \"https://github.com/login/oauth/access_token\"\n\
+             userinfo_url = \"https://api.github.com/user\"\n\
+             redirect_uri = \"https://myapp.example.com/auth/github/callback\"\n\
+             scope = \"read:user user:email\"\n";
+        fs::write(&autumn_toml_path, real_github_block).unwrap();
+
+        // `--oauth github,google`: github's block already exists (with real
+        // credentials) so `append_oauth_stubs_to_toml` leaves it untouched;
+        // only google's stub is freshly inserted.
+        let oauth = AuthOAuthOptions {
+            providers: vec!["github".to_owned(), "google".to_owned()],
+        };
+        plan_auth_with_options(tmp.path(), "User", "20260508000000", &oauth)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+        assert!(
+            fs::read_to_string(&autumn_toml_path)
+                .unwrap()
+                .contains("real-client-secret")
+        );
+
+        plan_auth_with_options(tmp.path(), "User", "20260508000000", &oauth)
+            .unwrap()
+            .revert(Flags::default())
+            .unwrap();
+
+        let toml_after = fs::read_to_string(&autumn_toml_path).unwrap();
+        assert!(
+            toml_after.contains("[auth.oauth2.github]"),
+            "pre-existing github block must survive destroy: {toml_after}"
+        );
+        assert!(
+            toml_after.contains("real-client-secret"),
+            "real credentials must never be deleted: {toml_after}"
+        );
+        assert!(
+            !toml_after.contains("[auth.oauth2.google]"),
+            "google's freshly-inserted stub must still be removed: {toml_after}"
         );
     }
 
