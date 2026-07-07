@@ -1006,6 +1006,53 @@ fn generate_then_destroy_migration_round_trips_git_clean() {
     assert!(status_stdout.trim().is_empty());
 }
 
+#[test]
+fn generate_then_destroy_plugin_round_trips_git_clean() {
+    // Regression test (issue #1048 PR review): `plan_plugin` refuses a
+    // non-empty target directory unless `--force` — a generate-time
+    // collision guard. Without special-casing destroy mode, `autumn destroy
+    // plugin Foo` would always hit that same guard (the plugin directory
+    // legitimately exists, holding the files this destroy is about to
+    // remove) and fail before ever reaching `Plan::revert`, even with no
+    // `--force` flag and no actual divergence.
+    let (_tmp, project) = fresh_project("destroy-plugin-app");
+
+    run_git(&project, &["init"]);
+    run_git(&project, &["add", "-A"]);
+    run_git(
+        &project,
+        &[
+            "-c",
+            "user.email=t@t.com",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-m",
+            "base",
+        ],
+    );
+
+    let before = snapshot_tree(&project);
+
+    run_autumn(&project, &["generate", "plugin", "Foo"]);
+    assert!(project.join("autumn-foo-plugin/Cargo.toml").is_file());
+
+    run_autumn(&project, &["destroy", "plugin", "Foo"]);
+    assert!(!project.join("autumn-foo-plugin").exists());
+
+    let after = snapshot_tree(&project);
+    assert_eq!(
+        before, after,
+        "working tree must be byte-identical after generate+destroy"
+    );
+
+    let status_stdout = run_git(&project, &["status", "--porcelain"]);
+    assert!(
+        status_stdout.trim().is_empty(),
+        "git status must be clean after generate+destroy, got:\n{status_stdout}"
+    );
+}
+
 /// AC5: `destroy --dry-run` prints a plan and exits 0 without touching disk.
 #[test]
 fn destroy_dry_run_writes_nothing() {

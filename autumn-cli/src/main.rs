@@ -2979,11 +2979,26 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
         } => {
             let cwd = resolve_cwd();
             let flags = generate::Flags { dry_run, force };
+            // `plan_plugin` refuses a non-empty target directory unless
+            // `--force` — a generate-time collision guard that makes no
+            // sense in destroy mode, where the directory legitimately
+            // exists (holding the files this destroy is about to remove).
+            // Always bypass it when building the plan for destroy, while
+            // still passing the user's real `flags` to `revert` below so
+            // its own, per-file content-divergence check still applies
+            // (issue #1048 PR review).
+            let plan_flags = match mode {
+                ApplyMode::Generate => flags,
+                ApplyMode::Destroy => generate::Flags {
+                    force: true,
+                    ..flags
+                },
+            };
             match generate::plugin::plan_plugin(
                 &cwd,
                 &name,
                 path.as_deref().map(std::path::Path::new),
-                flags,
+                plan_flags,
             ) {
                 Ok(plugin_plan) => {
                     let result = match mode {
