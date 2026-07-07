@@ -984,16 +984,17 @@ fn crate_referenced_elsewhere_in_project(
         .any(|dir| rs_tree_contains_marker(&project_root.join(dir), &markers, excluding, overrides))
 }
 
-/// A text marker that reliably indicates `feature`'s autumn-web API surface
+/// Text markers that reliably indicate `feature`'s autumn-web API surface
 /// is in use somewhere in the project — used as a whole-project supplement
 /// to the same-generator `owner_dir` sibling check for
 /// [`Revert::CargoAutumnWebFeature`]/[`Revert::CargoAutumnWebDevFeature`],
 /// since a feature can be needed by a COMPLETELY DIFFERENT generator kind
 /// than the one being destroyed (e.g. `generate auth` and `generate mailer`
 /// both need `"mail"` — destroying the only mailer must not strip it while
-/// auth's routes still call `Mail::builder()`). `None` for a feature with no
-/// single reliable marker — falls back to the `owner_dir` check alone.
-fn autumn_web_feature_marker(feature: &str) -> Option<&'static str> {
+/// auth's routes still call `Mail::builder()`). Any one marker matching is
+/// sufficient evidence. Empty for a feature with no reliable marker — falls
+/// back to the `owner_dir` check alone.
+fn autumn_web_feature_markers(feature: &str) -> &'static [&'static str] {
     match feature {
         // `maud`/`htmx` are in autumn-web's own `default = [...]` feature
         // set (see `autumn/Cargo.toml`) — a project's default-features
@@ -1004,21 +1005,27 @@ fn autumn_web_feature_marker(feature: &str) -> Option<&'static str> {
         // `src/main.rs`'s stock `layout()`, which always calls
         // `maud::html!`) as "still needed" in every project. No check
         // needed — fall through to the `owner_dir` check alone.
-        "mail" => Some("Mail::builder("),
-        "oauth2" => Some("OAuth2"),
-        "webauthn" => Some("Webauthn"),
-        "ws" => Some("#[ws]"),
+        "mail" => &["Mail::builder("],
+        "oauth2" => &["OAuth2"],
+        "webauthn" => &["Webauthn"],
+        // Real WebSocket-transport channels (`#[ws]`) AND SSE-transport
+        // channels/`--live` scaffolds (`autumn_web::sse::stream(`, no
+        // `#[ws]` marker at all) are both gated behind the same "ws"
+        // feature (issue #1048 PR review: destroying the only channel/live
+        // scaffold of one transport must not strip a feature the other
+        // transport, generated separately, still needs).
+        "ws" => &["#[ws]", "autumn_web::sse::stream("],
         // `TestDb::` (not bare `TestDb`) so a doc comment merely mentioning
         // the type (e.g. the template-shipped `tests/integration_test.rs`'s
         // "Add DB-backed tests with `TestDb`...") doesn't count as usage.
-        "test-support" => Some("TestDb::"),
-        _ => None,
+        "test-support" => &["TestDb::"],
+        _ => &[],
     }
 }
 
 /// Whether `feature` is still referenced anywhere under `project_root`'s
 /// `src/`, `tests/`, or `benches/` trees, other than in `excluding` — see
-/// [`autumn_web_feature_marker`]. Always `false` (never blocks removal) for
+/// [`autumn_web_feature_markers`]. Always `false` (never blocks removal) for
 /// a feature with no known marker.
 fn autumn_web_feature_still_needed_elsewhere(
     feature: &str,
@@ -1026,10 +1033,11 @@ fn autumn_web_feature_still_needed_elsewhere(
     excluding: &[PathBuf],
     overrides: &HashMap<PathBuf, String>,
 ) -> bool {
-    let Some(marker) = autumn_web_feature_marker(feature) else {
+    let markers = autumn_web_feature_markers(feature);
+    if markers.is_empty() {
         return false;
-    };
-    let markers = [marker.to_owned()];
+    }
+    let markers: Vec<String> = markers.iter().map(|m| (*m).to_owned()).collect();
     ["src", "tests", "benches"]
         .iter()
         .any(|dir| rs_tree_contains_marker(&project_root.join(dir), &markers, excluding, overrides))
@@ -1827,6 +1835,48 @@ mod tests {
         assert!(
             cargo_after.contains("diesel"),
             "diesel must survive — schema.rs still has a diesel::table! for `users`: \
+             {cargo_after}"
+        );
+    }
+
+    #[test]
+    fn revert_keeps_ws_feature_when_a_live_scaffold_route_still_uses_sse_stream() {
+        // `--live` scaffolds and SSE-transport channels both need the "ws"
+        // feature via `autumn_web::sse::stream(...)`, with no `#[ws]`
+        // marker at all (issue #1048 PR review) — destroying the only
+        // WebSocket-transport channel must not strip "ws" while a live
+        // scaffold's route in a completely different directory still needs
+        // it.
+        let (tmp, mut plan) = fixture();
+        let routes_dir = tmp.path().join("src/routes");
+        fs::create_dir_all(&routes_dir).unwrap();
+        fs::write(
+            routes_dir.join("posts.rs"),
+            "pub async fn stream_posts() {\n    autumn_web::sse::stream(&state, \"posts\")\n}\n",
+        )
+        .unwrap();
+
+        let cargo_path = tmp.path().join("Cargo.toml");
+        fs::write(
+            &cargo_path,
+            "[package]\nname = \"x\"\n\n[dependencies]\nautumn-web = { version = \"0.6\", features = [\"ws\"] }\n",
+        )
+        .unwrap();
+
+        let channels_dir = tmp.path().join("src/channels");
+        fs::create_dir_all(&channels_dir).unwrap();
+        plan.push_revert(Revert::CargoAutumnWebFeature {
+            path: cargo_path.clone(),
+            feature: "ws".to_owned(),
+            owner_dir: Some(channels_dir),
+        });
+
+        plan.revert(Flags::default()).unwrap();
+
+        let cargo_after = fs::read_to_string(&cargo_path).unwrap();
+        assert!(
+            cargo_after.contains("\"ws\""),
+            "ws must survive — a live scaffold route still uses autumn_web::sse::stream: \
              {cargo_after}"
         );
     }
