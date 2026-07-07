@@ -127,11 +127,13 @@ readme_cli_version() {
 # ── Server lifecycle ─────────────────────────────────────────────────────────
 
 kill_tree() {
-  local pid="$1" child
+  # Depth-first signal delivery to a whole process tree ($1 = root pid,
+  # $2 = signal, default TERM).
+  local pid="$1" sig="${2:-TERM}" child
   for child in $(pgrep -P "$pid" 2>/dev/null || true); do
-    kill_tree "$child"
+    kill_tree "$child" "$sig"
   done
-  kill -TERM "$pid" 2>/dev/null || true
+  kill -s "$sig" "$pid" 2>/dev/null || true
 }
 
 start_server() {
@@ -164,23 +166,28 @@ stop_server() {
   local pid
   pid="$(cat "$state/server.pid" 2>/dev/null || true)"
   [[ -n "$pid" ]] || return 0
-  kill_tree "$pid"
+  kill_tree "$pid" TERM
   local i
   for i in $(seq 1 20); do
     kill -0 "$pid" 2>/dev/null || break
     sleep 0.5
   done
   if kill -0 "$pid" 2>/dev/null; then
-    for child in $(pgrep -P "$pid" 2>/dev/null || true); do kill -KILL "$child" 2>/dev/null || true; done
-    kill -KILL "$pid" 2>/dev/null || true
+    kill_tree "$pid" KILL
   fi
   rm -f "$state/server.pid"
 }
 
 wait_for_200() {
-  local url="$1" log="$2" deadline
+  local url="$1" log="$2" deadline code
   deadline=$(($(date +%s) + serve_timeout))
-  until curl -fsS -o /dev/null --max-time 5 "$url" 2>/dev/null; do
+  # The contract is literally "a 200 from the route": test the status code —
+  # `curl -f` alone would also accept a 3xx redirect as success.
+  while :; do
+    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$url" 2>/dev/null || true)"
+    if [[ "$code" == "200" ]]; then
+      break
+    fi
     if ! kill -0 "$server_pid" 2>/dev/null; then
       echo "---- server log tail ($log) ----" >&2
       tail -n 60 "$log" >&2 || true
@@ -190,7 +197,7 @@ wait_for_200() {
       echo "---- server log tail ($log) ----" >&2
       tail -n 60 "$log" >&2 || true
       stop_server
-      fail "no 200 from ${url} within ${serve_timeout}s of 'cargo run' — see the server log tail above"
+      fail "no 200 from ${url} within ${serve_timeout}s of 'cargo run' (last status: ${code:-none}) — see the server log tail above"
     fi
     sleep 1
   done
@@ -199,6 +206,18 @@ wait_for_200() {
 # ── Phases ───────────────────────────────────────────────────────────────────
 
 phase_install() {
+  # Job-summary preamble FIRST, before anything in this phase can fail, so
+  # every failure row lands under the table header. An honest note on
+  # semantics: a push-triggered run validates the README against what is on
+  # crates.io — not the pushed code.
+  step_summary "## Quickstart Gate — README vs published crates"
+  step_summary ""
+  step_summary "Installs the README-pinned \`autumn-cli\` from crates.io (or the \`cli-version\` dispatch input) and runs the README quickstart verbatim."
+  step_summary "This validates the published crates against the README at this commit — it does **not** exercise the pushed code (the workspace \`[patch.crates-io]\` override means no other CI job sees what a new user installs)."
+  step_summary ""
+  step_summary "| Phase | Result | Duration | Notes |"
+  step_summary "|---|---|---|---|"
+
   assert_outside_checkout
   local version="${QUICKSTART_CLI_VERSION:-}"
   if [[ -z "$version" ]]; then
@@ -209,16 +228,6 @@ phase_install() {
   # Fresh state per gate run.
   rm -rf "$state"
   mkdir -p "$state"
-
-  # Job-summary preamble. An honest note on semantics: a push-triggered run
-  # validates the README against what is on crates.io — not the pushed code.
-  step_summary "## Quickstart Gate — README vs published crates"
-  step_summary ""
-  step_summary "Installs \`autumn-cli ${version}\` from crates.io and runs the README quickstart verbatim."
-  step_summary "This validates the published crates against the README at this commit — it does **not** exercise the pushed code (the workspace \`[patch.crates-io]\` override means no other CI job sees what a new user installs)."
-  step_summary ""
-  step_summary "| Phase | Result | Duration | Notes |"
-  step_summary "|---|---|---|---|"
 
   # Funnel start: the tracked install→first-200 number begins at the moment a
   # new user types `cargo install`.
@@ -241,11 +250,16 @@ phase_new() {
   [[ -f "$app_dir/Cargo.toml" ]] || fail "'autumn new my-app' exited 0 but produced no $app_dir/Cargo.toml"
 
   # Published-crate assertions on the generated manifest: a real user gets no
-  # path deps and no patch section.
+  # path deps and no patch section. Covers both the inline
+  # `autumn-web = { path = ... }` form and the two-line
+  # `[dependencies.autumn-web]` + `path = ...` table form. These are an early,
+  # readable tripwire — the authoritative backstop is the post-build lockfile
+  # source assertion in the 'build' phase.
   if grep -q '^\[patch' "$app_dir/Cargo.toml"; then
     fail "generated Cargo.toml contains a [patch] section — the project would not build against the published autumn-web"
   fi
-  if grep -E 'autumn-web.*path[[:space:]]*=' "$app_dir/Cargo.toml"; then
+  if grep -q -E 'autumn-web[^=]*=.*path[[:space:]]*=' "$app_dir/Cargo.toml" \
+    || grep -A 10 -E '^\[(dev-|build-)?dependencies\.autumn-web\]' "$app_dir/Cargo.toml" | grep -q -E '^[[:space:]]*path[[:space:]]*='; then
     fail "generated Cargo.toml references autumn-web by path — the project would not build against the published autumn-web"
   fi
   ok
@@ -266,7 +280,11 @@ phase_build() {
   local lock="$app_dir/Cargo.lock"
   [[ -f "$lock" ]] || fail "no Cargo.lock produced by the build"
   local source_line
-  source_line="$(awk '/^name = "autumn-web"$/{found=1} found && /^source = /{print; exit}' "$lock")"
+  # Reset `found` at every [[package]] boundary: a path-dependency autumn-web
+  # has NO `source` line at all, so without the reset awk would print the
+  # NEXT package's registry source and false-pass in exactly the leak
+  # scenario this assertion exists to catch.
+  source_line="$(awk '/^\[\[package\]\]/{found=0} /^name = "autumn-web"$/{found=1} found && /^source = /{print; exit}' "$lock")"
   if [[ "$source_line" != *"registry+https://github.com/rust-lang/crates.io-index"* ]]; then
     fail "autumn-web did not resolve from the crates.io registry (lockfile source: '${source_line:-none — path dependency}') — local workspace leaked into the quickstart"
   fi
@@ -280,10 +298,12 @@ phase_serve() {
   wait_for_200 "$base_url/" "$log"
   local t200 t_install elapsed
   t200=$(date +%s)
+  # Stop the server before any fail() below can exit — otherwise the cargo
+  # run tree would be leaked holding port ${port}.
+  stop_server
   t_install="$(cat "$state/t_install_start" 2>/dev/null || true)"
   [[ -n "$t_install" ]] || fail "missing funnel start time — the 'install' phase did not run"
   elapsed=$((t200 - t_install))
-  stop_server
   echo "$elapsed" >"$state/install_to_first_200_secs"
   echo "::notice::Quickstart funnel: install → first 200 from GET / took ${elapsed}s"
   step_summary "| \`${phase}\` | :white_check_mark: ok | $(phase_elapsed)s | GET / returned 200 |"

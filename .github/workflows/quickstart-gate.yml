@@ -44,8 +44,10 @@ on:
         required: false
         default: ""
 
+# Dispatched runs get their own concurrency group (keyed by run_id) so a push
+# to trunk-dev can never cancel an in-flight release-candidate gating run.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -61,6 +63,9 @@ jobs:
   quickstart:
     name: README quickstart vs published crates
     runs-on: ubuntu-latest
+    # A hung cargo install/build or download must not burn the default 6-hour
+    # job budget; the whole quickstart fits well inside an hour even cold.
+    timeout-minutes: 60
     services:
       postgres:
         image: postgres:16
