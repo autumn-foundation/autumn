@@ -78,23 +78,8 @@ pub fn plan_tauri(project_root: &Path) -> Result<Plan, GenerateError> {
         render_shell_lib_rs(&package_name, &bin_name),
     );
 
-    // Icons — reuse the PWA icon when the user already ran `autumn generate pwa`
-    let icons_dir = tauri.join("icons");
-    let pwa_icon_src = project_root.join("static").join("icons").join("icon.svg");
-    if pwa_icon_src.is_file() {
-        let contents = std::fs::read_to_string(&pwa_icon_src).map_err(GenerateError::Io)?;
-        plan.create_if_absent(icons_dir.join("icon.svg"), contents);
-    } else {
-        plan.create_if_absent(icons_dir.join("icon.svg"), render_placeholder_icon_svg());
-    }
-    // Placeholder raster icons so `cargo tauri build` works immediately.
-    // Replace with proper icons by running: cargo tauri icon static/icons/icon.svg
-    plan.create_bytes(icons_dir.join("32x32.png"), PLACEHOLDER_PNG);
-    plan.create_bytes(icons_dir.join("128x128.png"), PLACEHOLDER_PNG);
-    plan.create_bytes(icons_dir.join("128x128@2x.png"), PLACEHOLDER_PNG);
-    plan.create_bytes(icons_dir.join("icon.png"), PLACEHOLDER_PNG);
-    plan.create_bytes(icons_dir.join("icon.ico"), PLACEHOLDER_ICO);
-    plan.create_bytes(icons_dir.join("icon.icns"), PLACEHOLDER_ICNS);
+    // Icons — shared with the thin-client plan.
+    plan_icons(&mut plan, project_root, &tauri)?;
 
     // Platform-specific Tauri config overlays — Tauri CLI merges them at build/dev time.
     // beforeBuildCommand and beforeDevCommand live here so tauri.conf.json is
@@ -124,6 +109,28 @@ pub fn plan_tauri(project_root: &Path) -> Result<Plan, GenerateError> {
     plan.create(tauri.join(".gitignore"), render_gitignore());
 
     Ok(plan)
+}
+
+/// Register the icon actions shared by the desktop and thin-client plans:
+/// reuse the PWA icon when the user already ran `autumn generate pwa`, then
+/// add placeholder raster icons so `cargo tauri build` works immediately.
+/// Replace them with proper icons by running: `cargo tauri icon static/icons/icon.svg`
+fn plan_icons(plan: &mut Plan, project_root: &Path, tauri: &Path) -> Result<(), GenerateError> {
+    let icons_dir = tauri.join("icons");
+    let pwa_icon_src = project_root.join("static").join("icons").join("icon.svg");
+    if pwa_icon_src.is_file() {
+        let contents = std::fs::read_to_string(&pwa_icon_src).map_err(GenerateError::Io)?;
+        plan.create_if_absent(icons_dir.join("icon.svg"), contents);
+    } else {
+        plan.create_if_absent(icons_dir.join("icon.svg"), render_placeholder_icon_svg());
+    }
+    plan.create_bytes(icons_dir.join("32x32.png"), PLACEHOLDER_PNG);
+    plan.create_bytes(icons_dir.join("128x128.png"), PLACEHOLDER_PNG);
+    plan.create_bytes(icons_dir.join("128x128@2x.png"), PLACEHOLDER_PNG);
+    plan.create_bytes(icons_dir.join("icon.png"), PLACEHOLDER_PNG);
+    plan.create_bytes(icons_dir.join("icon.ico"), PLACEHOLDER_ICO);
+    plan.create_bytes(icons_dir.join("icon.icns"), PLACEHOLDER_ICNS);
+    Ok(())
 }
 
 // ── Package metadata helper ───────────────────────────────────────────────────
@@ -1431,22 +1438,10 @@ pub fn plan_tauri_thin_client(
         render_thin_client_ios_plist(&package_name),
     );
 
-    // Icons — identical to the desktop path: reuse the PWA icon when the user
-    // already ran `autumn generate pwa`, placeholder bytes otherwise.
-    let icons_dir = tauri.join("icons");
-    let pwa_icon_src = project_root.join("static").join("icons").join("icon.svg");
-    if pwa_icon_src.is_file() {
-        let contents = std::fs::read_to_string(&pwa_icon_src).map_err(GenerateError::Io)?;
-        plan.create_if_absent(icons_dir.join("icon.svg"), contents);
-    } else {
-        plan.create_if_absent(icons_dir.join("icon.svg"), render_placeholder_icon_svg());
-    }
-    plan.create_bytes(icons_dir.join("32x32.png"), PLACEHOLDER_PNG);
-    plan.create_bytes(icons_dir.join("128x128.png"), PLACEHOLDER_PNG);
-    plan.create_bytes(icons_dir.join("128x128@2x.png"), PLACEHOLDER_PNG);
-    plan.create_bytes(icons_dir.join("icon.png"), PLACEHOLDER_PNG);
-    plan.create_bytes(icons_dir.join("icon.ico"), PLACEHOLDER_ICO);
-    plan.create_bytes(icons_dir.join("icon.icns"), PLACEHOLDER_ICNS);
+    // Icons — identical to the desktop path (shared helper): reuse the PWA
+    // icon when the user already ran `autumn generate pwa`, placeholder
+    // bytes otherwise.
+    plan_icons(&mut plan, project_root, &tauri)?;
 
     // /gen covers the `cargo tauri android init` / `ios init` output.
     plan.create(tauri.join(".gitignore"), render_gitignore());
@@ -1491,6 +1486,12 @@ fn validate_remote_url(raw: &str) -> Result<url::Url, GenerateError> {
     }
 }
 
+/// Library target name for the thin-client shell crate: `{package_name}_mobile`
+/// with hyphens underscored (Cargo library target names cannot contain hyphens).
+fn mobile_lib_name(package_name: &str) -> String {
+    package_name.replace('-', "_") + "_mobile"
+}
+
 /// `tauri.conf.json` for the thin client: productName/version/identifier and
 /// bundle icons only — no `externalBin` (no sidecar binary) and no `resources`
 /// (config files live on the remote server, not in the app bundle).
@@ -1533,7 +1534,7 @@ fn render_thin_client_tauri_conf(package_name: &str, version: &str) -> String {
 /// mobile projects link the Rust core as a library, not a binary.
 fn render_thin_client_cargo_toml(package_name: &str) -> String {
     let mobile_name = format!("{package_name}-mobile");
-    let lib_name = package_name.replace('-', "_") + "_mobile";
+    let lib_name = mobile_lib_name(package_name);
     format!(
         r#"[package]
 name = "{mobile_name}"
@@ -1574,7 +1575,7 @@ strip = true
 }
 
 fn render_thin_client_main_rs(package_name: &str) -> String {
-    let lib_name = package_name.replace('-', "_") + "_mobile";
+    let lib_name = mobile_lib_name(package_name);
     format!(
         "#![cfg_attr(not(debug_assertions), windows_subsystem = \"windows\")]\n\
          \n\

@@ -120,7 +120,7 @@ hand-maintained project.
 
 **Server-side prerequisites** for the remote origin:
 
-- A valid, publicly-trusted TLS certificate — mobile webviews do not show
+- A valid, publicly trusted TLS certificate — mobile webviews do not show
   certificate-error interstitials; a bad cert is just a blank screen.
 - `session.secure = true` (or `AUTUMN_SESSION__SECURE=true`) in production so
   session cookies carry the `Secure` attribute (see
