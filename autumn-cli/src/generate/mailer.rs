@@ -874,11 +874,8 @@ async fn main() {
     fn destroying_one_of_two_list_unsubscribe_mailers_keeps_the_shared_migration() {
         let tmp = project_with_main(default_main());
         let migrations_dir = tmp.path().join("migrations");
-        let migration_dir_exists = || {
-            fs::read_dir(&migrations_dir)
-                .map(|mut d| d.next().is_some())
-                .unwrap_or(false)
-        };
+        let migration_dir_exists =
+            || fs::read_dir(&migrations_dir).is_ok_and(|mut d| d.next().is_some());
 
         plan_mailer(tmp.path(), "WeeklyDigest", Some("weekly_digest"), false)
             .unwrap()

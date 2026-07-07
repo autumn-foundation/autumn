@@ -188,7 +188,7 @@ impl Revert {
     /// Apply this revert to `content`, returning the new content. Every
     /// underlying transform is idempotent — a revert whose target is
     /// already absent returns `content` unchanged.
-    fn apply(&self, content: &str) -> String {
+    fn apply(&self, content: &str, project_root: &Path, excluding: &[PathBuf]) -> String {
         use super::inbound_mail::remove_inbound_mail_handler;
         use super::schema_edit::{
             remove_autumn_web_dev_dependency_feature, remove_autumn_web_feature, remove_job_entry,
@@ -200,8 +200,28 @@ impl Revert {
             Self::RoutesEntries { entries, .. } => remove_routes_entries(content, entries),
             Self::SchemaTable { table, .. } => remove_schema_table(content, table),
             Self::CargoDeps { names, .. } => {
-                let names: Vec<&str> = names.iter().map(String::as_str).collect();
-                super::model::remove_cargo_dependencies(content, &names)
+                // In addition to the `owner_dir` sibling-directory check
+                // already applied by the caller, only remove a name if
+                // nothing else in the project's source tree still
+                // references it — a hand-added dependency unrelated to any
+                // generator (issue #1048 PR review) survives the same way a
+                // dependency shared with a sibling resource already does.
+                // Best-effort: usage via a re-export or a derive macro that
+                // never spells out the crate's own name (e.g. plain
+                // `#[derive(Serialize)]` with no qualified `serde::` path)
+                // isn't detected.
+                let survives: Vec<&str> = names
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|name| {
+                        !crate_referenced_elsewhere_in_project(project_root, name, excluding)
+                    })
+                    .collect();
+                if survives.is_empty() {
+                    content.to_owned()
+                } else {
+                    super::model::remove_cargo_dependencies(content, &survives)
+                }
             }
             Self::CargoAutumnWebFeature { feature, .. } => {
                 remove_autumn_web_feature(content, feature)
@@ -691,8 +711,20 @@ impl Plan {
             }
         }
 
+        let grouped_reverts = group_reverts_by_path(&self.reverts);
+        // Every path this destroy is ITSELF also rewriting (e.g.
+        // `src/schema.rs`, emptied by a `SchemaTable` revert) must be
+        // excluded from `crate_referenced_elsewhere_in_project`'s scan
+        // alongside `files_to_remove`: its pre-destroy content (still on
+        // disk at scan time — the real rewrite/deletion happens later, in
+        // `Plan::revert`'s apply phase) isn't evidence of anything a
+        // *different* resource still needs, since this same operation is
+        // about to change it too.
+        let mut cargo_deps_excluding = files_to_remove.clone();
+        cargo_deps_excluding.extend(grouped_reverts.iter().map(|(path, _)| path.clone()));
+
         let mut modifies = Vec::new();
-        for (path, reverts) in group_reverts_by_path(&self.reverts) {
+        for (path, reverts) in grouped_reverts {
             if !path.exists() {
                 continue;
             }
@@ -709,7 +741,7 @@ impl Plan {
                     // feature — leave the Cargo.toml edit in place.
                     continue;
                 }
-                content = revert.apply(&content);
+                content = revert.apply(&content, &self.project_root, &cargo_deps_excluding);
             }
             if content == original {
                 continue;
@@ -797,6 +829,54 @@ fn resource_dir_has_other_files(dir: &Path, excluding: &[PathBuf]) -> bool {
             && path.file_name() != Some(std::ffi::OsStr::new("mod.rs"))
             && !excluding.contains(&path)
     })
+}
+
+/// Whether `crate_name`'s Rust identifier (`-` replaced with `_`) is
+/// referenced anywhere under `project_root`'s `src/`, `tests/`, or
+/// `benches/` trees — other than in `excluding` (this same destroy's own
+/// file deletions). A whole-project extension of [`resource_dir_has_other_files`]
+/// for [`Revert::CargoDeps`]: a project may hand-add a dependency for its
+/// own reasons with no generated resource ever touching it, so checking
+/// only the generator's `owner_dir` isn't enough to avoid stripping it.
+///
+/// Best-effort, not exhaustive: looks for `{ident}::` (a qualified path) or
+/// `use {ident}` (an import) as plain substrings; a crate used only via a
+/// re-export or a derive macro that never spells out its own name (e.g.
+/// bare `#[derive(Serialize)]` with no qualified `serde::` path anywhere)
+/// is not detected.
+fn crate_referenced_elsewhere_in_project(
+    project_root: &Path,
+    crate_name: &str,
+    excluding: &[PathBuf],
+) -> bool {
+    let ident = crate_name.replace('-', "_");
+    let markers = [format!("{ident}::"), format!("use {ident}")];
+    ["src", "tests", "benches"]
+        .iter()
+        .any(|dir| rs_tree_contains_marker(&project_root.join(dir), &markers, excluding))
+}
+
+/// Recursively scan `dir` for any `.rs` file (other than `excluding`)
+/// containing one of `markers` as a plain substring.
+fn rs_tree_contains_marker(dir: &Path, markers: &[String], excluding: &[PathBuf]) -> bool {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if path.is_dir() {
+            if rs_tree_contains_marker(&path, markers, excluding) {
+                return true;
+            }
+        } else if path.extension().is_some_and(|ext| ext == "rs")
+            && !excluding.contains(&path)
+            && fs::read_to_string(&path)
+                .is_ok_and(|content| markers.iter().any(|m| content.contains(m.as_str())))
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Outcome of matching one plan-time migration directory (built with a

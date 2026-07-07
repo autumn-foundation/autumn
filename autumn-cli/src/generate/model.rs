@@ -1809,6 +1809,46 @@ mod tests {
     }
 
     #[test]
+    fn destroying_last_model_keeps_dep_still_used_by_hand_written_code() {
+        // Codex PR review (issue #1048): a project can hand-add a dependency
+        // for its own reasons, unrelated to any generated resource. Destroy
+        // must not strip it just because the last model that also happened
+        // to need it is gone.
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"x\"\n\n[dependencies]\nautumn-web = \"0.6.0\"\ndiesel_migrations = \"2\"\n",
+        )
+        .unwrap();
+        let cargo_path = tmp.path().join("Cargo.toml");
+
+        plan_model(tmp.path(), "Post", &["owner:Uuid".into()], "20260427000000")
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+        // Hand-written code elsewhere in the project also uses `uuid`,
+        // independent of the generated model.
+        fs::create_dir_all(tmp.path().join("src/tasks")).unwrap();
+        fs::write(
+            tmp.path().join("src/tasks/cleanup.rs"),
+            "pub fn new_id() -> uuid::Uuid {\n    uuid::Uuid::new_v4()\n}\n",
+        )
+        .unwrap();
+        assert!(fs::read_to_string(&cargo_path).unwrap().contains("uuid"));
+
+        plan_model(tmp.path(), "Post", &["owner:Uuid".into()], "99999999999999")
+            .unwrap()
+            .revert(Flags::default())
+            .unwrap();
+
+        assert!(!tmp.path().join("src/models/post.rs").exists());
+        assert!(
+            fs::read_to_string(&cargo_path).unwrap().contains("uuid"),
+            "uuid must survive — hand-written src/tasks/cleanup.rs still uses it"
+        );
+    }
+
+    #[test]
     fn plan_rejects_lowercase_first_char() {
         let tmp = project();
         let err = plan_model(tmp.path(), "123Bad", &[], "20260427000000").unwrap_err();
