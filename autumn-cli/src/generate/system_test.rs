@@ -381,10 +381,18 @@ pub(super) fn patch_cargo_toml(existing: &str, snake_name: &str) -> String {
 /// `tests/system/*.rs` entry remains, mirroring the "shared while still
 /// needed" rule `emit::SHARED_MAIN_MODULE_NAMES` applies to `src/main.rs`
 /// module declarations (multiple system-test resources, and `generate pwa`'s
-/// own smoke test, all share this one feature declaration).
+/// own smoke test, all share this one feature declaration) — AND only if no
+/// hand-written `#[cfg(feature = "system-tests")]` elsewhere in the project
+/// still gates on it (issue #1048 PR review): the feature may have
+/// pre-existed for code this generator never touched.
 ///
 /// A no-op if this test's `[[test]]` entry isn't present.
-pub(super) fn remove_cargo_toml_patch(existing: &str, snake_name: &str) -> String {
+pub(super) fn remove_cargo_toml_patch(
+    existing: &str,
+    snake_name: &str,
+    project_root: &std::path::Path,
+    excluding: &[std::path::PathBuf],
+) -> String {
     let test_block =
         format!("\n[[test]]\nname = \"{snake_name}\"\npath = \"tests/system/{snake_name}.rs\"\n");
     let Some(pos) = existing.find(&test_block) else {
@@ -395,6 +403,9 @@ pub(super) fn remove_cargo_toml_patch(existing: &str, snake_name: &str) -> Strin
     without_test_entry.push_str(&existing[pos + test_block.len()..]);
 
     if without_test_entry.contains("tests/system/") {
+        return without_test_entry;
+    }
+    if super::emit::cargo_feature_still_gated_elsewhere("system-tests", project_root, excluding) {
         return without_test_entry;
     }
 
@@ -600,6 +611,44 @@ mod tests {
         );
         assert!(cargo_after.contains("checkout_flow"));
         assert!(!cargo_after.contains("todo_flow"));
+    }
+
+    #[test]
+    fn destroying_the_only_system_test_keeps_a_pre_existing_hand_written_feature_gate() {
+        // The project already gates unrelated hand-written code on
+        // `system-tests` (independent of this generator) before `generate
+        // system-test` ever runs. Destroying the only generated system test
+        // must not strip that pre-existing feature declaration out from
+        // under the hand-written code (issue #1048 PR review).
+        let tmp = temp_project();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(
+            tmp.path().join("src").join("lib.rs"),
+            "#[cfg(feature = \"system-tests\")]\npub fn only_for_browser_tests() {}\n",
+        )
+        .unwrap();
+
+        plan_system_test(tmp.path(), "TodoFlow")
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+        plan_system_test(tmp.path(), "TodoFlow")
+            .unwrap()
+            .revert(Flags::default())
+            .unwrap();
+
+        assert!(
+            !tmp.path()
+                .join("tests")
+                .join("system")
+                .join("todo_flow.rs")
+                .exists()
+        );
+        let cargo_after = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+        assert!(
+            cargo_after.contains("system-tests"),
+            "pre-existing hand-written feature gate must survive destroy"
+        );
     }
 
     #[test]

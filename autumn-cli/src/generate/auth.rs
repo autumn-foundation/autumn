@@ -593,16 +593,28 @@ pub fn plan_auth_with_providers(
     plan.push_revert(crate::generate::emit::Revert::SchemaTable {
         path: schema_path.clone(),
         table: table.clone(),
+        expected_block: append_schema_table("", &table, &auth_fields),
     });
     if totp {
+        let recovery_fields: Vec<super::dsl::Field> = [
+            "user_id:i64",
+            "code_digest:String",
+            "used_at:Option<NaiveDateTime>",
+        ]
+        .iter()
+        .map(|t| super::dsl::parse_field(t).expect("recovery field tokens are always valid"))
+        .collect();
         plan.push_revert(crate::generate::emit::Revert::SchemaTable {
             path: schema_path.clone(),
             table: "recovery_codes".to_owned(),
+            expected_block: append_schema_table("", "recovery_codes", &recovery_fields),
         });
     }
+    let sess_table_expected_block = append_schema_table("", &sess_table, &session_fields);
     plan.push_revert(crate::generate::emit::Revert::SchemaTable {
         path: schema_path,
         table: sess_table,
+        expected_block: sess_table_expected_block,
     });
 
     // ── Auth routes ────────────────────────────────────────────────────────
@@ -833,6 +845,7 @@ fn plan_auth_options_impl(
         plan.push_revert(crate::generate::emit::Revert::SchemaTable {
             path: schema_path,
             table: "oauth_identities".to_owned(),
+            expected_block: append_schema_table("", "oauth_identities", &oauth_fields),
         });
 
         // ── oauth routes ───────────────────────────────────────────────────────
@@ -999,6 +1012,7 @@ fn plan_auth_options_impl(
         plan.push_revert(crate::generate::emit::Revert::SchemaTable {
             path: schema_path,
             table: "webauthn_credentials".to_owned(),
+            expected_block: append_schema_table("", "webauthn_credentials", &wc_fields),
         });
 
         // ── src/routes/passkeys.rs ─────────────────────────────────────────────

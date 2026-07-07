@@ -201,6 +201,7 @@ pub fn plan_model_with_options(
     plan.push_revert(crate::generate::emit::Revert::SchemaTable {
         path: schema_path,
         table: table.clone(),
+        expected_block: append_schema_table_with_id("", &table, &schema_fields, options.id_type),
     });
 
     // (d) `Cargo.toml` deps — `#[autumn_web::model]` expands to references

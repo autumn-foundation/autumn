@@ -59,8 +59,15 @@ pub enum Revert {
     /// (`src/main.rs`).
     RoutesEntries { path: PathBuf, entries: Vec<String> },
     /// Remove the `diesel::table! { <table> ... }` block from `path`
-    /// (`src/schema.rs`).
-    SchemaTable { path: PathBuf, table: String },
+    /// (`src/schema.rs`) — but only if its content is still byte-identical
+    /// to `expected_block` (the literal text this generator invocation
+    /// would append for `table`), so a same-named table that pre-existed
+    /// with different columns is never destroyed (issue #1048 PR review).
+    SchemaTable {
+        path: PathBuf,
+        table: String,
+        expected_block: String,
+    },
     /// Remove the named crates' shorthand `[dependencies]` lines from `path`
     /// (`Cargo.toml`) — but only once `owner_dir` (e.g. `src/models`) has no
     /// other resource file left in it, so a sibling resource of the same
@@ -198,7 +205,11 @@ impl Revert {
         match self {
             Self::ModDecl { name, .. } => remove_mod_declaration(content, name),
             Self::RoutesEntries { entries, .. } => remove_routes_entries(content, entries),
-            Self::SchemaTable { table, .. } => remove_schema_table(content, table),
+            Self::SchemaTable {
+                table,
+                expected_block,
+                ..
+            } => remove_schema_table(content, table, expected_block),
             Self::CargoDeps { names, .. } => {
                 // In addition to the `owner_dir` sibling-directory check
                 // already applied by the caller, only remove a name if
@@ -247,7 +258,12 @@ impl Revert {
                 ..
             } => remove_inbound_mail_handler(content, handler_module_path),
             Self::SystemTestCargoPatch { snake_name, .. } => {
-                super::system_test::remove_cargo_toml_patch(content, snake_name)
+                super::system_test::remove_cargo_toml_patch(
+                    content,
+                    snake_name,
+                    project_root,
+                    excluding,
+                )
             }
             Self::PwaMainRsInjection { .. } => super::pwa::remove_pwa_injection(content),
             Self::AuthOAuthProviderStubs { providers, .. } => {
@@ -909,6 +925,25 @@ fn autumn_web_feature_still_needed_elsewhere(
         return false;
     };
     let markers = [marker.to_owned()];
+    ["src", "tests", "benches"]
+        .iter()
+        .any(|dir| rs_tree_contains_marker(&project_root.join(dir), &markers, excluding))
+}
+
+/// Whether a local Cargo `feature` (not an `autumn-web` feature — see
+/// [`autumn_web_feature_still_needed_elsewhere`] for that) is still gated on
+/// anywhere under `project_root`'s `src/`, `tests/`, or `benches/` trees,
+/// other than in `excluding`. Used by [`Revert::SystemTestCargoPatch`]:
+/// destroying the last generated system test (or `generate pwa`'s smoke
+/// test) must not strip a shared `[features] system-tests = [...]` entry
+/// that pre-existed for unrelated hand-written `#[cfg(feature =
+/// "system-tests")]` code (issue #1048 PR review).
+pub(super) fn cargo_feature_still_gated_elsewhere(
+    feature: &str,
+    project_root: &Path,
+    excluding: &[PathBuf],
+) -> bool {
+    let markers = [format!("feature = \"{feature}\"")];
     ["src", "tests", "benches"]
         .iter()
         .any(|dir| rs_tree_contains_marker(&project_root.join(dir), &markers, excluding))

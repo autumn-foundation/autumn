@@ -111,12 +111,16 @@ fn has_table(existing: &str, table: &str) -> bool {
 /// byte to whatever preceded it (including becoming empty, in which case the
 /// caller deletes the file rather than leaving a blank `src/schema.rs`).
 ///
-/// A no-op (returns `existing` unchanged) if `table` isn't declared, or if
-/// the block's shape doesn't match what `append_schema_table_with_id` would
-/// have produced (hand-edited/malformed) — destroy never corrupts a file it
-/// can't confidently reverse.
+/// A no-op (returns `existing` unchanged) if `table` isn't declared, if the
+/// block's shape doesn't match what `append_schema_table_with_id` would have
+/// produced (hand-edited/malformed), or if the block's content isn't
+/// byte-identical to `expected_block` (the literal text this generator
+/// invocation would append for `table`) — the last check protects a
+/// same-named table that pre-existed with different columns from ever being
+/// destroyed (issue #1048 PR review): destroy never corrupts, nor deletes, a
+/// table it didn't itself produce.
 #[must_use]
-pub fn remove_schema_table(existing: &str, table: &str) -> String {
+pub fn remove_schema_table(existing: &str, table: &str, expected_block: &str) -> String {
     if !has_table(existing, table) {
         return existing.to_owned();
     }
@@ -143,6 +147,11 @@ pub fn remove_schema_table(existing: &str, table: &str) -> String {
         return existing.to_owned();
     }
     let outer_close_idx = inner_close_idx + 1;
+
+    let found_block = format!("{}\n", lines[open_idx..=outer_close_idx].join("\n"));
+    if found_block != expected_block {
+        return existing.to_owned();
+    }
 
     // Also consume one preceding blank separator line, if present.
     let mut start = open_idx;
@@ -6792,8 +6801,9 @@ pub struct Comment {
     #[test]
     fn remove_schema_table_restores_empty_file() {
         let f = fields(&["title:String"]);
-        let after_add = append_schema_table("", "posts", &f);
-        assert_eq!(remove_schema_table(&after_add, "posts"), "");
+        let block = append_schema_table("", "posts", &f);
+        let after_add = block.clone();
+        assert_eq!(remove_schema_table(&after_add, "posts", &block), "");
     }
 
     #[test]
@@ -6801,15 +6811,33 @@ pub struct Comment {
         let f1 = fields(&["title:String"]);
         let f2 = fields(&["name:String"]);
         let base = append_schema_table("", "users", &f2);
+        let block = append_schema_table("", "posts", &f1);
         let after_add = append_schema_table(&base, "posts", &f1);
-        assert_eq!(remove_schema_table(&after_add, "posts"), base);
+        assert_eq!(remove_schema_table(&after_add, "posts", &block), base);
     }
 
     #[test]
     fn remove_schema_table_is_idempotent_when_absent() {
         let f = fields(&["name:String"]);
         let base = append_schema_table("", "users", &f);
-        assert_eq!(remove_schema_table(&base, "posts"), base);
+        let block = append_schema_table("", "posts", &f);
+        assert_eq!(remove_schema_table(&base, "posts", &block), base);
+    }
+
+    #[test]
+    fn remove_schema_table_never_removes_a_pre_existing_table_with_different_columns() {
+        // A hand-rolled `posts` table with different columns than this
+        // generator invocation would produce must survive `destroy` — it
+        // wasn't generate's own output, even though the name matches
+        // (issue #1048 PR review).
+        let hand_written = "diesel::table! {\n    posts (id) {\n        id -> BigInt,\n        \
+                             body -> Text,\n    }\n}\n";
+        let generated_block = append_schema_table("", "posts", &fields(&["title:String"]));
+        assert_eq!(
+            remove_schema_table(hand_written, "posts", &generated_block),
+            hand_written,
+            "pre-existing table with different columns must not be removed"
+        );
     }
 
     #[test]
