@@ -133,6 +133,16 @@ increments the process metric `autumn_tx_retries_total` (exhausted budgets
 increment `autumn_tx_retry_exhausted_total`) — both surfaced on the actuator
 health endpoint.
 
+> **Under a transactional test** (`TestApp::with_transactional_db`), the
+> connection is already inside the test harness's own outer transaction, so
+> `tx_with` nests via `SAVEPOINT` — exactly like `Db::tx` — and runs the
+> closure exactly once, ignoring the requested isolation level and retry
+> budget. Postgres rejects `SET TRANSACTION ISOLATION LEVEL` inside a
+> subtransaction, and there's nothing meaningful to retry against a single
+> test-harness connection. Test the *closure's logic*; verify isolation/retry
+> behavior itself against a real Postgres instance (see the `#[ignore]`d
+> integration tests in `tests/integration/tx_isolation_retry_integration.rs`).
+
 ### When SERIALIZABLE + retry, `#[lock_version]`, or `with_lock`?
 
 Autumn gives you three tools for concurrent writes; they compose rather than

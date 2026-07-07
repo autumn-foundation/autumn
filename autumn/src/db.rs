@@ -558,6 +558,33 @@ where
     })
 }
 
+/// Walk `err`'s source chain looking for a `tokio_postgres` SQLSTATE matching
+/// `predicate`, downcasting each link to [`tokio_postgres::Error`] and
+/// [`tokio_postgres::error::DbError`] in turn. Shared by [`is_query_canceled`]
+/// and [`is_retryable_txn_error`] — both need the same downcast-through-the-
+/// chain strategy, only with a different SQLSTATE to look for.
+fn source_chain_has_sqlstate(
+    err: &(dyn std::error::Error + 'static),
+    predicate: impl Fn(&tokio_postgres::error::SqlState) -> bool,
+) -> bool {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = source {
+        if e.downcast_ref::<tokio_postgres::Error>()
+            .and_then(tokio_postgres::Error::code)
+            .is_some_and(&predicate)
+        {
+            return true;
+        }
+        if e.downcast_ref::<tokio_postgres::error::DbError>()
+            .is_some_and(|db_err| predicate(db_err.code()))
+        {
+            return true;
+        }
+        source = e.source();
+    }
+    false
+}
+
 /// Check whether a Diesel error wraps a Postgres `57014` `query_canceled` error.
 ///
 /// Prefers downcasting through the source chain to find a
@@ -575,25 +602,9 @@ fn is_query_canceled(err: &diesel::result::Error) -> bool {
         return true;
     }
 
-    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(err);
-
-    while let Some(e) = source {
-        // Try downcasting to tokio_postgres::Error
-        if e.downcast_ref::<tokio_postgres::Error>()
-            .and_then(|pg_err| pg_err.code())
-            == Some(&tokio_postgres::error::SqlState::QUERY_CANCELED)
-        {
-            return true;
-        }
-        // Try downcasting to tokio_postgres::error::DbError
-        if e.downcast_ref::<tokio_postgres::error::DbError>()
-            .is_some_and(|db_err| db_err.code() == &tokio_postgres::error::SqlState::QUERY_CANCELED)
-        {
-            return true;
-        }
-        source = e.source();
-    }
-    false
+    source_chain_has_sqlstate(err, |state| {
+        *state == tokio_postgres::error::SqlState::QUERY_CANCELED
+    })
 }
 
 /// Error type for pool creation failures.
@@ -924,6 +935,22 @@ impl TxOptions {
         self
     }
 
+    /// `max_attempts`, clamped to at least 1.
+    ///
+    /// The `max_attempts` field is public (struct-literal update syntax is a
+    /// supported way to build a `TxOptions`), so a value of `0` can reach the
+    /// struct without going through [`TxOptions::max_attempts`]'s clamp. The
+    /// retry loop calls this instead of reading the field directly, so `0`
+    /// always behaves like `1` (run the closure once, no retry) rather than
+    /// skipping the closure entirely.
+    const fn effective_max_attempts(&self) -> u32 {
+        if self.max_attempts < 1 {
+            1
+        } else {
+            self.max_attempts
+        }
+    }
+
     /// Set the backoff before the first retry.
     #[must_use]
     pub const fn initial_backoff(mut self, delay: Duration) -> Self {
@@ -973,32 +1000,32 @@ fn retry_backoff_base(initial: Duration, max: Duration, attempt: u32) -> Duratio
 /// [`retry_backoff_base`] with +/-20% jitter applied, never exceeding `max`.
 ///
 /// Jitter decorrelates a thundering herd of transactions all retrying after the
-/// same conflict. Randomness is drawn via `getrandom`, matching
-/// [`crate::cache`]'s `jittered_ttl`; a `getrandom` failure degrades to no
-/// jitter rather than panicking.
+/// same conflict. Delegates to [`crate::cache::jittered_ttl`] (rather than
+/// re-implementing the RNG/fallback logic) so there's one jitter
+/// implementation in the crate, including its `getrandom`-failure fallback to
+/// `SystemTime` entropy instead of silently degrading to no jitter.
 fn retry_backoff_delay(initial: Duration, max: Duration, attempt: u32) -> Duration {
     let base = retry_backoff_base(initial, max, attempt);
-
-    let mut buf = [0u8; 4];
-    let factor = if getrandom::getrandom(&mut buf).is_ok() {
-        // Map the random u32 into [0, 1], then into the +/-20% band [0.8, 1.2].
-        let unit = f64::from(u32::from_le_bytes(buf)) / f64::from(u32::MAX);
-        0.2_f64.mul_add(2.0_f64.mul_add(unit, -1.0), 1.0)
-    } else {
-        1.0
-    };
-
-    base.mul_f64(factor).min(max)
+    crate::cache::jittered_ttl(base, 0.2).min(max)
 }
 
 /// Whether `err` wraps a Postgres serialization failure (`40001`) or deadlock
 /// (`40P01`) — the two transient errors that are safe to retry by re-running
 /// the whole transaction.
 ///
-/// Recovers the underlying `diesel::result::Error` from the [`AutumnError`] and
-/// walks its source chain for the authoritative `SqlState`, mirroring the
-/// downcast strategy in [`is_query_canceled`]. Falls back to string matching so
-/// custom error types that only preserve the message are still classified.
+/// When `err` preserves a `diesel::result::Error`, classification is
+/// structural and authoritative: diesel maps `40001` to
+/// `DatabaseErrorKind::SerializationFailure`, and any *other* `DatabaseErrorKind`
+/// (e.g. `UniqueViolation`) is trusted as non-retryable outright — it is never
+/// string-matched, so a constraint name or key value that happens to contain
+/// `"40001"` cannot misclassify it. `40P01` has no dedicated
+/// `DatabaseErrorKind` and surfaces as `Unknown`; for that one kind, the source
+/// chain's `SqlState` is checked first (locale-independent) and an
+/// English-locale message match is used only as a last resort.
+///
+/// Only when `err` does **not** preserve a `diesel::result::Error` at all (a
+/// custom `E` that only kept the message) does this fall back to scanning the
+/// displayed message and source chain for the two SQLSTATEs.
 fn is_retryable_txn_error(err: &AutumnError) -> bool {
     use tokio_postgres::error::SqlState;
 
@@ -1006,37 +1033,42 @@ fn is_retryable_txn_error(err: &AutumnError) -> bool {
         *state == SqlState::T_R_SERIALIZATION_FAILURE || *state == SqlState::T_R_DEADLOCK_DETECTED
     }
 
-    // Primary path: recover the raw diesel error and inspect it structurally.
     if let Some(diesel_err) = err.downcast_ref::<diesel::result::Error>() {
-        // Fast path: diesel maps 40001 to SerializationFailure. (40P01 is not
-        // mapped, so it is caught by the SqlState/string walk below.)
-        if let diesel::result::Error::DatabaseError(
-            diesel::result::DatabaseErrorKind::SerializationFailure,
-            _,
-        ) = diesel_err
-        {
-            return true;
-        }
-
-        let mut source: Option<&(dyn std::error::Error + 'static)> = Some(diesel_err);
-        while let Some(e) = source {
-            if e.downcast_ref::<tokio_postgres::Error>()
-                .and_then(tokio_postgres::Error::code)
-                .is_some_and(is_retryable_sqlstate)
-            {
-                return true;
+        return match diesel_err {
+            // Fast path: diesel maps 40001 to SerializationFailure.
+            diesel::result::Error::DatabaseError(
+                diesel::result::DatabaseErrorKind::SerializationFailure,
+                _,
+            ) => true,
+            // 40P01 (deadlock) — and, on some paths, 40001 too — has no
+            // dedicated `DatabaseErrorKind` and surfaces as `Unknown`: check
+            // the chain first (locale-independent), then this kind's own
+            // message as a last resort. Scoped to `Unknown` only so an
+            // unrelated kind's message (e.g. a unique-violation's constraint
+            // name) can never trigger a false positive.
+            diesel::result::Error::DatabaseError(
+                diesel::result::DatabaseErrorKind::Unknown,
+                info,
+            ) => {
+                if source_chain_has_sqlstate(diesel_err, is_retryable_sqlstate) {
+                    return true;
+                }
+                let message = info.message().to_lowercase();
+                message.contains("40001")
+                    || message.contains("40p01")
+                    || message.contains("could not serialize access")
+                    || message.contains("deadlock detected")
+                    || message.contains("serialization failure")
             }
-            if e.downcast_ref::<tokio_postgres::error::DbError>()
-                .is_some_and(|db| is_retryable_sqlstate(db.code()))
-            {
-                return true;
-            }
-            source = e.source();
-        }
+            // Any other kind (UniqueViolation, NotNullViolation, ...) is
+            // authoritatively non-retryable — no string matching against its
+            // message/constraint text.
+            _ => source_chain_has_sqlstate(diesel_err, is_retryable_sqlstate),
+        };
     }
 
-    // Fallback: scan the displayed message and its source chain. Covers custom
-    // `E` types whose conversion to `AutumnError` boxed away the diesel error.
+    // Fallback: `E` didn't preserve a `diesel::result::Error` at all — scan the
+    // displayed message and source chain for the two SQLSTATEs.
     let mut haystack = err.to_string().to_lowercase();
     for source in err.source_chain() {
         haystack.push('\n');
@@ -1356,7 +1388,38 @@ impl Db {
             db.tx.attempts = tracing::field::Empty,
         );
 
-        let is_test_tx = self.is_test_tx;
+        if self.is_test_tx {
+            // Under a transactional `TestApp` the connection is already inside
+            // the test harness's outer transaction (`begin_test_transaction`),
+            // so issuing a literal `BEGIN`/`SET TRANSACTION ISOLATION LEVEL`
+            // via `build_transaction()` here would be invalid — Postgres
+            // rejects `SET TRANSACTION ISOLATION LEVEL` inside a
+            // subtransaction, and the retry loop's per-attempt `&mut f`
+            // re-borrow doesn't type-check against the plain `transaction()`
+            // method's lifetime shape (unlike `build_transaction().run()`, its
+            // bound is not scoped to a single call). So: nest via `SAVEPOINT`
+            // instead, exactly like `Db::tx`, running the closure exactly
+            // once — the requested isolation/read-only/deferrable/retry
+            // options are inherited from (or meaningless nested inside) the
+            // outer test transaction, so there is nothing to retry against a
+            // single test-harness connection.
+            use diesel_async::AsyncConnection as _;
+            let registry: Arc<Mutex<Vec<CommitCallback>>> = Arc::new(Mutex::new(Vec::new()));
+            let conn: &mut AsyncPgConnection = &mut self.conn;
+            let result = AFTER_COMMIT_REGISTRY
+                .scope(registry, conn.transaction::<T, E, _>(f))
+                .instrument(span.clone())
+                .await
+                .map_err(Into::into);
+
+            span.record("db.tx.attempts", 1u32);
+            guard.disarmed = true;
+            // `is_test_tx` always suppresses after-commit spawning (matching
+            // `Db::tx`), so the registry is simply dropped without draining.
+            return result;
+        }
+
+        let max_attempts = opts.effective_max_attempts();
         let mut attempt: u32 = 0;
 
         let outcome: Result<T, crate::error::AutumnError> = loop {
@@ -1394,16 +1457,15 @@ impl Db {
 
             match attempt_result {
                 Ok(value) => {
-                    // Commit path: drain THIS attempt's callbacks and spawn them,
-                    // unless we're in a rolled-back transactional test.
-                    if !is_test_tx {
-                        let callbacks: Vec<CommitCallback> = {
-                            let mut reg = registry.lock().expect("registry lock");
-                            std::mem::take(&mut *reg)
-                        };
-                        if !callbacks.is_empty() {
-                            let _ = spawn_committed_after_commit_callbacks(callbacks);
-                        }
+                    // Commit path: drain THIS attempt's callbacks and spawn
+                    // them. (The `is_test_tx` case already returned above, so
+                    // spawning here is always live.)
+                    let callbacks: Vec<CommitCallback> = {
+                        let mut reg = registry.lock().expect("registry lock");
+                        std::mem::take(&mut *reg)
+                    };
+                    if !callbacks.is_empty() {
+                        let _ = spawn_committed_after_commit_callbacks(callbacks);
                     }
                     break Ok(value);
                 }
@@ -1411,7 +1473,7 @@ impl Db {
                     // Convert to AutumnError first, then classify on it.
                     let ae = crate::error::AutumnError::from(e);
                     let retryable = is_retryable_txn_error(&ae);
-                    match retry_decision(attempt, opts.max_attempts, retryable) {
+                    match retry_decision(attempt, max_attempts, retryable) {
                         RetryDecision::Retry => {
                             let retries_total = record_tx_retry();
                             let delay = retry_backoff_delay(
@@ -1422,7 +1484,7 @@ impl Db {
                             tracing::debug!(
                                 parent: &span,
                                 attempt,
-                                max_attempts = opts.max_attempts,
+                                max_attempts,
                                 delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
                                 autumn.tx.retries_total = retries_total,
                                 "retrying transaction after serialization/deadlock failure"
@@ -1438,7 +1500,7 @@ impl Db {
                                 tracing::warn!(
                                     parent: &span,
                                     attempt,
-                                    max_attempts = opts.max_attempts,
+                                    max_attempts,
                                     autumn.tx.retry_exhausted_total = exhausted_total,
                                     "transaction retry budget exhausted; returning final error"
                                 );
@@ -2604,6 +2666,23 @@ mod tests {
         assert_eq!(TxOptions::default().max_attempts(0).max_attempts, 1);
     }
 
+    #[test]
+    fn tx_options_effective_max_attempts_clamps_struct_literal_bypass() {
+        // `max_attempts` is a public field, so struct-literal update syntax can
+        // set it to 0 directly, bypassing the `max_attempts()` builder's clamp.
+        // The retry loop must still treat this as "run once", not "never run".
+        let opts = TxOptions {
+            max_attempts: 0,
+            ..TxOptions::default()
+        };
+        assert_eq!(opts.max_attempts, 0, "the raw field is not itself clamped");
+        assert_eq!(
+            opts.effective_max_attempts(),
+            1,
+            "the retry loop's accessor must clamp a struct-literal 0 to 1"
+        );
+    }
+
     // ── Backoff ──────────────────────────────────────────────────
 
     #[test]
@@ -2696,6 +2775,18 @@ mod tests {
         let err: AutumnError = AutumnError::internal_server_error(diesel_db_error(
             diesel::result::DatabaseErrorKind::UniqueViolation,
             "duplicate key value violates unique constraint",
+        ));
+        assert!(!is_retryable_txn_error(&err));
+    }
+
+    #[test]
+    fn unique_violation_with_magic_substring_in_message_is_not_retryable() {
+        // Regression: a non-retryable `DatabaseErrorKind` must never be
+        // misclassified just because its message/constraint text happens to
+        // contain a magic substring like "40001" or "deadlock detected".
+        let err: AutumnError = AutumnError::internal_server_error(diesel_db_error(
+            diesel::result::DatabaseErrorKind::UniqueViolation,
+            "duplicate key value violates unique constraint \"orders_40001_key\"",
         ));
         assert!(!is_retryable_txn_error(&err));
     }

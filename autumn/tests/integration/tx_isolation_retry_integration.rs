@@ -122,8 +122,19 @@ mod tx_isolation_retry_tests {
         let t1 = tokio::spawn(async move { try_go_off_call(db1, 1, o1, b1).await });
         let t2 = tokio::spawn(async move { try_go_off_call(db2, 2, o2, b2).await });
 
-        let _ = t1.await.expect("task1 join");
-        let _ = t2.await.expect("task2 join");
+        // If either task hits a non-retryable error before reaching the
+        // barrier, its partner would otherwise block on `barrier.wait()`
+        // forever. Bound the whole race so an unexpected failure surfaces as a
+        // clean test failure instead of an indefinite CI hang.
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let _ = t1.await.expect("task1 join");
+            let _ = t2.await.expect("task2 join");
+        })
+        .await
+        .expect(
+            "write-skew race did not complete within 30s — likely one participant hit a \
+             non-retryable error before reaching the barrier, leaving its partner blocked",
+        );
     }
 
     // ── The falsifiable success-metric test ────────────────────
