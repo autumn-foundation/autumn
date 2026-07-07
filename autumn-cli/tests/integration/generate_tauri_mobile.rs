@@ -101,18 +101,35 @@ fn generate_tauri_mobile_lib_rs_spawns_server_in_process() {
     let lib_rs = read(&project.join("src-tauri/src/lib.rs"));
 
     // In-process lifecycle: server thread spawned inside Builder::setup(...).
+    // Assert the crate-qualified serve() call and the literal HTTP request
+    // line — NOT comment-matchable substrings — so deleting the server-spawn
+    // or health-poll code from the template fails this test even though the
+    // surrounding comments survive.
     assert!(lib_rs.contains("tauri::Builder::default()"));
     assert!(lib_rs.contains(".setup("));
-    assert!(lib_rs.contains("std::thread::spawn"));
-    assert!(lib_rs.contains("block_on"));
+    assert!(
+        lib_rs.contains("block_on(mobile_inprocess_app::serve())"),
+        "lib.rs must block a dedicated thread on the app's serve() future"
+    );
+    let spawn_pos = lib_rs
+        .find("std::thread::spawn")
+        .expect("lib.rs must spawn the server thread");
+    assert!(
+        lib_rs[spawn_pos..].contains("block_on(mobile_inprocess_app::serve())"),
+        "the serve() call must live inside a spawned thread"
+    );
     assert!(
         lib_rs.contains("tauri::mobile_entry_point"),
         "lib.rs must declare the mobile entry point"
     );
 
-    // Readiness: /health poll before loading the webview at 127.0.0.1:<port>.
-    assert!(lib_rs.contains("/health"));
-    assert!(lib_rs.contains("127.0.0.1"));
+    // Readiness: a real GET /health probe before loading the webview at
+    // 127.0.0.1:<port>.
+    assert!(
+        lib_rs.contains(r"GET /health HTTP/1.1\r\n"),
+        "lib.rs must send a literal GET /health request line"
+    );
+    assert!(lib_rs.contains(r#"format!("http://127.0.0.1:{port}")"#));
 
     // No sidecar machinery of any kind.
     assert!(
@@ -137,14 +154,11 @@ fn generate_tauri_mobile_cargo_toml_is_mobile_lib() {
     assert!(cargo_toml.contains("cdylib"));
     assert!(cargo_toml.contains("rlib"));
 
-    // The shell depends on the parent app crate by path (in-process server).
+    // The shell depends on the parent app crate by path (in-process server),
+    // built with embedded assets — a device has no static/ dir to serve from.
     assert!(
-        cargo_toml.contains(r#"path = "..""#),
-        "src-tauri/Cargo.toml must depend on the app crate via path = \"..\""
-    );
-    assert!(
-        cargo_toml.contains("mobile-cargo-app"),
-        "src-tauri/Cargo.toml must name the app crate dependency"
+        cargo_toml.contains(r#"mobile-cargo-app = { path = "..", features = ["embed-assets"] }"#),
+        "src-tauri/Cargo.toml must depend on the app crate with embed-assets enabled"
     );
 
     // No sidecar plugin.
@@ -248,18 +262,25 @@ fn generate_tauri_mobile_sets_flaky_network_pool_defaults() {
 
     let lib_rs = read(&project.join("src-tauri/src/lib.rs"));
 
-    // Conservative remote-Postgres pool defaults for mobile networks.
+    // Conservative remote-Postgres pool defaults for mobile networks — pinned
+    // by VALUE (the advertised defaults), not just by variable name.
     assert!(
-        lib_rs.contains("AUTUMN_DATABASE__POOL_SIZE"),
-        "mobile lib.rs must pin a small pool size for flaky mobile networks"
+        lib_rs.contains(r#"set_var("AUTUMN_DATABASE__POOL_SIZE", "2")"#),
+        "mobile lib.rs must pin POOL_SIZE=2 for flaky mobile networks"
     );
     assert!(
-        lib_rs.contains("AUTUMN_DATABASE__CONNECT_TIMEOUT_SECS"),
-        "mobile lib.rs must pin a short connect timeout for flaky mobile networks"
+        lib_rs.contains(r#"set_var("AUTUMN_DATABASE__CONNECT_TIMEOUT_SECS", "5")"#),
+        "mobile lib.rs must pin CONNECT_TIMEOUT_SECS=5 for flaky mobile networks"
     );
     assert!(
         lib_rs.contains("AUTUMN_DATABASE__URL"),
         "mobile lib.rs must reference AUTUMN_DATABASE__URL for the remote Postgres"
+    );
+    // Release builds must run the prod profile (serve() bypasses the macro
+    // entry point that would otherwise mark release builds).
+    assert!(
+        lib_rs.contains(r#"set_var("AUTUMN_ENV", "prod")"#),
+        "mobile lib.rs must pin AUTUMN_ENV=prod for release builds"
     );
 }
 
@@ -312,8 +333,89 @@ fn generate_tauri_mobile_collision_without_force_exits_nonzero() {
         "second run without --force must exit non-zero"
     );
 
-    // With --force it succeeds (idempotent overwrite).
-    run_autumn(&project, &["generate", "tauri-mobile", "--force"]);
+    // With --force it succeeds (idempotent overwrite) — and the already
+    // extracted app stays extracted: main.rs remains the thin serve() caller
+    // and no re-extraction warning is printed.
+    let forced = run_autumn(&project, &["generate", "tauri-mobile", "--force"]);
+    let main_rs = read(&project.join("src/main.rs"));
+    assert!(
+        main_rs.contains("::serve().await"),
+        "after a --force re-run, src/main.rs must still be the thin serve() caller"
+    );
+    assert!(
+        !main_rs.contains("autumn_web::app()"),
+        "a --force re-run must not re-inline the app into main.rs"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&forced.stdout),
+        String::from_utf8_lossy(&forced.stderr)
+    );
+    assert!(
+        !combined.contains("skipping"),
+        "a --force re-run over an extracted app must be silent, got:\n{combined}"
+    );
+}
+
+#[test]
+fn destroy_tauri_mobile_removes_shell_keeps_extracted_app_lib() {
+    let (_tmp, project) = fresh_project("mobile-destroy-app");
+    run_autumn(&project, &["generate", "tauri-mobile"]);
+    assert!(project.join("src/lib.rs").is_file());
+
+    // Dry-run first: reports the plan, removes nothing.
+    run_autumn(&project, &["destroy", "tauri-mobile", "--dry-run"]);
+    assert!(
+        project.join("src-tauri").exists(),
+        "destroy --dry-run must not remove src-tauri/"
+    );
+
+    // Real destroy (unedited scaffold — no --force needed).
+    run_autumn(&project, &["destroy", "tauri-mobile"]);
+    assert!(
+        !project.join("src-tauri").exists(),
+        "destroy must remove the generated src-tauri/ shell"
+    );
+    // The extracted app lib survives: main.rs depends on it.
+    let lib_rs = read(&project.join("src/lib.rs"));
+    assert!(
+        lib_rs.contains("pub async fn serve()"),
+        "destroy must keep the extracted src/lib.rs"
+    );
+    let main_rs = read(&project.join("src/main.rs"));
+    assert!(
+        main_rs.contains("::serve()"),
+        "destroy must keep the thin src/main.rs serve() caller"
+    );
+}
+
+#[test]
+fn destroy_tauri_mobile_requires_force_after_editing_the_shell() {
+    let (_tmp, project) = fresh_project("mobile-destroy-edited-app");
+    run_autumn(&project, &["generate", "tauri-mobile"]);
+
+    // The documented setup flow edits src-tauri/src/lib.rs (DB URL), so every
+    // subsequent destroy hits the divergence check.
+    let shell_lib = project.join("src-tauri/src/lib.rs");
+    let edited = read(&shell_lib) + "\n// edited: AUTUMN_DATABASE__URL configured here\n";
+    fs::write(&shell_lib, edited).unwrap();
+
+    let refused = run_autumn_raw(&project, &["destroy", "tauri-mobile"]);
+    assert!(
+        !refused.status.success(),
+        "destroy over an edited shell must refuse without --force"
+    );
+    assert!(project.join("src-tauri").exists());
+
+    run_autumn(&project, &["destroy", "tauri-mobile", "--force"]);
+    assert!(
+        !project.join("src-tauri").exists(),
+        "destroy --force must remove the edited shell"
+    );
+    assert!(
+        project.join("src/lib.rs").is_file(),
+        "destroy --force must still keep the extracted app src/lib.rs"
+    );
 }
 
 #[test]
