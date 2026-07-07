@@ -51,9 +51,20 @@ use super::{GenerateError, ensure_project_root, read_or_empty};
 pub fn plan_tauri_mobile(project_root: &Path) -> Result<Plan, GenerateError> {
     ensure_project_root(project_root)?;
 
-    let (package_name, package_version) = read_app_meta(project_root)?;
+    let (package_name, package_version, has_embed_assets) = read_app_meta(project_root)?;
     let mut plan = Plan::new(project_root);
     let tauri = project_root.join("src-tauri");
+
+    if !has_embed_assets {
+        plan.warn(
+            "the app's Cargo.toml declares no `embed-assets` feature — the mobile \
+             shell will link the app WITHOUT embedded assets, so static files \
+             (CSS, htmx, widgets JS) will 404 on a device. Add \
+             `embed-assets = [\"autumn-web/embed-assets\"]` under [features] and \
+             re-run with --force (see docs/guide/tauri-mobile-in-process.md)."
+                .to_owned(),
+        );
+    }
 
     // Core Tauri project files
     plan.create(
@@ -62,7 +73,7 @@ pub fn plan_tauri_mobile(project_root: &Path) -> Result<Plan, GenerateError> {
     );
     plan.create(
         tauri.join("Cargo.toml"),
-        render_mobile_cargo_toml(&package_name),
+        render_mobile_cargo_toml(&package_name, has_embed_assets),
     );
     plan.create(tauri.join("build.rs"), render_mobile_build_rs());
     plan.create(
@@ -84,7 +95,7 @@ pub fn plan_tauri_mobile(project_root: &Path) -> Result<Plan, GenerateError> {
         plan.create_if_absent(icons_dir.join("icon.svg"), render_placeholder_icon_svg());
     }
     // Placeholder raster icons so `cargo tauri build` works immediately.
-    // Replace with proper icons by running: cargo tauri icon static/icons/icon.svg
+    // Replace with proper icons by running: cd src-tauri && cargo tauri icon icons/icon.svg
     plan.create_bytes(icons_dir.join("32x32.png"), PLACEHOLDER_PNG);
     plan.create_bytes(icons_dir.join("128x128.png"), PLACEHOLDER_PNG);
     plan.create_bytes(icons_dir.join("128x128@2x.png"), PLACEHOLDER_PNG);
@@ -116,32 +127,40 @@ Required prerequisites for building the mobile app:\n\
 \n\
   3. Point the app at your remote Postgres database:\n\
        edit src-tauri/src/lib.rs and set AUTUMN_DATABASE__URL (see the\n\
-       commented example in setup()).\n\
+       commented example in run()).\n\
 \n\
   4. Develop or build:\n\
        cd src-tauri && cargo tauri ios dev        (or: cargo tauri ios build)\n\
        cd src-tauri && cargo tauri android dev    (or: cargo tauri android build)\n\
+       Note: Android release builds block cleartext HTTP (incl. 127.0.0.1) by\n\
+       default — permit loopback via a network_security_config.xml (see the\n\
+       docs page below).\n\
 \n\
   The server runs IN-PROCESS on a background thread — mobile sandboxes forbid\n\
   sidecar processes, so this scaffold intentionally has no externalBin and no\n\
   staging scripts.  Read docs/guide/tauri-mobile-in-process.md for mobile\n\
   sandboxing restrictions, remote-Postgres pool tuning for flaky networks,\n\
-  and App Store guideline compliance notes.\n\
+  security notes, and App Store guideline compliance notes.\n\
 \n\
   Replace the placeholder icons before shipping:\n\
-       cargo tauri icon static/icons/icon.svg   (from the app root)\n"
+       cd src-tauri && cargo tauri icon icons/icon.svg\n"
         .to_owned()
 }
 
 // ── Package metadata helper ───────────────────────────────────────────────────
 
-/// Returns `(package_name, version)` from the app's `Cargo.toml`.
+/// Returns `(package_name, version, has_embed_assets)` from the app's
+/// `Cargo.toml`.
 ///
 /// A deliberately small, self-contained reader: the mobile shell has no
 /// sidecar, so — unlike the desktop generator — it needs no binary-target or
 /// dependency-key resolution. `version` resolves workspace inheritance
 /// (`version.workspace = true`) by walking up the directory tree.
-fn read_app_meta(project_root: &Path) -> Result<(String, String), GenerateError> {
+/// `has_embed_assets` is `true` when the app declares an `embed-assets`
+/// feature (the stock scaffold always does) — the mobile shell enables it on
+/// the app dependency so CSS/JS/static assets are compiled into the binary
+/// (a mobile app has no working directory to serve `static/` from).
+fn read_app_meta(project_root: &Path) -> Result<(String, String, bool), GenerateError> {
     let cargo_path = project_root.join("Cargo.toml");
     let content = std::fs::read_to_string(&cargo_path).map_err(GenerateError::Io)?;
     let doc: toml::Value = toml::from_str(&content)
@@ -165,7 +184,12 @@ fn read_app_meta(project_root: &Path) -> Result<(String, String), GenerateError>
         _ => "0.1.0".to_owned(),
     };
 
-    Ok((name, version))
+    let has_embed_assets = doc
+        .get("features")
+        .and_then(|f| f.get("embed-assets"))
+        .is_some();
+
+    Ok((name, version, has_embed_assets))
 }
 
 /// Walk from `project_root` upward looking for a `Cargo.toml` that declares
@@ -317,8 +341,21 @@ fn render_mobile_tauri_conf(package_name: &str, version: &str) -> String {
     )
 }
 
-fn render_mobile_cargo_toml(package_name: &str) -> String {
+fn render_mobile_cargo_toml(package_name: &str, has_embed_assets: bool) -> String {
     let shell_name = format!("{package_name}-mobile");
+    // Enable the app's `embed-assets` feature so CSS/htmx/static assets are
+    // compiled into the binary: a mobile app has no working directory holding
+    // a `static/` tree, so disk-served assets would 404 on device.
+    let app_dep = if has_embed_assets {
+        format!(
+            "# The `embed-assets` feature compiles the app's static/ tree (CSS, htmx,\n\
+             # widgets JS) into the binary — on a device there is no on-disk static/\n\
+             # directory to serve from.\n\
+             {package_name} = {{ path = \"..\", features = [\"embed-assets\"] }}"
+        )
+    } else {
+        format!("{package_name} = {{ path = \"..\" }}")
+    };
     format!(
         r#"[package]
 name = "{shell_name}"
@@ -347,7 +384,7 @@ getrandom = {{ version = "0.2", features = ["std"] }}
 # The autumn app itself — the server runs IN-PROCESS on a background thread
 # (mobile sandboxes forbid sidecar processes), so the shell links the app
 # crate directly instead of bundling a server binary.
-{package_name} = {{ path = ".." }}
+{app_dep}
 
 [profile.release]
 panic = "abort"
@@ -387,8 +424,8 @@ fn render_mobile_lib_rs(package_name: &str) -> String {
 //! on a background thread INSIDE this app process:
 //!
 //!   1. Bind loopback:0 to find a free ephemeral port.
-//!   2. Configure the server through environment variables (same process, set
-//!      before the server thread starts).
+//!   2. Configure the server through environment variables at the top of
+//!      run(), before tauri::Builder starts any platform threads.
 //!   3. std::thread::spawn a dedicated tokio runtime that block_on()s
 //!      {crate_ident}::serve() — the app entry extracted into src/lib.rs by
 //!      `autumn generate tauri-mobile`.
@@ -398,41 +435,33 @@ fn render_mobile_lib_rs(package_name: &str) -> String {
 //! The database is a REMOTE Postgres reached over the device network. The env
 //! defaults below (small pool, short connect timeout) are tuned for flaky
 //! mobile networks — see docs/guide/tauri-mobile-in-process.md for the full
-//! rationale, reconnection semantics, and App Store compliance notes.
+//! rationale, reconnection semantics, security notes, and App Store
+//! compliance notes.
 
 use std::net::TcpListener;
 use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {{
-    tauri::Builder::default()
-        .setup(|app| setup(app))
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
-}}
-
-fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {{
     // 1. Find a free loopback port: bind :0, read the assigned port, then drop
     //    the listener so the in-process server can bind that same address.
+    //    (The port is briefly unbound until the server thread claims it — see
+    //    the security section of docs/guide/tauri-mobile-in-process.md.)
     let port = {{
-        let l = TcpListener::bind("127.0.0.1:0")?;
-        l.local_addr()?.port()
+        let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind a loopback port");
+        listener
+            .local_addr()
+            .expect("failed to read the loopback port")
+            .port()
     }};
 
-    // 2. Per-app data directories (inside the mobile app sandbox).
-    let data_root = app.path().app_data_dir()?;
-    std::fs::create_dir_all(&data_root)?;
-    // Local blob storage in blobs/ (the only writable filesystem location).
-    let blobs_dir = data_root.join("blobs");
-    std::fs::create_dir_all(&blobs_dir)?;
-    // Per-install signing secret: autumn requires one in prod mode. Generate
-    // 32 random bytes on first launch and persist them so sessions survive
-    // restarts.
-    let signing_secret = load_or_generate_signing_secret(&data_root)?;
-
-    // 3. Configure the server via environment variables. The server runs in
-    //    THIS process, so plain std::env::set_var (before the server thread
-    //    starts) is the whole config story — no staged config files.
+    // 2. Configure the server via environment variables. The server runs in
+    //    THIS process, so std::env::set_var is the whole config story — no
+    //    staged config files (an autumn.toml in the app repo is NOT read by
+    //    this shell). This block runs at the top of run(), BEFORE
+    //    tauri::Builder starts platform runtimes: set_var is only sound while
+    //    no foreign threads may call getenv concurrently. Only the values
+    //    that need the app sandbox path are deferred to setup().
     std::env::set_var("AUTUMN_SERVER__HOST", "127.0.0.1");
     std::env::set_var("AUTUMN_SERVER__PORT", port.to_string());
     // ── Remote Postgres over a mobile network ───────────────────────────────
@@ -449,34 +478,35 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {{
     // re-establishes broken ones automatically, so a small pool recovers
     // faster and wastes fewer half-dead connections.
     std::env::set_var("AUTUMN_DATABASE__POOL_SIZE", "2");
-    // Fail fast when the radio is off/asleep instead of hanging a request
-    // behind a multi-minute OS-level TCP timeout.
+    // Fail fast on NEW connection attempts when the radio is off or asleep.
+    // (5 is also the framework default — pinned here so the mobile posture
+    // survives future framework default changes.)
     std::env::set_var("AUTUMN_DATABASE__CONNECT_TIMEOUT_SECS", "5");
     // ────────────────────────────────────────────────────────────────────────
     // The webview loads the app over plain HTTP on loopback; Secure cookies
     // would be silently dropped by the webview, breaking sessions and CSRF.
-    // Loopback never leaves the device, so this is safe.
+    // Loopback never leaves the device — but other apps ON the device can
+    // reach it too (see the security section of the docs page).
     std::env::set_var("AUTUMN_SESSION__SECURE", "false");
     // Loopback-only server: accept Host: 127.0.0.1 from the webview even when
     // production config pins trusted hosts to a public domain.
     std::env::set_var("AUTUMN_SECURITY__TRUSTED_HOSTS__HOSTS", "127.0.0.1,localhost");
-    std::env::set_var("AUTUMN_SECURITY__SIGNING_SECRET", &signing_secret);
-    // Route local blob storage into the app sandbox (the default target/blobs
-    // is relative to a read-only install location).
-    std::env::set_var(
-        "AUTUMN_STORAGE__LOCAL__ROOT",
-        blobs_dir.to_string_lossy().as_ref(),
-    );
+    // Local blob storage backend rooted in the app sandbox; the root path is
+    // set in setup() once the sandbox data dir is known.
+    std::env::set_var("AUTUMN_STORAGE__BACKEND", "local");
     std::env::set_var("AUTUMN_STORAGE__ALLOW_LOCAL_IN_PRODUCTION", "true");
     // No load balancer drains connections to an in-process loopback server;
     // skip the prestop grace so shutdown hooks run immediately.
     std::env::set_var("AUTUMN_SERVER__PRESTOP_GRACE_SECS", "0");
     // Profile selection: dev config during `cargo tauri [ios|android] dev`,
-    // prod config in release builds.
+    // prod config in release builds. Set explicitly — running serve()
+    // in-process bypasses the #[autumn_web::main] entry point that would
+    // otherwise bake the release/debug signal into profile detection, so
+    // without this a release build would silently run the dev profile.
     if cfg!(debug_assertions) {{
         std::env::set_var("AUTUMN_ENV", "dev");
     }} else {{
-        std::env::remove_var("AUTUMN_ENV");
+        std::env::set_var("AUTUMN_ENV", "prod");
     }}
     // Clear inherited one-off mode flags and desktop-only settings: any of
     // these would make AppBuilder::run() exit before binding the HTTP port
@@ -494,6 +524,32 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {{
     ] {{
         std::env::remove_var(var);
     }}
+
+    tauri::Builder::default()
+        .setup(move |app| setup(app, port))
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}}
+
+fn setup(app: &mut tauri::App, port: u16) -> Result<(), Box<dyn std::error::Error>> {{
+    // 3. Per-app data directories (inside the mobile app sandbox). These two
+    //    set_var calls are the only ones that must wait for the tauri App
+    //    handle (the sandbox path is not known before the Builder runs); they
+    //    still execute before the server thread reads the environment.
+    let data_root = app.path().app_data_dir()?;
+    std::fs::create_dir_all(&data_root)?;
+    // Local blob storage in blobs/ (the only writable filesystem location).
+    let blobs_dir = data_root.join("blobs");
+    std::fs::create_dir_all(&blobs_dir)?;
+    std::env::set_var(
+        "AUTUMN_STORAGE__LOCAL__ROOT",
+        blobs_dir.to_string_lossy().as_ref(),
+    );
+    // Per-install signing secret: autumn requires one in prod mode. Generate
+    // 32 random bytes on first launch and persist them so sessions survive
+    // restarts.
+    let signing_secret = load_or_generate_signing_secret(&data_root)?;
+    std::env::set_var("AUTUMN_SECURITY__SIGNING_SECRET", &signing_secret);
 
     // 4. Spawn the Autumn server on a background thread with its own tokio
     //    runtime. tauri's setup() is synchronous and must return quickly, so
@@ -544,8 +600,14 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {{
             std::thread::sleep(poll_timeout);
         }}
         if !ready {{
-            eprintln!("[{package_name}] Server did not become ready within 60 s — exiting.");
-            handle.exit(1);
+            eprintln!("[{package_name}] Server did not become ready within 60 s.");
+            show_startup_error(
+                &handle,
+                "The app's built-in server did not start in time. This is \
+                 usually a configuration problem — for example an unreachable \
+                 or misconfigured AUTUMN_DATABASE__URL. Check the device logs \
+                 for details.",
+            );
             return;
         }}
         if let Err(e) = tauri::WebviewWindowBuilder::new(
@@ -559,11 +621,53 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {{
         .build()
         {{
             eprintln!("[{package_name}] Failed to open window: {{e}}");
-            handle.exit(1);
+            show_startup_error(&handle, "The app window could not be opened.");
         }}
     }});
 
     Ok(())
+}}
+
+/// Surface a startup failure in a visible window instead of a silent exit or
+/// an endless blank screen. Falls back to exiting when even the error window
+/// cannot be built. Note: some framework-level startup failures (for example
+/// a database bootstrap error) call std::process::exit directly from the
+/// server thread and terminate the app before this can render — see the
+/// troubleshooting notes in docs/guide/tauri-mobile-in-process.md.
+fn show_startup_error(handle: &tauri::AppHandle, message: &str) {{
+    let html = format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"></head>\
+         <body style=\"font-family:system-ui;margin:2rem\">\
+         <h1>{package_name} could not start</h1>\
+         <p>{{message}}</p></body></html>"
+    );
+    let opened = format!("data:text/html,{{}}", percent_encode(&html))
+        .parse()
+        .ok()
+        .and_then(|url| {{
+            tauri::WebviewWindowBuilder::new(handle, "startup-error", tauri::WebviewUrl::External(url))
+                .title("{package_name}")
+                .build()
+                .ok()
+        }})
+        .is_some();
+    if !opened {{
+        handle.exit(1);
+    }}
+}}
+
+/// Minimal percent-encoding for embedding the error page in a data: URL
+/// (avoids pulling an extra dependency into the shell crate).
+fn percent_encode(input: &str) -> String {{
+    input
+        .bytes()
+        .map(|b| match b {{
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {{
+                char::from(b).to_string()
+            }}
+            _ => format!("%{{b:02X}}"),
+        }})
+        .collect()
 }}
 
 /// Generate a 32-byte random signing secret on first launch, persist it to
@@ -700,7 +804,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::fs::write(
             tmp.path().join("Cargo.toml"),
-            format!("[package]\nname = \"{name}\"\nversion = \"0.2.3\"\n"),
+            format!(
+                "[package]\nname = \"{name}\"\nversion = \"0.2.3\"\n\n\
+                 [features]\nembed-assets = [\"autumn-web/embed-assets\"]\n"
+            ),
         )
         .unwrap();
         std::fs::create_dir_all(tmp.path().join("src")).unwrap();
@@ -736,13 +843,43 @@ mod tests {
 
     #[test]
     fn cargo_toml_is_mobile_library_without_sidecar_plugin() {
-        let toml_src = render_mobile_cargo_toml("my-app");
+        let toml_src = render_mobile_cargo_toml("my-app", true);
         assert!(toml_src.contains(r#"crate-type = ["staticlib", "cdylib", "rlib"]"#));
-        assert!(toml_src.contains(r#"my-app = { path = ".." }"#));
+        assert!(
+            toml_src.contains(r#"my-app = { path = "..", features = ["embed-assets"] }"#),
+            "shell must build the app with embedded assets (no static/ dir on device)"
+        );
         assert!(toml_src.contains(r#"name = "my-app-mobile""#));
         assert!(!toml_src.contains("tauri-plugin-shell"));
         // The rendered manifest must be valid TOML.
         toml::from_str::<toml::Value>(&toml_src).expect("generated Cargo.toml must parse");
+    }
+
+    #[test]
+    fn cargo_toml_omits_embed_assets_when_app_lacks_the_feature() {
+        let toml_src = render_mobile_cargo_toml("my-app", false);
+        assert!(toml_src.contains(r#"my-app = { path = ".." }"#));
+        assert!(!toml_src.contains("embed-assets"));
+        toml::from_str::<toml::Value>(&toml_src).expect("generated Cargo.toml must parse");
+    }
+
+    #[test]
+    fn plan_warns_when_app_has_no_embed_assets_feature() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"my-app\"\nversion = \"0.2.3\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/main.rs"), stock_main_rs()).unwrap();
+
+        let plan = plan_tauri_mobile(tmp.path()).unwrap();
+        assert!(
+            plan.warnings.iter().any(|w| w.contains("embed-assets")),
+            "must warn when the app declares no embed-assets feature, got {:?}",
+            plan.warnings
+        );
     }
 
     #[test]
@@ -753,11 +890,60 @@ mod tests {
         assert!(lib.contains("std::thread::spawn"));
         assert!(lib.contains("block_on(my_app::serve())"));
         assert!(lib.contains("tauri::mobile_entry_point"));
-        assert!(lib.contains("AUTUMN_DATABASE__POOL_SIZE"));
-        assert!(lib.contains("AUTUMN_DATABASE__CONNECT_TIMEOUT_SECS"));
+        // The advertised flaky-network defaults are pinned by VALUE, not just
+        // by variable name (comments also name the variables).
+        assert!(lib.contains(r#"set_var("AUTUMN_DATABASE__POOL_SIZE", "2")"#));
+        assert!(lib.contains(r#"set_var("AUTUMN_DATABASE__CONNECT_TIMEOUT_SECS", "5")"#));
         assert!(lib.contains("AUTUMN_DATABASE__URL"));
         assert!(!lib.contains(".sidecar("));
         assert!(!lib.contains("tauri_plugin_shell"));
+    }
+
+    #[test]
+    fn lib_rs_pins_prod_profile_in_release_builds() {
+        let lib = render_mobile_lib_rs("my-app");
+        // Release builds must run the prod profile: serve() bypasses the
+        // #[autumn_web::main] macro that would otherwise mark release builds,
+        // so leaving AUTUMN_ENV unset would silently fall back to dev
+        // (permissive CORS, debug logging, no fail-fast secret checks).
+        assert!(lib.contains(r#"set_var("AUTUMN_ENV", "prod")"#));
+        assert!(lib.contains(r#"set_var("AUTUMN_ENV", "dev")"#));
+        assert!(
+            !lib.contains(r#"remove_var("AUTUMN_ENV")"#),
+            "release builds must pin prod explicitly, not unset AUTUMN_ENV"
+        );
+    }
+
+    #[test]
+    fn lib_rs_sets_env_before_tauri_builder_starts() {
+        let lib = render_mobile_lib_rs("my-app");
+        // std::env::set_var is only sound before other (platform) threads
+        // exist; the static env block must precede tauri::Builder in run().
+        let env_pos = lib
+            .find(r#"set_var("AUTUMN_ENV""#)
+            .expect("template must set AUTUMN_ENV");
+        let builder_pos = lib
+            .find("tauri::Builder::default()")
+            .expect("template must build a tauri app");
+        assert!(
+            env_pos < builder_pos,
+            "the env-var block must run before tauri::Builder::default()"
+        );
+        // Storage backend must be enabled explicitly: the prod profile
+        // defaults storage.backend to \"disabled\".
+        assert!(lib.contains(r#"set_var("AUTUMN_STORAGE__BACKEND", "local")"#));
+    }
+
+    #[test]
+    fn lib_rs_surfaces_startup_failure_in_a_visible_error_page() {
+        let lib = render_mobile_lib_rs("my-app");
+        assert!(
+            lib.contains("fn show_startup_error("),
+            "startup failures must surface a visible error, not a silent exit"
+        );
+        assert!(lib.contains("data:text/html"));
+        // The health-poll timeout path routes through the error page.
+        assert!(lib.contains("did not become ready"));
     }
 
     #[test]
@@ -876,9 +1062,13 @@ mod tests {
         )
         .unwrap();
 
-        let (name, version) = read_app_meta(&app).unwrap();
+        let (name, version, has_embed_assets) = read_app_meta(&app).unwrap();
         assert_eq!(name, "app");
         assert_eq!(version, "9.9.9");
+        assert!(
+            !has_embed_assets,
+            "no [features] table means no embed-assets feature"
+        );
     }
 
     #[test]
