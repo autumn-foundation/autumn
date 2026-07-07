@@ -1,0 +1,363 @@
+//! Integration tests for `autumn generate tauri-mobile` (issue #1507).
+//!
+//! The mobile generator scaffolds an **in-process** Tauri v2 shell: the Autumn
+//! Axum server runs on a background thread inside the app process (mobile
+//! sandboxes forbid spawning sidecar processes), connecting to a remote
+//! Postgres database.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+
+/// Scaffold a fresh Autumn app via `autumn new` in a temp dir; returns the
+/// temp dir guard and the project directory path.
+fn fresh_project(project_name: &str) -> (tempfile::TempDir, PathBuf) {
+    let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
+    let autumn_bin = env!("CARGO_BIN_EXE_autumn");
+
+    let output = Command::new(autumn_bin)
+        .args(["new", project_name])
+        .current_dir(temp_dir.path())
+        .output()
+        .expect("failed to run `autumn new`");
+    assert!(
+        output.status.success(),
+        "autumn new failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let project = temp_dir.path().join(project_name);
+    (temp_dir, project)
+}
+
+/// Run the autumn CLI in `project_dir`, returning the raw output.
+fn run_autumn_raw(project_dir: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_autumn"))
+        .args(args)
+        .current_dir(project_dir)
+        .output()
+        .expect("failed to run autumn")
+}
+
+/// Run the autumn CLI in `project_dir`, asserting success.
+fn run_autumn(project_dir: &Path, args: &[&str]) -> Output {
+    let output = run_autumn_raw(project_dir, args);
+    assert!(
+        output.status.success(),
+        "autumn {args:?} failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    output
+}
+
+fn read(path: &Path) -> String {
+    fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
+}
+
+#[test]
+fn generate_tauri_mobile_scaffolds_expected_files() {
+    let (_tmp, project) = fresh_project("mobile-scaffold-app");
+    run_autumn(&project, &["generate", "tauri-mobile"]);
+
+    for file in &[
+        "src-tauri/tauri.conf.json",
+        "src-tauri/Cargo.toml",
+        "src-tauri/build.rs",
+        "src-tauri/src/main.rs",
+        "src-tauri/src/lib.rs",
+        "src-tauri/.gitignore",
+        "src-tauri/icons/icon.svg",
+        "src-tauri/icons/32x32.png",
+        "src-tauri/icons/128x128.png",
+        "src-tauri/icons/128x128@2x.png",
+        "src-tauri/icons/icon.png",
+        "src-tauri/icons/icon.ico",
+        "src-tauri/icons/icon.icns",
+    ] {
+        assert!(
+            project.join(file).is_file(),
+            "{file} must be created by `autumn generate tauri-mobile`"
+        );
+    }
+
+    // The mobile model has NO sidecar: no staging scripts may be emitted.
+    assert!(
+        !project.join("src-tauri/stage-sidecar.sh").exists(),
+        "mobile scaffold must not emit stage-sidecar.sh (no sidecar on mobile)"
+    );
+    assert!(
+        !project.join("src-tauri/stage-sidecar.ps1").exists(),
+        "mobile scaffold must not emit stage-sidecar.ps1 (no sidecar on mobile)"
+    );
+}
+
+#[test]
+fn generate_tauri_mobile_lib_rs_spawns_server_in_process() {
+    let (_tmp, project) = fresh_project("mobile-inprocess-app");
+    run_autumn(&project, &["generate", "tauri-mobile"]);
+
+    let lib_rs = read(&project.join("src-tauri/src/lib.rs"));
+
+    // In-process lifecycle: server thread spawned inside Builder::setup(...).
+    assert!(lib_rs.contains("tauri::Builder::default()"));
+    assert!(lib_rs.contains(".setup("));
+    assert!(lib_rs.contains("std::thread::spawn"));
+    assert!(lib_rs.contains("block_on"));
+    assert!(
+        lib_rs.contains("tauri::mobile_entry_point"),
+        "lib.rs must declare the mobile entry point"
+    );
+
+    // Readiness: /health poll before loading the webview at 127.0.0.1:<port>.
+    assert!(lib_rs.contains("/health"));
+    assert!(lib_rs.contains("127.0.0.1"));
+
+    // No sidecar machinery of any kind.
+    assert!(
+        !lib_rs.contains(".sidecar("),
+        "mobile lib.rs must not spawn a sidecar process"
+    );
+    assert!(
+        !lib_rs.contains("tauri_plugin_shell"),
+        "mobile lib.rs must not use tauri-plugin-shell"
+    );
+}
+
+#[test]
+fn generate_tauri_mobile_cargo_toml_is_mobile_lib() {
+    let (_tmp, project) = fresh_project("mobile-cargo-app");
+    run_autumn(&project, &["generate", "tauri-mobile"]);
+
+    let cargo_toml = read(&project.join("src-tauri/Cargo.toml"));
+
+    // Mobile targets link the app as a library.
+    assert!(cargo_toml.contains("staticlib"));
+    assert!(cargo_toml.contains("cdylib"));
+    assert!(cargo_toml.contains("rlib"));
+
+    // The shell depends on the parent app crate by path (in-process server).
+    assert!(
+        cargo_toml.contains(r#"path = "..""#),
+        "src-tauri/Cargo.toml must depend on the app crate via path = \"..\""
+    );
+    assert!(
+        cargo_toml.contains("mobile-cargo-app"),
+        "src-tauri/Cargo.toml must name the app crate dependency"
+    );
+
+    // No sidecar plugin.
+    assert!(
+        !cargo_toml.contains("tauri-plugin-shell"),
+        "mobile shell must not depend on tauri-plugin-shell"
+    );
+}
+
+#[test]
+fn generate_tauri_mobile_conf_has_no_external_bin() {
+    let (_tmp, project) = fresh_project("mobile-conf-app");
+    run_autumn(&project, &["generate", "tauri-mobile"]);
+
+    let conf_raw = read(&project.join("src-tauri/tauri.conf.json"));
+    let conf: serde_json::Value =
+        serde_json::from_str(&conf_raw).expect("tauri.conf.json must be valid JSON");
+
+    assert!(
+        conf.get("identifier").and_then(|v| v.as_str()).is_some(),
+        "tauri.conf.json must set identifier"
+    );
+    assert!(
+        conf.get("productName").and_then(|v| v.as_str()).is_some(),
+        "tauri.conf.json must set productName"
+    );
+
+    // Sidecars cannot ship on mobile: externalBin must be absent (or null).
+    let external_bin = conf.get("bundle").and_then(|b| b.get("externalBin"));
+    assert!(
+        external_bin.is_none() || external_bin == Some(&serde_json::Value::Null),
+        "mobile tauri.conf.json must not declare bundle.externalBin, got: {external_bin:?}"
+    );
+}
+
+#[test]
+fn generate_tauri_mobile_extracts_app_lib() {
+    let (_tmp, project) = fresh_project("mobile-extract-app");
+    run_autumn(&project, &["generate", "tauri-mobile"]);
+
+    // The generator extracts the stock main.rs into src/lib.rs::serve() so
+    // the Tauri shell can run the server in-process.
+    let lib_rs = read(&project.join("src/lib.rs"));
+    assert!(
+        lib_rs.contains("pub async fn serve()"),
+        "app src/lib.rs must expose pub async fn serve()"
+    );
+    assert!(lib_rs.contains("autumn_web::app()"));
+    assert!(lib_rs.contains("routes!["));
+
+    // main.rs shrinks to a thin caller of the extracted lib entry point.
+    let main_rs = read(&project.join("src/main.rs"));
+    assert!(
+        main_rs.contains("::serve()"),
+        "app src/main.rs must call the extracted serve() entry point"
+    );
+    assert!(
+        !main_rs.contains("autumn_web::app()"),
+        "app src/main.rs must no longer build the app inline after extraction"
+    );
+}
+
+#[test]
+fn generate_tauri_mobile_skips_lib_extraction_when_main_customised() {
+    let (_tmp, project) = fresh_project("mobile-custom-app");
+
+    // Simulate a user-customised main.rs the anchored extraction can't match.
+    let main_path = project.join("src/main.rs");
+    let customised = read(&main_path).replace("#[autumn_web::main]", "#[tokio::main]");
+    fs::write(&main_path, &customised).unwrap();
+
+    let output = run_autumn(&project, &["generate", "tauri-mobile"]);
+
+    // Command still succeeds; the extraction is skipped, not fatal.
+    assert!(
+        !project.join("src/lib.rs").exists(),
+        "src/lib.rs must not be created when main.rs is customised"
+    );
+    assert_eq!(
+        read(&main_path),
+        customised,
+        "customised main.rs must be left untouched"
+    );
+
+    // The user is pointed at the docs page for the manual extraction steps.
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("tauri-mobile-in-process"),
+        "output must point at docs/guide/tauri-mobile-in-process.md, got:\n{combined}"
+    );
+}
+
+#[test]
+fn generate_tauri_mobile_sets_flaky_network_pool_defaults() {
+    let (_tmp, project) = fresh_project("mobile-pool-app");
+    run_autumn(&project, &["generate", "tauri-mobile"]);
+
+    let lib_rs = read(&project.join("src-tauri/src/lib.rs"));
+
+    // Conservative remote-Postgres pool defaults for mobile networks.
+    assert!(
+        lib_rs.contains("AUTUMN_DATABASE__POOL_SIZE"),
+        "mobile lib.rs must pin a small pool size for flaky mobile networks"
+    );
+    assert!(
+        lib_rs.contains("AUTUMN_DATABASE__CONNECT_TIMEOUT_SECS"),
+        "mobile lib.rs must pin a short connect timeout for flaky mobile networks"
+    );
+    assert!(
+        lib_rs.contains("AUTUMN_DATABASE__URL"),
+        "mobile lib.rs must reference AUTUMN_DATABASE__URL for the remote Postgres"
+    );
+}
+
+#[test]
+fn generate_tauri_mobile_prints_prerequisites() {
+    let (_tmp, project) = fresh_project("mobile-prereq-app");
+    let output = run_autumn(&project, &["generate", "tauri-mobile"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(stdout.contains("tauri-cli"), "must mention the Tauri CLI");
+    assert!(stdout.contains("ios"), "must mention iOS setup");
+    assert!(stdout.contains("android"), "must mention Android setup");
+    assert!(
+        stdout.contains("tauri-mobile-in-process"),
+        "must point at docs/guide/tauri-mobile-in-process.md"
+    );
+}
+
+#[test]
+fn generate_tauri_mobile_dry_run_writes_nothing() {
+    let (_tmp, project) = fresh_project("mobile-dryrun-app");
+    let main_before = read(&project.join("src/main.rs"));
+
+    run_autumn(&project, &["generate", "tauri-mobile", "--dry-run"]);
+
+    assert!(
+        !project.join("src-tauri").exists(),
+        "--dry-run must not create src-tauri/"
+    );
+    assert!(
+        !project.join("src/lib.rs").exists(),
+        "--dry-run must not create src/lib.rs"
+    );
+    assert_eq!(
+        read(&project.join("src/main.rs")),
+        main_before,
+        "--dry-run must not modify src/main.rs"
+    );
+}
+
+#[test]
+fn generate_tauri_mobile_collision_without_force_exits_nonzero() {
+    let (_tmp, project) = fresh_project("mobile-collision-app");
+    run_autumn(&project, &["generate", "tauri-mobile"]);
+
+    // Second run without --force must refuse to overwrite.
+    let second = run_autumn_raw(&project, &["generate", "tauri-mobile"]);
+    assert!(
+        !second.status.success(),
+        "second run without --force must exit non-zero"
+    );
+
+    // With --force it succeeds (idempotent overwrite).
+    run_autumn(&project, &["generate", "tauri-mobile", "--force"]);
+}
+
+#[test]
+fn docs_page_covers_sandboxing_pool_and_app_store() {
+    let docs_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/guide");
+    let page = read(&docs_dir.join("tauri-mobile-in-process.md"));
+
+    // AC1: mobile sandboxing restrictions — no process spawning / sidecars.
+    assert!(page.contains("sandbox"), "docs must cover mobile sandboxing");
+    assert!(
+        page.contains("sidecar"),
+        "docs must explain why the desktop sidecar model cannot ship on mobile"
+    );
+
+    // AC2: in-process background-thread architecture inside setup(...).
+    assert!(page.contains(".setup("), "docs must show the setup() hook");
+    assert!(
+        page.contains("std::thread::spawn"),
+        "docs must show the background server thread"
+    );
+
+    // AC3: remote Postgres pool behavior under flaky mobile networks.
+    assert!(
+        page.contains("AUTUMN_DATABASE__POOL_SIZE"),
+        "docs must cover pool sizing"
+    );
+    assert!(
+        page.contains("AUTUMN_DATABASE__CONNECT_TIMEOUT_SECS"),
+        "docs must cover connect timeouts"
+    );
+
+    // AC4: App Store Guideline compliance for hybrid native-web apps.
+    assert!(page.contains("4.2"), "docs must cover Apple guideline 4.2");
+    assert!(page.contains("2.5.2"), "docs must cover Apple guideline 2.5.2");
+    assert!(
+        page.contains("Google Play"),
+        "docs must cover the Google Play equivalent"
+    );
+
+    // The desktop guide links to the mobile page.
+    let desktop = read(&docs_dir.join("tauri.md"));
+    assert!(
+        desktop.contains("tauri-mobile-in-process.md"),
+        "docs/guide/tauri.md must link to the mobile in-process guide"
+    );
+}
