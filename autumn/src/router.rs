@@ -3843,11 +3843,11 @@ mod tests {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
-        let mut decoder = flate2::read::GzDecoder::new(body.as_ref());
-        let mut decoded = String::new();
-        std::io::Read::read_to_string(&mut decoder, &mut decoded)
+        let mut gz = flate2::read::GzDecoder::new(body.as_ref());
+        let mut output = String::new();
+        std::io::Read::read_to_string(&mut gz, &mut output)
             .expect("response body must be valid gzip");
-        assert_eq!(decoded, crate::ui::WIDGETS_CSS);
+        assert_eq!(output, crate::ui::WIDGETS_CSS);
     }
 
     /// `q=0` is an explicit opt-out (RFC 7231 §5.3.4): a client that lists
