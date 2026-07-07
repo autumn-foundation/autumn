@@ -3256,26 +3256,116 @@ pub async fn htmx_handler() -> axum::response::Response {
         .into_response()
 }
 
-/// Serves a framework-owned, compile-time-constant CSS asset: same-origin,
-/// immutably cached, and conditional-GET aware (a strong `ETag` hashed from
-/// `body`, so a revalidating client gets a bodyless `304` instead of the
-/// full asset). Shared by every framework CSS route ([`flash_css_handler`],
-/// [`widgets_css_handler`]) so the caching/content-type policy lives in one
-/// place.
+/// Gzip/brotli encodings of a compile-time-constant CSS body, computed once
+/// per process (via a call-site-owned [`std::sync::OnceLock`], see
+/// [`flash_css_handler`]/[`widgets_css_handler`]) rather than redone on every
+/// request — the bytes never change, so recompressing them per-request would
+/// burn CPU for a byte-identical result each time.
 #[cfg(any(feature = "flash", feature = "maud"))]
-fn static_css_response(headers: &http::HeaderMap, body: &'static str) -> axum::response::Response {
+struct PrecompressedCss {
+    gzip: bytes::Bytes,
+    brotli: bytes::Bytes,
+}
+
+#[cfg(any(feature = "flash", feature = "maud"))]
+impl PrecompressedCss {
+    fn compute(body: &'static str) -> Self {
+        use std::io::Write as _;
+
+        let mut gzip_encoder =
+            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gzip_encoder
+            .write_all(body.as_bytes())
+            .expect("in-memory gzip encoding cannot fail");
+        let gzip = gzip_encoder
+            .finish()
+            .expect("in-memory gzip encoding cannot fail");
+
+        let mut brotli_writer = brotli::CompressorWriter::new(Vec::new(), 4096, 11, 22);
+        brotli_writer
+            .write_all(body.as_bytes())
+            .expect("in-memory brotli encoding cannot fail");
+        let brotli = brotli_writer.into_inner();
+
+        Self {
+            gzip: gzip.into(),
+            brotli: brotli.into(),
+        }
+    }
+}
+
+/// `true` when the request's `Accept-Encoding` header accepts `coding`
+/// (case-insensitive, comma-separated, honoring an explicit `q=0` opt-out
+/// per RFC 7231 §5.3.4). A minimal parser rather than a full content-
+/// negotiation crate, since only `gzip`/`br` ever need checking here.
+#[cfg(any(feature = "flash", feature = "maud"))]
+fn accepts_encoding(headers: &http::HeaderMap, coding: &str) -> bool {
+    let Some(value) = headers
+        .get(http::header::ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return false;
+    };
+    value.split(',').any(|part| {
+        let mut segments = part.split(';');
+        let name = segments.next().unwrap_or("").trim();
+        name.eq_ignore_ascii_case(coding)
+            && segments
+                .find_map(|q| q.trim().strip_prefix("q="))
+                .and_then(|q| q.parse::<f32>().ok())
+                .is_none_or(|q| q > 0.0)
+    })
+}
+
+/// Serves a framework-owned, compile-time-constant CSS asset: same-origin,
+/// immutably cached, conditional-GET aware (a strong `ETag` hashed from
+/// `body`, so a revalidating client gets a bodyless `304` instead of the
+/// full asset), and served pre-compressed from `precompressed` when the
+/// client's `Accept-Encoding` allows it — computed once per process, not
+/// per request. Shared by every framework CSS route ([`flash_css_handler`],
+/// [`widgets_css_handler`]) so the caching/content-type/compression policy
+/// lives in one place.
+#[cfg(any(feature = "flash", feature = "maud"))]
+fn static_css_response(
+    headers: &http::HeaderMap,
+    body: &'static str,
+    precompressed: &'static PrecompressedCss,
+) -> axum::response::Response {
     use axum::response::IntoResponse;
+
+    let (encoded_body, content_encoding): (axum::body::Body, Option<&'static str>) =
+        if accepts_encoding(headers, "br") {
+            (precompressed.brotli.clone().into(), Some("br"))
+        } else if accepts_encoding(headers, "gzip") {
+            (precompressed.gzip.clone().into(), Some("gzip"))
+        } else {
+            (body.into(), None)
+        };
+
+    let mut response_headers = http::HeaderMap::new();
+    response_headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("text/css; charset=utf-8"),
+    );
+    response_headers.insert(
+        http::header::CACHE_CONTROL,
+        http::HeaderValue::from_static("public, max-age=31536000, immutable"),
+    );
+    // Cache intermediaries must key on the request's Accept-Encoding since
+    // the body served for this same URL differs (plain/gzip/br).
+    response_headers.insert(
+        http::header::VARY,
+        http::HeaderValue::from_static("Accept-Encoding"),
+    );
+    if let Some(encoding) = content_encoding {
+        response_headers.insert(
+            http::header::CONTENT_ENCODING,
+            http::HeaderValue::from_static(encoding),
+        );
+    }
+
     crate::etag::fresh_when(headers, body)
-        .or((
-            [
-                (http::header::CONTENT_TYPE, "text/css; charset=utf-8"),
-                (
-                    http::header::CACHE_CONTROL,
-                    "public, max-age=31536000, immutable",
-                ),
-            ],
-            body,
-        ))
+        .or((response_headers, encoded_body))
         .into_response()
 }
 
@@ -3283,14 +3373,24 @@ fn static_css_response(headers: &http::HeaderMap, body: &'static str) -> axum::r
 /// ([`crate::flash::FLASH_CSS`]) at [`crate::flash::FLASH_CSS_PATH`].
 #[cfg(feature = "flash")]
 pub async fn flash_css_handler(headers: http::HeaderMap) -> axum::response::Response {
-    static_css_response(&headers, crate::flash::FLASH_CSS)
+    static PRECOMPRESSED: std::sync::OnceLock<PrecompressedCss> = std::sync::OnceLock::new();
+    static_css_response(
+        &headers,
+        crate::flash::FLASH_CSS,
+        PRECOMPRESSED.get_or_init(|| PrecompressedCss::compute(crate::flash::FLASH_CSS)),
+    )
 }
 
 /// Serves the framework's widget stylesheet ([`crate::ui::WIDGETS_CSS`]) at
 /// [`crate::ui::WIDGETS_CSS_PATH`] (#1215).
 #[cfg(feature = "maud")]
 pub async fn widgets_css_handler(headers: http::HeaderMap) -> axum::response::Response {
-    static_css_response(&headers, crate::ui::WIDGETS_CSS)
+    static PRECOMPRESSED: std::sync::OnceLock<PrecompressedCss> = std::sync::OnceLock::new();
+    static_css_response(
+        &headers,
+        crate::ui::WIDGETS_CSS,
+        PRECOMPRESSED.get_or_init(|| PrecompressedCss::compute(crate::ui::WIDGETS_CSS)),
+    )
 }
 
 #[cfg(feature = "htmx")]
@@ -3671,6 +3771,138 @@ mod tests {
             .await
             .unwrap();
         assert!(revalidated_body.is_empty());
+    }
+
+    /// A client that sends `Accept-Encoding: br` gets the pre-computed brotli
+    /// encoding straight back (`Content-Encoding: br`), not a plain body that
+    /// the outer `CompressionLayer` then has to compress on the fly.
+    #[cfg(feature = "maud")]
+    #[tokio::test]
+    async fn widgets_css_route_serves_precompressed_brotli_when_accepted() {
+        let app = build_router(Vec::new(), &AutumnConfig::default(), test_state());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(crate::ui::WIDGETS_CSS_PATH)
+                    .header(http::header::ACCEPT_ENCODING, "br")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_ENCODING)
+                .unwrap(),
+            "br"
+        );
+        assert_eq!(
+            response.headers().get(http::header::VARY).unwrap(),
+            "Accept-Encoding"
+        );
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let mut decoded = Vec::new();
+        brotli::BrotliDecompress(&mut std::io::Cursor::new(body.as_ref()), &mut decoded)
+            .expect("response body must be valid brotli");
+        assert_eq!(String::from_utf8(decoded).unwrap(), crate::ui::WIDGETS_CSS);
+    }
+
+    /// Same as the brotli case, for a `gzip`-only client.
+    #[cfg(feature = "maud")]
+    #[tokio::test]
+    async fn widgets_css_route_serves_precompressed_gzip_when_accepted() {
+        let app = build_router(Vec::new(), &AutumnConfig::default(), test_state());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(crate::ui::WIDGETS_CSS_PATH)
+                    .header(http::header::ACCEPT_ENCODING, "gzip")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_ENCODING)
+                .unwrap(),
+            "gzip"
+        );
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let mut decoder = flate2::read::GzDecoder::new(body.as_ref());
+        let mut decoded = String::new();
+        std::io::Read::read_to_string(&mut decoder, &mut decoded)
+            .expect("response body must be valid gzip");
+        assert_eq!(decoded, crate::ui::WIDGETS_CSS);
+    }
+
+    /// `q=0` is an explicit opt-out (RFC 7231 §5.3.4): a client that lists
+    /// `br` but disqualifies it must fall back to the identity encoding
+    /// rather than being served brotli anyway.
+    #[cfg(feature = "maud")]
+    #[tokio::test]
+    async fn widgets_css_route_honors_q_zero_opt_out() {
+        let app = build_router(Vec::new(), &AutumnConfig::default(), test_state());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(crate::ui::WIDGETS_CSS_PATH)
+                    .header(http::header::ACCEPT_ENCODING, "br;q=0, gzip")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_ENCODING)
+                .unwrap(),
+            "gzip"
+        );
+    }
+
+    /// No `Accept-Encoding` header at all means identity — no
+    /// `Content-Encoding` header, plain-text body (matches the existing
+    /// `widgets_css_route_serves_the_shared_stylesheet` assertions).
+    #[cfg(feature = "maud")]
+    #[tokio::test]
+    async fn widgets_css_route_serves_identity_with_no_accept_encoding() {
+        let app = build_router(Vec::new(), &AutumnConfig::default(), test_state());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(crate::ui::WIDGETS_CSS_PATH)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            !response
+                .headers()
+                .contains_key(http::header::CONTENT_ENCODING)
+        );
     }
 
     /// Pins the production access-log wiring (#999): the layer is applied in

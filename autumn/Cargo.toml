@@ -120,6 +120,11 @@ axum.workspace = true
 bytes = "1"
 http-body = "1"
 http-body-util = "0.1"
+# Both already resolved transitively via tower-http's compression-gzip/
+# compression-br features (used to precompute static CSS encodings once
+# instead of recompressing on every request — see `static_css_response`).
+flate2 = "1"
+brotli = "8"
 bcrypt.workspace = true
 deadpool = { version = "0.13", default-features = false, features = ["managed", "rt_tokio_1"], optional = true }
 diesel = { workspace = true, optional = true }
