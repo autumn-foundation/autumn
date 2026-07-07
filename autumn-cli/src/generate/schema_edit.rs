@@ -1040,8 +1040,13 @@ pub fn remove_routes_entries_with_prefix(existing: &str, prefix: &str) -> String
 /// this generate call.
 ///
 /// A no-op (returns `existing` unchanged) if there's no `routes![...]`, or if
-/// any of `entries` is no longer present (already destroyed, or the routes
-/// list was hand-edited) — destroy never guesses at a partial match.
+/// NONE of `entries` is present any more (already destroyed). Removes
+/// whichever of `entries` ARE currently present when only some are — e.g.
+/// the user hand-removed one of this resource's routes before running
+/// `destroy` — rather than abandoning the whole cleanup and leaving the
+/// rest dangling (issue #1048 PR review): a route this resource's own file
+/// deletion is about to orphan must not survive just because a sibling
+/// entry from the same call was already gone.
 #[must_use]
 pub fn remove_routes_entries(existing: &str, entries: &[String]) -> String {
     if entries.is_empty() {
@@ -1056,7 +1061,7 @@ pub fn remove_routes_entries(existing: &str, entries: &[String]) -> String {
         .map(|s| s.trim().to_owned())
         .filter(|s| !s.is_empty())
         .collect();
-    if !entries.iter().all(|e| present_entries.contains(e)) {
+    if !entries.iter().any(|e| present_entries.contains(e)) {
         return existing.to_owned();
     }
     let kept: Vec<&String> = present_entries
@@ -7109,6 +7114,29 @@ pub struct Comment {
             "fn main() {\n    App::new()\n        .routes(routes![index])\n        .run()\n}\n";
         let appended = vec!["routes::posts::index".to_owned()];
         assert_eq!(remove_routes_entries(base, &appended), base);
+    }
+
+    #[test]
+    fn remove_routes_entries_removes_present_entries_even_when_one_is_already_gone() {
+        // issue #1048 PR review: a user may have hand-removed one of a
+        // resource's own route entries before running destroy. The rest of
+        // that resource's routes are still present and about to be
+        // orphaned (the underlying handler file is deleted regardless) —
+        // abandoning the whole cleanup because ONE entry is already absent
+        // would leave `main.rs` referencing a missing function/module.
+        let appended = vec![
+            "routes::posts::index".to_owned(),
+            "routes::posts::show".to_owned(),
+        ];
+        // Simulate the user having already removed `show` by hand.
+        let hand_edited = "fn main() {\n    App::new()\n        .routes(routes![index, routes::posts::index])\n        .run()\n}\n";
+        let reverted = remove_routes_entries(hand_edited, &appended);
+        assert_eq!(
+            reverted,
+            "fn main() {\n    App::new()\n        .routes(routes![index])\n        .run()\n}\n",
+            "the still-present `index` entry must be removed even though `show` was \
+             already gone: {reverted}"
+        );
     }
 
     #[test]
