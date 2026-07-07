@@ -28,6 +28,33 @@
 //! clients pull "rows with version greater than my cursor". Device clocks
 //! never order the change feed.
 //!
+//! # Client wiring
+//!
+//! ```rust,no_run
+//! use std::time::Duration;
+//! use autumn_web::sync::{SyncConfig, SyncEngine, SyncStore};
+//!
+//! # async fn wire() -> Result<(), autumn_web::sync::SyncError> {
+//! // Open (or create) the local store, e.g. inside the app's data dir.
+//! let store = SyncStore::open("/data/app/sync.db")?;
+//!
+//! // Reads and writes work fully offline; every write is journaled.
+//! store.put(
+//!     "notes",
+//!     "6b3f2c1e-5f43-4a67-9d31-2f4f6a8e9b10", // client-generated UUID pk
+//!     &serde_json::json!({ "title": "works offline" }),
+//! )?;
+//! let notes: Vec<(String, serde_json::Value)> = store.list("notes")?;
+//!
+//! // Sync in the background whenever connectivity allows.
+//! let engine = SyncEngine::new(store, SyncConfig::new("https://example.com/sync"));
+//! let _task = engine.spawn_background(Duration::from_secs(30));
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! The server side mounts in one line — see [`server::router`].
+//!
 //! # Scope
 //!
 //! Existing diesel `#[repository]` models are **not** transparently

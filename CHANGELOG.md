@@ -378,6 +378,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Previously the pool hardcoded `NoTls`, so `sslmode=require` failed every
   connection with "no TLS implementation configured" and cleartext was the
   only working configuration (issue #1507).
+- **offline-sync (new feature):** offline-first local storage plus a sync
+  engine for occasionally-connected apps such as the in-process Tauri mobile
+  shell (issue #1508). `autumn_web::sync` ships a local SQLite `SyncStore`
+  (JSON rows per collection, write-through change journal in the same
+  transaction, tombstoned deletes), a client `SyncEngine` (push pending →
+  pull versions past the cursor; at-least-once with server-side dedup,
+  exponential-backoff background task, transparent full resync that
+  preserves and replays pending changes), and a mountable server router
+  (`POST /sync/push` + `GET /sync/pull` via `AppBuilder::nest`) over
+  Postgres shadow tables with idempotent DDL (`PgSyncBackend`) or an
+  in-memory backend for tests. Conflicts are settled server-side by a
+  pluggable `ConflictResolver` (default: last-write-wins on the conflicting
+  writes' `updated_at`, device-id tiebreak); resolved rows get a new version
+  so every device converges. Zero new dependencies — builds on the `db` and
+  `http-client` features already in the graph.
 
 ## [0.6.0] - 2026-06-30
 

@@ -220,6 +220,24 @@ fn upsert_row(
     .map(|_| ())
 }
 
+/// Materialize a server-side row state (pull page or conflict resolution)
+/// into the local row table.
+fn upsert_remote_row(
+    conn: &mut SqliteConnection,
+    row: &RemoteRow,
+) -> Result<(), diesel::result::Error> {
+    let payload = row.payload.as_ref().map(serde_json::Value::to_string);
+    upsert_row(
+        conn,
+        &row.collection,
+        &row.pk,
+        payload.as_deref(),
+        row.version,
+        row.deleted,
+        &row.updated_at.to_rfc3339(),
+    )
+}
+
 fn current_server_version(
     conn: &mut SqliteConnection,
     collection: &str,
@@ -324,6 +342,38 @@ impl SyncStore {
             .map_err(|_| SyncError::Store("sync store mutex poisoned".into()))
     }
 
+    /// One local write = row upsert + coalesced journal entry, in a single
+    /// `SQLite` transaction (the change-tracking invariant of the store).
+    fn write_local(
+        &self,
+        collection: &str,
+        pk: &str,
+        op: Op,
+        payload: Option<&str>,
+    ) -> Result<(), SyncError> {
+        let now = Utc::now().to_rfc3339();
+        let op_name = match op {
+            Op::Upsert => "upsert",
+            Op::Delete => "delete",
+        };
+        let mut conn = self.lock()?;
+        conn.transaction::<_, diesel::result::Error, _>(|conn| {
+            let base_version = base_version_for(conn, collection, pk)?;
+            let server_version = current_server_version(conn, collection, pk)?;
+            upsert_row(
+                conn,
+                collection,
+                pk,
+                payload,
+                server_version,
+                op == Op::Delete,
+                &now,
+            )?;
+            replace_pending(conn, collection, pk, op_name, payload, base_version, &now)
+        })
+        .map_err(store_err)
+    }
+
     /// Insert or update `value` under `(collection, pk)`, journaling the
     /// change for the next sync in the same transaction.
     ///
@@ -338,31 +388,7 @@ impl SyncStore {
         value: &T,
     ) -> Result<(), SyncError> {
         let payload = serde_json::to_string(value)?;
-        let now = Utc::now().to_rfc3339();
-        let mut conn = self.lock()?;
-        conn.transaction::<_, diesel::result::Error, _>(|conn| {
-            let base_version = base_version_for(conn, collection, pk)?;
-            let server_version = current_server_version(conn, collection, pk)?;
-            upsert_row(
-                conn,
-                collection,
-                pk,
-                Some(&payload),
-                server_version,
-                false,
-                &now,
-            )?;
-            replace_pending(
-                conn,
-                collection,
-                pk,
-                "upsert",
-                Some(&payload),
-                base_version,
-                &now,
-            )
-        })
-        .map_err(store_err)
+        self.write_local(collection, pk, Op::Upsert, Some(&payload))
     }
 
     /// Delete the row at `(collection, pk)`, recording a local tombstone
@@ -372,15 +398,7 @@ impl SyncStore {
     ///
     /// Returns [`SyncError::Store`] on database failure.
     pub fn delete(&self, collection: &str, pk: &str) -> Result<(), SyncError> {
-        let now = Utc::now().to_rfc3339();
-        let mut conn = self.lock()?;
-        conn.transaction::<_, diesel::result::Error, _>(|conn| {
-            let base_version = base_version_for(conn, collection, pk)?;
-            let server_version = current_server_version(conn, collection, pk)?;
-            upsert_row(conn, collection, pk, None, server_version, true, &now)?;
-            replace_pending(conn, collection, pk, "delete", None, base_version, &now)
-        })
-        .map_err(store_err)
+        self.write_local(collection, pk, Op::Delete, None)
     }
 
     /// Fetch the row at `(collection, pk)`, or `None` if absent or deleted.
@@ -547,16 +565,7 @@ impl SyncStore {
                     }
                     ChangeOutcome::AlreadyApplied => {}
                     ChangeOutcome::Resolved { row } => {
-                        let payload = row.payload.as_ref().map(serde_json::Value::to_string);
-                        upsert_row(
-                            conn,
-                            &row.collection,
-                            &row.pk,
-                            payload.as_deref(),
-                            row.version,
-                            row.deleted,
-                            &row.updated_at.to_rfc3339(),
-                        )?;
+                        upsert_remote_row(conn, row)?;
                     }
                 }
                 sql_query("DELETE FROM autumn_sync_pending WHERE change_id = ?")
@@ -582,16 +591,7 @@ impl SyncStore {
                 if current_server_version(conn, &row.collection, &row.pk)? > row.version {
                     continue;
                 }
-                let payload = row.payload.as_ref().map(serde_json::Value::to_string);
-                upsert_row(
-                    conn,
-                    &row.collection,
-                    &row.pk,
-                    payload.as_deref(),
-                    row.version,
-                    row.deleted,
-                    &row.updated_at.to_rfc3339(),
-                )?;
+                upsert_remote_row(conn, row)?;
                 applied += 1;
             }
             Ok(applied)
