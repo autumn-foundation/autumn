@@ -450,6 +450,20 @@ fn docs_page_covers_sandboxing_pool_and_app_store() {
         "docs must cover connect timeouts"
     );
 
+    // Security model: loopback trust boundary, DB TLS, failure modes.
+    assert!(
+        page.contains("## 5. Security"),
+        "docs must have a clearly-titled security section"
+    );
+    assert!(
+        page.contains("Any app on the device"),
+        "docs must state the loopback trust boundary"
+    );
+    assert!(
+        page.contains("verify-full"),
+        "docs must cover database TLS modes"
+    );
+
     // AC4: App Store Guideline compliance for hybrid native-web apps.
     assert!(page.contains("4.2"), "docs must cover Apple guideline 4.2");
     assert!(

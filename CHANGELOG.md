@@ -358,13 +358,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Option B). Mobile sandboxes forbid sidecar processes, so the shell crate
   builds as staticlib/cdylib, links the app crate directly, spawns the server
   from `tauri::Builder::default().setup(...)`, health-polls `/health`, and
-  opens the webview at `http://127.0.0.1:<port>`; conservative pool defaults
-  (`AUTUMN_DATABASE__POOL_SIZE=2`, `AUTUMN_DATABASE__CONNECT_TIMEOUT_SECS=5`)
-  are pinned for flaky mobile networks. The generator also extracts the stock
+  opens the webview at `http://127.0.0.1:<port>`; a small pool
+  (`AUTUMN_DATABASE__POOL_SIZE=2`) is pinned for flaky mobile networks (and
+  `AUTUMN_DATABASE__CONNECT_TIMEOUT_SECS=5`, matching the framework default,
+  is pinned explicitly). The generator also extracts the stock
   `src/main.rs` into `src/lib.rs::serve()` (anchored; skipped with a warning
   when customised). Docs: mobile sandboxing restrictions, flaky-network pool
-  behavior, and App Store / Google Play guideline compliance in
+  behavior, the loopback security model, and App Store / Google Play
+  guideline compliance in
   [docs/guide/tauri-mobile-in-process.md](docs/guide/tauri-mobile-in-process.md).
+
+- **db:** TLS to Postgres. The connection pool now honors `sslmode` in the
+  database URL via a rustls-backed connector: `sslmode=require` encrypts the
+  connection (libpq parity — no certificate-identity check, so self-signed
+  and private-CA servers work), and `sslmode=verify-full` additionally
+  verifies the certificate chain and hostname against the Mozilla root store
+  (plus an `sslrootcert=<PEM file>` when given). URLs without `sslmode` (or
+  with `disable`/`prefer`) keep the previous plaintext behavior unchanged.
+  Previously the pool hardcoded `NoTls`, so `sslmode=require` failed every
+  connection with "no TLS implementation configured" and cleartext was the
+  only working configuration (issue #1507).
 
 ## [0.6.0] - 2026-06-30
 
