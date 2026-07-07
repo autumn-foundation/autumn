@@ -352,6 +352,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Accept-Encoding` accepts them, instead of relying solely on the
   general-purpose compression middleware to redo that work on every request.
 
+### Changed
+
+- **workspace:** `Cargo.lock` is now committed to the repository (it was
+  previously gitignored) so builds are reproducible and dependency updates
+  are reviewable.
+
 ## [0.6.0] - 2026-06-30
 
 ### Added
