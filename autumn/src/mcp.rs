@@ -205,6 +205,14 @@ pub(crate) struct McpWiring {
     /// marked [`RateLimitExempt`](crate::security::RateLimitExempt) to avoid
     /// double-counting against the dispatch pipeline's own limiter.
     pub envelope_rate_limited: bool,
+    /// Whether a [`LoadShedLayer`](crate::middleware::LoadShedLayer) wraps the
+    /// `/mcp` envelope (true iff `server.max_concurrent_requests` is
+    /// configured). The dispatch clone (cloned from the already-middleware-
+    /// wrapped router) carries the SAME shared layer instance, so a
+    /// `tools/call` is counted once at the envelope; its replayed dispatch is
+    /// marked [`LoadShedExempt`](crate::middleware::LoadShedExempt) to avoid
+    /// consuming a second slot for the same logical request.
+    pub envelope_load_shed: bool,
 }
 
 /// The shared MCP server state attached to the endpoint handler. Holds the
@@ -240,6 +248,10 @@ pub struct McpServer {
     /// Whether the `/mcp` envelope is rate-limited; gates exempting the
     /// replayed `tools/call` dispatch from the pipeline limiter.
     envelope_rate_limited: bool,
+    /// Whether the `/mcp` envelope is load-shed gated; gates exempting the
+    /// replayed `tools/call` dispatch from double-counting against the same
+    /// shared `LoadShedLayer` instance.
+    envelope_load_shed: bool,
     server_name: String,
     server_version: String,
 }
@@ -704,6 +716,7 @@ impl McpServer {
             tenant_header: wiring.tenant_header,
             csrf_header: wiring.csrf_header,
             envelope_rate_limited: wiring.envelope_rate_limited,
+            envelope_load_shed: wiring.envelope_load_shed,
             server_name: "autumn-mcp".to_owned(),
             server_version: env!("CARGO_PKG_VERSION").to_owned(),
         }
@@ -1286,6 +1299,16 @@ async fn serve_tools_call(
         request
             .extensions_mut()
             .insert(crate::security::RateLimitExempt);
+    }
+    // Likewise for load shedding: the envelope and the dispatch pipeline
+    // share the SAME `LoadShedLayer` instance (same `Arc` in-flight
+    // counter), so without this a `tools/call` would acquire one slot at the
+    // envelope and a second at this replay for the same logical request —
+    // silently halving the effective ceiling for MCP traffic.
+    if server.envelope_load_shed {
+        request
+            .extensions_mut()
+            .insert(crate::middleware::LoadShedExempt);
     }
 
     let response = match server.dispatch.clone().oneshot(request).await {
@@ -2445,6 +2468,7 @@ mod tests {
                 tenant_header: None,
                 csrf_header: "x-csrf-token".to_owned(),
                 envelope_rate_limited: false,
+                envelope_load_shed: false,
             },
         )
     }

@@ -2291,6 +2291,18 @@ fn write_builtin_http_metrics(
         snapshot.read_your_writes_pins_total
     );
 
+    // autumn_requests_shed_total
+    out.push_str(
+        "# HELP autumn_requests_shed_total \
+         HTTP requests rejected by admission control because server.max_concurrent_requests was at its ceiling\n",
+    );
+    out.push_str("# TYPE autumn_requests_shed_total counter\n");
+    let _ = writeln!(
+        out,
+        "autumn_requests_shed_total{{version=\"{version}\"}} {}",
+        snapshot.http.requests_shed_total
+    );
+
     // by_route
     if !snapshot.http.by_route.is_empty() {
         out.push_str("# HELP autumn_http_route_requests_total HTTP requests by route and method\n");
@@ -2401,6 +2413,7 @@ pub(crate) async fn prometheus_endpoint<S: ProvideActuatorState + Send + Sync + 
             "autumn_shutdown_aborted_requests_total",
             "autumn_request_timeouts_total",
             "autumn_read_your_writes_pins_total",
+            "autumn_requests_shed_total",
             "autumn_http_route_requests_total",
             "autumn_metrics_source_errors_total",
             "autumn_cache_read_through_hits_total",
@@ -4379,6 +4392,10 @@ mod tests {
         assert!(text.contains("# HELP autumn_read_your_writes_pins_total"));
         assert!(text.contains("# TYPE autumn_read_your_writes_pins_total counter"));
         assert!(text.contains("autumn_read_your_writes_pins_total{version=\"stable\"} 0"));
+
+        assert!(text.contains("# HELP autumn_requests_shed_total"));
+        assert!(text.contains("# TYPE autumn_requests_shed_total counter"));
+        assert!(text.contains("autumn_requests_shed_total{version=\"stable\"} 0"));
     }
 
     #[cfg(feature = "cache-moka")]

@@ -527,6 +527,13 @@ fn build_router_pre_state(
     // list there.
     let static_gate_layers = std::mem::take(&mut ctx.static_gate_layers);
 
+    // Built once and shared (by clone — it wraps an `Arc` in-flight counter)
+    // between the direct-route stack below and the late-mounted `/mcp`
+    // envelope further down, so both ingress surfaces admit against the same
+    // ceiling instead of each getting its own independent (never-shared)
+    // counter. See `apply_middleware`'s `load_shed_layer` parameter doc.
+    let load_shed_layer = build_load_shed_layer(config, state);
+
     router = apply_middleware(
         router,
         config,
@@ -537,6 +544,7 @@ fn build_router_pre_state(
         ctx.error_page_renderer,
         ctx.session_store,
         route_timeouts,
+        load_shed_layer.clone(),
     )?;
 
     if dev_reload_enabled {
@@ -653,6 +661,12 @@ fn build_router_pre_state(
             // when so, a tools/call is counted there and its replay is exempted
             // from the dispatch pipeline's limiter (avoiding double-counting).
             envelope_rate_limited: config.security.rate_limit.enabled,
+            // `dispatch` above is cloned from `router`, which already carries
+            // `load_shed_layer` (applied inside `apply_middleware`) — so when
+            // the envelope below is ALSO wrapped with that same shared layer,
+            // a tools/call must mark its replay exempt (avoiding double-
+            // counting against the same in-flight counter).
+            envelope_load_shed: load_shed_layer.is_some(),
         };
         let mut mcp_router =
             crate::mcp::build_mcp_router(&mount_path, tools, dispatch, wiring, endpoint_layer);
@@ -672,6 +686,18 @@ fn build_router_pre_state(
         // identity, exactly as the direct-route layer does, instead of a
         // spoofable raw `X-Forwarded-For`.
         mcp_router = mcp_router.layer(build_maintenance_layer(config, state));
+        // Admission control / load shedding (#1006), mirroring the layer
+        // `apply_middleware` installs for direct routes (see the comment
+        // there). The `/mcp` router is merged after that layer, so without
+        // this, `initialize`/`tools/list`/`tools/call` would bypass
+        // `server.max_concurrent_requests` entirely. Reuses the SAME
+        // `load_shed_layer` instance passed to `apply_middleware` above
+        // (cloned, sharing its `Arc` in-flight counter) rather than building
+        // a second, independently-counting layer — see that call site's
+        // comment. `None` (the default) is a no-op, matching direct routes.
+        if let Some(load_shed) = load_shed_layer {
+            mcp_router = mcp_router.layer(load_shed);
+        }
         // Stamp `ResolvedClientIdentity` on the *outer* `/mcp` request too. The
         // MCP route is merged after `apply_middleware`, so the centralized
         // `TrustedProxiesLayer` above does not wrap it; without this, the
@@ -1940,6 +1966,22 @@ where
     ))
 }
 
+/// Exact-match health/probe paths that must always bypass admission-style
+/// gates (maintenance mode, the startup barrier, load shedding): the
+/// compat health endpoint plus the `/live`, `/ready`, `/startup` lifecycle
+/// probes and the actuator's own `/health` alias. Callers additionally
+/// exempt the whole actuator prefix (`with_health_prefix`), since these
+/// gates are keyed on exact paths, not prefixes.
+fn probe_bypass_paths(config: &AutumnConfig) -> Vec<String> {
+    vec![
+        config.health.path.clone(),
+        config.health.live_path.clone(),
+        config.health.ready_path.clone(),
+        config.health.startup_path.clone(),
+        crate::actuator::actuator_route_path(&config.actuator.prefix, "/health"),
+    ]
+}
+
 /// Build the [`MaintenanceLayer`](crate::middleware::maintenance::MaintenanceLayer)
 /// from config + state, with the health/probe paths that always bypass the gate.
 ///
@@ -1956,16 +1998,38 @@ fn build_maintenance_layer(
         .extension::<crate::maintenance::MaintenanceState>()
         .map(|s| (*s).clone())
         .unwrap_or_default();
-    let bypass_paths = vec![
-        config.health.path.clone(),
-        config.health.live_path.clone(),
-        config.health.ready_path.clone(),
-        config.health.startup_path.clone(),
-        crate::actuator::actuator_route_path(&config.actuator.prefix, "/health"),
-    ];
     crate::middleware::maintenance::MaintenanceLayer::new(maintenance_state)
         .with_health_prefix(config.actuator.prefix.clone())
-        .with_probe_paths(bypass_paths)
+        .with_probe_paths(probe_bypass_paths(config))
+}
+
+/// Build the admission-control ([`LoadShedLayer`](crate::middleware::LoadShedLayer))
+/// layer from config, or `None` when `server.max_concurrent_requests` is unset
+/// or `0` — the default, preserving today's unlimited behavior with zero
+/// overhead (the layer is simply never applied; see [`apply_middleware`]).
+///
+/// Reuses the same probe/actuator bypass list as [`build_maintenance_layer`]
+/// so health/liveness/readiness probes are never shed under load (#1006).
+fn build_load_shed_layer(
+    config: &AutumnConfig,
+    state: &AppState,
+) -> Option<crate::middleware::LoadShedLayer> {
+    let limit = config.server.max_concurrent_requests.filter(|&n| n > 0)?;
+    // Mirror CORS headers onto a shed 503 the same way the timeout middleware
+    // does for the main stack (`mirror_cors = true` there): this layer sits
+    // outside `CorsLayer` on direct routes, so without mirroring a
+    // cross-origin browser client sees an opaque CORS failure instead of a
+    // readable 503. Harmless (but redundant) at the `/mcp` mount point, since
+    // that shares this same layer instance yet sits *inside* its own
+    // `CorsLayer`, which overwrites these headers with its own regardless.
+    let cors =
+        (!config.cors.allowed_origins.is_empty()).then(|| std::sync::Arc::new(config.cors.clone()));
+    Some(
+        crate::middleware::LoadShedLayer::new(limit, state.metrics.clone())
+            .with_health_prefix(config.actuator.prefix.clone())
+            .with_probe_paths(probe_bypass_paths(config))
+            .with_cors(cors),
+    )
 }
 
 /// Per-route timeout lookup table, keyed by the fully-qualified route template
@@ -2231,7 +2295,7 @@ async fn request_timeout_handler(
             // cross-origin browser clients can read the Problem Details body
             // instead of seeing an opaque CORS failure.
             if let Some(cors) = cors.as_deref() {
-                apply_cors_headers_to_timeout_response(cors, cors_origin.as_ref(), &mut response);
+                mirror_cors_headers(cors, cors_origin.as_ref(), &mut response);
             }
             response
         }
@@ -2306,6 +2370,12 @@ fn apply_middleware(
     #[cfg(feature = "maud")] error_page_renderer: Option<SharedRenderer>,
     session_store: Option<Arc<dyn crate::session::BoxedSessionStore>>,
     route_timeouts: RouteTimeoutTable,
+    // Built once by the caller (`build_router_pre_state`) and cloned into the
+    // late-mounted `/mcp` envelope too, so both ingress surfaces admit
+    // against the SAME shared in-flight counter — constructing a second
+    // `LoadShedLayer` here would give `/mcp` its own independent (always-zero)
+    // counter that never sheds. See `build_load_shed_layer`.
+    load_shed_layer: Option<crate::middleware::LoadShedLayer>,
 ) -> Result<axum::Router<AppState>, RouterBuildError> {
     // 404 fallback handler for unmatched routes must be registered BEFORE global middleware
     // so that unmatched routes are still protected by rate limiting, CSRF, CORS, etc.
@@ -2353,6 +2423,15 @@ fn apply_middleware(
     // Register MaintenanceLayer automatically (shared construction with the
     // late-mounted `/mcp` envelope — see `build_maintenance_layer`).
     router = router.layer(build_maintenance_layer(config, state));
+
+    // Admission control / load shedding (#1006). Outer to MaintenanceLayer so
+    // the cheap in-flight-count check runs before maintenance mode's
+    // bypass-header/IP-allowlist evaluation. `None` (the default — no
+    // `server.max_concurrent_requests` configured) applies no layer at all,
+    // so there is no overhead when the feature is unused.
+    if let Some(load_shed) = load_shed_layer {
+        router = router.layer(load_shed);
+    }
 
     router = router.layer(axum::middleware::from_fn(
         crate::webhook::webhook_replay_cleanup_middleware,
@@ -3004,10 +3083,10 @@ pub fn try_build_router_with_static_inner(
 #[derive(Clone)]
 struct StartupBarrierState {
     app_state: AppState,
-    live_path: String,
-    ready_path: String,
-    startup_path: String,
-    health_path: String,
+    // Canonical exact-match probe/health paths (`probe_bypass_paths`), the
+    // single source of truth shared with `TrustedHostPolicy` and the
+    // maintenance/load-shed gates — see that function's doc comment.
+    probe_paths: Vec<String>,
     actuator_paths: Vec<String>,
     actuator_subtree_paths: Vec<String>,
 }
@@ -3025,10 +3104,7 @@ impl StartupBarrierState {
 
         Self {
             app_state: app_state.clone(),
-            live_path: config.health.live_path.clone(),
-            ready_path: config.health.ready_path.clone(),
-            startup_path: config.health.startup_path.clone(),
-            health_path: config.health.path.clone(),
+            probe_paths: probe_bypass_paths(config),
             actuator_paths: crate::actuator::actuator_endpoint_paths(
                 &config.actuator.prefix,
                 config.actuator.sensitive,
@@ -3039,10 +3115,7 @@ impl StartupBarrierState {
     }
 
     fn allows_path(&self, path: &str) -> bool {
-        path == self.live_path
-            || path == self.ready_path
-            || path == self.startup_path
-            || path == self.health_path
+        self.probe_paths.iter().any(|allowed| path == allowed)
             || self.actuator_paths.iter().any(|allowed| path == allowed)
             || self
                 .actuator_subtree_paths
@@ -3183,7 +3256,14 @@ pub fn build_cors_layer(cors: &crate::config::CorsConfig) -> tower_http::cors::C
 /// the resolved `Access-Control-Allow-Origin` (with `Vary: origin` when it is
 /// reflected) and `Access-Control-Allow-Credentials`. Preflight (OPTIONS)
 /// requests are answered by `CorsLayer` directly and never reach the timer.
-fn apply_cors_headers_to_timeout_response(
+/// Mirror the `Access-Control-*` response headers a real `CorsLayer` would
+/// have added, onto a `response` synthesized by a layer that sits outside
+/// (outer to) `CorsLayer` in the ingress stack — so its 503 is CORS-readable
+/// instead of the client seeing an opaque CORS failure. Shared by the
+/// per-request timeout middleware and [`crate::middleware::LoadShedLayer`],
+/// the two admission-style gates that can short-circuit before `CorsLayer`
+/// runs.
+pub fn mirror_cors_headers(
     cors: &crate::config::CorsConfig,
     origin: Option<&http::HeaderValue>,
     response: &mut axum::response::Response,
@@ -3608,17 +3688,43 @@ mod tests {
                 .enable_all()
                 .build()
                 .unwrap();
-            let response = rt.block_on(async {
-                app.oneshot(
-                    Request::builder()
-                        .uri("/not-a-probe")
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap()
-            });
-            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+            // `tracing` callsite `Interest` is a single value cached per
+            // callsite across the WHOLE PROCESS, combined from every
+            // concurrently active dispatcher. `cargo test` runs this
+            // alongside thousands of other unit tests in the same binary,
+            // many of which touch the same `autumn::access` callsite without
+            // an active capturing subscriber; the combined interest can
+            // occasionally end up (re-)cached as "not interested" in the
+            // narrow window between rebuilding it and firing the request
+            // below. Rebuilding and re-firing converges almost immediately in
+            // practice, so retry a few times rather than flake.
+            let mut response = None;
+            for attempt in 1..=5 {
+                tracing::callsite::rebuild_interest_cache();
+                let resp = rt.block_on(async {
+                    app.clone()
+                        .oneshot(
+                            Request::builder()
+                                .uri("/not-a-probe")
+                                .body(Body::empty())
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap()
+                });
+                let captured = !events.lock().unwrap().is_empty();
+                response = Some(resp);
+                if captured {
+                    break;
+                }
+                assert!(
+                    attempt < 5,
+                    "access-log event was not captured after {attempt} attempts \
+                     (tracing interest-cache race with a concurrent test)"
+                );
+            }
+            assert_eq!(response.unwrap().status(), StatusCode::SERVICE_UNAVAILABLE);
         });
 
         let events = events.lock().unwrap().clone();
@@ -3888,6 +3994,7 @@ mod tests {
             tenant_header: None,
             csrf_header: "x-csrf-token".to_owned(),
             envelope_rate_limited: false,
+            envelope_load_shed: false,
         };
         let mcp_router =
             crate::mcp::build_mcp_router("/mcp", Vec::new(), axum::Router::new(), wiring, None);
@@ -5078,6 +5185,37 @@ mod trusted_host_tests {
             .await
             .expect("request should complete");
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// `probe_bypass_paths()` is meant to be the single canonical definition
+    /// of "which exact paths bypass admission-style gates" — `TrustedHostPolicy`
+    /// and `StartupBarrierState` must derive their own bypass sets from it
+    /// rather than each re-implementing the same list, so a change to
+    /// `probe_bypass_paths()` (or `config.health.*`) is automatically
+    /// reflected in both without touching either of them directly.
+    #[test]
+    fn probe_bypass_paths_is_the_single_source_for_trusted_host_and_startup_barrier() {
+        let mut cfg = AutumnConfig::default();
+        cfg.health.path = "/custom-health-check".into();
+        let expected = probe_bypass_paths(&cfg);
+        assert!(expected.contains(&"/custom-health-check".to_string()));
+
+        let trusted_host = TrustedHostPolicy::from_config(&cfg);
+        for path in &expected {
+            assert!(
+                trusted_host.probe_bypass_paths.contains(path),
+                "TrustedHostPolicy must derive its bypass set from probe_bypass_paths(): missing {path}"
+            );
+        }
+
+        let state = crate::state::AppState::for_test();
+        let barrier = StartupBarrierState::from_config(&cfg, &state);
+        for path in &expected {
+            assert!(
+                barrier.allows_path(path),
+                "StartupBarrierState must derive its bypass set from probe_bypass_paths(): missing {path}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -6306,13 +6444,7 @@ impl TrustedHostPolicy {
             );
         }
         let allow_any = rules.iter().any(|h| h == "*");
-        let probe_bypass_paths = std::collections::HashSet::from([
-            config.health.path.clone(),
-            config.health.live_path.clone(),
-            config.health.ready_path.clone(),
-            config.health.startup_path.clone(),
-            crate::actuator::actuator_route_path(&config.actuator.prefix, "/health"),
-        ]);
+        let probe_bypass_paths = probe_bypass_paths(config).into_iter().collect();
         Self {
             rules: Arc::new(rules),
             allow_any,

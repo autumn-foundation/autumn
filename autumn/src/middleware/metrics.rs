@@ -59,6 +59,10 @@ struct MetricsInner {
     /// Replica reads redirected to the primary by the RYWW pin.
     /// Exposed as `autumn_read_your_writes_pins_total`.
     read_your_writes_pins_total: AtomicU64,
+    /// Requests rejected by the admission-control (load-shedding) layer
+    /// because `server.max_concurrent_requests` was at its ceiling.
+    /// Exposed as `autumn_requests_shed_total`.
+    requests_shed_total: AtomicU64,
 }
 
 #[derive(Debug, Default)]
@@ -110,6 +114,7 @@ impl MetricsCollector {
                 shutdown_aborted_requests: AtomicU64::new(0),
                 request_timeouts_total: AtomicU64::new(0),
                 read_your_writes_pins_total: AtomicU64::new(0),
+                requests_shed_total: AtomicU64::new(0),
             }),
         }
     }
@@ -128,6 +133,15 @@ impl MetricsCollector {
     pub fn record_request_timeout(&self) {
         self.inner
             .request_timeouts_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment the load-shedding counter (`autumn_requests_shed_total`) —
+    /// a request rejected because `server.max_concurrent_requests` was at
+    /// its ceiling.
+    pub fn record_request_shed(&self) {
+        self.inner
+            .requests_shed_total
             .fetch_add(1, Ordering::Relaxed);
     }
 
@@ -348,6 +362,7 @@ impl MetricsCollector {
                     .shutdown_aborted_requests
                     .load(Ordering::Relaxed),
                 request_timeouts_total: self.inner.request_timeouts_total.load(Ordering::Relaxed),
+                requests_shed_total: self.inner.requests_shed_total.load(Ordering::Relaxed),
             },
             idempotency: IdempotencyMetricsSnapshot {
                 hits: self.inner.idempotency_hits.load(Ordering::Relaxed),
@@ -423,6 +438,10 @@ pub struct HttpMetrics {
     /// Requests that exceeded the configured per-request timeout
     /// (`autumn_request_timeouts_total`).
     pub request_timeouts_total: u64,
+    /// Requests rejected by the admission-control (load-shedding) layer
+    /// because `server.max_concurrent_requests` was at its ceiling
+    /// (`autumn_requests_shed_total`).
+    pub requests_shed_total: u64,
 }
 
 /// Percentiles for latency measurements.
@@ -810,5 +829,33 @@ mod tests {
         let snap = collector.snapshot();
         assert_eq!(snap.http.requests_total, 1);
         assert_eq!(snap.http.request_timeouts_total, 1);
+    }
+
+    // ── requests_shed_total (#1006) ─────────────────────────────────────────
+
+    #[test]
+    fn collector_requests_shed_starts_at_zero() {
+        let collector = MetricsCollector::new();
+        let snap = collector.snapshot();
+        assert_eq!(snap.http.requests_shed_total, 0);
+    }
+
+    #[test]
+    fn collector_records_request_shed() {
+        let collector = MetricsCollector::new();
+        collector.record_request_shed();
+        collector.record_request_shed();
+        let snap = collector.snapshot();
+        assert_eq!(snap.http.requests_shed_total, 2);
+    }
+
+    #[test]
+    fn requests_shed_total_independent_of_regular_requests() {
+        let collector = MetricsCollector::new();
+        collector.record("GET", "/api", 200, 5);
+        collector.record_request_shed();
+        let snap = collector.snapshot();
+        assert_eq!(snap.http.requests_total, 1);
+        assert_eq!(snap.http.requests_shed_total, 1);
     }
 }
