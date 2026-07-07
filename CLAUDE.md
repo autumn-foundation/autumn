@@ -1,5 +1,16 @@
 # CLAUDE.md - Autumn Workspace Guidelines
 
+## Versioning
+
+**Never bump the workspace version** (`version` under `[workspace.package]` in
+the root `Cargo.toml`, or any of the `autumn-web = { version = "..." }` /
+`autumn-macros = { version = "..." }` pins that track it) unless the user
+explicitly asks for a release/version bump. Land feature work as new bullets
+under the existing `## [Unreleased]` section in `CHANGELOG.md` — do not create
+a new dated/numbered `## [x.y.0]` section yourself. Cutting a release (bumping
+the version, dating the changelog section, updating install instructions) is a
+separate, deliberate step the user asks for by name.
+
 ## Commands
 
 - **Build**: `cargo build --workspace`

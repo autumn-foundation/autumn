@@ -115,7 +115,7 @@ managed-pg = ["db", "dep:postgresql_embedded"]
 managed-pg-bundled = ["managed-pg", "postgresql_embedded/bundled"]
 
 [dependencies]
-autumn-macros = { version = "0.7.0", path = "../autumn-macros" }
+autumn-macros = { version = "0.6.0", path = "../autumn-macros" }
 axum.workspace = true
 bytes = "1"
 http-body = "1"

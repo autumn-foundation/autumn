@@ -62,10 +62,10 @@ every widget source file for emitted `autumn-*`/`wizard-*` classes and asserts
 each has a backing rule in the shipped stylesheet — so a new widget class
 can't ship unstyled without failing the build.
 
-## Migrating from a per-app `input.css` (pre-0.7)
+## Migrating from a per-app `input.css`
 
 If your app's `input.css` had its own `@layer components` block styling
-`autumn-*` classes (the pattern `autumn new` generated before 0.7), delete it —
+`autumn-*` classes (the pattern `autumn new` generated previously), delete it —
 the shipped stylesheet replaces it. Two things to check afterward:
 
 - **Accent color**: the old copy-pasted block hardcoded an indigo accent
