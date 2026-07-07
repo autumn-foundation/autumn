@@ -1048,6 +1048,15 @@ fn collect_claimed_get_paths(
         claimed.insert(crate::htmx::IDIOMORPH_JS_PATH.to_owned());
         claimed.insert(crate::htmx::HTMX_SSE_JS_PATH.to_owned());
     }
+    // Framework CSS routes (flash/widget stylesheets) merge a GET
+    // unconditionally whenever their feature is on, before the late-merged
+    // OpenAPI/MCP routers — reserve them so a colliding configured path
+    // surfaces the typed collision error instead of panicking in
+    // `router.merge`.
+    #[cfg(feature = "flash")]
+    claimed.insert(crate::flash::FLASH_CSS_PATH.to_owned());
+    #[cfg(feature = "maud")]
+    claimed.insert(crate::ui::WIDGETS_CSS_PATH.to_owned());
     // Dev live-reload endpoints are only mounted when the env vars
     // that enable them are set, but reserving the paths regardless
     // makes the error message deterministic across dev/prod.
@@ -3331,6 +3340,7 @@ fn static_css_response(
     body: &'static str,
     precompressed: &'static PrecompressedCss,
 ) -> axum::response::Response {
+    use crate::etag::IntoETag as _;
     use axum::response::IntoResponse;
 
     let (encoded_body, content_encoding): (axum::body::Body, Option<&'static str>) =
@@ -3364,7 +3374,14 @@ fn static_css_response(
         );
     }
 
-    crate::etag::fresh_when(headers, body)
+    // A weak validator: the identity/gzip/br byte streams served for this
+    // one logical resource are not byte-identical, so a strong ETag (which
+    // asserts byte-for-byte equivalence — see `ETag::strong`) would be
+    // incorrect here, even though `Vary: Accept-Encoding` already keeps
+    // cache entries for different encodings distinct.
+    let etag = crate::etag::ETag::weak(body.into_etag().tag().to_owned());
+
+    crate::etag::fresh_when(headers, etag)
         .or((response_headers, encoded_body))
         .into_response()
 }
@@ -3771,6 +3788,38 @@ mod tests {
             .await
             .unwrap();
         assert!(revalidated_body.is_empty());
+    }
+
+    /// The widget stylesheet's `ETag` must be weak (`W/"..."`), not strong:
+    /// the identity/gzip/br byte streams served under it are not
+    /// byte-identical, and a strong `ETag` asserts exactly that (RFC 7232
+    /// §2.1).
+    #[cfg(feature = "maud")]
+    #[tokio::test]
+    async fn widgets_css_route_etag_is_weak_not_strong() {
+        let app = build_router(Vec::new(), &AutumnConfig::default(), test_state());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(crate::ui::WIDGETS_CSS_PATH)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let etag = response
+            .headers()
+            .get(http::header::ETAG)
+            .expect("widget stylesheet response should carry an ETag")
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert!(
+            etag.starts_with("W/\""),
+            "ETag must be weak since encoded variants aren't byte-identical: {etag}"
+        );
     }
 
     /// A client that sends `Accept-Encoding: br` gets the pre-computed brotli
@@ -4584,6 +4633,81 @@ mod tests {
         };
         let err = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx)
             .expect_err("scope '/api' + child '/' should collide with openapi path '/api'");
+        assert!(matches!(
+            err,
+            RouterBuildError::OpenApiPathCollision {
+                field: "openapi_json_path",
+                ..
+            }
+        ));
+    }
+
+    /// The widget stylesheet route merges a GET unconditionally whenever
+    /// `maud` is on, before the late-merged `OpenAPI` router — an
+    /// `openapi_json_path` configured to the same path must be rejected by
+    /// the preflight, not panic in `router.merge`.
+    #[cfg(all(feature = "openapi", feature = "maud"))]
+    #[test]
+    fn try_build_router_detects_widgets_css_path_collision() {
+        use crate::openapi::OpenApiConfig;
+
+        let openapi =
+            OpenApiConfig::new("Demo", "1.0.0").openapi_json_path(crate::ui::WIDGETS_CSS_PATH);
+        let config = AutumnConfig::default();
+        let ctx = RouterContext {
+            exception_filters: Vec::new(),
+            scoped_groups: Vec::new(),
+            merge_routers: Vec::new(),
+            nest_routers: Vec::new(),
+            custom_layers: Vec::new(),
+            static_gate_layers: Vec::new(),
+            #[cfg(feature = "maud")]
+            error_page_renderer: None,
+            session_store: None,
+            openapi: Some(openapi),
+            #[cfg(feature = "mcp")]
+            mcp: None,
+        };
+        let err = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx).expect_err(
+            "openapi_json_path colliding with the widget stylesheet route should be rejected",
+        );
+        assert!(matches!(
+            err,
+            RouterBuildError::OpenApiPathCollision {
+                field: "openapi_json_path",
+                ..
+            }
+        ));
+    }
+
+    /// Same as above for the flash stylesheet route (pre-existing gap, same
+    /// class of bug: the flash CSS route was also missing from
+    /// `collect_claimed_get_paths`).
+    #[cfg(all(feature = "openapi", feature = "flash"))]
+    #[test]
+    fn try_build_router_detects_flash_css_path_collision() {
+        use crate::openapi::OpenApiConfig;
+
+        let openapi =
+            OpenApiConfig::new("Demo", "1.0.0").openapi_json_path(crate::flash::FLASH_CSS_PATH);
+        let config = AutumnConfig::default();
+        let ctx = RouterContext {
+            exception_filters: Vec::new(),
+            scoped_groups: Vec::new(),
+            merge_routers: Vec::new(),
+            nest_routers: Vec::new(),
+            custom_layers: Vec::new(),
+            static_gate_layers: Vec::new(),
+            #[cfg(feature = "maud")]
+            error_page_renderer: None,
+            session_store: None,
+            openapi: Some(openapi),
+            #[cfg(feature = "mcp")]
+            mcp: None,
+        };
+        let err = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx).expect_err(
+            "openapi_json_path colliding with the flash stylesheet route should be rejected",
+        );
         assert!(matches!(
             err,
             RouterBuildError::OpenApiPathCollision {
