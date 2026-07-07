@@ -6,4 +6,5 @@ mod migrate_down;
 mod repo_hygiene;
 #[cfg(unix)]
 mod serve;
+mod tauri_mobile_thin_client;
 mod webhook_sim;
