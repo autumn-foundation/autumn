@@ -2045,7 +2045,9 @@ fn render_form_model_impl(pascal_name: &str) -> String {
 ///   blob key — a file input can't be repopulated, and `FieldControl::File`
 ///   would flip the form to `multipart/form-data` while scaffold forms stay
 ///   URL-encoded (uploads go through direct-upload URLs; see
-///   docs/guide/storage.md#direct-uploads);
+///   docs/guide/storage.md#direct-uploads). The appended markup renders the
+///   same inline-error/ARIA skeleton as the derived controls, so changeset
+///   errors on the attachment key still surface;
 /// - `references` columns are promoted to a `Select` over the referenced
 ///   table's ids (issue #1135 AC 2). The options are runtime data, so the
 ///   helper takes one `{column}_options: &[(String, String)]` parameter per
@@ -2063,11 +2065,31 @@ fn render_form_for_helper(pascal_name: &str, snake_name: &str, fields: &[Field])
             FieldKind::Attachment => {
                 let label = humanize_label(name);
                 let _ = write!(builder_calls, "\n        .exclude(\"{name}\")");
+                // The appended markup mirrors the inline-error/ARIA skeleton
+                // `FieldControl::File` renders (autumn-web's form.rs), so
+                // changeset errors on the attachment key surface next to the
+                // file input instead of being silently dropped — while still
+                // avoiding `FieldControl::File` itself, which would flip the
+                // form to `multipart/form-data`. Attachments are always
+                // `Option<String>`, so no `required`/`aria-required` signal.
                 let _ = write!(
                     appends,
-                    "\n        .append(html! {{ label {{ \"{label}\" }} \
-                     input type=\"file\" name=\"{name}\"; \
-                     input type=\"hidden\" name=\"{name}\" value=(changeset.field_value(\"{name}\").unwrap_or_default()); }})"
+                    "\n        .append(html! {{\n            \
+                     @let errors = changeset.errors_for(\"{name}\");\n            \
+                     div id=\"{name}-field\" class=\"autumn-field\" {{\n                \
+                     label for=\"{name}\" class=\"autumn-field__label\" {{ \"{label}\" }}\n                \
+                     input type=\"file\" id=\"{name}\" name=\"{name}\"\n                    \
+                     class=(if errors.is_empty() {{ \"autumn-field__input\" }} else {{ \"autumn-field__input autumn-field__input--invalid\" }})\n                    \
+                     aria-invalid=(if errors.is_empty() {{ \"false\" }} else {{ \"true\" }})\n                    \
+                     aria-describedby=(if errors.is_empty() {{ \"\" }} else {{ \"{name}-error\" }});\n                \
+                     input type=\"hidden\" name=\"{name}\" value=(changeset.field_value(\"{name}\").unwrap_or_default());\n                \
+                     @if !errors.is_empty() {{\n                    \
+                     div id=\"{name}-error\" role=\"alert\" class=\"autumn-field__errors\" {{\n                        \
+                     @for error in errors {{ p class=\"autumn-field__error\" {{ (error) }} }}\n                    \
+                     }}\n                \
+                     }}\n            \
+                     }}\n        \
+                     }})"
                 );
             }
             FieldKind::Enum => {
@@ -4840,10 +4862,28 @@ async fn main() {
         // the form to multipart, but scaffold forms stay URL-encoded.
         assert!(routes.contains(".exclude(\"avatar\")"), "{routes}");
         assert!(routes.contains(".append(html! {"), "{routes}");
-        assert!(routes.contains("input type=\"file\" name=\"avatar\""));
+        assert!(routes.contains("input type=\"file\" id=\"avatar\" name=\"avatar\""));
         assert!(routes.contains(
             "input type=\"hidden\" name=\"avatar\" value=(changeset.field_value(\"avatar\").unwrap_or_default())"
         ));
+
+        // The hand-rolled file input renders the same inline-error/ARIA
+        // skeleton as the derived controls (mirroring `FieldControl::File`
+        // in autumn-web's form.rs), so changeset errors on the attachment
+        // key are not silently dropped.
+        assert!(
+            routes.contains("@let errors = changeset.errors_for(\"avatar\");"),
+            "{routes}"
+        );
+        assert!(
+            routes.contains("aria-invalid=(if errors.is_empty() { \"false\" } else { \"true\" })"),
+            "{routes}"
+        );
+        assert!(
+            routes
+                .contains("div id=\"avatar-error\" role=\"alert\" class=\"autumn-field__errors\""),
+            "{routes}"
+        );
         assert!(
             !routes.contains("enctype"),
             "scaffold forms must stay URL-encoded even with attachments: {routes}"

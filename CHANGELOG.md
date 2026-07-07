@@ -31,7 +31,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   attachment columns stay a hand-rolled file input (appended before the submit
   button, so attachment fields now always render at the end of the form
   regardless of their declared column position, and the form remains
-  URL-encoded). `references` columns render as a `<select>` of the referenced
+  URL-encoded) that renders the same inline-error/ARIA skeleton as the derived
+  controls, so changeset errors on the attachment key surface next to the
+  file input. `references` columns render as a `<select>` of the referenced
   table's ids (AC "enum/references→select"): the generated handlers load the
   ids via a per-column `{column}_select_options` loader and thread them into
   the shared form helper — option labels are the raw id (which column makes a
