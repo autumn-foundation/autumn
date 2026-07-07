@@ -29,15 +29,18 @@ aws-smithy-types = ">=1.4, <1.5"
 # crates, so this only bounds resolution. Lift once upstream releases
 # are compatible.
 time = { version = ">=0.3.36, <0.3.48", default-features = false }
-# aws-smithy-async 1.3.0 and aws-smithy-runtime-api-macros 1.1.0 bumped their
-# rust-version to 1.94.1, above this workspace's pinned toolchains (MSRV
-# 1.88.0; CI's semver-check runner is 1.92.0). Both are transitive deps
-# pulled in via aws-config/aws-sdk-s3, not used directly by this crate — this
-# only bounds resolution, same as the aws-smithy-types/time constraints
-# above. Lift once CI's toolchain is bumped past 1.94.1 or upstream ships an
+# aws-smithy-async 1.3.0 bumped its rust-version to 1.94.1, above this
+# workspace's pinned toolchains (MSRV 1.88.0; CI's semver-check runner is
+# 1.92.0). Below 1.3, aws-smithy-runtime-api also stays below the 1.12.0
+# line that pulls in aws-smithy-runtime-api-macros (whose only sub-1.91.0-MSRV
+# release is an unusable 0.0.1 placeholder), so constraining this one crate is
+# enough — a separate direct pin on aws-smithy-runtime-api-macros is not
+# needed and must not be added. This is a transitive dep pulled in via
+# aws-config/aws-sdk-s3, not used directly by this crate — it only bounds
+# resolution, same as the aws-smithy-types/time constraints above. Lift once
+# CI's toolchain is bumped past 1.94.1 or upstream ships an
 # older-rustc-compatible release.
 aws-smithy-async = ">=1.2, <1.3"
-aws-smithy-runtime-api-macros = ">=1.0, <1.1"
 aws-sdk-s3 = "1"
 bytes = "1"
 futures = { workspace = true }
