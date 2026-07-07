@@ -1,0 +1,70 @@
+//! Offline-first local storage and background synchronization.
+//!
+//! This module gives occasionally-connected apps (the primary consumer is
+//! the in-process Tauri mobile shell, issue #1508) a local, in-process
+//! SQLite store plus a sync engine that reconciles it with a remote Autumn
+//! app backed by PostgreSQL.
+//!
+//! # Architecture
+//!
+//! - [`SyncStore`] — the local store. App data lives in it as JSON payloads
+//!   keyed by `(collection, pk)`. Every write also journals a pending change
+//!   in the same SQLite transaction (write-through change tracking), and
+//!   deletes are recorded as tombstone rows so they replicate.
+//! - [`SyncEngine`] — the client sync loop: push pending changes, then pull
+//!   rows newer than the local cursor. At-least-once with server-side
+//!   dedup; safe to retry; tolerates being offline indefinitely.
+//! - [`server`] — an [`axum::Router`] with `POST /push` + `GET /pull`,
+//!   mountable on the remote app via `AppBuilder::nest("/sync", ...)`,
+//!   persisting into Postgres shadow tables (or an in-memory backend for
+//!   tests and demos).
+//! - [`ConflictResolver`] — pluggable conflict policy, applied server-side
+//!   when a pushed change was based on a stale version. The default is
+//!   last-write-wins on the conflicting writes' `updated_at`, with the
+//!   device id as a deterministic tiebreak.
+//!
+//! Ordering is server-authoritative: the server assigns every accepted
+//! change a monotonically increasing version from one global sequence, and
+//! clients pull "rows with version greater than my cursor". Device clocks
+//! never order the change feed.
+//!
+//! # Scope
+//!
+//! Existing diesel `#[repository]` models are **not** transparently
+//! offline. Data the app wants available offline goes through the
+//! [`SyncStore`] API and is mirrored to the remote shadow tables.
+
+pub mod engine;
+pub mod protocol;
+pub mod resolver;
+pub mod server;
+pub mod store;
+
+pub use engine::{SyncConfig, SyncEngine, SyncReport, SyncStatus};
+pub use protocol::{
+    Change, ChangeOutcome, Op, PullQuery, PullResponse, PushRequest, PushResponse, RemoteRow,
+    Version,
+};
+pub use resolver::{ConflictResolver, LwwResolver, Resolution};
+pub use server::{MemorySyncBackend, PgSyncBackend, SyncBackend};
+pub use store::SyncStore;
+
+/// Errors produced by the sync store, engine, and server backends.
+#[derive(Debug, thiserror::Error)]
+pub enum SyncError {
+    /// A local SQLite store operation failed.
+    #[error("sync store error: {0}")]
+    Store(String),
+    /// A payload could not be serialized or deserialized.
+    #[error("sync serialization error: {0}")]
+    Serde(#[from] serde_json::Error),
+    /// The remote server could not be reached (offline, DNS, timeout).
+    #[error("sync transport error: {0}")]
+    Transport(String),
+    /// The remote server answered with an error response.
+    #[error("sync server error: {0}")]
+    Server(String),
+    /// A server-side backend (Postgres or in-memory) operation failed.
+    #[error("sync backend error: {0}")]
+    Backend(String),
+}
