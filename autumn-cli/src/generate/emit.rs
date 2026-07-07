@@ -5,7 +5,7 @@
 //! collision detection, `--force` / `--dry-run`, and the human-readable
 //! "Created/Modified" output that mirrors `autumn new`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -195,7 +195,22 @@ impl Revert {
     /// Apply this revert to `content`, returning the new content. Every
     /// underlying transform is idempotent — a revert whose target is
     /// already absent returns `content` unchanged.
-    fn apply(&self, content: &str, project_root: &Path, excluding: &[PathBuf]) -> String {
+    ///
+    /// `overrides` supplies the already-computed post-destroy content of
+    /// OTHER files this same `Plan::revert` is also modifying (e.g.
+    /// `src/schema.rs`, once its own `SchemaTable` revert has run) — the
+    /// project-wide crate/feature usage scan ([`crate_referenced_elsewhere_in_project`]/
+    /// [`autumn_web_feature_still_needed_elsewhere`]) reads from there
+    /// instead of stale pre-destroy disk content when a path is present,
+    /// falling back to `excluding`-gated disk reads otherwise (issue #1048
+    /// PR review).
+    fn apply(
+        &self,
+        content: &str,
+        project_root: &Path,
+        excluding: &[PathBuf],
+        overrides: &HashMap<PathBuf, String>,
+    ) -> String {
         use super::inbound_mail::remove_inbound_mail_handler;
         use super::schema_edit::{
             remove_autumn_web_dev_dependency_feature, remove_autumn_web_feature, remove_job_entry,
@@ -225,7 +240,12 @@ impl Revert {
                     .iter()
                     .map(String::as_str)
                     .filter(|name| {
-                        !crate_referenced_elsewhere_in_project(project_root, name, excluding)
+                        !crate_referenced_elsewhere_in_project(
+                            project_root,
+                            name,
+                            excluding,
+                            overrides,
+                        )
                     })
                     .collect();
                 if survives.is_empty() {
@@ -235,14 +255,24 @@ impl Revert {
                 }
             }
             Self::CargoAutumnWebFeature { feature, .. } => {
-                if autumn_web_feature_still_needed_elsewhere(feature, project_root, excluding) {
+                if autumn_web_feature_still_needed_elsewhere(
+                    feature,
+                    project_root,
+                    excluding,
+                    overrides,
+                ) {
                     content.to_owned()
                 } else {
                     remove_autumn_web_feature(content, feature)
                 }
             }
             Self::CargoAutumnWebDevFeature { feature, .. } => {
-                if autumn_web_feature_still_needed_elsewhere(feature, project_root, excluding) {
+                if autumn_web_feature_still_needed_elsewhere(
+                    feature,
+                    project_root,
+                    excluding,
+                    overrides,
+                ) {
                     content.to_owned()
                 } else {
                     remove_autumn_web_dev_dependency_feature(content, feature)
@@ -763,9 +793,57 @@ impl Plan {
         // disk at scan time — the real rewrite/deletion happens later, in
         // `Plan::revert`'s apply phase) isn't evidence of anything a
         // *different* resource still needs, since this same operation is
-        // about to change it too.
+        // about to change it too. `scan_overrides` (below) supplies each
+        // such file's real final content instead, so this exclusion only
+        // ever falls back to "treat as absent" for a file that becomes
+        // empty (deleted) — never for one that survives with other content.
         let mut cargo_deps_excluding = files_to_remove.clone();
         cargo_deps_excluding.extend(grouped_reverts.iter().map(|(path, _)| path.clone()));
+
+        // Precompute the final, post-destroy content of every modified file
+        // OTHER than `Cargo.toml` via each file's own, self-contained
+        // reverts (none of them — `SchemaTable`, `ModDecl`, etc. — consult
+        // another file's content). `Cargo.toml`'s `CargoDeps`/
+        // `CargoAutumnWebFeature`/`CargoAutumnWebDevFeature` reverts are the
+        // only ones that DO (the project-wide crate/feature usage scan),
+        // and always target `Cargo.toml` itself, so computing every other
+        // file's result first and excluding `Cargo.toml` here avoids any
+        // ordering cycle. This is what lets that scan see what
+        // `src/schema.rs` (or `src/main.rs`, a `mod.rs`, ...) will actually
+        // look like once this destroy is done — e.g. a table this destroy
+        // ISN'T touching, still present after its own removal — rather than
+        // either stale pre-destroy content (would wrongly count a table
+        // being removed as "still needed") or hiding the file from the scan
+        // entirely (would wrongly hide unrelated content in the same file
+        // that legitimately still needs the dependency) — issue #1048 PR
+        // review.
+        let cargo_toml_path = self.project_root.join("Cargo.toml");
+        let mut scan_overrides: HashMap<PathBuf, String> = HashMap::new();
+        for (path, reverts) in &grouped_reverts {
+            if *path == cargo_toml_path || !path.exists() {
+                continue;
+            }
+            let Ok(original) = fs::read_to_string(path) else {
+                continue;
+            };
+            let mut content = original;
+            for revert in reverts {
+                if let Some(dir) = revert.owner_dir()
+                    && resource_dir_has_other_files(dir, &files_to_remove)
+                {
+                    continue;
+                }
+                content = revert.apply(
+                    &content,
+                    &self.project_root,
+                    &cargo_deps_excluding,
+                    &scan_overrides,
+                );
+            }
+            if !content.trim().is_empty() {
+                scan_overrides.insert(path.clone(), content);
+            }
+        }
 
         let mut modifies = Vec::new();
         for (path, reverts) in grouped_reverts {
@@ -785,7 +863,12 @@ impl Plan {
                     // feature — leave the Cargo.toml edit in place.
                     continue;
                 }
-                content = revert.apply(&content, &self.project_root, &cargo_deps_excluding);
+                content = revert.apply(
+                    &content,
+                    &self.project_root,
+                    &cargo_deps_excluding,
+                    &scan_overrides,
+                );
             }
             if content == original {
                 continue;
@@ -892,12 +975,13 @@ fn crate_referenced_elsewhere_in_project(
     project_root: &Path,
     crate_name: &str,
     excluding: &[PathBuf],
+    overrides: &HashMap<PathBuf, String>,
 ) -> bool {
     let ident = crate_name.replace('-', "_");
     let markers = [format!("{ident}::"), format!("use {ident}")];
     ["src", "tests", "benches"]
         .iter()
-        .any(|dir| rs_tree_contains_marker(&project_root.join(dir), &markers, excluding))
+        .any(|dir| rs_tree_contains_marker(&project_root.join(dir), &markers, excluding, overrides))
 }
 
 /// A text marker that reliably indicates `feature`'s autumn-web API surface
@@ -940,6 +1024,7 @@ fn autumn_web_feature_still_needed_elsewhere(
     feature: &str,
     project_root: &Path,
     excluding: &[PathBuf],
+    overrides: &HashMap<PathBuf, String>,
 ) -> bool {
     let Some(marker) = autumn_web_feature_marker(feature) else {
         return false;
@@ -947,7 +1032,7 @@ fn autumn_web_feature_still_needed_elsewhere(
     let markers = [marker.to_owned()];
     ["src", "tests", "benches"]
         .iter()
-        .any(|dir| rs_tree_contains_marker(&project_root.join(dir), &markers, excluding))
+        .any(|dir| rs_tree_contains_marker(&project_root.join(dir), &markers, excluding, overrides))
 }
 
 /// Whether a local Cargo `feature` (not an `autumn-web` feature — see
@@ -964,28 +1049,51 @@ pub(super) fn cargo_feature_still_gated_elsewhere(
     excluding: &[PathBuf],
 ) -> bool {
     let markers = [format!("feature = \"{feature}\"")];
-    ["src", "tests", "benches"]
-        .iter()
-        .any(|dir| rs_tree_contains_marker(&project_root.join(dir), &markers, excluding))
+    let no_overrides = HashMap::new();
+    ["src", "tests", "benches"].iter().any(|dir| {
+        rs_tree_contains_marker(&project_root.join(dir), &markers, excluding, &no_overrides)
+    })
 }
 
-/// Recursively scan `dir` for any `.rs` file (other than `excluding`)
-/// containing one of `markers` as a plain substring.
-fn rs_tree_contains_marker(dir: &Path, markers: &[String], excluding: &[PathBuf]) -> bool {
+/// Recursively scan `dir` for any `.rs` file containing one of `markers` as
+/// a plain substring.
+///
+/// `overrides` (path → already-computed post-destroy content) takes
+/// priority over both disk and `excluding` — it's how a caller supplies the
+/// real final content of a file this same `Plan::revert` is also modifying
+/// in place (e.g. `src/schema.rs`), so scanning it doesn't see stale
+/// pre-destroy content (issue #1048 PR review). A path in `excluding` but
+/// absent from `overrides` is skipped entirely — it's either being deleted
+/// outright, or emptied down to nothing by its own reverts, so it won't
+/// exist to provide evidence either way once this destroy finishes.
+fn rs_tree_contains_marker(
+    dir: &Path,
+    markers: &[String],
+    excluding: &[PathBuf],
+    overrides: &HashMap<PathBuf, String>,
+) -> bool {
     let Ok(entries) = fs::read_dir(dir) else {
         return false;
     };
     for entry in entries.filter_map(Result::ok) {
         let path = entry.path();
         if path.is_dir() {
-            if rs_tree_contains_marker(&path, markers, excluding) {
+            if rs_tree_contains_marker(&path, markers, excluding, overrides) {
                 return true;
             }
-        } else if path.extension().is_some_and(|ext| ext == "rs")
-            && !excluding.contains(&path)
-            && fs::read_to_string(&path)
-                .is_ok_and(|content| markers.iter().any(|m| content.contains(m.as_str())))
-        {
+            continue;
+        }
+        if path.extension().is_none_or(|ext| ext != "rs") {
+            continue;
+        }
+        let content = overrides.get(&path).cloned().or_else(|| {
+            if excluding.contains(&path) {
+                None
+            } else {
+                fs::read_to_string(&path).ok()
+            }
+        });
+        if content.is_some_and(|c| markers.iter().any(|m| c.contains(m.as_str()))) {
             return true;
         }
     }
@@ -1637,6 +1745,67 @@ mod tests {
         plan.revert(Flags::default()).unwrap();
 
         assert!(!layout.exists());
+    }
+
+    #[test]
+    fn revert_keeps_a_dependency_still_needed_by_another_table_in_the_same_schema_file() {
+        // issue #1048 PR review: excluding the WHOLE `src/schema.rs` from
+        // the crate-usage scan (because this destroy is also rewriting it)
+        // hid a second, unrelated `diesel::table!` block that survives the
+        // destroy — wrongly treating `diesel` as unused project-wide when
+        // it's still needed by that other table. The scan must see
+        // `schema.rs`'s real POST-destroy content, not exclude the file
+        // outright.
+        use crate::generate::dsl::parse_fields;
+        use crate::generate::schema_edit::append_schema_table;
+
+        let (tmp, mut plan) = fixture();
+        let fields = parse_fields(&["title:String".to_owned()]).unwrap();
+        let posts_block = append_schema_table("", "posts", &fields);
+        let schema_path = tmp.path().join("src/schema.rs");
+        fs::create_dir_all(schema_path.parent().unwrap()).unwrap();
+        // A second, pre-existing table this destroy never touches.
+        let schema_with_users = append_schema_table("", "users", &fields);
+        let schema_content = append_schema_table(&schema_with_users, "posts", &fields);
+        fs::write(&schema_path, &schema_content).unwrap();
+
+        let cargo_path = tmp.path().join("Cargo.toml");
+        fs::write(
+            &cargo_path,
+            "[package]\nname = \"x\"\n\n[dependencies]\ndiesel = \"2\"\n",
+        )
+        .unwrap();
+
+        plan.push_revert(Revert::SchemaTable {
+            path: schema_path.clone(),
+            table: "posts".to_owned(),
+            expected_block: posts_block,
+        });
+        let models_dir = tmp.path().join("src/models");
+        fs::create_dir_all(&models_dir).unwrap();
+        plan.push_revert(Revert::CargoDeps {
+            path: cargo_path.clone(),
+            names: vec!["diesel".to_owned()],
+            owner_dir: models_dir,
+        });
+
+        plan.revert(Flags::default()).unwrap();
+
+        let schema_after = fs::read_to_string(&schema_path).unwrap();
+        assert!(
+            !schema_after.contains("posts ("),
+            "posts table must be removed"
+        );
+        assert!(
+            schema_after.contains("users ("),
+            "the other table must survive: {schema_after}"
+        );
+        let cargo_after = fs::read_to_string(&cargo_path).unwrap();
+        assert!(
+            cargo_after.contains("diesel"),
+            "diesel must survive — schema.rs still has a diesel::table! for `users`: \
+             {cargo_after}"
+        );
     }
 
     #[test]

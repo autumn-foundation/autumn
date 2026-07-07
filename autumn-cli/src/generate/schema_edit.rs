@@ -1298,9 +1298,17 @@ fn insert_mail_previews_call(existing: &str, mailer_type: &str) -> String {
 ///
 /// A no-op if there's no `mail_previews![...]`, or `mailer_type` isn't
 /// currently listed.
+///
+/// Locates the whole `.mail_previews(mail_previews![...])` call by balanced-
+/// paren scan (rather than assuming it stays on one line) when the list
+/// empties out, so a project that ran the call through `rustfmt` — which
+/// commonly wraps it across several lines once it has more than a couple of
+/// mailer names — doesn't end up with a dangling, now-meaningless remnant
+/// (issue #1048 PR review).
 #[must_use]
 pub fn remove_mail_preview_from_app(existing: &str, mailer_type: &str) -> String {
     const PREVIEW_MACRO: &str = "mail_previews![";
+    const CALL_PREFIX: &str = ".mail_previews(";
     let Some((spliced, now_empty)) =
         remove_entry_from_bracketed_list(existing, PREVIEW_MACRO, mailer_type)
     else {
@@ -1309,15 +1317,46 @@ pub fn remove_mail_preview_from_app(existing: &str, mailer_type: &str) -> String
     if !now_empty {
         return spliced;
     }
-    // Only entry -- remove the whole freshly-inserted line.
-    let lines: Vec<&str> = existing.lines().collect();
-    let Some(line_idx) = lines
-        .iter()
-        .position(|l| l.trim_start().starts_with(".mail_previews(mail_previews!["))
-    else {
+    // Only entry -- remove the whole freshly-inserted call, whichever lines
+    // it spans.
+    let Some(call_pos) = existing.find(CALL_PREFIX) else {
         return existing.to_owned();
     };
-    remove_single_line(&lines, line_idx, existing.ends_with('\n'))
+    let Some(call_end) = find_balanced_close_paren(existing, call_pos + CALL_PREFIX.len()) else {
+        return existing.to_owned();
+    };
+    let start_line = existing[..call_pos].rfind('\n').map_or(0, |i| i + 1);
+    let end_line = existing[call_end..]
+        .find('\n')
+        .map_or(existing.len(), |i| call_end + i + 1);
+    let mut out = String::with_capacity(existing.len());
+    out.push_str(&existing[..start_line]);
+    out.push_str(&existing[end_line..]);
+    out
+}
+
+/// Scan forward from `start` (the byte position just after an already-open
+/// `(`, i.e. depth 1) for the matching closing paren, returning the index
+/// just past it. `None` if the parens never balance (malformed/truncated
+/// input — destroy never guesses).
+fn find_balanced_close_paren(src: &str, start: usize) -> Option<usize> {
+    let bytes = src.as_bytes();
+    let mut depth = 1usize;
+    let mut i = start;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Shared bracket-list-entry removal behind [`remove_job_entry`] and
@@ -1977,6 +2016,30 @@ fn remove_feature_from_deps_section(
     None
 }
 
+/// Find the `features` key inside an inline-table `body` (e.g.
+/// `version = "1", default-features = false, features = ["mail"]`), as a
+/// whole key — not a substring match that a plain `body.find("features")`
+/// would also hit inside `default-features` when that key comes first
+/// (issue #1048 PR review: `default-features = false, features = ["mail"]`
+/// would otherwise truncate `before_features` mid-word at `default-` and
+/// rewrite the dependency into invalid TOML). Requires the match to be
+/// preceded by the body start or a non-identifier character, and followed
+/// by optional whitespace then `=`.
+fn find_features_key(body: &str) -> Option<usize> {
+    let mut search_from = 0;
+    while let Some(rel) = body[search_from..].find("features") {
+        let idx = search_from + rel;
+        let is_key_start = idx == 0
+            || !matches!(body.as_bytes()[idx - 1], b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'-');
+        let is_key_end = body[idx + "features".len()..].trim_start().starts_with('=');
+        if is_key_start && is_key_end {
+            return Some(idx);
+        }
+        search_from = idx + "features".len();
+    }
+    None
+}
+
 /// Parse `line` as `{indent}{dep_name} = { ...features = [...] ... }` and
 /// decide how to rewrite it once `feature_quoted` is removed from the
 /// features array. Returns [`FeatureRemovalEdit::Unchanged`] whenever the
@@ -2003,7 +2066,7 @@ fn parse_feature_removal(
         return FeatureRemovalEdit::Unchanged;
     };
     let body = rest[..body_end].trim();
-    let Some(features_kw) = body.find("features") else {
+    let Some(features_kw) = find_features_key(body) else {
         return FeatureRemovalEdit::Unchanged;
     };
     let before_features = body[..features_kw].trim().trim_end_matches(',').trim();
@@ -5147,6 +5210,34 @@ async fn main() {\n\
     }
 
     #[test]
+    fn remove_mail_preview_from_app_removes_a_rustfmt_wrapped_call() {
+        // rustfmt commonly wraps `.mail_previews(mail_previews![...])`
+        // across several lines once it has a couple of mailer names. Naive
+        // line-start matching would strip only the opening line and leave
+        // the rest (`WelcomeMailer,` / `])`) dangling — issue #1048 PR
+        // review.
+        let src = "fn main() {\n    App::new()\n        .mail_previews(mail_previews![\n            WelcomeMailer,\n        ])\n        .run()\n}\n";
+        let updated = remove_mail_preview_from_app(src, "WelcomeMailer");
+        assert!(
+            !updated.contains("mail_previews"),
+            "the whole call must be removed once its only entry is gone, got:\n{updated}"
+        );
+        assert_eq!(updated, "fn main() {\n    App::new()\n        .run()\n}\n");
+    }
+
+    #[test]
+    fn remove_mail_preview_from_app_keeps_other_entry_in_a_rustfmt_wrapped_call() {
+        let src = "fn main() {\n    App::new()\n        .mail_previews(mail_previews![\n            WelcomeMailer,\n            ReceiptMailer,\n        ])\n        .run()\n}\n";
+        let updated = remove_mail_preview_from_app(src, "WelcomeMailer");
+        assert!(
+            updated.contains("mail_previews"),
+            "the call must survive while another entry remains, got:\n{updated}"
+        );
+        assert!(updated.contains("ReceiptMailer"));
+        assert!(!updated.contains("WelcomeMailer"));
+    }
+
+    #[test]
     fn remove_mail_preview_from_app_is_idempotent_when_absent() {
         let base = "fn main() {\n    App::new()\n        .run()\n}\n";
         assert_eq!(remove_mail_preview_from_app(base, "WelcomeMailer"), base);
@@ -7088,6 +7179,20 @@ pub struct Comment {
             reverted,
             "[dependencies]\nautumn-web = { version = \"0.6.0\", features = [\"maud\"], default-features = false }\n",
             "trailing keys after the features array must survive: {reverted}"
+        );
+    }
+
+    #[test]
+    fn remove_autumn_web_feature_handles_default_features_key_before_features() {
+        // issue #1048 PR review: a plain `body.find("features")` matches
+        // inside `default-features` when that key comes first, truncating
+        // `before_features` mid-word and corrupting the rewritten line.
+        let base = "[dependencies]\nautumn-web = { version = \"0.6.0\", default-features = false, features = [\"maud\", \"htmx\"] }\n";
+        let reverted = remove_autumn_web_feature(base, "htmx");
+        assert_eq!(
+            reverted,
+            "[dependencies]\nautumn-web = { version = \"0.6.0\", default-features = false, features = [\"maud\"] }\n",
+            "must remove only the target feature, keeping default-features intact: {reverted}"
         );
     }
 

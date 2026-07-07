@@ -2713,13 +2713,32 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
             force,
         } => {
             let timestamp = generate::timestamp_now();
+            let project_root = resolve_cwd();
             let plan = generate::migration::plan_migration_with_options(
-                &resolve_cwd(),
+                &project_root,
                 &name,
                 &fields,
                 &timestamp,
                 &unique,
             );
+            // `plan_migration_with_options` needs the model's `#[searchable]`
+            // config to render `AddSearchTo<Table>`'s SQL — meaningless (and
+            // an error) once the model is already gone. A common cleanup
+            // order like `destroy model Post` then `destroy migration
+            // AddSearchToPosts` would otherwise strand the migration
+            // directory, since the failure happens before `Plan::revert`
+            // ever sees `--force` (issue #1048 PR review). Fall back to a
+            // suffix-only removal plan in destroy mode when the real plan
+            // can't be built.
+            let plan = if mode == ApplyMode::Destroy && plan.is_err() {
+                generate::migration::plan_migration_destroy_fallback(
+                    &project_root,
+                    &name,
+                    &timestamp,
+                )
+            } else {
+                plan
+            };
             apply_plan(plan, generate::Flags { dry_run, force }, mode);
         }
         GenerateCommands::Task {

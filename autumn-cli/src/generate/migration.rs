@@ -195,6 +195,43 @@ pub fn plan_migration_with_options(
     Ok(plan)
 }
 
+/// Fallback destroy-only plan for `autumn destroy migration <name>` when
+/// [`plan_migration_with_options`] can't be recomputed — e.g. an
+/// `AddSearchTo<Table>` migration whose model file (or its `#[searchable]`
+/// config) is already gone by the time destroy runs, a common cleanup order
+/// like deleting/destroying the model first (issue #1048 PR review).
+/// `plan_migration_with_options` needs that config to render the right SQL,
+/// which is meaningless (and an error) once it's gone.
+///
+/// Locates the migration directory by suffix only — the same
+/// `{timestamp}_{suffix}` naming [`plan_migration_with_options`] uses, which
+/// is all [`Plan::revert`] actually needs to find it (destroy always
+/// recomputes a fresh timestamp anyway, so exact SQL content was never
+/// load-bearing for *locating* the directory). Its expected content is
+/// unknowable without re-deriving the search config, so `up.sql`/`down.sql`
+/// are recorded with an empty placeholder — real content (never empty)
+/// always counts as diverged, so they're only removed with `--force`,
+/// exactly like [`super::admin::plan_admin_destroy_fallback`].
+///
+/// # Errors
+/// Returns [`GenerateError`] when `project_root` isn't a valid project, or
+/// `name` fails validation.
+pub fn plan_migration_destroy_fallback(
+    project_root: &Path,
+    name: &str,
+    timestamp: &str,
+) -> Result<Plan, GenerateError> {
+    ensure_project_root(project_root)?;
+    super::model::validate_resource_name(name)?;
+
+    let dir_name = format!("{timestamp}_{}", snake_or_pascal_to_snake(name));
+    let migration_dir = project_root.join("migrations").join(&dir_name);
+    let mut plan = Plan::new(project_root);
+    plan.create(migration_dir.join("up.sql"), String::new());
+    plan.create(migration_dir.join("down.sql"), String::new());
+    Ok(plan)
+}
+
 /// Convert a name like `AddTitleToPosts` → `add_title_to_posts`, while
 /// leaving an already-snake-case name untouched.
 fn snake_or_pascal_to_snake(name: &str) -> String {
@@ -468,6 +505,93 @@ pub struct Post {
         );
         assert!(down.contains("DROP INDEX IF EXISTS idx_posts_search_vector;"));
         assert!(down.contains("ALTER TABLE posts DROP COLUMN IF EXISTS search_vector;"));
+    }
+
+    // ── `plan_migration_destroy_fallback` (issue #1048 PR review) ───────────
+
+    #[test]
+    fn destroy_add_search_migration_after_model_already_destroyed_still_removes_it() {
+        // A common cleanup order — destroying the model before destroying
+        // an `AddSearchTo<Table>` migration that depended on its
+        // `#[searchable]` config — must not strand the migration directory
+        // just because `plan_migration_with_options` can no longer read it.
+        temp_env::with_vars(
+            [
+                ("AUTUMN_DATABASE__PRIMARY_URL", None::<&str>),
+                ("AUTUMN_DATABASE__URL", None::<&str>),
+                ("DATABASE_URL", None::<&str>),
+            ],
+            || {
+                let tmp = project();
+                let models_dir = tmp.path().join("src/models");
+                fs::create_dir_all(&models_dir).unwrap();
+                let model_src = r#"
+#[autumn_web::model(table = "posts")]
+#[searchable(language = "english")]
+pub struct Post {
+    #[id]
+    pub id: i64,
+    #[searchable(weight = "A")]
+    pub title: String,
+}
+"#;
+                fs::write(models_dir.join("post.rs"), model_src).unwrap();
+
+                let plan =
+                    plan_migration(tmp.path(), "AddSearchToPosts", &[], "20260427000000").unwrap();
+                plan.execute(Flags::default()).unwrap();
+                let dir = tmp
+                    .path()
+                    .join("migrations/20260427000000_add_search_to_posts");
+                assert!(dir.exists());
+
+                // Simulate `autumn destroy model Post` having already run.
+                fs::remove_file(models_dir.join("post.rs")).unwrap();
+                assert!(
+                    plan_migration(tmp.path(), "AddSearchToPosts", &[], "99999999999999").is_err()
+                );
+
+                let fallback_plan = plan_migration_destroy_fallback(
+                    tmp.path(),
+                    "AddSearchToPosts",
+                    "99999999999999",
+                )
+                .unwrap();
+                // Without --force: content is unverifiable (the search
+                // config is gone), so it's treated as diverged and left in
+                // place.
+                let err = fallback_plan
+                    .revert(Flags {
+                        dry_run: false,
+                        force: false,
+                    })
+                    .unwrap_err();
+                assert!(matches!(err, GenerateError::Diverged(_)));
+                assert!(dir.exists());
+
+                let fallback_plan = plan_migration_destroy_fallback(
+                    tmp.path(),
+                    "AddSearchToPosts",
+                    "99999999999999",
+                )
+                .unwrap();
+                fallback_plan
+                    .revert(Flags {
+                        dry_run: false,
+                        force: true,
+                    })
+                    .unwrap();
+                assert!(!dir.exists());
+            },
+        );
+    }
+
+    #[test]
+    fn plan_migration_destroy_fallback_fails_outside_project() {
+        let tmp = TempDir::new().unwrap();
+        let err = plan_migration_destroy_fallback(tmp.path(), "AddSearchToPosts", "20260427000000")
+            .unwrap_err();
+        assert!(matches!(err, GenerateError::NotInProject));
     }
 
     // ── references field: parity with `generate model` (issue #1026) ───────
