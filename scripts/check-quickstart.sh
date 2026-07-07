@@ -250,16 +250,20 @@ phase_new() {
   [[ -f "$app_dir/Cargo.toml" ]] || fail "'autumn new my-app' exited 0 but produced no $app_dir/Cargo.toml"
 
   # Published-crate assertions on the generated manifest: a real user gets no
-  # path deps and no patch section. Covers both the inline
-  # `autumn-web = { path = ... }` form and the two-line
-  # `[dependencies.autumn-web]` + `path = ...` table form. These are an early,
-  # readable tripwire — the authoritative backstop is the post-build lockfile
-  # source assertion in the 'build' phase.
+  # path deps and no patch section. The grep covers the inline
+  # `autumn-web = { ..., path = ... }` form (anchored so commented-out lines
+  # can't match, and `[^#]` so a trailing comment can't). The awk covers the
+  # two-line `[dependencies.autumn-web]` + `path = ...` table form,
+  # section-scoped (reset at the next `[` header) so a `path =` in a
+  # neighboring section can't false-positive. Note the awk hit flag: `exit 0`
+  # in a body rule still runs END, whose exit status would override it.
+  # These are an early, readable tripwire — the authoritative backstop is
+  # the post-build lockfile source assertion in the 'build' phase.
   if grep -q '^\[patch' "$app_dir/Cargo.toml"; then
     fail "generated Cargo.toml contains a [patch] section — the project would not build against the published autumn-web"
   fi
-  if grep -q -E 'autumn-web[^=]*=.*path[[:space:]]*=' "$app_dir/Cargo.toml" \
-    || grep -A 10 -E '^\[(dev-|build-)?dependencies\.autumn-web\]' "$app_dir/Cargo.toml" | grep -q -E '^[[:space:]]*path[[:space:]]*='; then
+  if grep -q -E '^[[:space:]]*autumn-web[^=]*=[^#]*path[[:space:]]*=' "$app_dir/Cargo.toml" \
+    || awk '/^\[(dev-|build-)?dependencies\.autumn-web\]/{found=1; next} /^\[/{found=0} found && /^[[:space:]]*path[[:space:]]*=/{hit=1; exit} END{exit !hit}' "$app_dir/Cargo.toml"; then
     fail "generated Cargo.toml references autumn-web by path — the project would not build against the published autumn-web"
   fi
   ok
