@@ -142,6 +142,8 @@ mod signed_webhooks;
 mod static_serving;
 #[cfg(feature = "storage")]
 mod storage_local_integration;
+#[cfg(feature = "maud")]
+mod stories;
 #[cfg(feature = "system-tests")]
 mod system_test_api;
 #[cfg(feature = "db")]

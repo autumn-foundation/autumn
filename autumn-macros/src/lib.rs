@@ -45,6 +45,7 @@ mod service;
 mod static_route;
 mod static_routes_macro;
 mod step_up;
+mod story_macro;
 mod tasks_macro;
 mod ws;
 

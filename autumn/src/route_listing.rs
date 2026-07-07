@@ -737,6 +737,39 @@ mod tests {
         );
     }
 
+    /// T18 (AC5, issue #1526): `autumn routes` introspection lists the story
+    /// gallery endpoints exactly when the resolved config enables them.
+    #[cfg(feature = "maud")]
+    #[test]
+    fn framework_routes_include_stories_when_enabled() {
+        let mut config = AutumnConfig::default();
+        config.stories.enabled = true;
+        let mut infos = Vec::new();
+        append_framework_routes(&mut infos, &config);
+        let paths: Vec<&str> = infos.iter().map(|i| i.path.as_str()).collect();
+        assert!(
+            paths.contains(&crate::stories::STORIES_PATH),
+            "enabled stories must list the index route: {paths:?}"
+        );
+        assert!(
+            paths.contains(&"/_stories/{slug}"),
+            "enabled stories must list the detail route: {paths:?}"
+        );
+
+        let default_config = AutumnConfig::default();
+        let mut infos = Vec::new();
+        append_framework_routes(&mut infos, &default_config);
+        let paths: Vec<&str> = infos.iter().map(|i| i.path.as_str()).collect();
+        assert!(
+            !paths.contains(&"/_stories"),
+            "disabled stories must not be listed: {paths:?}"
+        );
+        assert!(
+            !paths.contains(&"/_stories/{slug}"),
+            "disabled stories must not list the detail route: {paths:?}"
+        );
+    }
+
     // ── join_scope_path ────────────────────────────────────────────────────
 
     #[test]

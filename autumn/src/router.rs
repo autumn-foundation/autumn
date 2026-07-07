@@ -4446,7 +4446,7 @@ mod tests {
         config
     }
 
-    #[cfg(feature = "mail")]
+    #[cfg(any(feature = "mail", feature = "maud"))]
     async fn response_text(response: axum::response::Response) -> String {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -4593,6 +4593,258 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ── Widget story gallery mount gating (issue #1526) ─────────────────────
+    //
+    // Unlike the dev-only mail preview, `/_stories` is opt-in in ANY profile
+    // via `[stories] enabled = true` (default false): mounting is gated only
+    // on the resolved config flag, while handlers read the `StoryRegistry`
+    // from the AppState extension installed by `with_story_gallery`.
+
+    #[cfg(feature = "maud")]
+    fn story_gallery_config() -> AutumnConfig {
+        let mut config = AutumnConfig::default();
+        config.stories.enabled = true;
+        config.security.trusted_hosts.hosts = vec!["example.com".to_owned()];
+        config
+    }
+
+    #[cfg(feature = "maud")]
+    fn stories_state_with_builtin() -> AppState {
+        let state = test_state();
+        state.insert_extension(crate::stories::builtin());
+        state
+    }
+
+    #[cfg(feature = "maud")]
+    async fn get_with_host(router: axum::Router, uri: &str) -> axum::response::Response {
+        router
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header("host", "example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// T1 (AC4/AC5): with `[stories] enabled = true` and the builtin registry
+    /// installed, the grouped index is served at `/_stories` and pulls in the
+    /// framework widget stylesheet.
+    #[cfg(feature = "maud")]
+    #[tokio::test]
+    async fn build_router_mounts_story_gallery_when_enabled() {
+        let router = build_router(
+            Vec::new(),
+            &story_gallery_config(),
+            stories_state_with_builtin(),
+        );
+
+        let response = get_with_host(router, crate::stories::STORIES_PATH).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_text(response).await;
+        assert!(
+            body.contains("Data table"),
+            "index should list builtin story names: {body}"
+        );
+        assert!(
+            body.contains("autumn-widgets.css"),
+            "index should link the framework widget stylesheet: {body}"
+        );
+    }
+
+    /// T2 (AC4): the detail route serves the live render plus Source and
+    /// Rendered HTML tabs.
+    #[cfg(feature = "maud")]
+    #[tokio::test]
+    async fn story_detail_route_serves_render_source_and_html() {
+        let router = build_router(
+            Vec::new(),
+            &story_gallery_config(),
+            stories_state_with_builtin(),
+        );
+
+        let response = get_with_host(router, "/_stories/data-table").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_text(response).await;
+        assert!(
+            body.contains("<table"),
+            "detail page must contain the live data_table render: {body}"
+        );
+        assert!(
+            body.contains("data_table("),
+            "detail page must show the source snippet that produced the render: {body}"
+        );
+        assert!(
+            body.contains("Rendered HTML"),
+            "detail page must offer the rendered-HTML tab: {body}"
+        );
+        assert!(
+            body.contains("Source"),
+            "detail page must offer the source tab: {body}"
+        );
+    }
+
+    /// T3 (AC4): a mounted gallery 404s unknown slugs while the index stays up.
+    #[cfg(feature = "maud")]
+    #[tokio::test]
+    async fn story_detail_unknown_slug_is_404() {
+        let router = build_router(
+            Vec::new(),
+            &story_gallery_config(),
+            stories_state_with_builtin(),
+        );
+
+        let missing = get_with_host(router.clone(), "/_stories/nope").await;
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+        let index = get_with_host(router, "/_stories").await;
+        assert_eq!(
+            index.status(),
+            StatusCode::OK,
+            "index route must exist even when a slug misses"
+        );
+    }
+
+    /// T4 (AC5/AC6): off by default — no `[stories] enabled = true`, no
+    /// routes, even when a registry extension is installed.
+    #[cfg(feature = "maud")]
+    #[tokio::test]
+    async fn build_router_omits_story_gallery_by_default() {
+        let mut config = AutumnConfig::default();
+        assert!(
+            !config.stories.enabled,
+            "stories gallery must be off by default"
+        );
+        config.security.trusted_hosts.hosts = vec!["example.com".to_owned()];
+
+        let router = build_router(Vec::new(), &config, stories_state_with_builtin());
+        let response = get_with_host(router, "/_stories").await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Loads a layered `autumn.toml` for `profile` via `MockEnv` (no process
+    /// env, no `set_current_dir`) and reports the status `/_stories` returns.
+    #[cfg(feature = "maud")]
+    async fn stories_status_for_layered_profile(toml: &str, profile: &str) -> StatusCode {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("autumn.toml"), toml).expect("write autumn.toml");
+        let env = crate::config::MockEnv::new()
+            .with("AUTUMN_MANIFEST_DIR", dir.path().to_str().unwrap())
+            .with("AUTUMN_ENV", profile);
+        let mut config = AutumnConfig::load_with_env(&env).expect("layered config should load");
+        config.security.trusted_hosts.hosts = vec!["example.com".to_owned()];
+
+        let router = build_router(Vec::new(), &config, stories_state_with_builtin());
+        get_with_host(router, "/_stories").await.status()
+    }
+
+    /// T5 (AC6): profile-scoped gating works both ways through the existing
+    /// config layering — routes mount iff the resolved flag is true.
+    #[cfg(feature = "maud")]
+    #[tokio::test]
+    async fn story_routes_mount_iff_resolved_profile_flag() {
+        // Private app: dev-only gallery, absent in prod.
+        let dev_only = r#"
+[stories]
+enabled = false
+
+[profile.dev.stories]
+enabled = true
+"#;
+        assert_eq!(
+            stories_status_for_layered_profile(dev_only, "dev").await,
+            StatusCode::OK,
+            "dev profile override must mount the gallery"
+        );
+        assert_eq!(
+            stories_status_for_layered_profile(dev_only, "prod").await,
+            StatusCode::NOT_FOUND,
+            "prod must not mount the gallery when only dev enables it"
+        );
+
+        // Public showcase: enabled in prod, absent in dev.
+        let public_showcase = r#"
+[stories]
+enabled = false
+
+[profile.prod.stories]
+enabled = true
+"#;
+        assert_eq!(
+            stories_status_for_layered_profile(public_showcase, "prod").await,
+            StatusCode::OK,
+            "prod profile override must mount the gallery for a public showcase"
+        );
+        assert_eq!(
+            stories_status_for_layered_profile(public_showcase, "dev").await,
+            StatusCode::NOT_FOUND,
+            "dev must not mount the gallery when only prod enables it"
+        );
+    }
+
+    /// T6 (AC7): a custom app story registered via
+    /// `StoryGallery::builtin().extend(...)` is served alongside builtins.
+    #[cfg(feature = "maud")]
+    #[tokio::test]
+    async fn custom_story_served_alongside_builtins() {
+        let custom = crate::stories::story! {
+            "App",
+            "Badge",
+            {
+                maud::html! { span class="app-badge" { "hi from the app" } }
+            }
+        };
+        let state = test_state();
+        state.insert_extension(
+            crate::stories::StoryGallery::builtin()
+                .extend([custom])
+                .into_registry(),
+        );
+
+        let router = build_router(Vec::new(), &story_gallery_config(), state);
+
+        let detail = get_with_host(router.clone(), "/_stories/badge").await;
+        assert_eq!(detail.status(), StatusCode::OK);
+        let body = response_text(detail).await;
+        assert!(
+            body.contains("hi from the app"),
+            "custom story must render at its slug: {body}"
+        );
+
+        let index = get_with_host(router, "/_stories").await;
+        let body = response_text(index).await;
+        assert!(
+            body.contains("Badge"),
+            "index must list the custom story: {body}"
+        );
+        assert!(
+            body.contains("App"),
+            "index must show the custom story's group: {body}"
+        );
+        assert!(
+            body.contains("Data table"),
+            "builtins must still be listed alongside the custom story: {body}"
+        );
+    }
+
+    /// T17 (AC5, R12): enabled config but no registry extension (the user
+    /// forgot `with_story_gallery`) serves a friendly empty state, not a 500.
+    #[cfg(feature = "maud")]
+    #[tokio::test]
+    async fn enabled_without_registry_shows_empty_state() {
+        let router = build_router(Vec::new(), &story_gallery_config(), test_state());
+
+        let response = get_with_host(router, "/_stories").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_text(response).await;
+        assert!(
+            body.contains("with_story_gallery"),
+            "empty state should point at AppBuilder::with_story_gallery: {body}"
+        );
     }
 
     #[tokio::test]
