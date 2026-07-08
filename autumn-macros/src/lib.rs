@@ -45,6 +45,7 @@ mod service;
 mod static_route;
 mod static_routes_macro;
 mod step_up;
+mod story_macro;
 mod tasks_macro;
 mod ws;
 
@@ -286,6 +287,20 @@ pub fn mailer_preview(attr: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro]
 pub fn mail_previews(input: TokenStream) -> TokenStream {
     mail_previews_macro::mail_previews_macro(input.into()).into()
+}
+
+/// Define a widget story for the `/_stories` gallery:
+/// `story!{ "Group", "Name", { ... } }`.
+///
+/// The brace-delimited block is **both** executed for the live render and
+/// captured byte-for-byte (comments and formatting included) as the displayed
+/// source snippet, so the shown code is provably the code that rendered. The
+/// block must be a self-contained expression evaluating to `maud::Markup`:
+/// it is coerced to a plain `fn() -> Markup`, so capturing anything from the
+/// surrounding environment is a compile error.
+#[proc_macro]
+pub fn story(input: TokenStream) -> TokenStream {
+    story_macro::story_macro(input.into()).into()
 }
 
 /// Attribute macro for Autumn database models.
