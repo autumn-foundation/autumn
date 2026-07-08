@@ -136,7 +136,8 @@ fn plan_icons(plan: &mut Plan, project_root: &Path, tauri: &Path) -> Result<(), 
 // ── Mixed-mode guard (issue #1506) ────────────────────────────────────────────
 
 /// Files only the mobile thin-client scaffold (`--remote-url`) emits, relative
-/// to `src-tauri/` — checked before scaffolding the desktop mode.
+/// to `src-tauri/` — checked before scaffolding the desktop mode (and, via
+/// `tauri_mobile::ensure_no_other_mode_scaffold`, the mobile in-process mode).
 ///
 /// The capability files are the actively harmful leftovers: Tauri loads
 /// *every* file under `src-tauri/capabilities/`, and the desktop shell crate
@@ -144,21 +145,22 @@ fn plan_icons(plan: &mut Plan, project_root: &Path, tauri: &Path) -> Result<(), 
 /// name, so `tauri-build` fails permission validation. `Info.ios.plist` is
 /// merely dead on desktop but is equally unambiguous evidence of a
 /// thin-client scaffold.
-const THIN_CLIENT_MARKERS: [&str; 3] = [
+pub const THIN_CLIENT_MARKERS: [&str; 3] = [
     "capabilities/remote-app.json",
     "capabilities/remote-app-mobile.json",
     "Info.ios.plist",
 ];
 
 /// Files only the desktop (sidecar) scaffold emits, relative to `src-tauri/`
-/// — checked before scaffolding the thin-client mode.
+/// — checked before scaffolding the thin-client mode (and, via
+/// `tauri_mobile::ensure_no_other_mode_scaffold`, the mobile in-process mode).
 ///
 /// The per-OS overlay confs are the actively harmful leftovers: Tauri CLI
 /// merges `tauri.<platform>.conf.json` on top of `tauri.conf.json`
 /// automatically, so a stale overlay keeps running the sidecar staging script
 /// as `beforeBuildCommand`/`beforeDevCommand` on every `cargo tauri
 /// build`/`dev` of the thin client.
-const DESKTOP_MARKERS: [&str; 5] = [
+pub const DESKTOP_MARKERS: [&str; 5] = [
     "stage-sidecar.sh",
     "stage-sidecar.ps1",
     "tauri.linux.conf.json",

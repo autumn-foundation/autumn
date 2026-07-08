@@ -2953,7 +2953,21 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
         }
         GenerateCommands::TauriMobile { dry_run, force } => {
             let flags = generate::Flags { dry_run, force };
-            let plan = generate::tauri_mobile::plan_tauri_mobile(&resolve_cwd());
+            let project_root = resolve_cwd();
+            // Mixed-mode guard (mirrors the `tauri` arm above): generating
+            // the mobile in-process shell over a desktop-sidecar or
+            // thin-client src-tauri/ is rejected outright, even with --force
+            // — the other mode's leftovers (per-OS overlay confs, staging
+            // scripts, capability files) actively break the mobile build.
+            // Destroy is exempt: it is the documented remedy and must keep
+            // working on a mixed tree.
+            let guard = if mode == ApplyMode::Generate {
+                generate::tauri_mobile::ensure_no_other_mode_scaffold(&project_root)
+            } else {
+                Ok(())
+            };
+            let plan =
+                guard.and_then(|()| generate::tauri_mobile::plan_tauri_mobile(&project_root));
             let result = plan.and_then(|p| match mode {
                 ApplyMode::Generate => p.execute(flags),
                 ApplyMode::Destroy => p.revert(flags),
