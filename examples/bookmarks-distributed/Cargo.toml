@@ -9,7 +9,7 @@ autumn-web = { path = "../../autumn" }
 autumn-cache-redis = { path = "../../autumn-cache-redis" }
 chrono = { version = "0.4", features = ["serde"] }
 diesel = { version = "2", features = ["postgres", "chrono"] }
-diesel-async = { version = "0.8", features = ["postgres"] }
+diesel-async = { version = "0.9", features = ["postgres"] }
 futures = { workspace = true }
 pq-sys = { version = "0.7", features = ["bundled_without_openssl"] }
 diesel_migrations = "2"

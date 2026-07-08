@@ -8,7 +8,7 @@ publish = false
 autumn-web = { path = "../../autumn" }
 chrono = { version = "0.4", features = ["serde"] }
 diesel = { version = "2", features = ["postgres", "chrono"] }
-diesel-async = { version = "0.8", features = ["postgres"] }
+diesel-async = { version = "0.9", features = ["postgres"] }
 pq-sys = { version = "0.7", features = ["bundled_without_openssl"] }
 diesel_migrations = "2"
 serde = { version = "1", features = ["derive"] }
