@@ -536,7 +536,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ScopedBoxFuture` callbacks; internal call sites and macro-generated code
   were ported via a new semver-exempt `scoped_transaction` adapter, so the
   public `Db::tx` / `Db::tx_with` / `savepoint` closure API (including
-  `.scope_boxed()` usage in app code) is unchanged.
+  `.scope_boxed()` usage in app code) is unchanged. The CLI generators now
+  pin `diesel-async = "0.9"` in generated/starter `Cargo.toml`s and the
+  auth generator emits `async move |conn|` transaction closures instead of
+  `ScopedBoxFuture`-style `Box::pin` callbacks. [no-plugin]
 - **workspace:** `Cargo.lock` is now committed to the repository (it was
   previously gitignored) so builds are reproducible and dependency updates
   are reviewable.
