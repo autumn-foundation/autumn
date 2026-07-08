@@ -30,8 +30,20 @@ On a fresh machine with Rust and Postgres installed:
 autumn new my-app
 cd my-app
 autumn generate scaffold Post title:String body:Text published:bool
+# Before migrating, point the app at your Postgres — see the note below.
 autumn migrate
 autumn dev
+```
+
+One file edit belongs between `generate` and `migrate`: the generated
+`autumn.toml` ships with the database section commented out (look for
+"Uncomment to configure database:"). Uncomment it and point `url` at your
+Postgres so both `autumn migrate` and the running app can reach the
+database — without it, `autumn migrate` exits with `✗ No database URL found.`:
+
+```toml
+[database]
+url = "postgres://user:pass@localhost:5432/my_app"
 ```
 
 Visit <http://localhost:3000/posts> to see the generated index page.
