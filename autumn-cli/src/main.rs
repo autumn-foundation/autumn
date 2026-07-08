@@ -1834,7 +1834,7 @@ enum GenerateCommands {
     #[command(verbatim_doc_comment)]
     TauriMobile {
         /// Wire offline-first local storage + background sync (issue #1508):
-        /// app data lives in a `SyncStore`-backed SQLite file inside the app
+        /// app data lives in a `SyncStore`-backed `SQLite` file inside the app
         /// sandbox and a background `SyncEngine` syncs it with the remote
         /// deployment's `/sync` endpoints whenever the network allows. Adds
         /// the `offline-sync` feature (on `autumn-web`) to the app crate and

@@ -393,6 +393,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   writes' `updated_at`, device-id tiebreak); resolved rows get a new version
   so every device converges. Zero new dependencies — builds on the `db` and
   `http-client` features already in the graph.
+- **generator:** `autumn generate tauri-mobile --offline-sync` (issue #1508)
+  wires the offline-sync engine into the mobile scaffold: the shell opens a
+  `SyncStore`-backed SQLite database in the app sandbox (exported as
+  `AUTUMN_SYNC__DB_PATH`), runs a background `SyncEngine` against
+  `AUTUMN_SYNC__REMOTE_URL` (30 s interval, exponential backoff while
+  offline, plus an immediate pass on `RunEvent::Resumed` when the app
+  returns to the foreground), and the app crate gains a default
+  `offline-sync` feature and a `/sync` router mounted in the extracted
+  `serve()` — only when `AUTUMN_DATABASE__URL` is configured, and with
+  log-and-continue schema DDL, so the same binary boots fully offline on a
+  device (no database at all) and serves sync on the server. Without the
+  flag the emitted scaffold is byte-identical to before. Docs:
+  architecture, change tracking, tombstoning/GC, conflict resolution, and
+  an airplane-mode walkthrough in
+  [docs/guide/tauri-mobile-offline-sync.md](docs/guide/tauri-mobile-offline-sync.md).
 
 ## [0.6.0] - 2026-06-30
 

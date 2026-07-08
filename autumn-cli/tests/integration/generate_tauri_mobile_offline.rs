@@ -3,7 +3,7 @@
 //!
 //! The `--offline-sync` flag layers local-first storage onto the in-process
 //! mobile scaffold from issue #1507: app data lives in a `SyncStore`-backed
-//! SQLite file inside the app sandbox, and a background `SyncEngine` pushes
+//! `SQLite` file inside the app sandbox, and a background `SyncEngine` pushes
 //! and pulls changes to the remote Autumn deployment's `/sync` endpoints
 //! (`autumn_web::sync`, feature `offline-sync`) whenever the network allows.
 //!
@@ -143,7 +143,7 @@ fn offline_sync_app_lib_mounts_sync_router_behind_db_guard() {
     // is actually configured: the remote (server) deployment serves /sync,
     // while the same code running in-process on a device (no
     // AUTUMN_DATABASE__URL) starts fine fully offline as a sync CLIENT.
-    assert!(lib_rs.contains(r##"#[cfg(feature = "offline-sync")]"##));
+    assert!(lib_rs.contains(r#"#[cfg(feature = "offline-sync")]"#));
     assert!(
         lib_rs.contains("let app = mount_offline_sync(app).await;"),
         "serve() must route through the sync mounting helper"
@@ -289,7 +289,10 @@ fn offline_sync_docs_page_exists_and_is_linked() {
 
     // Change tracking / journal semantics.
     assert!(page.contains("change-tracking") || page.contains("change tracking"));
-    assert!(page.contains("journal"), "docs must cover the change journal");
+    assert!(
+        page.contains("journal"),
+        "docs must cover the change journal"
+    );
 
     // Tombstoning, GC horizon, and full resync.
     assert!(page.contains("tombstone"), "docs must cover tombstoning");
@@ -300,7 +303,10 @@ fn offline_sync_docs_page_exists_and_is_linked() {
     // Conflict resolution: default LWW + custom resolver trait with example.
     assert!(page.contains("last-write-wins"));
     assert!(page.contains("ConflictResolver"));
-    assert!(page.contains("impl ConflictResolver for"), "docs must show a custom resolver example");
+    assert!(
+        page.contains("impl ConflictResolver for"),
+        "docs must show a custom resolver example"
+    );
     assert!(page.contains("Resolution::"));
 
     // Server-authoritative versioning.
@@ -315,13 +321,17 @@ fn offline_sync_docs_page_exists_and_is_linked() {
 
     // Offline showcase walkthrough with an airplane-mode verify checklist.
     assert!(page.contains("--offline-sync"));
-    assert!(page.contains("airplane"), "docs must include the airplane-mode walkthrough");
+    assert!(
+        page.contains("airplane"),
+        "docs must include the airplane-mode walkthrough"
+    );
     assert!(page.contains("SyncStore"));
 
     // Honest limitations: scope, repositories, auth.
     assert!(
-        page.contains("## Limitations") || page.contains("# Limitations"),
-        "docs must have a limitations section"
+        page.lines()
+            .any(|l| l.starts_with('#') && l.to_lowercase().contains("limitations")),
+        "docs must have a limitations section heading"
     );
     assert!(
         page.contains("repositories"),
@@ -354,7 +364,7 @@ fn offline_sync_docs_code_matches_emitted_templates() {
     run_autumn(&project, &["generate", "tauri-mobile", "--offline-sync"]);
 
     let mut checked_blocks = 0;
-    let mut lines = page.lines().peekable();
+    let mut lines = page.lines();
     while let Some(line) = lines.next() {
         let Some(rest) = line.trim().strip_prefix("<!-- drift:") else {
             continue;

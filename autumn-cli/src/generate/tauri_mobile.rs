@@ -47,7 +47,7 @@ use super::{GenerateError, ensure_project_root, read_or_empty};
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TauriMobileOptions {
     /// Wire local-first offline storage + background sync (issue #1508):
-    /// a `SyncStore`-backed SQLite database in the app sandbox, a background
+    /// a `SyncStore`-backed `SQLite` database in the app sandbox, a background
     /// `SyncEngine` against `AUTUMN_SYNC__REMOTE_URL`, and the server-side
     /// `/sync` router in the extracted app crate (feature `offline-sync` on
     /// `autumn-web`).
@@ -64,12 +64,17 @@ pub fn plan_tauri_mobile(
     project_root: &Path,
     opts: TauriMobileOptions,
 ) -> Result<Plan, GenerateError> {
-    let _ = opts.offline_sync; // RED stub: template deltas land with GREEN.
     ensure_project_root(project_root)?;
 
     let (package_name, package_version, has_embed_assets) = read_app_meta(project_root)?;
     let mut plan = Plan::new(project_root);
     let tauri = project_root.join("src-tauri");
+    // The shell's own autumn-web dependency (offline sync only) must carry
+    // the same version requirement as the app crate's, so cargo unifies the
+    // two dependency edges into one crate instance.
+    let autumn_web_req = opts
+        .offline_sync
+        .then(|| read_app_autumn_web_req(project_root));
 
     if !has_embed_assets {
         plan.warn(
@@ -89,7 +94,7 @@ pub fn plan_tauri_mobile(
     );
     plan.create(
         tauri.join("Cargo.toml"),
-        render_mobile_cargo_toml(&package_name, has_embed_assets),
+        render_mobile_cargo_toml(&package_name, has_embed_assets, autumn_web_req.as_deref()),
     );
     plan.create(tauri.join("build.rs"), render_mobile_build_rs());
     plan.create(
@@ -98,7 +103,7 @@ pub fn plan_tauri_mobile(
     );
     plan.create(
         tauri.join("src").join("lib.rs"),
-        render_mobile_lib_rs(&package_name),
+        render_mobile_lib_rs(&package_name, opts.offline_sync),
     );
 
     // Icons — reuse the PWA icon when the user already ran `autumn generate pwa`.
@@ -122,16 +127,37 @@ pub fn plan_tauri_mobile(
     plan.create(tauri.join(".gitignore"), render_mobile_gitignore());
 
     // App-crate lib extraction so the shell can call `<app>::serve()` in-process.
-    plan_lib_extraction(project_root, &package_name, &mut plan);
+    plan_lib_extraction(project_root, &package_name, opts.offline_sync, &mut plan);
+
+    // App-crate offline-sync feature (Cargo.toml edit, offline sync only).
+    if opts.offline_sync {
+        plan_app_offline_sync_feature(project_root, &mut plan);
+    }
 
     Ok(plan)
 }
 
 /// Human-readable prerequisites message printed after a successful scaffold,
-/// honouring `opts` (`--offline-sync` adds the sync setup step).
+/// honouring `opts` (`--offline-sync` swaps the remote-connection step).
 pub fn render_mobile_prerequisites(opts: TauriMobileOptions) -> String {
-    let _ = opts.offline_sync; // RED stub: the offline-sync step lands with GREEN.
-    "\
+    // Step 3 is where the app meets the network: a direct remote-Postgres
+    // connection by default, the background sync engine under --offline-sync
+    // (where the device needs no database connection at all).
+    let connect_step = if opts.offline_sync {
+        "3. Point the background sync engine at your remote deployment:\n\
+         edit src-tauri/src/lib.rs and set AUTUMN_SYNC__REMOTE_URL to the\n\
+         /sync mount of your deployed app (see the commented block in run()).\n\
+         Deploy the SAME app with AUTUMN_DATABASE__URL set so it serves the\n\
+         /sync endpoints — and mount them behind auth before shipping. The\n\
+         device itself needs no database connection; read\n\
+         docs/guide/tauri-mobile-offline-sync.md for the offline walkthrough.\n"
+    } else {
+        "3. Point the app at your remote Postgres database:\n\
+         edit src-tauri/src/lib.rs and set AUTUMN_DATABASE__URL (see the\n\
+         commented example in run()).\n"
+    };
+    format!(
+        "\
 Required prerequisites for building the mobile app:\n\
 \n\
   1. Tauri CLI:\n\
@@ -143,9 +169,7 @@ Required prerequisites for building the mobile app:\n\
        Android: Android Studio / SDK + NDK (set ANDROID_HOME, NDK_HOME), then:\n\
                   cd src-tauri && cargo tauri android init\n\
 \n\
-  3. Point the app at your remote Postgres database:\n\
-       edit src-tauri/src/lib.rs and set AUTUMN_DATABASE__URL (see the\n\
-       commented example in run()).\n\
+{connect_step}\
 \n\
   4. Develop or build:\n\
        cd src-tauri && cargo tauri ios dev        (or: cargo tauri ios build)\n\
@@ -162,7 +186,7 @@ Required prerequisites for building the mobile app:\n\
 \n\
   Replace the placeholder icons before shipping:\n\
        cd src-tauri && cargo tauri icon icons/icon.svg\n"
-        .to_owned()
+    )
 }
 
 // ── Package metadata helper ───────────────────────────────────────────────────
@@ -232,6 +256,82 @@ fn resolve_workspace_version(project_root: &Path) -> Option<String> {
     None
 }
 
+/// The app crate's `autumn-web` version requirement (`autumn-web = "0.6.0"`,
+/// or the `version` key of a table dependency). The offline-sync shell pins
+/// its own direct `autumn-web` dependency to the SAME requirement so cargo
+/// unifies both dependency edges into one crate instance. Falls back to this
+/// CLI's version — the value `autumn new` scaffolds into the app manifest.
+fn read_app_autumn_web_req(project_root: &Path) -> String {
+    let content = read_or_empty(&project_root.join("Cargo.toml"));
+    toml::from_str::<toml::Value>(&content)
+        .ok()
+        .and_then(|doc| match doc.get("dependencies")?.get("autumn-web")? {
+            toml::Value::String(s) => Some(s.clone()),
+            toml::Value::Table(t) => t
+                .get("version")
+                .and_then(toml::Value::as_str)
+                .map(str::to_owned),
+            _ => None,
+        })
+        .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_owned())
+}
+
+// ── App-crate offline-sync feature (Cargo.toml edit) ──────────────────────────
+
+/// Plan the app-crate `Cargo.toml` edit for `--offline-sync`: declare
+/// `offline-sync = ["autumn-web/offline-sync"]` and put it in the `default`
+/// feature set, so a plain `cargo run` server deployment of the same app
+/// mounts the `/sync` endpoints the device syncs against.
+///
+/// Anchored + idempotent, following the `plan_lib_extraction` discipline: a
+/// manifest that already declares the feature is left untouched (silent
+/// `--force` re-runs), and a customised manifest gets a warning with the
+/// manual steps instead of a guessed edit. Like the `main.rs` extraction,
+/// this is an [`super::emit::Action::Modify`] that `autumn destroy` never
+/// reverses — the extracted `serve()` keeps compiling either way (its sync
+/// code is gated on the feature).
+fn plan_app_offline_sync_feature(project_root: &Path, plan: &mut Plan) {
+    const FEATURES_ANCHOR: &str = "[features]\n";
+    const DEFAULT_ANCHOR: &str = "default = [\"flash\"]\n";
+    const FEATURE_LINE: &str = "offline-sync = [\"autumn-web/offline-sync\"]\n";
+
+    let cargo_path = project_root.join("Cargo.toml");
+    let content = read_or_empty(&cargo_path);
+    if content.contains("offline-sync = [") {
+        return; // Already wired — keep re-runs silent and duplicate-free.
+    }
+    if !content.contains(FEATURES_ANCHOR) || !content.contains(DEFAULT_ANCHOR) {
+        plan.warn(
+            "Cargo.toml doesn't match the stock scaffold layout — skipping the \
+             automatic offline-sync feature edit. Add \
+             `offline-sync = [\"autumn-web/offline-sync\"]` under [features] \
+             yourself and include it in `default` (or build with \
+             `--features offline-sync`), so the server-side /sync endpoints \
+             compile (see docs/guide/tauri-mobile-offline-sync.md)."
+                .to_owned(),
+        );
+        return;
+    }
+    let edited = content
+        .replacen(
+            DEFAULT_ANCHOR,
+            "default = [\"flash\", \"offline-sync\"]\n",
+            1,
+        )
+        .replacen(
+            FEATURES_ANCHOR,
+            &format!(
+                "[features]\n\
+                 # Offline sync (autumn generate tauri-mobile --offline-sync): local\n\
+                 # SyncStore storage plus the server-side /sync router in serve(). In\n\
+                 # the default set so plain `cargo run` server deployments mount /sync.\n\
+                 {FEATURE_LINE}"
+            ),
+            1,
+        );
+    plan.modify(cargo_path, edited);
+}
+
 // ── App-crate lib extraction ──────────────────────────────────────────────────
 
 /// The exact prefix of the stock scaffold's entry point (`src/templates/
@@ -249,24 +349,104 @@ const SERVE_FN_HEADER: &str = "\
 /// thread. The `main.rs` binary still calls this on desktop.
 pub async fn serve() {";
 
+/// The stock scaffold's final `AppBuilder::run` call — the anchor after
+/// which nothing may run, so the `--offline-sync` mounting is inserted
+/// immediately before it (same anchored-edit discipline as
+/// [`MAIN_FN_ANCHOR`]).
+const RUN_CALL_ANCHOR: &str = "    app\n        .run()\n        .await;";
+
+/// The `--offline-sync` call inserted into `serve()` before
+/// [`RUN_CALL_ANCHOR`].
+const SYNC_MOUNT_CALL: &str = r#"    // Offline sync (issue #1508): mount the /sync endpoints when a database
+    // is configured; on a device (no AUTUMN_DATABASE__URL) this is a no-op —
+    // the app boots fully offline as a sync CLIENT (see src-tauri/src/lib.rs).
+    #[cfg(feature = "offline-sync")]
+    let app = mount_offline_sync(app).await;
+
+"#;
+
+/// The `--offline-sync` server-side mounting helper appended to the
+/// extracted `src/lib.rs`.
+const SYNC_MOUNT_HELPER: &str = r#"
+/// Mount the offline-sync server endpoints (`POST /sync/push`, `GET /sync/pull`).
+///
+/// Added by `autumn generate tauri-mobile --offline-sync`. The endpoints are
+/// mounted only when `AUTUMN_DATABASE__URL` is set: the REMOTE deployment of
+/// this app (the one with Postgres) serves `/sync` for every device, while
+/// the same code running in-process on a phone has no database and syncs as
+/// a client instead (see `src-tauri/src/lib.rs`). Before shipping, mount
+/// these endpoints behind authentication — they trust `device_id` as sent
+/// (see docs/guide/tauri-mobile-offline-sync.md).
+#[cfg(feature = "offline-sync")]
+async fn mount_offline_sync(app: autumn_web::app::AppBuilder) -> autumn_web::app::AppBuilder {
+    use std::sync::Arc;
+
+    use autumn_web::reexports::tokio;
+    use autumn_web::sync::{LwwResolver, PgSyncBackend, server};
+
+    // Diagnostics below use stderr: this helper runs BEFORE AppBuilder::run()
+    // installs the tracing subscriber, so tracing events here would be lost.
+    let Ok(database_url) = std::env::var("AUTUMN_DATABASE__URL") else {
+        eprintln!(
+            "offline-sync: AUTUMN_DATABASE__URL is not set — running as a \
+             sync client only; the remote deployment serves /sync"
+        );
+        return app;
+    };
+    let backend = Arc::new(PgSyncBackend::new(database_url));
+    // Idempotent DDL for the sync shadow tables. A temporarily unreachable
+    // database must not prevent the app from starting: log and continue —
+    // /sync requests fail until the schema exists (restart once the database
+    // is reachable, or run the DDL from a deploy step).
+    let schema_backend = Arc::clone(&backend);
+    match tokio::task::spawn_blocking(move || schema_backend.ensure_schema()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            eprintln!("offline-sync: could not ensure the sync schema (/sync will fail): {e}");
+        }
+        Err(e) => eprintln!("offline-sync: sync schema task failed: {e}"),
+    }
+    app.nest("/sync", server::router(backend, Arc::new(LwwResolver)))
+}
+"#;
+
 /// Plan the anchored extraction of the app's `src/main.rs` into
 /// `src/lib.rs::serve()`, with a graceful skip when the app doesn't match
-/// the stock scaffold shape.
+/// the stock scaffold shape. With `offline_sync`, the extracted `serve()`
+/// additionally mounts the server-side sync router (feature-gated, and only
+/// when a database is configured — see [`SYNC_MOUNT_HELPER`]).
 ///
 /// Uses `Modify` for `main.rs` (an intentional rewrite, not a collision) and
 /// `CreateIfAbsent` for `lib.rs` — so `autumn destroy tauri-mobile` removes
 /// the `src-tauri/` shell but leaves the extracted (still fully functional)
 /// app lib in place rather than deleting a `src/lib.rs` that `main.rs` now
 /// depends on.
-fn plan_lib_extraction(project_root: &Path, package_name: &str, plan: &mut Plan) {
+fn plan_lib_extraction(
+    project_root: &Path,
+    package_name: &str,
+    offline_sync: bool,
+    plan: &mut Plan,
+) {
     let crate_ident = package_name.replace('-', "_");
     let main_path = project_root.join("src").join("main.rs");
     let lib_path = project_root.join("src").join("lib.rs");
     let main_rs = read_or_empty(&main_path);
 
     if lib_path.exists() {
-        // Re-run after a successful extraction: nothing to do, stay silent.
+        // Re-run after a successful extraction: nothing to do, stay silent —
+        // unless this run wants sync mounting and the existing lib lacks it
+        // (e.g. the first run had no --offline-sync).
         if main_rs.contains(&format!("{crate_ident}::serve()")) {
+            if offline_sync && !read_or_empty(&lib_path).contains("mount_offline_sync") {
+                plan.warn(
+                    "src/lib.rs was extracted without --offline-sync — add the \
+                     server-side sync mounting yourself: gate a \
+                     `mount_offline_sync(app)` call before `.run()` behind \
+                     `#[cfg(feature = \"offline-sync\")]` (the full helper is in \
+                     docs/guide/tauri-mobile-offline-sync.md)."
+                        .to_owned(),
+                );
+            }
             return;
         }
         plan.warn(format!(
@@ -289,7 +469,25 @@ fn plan_lib_extraction(project_root: &Path, package_name: &str, plan: &mut Plan)
         return;
     }
 
-    let lib_rs = main_rs.replace(MAIN_FN_ANCHOR, SERVE_FN_HEADER);
+    let mut lib_rs = main_rs.replace(MAIN_FN_ANCHOR, SERVE_FN_HEADER);
+    if offline_sync {
+        if lib_rs.contains(RUN_CALL_ANCHOR) {
+            lib_rs = lib_rs.replacen(
+                RUN_CALL_ANCHOR,
+                &format!("{SYNC_MOUNT_CALL}{RUN_CALL_ANCHOR}"),
+                1,
+            );
+            lib_rs.push_str(SYNC_MOUNT_HELPER);
+        } else {
+            plan.warn(
+                "src/main.rs doesn't end in the stock `app.run().await` shape — \
+                 skipping the automatic /sync mounting in the extracted \
+                 src/lib.rs. Add it yourself before `.run()` (the full helper \
+                 is in docs/guide/tauri-mobile-offline-sync.md)."
+                    .to_owned(),
+            );
+        }
+    }
     plan.create_if_absent(lib_path, lib_rs);
     plan.modify(main_path, render_thin_app_main_rs(&crate_ident));
 }
@@ -359,7 +557,11 @@ fn render_mobile_tauri_conf(package_name: &str, version: &str) -> String {
     )
 }
 
-fn render_mobile_cargo_toml(package_name: &str, has_embed_assets: bool) -> String {
+fn render_mobile_cargo_toml(
+    package_name: &str,
+    has_embed_assets: bool,
+    autumn_web_req: Option<&str>,
+) -> String {
     let shell_name = format!("{package_name}-mobile");
     // Enable the app's `embed-assets` feature so CSS/htmx/static assets are
     // compiled into the binary: a mobile app has no working directory holding
@@ -374,6 +576,17 @@ fn render_mobile_cargo_toml(package_name: &str, has_embed_assets: bool) -> Strin
     } else {
         format!("{package_name} = {{ path = \"..\" }}")
     };
+    // Offline sync: the shell itself opens the local SyncStore and runs the
+    // background SyncEngine, so it needs autumn-web directly — pinned to the
+    // app's own requirement so cargo unifies both edges into one instance.
+    let sync_dep = autumn_web_req.map_or_else(String::new, |req| {
+        format!(
+            "\n# Offline sync (issue #1508): the shell opens the local SyncStore and runs\n\
+             # the background SyncEngine (autumn_web::sync). The version matches the app\n\
+             # crate's autumn-web requirement so cargo unifies both dependency edges.\n\
+             autumn-web = {{ version = \"{req}\", features = [\"offline-sync\"] }}\n"
+        )
+    });
     format!(
         r#"[package]
 name = "{shell_name}"
@@ -403,7 +616,7 @@ getrandom = {{ version = "0.2", features = ["std"] }}
 # (mobile sandboxes forbid sidecar processes), so the shell links the app
 # crate directly instead of bundling a server binary.
 {app_dep}
-
+{sync_dep}
 [profile.release]
 panic = "abort"
 codegen-units = 1
@@ -431,9 +644,135 @@ fn render_mobile_main_rs(package_name: &str) -> String {
     )
 }
 
+/// `--offline-sync` addition to the shell lib.rs module docs.
+const SYNC_LIB_DOC: &str = "\
+//!
+//! OFFLINE SYNC (--offline-sync): app data lives in a local SyncStore-backed
+//! SQLite database inside the app sandbox, and a background SyncEngine
+//! reconciles it with the remote deployment's /sync endpoints whenever the
+//! network allows — the device itself needs NO direct database connection.
+//! See docs/guide/tauri-mobile-offline-sync.md.
+";
+
+/// `--offline-sync` addition to the env-var block in the shell's `run()`.
+const SYNC_ENV_BLOCK: &str = r#"    // ── Offline sync (issue #1508) ──────────────────────────────────────────
+    // Local-first data: app state lives in a SyncStore-backed SQLite file in
+    // the app sandbox (AUTUMN_SYNC__DB_PATH, exported in setup() once the
+    // sandbox path is known) and a background SyncEngine syncs it with your
+    // remote Autumn deployment. Point the engine at the remote /sync mount:
+    // std::env::set_var(
+    //     "AUTUMN_SYNC__REMOTE_URL",
+    //     "https://app.example.com/sync",
+    // );
+    // With offline sync the device needs NO direct database connection: leave
+    // AUTUMN_DATABASE__URL unset and the in-process server boots without
+    // Postgres — the app works fully offline and converges with the remote in
+    // the background. Full guide: docs/guide/tauri-mobile-offline-sync.md.
+    // ────────────────────────────────────────────────────────────────────────
+"#;
+
+/// `--offline-sync` addition to the shell's `setup()` (the sync database
+/// path needs the sandbox data dir).
+const SYNC_SETUP_BLOCK: &str = r#"    // Offline sync: local-first app data lives in a SyncStore-backed SQLite
+    // file inside the sandbox. AUTUMN_SYNC__DB_PATH is exported so the app's
+    // routes open the SAME store the background engine syncs (see
+    // start_background_sync below).
+    let sync_db = data_root.join("sync.db");
+    std::env::set_var("AUTUMN_SYNC__DB_PATH", sync_db.to_string_lossy().as_ref());
+"#;
+
 #[allow(clippy::too_many_lines)]
-fn render_mobile_lib_rs(package_name: &str) -> String {
+fn render_mobile_lib_rs(package_name: &str, offline_sync: bool) -> String {
     let crate_ident = package_name.replace('-', "_");
+    let sync_doc = if offline_sync { SYNC_LIB_DOC } else { "" };
+    let sync_env_block = if offline_sync { SYNC_ENV_BLOCK } else { "" };
+    let sync_setup = if offline_sync { SYNC_SETUP_BLOCK } else { "" };
+    let sync_thread_line = if offline_sync {
+        "        start_background_sync(&runtime, sync_db);\n"
+    } else {
+        ""
+    };
+    // The offline-sync shell observes run-loop events (RunEvent::Resumed →
+    // immediate sync pass), so it must go through build().run(callback); the
+    // default shell keeps the simpler run(context).
+    let tauri_run_tail = if offline_sync {
+        format!(
+            r#"    tauri::Builder::default()
+        .setup(move |app| setup(app, port))
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_app_handle, event| {{
+            // Connectivity-regain trigger: mobile OSes freeze the process
+            // (and its timers) in the background, and connectivity usually
+            // returns together with the foreground. On resume, kick one
+            // immediate sync pass instead of waiting out the background
+            // interval/backoff.
+            if let tauri::RunEvent::Resumed = event {{
+                if let Some((handle, engine)) = SYNC_KICK.get() {{
+                    let engine = engine.clone();
+                    handle.spawn(async move {{
+                        if let Err(e) = engine.sync_once().await {{
+                            eprintln!(
+                                "[{package_name}] Resume sync failed (next background pass retries): {{e}}"
+                            );
+                        }}
+                    }});
+                }}
+            }}
+        }});"#
+        )
+    } else {
+        r#"    tauri::Builder::default()
+        .setup(move |app| setup(app, port))
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");"#
+            .to_owned()
+    };
+    let sync_helpers = if offline_sync {
+        format!(
+            r#"
+/// Handle to the background sync engine, set once from the server thread so
+/// the tauri run-loop callback can trigger an immediate sync pass on
+/// RunEvent::Resumed. Never set when AUTUMN_SYNC__REMOTE_URL is unset
+/// (offline-only mode).
+static SYNC_KICK: std::sync::OnceLock<(tokio::runtime::Handle, autumn_web::sync::SyncEngine)> =
+    std::sync::OnceLock::new();
+
+/// Open the local sync store and spawn the background sync engine on the
+/// server runtime (issue #1508). The app keeps working fully offline: local
+/// reads and writes always hit the SyncStore, and when
+/// AUTUMN_SYNC__REMOTE_URL is configured the engine pushes/pulls every 30 s
+/// (exponential backoff while the remote is unreachable), so the app
+/// converges automatically when connectivity returns. See
+/// docs/guide/tauri-mobile-offline-sync.md.
+fn start_background_sync(runtime: &tokio::runtime::Runtime, sync_db: std::path::PathBuf) {{
+    let store = match autumn_web::sync::SyncStore::open(&sync_db) {{
+        Ok(store) => store,
+        Err(e) => {{
+            eprintln!("[{package_name}] Failed to open the offline sync store: {{e}}");
+            return;
+        }}
+    }};
+    let Ok(remote_url) = std::env::var("AUTUMN_SYNC__REMOTE_URL") else {{
+        eprintln!(
+            "[{package_name}] AUTUMN_SYNC__REMOTE_URL is not set — running \
+             offline-only (local SyncStore, no background sync)."
+        );
+        return;
+    }};
+    let engine =
+        autumn_web::sync::SyncEngine::new(store, autumn_web::sync::SyncConfig::new(remote_url));
+    // spawn_background must be entered from inside the runtime; the returned
+    // JoinHandle detaches on drop (dropping never cancels the task).
+    let _sync_task =
+        runtime.block_on(async {{ engine.spawn_background(std::time::Duration::from_secs(30)) }});
+    let _ = SYNC_KICK.set((runtime.handle().clone(), engine));
+}}
+"#
+        )
+    } else {
+        String::new()
+    };
     format!(
         r#"//! Tauri mobile shell for {package_name} — in-process backend + remote Postgres.
 //!
@@ -455,7 +794,7 @@ fn render_mobile_lib_rs(package_name: &str) -> String {
 //! mobile networks — see docs/guide/tauri-mobile-in-process.md for the full
 //! rationale, reconnection semantics, security notes, and App Store
 //! compliance notes.
-
+{sync_doc}
 use std::net::TcpListener;
 use tauri::Manager;
 
@@ -501,7 +840,7 @@ pub fn run() {{
     // survives future framework default changes.)
     std::env::set_var("AUTUMN_DATABASE__CONNECT_TIMEOUT_SECS", "5");
     // ────────────────────────────────────────────────────────────────────────
-    // The webview loads the app over plain HTTP on loopback; Secure cookies
+{sync_env_block}    // The webview loads the app over plain HTTP on loopback; Secure cookies
     // would be silently dropped by the webview, breaking sessions and CSRF.
     // Loopback never leaves the device — but other apps ON the device can
     // reach it too (see the security section of the docs page).
@@ -543,10 +882,7 @@ pub fn run() {{
         std::env::remove_var(var);
     }}
 
-    tauri::Builder::default()
-        .setup(move |app| setup(app, port))
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+{tauri_run_tail}
 }}
 
 fn setup(app: &mut tauri::App, port: u16) -> Result<(), Box<dyn std::error::Error>> {{
@@ -563,7 +899,7 @@ fn setup(app: &mut tauri::App, port: u16) -> Result<(), Box<dyn std::error::Erro
         "AUTUMN_STORAGE__LOCAL__ROOT",
         blobs_dir.to_string_lossy().as_ref(),
     );
-    // Per-install signing secret: autumn requires one in prod mode. Generate
+{sync_setup}    // Per-install signing secret: autumn requires one in prod mode. Generate
     // 32 random bytes on first launch and persist them so sessions survive
     // restarts.
     let signing_secret = load_or_generate_signing_secret(&data_root)?;
@@ -579,7 +915,7 @@ fn setup(app: &mut tauri::App, port: u16) -> Result<(), Box<dyn std::error::Erro
             .enable_all()
             .build()
             .expect("failed to build tokio runtime for the in-process autumn server");
-        runtime.block_on({crate_ident}::serve());
+{sync_thread_line}        runtime.block_on({crate_ident}::serve());
     }});
 
     // 5. Poll for server readiness in a background thread so setup() returns
@@ -645,7 +981,7 @@ fn setup(app: &mut tauri::App, port: u16) -> Result<(), Box<dyn std::error::Erro
 
     Ok(())
 }}
-
+{sync_helpers}
 /// Surface a startup failure in a visible window instead of a silent exit or
 /// an endless blank screen. Falls back to exiting when even the error window
 /// cannot be built. Note: some framework-level startup failures (for example
@@ -833,10 +1169,12 @@ mod tests {
     }
 
     /// A minimal stand-in for the stock `main.rs.tmpl` output, carrying the
-    /// exact `MAIN_FN_ANCHOR` shape.
+    /// exact `MAIN_FN_ANCHOR` shape and the template's multi-line
+    /// `RUN_CALL_ANCHOR` ending.
     fn stock_main_rs() -> String {
         "use autumn_web::prelude::*;\n\n#[autumn_web::main]\nasync fn main() {\n    \
-         let app = autumn_web::app()\n        .routes(routes![]);\n    app.run().await;\n}\n"
+         let app = autumn_web::app()\n        .routes(routes![]);\n\n    \
+         app\n        .run()\n        .await;\n}\n"
             .to_owned()
     }
 
@@ -861,7 +1199,7 @@ mod tests {
 
     #[test]
     fn cargo_toml_is_mobile_library_without_sidecar_plugin() {
-        let toml_src = render_mobile_cargo_toml("my-app", true);
+        let toml_src = render_mobile_cargo_toml("my-app", true, None);
         assert!(toml_src.contains(r#"crate-type = ["staticlib", "cdylib", "rlib"]"#));
         assert!(
             toml_src.contains(r#"my-app = { path = "..", features = ["embed-assets"] }"#),
@@ -875,7 +1213,7 @@ mod tests {
 
     #[test]
     fn cargo_toml_omits_embed_assets_when_app_lacks_the_feature() {
-        let toml_src = render_mobile_cargo_toml("my-app", false);
+        let toml_src = render_mobile_cargo_toml("my-app", false, None);
         assert!(toml_src.contains(r#"my-app = { path = ".." }"#));
         assert!(!toml_src.contains("embed-assets"));
         toml::from_str::<toml::Value>(&toml_src).expect("generated Cargo.toml must parse");
@@ -902,7 +1240,7 @@ mod tests {
 
     #[test]
     fn lib_rs_spawns_in_process_server_with_pool_defaults() {
-        let lib = render_mobile_lib_rs("my-app");
+        let lib = render_mobile_lib_rs("my-app", false);
         assert!(lib.contains("tauri::Builder::default()"));
         assert!(lib.contains(".setup("));
         assert!(lib.contains("std::thread::spawn"));
@@ -919,7 +1257,7 @@ mod tests {
 
     #[test]
     fn lib_rs_pins_prod_profile_in_release_builds() {
-        let lib = render_mobile_lib_rs("my-app");
+        let lib = render_mobile_lib_rs("my-app", false);
         // Release builds must run the prod profile: serve() bypasses the
         // #[autumn_web::main] macro that would otherwise mark release builds,
         // so leaving AUTUMN_ENV unset would silently fall back to dev
@@ -934,7 +1272,7 @@ mod tests {
 
     #[test]
     fn lib_rs_sets_env_before_tauri_builder_starts() {
-        let lib = render_mobile_lib_rs("my-app");
+        let lib = render_mobile_lib_rs("my-app", false);
         // std::env::set_var is only sound before other (platform) threads
         // exist; the static env block must precede tauri::Builder in run().
         let env_pos = lib
@@ -954,7 +1292,7 @@ mod tests {
 
     #[test]
     fn lib_rs_surfaces_startup_failure_in_a_visible_error_page() {
-        let lib = render_mobile_lib_rs("my-app");
+        let lib = render_mobile_lib_rs("my-app", false);
         assert!(
             lib.contains("fn show_startup_error("),
             "startup failures must surface a visible error, not a silent exit"
@@ -1096,5 +1434,197 @@ mod tests {
         assert!(prereqs.contains("ios"));
         assert!(prereqs.contains("android"));
         assert!(prereqs.contains("tauri-mobile-in-process"));
+        assert!(
+            !prereqs.contains("AUTUMN_SYNC__REMOTE_URL"),
+            "without --offline-sync the prerequisites must not mention sync"
+        );
+    }
+
+    // ── --offline-sync (issue #1508) ───────────────────────────────────────
+
+    const OFFLINE: TauriMobileOptions = TauriMobileOptions { offline_sync: true };
+
+    /// An app dir whose Cargo.toml matches the stock scaffold's dependency
+    /// and feature shape (what `plan_app_offline_sync_feature` anchors on).
+    fn stock_app_dir(name: &str) -> TempDir {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"{name}\"\nversion = \"0.2.3\"\n\n\
+                 [dependencies]\nautumn-web = \"0.9.1\"\n\n\
+                 [features]\ndefault = [\"flash\"]\nflash = [\"autumn-web/flash\"]\n\
+                 embed-assets = [\"autumn-web/embed-assets\"]\n"
+            ),
+        )
+        .unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        tmp
+    }
+
+    #[test]
+    fn offline_cargo_toml_adds_matching_autumn_web_dependency() {
+        let toml_src = render_mobile_cargo_toml("my-app", true, Some("0.9.1"));
+        assert!(
+            toml_src.contains(r#"autumn-web = { version = "0.9.1", features = ["offline-sync"] }"#),
+            "the shell must depend on autumn-web (offline-sync) at the app's requirement"
+        );
+        toml::from_str::<toml::Value>(&toml_src).expect("generated Cargo.toml must parse");
+        // Without offline sync the dependency (and any sync trace) is absent.
+        let plain = render_mobile_cargo_toml("my-app", true, None);
+        assert!(!plain.contains("offline-sync"));
+        assert!(!plain.contains("autumn-web ="));
+    }
+
+    #[test]
+    fn offline_lib_rs_wires_store_engine_and_resume_trigger() {
+        let lib = render_mobile_lib_rs("my-app", true);
+        // Local store in the sandbox, exported for the app's routes.
+        assert!(lib.contains(r#"let sync_db = data_root.join("sync.db");"#));
+        assert!(lib.contains(r#""AUTUMN_SYNC__DB_PATH""#));
+        assert!(lib.contains("autumn_web::sync::SyncStore::open(&sync_db)"));
+        // Engine on the server runtime, configured from the environment.
+        assert!(lib.contains(r#"std::env::var("AUTUMN_SYNC__REMOTE_URL")"#));
+        assert!(lib.contains("autumn_web::sync::SyncConfig::new(remote_url)"));
+        assert!(lib.contains(".spawn_background(std::time::Duration::from_secs(30))"));
+        assert!(lib.contains("start_background_sync(&runtime, sync_db);"));
+        // Connectivity-regain trigger through the run-loop callback.
+        assert!(lib.contains(".build(tauri::generate_context!())"));
+        assert!(lib.contains("tauri::RunEvent::Resumed"));
+        assert!(lib.contains("engine.sync_once().await"));
+        assert!(lib.contains("docs/guide/tauri-mobile-offline-sync.md"));
+        // Offline startup: the direct database URL stays a commented example.
+        assert!(!lib.contains("\n    std::env::set_var(\"AUTUMN_DATABASE__URL\""));
+    }
+
+    #[test]
+    fn lib_rs_without_offline_flag_has_no_sync_wiring() {
+        let lib = render_mobile_lib_rs("my-app", false);
+        assert!(!lib.contains("AUTUMN_SYNC"));
+        assert!(!lib.contains("sync_once"));
+        assert!(!lib.contains("SYNC_KICK"));
+        assert!(
+            lib.contains(".run(tauri::generate_context!())"),
+            "the default shell must keep the simple run(context) tail"
+        );
+    }
+
+    #[test]
+    fn offline_plan_edits_app_cargo_toml_features() {
+        let tmp = stock_app_dir("my-app");
+        std::fs::write(tmp.path().join("src/main.rs"), stock_main_rs()).unwrap();
+
+        let plan = plan_tauri_mobile(tmp.path(), OFFLINE).unwrap();
+        let cargo_action = plan
+            .actions
+            .iter()
+            .find(|a| {
+                a.path().ends_with("Cargo.toml")
+                    && !a.path().to_string_lossy().contains("src-tauri")
+            })
+            .expect("plan must edit the app Cargo.toml");
+        let Action::Modify { contents, .. } = cargo_action else {
+            panic!("app Cargo.toml must be a Modify action, got {cargo_action:?}");
+        };
+        assert!(contents.contains(r#"offline-sync = ["autumn-web/offline-sync"]"#));
+        assert!(contents.contains(r#"default = ["flash", "offline-sync"]"#));
+        toml::from_str::<toml::Value>(contents).expect("edited Cargo.toml must stay valid TOML");
+    }
+
+    #[test]
+    fn offline_plan_skips_cargo_toml_edit_when_already_wired() {
+        let tmp = stock_app_dir("my-app");
+        std::fs::write(tmp.path().join("src/main.rs"), stock_main_rs()).unwrap();
+        let cargo_path = tmp.path().join("Cargo.toml");
+        let wired = read_or_empty(&cargo_path).replace(
+            "default = [\"flash\"]",
+            "default = [\"flash\", \"offline-sync\"]",
+        ) + "offline-sync = [\"autumn-web/offline-sync\"]\n";
+        std::fs::write(&cargo_path, wired).unwrap();
+
+        let plan = plan_tauri_mobile(tmp.path(), OFFLINE).unwrap();
+        assert!(
+            !plan.actions.iter().any(|a| a.path().ends_with("Cargo.toml")
+                && !a.path().to_string_lossy().contains("src-tauri")),
+            "an already-wired Cargo.toml must not be edited again"
+        );
+        assert!(plan.warnings.is_empty(), "re-runs must stay silent");
+    }
+
+    #[test]
+    fn offline_plan_warns_on_customised_cargo_toml_features() {
+        // No `default = ["flash"]` anchor — the feature edit must be skipped
+        // with a warning, never guessed.
+        let tmp = app_dir("my-app");
+        std::fs::write(tmp.path().join("src/main.rs"), stock_main_rs()).unwrap();
+
+        let plan = plan_tauri_mobile(tmp.path(), OFFLINE).unwrap();
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|w| w.contains("offline-sync") && w.contains("[features]")),
+            "must warn with manual steps on a customised Cargo.toml, got {:?}",
+            plan.warnings
+        );
+    }
+
+    #[test]
+    fn offline_extraction_mounts_sync_router_in_serve() {
+        let tmp = stock_app_dir("my-app");
+        std::fs::write(tmp.path().join("src/main.rs"), stock_main_rs()).unwrap();
+
+        let plan = plan_tauri_mobile(tmp.path(), OFFLINE).unwrap();
+        let lib_action =
+            app_src_action(&plan, "lib.rs").expect("plan must create the app src/lib.rs");
+        let Action::CreateIfAbsent { contents, .. } = lib_action else {
+            panic!("app lib.rs must be a CreateIfAbsent action, got {lib_action:?}");
+        };
+        assert!(contents.contains("let app = mount_offline_sync(app).await;"));
+        assert!(contents.contains("async fn mount_offline_sync"));
+        assert!(contents.contains("PgSyncBackend::new(database_url)"));
+        assert!(contents.contains("ensure_schema()"));
+        assert!(
+            contents.contains(r#".nest("/sync", server::router(backend, Arc::new(LwwResolver)))"#)
+        );
+        // The mount call must precede the final run().
+        let mount = contents.find("mount_offline_sync(app)").unwrap();
+        let run = contents.find(".run()").unwrap();
+        assert!(mount < run, "sync mounting must happen before .run()");
+    }
+
+    #[test]
+    fn offline_prerequisites_swap_in_the_sync_step() {
+        let prereqs = render_mobile_prerequisites(OFFLINE);
+        assert!(prereqs.contains("AUTUMN_SYNC__REMOTE_URL"));
+        assert!(prereqs.contains("tauri-mobile-offline-sync"));
+        assert!(
+            !prereqs.contains("set AUTUMN_DATABASE__URL (see the"),
+            "the direct-Postgres step must be replaced, not duplicated"
+        );
+    }
+
+    #[test]
+    fn read_app_autumn_web_req_reads_string_and_table_deps() {
+        let tmp = stock_app_dir("my-app");
+        assert_eq!(read_app_autumn_web_req(tmp.path()), "0.9.1");
+
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"my-app\"\nversion = \"0.1.0\"\n\n[dependencies]\n\
+             autumn-web = { version = \"1.2.3\", features = [\"mail\"] }\n",
+        )
+        .unwrap();
+        assert_eq!(read_app_autumn_web_req(tmp.path()), "1.2.3");
+
+        // No autumn-web dependency at all → fall back to the CLI's version.
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"my-app\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            read_app_autumn_web_req(tmp.path()),
+            env!("CARGO_PKG_VERSION")
+        );
     }
 }
