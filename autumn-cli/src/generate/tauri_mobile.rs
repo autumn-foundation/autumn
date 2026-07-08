@@ -461,20 +461,29 @@ fn resolve_app_autumn_web_value(project_root: &Path) -> (Option<toml::Value>, st
     let parse = |dir: &Path| -> Option<toml::Value> {
         toml::from_str(&read_or_empty(&dir.join("Cargo.toml"))).ok()
     };
-    let dep = parse(project_root)
+    let doc = parse(project_root);
+    // Resolve by PACKAGE, not by key: apps may rename the dependency
+    // (`autumn = { package = "autumn-web", ... }`), and a hard-coded
+    // `autumn-web` lookup would miss it (same convention as the desktop
+    // generator's `resolve_dep_key`).
+    let dep_key = doc.as_ref().map_or_else(
+        || "autumn-web".to_owned(),
+        |d| super::tauri::resolve_dep_key(project_root, d, "autumn-web"),
+    );
+    let dep = doc
         .as_ref()
-        .and_then(|doc| doc.get("dependencies")?.get("autumn-web"))
+        .and_then(|d| d.get("dependencies")?.get(&dep_key))
         .cloned();
     if let Some(toml::Value::Table(t)) = &dep
         && t.get("workspace").and_then(toml::Value::as_bool) == Some(true)
     {
-        // Workspace-inherited: find [workspace.dependencies].autumn-web in
-        // this manifest or the nearest ancestor's.
+        // Workspace-inherited: find the same dependency KEY in this
+        // manifest's or the nearest ancestor's [workspace.dependencies].
         let mut dir: Option<&Path> = Some(project_root);
         while let Some(d) = dir {
             if let Some(v) = parse(d)
                 .as_ref()
-                .and_then(|doc| doc.get("workspace")?.get("dependencies")?.get("autumn-web"))
+                .and_then(|doc| doc.get("workspace")?.get("dependencies")?.get(&dep_key))
                 .cloned()
             {
                 return (Some(v), d.to_path_buf());
@@ -630,23 +639,30 @@ fn shell_autumn_web_dep(project_root: &Path, plan: &mut Plan) -> ShellAutumnWebD
 fn plan_app_offline_sync_feature(project_root: &Path, plan: &mut Plan) {
     const FEATURES_ANCHOR: &str = "[features]\n";
     const DEFAULT_ANCHOR: &str = "default = [\"flash\"]\n";
-    const FEATURE_LINE: &str = "offline-sync = [\"autumn-web/offline-sync\"]\n";
 
     let cargo_path = project_root.join("Cargo.toml");
     let content = read_or_empty(&cargo_path);
+    // Cargo feature syntax names the DEPENDENCY KEY, not the package: a
+    // renamed dep (`autumn = { package = "autumn-web", ... }`) must be
+    // referenced as `autumn/offline-sync` — `autumn-web/offline-sync` would
+    // be rejected by cargo as an unknown dependency.
+    let dep_key = toml::from_str::<toml::Value>(&content).ok().map_or_else(
+        || "autumn-web".to_owned(),
+        |doc| super::tauri::resolve_dep_key(project_root, &doc, "autumn-web"),
+    );
+    let feature_line = format!("offline-sync = [\"{dep_key}/offline-sync\"]\n");
     if content.contains("offline-sync = [") {
         return; // Already wired — keep re-runs silent and duplicate-free.
     }
     if !content.contains(FEATURES_ANCHOR) || !content.contains(DEFAULT_ANCHOR) {
-        plan.warn(
+        plan.warn(format!(
             "Cargo.toml doesn't match the stock scaffold layout — skipping the \
              automatic offline-sync feature edit. Add \
-             `offline-sync = [\"autumn-web/offline-sync\"]` under [features] \
+             `offline-sync = [\"{dep_key}/offline-sync\"]` under [features] \
              yourself and include it in `default` (or build with \
              `--features offline-sync`), so the server-side /sync endpoints \
              compile (see docs/guide/tauri-mobile-offline-sync.md)."
-                .to_owned(),
-        );
+        ));
         return;
     }
     let edited = content
@@ -662,7 +678,7 @@ fn plan_app_offline_sync_feature(project_root: &Path, plan: &mut Plan) {
                  # Offline sync (autumn generate tauri-mobile --offline-sync): local\n\
                  # SyncStore storage plus the server-side /sync router in serve(). In\n\
                  # the default set so plain `cargo run` server deployments mount /sync.\n\
-                 {FEATURE_LINE}"
+                 {feature_line}"
             ),
             1,
         );
@@ -2206,6 +2222,68 @@ mod tests {
             !dep.dep_entry.contains("default-features"),
             "got: {}",
             dep.dep_entry
+        );
+    }
+
+    #[test]
+    fn offline_shell_dep_resolves_renamed_dependency_by_package() {
+        // Apps may rename the framework dep: the source must be resolved by
+        // PACKAGE, and the shell edge is emitted under the real package name.
+        let (dep, warnings) = shell_dep_for(
+            "autumn = { package = \"autumn-web\", version = \"0.9.1\" }",
+            "",
+        );
+        assert_eq!(
+            dep.dep_entry, r#"autumn-web = { version = "0.9.1", features = ["offline-sync"] }"#,
+            "a renamed registry dep must still resolve (not fall back)"
+        );
+        assert!(warnings.is_empty(), "got {warnings:?}");
+
+        let (dep, warnings) = shell_dep_for(
+            "autumn = { package = \"autumn-web\", path = \"../autumn\" }",
+            "",
+        );
+        assert_eq!(
+            dep.dep_entry, r#"autumn-web = { path = "../../autumn", features = ["offline-sync"] }"#,
+            "a renamed path dep must mirror its source"
+        );
+        assert!(warnings.is_empty(), "got {warnings:?}");
+    }
+
+    #[test]
+    fn offline_feature_edit_targets_the_actual_dependency_key() {
+        // Cargo feature syntax names the dependency KEY: with a renamed dep
+        // the edit must reference `<key>/offline-sync`, or cargo rejects the
+        // manifest outright.
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"my-app\"\nversion = \"0.2.3\"\n\n\
+             [dependencies]\nautumn = { package = \"autumn-web\", version = \"0.9.1\" }\n\n\
+             [features]\ndefault = [\"flash\"]\nflash = [\"autumn/flash\"]\n\
+             embed-assets = [\"autumn/embed-assets\"]\n",
+        )
+        .unwrap();
+        let mut plan = Plan::new(tmp.path());
+        plan_app_offline_sync_feature(tmp.path(), &mut plan);
+        assert!(plan.warnings.is_empty(), "got {:?}", plan.warnings);
+        let edited = plan
+            .actions
+            .iter()
+            .find_map(|a| match a {
+                Action::Modify { path, contents } if path.ends_with("Cargo.toml") => {
+                    Some(contents.clone())
+                }
+                _ => None,
+            })
+            .expect("the feature edit must be planned");
+        assert!(
+            edited.contains(r#"offline-sync = ["autumn/offline-sync"]"#),
+            "the feature must reference the RENAMED dependency key, got:\n{edited}"
+        );
+        assert!(
+            !edited.contains(r#"["autumn-web/offline-sync"]"#),
+            "the package name is not a valid feature dependency here"
         );
     }
 

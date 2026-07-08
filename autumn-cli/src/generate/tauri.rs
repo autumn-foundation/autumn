@@ -286,7 +286,7 @@ fn resolve_workspace_dep_package(project_root: &Path, dep_key: &str) -> Option<S
 /// workspace-inherited deps (`autumn_web = { workspace = true }`) by walking
 /// up to the workspace `Cargo.toml` to read the effective `package` there.
 /// Returns `package_name` itself when no alias is found.
-fn resolve_dep_key(project_root: &Path, doc: &toml::Value, package_name: &str) -> String {
+pub fn resolve_dep_key(project_root: &Path, doc: &toml::Value, package_name: &str) -> String {
     let Some(deps) = doc.get("dependencies").and_then(toml::Value::as_table) else {
         return package_name.to_owned();
     };

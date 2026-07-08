@@ -224,9 +224,10 @@ device instead of silently resurrecting on the next push.
 Tombstones accumulate. `SyncBackend::gc_tombstones(up_to)` physically drops
 tombstones with `version <= up_to` and records that version as the
 **`tombstone_horizon`** in `autumn_sync_meta`. The persisted horizon is
-**clamped to the latest assigned version**, so a maintenance job may pass an
-arbitrarily large `up_to` (e.g. `i64::MAX`) to mean "everything so far"
-without pushing client cursors above the server's version sequence. GC is an
+**clamped to the newest committed version** (and GC serializes with pushes
+via the same advisory lock), so a maintenance job may pass an arbitrarily
+large `up_to` (e.g. `i64::MAX`) to mean "everything so far" without pushing
+client cursors past rows they have not seen. GC is an
 explicit server-side operation (a job or admin task you schedule); it is
 **off by default**.
 

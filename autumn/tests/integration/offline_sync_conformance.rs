@@ -247,19 +247,24 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
         "a from-0 session paging past a sub-horizon cursor must get rows, got {mid_page:?}"
     );
 
-    // ── GC horizon is clamped to the latest assigned version ─────────────
+    // ── GC horizon is clamped to the newest committed version ────────────
     // A maintenance job may pass an arbitrarily large up_to ("everything so
-    // far"). The persisted horizon must not exceed the sequence: clients set
-    // cursor = max(next_cursor, tombstone_horizon) after a completed pull,
-    // so an above-sequence horizon would push cursors past versions the
-    // server has yet to assign — rows created later (versions <= horizon)
-    // would then be permanently invisible to those clients.
+    // far"). The persisted horizon must not run ahead of the change feed:
+    // clients set cursor = max(next_cursor, tombstone_horizon) after a
+    // completed pull, so an ahead-of-feed horizon would push cursors past
+    // rows they have not seen — rows created later (versions <= horizon)
+    // would then be permanently invisible to those clients. On Postgres
+    // the bound must come from COMMITTED state observed under the push
+    // advisory lock (the sequence is non-transactional: a concurrent
+    // in-flight push's nextval is visible before its row commits); this
+    // sequential suite pins the clamp value itself, and the lock-site
+    // comment in sync/server.rs documents the concurrency guarantee.
     let latest_before_gc = backend.latest_version().expect("latest");
     backend.gc_tombstones(i64::MAX).expect("gc with huge up_to");
     assert_eq!(
         backend.tombstone_horizon().expect("horizon"),
         latest_before_gc,
-        "the horizon must be clamped to the latest assigned version"
+        "the horizon must be clamped to the newest committed version"
     );
 
     // A client that completed a pull right after that GC sits at

@@ -248,6 +248,61 @@ fn offline_sync_shell_cargo_toml_preserves_no_default_features() {
     toml::from_str::<toml::Value>(&shell_cargo).expect("generated Cargo.toml must parse");
 }
 
+#[test]
+fn offline_sync_handles_renamed_framework_dependency() {
+    // Apps may rename the framework dep (`aw = { package = "autumn-web" }`):
+    // the dependency must be resolved by PACKAGE, and the feature edit must
+    // reference the actual dependency KEY (`aw/offline-sync`) — cargo
+    // rejects `autumn-web/offline-sync` when no such dep key exists.
+    let (_tmp, project) = fresh_project("offsync-renamed-app");
+    let cargo_path = project.join("Cargo.toml");
+    let rewritten = read(&cargo_path)
+        .lines()
+        .map(|l| {
+            l.strip_prefix("autumn-web = \"")
+                .and_then(|rest| rest.strip_suffix('"'))
+                .map_or_else(
+                    || l.replace("autumn-web/", "aw/"),
+                    |version| {
+                        format!("aw = {{ package = \"autumn-web\", version = \"{version}\" }}")
+                    },
+                )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&cargo_path, rewritten).unwrap();
+
+    run_autumn(&project, &["generate", "tauri-mobile", "--offline-sync"]);
+
+    // The feature edit lands on the renamed dependency key…
+    let app_cargo = read(&cargo_path);
+    assert!(
+        app_cargo.contains(r#"offline-sync = ["aw/offline-sync"]"#),
+        "the feature edit must target the renamed dep key, got:\n{app_cargo}"
+    );
+    assert!(
+        !app_cargo.contains(r#"["autumn-web/offline-sync"]"#),
+        "cargo would reject a feature naming a nonexistent dep key"
+    );
+    toml::from_str::<toml::Value>(&app_cargo).expect("edited Cargo.toml must stay valid TOML");
+
+    // …and the shell edge mirrors the resolved source (not the registry
+    // fallback the old key-based lookup produced).
+    let shell_cargo = read(&project.join("src-tauri/Cargo.toml"));
+    let version = app_cargo
+        .lines()
+        .find(|l| l.starts_with("aw = {"))
+        .and_then(|l| l.split("version = \"").nth(1))
+        .and_then(|rest| rest.split('"').next())
+        .expect("renamed dep must carry a version");
+    assert!(
+        shell_cargo.contains(&format!(
+            r#"autumn-web = {{ version = "{version}", features = ["offline-sync"] }}"#
+        )),
+        "the shell edge must resolve the renamed dep's source, got:\n{shell_cargo}"
+    );
+}
+
 // ── The app-side (server) wiring ────────────────────────────────────────────
 
 #[test]

@@ -161,14 +161,16 @@ pub trait SyncBackend: Send + Sync + 'static {
     /// task) once all active devices are expected to have synced past
     /// `up_to`.
     ///
-    /// The **persisted horizon is clamped to the latest assigned version**:
-    /// a maintenance job may pass an arbitrarily large `up_to` (e.g.
-    /// `i64::MAX`) to mean "everything so far", and without the clamp the
-    /// horizon would exceed the version sequence — clients set their cursor
-    /// to `max(next_cursor, tombstone_horizon)` after a completed pull, so
-    /// an above-sequence horizon would push cursors past versions the
-    /// server has yet to assign and those clients would permanently miss
-    /// every row created later with a version at or below the horizon.
+    /// The **persisted horizon is clamped to the newest committed
+    /// version**: a maintenance job may pass an arbitrarily large `up_to`
+    /// (e.g. `i64::MAX`) to mean "everything so far", and without the clamp
+    /// the horizon would run ahead of the change feed — clients set their
+    /// cursor to `max(next_cursor, tombstone_horizon)` after a completed
+    /// pull, so an ahead-of-feed horizon would push cursors past versions
+    /// not yet visible and those clients would permanently miss rows. On
+    /// Postgres the GC also takes the push advisory lock: the version
+    /// sequence is non-transactional, so only committed state observed
+    /// under that lock is a safe bound.
     ///
     /// # Errors
     ///
@@ -328,10 +330,13 @@ impl SyncBackend for MemorySyncBackend {
 
     fn gc_tombstones(&self, up_to: Version) -> Result<u64, SyncError> {
         let mut state = self.lock()?;
-        // Clamp to the latest assigned version (see the trait docs): a
-        // horizon above the sequence would push client cursors past
-        // versions the server has yet to assign, permanently hiding every
-        // row created later with a version at or below the horizon.
+        // Clamp to the newest committed version (see the trait docs).
+        // Unlike Postgres, `next_version` here IS the committed max: one
+        // mutex serializes whole apply_push batches with GC, and a version
+        // is allocated and its row inserted under the same lock scope — so
+        // there is no window where the counter is ahead of committed rows
+        // (the analogue of Postgres's non-transactional `nextval`, which
+        // the PG backend guards with the push advisory lock).
         let up_to = up_to.min(state.next_version);
         let before = state.rows.len();
         state
@@ -678,16 +683,33 @@ impl SyncBackend for PgSyncBackend {
     fn gc_tombstones(&self, up_to: Version) -> Result<u64, SyncError> {
         let mut conn = self.connect()?;
         conn.transaction::<_, diesel::result::Error, _>(|conn| {
-            // Clamp to the latest assigned version (see the trait docs): a
-            // horizon above the sequence would push client cursors past
-            // versions the server has yet to assign, permanently hiding
-            // every row created later with a version at or below the
-            // horizon.
-            let up_to = up_to.min(pg_latest_version(conn)?);
+            // Serialize with pushes (the SAME advisory lock apply_push
+            // takes): `nextval` is visible to other transactions BEFORE the
+            // allocating push commits, so a GC clamping against the raw
+            // sequence could persist a horizon covering an uncommitted
+            // version — a client pulling before that push commits would
+            // store a cursor past the row and miss it forever. Holding the
+            // push lock, no push is in flight while we read.
+            sql_query("SELECT pg_advisory_xact_lock($1)")
+                .bind::<BigInt, _>(PG_PUSH_ADVISORY_LOCK_KEY)
+                .execute(conn)?;
+            // Clamp to the newest COMMITTED version (see the trait docs):
+            // the max over surviving rows, floored by the already-persisted
+            // horizon (earlier GCs may have removed the top tombstones, so
+            // the row max alone can sit below it). Deliberately NOT the raw
+            // sequence — even under the lock it can exceed the committed
+            // max via rolled-back pushes (harmless, but the committed max
+            // is the tight, provably-safe bound).
+            let horizon_before = pg_horizon(conn)?;
+            let committed_max =
+                sql_query("SELECT COALESCE(MAX(version), 0) AS version FROM autumn_sync_rows")
+                    .get_result::<PgVersionRecord>(conn)?
+                    .version;
+            let up_to = up_to.min(committed_max.max(horizon_before));
             let removed = sql_query("DELETE FROM autumn_sync_rows WHERE deleted AND version <= $1")
                 .bind::<BigInt, _>(up_to)
                 .execute(conn)?;
-            let horizon = pg_horizon(conn)?.max(up_to);
+            let horizon = horizon_before.max(up_to);
             sql_query(
                 "INSERT INTO autumn_sync_meta (key, value) VALUES ($1, $2) \
                  ON CONFLICT (key) DO UPDATE SET value = excluded.value",
