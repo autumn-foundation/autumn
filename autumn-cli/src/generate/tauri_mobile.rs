@@ -490,7 +490,13 @@ fn dep_source_from_table(
         let adjusted = if Path::new(path).has_root() {
             path.replace('\\', "/")
         } else if manifest_dir == project_root {
-            format!("../{path}")
+            // Same backslash normalization as the other branches: a
+            // Windows-separated relative path written into the app's
+            // manifest would otherwise land in src-tauri/Cargo.toml as an
+            // invalid TOML basic-string escape (`\a`, `\v`) — or, where it
+            // happens to escape cleanly, as a checked-in platform-specific
+            // path.
+            format!("../{}", path.replace('\\', "/"))
         } else {
             let target = manifest_dir.join(path);
             let src_tauri = project_root.join("src-tauri");
@@ -2592,6 +2598,49 @@ mod tests {
             "a relative path dep must be recomputed for src-tauri/ (one level deeper)"
         );
         assert!(dep.patch_entry.is_none());
+        assert!(warnings.is_empty(), "got {warnings:?}");
+    }
+
+    #[test]
+    fn offline_shell_dep_normalizes_backslash_relative_paths() {
+        // Windows-style separators in the app's OWN manifest (a TOML
+        // literal string like path = 'vendor\autumn') must not leak into
+        // the generated src-tauri/Cargo.toml: emitted inside a BASIC
+        // string they become invalid escapes (\a), and where they happen
+        // to escape cleanly they are platform-specific checked-in paths.
+        let (dep, warnings) = shell_dep_for(r"autumn-web = { path = 'vendor\autumn' }", "");
+        assert_eq!(
+            dep.dep_entry,
+            r#"autumn-web = { path = "../vendor/autumn", features = ["offline-sync"] }"#,
+            "the direct-relative branch must normalize separators"
+        );
+        assert!(warnings.is_empty(), "got {warnings:?}");
+        let toml_src = render_mobile_cargo_toml("my-app", true, Some(&dep));
+        toml::from_str::<toml::Value>(&toml_src).expect("generated Cargo.toml must parse");
+
+        // Same for a mirrored [patch.crates-io] entry.
+        let (dep, warnings) = shell_dep_for(
+            "autumn-web = \"0.9.1\"",
+            "\n[patch.crates-io]\nautumn-web = { path = 'vendor\\autumn' }\n",
+        );
+        let patch = dep
+            .patch_entry
+            .clone()
+            .expect("the backslashed patch must still be mirrored");
+        assert!(
+            patch.contains(r#"autumn-web = { path = "../vendor/autumn" }"#),
+            "the patch mirror must normalize separators, got: {patch}"
+        );
+        assert!(warnings.is_empty(), "got {warnings:?}");
+        let toml_src = render_mobile_cargo_toml("my-app", true, Some(&dep));
+        toml::from_str::<toml::Value>(&toml_src).expect("generated Cargo.toml must parse");
+
+        // Forward-slash input stays byte-identical (regression).
+        let (dep, warnings) = shell_dep_for("autumn-web = { path = \"vendor/autumn\" }", "");
+        assert_eq!(
+            dep.dep_entry,
+            r#"autumn-web = { path = "../vendor/autumn", features = ["offline-sync"] }"#,
+        );
         assert!(warnings.is_empty(), "got {warnings:?}");
     }
 
