@@ -1273,6 +1273,167 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
         "the recreate must survive the ghost, got {row:?}"
     );
 
+    // ── No-op deletes never advance the incarnation marker ───────────────
+    // A redundant Delete over an existing tombstone clean-applies (it is a
+    // valid ack for the deleting device) but starts no live incarnation —
+    // the marker must stay put, or a device that pulled the ORIGINAL
+    // tombstone and intentionally recreates from its version would be
+    // misrouted into the previous-incarnation server-winning arm and its
+    // recreate silently discarded.
+    let response = backend
+        .apply_push(
+            SCOPE,
+            &push(
+                "device-a",
+                vec![change(
+                    "00000000-0000-4000-8000-000000000070",
+                    "graveyard",
+                    Op::Upsert,
+                    Some(json!({"title": "first tenant"})),
+                )],
+            ),
+            &resolver,
+        )
+        .expect("graveyard create");
+    let ChangeOutcome::Applied { version: grave_v1 } = response.outcomes[0] else {
+        panic!("create must clean-apply, got {:?}", response.outcomes[0]);
+    };
+    let grave_kill1 = Change {
+        base_version: grave_v1,
+        ..change(
+            "00000000-0000-4000-8000-000000000071",
+            "graveyard",
+            Op::Delete,
+            None,
+        )
+    };
+    let response = backend
+        .apply_push(SCOPE, &push("device-a", vec![grave_kill1]), &resolver)
+        .expect("first delete");
+    let ChangeOutcome::Applied {
+        version: first_grave_tomb,
+    } = response.outcomes[0]
+    else {
+        panic!("delete must clean-apply, got {:?}", response.outcomes[0]);
+    };
+    // Second incarnation: recreate over the seen tombstone…
+    let grave_rebirth = Change {
+        base_version: first_grave_tomb,
+        ..change(
+            "00000000-0000-4000-8000-000000000072",
+            "graveyard",
+            Op::Upsert,
+            Some(json!({"title": "second tenant"})),
+        )
+    };
+    let response = backend
+        .apply_push(SCOPE, &push("device-b", vec![grave_rebirth]), &resolver)
+        .expect("recreate");
+    let ChangeOutcome::Applied { version: grave_v2 } = response.outcomes[0] else {
+        panic!("recreate must clean-apply, got {:?}", response.outcomes[0]);
+    };
+    // …deleted again (the tombstone the fleet will pull)…
+    let grave_kill2 = Change {
+        base_version: grave_v2,
+        ..change(
+            "00000000-0000-4000-8000-000000000073",
+            "graveyard",
+            Op::Delete,
+            None,
+        )
+    };
+    let response = backend
+        .apply_push(SCOPE, &push("device-b", vec![grave_kill2]), &resolver)
+        .expect("second delete");
+    let ChangeOutcome::Applied {
+        version: second_grave_tomb,
+    } = response.outcomes[0]
+    else {
+        panic!("delete must clean-apply, got {:?}", response.outcomes[0]);
+    };
+    // …then a REDUNDANT delete from another device that also pulled the
+    // tombstone: clean-applies, but must not move the marker.
+    let redundant_delete = Change {
+        base_version: second_grave_tomb,
+        ..change(
+            "00000000-0000-4000-8000-000000000074",
+            "graveyard",
+            Op::Delete,
+            None,
+        )
+    };
+    let response = backend
+        .apply_push(SCOPE, &push("device-c", vec![redundant_delete]), &resolver)
+        .expect("redundant delete");
+    assert!(
+        matches!(response.outcomes[0], ChangeOutcome::Applied { .. }),
+        "a no-op delete over a tombstone is a valid ack, got {:?}",
+        response.outcomes[0]
+    );
+    // THE regression: device-d pulled the ORIGINAL second-incarnation
+    // tombstone (second_grave_tomb) and recreates from it with a newer clock. Its
+    // base is same-incarnation evidence — the resolver must run and (LWW)
+    // take the recreate. With the marker wrongly bumped by the redundant
+    // delete, this base would look previous-incarnation and the recreate
+    // would be discarded as a server-winning tombstone.
+    let mut third_tenant = change(
+        "00000000-0000-4000-8000-000000000075",
+        "graveyard",
+        Op::Upsert,
+        Some(json!({"title": "third tenant"})),
+    );
+    third_tenant.base_version = second_grave_tomb;
+    third_tenant.updated_at = Utc::now() + Duration::seconds(60);
+    let response = backend
+        .apply_push(SCOPE, &push("device-d", vec![third_tenant]), &resolver)
+        .expect("recreate from the original tombstone");
+    let ChangeOutcome::Resolved { row } = &response.outcomes[0] else {
+        panic!(
+            "a same-incarnation recreate must resolve, got {:?}",
+            response.outcomes[0]
+        );
+    };
+    assert!(
+        !row.deleted
+            && row
+                .payload
+                .as_ref()
+                .and_then(|p| p.get("title"))
+                .and_then(|v| v.as_str())
+                == Some("third tenant"),
+        "the recreate from the pre-redundant-delete tombstone must win, \
+         got {row:?}"
+    );
+    // The revival DID bump the marker (AR regression): a ghost edit from
+    // the FIRST incarnation is still server-winning against it.
+    let mut grave_ghost = change(
+        "00000000-0000-4000-8000-000000000076",
+        "graveyard",
+        Op::Upsert,
+        Some(json!({"title": "first tenant returns"})),
+    );
+    grave_ghost.base_version = grave_v1;
+    grave_ghost.updated_at = Utc::now() + Duration::days(365);
+    let response = backend
+        .apply_push(SCOPE, &push("device-a", vec![grave_ghost]), &resolver)
+        .expect("ghost edit");
+    let ChangeOutcome::Resolved { row } = &response.outcomes[0] else {
+        panic!(
+            "a first-incarnation base must resolve, got {:?}",
+            response.outcomes[0]
+        );
+    };
+    assert!(
+        !row.deleted
+            && row
+                .payload
+                .as_ref()
+                .and_then(|p| p.get("title"))
+                .and_then(|v| v.as_str())
+                == Some("third tenant"),
+        "old-incarnation ghosts must still lose to the revived row, got {row:?}"
+    );
+
     // ── Explicit-null payloads are real documents ─────────────────────────
     // `store.put(&None::<T>)` journals the JSON document `null`. On the
     // wire that is a PRESENT null — it must clean-apply (not be rejected as

@@ -340,10 +340,15 @@ struct ServerRow {
 ///   be answered with another tombstone.
 /// - **Everything else** (base matches the current version, a base-0
 ///   create against no row, or an at-horizon base against an absent
-///   row): a clean apply. A recreate over a seen tombstone, a fresh
-///   insert, or an at-horizon recreate starts a new incarnation; an
-///   update or delete of the live row continues the current one.
-///   `base_version == 0` never takes a server-winning arm.
+///   row): a clean apply. The incarnation marker only ever advances on a
+///   **transition to live**: a recreate over a seen tombstone, a fresh
+///   live insert, or an at-horizon recreate starts a new incarnation,
+///   while an update or delete of the live row — and a no-op delete over
+///   an existing tombstone — keeps the current marker (bumping it on a
+///   redundant delete would misroute another device's legitimate
+///   recreate from the original tombstone's version into the
+///   server-winning arm). `base_version == 0` never takes a
+///   server-winning arm.
 fn apply_change_row(
     change: &Change,
     device_id: &str,
@@ -394,16 +399,27 @@ fn apply_change_row(
             false,
         ),
         _ => {
+            let row = row_from_change(change, device_id, version);
             let created_version = match current {
                 // Updating/deleting the live row: the incarnation continues.
                 Some(cur) if !cur.row.deleted => cur.created_version,
-                // A recreate over a seen tombstone, or a fresh insert: a
-                // new incarnation.
+                // A no-op delete over an existing tombstone: no live
+                // incarnation begins, so the marker must NOT move — a
+                // device that pulled the ORIGINAL tombstone recreates from
+                // its version, and bumping the marker here would misroute
+                // that legitimate recreate into the previous-incarnation
+                // server-winning arm. The marker only ever advances on a
+                // transition to LIVE.
+                Some(cur) if row.deleted => cur.created_version,
+                // A recreate over a seen tombstone, a fresh live insert —
+                // or a tombstone minted from nothing (a base-0 delete of a
+                // pk that never existed, which has no prior marker to
+                // keep): a new incarnation.
                 _ => version,
             };
             (
                 ServerRow {
-                    row: row_from_change(change, device_id, version),
+                    row,
                     created_version,
                 },
                 true,
