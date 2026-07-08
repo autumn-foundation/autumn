@@ -761,6 +761,55 @@ fn shell_autumn_web_dep(project_root: &Path, plan: &mut Plan) -> ShellAutumnWebD
 /// this is an [`super::emit::Action::Modify`] that `autumn destroy` never
 /// reverses — the extracted `serve()` keeps compiling either way (its sync
 /// code is gated on the feature).
+/// Whether the manifest's `default` feature set enables `offline-sync`,
+/// directly or transitively through other features of THIS crate (entries
+/// containing `/` or `:` are dependency features — they cannot turn on the
+/// crate's own `#[cfg(feature = "offline-sync")]` and are ignored).
+fn offline_sync_enabled_by_default(manifest: &str) -> bool {
+    fn enables(
+        features: &toml::value::Table,
+        name: &str,
+        visited: &mut std::collections::HashSet<String>,
+    ) -> bool {
+        if name == "offline-sync" {
+            return true;
+        }
+        if !visited.insert(name.to_owned()) {
+            return false;
+        }
+        features
+            .get(name)
+            .and_then(toml::Value::as_array)
+            .is_some_and(|entries| {
+                entries.iter().filter_map(toml::Value::as_str).any(|entry| {
+                    !entry.contains('/')
+                        && !entry.contains(':')
+                        && enables(features, entry, visited)
+                })
+            })
+    }
+    let Ok(doc) = toml::from_str::<toml::Value>(manifest) else {
+        return false;
+    };
+    let Some(features) = doc.get("features").and_then(toml::Value::as_table) else {
+        return false;
+    };
+    if !features.contains_key("offline-sync") {
+        return false;
+    }
+    features
+        .get("default")
+        .and_then(toml::Value::as_array)
+        .is_some_and(|default| {
+            let mut visited = std::collections::HashSet::new();
+            default.iter().filter_map(toml::Value::as_str).any(|entry| {
+                !entry.contains('/')
+                    && !entry.contains(':')
+                    && enables(features, entry, &mut visited)
+            })
+        })
+}
+
 fn plan_app_offline_sync_feature(project_root: &Path, plan: &mut Plan) {
     const FEATURES_ANCHOR: &str = "[features]\n";
     const DEFAULT_ANCHOR: &str = "default = [\"flash\"]\n";
@@ -777,7 +826,41 @@ fn plan_app_offline_sync_feature(project_root: &Path, plan: &mut Plan) {
     );
     let feature_line = format!("offline-sync = [\"{dep_key}/offline-sync\"]\n");
     if content.contains("offline-sync = [") {
-        return; // Already wired — keep re-runs silent and duplicate-free.
+        // The feature exists — but "wired" also requires it to be ENABLED
+        // by `default`: the extracted serve() mounts /sync behind
+        // #[cfg(feature = "offline-sync")], and the documented flow assumes
+        // a plain `cargo run` deployment serves those endpoints. A defined
+        // but non-default feature would ship a mobile client whose server
+        // never mounts /sync.
+        if offline_sync_enabled_by_default(&content) {
+            return; // Already wired — keep re-runs silent and duplicate-free.
+        }
+        // Same anchored discipline as the fresh edit: add the feature to
+        // the stock `default` line when it still matches (everything else
+        // stays byte-identical), otherwise warn instead of guessing at a
+        // customised manifest.
+        if content.contains(DEFAULT_ANCHOR) {
+            plan.modify(
+                cargo_path,
+                content.replacen(
+                    DEFAULT_ANCHOR,
+                    "default = [\"flash\", \"offline-sync\"]\n",
+                    1,
+                ),
+            );
+        } else {
+            plan.warn(
+                "Cargo.toml declares an `offline-sync` feature, but `default` \
+                 doesn't enable it and the default line doesn't match the \
+                 stock scaffold — add `offline-sync` to the `default` feature \
+                 set yourself (or run the server deployment with `--features \
+                 offline-sync`), or the deployed app will never mount the \
+                 /sync endpoints the device syncs against \
+                 (see docs/guide/tauri-mobile-offline-sync.md)."
+                    .to_owned(),
+            );
+        }
+        return;
     }
     if !content.contains(FEATURES_ANCHOR) || !content.contains(DEFAULT_ANCHOR) {
         plan.warn(format!(
@@ -2553,6 +2636,106 @@ mod tests {
             !dep.dep_entry.contains("default-features"),
             "got: {}",
             dep.dep_entry
+        );
+    }
+
+    #[test]
+    fn offline_feature_edit_requires_default_enablement() {
+        fn manifest(features: &str) -> (TempDir, std::path::PathBuf) {
+            let tmp = TempDir::new().unwrap();
+            let path = tmp.path().join("Cargo.toml");
+            std::fs::write(
+                &path,
+                format!(
+                    "[package]\nname = \"my-app\"\nversion = \"0.2.3\"\n\n\
+                     [dependencies]\nautumn-web = \"0.9.1\"\n\n\
+                     [features]\n{features}"
+                ),
+            )
+            .unwrap();
+            (tmp, path)
+        }
+        fn planned_edit(tmp: &TempDir) -> (Option<String>, Vec<String>) {
+            let mut plan = Plan::new(tmp.path());
+            plan_app_offline_sync_feature(tmp.path(), &mut plan);
+            let edit = plan.actions.iter().find_map(|a| match a {
+                Action::Modify { contents, .. } => Some(contents.clone()),
+                _ => None,
+            });
+            (edit, plan.warnings)
+        }
+
+        // Feature present AND directly in default: wired — untouched,
+        // silent (byte-identical, since no action is planned at all).
+        let (tmp, _) = manifest(
+            "default = [\"flash\", \"offline-sync\"]\nflash = []\n\
+             offline-sync = [\"autumn-web/offline-sync\"]\n",
+        );
+        let (edit, warnings) = planned_edit(&tmp);
+        assert!(edit.is_none(), "wired manifests must stay untouched");
+        assert!(warnings.is_empty(), "got {warnings:?}");
+
+        // Enabled TRANSITIVELY through another default feature: also wired.
+        let (tmp, _) = manifest(
+            "default = [\"flash\", \"full\"]\nflash = []\n\
+             full = [\"offline-sync\"]\n\
+             offline-sync = [\"autumn-web/offline-sync\"]\n",
+        );
+        let (edit, warnings) = planned_edit(&tmp);
+        assert!(
+            edit.is_none(),
+            "transitive default enablement counts as wired"
+        );
+        assert!(warnings.is_empty(), "got {warnings:?}");
+
+        // A default entry naming only the DEP feature does not enable the
+        // crate's own cfg — not wired.
+        let (tmp, _) = manifest(
+            "default = [\"flash\", \"autumn-web/offline-sync\"]\nflash = []\n\
+             offline-sync = [\"autumn-web/offline-sync\"]\n",
+        );
+        let (edit, warnings) = planned_edit(&tmp);
+        assert!(
+            edit.is_some() || !warnings.is_empty(),
+            "a dep-feature default entry must not count as wired"
+        );
+
+        // Feature present but NOT in default, stock default line: only the
+        // default line is edited; the feature is not re-declared.
+        let (tmp, _) = manifest(
+            "default = [\"flash\"]\nflash = []\n\
+             offline-sync = [\"autumn-web/offline-sync\"]\n",
+        );
+        let (edit, warnings) = planned_edit(&tmp);
+        let edited = edit.expect("the stock default line must gain the feature");
+        assert!(warnings.is_empty(), "got {warnings:?}");
+        assert!(
+            edited.contains(r#"default = ["flash", "offline-sync"]"#),
+            "got:\n{edited}"
+        );
+        assert_eq!(
+            edited.matches("offline-sync = [").count(),
+            1,
+            "the existing feature declaration must not be duplicated:\n{edited}"
+        );
+
+        // Feature present, NOT in default, customised default line: loud
+        // warning instead of a guessed rewrite; manifest untouched.
+        let (tmp, _) = manifest(
+            "default = [\"flash\", \"extra\"]\nflash = []\nextra = []\n\
+             offline-sync = [\"autumn-web/offline-sync\"]\n",
+        );
+        let (edit, warnings) = planned_edit(&tmp);
+        assert!(
+            edit.is_none(),
+            "a customised default line is never rewritten"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains(
+                "`default` \
+                 doesn't enable it"
+            ) || w.contains("doesn't enable it")),
+            "got {warnings:?}"
         );
     }
 
