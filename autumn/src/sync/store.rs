@@ -827,24 +827,6 @@ impl SyncStore {
         .map_err(store_err)
     }
 
-    /// Drop all synced local state ahead of a full re-pull from cursor `0`.
-    /// Rows with a pending journal entry are preserved so unsynced local
-    /// writes survive and get replayed.
-    pub(crate) fn begin_full_resync(&self) -> Result<(), SyncError> {
-        let mut conn = self.lock()?;
-        conn.immediate_transaction::<_, diesel::result::Error, _>(|conn| {
-            sql_query(
-                "DELETE FROM autumn_sync_rows WHERE NOT EXISTS (\
-                 SELECT 1 FROM autumn_sync_pending p \
-                 WHERE p.collection = autumn_sync_rows.collection \
-                 AND p.pk = autumn_sync_rows.pk)",
-            )
-            .execute(conn)?;
-            set_state(conn, STATE_CURSOR, "0")
-        })
-        .map_err(store_err)
-    }
-
     /// Drop local tombstone rows whose deletion the server has already
     /// GC'd (acked `server_version <= horizon`). Safe because the server
     /// physically removed those tombstones — no future pull can carry a
@@ -1122,9 +1104,11 @@ mod tests {
             .apply_remote_rows(&[remote_row("notes", "n1", 4, false)])
             .expect("apply");
         assert!(store.has_synced_rows().expect("synced row"));
-        // A full resync clears it (the pending write survives).
-        store.begin_full_resync().expect("resync");
-        assert!(!store.has_synced_rows().expect("after resync"));
+        // Reconciling against an empty snapshot clears it (the pending
+        // write survives) — the shape `SyncEngine::resync_from_snapshot`
+        // lands after fetching a full snapshot.
+        store.reconcile_snapshot(&[], 0).expect("reconcile");
+        assert!(!store.has_synced_rows().expect("after reconcile"));
         assert_eq!(store.pending_count().expect("count"), 1);
     }
 

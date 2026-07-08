@@ -451,6 +451,131 @@ async fn offline_edit_of_a_gcd_row_does_not_resurrect_it() {
     assert_eq!(next.pushed, 0);
 }
 
+/// Regression for the server-demanded resync destroying local data when
+/// the replacement pull fails: the `FullResyncRequired` branch used to clear
+/// synced rows BEFORE fetching the replacement snapshot, so a connection
+/// lost right after the demand left the store emptied — including rows
+/// acked by the push moments earlier. The resync must fetch the complete
+/// snapshot first and reconcile only after it arrives: every failure
+/// leaves the pre-resync state intact (stale cursor re-triggers the
+/// demand), and connectivity's return converges with zero loss.
+#[tokio::test]
+async fn server_demanded_resync_never_drops_rows_while_snapshot_pull_fails() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use axum::middleware::Next;
+
+    // Snapshot pulls are the ones with session=0 (the resync); normal
+    // catch-up pulls (session=<stale cursor>) keep working so the server
+    // can DEMAND the resync in the first place.
+    static SNAPSHOT_UP: AtomicBool = AtomicBool::new(false);
+    async fn flaky_snapshot_pull(
+        request: axum::extract::Request,
+        next: Next,
+    ) -> Result<axum::response::Response, axum::http::StatusCode> {
+        let is_snapshot = request.uri().path().ends_with("/pull")
+            && request
+                .uri()
+                .query()
+                .is_some_and(|q| q.contains("session=0"));
+        if is_snapshot && !SNAPSHOT_UP.load(Ordering::SeqCst) {
+            return Err(axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        }
+        Ok(next.run(request).await)
+    }
+    // Fresh devices legitimately pull with session=0 too, so keep the
+    // snapshot route up during seeding and cut it right before the resync.
+    SNAPSHOT_UP.store(true, Ordering::SeqCst);
+
+    let backend = Arc::new(MemorySyncBackend::new());
+    let flaky: axum::Router = axum::Router::new().nest(
+        "/sync",
+        server::router(backend.clone(), Arc::new(LwwResolver))
+            .layer(axum::middleware::from_fn(flaky_snapshot_pull)),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback");
+    let addr = listener.local_addr().expect("local addr");
+    let _srv = tokio::spawn(async move {
+        axum::serve(listener, flaky).await.expect("serve");
+    });
+    let url = format!("http://{addr}/sync");
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // A creates a row; B syncs it (cursor > 0), then goes stale: A deletes
+    // "one", adds "two", and the server GCs the tombstone past B's cursor.
+    let store_a = open_store(&dir, "a.db");
+    let engine_a = engine_for(&store_a, &url);
+    let store_b = open_store(&dir, "b.db");
+    let engine_b = engine_for(&store_b, &url);
+    store_a.put("notes", "one", &note("first")).expect("put");
+    engine_a.sync_once().await.expect("a sync 1");
+    engine_b.sync_once().await.expect("b sync 1");
+    let stale_cursor = store_b.cursor().expect("b cursor");
+    assert!(stale_cursor > 0);
+    store_a.delete("notes", "one").expect("delete");
+    store_a.put("notes", "two", &note("second")).expect("put");
+    engine_a.sync_once().await.expect("a sync 2");
+    backend
+        .gc_tombstones(backend.latest_version().expect("latest"))
+        .expect("gc");
+
+    // The demand is set up; now cut the snapshot route.
+    SNAPSHOT_UP.store(false, Ordering::SeqCst);
+
+    // B writes locally, then syncs: the push acks "b-note", the catch-up
+    // pull is answered with `FullResyncRequired`, and the replacement
+    // snapshot pull 503s. Repeatedly. Every failure must leave B's rows —
+    // including the JUST-ACKED one — and its cursor untouched.
+    store_b
+        .put("notes", "b-note", &note("from b"))
+        .expect("put");
+    for attempt in 0..3 {
+        let err = engine_b.sync_once().await.expect_err("snapshot is down");
+        assert!(matches!(err, SyncError::Server(_)), "got {err:?}");
+        let listed: Vec<(String, Note)> = store_b.list("notes").expect("list");
+        let pks: Vec<&str> = listed.iter().map(|(pk, _)| pk.as_str()).collect();
+        assert!(
+            pks.contains(&"b-note"),
+            "the just-acked row must survive failed resync #{attempt}: {pks:?}"
+        );
+        assert!(
+            pks.contains(&"one"),
+            "pre-resync rows must survive failed resync #{attempt}: {pks:?}"
+        );
+        assert_eq!(
+            store_b.cursor().expect("b cursor"),
+            stale_cursor,
+            "a failed resync must leave the stale cursor so the server \
+             demands it again"
+        );
+        assert_eq!(
+            store_b.pending_count().expect("pending"),
+            0,
+            "the push before the demand acked the local write"
+        );
+    }
+
+    // Connectivity returns: the resync completes and B converges.
+    SNAPSHOT_UP.store(true, Ordering::SeqCst);
+    let report = engine_b.sync_once().await.expect("resync completes");
+    assert!(report.full_resync, "the demanded resync ran");
+    let listed: Vec<(String, Note)> = store_b.list("notes").expect("list");
+    let pks: Vec<&str> = listed.iter().map(|(pk, _)| pk.as_str()).collect();
+    assert!(!pks.contains(&"one"), "the GC'd delete lands: {pks:?}");
+    assert!(pks.contains(&"two"), "A's newer row arrives: {pks:?}");
+    assert!(pks.contains(&"b-note"), "B's own row survives: {pks:?}");
+    assert!(
+        store_b.cursor().expect("b cursor") >= backend.tombstone_horizon().expect("horizon"),
+        "the reconciled cursor lands at/above the horizon"
+    );
+
+    // Steady state afterwards.
+    let next = engine_b.sync_once().await.expect("steady");
+    assert!(!next.full_resync, "the resync must not loop");
+}
+
 /// Regression for the heal path destroying acknowledged local data while
 /// offline: a fresh device's first sync pushes fine (journal cleared,
 /// server versions recorded, cursor still 0), then the radio drops before

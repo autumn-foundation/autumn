@@ -235,10 +235,14 @@ The horizon exists to keep long-offline clients correct: a client whose
 sync session *started* behind the horizon might have missed a tombstone
 that no longer exists, so the server answers its pull with
 **`FullResyncRequired`** instead of a page of rows. The engine handles this
-transparently: it clears synced local state (**pending local changes are
-preserved**), re-pulls everything from cursor 0, then replays the preserved
-journal. Pick a GC cadence that makes this rare — e.g. GC tombstones older
-than 30 days if your fleet syncs at least monthly.
+transparently — and safely: it first fetches the **complete** from-zero
+snapshot, and only then reconciles local state against it in one
+transaction (**pending local changes are preserved** and replayed; synced
+rows absent from the snapshot are dropped). Nothing local is touched until
+the snapshot has fully arrived, so a connection lost mid-resync leaves the
+device's data intact and the resync re-triggers on the next pass. Pick a
+GC cadence that makes this rare — e.g. GC tombstones older than 30 days if
+your fleet syncs at least monthly.
 
 Two details make the horizon check safe in the corner cases:
 

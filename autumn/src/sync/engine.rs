@@ -159,37 +159,39 @@ impl SyncEngine {
         // transport failures must leave local state untouched, and the
         // push-ok-pull-failed first sync is exactly a transport failure.
         if self.store.cursor()? == 0 && self.store.has_synced_rows()? {
-            self.heal_zero_cursor_state(&mut report).await?;
+            self.resync_from_snapshot(&mut report).await?;
         }
         self.push_pending(&mut report).await?;
         if self.pull_updates(&mut report).await? {
-            // Stale cursor: reset synced state (pending survives), re-pull
-            // everything, then replay whatever is still journaled. The
-            // re-pull runs with a session-start cursor of 0, which the
-            // server never asks to resync, so multi-page re-pulls cannot
+            // Stale cursor: the server demands a full resync. Same
+            // clear-after-success shape as the zero-cursor heal above —
+            // the complete from-zero snapshot is fetched BEFORE anything
+            // local is touched, then one store transaction reconciles and
+            // lands the cursor (pending writes survive and replay). A
+            // failure mid-snapshot leaves the pre-resync state — including
+            // rows just acked by the push above — fully intact, and the
+            // still-stale cursor makes the server demand the resync again
+            // on the next pass; the snapshot runs with session=0, which the
+            // server never asks to resync, so multi-page snapshots cannot
             // trip the horizon check mid-pagination.
-            self.store.begin_full_resync()?;
-            report.full_resync = true;
-            if self.pull_updates(&mut report).await? {
-                return Err(SyncError::Server(
-                    "server demanded a full resync from cursor 0".into(),
-                ));
-            }
+            self.resync_from_snapshot(&mut report).await?;
             self.push_pending(&mut report).await?;
         }
         Ok(report)
     }
 
-    /// Heal the "synced rows but cursor 0" state (see `sync_once`): fetch
-    /// the COMPLETE from-zero snapshot first — buffered in memory, a
-    /// deliberate trade for the all-or-nothing reconcile; this is a rare
-    /// recovery path over device-sized datasets — then reconcile local
-    /// state against it in one store transaction
-    /// ([`SyncStore::reconcile_snapshot`]). A transport failure at any
-    /// point leaves local rows untouched and the cursor at 0, so the heal
-    /// simply re-runs on the next (possibly still offline) pass with zero
-    /// data loss.
-    async fn heal_zero_cursor_state(&self, report: &mut SyncReport) -> Result<(), SyncError> {
+    /// Full resync via a from-zero snapshot — used both for the
+    /// "synced rows but cursor 0" heal and for a server-demanded
+    /// `FullResyncRequired` (see `sync_once`): fetch the COMPLETE snapshot
+    /// first — buffered in memory, a deliberate trade for the
+    /// all-or-nothing reconcile; this is a rare recovery path over
+    /// device-sized datasets — then reconcile local state against it in one
+    /// store transaction ([`SyncStore::reconcile_snapshot`]). A transport
+    /// failure at any point leaves local rows AND the cursor untouched, so
+    /// the resync simply re-triggers on the next (possibly still offline)
+    /// pass — zero data loss, never a window where the store sits emptied
+    /// awaiting a pull that may not come.
+    async fn resync_from_snapshot(&self, report: &mut SyncReport) -> Result<(), SyncError> {
         let limit = self.config.pull_batch_size.clamp(1, MAX_PULL_LIMIT);
         let mut snapshot: Vec<RemoteRow> = Vec::new();
         let mut cursor: Version = 0;
