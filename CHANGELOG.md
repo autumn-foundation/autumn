@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **web:** new public `ProvideAuthorizationState` trait (PR #1505) — the
+  authorization layer (policy registry lookup, auth session key, forbidden
+  response, and the `db`-gated connection pool accessor) is now driven
+  through this trait instead of concrete `AppState`, decoupling
+  `authorization.rs` from `state.rs`. `AppState` implements it, so existing
+  apps are unaffected; custom state types can implement it to plug into
+  authorization.
 - **ci:** README-quickstart gate against the published crates (issue #1586) —
   `.github/workflows/quickstart-gate.yml` + `scripts/check-quickstart.sh`
   install the README-pinned `autumn-cli` from crates.io (never the local
