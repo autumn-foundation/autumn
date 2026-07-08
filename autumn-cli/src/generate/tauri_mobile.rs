@@ -43,12 +43,28 @@ use super::{GenerateError, ensure_project_root, read_or_empty};
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
-/// Compute the file actions for `autumn generate tauri-mobile`.
+/// Options for [`plan_tauri_mobile`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TauriMobileOptions {
+    /// Wire local-first offline storage + background sync (issue #1508):
+    /// a `SyncStore`-backed SQLite database in the app sandbox, a background
+    /// `SyncEngine` against `AUTUMN_SYNC__REMOTE_URL`, and the server-side
+    /// `/sync` router in the extracted app crate (feature `offline-sync` on
+    /// `autumn-web`).
+    pub offline_sync: bool,
+}
+
+/// Compute the file actions for `autumn generate tauri-mobile`, honouring
+/// `opts` (`--offline-sync`).
 ///
 /// # Errors
 /// Returns [`GenerateError::NotInProject`] when not at a project root, or
 /// [`GenerateError::Config`] if `Cargo.toml` is missing `[package].name`.
-pub fn plan_tauri_mobile(project_root: &Path) -> Result<Plan, GenerateError> {
+pub fn plan_tauri_mobile(
+    project_root: &Path,
+    opts: TauriMobileOptions,
+) -> Result<Plan, GenerateError> {
+    let _ = opts.offline_sync; // RED stub: template deltas land with GREEN.
     ensure_project_root(project_root)?;
 
     let (package_name, package_version, has_embed_assets) = read_app_meta(project_root)?;
@@ -111,8 +127,10 @@ pub fn plan_tauri_mobile(project_root: &Path) -> Result<Plan, GenerateError> {
     Ok(plan)
 }
 
-/// Human-readable prerequisites message printed after a successful scaffold.
-pub fn render_mobile_prerequisites() -> String {
+/// Human-readable prerequisites message printed after a successful scaffold,
+/// honouring `opts` (`--offline-sync` adds the sync setup step).
+pub fn render_mobile_prerequisites(opts: TauriMobileOptions) -> String {
+    let _ = opts.offline_sync; // RED stub: the offline-sync step lands with GREEN.
     "\
 Required prerequisites for building the mobile app:\n\
 \n\
@@ -874,7 +892,7 @@ mod tests {
         std::fs::create_dir_all(tmp.path().join("src")).unwrap();
         std::fs::write(tmp.path().join("src/main.rs"), stock_main_rs()).unwrap();
 
-        let plan = plan_tauri_mobile(tmp.path()).unwrap();
+        let plan = plan_tauri_mobile(tmp.path(), TauriMobileOptions::default()).unwrap();
         assert!(
             plan.warnings.iter().any(|w| w.contains("embed-assets")),
             "must warn when the app declares no embed-assets feature, got {:?}",
@@ -957,7 +975,7 @@ mod tests {
         let tmp = app_dir("my-app");
         std::fs::write(tmp.path().join("src/main.rs"), stock_main_rs()).unwrap();
 
-        let plan = plan_tauri_mobile(tmp.path()).unwrap();
+        let plan = plan_tauri_mobile(tmp.path(), TauriMobileOptions::default()).unwrap();
 
         let lib_action =
             app_src_action(&plan, "lib.rs").expect("plan must create the app src/lib.rs");
@@ -985,7 +1003,7 @@ mod tests {
         )
         .unwrap();
 
-        let plan = plan_tauri_mobile(tmp.path()).unwrap();
+        let plan = plan_tauri_mobile(tmp.path(), TauriMobileOptions::default()).unwrap();
 
         assert!(
             app_src_action(&plan, "lib.rs").is_none(),
@@ -1010,7 +1028,7 @@ mod tests {
         .unwrap();
         std::fs::write(tmp.path().join("src/lib.rs"), "pub async fn serve() {}\n").unwrap();
 
-        let plan = plan_tauri_mobile(tmp.path()).unwrap();
+        let plan = plan_tauri_mobile(tmp.path(), TauriMobileOptions::default()).unwrap();
         assert!(plan.warnings.is_empty());
         assert!(app_src_action(&plan, "main.rs").is_none());
     }
@@ -1021,7 +1039,7 @@ mod tests {
         std::fs::write(tmp.path().join("src/main.rs"), stock_main_rs()).unwrap();
         std::fs::write(tmp.path().join("src/lib.rs"), "pub fn helper() {}\n").unwrap();
 
-        let plan = plan_tauri_mobile(tmp.path()).unwrap();
+        let plan = plan_tauri_mobile(tmp.path(), TauriMobileOptions::default()).unwrap();
         assert!(
             plan.warnings
                 .iter()
@@ -1036,7 +1054,7 @@ mod tests {
         let tmp = app_dir("my-app");
         std::fs::write(tmp.path().join("src/main.rs"), stock_main_rs()).unwrap();
 
-        let plan = plan_tauri_mobile(tmp.path()).unwrap();
+        let plan = plan_tauri_mobile(tmp.path(), TauriMobileOptions::default()).unwrap();
         for action in &plan.actions {
             let p = action.path().to_string_lossy().replace('\\', "/");
             assert!(
@@ -1073,7 +1091,7 @@ mod tests {
 
     #[test]
     fn prerequisites_mention_mobile_toolchains_and_docs() {
-        let prereqs = render_mobile_prerequisites();
+        let prereqs = render_mobile_prerequisites(TauriMobileOptions::default());
         assert!(prereqs.contains("tauri-cli"));
         assert!(prereqs.contains("ios"));
         assert!(prereqs.contains("android"));
