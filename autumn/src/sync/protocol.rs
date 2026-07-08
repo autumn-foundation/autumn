@@ -38,6 +38,48 @@ pub enum Op {
     Delete,
 }
 
+/// Wire encoding for optional JSON payloads that must distinguish an
+/// ABSENT payload from an explicitly-`null` one.
+///
+/// `Option<serde_json::Value>` alone cannot: serde's stock impl maps a
+/// present `"payload": null` to `None`, so `Some(Value::Null)` — a
+/// perfectly legitimate JSON document, e.g. `store.put(&None::<T>)` —
+/// round-tripped into "payload omitted" and the server rejected the upsert
+/// as payload-less (and a pulled row with a `null` payload would
+/// materialize locally as absent). Deletion is signaled by [`Op::Delete`] /
+/// `deleted`, never by payload nullness, so `null` must survive the wire.
+///
+/// Combined with `#[serde(default, skip_serializing_if = "Option::is_none",
+/// with = ...)]` on the field:
+/// - `None` → field omitted (serialize skipped; absent key → `default`),
+/// - `Some(Value::Null)` → `"payload": null` (this module serializes the
+///   inner value directly and maps a PRESENT `null` back to
+///   `Some(Value::Null)`),
+/// - `Some(value)` → the value, round-tripped unchanged.
+mod payload_presence {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use serde_json::Value;
+
+    // serde's `with =` contract requires exactly `&Option<Value>` here.
+    #[allow(clippy::ref_option)]
+    pub fn serialize<S: Serializer>(
+        payload: &Option<Value>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        // Only reached for `Some(..)`: `skip_serializing_if` elides `None`.
+        // Serializing the INNER value keeps an explicit `null` on the wire.
+        payload.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<Value>, D::Error> {
+        // Only reached when the key is PRESENT (`default` covers absence):
+        // a present `null` is a real `Value::Null` payload.
+        Value::deserialize(deserializer).map(Some)
+    }
+}
+
 /// One journaled local write, pushed to the server.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Change {
@@ -53,8 +95,14 @@ pub struct Change {
     pub op: Op,
     /// JSON payload for upserts; `None` for deletes. The server **rejects**
     /// (`422`, nothing applied) any push batch containing an upsert without
-    /// a payload — it would create a live row clients cannot see.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// a payload — it would create a live row clients cannot see. An
+    /// explicitly-`null` payload is a real JSON document (`Some(Null)`),
+    /// distinct on the wire from an omitted one (see [`payload_presence`]).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "payload_presence"
+    )]
     pub payload: Option<serde_json::Value>,
     /// The server version this write was based on (`0` for a row the
     /// device has never seen synced). A mismatch with the server's current
@@ -82,8 +130,14 @@ pub struct RemoteRow {
     pub collection: String,
     /// Row primary key within the collection.
     pub pk: String,
-    /// JSON payload; `None` for tombstones.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// JSON payload; `None` for tombstones. An explicitly-`null` payload is
+    /// a real JSON document (`Some(Null)`), distinct on the wire from an
+    /// omitted one (see [`payload_presence`]).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "payload_presence"
+    )]
     pub payload: Option<serde_json::Value>,
     /// Server-assigned version (monotonic across all rows).
     pub version: Version,
@@ -237,6 +291,75 @@ mod tests {
         );
         let back: Change = serde_json::from_str(&json).unwrap();
         assert_eq!(back, change);
+    }
+
+    #[test]
+    fn payload_presence_distinguishes_absent_null_and_value() {
+        // Absent: no key on the wire, None back.
+        let mut change = sample_change();
+        change.op = Op::Delete;
+        change.payload = None;
+        let json = serde_json::to_string(&change).unwrap();
+        assert!(
+            !json.contains("payload"),
+            "absent must omit the key: {json}"
+        );
+        assert_eq!(serde_json::from_str::<Change>(&json).unwrap(), change);
+
+        // Explicit null: a REAL JSON document (e.g. store.put(&None::<T>)) —
+        // must survive as "payload": null and come back as Some(Null), not
+        // collapse into an omitted payload the server would reject.
+        let mut change = sample_change();
+        change.payload = Some(serde_json::Value::Null);
+        let json = serde_json::to_string(&change).unwrap();
+        assert!(
+            json.contains(r#""payload":null"#),
+            "present null must stay on the wire: {json}"
+        );
+        assert_eq!(serde_json::from_str::<Change>(&json).unwrap(), change);
+
+        // Ordinary value round-trips unchanged.
+        let change = sample_change();
+        let json = serde_json::to_string(&change).unwrap();
+        assert_eq!(serde_json::from_str::<Change>(&json).unwrap(), change);
+    }
+
+    #[test]
+    fn remote_row_payload_presence_round_trips() {
+        let row = |payload: Option<serde_json::Value>, deleted: bool| RemoteRow {
+            collection: "notes".to_owned(),
+            pk: "n1".to_owned(),
+            payload,
+            version: 7,
+            deleted,
+            updated_at: chrono::Utc::now(),
+            device_id: "d".to_owned(),
+        };
+        // Tombstone: payload key omitted entirely.
+        let tombstone = row(None, true);
+        let json = serde_json::to_string(&tombstone).unwrap();
+        assert!(!json.contains("payload"), "{json}");
+        assert_eq!(serde_json::from_str::<RemoteRow>(&json).unwrap(), tombstone);
+
+        // Live row whose document IS null: present on the wire, intact back
+        // — a collapse to None would materialize as an absent row on pull.
+        let null_row = row(Some(serde_json::Value::Null), false);
+        let json = serde_json::to_string(&null_row).unwrap();
+        assert!(json.contains(r#""payload":null"#), "{json}");
+        assert_eq!(serde_json::from_str::<RemoteRow>(&json).unwrap(), null_row);
+
+        // The Y dedup snapshot (serde_json::to_value/from_value on the
+        // resolved row) uses the same field encoding — Some(Null) must
+        // round-trip through a Value too.
+        let snapshot = serde_json::to_value(&null_row).unwrap();
+        assert_eq!(
+            serde_json::from_value::<RemoteRow>(snapshot).unwrap(),
+            null_row
+        );
+
+        let live = row(Some(serde_json::json!({"a": 1})), false);
+        let json = serde_json::to_string(&live).unwrap();
+        assert_eq!(serde_json::from_str::<RemoteRow>(&json).unwrap(), live);
     }
 
     #[test]

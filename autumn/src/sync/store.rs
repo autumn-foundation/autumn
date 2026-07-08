@@ -1073,6 +1073,53 @@ mod tests {
     }
 
     #[test]
+    fn null_documents_round_trip_through_journal_rows_and_pulls() {
+        // `put(&None::<T>)` stores the JSON document `null` — TEXT 'null'
+        // in the payload column, distinct from the SQL NULL a delete
+        // writes. The journal must surface it as Some(Value::Null) (a
+        // PRESENT payload the server accepts), reads must see the row, and
+        // a pulled remote row with a null payload must materialize.
+        let (_dir, store) = open_temp();
+        store
+            .put("notes", "opt", &None::<String>)
+            .expect("put none");
+        let pending = store.pending_changes(10).expect("pending");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].op, Op::Upsert);
+        assert_eq!(
+            pending[0].payload,
+            Some(serde_json::Value::Null),
+            "the journal must carry a PRESENT null, not an omitted payload"
+        );
+        let value: Option<serde_json::Value> = store.get("notes", "opt").expect("get");
+        assert_eq!(
+            value,
+            Some(serde_json::Value::Null),
+            "a null document is a present row"
+        );
+        // A DELETE journals an absent payload — the distinction the
+        // TEXT-'null'-vs-column-NULL storage preserves.
+        store.delete("notes", "opt").expect("delete");
+        let pending = store.pending_changes(10).expect("pending");
+        assert_eq!(pending[0].op, Op::Delete);
+        assert_eq!(pending[0].payload, None);
+
+        // Pulled remote rows with a null payload materialize as present.
+        let mut remote = remote_row("notes", "pulled-null", 5, false);
+        remote.payload = Some(serde_json::Value::Null);
+        store.apply_remote_rows(&[remote]).expect("apply");
+        let value: Option<serde_json::Value> = store.get("notes", "pulled-null").expect("get");
+        assert_eq!(value, Some(serde_json::Value::Null));
+        let listed: Vec<(String, serde_json::Value)> = store.list("notes").expect("list");
+        assert!(
+            listed
+                .iter()
+                .any(|(pk, v)| pk == "pulled-null" && v.is_null()),
+            "a null-payload row must appear in listings: {listed:?}"
+        );
+    }
+
+    #[test]
     fn apply_remote_page_persists_rows_and_cursor_together() {
         let (_dir, store) = open_temp();
         let applied = store

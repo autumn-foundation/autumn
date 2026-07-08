@@ -451,6 +451,44 @@ async fn offline_edit_of_a_gcd_row_does_not_resurrect_it() {
     assert_eq!(next.pushed, 0);
 }
 
+/// End-to-end regression for the null-payload collapse: `put(&None::<T>)`
+/// journals the JSON document `null`; the old wire encoding collapsed it
+/// into an omitted payload, so the very first push was rejected with 422
+/// and the client's queue was bricked (it retried the same rejected batch
+/// forever). The document must push, pull, and materialize intact.
+#[tokio::test]
+async fn null_documents_sync_end_to_end() {
+    let backend = Arc::new(MemorySyncBackend::new());
+    let (url, _srv) = start_sync_server(backend.clone(), Arc::new(LwwResolver)).await;
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    let store_a = open_store(&dir, "a.db");
+    let engine_a = engine_for(&store_a, &url);
+    let store_b = open_store(&dir, "b.db");
+    let engine_b = engine_for(&store_b, &url);
+
+    store_a.put("notes", "opt", &None::<String>).expect("put");
+    let report = engine_a
+        .sync_once()
+        .await
+        .expect("a null document must push cleanly, not 422-brick the queue");
+    assert_eq!(report.pushed, 1);
+    assert_eq!(store_a.pending_count().expect("pending"), 0);
+
+    engine_b.sync_once().await.expect("b sync");
+    let value: Option<Option<String>> = store_b.get("notes", "opt").expect("get");
+    assert_eq!(
+        value,
+        Some(None),
+        "the null document must materialize as a PRESENT row holding None"
+    );
+    let listed: Vec<(String, serde_json::Value)> = store_b.list("notes").expect("list");
+    assert!(
+        listed.iter().any(|(pk, v)| pk == "opt" && v.is_null()),
+        "the row must be visible, not conflated with a tombstone: {listed:?}"
+    );
+}
+
 /// Regression for the lost-response retry downgrade: B's edit conflicts
 /// with A's newer delete, the server resolves `KeepServer` (tombstone) but
 /// the response is lost. The retry must REPLAY the original Resolved

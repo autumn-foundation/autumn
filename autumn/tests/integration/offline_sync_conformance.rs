@@ -508,6 +508,84 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
         response.outcomes[0]
     );
 
+    // ── Explicit-null payloads are real documents ─────────────────────────
+    // `store.put(&None::<T>)` journals the JSON document `null`. On the
+    // wire that is a PRESENT null — it must clean-apply (not be rejected as
+    // payload-omitted) and pull back intact as Some(Null), not materialize
+    // as an absent row.
+    let response = backend
+        .apply_push(
+            &push(
+                "device-a",
+                vec![change(
+                    "00000000-0000-4000-8000-00000000000f",
+                    "nullable",
+                    Op::Upsert,
+                    Some(serde_json::Value::Null),
+                )],
+            ),
+            &resolver,
+        )
+        .expect("null-payload push");
+    let ChangeOutcome::Applied {
+        version: null_version,
+    } = response.outcomes[0]
+    else {
+        panic!(
+            "a null-payload upsert is a valid document, got {:?}",
+            response.outcomes[0]
+        );
+    };
+    let PullResponse::Ok { rows, .. } = backend
+        .pull_since(null_version - 1, 100, null_version - 1)
+        .expect("pull null row")
+    else {
+        panic!("an at-feed cursor never requires a resync");
+    };
+    let null_row = rows
+        .iter()
+        .find(|r| r.pk == "nullable")
+        .expect("the null-payload row must be pulled");
+    assert!(!null_row.deleted, "a null payload is not a tombstone");
+    assert_eq!(
+        null_row.payload,
+        Some(serde_json::Value::Null),
+        "the null document must survive the wire intact"
+    );
+
+    // And a Resolved outcome carrying a null payload replays intact too
+    // (exercises the dedup snapshot's JSONB round-trip on Postgres).
+    let mut null_conflict = change(
+        "00000000-0000-4000-8000-000000000010",
+        "nullable",
+        Op::Upsert,
+        Some(serde_json::Value::Null),
+    );
+    null_conflict.base_version = 0; // stale: the row is at null_version
+    null_conflict.updated_at = Utc::now() + Duration::seconds(60);
+    let null_request = push("device-b", vec![null_conflict]);
+    let response = backend
+        .apply_push(&null_request, &resolver)
+        .expect("null conflict push");
+    let ChangeOutcome::Resolved { row } = &response.outcomes[0] else {
+        panic!("stale base must resolve, got {:?}", response.outcomes[0]);
+    };
+    assert_eq!(row.payload, Some(serde_json::Value::Null));
+    let resolved_null_row = row.clone();
+    let replay = backend
+        .apply_push(&null_request, &resolver)
+        .expect("null replay");
+    let ChangeOutcome::Resolved { row } = &replay.outcomes[0] else {
+        panic!(
+            "the retry must replay Resolved, got {:?}",
+            replay.outcomes[0]
+        );
+    };
+    assert_eq!(
+        row, &resolved_null_row,
+        "the dedup snapshot must round-trip a null payload"
+    );
+
     // ── Dedup-record GC bounds the applied table ──────────────────────────
     // Every applied change so far left one dedup record; an age-based GC
     // with a future cutoff removes them all, and re-running is a no-op.
