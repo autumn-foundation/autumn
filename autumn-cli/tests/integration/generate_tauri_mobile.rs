@@ -392,6 +392,74 @@ fn generate_tauri_mobile_honors_custom_lib_name() {
 }
 
 #[test]
+fn generate_tauri_mobile_honors_custom_lib_path() {
+    let (_tmp, project) = fresh_project("mobile-libpath-app");
+
+    // Declare a custom library target file: Cargo compiles THAT file as the
+    // lib and ignores a stray src/lib.rs, so the serve() extraction must
+    // land there (issue #1585 review).
+    let cargo_path = project.join("Cargo.toml");
+    let cargo = read(&cargo_path);
+    fs::write(
+        &cargo_path,
+        format!("{cargo}\n[lib]\npath = \"src/app_lib.rs\"\n"),
+    )
+    .unwrap();
+
+    run_autumn(&project, &["generate", "tauri-mobile"]);
+
+    let app_lib = read(&project.join("src/app_lib.rs"));
+    assert!(
+        app_lib.contains("pub async fn serve()"),
+        "serve() must be extracted into the [lib].path file, got:\n{app_lib}"
+    );
+    assert!(
+        !project.join("src/lib.rs").exists(),
+        "no stray src/lib.rs may be created when [lib].path points elsewhere"
+    );
+    let main_rs = read(&project.join("src/main.rs"));
+    assert!(
+        main_rs.contains("::serve().await"),
+        "src/main.rs must be the thin serve() caller, got:\n{main_rs}"
+    );
+}
+
+#[test]
+fn generate_tauri_mobile_custom_lib_path_with_existing_file_falls_back_with_warning() {
+    let (_tmp, project) = fresh_project("mobile-libpath-existing-app");
+    let cargo_path = project.join("Cargo.toml");
+    let cargo = read(&cargo_path);
+    fs::write(
+        &cargo_path,
+        format!("{cargo}\n[lib]\npath = \"src/app_lib.rs\"\n"),
+    )
+    .unwrap();
+    let custom = "pub fn helper() {}\n";
+    fs::write(project.join("src/app_lib.rs"), custom).unwrap();
+    let main_before = read(&project.join("src/main.rs"));
+
+    let output = run_autumn(&project, &["generate", "tauri-mobile"]);
+
+    // Graceful fallback: the existing lib target and main.rs are untouched,
+    // and the warning names the actual [lib].path file.
+    assert_eq!(read(&project.join("src/app_lib.rs")), custom);
+    assert_eq!(read(&project.join("src/main.rs")), main_before);
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("src/app_lib.rs"),
+        "the fallback warning must name the [lib].path file, got:\n{combined}"
+    );
+    assert!(
+        combined.contains("tauri-mobile-in-process"),
+        "the fallback warning must point at the docs page, got:\n{combined}"
+    );
+}
+
+#[test]
 fn generate_tauri_mobile_refuses_desktop_leftovers_even_with_force() {
     let (_tmp, project) = fresh_project("mobile-over-desktop-app");
     run_autumn(&project, &["generate", "tauri"]);

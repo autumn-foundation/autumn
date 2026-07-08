@@ -55,6 +55,7 @@ pub fn plan_tauri_mobile(project_root: &Path) -> Result<Plan, GenerateError> {
         package_name,
         version: package_version,
         lib_ident,
+        lib_src_path,
         has_embed_assets,
     } = read_app_meta(project_root)?;
     let mut plan = Plan::new(project_root);
@@ -112,7 +113,7 @@ pub fn plan_tauri_mobile(project_root: &Path) -> Result<Plan, GenerateError> {
 
     // App-crate lib extraction so the shell can call `<app_lib>::serve()`
     // in-process.
-    plan_lib_extraction(project_root, &lib_ident, &mut plan);
+    plan_lib_extraction(project_root, &lib_ident, &lib_src_path, &mut plan);
 
     Ok(plan)
 }
@@ -226,6 +227,12 @@ struct AppMeta {
     /// use: `[lib].name` when the app sets one, otherwise `[package].name`
     /// with dashes replaced by underscores (Cargo's default lib target name).
     lib_ident: String,
+    /// The **library target source file**, relative to the project root:
+    /// `[lib].path` when the app sets one, otherwise `src/lib.rs` (Cargo's
+    /// default). The `serve()` extraction must target this file — a newly
+    /// created `src/lib.rs` would be ignored by Cargo when `[lib].path`
+    /// points elsewhere.
+    lib_src_path: String,
     /// Whether the app declares an `embed-assets` feature.
     has_embed_assets: bool,
 }
@@ -239,7 +246,9 @@ struct AppMeta {
 /// `lib_ident` honors a custom `[lib] name = "…"`: Cargo exposes the library
 /// crate to the app binary and to path dependents under that name, so the
 /// generated `<lib_ident>::serve()` calls must use it — the dash-to-underscore
-/// package name would not compile for those projects.
+/// package name would not compile for those projects. `lib_src_path` honors a
+/// custom `[lib] path = "…"` the same way: Cargo compiles THAT file as the
+/// library target and ignores a stray `src/lib.rs`.
 /// `has_embed_assets` is `true` when the app declares an `embed-assets`
 /// feature (the stock scaffold always does) — the mobile shell enables it on
 /// the app dependency so CSS/JS/static assets are compiled into the binary
@@ -279,10 +288,17 @@ fn read_app_meta(project_root: &Path) -> Result<AppMeta, GenerateError> {
         .and_then(|n| n.as_str())
         .map_or_else(|| name.replace('-', "_"), str::to_owned);
 
+    let lib_src_path = doc
+        .get("lib")
+        .and_then(|l| l.get("path"))
+        .and_then(|p| p.as_str())
+        .map_or_else(|| "src/lib.rs".to_owned(), str::to_owned);
+
     Ok(AppMeta {
         package_name: name,
         version,
         lib_ident,
+        lib_src_path,
         has_embed_assets,
     })
 }
@@ -326,22 +342,31 @@ const SERVE_FN_HEADER: &str = "\
 /// thread. The `main.rs` binary still calls this on desktop.
 pub async fn serve() {";
 
-/// Plan the anchored extraction of the app's `src/main.rs` into
-/// `src/lib.rs::serve()`, with a graceful skip when the app doesn't match
-/// the stock scaffold shape.
+/// Plan the anchored extraction of the app's `src/main.rs` into the app's
+/// **library target file** (`serve()`), with a graceful skip when the app
+/// doesn't match the stock scaffold shape.
 ///
 /// `crate_ident` is the app's **library crate identifier** ([`AppMeta::
 /// lib_ident`]) — `[lib].name` when set, else the dash-to-underscore package
-/// name.
+/// name. `lib_src_path` is the library target's source file ([`AppMeta::
+/// lib_src_path`]) — `[lib].path` when set, else `src/lib.rs`: Cargo compiles
+/// THAT file as the library, so extracting into a hard-coded `src/lib.rs`
+/// would leave the real lib target without `serve()` (and the shell would
+/// not compile) while adding an unused stray file.
 ///
 /// Uses `Modify` for `main.rs` (an intentional rewrite, not a collision) and
-/// `CreateIfAbsent` for `lib.rs` — so `autumn destroy tauri-mobile` removes
-/// the `src-tauri/` shell but leaves the extracted (still fully functional)
-/// app lib in place rather than deleting a `src/lib.rs` that `main.rs` now
-/// depends on.
-fn plan_lib_extraction(project_root: &Path, crate_ident: &str, plan: &mut Plan) {
+/// `CreateIfAbsent` for the lib file — so `autumn destroy tauri-mobile`
+/// removes the `src-tauri/` shell but leaves the extracted (still fully
+/// functional) app lib in place rather than deleting a lib file that
+/// `main.rs` now depends on.
+fn plan_lib_extraction(
+    project_root: &Path,
+    crate_ident: &str,
+    lib_src_path: &str,
+    plan: &mut Plan,
+) {
     let main_path = project_root.join("src").join("main.rs");
-    let lib_path = project_root.join("src").join("lib.rs");
+    let lib_path = project_root.join(lib_src_path);
     let main_rs = read_or_empty(&main_path);
 
     if lib_path.exists() {
@@ -350,9 +375,10 @@ fn plan_lib_extraction(project_root: &Path, crate_ident: &str, plan: &mut Plan) 
             return;
         }
         plan.warn(format!(
-            "src/lib.rs already exists — skipping the automatic extraction of \
-             src/main.rs. The Tauri mobile shell calls `{crate_ident}::serve()`; \
-             expose your app as `pub async fn serve()` in src/lib.rs by hand \
+            "{lib_src_path} already exists — skipping the automatic extraction \
+             of src/main.rs. The Tauri mobile shell calls \
+             `{crate_ident}::serve()`; expose your app as `pub async fn \
+             serve()` in {lib_src_path} by hand \
              (see docs/guide/tauri-mobile-in-process.md)."
         ));
         return;
@@ -361,9 +387,9 @@ fn plan_lib_extraction(project_root: &Path, crate_ident: &str, plan: &mut Plan) 
     if !main_rs.contains(MAIN_FN_ANCHOR) {
         plan.warn(format!(
             "src/main.rs doesn't match the stock scaffold layout — skipping the \
-             automatic extraction into src/lib.rs. The Tauri mobile shell calls \
-             `{crate_ident}::serve()`; move your `main()` body into a \
-             `pub async fn serve()` in src/lib.rs and call it from `main()` \
+             automatic extraction into {lib_src_path}. The Tauri mobile shell \
+             calls `{crate_ident}::serve()`; move your `main()` body into a \
+             `pub async fn serve()` in {lib_src_path} and call it from `main()` \
              (see docs/guide/tauri-mobile-in-process.md for the exact steps)."
         ));
         return;
@@ -1191,6 +1217,91 @@ mod tests {
         assert_eq!(
             meta.lib_ident, "custom_lib",
             "[lib].name must win over the dash-to-underscore package name"
+        );
+    }
+
+    #[test]
+    fn read_app_meta_honors_custom_lib_path() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"my-app\"\nversion = \"0.2.3\"\n\n\
+             [lib]\npath = \"src/app_lib.rs\"\n",
+        )
+        .unwrap();
+        let meta = read_app_meta(tmp.path()).unwrap();
+        assert_eq!(
+            meta.lib_src_path, "src/app_lib.rs",
+            "[lib].path must win over the default src/lib.rs"
+        );
+        // Default when [lib].path is absent.
+        let default = app_dir("my-app");
+        assert_eq!(
+            read_app_meta(default.path()).unwrap().lib_src_path,
+            "src/lib.rs"
+        );
+    }
+
+    #[test]
+    fn plan_extracts_serve_into_custom_lib_path() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"my-app\"\nversion = \"0.2.3\"\n\n\
+             [lib]\npath = \"src/app_lib.rs\"\n\n\
+             [features]\nembed-assets = [\"autumn-web/embed-assets\"]\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/main.rs"), stock_main_rs()).unwrap();
+
+        let plan = plan_tauri_mobile(tmp.path()).unwrap();
+
+        // serve() lands in the file Cargo actually compiles as the library.
+        let lib_action =
+            app_src_action(&plan, "app_lib.rs").expect("plan must create the custom-path lib file");
+        let Action::CreateIfAbsent { contents, .. } = lib_action else {
+            panic!("custom lib file must be a CreateIfAbsent action, got {lib_action:?}");
+        };
+        assert!(contents.contains("pub async fn serve()"));
+        assert!(
+            app_src_action(&plan, "lib.rs").is_none(),
+            "no stray src/lib.rs may be planned when [lib].path points elsewhere"
+        );
+        let main_action =
+            app_src_action(&plan, "main.rs").expect("plan must rewrite the app src/main.rs");
+        let Action::Modify { contents, .. } = main_action else {
+            panic!("app main.rs must be a Modify action, got {main_action:?}");
+        };
+        assert!(contents.contains("my_app::serve().await;"));
+        assert!(plan.warnings.is_empty(), "got {:?}", plan.warnings);
+    }
+
+    #[test]
+    fn plan_warns_when_custom_lib_path_file_already_exists() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"my-app\"\nversion = \"0.2.3\"\n\n\
+             [lib]\npath = \"src/app_lib.rs\"\n\n\
+             [features]\nembed-assets = [\"autumn-web/embed-assets\"]\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/main.rs"), stock_main_rs()).unwrap();
+        std::fs::write(tmp.path().join("src/app_lib.rs"), "pub fn helper() {}\n").unwrap();
+
+        let plan = plan_tauri_mobile(tmp.path()).unwrap();
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|w| w.contains("src/app_lib.rs already exists")),
+            "the graceful fallback must name the ACTUAL lib target file, got {:?}",
+            plan.warnings
+        );
+        assert!(
+            app_src_action(&plan, "main.rs").is_none(),
+            "main.rs must be left untouched on the fallback path"
         );
     }
 
