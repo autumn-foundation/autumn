@@ -360,6 +360,131 @@ fn generate_tauri_mobile_collision_without_force_exits_nonzero() {
 }
 
 #[test]
+fn generate_tauri_mobile_honors_custom_lib_name() {
+    let (_tmp, project) = fresh_project("mobile-libname-app");
+
+    // Declare a custom library crate name: Cargo then exposes the lib to the
+    // binary and to path dependents as `custom_lib`, so every generated
+    // serve() call site must use it (issue #1585 review).
+    let cargo_path = project.join("Cargo.toml");
+    let cargo = read(&cargo_path);
+    fs::write(
+        &cargo_path,
+        format!("{cargo}\n[lib]\nname = \"custom_lib\"\n"),
+    )
+    .unwrap();
+
+    run_autumn(&project, &["generate", "tauri-mobile"]);
+
+    let shell_lib = read(&project.join("src-tauri/src/lib.rs"));
+    assert!(
+        shell_lib.contains("block_on(custom_lib::serve())"),
+        "shell lib.rs must call the custom [lib] name, got:\n{shell_lib}"
+    );
+    assert!(
+        !shell_lib.contains("mobile_libname_app::serve()"),
+        "shell lib.rs must not call the dash-to-underscore package name"
+    );
+
+    let main_rs = read(&project.join("src/main.rs"));
+    assert!(
+        main_rs.contains("custom_lib::serve().await;"),
+        "thin src/main.rs must call the custom [lib] name, got:\n{main_rs}"
+    );
+}
+
+#[test]
+fn generate_tauri_mobile_refuses_desktop_leftovers_even_with_force() {
+    let (_tmp, project) = fresh_project("mobile-over-desktop-app");
+    run_autumn(&project, &["generate", "tauri"]);
+
+    for args in [
+        &["generate", "tauri-mobile"][..],
+        &["generate", "tauri-mobile", "--force"][..],
+    ] {
+        let refused = run_autumn_raw(&project, args);
+        assert!(
+            !refused.status.success(),
+            "autumn {args:?} must refuse over a desktop scaffold"
+        );
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert!(
+            stderr.contains("desktop (sidecar)"),
+            "error must name the conflicting mode, got:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("autumn destroy tauri"),
+            "error must point at the destroy remedy, got:\n{stderr}"
+        );
+    }
+
+    // The desktop scaffold survives intact — nothing was half-overwritten.
+    assert!(project.join("src-tauri/stage-sidecar.sh").is_file());
+    assert!(project.join("src-tauri/tauri.linux.conf.json").is_file());
+
+    // The documented remedy keeps working: destroy desktop, then generate.
+    run_autumn(&project, &["destroy", "tauri"]);
+    run_autumn(&project, &["generate", "tauri-mobile"]);
+    assert!(!project.join("src-tauri/stage-sidecar.sh").exists());
+}
+
+#[test]
+fn generate_tauri_mobile_refuses_thin_client_leftovers_even_with_force() {
+    let (_tmp, project) = fresh_project("mobile-over-thin-app");
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "tauri",
+            "--remote-url",
+            "https://app.example.com",
+        ],
+    );
+
+    let refused = run_autumn_raw(&project, &["generate", "tauri-mobile", "--force"]);
+    assert!(
+        !refused.status.success(),
+        "generate tauri-mobile --force must refuse over a thin-client scaffold"
+    );
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("thin-client"),
+        "error must name the conflicting mode, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("destroy tauri --remote-url"),
+        "error must point at the thin-client destroy remedy, got:\n{stderr}"
+    );
+
+    // The thin-client capability grants survive intact.
+    assert!(
+        project
+            .join("src-tauri/capabilities/remote-app.json")
+            .is_file()
+    );
+}
+
+#[test]
+fn generate_tauri_mobile_same_mode_force_regenerate_still_works() {
+    let (_tmp, project) = fresh_project("mobile-samemode-app");
+    run_autumn(&project, &["generate", "tauri-mobile"]);
+
+    // A same-mode --force regenerate is NOT a mixed-mode conflict: the guard
+    // only fires on the other modes' marker files.
+    let forced = run_autumn(&project, &["generate", "tauri-mobile", "--force"]);
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&forced.stdout),
+        String::from_utf8_lossy(&forced.stderr)
+    );
+    assert!(
+        !combined.contains("already contains"),
+        "same-mode --force must not trip the mixed-mode guard, got:\n{combined}"
+    );
+    assert!(project.join("src-tauri/src/lib.rs").is_file());
+}
+
+#[test]
 fn destroy_tauri_mobile_removes_shell_keeps_extracted_app_lib() {
     let (_tmp, project) = fresh_project("mobile-destroy-app");
     run_autumn(&project, &["generate", "tauri-mobile"]);

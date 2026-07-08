@@ -84,7 +84,9 @@ profile is pinned the same way: `AUTUMN_ENV=dev` in debug builds,
 
 ### Annotated `src-tauri/src/lib.rs`
 
-This is what the generator emits (abbreviated; `my_app` is your crate name):
+This is what the generator emits (abbreviated; `my_app` is your **library
+crate name** — `[lib] name` from your `Cargo.toml` when you set one, otherwise
+the package name with dashes replaced by underscores):
 
 ```rust
 use std::net::TcpListener;

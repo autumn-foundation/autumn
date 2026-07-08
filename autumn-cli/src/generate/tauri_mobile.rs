@@ -81,7 +81,12 @@ pub fn plan_tauri_mobile(
 ) -> Result<Plan, GenerateError> {
     ensure_project_root(project_root)?;
 
-    let (package_name, package_version, has_embed_assets) = read_app_meta(project_root)?;
+    let AppMeta {
+        package_name,
+        version: package_version,
+        lib_ident,
+        has_embed_assets,
+    } = read_app_meta(project_root)?;
     let mut plan = Plan::new(project_root);
     let tauri = project_root.join("src-tauri");
     // The shell's own autumn-web dependency (offline sync only) must carry
@@ -118,7 +123,7 @@ pub fn plan_tauri_mobile(
     );
     plan.create(
         tauri.join("src").join("lib.rs"),
-        render_mobile_lib_rs(&package_name, opts.offline_sync),
+        render_mobile_lib_rs(&package_name, &lib_ident, opts.offline_sync),
     );
 
     // Icons — reuse the PWA icon when the user already ran `autumn generate pwa`.
@@ -141,8 +146,9 @@ pub fn plan_tauri_mobile(
 
     plan.create(tauri.join(".gitignore"), render_mobile_gitignore());
 
-    // App-crate lib extraction so the shell can call `<app>::serve()` in-process.
-    plan_lib_extraction(project_root, &package_name, opts.offline_sync, &mut plan);
+    // App-crate lib extraction so the shell can call `<app_lib>::serve()`
+    // in-process.
+    plan_lib_extraction(project_root, &lib_ident, opts.offline_sync, &mut plan);
 
     // App-crate offline-sync feature (Cargo.toml edit, offline sync only).
     if opts.offline_sync {
@@ -150,6 +156,66 @@ pub fn plan_tauri_mobile(
     }
 
     Ok(plan)
+}
+
+// ── Mixed-mode guard (mirrors generate/tauri.rs, issue #1506) ─────────────────
+
+/// Refuse to scaffold the mobile in-process shell on top of another Tauri
+/// mode's `src-tauri/`.
+///
+/// `autumn generate tauri` (desktop sidecar), `autumn generate tauri
+/// --remote-url` (mobile thin client), and `autumn generate tauri-mobile`
+/// (mobile in-process) all write to `src-tauri/`, but their file sets only
+/// partially overlap — `--force` would overwrite the shared files and leave
+/// the other mode's leftovers behind, some of which actively break the
+/// mobile build: Tauri CLI merges stale desktop `tauri.<platform>.conf.json`
+/// overlays on top of `tauri.conf.json` (re-running the sidecar staging
+/// scripts), and loads every capability file under `src-tauri/capabilities/`
+/// (stale thin-client grants fail `tauri-build` validation against the
+/// in-process shell crate, which compiles none of those plugins). `--force`
+/// means "overwrite within the same mode", never "silently mix modes", so
+/// this check runs regardless of `--force`.
+///
+/// Called only for `autumn generate` — never for `autumn destroy`, which is
+/// the documented remedy and must keep working on a mixed tree.
+///
+/// # Errors
+/// Returns [`GenerateError::Config`] naming the conflicting marker file and
+/// the matching `autumn destroy tauri [--remote-url <URL>]` command to run
+/// first.
+pub fn ensure_no_other_mode_scaffold(project_root: &Path) -> Result<(), GenerateError> {
+    let tauri = project_root.join("src-tauri");
+    let first_existing = |markers: &[&str]| -> Option<String> {
+        markers
+            .iter()
+            .find(|m| tauri.join(m).is_file())
+            .map(|m| format!("src-tauri/{m}"))
+    };
+    if let Some(marker) = first_existing(&super::tauri::DESKTOP_MARKERS) {
+        return Err(GenerateError::Config(format!(
+            "src-tauri/ already contains a desktop (sidecar) Tauri scaffold \
+             ({marker} exists); refusing to scaffold the mobile in-process \
+             shell on top of it — stale per-OS tauri.*.conf.json overlays \
+             would keep running the sidecar staging scripts on every `cargo \
+             tauri build`. Run `autumn destroy tauri` first, then re-run \
+             `autumn generate tauri-mobile`. --force only overwrites files \
+             within the same mode; it never mixes modes."
+        )));
+    }
+    if let Some(marker) = first_existing(&super::tauri::THIN_CLIENT_MARKERS) {
+        return Err(GenerateError::Config(format!(
+            "src-tauri/ already contains a mobile thin-client Tauri scaffold \
+             ({marker} exists); refusing to scaffold the mobile in-process \
+             shell on top of it — Tauri loads every capability file under \
+             src-tauri/capabilities/, so the stale thin-client grants would \
+             fail validation against the in-process shell crate. Run `autumn \
+             destroy tauri --remote-url <URL>` (the URL the thin client was \
+             generated with) first, then re-run `autumn generate \
+             tauri-mobile`. --force only overwrites files within the same \
+             mode; it never mixes modes."
+        )));
+    }
+    Ok(())
 }
 
 /// Human-readable prerequisites message printed after a successful scaffold,
@@ -206,18 +272,36 @@ Required prerequisites for building the mobile app:\n\
 
 // ── Package metadata helper ───────────────────────────────────────────────────
 
-/// Returns `(package_name, version, has_embed_assets)` from the app's
-/// `Cargo.toml`.
+/// App-crate metadata the mobile generator needs from `Cargo.toml`.
+struct AppMeta {
+    /// `[package].name`, verbatim — used for the shell crate name, the bundle
+    /// identifier, the display title, and the path-dependency key.
+    package_name: String,
+    /// `[package].version`, with workspace inheritance resolved.
+    version: String,
+    /// The **library crate identifier** all generated `serve()` call sites
+    /// use: `[lib].name` when the app sets one, otherwise `[package].name`
+    /// with dashes replaced by underscores (Cargo's default lib target name).
+    lib_ident: String,
+    /// Whether the app declares an `embed-assets` feature.
+    has_embed_assets: bool,
+}
+
+/// Reads [`AppMeta`] from the app's `Cargo.toml`.
 ///
 /// A deliberately small, self-contained reader: the mobile shell has no
 /// sidecar, so — unlike the desktop generator — it needs no binary-target or
 /// dependency-key resolution. `version` resolves workspace inheritance
 /// (`version.workspace = true`) by walking up the directory tree.
+/// `lib_ident` honors a custom `[lib] name = "…"`: Cargo exposes the library
+/// crate to the app binary and to path dependents under that name, so the
+/// generated `<lib_ident>::serve()` calls must use it — the dash-to-underscore
+/// package name would not compile for those projects.
 /// `has_embed_assets` is `true` when the app declares an `embed-assets`
 /// feature (the stock scaffold always does) — the mobile shell enables it on
 /// the app dependency so CSS/JS/static assets are compiled into the binary
 /// (a mobile app has no working directory to serve `static/` from).
-fn read_app_meta(project_root: &Path) -> Result<(String, String, bool), GenerateError> {
+fn read_app_meta(project_root: &Path) -> Result<AppMeta, GenerateError> {
     let cargo_path = project_root.join("Cargo.toml");
     let content = std::fs::read_to_string(&cargo_path).map_err(GenerateError::Io)?;
     let doc: toml::Value = toml::from_str(&content)
@@ -246,7 +330,18 @@ fn read_app_meta(project_root: &Path) -> Result<(String, String, bool), Generate
         .and_then(|f| f.get("embed-assets"))
         .is_some();
 
-    Ok((name, version, has_embed_assets))
+    let lib_ident = doc
+        .get("lib")
+        .and_then(|l| l.get("name"))
+        .and_then(|n| n.as_str())
+        .map_or_else(|| name.replace('-', "_"), str::to_owned);
+
+    Ok(AppMeta {
+        package_name: name,
+        version,
+        lib_ident,
+        has_embed_assets,
+    })
 }
 
 /// Walk from `project_root` upward looking for a `Cargo.toml` that declares
@@ -448,6 +543,10 @@ async fn mount_offline_sync(app: autumn_web::app::AppBuilder) -> autumn_web::app
 /// additionally mounts the server-side sync router (feature-gated, and only
 /// when a database is configured — see [`SYNC_MOUNT_HELPER`]).
 ///
+/// `crate_ident` is the app's **library crate identifier** ([`AppMeta::
+/// lib_ident`]) — `[lib].name` when set, else the dash-to-underscore package
+/// name.
+///
 /// Uses `Modify` for `main.rs` (an intentional rewrite, not a collision) and
 /// `CreateIfAbsent` for `lib.rs` — so `autumn destroy tauri-mobile` removes
 /// the `src-tauri/` shell but leaves the extracted (still fully functional)
@@ -455,11 +554,10 @@ async fn mount_offline_sync(app: autumn_web::app::AppBuilder) -> autumn_web::app
 /// depends on.
 fn plan_lib_extraction(
     project_root: &Path,
-    package_name: &str,
+    crate_ident: &str,
     offline_sync: bool,
     plan: &mut Plan,
 ) {
-    let crate_ident = package_name.replace('-', "_");
     let main_path = project_root.join("src").join("main.rs");
     let lib_path = project_root.join("src").join("lib.rs");
     let main_rs = read_or_empty(&main_path);
@@ -521,7 +619,7 @@ fn plan_lib_extraction(
         }
     }
     plan.create_if_absent(lib_path, lib_rs);
-    plan.modify(main_path, render_thin_app_main_rs(&crate_ident));
+    plan.modify(main_path, render_thin_app_main_rs(crate_ident));
 }
 
 /// The rewritten app `src/main.rs`: a thin caller of the extracted
@@ -715,9 +813,11 @@ const SYNC_SETUP_BLOCK: &str = r#"    // Offline sync: local-first app data live
     std::env::set_var("AUTUMN_SYNC__DB_PATH", sync_db.to_string_lossy().as_ref());
 "#;
 
+/// Render the shell's `src/lib.rs`. `crate_ident` is the app's library crate
+/// identifier ([`AppMeta::lib_ident`]) used for the `<crate_ident>::serve()`
+/// call — `[lib].name` when the app sets one.
 #[allow(clippy::too_many_lines)]
-fn render_mobile_lib_rs(package_name: &str, offline_sync: bool) -> String {
-    let crate_ident = package_name.replace('-', "_");
+fn render_mobile_lib_rs(package_name: &str, crate_ident: &str, offline_sync: bool) -> String {
     let sync_doc = if offline_sync { SYNC_LIB_DOC } else { "" };
     let sync_env_block = if offline_sync { SYNC_ENV_BLOCK } else { "" };
     let sync_setup = if offline_sync { SYNC_SETUP_BLOCK } else { "" };
@@ -1274,7 +1374,7 @@ mod tests {
 
     #[test]
     fn lib_rs_spawns_in_process_server_with_pool_defaults() {
-        let lib = render_mobile_lib_rs("my-app", false);
+        let lib = render_mobile_lib_rs("my-app", "my_app", false);
         assert!(lib.contains("tauri::Builder::default()"));
         assert!(lib.contains(".setup("));
         assert!(lib.contains("std::thread::spawn"));
@@ -1291,7 +1391,7 @@ mod tests {
 
     #[test]
     fn lib_rs_pins_prod_profile_in_release_builds() {
-        let lib = render_mobile_lib_rs("my-app", false);
+        let lib = render_mobile_lib_rs("my-app", "my_app", false);
         // Release builds must run the prod profile: serve() bypasses the
         // #[autumn_web::main] macro that would otherwise mark release builds,
         // so leaving AUTUMN_ENV unset would silently fall back to dev
@@ -1306,7 +1406,7 @@ mod tests {
 
     #[test]
     fn lib_rs_sets_env_before_tauri_builder_starts() {
-        let lib = render_mobile_lib_rs("my-app", false);
+        let lib = render_mobile_lib_rs("my-app", "my_app", false);
         // std::env::set_var is only sound before other (platform) threads
         // exist; the static env block must precede tauri::Builder in run().
         let env_pos = lib
@@ -1326,7 +1426,7 @@ mod tests {
 
     #[test]
     fn lib_rs_surfaces_startup_failure_in_a_visible_error_page() {
-        let lib = render_mobile_lib_rs("my-app", false);
+        let lib = render_mobile_lib_rs("my-app", "my_app", false);
         assert!(
             lib.contains("fn show_startup_error("),
             "startup failures must surface a visible error, not a silent exit"
@@ -1452,12 +1552,178 @@ mod tests {
         )
         .unwrap();
 
-        let (name, version, has_embed_assets) = read_app_meta(&app).unwrap();
-        assert_eq!(name, "app");
-        assert_eq!(version, "9.9.9");
+        let meta = read_app_meta(&app).unwrap();
+        assert_eq!(meta.package_name, "app");
+        assert_eq!(meta.version, "9.9.9");
         assert!(
-            !has_embed_assets,
+            !meta.has_embed_assets,
             "no [features] table means no embed-assets feature"
+        );
+    }
+
+    #[test]
+    fn read_app_meta_defaults_lib_ident_to_underscored_package_name() {
+        let tmp = app_dir("my-app");
+        let meta = read_app_meta(tmp.path()).unwrap();
+        assert_eq!(meta.lib_ident, "my_app");
+    }
+
+    #[test]
+    fn read_app_meta_honors_custom_lib_name() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"my-app\"\nversion = \"0.2.3\"\n\n\
+             [lib]\nname = \"custom_lib\"\n",
+        )
+        .unwrap();
+        let meta = read_app_meta(tmp.path()).unwrap();
+        assert_eq!(
+            meta.lib_ident, "custom_lib",
+            "[lib].name must win over the dash-to-underscore package name"
+        );
+    }
+
+    #[test]
+    fn plan_uses_custom_lib_name_for_all_serve_call_sites() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"my-app\"\nversion = \"0.2.3\"\n\n\
+             [lib]\nname = \"custom_lib\"\n\n\
+             [features]\nembed-assets = [\"autumn-web/embed-assets\"]\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/main.rs"), stock_main_rs()).unwrap();
+
+        let plan = plan_tauri_mobile(tmp.path(), TauriMobileOptions::default()).unwrap();
+
+        // Shell lib.rs must call custom_lib::serve(), not my_app::serve().
+        let shell_lib = plan
+            .actions
+            .iter()
+            .find(|a| {
+                a.path()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+                    .ends_with("src-tauri/src/lib.rs")
+            })
+            .expect("plan must create the shell src/lib.rs");
+        let Action::Create { contents, .. } = shell_lib else {
+            panic!("shell lib.rs must be a Create action, got {shell_lib:?}");
+        };
+        assert!(
+            contents.contains("block_on(custom_lib::serve())"),
+            "shell lib.rs must call the custom [lib] name"
+        );
+        assert!(
+            !contents.contains("my_app::serve()"),
+            "shell lib.rs must not call the dash-to-underscore package name"
+        );
+
+        // The rewritten app main.rs must call custom_lib::serve() too.
+        let main_action =
+            app_src_action(&plan, "main.rs").expect("plan must rewrite the app src/main.rs");
+        let Action::Modify { contents, .. } = main_action else {
+            panic!("app main.rs must be a Modify action, got {main_action:?}");
+        };
+        assert!(
+            contents.contains("custom_lib::serve().await;"),
+            "thin main.rs must call the custom [lib] name"
+        );
+    }
+
+    #[test]
+    fn extraction_reruns_silently_with_custom_lib_name() {
+        // Re-run detection matches on `<lib_ident>::serve()` — with a custom
+        // [lib] name the already-extracted thin main.rs must be recognised.
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"my-app\"\nversion = \"0.2.3\"\n\n\
+             [lib]\nname = \"custom_lib\"\n\n\
+             [features]\nembed-assets = [\"autumn-web/embed-assets\"]\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(
+            tmp.path().join("src/main.rs"),
+            render_thin_app_main_rs("custom_lib"),
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("src/lib.rs"), "pub async fn serve() {}\n").unwrap();
+
+        let plan = plan_tauri_mobile(tmp.path(), TauriMobileOptions::default()).unwrap();
+        assert!(plan.warnings.is_empty(), "got {:?}", plan.warnings);
+        assert!(app_src_action(&plan, "main.rs").is_none());
+    }
+
+    #[test]
+    fn guard_refuses_desktop_leftovers() {
+        let tmp = app_dir("my-app");
+        let tauri = tmp.path().join("src-tauri");
+        std::fs::create_dir_all(&tauri).unwrap();
+        std::fs::write(tauri.join("stage-sidecar.sh"), "#!/bin/sh\n").unwrap();
+
+        let err = ensure_no_other_mode_scaffold(tmp.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("desktop (sidecar)"), "got: {err}");
+        assert!(err.contains("src-tauri/stage-sidecar.sh"), "got: {err}");
+        assert!(err.contains("autumn destroy tauri"), "got: {err}");
+    }
+
+    #[test]
+    fn guard_refuses_thin_client_leftovers() {
+        let tmp = app_dir("my-app");
+        let caps = tmp.path().join("src-tauri").join("capabilities");
+        std::fs::create_dir_all(&caps).unwrap();
+        std::fs::write(caps.join("remote-app.json"), "{}\n").unwrap();
+
+        let err = ensure_no_other_mode_scaffold(tmp.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("thin-client"), "got: {err}");
+        assert!(
+            err.contains("src-tauri/capabilities/remote-app.json"),
+            "got: {err}"
+        );
+        assert!(
+            err.contains("autumn destroy tauri --remote-url"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn guard_allows_clean_tree_and_same_mode_regenerate() {
+        // No src-tauri/ at all.
+        let clean = app_dir("my-app");
+        assert!(ensure_no_other_mode_scaffold(clean.path()).is_ok());
+
+        // An existing MOBILE scaffold (same mode) carries none of the other
+        // modes' marker files, so a --force regenerate keeps working.
+        let mobile = app_dir("my-app");
+        let tauri = mobile.path().join("src-tauri");
+        std::fs::create_dir_all(tauri.join("src")).unwrap();
+        std::fs::write(
+            tauri.join("tauri.conf.json"),
+            render_mobile_tauri_conf("my-app", "0.1.0"),
+        )
+        .unwrap();
+        std::fs::write(
+            tauri.join("Cargo.toml"),
+            render_mobile_cargo_toml("my-app", true, None),
+        )
+        .unwrap();
+        std::fs::write(
+            tauri.join("src").join("lib.rs"),
+            render_mobile_lib_rs("my-app", "my_app", false),
+        )
+        .unwrap();
+        assert!(
+            ensure_no_other_mode_scaffold(mobile.path()).is_ok(),
+            "same-mode regenerate must not be blocked by the guard"
         );
     }
 
@@ -1512,7 +1778,7 @@ mod tests {
 
     #[test]
     fn offline_lib_rs_wires_store_engine_and_resume_trigger() {
-        let lib = render_mobile_lib_rs("my-app", true);
+        let lib = render_mobile_lib_rs("my-app", "my_app", true);
         // Local store in the sandbox, exported for the app's routes.
         assert!(lib.contains(r#"let sync_db = data_root.join("sync.db");"#));
         assert!(lib.contains(r#""AUTUMN_SYNC__DB_PATH""#));
@@ -1536,7 +1802,7 @@ mod tests {
     /// from conditionals, so pin the default output byte-for-byte.
     #[test]
     fn default_lib_rs_matches_the_golden_snapshot() {
-        let generated = render_mobile_lib_rs("golden-app", false);
+        let generated = render_mobile_lib_rs("golden-app", "golden_app", false);
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/golden/tauri_mobile_default_lib.rs.golden"
@@ -1556,7 +1822,7 @@ mod tests {
 
     #[test]
     fn lib_rs_without_offline_flag_has_no_sync_wiring() {
-        let lib = render_mobile_lib_rs("my-app", false);
+        let lib = render_mobile_lib_rs("my-app", "my_app", false);
         assert!(!lib.contains("AUTUMN_SYNC"));
         assert!(!lib.contains("sync_once"));
         assert!(!lib.contains("SYNC_KICK"));
