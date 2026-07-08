@@ -352,6 +352,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Accept-Encoding` accepts them, instead of relying solely on the
   general-purpose compression middleware to redo that work on every request.
 
+- **ci:** plugin freshness gate (`scripts/check-plugin-freshness.sh` +
+  `.github/workflows/plugin-freshness.yml`) — a PR that adds entries to this
+  changelog's Unreleased `Added`/`Changed` sections without touching the
+  Claude plugin (`skills/`, `agents/`, `.claude-plugin/`) fails a fast,
+  toolchain-free check; exempt with a `[no-plugin]` token in the bullet or PR
+  body, or the `plugin-exempt` label. The same job sanity-checks that
+  `plugin.json` parses and that every `docs/guide/*.md` path referenced from
+  the plugin exists. Run `scripts/check-plugin-freshness.sh --self-test`
+  locally.
+
+### Documentation
+
+- **plugin:** refresh the Claude plugin to current framework state. Adds
+  prominent `#[state_machine]` coverage (attribute syntax, generated
+  `can_transition_{field}_to` / `transition_{field}_to`, guards, and a
+  `before_update` example replacing hand-rolled status validation), a
+  "Prefer framework idioms over raw Diesel/Axum" steering table, the
+  generated-repository method surface (pagination, bulk ops, read routing,
+  hooks), `Db::tx_with`/`TxOptions`, jobs additions (uniqueness/concurrency,
+  named queues, tracked jobs), events/listeners, cache stampede protection,
+  view widgets + `WIDGETS_CSS`, sharding, `autumn serve`, `autumn destroy`,
+  the `references`/`enum{...}`/`decimal`/`:unique` generator DSL, scoped
+  tokens, observability defaults, and load shedding. Features merged on
+  trunk-dev but absent from the published 0.5.0 crates are explicitly marked
+  "(unreleased)", and in-flight PRs (#1587 `form_for`, #1592
+  `find_in_batches`) are flagged as unmerged rather than documented as
+  available. Fixes stale claims (foreign keys/unique "not in the DSL", the
+  removed `--test repo_hygiene` target, `with_pool` →
+  `with_pool_untracked`).
+
 ## [0.6.0] - 2026-06-30
 
 ### Added
