@@ -1164,6 +1164,118 @@ fn field_has_serde_rename(field: &syn::Field) -> bool {
     renamed
 }
 
+/// The struct-level `#[serde(rename_all = "...")]` casing rule that applies
+/// to *serialization*, if any. Handles both the plain form and the split
+/// `rename_all(serialize = "...", deserialize = "...")` form (taking the
+/// `serialize` side — that is what `Changeset::field_value` indexes by).
+///
+/// Same parsing convention as `field_has_serde_rename`: a `#[serde(...)]`
+/// list this parser can't fully walk simply yields no rule (the real serde
+/// derive still validates the attribute itself).
+fn serde_rename_all_serialize_rule(attrs: &[syn::Attribute]) -> Option<String> {
+    let mut rule = None;
+    for attr in attrs.iter().filter(|a| a.path().is_ident("serde")) {
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("rename_all") {
+                if let Ok(value) = meta.value() {
+                    // rename_all = "camelCase"
+                    if let Ok(syn::Lit::Str(s)) = value.parse::<syn::Lit>() {
+                        rule = Some(s.value());
+                    }
+                } else {
+                    // rename_all(serialize = "...", deserialize = "...")
+                    let _ = meta.parse_nested_meta(|inner| {
+                        if let Ok(value) = inner.value()
+                            && let Ok(syn::Lit::Str(s)) = value.parse::<syn::Lit>()
+                            && inner.path.is_ident("serialize")
+                        {
+                            rule = Some(s.value());
+                        }
+                        Ok(())
+                    });
+                }
+            } else if let Ok(value) = meta.value() {
+                // Consume any `= value` so sibling metas keep parsing.
+                let _: syn::Result<syn::Lit> = value.parse();
+            }
+            Ok(())
+        });
+    }
+    rule
+}
+
+/// The field-level `#[serde(rename = "...")]` name that applies to
+/// *serialization*, if any. Handles both the plain form and the split
+/// `rename(serialize = "...", deserialize = "...")` form (taking the
+/// `serialize` side). Field-level `rename` overrides a struct-level
+/// `rename_all`, mirroring serde's own precedence.
+fn field_serde_serialize_rename(field: &syn::Field) -> Option<String> {
+    let mut renamed = None;
+    for attr in field.attrs.iter().filter(|a| a.path().is_ident("serde")) {
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("rename") {
+                if let Ok(value) = meta.value() {
+                    // rename = "headline"
+                    if let Ok(syn::Lit::Str(s)) = value.parse::<syn::Lit>() {
+                        renamed = Some(s.value());
+                    }
+                } else {
+                    // rename(serialize = "...", deserialize = "...")
+                    let _ = meta.parse_nested_meta(|inner| {
+                        if let Ok(value) = inner.value()
+                            && let Ok(syn::Lit::Str(s)) = value.parse::<syn::Lit>()
+                            && inner.path.is_ident("serialize")
+                        {
+                            renamed = Some(s.value());
+                        }
+                        Ok(())
+                    });
+                }
+            } else if let Ok(value) = meta.value() {
+                // Consume any `= value` so sibling metas keep parsing.
+                let _: syn::Result<syn::Lit> = value.parse();
+            }
+            Ok(())
+        });
+    }
+    renamed
+}
+
+/// Apply a struct-level `#[serde(rename_all = "...")]` casing rule to a
+/// (`snake_case`) field identifier, mirroring `serde_derive`'s
+/// `RenameRule::apply_to_field`. Returns `None` for a rule string serde
+/// itself would reject (the `Serialize` derive on the emitted struct then
+/// reports the error — no point duplicating it here).
+fn apply_serde_rename_all_rule(rule: &str, field: &str) -> Option<String> {
+    fn pascal(field: &str) -> String {
+        field
+            .split('_')
+            .map(|word| {
+                let mut chars = word.chars();
+                chars.next().map_or_else(String::new, |first| {
+                    first.to_uppercase().collect::<String>() + chars.as_str()
+                })
+            })
+            .collect()
+    }
+    match rule {
+        // serde treats fields as already snake_case/lowercase.
+        "lowercase" | "snake_case" => Some(field.to_owned()),
+        "UPPERCASE" | "SCREAMING_SNAKE_CASE" => Some(field.to_ascii_uppercase()),
+        "PascalCase" => Some(pascal(field)),
+        "camelCase" => {
+            let pascal = pascal(field);
+            let mut chars = pascal.chars();
+            chars
+                .next()
+                .map(|first| first.to_lowercase().collect::<String>() + chars.as_str())
+        }
+        "kebab-case" => Some(field.replace('_', "-")),
+        "SCREAMING-KEBAB-CASE" => Some(field.to_ascii_uppercase().replace('_', "-")),
+        _ => None,
+    }
+}
+
 /// Parse the struct-level language dictionary configuration from `#[searchable(language = "...")]`
 fn parse_model_searchable_lang(attrs: &[syn::Attribute]) -> syn::Result<Option<String>> {
     for attr in attrs {
@@ -1565,9 +1677,23 @@ fn datetime_local_serde_attr(ty: &syn::Type) -> Option<TokenStream> {
 /// primary key, `#[default]`, and `#[lock_version]` columns).
 ///
 /// This is what lets `form_for::<T>(...)` render a whole form in one call: the
-/// descriptor carries each field's serialized name, humanized label,
+/// descriptor carries each field's name (the Rust identifier — the POST key
+/// the generated `NewX`/`UpdateX` decode by), humanized label,
 /// type-appropriate control, and `required` flag (derived from non-`Option`).
-fn emit_form_model_impl(name: &syn::Ident, fields_for_new: &[&&Field]) -> TokenStream {
+///
+/// `rename_all_rule` is the struct-level `#[serde(rename_all = "...")]`
+/// serialization rule, if any. When a column's serde-effective *serialized*
+/// key differs from its identifier (field-level `#[serde(rename)]` wins over
+/// `rename_all`, mirroring serde), the descriptor records that key as
+/// `FormField::value_name` so `form_for`'s pre-fill lookup
+/// (`Changeset::field_value`, which indexes the changeset's serialized data)
+/// still finds the value — while the rendered input `name` stays the
+/// identifier the insert struct expects.
+fn emit_form_model_impl(
+    name: &syn::Ident,
+    fields_for_new: &[&&Field],
+    rename_all_rule: Option<&str>,
+) -> TokenStream {
     let field_exprs: Vec<TokenStream> = fields_for_new
         .iter()
         .filter_map(|f| {
@@ -1580,6 +1706,12 @@ fn emit_form_model_impl(name: &syn::Ident, fields_for_new: &[&&Field]) -> TokenS
                 .unwrap_or_else(|| f.ty.clone());
             let control = form_control_tokens(&inner, nullable);
             let required = !nullable;
+            let serialized_name = field_serde_serialize_rename(f).or_else(|| {
+                rename_all_rule.and_then(|rule| apply_serde_rename_all_rule(rule, field_name))
+            });
+            let value_name = serialized_name
+                .filter(|serialized| serialized != field_name)
+                .map(|serialized| quote! { .with_value_name(#serialized) });
             Some(quote! {
                 ::autumn_web::form::FormField::new(
                     #field_name,
@@ -1587,6 +1719,7 @@ fn emit_form_model_impl(name: &syn::Ident, fields_for_new: &[&&Field]) -> TokenS
                     #control,
                     #required,
                 )
+                #value_name
             })
         })
         .collect();
@@ -3284,8 +3417,15 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     // `impl FormModel for #name` (issue #1135) -- one descriptor per editable
-    // column, driving the single-call `form_for::<#name>(...)` builder.
-    let form_model_impl = emit_form_model_impl(name, &fields_for_new);
+    // column, driving the single-call `form_for::<#name>(...)` builder. The
+    // struct-level `rename_all` serialization rule (attrs pass through to the
+    // emitted query struct's `Serialize` derive) feeds the descriptors'
+    // pre-fill lookup keys for serde-renamed columns.
+    let form_model_impl = emit_form_model_impl(
+        name,
+        &fields_for_new,
+        serde_rename_all_serialize_rule(outer_attrs).as_deref(),
+    );
 
     quote! {
         #encrypted_use
@@ -3708,6 +3848,83 @@ pub fn pascal_to_snake(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Serde-rename resolution for FormField::value_name (#1135) ─────────
+
+    #[test]
+    fn field_serde_serialize_rename_parses_plain_and_split_forms() {
+        let field: syn::Field = syn::Field::parse_named
+            .parse2(quote! { #[serde(rename = "headline")] pub title: String })
+            .unwrap();
+        assert_eq!(
+            field_serde_serialize_rename(&field).as_deref(),
+            Some("headline")
+        );
+
+        let field: syn::Field = syn::Field::parse_named
+            .parse2(quote! {
+                #[serde(rename(serialize = "out", deserialize = "in"))]
+                pub title: String
+            })
+            .unwrap();
+        assert_eq!(field_serde_serialize_rename(&field).as_deref(), Some("out"));
+
+        // Deserialize-only rename leaves the serialized key alone.
+        let field: syn::Field = syn::Field::parse_named
+            .parse2(quote! { #[serde(rename(deserialize = "in"))] pub title: String })
+            .unwrap();
+        assert_eq!(field_serde_serialize_rename(&field), None);
+
+        let field: syn::Field = syn::Field::parse_named
+            .parse2(quote! { #[serde(default)] pub title: String })
+            .unwrap();
+        assert_eq!(field_serde_serialize_rename(&field), None);
+    }
+
+    #[test]
+    fn serde_rename_all_serialize_rule_parses_plain_and_split_forms() {
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[serde(rename_all = "camelCase")])];
+        assert_eq!(
+            serde_rename_all_serialize_rule(&attrs).as_deref(),
+            Some("camelCase")
+        );
+
+        let attrs: Vec<syn::Attribute> = vec![syn::parse_quote!(
+            #[serde(rename_all(serialize = "kebab-case", deserialize = "camelCase"))]
+        )];
+        assert_eq!(
+            serde_rename_all_serialize_rule(&attrs).as_deref(),
+            Some("kebab-case")
+        );
+
+        let attrs: Vec<syn::Attribute> = vec![syn::parse_quote!(#[serde(deny_unknown_fields)])];
+        assert_eq!(serde_rename_all_serialize_rule(&attrs), None);
+    }
+
+    #[test]
+    fn apply_serde_rename_all_rule_mirrors_serde_field_casings() {
+        let cases = [
+            ("lowercase", "word_count", "word_count"),
+            ("snake_case", "word_count", "word_count"),
+            ("UPPERCASE", "word_count", "WORD_COUNT"),
+            ("SCREAMING_SNAKE_CASE", "word_count", "WORD_COUNT"),
+            ("PascalCase", "word_count", "WordCount"),
+            ("camelCase", "word_count", "wordCount"),
+            ("camelCase", "title", "title"),
+            ("kebab-case", "word_count", "word-count"),
+            ("SCREAMING-KEBAB-CASE", "word_count", "WORD-COUNT"),
+        ];
+        for (rule, field, expected) in cases {
+            assert_eq!(
+                apply_serde_rename_all_rule(rule, field).as_deref(),
+                Some(expected),
+                "rule {rule} on {field}"
+            );
+        }
+        // A rule serde itself rejects resolves to no rename here.
+        assert_eq!(apply_serde_rename_all_rule("bogusCase", "word_count"), None);
+    }
 
     // ── RED: #[lock_version] detection ────────────────────────────────────
     // These tests cover the new `excluded_from_new` behaviour (must also

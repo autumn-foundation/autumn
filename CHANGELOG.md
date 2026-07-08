@@ -70,6 +70,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ChangesetForm`/`form_for` round-trip reaches it, and its JSON PATCH bodies
   are RFC 3339, which already decodes. Required `NaiveDate` columns need no
   treatment (the browser's `YYYY-MM-DD` is exactly chrono's wire shape).
+  Serde-renamed columns: a model field carrying `#[serde(rename = "...")]`
+  (or covered by a struct-level `#[serde(rename_all = "...")]`, both of which
+  pass through to the emitted model struct's `Serialize` derive) serializes
+  under a key that differs from its Rust identifier, and `form_for`'s
+  pre-fill lookup (`Changeset::field_value`) indexes serialized data — so
+  edit forms for renamed fields rendered blank/unselected values despite the
+  data being present. `FormField` now carries the serde-effective serialized
+  key separately as a new `value_name: Option<String>` field (constructor
+  defaults it to `None` = same as `name`; set via the new
+  `FormField::with_value_name`), which the `#[model]` derive resolves
+  automatically — field-level `rename`/`rename(serialize = ...)` wins over
+  struct-level `rename_all`, mirroring serde, with all eight serde field
+  casings implemented. `form_for` uses `value_name` **only** for the value
+  pre-fill; the rendered input `name`/`id`, error lookup, and
+  `.exclude`/`.override_*` matching keep the Rust identifier, which is what
+  the generated `NewX`/`UpdateX` structs (which do not propagate serde
+  renames) decode by. Hand-written `FormModel` impls over renaming data
+  types should call `.with_value_name(...)` themselves. (`FormField` gains a
+  public field; code constructing it via struct literal instead of
+  `FormField::new` needs the extra field.)
   `FieldControl` is `#[non_exhaustive]` (new control kinds won't be
   semver-major); duplicate `.override_field`/`.override_label` calls on the
   same field now resolve last-wins; `FieldControl::File` renders the same

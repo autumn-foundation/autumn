@@ -1890,8 +1890,17 @@ pub enum FieldControl {
 /// form control.
 #[derive(Debug, Clone)]
 pub struct FormField {
-    /// The field's `name`/`id` attribute — must match the changeset's
-    /// serialized field name.
+    /// The field's `name`/`id` attribute — i.e. the key the browser POSTs
+    /// this control under, which must match what the form's decode target
+    /// (e.g. the `#[model]`-generated `NewX` insert struct) expects. Also
+    /// the key [`Changeset::errors_for`] messages are looked up by, and the
+    /// key [`FormFor::exclude`]/[`FormFor::override_field`]/
+    /// [`FormFor::override_label`] match on.
+    ///
+    /// When the changeset's data type serializes this field under a
+    /// *different* key (a serde rename), set [`FormField::value_name`] so the
+    /// pre-filled value is still found — `name` itself deliberately stays the
+    /// POST key, not the serialized key.
     pub name: String,
     /// The human-readable `<label>` text.
     pub label: String,
@@ -1901,10 +1910,27 @@ pub struct FormField {
     /// attribute + `aria-required="true"`), where a required variant of the
     /// control exists.
     pub required: bool,
+    /// The serde-effective *serialized* key of this field on the changeset's
+    /// data type, when it differs from [`FormField::name`] (e.g.
+    /// `#[serde(rename = "headline")]` or a struct-level
+    /// `#[serde(rename_all = "camelCase")]`). Used **only** to look up the
+    /// pre-filled value via [`Changeset::field_value`]; the rendered
+    /// `name`/`id` attributes, error lookup, and builder matching all keep
+    /// using [`FormField::name`]. `None` means the serialized key equals
+    /// `name` (the common case).
+    ///
+    /// The `#[model]`-derived [`FormModel`] sets this automatically for
+    /// serde-renamed columns; hand-written descriptors use
+    /// [`FormField::with_value_name`].
+    pub value_name: Option<String>,
 }
 
 impl FormField {
     /// Construct a new field descriptor.
+    ///
+    /// The pre-fill lookup key ([`FormField::value_name`]) defaults to
+    /// `name`; use [`FormField::with_value_name`] when the changeset's data
+    /// type serializes the field under a different (serde-renamed) key.
     #[must_use]
     pub fn new(
         name: impl Into<String>,
@@ -1917,7 +1943,17 @@ impl FormField {
             label: label.into(),
             control,
             required,
+            value_name: None,
         }
+    }
+
+    /// Set the serialized key used to pre-fill this field's value from the
+    /// changeset (see [`FormField::value_name`]), returning `self` for
+    /// chaining after [`FormField::new`].
+    #[must_use]
+    pub fn with_value_name(mut self, value_name: impl Into<String>) -> Self {
+        self.value_name = Some(value_name.into());
+        self
     }
 }
 
@@ -1975,6 +2011,25 @@ pub trait FormModel {
 /// `YYYY-MM-DD` wire shape is exactly what chrono's `NaiveDate`
 /// `Deserialize` accepts. Hand-written form targets must attach the
 /// deserializers themselves — see each helper's documentation.
+///
+/// # Serde-renamed fields
+///
+/// A model column carrying `#[serde(rename = "...")]` (or covered by a
+/// struct-level `#[serde(rename_all = "...")]`) serializes under a key that
+/// differs from its Rust identifier, and [`Changeset::field_value`] — which
+/// pre-fills every control by serializing the changeset's data — indexes by
+/// that *serialized* key. The rendered input `name`, however, must stay the
+/// Rust identifier: the `#[model]`-generated `NewX`/`UpdateX` structs the
+/// form posts into do **not** propagate serde renames, so they decode by
+/// identifier. [`FormField`] therefore carries the two keys separately:
+/// [`FormField::name`] is the input `name`/`id`/error-lookup key, and
+/// [`FormField::value_name`] is the serde-effective serialized key used only
+/// for the pre-fill lookup. The `#[model]`-derived [`FormModel`] resolves
+/// field-level `rename`/`rename(serialize = ...)` and struct-level
+/// `rename_all` automatically; hand-written [`FormModel`] impls whose data
+/// type renames fields must call [`FormField::with_value_name`] themselves.
+/// Validation errors stay keyed by the Rust identifier (the `validator`
+/// crate reports the field ident, and the generated `NewX` has no renames).
 ///
 /// # Example
 ///
@@ -2193,9 +2248,70 @@ fn effective_form_fields<T: FormModel>(
         .collect()
 }
 
-/// Dispatch a single [`FormField`] to the matching typed-input helper.
+/// Serialize adapter that re-exposes one serde-renamed field of `data`
+/// under the descriptor's [`FormField::name`], so the typed-input helpers'
+/// [`Changeset::field_value`] lookup (keyed by the rendered input name)
+/// finds the value that `data` actually serializes under
+/// [`FormField::value_name`].
+///
+/// Serializes as a single-entry map `{ exposed_name: data.serialized_name }`
+/// (`null` when the serialized key is absent, which [`Changeset::field_value`]
+/// renders as an empty value — same as any missing field today).
+#[cfg(feature = "maud")]
+struct PrefillAlias<'a, T> {
+    /// The changeset's inner data (serialized in full, then re-keyed).
+    data: &'a T,
+    /// The serde-effective key `data` serializes the field under.
+    serialized_name: &'a str,
+    /// The key the rendering helpers look the value up by (`FormField::name`).
+    exposed_name: &'a str,
+}
+
+#[cfg(feature = "maud")]
+impl<T: Serialize> Serialize for PrefillAlias<'_, T> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::{Error as _, SerializeMap as _};
+        let value = serde_json::to_value(self.data).map_err(S::Error::custom)?;
+        let field_value = value
+            .get(self.serialized_name)
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let mut map = serializer.serialize_map(Some(1))?;
+        map.serialize_entry(self.exposed_name, &field_value)?;
+        map.end()
+    }
+}
+
+/// Render a single [`FormField`], routing the pre-fill lookup through the
+/// field's serialized key ([`FormField::value_name`]) when it differs from
+/// the rendered input name — see [`PrefillAlias`]. Everything else (input
+/// `name`/`id`, error lookup) stays keyed by [`FormField::name`].
 #[cfg(feature = "maud")]
 fn render_form_field<T: Serialize>(changeset: &Changeset<T>, field: &FormField) -> maud::Markup {
+    if let Some(value_name) = field
+        .value_name
+        .as_deref()
+        .filter(|value_name| *value_name != field.name)
+    {
+        let aliased = Changeset::from_errors(
+            PrefillAlias {
+                data: changeset.data(),
+                serialized_name: value_name,
+                exposed_name: &field.name,
+            },
+            changeset.errors().clone(),
+        );
+        return render_form_control(&aliased, field);
+    }
+    render_form_control(changeset, field)
+}
+
+/// Dispatch a single [`FormField`] to the matching typed-input helper.
+#[cfg(feature = "maud")]
+fn render_form_control<T: Serialize>(changeset: &Changeset<T>, field: &FormField) -> maud::Markup {
     match &field.control {
         FieldControl::Text => {
             if field.required {
@@ -3989,6 +4105,45 @@ mod tests {
             views: 0,
             published: false,
         }
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn form_for_prefills_serde_renamed_field_via_value_name() {
+        // The data type serializes `title` under "headline" — field_value
+        // indexes serialized output, so without value_name routing the
+        // pre-fill would come back blank even though the data is present.
+        #[derive(serde::Serialize)]
+        struct RenamedModel {
+            #[serde(rename = "headline")]
+            title: String,
+        }
+        impl FormModel for RenamedModel {
+            fn form_fields() -> Vec<FormField> {
+                vec![
+                    FormField::new("title", "Title", FieldControl::Text, true)
+                        .with_value_name("headline"),
+                ]
+            }
+        }
+
+        let mut errors = HashMap::new();
+        errors.insert("title".to_string(), vec!["too short".to_string()]);
+        let cs = Changeset::from_errors(
+            RenamedModel {
+                title: "Hello".into(),
+            },
+            errors,
+        );
+        let html = form_for(&cs, "/posts", "post").render().into_string();
+
+        // The POST key / id stays the Rust identifier…
+        assert!(html.contains(r#"name="title""#), "{html}");
+        assert!(!html.contains(r#"name="headline""#), "{html}");
+        // …the value is pre-filled through the serialized key…
+        assert!(html.contains(r#"value="Hello""#), "{html}");
+        // …and errors stay keyed by the identifier.
+        assert!(html.contains("too short"), "{html}");
     }
 
     #[cfg(feature = "maud")]

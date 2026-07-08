@@ -262,6 +262,88 @@ fn derived_new_struct_still_decodes_rfc3339_json_bodies() {
     assert_eq!(new_event.ends_at, None);
 }
 
+diesel::table! {
+    reviews (id) {
+        id -> Integer,
+        title -> Text,
+        author_name -> Text,
+        word_count -> Integer,
+    }
+}
+
+// Struct-level `rename_all` plus a field-level `rename` override — both pass
+// through to the emitted model struct's `Serialize` derive, so the model's
+// JSON keys are "headline", "authorName", and "wordCount".
+#[autumn_web::model(table = "reviews")]
+#[serde(rename_all = "camelCase")]
+pub struct Review {
+    pub id: i32,
+    #[serde(rename = "headline")]
+    pub title: String,
+    pub author_name: String,
+    pub word_count: i32,
+}
+
+#[test]
+fn derived_form_fields_resolve_serde_renames_into_value_name() {
+    // Regression test (Codex P2 on #1587): `FormField.name` must stay the
+    // Rust identifier (the POST key the generated `NewReview` decodes by),
+    // while the serde-effective serialized key lands in `value_name` so the
+    // pre-fill lookup (`Changeset::field_value`, which indexes serialized
+    // data) still finds the value.
+    let fields = Review::form_fields();
+    let names: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(names, ["title", "author_name", "word_count"]);
+
+    // Field-level rename wins over the struct-level rename_all.
+    assert_eq!(fields[0].value_name.as_deref(), Some("headline"));
+    assert_eq!(fields[1].value_name.as_deref(), Some("authorName"));
+    assert_eq!(fields[2].value_name.as_deref(), Some("wordCount"));
+}
+
+#[test]
+fn form_for_prefills_serde_renamed_fields_and_posts_rust_identifiers() {
+    // Regression test (Codex P2 on #1587): an edit form for a model with
+    // serde renames must pre-fill from the renamed serialized keys — before
+    // the `value_name` routing, `field_value("title")` found no "title" key
+    // in the serialized JSON (it's "headline") and rendered blank inputs
+    // despite the data being present.
+    let changeset = Changeset::new(Review {
+        id: 1,
+        title: "Great read".into(),
+        author_name: "Jane Doe".into(),
+        word_count: 812,
+    });
+    let html = form_for(&changeset, "/reviews/1", "put")
+        .csrf("tok")
+        .render()
+        .into_string();
+
+    // Values come from the serde-renamed serialized keys…
+    assert!(html.contains(r#"value="Great read""#), "{html}");
+    assert!(html.contains(r#"value="Jane Doe""#), "{html}");
+    assert!(html.contains(r#"value="812""#), "{html}");
+    // …while the POST keys stay the Rust identifiers the generated insert
+    // struct expects (NewX does not propagate serde renames)…
+    assert!(html.contains(r#"name="title""#), "{html}");
+    assert!(html.contains(r#"name="author_name""#), "{html}");
+    assert!(html.contains(r#"name="word_count""#), "{html}");
+    // …and the serialized keys never leak into the rendered form.
+    assert!(!html.contains(r#"name="headline""#), "{html}");
+    assert!(!html.contains(r#"name="authorName""#), "{html}");
+    assert!(!html.contains(r#"name="wordCount""#), "{html}");
+
+    // A browser round-trips exactly those identifier keys; the generated
+    // insert struct decodes them through the same serde_urlencoded machinery
+    // axum's `Form`/ChangesetForm use.
+    let new_review: NewReview =
+        serde_urlencoded::from_str("title=Great+read&author_name=Jane+Doe&word_count=812")
+            .expect("form_for submission must decode into the generated insert struct");
+    assert_eq!(new_review.title, "Great read");
+    assert_eq!(new_review.author_name, "Jane Doe");
+    assert_eq!(new_review.word_count, 812);
+}
+
 #[test]
 fn form_for_override_promotes_field_to_select() {
     // The scaffold uses this exact escape hatch to turn an enum column into a
