@@ -2185,10 +2185,21 @@ mod tls {
         Ok(MakeRustlsConnect::new(config))
     }
 
+    /// Whether tokio-postgres would parse this connection string as a URL.
+    /// Its `Config::from_str` only treats `postgres://`/`postgresql://`
+    /// prefixes as URLs; everything else is keyword/value syntax. A substring
+    /// check like `contains("://")` would send keyword strings whose values
+    /// embed URL-like tokens (`password=https://…`) down the URL path, where
+    /// `url::Url::parse` fails and the TLS posture silently falls back to
+    /// [`TlsPosture::Off`].
+    fn is_url_connection_string(database_url: &str) -> bool {
+        database_url.starts_with("postgres://") || database_url.starts_with("postgresql://")
+    }
+
     /// Extract query/keyword parameters relevant to TLS from either a
     /// `postgres://…` URL or a `key=value …` connection string.
     fn ssl_params(database_url: &str) -> Vec<(String, String)> {
-        if database_url.contains("://") {
+        if is_url_connection_string(database_url) {
             url::Url::parse(database_url)
                 .map(|u| {
                     u.query_pairs()
@@ -2295,7 +2306,7 @@ mod tls {
     /// parse: `sslmode` downgraded to `require` (the handshake decision), and
     /// `sslrootcert` removed (consumed by [`verifying_connector`] instead).
     fn sanitize_for_verify_full(database_url: &str) -> String {
-        if database_url.contains("://") {
+        if is_url_connection_string(database_url) {
             let Ok(mut parsed) = url::Url::parse(database_url) else {
                 return database_url.to_owned();
             };
@@ -2526,6 +2537,29 @@ mod tls {
         }
 
         #[test]
+        fn keyword_strings_with_url_like_values_stay_on_the_keyword_path() {
+            // Regression: `contains("://")` sent this whole string to
+            // url::Url::parse, which failed, so sslmode=require silently
+            // became Off (plaintext). Only `postgres://`/`postgresql://`
+            // prefixes are URLs, exactly as in tokio-postgres.
+            assert_eq!(
+                TlsPosture::from_database_url("host=db password=https://secret sslmode=require"),
+                TlsPosture::Require
+            );
+            assert_eq!(
+                TlsPosture::from_database_url(
+                    "host=db options='-c foo=bar://baz' sslmode='verify-full'"
+                ),
+                TlsPosture::VerifyFull { root_cert: None }
+            );
+            // The alternate scheme spelling is still parsed as a URL.
+            assert_eq!(
+                TlsPosture::from_database_url("postgresql://u@h/db?sslmode=require"),
+                TlsPosture::Require
+            );
+        }
+
+        #[test]
         fn verify_ca_and_require_with_rootcert_fail_loudly() {
             assert!(matches!(
                 TlsPosture::from_database_url("postgres://u@h/db?sslmode=verify-ca"),
@@ -2568,6 +2602,13 @@ mod tls {
                 r"host=h sslmode = 'verify-full' sslrootcert='/path with space/ca.pem' password='it\'s'",
             );
             assert_eq!(kv, r"host=h sslmode=require password='it\'s'");
+
+            // URL-like values must not push a keyword string onto the URL
+            // branch (which would pass it through unsanitized).
+            let kv = sanitize_for_verify_full(
+                "host=h password=https://secret sslmode=verify-full sslrootcert=/etc/ca.pem",
+            );
+            assert_eq!(kv, "host=h password=https://secret sslmode=require");
         }
 
         #[test]
