@@ -1391,6 +1391,43 @@ mod tests {
         assert!(ids.contains(&"button-name"), "{ids:?}");
     }
 
+    // ── nav_bar full-page a11y (#1137) ──────────────────────────────
+
+    #[test]
+    fn nav_bar_full_page_passes_all_a11y_lints() {
+        use autumn_web::widgets::{NavBarConfig, NavItem, NavMenu, nav_bar};
+
+        let nav = nav_bar(
+            "/",
+            &NavBarConfig::new()
+                .brand("Acme", "/")
+                .item(NavItem::link("/", "Home"))
+                .item(NavItem::menu(
+                    NavMenu::new("Products").link("/widgets", "Widgets"),
+                ))
+                .trailing(NavItem::plain_link("/login", "Log in")),
+        )
+        .into_string();
+
+        let html = format!(
+            r##"<!DOCTYPE html>
+<html lang="en">
+<body>
+  <a href="#main-content" class="skip-link">Skip to content</a>
+  <header>{nav}</header>
+  <main id="main-content">Content</main>
+</body>
+</html>"##
+        );
+
+        let violations = analyse_html(&html);
+        assert!(
+            violations.is_empty(),
+            "nav_bar layout must pass autumn check --a11y: {:#?}",
+            violations.iter().map(|v| v.rule_id).collect::<Vec<_>>()
+        );
+    }
+
     // ── severity ordering ──────────────────────────────────────────
 
     #[test]

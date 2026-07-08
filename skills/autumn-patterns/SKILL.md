@@ -12,6 +12,20 @@ description: >
 Reference `skills/autumn-web/SKILL.md` for the API quick guide. This file
 covers patterns and design decisions that apply across an Autumn app.
 
+**First rule: prefer the framework idiom.** Before hand-rolling validation,
+CRUD queries, pagination, forms, auth checks, background threads, or caching,
+check the "Prefer framework idioms over raw Diesel/Axum" table in
+`skills/autumn-web/SKILL.md`. Raw Axum/Diesel is allowed but is a last resort.
+
+## Status fields: `#[state_machine]`, not hand-rolled checks
+
+When a model has a status/phase column with legal transitions, declare them
+with `#[state_machine(transitions(...))]` on the field and enforce with the
+generated `transition_{field}_to` in `before_update` — never write your own
+`match (old, new)` validation in hooks or handlers. See
+`docs/guide/state-machines.md` and the worked example in
+`skills/autumn-web/references/examples.md`.
+
 ## Testing with TestApp and TestClient
 
 The `test-support` feature ships an in-process test client. No running
@@ -104,9 +118,16 @@ async fn publish_post(Path(id): Path<i64>, mut db: Db) -> AutumnResult<Redirect>
 Use `#[job]` for request-triggered work with retries. Keep jobs idempotent —
 they may run more than once.
 
-The `#[job]` macro requires exactly two arguments: `AppState` and a typed
-args struct (serializable). The macro generates a `PascalCaseJob` struct with
-a static `enqueue` method.
+The `#[job]` macro takes `AppState` and a typed args struct (serializable).
+The macro generates a `PascalCaseJob` struct with a static `enqueue` method.
+On trunk-dev (unreleased — not in published 0.5.0) a job may also accept an
+optional third `JobContext` argument for progress reporting on tracked jobs,
+and a `queue = "name"` attribute for named priority queues.
+
+Published 0.5.0 also supports idempotency/backpressure attributes:
+`#[job(unique)]`, `unique_by = "field"`, `unique_for_ms = N`,
+`concurrency = N`, `concurrency_key = "field"` — prefer these over
+hand-rolled dedupe tables or semaphores.
 
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -39,7 +39,7 @@ Autumn ships a small CLI for project scaffolding and tooling setup. Install the
 published CLI from crates.io:
 
 ```bash
-cargo install autumn-cli --version 0.6.0
+cargo install autumn-cli --version 0.5.0
 ```
 
 For local development only, from an Autumn source checkout, install the CLI you
@@ -239,7 +239,7 @@ Probe endpoints are also available at `/live`, `/ready`, and `/startup`.
 The `/health` response looks like:
 
 ```json
-{ "status": "ok", "version": "0.6.0" }
+{ "status": "ok", "version": "0.5.0" }
 ```
 
 Press **Ctrl+C** to stop the server (graceful shutdown with a configurable
@@ -471,7 +471,7 @@ Add the required dependencies to `Cargo.toml`:
 
 ```toml
 [dependencies]
-autumn-web = "0.6"
+autumn-web = "0.5"
 chrono = { version = "0.4", features = ["serde"] }
 diesel = { version = "2", features = ["postgres", "chrono"] }
 diesel-async = { version = "0.8", features = ["postgres"] }
@@ -941,6 +941,8 @@ Autumn uses a five-layer configuration system:
 host = "127.0.0.1"          # default
 port = 3000                  # default
 shutdown_timeout_secs = 30   # default, seconds to drain in-flight requests
+# max_concurrent_requests = 256 # unset by default (unlimited); caps in-flight
+                               # requests, shedding the excess with a 503
 
 [database]
 primary_url = "postgres://user:pass@localhost:5432/my_app"
@@ -974,6 +976,7 @@ Every config field can be overridden via environment variables. The pattern is
 | `AUTUMN_SERVER__PORT`                | `server.port`          |
 | `AUTUMN_SERVER__HOST`                | `server.host`          |
 | `AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS` | `server.shutdown_timeout_secs` |
+| `AUTUMN_SERVER__MAX_CONCURRENT_REQUESTS` | `server.max_concurrent_requests` |
 | `AUTUMN_DATABASE__URL`               | `database.url`         |
 | `AUTUMN_DATABASE__PRIMARY_URL`       | `database.primary_url` |
 | `AUTUMN_DATABASE__REPLICA_URL`       | `database.replica_url` |

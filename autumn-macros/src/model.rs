@@ -63,11 +63,26 @@ struct Association {
     kind: AssocKind,
     target: syn::Ident,
     /// The foreign-key column name. For `belongs_to` it is a column on this
-    /// model; for `has_many`/`has_one` it is a column on the target.
+    /// model; for `has_many`/`has_one` it is a column on the target. For a
+    /// `through =` (many-to-many) `has_many`, this is the join table's
+    /// column pointing back at *this* model (e.g. `post_id`).
     fk: String,
     /// The accessor method name and association store key, e.g. `author`,
     /// `comments`, `subreddit`.
     name: String,
+    /// Set for a many-to-many `has_many(Target, through = join_table)`
+    /// association: the join table this association is preloaded/mutated
+    /// through, plus the join table's column pointing at the target model.
+    through: Option<ThroughSpec>,
+}
+
+/// The join-table half of a many-to-many `has_many(..., through = ...)`
+/// association.
+struct ThroughSpec {
+    /// The join table name, e.g. `post_tags`.
+    table: String,
+    /// The join table's column pointing at the target model, e.g. `tag_id`.
+    target_fk: String,
 }
 
 /// Resolve the foreign-key column and accessor name for an association,
@@ -117,44 +132,82 @@ fn parse_assoc_attr(
 ) -> syn::Result<Association> {
     use syn::parse::ParseStream;
 
-    let (target, explicit_fk, explicit_name) = attr.parse_args_with(|input: ParseStream| {
-        let target: syn::Ident = input.parse()?;
-        let mut explicit_fk: Option<String> = None;
-        let mut explicit_name: Option<String> = None;
-        // Zero or more trailing `, key = value` pairs (`fk`, `name`), any order.
-        while input.peek(syn::Token![,]) {
-            input.parse::<syn::Token![,]>()?;
-            let key: syn::Ident = input.parse()?;
-            input.parse::<syn::Token![=]>()?;
-            // Accept either a bare identifier (`fk = author_id`) or a string
-            // literal (`fk = "author_id"`).
-            let value = if input.peek(LitStr) {
-                input.parse::<LitStr>()?.value()
-            } else {
-                input.parse::<syn::Ident>()?.to_string()
-            };
-            if key == "fk" {
-                explicit_fk = Some(value);
-            } else if key == "name" {
-                explicit_name = Some(value);
-            } else {
-                return Err(syn::Error::new_spanned(
-                    &key,
-                    "expected `fk = <column>` or `name = <accessor>` in association attribute",
-                ));
+    let (target, explicit_fk, explicit_name, explicit_through, explicit_target_fk) = attr
+        .parse_args_with(|input: ParseStream| {
+            let target: syn::Ident = input.parse()?;
+            let mut explicit_fk: Option<String> = None;
+            let mut explicit_name: Option<String> = None;
+            let mut explicit_through: Option<String> = None;
+            let mut explicit_target_fk: Option<String> = None;
+            // Zero or more trailing `, key = value` pairs (`fk`, `name`,
+            // `through`, `target_fk`), any order.
+            while input.peek(syn::Token![,]) {
+                input.parse::<syn::Token![,]>()?;
+                let key: syn::Ident = input.parse()?;
+                input.parse::<syn::Token![=]>()?;
+                // Accept either a bare identifier (`fk = author_id`) or a string
+                // literal (`fk = "author_id"`).
+                let value = if input.peek(LitStr) {
+                    input.parse::<LitStr>()?.value()
+                } else {
+                    input.parse::<syn::Ident>()?.to_string()
+                };
+                if key == "fk" {
+                    explicit_fk = Some(value);
+                } else if key == "name" {
+                    explicit_name = Some(value);
+                } else if key == "through" {
+                    explicit_through = Some(value);
+                } else if key == "target_fk" {
+                    explicit_target_fk = Some(value);
+                } else {
+                    return Err(syn::Error::new_spanned(
+                        &key,
+                        "expected `fk = <column>`, `name = <accessor>`, \
+                         `through = <join_table>`, or `target_fk = <column>` \
+                         in association attribute",
+                    ));
+                }
             }
-        }
-        Ok((target, explicit_fk, explicit_name))
-    })?;
+            Ok((
+                target,
+                explicit_fk,
+                explicit_name,
+                explicit_through,
+                explicit_target_fk,
+            ))
+        })?;
+
+    if explicit_through.is_some() && kind != AssocKind::HasMany {
+        return Err(syn::Error::new_spanned(
+            &target,
+            "`through = <join_table>` (many-to-many) is only supported on \
+             `has_many`, not `belongs_to`/`has_one`",
+        ));
+    }
+    if explicit_target_fk.is_some() && explicit_through.is_none() {
+        return Err(syn::Error::new_spanned(
+            &target,
+            "`target_fk = <column>` requires `through = <join_table>`",
+        ));
+    }
 
     let (fk, derived_name) =
         resolve_fk_and_name(kind, model_ident, &target, explicit_fk.as_deref());
     let name = explicit_name.unwrap_or(derived_name);
+
+    let through = explicit_through.map(|table| {
+        let snake_target = pascal_to_snake(&target.to_string());
+        let target_fk = explicit_target_fk.unwrap_or_else(|| format!("{snake_target}_id"));
+        ThroughSpec { table, target_fk }
+    });
+
     Ok(Association {
         kind,
         target,
         fk,
         name,
+        through,
     })
 }
 
@@ -177,7 +230,43 @@ fn resolve_associations(
         };
         out.push(parse_assoc_attr(attr, kind, model_ident)?);
     }
+    check_m2m_mutation_name_collisions(&out)?;
     Ok(out)
+}
+
+/// The singular form used to derive a many-to-many association's mutation
+/// helper names (`add_{singular}`, `remove_{singular}`), mirroring the
+/// codebase's naive `{target}s` pluralization in reverse: strip a trailing
+/// `s` if present.
+fn m2m_mutation_singular(assoc_name: &str) -> &str {
+    assoc_name.strip_suffix('s').unwrap_or(assoc_name)
+}
+
+/// Reject a model whose many-to-many associations would generate colliding
+/// `add_*`/`remove_*`/`set_*` mutation helper names (e.g. two `through =`
+/// associations that both derive `add_tag`), rather than emitting a trait
+/// with duplicate method definitions.
+fn check_m2m_mutation_name_collisions(assocs: &[Association]) -> syn::Result<()> {
+    let mut seen: std::collections::HashMap<&str, &syn::Ident> = std::collections::HashMap::new();
+    for assoc in assocs {
+        if assoc.through.is_none() {
+            continue;
+        }
+        let singular = m2m_mutation_singular(&assoc.name);
+        if let Some(_prev) = seen.insert(singular, &assoc.target) {
+            return Err(syn::Error::new_spanned(
+                &assoc.target,
+                format!(
+                    "many-to-many association `{}` would generate a mutation \
+                     helper `add_{singular}`/`remove_{singular}` that collides \
+                     with another `through =` association on this model; \
+                     disambiguate with `name = ...`",
+                    assoc.name
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Whether an attribute is one of the association declarations consumed by
@@ -219,6 +308,10 @@ fn emit_association_items(
     let mut accessor_impls: Vec<TokenStream> = Vec::new();
     // Loader body statements (one block per association).
     let mut loader_blocks: Vec<TokenStream> = Vec::new();
+    // Top-level items for many-to-many (`through =`) associations: the
+    // hidden join-table module and the per-association mutation trait +
+    // blanket impl. Emitted alongside (not inside) the `Preloadable` impl.
+    let mut m2m_items: Vec<TokenStream> = Vec::new();
 
     for assoc in assocs {
         let name_ident = format_ident!("{}", assoc.name);
@@ -338,8 +431,12 @@ fn emit_association_items(
                     }
                 });
             }
-            AssocKind::HasMany => {
-                // Many related records owned per-parent.
+            AssocKind::HasMany if assoc.through.is_none() => {
+                // Many related records owned per-parent. Each child row is
+                // fetched at most once (its own primary key is unique in the
+                // `WHERE fk IN (...)` result set), so it can be moved
+                // directly into its one owning parent's `Vec` — no sharing
+                // needed.
                 let stored_ty = quote! {
                     ::std::vec::Vec<::autumn_web::preload::Preloaded<#target>>
                 };
@@ -399,6 +496,345 @@ fn emit_association_items(
                         }
                     }
                 });
+            }
+            AssocKind::HasMany => {
+                let through = assoc
+                    .through
+                    .as_ref()
+                    .expect("through checked by guard above");
+                // Many-to-many: unlike plain has_many, the *same* target row
+                // can legitimately belong to more than one currently-loaded
+                // parent (the whole point of m2m), so children are shared via
+                // `Arc` — mirroring belongs_to/has_one — rather than moved
+                // into one owning parent's `Vec`.
+                let stored_ty = quote! {
+                    ::std::vec::Vec<::std::sync::Arc<::autumn_web::preload::Preloaded<#target>>>
+                };
+                accessor_sigs.push(quote! {
+                    /// The preloaded related records (possibly empty).
+                    /// `Err(NotLoaded)` if this association was not preloaded.
+                    fn #name_ident(&self) -> ::core::result::Result<
+                        ::std::vec::Vec<&::autumn_web::preload::Preloaded<#target>>,
+                        ::autumn_web::preload::NotLoaded,
+                    >;
+                });
+                accessor_impls.push(quote! {
+                    fn #name_ident(&self) -> ::core::result::Result<
+                        ::std::vec::Vec<&::autumn_web::preload::Preloaded<#target>>,
+                        ::autumn_web::preload::NotLoaded,
+                    > {
+                        match self.associations().get::<#stored_ty>(#key) {
+                            ::core::option::Option::Some(v) => ::core::result::Result::Ok(
+                                v.iter().map(|__a| &**__a).collect()
+                            ),
+                            ::core::option::Option::None => ::core::result::Result::Err(
+                                ::autumn_web::preload::NotLoaded::new(#model_str, #key),
+                            ),
+                        }
+                    }
+                });
+                {
+                    // Many-to-many: the fk lives on a join table, not on the
+                    // target. Emit a hidden module declaring the join table
+                    // (so this and the target model can both be `through =`
+                    // the same physical table without colliding), then a
+                    // single batched `INNER JOIN` loader keyed on the join
+                    // table's own two columns.
+                    let model_snake = pascal_to_snake(&model_ident.to_string());
+                    // Length-prefix `model_snake` so the module name can't
+                    // collide between two different (model, association)
+                    // pairs, e.g. model `Post` assoc `tag_things` vs. model
+                    // `PostTag` assoc `things` would otherwise both produce
+                    // `__autumn_m2m_post_tag_things`.
+                    let join_mod_ident = format_ident!(
+                        "__autumn_m2m_{}_{model_snake}_{}",
+                        model_snake.len(),
+                        assoc.name
+                    );
+                    let join_table_ident = format_ident!("{}", through.table);
+                    let target_fk_ident = format_ident!("{}", through.target_fk);
+
+                    m2m_items.push(quote! {
+                        // Hidden Diesel table declaration for the
+                        // `#join_table_ident` join table backing
+                        // `#model_ident::#name_ident` (`through = #join_table_ident`).
+                        // Scoped to its own module (keyed by model + association
+                        // name) so two models declaring `through` on the same
+                        // physical join table don't produce colliding types.
+                        #[allow(
+                            missing_docs,
+                            unreachable_pub,
+                            clippy::all,
+                            clippy::pedantic,
+                            clippy::nursery
+                        )]
+                        mod #join_mod_ident {
+                            #[allow(unused_imports)]
+                            use super::*;
+                            ::autumn_web::reexports::diesel::table! {
+                                #join_table_ident (#fk_ident, #target_fk_ident) {
+                                    #fk_ident -> Int8,
+                                    #target_fk_ident -> Int8,
+                                }
+                            }
+                            ::autumn_web::reexports::diesel::allow_tables_to_appear_in_same_query!(
+                                #join_table_ident, #target_table
+                            );
+                        }
+                    });
+
+                    loader_blocks.push(quote! {
+                        if let ::core::option::Option::Some(__child_spec) = &spec.#name_ident {
+                            #[allow(unused_imports)]
+                            use ::autumn_web::reexports::diesel::query_dsl::JoinOnDsl as _;
+                            let mut __keys: ::std::vec::Vec<i64> =
+                                records.iter().map(|__r| __r.id).collect();
+                            __keys.sort_unstable();
+                            __keys.dedup();
+                            let __pairs: ::std::vec::Vec<(i64, #target)> =
+                                #join_mod_ident::#join_table_ident::table
+                                    .inner_join(
+                                        #target_table::table.on(
+                                            #target_table::id.eq(
+                                                #join_mod_ident::#join_table_ident::#target_fk_ident
+                                            )
+                                        )
+                                    )
+                                    .filter(
+                                        #join_mod_ident::#join_table_ident::#fk_ident.eq_any(__keys)
+                                    )
+                                    .select((
+                                        #join_mod_ident::#join_table_ident::#fk_ident,
+                                        <#target as ::autumn_web::reexports::diesel::SelectableHelper<::autumn_web::reexports::diesel::pg::Pg>>::as_select(),
+                                    ))
+                                    .load::<(i64, #target)>(&mut *conn)
+                                    .await
+                                    .map_err(::autumn_web::AutumnError::from)?;
+                            // Fail-closed parity probe: run the target's batch
+                            // retain against an empty `Vec` so a tenant-scoped
+                            // target with no tenant context errors exactly like
+                            // belongs_to/has_one/has_many, even when every
+                            // parent's join rows happen to be empty (in which
+                            // case the per-row `__autumn_preload_keep` loop
+                            // below never runs).
+                            let _ = #target::__autumn_preload_retain(::std::vec::Vec::new())?;
+                            // The same target row can appear once per linking
+                            // parent (that's the point of many-to-many), so
+                            // recursing into nested associations must run on a
+                            // *deduplicated* set of targets, not once per join
+                            // row — otherwise two parents sharing a target
+                            // would each get their own independent (and only
+                            // one of them fully grouped) copy of its nested
+                            // associations. Dedup by id, recurse once, then
+                            // share the single recursed record across every
+                            // parent via `Arc`. Filter and dedup in the same
+                            // pass: each kept row is moved directly into
+                            // `__unique_by_id` (no clone) and only its
+                            // lightweight `(parent_key, target_id)` pair is
+                            // kept in `__links` for the final grouping pass
+                            // below.
+                            let mut __unique_by_id: ::std::collections::HashMap<i64, #target> =
+                                ::std::collections::HashMap::new();
+                            let mut __links: ::std::vec::Vec<(i64, i64)> = ::std::vec::Vec::new();
+                            for (__fk, __row) in __pairs {
+                                if let ::core::option::Option::Some(__row) =
+                                    #target::__autumn_preload_keep(__row)?
+                                {
+                                    let __id = __row.id;
+                                    __links.push((__fk, __id));
+                                    __unique_by_id.entry(__id).or_insert(__row);
+                                }
+                            }
+                            let mut __unique_children: ::std::vec::Vec<
+                                ::autumn_web::preload::Preloaded<#target>
+                            > = __unique_by_id
+                                .into_values()
+                                .map(::autumn_web::preload::Preloaded::new)
+                                .collect();
+                            <#target as ::autumn_web::preload::Preloadable>::load_associations(
+                                &mut __unique_children, &**__child_spec, &mut *conn,
+                            ).await?;
+                            let __arc_by_id: ::std::collections::HashMap<
+                                i64, ::std::sync::Arc<::autumn_web::preload::Preloaded<#target>>
+                            > = __unique_children
+                                .into_iter()
+                                .map(|__c| (__c.id, ::std::sync::Arc::new(__c)))
+                                .collect();
+                            let mut __groups: ::std::collections::HashMap<i64, #stored_ty> =
+                                ::std::collections::HashMap::new();
+                            for (__fk, __id) in &__links {
+                                if let ::core::option::Option::Some(__arc) = __arc_by_id.get(__id) {
+                                    __groups.entry(*__fk).or_default().push(::std::sync::Arc::clone(__arc));
+                                }
+                            }
+                            for __r in records.iter_mut() {
+                                let __v: #stored_ty = __groups.get(&__r.id).cloned().unwrap_or_default();
+                                __r.associations_mut().insert::<#stored_ty>(#key, __v);
+                            }
+                        }
+                    });
+
+                    // Mutation helpers: `add_{singular}` / `remove_{singular}`
+                    // / `set_{plural}` (replace-all), generated once per
+                    // `through =` association and blanket-implemented for any
+                    // repository whose `M2mConnSource::Model` is this model —
+                    // keeping method resolution unambiguous when a model has
+                    // more than one m2m association, or when two models' m2m
+                    // traits are both in scope.
+                    let mutation_trait_ident =
+                        format_ident!("{model_ident}{}Mutations", pascal_case(&assoc.name));
+                    let singular = m2m_mutation_singular(&assoc.name);
+                    let add_ident = format_ident!("add_{singular}");
+                    let remove_ident = format_ident!("remove_{singular}");
+                    let set_ident = format_ident!("set_{}", assoc.name);
+                    let mutation_trait_doc = format!(
+                        "Mutation helpers for the `{}` many-to-many association \
+                         (`#[has_many({}, through = {})]`). Each method acquires \
+                         its own primary-pool connection and is idempotent; \
+                         `{set_ident}` wraps its delete-then-insert in a single \
+                         transaction.",
+                        assoc.name, target, through.table,
+                    );
+
+                    m2m_items.push(quote! {
+                        #[doc = #mutation_trait_doc]
+                        #vis trait #mutation_trait_ident {
+                            /// Link `child_id` to `parent_id`. A duplicate call
+                            /// is a no-op (`ON CONFLICT DO NOTHING` on the join
+                            /// table's composite primary key), not a
+                            /// unique-constraint error.
+                            fn #add_ident(
+                                &self,
+                                parent_id: i64,
+                                child_id: i64,
+                            ) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<()>> + Send;
+                            /// Unlink `child_id` from `parent_id`. A no-op if
+                            /// the pair was not linked.
+                            fn #remove_ident(
+                                &self,
+                                parent_id: i64,
+                                child_id: i64,
+                            ) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<()>> + Send;
+                            /// Replace the full set of children linked to
+                            /// `parent_id` with exactly `child_ids`
+                            /// (deduplicated), in a single transaction.
+                            fn #set_ident(
+                                &self,
+                                parent_id: i64,
+                                child_ids: &[i64],
+                            ) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<()>> + Send;
+                        }
+
+                        impl<__R> #mutation_trait_ident for __R
+                        where
+                            __R: ::autumn_web::repository::M2mConnSource<Model = #model_ident>
+                                + ::core::marker::Sync,
+                        {
+                            async fn #add_ident(
+                                &self,
+                                parent_id: i64,
+                                child_id: i64,
+                            ) -> ::autumn_web::AutumnResult<()> {
+                                use ::autumn_web::reexports::diesel::{ExpressionMethods as _, QueryDsl as _};
+                                use ::autumn_web::reexports::diesel_async::RunQueryDsl as _;
+                                let mut conn = self.__autumn_m2m_write_conn().await?;
+                                ::autumn_web::reexports::diesel::insert_into(
+                                    #join_mod_ident::#join_table_ident::table
+                                )
+                                .values((
+                                    #join_mod_ident::#join_table_ident::#fk_ident.eq(parent_id),
+                                    #join_mod_ident::#join_table_ident::#target_fk_ident.eq(child_id),
+                                ))
+                                .on_conflict((
+                                    #join_mod_ident::#join_table_ident::#fk_ident,
+                                    #join_mod_ident::#join_table_ident::#target_fk_ident,
+                                ))
+                                .do_nothing()
+                                .execute(&mut conn)
+                                .await
+                                .map_err(::autumn_web::AutumnError::from)?;
+                                ::core::result::Result::Ok(())
+                            }
+
+                            async fn #remove_ident(
+                                &self,
+                                parent_id: i64,
+                                child_id: i64,
+                            ) -> ::autumn_web::AutumnResult<()> {
+                                use ::autumn_web::reexports::diesel::{ExpressionMethods as _, QueryDsl as _};
+                                use ::autumn_web::reexports::diesel_async::RunQueryDsl as _;
+                                let mut conn = self.__autumn_m2m_write_conn().await?;
+                                ::autumn_web::reexports::diesel::delete(
+                                    #join_mod_ident::#join_table_ident::table
+                                        .filter(
+                                            #join_mod_ident::#join_table_ident::#fk_ident.eq(parent_id)
+                                        )
+                                        .filter(
+                                            #join_mod_ident::#join_table_ident::#target_fk_ident.eq(child_id)
+                                        ),
+                                )
+                                .execute(&mut conn)
+                                .await
+                                .map_err(::autumn_web::AutumnError::from)?;
+                                ::core::result::Result::Ok(())
+                            }
+
+                            async fn #set_ident(
+                                &self,
+                                parent_id: i64,
+                                child_ids: &[i64],
+                            ) -> ::autumn_web::AutumnResult<()> {
+                                use ::autumn_web::reexports::diesel::{ExpressionMethods as _, QueryDsl as _};
+                                use ::autumn_web::reexports::diesel_async::RunQueryDsl as _;
+                                use ::autumn_web::reexports::diesel_async::AsyncConnection as _;
+                                use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
+                                let mut __ids: ::std::vec::Vec<i64> = child_ids.to_vec();
+                                __ids.sort_unstable();
+                                __ids.dedup();
+                                let mut conn = self.__autumn_m2m_write_conn().await?;
+                                ::autumn_web::__private::scoped_transaction::<(), ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
+                                    async move {
+                                        ::autumn_web::reexports::diesel::delete(
+                                            #join_mod_ident::#join_table_ident::table.filter(
+                                                #join_mod_ident::#join_table_ident::#fk_ident
+                                                    .eq(parent_id)
+                                            ),
+                                        )
+                                        .execute(conn)
+                                        .await
+                                        .map_err(::autumn_web::AutumnError::from)?;
+                                        if !__ids.is_empty() {
+                                            let __values: ::std::vec::Vec<_> = __ids
+                                                .iter()
+                                                .map(|__child_id| (
+                                                    #join_mod_ident::#join_table_ident::#fk_ident
+                                                        .eq(parent_id),
+                                                    #join_mod_ident::#join_table_ident::#target_fk_ident
+                                                        .eq(*__child_id),
+                                                ))
+                                                .collect();
+                                            ::autumn_web::reexports::diesel::insert_into(
+                                                #join_mod_ident::#join_table_ident::table
+                                            )
+                                            .values(__values)
+                                            .on_conflict((
+                                                #join_mod_ident::#join_table_ident::#fk_ident,
+                                                #join_mod_ident::#join_table_ident::#target_fk_ident,
+                                            ))
+                                            .do_nothing()
+                                            .execute(conn)
+                                            .await
+                                            .map_err(::autumn_web::AutumnError::from)?;
+                                        }
+                                        ::core::result::Result::Ok(())
+                                    }
+                                    .scope_boxed()
+                                })
+                                .await
+                            }
+                        }
+                    });
+                }
             }
         }
     }
@@ -472,6 +908,8 @@ fn emit_association_items(
                 })
             }
         }
+
+        #(#m2m_items)*
     }
 }
 
@@ -724,6 +1162,118 @@ fn field_has_serde_rename(field: &syn::Field) -> bool {
         });
     }
     renamed
+}
+
+/// The struct-level `#[serde(rename_all = "...")]` casing rule that applies
+/// to *serialization*, if any. Handles both the plain form and the split
+/// `rename_all(serialize = "...", deserialize = "...")` form (taking the
+/// `serialize` side — that is what `Changeset::field_value` indexes by).
+///
+/// Same parsing convention as `field_has_serde_rename`: a `#[serde(...)]`
+/// list this parser can't fully walk simply yields no rule (the real serde
+/// derive still validates the attribute itself).
+fn serde_rename_all_serialize_rule(attrs: &[syn::Attribute]) -> Option<String> {
+    let mut rule = None;
+    for attr in attrs.iter().filter(|a| a.path().is_ident("serde")) {
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("rename_all") {
+                if let Ok(value) = meta.value() {
+                    // rename_all = "camelCase"
+                    if let Ok(syn::Lit::Str(s)) = value.parse::<syn::Lit>() {
+                        rule = Some(s.value());
+                    }
+                } else {
+                    // rename_all(serialize = "...", deserialize = "...")
+                    let _ = meta.parse_nested_meta(|inner| {
+                        if let Ok(value) = inner.value()
+                            && let Ok(syn::Lit::Str(s)) = value.parse::<syn::Lit>()
+                            && inner.path.is_ident("serialize")
+                        {
+                            rule = Some(s.value());
+                        }
+                        Ok(())
+                    });
+                }
+            } else if let Ok(value) = meta.value() {
+                // Consume any `= value` so sibling metas keep parsing.
+                let _: syn::Result<syn::Lit> = value.parse();
+            }
+            Ok(())
+        });
+    }
+    rule
+}
+
+/// The field-level `#[serde(rename = "...")]` name that applies to
+/// *serialization*, if any. Handles both the plain form and the split
+/// `rename(serialize = "...", deserialize = "...")` form (taking the
+/// `serialize` side). Field-level `rename` overrides a struct-level
+/// `rename_all`, mirroring serde's own precedence.
+fn field_serde_serialize_rename(field: &syn::Field) -> Option<String> {
+    let mut renamed = None;
+    for attr in field.attrs.iter().filter(|a| a.path().is_ident("serde")) {
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("rename") {
+                if let Ok(value) = meta.value() {
+                    // rename = "headline"
+                    if let Ok(syn::Lit::Str(s)) = value.parse::<syn::Lit>() {
+                        renamed = Some(s.value());
+                    }
+                } else {
+                    // rename(serialize = "...", deserialize = "...")
+                    let _ = meta.parse_nested_meta(|inner| {
+                        if let Ok(value) = inner.value()
+                            && let Ok(syn::Lit::Str(s)) = value.parse::<syn::Lit>()
+                            && inner.path.is_ident("serialize")
+                        {
+                            renamed = Some(s.value());
+                        }
+                        Ok(())
+                    });
+                }
+            } else if let Ok(value) = meta.value() {
+                // Consume any `= value` so sibling metas keep parsing.
+                let _: syn::Result<syn::Lit> = value.parse();
+            }
+            Ok(())
+        });
+    }
+    renamed
+}
+
+/// Apply a struct-level `#[serde(rename_all = "...")]` casing rule to a
+/// (`snake_case`) field identifier, mirroring `serde_derive`'s
+/// `RenameRule::apply_to_field`. Returns `None` for a rule string serde
+/// itself would reject (the `Serialize` derive on the emitted struct then
+/// reports the error — no point duplicating it here).
+fn apply_serde_rename_all_rule(rule: &str, field: &str) -> Option<String> {
+    fn pascal(field: &str) -> String {
+        field
+            .split('_')
+            .map(|word| {
+                let mut chars = word.chars();
+                chars.next().map_or_else(String::new, |first| {
+                    first.to_uppercase().collect::<String>() + chars.as_str()
+                })
+            })
+            .collect()
+    }
+    match rule {
+        // serde treats fields as already snake_case/lowercase.
+        "lowercase" | "snake_case" => Some(field.to_owned()),
+        "UPPERCASE" | "SCREAMING_SNAKE_CASE" => Some(field.to_ascii_uppercase()),
+        "PascalCase" => Some(pascal(field)),
+        "camelCase" => {
+            let pascal = pascal(field);
+            let mut chars = pascal.chars();
+            chars
+                .next()
+                .map(|first| first.to_lowercase().collect::<String>() + chars.as_str())
+        }
+        "kebab-case" => Some(field.replace('_', "-")),
+        "SCREAMING-KEBAB-CASE" => Some(field.to_ascii_uppercase().replace('_', "-")),
+        _ => None,
+    }
 }
 
 /// Parse the struct-level language dictionary configuration from `#[searchable(language = "...")]`
@@ -1005,6 +1555,206 @@ fn is_option_type(ty: &syn::Type) -> bool {
 /// Return the final path segment name of a type (e.g. `foo::Bar` → `"Bar"`).
 fn type_name_str(ty: &syn::Type) -> String {
     crate::api_doc::last_segment_name(ty).unwrap_or_else(|| "unknown".to_owned())
+}
+
+/// Humanize a `snake_case` field name into a `<label>`-friendly title
+/// (e.g. `published_at` -> `"Published At"`). Mirrors the scaffold's
+/// `humanize_label` so a derived form and a hand-written one read alike.
+fn humanize_field_label(name: &str) -> String {
+    let name = name.strip_prefix("r#").unwrap_or(name);
+    name.split('_')
+        .filter(|word| !word.is_empty())
+        .map(|word| {
+            let mut chars = word.chars();
+            chars.next().map_or_else(String::new, |c| {
+                c.to_uppercase().to_string() + &chars.collect::<String>()
+            })
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Emit the `::autumn_web::form::FieldControl` expression for a model field,
+/// derived from its (Option-unwrapped) Rust type. `nullable` is `true` for
+/// `Option<...>` fields.
+///
+/// The mapping mirrors the scaffold's `render_changeset_form_inputs` control
+/// selection (#1131): strings/UUID -> text, integers -> stepped number,
+/// floats/decimals -> free-step number, `bool` -> checkbox (nullable `bool` ->
+/// a tri-state select so `NULL` stays reachable), dates/datetimes -> the
+/// corresponding pickers. Unrecognized types (e.g. user enums) fall back to a
+/// plain text control; callers can promote them to a `Select` via
+/// `FormFor::override_field` (which is exactly what the scaffold does for enum
+/// columns, whose variants it knows statically).
+fn form_control_tokens(inner_ty: &syn::Type, nullable: bool) -> TokenStream {
+    let name = type_name_str(inner_ty);
+    match name.as_str() {
+        "bool" => {
+            if nullable {
+                quote! {
+                    ::autumn_web::form::FieldControl::Select {
+                        options: ::std::vec![
+                            (::std::string::String::from(""), ::std::string::String::from("— Unset —")),
+                            (::std::string::String::from("true"), ::std::string::String::from("Yes")),
+                            (::std::string::String::from("false"), ::std::string::String::from("No")),
+                        ],
+                    }
+                }
+            } else {
+                quote! { ::autumn_web::form::FieldControl::Checkbox }
+            }
+        }
+        "i8" | "i16" | "i32" | "i64" | "i128" | "isize" | "u8" | "u16" | "u32" | "u64" | "u128"
+        | "usize" => quote! {
+            ::autumn_web::form::FieldControl::Number {
+                step: ::core::option::Option::Some(::std::string::String::from("1")),
+            }
+        },
+        "f32" | "f64" | "Decimal" | "BigDecimal" => quote! {
+            ::autumn_web::form::FieldControl::Number {
+                step: ::core::option::Option::Some(::std::string::String::from("any")),
+            }
+        },
+        "NaiveDate" => quote! { ::autumn_web::form::FieldControl::Date },
+        "NaiveDateTime" => quote! { ::autumn_web::form::FieldControl::DateTime },
+        // `<input type="datetime-local">` posts an *offsetless* wall-clock
+        // value, so only zone parameters with a sound interpretation of that
+        // shape get the picker: `Utc` and the server's `Local` (each wired to
+        // a matching tolerant deserializer — see `datetime_local_serde_attr`).
+        // Any other zone (`FixedOffset`, chrono-tz zones, or a bare
+        // `DateTime` alias whose zone the derive can't see) falls back to a
+        // text input: the pre-filled value is the field's serialized RFC 3339
+        // string, which chrono's default `Deserialize` round-trips as-is —
+        // honest, if plainer, instead of a picker whose submission 400s.
+        "DateTime" => {
+            let picker_zone = crate::api_doc::unwrap_single_generic(inner_ty, "DateTime")
+                .is_some_and(|tz| matches!(type_name_str(&tz).as_str(), "Utc" | "Local"));
+            if picker_zone {
+                quote! { ::autumn_web::form::FieldControl::DateTime }
+            } else {
+                quote! { ::autumn_web::form::FieldControl::Text }
+            }
+        }
+        // `String`/`str`/`Uuid` render as text, and so do unknown types
+        // (user enums, JSON, custom newtypes) as a safe fallback; promote
+        // via `.override_field(...)` where a richer control is known.
+        _ => quote! { ::autumn_web::form::FieldControl::Text },
+    }
+}
+
+/// For a `NewX` field whose column `form_for` renders as an HTML
+/// `datetime-local` control (see `form_control_tokens`), emit the serde
+/// attribute wiring the matching datetime-local-tolerant deserializer from
+/// `autumn_web::form`.
+///
+/// `<input type="datetime-local">` posts an offsetless value (and not always
+/// with seconds), which chrono's default `Deserialize` for `DateTime<Utc>`
+/// rejects — so a `form_for` submission would 400 before validation even when
+/// the pre-filled value is untouched. The referenced helpers accept both the
+/// browser shape (`YYYY-MM-DDTHH:MM[:SS[.f]]`, interpreted as UTC for
+/// `DateTime<Utc>` columns and as the server's local wall clock for
+/// `DateTime<Local>` ones) *and* RFC 3339 (offset converted to the field's
+/// zone), so JSON API create bodies posted to the same `NewX` keep decoding.
+///
+/// Returns `None` for non-datetime fields, and for `DateTime<Tz>` with a
+/// zone parameter other than `Utc`/`Local` — those columns don't render a
+/// `datetime-local` control in the first place (`form_control_tokens` falls
+/// back to a text input whose RFC 3339 value chrono's default `Deserialize`
+/// round-trips), so they keep that default.
+fn datetime_local_serde_attr(ty: &syn::Type) -> Option<TokenStream> {
+    let nullable = is_option_type(ty);
+    let inner = if nullable {
+        crate::api_doc::unwrap_single_generic(ty, "Option")?
+    } else {
+        ty.clone()
+    };
+    let base = match type_name_str(&inner).as_str() {
+        "NaiveDateTime" => "deserialize_naive_datetime_local",
+        "DateTime" => {
+            let tz = crate::api_doc::unwrap_single_generic(&inner, "DateTime")?;
+            match type_name_str(&tz).as_str() {
+                "Utc" => "deserialize_datetime_local_utc",
+                "Local" => "deserialize_datetime_local_local",
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    if nullable {
+        // `deserialize_with` disables serde's implicit missing-`Option`-field
+        // -is-`None` handling; `default` restores it so a JSON body may still
+        // omit the nullable column. (The `_option` helper itself maps a
+        // present-but-empty form value to `None`.)
+        let path = format!("::autumn_web::form::{base}_option");
+        Some(quote! { #[serde(default, deserialize_with = #path)] })
+    } else {
+        let path = format!("::autumn_web::form::{base}");
+        Some(quote! { #[serde(deserialize_with = #path)] })
+    }
+}
+
+/// Emit `impl ::autumn_web::form::FormModel for #name` (issue #1135), listing
+/// one `FormField` descriptor per user-editable column (the same
+/// `fields_for_new` set the insertable `NewX` struct uses -- i.e. excluding the
+/// primary key, `#[default]`, and `#[lock_version]` columns).
+///
+/// This is what lets `form_for::<T>(...)` render a whole form in one call: the
+/// descriptor carries each field's name (the Rust identifier — the POST key
+/// the generated `NewX`/`UpdateX` decode by), humanized label,
+/// type-appropriate control, and `required` flag (derived from non-`Option`).
+///
+/// `rename_all_rule` is the struct-level `#[serde(rename_all = "...")]`
+/// serialization rule, if any. When a column's serde-effective *serialized*
+/// key differs from its identifier (field-level `#[serde(rename)]` wins over
+/// `rename_all`, mirroring serde), the descriptor records that key as
+/// `FormField::value_name` so `form_for`'s pre-fill lookup
+/// (`Changeset::field_value`, which indexes the changeset's serialized data)
+/// still finds the value — while the rendered input `name` stays the
+/// identifier the insert struct expects.
+fn emit_form_model_impl(
+    name: &syn::Ident,
+    fields_for_new: &[&&Field],
+    rename_all_rule: Option<&str>,
+) -> TokenStream {
+    let field_exprs: Vec<TokenStream> = fields_for_new
+        .iter()
+        .filter_map(|f| {
+            let ident = f.ident.as_ref()?;
+            let field_name = ident.to_string();
+            let field_name = field_name.strip_prefix("r#").unwrap_or(&field_name);
+            let label = humanize_field_label(field_name);
+            let nullable = is_option_type(&f.ty);
+            let inner = crate::api_doc::unwrap_single_generic(&f.ty, "Option")
+                .unwrap_or_else(|| f.ty.clone());
+            let control = form_control_tokens(&inner, nullable);
+            let required = !nullable;
+            let serialized_name = field_serde_serialize_rename(f).or_else(|| {
+                rename_all_rule.and_then(|rule| apply_serde_rename_all_rule(rule, field_name))
+            });
+            let value_name = serialized_name
+                .filter(|serialized| serialized != field_name)
+                .map(|serialized| quote! { .with_value_name(#serialized) });
+            Some(quote! {
+                ::autumn_web::form::FormField::new(
+                    #field_name,
+                    #label,
+                    #control,
+                    #required,
+                )
+                #value_name
+            })
+        })
+        .collect();
+
+    quote! {
+        impl ::autumn_web::form::FormModel for #name {
+            fn form_fields() -> ::std::vec::Vec<::autumn_web::form::FormField> {
+                ::std::vec![
+                    #(#field_exprs),*
+                ]
+            }
+        }
+    }
 }
 
 /// Emit a `TokenStream` that evaluates (at runtime) to a `serde_json::Value`
@@ -1666,7 +2416,24 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 parse_field_encrypted_mode(f).unwrap_or(EncryptedMode::None),
             )
             .map(|w| quote! { #[diesel(serialize_as = #w)] });
-            quote! { #(#val_attrs)* #enc pub #ident: #ty }
+            // Non-nullable `bool` columns render as a checkbox in `form_for`
+            // (see `emit_form_model_impl`), and an unchecked HTML checkbox
+            // submits *no* key at all — a hidden `false` sibling is not an
+            // option because serde_urlencoded rejects duplicate keys (see
+            // `checkbox_input`'s doc in autumn/src/form.rs). Mark the field
+            // `#[serde(default)]` so a missing key decodes as `false` instead
+            // of failing with "missing field", mirroring the scaffold's
+            // `{Model}Form` convention.
+            let bool_default = (!is_option_type(ty) && type_name_str(ty) == "bool")
+                .then(|| quote! { #[serde(default)] });
+            // Datetime columns render as `<input type="datetime-local">` in
+            // `form_for`, whose submitted value carries no timezone offset —
+            // chrono's default `Deserialize` for `DateTime<Utc>` would reject
+            // even an unchanged pre-filled value as a 400. Wire the tolerant
+            // deserializer (which also still accepts RFC 3339 JSON bodies);
+            // see `datetime_local_serde_attr`.
+            let datetime_local = datetime_local_serde_attr(ty);
+            quote! { #(#val_attrs)* #enc #bool_default #datetime_local pub #ident: #ty }
         })
         .collect();
 
@@ -1798,6 +2565,16 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // Built from the model's own field set (the loading model can't see these
     // columns): soft-delete drops `deleted_at IS NOT NULL`; tenant scoping
     // keeps only rows matching the ambient `CURRENT_TENANT` when one is set.
+    //
+    // IMPORTANT: do not add an `if rows.is_empty() { return Ok(rows); }`
+    // early return ahead of the tenant check below. Many-to-many preload
+    // loaders (`through =`) call `__autumn_preload_retain(Vec::new())` as a
+    // fail-closed parity probe specifically to get the "no tenant context"
+    // error even when their join returns zero rows (model.rs, the
+    // `__autumn_m2m_...` loader block) — an empty-input early return would
+    // silently skip that check and break tenant isolation for a whole class
+    // of m2m preloads with no matching join rows. See
+    // `preload_retain_empty_rows_still_fails_closed_without_tenant` below.
     let deleted_at_field = all_fields
         .iter()
         .find(|f| f.ident.as_ref().is_some_and(|id| id == "deleted_at"))
@@ -1888,6 +2665,24 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 #soft_delete_retain
                 #tenant_retain
                 ::core::result::Result::Ok(rows)
+            }
+
+            /// Per-row sibling of `__autumn_preload_retain`, applying the
+            /// identical scoping rules to a single row. Used by many-to-many
+            /// (`through =`) preload loaders, which pair each child row with
+            /// its parent key before grouping and so can't run a batch
+            /// `Vec<Self>::retain` without losing that pairing. Takes `row`
+            /// by value (no `Clone` bound needed) and hands it back on
+            /// `Some` when it passes scoping. Delegates to
+            /// `__autumn_preload_retain` (a single-row batch) rather than
+            /// re-deriving the soft-delete/tenant predicates, so the two
+            /// can never drift apart.
+            #[doc(hidden)]
+            pub fn __autumn_preload_keep(
+                row: Self,
+            ) -> ::autumn_web::AutumnResult<::core::option::Option<Self>> {
+                let mut __kept = <Self>::__autumn_preload_retain(::std::vec![row])?;
+                ::core::result::Result::Ok(__kept.pop())
             }
         }
     };
@@ -2643,6 +3438,17 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! { where #(#commit_hook_deserialize_bounds,)* }
     };
 
+    // `impl FormModel for #name` (issue #1135) -- one descriptor per editable
+    // column, driving the single-call `form_for::<#name>(...)` builder. The
+    // struct-level `rename_all` serialization rule (attrs pass through to the
+    // emitted query struct's `Serialize` derive) feeds the descriptors'
+    // pre-fill lookup keys for serde-renamed columns.
+    let form_model_impl = emit_form_model_impl(
+        name,
+        &fields_for_new,
+        serde_rename_all_serialize_rule(outer_attrs).as_deref(),
+    );
+
     quote! {
         #encrypted_use
 
@@ -2654,6 +3460,8 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             #(#query_fields,)*
         }
         #name_debug_impl
+
+        #form_model_impl
 
         #[derive(#new_debug_derive Clone, ::diesel::Insertable)]
         #[derive(::serde::Serialize, ::serde::Deserialize)]
@@ -3063,6 +3871,83 @@ pub fn pascal_to_snake(s: &str) -> String {
 mod tests {
     use super::*;
 
+    // ── Serde-rename resolution for FormField::value_name (#1135) ─────────
+
+    #[test]
+    fn field_serde_serialize_rename_parses_plain_and_split_forms() {
+        let field: syn::Field = syn::Field::parse_named
+            .parse2(quote! { #[serde(rename = "headline")] pub title: String })
+            .unwrap();
+        assert_eq!(
+            field_serde_serialize_rename(&field).as_deref(),
+            Some("headline")
+        );
+
+        let field: syn::Field = syn::Field::parse_named
+            .parse2(quote! {
+                #[serde(rename(serialize = "out", deserialize = "in"))]
+                pub title: String
+            })
+            .unwrap();
+        assert_eq!(field_serde_serialize_rename(&field).as_deref(), Some("out"));
+
+        // Deserialize-only rename leaves the serialized key alone.
+        let field: syn::Field = syn::Field::parse_named
+            .parse2(quote! { #[serde(rename(deserialize = "in"))] pub title: String })
+            .unwrap();
+        assert_eq!(field_serde_serialize_rename(&field), None);
+
+        let field: syn::Field = syn::Field::parse_named
+            .parse2(quote! { #[serde(default)] pub title: String })
+            .unwrap();
+        assert_eq!(field_serde_serialize_rename(&field), None);
+    }
+
+    #[test]
+    fn serde_rename_all_serialize_rule_parses_plain_and_split_forms() {
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[serde(rename_all = "camelCase")])];
+        assert_eq!(
+            serde_rename_all_serialize_rule(&attrs).as_deref(),
+            Some("camelCase")
+        );
+
+        let attrs: Vec<syn::Attribute> = vec![syn::parse_quote!(
+            #[serde(rename_all(serialize = "kebab-case", deserialize = "camelCase"))]
+        )];
+        assert_eq!(
+            serde_rename_all_serialize_rule(&attrs).as_deref(),
+            Some("kebab-case")
+        );
+
+        let attrs: Vec<syn::Attribute> = vec![syn::parse_quote!(#[serde(deny_unknown_fields)])];
+        assert_eq!(serde_rename_all_serialize_rule(&attrs), None);
+    }
+
+    #[test]
+    fn apply_serde_rename_all_rule_mirrors_serde_field_casings() {
+        let cases = [
+            ("lowercase", "word_count", "word_count"),
+            ("snake_case", "word_count", "word_count"),
+            ("UPPERCASE", "word_count", "WORD_COUNT"),
+            ("SCREAMING_SNAKE_CASE", "word_count", "WORD_COUNT"),
+            ("PascalCase", "word_count", "WordCount"),
+            ("camelCase", "word_count", "wordCount"),
+            ("camelCase", "title", "title"),
+            ("kebab-case", "word_count", "word-count"),
+            ("SCREAMING-KEBAB-CASE", "word_count", "WORD-COUNT"),
+        ];
+        for (rule, field, expected) in cases {
+            assert_eq!(
+                apply_serde_rename_all_rule(rule, field).as_deref(),
+                Some(expected),
+                "rule {rule} on {field}"
+            );
+        }
+        // A rule serde itself rejects resolves to no rename here.
+        assert_eq!(apply_serde_rename_all_rule("bogusCase", "word_count"), None);
+    }
+
     // ── RED: #[lock_version] detection ────────────────────────────────────
     // These tests cover the new `excluded_from_new` behaviour (must also
     // exclude `#[lock_version]` fields) and the helper that detects whether
@@ -3147,6 +4032,171 @@ mod tests {
         assert_eq!(assocs[0].name, "authored");
         assert_eq!(assocs[1].fk, "approver_id");
         assert_eq!(assocs[1].name, "approved");
+    }
+
+    // ── Many-to-many (`through = join_table`) parsing (#1324) ────────────
+
+    #[test]
+    fn has_many_through_infers_join_columns_and_name() {
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[has_many(Tag, through = post_tags)])];
+        let assocs = resolve_associations(&model, &attrs).expect("parse ok");
+        assert_eq!(assocs.len(), 1);
+        assert_eq!(assocs[0].kind, AssocKind::HasMany);
+        // Join-table column pointing back at the source model.
+        assert_eq!(assocs[0].fk, "post_id");
+        assert_eq!(assocs[0].name, "tags");
+        let through = assocs[0].through.as_ref().expect("through present");
+        assert_eq!(through.table, "post_tags");
+        // Join-table column pointing at the target model.
+        assert_eq!(through.target_fk, "tag_id");
+    }
+
+    #[test]
+    fn has_many_through_accepts_fk_and_target_fk_overrides() {
+        let model: syn::Ident = syn::parse_quote!(Article);
+        let attrs: Vec<syn::Attribute> = vec![syn::parse_quote!(
+            #[has_many(Label, through = taggings, fk = piece_id, target_fk = sticker_id)]
+        )];
+        let assocs = resolve_associations(&model, &attrs).expect("parse ok");
+        assert_eq!(assocs[0].fk, "piece_id");
+        assert_eq!(assocs[0].name, "labels");
+        let through = assocs[0].through.as_ref().expect("through present");
+        assert_eq!(through.table, "taggings");
+        assert_eq!(through.target_fk, "sticker_id");
+    }
+
+    #[test]
+    fn through_rejected_on_belongs_to_and_has_one() {
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let belongs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[belongs_to(User, through = post_users)])];
+        assert!(resolve_associations(&model, &belongs).is_err());
+        let has_one: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[has_one(Profile, through = post_profiles)])];
+        assert!(resolve_associations(&model, &has_one).is_err());
+    }
+
+    #[test]
+    fn target_fk_without_through_is_error() {
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[has_many(Tag, target_fk = tag_id)])];
+        assert!(resolve_associations(&model, &attrs).is_err());
+    }
+
+    #[test]
+    fn m2m_colliding_mutation_method_names_rejected() {
+        // `tags` and `name = tag` both derive an `add_tag` helper — reject at
+        // macro time rather than emitting a trait with duplicate methods.
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let attrs: Vec<syn::Attribute> = vec![
+            syn::parse_quote!(#[has_many(Tag, through = post_tags)]),
+            syn::parse_quote!(#[has_many(Label, through = post_labels, name = tag)]),
+        ];
+        assert!(resolve_associations(&model, &attrs).is_err());
+    }
+
+    // ── Many-to-many codegen shape (#1324) ────────────────────────────────
+
+    #[test]
+    fn model_macro_m2m_emits_hidden_join_table_module() {
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[has_many(Tag, through = post_tags)]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub title: String,
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("__autumn_m2m_post_tags") || generated.contains("__autumn_m2m"),
+            "expected a hidden m2m join-table module, got: {generated}"
+        );
+        assert!(
+            generated.contains("table !"),
+            "expected a diesel table! invocation"
+        );
+        assert!(
+            generated.contains("allow_tables_to_appear_in_same_query"),
+            "expected the join table to be allowed alongside the target table"
+        );
+    }
+
+    #[test]
+    fn model_macro_m2m_loader_uses_single_inner_join_and_keep() {
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[has_many(Tag, through = post_tags)]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub title: String,
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("inner_join"),
+            "expected a single inner_join loader"
+        );
+        assert!(
+            generated.contains("eq_any"),
+            "expected a batched WHERE ... IN filter"
+        );
+        assert!(
+            generated.contains("__autumn_preload_keep"),
+            "expected the m2m loader to scope rows with the per-row keep predicate"
+        );
+    }
+
+    #[test]
+    fn model_macro_m2m_emits_mutation_trait() {
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[has_many(Tag, through = post_tags)]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub title: String,
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("PostTagsMutations"),
+            "expected a per-association mutation trait"
+        );
+        assert!(
+            generated.contains("add_tag"),
+            "expected an add_tag mutation helper"
+        );
+        assert!(
+            generated.contains("remove_tag"),
+            "expected a remove_tag mutation helper"
+        );
+        assert!(
+            generated.contains("set_tags"),
+            "expected a set_tags (replace-all) mutation helper"
+        );
+        assert!(
+            generated.contains("on_conflict_do_nothing") || generated.contains("on_conflict"),
+            "expected add_tag to be idempotent via ON CONFLICT DO NOTHING"
+        );
+        assert!(
+            generated.contains("M2mConnSource"),
+            "expected the mutation trait to be blanket-implemented over M2mConnSource"
+        );
     }
 
     #[test]
@@ -3785,5 +4835,66 @@ mod tests {
             generated.contains("transition_priority_to"),
             "multi-sm model must emit `transition_priority_to`: {generated}"
         );
+    }
+
+    // ── Datetime control/deserializer selection per zone parameter (#1135) ─
+
+    /// Regression test (Codex P2 on #1587): only `DateTime<Utc>` and
+    /// `DateTime<Local>` — the zones whose offsetless `datetime-local`
+    /// submission has a matching tolerant deserializer — may render the
+    /// datetime picker. Any other zone parameter (`FixedOffset`, chrono-tz
+    /// zones, a bare un-parameterized `DateTime` alias) must fall back to a
+    /// text control whose RFC 3339 value round-trips through chrono's
+    /// default `Deserialize`; giving them the picker would 400 every
+    /// submission.
+    #[test]
+    fn form_control_tokens_gates_datetime_picker_on_zone_param() {
+        let control = |ty: syn::Type| form_control_tokens(&ty, false).to_string();
+
+        let utc = control(syn::parse_quote!(chrono::DateTime<chrono::Utc>));
+        assert!(utc.contains("FieldControl :: DateTime"), "{utc}");
+        let local = control(syn::parse_quote!(chrono::DateTime<chrono::Local>));
+        assert!(local.contains("FieldControl :: DateTime"), "{local}");
+
+        let fixed = control(syn::parse_quote!(chrono::DateTime<chrono::FixedOffset>));
+        assert!(fixed.contains("FieldControl :: Text"), "{fixed}");
+        let tz = control(syn::parse_quote!(chrono::DateTime<chrono_tz::Tz>));
+        assert!(tz.contains("FieldControl :: Text"), "{tz}");
+        // A bare alias hides the zone from the derive — no picker either.
+        let bare = control(syn::parse_quote!(DateTime));
+        assert!(bare.contains("FieldControl :: Text"), "{bare}");
+    }
+
+    /// The deserializer wiring must stay in lockstep with the control choice
+    /// above: `Utc`/`Local` get their zone-matching tolerant deserializer
+    /// (`_option` for nullable), everything else keeps chrono's default
+    /// `Deserialize` (fine — those columns render as text, whose RFC 3339
+    /// value the default parses).
+    #[test]
+    fn datetime_local_serde_attr_matches_zone_param() {
+        let attr = |ty: syn::Type| datetime_local_serde_attr(&ty).map(|t| t.to_string());
+
+        let utc = attr(syn::parse_quote!(chrono::DateTime<chrono::Utc>)).unwrap();
+        assert!(utc.contains("deserialize_datetime_local_utc"), "{utc}");
+
+        let local = attr(syn::parse_quote!(chrono::DateTime<chrono::Local>)).unwrap();
+        assert!(
+            local.contains("deserialize_datetime_local_local"),
+            "{local}"
+        );
+        assert!(!local.contains("_option"), "{local}");
+
+        let nullable = attr(syn::parse_quote!(Option<chrono::DateTime<chrono::Local>>)).unwrap();
+        assert!(
+            nullable.contains("deserialize_datetime_local_local_option"),
+            "{nullable}"
+        );
+        assert!(nullable.contains("default"), "{nullable}");
+
+        assert_eq!(
+            attr(syn::parse_quote!(chrono::DateTime<chrono::FixedOffset>)),
+            None
+        );
+        assert_eq!(attr(syn::parse_quote!(DateTime)), None);
     }
 }

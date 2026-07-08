@@ -14,7 +14,7 @@ use std::sync::LazyLock;
 use autumn_web::extract::Multipart;
 use autumn_web::flash::{Flash, FlashLevel, FlashMessage};
 use autumn_web::job::{JobAdminQuery, JobAdminSnapshot, JobScheduleSummary, job_admin_backend};
-use autumn_web::prelude::HxResponseExt;
+use autumn_web::prelude::{HxRequest, HxResponseExt};
 use autumn_web::security::{CsrfFormField, CsrfToken, CsrfTokenHeader};
 use autumn_web::{AppState, AutumnError, AutumnResult};
 use axum::extract::{FromRequestParts, Path, Query, State};
@@ -771,6 +771,7 @@ async fn model_detail(
         id,
         &messages,
         csrf.token(),
+        csrf.form_field(),
         csrf.token_header(),
         &prefix,
         &actuator_prefix,
@@ -978,15 +979,24 @@ async fn model_action(
 
 /// `DELETE /admin/{slug}/{id}` — Delete a record.
 ///
-/// Called from the detail view's `hx-delete` button. Returns an empty 200
-/// body with `HX-Redirect` so htmx performs a full-page navigation to the
-/// list view (updating `window.location`), rather than swapping the list
-/// HTML into the stale detail page.
+/// Called from the detail view's `confirm_action` dialog (a plain `POST` +
+/// `_method=DELETE` form submission, not `hx-delete` — see
+/// `autumn_web::widgets::confirm_action`), or its `<noscript>` fallback
+/// button when JavaScript is disabled. Neither path sends `HX-Request`
+/// today, so the `hx.is_htmx` branch below is currently unreached by the
+/// admin plugin's own UI; it's kept for direct API/htmx clients that set
+/// the header themselves, in which case they get an empty 200 body with
+/// `HX-Redirect` so htmx performs a full-page navigation to the list view
+/// (updating `window.location`), rather than swapping the list HTML into
+/// the stale detail page. Non-htmx requests get a real 303 redirect, since
+/// a plain browser form submission ignores `HX-Redirect` and would
+/// otherwise land on a blank 200 response.
 async fn model_delete(
     State(state): State<AppState>,
     axum::Extension(registry): axum::Extension<Arc<AdminRegistry>>,
     axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
     Path((slug, id)): Path<(String, i64)>,
+    hx: HxRequest,
     flash: Flash,
 ) -> AutumnResult<Response> {
     let (pool, model) = resolve(&state, &registry, &slug)?;
@@ -998,7 +1008,12 @@ async fn model_delete(
     flash
         .success(format!("{} #{id} deleted.", model.display_name()))
         .await;
-    Ok(StatusCode::OK.hx_redirect(&format!("{prefix}/{slug}")))
+    let list_path = format!("{prefix}/{slug}");
+    if hx.is_htmx {
+        Ok(StatusCode::OK.hx_redirect(&list_path))
+    } else {
+        Ok(Redirect::to(&list_path).into_response())
+    }
 }
 
 // ── CSV export / import handlers ─────────────────────────────────────

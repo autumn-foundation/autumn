@@ -1,7 +1,51 @@
-# autumn-web 0.5.0 Example Reference
+# autumn-web Example Reference (published 0.5.0)
 
 Use these patterns when generating or reviewing Autumn apps. The official
 examples live under `examples/`; prefer current source when exact code matters.
+Everything here works on the published 0.5.0 crates unless marked otherwise.
+
+## Status field with a state machine (replaces hand-rolled hook validation)
+
+Do NOT write status-transition `match` blocks in `before_create`/
+`before_update` hooks or handlers — declare the graph on the model instead:
+
+```rust
+#[autumn_web::model]
+pub struct Page {
+    #[id]
+    pub id: i64,
+    pub title: String,
+    pub body: String,
+    #[state_machine(transitions(
+        draft -> published: "can_publish",
+        published -> archived,
+    ))]
+    pub status: String,
+}
+
+impl Page {
+    fn can_publish(&self) -> bool {
+        !self.title.is_empty() && !self.body.is_empty()
+    }
+}
+
+// In PageHooks::before_update — the only transition code you write:
+async fn before_update(
+    &self,
+    _ctx: &mut MutationContext,
+    draft: &mut UpdateDraft<Page>,
+) -> AutumnResult<()> {
+    if draft.after.status != draft.before.status {
+        let mut proposed = draft.after.clone();
+        proposed.status = draft.before.status.clone();
+        proposed.transition_status_to(&draft.after.status)?; // 400 on bad edge/guard
+    }
+    Ok(())
+}
+```
+
+See `examples/wiki/src/models.rs` + `examples/wiki/src/hooks.rs` and
+`docs/guide/state-machines.md`.
 
 ## Minimal app
 
