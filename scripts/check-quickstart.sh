@@ -131,6 +131,22 @@ readme_cli_version() {
   sed -n 's/^cargo install autumn-cli --version \([0-9][0-9A-Za-z.+-]*\).*$/\1/p' "$repo_root/README.md" | head -n 1
 }
 
+# Every database env override the published runtime/CLI honors must be
+# stripped from the documented commands, or a var the CI job happens to
+# carry could satisfy DB resolution and mask a broken documented
+# no-env/TOML path. Sources (published 0.5.0): autumn-web config.rs applies
+# AUTUMN_DATABASE__URL / AUTUMN_DATABASE__PRIMARY_URL /
+# AUTUMN_DATABASE__REPLICA_URL as database config overrides, and
+# autumn-cli's migrate resolution order is AUTUMN_DATABASE__PRIMARY_URL >
+# AUTUMN_DATABASE__URL > DATABASE_URL. Add future URL-bearing vars here
+# once — every `env` call site expands this list.
+db_env_strip=(
+  -u DATABASE_URL
+  -u AUTUMN_DATABASE__URL
+  -u AUTUMN_DATABASE__PRIMARY_URL
+  -u AUTUMN_DATABASE__REPLICA_URL
+)
+
 remove_prebuilt_binary() {
   # README users go straight from `autumn setup` to `autumn dev` — the
   # quickstart has no discrete build step. Our build phases run `cargo build`
@@ -150,10 +166,10 @@ configure_database() {
   # ships a commented-out [database] section headed "Uncomment to configure
   # database:", and README §Database Topologies says to set database.url.
   # Perform exactly that user edit here. The documented commands themselves
-  # (`autumn migrate`, `autumn dev`) then run with DATABASE_URL /
-  # AUTUMN_DATABASE__URL stripped from the environment, so the gate proves
-  # the file-based path a clean-shell user follows actually works — env vars
-  # the CI job happens to carry can never mask a broken documented step.
+  # (`autumn migrate`, `autumn dev`) then run with every supported DB env
+  # override stripped (see db_env_strip), so the gate proves the file-based
+  # path a clean-shell user follows actually works — env vars the CI job
+  # happens to carry can never mask a broken documented step.
   local toml="$app_dir/autumn.toml"
   [[ -f "$toml" ]] || fail "generated app has no autumn.toml to configure the database in"
   if ! grep -q '^\[database\]' "$toml"; then
@@ -227,8 +243,8 @@ start_server() {
   # spawns the app server as a child process. stop_server/kill_tree tears
   # down the whole watcher → server tree.
   #
-  # DATABASE_URL / AUTUMN_DATABASE__URL are ALWAYS stripped from the
-  # server's environment: database configuration must come from the
+  # Every supported DB env override (db_env_strip) is ALWAYS stripped from
+  # the server's environment: database configuration must come from the
   # documented user action — the [database] section in autumn.toml, written
   # by configure_database in the scaffold-migrate phase — never from env
   # vars the CI job happens to carry. That way the base serve phase
@@ -241,7 +257,7 @@ start_server() {
   fi
   (
     cd "$app_dir" || exit 1
-    exec env -u DATABASE_URL -u AUTUMN_DATABASE__URL autumn dev
+    exec env "${db_env_strip[@]}" autumn dev
   ) >"$log" 2>&1 &
   server_pid=$!
   echo "$server_pid" >"$state/server.pid"
@@ -445,7 +461,7 @@ phase_scaffold_migrate() {
   # autumn.toml alone (autumn-cli's resolve_database_url exits if no
   # TOML/env value is present — that failure must surface here, not be
   # masked by CI env vars a real user doesn't have).
-  (cd "$app_dir" && env -u DATABASE_URL -u AUTUMN_DATABASE__URL autumn migrate) \
+  (cd "$app_dir" && env "${db_env_strip[@]}" autumn migrate) \
     || fail "'autumn migrate' failed with database.url configured in autumn.toml (docs/guide/generators.md scaffold path)"
   ok "diesel CLI present, database created, database.url configured in autumn.toml"
 }
