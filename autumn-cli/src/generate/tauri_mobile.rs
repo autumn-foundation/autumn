@@ -914,6 +914,7 @@ fn offline_sync_feature_propagates(features: &toml::value::Table, dep_key: &str)
         })
 }
 
+#[allow(clippy::too_many_lines)] // one linear anchored-edit policy, clearest unsplit
 fn plan_app_offline_sync_feature(project_root: &Path, plan: &mut Plan) {
     const FEATURES_ANCHOR: &str = "[features]\n";
     const DEFAULT_ANCHOR: &str = "default = [\"flash\"]\n";
@@ -960,7 +961,10 @@ fn plan_app_offline_sync_feature(project_root: &Path, plan: &mut Plan) {
         //    never mounts /sync.
         let mut edited = content;
         let mut changed = false;
-        if !offline_sync_feature_propagates(features, &dep_key) {
+        let default_ok = offline_sync_enabled_by_default(features);
+        let propagation_ok = if offline_sync_feature_propagates(features, &dep_key) {
+            true
+        } else {
             // The one unambiguous anchored shape: an EMPTY declaration
             // gains exactly the dep entry. Any other non-propagating array
             // is a customised feature we refuse to guess at.
@@ -968,20 +972,38 @@ fn plan_app_offline_sync_feature(project_root: &Path, plan: &mut Plan) {
             if edited.contains(EMPTY_DECL) {
                 edited = edited.replacen(EMPTY_DECL, &feature_line, 1);
                 changed = true;
+                true
             } else {
-                plan.warn(format!(
-                    "Cargo.toml declares an `offline-sync` feature, but it \
-                     doesn't enable `{dep_key}/offline-sync` (directly or \
-                     through another feature of this crate), so the sync \
-                     code in serve() would compile against an autumn-web \
-                     built WITHOUT its sync module — a guaranteed build \
-                     failure. Add \"{dep_key}/offline-sync\" to your \
-                     `offline-sync` feature array \
-                     (see docs/guide/tauri-mobile-offline-sync.md)."
-                ));
+                false
             }
-        }
-        if !offline_sync_enabled_by_default(features) {
+        };
+        if !propagation_ok {
+            // The default edit below is deliberately GATED on propagation:
+            // adding a broken `offline-sync` to `default` would turn a
+            // previously-compiling default build into a guaranteed build
+            // failure. So when propagation could not be fixed here, warn
+            // about BOTH steps and touch nothing.
+            let default_note = if default_ok {
+                String::new()
+            } else {
+                " `default` was deliberately left untouched too — enabling \
+                 the broken feature by default would break every plain \
+                 `cargo build` — so after fixing the feature array, also \
+                 add `offline-sync` to the `default` set (or run the \
+                 server deployment with `--features offline-sync`)."
+                    .to_owned()
+            };
+            plan.warn(format!(
+                "Cargo.toml declares an `offline-sync` feature, but it \
+                 doesn't enable `{dep_key}/offline-sync` (directly or \
+                 through another feature of this crate), so the sync \
+                 code in serve() would compile against an autumn-web \
+                 built WITHOUT its sync module — a guaranteed build \
+                 failure. Add \"{dep_key}/offline-sync\" to your \
+                 `offline-sync` feature array.{default_note} \
+                 (see docs/guide/tauri-mobile-offline-sync.md)"
+            ));
+        } else if !default_ok {
             if edited.contains(DEFAULT_ANCHOR) {
                 edited = edited.replacen(
                     DEFAULT_ANCHOR,
@@ -3521,6 +3543,44 @@ mod tests {
             warnings.iter().any(|w| w.contains("autumn/offline-sync")),
             "a package-name entry does not reach the renamed dep's feature, \
              got {warnings:?}"
+        );
+
+        // A NON-PROPAGATING feature that is also missing from default must
+        // NOT get the default edit: enabling a broken feature by default
+        // would turn a previously-compiling `cargo build` into a
+        // guaranteed failure. Nothing is edited (stock anchor present or
+        // not), and ONE warning covers both required steps.
+        let tmp = manifest(
+            STOCK_DEP,
+            "default = [\"flash\"]\nflash = []\n\
+             offline-sync = [\"flash\"]\n",
+        );
+        let (edit, warnings) = planned_edit(&tmp);
+        assert!(
+            edit.is_none(),
+            "a broken feature must never be added to `default`, got:\n{edit:?}"
+        );
+        assert_eq!(warnings.len(), 1, "one warning covers both: {warnings:?}");
+        assert!(
+            warnings[0].contains("autumn-web/offline-sync")
+                && warnings[0].contains("`default` was deliberately left untouched"),
+            "the warning must cover the feature fix AND the skipped default \
+             edit, got {warnings:?}"
+        );
+
+        // Regression (AF): a PROPAGATING feature missing from default
+        // still gets the anchored default edit.
+        let tmp = manifest(
+            STOCK_DEP,
+            "default = [\"flash\"]\nflash = []\n\
+             offline-sync = [\"autumn-web/offline-sync\"]\n",
+        );
+        let (edit, warnings) = planned_edit(&tmp);
+        let edited = edit.expect("a propagating feature must still be defaulted");
+        assert!(warnings.is_empty(), "got {warnings:?}");
+        assert!(
+            edited.contains(r#"default = ["flash", "offline-sync"]"#),
+            "got:\n{edited}"
         );
     }
 
