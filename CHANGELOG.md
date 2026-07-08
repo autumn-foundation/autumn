@@ -544,7 +544,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unbounded memory allocation in W3C Baggage propagation) together with the
   matching `opentelemetry` / `opentelemetry-otlp` 0.32.0 and
   `tracing-opentelemetry` 0.33.0. `rsa` 0.9.10 (RUSTSEC-2023-0071, Marvin
-  attack) remains: no fixed release exists on its 0.9.x line.
+  attack) remains: no fixed release exists on its 0.9.x line. [no-plugin]
 - **deps:** bumped `diesel-async` from 0.8 to 0.9 (resolving 0.9.2, with
   `diesel` at 2.3.10) and `libsqlite3-sys` from 0.36 to 0.37 — 0.37 is the
   newest release line diesel 2.3 accepts (`<0.38`). diesel-async 0.9 changed
