@@ -177,6 +177,44 @@ fn offline_sync_shell_cargo_toml_mirrors_crates_io_patch() {
 }
 
 #[test]
+fn offline_sync_shell_cargo_toml_mirrors_renamed_crates_io_patch() {
+    // Same harness shape as the literal-key patch test, but the patch entry
+    // is renamed (`aw_local = { package = "autumn-web", ... }`): it must be
+    // matched by its effective package and mirrored whole into the shell
+    // manifest — a silently dropped patch would leave the shell on the
+    // registry while the app builds the patched source.
+    let (_tmp, project) = fresh_project("offsync-renamed-patch-app");
+    let cargo_path = project.join("Cargo.toml");
+    let framework_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .join("autumn")
+        .display()
+        .to_string()
+        .replace('\\', "/");
+    let patched = format!(
+        "{}\n[patch.crates-io]\naw_local = {{ package = \"autumn-web\", path = \"{framework_path}\" }}\n",
+        read(&cargo_path)
+    );
+    fs::write(&cargo_path, patched).unwrap();
+
+    run_autumn(&project, &["generate", "tauri-mobile", "--offline-sync"]);
+
+    let shell_cargo = read(&project.join("src-tauri/Cargo.toml"));
+    assert!(
+        shell_cargo.contains("[patch.crates-io]"),
+        "the shell manifest must mirror the renamed patch, got:\n{shell_cargo}"
+    );
+    assert!(
+        shell_cargo.contains(&format!(
+            r#"aw_local = {{ package = "autumn-web", path = "{framework_path}" }}"#
+        )),
+        "the entry must be mirrored whole (key + package + source), got:\n{shell_cargo}"
+    );
+    toml::from_str::<toml::Value>(&shell_cargo).expect("generated Cargo.toml must parse");
+}
+
+#[test]
 fn offline_sync_shell_cargo_toml_mirrors_path_dependency() {
     // A direct path dependency on autumn-web must be recomputed relative to
     // src-tauri/ (one directory deeper than the app manifest).

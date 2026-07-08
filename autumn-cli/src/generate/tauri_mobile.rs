@@ -495,23 +495,41 @@ fn resolve_app_autumn_web_value(project_root: &Path) -> (Option<toml::Value>, st
     (dep, project_root.to_path_buf())
 }
 
-/// Find an `[patch.crates-io] autumn-web = { … }` override in the app's
+/// Find a `[patch.crates-io]` override of the `autumn-web` PACKAGE — the
+/// literal `autumn-web` key or a renamed entry
+/// (`autumn_web_local = { package = "autumn-web", … }`) — in the app's
 /// manifest or the nearest ancestor's (patches only apply from a workspace
 /// root, but the app may be a workspace member). Returns the mirrored
-/// `[patch.crates-io]` section for the shell manifest, warning when a patch
-/// exists but cannot be represented.
+/// `[patch.crates-io]` section for the shell manifest (entry key and
+/// `package` rename preserved), warning when a patch exists but cannot be
+/// represented.
 fn mirror_autumn_web_patch(project_root: &Path, plan: &mut Plan) -> Option<String> {
     let mut dir: Option<&Path> = Some(project_root);
     while let Some(d) = dir {
-        let patch = toml::from_str::<toml::Value>(&read_or_empty(&d.join("Cargo.toml")))
+        // Match patch entries by EFFECTIVE package, not by key: a renamed
+        // patch (`autumn_web_local = {{ package = "autumn-web", … }}`) is
+        // just as valid as the literal `autumn-web` key, and skipping it
+        // would leave the shell on the crates.io registry while the app
+        // builds the patched source (same resolve-by-package convention as
+        // the dependency lookup above).
+        let entry = toml::from_str::<toml::Value>(&read_or_empty(&d.join("Cargo.toml")))
             .ok()
             .as_ref()
-            .and_then(|doc| doc.get("patch")?.get("crates-io")?.get("autumn-web"))
-            .cloned();
-        if let Some(value) = patch {
-            let source = value
-                .as_table()
-                .and_then(|t| dep_source_from_table(t, d, project_root));
+            .and_then(|doc| doc.get("patch")?.get("crates-io")?.as_table())
+            .and_then(|table| {
+                table.iter().find(|(key, value)| {
+                    key.as_str() == "autumn-web"
+                        || value
+                            .as_table()
+                            .and_then(|t| t.get("package"))
+                            .and_then(toml::Value::as_str)
+                            == Some("autumn-web")
+                })
+            })
+            .map(|(key, value)| (key.clone(), value.clone()));
+        if let Some((key, value)) = entry {
+            let table = value.as_table();
+            let source = table.and_then(|t| dep_source_from_table(t, d, project_root));
             let Some(source) = source else {
                 plan.warn(
                     "the app's [patch.crates-io] override of autumn-web could not \
@@ -525,12 +543,19 @@ fn mirror_autumn_web_patch(project_root: &Path, plan: &mut Plan) -> Option<Strin
                 );
                 return None;
             };
+            // Mirror the whole entry: original key plus its `package`
+            // rename, so the emitted section patches exactly what the app's
+            // does.
+            let package_part = table
+                .and_then(|t| t.get("package"))
+                .and_then(toml::Value::as_str)
+                .map_or_else(String::new, |package| format!("package = \"{package}\", "));
             return Some(format!(
                 "\n[patch.crates-io]\n\
                  # Mirrors the app's [patch.crates-io] override of autumn-web: the shell\n\
                  # declares its own [workspace], so the app's patch would otherwise NOT\n\
                  # apply here and the shell would compile a different framework source.\n\
-                 autumn-web = {{ {source} }}\n"
+                 {key} = {{ {package_part}{source} }}\n"
             ));
         }
         dir = d.parent();
@@ -2315,6 +2340,74 @@ mod tests {
         let toml_src = render_mobile_cargo_toml("my-app", true, Some(&dep));
         assert!(toml_src.contains("[patch.crates-io]"));
         toml::from_str::<toml::Value>(&toml_src).expect("generated Cargo.toml must parse");
+    }
+
+    #[test]
+    fn offline_shell_dep_mirrors_renamed_crates_io_patch() {
+        // A renamed patch entry is just as valid as the literal key: it
+        // must be matched by its `package` field and mirrored whole —
+        // key, rename, and source.
+        let (dep, warnings) = shell_dep_for(
+            "autumn-web = \"0.9.1\"",
+            "\n[patch.crates-io]\naw_local = { package = \"autumn-web\", path = \"/src/autumn/autumn\" }\n",
+        );
+        assert_eq!(
+            dep.dep_entry,
+            r#"autumn-web = { version = "0.9.1", features = ["offline-sync"] }"#,
+        );
+        let patch = dep
+            .patch_entry
+            .clone()
+            .expect("the renamed patch must be mirrored, not silently dropped");
+        assert!(
+            patch.contains(r#"aw_local = { package = "autumn-web", path = "/src/autumn/autumn" }"#),
+            "the entry must be mirrored whole (key + package + source), got: {patch}"
+        );
+        assert!(warnings.is_empty(), "got {warnings:?}");
+
+        // And the rendered manifest stays valid TOML.
+        let toml_src = render_mobile_cargo_toml("my-app", true, Some(&dep));
+        toml::from_str::<toml::Value>(&toml_src).expect("generated Cargo.toml must parse");
+    }
+
+    #[test]
+    fn offline_shell_dep_mirrors_renamed_patch_from_ancestor_workspace() {
+        // The renamed-patch lookup walks ancestor manifests exactly like
+        // the literal-key one; a relative patch path declared at the
+        // workspace root is absolutized against that root.
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"app\"]\n\n\
+             [patch.crates-io]\naw_local = { package = \"autumn-web\", path = \"vendor/autumn\" }\n",
+        )
+        .unwrap();
+        let app = tmp.path().join("app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(
+            app.join("Cargo.toml"),
+            "[package]\nname = \"my-app\"\nversion = \"0.2.3\"\n\n\
+             [dependencies]\nautumn-web = \"0.9.1\"\n",
+        )
+        .unwrap();
+        let mut plan = Plan::new(&app);
+        let dep = shell_autumn_web_dep(&app, &mut plan);
+        let expected = tmp
+            .path()
+            .join("vendor/autumn")
+            .display()
+            .to_string()
+            .replace('\\', "/");
+        let patch = dep
+            .patch_entry
+            .expect("the ancestor workspace's renamed patch must be mirrored");
+        assert!(
+            patch.contains(&format!(
+                r#"aw_local = {{ package = "autumn-web", path = "{expected}" }}"#
+            )),
+            "got: {patch}"
+        );
+        assert!(plan.warnings.is_empty(), "got {:?}", plan.warnings);
     }
 
     #[test]
