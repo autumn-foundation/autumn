@@ -172,6 +172,44 @@ async fn sslmode_require_negotiates_tls_and_sends_startup_encrypted() {
     );
 }
 
+/// The startup migration / wait-check path must use the SAME rustls
+/// connector as the pool (issue #1585 review): the bundled libpq has no SSL
+/// support, so a TLS-only server that the async pool reaches fine would
+/// still fail at startup when `run_startup_migrations` (or `autumn migrate
+/// --wait`) connects synchronously. The stub cannot run real migrations,
+/// but a completed TLS handshake carrying the startup message proves the
+/// wait path went through rustls rather than libpq.
+///
+/// A plain `#[test]` on purpose: the migration path is synchronous and
+/// `block_on`s internally, so it must run without an ambient tokio runtime
+/// (exactly like the CLI) — a `#[tokio::test]` worker thread would be the
+/// one context it forbids.
+#[test]
+fn wait_for_database_negotiates_tls_for_sslmode_require() {
+    let (port, rx) = spawn_stub(true);
+    let url = format!("postgres://app_user:secret@127.0.0.1:{port}/app?sslmode=require");
+
+    // The stub is not a real Postgres, so the wait can never succeed —
+    // what matters is what the stub OBSERVES from the first attempt.
+    let _ = autumn_web::migrate::wait_for_database(
+        &url,
+        std::time::Duration::from_secs(3),
+        |_attempt, _delay| {},
+    );
+
+    let observed = rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the stub must observe a connection from the wait path");
+    let Observed::TlsStartup(startup) = observed else {
+        panic!("the migration/wait path must negotiate TLS, got {observed:?}");
+    };
+    let haystack = String::from_utf8_lossy(&startup);
+    assert!(
+        haystack.contains("app_user"),
+        "startup message must arrive over the encrypted stream, got: {haystack}"
+    );
+}
+
 #[tokio::test]
 async fn keyword_value_connection_string_passes_validation_and_negotiates_tls() {
     // The libpq keyword/value form (with quoting and whitespace around `=`)
