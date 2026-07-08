@@ -3197,27 +3197,33 @@ mod tls {
             let Ok(mut parsed) = url::Url::parse(database_url) else {
                 return database_url.to_owned();
             };
-            let pairs: Vec<(String, String)> = parsed
-                .query_pairs()
-                .map(|(k, v)| (k.into_owned(), v.into_owned()))
-                .collect();
-            {
-                let mut editor = parsed.query_pairs_mut();
-                editor.clear();
-                for (k, v) in pairs {
-                    match k.as_str() {
-                        "sslmode" => {
-                            editor.append_pair("sslmode", "require");
-                        }
-                        "sslrootcert" => {}
-                        _ => {
-                            editor.append_pair(&k, &v);
-                        }
+            // Rewrite ONLY the sslmode/sslrootcert components, preserving
+            // every other raw query component byte-for-byte: decoding and
+            // re-serializing through query_pairs()/append_pair() would
+            // form-encode spaces as `+`, which libpq/tokio-postgres do not
+            // accept in Postgres URI parameters —
+            // `options=-c%20search_path%3Dtenant` would be mangled into
+            // `options=-c+search_path=tenant`. (The startup-wait splice in
+            // migrate.rs avoids those APIs for the same reason.)
+            let raw = parsed
+                .query()
+                .unwrap_or("")
+                .split('&')
+                .filter(|component| !component.is_empty())
+                .filter_map(|component| {
+                    let key = component.split('=').next().unwrap_or(component);
+                    match key {
+                        "sslmode" => Some("sslmode=require"),
+                        "sslrootcert" => None,
+                        _ => Some(component),
                     }
-                }
-            }
-            if parsed.query() == Some("") {
+                })
+                .collect::<Vec<_>>()
+                .join("&");
+            if raw.is_empty() {
                 parsed.set_query(None);
+            } else {
+                parsed.set_query(Some(&raw));
             }
             parsed.to_string()
         } else {
@@ -3477,6 +3483,22 @@ mod tls {
             assert!(!sanitized.contains("verify-full"), "{sanitized}");
             assert!(!sanitized.contains("sslrootcert"), "{sanitized}");
             assert!(sanitized.contains("application_name=app"), "{sanitized}");
+
+            // Percent-encoded components survive byte-for-byte: form
+            // re-encoding would turn %20 into `+`, which libpq and
+            // tokio-postgres do not accept as a space in URI parameters.
+            let sanitized = sanitize_for_verify_full(
+                "postgres://u@h/db?options=-c%20search_path%3Dtenant&sslmode=verify-full&sslrootcert=/etc/ca.pem",
+            );
+            assert_eq!(
+                sanitized, "postgres://u@h/db?options=-c%20search_path%3Dtenant&sslmode=require",
+                "raw components must be preserved verbatim"
+            );
+            // Dropping the only params leaves a clean URL with no `?`.
+            assert_eq!(
+                sanitize_for_verify_full("postgres://u@h/db?sslrootcert=/etc/ca.pem"),
+                "postgres://u@h/db"
+            );
 
             let kv = sanitize_for_verify_full(
                 "host=h user=u sslmode=verify-full sslrootcert=/etc/ca.pem dbname=db",
