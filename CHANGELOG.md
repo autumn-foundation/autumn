@@ -514,6 +514,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Accept-Encoding` accepts them, instead of relying solely on the
   general-purpose compression middleware to redo that work on every request.
 
+### Changed
+
+- **workspace:** `Cargo.lock` is now committed to the repository (it was
+  previously gitignored) so builds are reproducible and dependency updates
+  are reviewable.
+
+## [0.6.0] - 2026-06-30
+
+### Added
+
+- **ui:** reusable `card` and `stat_card` Maud widget helpers in
+  `autumn_web::widgets`, re-exported from the prelude. `card()` renders a
+  titled content panel with an optional header-action slot, footer, and
+  configurable heading level (`HeadingLevel::H1`–`H6`, default `H2`);
+  `stat_card()` renders a metric tile with label, value, and optional link.
+  Both are CSP-safe and HTML-escape caller-supplied text via Maud.
+  `CardConfig` uses a builder pattern with `const fn` and private fields
+  so the `title()` / `title_html()` escape path cannot be bypassed.
+  The admin plugin's 12 hand-rolled card blocks and dashboard stat tiles are
+  migrated to the new helpers, removing the duplication (#1122).
+
+## [0.5.0] - 2026-06-16
+
+### Added
+
 - **ci:** plugin freshness gate (`scripts/check-plugin-freshness.sh` +
   `.github/workflows/plugin-freshness.yml`) — a PR that adds entries to this
   changelog's Unreleased `Added`/`Changed` sections without touching the
