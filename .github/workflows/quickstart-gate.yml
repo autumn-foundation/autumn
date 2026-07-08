@@ -59,15 +59,28 @@ env:
   QUICKSTART_CLI_VERSION: ${{ inputs.cli-version }}
   # DATABASE_URL is deliberately NOT set job-wide: the README path up to
   # `GET /` configures no database, and the base serve phase must exercise
-  # that no-DB runtime. Only the scaffold migrate/serve steps get it (and
-  # the script additionally strips DB env from the base serve phase's
-  # server process as a belt-and-braces guarantee).
+  # that no-DB runtime. Only the scaffold-migrate step gets it — and even
+  # there the script only uses it to write database.url into autumn.toml
+  # (the documented config step); the documented commands themselves run
+  # with DB env stripped.
   QUICKSTART_DATABASE_URL: postgres://autumn:autumn@localhost:5432/quickstart
 
 jobs:
   quickstart:
-    name: README quickstart vs published crates
+    name: README quickstart vs published crates (${{ matrix.toolchain }})
     runs-on: ubuntu-latest
+    # Two toolchain legs: `stable` is the typical new user (and the canonical
+    # funnel metric); "1.88.0" is the MSRV the README advertises ("Rust
+    # 1.88.0+" — README ## Requirements), so an upstream dependency release
+    # or a published crate that quietly raises its rust-version above the
+    # documented floor turns this gate red instead of silently breaking only
+    # the users on the documented minimum. Keep the pin in lockstep with the
+    # README / [workspace.package] rust-version (scripts/check-msrv.sh
+    # guards that alignment).
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: [stable, "1.88.0"]
     # A hung cargo install/build or download must not burn the default 6-hour
     # job budget; the whole quickstart fits well inside an hour even cold.
     timeout-minutes: 60
@@ -94,7 +107,9 @@ jobs:
                       /opt/ghc /opt/hostedtoolcache/CodeQL
           df -h
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
 
       - name: Install diesel_cli (autumn migrate prerequisite, outside the funnel)
         run: cargo install diesel_cli --version "=2.2.0" --no-default-features --features postgres --locked
@@ -120,12 +135,14 @@ jobs:
       - name: "Scaffold: build"
         run: ./scripts/check-quickstart.sh scaffold-build
 
-      - name: "Scaffold: migrate (autumn migrate)"
+      - name: "Scaffold: migrate (configure autumn.toml + autumn migrate)"
         env:
+          # Consumed by the script only to write database.url into
+          # autumn.toml; `autumn migrate` itself runs with DB env stripped.
           DATABASE_URL: ${{ env.QUICKSTART_DATABASE_URL }}
         run: ./scripts/check-quickstart.sh scaffold-migrate
 
       - name: "Scaffold: first request (GET /posts → 200)"
-        env:
-          DATABASE_URL: ${{ env.QUICKSTART_DATABASE_URL }}
+        # No DB env: the server reads database.url from autumn.toml, the
+        # documented configuration a real user has.
         run: ./scripts/check-quickstart.sh scaffold-serve

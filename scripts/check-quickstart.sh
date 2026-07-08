@@ -33,9 +33,12 @@
 #                    `cargo install` to the first 200 response.
 #   scaffold         `autumn generate scaffold Post title:String body:Text published:bool`
 #   scaffold-build   `cargo build`
-#   scaffold-migrate `autumn migrate` (requires $DATABASE_URL and the diesel
-#                    CLI on PATH; see docs/guide/generators.md)
-#   scaffold-serve   `autumn dev` + poll `GET /posts` until 200.
+#   scaffold-migrate uncomment [database] in autumn.toml (the documented
+#                    config step, using $DATABASE_URL as the value), then
+#                    `autumn migrate` with DB env stripped (requires the
+#                    diesel CLI on PATH; see docs/guide/generators.md)
+#   scaffold-serve   `autumn dev` + poll `GET /posts` until 200 (DB config
+#                    comes from autumn.toml, not env).
 #
 # Environment:
 #   QUICKSTART_CLI_VERSION        Override the autumn-cli version to install
@@ -51,9 +54,13 @@
 #                                 3000, the README's documented port).
 #   QUICKSTART_SERVE_TIMEOUT_SECS Deadline for the first response after
 #                                 `autumn dev` starts (default 180).
-#   DATABASE_URL                  Postgres URL for the scaffold migrate/serve
-#                                 phases (CI provides a postgres:16 service
-#                                 container).
+#   DATABASE_URL                  Postgres URL the scaffold-migrate phase
+#                                 writes into autumn.toml's [database]
+#                                 section (the documented config step; CI
+#                                 provides a postgres:16 service container).
+#                                 Never passed to the app or migrate as an
+#                                 env var — the documented commands run with
+#                                 DB env stripped.
 set -Eeuo pipefail
 
 phase="${1:?usage: scripts/check-quickstart.sh <install|new|setup|build|serve|scaffold|scaffold-build|scaffold-migrate|scaffold-serve>}"
@@ -137,6 +144,32 @@ remove_prebuilt_binary() {
   rm -f "${CARGO_TARGET_DIR:-$app_dir/target}/debug/my-app"
 }
 
+configure_database() {
+  # The DOCUMENTED way to give the app a database: the generated autumn.toml
+  # ships a commented-out [database] section headed "Uncomment to configure
+  # database:", and README §Database Topologies says to set database.url.
+  # Perform exactly that user edit here. The documented commands themselves
+  # (`autumn migrate`, `autumn dev`) then run with DATABASE_URL /
+  # AUTUMN_DATABASE__URL stripped from the environment, so the gate proves
+  # the file-based path a clean-shell user follows actually works — env vars
+  # the CI job happens to carry can never mask a broken documented step.
+  local toml="$app_dir/autumn.toml"
+  [[ -f "$toml" ]] || fail "generated app has no autumn.toml to configure the database in"
+  if ! grep -q '^\[database\]' "$toml"; then
+    # [[:space:]]*$ tolerates the CRLF line endings the generated
+    # autumn.toml ships with (observed with the published autumn-cli 0.5.0);
+    # a bare $ would never match after the trailing \r.
+    sed -i \
+      -e 's|^# \[database\][[:space:]]*$|[database]|' \
+      -e "s|^# url = \"postgres://[^\"]*\"[[:space:]]*\$|url = \"${DATABASE_URL}\"|" \
+      "$toml"
+  fi
+  grep -q '^\[database\]' "$toml" \
+    || fail "could not uncomment the [database] section in the generated autumn.toml — the template changed shape; update scripts/check-quickstart.sh to match it"
+  grep -q "^url = \"${DATABASE_URL}\"" "$toml" \
+    || fail "could not set database.url in the generated autumn.toml — the template changed shape; update scripts/check-quickstart.sh to match it"
+}
+
 
 # ── Server lifecycle ─────────────────────────────────────────────────────────
 
@@ -156,36 +189,24 @@ start_server() {
   # exactly that way — a regression in the published CLI's dev
   # startup/watch path would otherwise slip past the gate while every new
   # user hits it. Verified to run headless (no tty needed); the watcher
-  # spawns the app server as a child process, and env vars set here pass
-  # through to it. stop_server/kill_tree tears down the whole
-  # watcher → server tree.
+  # spawns the app server as a child process. stop_server/kill_tree tears
+  # down the whole watcher → server tree.
   #
-  # $2 selects the runtime configuration the README path actually exercises:
-  #   no-db    The quickstart up to `GET /` configures no database, so the
-  #            server must run with NO DB env at all — strip DATABASE_URL /
-  #            AUTUMN_DATABASE__URL even if the CI job env carries them,
-  #            otherwise a regression that only affects the no-DB runtime
-  #            could slip through while the gate exercises a DB-configured
-  #            app.
-  #   with-db  The scaffolded /posts route needs Postgres. The generated
-  #            autumn.toml ships with [database] commented out, and the
-  #            runtime configures no pool from a bare DATABASE_URL on a
-  #            fresh app; injecting the URL through the framework's
-  #            documented `AUTUMN_*` config-override env var stands in for
-  #            the "uncomment [database] in autumn.toml" step — it does not
-  #            change any README command.
-  local log="$1" db_mode="$2"
+  # DATABASE_URL / AUTUMN_DATABASE__URL are ALWAYS stripped from the
+  # server's environment: database configuration must come from the
+  # documented user action — the [database] section in autumn.toml, written
+  # by configure_database in the scaffold-migrate phase — never from env
+  # vars the CI job happens to carry. That way the base serve phase
+  # exercises the no-DB runtime a README user gets ([database] is still
+  # commented out at that point), and the scaffold serve phase exercises
+  # the documented file-based configuration in a clean shell.
+  local log="$1"
   if curl -fsS -o /dev/null --max-time 2 "$base_url/" 2>/dev/null; then
     fail "port ${port} is already serving before the app started — port collision on the runner"
   fi
   (
     cd "$app_dir" || exit 1
-    if [[ "$db_mode" == "with-db" ]]; then
-      export AUTUMN_DATABASE__URL="$DATABASE_URL"
-      exec autumn dev
-    else
-      exec env -u DATABASE_URL -u AUTUMN_DATABASE__URL autumn dev
-    fi
+    exec env -u DATABASE_URL -u AUTUMN_DATABASE__URL autumn dev
   ) >"$log" 2>&1 &
   server_pid=$!
   echo "$server_pid" >"$state/server.pid"
@@ -243,6 +264,8 @@ phase_install() {
   step_summary ""
   step_summary "Installs the README-pinned \`autumn-cli\` from crates.io (or the \`cli-version\` dispatch input) and runs the README quickstart verbatim."
   step_summary "This validates the published crates against the README at this commit — it does **not** exercise the pushed code (the workspace \`[patch.crates-io]\` override means no other CI job sees what a new user installs)."
+  step_summary ""
+  step_summary "Toolchain: \`$(rustc --version 2>/dev/null | head -n 1 || echo unknown)\` — the \`stable\` leg is the canonical funnel metric; the MSRV leg guards the README's documented \`Rust 1.88.0+\` floor."
   step_summary ""
   step_summary "| Phase | Result | Duration | Notes |"
   step_summary "|---|---|---|---|"
@@ -327,10 +350,14 @@ phase_build() {
 phase_serve() {
   require_app
   local log="$state/server-serve.log"
-  # The README path up to `GET /` has no database configured — serve in
-  # no-db mode so this phase exercises the same runtime a README user gets.
+  # The README path up to `GET /` has no database configured — this phase
+  # must exercise the no-DB runtime a README user gets. Guard the phase
+  # order: the [database] section only becomes active in scaffold-migrate.
+  if grep -q '^\[database\]' "$app_dir/autumn.toml" 2>/dev/null; then
+    fail "autumn.toml already has an active [database] section — the base serve phase must exercise the no-DB runtime (phases run out of order?)"
+  fi
   remove_prebuilt_binary
-  start_server "$log" no-db
+  start_server "$log"
   wait_for_200 "$base_url/" "$log"
   local t200 t_install elapsed
   t200=$(date +%s)
@@ -367,18 +394,25 @@ phase_scaffold_build() {
 
 phase_scaffold_migrate() {
   require_app
-  [[ -n "${DATABASE_URL:-}" ]] || fail "DATABASE_URL is not set — the scaffold migrate/serve phases need a Postgres (CI provides a postgres:16 service container)"
+  [[ -n "${DATABASE_URL:-}" ]] || fail "DATABASE_URL is not set — it supplies the Postgres URL written into autumn.toml's [database] section (CI provides a postgres:16 service container)"
   command -v diesel >/dev/null || fail "the diesel CLI is not on PATH — 'autumn migrate' shells out to it (cargo install diesel_cli --no-default-features --features postgres)"
-  (cd "$app_dir" && autumn migrate) || fail "'autumn migrate' failed (docs/guide/generators.md scaffold path)"
-  ok
+  configure_database
+  # Run the documented command in a clean shell: DB config must resolve from
+  # autumn.toml alone (autumn-cli's resolve_database_url exits if no
+  # TOML/env value is present — that failure must surface here, not be
+  # masked by CI env vars a real user doesn't have).
+  (cd "$app_dir" && env -u DATABASE_URL -u AUTUMN_DATABASE__URL autumn migrate) \
+    || fail "'autumn migrate' failed with database.url configured in autumn.toml (docs/guide/generators.md scaffold path)"
+  ok "database.url configured in autumn.toml"
 }
 
 phase_scaffold_serve() {
   require_app
-  [[ -n "${DATABASE_URL:-}" ]] || fail "DATABASE_URL is not set — the scaffolded /posts route needs a Postgres"
+  grep -q '^\[database\]' "$app_dir/autumn.toml" 2>/dev/null \
+    || fail "autumn.toml has no active [database] section — run the scaffold-migrate phase first"
   local log="$state/server-scaffold-serve.log"
   remove_prebuilt_binary
-  start_server "$log" with-db
+  start_server "$log"
   # docs/guide/generators.md: "Visit http://localhost:3000/posts to see the
   # generated index page."
   wait_for_200 "$base_url/posts" "$log"
