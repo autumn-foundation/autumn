@@ -18,7 +18,7 @@
 /// Non-dot segments are preserved byte-for-byte (no general percent-decoding
 /// is performed). A trailing slash in the input is preserved so that
 /// segment-boundary prefix checks keep working.
-pub(crate) fn clean_path(path: &str) -> String {
+pub fn clean_path(path: &str) -> String {
     let mut segments: Vec<&str> = Vec::new();
     for segment in path.split('/') {
         if segment.is_empty() {
@@ -38,7 +38,12 @@ pub(crate) fn clean_path(path: &str) -> String {
     if path.starts_with('/') {
         normalized.push('/');
     }
-    normalized.push_str(&segments.join("/"));
+    for (i, segment) in segments.iter().enumerate() {
+        if i > 0 {
+            normalized.push('/');
+        }
+        normalized.push_str(segment);
+    }
     if path.ends_with('/') && !normalized.ends_with('/') {
         normalized.push('/');
     }
