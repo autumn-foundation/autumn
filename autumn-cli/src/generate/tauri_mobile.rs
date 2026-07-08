@@ -578,63 +578,137 @@ fn resolve_app_autumn_web_value(
 /// `package` rename preserved), warning when a patch exists but cannot be
 /// represented.
 fn mirror_autumn_web_patch(project_root: &Path, plan: &mut Plan) -> Option<String> {
-    let mut dir: Option<&Path> = Some(project_root);
-    while let Some(d) = dir {
-        // Match patch entries by EFFECTIVE package, not by key: a renamed
-        // patch (`autumn_web_local = {{ package = "autumn-web", … }}`) is
-        // just as valid as the literal `autumn-web` key, and skipping it
-        // would leave the shell on the crates.io registry while the app
-        // builds the patched source (same resolve-by-package convention as
-        // the dependency lookup above).
-        let entry = toml::from_str::<toml::Value>(&read_or_empty(&d.join("Cargo.toml")))
-            .ok()
-            .as_ref()
-            .and_then(|doc| doc.get("patch")?.get("crates-io")?.as_table())
-            .and_then(|table| {
-                table.iter().find(|(key, value)| {
-                    key.as_str() == "autumn-web"
-                        || value
-                            .as_table()
-                            .and_then(|t| t.get("package"))
-                            .and_then(toml::Value::as_str)
-                            == Some("autumn-web")
-                })
+    // Cargo only honors the [patch] tables of the EFFECTIVE workspace root
+    // (member-local [patch] tables are ignored, with a cargo warning), so
+    // mirror exclusively from that manifest: copying a member-local patch
+    // would make the shell compile a framework checkout the app itself
+    // never uses.
+    let root = effective_workspace_root(project_root);
+
+    // A member-local framework patch is skipped — tell the user why, since
+    // "my patch wasn't mirrored" is otherwise mystifying.
+    if root != project_root && autumn_web_patch_entry(project_root).is_some() {
+        plan.warn(format!(
+            "Cargo ignores [patch] tables outside the workspace root, so the \
+             [patch.crates-io] override of autumn-web in the app's own \
+             Cargo.toml was NOT mirrored into src-tauri/Cargo.toml (only the \
+             patch table of {} applies). Move the patch to the workspace \
+             root if the app should build against it.",
+            root.join("Cargo.toml").display(),
+        ));
+    }
+
+    let (key, value) = autumn_web_patch_entry(&root)?;
+    let table = value.as_table();
+    let source = table.and_then(|t| dep_source_from_table(t, &root, project_root));
+    let Some(source) = source else {
+        plan.warn(
+            "the app's [patch.crates-io] override of autumn-web could not \
+             be mirrored into src-tauri/Cargo.toml (only path and git \
+             patches are supported). The shell declares its own \
+             [workspace], so the app's patch does NOT apply there — copy \
+             your [patch.crates-io] section into src-tauri/Cargo.toml \
+             yourself or the shell will build against the crates.io \
+             registry version of autumn-web."
+                .to_owned(),
+        );
+        return None;
+    };
+    // Mirror the whole entry: original key plus its `package` rename, so
+    // the emitted section patches exactly what the root's does.
+    let package_part = table
+        .and_then(|t| t.get("package"))
+        .and_then(toml::Value::as_str)
+        .map_or_else(String::new, |package| format!("package = \"{package}\", "));
+    Some(format!(
+        "\n[patch.crates-io]\n\
+         # Mirrors the app's [patch.crates-io] override of autumn-web: the shell\n\
+         # declares its own [workspace], so the app's patch would otherwise NOT\n\
+         # apply here and the shell would compile a different framework source.\n\
+         {key} = {{ {package_part}{source} }}\n"
+    ))
+}
+
+/// The `[patch.crates-io]` entry of `dir`'s manifest that patches the
+/// `autumn-web` PACKAGE — matched by effective package, not by key: a
+/// renamed patch (`autumn_web_local = { package = "autumn-web", … }`) is
+/// just as valid as the literal `autumn-web` key, and skipping it would
+/// leave the shell on the crates.io registry while the app builds the
+/// patched source (same resolve-by-package convention as the dependency
+/// lookup).
+fn autumn_web_patch_entry(dir: &Path) -> Option<(String, toml::Value)> {
+    toml::from_str::<toml::Value>(&read_or_empty(&dir.join("Cargo.toml")))
+        .ok()
+        .as_ref()
+        .and_then(|doc| doc.get("patch")?.get("crates-io")?.as_table())
+        .and_then(|table| {
+            table.iter().find(|(key, value)| {
+                key.as_str() == "autumn-web"
+                    || value
+                        .as_table()
+                        .and_then(|t| t.get("package"))
+                        .and_then(toml::Value::as_str)
+                        == Some("autumn-web")
             })
-            .map(|(key, value)| (key.clone(), value.clone()));
-        if let Some((key, value)) = entry {
-            let table = value.as_table();
-            let source = table.and_then(|t| dep_source_from_table(t, d, project_root));
-            let Some(source) = source else {
-                plan.warn(
-                    "the app's [patch.crates-io] override of autumn-web could not \
-                     be mirrored into src-tauri/Cargo.toml (only path and git \
-                     patches are supported). The shell declares its own \
-                     [workspace], so the app's patch does NOT apply there — copy \
-                     your [patch.crates-io] section into src-tauri/Cargo.toml \
-                     yourself or the shell will build against the crates.io \
-                     registry version of autumn-web."
-                        .to_owned(),
-                );
-                return None;
+        })
+        .map(|(key, value)| (key.clone(), value.clone()))
+}
+
+/// The manifest directory whose `[patch]` tables Cargo actually honors for
+/// the app at `project_root`:
+///
+/// - the app itself when its manifest declares `[workspace]` (own root) or
+///   no enclosing workspace exists (standalone),
+/// - the target of an explicit `package.workspace = "…"` pointer,
+/// - otherwise the nearest ancestor manifest declaring `[workspace]` —
+///   unless that ancestor's `workspace.exclude` names the app's directory
+///   (exact relative path; glob patterns are not expanded — the cheap
+///   rule), in which case the app is standalone.
+///
+/// Full `members` glob verification is deliberately skipped: a nearest
+/// ancestor root that does not include the member is a broken workspace
+/// Cargo itself rejects.
+fn effective_workspace_root(project_root: &Path) -> std::path::PathBuf {
+    let parse = |dir: &Path| -> Option<toml::Value> {
+        toml::from_str(&read_or_empty(&dir.join("Cargo.toml"))).ok()
+    };
+    let doc = parse(project_root);
+    if doc.as_ref().is_some_and(|d| d.get("workspace").is_some()) {
+        return project_root.to_path_buf();
+    }
+    if let Some(pointer) = doc
+        .as_ref()
+        .and_then(|d| d.get("package")?.get("workspace"))
+        .and_then(toml::Value::as_str)
+    {
+        return project_root.join(pointer);
+    }
+    let mut dir = project_root.parent();
+    while let Some(d) = dir {
+        if let Some(workspace) = parse(d)
+            .as_ref()
+            .and_then(|doc| doc.get("workspace").cloned())
+        {
+            let excluded = workspace
+                .get("exclude")
+                .and_then(toml::Value::as_array)
+                .is_some_and(|entries| {
+                    entries.iter().filter_map(toml::Value::as_str).any(|entry| {
+                        lexical_relative(project_root, d)
+                            .is_some_and(|relative| relative == Path::new(entry))
+                    })
+                });
+            return if excluded {
+                // Excluded members are standalone: their own manifest's
+                // patch table is the effective one.
+                project_root.to_path_buf()
+            } else {
+                d.to_path_buf()
             };
-            // Mirror the whole entry: original key plus its `package`
-            // rename, so the emitted section patches exactly what the app's
-            // does.
-            let package_part = table
-                .and_then(|t| t.get("package"))
-                .and_then(toml::Value::as_str)
-                .map_or_else(String::new, |package| format!("package = \"{package}\", "));
-            return Some(format!(
-                "\n[patch.crates-io]\n\
-                 # Mirrors the app's [patch.crates-io] override of autumn-web: the shell\n\
-                 # declares its own [workspace], so the app's patch would otherwise NOT\n\
-                 # apply here and the shell would compile a different framework source.\n\
-                 {key} = {{ {package_part}{source} }}\n"
-            ));
         }
         dir = d.parent();
     }
-    None
+    project_root.to_path_buf()
 }
 
 /// Compute the shell's `autumn-web` dependency (offline sync only), mirroring
@@ -2859,6 +2933,106 @@ mod tests {
         assert!(
             !patch.contains(&tmp.path().display().to_string()),
             "no machine-specific absolute prefix may leak into the manifest"
+        );
+        assert!(plan.warnings.is_empty(), "got {:?}", plan.warnings);
+    }
+
+    #[test]
+    fn offline_member_local_patch_is_skipped_with_a_warning() {
+        // Cargo ignores [patch] tables outside the workspace root — a
+        // member-local patch must NOT be mirrored (the app never builds
+        // against it), and the skip must be explained.
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"app\"]\n",
+        )
+        .unwrap();
+        let app = tmp.path().join("app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(
+            app.join("Cargo.toml"),
+            "[package]\nname = \"my-app\"\nversion = \"0.2.3\"\n\n\
+             [dependencies]\nautumn-web = \"0.9.1\"\n\n\
+             [patch.crates-io]\nautumn-web = { path = \"/src/ignored/autumn\" }\n",
+        )
+        .unwrap();
+        let mut plan = Plan::new(&app);
+        let dep = shell_autumn_web_dep(&app, &mut plan);
+        assert!(
+            dep.patch_entry.is_none(),
+            "a member-local patch cargo ignores must not be mirrored, got {:?}",
+            dep.patch_entry
+        );
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|w| w.contains("outside the workspace root")),
+            "the skip must be explained, got {:?}",
+            plan.warnings
+        );
+    }
+
+    #[test]
+    fn offline_root_patch_wins_over_a_stale_member_local_one() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"app\"]\n\n\
+             [patch.crates-io]\nautumn-web = { path = \"/src/effective/autumn\" }\n",
+        )
+        .unwrap();
+        let app = tmp.path().join("app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(
+            app.join("Cargo.toml"),
+            "[package]\nname = \"my-app\"\nversion = \"0.2.3\"\n\n\
+             [dependencies]\nautumn-web = \"0.9.1\"\n\n\
+             [patch.crates-io]\nautumn-web = { path = \"/src/stale/autumn\" }\n",
+        )
+        .unwrap();
+        let mut plan = Plan::new(&app);
+        let dep = shell_autumn_web_dep(&app, &mut plan);
+        let patch = dep
+            .patch_entry
+            .expect("the workspace root's patch must be mirrored");
+        assert!(
+            patch.contains(r#"autumn-web = { path = "/src/effective/autumn" }"#),
+            "the EFFECTIVE (root) patch must win, got: {patch}"
+        );
+        assert!(
+            !patch.contains("/src/stale/autumn"),
+            "the ignored member-local patch must not leak in: {patch}"
+        );
+    }
+
+    #[test]
+    fn offline_excluded_member_uses_its_own_patch_table() {
+        // An ancestor workspace whose `exclude` names the app makes the app
+        // standalone: its own patch table is the effective one.
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[workspace]\nmembers = []\nexclude = [\"app\"]\n",
+        )
+        .unwrap();
+        let app = tmp.path().join("app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(
+            app.join("Cargo.toml"),
+            "[package]\nname = \"my-app\"\nversion = \"0.2.3\"\n\n\
+             [dependencies]\nautumn-web = \"0.9.1\"\n\n\
+             [patch.crates-io]\nautumn-web = { path = \"/src/standalone/autumn\" }\n",
+        )
+        .unwrap();
+        let mut plan = Plan::new(&app);
+        let dep = shell_autumn_web_dep(&app, &mut plan);
+        let patch = dep
+            .patch_entry
+            .expect("an excluded (standalone) app's own patch must be mirrored");
+        assert!(
+            patch.contains(r#"autumn-web = { path = "/src/standalone/autumn" }"#),
+            "got: {patch}"
         );
         assert!(plan.warnings.is_empty(), "got {:?}", plan.warnings);
     }
