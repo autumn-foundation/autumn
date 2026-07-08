@@ -327,6 +327,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   plus curated real-world combos (`db`, `mail`, `maud,htmx`, `storage,db`,
   `telemetry-otlp`) — so downstream apps building with a trimmed feature set
   can't silently break between releases (#982).
+- **ui:** Framework-owned widget stylesheet (issue #1215) — every semantic
+  `autumn-*` class emitted by form fields, the submit button, active
+  search/autocomplete, the nav bar, breadcrumbs, hero banners, modals, tabs,
+  pagination, property lists, direct-to-storage upload, and job status is now
+  backed by one shipped, token-themeable stylesheet (`autumn_web::ui::WIDGETS_CSS`,
+  served at `autumn_web::ui::WIDGETS_CSS_PATH`) instead of a ~264-line block
+  copy-pasted into every app's `input.css`. Plain CSS (no Tailwind build
+  required), embeddable in single-binary release builds (#1004), and
+  re-themed by overriding the existing `ui::tokens` design tokens rather than
+  forking the component CSS. The `autumn new` template and every example's
+  `input.css` no longer inline the widget CSS; a coverage test
+  (`widget_css_coverage`) fails the build if a widget ever emits an `autumn-*`
+  class with no backing rule. Additive API surface. **Visual change:** the
+  previous per-app copy hardcoded an indigo accent (`#4f46e5`) independent of
+  `ui::tokens`; the shipped stylesheet instead references `var(--primary)`,
+  so widgets now pick up the framework's existing brand token (violet,
+  `#7c3aed`) by default. Apps that want the old accent back can set
+  `--primary: #4f46e5;` (and friends) on `:root` in their own stylesheet,
+  loaded after the widget one. See [Widget styling](docs/guide/widget-styling.md).
+  The framework CSS routes (`autumn_web::flash::FLASH_CSS_PATH`,
+  `autumn_web::ui::WIDGETS_CSS_PATH`) also serve pre-compressed gzip/brotli
+  bodies (computed once per process, not per request) when the client's
+  `Accept-Encoding` accepts them, instead of relying solely on the
+  general-purpose compression middleware to redo that work on every request.
 
 ## [0.6.0] - 2026-06-30
 

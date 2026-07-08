@@ -470,8 +470,23 @@ pub fn plan_auth_with_providers(
         models_dir.join(format!("{snake_name}_session.rs")),
         render_session_model_file(&pascal_name, &snake_name, &table),
     );
-    model_mod = add_mod_declaration(&model_mod, &format!("{snake_name}_session"));
-    plan.modify(model_mod_path, model_mod);
+    let session_mod_name = format!("{snake_name}_session");
+    model_mod = add_mod_declaration(&model_mod, &session_mod_name);
+    plan.modify(model_mod_path.clone(), model_mod);
+    plan.push_revert(crate::generate::emit::Revert::ModDecl {
+        path: model_mod_path.clone(),
+        name: snake_name.clone(),
+    });
+    if totp {
+        plan.push_revert(crate::generate::emit::Revert::ModDecl {
+            path: model_mod_path.clone(),
+            name: "recovery_code".to_owned(),
+        });
+    }
+    plan.push_revert(crate::generate::emit::Revert::ModDecl {
+        path: model_mod_path,
+        name: session_mod_name,
+    });
 
     // ── src/schema.rs entry ────────────────────────────────────────────────
     // The generated model references `crate::schema::<table>`, so we must
@@ -513,7 +528,16 @@ pub fn plan_auth_with_providers(
     // would emit a second `CREATE TABLE recovery_codes` and `diesel migration
     // run` would fail with "relation already exists" (or clobber an unrelated
     // table). Reject up front rather than generate an unusable app.
-    if totp && schema_has_table(&schema_existing, "recovery_codes") {
+    //
+    // Only reject a *foreign* `recovery_codes` table: when the auth table
+    // itself is also already present, this is a re-run over our own output
+    // (`--force`, or `autumn destroy` recomputing this same plan against
+    // already-generated files — issue #1048), where the schema append below
+    // is an idempotent no-op. Mirrors the analogous `sess_table` guard below.
+    if totp
+        && schema_has_table(&schema_existing, "recovery_codes")
+        && !schema_has_table(&schema_existing, &table)
+    {
         return Err(GenerateError::InvalidName(
             name.to_owned(),
             "this project already defines a `recovery_codes` table, which `--totp` \
@@ -565,7 +589,33 @@ pub fn plan_auth_with_providers(
     .map(|t| super::dsl::parse_field(t).expect("session field tokens are always valid"))
     .collect();
     schema_new = append_schema_table(&schema_new, &sess_table, &session_fields);
-    plan.modify(schema_path, schema_new);
+    plan.modify(schema_path.clone(), schema_new);
+    plan.push_revert(crate::generate::emit::Revert::SchemaTable {
+        path: schema_path.clone(),
+        table: table.clone(),
+        expected_block: append_schema_table("", &table, &auth_fields),
+    });
+    if totp {
+        let recovery_fields: Vec<super::dsl::Field> = [
+            "user_id:i64",
+            "code_digest:String",
+            "used_at:Option<NaiveDateTime>",
+        ]
+        .iter()
+        .map(|t| super::dsl::parse_field(t).expect("recovery field tokens are always valid"))
+        .collect();
+        plan.push_revert(crate::generate::emit::Revert::SchemaTable {
+            path: schema_path.clone(),
+            table: "recovery_codes".to_owned(),
+            expected_block: append_schema_table("", "recovery_codes", &recovery_fields),
+        });
+    }
+    let sess_table_expected_block = append_schema_table("", &sess_table, &session_fields);
+    plan.push_revert(crate::generate::emit::Revert::SchemaTable {
+        path: schema_path,
+        table: sess_table,
+        expected_block: sess_table_expected_block,
+    });
 
     // ── Auth routes ────────────────────────────────────────────────────────
     let routes_dir = project_root.join("src").join("routes");
@@ -578,6 +628,10 @@ pub fn plan_auth_with_providers(
         route_mod_path.clone(),
         add_mod_declaration(&read_or_empty(&route_mod_path), "auth"),
     );
+    plan.push_revert(crate::generate::emit::Revert::ModDecl {
+        path: route_mod_path,
+        name: "auth".to_owned(),
+    });
 
     // ── Generated tests ────────────────────────────────────────────────────
     let tests_dir = project_root.join("tests");
@@ -619,7 +673,11 @@ pub fn plan_auth_with_providers(
     })?;
     let entries = auth_route_entries(totp);
     let updated = update_main_rs(&main_existing, &["models", "routes", "schema"], &entries);
-    plan.modify(main_path, updated);
+    plan.modify(main_path.clone(), updated);
+    plan.push_revert(crate::generate::emit::Revert::RoutesEntries {
+        path: main_path,
+        entries,
+    });
 
     // ── Cargo.toml deps + autumn-web/mail feature ─────────────────────────
     let cargo_toml_path = project_root.join("Cargo.toml");
@@ -641,8 +699,37 @@ pub fn plan_auth_with_providers(
     };
     let final_cargo = ensure_autumn_web_mail_feature(&with_deps);
     if final_cargo != cargo_existing {
-        plan.modify(cargo_toml_path, final_cargo);
+        plan.modify(cargo_toml_path.clone(), final_cargo);
     }
+    // Pushed unconditionally — see `plan_cargo_deps`'s matching comment in
+    // model.rs: destroy recomputes this plan against the already-generated
+    // Cargo.toml, where these entries are by definition already present.
+    // `owner_dir` is `src/models`: every auth resource always creates at
+    // least `<snake>.rs` and `<snake>_session.rs` there, and (unlike
+    // channels/mailers) an auth resource's routes file isn't
+    // name-parameterized (`src/routes/auth.rs` always, regardless of the
+    // resource name), so a second auth resource can't coexist under a
+    // different name anyway — `src/models` is a reliable "this auth resource
+    // still exists" marker.
+    let models_owner_dir = project_root.join("src").join("models");
+    let dep_names: Vec<String> = all_deps
+        .iter()
+        .map(|(name, _)| *name)
+        .filter(|name| !super::model::TEMPLATE_SHIPPED_CARGO_DEPS.contains(name))
+        .map(str::to_owned)
+        .collect();
+    if !dep_names.is_empty() {
+        plan.push_revert(crate::generate::emit::Revert::CargoDeps {
+            path: cargo_toml_path.clone(),
+            names: dep_names,
+            owner_dir: models_owner_dir.clone(),
+        });
+    }
+    plan.push_revert(crate::generate::emit::Revert::CargoAutumnWebFeature {
+        path: cargo_toml_path,
+        feature: "mail".to_owned(),
+        owner_dir: Some(models_owner_dir),
+    });
 
     Ok(plan)
 }
@@ -754,7 +841,12 @@ fn plan_auth_options_impl(
         .map(|t| super::dsl::parse_field(t).expect("oauth field tokens are always valid"))
         .collect();
         let updated_schema = append_schema_table(&schema_base, "oauth_identities", &oauth_fields);
-        plan.modify(schema_path, updated_schema);
+        plan.modify(schema_path.clone(), updated_schema);
+        plan.push_revert(crate::generate::emit::Revert::SchemaTable {
+            path: schema_path,
+            table: "oauth_identities".to_owned(),
+            expected_block: append_schema_table("", "oauth_identities", &oauth_fields),
+        });
 
         // ── oauth routes ───────────────────────────────────────────────────────
         let routes_dir = project_root.join("src").join("routes");
@@ -775,7 +867,11 @@ fn plan_auth_options_impl(
         let route_mod_base = find_plan_content_for_path(&plan, &route_mod_path)
             .unwrap_or_else(|| read_or_empty(&route_mod_path));
         let updated_route_mod = add_mod_declaration(&route_mod_base, "oauth");
-        plan.modify(route_mod_path, updated_route_mod);
+        plan.modify(route_mod_path.clone(), updated_route_mod);
+        plan.push_revert(crate::generate::emit::Revert::ModDecl {
+            path: route_mod_path,
+            name: "oauth".to_owned(),
+        });
 
         // ── Register oauth routes in src/main.rs ───────────────────────────────
         let main_path = project_root.join("src").join("main.rs");
@@ -794,7 +890,11 @@ fn plan_auth_options_impl(
             &["models", "routes", "schema"],
             &oauth_entries,
         );
-        plan.modify(main_path, updated_main);
+        plan.modify(main_path.clone(), updated_main);
+        plan.push_revert(crate::generate::emit::Revert::RoutesEntries {
+            path: main_path,
+            entries: oauth_entries,
+        });
 
         // ── docs/guide/oauth.md ────────────────────────────────────────────────
         let docs_dir = project_root.join("docs").join("guide");
@@ -811,8 +911,13 @@ fn plan_auth_options_impl(
             .unwrap_or_else(|| cargo_existing.clone());
         let with_oauth2 = ensure_autumn_web_oauth2_feature(&base_cargo);
         if with_oauth2 != base_cargo {
-            plan.modify(cargo_toml_path, with_oauth2);
+            plan.modify(cargo_toml_path.clone(), with_oauth2);
         }
+        plan.push_revert(crate::generate::emit::Revert::CargoAutumnWebFeature {
+            path: cargo_toml_path,
+            feature: "oauth2".to_owned(),
+            owner_dir: Some(project_root.join("src").join("models")),
+        });
 
         // ── autumn.toml OAuth provider stubs ───────────────────────────────────
         let autumn_toml_path = project_root.join("autumn.toml");
@@ -820,8 +925,12 @@ fn plan_auth_options_impl(
             let toml_existing = read_or_empty(&autumn_toml_path);
             let updated_toml = append_oauth_stubs_to_toml(&toml_existing, &oauth.providers);
             if updated_toml != toml_existing {
-                plan.modify(autumn_toml_path, updated_toml);
+                plan.modify(autumn_toml_path.clone(), updated_toml);
             }
+            plan.push_revert(crate::generate::emit::Revert::AuthOAuthProviderStubs {
+                path: autumn_toml_path,
+                providers: oauth.providers.clone(),
+            });
         }
     }
 
@@ -829,10 +938,18 @@ fn plan_auth_options_impl(
         // ── webauthn_credentials collision check ───────────────────────────────
         // If the project already has webauthn_credentials in schema.rs, the
         // migration below would fail at `diesel migration run`. Reject upfront.
+        //
+        // Only reject a *foreign* `webauthn_credentials` table: when the auth
+        // user table itself is also already present, this is a re-run over
+        // our own output (`--force`, or `autumn destroy` recomputing this
+        // same plan against already-generated files — issue #1048), where
+        // the schema append below is an idempotent no-op.
         let schema_for_check = project_root.join("src").join("schema.rs");
         let schema_existing_for_passkey = find_plan_content_for_path(&plan, &schema_for_check)
             .unwrap_or_else(|| read_or_empty(&schema_for_check));
-        if schema_has_table(&schema_existing_for_passkey, "webauthn_credentials") {
+        if schema_has_table(&schema_existing_for_passkey, "webauthn_credentials")
+            && !schema_has_table(&schema_existing_for_passkey, &user_table)
+        {
             return Err(GenerateError::InvalidName(
                 name.to_owned(),
                 "this project already defines a `webauthn_credentials` table, which \
@@ -868,9 +985,13 @@ fn plan_auth_options_impl(
         let model_mod_base = find_plan_content_for_path(&plan, &model_mod_path)
             .unwrap_or_else(|| read_or_empty(&model_mod_path));
         plan.modify(
-            model_mod_path,
+            model_mod_path.clone(),
             add_mod_declaration(&model_mod_base, "webauthn_credential"),
         );
+        plan.push_revert(crate::generate::emit::Revert::ModDecl {
+            path: model_mod_path,
+            name: "webauthn_credential".to_owned(),
+        });
 
         // ── src/schema.rs: webauthn_credentials table ─────────────────────────
         let schema_path = project_root.join("src").join("schema.rs");
@@ -887,7 +1008,12 @@ fn plan_auth_options_impl(
         .map(|t| super::dsl::parse_field(t).expect("webauthn credential field tokens are valid"))
         .collect();
         let updated_schema = append_schema_table(&schema_base, "webauthn_credentials", &wc_fields);
-        plan.modify(schema_path, updated_schema);
+        plan.modify(schema_path.clone(), updated_schema);
+        plan.push_revert(crate::generate::emit::Revert::SchemaTable {
+            path: schema_path,
+            table: "webauthn_credentials".to_owned(),
+            expected_block: append_schema_table("", "webauthn_credentials", &wc_fields),
+        });
 
         // ── src/routes/passkeys.rs ─────────────────────────────────────────────
         let routes_dir = project_root.join("src").join("routes");
@@ -899,9 +1025,13 @@ fn plan_auth_options_impl(
         let route_mod_base = find_plan_content_for_path(&plan, &route_mod_path)
             .unwrap_or_else(|| read_or_empty(&route_mod_path));
         plan.modify(
-            route_mod_path,
+            route_mod_path.clone(),
             add_mod_declaration(&route_mod_base, "passkeys"),
         );
+        plan.push_revert(crate::generate::emit::Revert::ModDecl {
+            path: route_mod_path,
+            name: "passkeys".to_owned(),
+        });
 
         // ── Register passkey routes in src/main.rs ─────────────────────────────
         let main_path = project_root.join("src").join("main.rs");
@@ -919,7 +1049,11 @@ fn plan_auth_options_impl(
             &["models", "routes", "schema"],
             &pk_entries,
         );
-        plan.modify(main_path, updated_main);
+        plan.modify(main_path.clone(), updated_main);
+        plan.push_revert(crate::generate::emit::Revert::RoutesEntries {
+            path: main_path,
+            entries: pk_entries,
+        });
 
         // ── tests/auth_passkeys.rs ─────────────────────────────────────────────
         let tests_dir = project_root.join("tests");
@@ -944,8 +1078,11 @@ fn plan_auth_options_impl(
                 "http://localhost:3000",
             );
             if updated_toml != toml_existing {
-                plan.modify(autumn_toml_path, updated_toml);
+                plan.modify(autumn_toml_path.clone(), updated_toml);
             }
+            plan.push_revert(crate::generate::emit::Revert::AuthWebauthnStub {
+                path: autumn_toml_path,
+            });
         }
 
         // ── Cargo.toml: add webauthn-rs dep + webauthn feature on autumn-web ───
@@ -959,8 +1096,27 @@ fn plan_auth_options_impl(
         let with_deps = ensure_webauthn_rs_features(&with_deps);
         let with_webauthn = ensure_autumn_web_webauthn_feature(&with_deps);
         if with_webauthn != base_cargo {
-            plan.modify(cargo_toml_path, with_webauthn);
+            plan.modify(cargo_toml_path.clone(), with_webauthn);
         }
+        let passkey_models_owner_dir = project_root.join("src").join("models");
+        let passkey_dep_names: Vec<String> = all_passkey_deps
+            .iter()
+            .map(|(name, _)| *name)
+            .filter(|name| !super::model::TEMPLATE_SHIPPED_CARGO_DEPS.contains(name))
+            .map(str::to_owned)
+            .collect();
+        if !passkey_dep_names.is_empty() {
+            plan.push_revert(crate::generate::emit::Revert::CargoDeps {
+                path: cargo_toml_path.clone(),
+                names: passkey_dep_names,
+                owner_dir: passkey_models_owner_dir.clone(),
+            });
+        }
+        plan.push_revert(crate::generate::emit::Revert::CargoAutumnWebFeature {
+            path: cargo_toml_path,
+            feature: "webauthn".to_owned(),
+            owner_dir: Some(passkey_models_owner_dir),
+        });
     }
 
     Ok(plan)
@@ -1306,10 +1462,22 @@ fn append_oauth_stubs_to_toml(existing: &str, providers: &[String]) -> String {
         if out.contains(&header) {
             continue;
         }
-        let preset = match name.as_str() {
-            "github" => {
-                r#"
-[auth.oauth2.github]
+        out.push('\n');
+        out.push_str(&oauth_provider_stub_block(name));
+    }
+    out.push('\n');
+    out
+}
+
+/// The exact `[auth.oauth2.<name>]` stub block [`append_oauth_stubs_to_toml`]
+/// inserts for a known or unknown provider name. Shared with
+/// `remove_oauth_provider_stubs` (via [`toml_table_block_matches`]) so
+/// `autumn destroy` can verify a block is still byte-identical to this stub
+/// — never hand-filled with real credentials, and never a pre-existing
+/// block `generate` left untouched — before removing it.
+fn oauth_provider_stub_block(name: &str) -> String {
+    match name {
+        "github" => r#"[auth.oauth2.github]
 client_id = ""
 client_secret = ""
 authorize_url = "https://github.com/login/oauth/authorize"
@@ -1318,10 +1486,8 @@ userinfo_url = "https://api.github.com/user"
 redirect_uri = "http://localhost:3000/auth/github/callback"
 scope = "read:user user:email"
 "#
-            }
-            "google" => {
-                r#"
-[auth.oauth2.google]
+        .to_owned(),
+        "google" => r#"[auth.oauth2.google]
 client_id = ""
 client_secret = ""
 authorize_url = "https://accounts.google.com/o/oauth2/v2/auth"
@@ -1333,10 +1499,8 @@ issuer = "https://accounts.google.com"
 jwks_url = "https://www.googleapis.com/oauth2/v3/certs"
 discovery_url = "https://accounts.google.com"
 "#
-            }
-            "microsoft" => {
-                r#"
-[auth.oauth2.microsoft]
+        .to_owned(),
+        "microsoft" => r#"[auth.oauth2.microsoft]
 client_id = ""
 client_secret = ""
 authorize_url = "https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
@@ -1347,10 +1511,9 @@ issuer = "https://login.microsoftonline.com/common/v2.0"
 jwks_url = "https://login.microsoftonline.com/common/discovery/v2.0/keys"
 discovery_url = "https://login.microsoftonline.com/common/v2.0"
 "#
-            }
-            _ => &format!(
-                r#"
-[auth.oauth2.{name}]
+        .to_owned(),
+        _ => format!(
+            r#"[auth.oauth2.{name}]
 client_id = ""
 client_secret = ""
 authorize_url = "https://example.com/oauth/authorize"
@@ -1358,13 +1521,8 @@ token_url = "https://example.com/oauth/token"
 redirect_uri = "http://localhost:3000/auth/{name}/callback"
 scope = "openid profile email"
 "#
-            ),
-        };
-        out.push('\n');
-        out.push_str(preset.trim_start());
+        ),
     }
-    out.push('\n');
-    out
 }
 
 // ── Template rendering ────────────────────────────────────────────────────────
@@ -7755,6 +7913,101 @@ fn append_webauthn_stub_to_toml(
     out
 }
 
+/// Inverse of [`append_oauth_stubs_to_toml`] (`autumn destroy`, issue #1048).
+///
+/// Removes each `[auth.oauth2.<provider>]` stub block for `providers`, but
+/// only when its current content is still byte-identical to the stub
+/// `append_oauth_stubs_to_toml` would have inserted — never a block that
+/// pre-existed before this `generate` call (real credentials `generate`
+/// never touched), and never one the user has since filled in. A no-op for
+/// any provider whose header isn't present, or whose content no longer
+/// matches (already destroyed, hand-edited, or a pre-existing real config).
+pub(super) fn remove_oauth_provider_stubs(existing: &str, providers: &[String]) -> String {
+    let mut content = existing.to_owned();
+    for name in providers {
+        let header = format!("[auth.oauth2.{name}]");
+        if toml_table_block_matches(&content, &header, &oauth_provider_stub_block(name)) {
+            content = remove_toml_table_block(&content, &header);
+        }
+    }
+    content
+}
+
+/// Inverse of [`append_webauthn_stub_to_toml`] (`autumn destroy`, issue #1048).
+///
+/// A no-op if `[auth.webauthn]` isn't present, or if its content no longer
+/// matches exactly what `append_webauthn_stub_to_toml` always inserts (the
+/// same "never touch a pre-existing or since-edited block" guard as
+/// [`remove_oauth_provider_stubs`]).
+pub(super) fn remove_webauthn_stub(existing: &str) -> String {
+    const HEADER: &str = "[auth.webauthn]";
+    let expected = "[auth.webauthn]\n\
+                     rp_id = \"localhost\"\n\
+                     rp_name = \"My App\"\n\
+                     rp_origin = \"http://localhost:3000\"\n";
+    if toml_table_block_matches(existing, HEADER, expected) {
+        remove_toml_table_block(existing, HEADER)
+    } else {
+        existing.to_owned()
+    }
+}
+
+/// The `(start, end)` line-index span of a top-level `[header]` TOML table —
+/// the header line through the last line before the next top-level `[...]`
+/// header or EOF. `None` if `header` isn't present.
+fn toml_table_block_range(lines: &[&str], header: &str) -> Option<(usize, usize)> {
+    let start = lines.iter().position(|l| l.trim() == header)?;
+    let end = lines[start + 1..]
+        .iter()
+        .position(|l| l.trim_start().starts_with('['))
+        .map_or(lines.len(), |rel| start + 1 + rel);
+    Some((start, end))
+}
+
+/// Whether `[header]`'s current block content is byte-identical (ignoring a
+/// trailing-newline difference) to `expected_block` — used to verify a stub
+/// hasn't been hand-filled with real values, or didn't pre-exist before
+/// `generate` ever ran, before `autumn destroy` removes it.
+fn toml_table_block_matches(existing: &str, header: &str, expected_block: &str) -> bool {
+    let lines: Vec<&str> = existing.lines().collect();
+    let Some((start, end)) = toml_table_block_range(&lines, header) else {
+        return false;
+    };
+    lines[start..end].join("\n").trim_end() == expected_block.trim_end()
+}
+
+/// Remove a top-level `[header]` TOML table — the header line and every line
+/// up to (but not including) the next top-level `[...]` header or EOF — plus
+/// one immediately preceding blank separator line, if present.
+///
+/// This is the exact inverse shape of how [`append_oauth_stubs_to_toml`] and
+/// [`append_webauthn_stub_to_toml`] insert a table at the end of the file
+/// (`existing.trim_end()` followed by a separator and the new block): consuming
+/// one preceding blank line here undoes that separator, and discarding
+/// everything from the header to EOF when this is the last table in the file
+/// undoes the trailing blank line those functions leave behind. A no-op if
+/// `header` isn't present.
+fn remove_toml_table_block(existing: &str, header: &str) -> String {
+    let lines: Vec<&str> = existing.lines().collect();
+    let Some((start, end)) = toml_table_block_range(&lines, header) else {
+        return existing.to_owned();
+    };
+
+    let mut block_start = start;
+    if block_start > 0 && lines[block_start - 1].trim().is_empty() {
+        block_start -= 1;
+    }
+
+    let mut new_lines: Vec<&str> = Vec::with_capacity(lines.len());
+    new_lines.extend_from_slice(&lines[..block_start]);
+    new_lines.extend_from_slice(&lines[end..]);
+    let mut out = new_lines.join("\n");
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out
+}
+
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -7781,6 +8034,299 @@ mod tests {
         )
         .unwrap();
         tmp
+    }
+
+    /// A Cargo.toml matching what `autumn new`'s own template ships
+    /// (`autumn-web`, `diesel_migrations`, and `maud` already present — see
+    /// `TEMPLATE_SHIPPED_CARGO_DEPS`), used by the round-trip tests below so
+    /// those three names are genuinely pre-existing rather than freshly
+    /// added by this generator (and thus rightly excluded from its
+    /// `Revert::CargoDeps`).
+    fn template_shipped_cargo_toml() -> &'static str {
+        "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = \"0.3\"\n\
+         diesel_migrations = \"2\"\nmaud = { version = \"0.27\", features = [\"axum\"] }\n"
+    }
+
+    // ── generate/destroy round trips (issue #1048) ──────────────────────────
+    //
+    // `autumn destroy auth` recomputes the exact same plan `generate` did and
+    // interprets it in reverse (see `Plan::revert`): every `Create`d file is
+    // deleted, and every shared-file edit recorded via `plan.push_revert(...)`
+    // is undone. These tests assert the round trip is byte-identical for the
+    // base scaffold plus each optional feature flag.
+
+    #[test]
+    fn generate_then_destroy_base_auth_round_trips_to_original_project_state() {
+        let tmp = project_with_main();
+        let cargo_path = tmp.path().join("Cargo.toml");
+        fs::write(&cargo_path, template_shipped_cargo_toml()).unwrap();
+        let main_path = tmp.path().join("src/main.rs");
+        let original_cargo = fs::read_to_string(&cargo_path).unwrap();
+        let original_main = fs::read_to_string(&main_path).unwrap();
+
+        let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
+        plan.execute(Flags::default()).unwrap();
+        assert!(tmp.path().join("src/models/user.rs").exists());
+        assert!(
+            fs::read_to_string(&main_path)
+                .unwrap()
+                .contains("routes::auth::signup")
+        );
+        assert!(fs::read_to_string(&cargo_path).unwrap().contains("axum"));
+
+        let destroy_plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
+        destroy_plan.revert(Flags::default()).unwrap();
+
+        assert!(!tmp.path().join("src/models").exists());
+        assert!(!tmp.path().join("src/routes").exists());
+        assert!(!tmp.path().join("src/schema.rs").exists());
+        assert!(!tmp.path().join("tests/auth.rs").exists());
+        assert!(!tmp.path().join("tests/auth_sessions.rs").exists());
+        assert!(!tmp.path().join("docs/guide/authentication.md").exists());
+        assert!(!tmp.path().join("migrations").exists());
+        assert_eq!(fs::read_to_string(&main_path).unwrap(), original_main);
+        assert_eq!(fs::read_to_string(&cargo_path).unwrap(), original_cargo);
+    }
+
+    #[test]
+    fn generate_then_destroy_auth_with_totp_round_trips_to_original_project_state() {
+        let tmp = project_with_main();
+        let cargo_path = tmp.path().join("Cargo.toml");
+        fs::write(&cargo_path, template_shipped_cargo_toml()).unwrap();
+        let main_path = tmp.path().join("src/main.rs");
+        let original_cargo = fs::read_to_string(&cargo_path).unwrap();
+        let original_main = fs::read_to_string(&main_path).unwrap();
+
+        let plan =
+            plan_auth_with_providers(tmp.path(), "User", "20260508000000", &[], true).unwrap();
+        plan.execute(Flags::default()).unwrap();
+        assert!(tmp.path().join("src/models/recovery_code.rs").exists());
+        assert!(tmp.path().join("tests/auth_2fa.rs").exists());
+        assert!(fs::read_to_string(&cargo_path).unwrap().contains("totp-rs"));
+        assert!(
+            fs::read_to_string(tmp.path().join("src/schema.rs"))
+                .unwrap()
+                .contains("recovery_codes")
+        );
+
+        let destroy_plan =
+            plan_auth_with_providers(tmp.path(), "User", "20260508000000", &[], true).unwrap();
+        destroy_plan.revert(Flags::default()).unwrap();
+
+        assert!(!tmp.path().join("src/models").exists());
+        assert!(!tmp.path().join("src/routes").exists());
+        assert!(!tmp.path().join("src/schema.rs").exists());
+        assert!(!tmp.path().join("tests/auth_2fa.rs").exists());
+        assert!(!tmp.path().join("migrations").exists());
+        assert_eq!(fs::read_to_string(&main_path).unwrap(), original_main);
+        assert_eq!(fs::read_to_string(&cargo_path).unwrap(), original_cargo);
+    }
+
+    #[test]
+    fn generate_then_destroy_auth_with_oauth_round_trips_to_original_project_state() {
+        let tmp = project_with_main();
+        let cargo_path = tmp.path().join("Cargo.toml");
+        fs::write(&cargo_path, template_shipped_cargo_toml()).unwrap();
+        let main_path = tmp.path().join("src/main.rs");
+        let autumn_toml_path = tmp.path().join("autumn.toml");
+        fs::write(&autumn_toml_path, "[server]\nport = 3000\n").unwrap();
+        let original_cargo = fs::read_to_string(&cargo_path).unwrap();
+        let original_main = fs::read_to_string(&main_path).unwrap();
+        let original_toml = fs::read_to_string(&autumn_toml_path).unwrap();
+
+        let oauth = AuthOAuthOptions {
+            providers: vec!["github".to_owned(), "google".to_owned()],
+        };
+        let plan = plan_auth_with_options(tmp.path(), "User", "20260508000000", &oauth).unwrap();
+        plan.execute(Flags::default()).unwrap();
+        assert!(tmp.path().join("src/routes/oauth.rs").exists());
+        assert!(
+            fs::read_to_string(&autumn_toml_path)
+                .unwrap()
+                .contains("[auth.oauth2.github]")
+        );
+        assert!(fs::read_to_string(&cargo_path).unwrap().contains("oauth2"));
+        assert!(
+            fs::read_to_string(tmp.path().join("src/schema.rs"))
+                .unwrap()
+                .contains("oauth_identities")
+        );
+
+        let destroy_plan =
+            plan_auth_with_options(tmp.path(), "User", "20260508000000", &oauth).unwrap();
+        destroy_plan.revert(Flags::default()).unwrap();
+
+        assert!(!tmp.path().join("src/models").exists());
+        assert!(!tmp.path().join("src/routes").exists());
+        assert!(!tmp.path().join("src/schema.rs").exists());
+        assert!(!tmp.path().join("docs/guide/oauth.md").exists());
+        assert!(!tmp.path().join("migrations").exists());
+        assert_eq!(fs::read_to_string(&main_path).unwrap(), original_main);
+        assert_eq!(fs::read_to_string(&cargo_path).unwrap(), original_cargo);
+        assert_eq!(
+            fs::read_to_string(&autumn_toml_path).unwrap(),
+            original_toml
+        );
+    }
+
+    #[test]
+    fn destroy_never_removes_a_pre_existing_oauth_provider_block_with_real_credentials() {
+        let tmp = project_with_main();
+        fs::write(tmp.path().join("Cargo.toml"), template_shipped_cargo_toml()).unwrap();
+        let autumn_toml_path = tmp.path().join("autumn.toml");
+        let real_github_block = "[server]\nport = 3000\n\n[auth.oauth2.github]\n\
+             client_id = \"real-client-id\"\n\
+             client_secret = \"real-client-secret\"\n\
+             authorize_url = \"https://github.com/login/oauth/authorize\"\n\
+             token_url = \"https://github.com/login/oauth/access_token\"\n\
+             userinfo_url = \"https://api.github.com/user\"\n\
+             redirect_uri = \"https://myapp.example.com/auth/github/callback\"\n\
+             scope = \"read:user user:email\"\n";
+        fs::write(&autumn_toml_path, real_github_block).unwrap();
+
+        // `--oauth github,google`: github's block already exists (with real
+        // credentials) so `append_oauth_stubs_to_toml` leaves it untouched;
+        // only google's stub is freshly inserted.
+        let oauth = AuthOAuthOptions {
+            providers: vec!["github".to_owned(), "google".to_owned()],
+        };
+        plan_auth_with_options(tmp.path(), "User", "20260508000000", &oauth)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+        assert!(
+            fs::read_to_string(&autumn_toml_path)
+                .unwrap()
+                .contains("real-client-secret")
+        );
+
+        plan_auth_with_options(tmp.path(), "User", "20260508000000", &oauth)
+            .unwrap()
+            .revert(Flags::default())
+            .unwrap();
+
+        let toml_after = fs::read_to_string(&autumn_toml_path).unwrap();
+        assert!(
+            toml_after.contains("[auth.oauth2.github]"),
+            "pre-existing github block must survive destroy: {toml_after}"
+        );
+        assert!(
+            toml_after.contains("real-client-secret"),
+            "real credentials must never be deleted: {toml_after}"
+        );
+        assert!(
+            !toml_after.contains("[auth.oauth2.google]"),
+            "google's freshly-inserted stub must still be removed: {toml_after}"
+        );
+    }
+
+    #[test]
+    fn generate_then_destroy_auth_with_passkeys_round_trips_to_original_project_state() {
+        let tmp = project_with_main();
+        let cargo_path = tmp.path().join("Cargo.toml");
+        fs::write(&cargo_path, template_shipped_cargo_toml()).unwrap();
+        let main_path = tmp.path().join("src/main.rs");
+        let autumn_toml_path = tmp.path().join("autumn.toml");
+        fs::write(&autumn_toml_path, "[server]\nport = 3000\n").unwrap();
+        let original_cargo = fs::read_to_string(&cargo_path).unwrap();
+        let original_main = fs::read_to_string(&main_path).unwrap();
+        let original_toml = fs::read_to_string(&autumn_toml_path).unwrap();
+
+        let plan = plan_auth_full_ex(
+            tmp.path(),
+            "User",
+            "20260508000000",
+            &AuthOAuthOptions::default(),
+            false,
+            true,
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+        assert!(tmp.path().join("src/routes/passkeys.rs").exists());
+        assert!(
+            fs::read_to_string(&autumn_toml_path)
+                .unwrap()
+                .contains("[auth.webauthn]")
+        );
+        assert!(
+            fs::read_to_string(&cargo_path)
+                .unwrap()
+                .contains("webauthn-rs")
+        );
+        assert!(
+            fs::read_to_string(tmp.path().join("src/schema.rs"))
+                .unwrap()
+                .contains("webauthn_credentials")
+        );
+
+        let destroy_plan = plan_auth_full_ex(
+            tmp.path(),
+            "User",
+            "20260508000000",
+            &AuthOAuthOptions::default(),
+            false,
+            true,
+        )
+        .unwrap();
+        destroy_plan.revert(Flags::default()).unwrap();
+
+        assert!(!tmp.path().join("src/models").exists());
+        assert!(!tmp.path().join("src/routes").exists());
+        assert!(!tmp.path().join("src/schema.rs").exists());
+        assert!(!tmp.path().join("tests/auth_passkeys.rs").exists());
+        assert!(!tmp.path().join("docs/guide/passkeys.md").exists());
+        assert!(!tmp.path().join("migrations").exists());
+        assert_eq!(fs::read_to_string(&main_path).unwrap(), original_main);
+        assert_eq!(fs::read_to_string(&cargo_path).unwrap(), original_cargo);
+        assert_eq!(
+            fs::read_to_string(&autumn_toml_path).unwrap(),
+            original_toml
+        );
+    }
+
+    #[test]
+    fn generate_then_destroy_auth_with_totp_oauth_and_passkeys_round_trips_to_original_project_state()
+     {
+        // Combines every optional flag in one plan, exercising the trickiest
+        // case for the `autumn.toml` reverts: `--oauth` appends its stub
+        // block first, then `--passkeys` appends `[auth.webauthn]` on top of
+        // that (reading the base plan's already-updated content) — both
+        // edits must unwind cleanly regardless of their relative order in
+        // the file.
+        let tmp = project_with_main();
+        let cargo_path = tmp.path().join("Cargo.toml");
+        fs::write(&cargo_path, template_shipped_cargo_toml()).unwrap();
+        let main_path = tmp.path().join("src/main.rs");
+        let autumn_toml_path = tmp.path().join("autumn.toml");
+        fs::write(&autumn_toml_path, "[server]\nport = 3000\n").unwrap();
+        let original_cargo = fs::read_to_string(&cargo_path).unwrap();
+        let original_main = fs::read_to_string(&main_path).unwrap();
+        let original_toml = fs::read_to_string(&autumn_toml_path).unwrap();
+
+        let oauth = AuthOAuthOptions {
+            providers: vec!["github".to_owned()],
+        };
+        let plan =
+            plan_auth_full_ex(tmp.path(), "User", "20260508000000", &oauth, true, true).unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let toml_after_generate = fs::read_to_string(&autumn_toml_path).unwrap();
+        assert!(toml_after_generate.contains("[auth.oauth2.github]"));
+        assert!(toml_after_generate.contains("[auth.webauthn]"));
+
+        let destroy_plan =
+            plan_auth_full_ex(tmp.path(), "User", "20260508000000", &oauth, true, true).unwrap();
+        destroy_plan.revert(Flags::default()).unwrap();
+
+        assert!(!tmp.path().join("src/models").exists());
+        assert!(!tmp.path().join("src/routes").exists());
+        assert!(!tmp.path().join("src/schema.rs").exists());
+        assert!(!tmp.path().join("migrations").exists());
+        assert_eq!(fs::read_to_string(&main_path).unwrap(), original_main);
+        assert_eq!(fs::read_to_string(&cargo_path).unwrap(), original_cargo);
+        assert_eq!(
+            fs::read_to_string(&autumn_toml_path).unwrap(),
+            original_toml
+        );
     }
 
     // ── Plan structure ──────────────────────────────────────────────────────

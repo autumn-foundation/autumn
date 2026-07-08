@@ -57,13 +57,162 @@ Hooks executed inside `db.tx` participate in the same database transaction.
 - `Err(_)` rolls back
 - panics unwind through the transaction boundary and do not commit partial work
 
+## Isolation levels and automatic retry
+
+`db.tx` always runs at Postgres' default **READ COMMITTED**. For
+correctness-critical work (ledgers, inventory, uniqueness invariants) you can
+request a stronger isolation level — and have transient conflicts retried
+automatically — with `db.tx_with(TxOptions::…, |conn| …)`:
+
+```rust,no_run
+use autumn_web::prelude::*;
+use autumn_web::db::TxOptions;
+use diesel::prelude::*;
+use diesel_async::RunQueryDsl;
+use scoped_futures::ScopedFutureExt;
+
+async fn transfer(mut db: Db, from: i64, to: i64, cents: i64) -> AutumnResult<()> {
+    // SERIALIZABLE + automatic retry: one argument, no hand-rolled retry loop.
+    db.tx_with(TxOptions::serializable(), |conn| {
+        async move {
+            // ... read balances, check invariants, write both rows ...
+            Ok::<_, AutumnError>(())
+        }
+        .scope_boxed()
+    })
+    .await
+}
+```
+
+### What each level buys — and costs
+
+| Level | Guards against | Cost |
+| --- | --- | --- |
+| `read_committed()` (default) | dirty reads | none — each statement sees the latest committed data, so read-then-write races (lost updates, write skew) are possible |
+| `repeatable_read()` | non-repeatable & phantom reads | a fixed snapshot per transaction; concurrent writers to your rows abort with `40001` |
+| `serializable()` | **all** serialization anomalies, incl. write skew | strongest guarantee; contention surfaces as `40001` and must be retried |
+
+`TxOptions` is a small builder:
+
+```rust
+use autumn_web::db::{TxOptions, IsolationLevel};
+
+let opts = TxOptions::serializable()    // Serializable + retry (max_attempts = 5)
+    .read_only()                        // SET TRANSACTION READ ONLY
+    .max_attempts(10)                   // override the retry budget
+    .initial_backoff(std::time::Duration::from_millis(5));
+assert_eq!(opts.isolation, IsolationLevel::Serializable);
+```
+
+`TxOptions::default()` (and `read_committed()`) is byte-for-byte equivalent to
+`db.tx`: READ COMMITTED, one attempt, no retry. `repeatable_read()` and
+`serializable()` default to a 5-attempt retry budget because retry is the whole
+point at those levels.
+
+### Automatic retry
+
+At REPEATABLE READ and SERIALIZABLE, Postgres rejects transactions that would
+break isolation with a **serialization failure** (`40001`); deadlocks surface as
+`40P01`. `tx_with` classifies these two SQLSTATEs and re-runs the whole closure,
+sleeping a **capped exponential backoff with jitter** between attempts
+(`initial_backoff * 2^(n-1)`, capped at `max_backoff`, ±20% jitter). Any other
+error, and an exhausted retry budget, propagate as today's `AutumnError` — the
+**final** underlying error, never swallowed.
+
+> **The closure must be re-runnable.** Because it can execute more than once, the
+> closure must be free of side effects that are not themselves transactional (or
+> must be idempotent). Database work is rolled back between attempts, and
+> after-commit callbacks from failed attempts are discarded — but any
+> non-database side effect in the body (an external API call, a channel send, an
+> in-memory mutation) will re-run on every retry. Keep such effects out of the
+> closure, or gate them on the final success.
+
+Retries are observable: the transaction runs under a `db.transaction` span
+carrying `db.isolation` and the final `db.tx.attempts` count, and each retry
+increments the process metric `autumn_tx_retries_total` (exhausted budgets
+increment `autumn_tx_retry_exhausted_total`) — both surfaced on the actuator
+health endpoint.
+
+> **Under a transactional test** (`TestApp::with_transactional_db`), the
+> connection is already inside the test harness's own outer transaction, so
+> `tx_with` nests via `SAVEPOINT` — exactly like `Db::tx` — and runs the
+> closure exactly once, ignoring the requested isolation level and retry
+> budget. Postgres rejects `SET TRANSACTION ISOLATION LEVEL` inside a
+> subtransaction, and there's nothing meaningful to retry against a single
+> test-harness connection. Test the *closure's logic*; verify isolation/retry
+> behavior itself against a real Postgres instance (see the `#[ignore]`d
+> integration tests in `tests/integration/tx_isolation_retry_integration.rs`).
+
+### When SERIALIZABLE + retry, `#[lock_version]`, or `with_lock`?
+
+Autumn gives you three tools for concurrent writes; they compose rather than
+compete (see the [cloud-native guide](./cloud-native.md) for the locking
+attributes):
+
+- **`TxOptions::serializable()` + retry** — the right default when correctness
+  depends on an invariant spanning **multiple rows or tables** that a single-row
+  version check can't see (write skew: two transactions each read a set and
+  write into it). One argument; the database detects the conflict and `tx_with`
+  retries.
+- **`#[lock_version]` optimistic locking** — best for **low-contention,
+  single-row** updates through the generated repository. No stronger isolation
+  needed; a stale write returns `RepositoryError::Conflict` (HTTP 409) for the
+  client to retry.
+- **`with_lock` pessimistic locking** — best for a **hot single row** where you
+  want to serialize writers explicitly with `SELECT … FOR UPDATE` and avoid
+  wasted retry work.
+
 ## Nesting policy
 
-Nested `Db::tx` calls are currently **rejected at runtime** with:
+Nested `Db::tx` / `Db::tx_with` calls are **rejected at runtime**:
 
-`Nested Db::tx calls are not supported`
+`Nested Db::tx calls are not supported; use autumn_web::db::savepoint(conn, ..) inside the closure for a same-connection savepoint`
 
-This avoids ambiguity and keeps transaction boundaries explicit.
+`Db::tx` cannot be re-entered on the same connection — its closure receives
+`&mut PooledConnection`, not `&mut Db` — and a second `Db` is a *separate*
+connection, which a savepoint cannot model. Keep transaction boundaries explicit
+and reach for a savepoint (below) when you need a partial rollback.
+
+### Savepoints via `savepoint`
+
+For a nested, partially-rollbackable unit of work on the **same** connection,
+call `autumn_web::db::savepoint(conn, |conn| …)` inside a `tx`/`tx_with` closure.
+It issues a Postgres `SAVEPOINT`, releasing it when your closure returns `Ok` and
+rolling back to it (`ROLLBACK TO SAVEPOINT`) on `Err` — leaving the surrounding
+transaction intact:
+
+```rust,no_run
+use autumn_web::prelude::*;
+use autumn_web::db::savepoint;
+use scoped_futures::ScopedFutureExt;
+
+async fn with_optional_step(mut db: Db) -> AutumnResult<()> {
+    db.tx(|conn| {
+        async move {
+            // ... required write on the outer transaction ...
+
+            // Optional step: if it fails, roll back only this savepoint.
+            let _ = savepoint(conn, |conn| {
+                async move {
+                    // ... best-effort write ...
+                    Ok::<_, AutumnError>(())
+                }
+                .scope_boxed()
+            })
+            .await;
+
+            // ... more outer-transaction work; commits regardless of the savepoint ...
+            Ok::<_, AutumnError>(())
+        }
+        .scope_boxed()
+    })
+    .await
+}
+```
+
+> After-commit callbacks registered inside a savepoint fire when the **outer**
+> transaction commits, regardless of whether the savepoint rolled back — the
+> callback registry is transaction-scoped, not savepoint-scoped.
 
 ---
 

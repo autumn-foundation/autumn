@@ -683,6 +683,25 @@ impl AutumnError {
         let err: &(dyn std::error::Error + 'static) = self.inner.as_ref();
         err.downcast_ref::<T>()
     }
+
+    /// Try to downcast the inner error, or any error in its `source()` chain,
+    /// to a specific type.
+    ///
+    /// Unlike [`downcast_ref`](Self::downcast_ref), which only inspects the
+    /// top-level wrapped error, this walks the full chain — useful when a
+    /// custom error type wraps a lower-level error (e.g. via
+    /// `#[source]`/`#[from]`) without itself being that type.
+    #[must_use]
+    pub fn downcast_chain_ref<T: std::error::Error + 'static>(&self) -> Option<&T> {
+        let mut current: Option<&(dyn std::error::Error + 'static)> = Some(self.inner.as_ref());
+        while let Some(err) = current {
+            if let Some(t) = err.downcast_ref::<T>() {
+                return Some(t);
+            }
+            current = err.source();
+        }
+        None
+    }
 }
 
 /// Checks whether `err`'s inner error is a Postgres unique-constraint

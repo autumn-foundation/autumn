@@ -1445,7 +1445,7 @@ impl DummyBroadcast {
 pub fn set_global_channels(_channels: Channels) {}
 
 #[cfg(not(feature = "ws"))]
-pub fn clear_global_channels() {}
+pub const fn clear_global_channels() {}
 
 #[cfg(not(feature = "ws"))]
 #[must_use]

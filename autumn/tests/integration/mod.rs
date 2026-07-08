@@ -72,6 +72,7 @@ mod job_tracking_route;
 mod job_tracking_stores_integration;
 #[cfg(all(feature = "ws", feature = "maud", feature = "htmx", feature = "db"))]
 mod live_broadcast;
+mod load_shed;
 #[cfg(feature = "mail")]
 mod mail;
 #[cfg(feature = "mail")]
@@ -150,7 +151,10 @@ mod test_app_integration;
 mod test_db_integration;
 mod time_zone_integration;
 mod transactional_test_integration;
+mod tx_isolation_retry_integration;
 mod webhook_outbound;
+#[cfg(feature = "maud")]
+mod widget_css_coverage;
 mod widgets_modal;
 mod widgets_tabs;
 #[cfg(feature = "ws")]

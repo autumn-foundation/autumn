@@ -40,7 +40,7 @@ thiserror = "2"
 maud = { version = "0.27", features = ["axum"] }
 toml = "1.1"
 tower = "0.5"
-tower-http = { version = "0.6", features = ["cors", "fs", "trace", "compression-gzip", "compression-br"] }
+tower-http = { version = "0.7", features = ["cors", "fs", "trace", "compression-gzip", "compression-br"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 tracing-opentelemetry = "0.32.1"

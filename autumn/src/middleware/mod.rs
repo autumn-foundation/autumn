@@ -22,6 +22,7 @@ pub(crate) mod access_log;
 pub(crate) mod dev;
 pub(crate) mod error_page_filter;
 pub(crate) mod exception_filter;
+pub(crate) mod load_shed;
 pub(crate) mod log_context;
 pub mod maintenance;
 pub(crate) mod method_override;
@@ -34,6 +35,7 @@ pub use access_log::{
     ACCESS_LOG_TARGET, AccessLogEmitted, AccessLogLayer, AccessLogService, UNMATCHED_ROUTE,
 };
 pub use exception_filter::{AutumnErrorInfo, ExceptionFilter, ExceptionFilterLayer};
+pub use load_shed::{LoadShedExempt, LoadShedLayer, LoadShedService};
 pub use log_context::{LogContextLayer, LogContextService};
 pub use maintenance::{DEFAULT_HEALTH_PREFIX, MaintenanceLayer, MaintenanceService};
 pub use method_override::{
