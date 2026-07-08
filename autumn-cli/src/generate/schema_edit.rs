@@ -939,13 +939,31 @@ pub fn remove_main_mod_declarations(existing: &str, names: &[&str]) -> String {
     out
 }
 
+/// Whether the byte offset `pos` in `text` sits after a `//` on its own line —
+/// i.e. the match at `pos` lives inside a line comment (`//`, `///`, or `//!`).
+/// Used to skip `routes![` occurrences that appear in comments (e.g. a doc
+/// comment explaining the macro) rather than in real code.
+fn is_on_comment_line(text: &str, pos: usize) -> bool {
+    let line_start = text[..pos].rfind('\n').map_or(0, |nl| nl + 1);
+    text[line_start..pos].contains("//")
+}
+
 /// Locate the body span (byte offsets, exclusive of the enclosing
 /// `routes![`/`]`) of the *first* `routes![ ... ]` macro invocation in
-/// `existing`. Returns `None` if there is no `routes![` or its brackets are
-/// unmatched. Shared by every function that reads or rewrites the
+/// `existing`, skipping occurrences on comment lines (a doc comment such as
+/// `//! routes![...]` must not be edited — injecting entries there breaks
+/// compilation). Returns `None` if there is no non-comment `routes![` or its
+/// brackets are unmatched. Shared by every function that reads or rewrites the
 /// `routes![...]` body so the bracket-scan logic lives in exactly one place.
 fn find_routes_body_range(existing: &str) -> Option<(usize, usize)> {
-    let start = existing.find("routes![")?;
+    let mut search_from = 0;
+    let start = loop {
+        let pos = search_from + existing[search_from..].find("routes![")?;
+        if !is_on_comment_line(existing, pos) {
+            break pos;
+        }
+        search_from = pos + "routes![".len();
+    };
     let body_start = start + "routes![".len();
     // Find the matching closing bracket. The macro body cannot contain a
     // raw `]` outside of nested `[ ... ]`, so we just track depth.
@@ -5003,6 +5021,66 @@ async fn main() {\n\
         let original = "fn main() {\n    routes![]\n}\n";
         let updated = ensure_routes_entries(original, &["foo".into()]);
         assert!(updated.contains("foo"));
+    }
+
+    #[test]
+    fn ensure_routes_entries_skips_routes_macro_in_comments() {
+        // A doc comment mentioning `routes![]` must not receive the injected
+        // entries — that used to break compilation by editing the comment.
+        let original = "\
+//! Register handlers with `.routes(routes![])` in main.
+// e.g. routes![index]
+fn main() {
+    routes![]
+}
+";
+        let updated = ensure_routes_entries(original, &["foo".into()]);
+        assert!(
+            updated.contains("//! Register handlers with `.routes(routes![])` in main."),
+            "doc comment must be untouched: {updated}"
+        );
+        assert!(
+            updated.contains("// e.g. routes![index]"),
+            "line comment must be untouched: {updated}"
+        );
+        assert!(
+            updated.contains("foo,"),
+            "entry must land in the real macro: {updated}"
+        );
+        assert!(
+            updated.rfind("foo,").unwrap() > updated.find("fn main()").unwrap(),
+            "entry must be inside the macro in fn main, not in the comments: {updated}"
+        );
+    }
+
+    #[test]
+    fn ensure_routes_entries_only_comment_matches_is_noop() {
+        let original = "//! Add handlers via routes![].\nfn main() {}\n";
+        let updated = ensure_routes_entries(original, &["foo".into()]);
+        assert_eq!(updated, original);
+    }
+
+    #[test]
+    fn remove_routes_entries_with_prefix_skips_commented_macro() {
+        let original = "\
+// routes![channels::chat::chat_page]
+fn main() {
+    routes![
+        channels::chat::chat_page,
+        index,
+    ]
+}
+";
+        let updated = remove_routes_entries_with_prefix(original, "channels::chat::");
+        assert!(
+            updated.contains("// routes![channels::chat::chat_page]"),
+            "comment must be untouched: {updated}"
+        );
+        assert!(updated.contains("index,"));
+        assert!(
+            !updated.contains("routes![\n        channels::chat::chat_page"),
+            "real entry must be removed: {updated}"
+        );
     }
 
     // ── remove_routes_entries_with_prefix ──────────────────────────────────
