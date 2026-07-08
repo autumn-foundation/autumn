@@ -430,7 +430,16 @@ body { margin: 0; font-family: system-ui, sans-serif; color: #1f2933; }
 .story-empty { padding: 2rem; border: 1px dashed #cbd2d9; border-radius: 6px; }
 ";
 
-/// Full HTML document shell: framework widget stylesheet + gallery chrome.
+/// Full HTML document shell: framework widget stylesheet + widget runtime
+/// script + gallery chrome.
+///
+/// Interactive widgets (`modal_trigger`, `confirm_action`, `nav_bar`, …) emit
+/// `data-*` hooks wired by the framework's `autumn-widgets.js` runtime, so the
+/// shell loads that same-origin script (always mounted under the `htmx`
+/// feature) alongside the stylesheet — otherwise the live previews of those
+/// stories would be inert in browsers that need the JS fallback. The script
+/// needs no CSP nonce: the framework's default policy keeps `'self'` in
+/// `script-src` in both plain and nonce modes.
 ///
 /// When the security layer's per-request CSP nonce is active
 /// (`security.headers.csp_nonce.enabled = true`, which drops
@@ -442,6 +451,10 @@ fn story_page(
     body: &maud::Markup,
     nonce: Option<&crate::security::CspNonce>,
 ) -> maud::Markup {
+    #[cfg(feature = "htmx")]
+    let widgets_js: Option<&str> = Some(crate::htmx::AUTUMN_WIDGETS_JS_PATH);
+    #[cfg(not(feature = "htmx"))]
+    let widgets_js: Option<&str> = None;
     maud::html! {
         (maud::DOCTYPE)
         html lang="en" {
@@ -450,6 +463,9 @@ fn story_page(
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { (title) " — Autumn stories" }
                 link rel="stylesheet" href=(crate::ui::WIDGETS_CSS_PATH);
+                @if let Some(src) = widgets_js {
+                    script src=(src) defer {}
+                }
                 style nonce=[nonce.map(crate::security::CspNonce::value)] {
                     (maud::PreEscaped(STORY_GALLERY_CSS))
                 }
@@ -680,8 +696,8 @@ mod tests {
         assert!(fine.render().is_ok());
     }
 
-    // U6 (AC4): the index page links the framework widget stylesheet and
-    // lists stories grouped in the sidebar.
+    // U6 (AC4): the index page links the framework widget stylesheet, loads
+    // the widget runtime script, and lists stories grouped in the sidebar.
     #[test]
     fn index_page_links_widgets_css_and_groups_stories() {
         assert_eq!(STORIES_PATH, "/_stories");
@@ -702,6 +718,20 @@ mod tests {
             !css_selector.matches(&dom).is_empty(),
             "index must link the framework widget stylesheet: {page}"
         );
+
+        #[cfg(feature = "htmx")]
+        {
+            let js_selector = crate::test_html::SelectorList::parse(&format!(
+                "script[src=\"{}\"]",
+                crate::htmx::AUTUMN_WIDGETS_JS_PATH
+            ))
+            .expect("selector parses");
+            assert!(
+                !js_selector.matches(&dom).is_empty(),
+                "index must load the widget runtime script so interactive \
+                 stories (modal, confirm-action, nav-bar) work live: {page}"
+            );
+        }
 
         let link_selector =
             crate::test_html::SelectorList::parse("a[href=\"/_stories/data-table\"]")
@@ -749,6 +779,19 @@ mod tests {
             !tabs.matches(&dom).is_empty(),
             "detail page must use the tabs widget for Source / Rendered HTML: {page}"
         );
+
+        #[cfg(feature = "htmx")]
+        {
+            let js_selector = crate::test_html::SelectorList::parse(&format!(
+                "script[src=\"{}\"]",
+                crate::htmx::AUTUMN_WIDGETS_JS_PATH
+            ))
+            .expect("selector parses");
+            assert!(
+                !js_selector.matches(&dom).is_empty(),
+                "detail page must load the widget runtime script: {page}"
+            );
+        }
 
         assert!(
             page.contains("maud::html!"),
