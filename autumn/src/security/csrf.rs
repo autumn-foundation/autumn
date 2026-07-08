@@ -391,7 +391,11 @@ where
     }
 
     fn call(&mut self, mut req: Request<axum::body::Body>) -> Self::Future {
-        let path = req.uri().path();
+        // Match exemptions against the normalized path so dot-segment tricks
+        // like `/api/../submit` (or percent-encoded `%2e%2e` variants) cannot
+        // satisfy an `/api/` exemption prefix while targeting another route.
+        let clean = crate::security::path::clean_path(req.uri().path());
+        let path = clean.as_str();
         let is_exempt = self.settings.exempt_paths.iter().any(|prefix| {
             if path == prefix {
                 true
