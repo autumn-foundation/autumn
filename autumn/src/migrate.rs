@@ -25,9 +25,9 @@
 //! }
 //! ```
 
+use diesel::RunQueryDsl;
 use diesel::migration::{Migration, MigrationSource};
 use diesel::pg::Pg;
-use diesel::{Connection, RunQueryDsl};
 use diesel_migrations::{FileBasedMigrations, HarnessWithOutput, MigrationHarness};
 use std::path::Path;
 
@@ -75,6 +75,39 @@ pub enum MigrationError {
         /// Configured wait timeout in seconds.
         timeout_secs: u64,
     },
+}
+
+/// Run `$body` with a `&mut` connection to `$url` that honors the
+/// connection string's `sslmode`
+/// (see [`crate::db::establish_migration_connection`]): TLS-off strings keep
+/// the historical native `PgConnection`, TLS-requiring ones connect through
+/// the pool's rustls connector — the bundled libpq has no SSL support, so
+/// the native path cannot reach TLS-only servers at all (issue #1585
+/// review). The body is expanded once per concrete connection type, so it
+/// may only use the sync diesel APIs both provide (queries, transactions,
+/// `MigrationHarness`).
+macro_rules! with_migration_connection {
+    ($url:expr, |$conn:ident| $body:expr) => {
+        match crate::db::establish_migration_connection($url)
+            .map_err(|e| MigrationError::Connection(e.to_string()))?
+        {
+            crate::db::MigrationConnection::Native(mut native) => {
+                let $conn = &mut native;
+                $body
+            }
+            crate::db::MigrationConnection::Rustls { mut conn, runtime } => {
+                let result = {
+                    let $conn = &mut conn;
+                    $body
+                };
+                // The runtime (when owned) drives the connection's tokio
+                // driver task: it must outlive every use of `conn`.
+                drop(conn);
+                drop(runtime);
+                result
+            }
+        }
+    };
 }
 
 /// `PostgreSQL` advisory lock key used to serialize concurrent migration runs.
@@ -177,8 +210,11 @@ impl<DB: diesel::backend::Backend> diesel::migration::MigrationSource<DB>
 
 /// Run all pending migrations against the given database URL.
 ///
-/// Uses a **synchronous** `PgConnection` (not the async pool) because
-/// Diesel migrations require `MigrationHarness`, which is sync-only.
+/// Uses a **synchronous** connection (not the async pool) because Diesel
+/// migrations require `MigrationHarness`, which is sync-only. The
+/// connection honors the URL's `sslmode`: TLS-requiring strings connect
+/// through the pool's rustls connector (the bundled libpq cannot), so
+/// migrations work against TLS-only servers too.
 ///
 /// Returns the list of migration versions that were applied, or an error
 /// if a migration fails (including the failing SQL in the message).
@@ -191,17 +227,16 @@ pub fn run_pending(
     database_url: &str,
     migrations: impl diesel::migration::MigrationSource<diesel::pg::Pg>,
 ) -> Result<MigrationResult, MigrationError> {
-    let mut conn = diesel::PgConnection::establish(database_url)
-        .map_err(|e| MigrationError::Connection(e.to_string()))?;
+    with_migration_connection!(database_url, |conn| {
+        let mut harness = HarnessWithOutput::write_to_stdout(conn);
 
-    let mut harness = HarnessWithOutput::write_to_stdout(&mut conn);
+        let applied = harness
+            .run_pending_migrations(migrations)
+            .map_err(|e| MigrationError::Migration(e.to_string()))?;
 
-    let applied = harness
-        .run_pending_migrations(migrations)
-        .map_err(|e| MigrationError::Migration(e.to_string()))?;
-
-    Ok(MigrationResult {
-        applied: applied.iter().map(|m| format!("{m}")).collect(),
+        Ok(MigrationResult {
+            applied: applied.iter().map(|m| format!("{m}")).collect(),
+        })
     })
 }
 
@@ -215,17 +250,16 @@ pub fn pending_migrations(
     database_url: &str,
     migrations: impl diesel::migration::MigrationSource<diesel::pg::Pg>,
 ) -> Result<Vec<String>, MigrationError> {
-    let mut conn = diesel::PgConnection::establish(database_url)
-        .map_err(|e| MigrationError::Connection(e.to_string()))?;
+    with_migration_connection!(database_url, |conn| {
+        let pending = conn
+            .pending_migrations(migrations)
+            .map_err(|e| MigrationError::Migration(e.to_string()))?;
 
-    let pending = conn
-        .pending_migrations(migrations)
-        .map_err(|e| MigrationError::Migration(e.to_string()))?;
-
-    Ok(pending
-        .iter()
-        .map(|m| m.name().version().to_string())
-        .collect())
+        Ok(pending
+            .iter()
+            .map(|m| m.name().version().to_string())
+            .collect())
+    })
 }
 
 pub(crate) fn compare_replica_migration_versions(
@@ -252,14 +286,14 @@ pub(crate) fn compare_replica_migration_versions(
 }
 
 fn applied_migration_versions(database_url: &str) -> Result<Vec<String>, MigrationError> {
-    let mut conn = diesel::PgConnection::establish(database_url)
-        .map_err(|e| MigrationError::Connection(e.to_string()))?;
+    with_migration_connection!(database_url, |conn| {
+        let rows =
+            diesel::sql_query("SELECT version FROM __diesel_schema_migrations ORDER BY version")
+                .load::<AppliedMigrationVersion>(conn)
+                .map_err(|e| MigrationError::Migration(e.to_string()))?;
 
-    let rows = diesel::sql_query("SELECT version FROM __diesel_schema_migrations ORDER BY version")
-        .load::<AppliedMigrationVersion>(&mut conn)
-        .map_err(|e| MigrationError::Migration(e.to_string()))?;
-
-    Ok(rows.into_iter().map(|row| row.version).collect())
+        Ok(rows.into_iter().map(|row| row.version).collect())
+    })
 }
 
 pub(crate) fn check_replica_migration_readiness(
@@ -312,6 +346,19 @@ pub fn acquire_migration_lock(
     conn: &mut diesel::PgConnection,
     timeout: std::time::Duration,
 ) -> Result<(), MigrationError> {
+    acquire_migration_lock_on(conn, timeout)
+}
+
+/// Generic body of [`acquire_migration_lock`], usable with both the native
+/// `PgConnection` and the rustls migration wrapper (see
+/// [`crate::db::MigrationConnection`]).
+fn acquire_migration_lock_on<C>(
+    conn: &mut C,
+    timeout: std::time::Duration,
+) -> Result<(), MigrationError>
+where
+    C: diesel::connection::LoadConnection<Backend = Pg>,
+{
     let start = std::time::Instant::now();
     let poll = std::time::Duration::from_millis(500);
 
@@ -358,6 +405,15 @@ pub fn acquire_migration_lock(
 /// also releases session-level advisory locks automatically when the connection
 /// closes, so a missed explicit release is safe.
 pub fn release_migration_lock(conn: &mut diesel::PgConnection) {
+    release_migration_lock_on(conn);
+}
+
+/// Generic body of [`release_migration_lock`], usable with both the native
+/// `PgConnection` and the rustls migration wrapper.
+fn release_migration_lock_on<C>(conn: &mut C)
+where
+    C: diesel::connection::LoadConnection<Backend = Pg>,
+{
     match diesel::sql_query("SELECT pg_advisory_unlock($1) AS released")
         .bind::<diesel::sql_types::BigInt, _>(MIGRATION_ADVISORY_LOCK_KEY)
         .get_result::<AdvisoryUnlockRow>(conn)
@@ -387,7 +443,11 @@ pub fn release_migration_lock(conn: &mut diesel::PgConnection) {
 /// not need cross-process serialization (they are single-process by nature).
 /// Skip this guard when running against those backends.
 pub struct MigrationLockGuard {
-    conn: diesel::PgConnection,
+    // TLS-aware (issue #1585 review): `autumn migrate` acquires this lock
+    // BEFORE spawning the external diesel CLI, so the lock connection itself
+    // must honor the URL's sslmode — the bundled libpq cannot reach
+    // TLS-only servers at all.
+    conn: crate::db::MigrationConnection,
 }
 
 impl std::fmt::Debug for MigrationLockGuard {
@@ -398,7 +458,10 @@ impl std::fmt::Debug for MigrationLockGuard {
 
 impl Drop for MigrationLockGuard {
     fn drop(&mut self) {
-        release_migration_lock(&mut self.conn);
+        match &mut self.conn {
+            crate::db::MigrationConnection::Native(conn) => release_migration_lock_on(conn),
+            crate::db::MigrationConnection::Rustls { conn, .. } => release_migration_lock_on(conn),
+        }
     }
 }
 
@@ -462,8 +525,12 @@ fn framework_migration_versions() -> Result<std::collections::BTreeSet<String>, 
 /// Classify the database's applied migrations into user migrations (ascending
 /// by version), excluding framework-owned ones and resolving each to its local
 /// directory via Diesel's `name()`/`version()` metadata.
-fn resolve_applied_user_migrations(
-    conn: &mut diesel::PgConnection,
+///
+/// Generic over the connection so it works with both the native
+/// `PgConnection` and the rustls migration wrapper (see
+/// [`crate::db::MigrationConnection`]).
+fn resolve_applied_user_migrations<C: MigrationHarness<Pg>>(
+    conn: &mut C,
     all_migrations: &[Box<dyn Migration<Pg>>],
     migrations_dir: &Path,
 ) -> Result<Vec<AppliedUserMigration>, MigrationError> {
@@ -558,16 +625,18 @@ pub fn applied_user_migrations(
     database_url: &str,
     migrations_dir: &Path,
 ) -> Result<Vec<AppliedUserMigration>, MigrationError> {
-    let mut conn = diesel::PgConnection::establish(database_url)
-        .map_err(|e| MigrationError::Connection(e.to_string()))?;
+    // TLS-aware: honors the URL's sslmode (`autumn migrate status` rollback
+    // availability must work against TLS-only servers too).
+    with_migration_connection!(database_url, |conn| {
+        let source = FileBasedMigrations::from_path(migrations_dir).map_err(|e| {
+            MigrationError::Migration(format!("failed to read migrations dir: {e}"))
+        })?;
+        let all_migrations: Vec<Box<dyn Migration<Pg>>> = source
+            .migrations()
+            .map_err(|e| MigrationError::Migration(e.to_string()))?;
 
-    let source = FileBasedMigrations::from_path(migrations_dir)
-        .map_err(|e| MigrationError::Migration(format!("failed to read migrations dir: {e}")))?;
-    let all_migrations: Vec<Box<dyn Migration<Pg>>> = source
-        .migrations()
-        .map_err(|e| MigrationError::Migration(e.to_string()))?;
-
-    resolve_applied_user_migrations(&mut conn, &all_migrations, migrations_dir)
+        resolve_applied_user_migrations(conn, &all_migrations, migrations_dir)
+    })
 }
 
 /// Plan and execute a user-migration rollback atomically under the migration
@@ -606,56 +675,58 @@ where
 {
     let timeout = wait_timeout.unwrap_or(DEFAULT_LOCK_WAIT_TIMEOUT);
 
-    let mut conn = diesel::PgConnection::establish(database_url)
-        .map_err(|e| MigrationError::Connection(e.to_string()))?;
+    // TLS-aware: honors the URL's sslmode (`autumn migrate down` must work
+    // against TLS-only servers too).
+    with_migration_connection!(database_url, |conn| {
+        let source = FileBasedMigrations::from_path(migrations_dir).map_err(|e| {
+            MigrationError::Migration(format!("failed to read migrations dir: {e}"))
+        })?;
+        let all_migrations: Vec<Box<dyn Migration<Pg>>> = source
+            .migrations()
+            .map_err(|e| MigrationError::Migration(e.to_string()))?;
 
-    let source = FileBasedMigrations::from_path(migrations_dir)
-        .map_err(|e| MigrationError::Migration(format!("failed to read migrations dir: {e}")))?;
-    let all_migrations: Vec<Box<dyn Migration<Pg>>> = source
-        .migrations()
-        .map_err(|e| MigrationError::Migration(e.to_string()))?;
+        acquire_migration_lock_on(conn, timeout)?;
 
-    acquire_migration_lock(&mut conn, timeout)?;
+        let result: Result<usize, MigrationError> = (|| {
+            let applied_user =
+                resolve_applied_user_migrations(&mut *conn, &all_migrations, migrations_dir)?;
+            let versions = plan(&applied_user)?;
 
-    let result: Result<usize, MigrationError> = (|| {
-        let applied_user =
-            resolve_applied_user_migrations(&mut conn, &all_migrations, migrations_dir)?;
-        let versions = plan(&applied_user)?;
+            let mut count = 0;
+            for version in &versions {
+                // Build a borrowed `MigrationVersion` once per version (no heap
+                // allocation) instead of allocating a `String` for every migration.
+                let target = diesel::migration::MigrationVersion::from(version.as_str());
+                let migration = all_migrations
+                    .iter()
+                    .find(|m| m.name().version() == target)
+                    .ok_or_else(|| {
+                        MigrationError::Migration(format!(
+                            "migration version {version} is applied but not present in {} — \
+                             cannot revert (its down.sql is unavailable)",
+                            migrations_dir.display()
+                        ))
+                    })?;
 
-        let mut count = 0;
-        for version in &versions {
-            // Build a borrowed `MigrationVersion` once per version (no heap
-            // allocation) instead of allocating a `String` for every migration.
-            let target = diesel::migration::MigrationVersion::from(version.as_str());
-            let migration = all_migrations
-                .iter()
-                .find(|m| m.name().version() == target)
-                .ok_or_else(|| {
-                    MigrationError::Migration(format!(
-                        "migration version {version} is applied but not present in {} — \
-                         cannot revert (its down.sql is unavailable)",
-                        migrations_dir.display()
-                    ))
-                })?;
+                let started = std::time::Instant::now();
+                conn.revert_migration(migration.as_ref())
+                    .map_err(|e| MigrationError::Migration(e.to_string()))?;
+                let duration = started.elapsed();
 
-            let started = std::time::Instant::now();
-            conn.revert_migration(migration.as_ref())
-                .map_err(|e| MigrationError::Migration(e.to_string()))?;
-            let duration = started.elapsed();
+                on_reverted(&RevertedMigration {
+                    version: version.clone(),
+                    name: migration.name().to_string(),
+                    duration,
+                });
+                count += 1;
+            }
+            Ok(count)
+        })();
 
-            on_reverted(&RevertedMigration {
-                version: version.clone(),
-                name: migration.name().to_string(),
-                duration,
-            });
-            count += 1;
-        }
-        Ok(count)
-    })();
+        release_migration_lock_on(conn);
 
-    release_migration_lock(&mut conn);
-
-    result
+        result
+    })
 }
 
 // ── Startup wait-for-database ─────────────────────────────────────────────────
@@ -823,27 +894,42 @@ pub(crate) fn wait_for_database_inner(
 }
 
 fn with_connect_timeout(url: &str, timeout_secs: u64) -> String {
-    // Splice `connect_timeout` directly into the raw percent-encoded query
-    // string so existing parameters (e.g. `options=-c%20search_path%3Dapp`)
-    // are preserved byte-for-byte.  Using query_pairs() / append_pair() would
-    // decode and re-encode them via form encoding (spaces → `+`), which libpq
-    // does not accept.
-    url::Url::parse(url).map_or_else(
-        |_| url.to_owned(),
-        |mut parsed| {
-            let pair = format!("connect_timeout={timeout_secs}");
-            let raw = parsed
-                .query()
-                .unwrap_or("")
-                .split('&')
-                .filter(|p| !p.is_empty() && !p.starts_with("connect_timeout="))
-                .chain(std::iter::once(pair.as_str()))
-                .collect::<Vec<_>>()
-                .join("&");
-            parsed.set_query(Some(&raw));
-            parsed.to_string()
-        },
-    )
+    if crate::pg_conn_str::is_url(url) {
+        // Splice `connect_timeout` directly into the raw percent-encoded query
+        // string so existing parameters (e.g. `options=-c%20search_path%3Dapp`)
+        // are preserved byte-for-byte.  Using query_pairs() / append_pair() would
+        // decode and re-encode them via form encoding (spaces → `+`), which libpq
+        // does not accept.
+        return url::Url::parse(url).map_or_else(
+            |_| url.to_owned(),
+            |mut parsed| {
+                let pair = format!("connect_timeout={timeout_secs}");
+                let raw = parsed
+                    .query()
+                    .unwrap_or("")
+                    .split('&')
+                    .filter(|p| !p.is_empty() && !p.starts_with("connect_timeout="))
+                    .chain(std::iter::once(pair.as_str()))
+                    .collect::<Vec<_>>()
+                    .join("&");
+                parsed.set_query(Some(&raw));
+                parsed.to_string()
+            },
+        );
+    }
+    // Keyword/value form (accepted by config validation since the keyword
+    // parser landed): without this, a `--wait` attempt against a blackholed
+    // host gets no per-attempt connect_timeout and a single hung connect can
+    // outlive the whole wait budget. Append the parameter — unless the user
+    // already set their own connect_timeout, which is respected as-is.
+    match crate::pg_conn_str::keyword_value_pairs(url) {
+        Some(pairs) if !pairs.iter().any(|(key, _)| key == "connect_timeout") => {
+            format!("{url} connect_timeout={timeout_secs}")
+        }
+        // User-provided timeout, or a string tokio-postgres itself would
+        // reject: pass through untouched so connect reports its own error.
+        _ => url.to_owned(),
+    }
 }
 
 /// Wait for the database at `database_url` to accept connections, retrying
@@ -879,7 +965,10 @@ pub fn wait_for_database(
             let remaining = max_wait.saturating_sub(start.elapsed());
             let connect_timeout_secs = remaining.as_secs().max(1);
             let timed_url = with_connect_timeout(database_url, connect_timeout_secs);
-            diesel::PgConnection::establish(&timed_url)
+            // TLS-aware: honors the URL's sslmode (the bundled libpq has no
+            // SSL support, so waiting on a TLS-only server through the
+            // native path would never succeed).
+            crate::db::establish_migration_connection(&timed_url)
                 .map(|_conn| ())
                 .map_err(|e| {
                     let msg = e.to_string();
@@ -921,10 +1010,21 @@ pub fn hold_migration_lock(
     database_url: &str,
     wait_timeout: std::time::Duration,
 ) -> Result<MigrationLockGuard, MigrationError> {
-    let mut conn = diesel::PgConnection::establish(database_url)
+    // TLS-aware: honors the URL's sslmode, exactly like `run_pending_locked`
+    // (see `crate::db::establish_migration_connection`) — this lock is taken
+    // before spawning the external diesel CLI, so it must reach TLS-only
+    // servers too.
+    let mut conn = crate::db::establish_migration_connection(database_url)
         .map_err(|e| MigrationError::Connection(e.to_string()))?;
 
-    acquire_migration_lock(&mut conn, wait_timeout)?;
+    match &mut conn {
+        crate::db::MigrationConnection::Native(conn) => {
+            acquire_migration_lock_on(conn, wait_timeout)?;
+        }
+        crate::db::MigrationConnection::Rustls { conn, .. } => {
+            acquire_migration_lock_on(conn, wait_timeout)?;
+        }
+    }
 
     Ok(MigrationLockGuard { conn })
 }
@@ -960,25 +1060,24 @@ pub fn run_pending_locked(
 ) -> Result<MigrationResult, MigrationError> {
     let timeout = wait_timeout.unwrap_or(DEFAULT_LOCK_WAIT_TIMEOUT);
 
-    let mut conn = diesel::PgConnection::establish(database_url)
-        .map_err(|e| MigrationError::Connection(e.to_string()))?;
+    with_migration_connection!(database_url, |conn| {
+        acquire_migration_lock_on(conn, timeout)?;
 
-    acquire_migration_lock(&mut conn, timeout)?;
+        // Collect migration names eagerly so the harness borrow on `conn` is
+        // dropped before we call release_migration_lock on the same connection.
+        let migration_result: Result<Vec<String>, MigrationError> = {
+            let mut harness = HarnessWithOutput::write_to_stdout(&mut *conn);
+            harness
+                .run_pending_migrations(migrations)
+                .map(|applied| applied.iter().map(|m| format!("{m}")).collect())
+                .map_err(|e| MigrationError::Migration(e.to_string()))
+        };
 
-    // Collect migration names eagerly so the harness borrow on `conn` is
-    // dropped before we call release_migration_lock on the same connection.
-    let migration_result: Result<Vec<String>, MigrationError> = {
-        let mut harness = HarnessWithOutput::write_to_stdout(&mut conn);
-        harness
-            .run_pending_migrations(migrations)
-            .map(|applied| applied.iter().map(|m| format!("{m}")).collect())
-            .map_err(|e| MigrationError::Migration(e.to_string()))
-    };
+        release_migration_lock_on(conn);
 
-    release_migration_lock(&mut conn);
-
-    Ok(MigrationResult {
-        applied: migration_result?,
+        Ok(MigrationResult {
+            applied: migration_result?,
+        })
     })
 }
 
@@ -1177,6 +1276,52 @@ pub(crate) fn auto_migrate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Per-attempt connect_timeout injection (`--wait`) ───────────────────
+
+    #[test]
+    fn with_connect_timeout_appends_to_keyword_strings() {
+        // Keyword/value strings pass config validation, so the wait loop
+        // must bound their connect attempts too — a blackholed host must
+        // not hang one attempt past the whole wait budget.
+        assert_eq!(
+            with_connect_timeout("host=db user=app sslmode=require", 7),
+            "host=db user=app sslmode=require connect_timeout=7"
+        );
+        // Quoted/spaced variants still gain the parameter.
+        assert_eq!(
+            with_connect_timeout("host=db password='p w' sslmode = require", 7),
+            "host=db password='p w' sslmode = require connect_timeout=7"
+        );
+    }
+
+    #[test]
+    fn with_connect_timeout_respects_a_user_provided_keyword_timeout() {
+        assert_eq!(
+            with_connect_timeout("host=db connect_timeout=42 user=app", 7),
+            "host=db connect_timeout=42 user=app",
+            "an explicit user timeout must not be overridden"
+        );
+    }
+
+    #[test]
+    fn with_connect_timeout_url_behavior_is_unchanged() {
+        assert_eq!(
+            with_connect_timeout("postgres://u@h/db", 7),
+            "postgres://u@h/db?connect_timeout=7"
+        );
+        // Existing raw query params survive byte-for-byte; a stale
+        // connect_timeout is replaced (the wait loop shrinks it per attempt).
+        assert_eq!(
+            with_connect_timeout(
+                "postgres://u@h/db?options=-c%20search_path%3Dapp&connect_timeout=99",
+                7
+            ),
+            "postgres://u@h/db?options=-c%20search_path%3Dapp&connect_timeout=7"
+        );
+        // Malformed strings pass through so connect reports its own error.
+        assert_eq!(with_connect_timeout("host=", 7), "host=");
+    }
 
     // ── Red-phase tests for advisory-lock API (fail until implemented) ─────
 

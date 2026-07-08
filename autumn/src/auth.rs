@@ -206,6 +206,36 @@ pub async fn __check_secured_with_key(
     Ok(())
 }
 
+/// Runtime scope check used by `#[secured(scopes = [...])]`. **Not intended for
+/// direct use** — use `#[secured]` instead.
+///
+/// Default-deny: with a non-empty `required_scopes`, every required scope must
+/// be present in the authenticating token's granted scopes, otherwise `403
+/// Forbidden`. An empty requirement is a no-op (`Ok`). A token with no granted
+/// scopes (`granted == None`) is denied whenever a scope is required, so a pure
+/// service token that lacks the scope is rejected.
+// Async (with no await) to mirror `__check_secured_with_key`, so the macro can
+// uniformly `.await` whichever check it emits.
+#[doc(hidden)]
+#[allow(clippy::unused_async)]
+pub async fn __check_secured_scopes(
+    granted: Option<&ApiTokenScopes>,
+    required_scopes: &[&str],
+) -> crate::AutumnResult<()> {
+    if required_scopes.is_empty() {
+        return Ok(());
+    }
+    let granted: &[String] = granted.map_or(&[], |g| g.0.as_slice());
+    if required_scopes
+        .iter()
+        .all(|req| granted.iter().any(|g| g == req))
+    {
+        Ok(())
+    } else {
+        Err(crate::AutumnError::forbidden_msg("insufficient scope"))
+    }
+}
+
 // ── Auth<T> extractor ───────────────────────────────────────────
 
 /// Extractor that retrieves the authenticated user from request extensions.
@@ -1452,6 +1482,66 @@ impl Default for AuthConfig {
 // API Token Authentication
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// A verified token: the principal it authenticates plus the scopes it grants.
+///
+/// Returned by [`ApiTokenStore::verify_scoped`]. The granted `scopes` are flat
+/// permission strings (e.g. `posts:read`, `posts:write`) and are threaded into
+/// the policy layer so handlers can authorize on them via
+/// [`crate::authorization::PolicyContext::has_scope`] and
+/// `#[secured(scopes = [...])]`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct VerifiedToken {
+    /// The principal the token authenticates (e.g. `user:42`, `service:ci`).
+    pub principal_id: String,
+    /// Flat permission strings granted to this token.
+    pub scopes: Vec<String>,
+    /// Human-readable name supplied at mint time; used by [`ApiTokenStore::rotate`]
+    /// to re-issue the replacement with the same name.
+    pub name: String,
+    /// Expiry carried through so [`ApiTokenStore::rotate`] can preserve it on
+    /// the replacement token instead of issuing a non-expiring one.
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Non-secret metadata for an issued token, returned by
+/// [`ApiTokenStore::list`].
+///
+/// **Never** carries the raw token or its hash — listing a principal's tokens
+/// must not expose anything that could be replayed as a credential.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenMetadata {
+    /// Store-defined identifier (e.g. a `BIGSERIAL` id rendered as a string).
+    pub id: String,
+    /// Human-readable name supplied at mint time.
+    pub name: String,
+    /// The principal the token authenticates.
+    pub principal_id: String,
+    /// Flat permission strings granted to this token.
+    pub scopes: Vec<String>,
+    /// When the token was issued.
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    /// Optional expiry; `None` means the token never expires.
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Last successful authentication, recorded on use.
+    pub last_used_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Revocation timestamp; `None` means the token is still active.
+    pub revoked_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Parameters for minting a scoped token via
+/// [`ApiTokenStore::issue_scoped`] / [`issue_scoped_api_token`].
+#[derive(Debug, Clone, Default)]
+pub struct IssueTokenSpec<'a> {
+    /// The principal the token authenticates.
+    pub principal_id: &'a str,
+    /// Human-readable name (e.g. `ci`, `partner-integration`).
+    pub name: &'a str,
+    /// Flat permission strings to grant.
+    pub scopes: &'a [String],
+    /// Optional expiry; `None` mints a non-expiring token.
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 /// Backend trait for storing and verifying API bearer tokens.
 ///
 /// Implementations persist only the token hash — the raw token is never stored
@@ -1460,6 +1550,16 @@ impl Default for AuthConfig {
 ///
 /// All methods take `&self`; use interior mutability where write access is
 /// needed.
+///
+/// # Scoped tokens
+///
+/// The original three methods (`issue` / `verify` / `revoke`) remain the
+/// minimal contract. The scoped surface — [`issue_scoped`](Self::issue_scoped),
+/// [`verify_scoped`](Self::verify_scoped), [`list`](Self::list), and
+/// [`rotate`](Self::rotate) — is provided with **default implementations** that
+/// delegate to the original three, so existing `impl ApiTokenStore` blocks keep
+/// compiling unchanged. The built-in stores override them to carry names,
+/// scopes, expiry, and `last_used_at`.
 pub trait ApiTokenStore: Send + Sync + 'static {
     /// Issue a new token for `principal_id` and return the raw value.
     ///
@@ -1470,8 +1570,8 @@ pub trait ApiTokenStore: Send + Sync + 'static {
         principal_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = crate::AutumnResult<String>> + Send + 'a>>;
 
-    /// Verify `raw_token` and return its principal ID, or `None` for unknown
-    /// or revoked tokens.
+    /// Verify `raw_token` and return its principal ID, or `None` for unknown,
+    /// revoked, or expired tokens.
     fn verify<'a>(
         &'a self,
         raw_token: &'a str,
@@ -1482,6 +1582,82 @@ pub trait ApiTokenStore: Send + Sync + 'static {
         &'a self,
         raw_token: &'a str,
     ) -> Pin<Box<dyn Future<Output = crate::AutumnResult<()>> + Send + 'a>>;
+
+    /// Issue a token carrying a name, scopes, and an optional expiry.
+    ///
+    /// The default implementation delegates to [`issue`](Self::issue),
+    /// dropping the name/scopes/expiry — so legacy stores keep working while
+    /// returning unscoped tokens. Stores that support scopes override this.
+    fn issue_scoped<'a>(
+        &'a self,
+        spec: IssueTokenSpec<'a>,
+    ) -> Pin<Box<dyn Future<Output = crate::AutumnResult<String>> + Send + 'a>> {
+        Box::pin(async move { self.issue(spec.principal_id).await })
+    }
+
+    /// Verify `raw_token` and return the principal plus its granted scopes.
+    ///
+    /// The default implementation delegates to [`verify`](Self::verify) and
+    /// yields an empty scope set, preserving legacy behavior.
+    fn verify_scoped<'a>(
+        &'a self,
+        raw_token: &'a str,
+    ) -> Pin<Box<dyn Future<Output = crate::AutumnResult<Option<VerifiedToken>>> + Send + 'a>> {
+        Box::pin(async move {
+            Ok(self
+                .verify(raw_token)
+                .await?
+                .map(|principal_id| VerifiedToken {
+                    principal_id,
+                    scopes: Vec::new(),
+                    name: String::new(),
+                    expires_at: None,
+                }))
+        })
+    }
+
+    /// List non-secret metadata for every token belonging to `principal_id`.
+    ///
+    /// The default implementation returns an empty list (opt-in). Listing
+    /// **never** exposes the raw token or its hash.
+    fn list<'a>(
+        &'a self,
+        principal_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = crate::AutumnResult<Vec<TokenMetadata>>> + Send + 'a>> {
+        let _ = principal_id;
+        Box::pin(async move { Ok(Vec::new()) })
+    }
+
+    /// Rotate `raw_token`: revoke it and issue a replacement carrying the same
+    /// name and scopes, returning the new raw token (or `None` if the token
+    /// was unknown).
+    ///
+    /// The default implementation reads the token's scopes via
+    /// [`verify_scoped`](Self::verify_scoped), revokes it, then mints a fresh
+    /// token with the same scopes.
+    fn rotate<'a>(
+        &'a self,
+        raw_token: &'a str,
+    ) -> Pin<Box<dyn Future<Output = crate::AutumnResult<Option<String>>> + Send + 'a>> {
+        Box::pin(async move {
+            match self.verify_scoped(raw_token).await? {
+                Some(vt) => {
+                    self.revoke(raw_token).await?;
+                    let scopes = vt.scopes.clone();
+                    let raw = self
+                        .issue_scoped(IssueTokenSpec {
+                            principal_id: &vt.principal_id,
+                            name: &vt.name,
+                            scopes: &scopes,
+                            expires_at: vt.expires_at,
+                        })
+                        .await?;
+                    Ok(Some(raw))
+                }
+                None => Ok(None),
+            }
+        })
+    }
 }
 
 /// Compute the SHA-256 hash of a raw API token as a lowercase 64-char hex string.
@@ -1513,7 +1689,8 @@ pub fn hash_api_token(raw: &str) -> String {
 /// Generate a 256-bit random raw API token as a lowercase hex string.
 ///
 /// Uses two UUID v4 values (128 bits each) concatenated for a 64-char result.
-fn generate_raw_token() -> String {
+#[must_use]
+pub fn generate_raw_token() -> String {
     let u1 = uuid::Uuid::new_v4();
     let u2 = uuid::Uuid::new_v4();
     format!("{}{}", u1.simple(), u2.simple())
@@ -1539,17 +1716,93 @@ fn generate_raw_token() -> String {
 /// assert_eq!(store.verify(&token).await.unwrap(), None);
 /// # });
 /// ```
+/// A token row held by [`InMemoryApiTokenStore`], keyed by token hash.
+#[derive(Debug, Clone)]
+struct StoredToken {
+    id: u64,
+    principal_id: String,
+    name: String,
+    scopes: Vec<String>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    last_used_at: Option<chrono::DateTime<chrono::Utc>>,
+    revoked_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 #[derive(Clone)]
 pub struct InMemoryApiTokenStore {
-    // hash → principal_id
-    tokens: Arc<std::sync::RwLock<std::collections::HashMap<String, String>>>,
+    // hash → stored token
+    tokens: Arc<std::sync::RwLock<std::collections::HashMap<String, StoredToken>>>,
+    next_id: Arc<std::sync::atomic::AtomicU64>,
+    clock: Arc<dyn crate::time::ClockSource>,
 }
 
 impl Default for InMemoryApiTokenStore {
     fn default() -> Self {
         Self {
             tokens: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            next_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            clock: Arc::new(crate::time::SystemClock),
         }
+    }
+}
+
+impl InMemoryApiTokenStore {
+    /// Replace the clock used to evaluate expiry and stamp `last_used_at`.
+    ///
+    /// Defaults to [`crate::time::SystemClock`]; tests pass a
+    /// [`crate::time::FixedClock`] / [`crate::time::TickingClock`] to make
+    /// expiry and usage timestamps deterministic.
+    #[must_use]
+    pub fn with_clock(mut self, clock: Arc<dyn crate::time::ClockSource>) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// Insert a freshly-minted token and return its raw value.
+    fn insert_token(&self, spec: &IssueTokenSpec<'_>) -> String {
+        let raw = generate_raw_token();
+        let hash = hash_api_token(&raw);
+        let id = self
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let stored = StoredToken {
+            id,
+            principal_id: spec.principal_id.to_owned(),
+            name: spec.name.to_owned(),
+            scopes: spec.scopes.to_vec(),
+            created_at: self.clock.now(),
+            expires_at: spec.expires_at,
+            last_used_at: None,
+            revoked_at: None,
+        };
+        self.tokens
+            .write()
+            .expect("api token store lock poisoned")
+            .insert(hash, stored);
+        raw
+    }
+
+    /// Resolve a live token by raw value, stamping `last_used_at`.
+    ///
+    /// Returns `None` for unknown, revoked, or expired tokens.
+    fn resolve_used(&self, raw_token: &str) -> Option<VerifiedToken> {
+        let hash = hash_api_token(raw_token);
+        let now = self.clock.now();
+        let mut guard = self.tokens.write().expect("api token store lock poisoned");
+        let stored = guard.get_mut(&hash)?;
+        if stored.revoked_at.is_some() || stored.expires_at.is_some_and(|exp| exp <= now) {
+            return None;
+        }
+        stored.last_used_at = Some(now);
+        let verified = VerifiedToken {
+            principal_id: stored.principal_id.clone(),
+            scopes: stored.scopes.clone(),
+            name: stored.name.clone(),
+            expires_at: stored.expires_at,
+        };
+        drop(guard);
+        Some(verified)
     }
 }
 
@@ -1559,13 +1812,10 @@ impl ApiTokenStore for InMemoryApiTokenStore {
         principal_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = crate::AutumnResult<String>> + Send + 'a>> {
         Box::pin(async move {
-            let raw = generate_raw_token();
-            let hash = hash_api_token(&raw);
-            self.tokens
-                .write()
-                .expect("api token store lock poisoned")
-                .insert(hash, principal_id.to_owned());
-            Ok(raw)
+            Ok(self.insert_token(&IssueTokenSpec {
+                principal_id,
+                ..Default::default()
+            }))
         })
     }
 
@@ -1573,15 +1823,7 @@ impl ApiTokenStore for InMemoryApiTokenStore {
         &'a self,
         raw_token: &'a str,
     ) -> Pin<Box<dyn Future<Output = crate::AutumnResult<Option<String>>> + Send + 'a>> {
-        Box::pin(async move {
-            let hash = hash_api_token(raw_token);
-            Ok(self
-                .tokens
-                .read()
-                .expect("api token store lock poisoned")
-                .get(&hash)
-                .cloned())
-        })
+        Box::pin(async move { Ok(self.resolve_used(raw_token).map(|vt| vt.principal_id)) })
     }
 
     fn revoke<'a>(
@@ -1590,11 +1832,58 @@ impl ApiTokenStore for InMemoryApiTokenStore {
     ) -> Pin<Box<dyn Future<Output = crate::AutumnResult<()>> + Send + 'a>> {
         Box::pin(async move {
             let hash = hash_api_token(raw_token);
-            self.tokens
-                .write()
-                .expect("api token store lock poisoned")
-                .remove(&hash);
+            let now = self.clock.now();
+            let mut guard = self.tokens.write().expect("api token store lock poisoned");
+            if let Some(stored) = guard.get_mut(&hash) {
+                stored.revoked_at.get_or_insert(now);
+            }
+            drop(guard);
             Ok(())
+        })
+    }
+
+    fn issue_scoped<'a>(
+        &'a self,
+        spec: IssueTokenSpec<'a>,
+    ) -> Pin<Box<dyn Future<Output = crate::AutumnResult<String>> + Send + 'a>> {
+        Box::pin(async move { Ok(self.insert_token(&spec)) })
+    }
+
+    fn verify_scoped<'a>(
+        &'a self,
+        raw_token: &'a str,
+    ) -> Pin<Box<dyn Future<Output = crate::AutumnResult<Option<VerifiedToken>>> + Send + 'a>> {
+        Box::pin(async move { Ok(self.resolve_used(raw_token)) })
+    }
+
+    fn list<'a>(
+        &'a self,
+        principal_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = crate::AutumnResult<Vec<TokenMetadata>>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut out: Vec<TokenMetadata> = {
+                let guard = self.tokens.read().expect("api token store lock poisoned");
+                guard
+                    .values()
+                    .filter(|s| s.principal_id == principal_id)
+                    .map(|s| TokenMetadata {
+                        id: s.id.to_string(),
+                        name: s.name.clone(),
+                        principal_id: s.principal_id.clone(),
+                        scopes: s.scopes.clone(),
+                        created_at: s.created_at,
+                        expires_at: s.expires_at,
+                        last_used_at: s.last_used_at,
+                        revoked_at: s.revoked_at,
+                    })
+                    .collect()
+            };
+            out.sort_by(|a, b| {
+                a.id.parse::<u64>()
+                    .unwrap_or(0)
+                    .cmp(&b.id.parse().unwrap_or(0))
+            });
+            Ok(out)
         })
     }
 }
@@ -1627,10 +1916,82 @@ pub async fn revoke_api_token(
     store.revoke(raw_token).await
 }
 
+/// Issue a named, scoped API token with an optional expiry using `store`.
+///
+/// Returns the raw token string that must be transmitted to the client once.
+/// The granted scopes flow into the policy layer when the token authenticates
+/// (see [`crate::authorization::PolicyContext::has_scope`] and
+/// `#[secured(scopes = [...])]`).
+///
+/// # Errors
+///
+/// Propagates any error from the underlying store.
+pub async fn issue_scoped_api_token(
+    store: &dyn ApiTokenStore,
+    spec: IssueTokenSpec<'_>,
+) -> crate::AutumnResult<String> {
+    store.issue_scoped(spec).await
+}
+
+/// List non-secret metadata for every token belonging to `principal_id`.
+///
+/// The returned [`TokenMetadata`] never includes the raw token or its hash, so
+/// it is safe to surface in a management UI or CLI.
+///
+/// # Errors
+///
+/// Propagates any error from the underlying store.
+pub async fn list_api_tokens(
+    store: &dyn ApiTokenStore,
+    principal_id: &str,
+) -> crate::AutumnResult<Vec<TokenMetadata>> {
+    store.list(principal_id).await
+}
+
+/// Rotate an API token: revoke `raw_token` and mint a replacement carrying the
+/// same name and scopes.
+///
+/// Returns the new raw token, or `None` if `raw_token` was unknown.
+///
+/// # Errors
+///
+/// Propagates any error from the underlying store.
+pub async fn rotate_api_token(
+    store: &dyn ApiTokenStore,
+    raw_token: &str,
+) -> crate::AutumnResult<Option<String>> {
+    store.rotate(raw_token).await
+}
+
 /// Private marker inserted into request extensions by [`RequireApiToken`] after
 /// a bearer token is successfully verified.
 #[derive(Clone)]
 struct ApiTokenPrincipal(String);
+
+/// Scopes granted to the authenticating service token, inserted into request
+/// extensions by [`RequireApiToken`] after a bearer token is verified.
+///
+/// Public so policy code and the `#[secured(scopes = [...])]` gate can read the
+/// granted scopes from request extensions. Absent when the request did not
+/// authenticate via a scoped token (the empty-scope case).
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use autumn_web::prelude::*;
+/// use autumn_web::auth::ApiTokenScopes;
+/// use autumn_web::reexports::axum::extract::Extension;
+///
+/// #[get("/whoami")]
+/// async fn whoami(scopes: Option<Extension<ApiTokenScopes>>) -> String {
+///     match scopes {
+///         Some(Extension(ApiTokenScopes(s))) => format!("scopes: {s:?}"),
+///         None => "no token scopes".to_owned(),
+///     }
+/// }
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ApiTokenScopes(pub Vec<String>);
 
 /// Extractor that yields the verified principal ID from a bearer-protected route.
 ///
@@ -1765,12 +2126,23 @@ where
                 return Ok(api_token_unauthorized_response(request_id, instance));
             };
 
-            match store.verify(&raw_token).await {
-                Ok(Some(principal_id)) => {
+            match store.verify_scoped(&raw_token).await {
+                Ok(Some(verified)) => {
+                    let VerifiedToken {
+                        principal_id,
+                        scopes,
+                        ..
+                    } = verified;
                     // Fulfil the RateLimitPrincipal contract so key_strategy =
                     // "authenticated_principal" works without an extra middleware shim.
                     req.extensions_mut()
                         .insert(crate::security::RateLimitPrincipal(principal_id.clone()));
+                    // Expose the granted scopes via request extensions (NOT the
+                    // session — writing to the session would persist a cookie
+                    // and leak scopes onto later cookie-only requests). The
+                    // `#[secured(scopes = …)]` gate and `PolicyContext`
+                    // scope-aware helpers read this extension.
+                    req.extensions_mut().insert(ApiTokenScopes(scopes));
                     req.extensions_mut().insert(ApiTokenPrincipal(principal_id));
                     inner.call(req).await
                 }
@@ -1888,14 +2260,21 @@ mod db_store {
     use std::future::Future;
     use std::pin::Pin;
 
+    use std::sync::Arc;
+
+    use chrono::{DateTime, NaiveDateTime, Utc};
     use diesel::OptionalExtension as _;
     use diesel::prelude::*;
     use diesel_async::AsyncPgConnection;
     use diesel_async::RunQueryDsl;
     use diesel_async::pooled_connection::deadpool::Pool;
 
-    use super::{ApiTokenStore, generate_raw_token, hash_api_token};
+    use super::{
+        ApiTokenStore, IssueTokenSpec, TokenMetadata, VerifiedToken, generate_raw_token,
+        hash_api_token,
+    };
     use crate::error::AutumnError;
+    use crate::time::{ClockSource, SystemClock};
 
     diesel::table! {
         api_tokens (id) {
@@ -1904,6 +2283,10 @@ mod db_store {
             principal_id -> Text,
             created_at -> Timestamp,
             revoked_at -> Nullable<Timestamp>,
+            name -> Text,
+            scopes -> Jsonb,
+            expires_at -> Nullable<Timestamp>,
+            last_used_at -> Nullable<Timestamp>,
         }
     }
 
@@ -1912,6 +2295,47 @@ mod db_store {
     struct NewApiToken<'a> {
         token_hash: &'a str,
         principal_id: &'a str,
+        name: &'a str,
+        scopes: serde_json::Value,
+        expires_at: Option<NaiveDateTime>,
+    }
+
+    /// Row shape returned by [`DbApiTokenStore::list`].
+    #[derive(Queryable)]
+    struct TokenRow {
+        id: i64,
+        name: String,
+        principal_id: String,
+        scopes: serde_json::Value,
+        created_at: NaiveDateTime,
+        expires_at: Option<NaiveDateTime>,
+        last_used_at: Option<NaiveDateTime>,
+        revoked_at: Option<NaiveDateTime>,
+    }
+
+    const fn to_utc(naive: NaiveDateTime) -> DateTime<Utc> {
+        DateTime::from_naive_utc_and_offset(naive, Utc)
+    }
+
+    fn scopes_to_json(scopes: &[String]) -> serde_json::Value {
+        serde_json::Value::Array(
+            scopes
+                .iter()
+                .map(|s| serde_json::Value::String(s.clone()))
+                .collect(),
+        )
+    }
+
+    #[must_use]
+    pub fn scopes_from_json(value: &serde_json::Value) -> Vec<String> {
+        value
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Postgres-backed [`ApiTokenStore`].
@@ -1919,6 +2343,10 @@ mod db_store {
     /// Tokens are hashed at rest (SHA-256) and never stored in plaintext.
     /// Suitable for production deployments where token state must survive
     /// process restarts and be shared across instances.
+    ///
+    /// Carries name, scopes, optional expiry, and `last_used_at` in the managed
+    /// `api_tokens` table (see [`super::API_TOKEN_MIGRATIONS`]). Expired tokens
+    /// fail to verify; `last_used_at` is stamped on every successful use.
     ///
     /// # Setup
     ///
@@ -1940,13 +2368,37 @@ mod db_store {
     #[derive(Clone)]
     pub struct DbApiTokenStore {
         pool: Pool<AsyncPgConnection>,
+        clock: Arc<dyn ClockSource>,
     }
 
     impl DbApiTokenStore {
         /// Create a [`DbApiTokenStore`] backed by `pool`.
         #[must_use]
-        pub const fn new(pool: Pool<AsyncPgConnection>) -> Self {
-            Self { pool }
+        pub fn new(pool: Pool<AsyncPgConnection>) -> Self {
+            Self {
+                pool,
+                clock: Arc::new(SystemClock),
+            }
+        }
+
+        /// Replace the clock used to evaluate expiry and stamp `last_used_at`.
+        ///
+        /// Defaults to [`SystemClock`]; tests pass a fixed/ticking clock to make
+        /// expiry and usage timestamps deterministic.
+        #[must_use]
+        pub fn with_clock(mut self, clock: Arc<dyn ClockSource>) -> Self {
+            self.clock = clock;
+            self
+        }
+
+        async fn conn(
+            &self,
+        ) -> crate::AutumnResult<diesel_async::pooled_connection::deadpool::Object<AsyncPgConnection>>
+        {
+            self.pool
+                .get()
+                .await
+                .map_err(|e| AutumnError::internal_server_error_msg(e.to_string()))
         }
     }
 
@@ -1955,23 +2407,9 @@ mod db_store {
             &'a self,
             principal_id: &'a str,
         ) -> Pin<Box<dyn Future<Output = crate::AutumnResult<String>> + Send + 'a>> {
-            Box::pin(async move {
-                let raw = generate_raw_token();
-                let hash = hash_api_token(&raw);
-                let mut conn = self
-                    .pool
-                    .get()
-                    .await
-                    .map_err(|e| AutumnError::internal_server_error_msg(e.to_string()))?;
-                diesel::insert_into(api_tokens::table)
-                    .values(NewApiToken {
-                        token_hash: &hash,
-                        principal_id,
-                    })
-                    .execute(&mut conn)
-                    .await
-                    .map_err(|e| AutumnError::internal_server_error_msg(e.to_string()))?;
-                Ok(raw)
+            self.issue_scoped(IssueTokenSpec {
+                principal_id,
+                ..Default::default()
             })
         }
 
@@ -1981,21 +2419,10 @@ mod db_store {
         ) -> Pin<Box<dyn Future<Output = crate::AutumnResult<Option<String>>> + Send + 'a>>
         {
             Box::pin(async move {
-                let hash = hash_api_token(raw_token);
-                let mut conn = self
-                    .pool
-                    .get()
-                    .await
-                    .map_err(|e| AutumnError::internal_server_error_msg(e.to_string()))?;
-                let principal: Option<String> = api_tokens::table
-                    .filter(api_tokens::token_hash.eq(&hash))
-                    .filter(api_tokens::revoked_at.is_null())
-                    .select(api_tokens::principal_id)
-                    .first(&mut conn)
-                    .await
-                    .optional()
-                    .map_err(|e| AutumnError::internal_server_error_msg(e.to_string()))?;
-                Ok(principal)
+                Ok(self
+                    .verify_scoped(raw_token)
+                    .await?
+                    .map(|vt| vt.principal_id))
             })
         }
 
@@ -2005,18 +2432,191 @@ mod db_store {
         ) -> Pin<Box<dyn Future<Output = crate::AutumnResult<()>> + Send + 'a>> {
             Box::pin(async move {
                 let hash = hash_api_token(raw_token);
-                let mut conn = self
-                    .pool
-                    .get()
-                    .await
-                    .map_err(|e| AutumnError::internal_server_error_msg(e.to_string()))?;
+                let now = self.clock.now().naive_utc();
+                let mut conn = self.conn().await?;
                 diesel::update(api_tokens::table)
                     .filter(api_tokens::token_hash.eq(&hash))
-                    .set(api_tokens::revoked_at.eq(diesel::dsl::now.nullable()))
+                    .filter(api_tokens::revoked_at.is_null())
+                    .set(api_tokens::revoked_at.eq(Some(now)))
                     .execute(&mut conn)
                     .await
                     .map_err(|e| AutumnError::internal_server_error_msg(e.to_string()))?;
                 Ok(())
+            })
+        }
+
+        fn issue_scoped<'a>(
+            &'a self,
+            spec: IssueTokenSpec<'a>,
+        ) -> Pin<Box<dyn Future<Output = crate::AutumnResult<String>> + Send + 'a>> {
+            Box::pin(async move {
+                let raw = generate_raw_token();
+                let hash = hash_api_token(&raw);
+                let mut conn = self.conn().await?;
+                diesel::insert_into(api_tokens::table)
+                    .values(NewApiToken {
+                        token_hash: &hash,
+                        principal_id: spec.principal_id,
+                        name: spec.name,
+                        scopes: scopes_to_json(spec.scopes),
+                        expires_at: spec.expires_at.map(|dt| dt.naive_utc()),
+                    })
+                    .execute(&mut conn)
+                    .await
+                    .map_err(|e| AutumnError::internal_server_error_msg(e.to_string()))?;
+                Ok(raw)
+            })
+        }
+
+        fn rotate<'a>(
+            &'a self,
+            raw_token: &'a str,
+        ) -> Pin<Box<dyn Future<Output = crate::AutumnResult<Option<String>>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                #[derive(diesel::QueryableByName)]
+                struct CountRow {
+                    #[diesel(sql_type = diesel::sql_types::BigInt)]
+                    count: i64,
+                }
+
+                let old_hash = hash_api_token(raw_token);
+                let new_raw = generate_raw_token();
+                let new_hash = hash_api_token(&new_raw);
+                let now = self.clock.now().naive_utc();
+                let mut conn = self.conn().await?;
+                // Atomic CTE: revoke the old token and insert a replacement carrying
+                // the same name/scopes/expiry in a single statement. If the old hash
+                // is unknown or already revoked the UPDATE returns 0 rows, the INSERT
+                // is a no-op, and COUNT(*) returns 0 — the caller sees None.
+                // $3 is the store clock's `now` so the expiry predicate matches the
+                // same instant used by verify_scoped, avoiding clock-skew races.
+                let row: CountRow = diesel::sql_query(
+                    "WITH rotated AS ( \
+                        UPDATE api_tokens \
+                        SET revoked_at = $3 \
+                        WHERE token_hash = $1 AND revoked_at IS NULL \
+                            AND (expires_at IS NULL OR expires_at > $3) \
+                        RETURNING principal_id, name, scopes, expires_at \
+                     ), \
+                     inserted AS ( \
+                        INSERT INTO api_tokens (token_hash, principal_id, name, scopes, expires_at) \
+                        SELECT $2, principal_id, name, scopes, expires_at FROM rotated \
+                        RETURNING 1 \
+                     ) \
+                     SELECT COUNT(*)::bigint AS count FROM inserted",
+                )
+                .bind::<diesel::sql_types::Text, _>(&old_hash)
+                .bind::<diesel::sql_types::Text, _>(&new_hash)
+                .bind::<diesel::sql_types::Timestamp, _>(now)
+                .get_result(&mut conn)
+                .await
+                .map_err(|e| AutumnError::internal_server_error_msg(e.to_string()))?;
+                if row.count == 0 {
+                    Ok(None)
+                } else {
+                    Ok(Some(new_raw))
+                }
+            })
+        }
+
+        fn verify_scoped<'a>(
+            &'a self,
+            raw_token: &'a str,
+        ) -> Pin<Box<dyn Future<Output = crate::AutumnResult<Option<VerifiedToken>>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                let hash = hash_api_token(raw_token);
+                let now = self.clock.now().naive_utc();
+                let mut conn = self.conn().await?;
+                // Live tokens only: not revoked, and either no expiry or not yet expired.
+                let row: Option<(
+                    i64,
+                    String,
+                    String,
+                    Option<NaiveDateTime>,
+                    serde_json::Value,
+                )> = api_tokens::table
+                    .filter(api_tokens::token_hash.eq(&hash))
+                    .filter(api_tokens::revoked_at.is_null())
+                    .filter(
+                        api_tokens::expires_at
+                            .is_null()
+                            .or(api_tokens::expires_at.gt(now)),
+                    )
+                    .select((
+                        api_tokens::id,
+                        api_tokens::principal_id,
+                        api_tokens::name,
+                        api_tokens::expires_at,
+                        api_tokens::scopes,
+                    ))
+                    .first(&mut conn)
+                    .await
+                    .optional()
+                    .map_err(|e| AutumnError::internal_server_error_msg(e.to_string()))?;
+
+                let Some((id, principal_id, name, expires_at_naive, scopes_json)) = row else {
+                    return Ok(None);
+                };
+                // Throttled usage stamp: only write last_used_at when it is NULL or
+                // older than 5 minutes, avoiding a write on every single request.
+                let threshold = now - chrono::Duration::minutes(5);
+                let _ = diesel::update(
+                    api_tokens::table.filter(api_tokens::id.eq(id)).filter(
+                        api_tokens::last_used_at
+                            .is_null()
+                            .or(api_tokens::last_used_at.lt(threshold)),
+                    ),
+                )
+                .set(api_tokens::last_used_at.eq(Some(now)))
+                .execute(&mut conn)
+                .await;
+                Ok(Some(VerifiedToken {
+                    principal_id,
+                    scopes: scopes_from_json(&scopes_json),
+                    name,
+                    expires_at: expires_at_naive.map(to_utc),
+                }))
+            })
+        }
+
+        fn list<'a>(
+            &'a self,
+            principal_id: &'a str,
+        ) -> Pin<Box<dyn Future<Output = crate::AutumnResult<Vec<TokenMetadata>>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                let mut conn = self.conn().await?;
+                let rows: Vec<TokenRow> = api_tokens::table
+                    .filter(api_tokens::principal_id.eq(principal_id))
+                    .order(api_tokens::id.asc())
+                    .select((
+                        api_tokens::id,
+                        api_tokens::name,
+                        api_tokens::principal_id,
+                        api_tokens::scopes,
+                        api_tokens::created_at,
+                        api_tokens::expires_at,
+                        api_tokens::last_used_at,
+                        api_tokens::revoked_at,
+                    ))
+                    .load(&mut conn)
+                    .await
+                    .map_err(|e| AutumnError::internal_server_error_msg(e.to_string()))?;
+                Ok(rows
+                    .into_iter()
+                    .map(|r| TokenMetadata {
+                        id: r.id.to_string(),
+                        name: r.name,
+                        principal_id: r.principal_id,
+                        scopes: scopes_from_json(&r.scopes),
+                        created_at: to_utc(r.created_at),
+                        expires_at: r.expires_at.map(to_utc),
+                        last_used_at: r.last_used_at.map(to_utc),
+                        revoked_at: r.revoked_at.map(to_utc),
+                    })
+                    .collect())
             })
         }
     }
@@ -2024,6 +2624,14 @@ mod db_store {
 
 #[cfg(feature = "db")]
 pub use db_store::DbApiTokenStore;
+/// Convert a JSONB `serde_json::Value` (array of strings) to a flat scope list.
+///
+/// Returns an empty `Vec` for non-array values; non-string array elements are
+/// silently skipped. This is the canonical deserializer for the `scopes` JSONB
+/// column shared by [`DbApiTokenStore`] and the admin panel.
+#[cfg(feature = "db")]
+#[doc(hidden)]
+pub use db_store::scopes_from_json;
 
 #[cfg(test)]
 mod tests {
@@ -3285,6 +3893,214 @@ mod api_token_tests {
         let raw = store.issue("user:6").await.unwrap();
         revoke_api_token(&store, &raw).await.unwrap();
         assert_eq!(store.verify(&raw).await.unwrap(), None);
+    }
+
+    // ── Scoped service tokens (issue #1158) ──────────────────────────────────
+
+    use super::{
+        __check_secured_scopes, ApiTokenScopes, IssueTokenSpec, issue_scoped_api_token,
+        list_api_tokens, rotate_api_token,
+    };
+    use crate::time::{FixedClock, TickingClock};
+    use chrono::{Duration as ChronoDuration, TimeZone as _, Utc};
+
+    fn scopes(s: &[&str]) -> Vec<String> {
+        s.iter().map(|x| (*x).to_owned()).collect()
+    }
+
+    /// A legacy store implementing only the original three methods relies on
+    /// the default `verify_scoped`, which must yield empty scopes — proving the
+    /// scoped surface is purely additive.
+    #[derive(Default)]
+    struct LegacyOnlyStore(InMemoryApiTokenStore);
+
+    impl ApiTokenStore for LegacyOnlyStore {
+        fn issue<'a>(
+            &'a self,
+            principal_id: &'a str,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = crate::AutumnResult<String>> + Send + 'a>,
+        > {
+            self.0.issue(principal_id)
+        }
+        fn verify<'a>(
+            &'a self,
+            raw_token: &'a str,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = crate::AutumnResult<Option<String>>> + Send + 'a>,
+        > {
+            self.0.verify(raw_token)
+        }
+        fn revoke<'a>(
+            &'a self,
+            raw_token: &'a str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send + 'a>>
+        {
+            self.0.revoke(raw_token)
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_store_default_verify_scoped_yields_empty_scopes() {
+        let store = LegacyOnlyStore::default();
+        let raw = store.issue("user:1").await.unwrap();
+        let verified = store.verify_scoped(&raw).await.unwrap().unwrap();
+        assert_eq!(verified.principal_id, "user:1");
+        assert!(verified.scopes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn issue_scoped_round_trips_name_and_scopes() {
+        let store = InMemoryApiTokenStore::default();
+        let granted = scopes(&["posts:read", "posts:write"]);
+        let raw = issue_scoped_api_token(
+            &store,
+            IssueTokenSpec {
+                principal_id: "service:ci",
+                name: "ci",
+                scopes: &granted,
+                expires_at: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let verified = store.verify_scoped(&raw).await.unwrap().unwrap();
+        assert_eq!(verified.principal_id, "service:ci");
+        assert_eq!(verified.scopes, granted);
+
+        let listed = list_api_tokens(&store, "service:ci").await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "ci");
+        assert_eq!(listed[0].scopes, granted);
+    }
+
+    #[tokio::test]
+    async fn expired_token_verifies_as_none() {
+        let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let store = InMemoryApiTokenStore::default().with_clock(Arc::new(FixedClock::at(now)));
+        let granted = scopes(&["posts:read"]);
+        let raw = store
+            .issue_scoped(IssueTokenSpec {
+                principal_id: "service:ci",
+                name: "ci",
+                scopes: &granted,
+                expires_at: Some(now - ChronoDuration::seconds(1)),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(store.verify(&raw).await.unwrap(), None);
+        assert!(store.verify_scoped(&raw).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn unexpired_token_verifies_then_records_last_used_at() {
+        let start = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let clock = TickingClock::starting_at(start);
+        let store = InMemoryApiTokenStore::default().with_clock(Arc::new(clock));
+        let granted = scopes(&["posts:read"]);
+        let raw = store
+            .issue_scoped(IssueTokenSpec {
+                principal_id: "service:ci",
+                name: "ci",
+                scopes: &granted,
+                expires_at: Some(start + ChronoDuration::days(30)),
+            })
+            .await
+            .unwrap();
+
+        // Before use, last_used_at is unset.
+        assert!(
+            list_api_tokens(&store, "service:ci").await.unwrap()[0]
+                .last_used_at
+                .is_none()
+        );
+
+        assert!(store.verify_scoped(&raw).await.unwrap().is_some());
+
+        assert!(
+            list_api_tokens(&store, "service:ci").await.unwrap()[0]
+                .last_used_at
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn list_metadata_carries_no_secret_and_reflects_revocation() {
+        let store = InMemoryApiTokenStore::default();
+        let granted = scopes(&["posts:read"]);
+        let raw = store
+            .issue_scoped(IssueTokenSpec {
+                principal_id: "service:ci",
+                name: "ci",
+                scopes: &granted,
+                expires_at: None,
+            })
+            .await
+            .unwrap();
+
+        let listed = list_api_tokens(&store, "service:ci").await.unwrap();
+        assert_eq!(listed.len(), 1);
+        // Metadata must not expose anything replayable as a credential: the raw
+        // token and its hash never appear in TokenMetadata's fields.
+        assert!(listed[0].revoked_at.is_none());
+
+        store.revoke(&raw).await.unwrap();
+        assert_eq!(store.verify(&raw).await.unwrap(), None);
+        let listed = list_api_tokens(&store, "service:ci").await.unwrap();
+        assert!(listed[0].revoked_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn rotate_revokes_old_and_preserves_scopes() {
+        let store = InMemoryApiTokenStore::default();
+        let granted = scopes(&["posts:read", "posts:write"]);
+        let old = store
+            .issue_scoped(IssueTokenSpec {
+                principal_id: "service:ci",
+                name: "ci",
+                scopes: &granted,
+                expires_at: None,
+            })
+            .await
+            .unwrap();
+
+        let new = rotate_api_token(&store, &old).await.unwrap().unwrap();
+        assert_ne!(new, old);
+        // Old token no longer authenticates.
+        assert!(store.verify_scoped(&old).await.unwrap().is_none());
+        // New token carries the same scopes.
+        let verified = store.verify_scoped(&new).await.unwrap().unwrap();
+        assert_eq!(verified.scopes, granted);
+        assert_eq!(verified.principal_id, "service:ci");
+
+        // Rotating an unknown token yields None.
+        assert!(rotate_api_token(&store, "nope").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn check_secured_scopes_is_default_deny_and_all_must_match() {
+        // Empty requirement is a no-op.
+        assert!(__check_secured_scopes(None, &[]).await.is_ok());
+        // No granted scopes but a requirement => denied (403).
+        let err = __check_secured_scopes(None, &["posts:write"])
+            .await
+            .unwrap_err();
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
+        // Subset present => allowed.
+        let granted = ApiTokenScopes(scopes(&["posts:read", "posts:write"]));
+        assert!(
+            __check_secured_scopes(Some(&granted), &["posts:write"])
+                .await
+                .is_ok()
+        );
+        // Missing one of several required => denied (all-must-match).
+        assert!(
+            __check_secured_scopes(Some(&granted), &["posts:write", "posts:delete"])
+                .await
+                .is_err()
+        );
     }
 
     // ── RequireApiToken middleware ───────────────────────────────────────────

@@ -12,7 +12,7 @@ keywords = ["web", "admin", "axum", "htmx", "fullstack"]
 categories = ["web-programming", "web-programming::http-server"]
 
 [dependencies]
-autumn-web = { version = "0.5.0", path = "../autumn", features = ["maud", "htmx", "db", "flash", "multipart"] }
+autumn-web = { version = "0.6.0", path = "../autumn", features = ["maud", "htmx", "db", "flash", "multipart"] }
 axum = { workspace = true, features = ["multipart"] }
 csv = { workspace = true }
 diesel = { workspace = true }
@@ -29,6 +29,10 @@ tracing = { workspace = true }
 chrono = { workspace = true }
 
 [dev-dependencies]
+diesel = { workspace = true }
+diesel-async = { workspace = true }
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }
 tower = { workspace = true, features = ["util"] }
 

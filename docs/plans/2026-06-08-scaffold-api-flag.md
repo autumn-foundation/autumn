@@ -1,5 +1,13 @@
 # Scaffold API Flag Implementation Plan
 
+> **Superseded (issue #1023):** the TcpStream-based JSON round-trip smoke test
+> this plan describes was replaced by an in-process test built on
+> `autumn_web::test::{TestApp, TestClient, TestDb}` — see
+> `autumn-cli/src/generate/scaffold.rs`'s `render_api_smoke_test` and
+> `docs/guide/generators.md`. This plan is kept as the historical record of the
+> original `--api` flag implementation; the smoke-test sections below no
+> longer describe current behavior.
+
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Add an `--api` flag to `autumn generate scaffold` to generate a JSON-only CRUD resource with no HTML/templates and a JSON round-trip smoke test.

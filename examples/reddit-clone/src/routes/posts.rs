@@ -5,6 +5,8 @@
 //! Maud templates with Tailwind CSS, and feature-flag fragment gating
 //! via the `Flags` extractor.
 
+use std::collections::HashMap;
+
 use autumn_web::experiments::Experiments;
 use autumn_web::extract::Path;
 use autumn_web::extract::State;
@@ -15,9 +17,11 @@ use diesel_async::RunQueryDsl;
 use scoped_futures::ScopedFutureExt;
 
 use crate::jobs::{PostPublicationArgs, PostPublicationJob};
-use crate::models::{Comment, CommentAssociations, Post, PostAssociations, Subreddit};
-use crate::repositories::PgPostRepository;
-use crate::schema::{posts, subreddits};
+use crate::models::{
+    Comment, CommentAssociations, NewTag, Post, PostAssociations, PostTagsMutations, Subreddit, Tag,
+};
+use crate::repositories::{PgPostRepository, PostRepository};
+use crate::schema::{posts, subreddits, tags};
 use crate::slugify::slugify;
 
 fn posts_per_page() -> i64 {
@@ -105,38 +109,39 @@ pub async fn front_page(
             // the preloaded record's typed accessors (`?`-free in templates:
             // treat a missing preload as "absent").
             @if compact_layout {
-                ul id="posts-list" class="divide-y divide-gray-100"
+                ul id="posts-list" class="divide-y divide-gray-100 posts-feed-compact"
                     hx-ext="sse" sse-connect="/posts/stream" sse-swap="message" hx-swap="none" {
                     @for post in &hot_posts {
                         @let author = post.author().ok().flatten();
                         @let sub = post.subreddit().ok().flatten();
                         @if let Some(sub) = sub {
-                            li id=(format!("post-{}", post.id))
-                                class="flex items-center gap-3 py-2 px-2 hover:bg-gray-50 transition-colors" {
-                                span class="text-sm font-semibold text-gray-500 w-8 text-right shrink-0" {
-                                    (post.score)
-                                }
-                                div class="flex-1 min-w-0" {
-                                    a href=(paths::show(&sub.slug, &post.slug))
-                                       class="text-sm font-medium text-gray-900 hover:text-orange-600 \
-                                              line-clamp-1" {
-                                        (post.title)
+                            li id=(format!("post-{}", post.id)) class="posts-feed-item transition-all" {
+                                div class="posts-feed-compact-version flex items-center gap-3 py-2 px-2 hover:bg-gray-50 transition-colors" {
+                                    span class="text-sm font-semibold text-gray-500 w-8 text-right shrink-0" {
+                                        (post.score)
                                     }
-                                    div class="text-xs text-gray-400" {
-                                        a href=(super::subreddits::__autumn_path_show(&sub.slug))
-                                           class="text-gray-500 hover:underline" {
-                                            "r/" (sub.name)
-                                        }
-                                        @if let Some(author) = author {
-                                            " \u{2022} "
-                                            a href=(super::auth::__autumn_path_profile(&author.username))
-                                               class="text-gray-500 hover:underline" { "u/" (author.username) }
-                                        }
-                                        " \u{2022} " (time_ago(&post.created_at))
-                                        " \u{2022} "
+                                    div class="flex-1 min-w-0" {
                                         a href=(paths::show(&sub.slug, &post.slug))
-                                           class="text-gray-500 hover:text-orange-600" {
-                                            (post.comment_count) " comments"
+                                           class="text-sm font-medium text-gray-900 hover:text-orange-600 \
+                                                  line-clamp-1" {
+                                            (post.title)
+                                        }
+                                        div class="text-xs text-gray-400" {
+                                            a href=(super::subreddits::__autumn_path_show(&sub.slug))
+                                               class="text-gray-500 hover:underline" {
+                                                "r/" (sub.name)
+                                            }
+                                            @if let Some(author) = author {
+                                                " \u{2022} "
+                                                a href=(super::auth::__autumn_path_profile(&author.username))
+                                                   class="text-gray-500 hover:underline" { "u/" (author.username) }
+                                            }
+                                            " \u{2022} " (time_ago(&post.created_at))
+                                            " \u{2022} "
+                                            a href=(paths::show(&sub.slug, &post.slug))
+                                               class="text-gray-500 hover:text-orange-600" {
+                                                (post.comment_count) " comments"
+                                            }
                                         }
                                     }
                                 }
@@ -154,34 +159,33 @@ pub async fn front_page(
                         @let author = post.author().ok().flatten();
                         @let sub = post.subreddit().ok().flatten();
                         @if let Some(sub) = sub {
-                            li id=(format!("post-{}", post.id))
-                                class="bg-white rounded-lg shadow-sm border border-gray-200 \
-                                       hover:border-orange-300 transition-colors" {
-                                div class="flex items-start gap-3 p-4" {
-                                    (vote_controls(post.id, post.score))
-                                    div class="flex-1 min-w-0" {
-                                        a href=(paths::show(&sub.slug, &post.slug))
-                                           class="text-lg font-medium text-gray-900 hover:text-orange-600 \
-                                                  line-clamp-2" {
-                                            (post.title)
-                                        }
-                                        div class="text-xs text-gray-400 mt-1" {
-                                            a href=(super::subreddits::__autumn_path_show(&sub.slug))
-                                               class="font-medium text-gray-600 hover:underline" {
-                                                "r/" (sub.name)
-                                            }
-                                            @if let Some(author) = author {
-                                                " \u{2022} posted by "
-                                                a href=(super::auth::__autumn_path_profile(&author.username))
-                                                   class="text-gray-500 hover:underline" {
-                                                    "u/" (author.username)
-                                                }
-                                            }
-                                            " " (time_ago(&post.created_at))
-                                            " \u{2022} "
+                            li id=(format!("post-{}", post.id)) class="posts-feed-item transition-all" {
+                                div class="posts-feed-card-version bg-white rounded-lg shadow-sm border border-gray-200 hover:border-orange-300 transition-colors" {
+                                    div class="flex items-start gap-3 p-4" {
+                                        (vote_controls(post.id, post.score))
+                                        div class="flex-1 min-w-0" {
                                             a href=(paths::show(&sub.slug, &post.slug))
-                                               class="text-gray-500 hover:text-orange-600" {
-                                                (post.comment_count) " comments"
+                                               class="text-lg font-medium text-gray-900 hover:text-orange-600 line-clamp-2" {
+                                                (post.title)
+                                            }
+                                            div class="text-xs text-gray-400 mt-1" {
+                                                a href=(super::subreddits::__autumn_path_show(&sub.slug))
+                                                   class="font-medium text-gray-600 hover:underline" {
+                                                    "r/" (sub.name)
+                                                }
+                                                @if let Some(author) = author {
+                                                    " \u{2022} posted by "
+                                                    a href=(super::auth::__autumn_path_profile(&author.username))
+                                                       class="text-gray-500 hover:underline" {
+                                                        "u/" (author.username)
+                                                    }
+                                                }
+                                                " " (time_ago(&post.created_at))
+                                                " \u{2022} "
+                                                a href=(paths::show(&sub.slug, &post.slug))
+                                                   class="text-gray-500 hover:text-orange-600" {
+                                                    (post.comment_count) " comments"
+                                                }
                                             }
                                         }
                                     }
@@ -366,8 +370,10 @@ pub struct SubmitPostForm {
 #[secured]
 #[post("/submit")]
 pub async fn submit(
+    State(state): State<AppState>,
     session: Session,
     mut db: Db,
+    _repo: PgPostRepository,
     flash: Flash,
     form: Form<SubmitPostForm>,
 ) -> AutumnResult<Redirect> {
@@ -412,50 +418,95 @@ pub async fn submit(
     // Ensure unique slug within this subreddit by appending a suffix
     let slug = unique_slug(&base_slug, form.0.subreddit_id, &mut db).await?;
 
-    // Insert the post, then create an explicit author upvote so
-    // score always matches the sum of actual vote rows.
     let body = form.0.body.trim().to_string();
     let subreddit_id = form.0.subreddit_id;
     let subreddit_slug = sub.slug.clone();
-    db.tx(move |conn| {
-        async move {
-            let post_id: i64 = diesel::insert_into(posts::table)
-                .values((
-                    posts::title.eq(&title),
-                    posts::slug.eq(&slug),
-                    posts::body.eq(&body),
-                    posts::url.eq(&url),
-                    posts::author_id.eq(user_id),
-                    posts::subreddit_id.eq(subreddit_id),
-                    posts::score.eq(1_i64),
+
+    let new_post = crate::models::NewPost {
+        title: title.clone(),
+        slug: slug.clone(),
+        body: body.clone(),
+        url,
+        author_id: user_id,
+        subreddit_id,
+    };
+
+    let subreddit_slug_for_job = subreddit_slug.clone();
+    let author_username_for_job = author_username.clone();
+    let post: Post = db
+        .tx(move |conn| {
+            let new_post = new_post.clone();
+            let subreddit_slug = subreddit_slug_for_job.clone();
+            let author_username = author_username_for_job.clone();
+            async move {
+                let post: Post = diesel::insert_into(posts::table)
+                    .values(&new_post)
+                    .get_result(conn)
+                    .await?;
+
+                let post_id = post.id;
+                diesel::insert_into(crate::schema::votes::table)
+                    .values((
+                        crate::schema::votes::user_id.eq(user_id),
+                        crate::schema::votes::post_id.eq(post_id),
+                        crate::schema::votes::value.eq(1_i16),
+                    ))
+                    .execute(conn)
+                    .await?;
+
+                diesel::update(posts::table.find(post_id))
+                    .set(posts::score.eq(1_i64))
+                    .execute(conn)
+                    .await?;
+
+                let post: Post = posts::table.find(post_id).first(conn).await?;
+
+                // Enqueue the publication job inside the transaction
+                let payload = serde_json::to_value(PostPublicationArgs::new(
+                    post.id,
+                    &post.title,
+                    &post.slug,
+                    &subreddit_slug,
+                    &author_username,
                 ))
-                .returning(posts::id)
-                .get_result(conn)
-                .await?;
+                .unwrap();
+                autumn_web::job::enqueue_on_conn(PostPublicationJob::NAME, &payload, conn).await?;
 
-            diesel::insert_into(crate::schema::votes::table)
-                .values((
-                    crate::schema::votes::user_id.eq(user_id),
-                    crate::schema::votes::post_id.eq(post_id),
-                    crate::schema::votes::value.eq(1_i16),
-                ))
-                .execute(conn)
-                .await?;
+                Ok::<_, AutumnError>(post)
+            }
+            .scope_boxed()
+        })
+        .await?;
 
-            // Default jobs.backend is Postgres, so keep the job row in this
-            // transaction: a failed enqueue rolls back the post and vote too.
-            autumn_web::job::enqueue_on_conn(
-                PostPublicationJob::NAME,
-                PostPublicationArgs::new(post_id, &title, &slug, &subreddit_slug, &author_username),
-                conn,
-            )
-            .await?;
+    let lookup = crate::repositories::PostRelationsLookup {
+        author_name: author_username.clone(),
+        sub_name: sub.name.clone(),
+        sub_slug: sub.slug.clone(),
+    };
 
-            Ok::<_, AutumnError>(())
-        }
-        .scope_boxed()
-    })
-    .await?;
+    let sse_state = state.clone();
+    let sse_post = post.clone();
+    let sse_sub_slug = subreddit_slug.clone();
+    crate::repositories::CURRENT_POST_RELATIONS
+        .scope(lookup, async move {
+            let _ = sse_state.broadcast().publish_oob(
+                "posts",
+                &sse_post.dom_id(),
+                &autumn_web::htmx::OobSwap::OuterHTML,
+                &sse_post.render_fragment(),
+            );
+
+            let _ = sse_state.broadcast().publish_oob(
+                &format!("posts:r/{}", sse_sub_slug),
+                &sse_post.dom_id(),
+                &autumn_web::htmx::OobSwap::Target(
+                    autumn_web::htmx::OobMethod::BeforeEnd,
+                    "#posts-list".to_string(),
+                ),
+                &sse_post.render_fragment(),
+            );
+        })
+        .await;
 
     flash.success("Post created.").await;
     Ok(Redirect::to(&super::subreddits::__autumn_path_show(
@@ -520,21 +571,26 @@ pub async fn show(
     // primary too (`on_primary`) to keep both reads on one consistent role.
     drop(db);
 
-    // Eager-load the post's author and its comments (each with their author),
-    // replacing the per-row author lookup + hand-written comment/author join.
-    // For a post with N comments this is a fixed 2 extra queries (post.author,
-    // comments) + 1 (comments.author) = at most 3 here, never `2 + N`.
+    // Eager-load the post's author, its comments (each with their author),
+    // and its tags (#1324, many-to-many through `post_tags`) -- replacing
+    // the per-row author lookup + hand-written comment/author join, and what
+    // would otherwise be a hand-rolled `post_tags` join query. For a post
+    // with N comments and M tags this is a fixed 2 extra queries
+    // (post.author, comments) + 1 (comments.author) + 1 (post.tags) = at
+    // most 4 here, never `3 + N + M`.
     let mut loaded = repo
         .on_primary()
         .preload(
             vec![post],
             Post::preload()
                 .author()
-                .comments_with(Comment::preload().author()),
+                .comments_with(Comment::preload().author())
+                .tags(),
         )
         .await?;
     let post = loaded.remove(0);
     let author = post.author()?;
+    let post_tags = post.tags()?;
 
     // Show top-level comments (parent_id IS NULL), highest score first.
     let mut post_comments: Vec<&autumn_web::preload::Preloaded<Comment>> = post
@@ -597,6 +653,18 @@ pub async fn show(
                                 }
                             }
                         }
+                        // Preloaded many-to-many tags (#1324): `post.tags()`
+                        // reads the batched `post_tags` join loaded above, no
+                        // per-tag query.
+                        @if !post_tags.is_empty() {
+                            div class="flex flex-wrap gap-2 mt-3" {
+                                @for tag in &post_tags {
+                                    span class="px-2 py-0.5 rounded-full bg-orange-50 text-orange-700 text-xs" {
+                                        "#" (tag.slug)
+                                    }
+                                }
+                            }
+                        }
                         @if is_author {
                             div class="flex gap-3 mt-4 pt-4 border-t border-gray-100 text-sm" {
                                 a href=(paths::edit_form(&sub.slug, &post.slug))
@@ -606,6 +674,20 @@ pub async fn show(
                                     hx-confirm="Delete this post? This cannot be undone."
                                     class="text-red-500 hover:text-red-700 cursor-pointer" {
                                     "Delete"
+                                }
+                            }
+                            form action=(paths::manage_tags(&sub.slug, &post.slug)) method="post"
+                                 class="flex items-center gap-2 mt-3 text-sm" {
+                                input type="hidden" name="_csrf" value=(csrf.token());
+                                input type="text" name="tags"
+                                      value=(post_tags.iter().map(|t| t.slug.clone()).collect::<Vec<_>>().join(", "))
+                                      placeholder="tags, comma separated"
+                                      class="flex-1 border border-gray-300 rounded px-2 py-1 text-xs \
+                                             focus:outline-none focus:ring-2 focus:ring-orange-400" {}
+                                button type="submit"
+                                       class="px-3 py-1 bg-gray-100 text-gray-700 rounded text-xs \
+                                              hover:bg-gray-200" {
+                                    "Save tags"
                                 }
                             }
                         }
@@ -689,6 +771,30 @@ pub async fn show(
 
 // ── Edit post ──────────────────────────────────────────────────
 
+/// Load a post by `(sub_slug, post_slug)` and authorize `action` against it,
+/// or fail with 404/authorization error. Shared by every handler that
+/// mutates (or renders a mutation form for) a single post.
+async fn load_post_and_authorize(
+    state: &AppState,
+    session: &Session,
+    db: &mut Db,
+    sub_slug: &str,
+    post_slug: &str,
+    action: &str,
+) -> AutumnResult<Post> {
+    let post: Post = posts::table
+        .inner_join(subreddits::table.on(posts::subreddit_id.eq(subreddits::id)))
+        .filter(subreddits::slug.eq(sub_slug))
+        .filter(posts::slug.eq(post_slug))
+        .select(Post::as_select())
+        .first(&mut *db)
+        .await
+        .map_err(|_| AutumnError::not_found_msg("Post not found"))?;
+
+    autumn_web::authorization::authorize::<Post>(state, session, action, &post).await?;
+    Ok(post)
+}
+
 #[secured]
 #[get("/r/{sub_slug}/posts/{post_slug}/edit")]
 pub async fn edit_form(
@@ -700,16 +806,8 @@ pub async fn edit_form(
 ) -> AutumnResult<Markup> {
     let current_user = session.get("username").await;
 
-    let post: Post = posts::table
-        .inner_join(subreddits::table.on(posts::subreddit_id.eq(subreddits::id)))
-        .filter(subreddits::slug.eq(&sub_slug))
-        .filter(posts::slug.eq(&post_slug))
-        .select(Post::as_select())
-        .first(&mut *db)
-        .await
-        .map_err(|_| AutumnError::not_found_msg("Post not found"))?;
-
-    autumn_web::authorization::authorize::<Post>(&state, &session, "update", &post).await?;
+    let post =
+        load_post_and_authorize(&state, &session, &mut db, &sub_slug, &post_slug, "update").await?;
 
     Ok(layout(
         &format!("Edit: {}", post.title),
@@ -769,19 +867,12 @@ pub async fn update(
     State(state): State<AppState>,
     session: Session,
     mut db: Db,
+    repo: PgPostRepository,
     flash: Flash,
     form: Form<EditPostForm>,
 ) -> AutumnResult<Redirect> {
-    let post: Post = posts::table
-        .inner_join(subreddits::table.on(posts::subreddit_id.eq(subreddits::id)))
-        .filter(subreddits::slug.eq(&sub_slug))
-        .filter(posts::slug.eq(&post_slug))
-        .select(Post::as_select())
-        .first(&mut *db)
-        .await
-        .map_err(|_| AutumnError::not_found_msg("Post not found"))?;
-
-    autumn_web::authorization::authorize::<Post>(&state, &session, "update", &post).await?;
+    let post =
+        load_post_and_authorize(&state, &session, &mut db, &sub_slug, &post_slug, "update").await?;
 
     let title = form.0.title.trim().to_string();
     if title.is_empty() || title.len() > 300 {
@@ -799,18 +890,152 @@ pub async fn update(
     // Ensure unique slug within subreddit, excluding the current post
     let new_slug = unique_slug_excluding(&base_slug, post.subreddit_id, post.id, &mut db).await?;
 
-    diesel::update(posts::table.find(post.id))
-        .set((
-            posts::title.eq(&title),
-            posts::slug.eq(&new_slug),
-            posts::body.eq(form.0.body.trim()),
-            posts::updated_at.eq(chrono::Utc::now().naive_utc()),
-        ))
-        .execute(&mut *db)
+    let changes = crate::models::UpdatePost {
+        title: Patch::Set(title),
+        slug: Patch::Set(new_slug.clone()),
+        body: Patch::Set(form.0.body.trim().to_string()),
+        ..Default::default()
+    };
+    let sub: Subreddit = subreddits::table
+        .find(post.subreddit_id)
+        .first(&mut *db)
+        .await?;
+
+    let author: crate::models::User = crate::schema::users::table
+        .find(post.author_id)
+        .first(&mut *db)
+        .await?;
+
+    let lookup = crate::repositories::PostRelationsLookup {
+        author_name: author.username,
+        sub_name: sub.name.clone(),
+        sub_slug: sub.slug.clone(),
+    };
+
+    crate::repositories::CURRENT_POST_RELATIONS
+        .scope(lookup, async move { repo.update(post.id, &changes).await })
         .await?;
 
     flash.success("Post updated.").await;
     Ok(Redirect::to(&paths::show(&sub_slug, &new_slug)))
+}
+
+// ── Manage tags (#1324 many-to-many demo) ───────────────────────
+
+#[derive(serde::Deserialize)]
+pub struct ManageTagsForm {
+    /// Comma-separated tag names (newlines also split), e.g. `"rust, webdev"`.
+    #[serde(default)]
+    pub tags: String,
+}
+
+/// Resolve free-text tag names to ids, creating any tag that doesn't exist
+/// yet. Batched to at most one lookup, one insert, and one lookup for any
+/// insert that lost a create race to a concurrent request (find-then-insert;
+/// a losing insert just means the slug already exists by the time it runs,
+/// in which case the already-created row is looked up instead — the same
+/// shape the DB layer as a whole already handles via other unique
+/// constraints in this app) — 1-3 round trips total, not per tag name.
+async fn resolve_or_create_tag_ids(raw: &str, db: &mut Db) -> AutumnResult<Vec<i64>> {
+    let mut slug_order: Vec<String> = Vec::new();
+    let mut name_by_slug: HashMap<String, String> = HashMap::new();
+    for piece in raw.split([',', '\n']) {
+        let name = piece.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let slug = slugify(name);
+        if slug.is_empty() {
+            continue;
+        }
+        if !name_by_slug.contains_key(&slug) {
+            slug_order.push(slug.clone());
+        }
+        name_by_slug.insert(slug, name.to_string());
+    }
+    if slug_order.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut id_by_slug: HashMap<String, i64> = tags::table
+        .filter(tags::slug.eq_any(slug_order.clone()))
+        .select(Tag::as_select())
+        .load(&mut **db)
+        .await?
+        .into_iter()
+        .map(|tag| (tag.slug, tag.id))
+        .collect();
+
+    let missing: Vec<String> = slug_order
+        .iter()
+        .filter(|slug| !id_by_slug.contains_key(*slug))
+        .cloned()
+        .collect();
+    if !missing.is_empty() {
+        let new_tags: Vec<NewTag> = missing
+            .iter()
+            .map(|slug| NewTag {
+                name: name_by_slug[slug].clone(),
+                slug: slug.clone(),
+            })
+            .collect();
+        let inserted: Vec<Tag> = diesel::insert_into(tags::table)
+            .values(&new_tags)
+            .on_conflict(tags::slug)
+            .do_nothing()
+            .get_results(&mut **db)
+            .await?;
+        id_by_slug.extend(inserted.into_iter().map(|tag| (tag.slug, tag.id)));
+
+        // Any slug still missing lost a create race to a concurrent insert;
+        // the row now exists, look it up.
+        let still_missing: Vec<String> = missing
+            .into_iter()
+            .filter(|slug| !id_by_slug.contains_key(slug))
+            .collect();
+        if !still_missing.is_empty() {
+            let races: Vec<Tag> = tags::table
+                .filter(tags::slug.eq_any(still_missing))
+                .select(Tag::as_select())
+                .load(&mut **db)
+                .await?;
+            id_by_slug.extend(races.into_iter().map(|tag| (tag.slug, tag.id)));
+        }
+    }
+
+    let mut ids = Vec::with_capacity(slug_order.len());
+    for slug in &slug_order {
+        let id = id_by_slug.get(slug).copied().ok_or_else(|| {
+            AutumnError::not_found_msg(format!("Tag slug '{slug}' not found after resolution"))
+        })?;
+        ids.push(id);
+    }
+    Ok(ids)
+}
+
+/// Replace a post's tags with the free-text `tags` field, creating any new
+/// tags. Demonstrates the generated `set_tags` (#[has_many(Tag, through =
+/// post_tags)]) mutation helper end-to-end from an HTTP handler.
+#[secured]
+#[post("/r/{sub_slug}/posts/{post_slug}/tags")]
+pub async fn manage_tags(
+    Path((sub_slug, post_slug)): Path<(String, String)>,
+    State(state): State<AppState>,
+    session: Session,
+    mut db: Db,
+    repo: PgPostRepository,
+    flash: Flash,
+    form: Form<ManageTagsForm>,
+) -> AutumnResult<Redirect> {
+    let post =
+        load_post_and_authorize(&state, &session, &mut db, &sub_slug, &post_slug, "update").await?;
+
+    let tag_ids = resolve_or_create_tag_ids(&form.0.tags, &mut db).await?;
+    drop(db);
+    repo.set_tags(post.id, &tag_ids).await?;
+
+    flash.success("Tags updated.").await;
+    Ok(Redirect::to(&paths::show(&sub_slug, &post_slug)))
 }
 
 // ── Delete post (htmx) ────────────────────────────────────────
@@ -822,22 +1047,20 @@ pub async fn delete_post(
     State(state): State<AppState>,
     session: Session,
     mut db: Db,
+    repo: PgPostRepository,
     flash: Flash,
 ) -> AutumnResult<autumn_web::reexports::axum::response::Response> {
-    let post: Post = posts::table
-        .inner_join(subreddits::table.on(posts::subreddit_id.eq(subreddits::id)))
-        .filter(subreddits::slug.eq(&sub_slug))
-        .filter(posts::slug.eq(&post_slug))
-        .select(Post::as_select())
-        .first(&mut *db)
-        .await
-        .map_err(|_| AutumnError::not_found_msg("Post not found"))?;
+    let post =
+        load_post_and_authorize(&state, &session, &mut db, &sub_slug, &post_slug, "delete").await?;
 
-    autumn_web::authorization::authorize::<Post>(&state, &session, "delete", &post).await?;
+    repo.delete_by_id(post.id).await?;
 
-    diesel::delete(posts::table.find(post.id))
-        .execute(&mut *db)
-        .await?;
+    let _ = state.broadcast().publish_oob(
+        &format!("posts:r/{}", sub_slug),
+        &post.dom_id(),
+        &autumn_web::htmx::OobSwap::Delete,
+        &autumn_web::html! {},
+    );
 
     flash.success("Post deleted.").await;
     Ok(super::layout::hx_redirect_to(
@@ -903,6 +1126,7 @@ autumn_web::paths![
     show,
     edit_form,
     update,
+    manage_tags,
     delete_post
 ];
 

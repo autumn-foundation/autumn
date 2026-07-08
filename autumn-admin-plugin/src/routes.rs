@@ -12,9 +12,9 @@ use std::convert::Infallible;
 use std::sync::LazyLock;
 
 use autumn_web::extract::Multipart;
-use autumn_web::flash::Flash;
+use autumn_web::flash::{Flash, FlashLevel, FlashMessage};
 use autumn_web::job::{JobAdminQuery, JobAdminSnapshot, JobScheduleSummary, job_admin_backend};
-use autumn_web::prelude::HxResponseExt;
+use autumn_web::prelude::{HxRequest, HxResponseExt};
 use autumn_web::security::{CsrfFormField, CsrfToken, CsrfTokenHeader};
 use autumn_web::{AppState, AutumnError, AutumnResult};
 use axum::extract::{FromRequestParts, Path, Query, State};
@@ -384,6 +384,17 @@ fn render(markup: maud::Markup) -> Response {
     Html(markup.into_string()).into_response()
 }
 
+/// Extract the value of the `__autumn_reveal` cookie from request headers.
+fn extract_reveal_cookie(headers: &axum::http::HeaderMap) -> Option<String> {
+    let cookie_str = headers.get(axum::http::header::COOKIE)?.to_str().ok()?;
+    cookie_str.split(';').find_map(|part| {
+        part.trim()
+            .strip_prefix("__autumn_reveal=")
+            .filter(|v| !v.is_empty())
+            .map(str::to_owned)
+    })
+}
+
 // ── Handlers ────────────────────────────────────────────────────────
 
 /// `GET /admin` — Dashboard with model counts.
@@ -653,7 +664,7 @@ async fn model_create(
     let (pool, model) = resolve(&state, &registry, &slug)?;
 
     let fields = model.fields();
-    let form_data = coerce_form_fields(strip_meta_fields(form_data, &fields), &fields);
+    let form_data = coerce_form_fields(strip_meta_fields(form_data, &fields, false), &fields);
     let record = model
         .create(&pool, form_data)
         .await
@@ -667,10 +678,48 @@ async fn model_create(
             model.display_name()
         ))
     })?;
-    flash
-        .success(format!("{} created.", model.display_name()))
-        .await;
-    Ok(Redirect::to(&format!("{prefix}/{slug}/{new_id}")).into_response())
+    let detail_path = format!("{prefix}/{slug}/{new_id}");
+    let mut response = Redirect::to(&detail_path).into_response();
+
+    // If the model returned a one-time secret (e.g. a raw API token), hand it
+    // off via a short-lived HttpOnly reveal cookie rather than through flash.
+    // Flash::push stores messages in the Session, and SessionLayer persists
+    // dirty sessions to the configured backing store (Redis/DB) — putting a raw
+    // bearer token there even briefly is a plaintext-secret-storage violation.
+    // The reveal cookie is path-scoped to the detail page and expires in 5
+    // minutes; the detail handler reads it exactly once and clears it.
+    //
+    // Additionally, skip flash.success() on secret-returning creates: the
+    // session write would dirty the session before the redirect; if the session
+    // store (Redis/DB) is unavailable, SessionLayer replaces the handler's
+    // response with its own error — discarding the Set-Cookie header and
+    // permanently losing the raw credential.  The "copy now" FlashMessage
+    // rendered by model_detail from the reveal cookie is sufficient notification.
+    if let Some(Value::String(secret)) = record.get("token") {
+        // Mirror the session cookie's Secure flag so the reveal cookie is
+        // accepted in both HTTPS and explicit HTTP-only deployments.
+        let secure_attr = if state.config().session.secure {
+            "; Secure"
+        } else {
+            ""
+        };
+        let cookie = format!(
+            "__autumn_reveal={secret}; HttpOnly{secure_attr}; SameSite=Strict; Path={detail_path}; Max-Age=300"
+        );
+        if let Ok(hv) = axum::http::HeaderValue::from_str(&cookie) {
+            response
+                .headers_mut()
+                .insert(axum::http::header::SET_COOKIE, hv);
+        }
+    } else {
+        // Non-secret create: safe to write a flash message (no raw credential
+        // at risk if the session save fails — the record is already committed
+        // and remains accessible via the list view).
+        flash
+            .success(format!("{} created.", model.display_name()))
+            .await;
+    }
+    Ok(response)
 }
 
 /// `GET /admin/{slug}/{id}` — Detail view.
@@ -682,6 +731,7 @@ async fn model_detail(
     axum::Extension(ActuatorPrefix(actuator_prefix)): axum::Extension<ActuatorPrefix>,
     axum::Extension(HasRuntimeConfig(show_config)): axum::Extension<HasRuntimeConfig>,
     Path((slug, id)): Path<(String, i64)>,
+    request_headers: axum::http::HeaderMap,
     csrf: AdminCsrf,
     flash: Flash,
 ) -> AutumnResult<Response> {
@@ -697,8 +747,20 @@ async fn model_detail(
 
     let display = model.record_display(&record);
     let fields = model.fields();
-    let messages = flash.consume().await;
-    Ok(render(templates::model_detail_page(
+
+    // Consume the reveal cookie if present (set by model_create for one-time
+    // secrets such as raw API tokens).  The secret is appended to the in-memory
+    // messages slice; it never touches the session store.
+    let reveal_secret = extract_reveal_cookie(&request_headers);
+    let mut messages = flash.consume().await;
+    if let Some(ref secret) = reveal_secret {
+        messages.push(FlashMessage {
+            level: FlashLevel::Info,
+            message: format!("Copy your token now — it will not be shown again: {secret}"),
+        });
+    }
+
+    let mut response = render(templates::model_detail_page(
         &registry,
         &slug,
         model.display_name(),
@@ -709,12 +771,34 @@ async fn model_detail(
         id,
         &messages,
         csrf.token(),
+        csrf.form_field(),
         csrf.token_header(),
         &prefix,
         &actuator_prefix,
         model.has_history(),
         show_config,
-    )))
+    ))
+    .into_response();
+
+    // Clear the reveal cookie so a page refresh does not show the token again.
+    // Mirror the session cookie's Secure flag for consistency.
+    if reveal_secret.is_some() {
+        let secure_attr = if state.config().session.secure {
+            "; Secure"
+        } else {
+            ""
+        };
+        let clear = format!(
+            "__autumn_reveal=; HttpOnly{secure_attr}; SameSite=Strict; Path={prefix}/{slug}/{id}; Max-Age=0"
+        );
+        if let Ok(hv) = axum::http::HeaderValue::from_str(&clear) {
+            response
+                .headers_mut()
+                .insert(axum::http::header::SET_COOKIE, hv);
+        }
+    }
+
+    Ok(response)
 }
 
 /// `GET /admin/{slug}/{id}/history` - Version history pane.
@@ -820,7 +904,7 @@ async fn model_update(
     let (pool, model) = resolve(&state, &registry, &slug)?;
 
     let fields = model.fields();
-    let form_data = coerce_form_fields(strip_meta_fields(form_data, &fields), &fields);
+    let form_data = coerce_form_fields(strip_meta_fields(form_data, &fields, true), &fields);
     model
         .update(&pool, id, form_data)
         .await
@@ -895,15 +979,24 @@ async fn model_action(
 
 /// `DELETE /admin/{slug}/{id}` — Delete a record.
 ///
-/// Called from the detail view's `hx-delete` button. Returns an empty 200
-/// body with `HX-Redirect` so htmx performs a full-page navigation to the
-/// list view (updating `window.location`), rather than swapping the list
-/// HTML into the stale detail page.
+/// Called from the detail view's `confirm_action` dialog (a plain `POST` +
+/// `_method=DELETE` form submission, not `hx-delete` — see
+/// `autumn_web::widgets::confirm_action`), or its `<noscript>` fallback
+/// button when JavaScript is disabled. Neither path sends `HX-Request`
+/// today, so the `hx.is_htmx` branch below is currently unreached by the
+/// admin plugin's own UI; it's kept for direct API/htmx clients that set
+/// the header themselves, in which case they get an empty 200 body with
+/// `HX-Redirect` so htmx performs a full-page navigation to the list view
+/// (updating `window.location`), rather than swapping the list HTML into
+/// the stale detail page. Non-htmx requests get a real 303 redirect, since
+/// a plain browser form submission ignores `HX-Redirect` and would
+/// otherwise land on a blank 200 response.
 async fn model_delete(
     State(state): State<AppState>,
     axum::Extension(registry): axum::Extension<Arc<AdminRegistry>>,
     axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
     Path((slug, id)): Path<(String, i64)>,
+    hx: HxRequest,
     flash: Flash,
 ) -> AutumnResult<Response> {
     let (pool, model) = resolve(&state, &registry, &slug)?;
@@ -915,7 +1008,12 @@ async fn model_delete(
     flash
         .success(format!("{} #{id} deleted.", model.display_name()))
         .await;
-    Ok(StatusCode::OK.hx_redirect(&format!("{prefix}/{slug}")))
+    let list_path = format!("{prefix}/{slug}");
+    if hx.is_htmx {
+        Ok(StatusCode::OK.hx_redirect(&list_path))
+    } else {
+        Ok(Redirect::to(&list_path).into_response())
+    }
 }
 
 // ── CSV export / import handlers ─────────────────────────────────────
@@ -1269,7 +1367,7 @@ async fn config_key_history(
 
 /// Filter incoming form data down to fields the model declared as editable.
 ///
-/// Enforcement (all three are necessary):
+/// Enforcement (all four are necessary):
 ///
 /// 1. **Drop underscore-prefixed keys** (`_csrf` and similar form internals).
 /// 2. **Drop keys not declared in `fields`** so a crafted POST can't inject
@@ -1277,12 +1375,15 @@ async fn config_key_history(
 /// 3. **Drop keys whose `AdminField::editable = false`** so read-only columns
 ///    (`id`, `created_at`, computed fields, privilege flags) can't be
 ///    overwritten by admins submitting tampered forms.
-/// 4. **Drop blank string values on declared `Password` fields** so "leave
+/// 4. **Drop `create_only` keys on update** so immutable-after-create fields
+///    (e.g. `principal_id`, `expires_at`) can't be silently ignored while
+///    an admin thinks they've changed them.
+/// 5. **Drop blank string values on declared `Password` fields** so "leave
 ///    blank to keep current" doesn't wipe stored hashes.
 ///
 /// The UI's readonly contract is the source of truth: if the admin didn't
 /// declare a field as editable, model code never sees it.
-fn strip_meta_fields(mut data: Value, fields: &[AdminField]) -> Value {
+fn strip_meta_fields(mut data: Value, fields: &[AdminField], for_update: bool) -> Value {
     if let Some(obj) = data.as_object_mut() {
         obj.retain(|k, v| {
             if k.starts_with('_') {
@@ -1302,6 +1403,12 @@ fn strip_meta_fields(mut data: Value, fields: &[AdminField]) -> Value {
             }
             if !field.editable {
                 // Readonly field — drop it regardless of submitted value.
+                return false;
+            }
+            if for_update && field.create_only {
+                // Immutable-after-create field — drop on update so the model
+                // never sees it and the admin can't be misled into thinking
+                // the change was persisted.
                 return false;
             }
             // Drop blank string values on Password fields so admins editing
@@ -1468,7 +1575,7 @@ mod tests {
     #[test]
     fn strip_meta_removes_csrf_and_underscore_fields() {
         let input = json!({"name": "x", "_csrf": "t", "_foo": 1});
-        let out = strip_meta_fields(input, &fields(&[("name", AdminFieldKind::Text)]));
+        let out = strip_meta_fields(input, &fields(&[("name", AdminFieldKind::Text)]), false);
         assert_eq!(out, json!({"name": "x"}));
     }
 
@@ -1478,10 +1585,10 @@ mod tests {
             ("password", AdminFieldKind::Password),
             ("other", AdminFieldKind::Text),
         ]);
-        let out = strip_meta_fields(json!({"password": "", "other": "y"}), &fields);
+        let out = strip_meta_fields(json!({"password": "", "other": "y"}), &fields, false);
         assert_eq!(out, json!({"other": "y"}));
 
-        let out = strip_meta_fields(json!({"password": "hunter2", "other": "y"}), &fields);
+        let out = strip_meta_fields(json!({"password": "hunter2", "other": "y"}), &fields, false);
         assert_eq!(out, json!({"password": "hunter2", "other": "y"}));
     }
 
@@ -1490,7 +1597,7 @@ mod tests {
         // Regression: the old name-heuristic version missed this.
         // A field called "secret" declared as Password must still be stripped.
         let fields = fields(&[("secret", AdminFieldKind::Password)]);
-        let out = strip_meta_fields(json!({"secret": ""}), &fields);
+        let out = strip_meta_fields(json!({"secret": ""}), &fields, false);
         assert_eq!(out, json!({}));
     }
 
@@ -1500,7 +1607,7 @@ mod tests {
             ("name", AdminFieldKind::Text),
             ("bio", AdminFieldKind::TextArea),
         ]);
-        let out = strip_meta_fields(json!({"name": "", "bio": ""}), &fields);
+        let out = strip_meta_fields(json!({"name": "", "bio": ""}), &fields, false);
         assert_eq!(out, json!({"name": "", "bio": ""}));
     }
 
@@ -1762,7 +1869,7 @@ mod tests {
         // but legal), we should NOT drop the empty string — the model gets to
         // decide. Only `AdminFieldKind::Password` triggers the strip.
         let fields = fields(&[("password", AdminFieldKind::Text)]);
-        let out = strip_meta_fields(json!({"password": ""}), &fields);
+        let out = strip_meta_fields(json!({"password": ""}), &fields, false);
         assert_eq!(out, json!({"password": ""}));
     }
 
@@ -1773,7 +1880,7 @@ mod tests {
         // that doesn't expose it).
         let fields = fields(&[("name", AdminFieldKind::Text)]);
         let input = json!({"name": "x", "is_admin": true, "raw_column": "y"});
-        let out = strip_meta_fields(input, &fields);
+        let out = strip_meta_fields(input, &fields, false);
         assert_eq!(out, json!({"name": "x"}));
     }
 
@@ -1786,8 +1893,25 @@ mod tests {
         let mut hidden = AdminField::new("owner_id", AdminFieldKind::Hidden);
         hidden.editable = true; // deliberately wrong
         let schema = vec![hidden];
-        let out = strip_meta_fields(json!({"owner_id": 999}), &schema);
+        let out = strip_meta_fields(json!({"owner_id": 999}), &schema, false);
         assert_eq!(out, json!({}));
+    }
+
+    #[test]
+    fn strip_meta_drops_create_only_fields_on_update_but_keeps_on_create() {
+        let mut principal = AdminField::new("principal_id", AdminFieldKind::Text);
+        principal.create_only = true;
+        let name = AdminField::new("name", AdminFieldKind::Text);
+        let schema = vec![principal, name];
+        let input = json!({"principal_id": "svc:x", "name": "my-token"});
+
+        // create context — create_only field is kept
+        let out = strip_meta_fields(input.clone(), &schema, false);
+        assert_eq!(out, json!({"principal_id": "svc:x", "name": "my-token"}));
+
+        // update context — create_only field is dropped
+        let out = strip_meta_fields(input, &schema, true);
+        assert_eq!(out, json!({"name": "my-token"}));
     }
 
     #[test]
@@ -1806,7 +1930,7 @@ mod tests {
             "created_at": "2026-01-01T00:00:00Z",
             "name": "legit",
         });
-        let out = strip_meta_fields(input, &schema);
+        let out = strip_meta_fields(input, &schema, false);
         assert_eq!(out, json!({"name": "legit"}));
     }
 
@@ -1832,5 +1956,49 @@ mod tests {
         assert_eq!(parse_form_bool("maybe"), None);
         assert_eq!(parse_form_bool("y"), None);
         assert_eq!(parse_form_bool("2"), None);
+    }
+
+    // ── extract_reveal_cookie ─────────────────────────────────────────────────
+
+    fn headers_with_cookie(cookie: &str) -> axum::http::HeaderMap {
+        let mut map = axum::http::HeaderMap::new();
+        map.insert(
+            axum::http::header::COOKIE,
+            axum::http::HeaderValue::from_str(cookie).unwrap(),
+        );
+        map
+    }
+
+    #[test]
+    fn extract_reveal_cookie_returns_none_when_no_cookie_header() {
+        let headers = axum::http::HeaderMap::new();
+        assert!(extract_reveal_cookie(&headers).is_none());
+    }
+
+    #[test]
+    fn extract_reveal_cookie_returns_none_when_cookie_absent_from_header() {
+        let headers = headers_with_cookie("session=abc; other=xyz");
+        assert!(extract_reveal_cookie(&headers).is_none());
+    }
+
+    #[test]
+    fn extract_reveal_cookie_returns_none_when_value_is_empty() {
+        let headers = headers_with_cookie("__autumn_reveal=; session=abc");
+        assert!(extract_reveal_cookie(&headers).is_none());
+    }
+
+    #[test]
+    fn extract_reveal_cookie_returns_value_when_present() {
+        let headers = headers_with_cookie("session=abc; __autumn_reveal=tok123; other=xyz");
+        assert_eq!(extract_reveal_cookie(&headers).as_deref(), Some("tok123"));
+    }
+
+    #[test]
+    fn extract_reveal_cookie_handles_leading_only_cookie() {
+        let headers = headers_with_cookie("__autumn_reveal=supersecret");
+        assert_eq!(
+            extract_reveal_cookie(&headers).as_deref(),
+            Some("supersecret")
+        );
     }
 }

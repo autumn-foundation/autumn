@@ -79,11 +79,34 @@ pub(crate) fn record_after_commit_failure() -> u64 {
     AFTER_COMMIT_FAILURES_TOTAL.fetch_add(1, Ordering::Relaxed) + 1
 }
 
+/// Total number of transaction retries triggered by a transient serialization
+/// failure (`40001`) or deadlock (`40P01`) since process start.
+///
+/// Incremented by [`Db::tx_with`] each time a retryable transaction error is
+/// re-run under a stronger isolation level. Surfaces contention on the existing
+/// metrics surface (`autumn_tx_retries_total`).
+pub static TX_RETRIES_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Total number of transactions that exhausted their retry budget without
+/// succeeding, since process start. Exposed as `autumn_tx_retry_exhausted_total`.
+pub static TX_RETRY_EXHAUSTED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn record_tx_retry() -> u64 {
+    TX_RETRIES_TOTAL.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+pub(crate) fn record_tx_retry_exhausted() -> u64 {
+    TX_RETRY_EXHAUSTED_TOTAL.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+/// Guidance appended to the nested-`tx` rejection, naming the supported
+/// alternative for a same-connection nested transaction.
+const NESTED_TX_MESSAGE: &str = "Nested Db::tx calls are not supported; use \
+    autumn_web::db::savepoint(conn, ..) inside the closure for a same-connection savepoint";
+
 pub(crate) fn reject_ambient_after_commit_registry_for_tx() -> Result<(), AutumnError> {
     if AFTER_COMMIT_REGISTRY.try_with(|_| ()).is_ok() {
-        return Err(AutumnError::bad_request_msg(
-            "Nested Db::tx calls are not supported",
-        ));
+        return Err(AutumnError::bad_request_msg(NESTED_TX_MESSAGE));
     }
     Ok(())
 }
@@ -535,6 +558,33 @@ where
     })
 }
 
+/// Walk `err`'s source chain looking for a `tokio_postgres` SQLSTATE matching
+/// `predicate`, downcasting each link to [`tokio_postgres::Error`] and
+/// [`tokio_postgres::error::DbError`] in turn. Shared by [`is_query_canceled`]
+/// and [`is_retryable_txn_error`] — both need the same downcast-through-the-
+/// chain strategy, only with a different SQLSTATE to look for.
+fn source_chain_has_sqlstate(
+    err: &(dyn std::error::Error + 'static),
+    predicate: impl Fn(&tokio_postgres::error::SqlState) -> bool,
+) -> bool {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = source {
+        if e.downcast_ref::<tokio_postgres::Error>()
+            .and_then(tokio_postgres::Error::code)
+            .is_some_and(&predicate)
+        {
+            return true;
+        }
+        if e.downcast_ref::<tokio_postgres::error::DbError>()
+            .is_some_and(|db_err| predicate(db_err.code()))
+        {
+            return true;
+        }
+        source = e.source();
+    }
+    false
+}
+
 /// Check whether a Diesel error wraps a Postgres `57014` `query_canceled` error.
 ///
 /// Prefers downcasting through the source chain to find a
@@ -552,25 +602,9 @@ fn is_query_canceled(err: &diesel::result::Error) -> bool {
         return true;
     }
 
-    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(err);
-
-    while let Some(e) = source {
-        // Try downcasting to tokio_postgres::Error
-        if e.downcast_ref::<tokio_postgres::Error>()
-            .and_then(|pg_err| pg_err.code())
-            == Some(&tokio_postgres::error::SqlState::QUERY_CANCELED)
-        {
-            return true;
-        }
-        // Try downcasting to tokio_postgres::error::DbError
-        if e.downcast_ref::<tokio_postgres::error::DbError>()
-            .is_some_and(|db_err| db_err.code() == &tokio_postgres::error::SqlState::QUERY_CANCELED)
-        {
-            return true;
-        }
-        source = e.source();
-    }
-    false
+    source_chain_has_sqlstate(err, |state| {
+        *state == tokio_postgres::error::SqlState::QUERY_CANCELED
+    })
 }
 
 /// Error type for pool creation failures.
@@ -661,7 +695,21 @@ fn build_pool(
     connect_timeout_secs: u64,
 ) -> Result<Pool<AsyncPgConnection>, PoolError> {
     let timeout = Duration::from_secs(connect_timeout_secs);
-    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url);
+    // When the URL's `sslmode` asks for TLS, plug a rustls-backed connector
+    // into the pool via a custom setup callback — diesel-async's default
+    // establish path hardcodes `NoTls`, which cannot satisfy
+    // `sslmode=require` at all. `sslmode` absent/`disable`/`prefer` keeps the
+    // default (NoTls) path, so existing configurations behave exactly as
+    // before. See [`tls`] for the full posture table.
+    let manager = match tls::TlsPosture::from_database_url(url) {
+        tls::TlsPosture::Off => AsyncDieselConnectionManager::<AsyncPgConnection>::new(url),
+        posture => {
+            let mut config =
+                diesel_async::pooled_connection::ManagerConfig::<AsyncPgConnection>::default();
+            config.custom_setup = tls::setup_callback(posture);
+            AsyncDieselConnectionManager::<AsyncPgConnection>::new_with_config(url, config)
+        }
+    };
     Pool::builder(manager)
         .max_size(pool_size.max(1))
         .wait_timeout(Some(timeout))
@@ -757,6 +805,399 @@ pub fn create_shard_topology(
     Ok(DatabaseTopology::from_pools(primary, replica))
 }
 
+// ── Transaction options, retry, and isolation (issue #1202) ──────────────────
+
+/// Postgres transaction isolation level, requested per call via [`TxOptions`].
+///
+/// `ReadCommitted` is Postgres' default and Autumn's default; the stronger
+/// levels are opt-in on [`Db::tx_with`]. See the transactions guide for what
+/// each level buys and costs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IsolationLevel {
+    /// Postgres default. Each statement sees rows committed before it began.
+    #[default]
+    ReadCommitted,
+    /// A snapshot fixed at the first query; no non-repeatable or phantom reads.
+    RepeatableRead,
+    /// Full serializability (SSI). Transactions behave as if run one at a time;
+    /// conflicts surface as `40001` and are retried by [`Db::tx_with`].
+    Serializable,
+}
+
+impl IsolationLevel {
+    /// The SQL fragment used in tracing (`db.isolation`).
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadCommitted => "read_committed",
+            Self::RepeatableRead => "repeatable_read",
+            Self::Serializable => "serializable",
+        }
+    }
+}
+
+/// Default number of attempts (including the first) for the retrying isolation
+/// levels. Chosen to match the jobs system's default retry budget.
+const DEFAULT_TX_MAX_ATTEMPTS: u32 = 5;
+
+/// Options for [`Db::tx_with`]: isolation level, access mode, and the automatic
+/// retry policy for transient serialization failures.
+///
+/// [`TxOptions::default`] is byte-for-byte equivalent to today's [`Db::tx`]:
+/// READ COMMITTED, read-write, a single attempt, and no retry.
+///
+/// ```rust
+/// use autumn_web::db::{TxOptions, IsolationLevel};
+///
+/// let opts = TxOptions::serializable().read_only().max_attempts(8);
+/// assert_eq!(opts.isolation, IsolationLevel::Serializable);
+/// assert!(opts.read_only);
+/// assert_eq!(opts.max_attempts, 8);
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub struct TxOptions {
+    /// Requested isolation level.
+    pub isolation: IsolationLevel,
+    /// Run the transaction `READ ONLY`.
+    pub read_only: bool,
+    /// Add `DEFERRABLE` (only meaningful for `SERIALIZABLE READ ONLY`).
+    pub deferrable: bool,
+    /// Total attempts including the first. `1` disables retry.
+    pub max_attempts: u32,
+    /// Backoff before the first retry; doubles each subsequent retry.
+    pub initial_backoff: Duration,
+    /// Upper bound on any single backoff delay.
+    pub max_backoff: Duration,
+}
+
+impl Default for TxOptions {
+    fn default() -> Self {
+        Self {
+            isolation: IsolationLevel::ReadCommitted,
+            read_only: false,
+            deferrable: false,
+            max_attempts: 1,
+            initial_backoff: Duration::from_millis(5),
+            max_backoff: Duration::from_millis(500),
+        }
+    }
+}
+
+impl TxOptions {
+    /// READ COMMITTED, no retry — identical to [`Db::tx`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// READ COMMITTED (the default), no retry.
+    #[must_use]
+    pub fn read_committed() -> Self {
+        Self {
+            isolation: IsolationLevel::ReadCommitted,
+            ..Self::default()
+        }
+    }
+
+    /// REPEATABLE READ with automatic retry (`serialization_failure` can occur
+    /// at this level too).
+    #[must_use]
+    pub fn repeatable_read() -> Self {
+        Self {
+            isolation: IsolationLevel::RepeatableRead,
+            max_attempts: DEFAULT_TX_MAX_ATTEMPTS,
+            ..Self::default()
+        }
+    }
+
+    /// SERIALIZABLE with automatic retry. This is the correctness-critical
+    /// default: conflicts surface as `40001` and are retried transparently.
+    #[must_use]
+    pub fn serializable() -> Self {
+        Self {
+            isolation: IsolationLevel::Serializable,
+            max_attempts: DEFAULT_TX_MAX_ATTEMPTS,
+            ..Self::default()
+        }
+    }
+
+    /// Set the isolation level, keeping the other options.
+    #[must_use]
+    pub const fn isolation(mut self, level: IsolationLevel) -> Self {
+        self.isolation = level;
+        self
+    }
+
+    /// Run the transaction `READ ONLY`.
+    #[must_use]
+    pub const fn read_only(mut self) -> Self {
+        self.read_only = true;
+        self
+    }
+
+    /// Add `DEFERRABLE` (for `SERIALIZABLE READ ONLY`).
+    #[must_use]
+    pub const fn deferrable(mut self) -> Self {
+        self.deferrable = true;
+        self
+    }
+
+    /// Set the maximum number of attempts (clamped to at least 1). A value of
+    /// `1` disables retry.
+    #[must_use]
+    pub const fn max_attempts(mut self, attempts: u32) -> Self {
+        self.max_attempts = if attempts < 1 { 1 } else { attempts };
+        self
+    }
+
+    /// `max_attempts`, clamped to at least 1.
+    ///
+    /// The `max_attempts` field is public (struct-literal update syntax is a
+    /// supported way to build a `TxOptions`), so a value of `0` can reach the
+    /// struct without going through [`TxOptions::max_attempts`]'s clamp. The
+    /// retry loop calls this instead of reading the field directly, so `0`
+    /// always behaves like `1` (run the closure once, no retry) rather than
+    /// skipping the closure entirely.
+    const fn effective_max_attempts(&self) -> u32 {
+        if self.max_attempts < 1 {
+            1
+        } else {
+            self.max_attempts
+        }
+    }
+
+    /// Set the backoff before the first retry.
+    #[must_use]
+    pub const fn initial_backoff(mut self, delay: Duration) -> Self {
+        self.initial_backoff = delay;
+        self
+    }
+
+    /// Set the ceiling on any single backoff delay.
+    #[must_use]
+    pub const fn max_backoff(mut self, delay: Duration) -> Self {
+        self.max_backoff = delay;
+        self
+    }
+}
+
+/// Whether the retry loop should re-run the closure or return the error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryDecision {
+    Retry,
+    Stop,
+}
+
+/// Decide whether a just-failed attempt should be retried.
+///
+/// `attempt` is the 1-indexed number of the attempt that just failed. A retry
+/// happens only when the error is retryable **and** attempts remain.
+const fn retry_decision(attempt: u32, max_attempts: u32, retryable: bool) -> RetryDecision {
+    if retryable && attempt < max_attempts {
+        RetryDecision::Retry
+    } else {
+        RetryDecision::Stop
+    }
+}
+
+/// Deterministic capped exponential backoff base: `initial * 2^(attempt-1)`,
+/// saturating on overflow and capped at `max`.
+///
+/// Mirrors the jobs system's backoff shape (`pg_retry_delay_ms`) plus the cap
+/// idiom from the migrate startup loop. Kept jitter-free so it is unit-testable.
+fn retry_backoff_base(initial: Duration, max: Duration, attempt: u32) -> Duration {
+    // Cap the shift so `2^shift` never overflows and huge attempts saturate.
+    let shift = attempt.saturating_sub(1).min(31);
+    let multiplier = 1u32 << shift;
+    initial.checked_mul(multiplier).unwrap_or(max).min(max)
+}
+
+/// [`retry_backoff_base`] with +/-20% jitter applied, never exceeding `max`.
+///
+/// Jitter decorrelates a thundering herd of transactions all retrying after the
+/// same conflict. Delegates to [`crate::cache::jittered_ttl`] (rather than
+/// re-implementing the RNG/fallback logic) so there's one jitter
+/// implementation in the crate, including its `getrandom`-failure fallback to
+/// `SystemTime` entropy instead of silently degrading to no jitter.
+fn retry_backoff_delay(initial: Duration, max: Duration, attempt: u32) -> Duration {
+    let base = retry_backoff_base(initial, max, attempt);
+    crate::cache::jittered_ttl(base, 0.2).min(max)
+}
+
+/// Whether `err` wraps a Postgres serialization failure (`40001`) or deadlock
+/// (`40P01`) — the two transient errors that are safe to retry by re-running
+/// the whole transaction.
+///
+/// Classification is structural and authoritative, never based on scanning an
+/// arbitrary error's displayed message: a `diesel::result::Error` anywhere in
+/// `err`'s source chain (not just the top-level wrapped error — a custom `E`
+/// that wraps a diesel error via `#[source]`/`#[from]` is still found) is
+/// classified by its `DatabaseErrorKind`. `diesel-async`'s Postgres backend
+/// maps `40001` to `SerializationFailure` directly from the real SQLSTATE (see
+/// `diesel_async::pg::error_helper::from_tokio_postgres_error`) — fully
+/// reliable, no message inspection involved. Any *other* kind (e.g.
+/// `UniqueViolation`) is trusted as non-retryable outright — never
+/// string-matched, so a constraint name or key value that happens to contain
+/// `"40001"` cannot misclassify it.
+///
+/// `40P01` (deadlock) has no dedicated `DatabaseErrorKind` and always surfaces
+/// as `Unknown`. Worse: the wrapper type diesel-async uses to carry Postgres's
+/// error fields for an `Unknown`-kind error (`PostgresDbErrorWrapper`, private
+/// to diesel-async) implements only `DatabaseErrorInformation`, not
+/// `std::error::Error` — so [`source_chain_has_sqlstate`]'s downcast walk can
+/// **never** reach the real SQLSTATE for it; there is no structural path to a
+/// deadlock's code at all through this crate boundary. The only signal
+/// available is the message, so this checks it — but with an **exact**
+/// match, not a substring: Postgres's deadlock detector always raises the
+/// primary message as precisely `"deadlock detected"` with nothing else (the
+/// context lives in DETAIL/HINT, not here), so an app's own `RAISE EXCEPTION`
+/// would have to reproduce that exact string as its *entire* message to
+/// collide — unlike a substring check, which a longer business message
+/// merely mentioning the phrase would already trip.
+///
+/// When no `diesel::result::Error` is found anywhere in the chain, this checks
+/// for a raw `tokio_postgres` SQLSTATE directly (a custom `E` that bypasses
+/// diesel). If neither is found, the error is **not** retried — there is
+/// deliberately no generic message-substring fallback beyond the one exact
+/// match above: retrying based on bare text risks misclassifying an unrelated
+/// domain/validation error as a transient conflict, silently re-running a
+/// non-idempotent closure and delaying the response.
+fn is_retryable_txn_error(err: &AutumnError) -> bool {
+    use tokio_postgres::error::SqlState;
+
+    fn is_retryable_sqlstate(state: &SqlState) -> bool {
+        *state == SqlState::T_R_SERIALIZATION_FAILURE || *state == SqlState::T_R_DEADLOCK_DETECTED
+    }
+
+    if let Some(diesel_err) = err.downcast_chain_ref::<diesel::result::Error>() {
+        return match diesel_err {
+            // Fast path: diesel-async maps 40001 to SerializationFailure from
+            // the real SQLSTATE. Fully structural, no message involved.
+            diesel::result::Error::DatabaseError(
+                diesel::result::DatabaseErrorKind::SerializationFailure,
+                _,
+            ) => true,
+            // 40P01 (deadlock) has no dedicated kind and surfaces as Unknown.
+            // The chain walk is kept for forward-compatibility (a future
+            // diesel/diesel-async release, or another backend, could start
+            // exposing the real SQLSTATE through the source chain) but is
+            // currently unreachable for diesel-async's own Postgres backend
+            // — see the doc comment above. The message check that follows is
+            // therefore the only thing that actually fires deadlock retries
+            // today, hence the exact (not substring) match.
+            diesel::result::Error::DatabaseError(
+                diesel::result::DatabaseErrorKind::Unknown,
+                info,
+            ) => {
+                source_chain_has_sqlstate(diesel_err, is_retryable_sqlstate)
+                    || info
+                        .message()
+                        .trim()
+                        .eq_ignore_ascii_case("deadlock detected")
+            }
+            // Any other kind (UniqueViolation, NotNullViolation, ...) is
+            // authoritatively non-retryable — no string matching against its
+            // message/constraint text.
+            _ => source_chain_has_sqlstate(diesel_err, is_retryable_sqlstate),
+        };
+    }
+
+    // No `diesel::result::Error` anywhere in the chain — check for a raw
+    // `tokio_postgres` SQLSTATE directly. No text-based fallback beyond this;
+    // see the doc comment above for why.
+    err.downcast_chain_ref::<tokio_postgres::Error>()
+        .and_then(tokio_postgres::Error::code)
+        .is_some_and(is_retryable_sqlstate)
+        || err
+            .downcast_chain_ref::<tokio_postgres::error::DbError>()
+            .is_some_and(|db| is_retryable_sqlstate(db.code()))
+}
+
+/// Run `f` inside a transaction on `conn`, adapting the `ScopedBoxFuture`
+/// callback shape used throughout Autumn's generated code to the
+/// `AsyncFnOnce` callback [`diesel_async::AsyncConnection::transaction`]
+/// expects since diesel-async 0.9.
+///
+/// This is a runtime support function for code generated by Autumn proc
+/// macros. It is semver-exempt; do not call it directly.
+///
+/// # Errors
+///
+/// Returns the error from `f`, or a `diesel::result::Error` from starting,
+/// committing, or rolling back the transaction.
+#[doc(hidden)]
+pub async fn scoped_transaction<'a, T, E, C, F>(conn: &'a mut C, f: F) -> Result<T, E>
+where
+    C: diesel_async::AsyncConnection + Send,
+    T: Send + 'a,
+    E: From<diesel::result::Error> + Send + 'a,
+    F: for<'r> FnOnce(&'r mut C) -> scoped_futures::ScopedBoxFuture<'a, 'r, Result<T, E>>
+        + Send
+        + 'a,
+{
+    // Mirrors the default body of `TransactionManager::transaction` in
+    // diesel-async 0.9, but drives the boxed callback future directly instead
+    // of going through the `AsyncFnOnce` bounds (which reject the boxed
+    // `ScopedBoxFuture` callback shape).
+    use diesel_async::TransactionManager as _;
+
+    C::TransactionManager::begin_transaction(conn).await?;
+    match f(&mut *conn).await {
+        Ok(value) => {
+            C::TransactionManager::commit_transaction(conn).await?;
+            Ok(value)
+        }
+        Err(user_error) => match C::TransactionManager::rollback_transaction(conn).await {
+            // A broken transaction manager means the rollback error is a
+            // consequence of the original error; surface the original.
+            Ok(()) | Err(diesel::result::Error::BrokenTransactionManager) => Err(user_error),
+            Err(rollback_error) => Err(rollback_error.into()),
+        },
+    }
+}
+
+/// Run `f` inside a Postgres `SAVEPOINT` on a connection already inside a
+/// transaction.
+///
+/// Pass the `conn` handed to a [`Db::tx`] / [`Db::tx_with`] closure. The
+/// savepoint is released when `f` returns `Ok`, or rolled back (`ROLLBACK TO
+/// SAVEPOINT`) when it returns `Err` — leaving the surrounding transaction
+/// intact.
+///
+/// This is the supported way to get a nested, partially-rollbackable unit of
+/// work: `Db::tx` itself cannot be re-entered on the same connection (its
+/// closure receives `&mut PooledConnection`, not `&mut Db`), so a same-connection
+/// savepoint can only live here, inside the closure.
+///
+/// # Caveat
+///
+/// After-commit callbacks registered inside the savepoint via
+/// [`register_after_commit`] fire when the **outer** transaction commits,
+/// regardless of whether this savepoint rolled back — the callback registry is
+/// transaction-scoped, not savepoint-scoped.
+///
+/// # Errors
+///
+/// Returns the error from `f`, or a `diesel::result::Error` if the savepoint
+/// itself cannot be established or released.
+pub async fn savepoint<'a, C, T, E, F>(conn: &'a mut C, f: F) -> Result<T, E>
+where
+    // Generic over the connection so it works with the `&mut PooledConnection`
+    // handed to a `tx` closure and the `&mut AsyncPgConnection` handed to a
+    // `tx_with` closure alike.
+    C: diesel_async::AsyncConnection + Send,
+    T: Send + 'a,
+    E: From<diesel::result::Error> + Send + 'a,
+    F: for<'r> FnOnce(&'r mut C) -> scoped_futures::ScopedBoxFuture<'a, 'r, Result<T, E>>
+        + Send
+        + 'a,
+{
+    // `scoped_transaction` drives `C::TransactionManager` exactly like
+    // `conn.transaction` does. diesel-async issues SAVEPOINT (not BEGIN)
+    // because `conn` is already in a transaction, and RELEASE / ROLLBACK TO on
+    // Ok / Err respectively.
+    scoped_transaction(conn, f).await
+}
+
 // ── Db extractor ─────────────────────────────────────────────
 
 /// Connection type managed by the deadpool pool.
@@ -850,10 +1291,12 @@ impl Db {
         &self.span
     }
 
-    /// Run an async closure inside a database transaction.
+    /// Run an async closure inside a database transaction at the default
+    /// isolation level (READ COMMITTED).
     ///
     /// Commits when the closure returns `Ok(_)`, rolls back when it returns
-    /// `Err(_)`.
+    /// `Err(_)`. For a stronger isolation level and/or automatic
+    /// serialization-failure retry, use [`Db::tx_with`].
     ///
     /// # Errors
     ///
@@ -880,8 +1323,6 @@ impl Db {
             + Send
             + 'a,
     {
-        use diesel_async::AsyncConnection as _;
-
         if self.tx_poisoned {
             return Err(crate::error::AutumnError::service_unavailable_msg(
                 "Database connection is in an invalid transaction state",
@@ -889,7 +1330,7 @@ impl Db {
         }
         if self.tx_depth > 0 {
             return Err(crate::error::AutumnError::bad_request_msg(
-                "Nested Db::tx calls are not supported",
+                NESTED_TX_MESSAGE,
             ));
         }
         reject_ambient_after_commit_registry_for_tx()?;
@@ -906,8 +1347,18 @@ impl Db {
         // read the registry after the `scope` future completes.
         let registry: Arc<Mutex<Vec<CommitCallback>>> = Arc::new(Mutex::new(Vec::new()));
 
+        // NOTE: `tx` keeps its own body rather than delegating to `tx_with`
+        // because the two hand out different connection types. `transaction()`
+        // runs on the pooled `Object` (closure sees `&mut PooledConnection`),
+        // whereas `tx_with` must use `build_transaction()` — only available on
+        // `AsyncPgConnection` — so its closure sees `&mut AsyncPgConnection`.
+        // `scoped_transaction` adapts the public `ScopedBoxFuture` callback
+        // shape to the transaction API diesel-async 0.9 expects.
         let result = AFTER_COMMIT_REGISTRY
-            .scope(registry.clone(), self.conn.transaction::<T, E, _>(f))
+            .scope(
+                registry.clone(),
+                scoped_transaction::<T, E, _, _>(&mut self.conn, f),
+            )
             .await
             .map_err(Into::into);
 
@@ -931,6 +1382,219 @@ impl Db {
         }
 
         result
+    }
+
+    /// Run an async closure inside a database transaction with explicit
+    /// [`TxOptions`] — isolation level, read-only/deferrable mode, and automatic
+    /// retry of transient serialization failures (`40001`) and deadlocks
+    /// (`40P01`).
+    ///
+    /// Commits when the closure returns `Ok(_)`, rolls back when it returns
+    /// `Err(_)`. On a retryable failure with attempts remaining, the whole
+    /// closure is re-run after a capped exponential backoff with jitter.
+    ///
+    /// # The closure must be re-runnable
+    ///
+    /// **Because the closure can run more than once, it must be free of
+    /// side effects that are not themselves transactional (or must be
+    /// idempotent).** Database work is rolled back between attempts, and
+    /// after-commit callbacks from failed attempts are discarded — but any
+    /// non-database side effect in the closure body (logging aside — external
+    /// API calls, channel sends, in-memory mutation) will re-execute on each
+    /// retry. Keep such effects out of the closure, or gate them on the final
+    /// success.
+    ///
+    /// # Observability
+    ///
+    /// The transaction runs under a `db.transaction` span carrying
+    /// `db.isolation` and the final `db.tx.attempts` count. Each retry also
+    /// increments [`TX_RETRIES_TOTAL`]; an exhausted retry budget increments
+    /// [`TX_RETRY_EXHAUSTED_TOTAL`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AutumnError`] under the same conditions as [`Db::tx`]. A
+    /// non-retryable error is returned immediately; when the retry budget is
+    /// exhausted, the **final** underlying error is returned (never swallowed).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal after-commit registry mutex is poisoned (only
+    /// possible if a previous thread holding the lock panicked).
+    #[allow(clippy::too_many_lines)]
+    pub async fn tx_with<'a, T, E, F>(
+        &'a mut self,
+        opts: TxOptions,
+        mut f: F,
+    ) -> Result<T, crate::error::AutumnError>
+    where
+        T: Send + 'a,
+        E: From<diesel::result::Error> + Send + Sync + 'a,
+        crate::error::AutumnError: From<E>,
+        // The closure receives `&mut AsyncPgConnection` (not `&mut PooledConnection`
+        // as `tx` does): isolation levels require `build_transaction()`, which is
+        // inherent on `AsyncPgConnection`. Diesel query methods work on either.
+        F: for<'r> FnMut(
+                &'r mut AsyncPgConnection,
+            ) -> scoped_futures::ScopedBoxFuture<'a, 'r, Result<T, E>>
+            + Send
+            + 'a,
+    {
+        if self.tx_poisoned {
+            return Err(crate::error::AutumnError::service_unavailable_msg(
+                "Database connection is in an invalid transaction state",
+            ));
+        }
+        if self.tx_depth > 0 {
+            return Err(crate::error::AutumnError::bad_request_msg(
+                NESTED_TX_MESSAGE,
+            ));
+        }
+        reject_ambient_after_commit_registry_for_tx()?;
+
+        self.tx_depth += 1;
+        let mut guard = TxDepthGuard {
+            depth: &mut self.tx_depth,
+            poisoned: &mut self.tx_poisoned,
+            disarmed: false,
+        };
+
+        let span = tracing::info_span!(
+            "db.transaction",
+            db.system = "postgresql",
+            db.isolation = opts.isolation.as_str(),
+            db.tx.attempts = tracing::field::Empty,
+        );
+
+        if self.is_test_tx {
+            // Under a transactional `TestApp` the connection is already inside
+            // the test harness's outer transaction (`begin_test_transaction`),
+            // so issuing a literal `BEGIN`/`SET TRANSACTION ISOLATION LEVEL`
+            // via `build_transaction()` here would be invalid — Postgres
+            // rejects `SET TRANSACTION ISOLATION LEVEL` inside a
+            // subtransaction, and the retry loop's per-attempt `&mut f`
+            // re-borrow doesn't type-check against the plain `transaction()`
+            // method's lifetime shape (unlike `build_transaction().run()`, its
+            // bound is not scoped to a single call). So: nest via `SAVEPOINT`
+            // instead, exactly like `Db::tx`, running the closure exactly
+            // once — the requested isolation/read-only/deferrable/retry
+            // options are inherited from (or meaningless nested inside) the
+            // outer test transaction, so there is nothing to retry against a
+            // single test-harness connection.
+            let registry: Arc<Mutex<Vec<CommitCallback>>> = Arc::new(Mutex::new(Vec::new()));
+            let conn: &mut AsyncPgConnection = &mut self.conn;
+            let result = AFTER_COMMIT_REGISTRY
+                .scope(registry, scoped_transaction::<T, E, _, _>(conn, f))
+                .instrument(span.clone())
+                .await
+                .map_err(Into::into);
+
+            span.record("db.tx.attempts", 1u32);
+            guard.disarmed = true;
+            // `is_test_tx` always suppresses after-commit spawning (matching
+            // `Db::tx`), so the registry is simply dropped without draining.
+            return result;
+        }
+
+        let max_attempts = opts.effective_max_attempts();
+        let mut attempt: u32 = 0;
+
+        let outcome: Result<T, crate::error::AutumnError> = loop {
+            attempt += 1;
+
+            // A fresh registry per attempt: a rolled-back attempt's after-commit
+            // callbacks are discarded simply by dropping this `Arc` undrained.
+            let registry: Arc<Mutex<Vec<CommitCallback>>> = Arc::new(Mutex::new(Vec::new()));
+
+            let attempt_result: Result<T, E> = {
+                // *** LOAD-BEARING ORDER: borrow `f` BEFORE `build_transaction()`.
+                // diesel-async's `TransactionBuilder::run` bounds the closure by
+                // the connection-borrow lifetime; `&mut f`'s region must start
+                // earlier than that borrow or it fails to compile. Do not reorder.
+                let f_ref = &mut f;
+
+                let mut builder = self.conn.build_transaction();
+                builder = match opts.isolation {
+                    IsolationLevel::ReadCommitted => builder.read_committed(),
+                    IsolationLevel::RepeatableRead => builder.repeatable_read(),
+                    IsolationLevel::Serializable => builder.serializable(),
+                };
+                if opts.read_only {
+                    builder = builder.read_only();
+                }
+                if opts.deferrable {
+                    builder = builder.deferrable();
+                }
+
+                AFTER_COMMIT_REGISTRY
+                    .scope(
+                        registry.clone(),
+                        builder.run::<T, E, _>(async move |conn| f_ref(conn).await),
+                    )
+                    .instrument(span.clone())
+                    .await
+            };
+
+            match attempt_result {
+                Ok(value) => {
+                    // Commit path: drain THIS attempt's callbacks and spawn
+                    // them. (The `is_test_tx` case already returned above, so
+                    // spawning here is always live.)
+                    let callbacks: Vec<CommitCallback> = {
+                        let mut reg = registry.lock().expect("registry lock");
+                        std::mem::take(&mut *reg)
+                    };
+                    if !callbacks.is_empty() {
+                        let _ = spawn_committed_after_commit_callbacks(callbacks);
+                    }
+                    break Ok(value);
+                }
+                Err(e) => {
+                    // Convert to AutumnError first, then classify on it.
+                    let ae = crate::error::AutumnError::from(e);
+                    let retryable = is_retryable_txn_error(&ae);
+                    match retry_decision(attempt, max_attempts, retryable) {
+                        RetryDecision::Retry => {
+                            let retries_total = record_tx_retry();
+                            let delay = retry_backoff_delay(
+                                opts.initial_backoff,
+                                opts.max_backoff,
+                                attempt,
+                            );
+                            tracing::debug!(
+                                parent: &span,
+                                attempt,
+                                max_attempts,
+                                delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+                                autumn.tx.retries_total = retries_total,
+                                "retrying transaction after serialization/deadlock failure"
+                            );
+                            // `registry` drops here → rolled-back attempt's
+                            // after-commit callbacks are discarded; the loop
+                            // then re-runs the closure.
+                            tokio::time::sleep(delay).await;
+                        }
+                        RetryDecision::Stop => {
+                            if retryable {
+                                let exhausted_total = record_tx_retry_exhausted();
+                                tracing::warn!(
+                                    parent: &span,
+                                    attempt,
+                                    max_attempts,
+                                    autumn.tx.retry_exhausted_total = exhausted_total,
+                                    "transaction retry budget exhausted; returning final error"
+                                );
+                            }
+                            break Err(ae);
+                        }
+                    }
+                }
+            }
+        };
+
+        span.record("db.tx.attempts", attempt);
+        guard.disarmed = true;
+        outcome
     }
 }
 
@@ -1059,6 +1723,31 @@ impl Db {
             is_test_tx,
         })
     }
+
+    /// Check a plain, uninstrumented connection out of `pool` for use in tests.
+    ///
+    /// Unlike the request extractor, this applies no interceptors, statement
+    /// timeout, or route metrics — it exists so integration tests can drive
+    /// [`Db::tx`] / [`Db::tx_with`] directly against a [`crate::test::TestDb`]
+    /// pool without spinning up a full `TestApp`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AutumnError`] if a connection cannot be acquired from `pool`.
+    #[cfg(feature = "test-support")]
+    pub async fn connect_for_test(pool: &Pool<AsyncPgConnection>) -> Result<Self, AutumnError> {
+        Self::checkout(DbCheckoutParams {
+            pool,
+            pool_name: "test",
+            shard: None,
+            statement_timeout: None,
+            route_key: None,
+            metrics: None,
+            slow_query_threshold: std::time::Duration::from_millis(500),
+            interceptors: Vec::new(),
+        })
+        .await
+    }
 }
 
 /// Request-derived context shared by every `Db`-producing extractor.
@@ -1109,7 +1798,7 @@ where
             .ok_or_else(|| AutumnError::service_unavailable_msg("Database not configured"))?;
         let ctx = RequestDbContext::from_parts(parts, state);
 
-        Self::checkout(DbCheckoutParams {
+        let result = Self::checkout(DbCheckoutParams {
             pool,
             pool_name: "primary",
             shard: None,
@@ -1119,7 +1808,13 @@ where
             slow_query_threshold: ctx.slow_query_threshold,
             interceptors: ctx.interceptors,
         })
-        .await
+        .await;
+        // Notify the RYWW task-local that a primary connection was checked out.
+        // No-op when read_your_writes = "off" (task-local absent).
+        if result.is_ok() {
+            crate::read_your_writes::mark_write();
+        }
+        result
     }
 }
 
@@ -1959,5 +2654,1061 @@ mod tests {
         assert_eq!(super::scrub_sql("SELECT 1_000.5_0"), "SELECT ?");
         assert_eq!(super::scrub_sql("SELECT col_5_val"), "SELECT col_5_val");
         assert_eq!(super::scrub_sql("SELECT col_5"), "SELECT col_5");
+    }
+
+    // ── Transaction isolation + retry (issue #1202) ─────────────────
+
+    #[derive(Debug)]
+    struct FakeDbErrorInfo {
+        message: &'static str,
+    }
+
+    impl diesel::result::DatabaseErrorInformation for FakeDbErrorInfo {
+        fn message(&self) -> &str {
+            self.message
+        }
+        fn details(&self) -> Option<&str> {
+            None
+        }
+        fn hint(&self) -> Option<&str> {
+            None
+        }
+        fn table_name(&self) -> Option<&str> {
+            None
+        }
+        fn column_name(&self) -> Option<&str> {
+            None
+        }
+        fn constraint_name(&self) -> Option<&str> {
+            None
+        }
+        fn statement_position(&self) -> Option<i32> {
+            None
+        }
+    }
+
+    fn diesel_db_error(
+        kind: diesel::result::DatabaseErrorKind,
+        message: &'static str,
+    ) -> diesel::result::Error {
+        diesel::result::Error::DatabaseError(kind, Box::new(FakeDbErrorInfo { message }))
+    }
+
+    // ── TxOptions builder ────────────────────────────────────────
+
+    #[test]
+    fn tx_options_default_is_read_committed_no_retry() {
+        let opts = TxOptions::default();
+        assert_eq!(opts.isolation, IsolationLevel::ReadCommitted);
+        assert!(!opts.read_only);
+        assert!(!opts.deferrable);
+        assert_eq!(
+            opts.max_attempts, 1,
+            "default must behave exactly like today's tx(): one attempt, no retry"
+        );
+    }
+
+    #[test]
+    fn tx_options_serializable_enables_retry() {
+        let opts = TxOptions::serializable();
+        assert_eq!(opts.isolation, IsolationLevel::Serializable);
+        assert!(
+            opts.max_attempts > 1,
+            "serializable() should default to retrying since retry is the point"
+        );
+    }
+
+    #[test]
+    fn tx_options_repeatable_read_enables_retry() {
+        let opts = TxOptions::repeatable_read();
+        assert_eq!(opts.isolation, IsolationLevel::RepeatableRead);
+        assert!(opts.max_attempts > 1);
+    }
+
+    #[test]
+    fn tx_options_builder_chains() {
+        let opts = TxOptions::serializable()
+            .read_only()
+            .deferrable()
+            .max_attempts(9)
+            .initial_backoff(Duration::from_millis(3))
+            .max_backoff(Duration::from_millis(30));
+        assert!(opts.read_only);
+        assert!(opts.deferrable);
+        assert_eq!(opts.max_attempts, 9);
+        assert_eq!(opts.initial_backoff, Duration::from_millis(3));
+        assert_eq!(opts.max_backoff, Duration::from_millis(30));
+    }
+
+    #[test]
+    fn tx_options_max_attempts_clamps_to_at_least_one() {
+        // A zero here must never produce a loop that skips the closure entirely.
+        assert_eq!(TxOptions::default().max_attempts(0).max_attempts, 1);
+    }
+
+    #[test]
+    fn tx_options_effective_max_attempts_clamps_struct_literal_bypass() {
+        // `max_attempts` is a public field, so struct-literal update syntax can
+        // set it to 0 directly, bypassing the `max_attempts()` builder's clamp.
+        // The retry loop must still treat this as "run once", not "never run".
+        let opts = TxOptions {
+            max_attempts: 0,
+            ..TxOptions::default()
+        };
+        assert_eq!(opts.max_attempts, 0, "the raw field is not itself clamped");
+        assert_eq!(
+            opts.effective_max_attempts(),
+            1,
+            "the retry loop's accessor must clamp a struct-literal 0 to 1"
+        );
+    }
+
+    // ── Backoff ──────────────────────────────────────────────────
+
+    #[test]
+    fn retry_backoff_base_doubles_per_attempt() {
+        let initial = Duration::from_millis(5);
+        let max = Duration::from_secs(60);
+        assert_eq!(
+            retry_backoff_base(initial, max, 1),
+            Duration::from_millis(5)
+        );
+        assert_eq!(
+            retry_backoff_base(initial, max, 2),
+            Duration::from_millis(10)
+        );
+        assert_eq!(
+            retry_backoff_base(initial, max, 3),
+            Duration::from_millis(20)
+        );
+        assert_eq!(
+            retry_backoff_base(initial, max, 4),
+            Duration::from_millis(40)
+        );
+    }
+
+    #[test]
+    fn retry_backoff_base_caps_at_max() {
+        let initial = Duration::from_millis(5);
+        let max = Duration::from_millis(50);
+        // 5,10,20,40 then capped at 50 for all higher attempts.
+        assert_eq!(
+            retry_backoff_base(initial, max, 5),
+            Duration::from_millis(50)
+        );
+        assert_eq!(retry_backoff_base(initial, max, 40), max);
+        // Huge attempt must not panic on shift overflow.
+        assert_eq!(retry_backoff_base(initial, max, u32::MAX), max);
+    }
+
+    #[test]
+    fn retry_backoff_delay_stays_within_jitter_bounds_and_cap() {
+        let initial = Duration::from_millis(100);
+        let max = Duration::from_secs(10);
+        for attempt in 1..=6u32 {
+            let base = retry_backoff_base(initial, max, attempt);
+            for _ in 0..64 {
+                let d = retry_backoff_delay(initial, max, attempt);
+                // Jitter is +/-20% of base, never exceeding the cap.
+                assert!(
+                    d >= base.mul_f64(0.8) && d <= base.mul_f64(1.2),
+                    "delay {d:?} out of jitter bounds for base {base:?}"
+                );
+                assert!(d <= max, "delay {d:?} exceeded cap {max:?}");
+            }
+        }
+    }
+
+    // ── Retryable-error classification ───────────────────────────
+
+    #[test]
+    fn serialization_failure_is_retryable() {
+        let err: AutumnError = AutumnError::internal_server_error(diesel_db_error(
+            diesel::result::DatabaseErrorKind::SerializationFailure,
+            "could not serialize access due to read/write dependencies among transactions",
+        ));
+        assert!(is_retryable_txn_error(&err));
+    }
+
+    #[test]
+    fn deadlock_is_retryable() {
+        // Postgres 40P01 is not mapped to a dedicated DatabaseErrorKind, so it
+        // is caught via an exact match against Postgres's own invariant
+        // primary message for this condition.
+        let err: AutumnError = AutumnError::internal_server_error(diesel_db_error(
+            diesel::result::DatabaseErrorKind::Unknown,
+            "deadlock detected",
+        ));
+        assert!(is_retryable_txn_error(&err));
+    }
+
+    #[test]
+    fn deadlock_message_is_matched_case_and_whitespace_insensitively() {
+        let err: AutumnError = AutumnError::internal_server_error(diesel_db_error(
+            diesel::result::DatabaseErrorKind::Unknown,
+            "  Deadlock Detected  ",
+        ));
+        assert!(is_retryable_txn_error(&err));
+    }
+
+    #[test]
+    fn unknown_kind_message_merely_mentioning_deadlock_is_not_retryable() {
+        // Regression (PR #1581 review, round 2): an `Unknown`-kind Postgres
+        // error from application SQL (e.g. `RAISE EXCEPTION`) whose message
+        // merely *mentions* "deadlock detected" or "40001" as part of a
+        // longer business message must not be retried -- only an exact match
+        // against Postgres's own invariant primary message counts.
+        let err: AutumnError = AutumnError::internal_server_error(diesel_db_error(
+            diesel::result::DatabaseErrorKind::Unknown,
+            "order 40001 could not be processed: deadlock detected in workflow",
+        ));
+        assert!(!is_retryable_txn_error(&err));
+    }
+
+    #[test]
+    fn unknown_kind_40001_text_alone_is_not_retryable() {
+        // A bare "40001" in an Unknown-kind message is no longer treated as a
+        // retry signal -- genuine 40001s are already reliably classified via
+        // the DatabaseErrorKind::SerializationFailure fast path (diesel-async
+        // maps the real SQLSTATE), so this text pattern is dead weight that
+        // only added false-positive risk.
+        let err: AutumnError = AutumnError::internal_server_error(diesel_db_error(
+            diesel::result::DatabaseErrorKind::Unknown,
+            "ERROR: 40001: could not serialize access",
+        ));
+        assert!(!is_retryable_txn_error(&err));
+    }
+
+    #[test]
+    fn unique_violation_is_not_retryable() {
+        let err: AutumnError = AutumnError::internal_server_error(diesel_db_error(
+            diesel::result::DatabaseErrorKind::UniqueViolation,
+            "duplicate key value violates unique constraint",
+        ));
+        assert!(!is_retryable_txn_error(&err));
+    }
+
+    #[test]
+    fn unique_violation_with_magic_substring_in_message_is_not_retryable() {
+        // Regression: a non-retryable `DatabaseErrorKind` must never be
+        // misclassified just because its message/constraint text happens to
+        // contain a magic substring like "40001" or "deadlock detected".
+        let err: AutumnError = AutumnError::internal_server_error(diesel_db_error(
+            diesel::result::DatabaseErrorKind::UniqueViolation,
+            "duplicate key value violates unique constraint \"orders_40001_key\"",
+        ));
+        assert!(!is_retryable_txn_error(&err));
+    }
+
+    #[test]
+    fn plain_internal_error_is_not_retryable() {
+        let err = AutumnError::internal_server_error_msg("something unrelated broke");
+        assert!(!is_retryable_txn_error(&err));
+    }
+
+    #[test]
+    fn domain_error_with_magic_substring_and_no_db_error_is_not_retryable() {
+        // Regression (PR #1581 review): a plain domain/validation error — no
+        // diesel::result::Error or tokio_postgres error anywhere in its
+        // chain — must never be retried just because its message happens to
+        // contain a magic substring like "40001" or "deadlock detected".
+        // Retry requires a structured signal, never bare text.
+        let err = AutumnError::bad_request_msg(
+            "order 40001 could not be processed: deadlock detected in workflow",
+        );
+        assert!(!is_retryable_txn_error(&err));
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("app error")]
+    struct WrappedDbError(#[source] diesel::result::Error);
+
+    #[test]
+    fn serialization_failure_wrapped_in_custom_error_is_retryable() {
+        // A custom `E` (e.g. an app error enum with a `#[from] diesel::result::Error`
+        // variant) is not itself a `diesel::result::Error`, so it isn't found by
+        // a top-level-only downcast. `downcast_chain_ref` walks `source()` to
+        // find it, so wrapped diesel errors are still classified structurally
+        // — no need to fall back to message scanning for this common case.
+        let err: AutumnError = AutumnError::internal_server_error(WrappedDbError(diesel_db_error(
+            diesel::result::DatabaseErrorKind::SerializationFailure,
+            "could not serialize access due to read/write dependencies among transactions",
+        )));
+        assert!(is_retryable_txn_error(&err));
+    }
+
+    #[test]
+    fn unique_violation_wrapped_in_custom_error_is_not_retryable() {
+        let err: AutumnError = AutumnError::internal_server_error(WrappedDbError(diesel_db_error(
+            diesel::result::DatabaseErrorKind::UniqueViolation,
+            "duplicate key value violates unique constraint",
+        )));
+        assert!(!is_retryable_txn_error(&err));
+    }
+
+    // ── Attempt accounting ───────────────────────────────────────
+
+    #[test]
+    fn retry_decision_retries_until_attempts_exhausted() {
+        // A retryable error keeps retrying while attempts remain, then stops.
+        let max = 3;
+        assert_eq!(retry_decision(1, max, true), RetryDecision::Retry);
+        assert_eq!(retry_decision(2, max, true), RetryDecision::Retry);
+        assert_eq!(
+            retry_decision(3, max, true),
+            RetryDecision::Stop,
+            "the final attempt must stop even when the error is retryable (exhausted)"
+        );
+    }
+
+    #[test]
+    fn retry_decision_stops_immediately_on_non_retryable() {
+        assert_eq!(retry_decision(1, 5, false), RetryDecision::Stop);
+    }
+
+    #[test]
+    fn retry_decision_single_attempt_never_retries() {
+        // max_attempts == 1 (the default) must behave exactly like today's tx().
+        assert_eq!(retry_decision(1, 1, true), RetryDecision::Stop);
+    }
+}
+
+// ── Postgres TLS (sslmode) support ───────────────────────────────────────────
+
+/// TLS support for the Postgres pool, driven by `sslmode` in the database URL.
+///
+/// diesel-async's default `AsyncPgConnection::establish` hardcodes
+/// `tokio_postgres::NoTls`, which makes `sslmode=require` fail on every
+/// connection with "no TLS implementation configured". This module plugs a
+/// rustls-backed connector into the pool via
+/// [`diesel_async::pooled_connection::ManagerConfig::custom_setup`] when the
+/// URL asks for TLS. Both URL (`postgres://…?sslmode=require`) and
+/// keyword/value (`host=… sslmode=require`) connection strings are
+/// recognized. The synchronous migration/startup-wait path shares the same
+/// connector through [`super::establish_migration_connection`] — the
+/// bundled libpq has no SSL support, so the native `PgConnection` path
+/// cannot reach TLS-only servers at all.
+///
+/// | `sslmode`                     | behavior |
+/// | ----------------------------- | -------- |
+/// | absent, `disable`, `prefer`   | unchanged: the default `NoTls` path (plaintext), exactly as before this module existed |
+/// | `require`                     | TLS. The connection is encrypted and the handshake signatures are verified, but the server's certificate **chain/identity is not** — matching what `libpq`/`psql` do for `require` (self-signed and private-CA servers work) |
+/// | `verify-full`                 | TLS with full chain **and** hostname verification against the Mozilla root store (`webpki-roots`), plus any `sslrootcert=<PEM file>` from the URL |
+/// | `verify-ca`                   | rejected with guidance: chain-only verification is not implemented; use `verify-full` (stricter) or `require` |
+///
+/// `require` combined with `sslrootcert` is also rejected rather than
+/// silently ignoring the CA file: `libpq` documents that combination as
+/// upgrading to certificate verification, so dropping the file would
+/// silently weaken what the operator asked for.
+mod tls {
+    use std::sync::Arc;
+
+    use diesel::{ConnectionError, ConnectionResult};
+    use diesel_async::pooled_connection::SetupCallback;
+    use diesel_async::{AsyncConnection as _, AsyncPgConnection};
+    use futures::FutureExt as _;
+    use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+    use rustls::crypto::CryptoProvider;
+    use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+    use rustls::{DigitallySignedStruct, SignatureScheme};
+    use tokio_postgres_rustls::MakeRustlsConnect;
+
+    /// TLS posture derived from the connection string's `sslmode` (and
+    /// `sslrootcert`). See the [module docs](self) for the full table.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(super) enum TlsPosture {
+        /// No TLS machinery: keep diesel-async's default `NoTls` setup path.
+        Off,
+        /// Encrypt without verifying the server certificate chain
+        /// (`libpq` parity for `sslmode=require`).
+        Require,
+        /// Encrypt and fully verify the certificate chain + hostname.
+        VerifyFull {
+            /// Optional `sslrootcert` PEM file to trust in addition to the
+            /// Mozilla root store.
+            root_cert: Option<String>,
+        },
+        /// A recognized-but-unsupported combination; every connection attempt
+        /// fails loudly with this reason instead of silently downgrading.
+        Unsupported { reason: String },
+    }
+
+    impl TlsPosture {
+        /// Classify a database URL / keyword-value connection string.
+        pub(super) fn from_database_url(database_url: &str) -> Self {
+            let params = ssl_params(database_url);
+            // Last occurrence wins, matching libpq/tokio-postgres semantics.
+            let get = |key: &str| {
+                params
+                    .iter()
+                    .rev()
+                    .find(|(k, _)| k == key)
+                    .map(|(_, v)| v.as_str())
+            };
+            let root_cert = get("sslrootcert").map(str::to_owned);
+            match get("sslmode") {
+                Some("require") => {
+                    if root_cert.is_some() {
+                        Self::Unsupported {
+                            reason: "sslmode=require with sslrootcert is not supported: \
+                                     PostgreSQL treats that combination as requiring \
+                                     certificate verification against the CA file, which \
+                                     this pool implements only for sslmode=verify-full. \
+                                     Use sslmode=verify-full to verify the certificate, or \
+                                     sslmode=require without sslrootcert to encrypt without \
+                                     verifying it."
+                                .to_owned(),
+                        }
+                    } else {
+                        Self::Require
+                    }
+                }
+                Some("verify-full") => Self::VerifyFull { root_cert },
+                Some("verify-ca") => Self::Unsupported {
+                    reason: "sslmode=verify-ca is not supported: chain-only verification \
+                             (without hostname checking) is not implemented. Use \
+                             sslmode=verify-full (stricter) or sslmode=require (encrypts \
+                             without verifying the certificate)."
+                        .to_owned(),
+                },
+                // Absent, `disable`, `prefer`, or anything unrecognized:
+                // preserve the pre-TLS behavior exactly (including the error
+                // tokio-postgres itself raises for invalid values).
+                _ => Self::Off,
+            }
+        }
+    }
+
+    /// Build the pool's custom connection-setup callback for a TLS posture.
+    pub(super) fn setup_callback(posture: TlsPosture) -> SetupCallback<AsyncPgConnection> {
+        Box::new(move |url: &str| {
+            let posture = posture.clone();
+            let url = url.to_owned();
+            async move { establish(&url, posture).await }.boxed()
+        })
+    }
+
+    /// Establish an [`AsyncPgConnection`] honoring `posture` — the single
+    /// connect path shared by the pool's setup callback and the synchronous
+    /// migration/wait-check wrapper
+    /// ([`super::establish_migration_connection`]).
+    pub(super) async fn establish(
+        url: &str,
+        posture: TlsPosture,
+    ) -> ConnectionResult<AsyncPgConnection> {
+        match posture {
+            // Defensive: `build_pool` never installs the callback for
+            // `Off`, but fall back to the stock path if it ever does.
+            TlsPosture::Off => AsyncPgConnection::establish(url).await,
+            TlsPosture::Require => connect_with(url, relaxed_connector()?).await,
+            TlsPosture::VerifyFull { root_cert } => {
+                // tokio-postgres's own connection-string parser
+                // rejects `verify-*` and `sslrootcert`, so hand it a
+                // sanitized string; the real verification lives in
+                // the rustls config.
+                let sanitized = sanitize_for_verify_full(url);
+                connect_with(&sanitized, verifying_connector(root_cert.as_deref())?).await
+            }
+            TlsPosture::Unsupported { reason } => {
+                Err(ConnectionError::InvalidConnectionUrl(reason))
+            }
+        }
+    }
+
+    async fn connect_with(
+        url: &str,
+        tls: MakeRustlsConnect,
+    ) -> ConnectionResult<AsyncPgConnection> {
+        let (client, connection) = tokio_postgres::connect(url, tls).await.map_err(|e| {
+            // tokio_postgres's Display gives only the error kind ("error
+            // performing TLS handshake"); append the source so operators see
+            // the actionable cause ("server does not support TLS", a
+            // certificate verification failure, …).
+            let msg = std::error::Error::source(&e)
+                .map_or_else(|| e.to_string(), |source| format!("{e}: {source}"));
+            ConnectionError::BadConnection(msg)
+        })?;
+        AsyncPgConnection::try_from_client_and_connection(client, connection).await
+    }
+
+    /// Encrypt-only connector for `sslmode=require`: handshake signatures are
+    /// verified but the certificate chain/identity is not, mirroring
+    /// `libpq`/`psql` behavior for `require` (which self-signed and
+    /// private-CA deployments rely on).
+    fn relaxed_connector() -> Result<MakeRustlsConnect, ConnectionError> {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let config = rustls::ClientConfig::builder_with_provider(provider.clone())
+            .with_safe_default_protocol_versions()
+            .map_err(|e| {
+                ConnectionError::BadConnection(format!("failed to build TLS config: {e}"))
+            })?
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoServerCertVerification(
+                (*provider).clone(),
+            )))
+            .with_no_client_auth();
+        Ok(MakeRustlsConnect::new(config))
+    }
+
+    /// Fully verifying connector for `sslmode=verify-full`: certificate chain
+    /// and hostname are checked against the Mozilla root store plus any
+    /// `sslrootcert` PEM file from the connection string. `webpki-roots` is
+    /// used (rather than the platform store) so behavior is deterministic on
+    /// every target, including mobile, where no native store is reachable.
+    fn verifying_connector(root_cert: Option<&str>) -> Result<MakeRustlsConnect, ConnectionError> {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        if let Some(path) = root_cert {
+            use rustls_pki_types::pem::PemObject as _;
+            let certs = CertificateDer::pem_file_iter(path).map_err(|e| {
+                ConnectionError::BadConnection(format!("failed to read sslrootcert {path}: {e}"))
+            })?;
+            for cert in certs {
+                let cert = cert.map_err(|e| {
+                    ConnectionError::BadConnection(format!(
+                        "failed to parse sslrootcert {path}: {e}"
+                    ))
+                })?;
+                roots.add(cert).map_err(|e| {
+                    ConnectionError::BadConnection(format!(
+                        "failed to trust sslrootcert {path}: {e}"
+                    ))
+                })?;
+            }
+        }
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let config = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .map_err(|e| {
+                ConnectionError::BadConnection(format!("failed to build TLS config: {e}"))
+            })?
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        Ok(MakeRustlsConnect::new(config))
+    }
+
+    /// Whether tokio-postgres would parse this connection string as a URL —
+    /// see [`crate::pg_conn_str::is_url`]. Getting this wrong would send
+    /// keyword strings whose values embed URL-like tokens
+    /// (`password=https://…`) down the URL path, where `url::Url::parse`
+    /// fails and the TLS posture silently falls back to [`TlsPosture::Off`].
+    /// Shared with config validation so the two never disagree about which
+    /// strings are reachable.
+    use crate::pg_conn_str::is_url as is_url_connection_string;
+    /// Parse a libpq-style `key = value` connection string, mirroring
+    /// tokio-postgres's (private) parser — see
+    /// [`crate::pg_conn_str::keyword_value_pairs`]. Naive whitespace
+    /// splitting would miss `sslmode` in quoted/spaced strings and silently
+    /// downgrade the TLS posture to [`TlsPosture::Off`].
+    use crate::pg_conn_str::keyword_value_pairs;
+
+    /// Extract query/keyword parameters relevant to TLS from either a
+    /// `postgres://…` URL or a `key=value …` connection string.
+    fn ssl_params(database_url: &str) -> Vec<(String, String)> {
+        if is_url_connection_string(database_url) {
+            url::Url::parse(database_url)
+                .map(|u| {
+                    u.query_pairs()
+                        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            keyword_value_pairs(database_url).unwrap_or_default()
+        }
+    }
+
+    /// Serialize one value of a keyword/value connection string, quoting it
+    /// whenever it would not survive re-parsing as a bare token.
+    fn quote_keyword_value(value: &str) -> String {
+        if !value.is_empty()
+            && !value.contains(|c: char| c.is_whitespace() || c == '\'' || c == '\\')
+        {
+            return value.to_owned();
+        }
+        let mut quoted = String::with_capacity(value.len() + 2);
+        quoted.push('\'');
+        for c in value.chars() {
+            if c == '\'' || c == '\\' {
+                quoted.push('\\');
+            }
+            quoted.push(c);
+        }
+        quoted.push('\'');
+        quoted
+    }
+
+    /// Rewrite a `verify-full` connection string into one tokio-postgres can
+    /// parse: `sslmode` downgraded to `require` (the handshake decision), and
+    /// `sslrootcert` removed (consumed by [`verifying_connector`] instead).
+    fn sanitize_for_verify_full(database_url: &str) -> String {
+        if is_url_connection_string(database_url) {
+            let Ok(mut parsed) = url::Url::parse(database_url) else {
+                return database_url.to_owned();
+            };
+            // Rewrite ONLY the sslmode/sslrootcert components, preserving
+            // every other raw query component byte-for-byte: decoding and
+            // re-serializing through query_pairs()/append_pair() would
+            // form-encode spaces as `+`, which libpq/tokio-postgres do not
+            // accept in Postgres URI parameters —
+            // `options=-c%20search_path%3Dtenant` would be mangled into
+            // `options=-c+search_path=tenant`. (The startup-wait splice in
+            // migrate.rs avoids those APIs for the same reason.)
+            let raw = parsed
+                .query()
+                .unwrap_or("")
+                .split('&')
+                .filter(|component| !component.is_empty())
+                .filter_map(|component| {
+                    let key = component.split('=').next().unwrap_or(component);
+                    match key {
+                        "sslmode" => Some("sslmode=require"),
+                        "sslrootcert" => None,
+                        _ => Some(component),
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("&");
+            if raw.is_empty() {
+                parsed.set_query(None);
+            } else {
+                parsed.set_query(Some(&raw));
+            }
+            parsed.to_string()
+        } else {
+            let Some(pairs) = keyword_value_pairs(database_url) else {
+                // Malformed: pass through so tokio-postgres reports its own
+                // parse error instead of us inventing a different string.
+                return database_url.to_owned();
+            };
+            pairs
+                .into_iter()
+                .filter_map(|(k, v)| match k.as_str() {
+                    "sslmode" => Some("sslmode=require".to_owned()),
+                    "sslrootcert" => None,
+                    _ => Some(format!("{k}={}", quote_keyword_value(&v))),
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+    }
+
+    /// Accepts any server certificate without validating its chain or
+    /// hostname, while still cryptographically verifying the TLS handshake
+    /// signatures (the connection is genuinely encrypted to *some* holder of
+    /// the presented key — "no identity check", not "no security"). This is
+    /// exactly `libpq`/`psql`'s posture for `sslmode=require`; identity
+    /// verification is `sslmode=verify-full`'s job.
+    #[derive(Debug)]
+    struct NoServerCertVerification(CryptoProvider);
+
+    impl ServerCertVerifier for NoServerCertVerification {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _server_name: &ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: UnixTime,
+        ) -> Result<ServerCertVerified, rustls::Error> {
+            Ok(ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls12_signature(
+                message,
+                cert,
+                dss,
+                &self.0.signature_verification_algorithms,
+            )
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls13_signature(
+                message,
+                cert,
+                dss,
+                &self.0.signature_verification_algorithms,
+            )
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            self.0.signature_verification_algorithms.supported_schemes()
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn absent_disable_and_prefer_keep_the_default_notls_path() {
+            for url in [
+                "postgres://user:pass@db.example.com:5432/app",
+                "postgres://user:pass@db.example.com:5432/app?sslmode=disable",
+                "postgres://user:pass@db.example.com:5432/app?sslmode=prefer",
+                "host=db.example.com user=user",
+                "host=db.example.com user=user sslmode=disable",
+            ] {
+                assert_eq!(
+                    TlsPosture::from_database_url(url),
+                    TlsPosture::Off,
+                    "{url} must keep the default NoTls path"
+                );
+            }
+        }
+
+        #[test]
+        fn unrecognized_sslmode_values_keep_the_default_path_and_its_errors() {
+            // tokio-postgres itself rejects these at connect time; the pool
+            // must not mask that with a different TLS decision.
+            assert_eq!(
+                TlsPosture::from_database_url("postgres://u@h/db?sslmode=allow"),
+                TlsPosture::Off
+            );
+            assert_eq!(
+                TlsPosture::from_database_url("postgres://u@h/db?sslmode=bogus"),
+                TlsPosture::Off
+            );
+        }
+
+        #[test]
+        fn require_selects_the_relaxed_tls_connector() {
+            assert_eq!(
+                TlsPosture::from_database_url(
+                    "postgres://user:pass@db.example.com:5432/app?sslmode=require"
+                ),
+                TlsPosture::Require
+            );
+            assert_eq!(
+                TlsPosture::from_database_url("host=db.example.com sslmode=require"),
+                TlsPosture::Require
+            );
+        }
+
+        #[test]
+        fn verify_full_selects_the_verifying_connector_with_optional_root() {
+            assert_eq!(
+                TlsPosture::from_database_url("postgres://u@h/db?sslmode=verify-full"),
+                TlsPosture::VerifyFull { root_cert: None }
+            );
+            assert_eq!(
+                TlsPosture::from_database_url(
+                    "postgres://u@h/db?sslmode=verify-full&sslrootcert=/etc/ca.pem"
+                ),
+                TlsPosture::VerifyFull {
+                    root_cert: Some("/etc/ca.pem".to_owned())
+                }
+            );
+        }
+
+        #[test]
+        fn keyword_strings_with_spaces_around_equals_are_parsed() {
+            // Regression: whitespace-splitting missed `sslmode` here and
+            // silently downgraded the posture to Off (plaintext).
+            assert_eq!(
+                TlsPosture::from_database_url("host=db user=u sslmode = require"),
+                TlsPosture::Require
+            );
+            assert_eq!(
+                TlsPosture::from_database_url("sslmode = require"),
+                TlsPosture::Require
+            );
+            assert_eq!(
+                TlsPosture::from_database_url("host = db sslmode\t=\nverify-full user=u"),
+                TlsPosture::VerifyFull { root_cert: None }
+            );
+        }
+
+        #[test]
+        fn keyword_strings_with_quoted_values_are_parsed() {
+            assert_eq!(
+                TlsPosture::from_database_url("sslmode='verify-full'"),
+                TlsPosture::VerifyFull { root_cert: None }
+            );
+            assert_eq!(
+                TlsPosture::from_database_url(
+                    "host=db sslmode='verify-full' sslrootcert='/path with space/ca.pem'"
+                ),
+                TlsPosture::VerifyFull {
+                    root_cert: Some("/path with space/ca.pem".to_owned())
+                }
+            );
+            // Backslash escapes work inside and outside quotes, as in
+            // tokio-postgres/libpq.
+            assert_eq!(
+                TlsPosture::from_database_url(r"sslmode=verify-full sslrootcert='/pki/it\'s.pem'"),
+                TlsPosture::VerifyFull {
+                    root_cert: Some("/pki/it's.pem".to_owned())
+                }
+            );
+            assert_eq!(
+                TlsPosture::from_database_url(r"sslmode=verify-full sslrootcert=/pki/my\ ca.pem"),
+                TlsPosture::VerifyFull {
+                    root_cert: Some("/pki/my ca.pem".to_owned())
+                }
+            );
+        }
+
+        #[test]
+        fn malformed_keyword_strings_keep_the_default_path_and_its_errors() {
+            // tokio-postgres rejects these at connect time; the posture must
+            // not guess a different TLS decision for them.
+            for url in [
+                "host=db sslmode",            // missing `=` and value
+                "host=db sslmode=",           // empty unquoted value
+                "host=db sslmode='require",   // unterminated quote
+                r"host=db sslmode='require\", // EOF right after escape
+            ] {
+                assert_eq!(
+                    TlsPosture::from_database_url(url),
+                    TlsPosture::Off,
+                    "{url:?} must keep the default NoTls path"
+                );
+            }
+        }
+
+        #[test]
+        fn keyword_strings_with_url_like_values_stay_on_the_keyword_path() {
+            // Regression: `contains("://")` sent this whole string to
+            // url::Url::parse, which failed, so sslmode=require silently
+            // became Off (plaintext). Only `postgres://`/`postgresql://`
+            // prefixes are URLs, exactly as in tokio-postgres.
+            assert_eq!(
+                TlsPosture::from_database_url("host=db password=https://secret sslmode=require"),
+                TlsPosture::Require
+            );
+            assert_eq!(
+                TlsPosture::from_database_url(
+                    "host=db options='-c foo=bar://baz' sslmode='verify-full'"
+                ),
+                TlsPosture::VerifyFull { root_cert: None }
+            );
+            // The alternate scheme spelling is still parsed as a URL.
+            assert_eq!(
+                TlsPosture::from_database_url("postgresql://u@h/db?sslmode=require"),
+                TlsPosture::Require
+            );
+        }
+
+        #[test]
+        fn verify_ca_and_require_with_rootcert_fail_loudly() {
+            assert!(matches!(
+                TlsPosture::from_database_url("postgres://u@h/db?sslmode=verify-ca"),
+                TlsPosture::Unsupported { .. }
+            ));
+            assert!(matches!(
+                TlsPosture::from_database_url(
+                    "postgres://u@h/db?sslmode=require&sslrootcert=/etc/ca.pem"
+                ),
+                TlsPosture::Unsupported { .. }
+            ));
+        }
+
+        #[test]
+        fn last_sslmode_occurrence_wins() {
+            assert_eq!(
+                TlsPosture::from_database_url("postgres://u@h/db?sslmode=disable&sslmode=require"),
+                TlsPosture::Require
+            );
+        }
+
+        #[test]
+        fn sanitize_rewrites_verify_full_and_drops_sslrootcert() {
+            let sanitized = sanitize_for_verify_full(
+                "postgres://u@h:5432/db?application_name=app&sslmode=verify-full&sslrootcert=/etc/ca.pem",
+            );
+            assert!(sanitized.contains("sslmode=require"), "{sanitized}");
+            assert!(!sanitized.contains("verify-full"), "{sanitized}");
+            assert!(!sanitized.contains("sslrootcert"), "{sanitized}");
+            assert!(sanitized.contains("application_name=app"), "{sanitized}");
+
+            // Percent-encoded components survive byte-for-byte: form
+            // re-encoding would turn %20 into `+`, which libpq and
+            // tokio-postgres do not accept as a space in URI parameters.
+            let sanitized = sanitize_for_verify_full(
+                "postgres://u@h/db?options=-c%20search_path%3Dtenant&sslmode=verify-full&sslrootcert=/etc/ca.pem",
+            );
+            assert_eq!(
+                sanitized, "postgres://u@h/db?options=-c%20search_path%3Dtenant&sslmode=require",
+                "raw components must be preserved verbatim"
+            );
+            // Dropping the only params leaves a clean URL with no `?`.
+            assert_eq!(
+                sanitize_for_verify_full("postgres://u@h/db?sslrootcert=/etc/ca.pem"),
+                "postgres://u@h/db"
+            );
+
+            let kv = sanitize_for_verify_full(
+                "host=h user=u sslmode=verify-full sslrootcert=/etc/ca.pem dbname=db",
+            );
+            assert_eq!(kv, "host=h user=u sslmode=require dbname=db");
+
+            // Whitespace/quoting variants normalize to a string
+            // tokio-postgres parses to the same parameters.
+            let kv = sanitize_for_verify_full(
+                r"host=h sslmode = 'verify-full' sslrootcert='/path with space/ca.pem' password='it\'s'",
+            );
+            assert_eq!(kv, r"host=h sslmode=require password='it\'s'");
+
+            // URL-like values must not push a keyword string onto the URL
+            // branch (which would pass it through unsanitized).
+            let kv = sanitize_for_verify_full(
+                "host=h password=https://secret sslmode=verify-full sslrootcert=/etc/ca.pem",
+            );
+            assert_eq!(kv, "host=h password=https://secret sslmode=require");
+        }
+
+        #[test]
+        fn verifying_connector_builds_with_and_without_root_cert_file() {
+            assert!(verifying_connector(None).is_ok());
+            assert!(
+                verifying_connector(Some("/nonexistent/ca.pem")).is_err(),
+                "an unreadable sslrootcert must fail loudly"
+            );
+        }
+
+        #[test]
+        fn relaxed_connector_builds() {
+            assert!(relaxed_connector().is_ok());
+        }
+    }
+}
+
+// ── Synchronous TLS-aware connections (migrations, wait checks) ───────────────
+
+/// A synchronous diesel Pg connection for migrations and startup wait
+/// checks, honoring the connection string's `sslmode` (issue #1585 review).
+///
+/// diesel's native [`diesel::PgConnection`] connects through libpq, and the
+/// workspace bundles libpq **without** SSL support (`pq-sys`'s
+/// `bundled_without_openssl`) — so with `sslmode=require`/`verify-full` the
+/// async pool (rustls) connects fine while the sync migration path fails at
+/// startup before the app ever serves. For those postures this wraps an
+/// [`AsyncPgConnection`] established through the pool's own rustls connector
+/// in diesel-async's [`AsyncConnectionWrapper`], which provides the full
+/// sync diesel API including `MigrationHarness`. With TLS off the native
+/// `PgConnection` path is kept byte-identical to the historical behavior.
+///
+/// [`AsyncConnectionWrapper`]:
+///     diesel_async::async_connection_wrapper::AsyncConnectionWrapper
+#[allow(clippy::large_enum_variant)] // short-lived, one per migration target
+pub(crate) enum MigrationConnection {
+    /// The historical libpq-backed connection (TLS posture `Off`).
+    Native(diesel::PgConnection),
+    /// rustls-backed sync wrapper (TLS posture `Require`/`VerifyFull`).
+    Rustls {
+        /// Runtime owning the connection's tokio driver task when none was
+        /// ambient (plain sync contexts like the CLI); `None` when an
+        /// ambient runtime drives it (`spawn_blocking` contexts). Callers
+        /// must keep this alive as long as `conn` — dropping the runtime
+        /// kills the driver and every query after that hangs or errors.
+        runtime: Option<tokio::runtime::Runtime>,
+        conn: diesel_async::async_connection_wrapper::AsyncConnectionWrapper<AsyncPgConnection>,
+    },
+}
+
+/// Whether migrations/wait checks for `database_url` must go through the
+/// rustls wrapper rather than the native libpq path. Split out of
+/// [`establish_migration_connection`] so the path selection is unit-testable
+/// without a server.
+fn migration_connection_needs_rustls(database_url: &str) -> bool {
+    !matches!(
+        tls::TlsPosture::from_database_url(database_url),
+        tls::TlsPosture::Off
+    )
+}
+
+/// Establish a [`MigrationConnection`] for `database_url`.
+///
+/// **Never call from an async executor thread**: the rustls arm `block_on`s
+/// connection setup. Sync contexts (the CLI) and `spawn_blocking` tasks (the
+/// startup migration path) are both fine.
+///
+/// # Errors
+///
+/// Returns the underlying [`diesel::ConnectionError`] when the connection
+/// cannot be established (including [`TlsPosture::Unsupported`] postures,
+/// which fail with their documented guidance).
+///
+/// [`TlsPosture::Unsupported`]: tls::TlsPosture::Unsupported
+pub(crate) fn establish_migration_connection(
+    database_url: &str,
+) -> Result<MigrationConnection, diesel::ConnectionError> {
+    use diesel::Connection as _;
+    if !migration_connection_needs_rustls(database_url) {
+        return diesel::PgConnection::establish(database_url).map(MigrationConnection::Native);
+    }
+    let posture = tls::TlsPosture::from_database_url(database_url);
+    // The driver task tokio::spawn()ed during establish must stay driven for
+    // the connection's lifetime: reuse the ambient runtime when there is one
+    // (spawn_blocking context), otherwise create one and keep it alive
+    // alongside the connection.
+    let (runtime, handle) = if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        (None, handle)
+    } else {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .map_err(|e| {
+                diesel::ConnectionError::BadConnection(format!(
+                    "failed to build a tokio runtime for the TLS migration connection: {e}"
+                ))
+            })?;
+        let handle = runtime.handle().clone();
+        (Some(runtime), handle)
+    };
+    let inner = handle.block_on(tls::establish(database_url, posture))?;
+    Ok(MigrationConnection::Rustls {
+        runtime,
+        conn: diesel_async::async_connection_wrapper::AsyncConnectionWrapper::from(inner),
+    })
+}
+
+#[cfg(test)]
+mod migration_connection_tests {
+    use super::migration_connection_needs_rustls;
+
+    #[test]
+    fn migration_path_selection_follows_the_tls_posture() {
+        // NoTls URLs keep the historical native libpq path byte-identical.
+        for url in [
+            "postgres://u@h/db",
+            "postgres://u@h/db?sslmode=disable",
+            "postgres://u@h/db?sslmode=prefer",
+            "host=db user=u",
+        ] {
+            assert!(
+                !migration_connection_needs_rustls(url),
+                "must stay on the native path: {url}"
+            );
+        }
+        // TLS-requiring strings (URL and keyword forms) — and unsupported
+        // postures, which must fail with the TLS module's guidance instead
+        // of libpq's — go through the rustls wrapper.
+        for url in [
+            "postgres://u@h/db?sslmode=require",
+            "postgres://u@h/db?sslmode=verify-full",
+            "postgres://u@h/db?sslmode=verify-full&sslrootcert=/etc/ca.pem",
+            "postgres://u@h/db?sslmode=verify-ca",
+            "host=db user=u sslmode=require",
+            "host=db sslmode = 'verify-full'",
+        ] {
+            assert!(
+                migration_connection_needs_rustls(url),
+                "must use the rustls wrapper: {url}"
+            );
+        }
     }
 }

@@ -3,27 +3,55 @@
 //! The generated scaffold provides the resource shape. The shipped example adds
 //! Tailwind styling, htmx affordances, tag filtering, and local-demo writes.
 //!
-//! # Active Search & Autocomplete (issue #768)
+//! # Widgets in use
 //!
-//! Two widget-driven routes are included to demonstrate the primitives:
+//! - **`data_table`** — renders the bookmark list as a semantic `<table>` with
+//!   typed columns (Title link, Tag link, Status badge, Edit action). Used in
+//!   the index, by-tag, and search-result views.
+//! - **`active_search`** — wires the search input to `/bookmarks/search` via
+//!   htmx; search results swap in a fresh `data_table`.
+//! - **`autocomplete_input`** — tag picker on the new/edit forms.
+//! - **`property_list`** — renders the detail view (`/bookmarks/{id}`) as a
+//!   semantic `<dl>` of labelled field values, replacing hand-rolled markup.
 //!
-//! - `GET /bookmarks/search?q=…` — returns a rendered partial of matching
-//!   bookmarks. The index page wires this up via [`autumn_web::widgets::active_search`].
-//! - `GET /bookmarks/tags/autocomplete?q=…` — returns matching tag option
-//!   partials. The new/edit forms wire this up via
-//!   [`autumn_web::widgets::autocomplete_input`].
-//!
-//! Both handlers are ordinary Autumn route handlers that return `Markup`.
-//! They own the Diesel query; the widgets own the htmx wiring.
+//! All four compose without special wiring, demonstrating the widget lane
+//! (data_table, active_search, autocomplete_input, property_list).
 
 use autumn_web::extract::{Form, Path};
+use autumn_web::form::Changeset;
 use autumn_web::prelude::*;
+use autumn_web::widgets::{Column, DataTableConfig, data_table, property_list};
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 
 use crate::models::bookmark::{Bookmark, NewBookmark};
 use crate::repositories::bookmark::{BookmarkRepository, PgBookmarkRepository};
 use crate::schema::bookmarks;
+
+/// Mirrors [`Bookmark`]'s validated fields (`url`, `title`) plus `tag` — the
+/// form shape submitted by the new/edit pages. Deriving `Validate` runs the
+/// same `#[validate(url)]`/`#[validate(length(...))]` rules declared on the
+/// model (issue #1124): a rejected submission re-renders the same form at
+/// `422` with every field preserved and an inline error next to the
+/// offending input, instead of a 400 dead-end with the user's input lost.
+#[derive(serde::Deserialize, serde::Serialize, Default, validator::Validate, Clone)]
+pub struct BookmarkForm {
+    #[validate(url)]
+    pub url: String,
+    #[validate(length(min = 1, max = 200))]
+    pub title: String,
+    pub tag: String,
+}
+
+impl From<&Bookmark> for BookmarkForm {
+    fn from(row: &Bookmark) -> Self {
+        Self {
+            url: row.url.clone(),
+            title: row.title.clone(),
+            tag: row.tag.clone(),
+        }
+    }
+}
 
 fn layout(title: &str, content: Markup) -> Markup {
     html! {
@@ -33,6 +61,7 @@ fn layout(title: &str, content: Markup) -> Markup {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { (title) " - Bookmarks" }
+                link rel="stylesheet" href=(autumn_web::ui::WIDGETS_CSS_PATH);
                 link rel="stylesheet" href="/static/css/autumn.css";
                 script src="/static/js/htmx.min.js" {}
                 script src=(autumn_web::AUTUMN_WIDGETS_JS_PATH) defer {}
@@ -54,41 +83,47 @@ fn layout(title: &str, content: Markup) -> Markup {
     }
 }
 
-fn bookmark_card(bookmark: &Bookmark) -> Markup {
-    html! {
-        li id=(format!("bookmark-{}", bookmark.id))
-           class="p-4 bg-white rounded shadow flex justify-between items-center gap-4" {
-            div {
-                a href=(bookmark.url) target="_blank"
+/// Column definitions shared by the index, by-tag, and search-result views.
+///
+/// Closures capture nothing from the outer scope, so the lifetime is `'static`.
+fn bookmark_columns() -> Vec<Column<'static, Bookmark>> {
+    vec![
+        Column::new("Title", |row: &Bookmark| {
+            html! {
+                a href=(row.url) target="_blank"
                    class="text-indigo-600 font-medium hover:underline" {
-                    (bookmark.title)
+                    (row.title)
                 }
-                a href=(format!("/bookmarks/tag/{}", bookmark.tag))
-                   class="ml-2 text-xs bg-gray-200 rounded px-2 py-0.5" {
-                    (bookmark.tag)
+            }
+        }),
+        Column::new("Tag", |row: &Bookmark| {
+            html! {
+                a href=(format!("/bookmarks/tag/{}", row.tag))
+                   class="text-xs bg-gray-200 rounded px-2 py-0.5" {
+                    (row.tag)
                 }
-                @if !bookmark.alive {
-                    span class="ml-2 text-xs bg-red-100 text-red-600 rounded px-2 py-0.5" {
+            }
+        }),
+        Column::new("Status", |row: &Bookmark| {
+            html! {
+                @if row.alive {
+                    span class="text-xs bg-green-100 text-green-700 rounded px-2 py-0.5" {
+                        "active"
+                    }
+                } @else {
+                    span class="text-xs bg-red-100 text-red-600 rounded px-2 py-0.5" {
                         "dead link"
                     }
                 }
             }
-            div class="flex items-center gap-3 text-sm" {
-                a href=(format!("/bookmarks/{}/edit", bookmark.id))
-                   class="text-gray-500 hover:text-gray-700" {
-                    "Edit"
-                }
-                button
-                    hx-delete=(format!("/api/bookmarks/{}", bookmark.id))
-                    hx-target=(format!("#bookmark-{}", bookmark.id))
-                    hx-swap="outerHTML"
-                    hx-confirm="Delete this bookmark?"
-                    class="text-red-500 hover:text-red-700" {
-                    "Delete"
-                }
+        }),
+        Column::new("", |row: &Bookmark| {
+            html! {
+                a href=(format!("/bookmarks/{}/edit", row.id))
+                   class="text-sm text-gray-500 hover:text-gray-700" { "Edit" }
             }
-        }
-    }
+        }),
+    ]
 }
 
 #[get("/bookmarks")]
@@ -101,6 +136,8 @@ pub async fn index(repo: PgBookmarkRepository) -> AutumnResult<Markup> {
     .placeholder("Search by title, URL, or tag…")
     .debounce(400)
     .min_length(2);
+    let columns = bookmark_columns();
+    let table_config = DataTableConfig::new("No bookmarks yet.").base_path("/bookmarks");
 
     Ok(layout(
         "All",
@@ -126,16 +163,9 @@ pub async fn index(repo: PgBookmarkRepository) -> AutumnResult<Markup> {
                     &search_config,
                 ))
             }
-            // ── Results (initial list; replaced by search partial) ────────
+            // ── Results (initial table; swapped in by search partial) ─────
             div id="bookmark-search-results" role="status" aria-live="polite" aria-atomic="true" {
-                ul class="space-y-3" {
-                    @for row in &rows {
-                        (bookmark_card(row))
-                    }
-                    @if rows.is_empty() {
-                        li class="text-gray-400 text-center py-8" { "No bookmarks yet." }
-                    }
-                }
+                (data_table(&rows, &columns, &table_config))
             }
         },
     ))
@@ -150,13 +180,37 @@ pub async fn show(id: Path<i64>, mut db: Db) -> AutumnResult<Markup> {
         .await
         .map_err(AutumnError::not_found)?;
 
+    let props: Vec<(&str, maud::Markup)> = vec![
+        ("Id", html! { (row.id) }),
+        ("Url", html! { a href=(&row.url) { (&row.url) } }),
+        ("Title", html! { (&row.title) }),
+        (
+            "Tag",
+            html! { a href=(format!("/bookmarks/tag/{}", row.tag)) { (&row.tag) } },
+        ),
+        ("Alive", html! { (row.alive.to_string()) }),
+        ("Created at", html! { (row.created_at.to_string()) }),
+    ];
     Ok(layout(
         &format!("Bookmark #{}", row.id),
         html! {
             div class="mb-6" {
                 a href="/bookmarks" class="text-sm text-indigo-600 hover:underline" { "Back to list" }
             }
-            (bookmark_card(&row))
+            (property_list(&props))
+            div class="flex gap-3 mt-6" {
+                a href=(format!("/bookmarks/{}/edit", row.id))
+                   class="bg-indigo-600 text-white px-4 py-2 rounded hover:bg-indigo-700 text-sm" {
+                    "Edit"
+                }
+                button
+                    hx-delete=(format!("/api/bookmarks/{}", row.id))
+                    hx-confirm="Delete this bookmark?"
+                    hx-on--after-request="if(event.detail.successful) window.location='/bookmarks'"
+                    class="bg-red-600 text-white px-4 py-2 rounded hover:bg-red-700 text-sm" {
+                    "Delete"
+                }
+            }
         },
     ))
 }
@@ -164,6 +218,9 @@ pub async fn show(id: Path<i64>, mut db: Db) -> AutumnResult<Markup> {
 #[get("/bookmarks/tag/{tag}")]
 pub async fn by_tag(Path(tag): Path<String>, repo: PgBookmarkRepository) -> AutumnResult<Markup> {
     let tagged = repo.find_by_tag(tag.clone()).await?;
+    let columns = bookmark_columns();
+    let table_config = DataTableConfig::new("No bookmarks with this tag.").base_path("/bookmarks");
+
     Ok(layout(
         &format!("#{tag}"),
         html! {
@@ -171,43 +228,34 @@ pub async fn by_tag(Path(tag): Path<String>, repo: PgBookmarkRepository) -> Autu
                 a href="/bookmarks" class="text-sm text-indigo-600 hover:underline" { "Back to all" }
                 h1 class="text-2xl font-bold mt-2" { "Tag: " (tag) }
             }
-            ul class="space-y-3" {
-                @for row in &tagged {
-                    (bookmark_card(row))
-                }
-                @if tagged.is_empty() {
-                    li class="text-gray-400 text-center py-8" { "No bookmarks with this tag." }
-                }
-            }
+            (data_table(&tagged, &columns, &table_config))
         },
     ))
 }
 
-#[get("/bookmarks/new")]
-pub async fn new_form() -> AutumnResult<Markup> {
+/// Shared new-bookmark form body (issue #1124): rendered both by the plain
+/// `GET /bookmarks/new` and by `create`'s `422` re-render, from a
+/// `Changeset<BookmarkForm>` — so a rejected submission shows the exact same
+/// form with every field preserved and an inline error next to the offending
+/// input, using the shipped changeset-aware `text_input` helper.
+fn new_bookmark_form(changeset: &Changeset<BookmarkForm>) -> Markup {
+    // Seed the widget from the changeset so a rejected submission (invalid
+    // url/title) doesn't silently drop a tag the user already typed.
+    let tag_value = changeset.field_value("tag").unwrap_or_default();
     let tag_ac =
         autumn_web::widgets::AutocompleteConfig::new("/bookmarks/tags/autocomplete", "tag")
             .placeholder("Search existing tags…")
             .min_length(1)
-            .free_text(); // tags are plain strings; allow typing a new tag
+            .free_text() // tags are plain strings; allow typing a new tag
+            .initial_value(&tag_value);
 
-    Ok(layout(
+    layout(
         "Add Bookmark",
         html! {
             h1 class="text-2xl font-bold mb-6" { "Add Bookmark" }
             form action="/bookmarks" method="post" class="space-y-4" {
-                div {
-                    label for="url" class="block text-sm font-medium" { "URL" }
-                    input type="url" id="url" name="url" required
-                          placeholder="https://example.com"
-                          class="w-full border rounded p-2 mt-1";
-                }
-                div {
-                    label for="title" class="block text-sm font-medium" { "Title" }
-                    input type="text" id="title" name="title" required
-                          placeholder="My favorite site"
-                          class="w-full border rounded p-2 mt-1";
-                }
+                (autumn_web::form::text_input(changeset, "url", "URL"))
+                (autumn_web::form::text_input(changeset, "title", "Title"))
                 // ── Tag autocomplete ──────────────────────────────────────
                 // The widget renders a hidden <input name="tag"> for the selected
                 // value and a <noscript><select name="tag"> for the no-JS path.
@@ -220,16 +268,55 @@ pub async fn new_form() -> AutumnResult<Markup> {
                 }
             }
         },
-    ))
+    )
+}
+
+#[get("/bookmarks/new")]
+pub async fn new_form() -> AutumnResult<Markup> {
+    Ok(new_bookmark_form(&Changeset::new(BookmarkForm::default())))
 }
 
 #[post("/bookmarks")]
 pub async fn create(
     repo: PgBookmarkRepository,
-    Form(new): Form<NewBookmark>,
-) -> AutumnResult<Redirect> {
+    Form(form): Form<BookmarkForm>,
+) -> AutumnResult<autumn_web::reexports::axum::response::Response> {
+    let changeset = form.into_changeset();
+    if !changeset.is_valid() {
+        return Ok((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            new_bookmark_form(&changeset),
+        )
+            .into_response());
+    }
+    let data = changeset.into_inner();
+    let new = NewBookmark {
+        url: data.url,
+        title: data.title,
+        tag: data.tag,
+    };
     repo.save(&new).await?;
-    Ok(Redirect::to("/bookmarks"))
+    Ok(Redirect::to("/bookmarks").into_response())
+}
+
+/// Shared edit-bookmark form body — see [`new_bookmark_form`]'s doc comment;
+/// the same reasoning applies to `update`'s `422` re-render.
+fn edit_bookmark_form(id: i64, changeset: &Changeset<BookmarkForm>) -> Markup {
+    layout(
+        &format!("Edit Bookmark #{id}"),
+        html! {
+            h1 class="text-2xl font-bold mb-6" { "Edit Bookmark" }
+            form action=(format!("/bookmarks/{id}/update")) method="post" class="space-y-4" {
+                (autumn_web::form::text_input(changeset, "url", "URL"))
+                (autumn_web::form::text_input(changeset, "title", "Title"))
+                (autumn_web::form::text_input(changeset, "tag", "Tag"))
+                button type="submit"
+                       class="bg-indigo-600 text-white px-6 py-2 rounded hover:bg-indigo-700" {
+                    "Save"
+                }
+            }
+        },
+    )
 }
 
 #[get("/bookmarks/{id}/edit")]
@@ -241,35 +328,9 @@ pub async fn edit_form(id: Path<i64>, mut db: Db) -> AutumnResult<Markup> {
         .await
         .map_err(AutumnError::not_found)?;
 
-    Ok(layout(
-        &format!("Edit Bookmark #{}", row.id),
-        html! {
-            h1 class="text-2xl font-bold mb-6" { "Edit Bookmark" }
-            form action=(format!("/bookmarks/{}/update", row.id)) method="post" class="space-y-4" {
-                div {
-                    label for="url" class="block text-sm font-medium" { "URL" }
-                    input type="url" id="url" name="url" required
-                          value=(row.url)
-                          class="w-full border rounded p-2 mt-1";
-                }
-                div {
-                    label for="title" class="block text-sm font-medium" { "Title" }
-                    input type="text" id="title" name="title" required
-                          value=(row.title)
-                          class="w-full border rounded p-2 mt-1";
-                }
-                div {
-                    label for="tag" class="block text-sm font-medium" { "Tag" }
-                    input type="text" id="tag" name="tag" required
-                          value=(row.tag)
-                          class="w-full border rounded p-2 mt-1";
-                }
-                button type="submit"
-                       class="bg-indigo-600 text-white px-6 py-2 rounded hover:bg-indigo-700" {
-                    "Save"
-                }
-            }
-        },
+    Ok(edit_bookmark_form(
+        row.id,
+        &Changeset::new(BookmarkForm::from(&row)),
     ))
 }
 
@@ -277,13 +338,22 @@ pub async fn edit_form(id: Path<i64>, mut db: Db) -> AutumnResult<Markup> {
 pub async fn update(
     id: Path<i64>,
     mut db: Db,
-    Form(form): Form<NewBookmark>,
-) -> AutumnResult<Redirect> {
+    Form(form): Form<BookmarkForm>,
+) -> AutumnResult<autumn_web::reexports::axum::response::Response> {
+    let changeset = form.into_changeset();
+    if !changeset.is_valid() {
+        return Ok((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            edit_bookmark_form(*id, &changeset),
+        )
+            .into_response());
+    }
+    let data = changeset.into_inner();
     let updated = diesel::update(bookmarks::table.find(*id))
         .set((
-            bookmarks::url.eq(form.url.clone()),
-            bookmarks::title.eq(form.title.clone()),
-            bookmarks::tag.eq(form.tag.clone()),
+            bookmarks::url.eq(data.url),
+            bookmarks::title.eq(data.title),
+            bookmarks::tag.eq(data.tag),
         ))
         .execute(&mut *db)
         .await?;
@@ -295,7 +365,7 @@ pub async fn update(
         )));
     }
 
-    Ok(Redirect::to(&format!("/bookmarks/{}", *id)))
+    Ok(Redirect::to(&format!("/bookmarks/{}", *id)).into_response())
 }
 
 // ── Active search handler ─────────────────────────────────────────────────────
@@ -314,7 +384,7 @@ fn escape_like(s: &str) -> String {
         .replace('_', "\\_")
 }
 
-/// Active search handler — returns a `<ul>` partial of matching bookmarks.
+/// Active search handler — returns a `data_table` partial of matching bookmarks.
 ///
 /// Wired up by [`autumn_web::widgets::active_search_input`] on the index page.
 /// Works equally well without JavaScript (direct GET form submission).
@@ -339,17 +409,17 @@ pub async fn search(Query(params): Query<SearchQuery>, mut db: Db) -> AutumnResu
         .load(&mut *db)
         .await?;
 
-    Ok(html! {
-        @if results.is_empty() {
-            (autumn_web::widgets::active_search_empty_state("No bookmarks match your search."))
-        } @else {
-            ul class="space-y-3" {
-                @for row in &results {
-                    (bookmark_card(row))
-                }
-            }
-        }
-    })
+    if results.is_empty() {
+        return Ok(autumn_web::widgets::active_search_empty_state(
+            "No bookmarks match your search.",
+        ));
+    }
+    let columns = bookmark_columns();
+    Ok(data_table(
+        &results,
+        &columns,
+        &DataTableConfig::new("").base_path("/bookmarks"),
+    ))
 }
 
 // ── Tag autocomplete handler ──────────────────────────────────────────────────

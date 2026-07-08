@@ -115,14 +115,25 @@ vendor_in_tree_autumn_web() {
   # workspace root, so these crate dirs are source-only and cheap to copy.
   cp -R "${REPO_ROOT}/autumn" "${vendor_dir}/autumn"
   cp -R "${REPO_ROOT}/autumn-macros" "${vendor_dir}/autumn-macros"
+  cp -R "${REPO_ROOT}/autumn-cli" "${vendor_dir}/autumn-cli"
   # Drop any stray build artifacts so the context stays small and deterministic.
-  rm -rf "${vendor_dir}/autumn/target" "${vendor_dir}/autumn-macros/target"
+  rm -rf "${vendor_dir}/autumn/target" "${vendor_dir}/autumn-macros/target" \
+         "${vendor_dir}/autumn-cli/target"
+  # Copy the monorepo Cargo.lock into vendor/ so `cargo install --locked` inside
+  # Docker uses the same pinned dependency versions as the main workspace (e.g.
+  # time=0.3.47, which is compatible with cookie-0.18.1; free resolution picks
+  # time=0.3.52 which broke the time::parse() API).
+  cp "${REPO_ROOT}/Cargo.lock" "${vendor_dir}/Cargo.lock"
 
   # A workspace root so the vendored crates' `*.workspace = true` keys,
   # `[workspace.dependencies]`, and `[workspace.lints]` resolve exactly as in the
-  # real tree. Derived from the real root manifest (members trimmed to the two
+  # real tree. Derived from the real root manifest (members trimmed to the three
   # vendored crates) so it stays in sync automatically.
-  sed 's|^members = \[.*\]|members = ["autumn", "autumn-macros"]|' \
+  # autumn-cli is included so that `cargo install --path ./vendor/autumn-cli` (used
+  # by inject_local_autumn_binary) resolves workspace dependencies correctly and
+  # compiles inside Docker against the builder's glibc — avoiding the glibc version
+  # mismatch that arises when copying a runner-built binary into the container.
+  sed 's|^members = \[.*\]|members = ["autumn", "autumn-macros", "autumn-cli"]|' \
     "${REPO_ROOT}/Cargo.toml" > "${vendor_dir}/Cargo.toml"
 
   # The scaffold's own Cargo.toml declares an (empty) `[workspace]`, which makes
@@ -157,6 +168,20 @@ TOML
 stage_vendor_before_chef_cook() {
   sed -i \
     's|^COPY --from=planner /app/recipe.json recipe.json$|COPY --from=planner /app/vendor vendor\nCOPY --from=planner /app/recipe.json recipe.json|' \
+    "${PROJECT_DIR}/Dockerfile"
+}
+
+# Patch the generated Dockerfile to install autumn-cli from the vendored in-tree
+# source rather than from crates.io. This avoids the glibc version mismatch that
+# arises when a runner-built binary is copied into the Docker builder container
+# (the runner may link against a newer glibc than the Debian Bookworm base image),
+# and ensures sub-commands like `autumn build --embed` that post-date the last
+# published release are available inside the build.  The generated Dockerfile is
+# unchanged from what users receive.
+inject_local_autumn_binary() {
+  log "Patching Dockerfile to install autumn-cli from in-tree vendor source"
+  sed -i \
+    's|^RUN cargo install --locked autumn-cli.*$|RUN cargo install --locked --path ./vendor/autumn-cli|' \
     "${PROJECT_DIR}/Dockerfile"
 }
 
@@ -226,6 +251,7 @@ run_default_target() {
   log "release init (bare/default target)"
   ( cd "${PROJECT_DIR}" && "${AUTUMN}" release init --force )
   stage_vendor_before_chef_cook
+  inject_local_autumn_binary
 
   log "docker build the generated image"
   if ! ( cd "${PROJECT_DIR}" && docker build -t "${IMAGE_TAG}" . 2>&1 | tee "${WORKDIR}/build.log" ); then
@@ -275,6 +301,7 @@ run_compose_target() {
   log "release init --target docker-compose"
   ( cd "${PROJECT_DIR}" && "${AUTUMN}" release init --force --target docker-compose )
   stage_vendor_before_chef_cook
+  inject_local_autumn_binary
 
   # The generated compose app runs in the prod profile, which requires a
   # non-empty trusted-host allowlist to bind. Inject it (and a signing secret)

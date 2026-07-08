@@ -941,6 +941,8 @@ Autumn uses a five-layer configuration system:
 host = "127.0.0.1"          # default
 port = 3000                  # default
 shutdown_timeout_secs = 30   # default, seconds to drain in-flight requests
+# max_concurrent_requests = 256 # unset by default (unlimited); caps in-flight
+                               # requests, shedding the excess with a 503
 
 [database]
 primary_url = "postgres://user:pass@localhost:5432/my_app"
@@ -974,6 +976,7 @@ Every config field can be overridden via environment variables. The pattern is
 | `AUTUMN_SERVER__PORT`                | `server.port`          |
 | `AUTUMN_SERVER__HOST`                | `server.host`          |
 | `AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS` | `server.shutdown_timeout_secs` |
+| `AUTUMN_SERVER__MAX_CONCURRENT_REQUESTS` | `server.max_concurrent_requests` |
 | `AUTUMN_DATABASE__URL`               | `database.url`         |
 | `AUTUMN_DATABASE__PRIMARY_URL`       | `database.primary_url` |
 | `AUTUMN_DATABASE__REPLICA_URL`       | `database.replica_url` |

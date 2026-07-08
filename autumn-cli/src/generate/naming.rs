@@ -37,14 +37,12 @@ pub fn snake_to_pascal(s: &str) -> String {
 /// Naive English pluraliser, intentionally limited to the cases that come up
 /// in identifier-shaped words (table names, route paths, file names).
 ///
-/// Rules, in order:
-/// 1. Already pluralisable irregulars handled explicitly.
-/// 2. Words ending in `s|x|z|ch|sh` → +`es`.
-/// 3. Words ending in consonant + `y` → strip `y`, add `ies`.
-/// 4. Otherwise → +`s`.
-///
-/// All input is treated as a single ASCII identifier (`snake_case` chunks
-/// are pluralised on the *last* chunk only — `blog_post` → `blog_posts`).
+/// Word-level rules (irregulars, sibilant endings, consonant+`y`) live in
+/// [`autumn_web::format::pluralize_word`], shared with the view-layer
+/// `pluralize` template helper so generated identifiers and rendered page
+/// text agree. This wraps it with `snake_case` segment-splitting: all input
+/// is treated as a single ASCII identifier, pluralised on the *last* chunk
+/// only — `blog_post` → `blog_posts`.
 #[must_use]
 pub fn pluralize(s: &str) -> String {
     if s.is_empty() {
@@ -53,42 +51,7 @@ pub fn pluralize(s: &str) -> String {
     let (prefix, last) = s
         .rfind('_')
         .map_or(("", s), |idx| (&s[..=idx], &s[idx + 1..]));
-    format!("{prefix}{}", pluralize_word(last))
-}
-
-fn pluralize_word(s: &str) -> String {
-    if s.is_empty() {
-        return String::new();
-    }
-    // Irregulars covering the most common identifiers we see in practice.
-    match s {
-        "person" => return "people".into(),
-        "child" => return "children".into(),
-        "man" => return "men".into(),
-        "woman" => return "women".into(),
-        "mouse" => return "mice".into(),
-        "goose" => return "geese".into(),
-        _ => {}
-    }
-    let lower = s.to_ascii_lowercase();
-    if lower.ends_with("ss")
-        || lower.ends_with('x')
-        || lower.ends_with('z')
-        || lower.ends_with("ch")
-        || lower.ends_with("sh")
-    {
-        return format!("{s}es");
-    }
-    if lower.ends_with('y') {
-        // consonant + y → ies
-        let prev = s.chars().rev().nth(1);
-        if prev.is_some_and(|c| !"aeiou".contains(c)) {
-            let mut out: String = s.chars().take(s.chars().count() - 1).collect();
-            out.push_str("ies");
-            return out;
-        }
-    }
-    format!("{s}s")
+    format!("{prefix}{}", autumn_web::format::pluralize_word(last))
 }
 
 /// Convert a resource name from any reasonable casing into `snake_case`.
@@ -111,6 +74,26 @@ pub fn pascal(s: &str) -> String {
     } else {
         s.to_owned()
     }
+}
+
+/// Humanize a `snake_case`/`kebab-case` token into a display label:
+/// split on `_`/`-`, then title-case each word (`in_review` → `In Review`).
+///
+/// Shared by the admin generator's `--select` widget and the scaffold
+/// generator's `enum{…}` field `<select>` widget, so both render the same
+/// label for the same value.
+#[must_use]
+pub fn humanize_label(value: &str) -> String {
+    value
+        .split(['_', '-'])
+        .map(|word| {
+            let mut chars = word.chars();
+            chars.next().map_or_else(String::new, |c| {
+                c.to_uppercase().collect::<String>() + chars.as_str()
+            })
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[cfg(test)]
@@ -194,5 +177,12 @@ mod tests {
     #[test]
     fn pascal_normalises_snake() {
         assert_eq!(pascal("blog_post"), "BlogPost");
+    }
+
+    #[test]
+    fn humanize_label_title_cases_snake_case() {
+        assert_eq!(humanize_label("draft"), "Draft");
+        assert_eq!(humanize_label("in_review"), "In Review");
+        assert_eq!(humanize_label("archived-old"), "Archived Old");
     }
 }

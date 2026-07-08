@@ -70,24 +70,11 @@ ok "catalog file found"
 echo ""
 
 # ---------------------------------------------------------------------------
-# Helper: extract cataloged example names by tier from EXAMPLES.md
-# Each marker line has the form:
-#   <!-- catalog:example name=<dir> tier=<tier> -->
+# Helper: extract cataloged example names by tier from EXAMPLES.md — shared
+# with scripts/check-examples-e2e.sh via scripts/lib/catalog.sh so the
+# marker-format regex lives in exactly one place.
 # ---------------------------------------------------------------------------
-catalog_names_by_tier() {
-  local tier="$1"
-  grep -E "<!-- catalog:example name=[^ ]+ tier=${tier}" "$CATALOG" \
-    | grep -oE 'name=[^ >]+' \
-    | sed 's/name=//' \
-    || true
-}
-
-all_catalog_names() {
-  grep -E "<!-- catalog:example name=" "$CATALOG" \
-    | grep -oE 'name=[^ >]+' \
-    | sed 's/name=//' \
-    || true
-}
+source "$root/scripts/lib/catalog.sh"
 
 # ---------------------------------------------------------------------------
 # 1. Every examples/ directory must be cataloged
@@ -95,7 +82,7 @@ all_catalog_names() {
 echo "==> Checking every examples/ directory is cataloged"
 
 mapfile -t example_dirs < <(find "$EXAMPLES_DIR" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort)
-mapfile -t catalog_all < <(all_catalog_names | sort)
+mapfile -t catalog_all < <(all_catalog_names "$CATALOG" | sort)
 
 for dir in "${example_dirs[@]}"; do
   if printf '%s\n' "${catalog_all[@]}" | grep -qx "$dir"; then
@@ -126,7 +113,7 @@ mapfile -t workspace_examples < <(
     | sed 's|examples/||' \
     | sort
 )
-mapfile -t catalog_supported < <(catalog_names_by_tier "supported" | sort)
+mapfile -t catalog_supported < <(catalog_names_by_tier "$CATALOG" "supported" | sort)
 
 for member in "${workspace_examples[@]}"; do
   if printf '%s\n' "${catalog_supported[@]}" | grep -qx "$member"; then
@@ -236,9 +223,9 @@ echo ""
 # ---------------------------------------------------------------------------
 echo "==> Catalog summary by support tier"
 
-mapfile -t _supported_summary  < <(catalog_names_by_tier "supported"    | sort)
-mapfile -t _exp_summary        < <(catalog_names_by_tier "experimental" | sort)
-mapfile -t _excl_summary       < <(catalog_names_by_tier "excluded"     | sort)
+mapfile -t _supported_summary  < <(catalog_names_by_tier "$CATALOG" "supported"    | sort)
+mapfile -t _exp_summary        < <(catalog_names_by_tier "$CATALOG" "experimental" | sort)
+mapfile -t _excl_summary       < <(catalog_names_by_tier "$CATALOG" "excluded"     | sort)
 
 _count_supported=${#_supported_summary[@]}
 echo ""

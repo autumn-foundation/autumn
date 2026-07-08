@@ -1,0 +1,6 @@
+{
+  "build": {
+    "beforeBuildCommand": "bash src-tauri/stage-sidecar.sh",
+    "beforeDevCommand": { "script": "bash src-tauri/stage-sidecar.sh", "wait": true }
+  }
+}

@@ -1,0 +1,23 @@
+[package]
+name = "reddit-clone-desktop"
+version = "0.0.1"
+edition = "2021"
+
+# Standalone workspace so this crate is independent from the autumn app workspace —
+# no change to the root Cargo.toml is needed.
+[workspace]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-shell = "2"
+getrandom = { version = "0.2", features = ["std"] }
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

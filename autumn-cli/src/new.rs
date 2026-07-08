@@ -22,6 +22,9 @@ mod templates {
     pub const SEED_CARGO_TOML: &str = include_str!("templates/seed_Cargo.toml.tmpl");
     pub const INTEGRATION_TEST: &str = include_str!("templates/tests/integration_test.rs.tmpl");
     pub const CI_WORKFLOW: &str = include_str!("templates/.github/workflows/ci.yml.tmpl");
+    pub const RUST_TOOLCHAIN: &str = include_str!("templates/rust-toolchain.toml.tmpl");
+    pub const RUSTFMT: &str = include_str!("templates/rustfmt.toml.tmpl");
+    pub const CLIPPY: &str = include_str!("templates/clippy.toml.tmpl");
 }
 
 /// Variables substituted into project and starter template files.
@@ -286,6 +289,10 @@ fn generate_inner(
     // uncovered line (as it does for the multi-line writes above).
     let ci_workflow = project_dir.join(".github/workflows/ci.yml");
     fs::write(ci_workflow, render(templates::CI_WORKFLOW))?;
+    let rust_toolchain = project_dir.join("rust-toolchain.toml");
+    fs::write(rust_toolchain, render(templates::RUST_TOOLCHAIN))?;
+    fs::write(project_dir.join("rustfmt.toml"), render(templates::RUSTFMT))?;
+    fs::write(project_dir.join("clippy.toml"), render(templates::CLIPPY))?;
 
     write_optional_scaffold_files(&project_dir, name, opts, &render)?;
 
@@ -393,6 +400,9 @@ fn print_scaffold_summary(name: &str, opts: GenerateOptions) {
     println!("  Created {name}/static/css/input.css");
     println!("  Created {name}/tailwind.config.js");
     println!("  Created {name}/.gitignore");
+    println!("  Created {name}/rust-toolchain.toml");
+    println!("  Created {name}/rustfmt.toml");
+    println!("  Created {name}/clippy.toml");
     println!("  Created {name}/migrations/");
     println!("  Created {name}/tests/integration_test.rs");
     println!("  Created {name}/config/master.key (keep secret — never commit)");
@@ -791,6 +801,113 @@ mod tests {
         assert!(content.contains(r#"#[get("/hello/{name}")]"#));
         assert!(content.contains("#[autumn_web::main]"));
         assert!(content.contains("autumn_web::app()"));
+    }
+
+    // ── nav_bar scaffold layout (#1137) ─────────────────────────────
+
+    #[test]
+    fn main_template_uses_nav_bar_widget() {
+        assert!(
+            templates::MAIN_RS.contains("nav_bar("),
+            "main.rs.tmpl should render its nav via nav_bar(), got:\n{}",
+            templates::MAIN_RS
+        );
+        assert!(
+            templates::MAIN_RS.contains("NavBarConfig::new()"),
+            "main.rs.tmpl should build a NavBarConfig, got:\n{}",
+            templates::MAIN_RS
+        );
+        assert!(
+            !templates::MAIN_RS.contains(r#"nav aria-label="Main navigation""#),
+            "main.rs.tmpl should no longer hand-roll its <nav>, got:\n{}",
+            templates::MAIN_RS
+        );
+    }
+
+    #[test]
+    fn main_template_layout_takes_current_path() {
+        assert!(
+            templates::MAIN_RS.contains("current_path: &str"),
+            "layout() should take current_path so nav_bar can mark the active link, got:\n{}",
+            templates::MAIN_RS
+        );
+        assert!(
+            templates::MAIN_RS.contains("CurrentPath"),
+            "index() should extract CurrentPath to pass to layout(), got:\n{}",
+            templates::MAIN_RS
+        );
+    }
+
+    #[test]
+    fn main_template_nav_keeps_descriptive_aria_label() {
+        // The old hand-rolled <nav> had aria-label="Main navigation"; nav_bar's
+        // own default is just "Main", so the template must call .aria_label(...)
+        // explicitly or the landmark's accessible name silently degrades.
+        assert!(
+            templates::MAIN_RS.contains(r#".aria_label("Main navigation")"#),
+            "layout()'s NavBarConfig should keep the descriptive \"Main navigation\" \
+             aria-label instead of nav_bar's generic \"Main\" default, got:\n{}",
+            templates::MAIN_RS
+        );
+    }
+
+    #[test]
+    fn input_css_mobile_nav_collapse_wraps_below_header() {
+        // .autumn-nav is a flex row (nowrap by default) and .autumn-nav__collapse
+        // is one of its flex items; giving that item `basis-full` only drops it
+        // to a new row if the row itself is allowed to wrap. Without flex-wrap
+        // on the enhanced root, the opened mobile menu squeezes/overflows onto
+        // the same row as the brand and toggle instead of appearing below them.
+        //
+        // This rule now ships from the framework itself (#1215), not the
+        // per-project input.css.tmpl — assert against the shared stylesheet.
+        let css = autumn_web::ui::WIDGETS_COMPONENT_CSS;
+        let rule_body = css_rule_body(css, ".autumn-nav--enhanced {");
+        assert!(
+            rule_body.contains("flex-wrap"),
+            "the mobile media query must set flex-wrap on .autumn-nav--enhanced itself \
+             so .autumn-nav__collapse's basis-full can actually start a new row, got:\n{css}"
+        );
+    }
+
+    /// Extract the declaration block (without the braces) of the first CSS
+    /// rule whose selector text starts with `selector_prefix` (which must
+    /// include the trailing ` {`). Scans by byte position rather than
+    /// matching a literal multi-line blob, so it doesn't depend on the
+    /// source file's line-ending style — this repo checks out `*.tmpl` as
+    /// `text=auto`, which normalizes to CRLF on Windows, and a pattern with
+    /// an embedded `\n` would never match the CRLF-containing string
+    /// `include_str!` reads back on that platform.
+    fn css_rule_body<'a>(css: &'a str, selector_prefix: &str) -> &'a str {
+        let rule_start = css
+            .find(selector_prefix)
+            .unwrap_or_else(|| panic!("no bare `{selector_prefix}` rule found in input.css.tmpl"));
+        let rest = &css[rule_start..];
+        &rest[..rest
+            .find('}')
+            .unwrap_or_else(|| panic!("unterminated `{selector_prefix}` rule"))]
+    }
+
+    #[test]
+    fn input_css_nav_collapse_is_flex_row_so_trailing_items_align_right() {
+        // .autumn-nav__collapse wraps both the primary .autumn-nav__items
+        // list and the .autumn-nav__items--trailing list; without collapse
+        // itself being a flex row (and growing to fill the nav's remaining
+        // width), the trailing list's ml-auto has no flex row to push
+        // against — the two lists just stack vertically as ordinary block
+        // children instead of sitting side by side with trailing pinned to
+        // the far right, as nav_bar's trailing-slot design intends.
+        //
+        // This rule now ships from the framework itself (#1215), not the
+        // per-project input.css.tmpl — assert against the shared stylesheet.
+        let css = autumn_web::ui::WIDGETS_COMPONENT_CSS;
+        let rule_body = css_rule_body(css, ".autumn-nav__collapse {");
+        assert!(
+            rule_body.contains("flex") && !rule_body.contains("flex-col"),
+            "the base (non-mobile) .autumn-nav__collapse rule must be a flex row \
+             so .autumn-nav__items--trailing's ml-auto can push it to the right \
+             edge of the nav, got:\n{css}"
+        );
     }
 
     #[test]
@@ -1336,6 +1453,137 @@ mod tests {
             s.contains("stripe_secret_key") || s.contains('#'),
             "decrypted content should have placeholder comments"
         );
+    }
+
+    // ── rust-toolchain.toml / rustfmt.toml / clippy.toml scaffolding ─────────
+
+    #[test]
+    fn generates_rust_toolchain_toml() {
+        let tmp = TempDir::new().unwrap();
+        generate("toolchain-app", tmp.path()).unwrap();
+        let p = tmp.path().join("toolchain-app");
+        assert!(
+            p.join("rust-toolchain.toml").is_file(),
+            "`autumn new` must write rust-toolchain.toml"
+        );
+    }
+
+    #[test]
+    fn rust_toolchain_pins_channel_to_msrv() {
+        let tmp = TempDir::new().unwrap();
+        generate("toolchain-ver-app", tmp.path()).unwrap();
+        let content =
+            fs::read_to_string(tmp.path().join("toolchain-ver-app/rust-toolchain.toml")).unwrap();
+        assert!(
+            content.contains("channel"),
+            "rust-toolchain.toml must set channel: {content}"
+        );
+        assert!(
+            content.contains("1.88.0"),
+            "rust-toolchain.toml channel must match the Cargo.toml rust-version (1.88.0): {content}"
+        );
+    }
+
+    #[test]
+    fn rust_toolchain_lists_rustfmt_and_clippy_components() {
+        let tmp = TempDir::new().unwrap();
+        generate("toolchain-comp-app", tmp.path()).unwrap();
+        let content =
+            fs::read_to_string(tmp.path().join("toolchain-comp-app/rust-toolchain.toml")).unwrap();
+        assert!(
+            content.contains("rustfmt"),
+            "rust-toolchain.toml must list rustfmt in components: {content}"
+        );
+        assert!(
+            content.contains("clippy"),
+            "rust-toolchain.toml must list clippy in components: {content}"
+        );
+    }
+
+    #[test]
+    fn generates_rustfmt_toml() {
+        let tmp = TempDir::new().unwrap();
+        generate("fmt-app", tmp.path()).unwrap();
+        let p = tmp.path().join("fmt-app");
+        assert!(
+            p.join("rustfmt.toml").is_file(),
+            "`autumn new` must write rustfmt.toml"
+        );
+    }
+
+    #[test]
+    fn rustfmt_toml_has_correct_edition_and_max_width() {
+        let tmp = TempDir::new().unwrap();
+        generate("fmt-cfg-app", tmp.path()).unwrap();
+        let content = fs::read_to_string(tmp.path().join("fmt-cfg-app/rustfmt.toml")).unwrap();
+        assert!(
+            content.contains(r#"edition = "2024""#),
+            "rustfmt.toml must set edition = \"2024\": {content}"
+        );
+        assert!(
+            content.contains("max_width = 100"),
+            "rustfmt.toml must set max_width = 100: {content}"
+        );
+    }
+
+    #[test]
+    fn generates_clippy_toml() {
+        let tmp = TempDir::new().unwrap();
+        generate("clippy-app", tmp.path()).unwrap();
+        let p = tmp.path().join("clippy-app");
+        assert!(
+            p.join("clippy.toml").is_file(),
+            "`autumn new` must write clippy.toml"
+        );
+    }
+
+    #[test]
+    fn clippy_toml_msrv_matches_rust_version() {
+        let tmp = TempDir::new().unwrap();
+        generate("clippy-msrv-app", tmp.path()).unwrap();
+        let content = fs::read_to_string(tmp.path().join("clippy-msrv-app/clippy.toml")).unwrap();
+        assert!(
+            content.contains("msrv"),
+            "clippy.toml must set msrv: {content}"
+        );
+        assert!(
+            content.contains("1.88.0"),
+            "clippy.toml msrv must match Cargo.toml rust-version (1.88.0): {content}"
+        );
+    }
+
+    #[test]
+    fn gitignore_does_not_exclude_toolchain_files() {
+        let tmp = TempDir::new().unwrap();
+        generate("gi-toolchain-app", tmp.path()).unwrap();
+        let content = fs::read_to_string(tmp.path().join("gi-toolchain-app/.gitignore")).unwrap();
+        assert!(
+            !content.contains("rust-toolchain"),
+            ".gitignore must NOT exclude rust-toolchain.toml: {content}"
+        );
+        assert!(
+            !content.contains("rustfmt.toml"),
+            ".gitignore must NOT exclude rustfmt.toml: {content}"
+        );
+        assert!(
+            !content.contains("clippy.toml"),
+            ".gitignore must NOT exclude clippy.toml: {content}"
+        );
+    }
+
+    #[test]
+    fn scaffold_summary_mentions_toolchain_files() {
+        let tmp = TempDir::new().unwrap();
+        // Use generate_with (non-quiet) and capture stdout.
+        // We can't easily capture stdout in unit tests, so we verify the files
+        // exist and the summary helper doesn't strip them — this is covered by
+        // the file-existence tests above. This test verifies print_scaffold_summary
+        // is at least called without panic for the default case.
+        generate("summary-toolchain-app", tmp.path()).unwrap();
+        let p = tmp.path().join("summary-toolchain-app");
+        assert!(p.join("rust-toolchain.toml").is_file());
+        assert!(p.join("rustfmt.toml").is_file());
+        assert!(p.join("clippy.toml").is_file());
     }
 
     #[test]

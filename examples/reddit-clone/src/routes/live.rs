@@ -211,3 +211,13 @@ pub async fn posts_stream(
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, std::convert::Infallible>>> {
     autumn_web::sse::stream(&state, "posts")
 }
+
+/// SSE endpoint for subreddit-specific post OOB updates.
+#[get("/r/{slug}/posts/stream")]
+pub async fn subreddit_posts_stream(
+    State(state): State<AppState>,
+    slug: Path<String>,
+) -> Sse<impl tokio_stream::Stream<Item = Result<Event, std::convert::Infallible>>> {
+    let topic = format!("posts:r/{}", *slug);
+    autumn_web::sse::stream(&state, &topic)
+}

@@ -74,6 +74,9 @@ impl HealthIndicator for LiveFeedRelayIndicator {
     }
 }
 
+#[cfg(feature = "embed-assets")]
+static EMBEDDED_STATIC: autumn_web::include_dir::Dir = autumn_web::embed_static!();
+
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
 
 #[autumn_web::main]
@@ -92,7 +95,7 @@ async fn main() {
     // assignments survive restarts and you can conclude experiments from the DB.
     let experiment_svc = experiments::setup();
 
-    autumn_web::app()
+    let app = autumn_web::app()
         .migrations(autumn_web::migrate::FRAMEWORK_MIGRATIONS)
         .migrations(MIGRATIONS)
         .with_flag_store(flag_store)
@@ -123,6 +126,7 @@ async fn main() {
             routes::posts::show,
             routes::posts::edit_form,
             routes::posts::update,
+            routes::posts::manage_tags,
             routes::posts::delete_post,
             routes::comments::create,
             routes::comments::list_comments,
@@ -134,6 +138,7 @@ async fn main() {
             routes::live::subreddit_viewers,
             routes::live::subreddit_viewer_stream,
             routes::live::posts_stream,
+            routes::live::subreddit_posts_stream,
             repositories::subreddit_api_list,
             repositories::subreddit_api_get,
             repositories::post_api_list,
@@ -161,7 +166,10 @@ async fn main() {
         // Gates /ready (IndicatorGroup::Readiness by default), so a degraded relay
         // will block rolling deploys until it recovers.
         .health_indicator("live_feed_relay", Arc::new(LiveFeedRelayIndicator))
-        .idempotent()
-        .run()
-        .await;
+        .idempotent();
+
+    #[cfg(feature = "embed-assets")]
+    let app = app.embedded_static(&EMBEDDED_STATIC);
+
+    app.run().await;
 }
