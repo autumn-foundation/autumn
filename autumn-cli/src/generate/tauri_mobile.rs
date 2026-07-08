@@ -519,7 +519,7 @@ fn table_default_features(table: &toml::value::Table) -> Option<bool> {
 
 /// Resolve the app's `autumn-web` dependency VALUE, following
 /// `workspace = true` inheritance to the `[workspace.dependencies]` table of
-/// the nearest ancestor manifest that declares it. Returns the value, the
+/// the app's EFFECTIVE workspace root. Returns the value, the
 /// directory of the manifest that declared it (relative `path` sources
 /// resolve against that directory), and — for workspace-inherited deps — the
 /// MEMBER-level `default-features` setting, which the resolved workspace
@@ -551,18 +551,29 @@ fn resolve_app_autumn_web_value(
         // Capture the member-level default-features BEFORE the member table
         // is replaced by the workspace entry.
         let member_default_features = table_default_features(t);
-        // Workspace-inherited: find the same dependency KEY in this
-        // manifest's or the nearest ancestor's [workspace.dependencies].
-        let mut dir: Option<&Path> = Some(project_root);
-        while let Some(d) = dir {
-            if let Some(v) = parse(d)
-                .as_ref()
-                .and_then(|doc| doc.get("workspace")?.get("dependencies")?.get(&dep_key))
-                .cloned()
-            {
-                return (Some(v), d.to_path_buf(), member_default_features);
-            }
-            dir = d.parent();
+        // Workspace-inherited: Cargo resolves `workspace = true` against
+        // the [workspace.dependencies] table of exactly ONE manifest — the
+        // app's EFFECTIVE workspace root (the member's own [workspace],
+        // the target of an explicit `package.workspace = "…"` pointer, or
+        // the nearest non-excluding ancestor root). Reuse the same root
+        // resolution the [patch.crates-io] mirroring uses, so both walks
+        // agree: a plain ancestor scan would never find a pointer target
+        // that is not an ancestor, and — worse — could stop at a NEARER
+        // manifest's [workspace.dependencies] entry that a pointer
+        // deliberately skips past, mirroring a framework source the app
+        // never builds against.
+        let root = effective_workspace_root(project_root);
+        if let Some(v) = parse(&root)
+            .as_ref()
+            .and_then(|doc| doc.get("workspace")?.get("dependencies")?.get(&dep_key))
+            .cloned()
+        {
+            // Relative `path` sources in the returned value resolve
+            // against the ROOT manifest's directory — the caller's
+            // re-relativization (dep_source_from_table) computes from it,
+            // and lexical_relative folds any `..` a pointer target
+            // carries.
+            return (Some(v), root, member_default_features);
         }
         return (None, project_root.to_path_buf(), member_default_features);
     }
@@ -3184,6 +3195,91 @@ mod tests {
         assert!(
             !dep.dep_entry.contains(&tmp.path().display().to_string()),
             "no machine-specific absolute prefix may leak into the manifest"
+        );
+        assert!(plan.warnings.is_empty(), "got {:?}", plan.warnings);
+    }
+
+    #[test]
+    fn offline_shell_dep_follows_package_workspace_pointer_for_inheritance() {
+        // An explicit `[package] workspace = "…"` pointer names the app's
+        // workspace root directly — the root need not be an ancestor of the
+        // app at all, so an ancestor-only [workspace.dependencies] scan
+        // never finds it and --offline-sync would fall back to a bare
+        // registry edge instead of mirroring the inherited path source.
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(
+            ws.join("Cargo.toml"),
+            "[workspace]\nmembers = []\n\n\
+             [workspace.dependencies]\nautumn-web = { path = \"vendor/autumn\" }\n",
+        )
+        .unwrap();
+        let app = tmp.path().join("app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(
+            app.join("Cargo.toml"),
+            "[package]\nname = \"my-app\"\nversion = \"0.2.3\"\nworkspace = \"../ws\"\n\n\
+             [dependencies]\nautumn-web = { workspace = true }\n",
+        )
+        .unwrap();
+        let mut plan = Plan::new(&app);
+        let dep = shell_autumn_web_dep(&app, &mut plan);
+        // vendor/autumn resolves against the POINTED root (tmp/ws), then
+        // re-relativizes against the generated tmp/app/src-tauri/.
+        assert_eq!(
+            dep.dep_entry,
+            r#"autumn-web = { path = "../../ws/vendor/autumn", features = ["offline-sync"] }"#,
+        );
+        assert!(
+            !dep.dep_entry.contains(&tmp.path().display().to_string()),
+            "no machine-specific absolute prefix may leak into the manifest"
+        );
+        assert!(plan.warnings.is_empty(), "got {:?}", plan.warnings);
+    }
+
+    #[test]
+    fn offline_shell_dep_pointer_skips_a_nearer_excluding_workspace() {
+        // A pointer may deliberately skip PAST a nearer workspace root (the
+        // Cargo-legal layout requires that nearer root to exclude the app).
+        // The inheritance scan must resolve against the POINTED root, not
+        // stop at the nearer manifest's [workspace.dependencies] entry —
+        // otherwise the shell mirrors a framework source the app never
+        // builds against.
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"mid/app\"]\n\n\
+             [workspace.dependencies]\nautumn-web = { path = \"framework/autumn\" }\n",
+        )
+        .unwrap();
+        let mid = tmp.path().join("mid");
+        std::fs::create_dir_all(&mid).unwrap();
+        std::fs::write(
+            mid.join("Cargo.toml"),
+            "[workspace]\nmembers = []\nexclude = [\"app\"]\n\n\
+             [workspace.dependencies]\nautumn-web = { path = \"wrong/autumn\" }\n",
+        )
+        .unwrap();
+        let app = mid.join("app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(
+            app.join("Cargo.toml"),
+            "[package]\nname = \"my-app\"\nversion = \"0.2.3\"\nworkspace = \"../..\"\n\n\
+             [dependencies]\nautumn-web = { workspace = true }\n",
+        )
+        .unwrap();
+        let mut plan = Plan::new(&app);
+        let dep = shell_autumn_web_dep(&app, &mut plan);
+        assert_eq!(
+            dep.dep_entry,
+            r#"autumn-web = { path = "../../../framework/autumn", features = ["offline-sync"] }"#,
+            "the POINTED root's entry must win over the nearer excluding root's"
+        );
+        assert!(
+            !dep.dep_entry.contains("wrong"),
+            "the skipped nearer entry must not leak in, got: {}",
+            dep.dep_entry
         );
         assert!(plan.warnings.is_empty(), "got {:?}", plan.warnings);
     }
