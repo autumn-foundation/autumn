@@ -1530,6 +1530,14 @@ static SYNC_KICK: std::sync::OnceLock<(tokio::runtime::Handle, autumn_web::sync:
 /// (exponential backoff while the remote is unreachable), so the app
 /// converges automatically when connectivity returns. See
 /// docs/guide/tauri-mobile-offline-sync.md.
+///
+/// MULTI-ACCOUNT apps: this one store file serves the whole installation.
+/// If the same device can re-authenticate as a different account, bind the
+/// store to the signed-in account with `store.set_identity(user_key)` on
+/// every login/logout BEFORE syncing — on an account change it resets the
+/// cached rows, pending outbox, and cursor so the next account never sees
+/// (or skips past) the previous account's data. Pair it with the server's
+/// `scoped_router` — see the guide's "Scope data per user" section.
 fn start_background_sync(runtime: &tokio::runtime::Runtime, sync_db: std::path::PathBuf) {{
     let store = match autumn_web::sync::SyncStore::open(&sync_db) {{
         Ok(store) => store,

@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS autumn_sync_state (
 
 const STATE_DEVICE_ID: &str = "device_id";
 const STATE_CURSOR: &str = "cursor";
+const STATE_IDENTITY: &str = "identity";
 
 fn store_err(err: impl std::fmt::Display) -> SyncError {
     SyncError::Store(err.to_string())
@@ -461,6 +462,64 @@ impl SyncStore {
         self.conn
             .lock()
             .map_err(|_| SyncError::Store("sync store mutex poisoned".into()))
+    }
+
+    /// Bind the store to the LOCAL identity of the authenticated account
+    /// (e.g. your auth layer's user id) — and, when it differs from the
+    /// identity previously bound, RESET the local cache first: cached
+    /// rows, local tombstones, the pending outbox, and the cursor are all
+    /// dropped in one transaction before the new identity is persisted.
+    ///
+    /// Why this exists: in scoped deployments (see the sync server's
+    /// `SyncScope`) one installation can re-authenticate as a different
+    /// account, but this store is one `SQLite` file keyed only by
+    /// `(collection, pk)`. Without the reset the next account would (1)
+    /// SEE the previous account's cached rows before its first pull — a
+    /// local data leak — and (2) inherit the previous account's cursor;
+    /// versions come from ONE global sequence across scopes, so that
+    /// cursor can sit ABOVE the new account's own rows and its first pull
+    /// would skip them permanently.
+    ///
+    /// The **pending outbox is dropped too**: those changes were authored
+    /// by the previous account and must not be pushed as the new one.
+    /// Unsynced edits of the outgoing account are therefore lost on
+    /// switch — sync before switching when they must survive. The device
+    /// id is kept (it identifies the installation, not the account).
+    ///
+    /// Call this on every login (and, to wipe eagerly at logout, with a
+    /// sentinel such as `"signed-out"`), BEFORE the next sync pass. The
+    /// identity is a client-side key from your auth layer — the
+    /// server-side scope string is derived from auth on the server and
+    /// never client-supplied, so the two strings need not match; the
+    /// identity only has to CHANGE whenever the authenticated account
+    /// changes. The first bind on a store that never had one adopts the
+    /// existing data without clearing (upgrade continuity), and never
+    /// calling this at all preserves today's single-user behavior.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SyncError::Store`] on database failure.
+    pub fn set_identity(&self, identity: &str) -> Result<(), SyncError> {
+        let mut conn = self.lock()?;
+        conn.immediate_transaction::<_, diesel::result::Error, _>(|conn| {
+            let previous = sql_query("SELECT value FROM autumn_sync_state WHERE key = ?")
+                .bind::<Text, _>(STATE_IDENTITY)
+                .get_result::<StateRecord>(conn)
+                .optional()?
+                .map(|record| record.value);
+            if previous.as_deref() == Some(identity) {
+                return Ok(());
+            }
+            if previous.is_some() {
+                sql_query("DELETE FROM autumn_sync_rows").execute(conn)?;
+                sql_query("DELETE FROM autumn_sync_pending").execute(conn)?;
+                sql_query("DELETE FROM autumn_sync_state WHERE key = ?")
+                    .bind::<Text, _>(STATE_CURSOR)
+                    .execute(conn)?;
+            }
+            set_state(conn, STATE_IDENTITY, identity)
+        })
+        .map_err(store_err)
     }
 
     /// One local write = row upsert + coalesced journal entry, in a single
@@ -930,6 +989,94 @@ mod tests {
             .expect("third put");
         let next = store.pending_changes(10).expect("pending");
         assert_eq!(next[0].base_version, 9, "acked version must never regress");
+    }
+
+    #[test]
+    fn identity_switch_clears_rows_cursor_and_pending() {
+        let (_dir, store) = open_temp();
+        store.set_identity("user:alice").expect("bind alice");
+        // Alice's world: a synced row, a pending local edit, and a cursor.
+        store
+            .apply_remote_page(&[remote_row("notes", "n1", 5, false)], 5)
+            .expect("apply page");
+        store
+            .put("notes", "local", &json!({"title": "alice's draft"}))
+            .expect("put");
+        assert_eq!(store.cursor().expect("cursor"), 5);
+        assert_eq!(store.pending_count().expect("pending"), 1);
+        let device_before = store.device_id().expect("device");
+
+        // Re-binding the SAME identity is a no-op: everything survives.
+        store.set_identity("user:alice").expect("rebind alice");
+        assert_eq!(store.cursor().expect("cursor"), 5);
+        assert_eq!(store.pending_count().expect("pending"), 1);
+
+        // A DIFFERENT identity resets the cache: rows, the pending outbox
+        // (the outgoing account's edits must not replay as the new one),
+        // and the cursor (versions are one global sequence across scopes,
+        // so an inherited higher cursor would skip the new account's own
+        // rows). The device id identifies the installation and survives.
+        store.set_identity("user:bob").expect("bind bob");
+        assert_eq!(store.cursor().expect("cursor"), 0, "cursor reset");
+        assert_eq!(store.pending_count().expect("pending"), 0, "outbox reset");
+        assert!(
+            store
+                .get::<serde_json::Value>("notes", "n1")
+                .expect("get")
+                .is_none(),
+            "the previous account's cached rows must be gone"
+        );
+        assert!(
+            store
+                .get::<serde_json::Value>("notes", "local")
+                .expect("get")
+                .is_none(),
+            "the previous account's local edits must be gone"
+        );
+        assert_eq!(store.device_id().expect("device"), device_before);
+    }
+
+    #[test]
+    fn identity_persists_across_reopen_and_first_bind_adopts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("sync.db");
+        {
+            let store = SyncStore::open(&path).expect("open");
+            // Pre-identity data: the FIRST bind adopts it (a formerly
+            // single-user store being upgraded keeps its data).
+            store
+                .put("notes", "n1", &json!({"title": "kept"}))
+                .expect("put");
+            store.set_identity("user:alice").expect("first bind");
+            assert!(
+                store
+                    .get::<serde_json::Value>("notes", "n1")
+                    .expect("get")
+                    .is_some(),
+                "the first bind must adopt existing single-user data"
+            );
+        }
+        {
+            // Reopen: the identity persisted, so the same account keeps
+            // its cache — and a different account still wipes it.
+            let store = SyncStore::open(&path).expect("reopen");
+            store.set_identity("user:alice").expect("rebind");
+            assert!(
+                store
+                    .get::<serde_json::Value>("notes", "n1")
+                    .expect("get")
+                    .is_some(),
+                "the persisted identity must survive a reopen"
+            );
+            store.set_identity("user:bob").expect("switch");
+            assert!(
+                store
+                    .get::<serde_json::Value>("notes", "n1")
+                    .expect("get")
+                    .is_none(),
+                "an account switch after reopen must still reset"
+            );
+        }
     }
 
     #[test]

@@ -492,6 +492,29 @@ users' data. This wiring is pinned end-to-end by the
 `scoped_router_partitions_data_by_authenticated_principal` integration
 test.
 
+**Client side — one installation, many accounts.** The local `SyncStore`
+is one SQLite file per installation. When the same device can
+re-authenticate as a different account (logout/login, token rotation),
+bind the store to the signed-in account and reset on change:
+
+```rust
+// On every login — and, to wipe eagerly at logout, with a sentinel:
+store.set_identity(&format!("user:{user_id}"))?;
+```
+
+`set_identity` compares against the identity persisted in the store and,
+when it changed, drops the cached rows, local tombstones, pending outbox,
+and cursor in one transaction — so the next account starts from a clean
+first sync instead of (1) reading the previous account's cached rows
+before ever pulling, or (2) inheriting a cursor that silently skips its
+own lower-versioned rows (versions come from one global sequence across
+scopes). Pending edits belong to the outgoing account and are
+deliberately dropped — sync before switching if they must survive. The
+identity is your auth layer's client-side key; it does not need to equal
+the server-side scope string (which is derived from auth on the server
+and never client-supplied), it only has to change whenever the account
+does. Never calling `set_identity` keeps today's single-user behavior.
+
 ### The shell: local store + background engine
 
 `src-tauri/Cargo.toml` gains a direct `autumn-web` dependency with the
