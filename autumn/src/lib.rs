@@ -72,6 +72,7 @@ pub mod assets;
 pub mod audit;
 pub mod auth;
 pub mod authorization;
+pub mod batches;
 pub mod cache;
 #[cfg(feature = "ws")]
 pub mod channels;
