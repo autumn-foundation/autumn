@@ -463,8 +463,8 @@ fn semver_script_checks_optional_features_with_pinned_rustdoc_toolchain() {
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", script_path.display()));
 
     assert!(
-        script.contains(r#"semver_toolchain="${AUTUMN_SEMVER_RUST_VERSION:-1.92.0}""#),
-        "{} must pin the semver rustdoc toolchain to Rust 1.92.0 by default",
+        script.contains(r#"semver_toolchain="${AUTUMN_SEMVER_RUST_VERSION:-1.94.1}""#),
+        "{} must pin the semver rustdoc toolchain to Rust 1.94.1 by default",
         script_path.display(),
     );
     assert!(
@@ -492,8 +492,8 @@ fn semver_script_checks_optional_features_with_pinned_rustdoc_toolchain() {
         .and_then(|job| job.split("\n  # ---").next())
         .unwrap_or_else(|| panic!("{} must define a semver job", workflow_path.display()));
     assert!(
-        semver_job.contains("dtolnay/rust-toolchain@1.92.0"),
-        "{} semver job must install the pinned Rust 1.92.0 toolchain",
+        semver_job.contains("dtolnay/rust-toolchain@1.94.1"),
+        "{} semver job must install the pinned Rust 1.94.1 toolchain",
         workflow_path.display(),
     );
     assert!(

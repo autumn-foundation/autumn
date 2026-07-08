@@ -51,13 +51,14 @@ use std::collections::BTreeSet;
 /// `#[cfg(feature = "...")]`. Keep in sync with `config.rs`'s `AutumnConfig`
 /// struct — [`feature_gated_roots_mapping_matches_config_when_enabled`] below
 /// self-checks this list whenever a listed feature happens to be enabled.
-const fn feature_gated_roots() -> [(bool, &'static str); 5] {
+const fn feature_gated_roots() -> [(bool, &'static str); 6] {
     [
         (cfg!(feature = "i18n"), "i18n"),
         (cfg!(feature = "mail"), "mail"),
         (cfg!(feature = "storage"), "storage"),
         (cfg!(feature = "http-client"), "http"),
         (cfg!(feature = "reporting"), "reporting"),
+        (cfg!(feature = "maud"), "stories"),
     ]
 }
 

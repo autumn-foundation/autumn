@@ -533,26 +533,21 @@ fn build_router_pre_state(
     // ceiling instead of each getting its own independent (never-shared)
     // counter. See `apply_middleware`'s `load_shed_layer` parameter doc.
     let load_shed_layer = build_load_shed_layer(config, state);
+    #[cfg(feature = "mcp")]
+    let mcp_load_shed_layer = load_shed_layer.clone();
 
-    // The clone is only *reused* further down inside the `feature = "mcp"`
-    // block (the `/mcp` envelope shares the same in-flight counter); with the
-    // feature off it looks redundant to clippy, but keeping it unconditional
-    // avoids cfg-splitting this call site.
-    #[allow(clippy::redundant_clone)]
-    {
-        router = apply_middleware(
-            router,
-            config,
-            state,
-            ctx.exception_filters,
-            ctx.custom_layers,
-            #[cfg(feature = "maud")]
-            ctx.error_page_renderer,
-            ctx.session_store,
-            route_timeouts,
-            load_shed_layer.clone(),
-        )?;
-    }
+    router = apply_middleware(
+        router,
+        config,
+        state,
+        ctx.exception_filters,
+        ctx.custom_layers,
+        #[cfg(feature = "maud")]
+        ctx.error_page_renderer,
+        ctx.session_store,
+        route_timeouts,
+        load_shed_layer,
+    )?;
 
     if dev_reload_enabled {
         router = router
@@ -673,7 +668,7 @@ fn build_router_pre_state(
             // the envelope below is ALSO wrapped with that same shared layer,
             // a tools/call must mark its replay exempt (avoiding double-
             // counting against the same in-flight counter).
-            envelope_load_shed: load_shed_layer.is_some(),
+            envelope_load_shed: mcp_load_shed_layer.is_some(),
         };
         let mut mcp_router =
             crate::mcp::build_mcp_router(&mount_path, tools, dispatch, wiring, endpoint_layer);
@@ -702,7 +697,7 @@ fn build_router_pre_state(
         // (cloned, sharing its `Arc` in-flight counter) rather than building
         // a second, independently-counting layer — see that call site's
         // comment. `None` (the default) is a no-op, matching direct routes.
-        if let Some(load_shed) = load_shed_layer {
+        if let Some(load_shed) = mcp_load_shed_layer {
             mcp_router = mcp_router.layer(load_shed);
         }
         // Stamp `ResolvedClientIdentity` on the *outer* `/mcp` request too. The
@@ -1112,6 +1107,16 @@ fn collect_claimed_get_paths(
         claimed.insert(crate::mail::MAIL_PREVIEW_PATH.to_owned());
         claimed.insert("/_autumn/mail/messages/{message_id}".to_owned());
         claimed.insert("/_autumn/mail/previews/{mailer}/{method}".to_owned());
+    }
+    // The widget story gallery merges GETs at `/_stories` and
+    // `/_stories/{slug}` when `stories.enabled` resolves true, before the
+    // late-merged OpenAPI/MCP routers — reserve them so a colliding
+    // configured mount path surfaces the typed collision error instead of
+    // panicking in `router.merge`.
+    #[cfg(feature = "maud")]
+    if config.stories.enabled {
+        claimed.insert(crate::stories::STORIES_PATH.to_owned());
+        claimed.insert("/_stories/{slug}".to_owned());
     }
     // The default unsubscribe endpoint merges a GET (+POST) at `UNSUBSCRIBE_PATH`
     // before the late-merged OpenAPI/MCP routers, so reserve it too — otherwise an
@@ -1566,6 +1571,19 @@ fn mount_framework_routes(
         tracing::debug!(
             path = crate::mail::MAIL_PREVIEW_PATH,
             "Mounted dev mail preview endpoints"
+        );
+    }
+
+    // Widget story gallery (#1526) — off by default, opt-in in ANY profile
+    // via `[stories] enabled = true` (profile-layered). Handlers read the
+    // StoryRegistry from the AppState extension installed by
+    // `AppBuilder::with_story_gallery`.
+    #[cfg(feature = "maud")]
+    if config.stories.enabled {
+        router = router.merge(crate::stories::story_router());
+        tracing::debug!(
+            path = crate::stories::STORIES_PATH,
+            "Mounted story gallery endpoints"
         );
     }
 
@@ -4453,7 +4471,7 @@ mod tests {
         config
     }
 
-    #[cfg(feature = "mail")]
+    #[cfg(any(feature = "mail", feature = "maud"))]
     async fn response_text(response: axum::response::Response) -> String {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -4600,6 +4618,298 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ── Widget story gallery mount gating (issue #1526) ─────────────────────
+    //
+    // Unlike the dev-only mail preview, `/_stories` is opt-in in ANY profile
+    // via `[stories] enabled = true` (default false): mounting is gated only
+    // on the resolved config flag, while handlers read the `StoryRegistry`
+    // from the AppState extension installed by `with_story_gallery`.
+
+    #[cfg(feature = "maud")]
+    fn story_gallery_config() -> AutumnConfig {
+        let mut config = AutumnConfig::default();
+        config.stories.enabled = true;
+        config.security.trusted_hosts.hosts = vec!["example.com".to_owned()];
+        config
+    }
+
+    #[cfg(feature = "maud")]
+    fn stories_state_with_builtin() -> AppState {
+        let state = test_state();
+        state.insert_extension(crate::stories::builtin());
+        state
+    }
+
+    #[cfg(feature = "maud")]
+    async fn get_with_host(router: axum::Router, uri: &str) -> axum::response::Response {
+        router
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header("host", "example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// T1 (AC4/AC5): with `[stories] enabled = true` and the builtin registry
+    /// installed, the grouped index is served at `/_stories` and pulls in the
+    /// framework widget stylesheet.
+    #[cfg(feature = "maud")]
+    #[tokio::test]
+    async fn build_router_mounts_story_gallery_when_enabled() {
+        let router = build_router(
+            Vec::new(),
+            &story_gallery_config(),
+            stories_state_with_builtin(),
+        );
+
+        let response = get_with_host(router, crate::stories::STORIES_PATH).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_text(response).await;
+        assert!(
+            body.contains("Data table"),
+            "index should list builtin story names: {body}"
+        );
+        assert!(
+            body.contains("autumn-widgets.css"),
+            "index should link the framework widget stylesheet: {body}"
+        );
+    }
+
+    /// T2 (AC4): the detail route serves the live render plus Source and
+    /// Rendered HTML tabs.
+    #[cfg(feature = "maud")]
+    #[tokio::test]
+    async fn story_detail_route_serves_render_source_and_html() {
+        let router = build_router(
+            Vec::new(),
+            &story_gallery_config(),
+            stories_state_with_builtin(),
+        );
+
+        let response = get_with_host(router, "/_stories/data-table").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_text(response).await;
+        assert!(
+            body.contains("<table"),
+            "detail page must contain the live data_table render: {body}"
+        );
+        assert!(
+            body.contains("data_table("),
+            "detail page must show the source snippet that produced the render: {body}"
+        );
+        assert!(
+            body.contains("Rendered HTML"),
+            "detail page must offer the rendered-HTML tab: {body}"
+        );
+        assert!(
+            body.contains("Source"),
+            "detail page must offer the source tab: {body}"
+        );
+    }
+
+    /// T3 (AC4): a mounted gallery 404s unknown slugs while the index stays up.
+    #[cfg(feature = "maud")]
+    #[tokio::test]
+    async fn story_detail_unknown_slug_is_404() {
+        let router = build_router(
+            Vec::new(),
+            &story_gallery_config(),
+            stories_state_with_builtin(),
+        );
+
+        let missing = get_with_host(router.clone(), "/_stories/nope").await;
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+        let index = get_with_host(router, "/_stories").await;
+        assert_eq!(
+            index.status(),
+            StatusCode::OK,
+            "index route must exist even when a slug misses"
+        );
+    }
+
+    /// T4 (AC5/AC6): off by default — no `[stories] enabled = true`, no
+    /// routes, even when a registry extension is installed.
+    #[cfg(feature = "maud")]
+    #[tokio::test]
+    async fn build_router_omits_story_gallery_by_default() {
+        let mut config = AutumnConfig::default();
+        assert!(
+            !config.stories.enabled,
+            "stories gallery must be off by default"
+        );
+        config.security.trusted_hosts.hosts = vec!["example.com".to_owned()];
+
+        let router = build_router(Vec::new(), &config, stories_state_with_builtin());
+        let response = get_with_host(router, "/_stories").await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Loads a layered `autumn.toml` for `profile` via `MockEnv` (no process
+    /// env, no `set_current_dir`) and reports the status `/_stories` returns.
+    #[cfg(feature = "maud")]
+    async fn stories_status_for_layered_profile(toml: &str, profile: &str) -> StatusCode {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("autumn.toml"), toml).expect("write autumn.toml");
+        let env = crate::config::MockEnv::new()
+            .with("AUTUMN_MANIFEST_DIR", dir.path().to_str().unwrap())
+            .with("AUTUMN_ENV", profile);
+        let mut config = AutumnConfig::load_with_env(&env).expect("layered config should load");
+        config.security.trusted_hosts.hosts = vec!["example.com".to_owned()];
+
+        let router = build_router(Vec::new(), &config, stories_state_with_builtin());
+        get_with_host(router, "/_stories").await.status()
+    }
+
+    /// T5 (AC6): profile-scoped gating works both ways through the existing
+    /// config layering — routes mount iff the resolved flag is true.
+    #[cfg(feature = "maud")]
+    #[tokio::test]
+    async fn story_routes_mount_iff_resolved_profile_flag() {
+        // Private app: dev-only gallery, absent in prod.
+        let dev_only = r"
+[stories]
+enabled = false
+
+[profile.dev.stories]
+enabled = true
+";
+        assert_eq!(
+            stories_status_for_layered_profile(dev_only, "dev").await,
+            StatusCode::OK,
+            "dev profile override must mount the gallery"
+        );
+        assert_eq!(
+            stories_status_for_layered_profile(dev_only, "prod").await,
+            StatusCode::NOT_FOUND,
+            "prod must not mount the gallery when only dev enables it"
+        );
+
+        // Public showcase: enabled in prod, absent in dev.
+        let public_showcase = r"
+[stories]
+enabled = false
+
+[profile.prod.stories]
+enabled = true
+";
+        assert_eq!(
+            stories_status_for_layered_profile(public_showcase, "prod").await,
+            StatusCode::OK,
+            "prod profile override must mount the gallery for a public showcase"
+        );
+        assert_eq!(
+            stories_status_for_layered_profile(public_showcase, "dev").await,
+            StatusCode::NOT_FOUND,
+            "dev must not mount the gallery when only prod enables it"
+        );
+    }
+
+    /// T6 (AC7): a custom app story registered via
+    /// `StoryGallery::builtin().extend(...)` is served alongside builtins.
+    #[cfg(feature = "maud")]
+    #[tokio::test]
+    async fn custom_story_served_alongside_builtins() {
+        let custom = crate::stories::story! {
+            "App",
+            "Badge",
+            {
+                maud::html! { span class="app-badge" { "hi from the app" } }
+            }
+        };
+        let state = test_state();
+        state.insert_extension(
+            crate::stories::StoryGallery::builtin()
+                .extend([custom])
+                .into_registry(),
+        );
+
+        let router = build_router(Vec::new(), &story_gallery_config(), state);
+
+        let detail = get_with_host(router.clone(), "/_stories/badge").await;
+        assert_eq!(detail.status(), StatusCode::OK);
+        let body = response_text(detail).await;
+        assert!(
+            body.contains("hi from the app"),
+            "custom story must render at its slug: {body}"
+        );
+
+        let index = get_with_host(router, "/_stories").await;
+        let body = response_text(index).await;
+        assert!(
+            body.contains("Badge"),
+            "index must list the custom story: {body}"
+        );
+        assert!(
+            body.contains("App"),
+            "index must show the custom story's group: {body}"
+        );
+        assert!(
+            body.contains("Data table"),
+            "builtins must still be listed alongside the custom story: {body}"
+        );
+    }
+
+    /// Review follow-up (#1526): with `security.headers.csp_nonce.enabled =
+    /// true` the default CSP's `style-src` drops `'unsafe-inline'` in favor of
+    /// a per-request nonce, so the gallery's inline `<style>` must carry the
+    /// exact nonce the CSP header advertises or browsers block all of the
+    /// gallery chrome CSS.
+    #[cfg(feature = "maud")]
+    #[tokio::test]
+    async fn story_pages_inline_style_carries_csp_header_nonce() {
+        let mut config = story_gallery_config();
+        config.security.headers.csp_nonce.enabled = true;
+
+        let router = build_router(Vec::new(), &config, stories_state_with_builtin());
+
+        for uri in ["/_stories", "/_stories/data-table"] {
+            let response = get_with_host(router.clone(), uri).await;
+            assert_eq!(response.status(), StatusCode::OK);
+
+            let csp = response
+                .headers()
+                .get("content-security-policy")
+                .expect("CSP header must be present")
+                .to_str()
+                .unwrap()
+                .to_owned();
+            let nonce = csp
+                .split("'nonce-")
+                .nth(1)
+                .and_then(|rest| rest.split('\'').next())
+                .unwrap_or_else(|| panic!("CSP header must advertise a nonce: {csp}"))
+                .to_owned();
+            assert!(!nonce.is_empty(), "advertised nonce must be non-empty");
+
+            let body = response_text(response).await;
+            assert!(
+                body.contains(&format!(r#"<style nonce="{nonce}">"#)),
+                "{uri} inline style must carry the CSP header nonce {nonce}: {body}"
+            );
+        }
+    }
+
+    /// T17 (AC5, R12): enabled config but no registry extension (the user
+    /// forgot `with_story_gallery`) serves a friendly empty state, not a 500.
+    #[cfg(feature = "maud")]
+    #[tokio::test]
+    async fn enabled_without_registry_shows_empty_state() {
+        let router = build_router(Vec::new(), &story_gallery_config(), test_state());
+
+        let response = get_with_host(router, "/_stories").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_text(response).await;
+        assert!(
+            body.contains("with_story_gallery"),
+            "empty state should point at AppBuilder::with_story_gallery: {body}"
+        );
     }
 
     #[tokio::test]
@@ -5358,6 +5668,42 @@ mod tests {
                 field: "openapi_json_path",
                 ref path,
             } if path == crate::job_tracking::JOB_STATUS_ROUTE_PATH
+        ));
+    }
+
+    #[cfg(all(feature = "openapi", feature = "maud"))]
+    #[tokio::test]
+    async fn try_build_router_rejects_openapi_path_on_story_gallery() {
+        // The story gallery merges GETs at `/_stories` (+ `/_stories/{slug}`)
+        // when `stories.enabled` resolves true, before the late-merged
+        // OpenAPI router, so the collision preflight must reserve it —
+        // otherwise mounting OpenAPI there panics in `router.merge` instead
+        // of surfacing the typed collision.
+        let mut config = AutumnConfig::default();
+        config.stories.enabled = true;
+        let openapi = crate::openapi::OpenApiConfig::new("Demo", "1.0.0")
+            .openapi_json_path(crate::stories::STORIES_PATH);
+        let ctx = RouterContext {
+            exception_filters: Vec::new(),
+            scoped_groups: Vec::new(),
+            merge_routers: Vec::new(),
+            nest_routers: Vec::new(),
+            custom_layers: Vec::new(),
+            static_gate_layers: Vec::new(),
+            error_page_renderer: None,
+            session_store: None,
+            openapi: Some(openapi),
+            #[cfg(feature = "mcp")]
+            mcp: None,
+        };
+        let err = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx)
+            .expect_err("story gallery path should be reserved while stories are enabled");
+        assert!(matches!(
+            err,
+            RouterBuildError::OpenApiPathCollision {
+                field: "openapi_json_path",
+                ref path,
+            } if path == crate::stories::STORIES_PATH
         ));
     }
 

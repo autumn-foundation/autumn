@@ -1,0 +1,497 @@
+//! Derived-`FormModel` integration tests for `#[model]` (issue #1135).
+//!
+//! Proves the acceptance criteria that the framework knows every field and its
+//! type at the derive layer: a plain `#[model]` struct gains a `FormModel`
+//! implementation whose `form_fields()` lists one type-appropriate descriptor
+//! per editable column (primary key excluded), and that `form_for` renders a
+//! complete form from it in a single call.
+//!
+//! NB: diesel prelude imports are deliberately omitted so the sync
+//! `RunQueryDsl` never clashes with the model's generated async query code
+//! (same convention as `encryption_columns.rs`).
+
+#![cfg(all(feature = "db", feature = "maud"))]
+// `Article`'s `f64` column makes the `#[model]` expansion (change tracking
+// uses strict equality) trip clippy's `float_cmp`; that generated comparison
+// is the macro's concern, not this test's, and an item-level allow can't
+// reach the macro-emitted impls.
+#![allow(clippy::float_cmp)]
+
+use autumn_web::form::{Changeset, FieldControl, FormModel, form_for};
+
+diesel::table! {
+    articles (id) {
+        id -> Integer,
+        title -> Text,
+        body -> Nullable<Text>,
+        views -> Integer,
+        rating -> Double,
+        published -> Bool,
+    }
+}
+
+#[autumn_web::model(table = "articles")]
+pub struct Article {
+    pub id: i32,
+    pub title: String,
+    pub body: Option<String>,
+    pub views: i32,
+    pub rating: f64,
+    pub published: bool,
+}
+
+#[test]
+fn derived_form_fields_exclude_pk_and_map_types() {
+    let fields = Article::form_fields();
+
+    // Primary key is excluded; remaining columns keep declaration order.
+    let names: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(names, ["title", "body", "views", "rating", "published"]);
+
+    // Humanized labels.
+    assert_eq!(fields[0].label, "Title");
+
+    // String -> Text, required (non-Option).
+    assert!(matches!(fields[0].control, FieldControl::Text));
+    assert!(fields[0].required);
+
+    // Option<String> -> Text, not required.
+    assert!(matches!(fields[1].control, FieldControl::Text));
+    assert!(!fields[1].required);
+
+    // i32 -> Number { step: "1" }, required.
+    assert!(
+        matches!(&fields[2].control, FieldControl::Number { step } if step.as_deref() == Some("1"))
+    );
+    assert!(fields[2].required);
+
+    // f64 -> Number { step: "any" }.
+    assert!(
+        matches!(&fields[3].control, FieldControl::Number { step } if step.as_deref() == Some("any"))
+    );
+
+    // bool -> Checkbox.
+    assert!(matches!(fields[4].control, FieldControl::Checkbox));
+}
+
+#[test]
+fn form_for_renders_full_form_from_derived_model() {
+    let changeset = Changeset::new(Article {
+        id: 1,
+        title: "Hello".into(),
+        body: None,
+        views: 3,
+        rating: 4.5,
+        published: true,
+    });
+
+    let html = form_for(&changeset, "/articles", "post")
+        .csrf("tok")
+        .render()
+        .into_string();
+
+    // Opening form tag + auto-injected CSRF + one control per field + submit.
+    assert!(html.contains("<form"));
+    assert!(html.contains(r#"name="_csrf""#));
+    assert!(html.contains(r#"value="tok""#));
+    assert!(html.contains(r#"name="title""#));
+    assert!(html.contains(r#"name="body""#));
+    assert!(html.contains(r#"name="views""#));
+    assert!(html.contains(r#"type="checkbox""#));
+    assert!(html.contains(r#"name="published""#));
+    assert!(html.contains(r#"type="submit""#));
+    // Current values are pre-filled from the changeset.
+    assert!(html.contains(r#"value="Hello""#));
+}
+
+#[test]
+fn derived_new_struct_decodes_unchecked_checkbox_as_false() {
+    // Regression test (Codex P2 on #1587): `form_for` renders a non-nullable
+    // `bool` as a checkbox, and `checkbox_input` deliberately emits no hidden
+    // `false` fallback (serde_urlencoded rejects duplicate keys, so a hidden
+    // sibling would 400 every *checked* submission). An unchecked box thus
+    // submits no `published` key at all — the `#[model]`-generated insert
+    // struct must decode that as `false` via `#[serde(default)]`, not reject
+    // the whole submission with "missing field `published`".
+    let changeset = Changeset::new(Article {
+        id: 1,
+        title: "Hello".into(),
+        body: None,
+        views: 3,
+        rating: 4.5,
+        published: false,
+    });
+    let html = form_for(&changeset, "/articles", "post")
+        .csrf("tok")
+        .render()
+        .into_string();
+    // Exactly one control carries the field name (no hidden fallback input).
+    assert_eq!(html.matches(r#"name="published""#).count(), 1, "{html}");
+
+    // A browser submitting this form with the box UNCHECKED sends every other
+    // field but omits `published` entirely. Decode through the same
+    // serde_urlencoded machinery axum's `Form` extractor and ChangesetForm
+    // use, straight into the generated insert struct.
+    let new_article: NewArticle =
+        serde_urlencoded::from_str("title=Hello&body=&views=3&rating=4.5")
+            .expect("unchecked checkbox submission must decode, not 400");
+    assert!(!new_article.published);
+    assert_eq!(new_article.title, "Hello");
+
+    // And a CHECKED box submits `published=true` exactly once.
+    let new_article: NewArticle =
+        serde_urlencoded::from_str("title=Hello&body=&views=3&rating=4.5&published=true").unwrap();
+    assert!(new_article.published);
+}
+
+diesel::table! {
+    events (id) {
+        id -> Integer,
+        title -> Text,
+        published_at -> Timestamptz,
+        starts_at -> Timestamp,
+        ends_at -> Nullable<Timestamptz>,
+    }
+}
+
+#[autumn_web::model(table = "events")]
+pub struct Event {
+    pub id: i32,
+    pub title: String,
+    pub published_at: chrono::DateTime<chrono::Utc>,
+    pub starts_at: chrono::NaiveDateTime,
+    pub ends_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[test]
+fn derived_new_struct_decodes_datetime_local_submission() {
+    // Regression test (Codex P2 on #1587): `form_for` renders
+    // `DateTime<Utc>`/`NaiveDateTime` columns as `<input
+    // type="datetime-local">`, whose value has no timezone offset — chrono's
+    // default `Deserialize` for `DateTime<Utc>` demands an RFC 3339 offset,
+    // so without the generated `deserialize_with` wiring even an *untouched*
+    // pre-filled value would be rejected as a 400 before validation.
+    use chrono::TimeZone as _;
+    let published = chrono::Utc
+        .with_ymd_and_hms(2024, 3, 15, 10, 30, 56)
+        .unwrap();
+    let changeset = Changeset::new(Event {
+        id: 1,
+        title: "Launch".into(),
+        published_at: published,
+        starts_at: published.naive_utc(),
+        ends_at: None,
+    });
+    let html = form_for(&changeset, "/events", "post")
+        .csrf("tok")
+        .render()
+        .into_string();
+
+    // The pre-filled value is the offsetless datetime-local shape (browsers
+    // reject a trailing `Z`/offset in a datetime-local input).
+    assert!(html.contains(r#"value="2024-03-15T10:30:56""#), "{html}");
+    assert!(!html.contains("2024-03-15T10:30:56Z"), "{html}");
+
+    // A browser that round-trips the form untouched posts back exactly that
+    // offsetless value. Decode through the same serde_urlencoded machinery
+    // axum's `Form` and ChangesetForm use, straight into the generated
+    // insert struct — the wall clock is interpreted as UTC.
+    let body = "title=Launch\
+                &published_at=2024-03-15T10%3A30%3A56\
+                &starts_at=2024-03-15T10%3A30%3A56\
+                &ends_at=";
+    let new_event: NewEvent = serde_urlencoded::from_str(body)
+        .expect("untouched datetime-local submission must decode, not 400");
+    assert_eq!(new_event.published_at, published);
+    assert_eq!(new_event.starts_at, published.naive_utc());
+    // Empty nullable datetime decodes as None, not a parse error.
+    assert_eq!(new_event.ends_at, None);
+
+    // A value edited through the browser's native picker may drop the
+    // seconds component entirely (minute granularity).
+    let body = "title=Launch\
+                &published_at=2024-03-15T10%3A30\
+                &starts_at=2024-03-15T10%3A30\
+                &ends_at=2024-03-15T11%3A00";
+    let new_event: NewEvent = serde_urlencoded::from_str(body)
+        .expect("minute-granularity datetime-local submission must decode");
+    assert_eq!(
+        new_event.published_at,
+        chrono::Utc
+            .with_ymd_and_hms(2024, 3, 15, 10, 30, 0)
+            .unwrap()
+    );
+    assert_eq!(
+        new_event.ends_at,
+        Some(chrono::Utc.with_ymd_and_hms(2024, 3, 15, 11, 0, 0).unwrap())
+    );
+}
+
+#[test]
+fn derived_new_struct_still_decodes_rfc3339_json_bodies() {
+    // The generated `NewX` also serves JSON API create bodies — attaching the
+    // datetime-local deserializer must not break RFC 3339 input. An explicit
+    // offset is honored and normalized to UTC.
+    use chrono::TimeZone as _;
+    let expected = chrono::Utc
+        .with_ymd_and_hms(2024, 3, 15, 10, 30, 56)
+        .unwrap();
+
+    let json = r#"{
+        "title": "Launch",
+        "published_at": "2024-03-15T10:30:56Z",
+        "starts_at": "2024-03-15T10:30:56",
+        "ends_at": "2024-03-15T19:30:56+09:00"
+    }"#;
+    let new_event: NewEvent =
+        serde_json::from_str(json).expect("RFC 3339 JSON create body must keep decoding");
+    assert_eq!(new_event.published_at, expected);
+    assert_eq!(new_event.starts_at, expected.naive_utc());
+    assert_eq!(new_event.ends_at, Some(expected));
+
+    // A JSON body may still omit the nullable column entirely
+    // (`#[serde(default)]` restores the implicit-None handling that
+    // `deserialize_with` would otherwise disable).
+    let json = r#"{
+        "title": "Launch",
+        "published_at": "2024-03-15T10:30:56Z",
+        "starts_at": "2024-03-15T10:30:56"
+    }"#;
+    let new_event: NewEvent =
+        serde_json::from_str(json).expect("omitted nullable datetime must decode as None");
+    assert_eq!(new_event.ends_at, None);
+}
+
+diesel::table! {
+    meetings (id) {
+        id -> Integer,
+        title -> Text,
+        scheduled_at -> Timestamptz,
+        reminder_at -> Nullable<Timestamptz>,
+    }
+}
+
+// `DateTime<Local>` is the other zone parameter diesel's chrono support can
+// round-trip for `Timestamptz` (it has no `FromSql` for `DateTime<FixedOffset>`
+// or chrono-tz zones, so those can't appear on a compilable `#[model]` struct
+// — their text-input fallback is asserted at the token level in
+// autumn-macros' `form_control_tokens_gates_datetime_picker_on_zone_param`).
+#[autumn_web::model(table = "meetings")]
+pub struct Meeting {
+    pub id: i32,
+    pub title: String,
+    pub scheduled_at: chrono::DateTime<chrono::Local>,
+    pub reminder_at: Option<chrono::DateTime<chrono::Local>>,
+}
+
+#[test]
+fn derived_new_struct_decodes_datetime_local_submission_for_local_zone() {
+    // Regression test (Codex P2 on #1587): `form_for` renders a
+    // `DateTime<Local>` column as `<input type="datetime-local">` too, but
+    // `datetime_local_serde_attr` used to wire a tolerant deserializer only
+    // for `DateTime<Utc>` — the generated `NewMeeting` kept chrono's default
+    // `Deserialize` for `DateTime<Local>`, which demands an RFC 3339 offset,
+    // so posting the rendered form back 400'd even with the value untouched.
+    //
+    // All wall clocks below sit at midday, which no real timezone's DST
+    // transition touches, so the test is deterministic without pinning `TZ`.
+    use chrono::TimeZone as _;
+    let scheduled = chrono::Local
+        .with_ymd_and_hms(2024, 3, 15, 12, 30, 56)
+        .earliest()
+        .expect("midday local wall clock must exist");
+    let changeset = Changeset::new(Meeting {
+        id: 1,
+        title: "Standup".into(),
+        scheduled_at: scheduled,
+        reminder_at: None,
+    });
+
+    // The derived control for a Local column is still the datetime picker…
+    let fields = Meeting::form_fields();
+    assert!(matches!(fields[1].control, FieldControl::DateTime));
+    assert!(matches!(fields[2].control, FieldControl::DateTime));
+
+    // …whose pre-filled value is the offsetless local wall clock (chrono
+    // serializes `DateTime<Local>` as RFC 3339 with the local offset;
+    // `datetime_input` strips it, keeping the wall clock).
+    let html = form_for(&changeset, "/meetings", "post")
+        .csrf("tok")
+        .render()
+        .into_string();
+    assert!(html.contains(r#"value="2024-03-15T12:30:56""#), "{html}");
+
+    // A browser that round-trips the form untouched posts back exactly that
+    // offsetless value; it must decode to the same instant, not 400.
+    let body = "title=Standup&scheduled_at=2024-03-15T12%3A30%3A56&reminder_at=";
+    let new_meeting: NewMeeting = serde_urlencoded::from_str(body)
+        .expect("untouched datetime-local submission must decode, not 400");
+    assert_eq!(new_meeting.scheduled_at, scheduled);
+    // Empty nullable datetime decodes as None, not a parse error.
+    assert_eq!(new_meeting.reminder_at, None);
+
+    // A value edited through the browser's native picker may drop seconds.
+    let body = "title=Standup&scheduled_at=2024-03-15T12%3A30&reminder_at=2024-03-15T13%3A00";
+    let new_meeting: NewMeeting = serde_urlencoded::from_str(body)
+        .expect("minute-granularity datetime-local submission must decode");
+    assert_eq!(
+        new_meeting.scheduled_at,
+        chrono::Local
+            .with_ymd_and_hms(2024, 3, 15, 12, 30, 0)
+            .earliest()
+            .unwrap()
+    );
+    assert_eq!(
+        new_meeting.reminder_at,
+        Some(
+            chrono::Local
+                .with_ymd_and_hms(2024, 3, 15, 13, 0, 0)
+                .earliest()
+                .unwrap()
+        )
+    );
+}
+
+#[test]
+fn derived_new_struct_still_decodes_rfc3339_json_bodies_for_local_zone() {
+    // The generated `NewMeeting` also serves JSON API create bodies — the
+    // datetime-local deserializer must keep accepting RFC 3339, honoring the
+    // explicit offset and converting the instant to the local zone.
+    let expected = chrono::DateTime::parse_from_rfc3339("2024-03-15T10:30:56Z")
+        .unwrap()
+        .with_timezone(&chrono::Local);
+
+    let json = r#"{
+        "title": "Standup",
+        "scheduled_at": "2024-03-15T10:30:56Z",
+        "reminder_at": "2024-03-15T19:30:56+09:00"
+    }"#;
+    let new_meeting: NewMeeting =
+        serde_json::from_str(json).expect("RFC 3339 JSON create body must keep decoding");
+    assert_eq!(new_meeting.scheduled_at, expected);
+    assert_eq!(new_meeting.reminder_at, Some(expected));
+
+    // A JSON body may still omit the nullable column entirely.
+    let json = r#"{
+        "title": "Standup",
+        "scheduled_at": "2024-03-15T10:30:56Z"
+    }"#;
+    let new_meeting: NewMeeting =
+        serde_json::from_str(json).expect("omitted nullable datetime must decode as None");
+    assert_eq!(new_meeting.reminder_at, None);
+}
+
+diesel::table! {
+    reviews (id) {
+        id -> Integer,
+        title -> Text,
+        author_name -> Text,
+        word_count -> Integer,
+    }
+}
+
+// Struct-level `rename_all` plus a field-level `rename` override — both pass
+// through to the emitted model struct's `Serialize` derive, so the model's
+// JSON keys are "headline", "authorName", and "wordCount".
+#[autumn_web::model(table = "reviews")]
+#[serde(rename_all = "camelCase")]
+pub struct Review {
+    pub id: i32,
+    #[serde(rename = "headline")]
+    pub title: String,
+    pub author_name: String,
+    pub word_count: i32,
+}
+
+#[test]
+fn derived_form_fields_resolve_serde_renames_into_value_name() {
+    // Regression test (Codex P2 on #1587): `FormField.name` must stay the
+    // Rust identifier (the POST key the generated `NewReview` decodes by),
+    // while the serde-effective serialized key lands in `value_name` so the
+    // pre-fill lookup (`Changeset::field_value`, which indexes serialized
+    // data) still finds the value.
+    let fields = Review::form_fields();
+    let names: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(names, ["title", "author_name", "word_count"]);
+
+    // Field-level rename wins over the struct-level rename_all.
+    assert_eq!(fields[0].value_name.as_deref(), Some("headline"));
+    assert_eq!(fields[1].value_name.as_deref(), Some("authorName"));
+    assert_eq!(fields[2].value_name.as_deref(), Some("wordCount"));
+}
+
+#[test]
+fn form_for_prefills_serde_renamed_fields_and_posts_rust_identifiers() {
+    // Regression test (Codex P2 on #1587): an edit form for a model with
+    // serde renames must pre-fill from the renamed serialized keys — before
+    // the `value_name` routing, `field_value("title")` found no "title" key
+    // in the serialized JSON (it's "headline") and rendered blank inputs
+    // despite the data being present.
+    let changeset = Changeset::new(Review {
+        id: 1,
+        title: "Great read".into(),
+        author_name: "Jane Doe".into(),
+        word_count: 812,
+    });
+    let html = form_for(&changeset, "/reviews/1", "put")
+        .csrf("tok")
+        .render()
+        .into_string();
+
+    // Values come from the serde-renamed serialized keys…
+    assert!(html.contains(r#"value="Great read""#), "{html}");
+    assert!(html.contains(r#"value="Jane Doe""#), "{html}");
+    assert!(html.contains(r#"value="812""#), "{html}");
+    // …while the POST keys stay the Rust identifiers the generated insert
+    // struct expects (NewX does not propagate serde renames)…
+    assert!(html.contains(r#"name="title""#), "{html}");
+    assert!(html.contains(r#"name="author_name""#), "{html}");
+    assert!(html.contains(r#"name="word_count""#), "{html}");
+    // …and the serialized keys never leak into the rendered form.
+    assert!(!html.contains(r#"name="headline""#), "{html}");
+    assert!(!html.contains(r#"name="authorName""#), "{html}");
+    assert!(!html.contains(r#"name="wordCount""#), "{html}");
+
+    // A browser round-trips exactly those identifier keys; the generated
+    // insert struct decodes them through the same serde_urlencoded machinery
+    // axum's `Form`/ChangesetForm use.
+    let new_review: NewReview =
+        serde_urlencoded::from_str("title=Great+read&author_name=Jane+Doe&word_count=812")
+            .expect("form_for submission must decode into the generated insert struct");
+    assert_eq!(new_review.title, "Great read");
+    assert_eq!(new_review.author_name, "Jane Doe");
+    assert_eq!(new_review.word_count, 812);
+}
+
+#[test]
+fn form_for_override_promotes_field_to_select() {
+    // The scaffold uses this exact escape hatch to turn an enum column into a
+    // <select>; here we prove it works on a derived model.
+    let changeset = Changeset::new(Article {
+        id: 1,
+        title: "Hello".into(),
+        body: None,
+        views: 3,
+        rating: 4.5,
+        published: true,
+    });
+
+    let html = form_for(&changeset, "/articles", "post")
+        .exclude("rating")
+        .override_field(
+            "title",
+            FieldControl::Select {
+                options: vec![
+                    ("draft".to_string(), "Draft".to_string()),
+                    ("live".to_string(), "Live".to_string()),
+                ],
+            },
+        )
+        .render()
+        .into_string();
+
+    assert!(html.contains("<select"));
+    assert!(html.contains(r#"name="title""#));
+    // Excluded field is gone.
+    assert!(!html.contains(r#"name="rating""#));
+}
