@@ -4,6 +4,8 @@ mod db_pull;
 mod generate_references_postgres;
 mod migrate_down;
 mod repo_hygiene;
+mod scaffold_form_for;
 #[cfg(unix)]
 mod serve;
+mod tauri_mobile_thin_client;
 mod webhook_sim;
