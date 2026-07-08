@@ -533,7 +533,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   minimal stub) so live `hx-ext="morph"` updates actually DOM-morph, and
   patched its htmx extension so non-morph out-of-band swaps (e.g.
   `beforeend`/`delete`) no longer throw a caught console error. Served the
-  idiomorph script with a revalidating cache policy (a strong content-derived
+  idiomorph script with a revalidating cache policy (a weak content-derived
   `ETag` plus `Cache-Control: public, max-age=0, must-revalidate`) instead of a
   year-long `immutable` cache, so clients that had cached the old stub pick up
   the real script on their next revalidation rather than running stale code for

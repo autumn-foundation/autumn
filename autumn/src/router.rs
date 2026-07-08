@@ -3547,13 +3547,20 @@ pub async fn autumn_widgets_handler() -> axum::response::Response {
         .into_response()
 }
 
-/// Strong `ETag` for the vendored idiomorph script, derived once from the
+/// Weak `ETag` for the vendored idiomorph script, derived once from the
 /// embedded bytes.
 ///
 /// The idiomorph URL is **not** content-fingerprinted, so it cannot safely use
 /// an `immutable` cache. Instead the handler emits this content-derived `ETag`
 /// alongside a revalidating `Cache-Control`, letting caches confirm freshness
 /// (and pick up new bytes) whenever the vendored script changes.
+///
+/// The validator is **weak**: when compression is enabled,
+/// `apply_compression_middleware` gzips/brotli-encodes this
+/// `application/javascript` response after the handler attaches the `ETag`, so
+/// the identity, gzip, and br variants share one tag despite differing byte
+/// streams. A strong `ETag` asserts byte-for-byte equivalence and would be
+/// invalid across those encodings (matching the sibling CSS asset handler).
 #[cfg(feature = "htmx")]
 static IDIOMORPH_ETAG: std::sync::LazyLock<crate::etag::ETag> = std::sync::LazyLock::new(|| {
     use sha2::{Digest, Sha256};
@@ -3564,7 +3571,7 @@ static IDIOMORPH_ETAG: std::sync::LazyLock<crate::etag::ETag> = std::sync::LazyL
     for byte in digest {
         let _ = write!(hex, "{byte:02x}");
     }
-    crate::etag::ETag::strong(format!("idiomorph-{hex}"))
+    crate::etag::ETag::weak(format!("idiomorph-{hex}"))
 });
 
 /// Serves the vendored idiomorph DOM-morphing library at [`crate::htmx::IDIOMORPH_JS_PATH`].
@@ -3572,7 +3579,7 @@ static IDIOMORPH_ETAG: std::sync::LazyLock<crate::etag::ETag> = std::sync::LazyL
 /// Idiomorph enables smooth DOM morphing via `hx-swap="morph"` in htmx.
 ///
 /// Because the serving URL is not content-fingerprinted, the response uses a
-/// revalidating cache policy (`must-revalidate` plus a strong content-derived
+/// revalidating cache policy (`must-revalidate` plus a weak content-derived
 /// `ETag`) rather than a year-long `immutable` cache. This ensures clients that
 /// cached an earlier version of the script pick up new bytes instead of running
 /// a stale copy for up to a year.
@@ -7534,16 +7541,19 @@ mod idiomorph_tests {
             "cache-control must not be immutable for a non-fingerprinted URL, got: {cc}"
         );
 
-        // A strong, content-derived ETag lets caches revalidate (and pick up new
-        // bytes when the script changes).
+        // A weak, content-derived ETag lets caches revalidate (and pick up new
+        // bytes when the script changes). It is weak rather than strong because
+        // compression middleware may re-encode this response after the handler
+        // attaches the validator, so the identity/gzip/br variants share a tag
+        // despite differing byte streams.
         let etag = response
             .headers()
             .get(http::header::ETAG)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
         assert!(
-            etag.starts_with("\"idiomorph-") && etag.ends_with('"'),
-            "expected a strong quoted idiomorph ETag, got: {etag}"
+            etag.starts_with("W/\"idiomorph-") && etag.ends_with('"'),
+            "expected a weak quoted idiomorph ETag, got: {etag}"
         );
 
         let body = response.into_body().collect().await.unwrap().to_bytes();
