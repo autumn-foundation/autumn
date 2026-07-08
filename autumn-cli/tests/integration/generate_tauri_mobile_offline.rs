@@ -34,12 +34,18 @@ fn read_shell_sources(project: &Path) -> String {
     combined
 }
 
+/// Scaffold a fresh app and run `generate tauri-mobile --offline-sync` on it.
+fn offline_project(name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+    let (tmp, project) = fresh_project(name);
+    run_autumn(&project, &["generate", "tauri-mobile", "--offline-sync"]);
+    (tmp, project)
+}
+
 // ── The offline-sync shell wiring ───────────────────────────────────────────
 
 #[test]
 fn offline_sync_shell_wires_syncstore_engine_and_resume_trigger() {
-    let (_tmp, project) = fresh_project("offsync-shell-app");
-    run_autumn(&project, &["generate", "tauri-mobile", "--offline-sync"]);
+    let (_tmp, project) = offline_project("offsync-shell-app");
 
     let lib_rs = read(&project.join("src-tauri/src/lib.rs"));
 
@@ -102,8 +108,7 @@ fn offline_sync_shell_wires_syncstore_engine_and_resume_trigger() {
 
 #[test]
 fn offline_sync_shell_cargo_toml_enables_autumn_web_offline_sync() {
-    let (_tmp, project) = fresh_project("offsync-cargo-app");
-    run_autumn(&project, &["generate", "tauri-mobile", "--offline-sync"]);
+    let (_tmp, project) = offline_project("offsync-cargo-app");
 
     let cargo_toml = read(&project.join("src-tauri/Cargo.toml"));
     assert!(
@@ -133,8 +138,7 @@ fn offline_sync_shell_cargo_toml_enables_autumn_web_offline_sync() {
 
 #[test]
 fn offline_sync_app_lib_mounts_sync_router_behind_db_guard() {
-    let (_tmp, project) = fresh_project("offsync-server-app");
-    run_autumn(&project, &["generate", "tauri-mobile", "--offline-sync"]);
+    let (_tmp, project) = offline_project("offsync-server-app");
 
     let lib_rs = read(&project.join("src/lib.rs"));
     assert!(lib_rs.contains("pub async fn serve()"));
@@ -169,8 +173,7 @@ fn offline_sync_app_lib_mounts_sync_router_behind_db_guard() {
 
 #[test]
 fn offline_sync_app_cargo_toml_gains_default_offline_sync_feature() {
-    let (_tmp, project) = fresh_project("offsync-feature-app");
-    run_autumn(&project, &["generate", "tauri-mobile", "--offline-sync"]);
+    let (_tmp, project) = offline_project("offsync-feature-app");
 
     let cargo_toml = read(&project.join("Cargo.toml"));
     assert!(
@@ -187,8 +190,7 @@ fn offline_sync_app_cargo_toml_gains_default_offline_sync_feature() {
 
 #[test]
 fn offline_sync_rerun_with_force_is_idempotent() {
-    let (_tmp, project) = fresh_project("offsync-rerun-app");
-    run_autumn(&project, &["generate", "tauri-mobile", "--offline-sync"]);
+    let (_tmp, project) = offline_project("offsync-rerun-app");
     let cargo_after_first = read(&project.join("Cargo.toml"));
 
     run_autumn(
@@ -360,8 +362,7 @@ fn offline_sync_docs_code_matches_emitted_templates() {
     let docs_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/guide");
     let page = read(&docs_dir.join("tauri-mobile-offline-sync.md"));
 
-    let (_tmp, project) = fresh_project("offsync-drift-app");
-    run_autumn(&project, &["generate", "tauri-mobile", "--offline-sync"]);
+    let (_tmp, project) = offline_project("offsync-drift-app");
 
     let mut checked_blocks = 0;
     let mut lines = page.lines();
@@ -407,8 +408,7 @@ fn offline_sync_docs_code_matches_emitted_templates() {
 
 #[test]
 fn destroy_offline_sync_scaffold_removes_shell_keeps_app_edits() {
-    let (_tmp, project) = fresh_project("offsync-destroy-app");
-    run_autumn(&project, &["generate", "tauri-mobile", "--offline-sync"]);
+    let (_tmp, project) = offline_project("offsync-destroy-app");
     let cargo_after_generate = read(&project.join("Cargo.toml"));
 
     run_autumn(&project, &["destroy", "tauri-mobile", "--offline-sync"]);

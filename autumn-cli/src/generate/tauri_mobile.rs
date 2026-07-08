@@ -19,6 +19,20 @@
 //! longer matches, the extraction is skipped with a warning pointing at the
 //! manual steps in `docs/guide/tauri-mobile-in-process.md`.
 //!
+//! # `--offline-sync` (issue #1508, Option C)
+//!
+//! With [`TauriMobileOptions::offline_sync`] the scaffold becomes
+//! local-first: app data lives in a `SyncStore`-backed `SQLite` database in
+//! the app sandbox (the shell exports its path as `AUTUMN_SYNC__DB_PATH`),
+//! a background `SyncEngine` syncs it with the remote deployment's `/sync`
+//! endpoints (`AUTUMN_SYNC__REMOTE_URL`; plus an immediate pass on
+//! `RunEvent::Resumed`), and the app crate gains a default `offline-sync`
+//! feature and a `/sync` router mounted in the extracted `serve()` — only
+//! when `AUTUMN_DATABASE__URL` is configured, so the same binary boots
+//! fully offline on a device and serves sync on the server. Without the
+//! flag the emitted scaffold is byte-identical to the plain #1507 output.
+//! See `docs/guide/tauri-mobile-offline-sync.md`.
+//!
 //! # Generated files
 //!
 //! ```text
