@@ -24,8 +24,10 @@ name: Quickstart Gate
 #
 # Deliberately NO Rust build caching on the quickstart phases: the gate's
 # tracked number is the fresh-user funnel (cold `cargo install` → first 200),
-# and a warmed cache would corrupt it. Only diesel_cli (a migrate
-# prerequisite that sits outside the funnel) is installed ahead of time.
+# and a warmed cache would corrupt it. Nothing user-facing is pre-installed
+# either — the Diesel CLI (documented prerequisite of the scaffold path) is
+# installed by the scaffold-migrate phase with exactly the documented
+# command, after the funnel has been measured.
 
 on:
   push:
@@ -85,12 +87,17 @@ jobs:
     # job budget; the whole quickstart fits well inside an hour even cold.
     timeout-minutes: 60
     services:
+      # The `quickstart` database is deliberately NOT pre-created (no
+      # POSTGRES_DB): the documented scaffold path includes creating the
+      # database (`createdb my_app` in docs/guide/generators.md), and the
+      # scaffold-migrate phase runs that step — pre-creating it here would
+      # mask a fresh user's failure. The image's default database (named
+      # after POSTGRES_USER) only serves as the createdb maintenance DB.
       postgres:
         image: postgres:16
         env:
           POSTGRES_USER: autumn
           POSTGRES_PASSWORD: autumn
-          POSTGRES_DB: quickstart
         ports:
           - 5432:5432
         options: >-
@@ -111,8 +118,10 @@ jobs:
         with:
           toolchain: ${{ matrix.toolchain }}
 
-      - name: Install diesel_cli (autumn migrate prerequisite, outside the funnel)
-        run: cargo install diesel_cli --version "=2.2.0" --no-default-features --features postgres --locked
+      # No diesel_cli pre-install: the Diesel CLI is a documented user-facing
+      # prerequisite of the scaffold path (docs/guide/generators.md), so the
+      # scaffold-migrate phase installs it with exactly the documented
+      # command. Pre-installing it here would mask a fresh user's failure.
 
       - name: "Quickstart: install (cargo install autumn-cli)"
         run: ./scripts/check-quickstart.sh install
@@ -135,10 +144,11 @@ jobs:
       - name: "Scaffold: build"
         run: ./scripts/check-quickstart.sh scaffold-build
 
-      - name: "Scaffold: migrate (configure autumn.toml + autumn migrate)"
+      - name: "Scaffold: migrate (diesel_cli + autumn.toml + createdb + autumn migrate)"
         env:
           # Consumed by the script only to write database.url into
-          # autumn.toml; `autumn migrate` itself runs with DB env stripped.
+          # autumn.toml and to point createdb at the service container;
+          # `autumn migrate` itself runs with DB env stripped.
           DATABASE_URL: ${{ env.QUICKSTART_DATABASE_URL }}
         run: ./scripts/check-quickstart.sh scaffold-migrate
 

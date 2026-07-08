@@ -33,10 +33,11 @@
 #                    `cargo install` to the first 200 response.
 #   scaffold         `autumn generate scaffold Post title:String body:Text published:bool`
 #   scaffold-build   `cargo build`
-#   scaffold-migrate uncomment [database] in autumn.toml (the documented
-#                    config step, using $DATABASE_URL as the value), then
-#                    `autumn migrate` with DB env stripped (requires the
-#                    diesel CLI on PATH; see docs/guide/generators.md)
+#   scaffold-migrate the documented scaffold prerequisites + migrate
+#                    (docs/guide/generators.md): install the Diesel CLI if
+#                    missing, uncomment [database] in autumn.toml (using
+#                    $DATABASE_URL as the value), `createdb`, then
+#                    `autumn migrate` with DB env stripped.
 #   scaffold-serve   `autumn dev` + poll `GET /posts` until 200 (DB config
 #                    comes from autumn.toml, not env).
 #
@@ -168,6 +169,40 @@ configure_database() {
     || fail "could not uncomment the [database] section in the generated autumn.toml — the template changed shape; update scripts/check-quickstart.sh to match it"
   grep -q "^url = \"${DATABASE_URL}\"" "$toml" \
     || fail "could not set database.url in the generated autumn.toml — the template changed shape; update scripts/check-quickstart.sh to match it"
+}
+
+create_database() {
+  # The documented database-creation step (docs/guide/generators.md):
+  # `autumn migrate` runs migrations against the configured database but
+  # does not create it, and the published autumn-cli (0.5.0) has no
+  # `autumn db create` subcommand — the guide documents `createdb my_app`.
+  # Run exactly that, with connection parameters taken from the same URL
+  # written into autumn.toml (standing in for the user's local Postgres
+  # auth). The CI service container deliberately does NOT pre-create this
+  # database, so skipping this step fails the migrate phase — exactly as it
+  # fails for a fresh user.
+  local url="$DATABASE_URL" dbname rest cred hostport host port user pass
+  dbname="${url##*/}"; dbname="${dbname%%\?*}"
+  rest="${url#*://}"; rest="${rest%/*}"
+  if [[ "$rest" == *@* ]]; then
+    cred="${rest%@*}"; hostport="${rest##*@}"
+    user="${cred%%:*}"
+    if [[ "$cred" == *:* ]]; then pass="${cred#*:}"; else pass=""; fi
+  else
+    hostport="$rest"; user=""; pass=""
+  fi
+  host="${hostport%%:*}"
+  if [[ "$hostport" == *:* ]]; then port="${hostport#*:}"; else port=5432; fi
+  command -v createdb >/dev/null \
+    || fail "createdb (postgresql-client) is not on PATH — the documented database-creation step needs it"
+  if PGPASSWORD="$pass" createdb -h "$host" -p "$port" ${user:+-U "$user"} "$dbname" 2>"$state/createdb.err"; then
+    echo "created database '${dbname}' (documented 'createdb' step)"
+  elif grep -q "already exists" "$state/createdb.err"; then
+    echo "database '${dbname}' already exists — documented 'createdb' step skipped"
+  else
+    cat "$state/createdb.err" >&2 || true
+    fail "'createdb ${dbname}' (the documented database-creation step) failed — see the output above"
+  fi
 }
 
 
@@ -395,15 +430,24 @@ phase_scaffold_build() {
 phase_scaffold_migrate() {
   require_app
   [[ -n "${DATABASE_URL:-}" ]] || fail "DATABASE_URL is not set — it supplies the Postgres URL written into autumn.toml's [database] section (CI provides a postgres:16 service container)"
-  command -v diesel >/dev/null || fail "the diesel CLI is not on PATH — 'autumn migrate' shells out to it (cargo install diesel_cli --no-default-features --features postgres)"
+  # The documented one-time prerequisite (docs/guide/generators.md):
+  # `autumn migrate` delegates to the Diesel CLI. Install it with exactly
+  # the documented command when missing — CI must not pre-install it, or a
+  # fresh user's missing-prerequisite failure would be masked here. Sits
+  # outside the funnel number, which ends at the base serve phase.
+  if ! command -v diesel >/dev/null; then
+    cargo install diesel_cli --no-default-features --features postgres \
+      || fail "'cargo install diesel_cli --no-default-features --features postgres' failed — the documented Diesel CLI prerequisite for 'autumn migrate' does not install"
+  fi
   configure_database
+  create_database
   # Run the documented command in a clean shell: DB config must resolve from
   # autumn.toml alone (autumn-cli's resolve_database_url exits if no
   # TOML/env value is present — that failure must surface here, not be
   # masked by CI env vars a real user doesn't have).
   (cd "$app_dir" && env -u DATABASE_URL -u AUTUMN_DATABASE__URL autumn migrate) \
     || fail "'autumn migrate' failed with database.url configured in autumn.toml (docs/guide/generators.md scaffold path)"
-  ok "database.url configured in autumn.toml"
+  ok "diesel CLI present, database created, database.url configured in autumn.toml"
 }
 
 phase_scaffold_serve() {

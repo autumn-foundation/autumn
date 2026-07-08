@@ -24,13 +24,17 @@ ordinary user code that you should edit freely.
 ## Five commands to a working CRUD app
 
 This is the path that every other batteries-included framework boasts about.
-On a fresh machine with Rust and Postgres installed:
+On a fresh machine with Rust and Postgres installed, there is one one-time
+prerequisite: `autumn migrate` delegates to the Diesel CLI, so install it
+once with `cargo install diesel_cli --no-default-features --features postgres`.
 
 ```bash
 autumn new my-app
 cd my-app
 autumn generate scaffold Post title:String body:Text published:bool
-# Before migrating, point the app at your Postgres — see the note below.
+# Before migrating: configure the database (see the note below) and
+# create it if it does not exist yet:
+createdb my_app
 autumn migrate
 autumn dev
 ```
@@ -39,7 +43,10 @@ One file edit belongs between `generate` and `migrate`: the generated
 `autumn.toml` ships with the database section commented out (look for
 "Uncomment to configure database:"). Uncomment it and point `url` at your
 Postgres so both `autumn migrate` and the running app can reach the
-database — without it, `autumn migrate` exits with `✗ No database URL found.`:
+database — without it, `autumn migrate` exits with `✗ No database URL found.`.
+`autumn migrate` runs migrations against that database but does not create
+it, hence the `createdb my_app` above (any equivalent, such as
+`CREATE DATABASE` in psql, works too):
 
 ```toml
 [database]
