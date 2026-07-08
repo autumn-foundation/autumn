@@ -150,7 +150,12 @@ fn gc_tombstone_row(change: &Change, version: Version) -> RemoteRow {
 pub trait SyncBackend: Send + Sync + 'static {
     /// Apply one push batch atomically, returning one outcome per change
     /// (request order). Conflicts are settled via `resolver` and assigned a
-    /// new version. Changes whose base row was deleted and its tombstone
+    /// new version. Retries of an already-applied change REPLAY the
+    /// original outcome: clean applies answer `AlreadyApplied` with the
+    /// originally assigned version, and `Resolved` outcomes answer the same
+    /// `Resolved { row }` the lost response carried (snapshotted in the
+    /// dedup record, so later writes or tombstone GC cannot alter the
+    /// replay — see [`AppliedRecord`]). Changes whose base row was deleted and its tombstone
     /// already GC'd (`base_version > 0` but at or below the tombstone
     /// horizon, row absent) are **deterministically server-winning** — the
     /// resolver is bypassed for this shape (its input would be fabricated;
@@ -223,7 +228,11 @@ pub trait SyncBackend: Send + Sync + 'static {
     /// **longer than any client's plausible offline retry horizon**: a
     /// device retrying a change whose dedup record was GC'd will re-apply
     /// it (content-idempotent for upserts/deletes, but it bumps the row
-    /// version and, under a custom resolver, may re-run resolution).
+    /// version and, under a custom resolver, may re-run resolution). The
+    /// dedup records also carry the resolved-row snapshots that let retries
+    /// replay `Resolved` outcomes, so this retention window is the only
+    /// bound on that replay — row-table writes and tombstone GC never
+    /// invalidate it.
     ///
     /// # Errors
     ///
@@ -246,11 +255,23 @@ pub trait SyncBackend: Send + Sync + 'static {
 }
 
 /// Push-dedup record: the version a change was assigned when first
-/// applied, and when — mirrors a row of `autumn_sync_applied` on Postgres.
-#[derive(Debug, Clone, Copy)]
+/// applied, when — and, for `Resolved` outcomes, a snapshot of the resolved
+/// row so a retry after a lost response REPLAYS the original outcome.
+/// Without the snapshot a retry answered `AlreadyApplied` would look like a
+/// clean ack to the client: it would record the resolved version without
+/// ever seeing the resolved row, keep its losing payload visible, and its
+/// next edit (based on that version) would clean-apply over the resolution
+/// — e.g. resurrecting a server-winning delete. Snapshotting in the dedup
+/// record (rather than reloading from the rows table) keeps the replay
+/// independent of later writes and tombstone GC; the only window remains
+/// `gc_applied` retention, which already documents that post-GC retries
+/// re-apply. Mirrors a row of `autumn_sync_applied` on Postgres.
+#[derive(Debug, Clone)]
 struct AppliedRecord {
     version: Version,
     applied_at: DateTime<Utc>,
+    /// `Some` when the original outcome was `Resolved { row }`.
+    resolved_row: Option<RemoteRow>,
 }
 
 #[derive(Debug, Default)]
@@ -304,9 +325,15 @@ impl SyncBackend for MemorySyncBackend {
         for change in &request.changes {
             let dedup_key = (request.device_id.clone(), change.change_id.clone());
             if let Some(record) = state.applied.get(&dedup_key) {
-                outcomes.push(ChangeOutcome::AlreadyApplied {
-                    version: record.version,
-                });
+                // Replay the ORIGINAL outcome: a Resolved result must come
+                // back as the same Resolved row, not a clean-looking
+                // AlreadyApplied ack (see AppliedRecord).
+                outcomes.push(record.resolved_row.as_ref().map_or(
+                    ChangeOutcome::AlreadyApplied {
+                        version: record.version,
+                    },
+                    |row| ChangeOutcome::Resolved { row: row.clone() },
+                ));
                 continue;
             }
             let row_key = (change.collection.clone(), change.pk.clone());
@@ -339,11 +366,16 @@ impl SyncBackend for MemorySyncBackend {
                     (ChangeOutcome::Applied { version }, version)
                 }
             };
+            let resolved_row = match &outcome {
+                ChangeOutcome::Resolved { row } => Some(row.clone()),
+                _ => None,
+            };
             state.applied.insert(
                 dedup_key,
                 AppliedRecord {
                     version,
                     applied_at: Utc::now(),
+                    resolved_row,
                 },
             );
             outcomes.push(outcome);
@@ -449,6 +481,10 @@ CREATE TABLE IF NOT EXISTS autumn_sync_applied (
     change_id TEXT NOT NULL,
     version BIGINT NOT NULL DEFAULT 0,
     applied_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- Snapshot of the resolved row when the original outcome was Resolved,
+    -- so retries replay the resolution instead of a clean-looking
+    -- AlreadyApplied ack (NULL for clean applies).
+    resolved_row JSONB,
     PRIMARY KEY (device_id, change_id)
 );
 CREATE TABLE IF NOT EXISTS autumn_sync_meta (
@@ -524,6 +560,16 @@ impl PgRowRecord {
 struct PgVersionRecord {
     #[diesel(sql_type = BigInt)]
     version: i64,
+}
+
+/// Dedup-record row: originally assigned version plus the resolved-row
+/// snapshot for `Resolved` outcomes (see [`AppliedRecord`]).
+#[derive(QueryableByName)]
+struct PgAppliedRecord {
+    #[diesel(sql_type = BigInt)]
+    version: i64,
+    #[diesel(sql_type = Nullable<Jsonb>)]
+    resolved_row: Option<serde_json::Value>,
 }
 
 #[derive(QueryableByName)]
@@ -650,16 +696,26 @@ impl SyncBackend for PgSyncBackend {
             let mut outcomes = Vec::with_capacity(request.changes.len());
             for change in &request.changes {
                 let duplicate = sql_query(
-                    "SELECT version FROM autumn_sync_applied \
+                    "SELECT version, resolved_row FROM autumn_sync_applied \
                      WHERE device_id = $1 AND change_id = $2",
                 )
                 .bind::<Text, _>(&request.device_id)
                 .bind::<Text, _>(&change.change_id)
-                .get_result::<PgVersionRecord>(conn)
+                .get_result::<PgAppliedRecord>(conn)
                 .optional()?;
                 if let Some(record) = duplicate {
-                    outcomes.push(ChangeOutcome::AlreadyApplied {
-                        version: record.version,
+                    // Replay the ORIGINAL outcome: a Resolved result must
+                    // come back as the same Resolved row, not a
+                    // clean-looking AlreadyApplied ack (see AppliedRecord).
+                    outcomes.push(match record.resolved_row {
+                        Some(value) => ChangeOutcome::Resolved {
+                            row: serde_json::from_value(value).map_err(|e| {
+                                diesel::result::Error::DeserializationError(e.into())
+                            })?,
+                        },
+                        None => ChangeOutcome::AlreadyApplied {
+                            version: record.version,
+                        },
                     });
                     continue;
                 }
@@ -704,13 +760,22 @@ impl SyncBackend for PgSyncBackend {
                     }
                 };
 
+                let resolved_row = match &outcome {
+                    ChangeOutcome::Resolved { row } => Some(
+                        serde_json::to_value(row)
+                            .map_err(|e| diesel::result::Error::SerializationError(e.into()))?,
+                    ),
+                    _ => None,
+                };
                 sql_query(
-                    "INSERT INTO autumn_sync_applied (device_id, change_id, version) \
-                     VALUES ($1, $2, $3)",
+                    "INSERT INTO autumn_sync_applied \
+                     (device_id, change_id, version, resolved_row) \
+                     VALUES ($1, $2, $3, $4)",
                 )
                 .bind::<Text, _>(&request.device_id)
                 .bind::<Text, _>(&change.change_id)
                 .bind::<BigInt, _>(version)
+                .bind::<Nullable<Jsonb>, _>(resolved_row)
                 .execute(conn)?;
                 outcomes.push(outcome);
             }

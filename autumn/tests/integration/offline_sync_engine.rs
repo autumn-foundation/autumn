@@ -451,6 +451,110 @@ async fn offline_edit_of_a_gcd_row_does_not_resurrect_it() {
     assert_eq!(next.pushed, 0);
 }
 
+/// Regression for the lost-response retry downgrade: B's edit conflicts
+/// with A's newer delete, the server resolves `KeepServer` (tombstone) but
+/// the response is lost. The retry must REPLAY the original Resolved
+/// tombstone — under the old `AlreadyApplied` downgrade the client recorded
+/// the resolved version as a clean ack, kept its losing payload visible,
+/// and its next edit could clean-apply over the resolution and resurrect
+/// the deleted row.
+#[tokio::test]
+async fn lost_resolved_response_retry_converges_without_resurrection() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use axum::middleware::Next;
+    use axum::response::IntoResponse;
+
+    // Loses exactly ONE push response AFTER the backend has applied it —
+    // the client sees a transport-style failure while the server state
+    // (and its dedup record) already exists.
+    static LOSE_NEXT_PUSH_RESPONSE: AtomicBool = AtomicBool::new(false);
+    async fn lossy_push(request: axum::extract::Request, next: Next) -> axum::response::Response {
+        let is_push = request.uri().path().ends_with("/push");
+        let response = next.run(request).await;
+        if is_push && LOSE_NEXT_PUSH_RESPONSE.swap(false, Ordering::SeqCst) {
+            return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+        response
+    }
+    LOSE_NEXT_PUSH_RESPONSE.store(false, Ordering::SeqCst);
+
+    let backend = Arc::new(MemorySyncBackend::new());
+    let lossy: axum::Router = axum::Router::new().nest(
+        "/sync",
+        server::router(backend.clone(), Arc::new(LwwResolver))
+            .layer(axum::middleware::from_fn(lossy_push)),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback");
+    let addr = listener.local_addr().expect("local addr");
+    let _srv = tokio::spawn(async move {
+        axum::serve(listener, lossy).await.expect("serve");
+    });
+    let url = format!("http://{addr}/sync");
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // A creates "victim"; B syncs it. B edits it offline, then A deletes it
+    // with a NEWER stamp — B's push will lose the LWW conflict.
+    let store_a = open_store(&dir, "a.db");
+    let engine_a = engine_for(&store_a, &url);
+    let store_b = open_store(&dir, "b.db");
+    let engine_b = engine_for(&store_b, &url);
+    store_a
+        .put("notes", "victim", &note("original"))
+        .expect("put");
+    engine_a.sync_once().await.expect("a sync 1");
+    engine_b.sync_once().await.expect("b sync 1");
+    store_b
+        .put("notes", "victim", &note("losing edit"))
+        .expect("b edit");
+    store_a.delete("notes", "victim").expect("a delete");
+    engine_a.sync_once().await.expect("a sync 2");
+
+    // B's push is applied server-side (Resolved: the deletion wins) but the
+    // response is lost — B's journal entry and losing payload survive.
+    LOSE_NEXT_PUSH_RESPONSE.store(true, Ordering::SeqCst);
+    let err = engine_b.sync_once().await.expect_err("response is lost");
+    assert!(matches!(err, SyncError::Server(_)), "got {err:?}");
+    assert_eq!(
+        store_b.pending_count().expect("pending"),
+        1,
+        "the unconfirmed change stays journaled for the retry"
+    );
+
+    // The retry replays the original Resolved tombstone: B converges on the
+    // deletion instead of recording a clean ack over its losing payload.
+    engine_b.sync_once().await.expect("retry");
+    assert_eq!(store_b.pending_count().expect("pending"), 0);
+    let listed: Vec<(String, Note)> = store_b.list("notes").expect("b list");
+    assert!(
+        listed.iter().all(|(pk, _)| pk != "victim"),
+        "B must converge on the server-winning delete: {listed:?}"
+    );
+    assert!(
+        backend_rows(backend.as_ref())
+            .iter()
+            .all(|r| r.pk != "victim" || r.deleted),
+        "the server must not hold a resurrected row"
+    );
+
+    // And a NEW local write afterwards is a deliberate re-create that
+    // settles cleanly — no false conflicts from the replayed ack.
+    store_b
+        .put("notes", "victim", &note("recreated knowingly"))
+        .expect("recreate");
+    let report = engine_b.sync_once().await.expect("recreate sync");
+    assert_eq!(report.pushed, 1);
+    assert!(!report.full_resync, "no resync loop");
+    assert!(
+        backend_rows(backend.as_ref())
+            .iter()
+            .any(|r| r.pk == "victim" && !r.deleted),
+        "a post-convergence re-create is a legitimate new write"
+    );
+}
+
 /// Regression for the server-demanded resync destroying local data when
 /// the replacement pull fails: the `FullResyncRequired` branch used to clear
 /// synced rows BEFORE fetching the replacement snapshot, so a connection

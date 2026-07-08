@@ -137,8 +137,9 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
     );
     winner.base_version = 0; // stale: n1 is at versions[0]
     winner.updated_at = Utc::now() + Duration::seconds(30);
+    let winner_request = push("device-b", vec![winner]);
     let response = backend
-        .apply_push(&push("device-b", vec![winner]), &resolver)
+        .apply_push(&winner_request, &resolver)
         .expect("conflict push");
     let ChangeOutcome::Resolved { row } = &response.outcomes[0] else {
         panic!(
@@ -156,6 +157,33 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
         "newer client write wins LWW"
     );
     let winner_version = row.version;
+    let winner_row = row.clone();
+
+    // ── Retrying a RESOLVED change replays the resolution ────────────────
+    // A lost response must not downgrade the outcome to a clean-looking
+    // AlreadyApplied ack: the client would record the resolved version
+    // without ever seeing the resolved row — its losing payload would stay
+    // visible and its next edit (based on that version) would clean-apply
+    // over the resolution (e.g. resurrect a server-winning delete).
+    let latest_before_replay = backend.latest_version().expect("latest");
+    let replay = backend
+        .apply_push(&winner_request, &resolver)
+        .expect("replay push");
+    let ChangeOutcome::Resolved { row } = &replay.outcomes[0] else {
+        panic!(
+            "a retry of a Resolved change must replay Resolved, got {:?}",
+            replay.outcomes[0]
+        );
+    };
+    assert_eq!(
+        row, &winner_row,
+        "the replay must carry the originally resolved row"
+    );
+    assert_eq!(
+        backend.latest_version().expect("latest"),
+        latest_before_replay,
+        "a replay must not assign versions"
+    );
 
     // ── Conflict: older client write loses under LWW, still re-versioned ─
     let mut loser = change(
@@ -380,8 +408,9 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
     );
     stale_edit.base_version = versions[1]; // n2's pre-delete version (< horizon)
     stale_edit.updated_at = Utc::now() - Duration::seconds(3600);
+    let stale_request = push("device-offline", vec![stale_edit]);
     let response = backend
-        .apply_push(&push("device-offline", vec![stale_edit]), &resolver)
+        .apply_push(&stale_request, &resolver)
         .expect("stale push");
     let ChangeOutcome::Resolved { row } = &response.outcomes[0] else {
         panic!(
@@ -396,6 +425,23 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
     assert!(
         row.version > latest_before_stale,
         "the resolution gets a fresh version so every device converges"
+    );
+    let stale_tombstone = row.clone();
+
+    // A retry of the stale push (lost response) replays the SAME
+    // server-winning tombstone — never a clean-looking AlreadyApplied.
+    let replay = backend
+        .apply_push(&stale_request, &resolver)
+        .expect("stale replay");
+    let ChangeOutcome::Resolved { row } = &replay.outcomes[0] else {
+        panic!(
+            "a retry of the stale push must replay Resolved, got {:?}",
+            replay.outcomes[0]
+        );
+    };
+    assert_eq!(
+        row, &stale_tombstone,
+        "the replay must carry the original tombstone"
     );
     let PullResponse::Ok { rows, .. } = backend
         .pull_since(latest_before_stale, 100, latest_before_stale)
