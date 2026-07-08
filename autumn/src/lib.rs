@@ -72,6 +72,7 @@ pub mod assets;
 pub mod audit;
 pub mod auth;
 pub mod authorization;
+pub mod batches;
 pub mod cache;
 #[cfg(feature = "ws")]
 pub mod channels;
@@ -431,6 +432,11 @@ pub use app::{ApiVersion, RegisteredApiVersions};
 /// connection. See [`db::Db`] for full documentation and examples.
 #[cfg(feature = "db")]
 pub use db::Db;
+
+/// Transaction options (isolation level + retry policy) and the savepoint
+/// helper for [`Db::tx_with`]. See [`db::TxOptions`].
+#[cfg(feature = "db")]
+pub use db::{IsolationLevel, TxOptions, savepoint};
 
 /// Framework error type and result alias.
 ///

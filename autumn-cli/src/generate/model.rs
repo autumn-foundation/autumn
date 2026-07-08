@@ -245,7 +245,13 @@ pub fn plan_model_with_options(
 /// single-file `src/models.rs` (only counts if its content actually declares
 /// the resource's table, via a word-boundary-aware check so `posts` isn't
 /// confused with a longer table name like `posts_tags`).
-fn model_file_exists(project_root: &Path, table: &str, base: &str) -> bool {
+///
+/// Shared with the scaffold generator (`pub(super)`): the same presence test
+/// that decides whether [`check_reference_targets`] warns also decides
+/// whether a scaffolded `references` column can render as a `<select>` of
+/// the target table's ids (which needs the target's `src/schema.rs` entry)
+/// or must fall back to the derived numeric id input.
+pub(super) fn model_file_exists(project_root: &Path, table: &str, base: &str) -> bool {
     let per_resource = project_root
         .join("src")
         .join("models")

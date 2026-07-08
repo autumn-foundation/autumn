@@ -1609,6 +1609,12 @@ struct ActuatorHealth {
     uptime: String,
     #[cfg(feature = "db")]
     autumn_after_commit_failures_total: u64,
+    /// Total transaction retries triggered by a `40001`/`40P01` (issue #1202).
+    #[cfg(feature = "db")]
+    autumn_tx_retries_total: u64,
+    /// Total transactions that exhausted their retry budget (issue #1202).
+    #[cfg(feature = "db")]
+    autumn_tx_retry_exhausted_total: u64,
     /// Per-component health, keyed by indicator name.
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     components: HashMap<String, ComponentHealth>,
@@ -1762,6 +1768,12 @@ pub async fn health<S: ProvideActuatorState + Send + Sync + 'static>(
         uptime: state.uptime_display(),
         #[cfg(feature = "db")]
         autumn_after_commit_failures_total: crate::db::AFTER_COMMIT_FAILURES_TOTAL
+            .load(std::sync::atomic::Ordering::Relaxed),
+        #[cfg(feature = "db")]
+        autumn_tx_retries_total: crate::db::TX_RETRIES_TOTAL
+            .load(std::sync::atomic::Ordering::Relaxed),
+        #[cfg(feature = "db")]
+        autumn_tx_retry_exhausted_total: crate::db::TX_RETRY_EXHAUSTED_TOTAL
             .load(std::sync::atomic::Ordering::Relaxed),
         components,
         checks,
