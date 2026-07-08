@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **ci:** README-quickstart gate against the published crates (issue #1586) —
+  `.github/workflows/quickstart-gate.yml` + `scripts/check-quickstart.sh`
+  install the README-pinned `autumn-cli` from crates.io (never the local
+  workspace), run `autumn new` / `autumn setup` / build / serve and assert a
+  200 from `GET /`, then run the README's
+  `autumn generate scaffold Post title:String body:Text published:bool` path
+  through build, `autumn migrate`, and a 200 from `GET /posts`. Runs on every
+  push to `trunk-dev`, on a daily schedule (catches upstream dependency
+  releases), and via `workflow_dispatch` with a `cli-version` input for gating
+  a freshly published release candidate (post-publish, pre-announce — see
+  `docs/release-checklist.md`). Each phase is a named CI step that emits
+  `::error::` on failure so a red run names the broken quickstart step, and
+  the job summary records the tracked install→first-200 funnel time.
 - **generator:** `autumn generate tauri --remote-url <URL>` scaffolds a
   **mobile thin-client** Tauri shell (issue #1506): the webview loads your
   remote HTTPS Autumn server directly (https enforced; loopback and
@@ -514,6 +527,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Accept-Encoding` accepts them, instead of relying solely on the
   general-purpose compression middleware to redo that work on every request.
 
+### Changed
+
+- **deps:** bumped `diesel-async` from 0.8 to 0.9 (resolving 0.9.2, with
+  `diesel` at 2.3.10) and `libsqlite3-sys` from 0.36 to 0.37 — 0.37 is the
+  newest release line diesel 2.3 accepts (`<0.38`). diesel-async 0.9 changed
+  `AsyncConnection::transaction` to take `AsyncFnOnce` closures instead of
+  `ScopedBoxFuture` callbacks; internal call sites and macro-generated code
+  were ported via a new semver-exempt `scoped_transaction` adapter, so the
+  public `Db::tx` / `Db::tx_with` / `savepoint` closure API (including
+  `.scope_boxed()` usage in app code) is unchanged. The CLI generators now
+  pin `diesel-async = "0.9"` in generated/starter `Cargo.toml`s and the
+  auth generator emits `async move |conn|` transaction closures instead of
+  `ScopedBoxFuture`-style `Box::pin` callbacks. [no-plugin]
+- **workspace:** `Cargo.lock` is now committed to the repository (it was
+  previously gitignored) so builds are reproducible and dependency updates
+  are reviewable.
+
+## [0.6.0] - 2026-06-30
+
+### Added
+
+- **ui:** reusable `card` and `stat_card` Maud widget helpers in
+  `autumn_web::widgets`, re-exported from the prelude. `card()` renders a
+  titled content panel with an optional header-action slot, footer, and
+  configurable heading level (`HeadingLevel::H1`–`H6`, default `H2`);
+  `stat_card()` renders a metric tile with label, value, and optional link.
+  Both are CSP-safe and HTML-escape caller-supplied text via Maud.
+  `CardConfig` uses a builder pattern with `const fn` and private fields
+  so the `title()` / `title_html()` escape path cannot be bypassed.
+  The admin plugin's 12 hand-rolled card blocks and dashboard stat tiles are
+  migrated to the new helpers, removing the duplication (#1122).
+
+## [0.5.0] - 2026-06-16
+
+### Added
+
 - **ci:** plugin freshness gate (`scripts/check-plugin-freshness.sh` +
   `.github/workflows/plugin-freshness.yml`) — a PR that adds entries to this
   changelog's Unreleased `Added`/`Changed` sections without touching the
@@ -685,9 +734,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the `references`/`enum{...}`/`decimal`/`:unique` generator DSL, scoped
   tokens, observability defaults, and load shedding. Features merged on
   trunk-dev but absent from the published 0.5.0 crates are explicitly marked
-  "(unreleased)", and in-flight PRs (#1587 `form_for`, #1592
-  `find_in_batches`) are flagged as unmerged rather than documented as
-  available. Fixes stale claims (foreign keys/unique "not in the DSL", the
+  "(unreleased)". Follow-up: once #1587 (`form_for`) and #1592
+  (`find_in_batches`) merged, their in-flight/do-not-use flags were replaced
+  with real coverage — `form_for`/`FormModel`/`FieldControl` (builder methods,
+  derived control mapping, checkbox/datetime/serde-rename decode contracts,
+  scaffold `{snake}_form_for` emission) and
+  `find_in_batches`/`find_each`/`autumn_web::batches` (keyset semantics,
+  retryable errors, scoping/routing inheritance, sharding limits) — each
+  marked "(unreleased)". Fixes stale claims (foreign keys/unique "not in the DSL", the
   removed `--test repo_hygiene` target) and documents that published 0.5.0
   repositories have no pool constructor (`with_pool_untracked` is
   trunk-dev-only).

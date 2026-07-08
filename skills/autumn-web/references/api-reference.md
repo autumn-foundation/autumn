@@ -114,9 +114,19 @@ Published 0.5.0: `find_by_id`, `find_all`, `count`, `exists_by_id`, `save`,
 
 **(unreleased)**: `preload(records, spec)` (declarative associations);
 `from_shard(&ShardedDb)`; `with_pool_untracked` (new on
-trunk-dev — published 0.5.0 repositories have no pool constructor).
-**In flight (PR #1592, unmerged)**:
-`find_in_batches(n)` / `find_each(n)` — do not use until merged.
+trunk-dev — published 0.5.0 repositories have no pool constructor);
+`find_in_batches(batch_size)` / `find_each(batch_size)` — bounded-memory
+whole-table iteration on every repository via a primary-key keyset cursor
+(`WHERE id > last ORDER BY id ASC LIMIT batch_size`, never `LIMIT`/`OFFSET`).
+Handle types live in `autumn_web::batches`: `FindInBatches`
+(`next_batch().await? -> Option<Vec<Model>>`), `FindEach`
+(`next().await? -> Option<Model>`), and the macro-implemented `BatchSource`
+trait. Inherits soft-delete/tenant-scoping/read-routing like `find_all`;
+errors are retryable (keyset cursor advances only on success — `Ok(None)`
+always means completion); `batch_size == 0` is an error; `batch_size` is not
+clamped to `MAX_PAGE_SIZE`; sharded repositories reject cross-shard
+`across_tenants()` iteration like `cursor_page`. See "Batched iteration" in
+`docs/guide/pagination.md`.
 
 ## Db transactions
 
@@ -140,8 +150,34 @@ Free functions rendering changeset-aware, accessible inputs:
   `form.text_input(...)`).
 - **(unreleased)**: `checkbox_input`, `number_input`, `date_input`,
   `datetime_input`, `select_input`.
-- **In flight (PR #1587, unmerged)**: `form_for` whole-form builder +
-  `FormModel` derive — do not use until merged.
+- **(unreleased — trunk-dev, not in published 0.5.0)**: `form_for(&changeset,
+  action, method) -> FormFor` whole-form builder. Renders the opening
+  `<form>` (audited CSRF injection + hidden `_method` override, as
+  `form_tag`), one pre-filled control with inline errors per
+  `FormModel::form_fields()` entry, and a submit button. `FormFor` builder
+  methods: `.csrf(token)`, `.csrf_field_name(name)` (default `"_csrf"`),
+  `.exclude(field)`, `.override_field(field, FieldControl)`,
+  `.override_label(field, label)` (repeat calls on one field: last wins),
+  `.append(markup)` (extra markup before the submit button),
+  `.submit_label(label)` (default `"Save"`), `.multipart()`, `.render()`.
+  `FormModel` (`fn form_fields() -> Vec<FormField>`) is implemented by
+  `#[model]` for the same user-editable columns as `NewX`; hand-written
+  impls build `FormField::new(name, label, control, required)` and use
+  `.with_value_name(serialized_key)` when the data type serde-renames the
+  field (the derive resolves `rename`/`rename_all` automatically —
+  `value_name` affects only value pre-fill; input `name`/`id`, error
+  lookup, and builder matching keep the Rust identifier).
+  `FieldControl` variants (`#[non_exhaustive]`): `Text`, `Textarea`,
+  `Password`, `Number { step: Option<String> }`, `Checkbox`, `Date`,
+  `DateTime`, `Select { options: Vec<(String, String)> }`, `File` (any
+  `File` field ⇒ `enctype="multipart/form-data"`).
+  Decode-side contracts handled by the `#[model]`-generated `NewX`:
+  non-nullable `bool` columns are `#[serde(default)]` (unchecked checkbox ⇒
+  `false`); datetime columns attach `deserialize_datetime_local_utc[_option]`
+  / `deserialize_datetime_local_local[_option]` /
+  `deserialize_naive_datetime_local[_option]` (offsetless `datetime-local`
+  values decode; RFC 3339 still accepted). `DateTime` columns with a zone
+  other than `Utc`/`Local` render as `Text` (RFC 3339 string), not a picker.
 
 ## View widgets and UI (all unreleased — trunk-dev only)
 

@@ -516,7 +516,7 @@ pub(super) const MODEL_DEPS: &[(&str, &str)] = &[
     ),
     (
         "diesel-async",
-        "{ version = \"0.8\", features = [\"postgres\"] }",
+        "{ version = \"0.9\", features = [\"postgres\"] }",
     ),
     (
         "pq-sys",
