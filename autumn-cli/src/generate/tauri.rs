@@ -479,9 +479,19 @@ fn resolve_bin_name(
     )))
 }
 
-fn read_package_meta(
+/// Parse `Cargo.toml` and return `(package_name, version, parsed_doc)` — the
+/// subset of package metadata that does **not** require a resolvable binary
+/// target. The thin-client planner uses this directly: it never builds or
+/// spawns a sidecar, so a library-only package or a multi-`[[bin]]` package
+/// without `default-run` is a perfectly fine thin-client host and must not
+/// be blocked by sidecar-target validation (issue #1506 review).
+///
+/// `version` resolves workspace inheritance: if `[package] version.workspace
+/// = true` the function walks up the directory tree to find
+/// `[workspace.package] version` in an ancestor `Cargo.toml`.
+fn read_package_name_version(
     project_root: &Path,
-) -> Result<(String, String, String, bool, String), GenerateError> {
+) -> Result<(String, String, toml::Value), GenerateError> {
     let cargo_path = project_root.join("Cargo.toml");
     let content = std::fs::read_to_string(&cargo_path).map_err(GenerateError::Io)?;
     let doc: toml::Value = toml::from_str(&content)
@@ -505,6 +515,17 @@ fn read_package_meta(
         }
         _ => "0.1.0".to_owned(),
     };
+
+    Ok((name, version, doc))
+}
+
+fn read_package_meta(
+    project_root: &Path,
+) -> Result<(String, String, String, bool, String), GenerateError> {
+    let (name, version, doc) = read_package_name_version(project_root)?;
+    let pkg = doc
+        .get("package")
+        .ok_or_else(|| GenerateError::Config("Cargo.toml missing [package].name".to_owned()))?;
 
     let default_run = pkg
         .get("default-run")
@@ -1492,8 +1513,10 @@ pub fn plan_tauri_thin_client(
     // doc comment. The raw flag value is not.
     let normalized_url = validated.as_str();
 
-    let (package_name, package_version, _bin_name, _has_embed_assets, _dep_key) =
-        read_package_meta(project_root)?;
+    // Deliberately not read_package_meta: that helper also resolves the
+    // sidecar binary target, which a thin client neither builds nor spawns —
+    // requiring one would wrongly reject lib-only and multi-bin packages.
+    let (package_name, package_version, _doc) = read_package_name_version(project_root)?;
     let mut plan = Plan::new(project_root);
     let tauri = project_root.join("src-tauri");
 
@@ -5451,5 +5474,63 @@ mod tests {
             "desktop `autumn generate tauri` (no --remote-url) must keep emitting \
              exactly the sidecar file set — and never a capabilities/ file"
         );
+    }
+
+    // ── Thin-client planning must not require a sidecar binary (#1506) ────────
+    //
+    // The thin client never builds or spawns a sidecar, so packages with no
+    // selectable binary target must still scaffold. The mirror-image desktop
+    // behaviour (plan_tauri *must* error on these layouts) is pinned above by
+    // `plan_errors_when_package_has_no_bin_target` and
+    // `plan_errors_on_multiple_explicit_bins_without_default_run`.
+
+    /// Fixture: a library-only package — no `src/main.rs`, no `[[bin]]`,
+    /// nothing under `src/bin/` — just `src/lib.rs`.
+    fn project_lib_only(pkg_name: &str) -> TempDir {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            format!(
+                "[package]\nname=\"{pkg_name}\"\nversion=\"0.3.0\"\nedition=\"2024\"\n\
+                 \n[dependencies]\nautumn-web = \"0.5.0\"\n"
+            ),
+        )
+        .unwrap();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(tmp.path().join("src/lib.rs"), "pub fn hello() {}\n").unwrap();
+        tmp
+    }
+
+    #[test]
+    fn thin_client_plan_succeeds_on_library_only_package() {
+        let tmp = project_lib_only("libonly-app");
+        let plan = plan_tauri_thin_client(tmp.path(), "https://app.example.com")
+            .expect("thin-client planning must not require a binary target");
+        // The package name and version must still flow into tauri.conf.json.
+        let conf: serde_json::Value =
+            serde_json::from_str(created_str(&plan, "src-tauri/tauri.conf.json")).unwrap();
+        assert_eq!(
+            conf["version"].as_str(),
+            Some("0.3.0"),
+            "package version must reach tauri.conf.json for a lib-only package"
+        );
+        assert_eq!(
+            conf["identifier"].as_str(),
+            Some("com.example.libonlyapp"),
+            "package name must reach tauri.conf.json for a lib-only package"
+        );
+    }
+
+    #[test]
+    fn thin_client_plan_succeeds_on_multi_bin_package_without_default_run() {
+        // Multiple explicit [[bin]] targets and no `default-run` is ambiguous
+        // for the *sidecar* — but a thin client has no sidecar, so planning
+        // must succeed without asking the user to pick one.
+        let tmp = project_with_multiple_bins_no_default("multibin-app", &["worker", "web"]);
+        let plan = plan_tauri_thin_client(tmp.path(), "https://app.example.com")
+            .expect("thin-client planning must not resolve a sidecar binary");
+        let conf: serde_json::Value =
+            serde_json::from_str(created_str(&plan, "src-tauri/tauri.conf.json")).unwrap();
+        assert_eq!(conf["identifier"].as_str(), Some("com.example.multibinapp"));
     }
 }
