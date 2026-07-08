@@ -72,10 +72,6 @@ pub mod assets;
 pub mod audit;
 pub mod auth;
 pub mod authorization;
-/// Bounded-memory, keyset-based iteration over an entire table.
-///
-/// See [`batches`] for [`batches::FindInBatches`], [`batches::FindEach`], and
-/// the [`batches::BatchSource`] trait that generated repositories implement.
 pub mod batches;
 pub mod cache;
 #[cfg(feature = "ws")]
