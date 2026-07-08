@@ -89,12 +89,13 @@ pub fn plan_tauri_mobile(
     } = read_app_meta(project_root)?;
     let mut plan = Plan::new(project_root);
     let tauri = project_root.join("src-tauri");
-    // The shell's own autumn-web dependency (offline sync only) must carry
-    // the same version requirement as the app crate's, so cargo unifies the
-    // two dependency edges into one crate instance.
-    let autumn_web_req = opts
+    // The shell's own autumn-web dependency (offline sync only) must mirror
+    // the app crate's actual dependency SOURCE — version, path, or git — so
+    // cargo unifies the two dependency edges into one crate instance (see
+    // [`shell_autumn_web_dep`]).
+    let autumn_web_dep = opts
         .offline_sync
-        .then(|| read_app_autumn_web_req(project_root));
+        .then(|| shell_autumn_web_dep(project_root, &mut plan));
 
     if !has_embed_assets {
         plan.warn(
@@ -114,7 +115,7 @@ pub fn plan_tauri_mobile(
     );
     plan.create(
         tauri.join("Cargo.toml"),
-        render_mobile_cargo_toml(&package_name, has_embed_assets, autumn_web_req.as_deref()),
+        render_mobile_cargo_toml(&package_name, has_embed_assets, autumn_web_dep.as_ref()),
     );
     plan.create(tauri.join("build.rs"), render_mobile_build_rs());
     plan.create(
@@ -366,24 +367,209 @@ fn resolve_workspace_version(project_root: &Path) -> Option<String> {
     None
 }
 
-/// The app crate's `autumn-web` version requirement (`autumn-web = "0.6.0"`,
-/// or the `version` key of a table dependency). The offline-sync shell pins
-/// its own direct `autumn-web` dependency to the SAME requirement so cargo
-/// unifies both dependency edges into one crate instance. Falls back to this
-/// CLI's version — the value `autumn new` scaffolds into the app manifest.
-fn read_app_autumn_web_req(project_root: &Path) -> String {
-    let content = read_or_empty(&project_root.join("Cargo.toml"));
-    toml::from_str::<toml::Value>(&content)
-        .ok()
-        .and_then(|doc| match doc.get("dependencies")?.get("autumn-web")? {
-            toml::Value::String(s) => Some(s.clone()),
-            toml::Value::Table(t) => t
-                .get("version")
-                .and_then(toml::Value::as_str)
-                .map(str::to_owned),
-            _ => None,
-        })
-        .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_owned())
+/// The shell's own `autumn-web` dependency (offline sync only), mirroring
+/// the app crate's **actual** dependency source.
+///
+/// The shell manifest declares its own `[workspace]`, so it inherits neither
+/// the app's `[patch.crates-io]` overrides nor a parent workspace's
+/// dependency table. A registry-only `autumn-web = { version = … }` edge
+/// would therefore compile the shell against a DIFFERENT framework source
+/// than the app for path/git/workspace-dep users — or fail outright while
+/// the `offline-sync` feature is not published on crates.io. This struct
+/// carries the mirrored edge (and, for patched registry deps, a mirrored
+/// `[patch.crates-io]` section).
+struct ShellAutumnWebDep {
+    /// The full `autumn-web = { … }` line for the shell's `[dependencies]`.
+    dep_entry: String,
+    /// A mirrored `[patch.crates-io]` section (trailing part of the
+    /// manifest), when the app's manifest — or an ancestor workspace root —
+    /// patches `autumn-web` with a path/git override.
+    patch_entry: Option<String>,
+}
+
+/// Render the `path = "…"` or `git = "…"[, rev/branch/tag = "…"]` source part
+/// of a dependency (or patch) table, adjusted so it stays valid when written
+/// into `src-tauri/Cargo.toml`:
+///
+/// - absolute paths are kept as-is,
+/// - paths relative to the app's own manifest gain a `../` prefix
+///   (`src-tauri/` sits one level below the project root),
+/// - paths declared in an ancestor manifest (workspace root) are made
+///   absolute against that manifest's directory.
+///
+/// Returns `None` when the table names neither a path nor a git source.
+fn dep_source_from_table(
+    table: &toml::value::Table,
+    manifest_dir: &Path,
+    project_root: &Path,
+) -> Option<String> {
+    if let Some(path) = table.get("path").and_then(toml::Value::as_str) {
+        let adjusted = if Path::new(path).is_absolute() {
+            path.replace('\\', "/")
+        } else if manifest_dir == project_root {
+            format!("../{path}")
+        } else {
+            manifest_dir
+                .join(path)
+                .display()
+                .to_string()
+                .replace('\\', "/")
+        };
+        return Some(format!("path = \"{adjusted}\""));
+    }
+    if let Some(git) = table.get("git").and_then(toml::Value::as_str) {
+        use std::fmt::Write as _;
+        let mut source = format!("git = \"{git}\"");
+        for key in ["rev", "branch", "tag"] {
+            if let Some(v) = table.get(key).and_then(toml::Value::as_str) {
+                let _ = write!(source, ", {key} = \"{v}\"");
+            }
+        }
+        return Some(source);
+    }
+    None
+}
+
+/// Resolve the app's `autumn-web` dependency VALUE, following
+/// `workspace = true` inheritance to the `[workspace.dependencies]` table of
+/// the nearest ancestor manifest that declares it. Returns the value and the
+/// directory of the manifest that declared it (relative `path` sources
+/// resolve against that directory).
+fn resolve_app_autumn_web_value(project_root: &Path) -> (Option<toml::Value>, std::path::PathBuf) {
+    let parse = |dir: &Path| -> Option<toml::Value> {
+        toml::from_str(&read_or_empty(&dir.join("Cargo.toml"))).ok()
+    };
+    let dep = parse(project_root)
+        .as_ref()
+        .and_then(|doc| doc.get("dependencies")?.get("autumn-web"))
+        .cloned();
+    if let Some(toml::Value::Table(t)) = &dep
+        && t.get("workspace").and_then(toml::Value::as_bool) == Some(true)
+    {
+        // Workspace-inherited: find [workspace.dependencies].autumn-web in
+        // this manifest or the nearest ancestor's.
+        let mut dir: Option<&Path> = Some(project_root);
+        while let Some(d) = dir {
+            if let Some(v) = parse(d)
+                .as_ref()
+                .and_then(|doc| doc.get("workspace")?.get("dependencies")?.get("autumn-web"))
+                .cloned()
+            {
+                return (Some(v), d.to_path_buf());
+            }
+            dir = d.parent();
+        }
+        return (None, project_root.to_path_buf());
+    }
+    (dep, project_root.to_path_buf())
+}
+
+/// Find an `[patch.crates-io] autumn-web = { … }` override in the app's
+/// manifest or the nearest ancestor's (patches only apply from a workspace
+/// root, but the app may be a workspace member). Returns the mirrored
+/// `[patch.crates-io]` section for the shell manifest, warning when a patch
+/// exists but cannot be represented.
+fn mirror_autumn_web_patch(project_root: &Path, plan: &mut Plan) -> Option<String> {
+    let mut dir: Option<&Path> = Some(project_root);
+    while let Some(d) = dir {
+        let patch = toml::from_str::<toml::Value>(&read_or_empty(&d.join("Cargo.toml")))
+            .ok()
+            .as_ref()
+            .and_then(|doc| doc.get("patch")?.get("crates-io")?.get("autumn-web"))
+            .cloned();
+        if let Some(value) = patch {
+            let source = value
+                .as_table()
+                .and_then(|t| dep_source_from_table(t, d, project_root));
+            let Some(source) = source else {
+                plan.warn(
+                    "the app's [patch.crates-io] override of autumn-web could not \
+                     be mirrored into src-tauri/Cargo.toml (only path and git \
+                     patches are supported). The shell declares its own \
+                     [workspace], so the app's patch does NOT apply there — copy \
+                     your [patch.crates-io] section into src-tauri/Cargo.toml \
+                     yourself or the shell will build against the crates.io \
+                     registry version of autumn-web."
+                        .to_owned(),
+                );
+                return None;
+            };
+            return Some(format!(
+                "\n[patch.crates-io]\n\
+                 # Mirrors the app's [patch.crates-io] override of autumn-web: the shell\n\
+                 # declares its own [workspace], so the app's patch would otherwise NOT\n\
+                 # apply here and the shell would compile a different framework source.\n\
+                 autumn-web = {{ {source} }}\n"
+            ));
+        }
+        dir = d.parent();
+    }
+    None
+}
+
+/// Compute the shell's `autumn-web` dependency (offline sync only), mirroring
+/// the app crate's actual dependency source — see [`ShellAutumnWebDep`]:
+///
+/// - **path/git deps** (direct or workspace-inherited) are copied onto the
+///   shell edge, with relative paths recomputed for `src-tauri/`,
+/// - **registry (version) deps** keep the app's version requirement, plus a
+///   mirrored `[patch.crates-io]` section when the app patches `autumn-web`,
+/// - anything unrepresentable falls back to this CLI's version (the value
+///   `autumn new` scaffolds) with a loud warning telling the user to edit
+///   the shell manifest by hand.
+fn shell_autumn_web_dep(project_root: &Path, plan: &mut Plan) -> ShellAutumnWebDep {
+    let (dep_value, manifest_dir) = resolve_app_autumn_web_value(project_root);
+
+    // Path/git sources are mirrored directly onto the shell's edge.
+    if let Some(toml::Value::Table(t)) = &dep_value
+        && let Some(source) = dep_source_from_table(t, &manifest_dir, project_root)
+    {
+        let version_part = t
+            .get("version")
+            .and_then(toml::Value::as_str)
+            .map_or_else(String::new, |v| format!("version = \"{v}\", "));
+        return ShellAutumnWebDep {
+            dep_entry: format!(
+                "autumn-web = {{ {version_part}{source}, features = [\"offline-sync\"] }}"
+            ),
+            patch_entry: None,
+        };
+    }
+
+    // Registry requirement: keep the app's version and mirror any
+    // [patch.crates-io] override of autumn-web into the shell manifest.
+    let version = match &dep_value {
+        Some(toml::Value::String(s)) => Some(s.clone()),
+        Some(toml::Value::Table(t)) => t
+            .get("version")
+            .and_then(toml::Value::as_str)
+            .map(str::to_owned),
+        _ => None,
+    };
+    let registry_entry = |req: &str| {
+        format!("autumn-web = {{ version = \"{req}\", features = [\"offline-sync\"] }}")
+    };
+    let Some(version) = version else {
+        plan.warn(format!(
+            "could not determine the app's autumn-web dependency source — the \
+             shell's src-tauri/Cargo.toml falls back to the crates.io registry \
+             (autumn-web = \"{}\"), which may be a DIFFERENT framework source \
+             than the app builds against (and may lack the offline-sync \
+             feature). Edit the autumn-web entry in src-tauri/Cargo.toml to \
+             match your app's source — path, git, or version (see \
+             docs/guide/tauri-mobile-offline-sync.md).",
+            env!("CARGO_PKG_VERSION"),
+        ));
+        return ShellAutumnWebDep {
+            dep_entry: registry_entry(env!("CARGO_PKG_VERSION")),
+            patch_entry: None,
+        };
+    };
+    let patch_entry = mirror_autumn_web_patch(project_root, plan);
+    ShellAutumnWebDep {
+        dep_entry: registry_entry(&version),
+        patch_entry,
+    }
 }
 
 // ── App-crate offline-sync feature (Cargo.toml edit) ──────────────────────────
@@ -690,7 +876,7 @@ fn render_mobile_tauri_conf(package_name: &str, version: &str) -> String {
 fn render_mobile_cargo_toml(
     package_name: &str,
     has_embed_assets: bool,
-    autumn_web_req: Option<&str>,
+    autumn_web_dep: Option<&ShellAutumnWebDep>,
 ) -> String {
     let shell_name = format!("{package_name}-mobile");
     // Enable the app's `embed-assets` feature so CSS/htmx/static assets are
@@ -707,16 +893,21 @@ fn render_mobile_cargo_toml(
         format!("{package_name} = {{ path = \"..\" }}")
     };
     // Offline sync: the shell itself opens the local SyncStore and runs the
-    // background SyncEngine, so it needs autumn-web directly — pinned to the
-    // app's own requirement so cargo unifies both edges into one instance.
-    let sync_dep = autumn_web_req.map_or_else(String::new, |req| {
+    // background SyncEngine, so it needs autumn-web directly — mirroring the
+    // app's own dependency source (version, path, or git) so cargo unifies
+    // both edges into one instance.
+    let sync_dep = autumn_web_dep.map_or_else(String::new, |dep| {
         format!(
             "\n# Offline sync (issue #1508): the shell opens the local SyncStore and runs\n\
-             # the background SyncEngine (autumn_web::sync). The version matches the app\n\
-             # crate's autumn-web requirement so cargo unifies both dependency edges.\n\
-             autumn-web = {{ version = \"{req}\", features = [\"offline-sync\"] }}\n"
+             # the background SyncEngine (autumn_web::sync). The dependency mirrors the\n\
+             # app crate's own autumn-web source so cargo unifies both dependency edges.\n\
+             {}\n",
+            dep.dep_entry
         )
     });
+    let patch_section = autumn_web_dep
+        .and_then(|dep| dep.patch_entry.as_deref())
+        .unwrap_or("");
     format!(
         r#"[package]
 name = "{shell_name}"
@@ -753,7 +944,7 @@ codegen-units = 1
 lto = true
 opt-level = "s"
 strip = true
-"#
+{patch_section}"#
     )
 }
 
@@ -1764,16 +1955,177 @@ mod tests {
 
     #[test]
     fn offline_cargo_toml_adds_matching_autumn_web_dependency() {
-        let toml_src = render_mobile_cargo_toml("my-app", true, Some("0.9.1"));
+        let mut plan = Plan::new(Path::new("."));
+        let tmp = stock_app_dir("my-app");
+        let dep = shell_autumn_web_dep(tmp.path(), &mut plan);
+        let toml_src = render_mobile_cargo_toml("my-app", true, Some(&dep));
         assert!(
             toml_src.contains(r#"autumn-web = { version = "0.9.1", features = ["offline-sync"] }"#),
             "the shell must depend on autumn-web (offline-sync) at the app's requirement"
         );
+        assert!(
+            !toml_src.contains("[patch.crates-io]"),
+            "an unpatched registry dep must not grow a patch section"
+        );
+        assert!(plan.warnings.is_empty(), "got {:?}", plan.warnings);
         toml::from_str::<toml::Value>(&toml_src).expect("generated Cargo.toml must parse");
         // Without offline sync the dependency (and any sync trace) is absent.
-        let plain = render_mobile_cargo_toml("my-app", true, None);
-        assert!(!plain.contains("offline-sync"));
-        assert!(!plain.contains("autumn-web ="));
+        let no_sync = render_mobile_cargo_toml("my-app", true, None);
+        assert!(!no_sync.contains("offline-sync"));
+        assert!(!no_sync.contains("autumn-web ="));
+    }
+
+    /// Write `deps` verbatim under `[dependencies]` (plus optional extra
+    /// top-level TOML) and resolve the shell's autumn-web dependency.
+    fn shell_dep_for(deps: &str, extra: &str) -> (ShellAutumnWebDep, Vec<String>) {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"my-app\"\nversion = \"0.2.3\"\n\n\
+                 [dependencies]\n{deps}\n{extra}"
+            ),
+        )
+        .unwrap();
+        let mut plan = Plan::new(tmp.path());
+        let dep = shell_autumn_web_dep(tmp.path(), &mut plan);
+        (dep, plan.warnings)
+    }
+
+    #[test]
+    fn offline_shell_dep_mirrors_path_source_relative_to_src_tauri() {
+        let (dep, warnings) = shell_dep_for(
+            "autumn-web = { path = \"../autumn\", version = \"0.9.1\" }",
+            "",
+        );
+        assert_eq!(
+            dep.dep_entry,
+            r#"autumn-web = { version = "0.9.1", path = "../../autumn", features = ["offline-sync"] }"#,
+            "a relative path dep must be recomputed for src-tauri/ (one level deeper)"
+        );
+        assert!(dep.patch_entry.is_none());
+        assert!(warnings.is_empty(), "got {warnings:?}");
+    }
+
+    #[test]
+    fn offline_shell_dep_mirrors_absolute_path_source() {
+        let (dep, warnings) = shell_dep_for("autumn-web = { path = \"/src/autumn/autumn\" }", "");
+        assert_eq!(
+            dep.dep_entry,
+            r#"autumn-web = { path = "/src/autumn/autumn", features = ["offline-sync"] }"#,
+        );
+        assert!(warnings.is_empty(), "got {warnings:?}");
+    }
+
+    #[test]
+    fn offline_shell_dep_mirrors_git_source_with_rev() {
+        let (dep, warnings) = shell_dep_for(
+            "autumn-web = { git = \"https://github.com/madmax983/autumn\", rev = \"abc123\" }",
+            "",
+        );
+        assert_eq!(
+            dep.dep_entry,
+            r#"autumn-web = { git = "https://github.com/madmax983/autumn", rev = "abc123", features = ["offline-sync"] }"#,
+        );
+        assert!(warnings.is_empty(), "got {warnings:?}");
+    }
+
+    #[test]
+    fn offline_shell_dep_mirrors_crates_io_patch_into_shell_manifest() {
+        // The common test-harness / local-development shape: a registry dep
+        // plus a [patch.crates-io] path override. The shell is its own
+        // [workspace], so the patch must be mirrored explicitly.
+        let (dep, warnings) = shell_dep_for(
+            "autumn-web = \"0.9.1\"",
+            "\n[patch.crates-io]\nautumn-web = { path = \"/src/autumn/autumn\" }\n",
+        );
+        assert_eq!(
+            dep.dep_entry,
+            r#"autumn-web = { version = "0.9.1", features = ["offline-sync"] }"#,
+        );
+        let patch = dep
+            .patch_entry
+            .clone()
+            .expect("the crates-io patch must be mirrored");
+        assert!(patch.contains("[patch.crates-io]"), "got: {patch}");
+        assert!(
+            patch.contains(r#"autumn-web = { path = "/src/autumn/autumn" }"#),
+            "got: {patch}"
+        );
+        assert!(warnings.is_empty(), "got {warnings:?}");
+
+        // And the rendered manifest carries the section and stays valid TOML.
+        let toml_src = render_mobile_cargo_toml("my-app", true, Some(&dep));
+        assert!(toml_src.contains("[patch.crates-io]"));
+        toml::from_str::<toml::Value>(&toml_src).expect("generated Cargo.toml must parse");
+    }
+
+    #[test]
+    fn offline_shell_dep_resolves_workspace_inherited_path_dep() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"app\"]\n\n\
+             [workspace.dependencies]\nautumn-web = { path = \"vendor/autumn\" }\n",
+        )
+        .unwrap();
+        let app = tmp.path().join("app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(
+            app.join("Cargo.toml"),
+            "[package]\nname = \"my-app\"\nversion = \"0.2.3\"\n\n\
+             [dependencies]\nautumn-web = { workspace = true }\n",
+        )
+        .unwrap();
+        let mut plan = Plan::new(&app);
+        let dep = shell_autumn_web_dep(&app, &mut plan);
+        // Declared in the workspace root: made absolute against that root.
+        let expected = tmp
+            .path()
+            .join("vendor/autumn")
+            .display()
+            .to_string()
+            .replace('\\', "/");
+        assert_eq!(
+            dep.dep_entry,
+            format!(r#"autumn-web = {{ path = "{expected}", features = ["offline-sync"] }}"#),
+        );
+        assert!(plan.warnings.is_empty(), "got {:?}", plan.warnings);
+    }
+
+    #[test]
+    fn offline_shell_dep_warns_and_falls_back_when_source_is_unrepresentable() {
+        // No autumn-web dependency at all: fall back to the CLI's own version
+        // with a loud warning instead of silently inventing a registry edge.
+        let (dep, warnings) = shell_dep_for("serde = \"1\"", "");
+        assert_eq!(
+            dep.dep_entry,
+            format!(
+                r#"autumn-web = {{ version = "{}", features = ["offline-sync"] }}"#,
+                env!("CARGO_PKG_VERSION"),
+            ),
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("could not determine the app's autumn-web dependency source")),
+            "got {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn offline_shell_dep_warns_when_patch_is_unrepresentable() {
+        let (dep, warnings) = shell_dep_for(
+            "autumn-web = \"0.9.1\"",
+            "\n[patch.crates-io]\nautumn-web = { version = \"0.9.2\" }\n",
+        );
+        assert!(dep.patch_entry.is_none());
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("[patch.crates-io] override of autumn-web could not")),
+            "got {warnings:?}"
+        );
     }
 
     #[test]
@@ -1927,9 +2279,13 @@ mod tests {
     }
 
     #[test]
-    fn read_app_autumn_web_req_reads_string_and_table_deps() {
+    fn shell_autumn_web_dep_reads_string_and_table_version_deps() {
         let tmp = stock_app_dir("my-app");
-        assert_eq!(read_app_autumn_web_req(tmp.path()), "0.9.1");
+        let mut plan = Plan::new(tmp.path());
+        assert_eq!(
+            shell_autumn_web_dep(tmp.path(), &mut plan).dep_entry,
+            r#"autumn-web = { version = "0.9.1", features = ["offline-sync"] }"#
+        );
 
         std::fs::write(
             tmp.path().join("Cargo.toml"),
@@ -1937,17 +2293,10 @@ mod tests {
              autumn-web = { version = \"1.2.3\", features = [\"mail\"] }\n",
         )
         .unwrap();
-        assert_eq!(read_app_autumn_web_req(tmp.path()), "1.2.3");
-
-        // No autumn-web dependency at all → fall back to the CLI's version.
-        std::fs::write(
-            tmp.path().join("Cargo.toml"),
-            "[package]\nname = \"my-app\"\nversion = \"0.1.0\"\n",
-        )
-        .unwrap();
         assert_eq!(
-            read_app_autumn_web_req(tmp.path()),
-            env!("CARGO_PKG_VERSION")
+            shell_autumn_web_dep(tmp.path(), &mut plan).dep_entry,
+            r#"autumn-web = { version = "1.2.3", features = ["offline-sync"] }"#
         );
+        assert!(plan.warnings.is_empty(), "got {:?}", plan.warnings);
     }
 }

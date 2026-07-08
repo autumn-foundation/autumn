@@ -40,6 +40,30 @@ fn backend_err(err: impl std::fmt::Display) -> SyncError {
     SyncError::Backend(err.to_string())
 }
 
+/// Validate a push batch before applying anything: every upsert must carry
+/// `Some(payload)`. An upsert with a missing payload would create a **live**
+/// server row with a NULL payload — clients pulling it materialize an
+/// invisible row (the store's `get`/`list` treat a `None` payload as absent)
+/// while still advancing their cursor past it, so the bad state silently
+/// replicates everywhere. Rejected up front as a protocol violation; the
+/// batch is atomic, so nothing is applied.
+///
+/// Shared by both backends so they stay conformant (see the conformance
+/// suite), and surfaced by the router as a 4xx response.
+fn validate_push(request: &PushRequest) -> Result<(), SyncError> {
+    for change in &request.changes {
+        if change.op == Op::Upsert && change.payload.is_none() {
+            return Err(SyncError::Protocol(format!(
+                "upsert change {} ({}/{}) has no payload — upserts must carry \
+                 a JSON payload (only deletes may omit it); nothing from this \
+                 batch was applied",
+                change.change_id, change.collection, change.pk
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Build the [`RemoteRow`] a cleanly applied (or client-winning) change
 /// produces.
 fn row_from_change(change: &Change, device_id: &str, version: Version) -> RemoteRow {
@@ -98,8 +122,11 @@ pub trait SyncBackend: Send + Sync + 'static {
     ///
     /// # Errors
     ///
-    /// Returns [`SyncError::Backend`] on storage failure (the whole batch
-    /// rolls back).
+    /// Returns [`SyncError::Protocol`] when the batch violates the protocol
+    /// — an [`Op::Upsert`] change without `Some(payload)` — with nothing
+    /// applied (the router surfaces this as a 4xx response), or
+    /// [`SyncError::Backend`] on storage failure (the whole batch rolls
+    /// back).
     fn apply_push(
         &self,
         request: &PushRequest,
@@ -133,6 +160,15 @@ pub trait SyncBackend: Send + Sync + 'static {
     /// Never runs implicitly — call it deliberately (e.g. from a scheduled
     /// task) once all active devices are expected to have synced past
     /// `up_to`.
+    ///
+    /// The **persisted horizon is clamped to the latest assigned version**:
+    /// a maintenance job may pass an arbitrarily large `up_to` (e.g.
+    /// `i64::MAX`) to mean "everything so far", and without the clamp the
+    /// horizon would exceed the version sequence — clients set their cursor
+    /// to `max(next_cursor, tombstone_horizon)` after a completed pull, so
+    /// an above-sequence horizon would push cursors past versions the
+    /// server has yet to assign and those clients would permanently miss
+    /// every row created later with a version at or below the horizon.
     ///
     /// # Errors
     ///
@@ -219,6 +255,7 @@ impl SyncBackend for MemorySyncBackend {
         request: &PushRequest,
         resolver: &dyn ConflictResolver,
     ) -> Result<PushResponse, SyncError> {
+        validate_push(request)?;
         // One lock scope = one atomic batch, mirroring the PG transaction.
         let mut state = self.lock()?;
         let mut outcomes = Vec::with_capacity(request.changes.len());
@@ -291,6 +328,11 @@ impl SyncBackend for MemorySyncBackend {
 
     fn gc_tombstones(&self, up_to: Version) -> Result<u64, SyncError> {
         let mut state = self.lock()?;
+        // Clamp to the latest assigned version (see the trait docs): a
+        // horizon above the sequence would push client cursors past
+        // versions the server has yet to assign, permanently hiding every
+        // row created later with a version at or below the horizon.
+        let up_to = up_to.min(state.next_version);
         let before = state.rows.len();
         state
             .rows
@@ -471,6 +513,18 @@ fn pg_horizon(conn: &mut PgConnection) -> Result<Version, diesel::result::Error>
     Ok(record.and_then(|r| r.value.parse().ok()).unwrap_or(0))
 }
 
+/// The most recently assigned version — the sequence's `last_value` once it
+/// has been called, `0` on a fresh backend.
+fn pg_latest_version(conn: &mut PgConnection) -> Result<Version, diesel::result::Error> {
+    let record = sql_query("SELECT last_value, is_called FROM autumn_sync_version_seq")
+        .get_result::<PgSequenceRecord>(conn)?;
+    Ok(if record.is_called {
+        record.last_value
+    } else {
+        0
+    })
+}
+
 /// Postgres-backed [`SyncBackend`] persisting into shadow tables.
 ///
 /// State lives in `autumn_sync_rows` / `autumn_sync_applied` /
@@ -519,6 +573,7 @@ impl SyncBackend for PgSyncBackend {
         request: &PushRequest,
         resolver: &dyn ConflictResolver,
     ) -> Result<PushResponse, SyncError> {
+        validate_push(request)?;
         let mut conn = self.connect()?;
         conn.transaction::<_, diesel::result::Error, _>(|conn| {
             // Serialize push batches (held until commit). See the doc
@@ -623,6 +678,12 @@ impl SyncBackend for PgSyncBackend {
     fn gc_tombstones(&self, up_to: Version) -> Result<u64, SyncError> {
         let mut conn = self.connect()?;
         conn.transaction::<_, diesel::result::Error, _>(|conn| {
+            // Clamp to the latest assigned version (see the trait docs): a
+            // horizon above the sequence would push client cursors past
+            // versions the server has yet to assign, permanently hiding
+            // every row created later with a version at or below the
+            // horizon.
+            let up_to = up_to.min(pg_latest_version(conn)?);
             let removed = sql_query("DELETE FROM autumn_sync_rows WHERE deleted AND version <= $1")
                 .bind::<BigInt, _>(up_to)
                 .execute(conn)?;
@@ -655,14 +716,7 @@ impl SyncBackend for PgSyncBackend {
 
     fn latest_version(&self) -> Result<Version, SyncError> {
         let mut conn = self.connect()?;
-        let record = sql_query("SELECT last_value, is_called FROM autumn_sync_version_seq")
-            .get_result::<PgSequenceRecord>(&mut conn)
-            .map_err(backend_err)?;
-        Ok(if record.is_called {
-            record.last_value
-        } else {
-            0
-        })
+        pg_latest_version(&mut conn).map_err(backend_err)
     }
 }
 
@@ -676,10 +730,12 @@ impl SyncBackend for PgSyncBackend {
 /// **Mount it behind authentication** — the endpoints trust `device_id` as
 /// sent, and anyone who can reach them can read and write every synced row.
 ///
-/// Request bounds: push batches larger than
+/// Request bounds and validation: push batches larger than
 /// [`MAX_PUSH_CHANGES`](crate::sync::protocol::MAX_PUSH_CHANGES) changes
 /// are rejected with `413` (request bodies are additionally capped by
-/// axum's default body limit), and the pull `limit` is clamped to at most
+/// axum's default body limit), batches containing an upsert without a
+/// payload are rejected with `422` (nothing applied — see
+/// [`SyncBackend::apply_push`]), and the pull `limit` is clamped to at most
 /// [`MAX_PULL_LIMIT`](crate::sync::protocol::MAX_PULL_LIMIT) (minimum 1).
 pub fn router<S>(
     backend: Arc<dyn SyncBackend>,
@@ -736,6 +792,13 @@ fn respond<T: serde::Serialize>(
 ) -> axum::response::Response {
     match result {
         Ok(Ok(response)) => Json(response).into_response(),
+        // Protocol violations (e.g. an upsert without a payload) are CLIENT
+        // errors: answer 422 so the pushing device surfaces the bug instead
+        // of retrying a batch the server will never accept.
+        Ok(Err(err @ SyncError::Protocol(_))) => {
+            tracing::warn!(error = %err, "sync request rejected");
+            (StatusCode::UNPROCESSABLE_ENTITY, err.to_string()).into_response()
+        }
         Ok(Err(err)) => {
             tracing::error!(error = %err, "sync request failed");
             (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()

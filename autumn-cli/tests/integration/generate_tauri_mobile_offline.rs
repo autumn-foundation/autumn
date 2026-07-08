@@ -134,6 +134,83 @@ fn offline_sync_shell_cargo_toml_enables_autumn_web_offline_sync() {
     toml::from_str::<toml::Value>(&cargo_toml).expect("generated Cargo.toml must parse");
 }
 
+#[test]
+fn offline_sync_shell_cargo_toml_mirrors_crates_io_patch() {
+    // The common local-development shape (and this repo's own test harness):
+    // a registry autumn-web dep plus a [patch.crates-io] path override. The
+    // shell manifest declares its own [workspace], so the app's patch does
+    // not reach it — the generator must mirror the patch or the shell would
+    // build a different framework source (or fail on the unpublished
+    // offline-sync feature).
+    let (_tmp, project) = fresh_project("offsync-patch-app");
+    let cargo_path = project.join("Cargo.toml");
+    let framework_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .join("autumn")
+        .display()
+        .to_string()
+        .replace('\\', "/");
+    let patched = format!(
+        "{}\n[patch.crates-io]\nautumn-web = {{ path = \"{framework_path}\" }}\n",
+        read(&cargo_path)
+    );
+    fs::write(&cargo_path, patched).unwrap();
+
+    run_autumn(&project, &["generate", "tauri-mobile", "--offline-sync"]);
+
+    let shell_cargo = read(&project.join("src-tauri/Cargo.toml"));
+    assert!(
+        shell_cargo.contains("[patch.crates-io]"),
+        "the shell manifest must mirror the app's [patch.crates-io] override, got:\n{shell_cargo}"
+    );
+    assert!(
+        shell_cargo.contains(&format!(r#"autumn-web = {{ path = "{framework_path}" }}"#)),
+        "the mirrored patch must point at the same framework source, got:\n{shell_cargo}"
+    );
+    // The dependency edge itself stays at the app's registry requirement.
+    assert!(
+        shell_cargo.contains(r#"autumn-web = { version = ""#),
+        "the dependency edge keeps the app's version requirement"
+    );
+    toml::from_str::<toml::Value>(&shell_cargo).expect("generated Cargo.toml must parse");
+}
+
+#[test]
+fn offline_sync_shell_cargo_toml_mirrors_path_dependency() {
+    // A direct path dependency on autumn-web must be recomputed relative to
+    // src-tauri/ (one directory deeper than the app manifest).
+    let (_tmp, project) = fresh_project("offsync-pathdep-app");
+    let cargo_path = project.join("Cargo.toml");
+    let rewritten = read(&cargo_path)
+        .lines()
+        .map(|l| {
+            if l.starts_with("autumn-web = \"") {
+                "autumn-web = { path = \"../vendored-autumn\" }".to_owned()
+            } else {
+                l.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&cargo_path, rewritten).unwrap();
+
+    run_autumn(&project, &["generate", "tauri-mobile", "--offline-sync"]);
+
+    let shell_cargo = read(&project.join("src-tauri/Cargo.toml"));
+    assert!(
+        shell_cargo.contains(
+            r#"autumn-web = { path = "../../vendored-autumn", features = ["offline-sync"] }"#
+        ),
+        "the shell's autumn-web edge must mirror the app's path source, got:\n{shell_cargo}"
+    );
+    assert!(
+        !shell_cargo.contains("[patch.crates-io]"),
+        "a direct path dep needs no patch section"
+    );
+    toml::from_str::<toml::Value>(&shell_cargo).expect("generated Cargo.toml must parse");
+}
+
 // ── The app-side (server) wiring ────────────────────────────────────────────
 
 #[test]

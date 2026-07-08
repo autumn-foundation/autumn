@@ -51,7 +51,9 @@ pub struct Change {
     pub pk: String,
     /// Upsert or delete.
     pub op: Op,
-    /// JSON payload for upserts; `None` for deletes.
+    /// JSON payload for upserts; `None` for deletes. The server **rejects**
+    /// (`422`, nothing applied) any push batch containing an upsert without
+    /// a payload — it would create a live row clients cannot see.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload: Option<serde_json::Value>,
     /// The server version this write was based on (`0` for a row the

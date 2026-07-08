@@ -223,8 +223,12 @@ device instead of silently resurrecting on the next push.
 
 Tombstones accumulate. `SyncBackend::gc_tombstones(up_to)` physically drops
 tombstones with `version <= up_to` and records that version as the
-**`tombstone_horizon`** in `autumn_sync_meta`. GC is an explicit server-side
-operation (a job or admin task you schedule); it is **off by default**.
+**`tombstone_horizon`** in `autumn_sync_meta`. The persisted horizon is
+**clamped to the latest assigned version**, so a maintenance job may pass an
+arbitrarily large `up_to` (e.g. `i64::MAX`) to mean "everything so far"
+without pushing client cursors above the server's version sequence. GC is an
+explicit server-side operation (a job or admin task you schedule); it is
+**off by default**.
 
 The horizon exists to keep long-offline clients correct: a client whose
 sync session *started* behind the horizon might have missed a tombstone
@@ -405,8 +409,16 @@ installation, not an account.
 ### The shell: local store + background engine
 
 `src-tauri/Cargo.toml` gains a direct `autumn-web` dependency with the
-`offline-sync` feature (version-matched to the app's own requirement so
-cargo unifies them). `setup()` places the sync database in the app sandbox
+`offline-sync` feature, **mirroring the app's own dependency source** so
+cargo unifies both edges into one crate instance: a registry version stays
+a version (with any `[patch.crates-io]` override of `autumn-web` from the
+app's manifest — or its workspace root — copied into the shell manifest,
+since the shell declares its own `[workspace]` and would otherwise ignore
+the patch), a `path` dependency is recomputed relative to `src-tauri/`, and
+a `git` dependency keeps its `rev`/`branch`/`tag`. When the source cannot
+be represented, the generator warns and falls back to the registry — edit
+the `autumn-web` entry in `src-tauri/Cargo.toml` by hand in that case.
+`setup()` places the sync database in the app sandbox
 and exports its path for your routes:
 
 <!-- drift:src-tauri/src/lib.rs -->

@@ -247,6 +247,117 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
         "a from-0 session paging past a sub-horizon cursor must get rows, got {mid_page:?}"
     );
 
+    // ── GC horizon is clamped to the latest assigned version ─────────────
+    // A maintenance job may pass an arbitrarily large up_to ("everything so
+    // far"). The persisted horizon must not exceed the sequence: clients set
+    // cursor = max(next_cursor, tombstone_horizon) after a completed pull,
+    // so an above-sequence horizon would push cursors past versions the
+    // server has yet to assign — rows created later (versions <= horizon)
+    // would then be permanently invisible to those clients.
+    let latest_before_gc = backend.latest_version().expect("latest");
+    backend.gc_tombstones(i64::MAX).expect("gc with huge up_to");
+    assert_eq!(
+        backend.tombstone_horizon().expect("horizon"),
+        latest_before_gc,
+        "the horizon must be clamped to the latest assigned version"
+    );
+
+    // A client that completed a pull right after that GC sits at
+    // max(next_cursor, horizon) == latest_before_gc. A row created AFTER the
+    // GC must still reach it.
+    let response = backend
+        .apply_push(
+            &push(
+                "device-a",
+                vec![change(
+                    "00000000-0000-4000-8000-000000000006",
+                    "n3",
+                    Op::Upsert,
+                    Some(json!({"title": "post-gc"})),
+                )],
+            ),
+            &resolver,
+        )
+        .expect("post-gc push");
+    let ChangeOutcome::Applied { version } = response.outcomes[0] else {
+        panic!("expected Applied, got {:?}", response.outcomes[0]);
+    };
+    assert!(
+        version > latest_before_gc,
+        "new versions must land above the clamped horizon"
+    );
+    let PullResponse::Ok { rows, .. } = backend
+        .pull_since(latest_before_gc, 100, latest_before_gc)
+        .expect("post-gc pull")
+    else {
+        panic!("a cursor at the horizon never requires a resync");
+    };
+    assert!(
+        rows.iter().any(|r| r.pk == "n3"),
+        "a row created after a huge-up_to GC must be delivered, got {rows:?}"
+    );
+
+    // ── Upserts without a payload are protocol violations ────────────────
+    // An upsert with payload = None would create a live row with a NULL
+    // payload: clients materialize an invisible row (store get/list treat a
+    // missing payload as absent) while still advancing their cursor. The
+    // whole batch must be rejected atomically — including valid changes
+    // sharing the batch — and leave no trace (no version burn is asserted
+    // loosely: latest_version must not move).
+    let latest_before_reject = backend.latest_version().expect("latest");
+    let bad_batch = push(
+        "device-a",
+        vec![
+            change(
+                "00000000-0000-4000-8000-00000000000a",
+                "n4",
+                Op::Upsert,
+                Some(json!({"title": "valid sibling"})),
+            ),
+            change(
+                "00000000-0000-4000-8000-00000000000b",
+                "n5",
+                Op::Upsert,
+                None,
+            ),
+        ],
+    );
+    let err = backend
+        .apply_push(&bad_batch, &resolver)
+        .expect_err("an upsert without a payload must be rejected");
+    assert!(
+        matches!(err, autumn_web::sync::SyncError::Protocol(_)),
+        "payload-less upserts are protocol errors, got {err:?}"
+    );
+    assert_eq!(
+        backend.latest_version().expect("latest"),
+        latest_before_reject,
+        "a rejected batch must not assign versions"
+    );
+    let PullResponse::Ok { rows, .. } = backend
+        .pull_since(latest_before_reject, 100, latest_before_reject)
+        .expect("pull after rejected push")
+    else {
+        panic!("a caught-up cursor never requires a resync");
+    };
+    assert!(
+        rows.is_empty(),
+        "nothing from a rejected batch may be applied, got {rows:?}"
+    );
+    // The valid sibling was not dedup-recorded either: re-pushing it alone
+    // applies cleanly instead of echoing AlreadyApplied.
+    let response = backend
+        .apply_push(
+            &push("device-a", vec![bad_batch.changes[0].clone()]),
+            &resolver,
+        )
+        .expect("re-push of the valid sibling");
+    assert!(
+        matches!(response.outcomes[0], ChangeOutcome::Applied { .. }),
+        "the valid sibling of a rejected batch must apply on retry, got {:?}",
+        response.outcomes[0]
+    );
+
     // ── Dedup-record GC bounds the applied table ──────────────────────────
     // Every applied change so far left one dedup record; an age-based GC
     // with a future cutoff removes them all, and re-running is a no-op.

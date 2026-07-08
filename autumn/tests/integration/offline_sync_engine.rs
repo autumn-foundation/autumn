@@ -641,6 +641,88 @@ async fn server_bounds_push_batch_size_and_pull_limit() {
     assert!(matches!(pull, PullResponse::Ok { .. }));
 }
 
+/// Protocol validation over HTTP: a push batch containing an upsert without
+/// a payload is rejected with 422 and nothing is applied — a NULL-payload
+/// row would be invisible to clients (store get/list treat a missing
+/// payload as absent) while still advancing their cursor.
+#[tokio::test]
+async fn server_rejects_payloadless_upsert_with_422() {
+    let backend = Arc::new(MemorySyncBackend::new());
+    let (url, _srv) = start_sync_server(backend.clone(), Arc::new(LwwResolver)).await;
+    let client = reqwest::Client::new();
+
+    let bad = PushRequest {
+        device_id: "device-a".to_owned(),
+        changes: vec![
+            Change {
+                change_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+                collection: "notes".to_owned(),
+                pk: "good".to_owned(),
+                op: Op::Upsert,
+                payload: Some(json!({"title": "valid sibling"})),
+                base_version: 0,
+                updated_at: Utc::now(),
+            },
+            Change {
+                change_id: "00000000-0000-4000-8000-000000000002".to_owned(),
+                collection: "notes".to_owned(),
+                pk: "bad".to_owned(),
+                op: Op::Upsert,
+                payload: None,
+                base_version: 0,
+                updated_at: Utc::now(),
+            },
+        ],
+    };
+    let response = client
+        .post(format!("{url}/push"))
+        .json(&bad)
+        .send()
+        .await
+        .expect("send payload-less upsert");
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "an upsert without a payload must be rejected as a protocol error"
+    );
+    let body = response.text().await.expect("error body");
+    assert!(
+        body.contains("payload"),
+        "the error must name the missing payload, got: {body}"
+    );
+    assert!(
+        backend_rows(backend.as_ref()).is_empty(),
+        "a rejected batch must not be applied — not even its valid changes"
+    );
+
+    // Deletes legitimately omit the payload and must keep working.
+    let tombstone_only = PushRequest {
+        device_id: "device-a".to_owned(),
+        changes: vec![Change {
+            change_id: "00000000-0000-4000-8000-000000000003".to_owned(),
+            collection: "notes".to_owned(),
+            pk: "gone".to_owned(),
+            op: Op::Delete,
+            payload: None,
+            base_version: 0,
+            updated_at: Utc::now(),
+        }],
+    };
+    let response = client
+        .post(format!("{url}/push"))
+        .json(&tombstone_only)
+        .send()
+        .await
+        .expect("send delete");
+    assert!(
+        response.status().is_success(),
+        "deletes without a payload are valid, got {}",
+        response.status()
+    );
+    let push: PushResponse = response.json().await.expect("push json");
+    assert!(matches!(push.outcomes[0], ChangeOutcome::Applied { .. }));
+}
+
 /// The documented auth wiring works end-to-end: an auth middleware layer
 /// on the sync router rejects unauthenticated engines, and
 /// `SyncConfig::bearer_token` gets an engine through it.

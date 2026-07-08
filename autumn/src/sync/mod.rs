@@ -94,4 +94,9 @@ pub enum SyncError {
     /// A server-side backend (Postgres or in-memory) operation failed.
     #[error("sync backend error: {0}")]
     Backend(String),
+    /// A request violated the sync protocol (client error — the server
+    /// rejects it with a 4xx status and applies nothing). Example: an
+    /// [`Op::Upsert`] change without a payload.
+    #[error("sync protocol error: {0}")]
+    Protocol(String),
 }
