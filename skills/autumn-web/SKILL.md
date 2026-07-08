@@ -820,7 +820,7 @@ autumn plugin-check --plugin-name autumn-admin-plugin --prefix /admin
 autumn serve --daemon            # non-watch local daemon; also: serve stop|status|restart
 autumn serve --bundled-pg        # managed local Postgres (managed-pg-bundled feature)
 autumn destroy scaffold Post title:String   # cleanly reverses generate; --dry-run supported
-autumn generate scaffold Post title:String status:enum{draft,published} price:decimal{10,2} author:references email:String:unique
+autumn generate scaffold Post title:String 'status:enum{draft,published}' 'price:decimal{10,2}' author:references email:String:unique
 autumn generate scaffold Post title:String --live --live-validation
 autumn generate tauri            # desktop sidecar project (cargo tauri build)
 autumn generate plugin my-plugin # installable/conformant plugin crate
