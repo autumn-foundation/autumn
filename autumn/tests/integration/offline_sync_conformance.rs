@@ -801,6 +801,239 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
         "post-horizon conflicts must still reach the (LWW) resolver"
     );
 
+    // ── Unrelated same-scope GC never disturbs live-row conflicts ────────
+    // Row "bystander" is created, row "victim-b" is deleted and GC'd (the
+    // scope's horizon rises above bystander's base), bystander is updated
+    // by one device, and an offline device then edits it from the old
+    // base. The base is SAME-INCARNATION evidence (bystander never had a
+    // tombstone), so the resolver must run no matter where the horizon
+    // sits — a horizon-keyed live-row guard would silently discard the
+    // edit as KeepServer.
+    let response = backend
+        .apply_push(
+            SCOPE,
+            &push(
+                "device-a",
+                vec![change(
+                    "00000000-0000-4000-8000-000000000050",
+                    "bystander",
+                    Op::Upsert,
+                    Some(json!({"title": "one"})),
+                )],
+            ),
+            &resolver,
+        )
+        .expect("bystander create");
+    let ChangeOutcome::Applied {
+        version: bystander_v1,
+    } = response.outcomes[0]
+    else {
+        panic!("bystander must clean-apply, got {:?}", response.outcomes[0]);
+    };
+    let response = backend
+        .apply_push(
+            SCOPE,
+            &push(
+                "device-a",
+                vec![change(
+                    "00000000-0000-4000-8000-000000000051",
+                    "victim-b",
+                    Op::Upsert,
+                    Some(json!({"title": "doomed"})),
+                )],
+            ),
+            &resolver,
+        )
+        .expect("victim create");
+    let ChangeOutcome::Applied { version: victim_v } = response.outcomes[0] else {
+        panic!("victim must clean-apply, got {:?}", response.outcomes[0]);
+    };
+    let victim_kill = Change {
+        base_version: victim_v,
+        ..change(
+            "00000000-0000-4000-8000-000000000052",
+            "victim-b",
+            Op::Delete,
+            None,
+        )
+    };
+    backend
+        .apply_push(SCOPE, &push("device-a", vec![victim_kill]), &resolver)
+        .expect("victim delete");
+    let removed = backend
+        .gc_tombstones(backend.latest_version().expect("latest"))
+        .expect("unrelated gc");
+    assert!(removed >= 1, "victim-b's tombstone must be GC'd");
+    assert!(
+        backend.tombstone_horizon(SCOPE).expect("horizon") > bystander_v1,
+        "the unrelated GC must have raised the horizon above bystander's base"
+    );
+    let update = Change {
+        base_version: bystander_v1,
+        ..change(
+            "00000000-0000-4000-8000-000000000053",
+            "bystander",
+            Op::Upsert,
+            Some(json!({"title": "two"})),
+        )
+    };
+    let response = backend
+        .apply_push(SCOPE, &push("device-b", vec![update]), &resolver)
+        .expect("bystander update");
+    assert!(matches!(
+        response.outcomes[0],
+        ChangeOutcome::Applied { .. }
+    ));
+    // Offline edit from the pre-GC base, newer clock: resolver runs, LWW
+    // takes the client (pre-AR this was forced KeepServer — data loss).
+    let mut offline_edit = change(
+        "00000000-0000-4000-8000-000000000054",
+        "bystander",
+        Op::Upsert,
+        Some(json!({"title": "three"})),
+    );
+    offline_edit.base_version = bystander_v1;
+    offline_edit.updated_at = Utc::now() + Duration::seconds(60);
+    let response = backend
+        .apply_push(SCOPE, &push("device-c", vec![offline_edit]), &resolver)
+        .expect("offline edit");
+    let ChangeOutcome::Resolved { row } = &response.outcomes[0] else {
+        panic!(
+            "a same-incarnation stale edit must resolve, got {:?}",
+            response.outcomes[0]
+        );
+    };
+    assert_eq!(
+        row.payload
+            .as_ref()
+            .and_then(|p| p.get("title"))
+            .and_then(|v| v.as_str()),
+        Some("three"),
+        "the resolver must run despite the unrelated GC — LWW takes the \
+         newer client edit"
+    );
+    // …and the other LWW direction still works through the resolver too.
+    let mut losing_edit = change(
+        "00000000-0000-4000-8000-000000000055",
+        "bystander",
+        Op::Upsert,
+        Some(json!({"title": "ancient"})),
+    );
+    losing_edit.base_version = bystander_v1;
+    losing_edit.updated_at = Utc::now() - Duration::seconds(3600);
+    let response = backend
+        .apply_push(SCOPE, &push("device-d", vec![losing_edit]), &resolver)
+        .expect("losing offline edit");
+    let ChangeOutcome::Resolved { row } = &response.outcomes[0] else {
+        panic!(
+            "the losing direction must also resolve, got {:?}",
+            response.outcomes[0]
+        );
+    };
+    assert_eq!(
+        row.payload
+            .as_ref()
+            .and_then(|p| p.get("title"))
+            .and_then(|v| v.as_str()),
+        Some("three"),
+        "LWW keeps the server content for an older client edit"
+    );
+
+    // ── Delete → recreate WITHOUT GC: old-incarnation bases still lose ───
+    // Incarnation evidence makes the recreate protection exact even while
+    // the tombstone still exists: a recreate over a SEEN tombstone starts
+    // a new incarnation, and edits based on the previous one are
+    // server-winning — no GC required.
+    let response = backend
+        .apply_push(
+            SCOPE,
+            &push(
+                "device-a",
+                vec![change(
+                    "00000000-0000-4000-8000-000000000056",
+                    "phoenix",
+                    Op::Upsert,
+                    Some(json!({"title": "first flight"})),
+                )],
+            ),
+            &resolver,
+        )
+        .expect("phoenix create");
+    let ChangeOutcome::Applied {
+        version: phoenix_v1,
+    } = response.outcomes[0]
+    else {
+        panic!("phoenix must clean-apply, got {:?}", response.outcomes[0]);
+    };
+    let phoenix_kill = Change {
+        base_version: phoenix_v1,
+        ..change(
+            "00000000-0000-4000-8000-000000000057",
+            "phoenix",
+            Op::Delete,
+            None,
+        )
+    };
+    let response = backend
+        .apply_push(SCOPE, &push("device-a", vec![phoenix_kill]), &resolver)
+        .expect("phoenix delete");
+    let ChangeOutcome::Applied {
+        version: phoenix_tomb,
+    } = response.outcomes[0]
+    else {
+        panic!(
+            "the delete must clean-apply, got {:?}",
+            response.outcomes[0]
+        );
+    };
+    // Recreate by a device that SAW the tombstone (base == its version).
+    let rebirth = Change {
+        base_version: phoenix_tomb,
+        ..change(
+            "00000000-0000-4000-8000-000000000058",
+            "phoenix",
+            Op::Upsert,
+            Some(json!({"title": "second flight"})),
+        )
+    };
+    let response = backend
+        .apply_push(SCOPE, &push("device-b", vec![rebirth]), &resolver)
+        .expect("phoenix recreate");
+    assert!(matches!(
+        response.outcomes[0],
+        ChangeOutcome::Applied { .. }
+    ));
+    // A ghost edit from the FIRST incarnation (tombstone never GC'd) with
+    // a fast clock: server-winning, the new incarnation intact.
+    let mut phoenix_ghost = change(
+        "00000000-0000-4000-8000-000000000059",
+        "phoenix",
+        Op::Upsert,
+        Some(json!({"title": "ghost flight"})),
+    );
+    phoenix_ghost.base_version = phoenix_v1;
+    phoenix_ghost.updated_at = Utc::now() + Duration::days(365);
+    let response = backend
+        .apply_push(SCOPE, &push("device-c", vec![phoenix_ghost]), &resolver)
+        .expect("phoenix ghost edit");
+    let ChangeOutcome::Resolved { row } = &response.outcomes[0] else {
+        panic!(
+            "an old-incarnation base must resolve, got {:?}",
+            response.outcomes[0]
+        );
+    };
+    assert!(
+        !row.deleted
+            && row
+                .payload
+                .as_ref()
+                .and_then(|p| p.get("title"))
+                .and_then(|v| v.as_str())
+                == Some("second flight"),
+        "the recreate must win over the previous incarnation without any \
+         GC involved, got {row:?}"
+    );
+
     // ── Explicit-null payloads are real documents ─────────────────────────
     // `store.put(&None::<T>)` journals the JSON document `null`. On the
     // wire that is a PRESENT null — it must clean-apply (not be rejected as
@@ -973,21 +1206,31 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
         replay.outcomes[0]
     );
 
-    // A push can never touch another scope's row: a conflicting edit in
-    // tenant-b (its base_version even names tenant-a's version) resolves
-    // against tenant-b's OWN row only.
-    let mut cross = tenant_change("00000000-0000-4000-8000-000000000021", "tenant-b wins");
-    cross.base_version = version_a; // stale IN TENANT-B (its row is at version_b)
+    // A push can never touch another scope's row — and a base_version
+    // naming ANOTHER scope's version is, in this scope, a version no
+    // incarnation of the row ever had (it predates the row's creation):
+    // deterministically server-winning, settled against tenant-b's OWN
+    // row only, even with a fast client clock.
+    let mut cross = tenant_change("00000000-0000-4000-8000-000000000021", "cross-scope ghost");
+    cross.base_version = version_a; // predates tenant-b's row entirely
     cross.updated_at = Utc::now() + Duration::seconds(60);
     let response = backend
         .apply_push("tenant-b", &push("device-x", vec![cross]), &resolver)
         .expect("cross-scope-shaped push");
     let ChangeOutcome::Resolved { row } = &response.outcomes[0] else {
         panic!(
-            "a stale edit must resolve within its own scope, got {:?}",
+            "an unverifiable base must resolve within its own scope, got {:?}",
             response.outcomes[0]
         );
     };
+    assert_eq!(
+        row.payload
+            .as_ref()
+            .and_then(|p| p.get("title"))
+            .and_then(|v| v.as_str()),
+        Some("beta"),
+        "a pre-incarnation base claim must not clobber tenant-b's row"
+    );
     let tenant_b_version = row.version;
 
     // Deletes are scoped tombstones: deleting s1 in tenant-b leaves
@@ -1086,9 +1329,11 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
         ChangeOutcome::Applied { .. }
     ));
     // …then push a conflicting edit based on the OLD tenant-a version
-    // (non-zero, far below tenant-b's horizon, above tenant-a's own 0).
-    // Under a shared horizon this would be forced KeepServer; per-scope it
-    // must run the LWW resolver, where the newer timestamp wins.
+    // (non-zero, far below tenant-b's horizon, same incarnation of
+    // tenant-a's row). A shared-horizon guard would have forced
+    // KeepServer here; with per-scope horizons AND incarnation-keyed
+    // live-row arms it must run the LWW resolver, where the newer
+    // timestamp wins.
     let mut conflict_a = tenant_change("00000000-0000-4000-8000-000000000024", "alpha 3");
     conflict_a.base_version = version_a;
     conflict_a.updated_at = Utc::now() + Duration::seconds(60);

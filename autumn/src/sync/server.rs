@@ -278,63 +278,128 @@ fn gc_tombstone_row(change: &Change, version: Version) -> RemoteRow {
     }
 }
 
+/// A stored server row plus its **incarnation marker** — server-side
+/// bookkeeping only, never part of the wire protocol ([`RemoteRow`] is
+/// what pulls and `Resolved` outcomes carry).
+///
+/// `created_version` is the version at which this INCARNATION of the pk
+/// began: set on first insert, and re-set whenever the row is REVIVED —
+/// a change turning a tombstone (or nothing) back into a live row, via a
+/// clean recreate or a resolver decision. It never moves on updates,
+/// deletes, or conflict resolutions of a live row, so `base_version <
+/// created_version` is exact evidence that a pushed base referred to a
+/// PREVIOUS incarnation (a delete + recreate happened in between —
+/// whether or not the delete's tombstone was ever GC'd), while
+/// `base_version >= created_version` proves the base belongs to the
+/// current lineage and the resolver has real inputs to work with.
+#[derive(Debug, Clone)]
+struct ServerRow {
+    row: RemoteRow,
+    created_version: Version,
+}
+
 /// Decide what one (non-duplicate) change writes, given the CURRENT server
-/// row and the freshly allocated `version`. Returns the row to persist and
-/// whether this was a clean apply (`Applied`) rather than a conflict
-/// (`Resolved`). This is the single authoritative copy of the conflict-arm
-/// policy — both backends call it, so they cannot diverge:
+/// row and the freshly allocated `version`. Returns the row to persist
+/// (with its incarnation marker — see [`ServerRow`]) and whether this was
+/// a clean apply (`Applied`) rather than a conflict (`Resolved`). This is
+/// the single authoritative copy of the conflict-arm policy — both
+/// backends call it, so they cannot diverge:
 ///
-/// - **Pre-horizon stale base against a TOMBSTONE or an ABSENT row**
-///   (`base_version > 0`, at or below the horizon; absent means the
-///   tombstone was physically GC'd, present-deleted means a previous stale
-///   push materialized one): deterministically server-winning — a fresh
-///   [`gc_tombstone_row`], the resolver bypassed (its input would be
-///   fabricated; clock-based policies could resurrect the row).
-/// - **Pre-horizon stale base against a LIVE row**: the history that would
-///   justify a resolver decision was GC'd — including the case where this
-///   pk was deleted, its tombstone GC'd, and another device legitimately
-///   RECREATED it with a base-0 insert. Left to the resolver, a fast
-///   client clock (LWW) could clobber or even delete the new incarnation
-///   before the stale device is forced to resync. Deterministically
-///   server-winning: the live row is kept, re-versioned so the pusher
-///   converges via its next pull (the standard `KeepServer` shape).
-/// - **Post-horizon stale base**: an ordinary conflict — the resolver
-///   decides.
+/// - **Previous-incarnation base against a LIVE row** (`base_version > 0`
+///   and below the row's `created_version`): the pk was deleted and
+///   recreated since the pusher last saw it (or the base is a version no
+///   incarnation of this pk ever had — equally unverifiable).
+///   Deterministically server-winning: the live row is kept, re-versioned
+///   so the pusher converges via its next pull (the standard `KeepServer`
+///   shape). A resolver decision here would compare across incarnations —
+///   a fast client clock (LWW) could clobber or even delete the new
+///   incarnation. No horizon is consulted: the incarnation marker is
+///   exact, so an unrelated same-scope GC can never force this arm onto
+///   an ordinary stale edit.
+/// - **Previous-incarnation base against a TOMBSTONE**: the deletion
+///   sticks — a fresh [`gc_tombstone_row`], the resolver bypassed
+///   (covers tombstones materialized by earlier stale pushes and plain
+///   delete→recreate→delete lineages alike).
+/// - **Same-incarnation stale base** (`base_version >= created_version`,
+///   `!= version` — or a base-0 create racing an existing row): an
+///   ordinary conflict, the resolver decides — regardless of any GC
+///   horizon. A revival this produces (tombstone → live) starts a new
+///   incarnation.
+/// - **Absent row with a pre-horizon base** (`base_version > 0`, at or
+///   below the REQUESTING SCOPE's tombstone horizon): the base row's
+///   tombstone was physically GC'd — no incarnation evidence survives, so
+///   the per-scope horizon is the proof, and the deletion sticks via a
+///   fresh [`gc_tombstone_row`].
 /// - **Everything else** (base matches the current version, or a base-0
-///   create/recreate against no row): a clean apply. `base_version == 0`
-///   never takes a server-winning arm.
-///
-/// `horizon` must be the REQUESTING SCOPE's tombstone horizon: horizons
-/// are tracked per scope, so another tenant's GC can never route this
-/// tenant's ordinary conflicts into the server-winning arms.
+///   create against no row): a clean apply. A recreate over a seen
+///   tombstone or a fresh insert starts a new incarnation; an update or
+///   delete of the live row continues the current one. `base_version ==
+///   0` never takes a server-winning arm.
 fn apply_change_row(
     change: &Change,
     device_id: &str,
-    current: Option<&RemoteRow>,
+    current: Option<&ServerRow>,
     horizon: Version,
     resolver: &dyn ConflictResolver,
     version: Version,
-) -> (RemoteRow, bool) {
-    let pre_horizon_stale = change.base_version > 0
-        && change.base_version <= horizon
-        && current.is_none_or(|server| server.version != change.base_version);
+) -> (ServerRow, bool) {
+    let previous_incarnation =
+        change.base_version > 0 && current.is_some_and(|c| change.base_version < c.created_version);
     match current {
-        Some(server) if pre_horizon_stale && server.deleted => {
-            (gc_tombstone_row(change, version), false)
-        }
-        Some(server) if pre_horizon_stale => (
-            resolved_row(Resolution::KeepServer, change, device_id, server, version),
+        Some(cur) if previous_incarnation && !cur.row.deleted => (
+            ServerRow {
+                row: resolved_row(Resolution::KeepServer, change, device_id, &cur.row, version),
+                created_version: cur.created_version,
+            },
             false,
         ),
-        Some(server) if server.version != change.base_version => {
-            let resolution = resolver.resolve(device_id, change, server);
+        Some(cur) if previous_incarnation => (
+            ServerRow {
+                row: gc_tombstone_row(change, version),
+                created_version: cur.created_version,
+            },
+            false,
+        ),
+        Some(cur) if cur.row.version != change.base_version => {
+            let resolution = resolver.resolve(device_id, change, &cur.row);
+            let row = resolved_row(resolution, change, device_id, &cur.row, version);
+            let created_version = if cur.row.deleted && !row.deleted {
+                // Revival from a tombstone: a new incarnation begins.
+                version
+            } else {
+                cur.created_version
+            };
             (
-                resolved_row(resolution, change, device_id, server, version),
+                ServerRow {
+                    row,
+                    created_version,
+                },
                 false,
             )
         }
-        None if pre_horizon_stale => (gc_tombstone_row(change, version), false),
-        _ => (row_from_change(change, device_id, version), true),
+        None if change.base_version > 0 && change.base_version <= horizon => (
+            ServerRow {
+                row: gc_tombstone_row(change, version),
+                created_version: version,
+            },
+            false,
+        ),
+        _ => {
+            let created_version = match current {
+                // Updating/deleting the live row: the incarnation continues.
+                Some(cur) if !cur.row.deleted => cur.created_version,
+                // A recreate over a seen tombstone, or a fresh insert: a
+                // new incarnation.
+                _ => version,
+            };
+            (
+                ServerRow {
+                    row: row_from_change(change, device_id, version),
+                    created_version,
+                },
+                true,
+            )
+        }
     }
 }
 
@@ -372,19 +437,21 @@ pub trait SyncBackend: Send + Sync + 'static {
     /// dedup record, so later writes or tombstone GC cannot alter the
     /// replay — see [`AppliedRecord`]).
     ///
-    /// Any change with a **non-zero `base_version` at or below the
-    /// tombstone horizon** is **deterministically server-winning** — the
-    /// resolver is bypassed for the whole shape family, because the
-    /// history that would justify a resolution was GC'd (clock-based
-    /// policies could otherwise be gamed by a fast device clock):
-    /// an absent base row (its tombstone was physically dropped) or a
-    /// materialized tombstone answers a fresh tombstone as the `Resolved`
-    /// outcome (see [`gc_tombstone_row`]), while a LIVE row — the pk was
-    /// deleted, GC'd, and legitimately recreated by another device —
-    /// answers the live row re-versioned (`KeepServer`), so a stale
-    /// pre-horizon edit or delete can never clobber the new incarnation.
-    /// `base_version == 0` creates/recreates still clean-apply, and stale
-    /// bases ABOVE the horizon still engage the resolver.
+    /// Conflict routing keys on **incarnation evidence**: every stored row
+    /// remembers the version its current incarnation began at (set on
+    /// insert and on every revival — see `ServerRow`). A non-zero
+    /// `base_version` BELOW that marker referred to a previous incarnation
+    /// (a delete + recreate happened in between, whether or not the
+    /// tombstone was GC'd) and is **deterministically server-winning** —
+    /// the live row answers re-versioned (`KeepServer`) and a tombstone
+    /// answers a fresh tombstone (see [`gc_tombstone_row`]) — while a base
+    /// at or above the marker is a same-incarnation conflict the resolver
+    /// settles normally, **regardless of any GC horizon** (an unrelated
+    /// same-scope GC can never suppress ordinary conflict resolution).
+    /// Only an ABSENT row still needs the per-scope tombstone horizon: a
+    /// non-zero base at or below it means the base row's tombstone was
+    /// physically dropped, and the deletion sticks. `base_version == 0`
+    /// creates/recreates always clean-apply or conflict normally.
     ///
     /// # Errors
     ///
@@ -506,8 +573,9 @@ struct AppliedRecord {
 #[derive(Debug, Default)]
 struct MemoryState {
     /// Rows keyed by `(scope, collection, pk)` — the scope prefix is the
-    /// partition, mirroring the Postgres primary key.
-    rows: BTreeMap<(String, String, String), RemoteRow>,
+    /// partition, mirroring the Postgres primary key. Values carry the
+    /// incarnation marker alongside the wire row (see [`ServerRow`]).
+    rows: BTreeMap<(String, String, String), ServerRow>,
     /// Dedup records keyed by `(scope, device_id, change_id)`: `device_id`
     /// and `change_id` are client-supplied, so without the scope prefix a
     /// client in another scope could replay a foreign record's outcome (and
@@ -590,7 +658,7 @@ impl SyncBackend for MemorySyncBackend {
             let version = state.allocate_version();
             // The conflict-arm policy is the shared apply_change_row —
             // one authoritative copy for both backends.
-            let (row, clean) = apply_change_row(
+            let (stored, clean) = apply_change_row(
                 change,
                 &request.device_id,
                 current.as_ref(),
@@ -599,10 +667,11 @@ impl SyncBackend for MemorySyncBackend {
                 version,
             );
             let outcome = if clean {
-                state.rows.insert(row_key, row);
+                state.rows.insert(row_key, stored);
                 ChangeOutcome::Applied { version }
             } else {
-                state.rows.insert(row_key, row.clone());
+                let row = stored.row.clone();
+                state.rows.insert(row_key, stored);
                 ChangeOutcome::Resolved { row }
             };
             let resolved_row = match &outcome {
@@ -647,8 +716,8 @@ impl SyncBackend for MemorySyncBackend {
         let mut rows: Vec<RemoteRow> = state
             .rows
             .iter()
-            .filter(|((row_scope, _, _), row)| row_scope == scope && row.version > cursor)
-            .map(|(_, row)| row.clone())
+            .filter(|((row_scope, _, _), stored)| row_scope == scope && stored.row.version > cursor)
+            .map(|(_, stored)| stored.row.clone())
             .collect();
         drop(state);
         rows.sort_by_key(|row| row.version);
@@ -670,10 +739,10 @@ impl SyncBackend for MemorySyncBackend {
         // horizon.
         let mut per_scope: HashMap<String, Version> = HashMap::new();
         let mut removed = 0u64;
-        state.rows.retain(|(row_scope, _, _), row| {
-            if row.deleted && row.version <= up_to {
+        state.rows.retain(|(row_scope, _, _), stored| {
+            if stored.row.deleted && stored.row.version <= up_to {
                 let max = per_scope.entry(row_scope.clone()).or_insert(0);
-                *max = (*max).max(row.version);
+                *max = (*max).max(stored.row.version);
                 removed += 1;
                 false
             } else {
@@ -726,6 +795,11 @@ CREATE TABLE IF NOT EXISTS autumn_sync_rows (
     deleted BOOLEAN NOT NULL DEFAULT FALSE,
     updated_at TIMESTAMPTZ NOT NULL,
     device_id TEXT NOT NULL DEFAULT '',
+    -- The version this INCARNATION of the row began at: set on insert and
+    -- on every revival from a tombstone/absent state. A pushed base below
+    -- it referred to a previous (deleted + recreated) incarnation and is
+    -- settled server-winning without consulting the resolver.
+    created_version BIGINT NOT NULL,
     PRIMARY KEY (scope, collection, pk)
 );
 CREATE INDEX IF NOT EXISTS autumn_sync_rows_scope_version_idx
@@ -800,18 +874,23 @@ struct PgRowRecord {
     updated_at: DateTime<Utc>,
     #[diesel(sql_type = Text)]
     device_id: String,
+    #[diesel(sql_type = BigInt)]
+    created_version: i64,
 }
 
 impl PgRowRecord {
-    fn into_remote_row(self) -> RemoteRow {
-        RemoteRow {
-            collection: self.collection,
-            pk: self.pk,
-            payload: self.payload,
-            version: self.version,
-            deleted: self.deleted,
-            updated_at: self.updated_at,
-            device_id: self.device_id,
+    fn into_server_row(self) -> ServerRow {
+        ServerRow {
+            row: RemoteRow {
+                collection: self.collection,
+                pk: self.pk,
+                payload: self.payload,
+                version: self.version,
+                deleted: self.deleted,
+                updated_at: self.updated_at,
+                device_id: self.device_id,
+            },
+            created_version: self.created_version,
         }
     }
 }
@@ -853,16 +932,19 @@ struct PgSequenceRecord {
 fn pg_upsert_row(
     conn: &mut PgConnection,
     scope: &str,
-    row: &RemoteRow,
+    stored: &ServerRow,
 ) -> Result<(), diesel::result::Error> {
+    let row = &stored.row;
     sql_query(
         "INSERT INTO autumn_sync_rows \
-         (scope, collection, pk, payload, version, deleted, updated_at, device_id) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+         (scope, collection, pk, payload, version, deleted, updated_at, device_id, \
+          created_version) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
          ON CONFLICT (scope, collection, pk) DO UPDATE SET \
          payload = excluded.payload, version = excluded.version, \
          deleted = excluded.deleted, updated_at = excluded.updated_at, \
-         device_id = excluded.device_id",
+         device_id = excluded.device_id, \
+         created_version = excluded.created_version",
     )
     .bind::<Text, _>(scope)
     .bind::<Text, _>(&row.collection)
@@ -872,6 +954,7 @@ fn pg_upsert_row(
     .bind::<Bool, _>(row.deleted)
     .bind::<Timestamptz, _>(row.updated_at)
     .bind::<Text, _>(&row.device_id)
+    .bind::<BigInt, _>(stored.created_version)
     .execute(conn)
     .map(|_| ())
 }
@@ -995,7 +1078,8 @@ impl SyncBackend for PgSyncBackend {
                 }
 
                 let current = sql_query(
-                    "SELECT collection, pk, payload, version, deleted, updated_at, device_id \
+                    "SELECT collection, pk, payload, version, deleted, updated_at, device_id, \
+                     created_version \
                      FROM autumn_sync_rows \
                      WHERE scope = $1 AND collection = $2 AND pk = $3 FOR UPDATE",
                 )
@@ -1004,12 +1088,12 @@ impl SyncBackend for PgSyncBackend {
                 .bind::<Text, _>(&change.pk)
                 .get_result::<PgRowRecord>(conn)
                 .optional()?
-                .map(PgRowRecord::into_remote_row);
+                .map(PgRowRecord::into_server_row);
 
                 let version = pg_next_version(conn)?;
                 // The conflict-arm policy is the shared apply_change_row —
                 // one authoritative copy for both backends.
-                let (row, clean) = apply_change_row(
+                let (stored, clean) = apply_change_row(
                     change,
                     &request.device_id,
                     current.as_ref(),
@@ -1017,11 +1101,11 @@ impl SyncBackend for PgSyncBackend {
                     resolver,
                     version,
                 );
-                pg_upsert_row(conn, scope, &row)?;
+                pg_upsert_row(conn, scope, &stored)?;
                 let outcome = if clean {
                     ChangeOutcome::Applied { version }
                 } else {
-                    ChangeOutcome::Resolved { row }
+                    ChangeOutcome::Resolved { row: stored.row }
                 };
 
                 let resolved_row = match &outcome {
@@ -1087,7 +1171,8 @@ impl SyncBackend for PgSyncBackend {
                     });
                 }
                 let rows: Vec<RemoteRow> = sql_query(
-                    "SELECT collection, pk, payload, version, deleted, updated_at, device_id \
+                    "SELECT collection, pk, payload, version, deleted, updated_at, device_id, \
+                     created_version \
                      FROM autumn_sync_rows \
                      WHERE scope = $1 AND version > $2 ORDER BY version LIMIT $3",
                 )
@@ -1096,7 +1181,7 @@ impl SyncBackend for PgSyncBackend {
                 .bind::<BigInt, _>(limit.max(0))
                 .get_results::<PgRowRecord>(conn)?
                 .into_iter()
-                .map(PgRowRecord::into_remote_row)
+                .map(|record| record.into_server_row().row)
                 .collect();
                 let next_cursor = rows.last().map_or(cursor, |row| row.version);
                 Ok(PullResponse::Ok {
