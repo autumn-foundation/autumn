@@ -1013,6 +1013,331 @@ async fn multi_page_initial_sync_completes_after_gc() {
     assert!(!next.full_resync);
 }
 
+/// Test double for the from-zero GC race: a backend that runs a
+/// delete-plus-`gc_tombstones` (or a horizon-advancing churn cycle)
+/// immediately BEFORE chosen pull calls, deterministically simulating a
+/// tombstone GC committing between two pages of one from-zero
+/// catch-up/snapshot. From-zero sessions are exempt from the server's
+/// horizon check, so without the client-side per-page horizon guard an
+/// early page's live row whose delete is GC'd before a later page would
+/// stay visible forever while the cursor lands past the new horizon.
+struct GcInjectingBackend {
+    inner: MemorySyncBackend,
+    /// pk to delete + GC right before the Nth `pull_since` call (1-based).
+    delete_before_pull: std::sync::Mutex<std::collections::HashMap<usize, &'static str>>,
+    /// While true, every pull after the first is preceded by a
+    /// create+delete+GC churn cycle, so the horizon moves on every page.
+    churn: std::sync::atomic::AtomicBool,
+    pulls: std::sync::atomic::AtomicUsize,
+}
+
+impl GcInjectingBackend {
+    fn new(inner: MemorySyncBackend) -> Self {
+        Self {
+            inner,
+            delete_before_pull: std::sync::Mutex::new(std::collections::HashMap::new()),
+            churn: std::sync::atomic::AtomicBool::new(false),
+            pulls: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn pull_count(&self) -> usize {
+        self.pulls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn push_one(&self, change: Change) -> Version {
+        let response = self
+            .inner
+            .apply_push(
+                SyncScope::GLOBAL,
+                &PushRequest {
+                    device_id: "gc-injector".to_owned(),
+                    changes: vec![change],
+                },
+                &LwwResolver,
+            )
+            .expect("injected push");
+        match response.outcomes[0] {
+            ChangeOutcome::Applied { version } => version,
+            ref other => panic!("injected change must clean-apply, got {other:?}"),
+        }
+    }
+
+    /// Delete the live row `pk` and GC its tombstone away.
+    fn delete_and_gc(&self, pk: &str) {
+        let rows = match self
+            .inner
+            .pull_since(SyncScope::GLOBAL, 0, 10_000, 0)
+            .expect("inner pull")
+        {
+            PullResponse::Ok { rows, .. } => rows,
+            PullResponse::FullResyncRequired { .. } => unreachable!("cursor 0 never resyncs"),
+        };
+        let row = rows
+            .iter()
+            .find(|r| r.pk == pk && !r.deleted)
+            .expect("live row to delete");
+        self.push_one(Change {
+            change_id: format!("gc-inject-delete-{pk}"),
+            collection: row.collection.clone(),
+            pk: pk.to_owned(),
+            op: Op::Delete,
+            payload: None,
+            base_version: row.version,
+            updated_at: Utc::now(),
+        });
+        let latest = self.inner.latest_version().expect("latest");
+        assert!(
+            self.inner.gc_tombstones(latest).expect("gc") >= 1,
+            "the injected tombstone must be GC'd"
+        );
+    }
+
+    /// Create a throwaway row, delete it, and GC — advancing the horizon
+    /// without touching the payload rows.
+    fn churn_once(&self, n: usize) {
+        let version = self.push_one(Change {
+            change_id: format!("churn-up-{n}"),
+            collection: "churn".to_owned(),
+            pk: format!("churn-{n}"),
+            op: Op::Upsert,
+            payload: Some(json!({"churn": n})),
+            base_version: 0,
+            updated_at: Utc::now(),
+        });
+        self.push_one(Change {
+            change_id: format!("churn-del-{n}"),
+            collection: "churn".to_owned(),
+            pk: format!("churn-{n}"),
+            op: Op::Delete,
+            payload: None,
+            base_version: version,
+            updated_at: Utc::now(),
+        });
+        let latest = self.inner.latest_version().expect("latest");
+        self.inner.gc_tombstones(latest).expect("churn gc");
+    }
+}
+
+impl SyncBackend for GcInjectingBackend {
+    fn apply_push(
+        &self,
+        scope: &str,
+        request: &PushRequest,
+        resolver: &dyn ConflictResolver,
+    ) -> Result<PushResponse, SyncError> {
+        self.inner.apply_push(scope, request, resolver)
+    }
+    fn pull_since(
+        &self,
+        scope: &str,
+        cursor: Version,
+        limit: i64,
+        session_start: Version,
+    ) -> Result<PullResponse, SyncError> {
+        let n = self.pulls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let injected = self.delete_before_pull.lock().expect("lock").remove(&n);
+        if let Some(pk) = injected {
+            self.delete_and_gc(pk);
+        }
+        if n > 1 && self.churn.load(std::sync::atomic::Ordering::SeqCst) {
+            self.churn_once(n);
+        }
+        self.inner.pull_since(scope, cursor, limit, session_start)
+    }
+    fn gc_tombstones(&self, up_to: Version) -> Result<u64, SyncError> {
+        self.inner.gc_tombstones(up_to)
+    }
+    fn gc_applied(&self, older_than: chrono::DateTime<Utc>) -> Result<u64, SyncError> {
+        self.inner.gc_applied(older_than)
+    }
+    fn tombstone_horizon(&self) -> Result<Version, SyncError> {
+        self.inner.tombstone_horizon()
+    }
+    fn latest_version(&self) -> Result<Version, SyncError> {
+        self.inner.latest_version()
+    }
+}
+
+/// Seed n1..n5 into a wrapped backend and serve it; page size 2 makes the
+/// initial from-zero catch-up span three pages.
+async fn gc_race_fixture(
+    backend: &Arc<GcInjectingBackend>,
+) -> (String, tokio::task::JoinHandle<()>, SyncConfig) {
+    for i in 1..=5 {
+        backend.push_one(Change {
+            change_id: format!("00000000-0000-4000-8000-0000000000a{i}"),
+            collection: "notes".to_owned(),
+            pk: format!("n{i}"),
+            op: Op::Upsert,
+            payload: Some(json!({"title": format!("note {i}")})),
+            base_version: 0,
+            updated_at: Utc::now(),
+        });
+    }
+    let (url, srv) = start_sync_server(
+        backend.clone() as Arc<dyn SyncBackend>,
+        Arc::new(LwwResolver),
+    )
+    .await;
+    let mut config = SyncConfig::new(&url);
+    config.pull_batch_size = 2;
+    (url, srv, config)
+}
+
+/// A tombstone GC committing between two pages of a fresh device's
+/// from-zero catch-up must not leave the deleted row visible: the per-page
+/// horizon guard detects the movement, defers to the (restart-protected)
+/// snapshot resync, and the device converges with the row absent.
+#[tokio::test]
+async fn gc_between_pages_of_a_from_zero_catchup_converges_without_stale_rows() {
+    let backend = Arc::new(GcInjectingBackend::new(MemorySyncBackend::new()));
+    let (_url, _srv, config) = gc_race_fixture(&backend).await;
+    // Page 1 serves n1 live; before page 2 its delete commits AND its
+    // tombstone is GC'd — the tombstone can never be pulled.
+    backend
+        .delete_before_pull
+        .lock()
+        .expect("lock")
+        .insert(2, "n1");
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = open_store(&dir, "fresh.db");
+    let report = SyncEngine::new(store.clone(), config)
+        .sync_once()
+        .await
+        .expect("sync converges despite the racing GC");
+    assert!(
+        report.full_resync,
+        "the horizon movement must trigger the snapshot resync"
+    );
+    assert_eq!(
+        store.get::<Note>("notes", "n1").expect("get n1"),
+        None,
+        "the row deleted+GC'd mid-catch-up must not survive"
+    );
+    for i in 2..=5 {
+        assert!(
+            store
+                .get::<Note>("notes", &format!("n{i}"))
+                .expect("get")
+                .is_some(),
+            "live row n{i} must arrive"
+        );
+    }
+}
+
+/// A GC racing the SNAPSHOT itself (between two of its pages) restarts the
+/// snapshot from scratch: rows already buffered from early pages would
+/// otherwise resurrect — the tombstone for a buffered row was physically
+/// dropped before a later page could deliver it.
+#[tokio::test]
+async fn gc_between_snapshot_pages_restarts_the_snapshot() {
+    let backend = Arc::new(GcInjectingBackend::new(MemorySyncBackend::new()));
+    let (_url, _srv, config) = gc_race_fixture(&backend).await;
+    {
+        let mut inject = backend.delete_before_pull.lock().expect("lock");
+        // Pull #2: second page of the initial catch-up → triggers the
+        // resync. Pull #4: second page of snapshot attempt 1, whose first
+        // page (pull #3) already buffered n2 live → must restart.
+        inject.insert(2, "n1");
+        inject.insert(4, "n2");
+    }
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = open_store(&dir, "fresh.db");
+    let report = SyncEngine::new(store.clone(), config)
+        .sync_once()
+        .await
+        .expect("sync converges after the snapshot restart");
+    assert!(report.full_resync);
+    assert_eq!(
+        store.get::<Note>("notes", "n1").expect("get n1"),
+        None,
+        "the catch-up-raced deletion must hold"
+    );
+    assert_eq!(
+        store.get::<Note>("notes", "n2").expect("get n2"),
+        None,
+        "the row buffered by the ABORTED snapshot attempt must not \
+         survive the restart"
+    );
+    for i in 3..=5 {
+        assert!(
+            store
+                .get::<Note>("notes", &format!("n{i}"))
+                .expect("get")
+                .is_some(),
+            "live row n{i} must arrive"
+        );
+    }
+    // Catch-up pages (2) + aborted snapshot attempt (2) + clean attempt (2).
+    assert_eq!(backend.pull_count(), 6, "exactly one snapshot restart");
+}
+
+/// Snapshot restarts are BOUNDED: a GC schedule that keeps moving the
+/// horizon between every pair of pages eventually surfaces an error
+/// instead of restarting forever — and local state stays intact, so a
+/// later pass (once the churn stops) converges normally.
+#[tokio::test]
+async fn snapshot_restarts_are_bounded_and_recoverable() {
+    let backend = Arc::new(GcInjectingBackend::new(MemorySyncBackend::new()));
+    let (_url, _srv, config) = gc_race_fixture(&backend).await;
+    backend
+        .churn
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = open_store(&dir, "fresh.db");
+    let engine = SyncEngine::new(store.clone(), config);
+    let err = engine
+        .sync_once()
+        .await
+        .expect_err("perpetual mid-snapshot GC churn must surface an error");
+    assert!(
+        matches!(&err, SyncError::Server(msg) if msg.contains("mid-snapshot")),
+        "the error must name the mid-snapshot GC churn, got {err:?}"
+    );
+
+    // The churn stops; the same store recovers on the next pass.
+    backend
+        .churn
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    engine.sync_once().await.expect("recovery pass");
+    for i in 1..=5 {
+        assert!(
+            store
+                .get::<Note>("notes", &format!("n{i}"))
+                .expect("get")
+                .is_some(),
+            "live row n{i} must arrive after the churn stops"
+        );
+    }
+}
+
+/// Regression guard for the guard itself: a normal multi-page from-zero
+/// catch-up with a STABLE horizon completes in exactly its page count —
+/// no spurious restarts, no resync.
+#[tokio::test]
+async fn stable_horizon_multi_page_catchup_never_restarts() {
+    let backend = Arc::new(GcInjectingBackend::new(MemorySyncBackend::new()));
+    let (_url, _srv, config) = gc_race_fixture(&backend).await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = open_store(&dir, "fresh.db");
+    let report = SyncEngine::new(store.clone(), config)
+        .sync_once()
+        .await
+        .expect("plain multi-page sync");
+    assert!(!report.full_resync, "a stable horizon never resyncs");
+    assert_eq!(report.pulled, 5);
+    assert_eq!(
+        backend.pull_count(),
+        3,
+        "three pages, no restarts (2 + 2 + 1 rows)"
+    );
+}
+
 /// Overlapping `sync_once` calls (the Tauri shell's resume kick racing the
 /// background loop) must serialize: the journal batch is pushed exactly
 /// once across both passes.

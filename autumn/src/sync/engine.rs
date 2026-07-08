@@ -9,6 +9,14 @@ use super::protocol::{
 };
 use super::store::SyncStore;
 
+/// How many times one `resync_from_snapshot` call restarts its from-zero
+/// snapshot after detecting a mid-snapshot tombstone GC (the server's
+/// horizon moved between pages) before giving up with an error. Restarts
+/// are complete re-fetches, so an aggressive GC schedule could otherwise
+/// starve the resync forever; local state is untouched on the error path
+/// and the next sync pass simply tries again.
+const MAX_SNAPSHOT_RESTARTS: usize = 5;
+
 /// Configuration for a [`SyncEngine`].
 #[derive(Debug, Clone)]
 pub struct SyncConfig {
@@ -173,7 +181,9 @@ impl SyncEngine {
             // still-stale cursor makes the server demand the resync again
             // on the next pass; the snapshot runs with session=0, which the
             // server never asks to resync, so multi-page snapshots cannot
-            // trip the horizon check mid-pagination.
+            // trip the horizon check mid-pagination (a GC racing the
+            // snapshot is instead detected CLIENT-side via the per-page
+            // horizon and restarts the snapshot — see resync_from_snapshot).
             self.resync_from_snapshot(&mut report).await?;
             self.push_pending(&mut report).await?;
         }
@@ -191,10 +201,30 @@ impl SyncEngine {
     /// the resync simply re-triggers on the next (possibly still offline)
     /// pass — zero data loss, never a window where the store sits emptied
     /// awaiting a pull that may not come.
+    ///
+    /// From-zero sessions are exempt from the server's tombstone-horizon
+    /// check (a fresh device must be able to page its first sync), so a GC
+    /// racing this snapshot has to be detected CLIENT-side: every page
+    /// reports the server's `tombstone_horizon`, and a change relative to
+    /// the attempt's first page means tombstones may have been physically
+    /// dropped for rows already buffered (an early page served the live
+    /// row; its delete committed and was GC'd before a later page — the
+    /// tombstone would never be seen, and reconciling the buffered snapshot
+    /// would keep the stale row forever while the cursor lands past the new
+    /// horizon). Detection restarts the snapshot from scratch —
+    /// [`MAX_SNAPSHOT_RESTARTS`] times at most, then errs out so a
+    /// pathological GC schedule cannot starve the sync loop. The horizon is
+    /// global across scopes (see the sync server), so this check is
+    /// conservative-safe under scoped mounts: an unrelated scope's GC can
+    /// only cause a spurious restart, never a missed deletion.
     async fn resync_from_snapshot(&self, report: &mut SyncReport) -> Result<(), SyncError> {
         let limit = self.config.pull_batch_size.clamp(1, MAX_PULL_LIMIT);
         let mut snapshot: Vec<RemoteRow> = Vec::new();
         let mut cursor: Version = 0;
+        // The horizon observed on the CURRENT attempt's first page (None
+        // until that page arrives).
+        let mut attempt_horizon: Option<Version> = None;
+        let mut restarts: usize = 0;
         let (final_cursor, tombstone_horizon) = loop {
             let response = self
                 .authorized(self.client.get(format!(
@@ -220,6 +250,27 @@ impl SyncEngine {
                     next_cursor,
                     tombstone_horizon,
                 } => {
+                    match attempt_horizon {
+                        None => attempt_horizon = Some(tombstone_horizon),
+                        // The horizon moved mid-snapshot: a GC may have
+                        // dropped tombstones for rows already buffered.
+                        // Restart from scratch (see the doc comment).
+                        Some(start) if tombstone_horizon != start => {
+                            restarts += 1;
+                            if restarts > MAX_SNAPSHOT_RESTARTS {
+                                return Err(SyncError::Server(format!(
+                                    "tombstone GC kept moving the horizon mid-snapshot; \
+                                     giving up after {MAX_SNAPSHOT_RESTARTS} restarts — \
+                                     local state is untouched, retry the sync later"
+                                )));
+                            }
+                            snapshot.clear();
+                            cursor = 0;
+                            attempt_horizon = None;
+                            continue;
+                        }
+                        Some(_) => {}
+                    }
                     let page_len = rows.len();
                     snapshot.extend(rows);
                     let caught_up =
@@ -297,6 +348,9 @@ impl SyncEngine {
     async fn pull_updates(&self, report: &mut SyncReport) -> Result<bool, SyncError> {
         let session_start = self.store.cursor()?;
         let limit = self.config.pull_batch_size.clamp(1, MAX_PULL_LIMIT);
+        // Horizon observed on the first page — only consulted for from-zero
+        // sessions, which the server exempts from its own horizon check.
+        let mut first_page_horizon: Option<Version> = None;
         loop {
             let cursor = self.store.cursor()?;
             let response = self
@@ -319,6 +373,25 @@ impl SyncEngine {
                     next_cursor,
                     tombstone_horizon,
                 } => {
+                    // A from-zero session (fresh device paging its first
+                    // sync) is exempt from the server's horizon check, so a
+                    // GC between its pages must be detected here — exactly
+                    // the race `resync_from_snapshot` guards against: an
+                    // early page applied a live row whose delete was GC'd
+                    // before a later page, so the tombstone never arrives
+                    // while the final cursor lands past the new horizon.
+                    // Treat it like a server-demanded resync: the snapshot
+                    // path re-fetches from scratch and carries its own
+                    // bounded restart guard. Sessions with a non-zero start
+                    // need nothing — the server itself answers
+                    // FullResyncRequired once the horizon passes them.
+                    if session_start == 0 {
+                        match first_page_horizon {
+                            None => first_page_horizon = Some(tombstone_horizon),
+                            Some(start) if tombstone_horizon != start => return Ok(true),
+                            Some(_) => {}
+                        }
+                    }
                     let page_len = rows.len();
                     let caught_up =
                         rows.is_empty() || i64::try_from(page_len).unwrap_or(i64::MAX) < limit;
