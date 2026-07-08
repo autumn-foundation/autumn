@@ -665,8 +665,12 @@ fn autumn_web_patch_entry(dir: &Path) -> Option<(String, toml::Value)> {
         .map(|(key, value)| (key.clone(), value.clone()))
 }
 
-/// The manifest directory whose `[patch]` tables Cargo actually honors for
-/// the app at `project_root`:
+/// The app's EFFECTIVE workspace root: the single manifest directory whose
+/// `[patch]` tables Cargo honors and whose `[workspace.dependencies]` table
+/// `workspace = true` inheritance resolves against (shared by the patch
+/// mirroring, the dependency-value resolution, and the desktop generator's
+/// renamed-dep key lookup, so all the walks agree). For the app at
+/// `project_root` this is:
 ///
 /// - the app itself when its manifest declares `[workspace]` (own root) or
 ///   no enclosing workspace exists (standalone),
@@ -679,7 +683,7 @@ fn autumn_web_patch_entry(dir: &Path) -> Option<(String, toml::Value)> {
 /// Full `members` glob verification is deliberately skipped: a nearest
 /// ancestor root that does not include the member is a broken workspace
 /// Cargo itself rejects.
-fn effective_workspace_root(project_root: &Path) -> std::path::PathBuf {
+pub fn effective_workspace_root(project_root: &Path) -> std::path::PathBuf {
     let parse = |dir: &Path| -> Option<toml::Value> {
         toml::from_str(&read_or_empty(&dir.join("Cargo.toml"))).ok()
     };
@@ -846,52 +850,67 @@ fn shell_autumn_web_dep(project_root: &Path, plan: &mut Plan) -> ShellAutumnWebD
 /// this is an [`super::emit::Action::Modify`] that `autumn destroy` never
 /// reverses — the extracted `serve()` keeps compiling either way (its sync
 /// code is gated on the feature).
+/// The app's own `[features]` reachable from `start` by following
+/// own-crate feature edges (`start` itself included). Entries containing
+/// `/` or `:` are dependency features (`dep/feat`, `dep?/feat`,
+/// `dep:name`) — they cannot enable an own-crate feature, so they are
+/// never followed. This one walk backs BOTH feature checks below
+/// (default-enablement and dep-propagation), so the two can never
+/// diverge on graph semantics.
+fn reachable_own_features(
+    features: &toml::value::Table,
+    start: &str,
+) -> std::collections::HashSet<String> {
+    let mut visited = std::collections::HashSet::new();
+    let mut stack = vec![start.to_owned()];
+    while let Some(name) = stack.pop() {
+        if !visited.insert(name.clone()) {
+            continue;
+        }
+        if let Some(entries) = features.get(&name).and_then(toml::Value::as_array) {
+            for entry in entries.iter().filter_map(toml::Value::as_str) {
+                if !entry.contains('/') && !entry.contains(':') {
+                    stack.push(entry.to_owned());
+                }
+            }
+        }
+    }
+    visited
+}
+
 /// Whether the manifest's `default` feature set enables `offline-sync`,
-/// directly or transitively through other features of THIS crate (entries
-/// containing `/` or `:` are dependency features — they cannot turn on the
-/// crate's own `#[cfg(feature = "offline-sync")]` and are ignored).
-fn offline_sync_enabled_by_default(manifest: &str) -> bool {
-    fn enables(
-        features: &toml::value::Table,
-        name: &str,
-        visited: &mut std::collections::HashSet<String>,
-    ) -> bool {
-        if name == "offline-sync" {
-            return true;
-        }
-        if !visited.insert(name.to_owned()) {
-            return false;
-        }
-        features
-            .get(name)
-            .and_then(toml::Value::as_array)
-            .is_some_and(|entries| {
-                entries.iter().filter_map(toml::Value::as_str).any(|entry| {
-                    !entry.contains('/')
-                        && !entry.contains(':')
-                        && enables(features, entry, visited)
+/// directly or transitively through other features of THIS crate.
+fn offline_sync_enabled_by_default(features: &toml::value::Table) -> bool {
+    features.contains_key("offline-sync")
+        && reachable_own_features(features, "default").contains("offline-sync")
+}
+
+/// Whether the app's existing `offline-sync` feature actually enables the
+/// framework's feature on the `dep_key` dependency edge — a
+/// `{dep_key}/offline-sync` (or weak `{dep_key}?/offline-sync`) entry,
+/// directly or transitively through other own-crate features.
+///
+/// This matters because the extracted `serve()` compiles its sync code under
+/// `#[cfg(feature = "offline-sync")]` while the code it calls
+/// (`autumn_web::sync`) only exists when the DEPENDENCY's feature is on: a
+/// declaration like `offline-sync = []` satisfies the cfg but leaves the
+/// dependency compiled without its sync module — a guaranteed build
+/// failure.
+fn offline_sync_feature_propagates(features: &toml::value::Table, dep_key: &str) -> bool {
+    let strong = format!("{dep_key}/offline-sync");
+    let weak = format!("{dep_key}?/offline-sync");
+    reachable_own_features(features, "offline-sync")
+        .iter()
+        .any(|name| {
+            features
+                .get(name)
+                .and_then(toml::Value::as_array)
+                .is_some_and(|entries| {
+                    entries
+                        .iter()
+                        .filter_map(toml::Value::as_str)
+                        .any(|entry| entry == strong || entry == weak)
                 })
-            })
-    }
-    let Ok(doc) = toml::from_str::<toml::Value>(manifest) else {
-        return false;
-    };
-    let Some(features) = doc.get("features").and_then(toml::Value::as_table) else {
-        return false;
-    };
-    if !features.contains_key("offline-sync") {
-        return false;
-    }
-    features
-        .get("default")
-        .and_then(toml::Value::as_array)
-        .is_some_and(|default| {
-            let mut visited = std::collections::HashSet::new();
-            default.iter().filter_map(toml::Value::as_str).any(|entry| {
-                !entry.contains('/')
-                    && !entry.contains(':')
-                    && enables(features, entry, &mut visited)
-            })
         })
 }
 
@@ -912,50 +931,79 @@ fn plan_app_offline_sync_feature(project_root: &Path, plan: &mut Plan) {
     );
     let feature_line = format!("offline-sync = [\"{dep_key}/offline-sync\"]\n");
     // Detect an existing feature via the PARSED [features] table (the same
-    // source of truth `offline_sync_enabled_by_default` reads), never a
+    // source of truth the graph checks below read), never a
     // substring scan: `offline-sync=[]` (no spaces) or a multiline array
     // would slip past a textual `"offline-sync = ["` check into the
     // fresh-insert branch below, which would then write a DUPLICATE
     // `offline-sync` key under [features] — a manifest cargo rejects.
-    let feature_defined = doc
+    let features = doc
         .as_ref()
         .and_then(|doc| doc.get("features"))
-        .and_then(toml::Value::as_table)
-        .is_some_and(|features| features.contains_key("offline-sync"));
-    if feature_defined {
-        // The feature exists — but "wired" also requires it to be ENABLED
-        // by `default`: the extracted serve() mounts /sync behind
-        // #[cfg(feature = "offline-sync")], and the documented flow assumes
-        // a plain `cargo run` deployment serves those endpoints. A defined
-        // but non-default feature would ship a mobile client whose server
-        // never mounts /sync.
-        if offline_sync_enabled_by_default(&content) {
-            return; // Already wired — keep re-runs silent and duplicate-free.
+        .and_then(toml::Value::as_table);
+    if let Some(features) = features.filter(|f| f.contains_key("offline-sync")) {
+        // The feature exists — but "wired" requires two more things, each
+        // patched with the same anchored discipline as the fresh edit
+        // (byte-precise anchor or a loud warning, never a guessed rewrite
+        // of a customised manifest):
+        //
+        // 1. It must PROPAGATE to the dependency — include
+        //    `{dep_key}/offline-sync`, directly or transitively through
+        //    other own-crate features. serve()'s sync code compiles under
+        //    #[cfg(feature = "offline-sync")] but calls autumn_web::sync,
+        //    which only exists when the DEPENDENCY's feature is on, so a
+        //    non-propagating declaration (e.g. `offline-sync = []`) is a
+        //    guaranteed build failure.
+        // 2. `default` must enable it: the extracted serve() mounts /sync
+        //    behind the cfg, and the documented flow assumes a plain
+        //    `cargo run` deployment serves those endpoints. A defined but
+        //    non-default feature would ship a mobile client whose server
+        //    never mounts /sync.
+        let mut edited = content;
+        let mut changed = false;
+        if !offline_sync_feature_propagates(features, &dep_key) {
+            // The one unambiguous anchored shape: an EMPTY declaration
+            // gains exactly the dep entry. Any other non-propagating array
+            // is a customised feature we refuse to guess at.
+            const EMPTY_DECL: &str = "offline-sync = []\n";
+            if edited.contains(EMPTY_DECL) {
+                edited = edited.replacen(EMPTY_DECL, &feature_line, 1);
+                changed = true;
+            } else {
+                plan.warn(format!(
+                    "Cargo.toml declares an `offline-sync` feature, but it \
+                     doesn't enable `{dep_key}/offline-sync` (directly or \
+                     through another feature of this crate), so the sync \
+                     code in serve() would compile against an autumn-web \
+                     built WITHOUT its sync module — a guaranteed build \
+                     failure. Add \"{dep_key}/offline-sync\" to your \
+                     `offline-sync` feature array \
+                     (see docs/guide/tauri-mobile-offline-sync.md)."
+                ));
+            }
         }
-        // Same anchored discipline as the fresh edit: add the feature to
-        // the stock `default` line when it still matches (everything else
-        // stays byte-identical), otherwise warn instead of guessing at a
-        // customised manifest.
-        if content.contains(DEFAULT_ANCHOR) {
-            plan.modify(
-                cargo_path,
-                content.replacen(
+        if !offline_sync_enabled_by_default(features) {
+            if edited.contains(DEFAULT_ANCHOR) {
+                edited = edited.replacen(
                     DEFAULT_ANCHOR,
                     "default = [\"flash\", \"offline-sync\"]\n",
                     1,
-                ),
-            );
-        } else {
-            plan.warn(
-                "Cargo.toml declares an `offline-sync` feature, but `default` \
-                 doesn't enable it and the default line doesn't match the \
-                 stock scaffold — add `offline-sync` to the `default` feature \
-                 set yourself (or run the server deployment with `--features \
-                 offline-sync`), or the deployed app will never mount the \
-                 /sync endpoints the device syncs against \
-                 (see docs/guide/tauri-mobile-offline-sync.md)."
-                    .to_owned(),
-            );
+                );
+                changed = true;
+            } else {
+                plan.warn(
+                    "Cargo.toml declares an `offline-sync` feature, but `default` \
+                     doesn't enable it and the default line doesn't match the \
+                     stock scaffold — add `offline-sync` to the `default` feature \
+                     set yourself (or run the server deployment with `--features \
+                     offline-sync`), or the deployed app will never mount the \
+                     /sync endpoints the device syncs against \
+                     (see docs/guide/tauri-mobile-offline-sync.md)."
+                        .to_owned(),
+                );
+            }
+        }
+        if changed {
+            plan.modify(cargo_path, edited);
         }
         return;
     }
@@ -3282,6 +3330,198 @@ mod tests {
             dep.dep_entry
         );
         assert!(plan.warnings.is_empty(), "got {:?}", plan.warnings);
+    }
+
+    #[test]
+    fn offline_pointer_root_resolves_renamed_inherited_dep_key() {
+        // A `[package] workspace = "…"` pointer plus a RENAMED inherited
+        // dep: the dep-key resolution must read the pointed root's
+        // [workspace.dependencies] to learn that `autumn` is the
+        // autumn-web package. An ancestor-only walk misses it: the key
+        // mis-resolves to "autumn-web", the member lookup finds no such
+        // dependency (falling back to a registry edge), and the feature
+        // edit emits `autumn-web/offline-sync` — a spelling cargo rejects
+        // for a renamed dependency.
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(
+            ws.join("Cargo.toml"),
+            "[workspace]\nmembers = []\n\n\
+             [workspace.dependencies]\n\
+             autumn = { package = \"autumn-web\", path = \"vendor/autumn\" }\n",
+        )
+        .unwrap();
+        let app = tmp.path().join("app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(
+            app.join("Cargo.toml"),
+            "[package]\nname = \"my-app\"\nversion = \"0.2.3\"\nworkspace = \"../ws\"\n\n\
+             [dependencies]\nautumn = { workspace = true }\n\n\
+             [features]\ndefault = [\"flash\"]\nflash = []\n",
+        )
+        .unwrap();
+
+        // Shell edge: mirrored from the pointed root — no registry fallback.
+        let mut plan = Plan::new(&app);
+        let dep = shell_autumn_web_dep(&app, &mut plan);
+        assert_eq!(
+            dep.dep_entry,
+            r#"autumn-web = { path = "../../ws/vendor/autumn", features = ["offline-sync"] }"#,
+            "the renamed inherited dep must resolve through the pointed root"
+        );
+        assert!(plan.warnings.is_empty(), "got {:?}", plan.warnings);
+
+        // Feature entry: names the ALIAS key — the only spelling cargo
+        // accepts for a renamed dependency.
+        let mut plan = Plan::new(&app);
+        plan_app_offline_sync_feature(&app, &mut plan);
+        assert!(plan.warnings.is_empty(), "got {:?}", plan.warnings);
+        let edited = plan
+            .actions
+            .iter()
+            .find_map(|a| match a {
+                Action::Modify { contents, .. } => Some(contents.clone()),
+                _ => None,
+            })
+            .expect("the feature edit must be planned");
+        assert!(
+            edited.contains(r#"offline-sync = ["autumn/offline-sync"]"#),
+            "the feature must reference the RENAMED dependency key, got:\n{edited}"
+        );
+        assert!(
+            !edited.contains(r#"["autumn-web/offline-sync"]"#),
+            "the package name is not a valid feature dependency here, got:\n{edited}"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // one linear case list, clearest unsplit
+    fn offline_feature_wired_check_requires_dep_propagation() {
+        // A declared `offline-sync` feature only counts as wired when it
+        // actually ENABLES `{dep_key}/offline-sync` (directly or through
+        // another own-crate feature): serve()'s sync code compiles under
+        // cfg(feature = "offline-sync") but calls autumn_web::sync, which
+        // only exists when the dependency's feature is on — so e.g.
+        // `offline-sync = []` satisfies the cfg while guaranteeing a build
+        // failure.
+        fn manifest(deps: &str, features: &str) -> TempDir {
+            let tmp = TempDir::new().unwrap();
+            std::fs::write(
+                tmp.path().join("Cargo.toml"),
+                format!(
+                    "[package]\nname = \"my-app\"\nversion = \"0.2.3\"\n\n\
+                     [dependencies]\n{deps}\n\n\
+                     [features]\n{features}"
+                ),
+            )
+            .unwrap();
+            tmp
+        }
+        fn planned_edit(tmp: &TempDir) -> (Option<String>, Vec<String>) {
+            let mut plan = Plan::new(tmp.path());
+            plan_app_offline_sync_feature(tmp.path(), &mut plan);
+            let edit = plan.actions.iter().find_map(|a| match a {
+                Action::Modify { contents, .. } => Some(contents.clone()),
+                _ => None,
+            });
+            (edit, plan.warnings)
+        }
+        const STOCK_DEP: &str = "autumn-web = \"0.9.1\"";
+
+        // Empty declaration, default-enabled: the anchored patch fills in
+        // exactly the dep entry; the default line is untouched.
+        let tmp = manifest(
+            STOCK_DEP,
+            "default = [\"flash\", \"offline-sync\"]\nflash = []\noffline-sync = []\n",
+        );
+        let (edit, warnings) = planned_edit(&tmp);
+        let edited = edit.expect("an empty offline-sync declaration must be patched");
+        assert!(warnings.is_empty(), "got {warnings:?}");
+        assert!(
+            edited.contains(r#"offline-sync = ["autumn-web/offline-sync"]"#),
+            "got:\n{edited}"
+        );
+        assert!(
+            edited.contains(r#"default = ["flash", "offline-sync"]"#),
+            "the already-correct default line must stay untouched:\n{edited}"
+        );
+        toml::from_str::<toml::Value>(&edited).expect("edited manifest must stay valid TOML");
+
+        // Empty declaration AND missing from default: both anchored
+        // patches land in one edit.
+        let tmp = manifest(
+            STOCK_DEP,
+            "default = [\"flash\"]\nflash = []\noffline-sync = []\n",
+        );
+        let (edit, warnings) = planned_edit(&tmp);
+        let edited = edit.expect("both fixes must be planned");
+        assert!(warnings.is_empty(), "got {warnings:?}");
+        assert!(
+            edited.contains(r#"offline-sync = ["autumn-web/offline-sync"]"#)
+                && edited.contains(r#"default = ["flash", "offline-sync"]"#),
+            "got:\n{edited}"
+        );
+        toml::from_str::<toml::Value>(&edited).expect("edited manifest must stay valid TOML");
+
+        // A non-empty, non-propagating array is a customised feature: loud
+        // warning naming the missing entry, never a guessed rewrite.
+        let tmp = manifest(
+            STOCK_DEP,
+            "default = [\"flash\", \"offline-sync\"]\nflash = []\n\
+             offline-sync = [\"flash\"]\n",
+        );
+        let (edit, warnings) = planned_edit(&tmp);
+        assert!(edit.is_none(), "a customised array is never rewritten");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("autumn-web/offline-sync")),
+            "the warning must name the missing dep entry, got {warnings:?}"
+        );
+
+        // Propagating TRANSITIVELY through another own-crate feature:
+        // wired, untouched.
+        let tmp = manifest(
+            STOCK_DEP,
+            "default = [\"flash\", \"offline-sync\"]\nflash = []\n\
+             offline-sync = [\"sync-impl\"]\n\
+             sync-impl = [\"autumn-web/offline-sync\"]\n",
+        );
+        let (edit, warnings) = planned_edit(&tmp);
+        assert!(edit.is_none(), "transitive propagation counts as wired");
+        assert!(warnings.is_empty(), "got {warnings:?}");
+
+        // The weak dep-feature form propagates too.
+        let tmp = manifest(
+            STOCK_DEP,
+            "default = [\"flash\", \"offline-sync\"]\nflash = []\n\
+             offline-sync = [\"autumn-web?/offline-sync\"]\n",
+        );
+        let (edit, warnings) = planned_edit(&tmp);
+        assert!(edit.is_none(), "the weak form counts as propagating");
+        assert!(warnings.is_empty(), "got {warnings:?}");
+
+        // A RENAMED dep propagates via its alias key — and only via it.
+        let tmp = manifest(
+            "autumn = { package = \"autumn-web\", version = \"0.9.1\" }",
+            "default = [\"flash\", \"offline-sync\"]\nflash = []\n\
+             offline-sync = [\"autumn/offline-sync\"]\n",
+        );
+        let (edit, warnings) = planned_edit(&tmp);
+        assert!(edit.is_none(), "the alias entry counts as propagating");
+        assert!(warnings.is_empty(), "got {warnings:?}");
+        let tmp = manifest(
+            "autumn = { package = \"autumn-web\", version = \"0.9.1\" }",
+            "default = [\"flash\", \"offline-sync\"]\nflash = []\n\
+             offline-sync = [\"autumn-web/offline-sync\"]\n",
+        );
+        let (_edit, warnings) = planned_edit(&tmp);
+        assert!(
+            warnings.iter().any(|w| w.contains("autumn/offline-sync")),
+            "a package-name entry does not reach the renamed dep's feature, \
+             got {warnings:?}"
+        );
     }
 
     #[test]
