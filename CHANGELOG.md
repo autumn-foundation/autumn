@@ -658,6 +658,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   behavior, the loopback security model, and App Store / Google Play
   guideline compliance in
   [docs/guide/tauri-mobile-in-process.md](docs/guide/tauri-mobile-in-process.md).
+  [no-plugin]
 
 - **db:** TLS to Postgres. The connection pool now honors `sslmode` in the
   database URL via a rustls-backed connector: `sslmode=require` encrypts the
@@ -668,7 +669,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with `disable`/`prefer`) keep the previous plaintext behavior unchanged.
   Previously the pool hardcoded `NoTls`, so `sslmode=require` failed every
   connection with "no TLS implementation configured" and cleartext was the
-  only working configuration (issue #1507).
+  only working configuration (issue #1507). [no-plugin]
 
 ### Documentation
 
