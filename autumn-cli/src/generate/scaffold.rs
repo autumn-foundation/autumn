@@ -145,6 +145,52 @@ pub fn plan_scaffold_with_options(
     let snake_name = snake(name);
     let plural = pluralize(&snake_name);
 
+    // `references` columns whose target model can't be found in the project
+    // (same presence test `check_reference_targets` used for its warning —
+    // the table presumably exists out-of-band, or gets generated later).
+    // Their "select over the referenced table's ids" promotion (issue #1135
+    // AC 2) needs the target's `src/schema.rs` entry at compile time, so the
+    // routes renderer skips the select machinery for these columns and lets
+    // them fall back to the derived numeric id input — a warning-only missing
+    // target has always produced compilable output, and importing a
+    // nonexistent schema module would break that. A self-referential column
+    // (target == this scaffold's own table) is never "missing": its schema
+    // entry is being generated right now.
+    let missing_reference_targets: BTreeSet<String> = form_fields
+        .iter()
+        .filter(|f| f.kind.is_reference())
+        .filter_map(|f| {
+            let table = f.reference_table()?;
+            if table == plural {
+                return None;
+            }
+            let base = f.name.strip_suffix("_id").unwrap_or(&f.name);
+            if super::model::model_file_exists(project_root, &table, base) {
+                None
+            } else {
+                Some(f.name.clone())
+            }
+        })
+        .collect();
+    if !options_with_key.api && !options_with_key.live_validation {
+        for f in form_fields.iter().filter(|f| f.kind.is_reference()) {
+            if !missing_reference_targets.contains(&f.name) {
+                continue;
+            }
+            let Some(table) = f.reference_table() else {
+                continue;
+            };
+            let base = f.name.strip_suffix("_id").unwrap_or(&f.name);
+            plan.warn(format!(
+                "'{}' will render as a plain numeric id input in the generated form: \
+                 without the '{base}' model, table '{table}' has no `src/schema.rs` entry \
+                 to load select options from. Generate the '{base}' model first (or re-run \
+                 this scaffold once it exists) to get a select of {table} ids instead.",
+                f.name
+            ));
+        }
+    }
+
     // Repository file under `src/repositories/<snake>.rs`
     let repos_dir = project_root.join("src").join("repositories");
     plan.create(
@@ -182,6 +228,7 @@ pub fn plan_scaffold_with_options(
                 options_with_key.live,
                 options_with_key.live_validation,
                 metadata.validations(),
+                &missing_reference_targets,
             ),
         );
         let route_mod_path = routes_dir.join("mod.rs");
@@ -1068,6 +1115,7 @@ fn render_routes_file(
     live: bool,
     live_validation: bool,
     validations: &BTreeMap<String, Vec<String>>,
+    missing_reference_targets: &BTreeSet<String>,
 ) -> String {
     let id_rust = id_type.rust_type();
     let validated_fields: Vec<&str> = validations.keys().map(String::as_str).collect();
@@ -1080,11 +1128,18 @@ fn render_routes_file(
     // runtime data, so the handlers that render the form load them and pass
     // them into the shared `{snake}_form_for` helper. `--live-validation`
     // keeps the old per-field emission (no `form_for`), so no options are
-    // loaded there.
+    // loaded there. Columns in `missing_reference_targets` (their referenced
+    // model — and therefore its `src/schema.rs` entry — isn't in the project)
+    // are left out entirely: no loader, no schema import, no Select override,
+    // so they fall back to the derived numeric id input and the generated
+    // file still compiles (the caller warned about the downgrade).
     let reference_fields: Vec<&Field> = if live_validation {
         Vec::new()
     } else {
-        fields.iter().filter(|f| f.kind.is_reference()).collect()
+        fields
+            .iter()
+            .filter(|f| f.kind.is_reference() && !missing_reference_targets.contains(&f.name))
+            .collect()
     };
     let has_reference_selects = !reference_fields.is_empty();
     let model_form = render_model_form(pascal_name, fields, validations);
@@ -1362,7 +1417,7 @@ fn render_routes_file(
         (
             new_form_body,
             edit_form_body,
-            render_form_for_helper(pascal_name, snake_name, fields)
+            render_form_for_helper(pascal_name, snake_name, fields, missing_reference_targets)
                 + &render_reference_option_loaders(&reference_fields, db_ty),
         )
     };
@@ -1657,10 +1712,11 @@ pub async fn index(
 
     // Schema imports: the resource's own table, plus — when reference selects
     // are rendered — each referenced table so its ids can be loaded for the
-    // select options. Requires the referenced resource to have been generated
-    // first (its `diesel::table!` entry must exist in `src/schema.rs`), the
-    // same ordering the migration's FOREIGN KEY already imposes at the
-    // database level.
+    // select options. Only targets that are actually present in the project
+    // reach this point (`reference_fields` already excludes
+    // `missing_reference_targets`): importing a table whose `diesel::table!`
+    // entry doesn't exist in `src/schema.rs` would fail to compile, and a
+    // missing target has always been a warning, not an error.
     let schema_import = {
         let mut extra_tables: BTreeSet<String> = reference_fields
             .iter()
@@ -2052,8 +2108,17 @@ fn render_form_model_impl(pascal_name: &str) -> String {
 ///   table's ids (issue #1135 AC 2). The options are runtime data, so the
 ///   helper takes one `{column}_options: &[(String, String)]` parameter per
 ///   reference and the calling handlers load them (see the generated
-///   `{column}_select_options` loader).
-fn render_form_for_helper(pascal_name: &str, snake_name: &str, fields: &[Field]) -> String {
+///   `{column}_select_options` loader). Columns named in
+///   `missing_reference_targets` (their referenced model isn't in the
+///   project, so there is no schema entry to load options from) keep the
+///   derived numeric id input instead — the plan carries a warning saying
+///   how to get the select.
+fn render_form_for_helper(
+    pascal_name: &str,
+    snake_name: &str,
+    fields: &[Field],
+    missing_reference_targets: &BTreeSet<String>,
+) -> String {
     use std::fmt::Write as _;
     let mut extra_params = String::new();
     let mut preludes = String::new();
@@ -2120,7 +2185,13 @@ fn render_form_for_helper(pascal_name: &str, snake_name: &str, fields: &[Field])
                 // input; the reference renders as a select over the
                 // referenced table's ids instead. A blank first option gives
                 // required selects browser-native "please select" behavior
-                // (nullable references use it to unset the value).
+                // (nullable references use it to unset the value). When the
+                // referenced model is missing from the project the select's
+                // option loader could not compile (no schema entry to query),
+                // so the column keeps the derived number input.
+                if missing_reference_targets.contains(name) {
+                    continue;
+                }
                 let placeholder = if f.nullable {
                     "— Unset —"
                 } else {
@@ -3512,6 +3583,22 @@ mod tests {
         tmp
     }
 
+    /// Write a minimal existing `src/models/<base>.rs` (i64-keyed) so a
+    /// `references` column targeting it counts as present — both for
+    /// `check_reference_targets`' warning and for the scaffold's
+    /// references→select promotion (issue #1135 AC 2), which needs the
+    /// target's schema entry to exist.
+    fn write_target_model(tmp: &TempDir, base: &str, pascal: &str) {
+        fs::create_dir_all(tmp.path().join("src/models")).unwrap();
+        fs::write(
+            tmp.path().join(format!("src/models/{base}.rs")),
+            format!(
+                "#[autumn_web::model]\npub struct {pascal} {{\n    #[id]\n    pub id: i64,\n}}\n"
+            ),
+        )
+        .unwrap();
+    }
+
     fn default_main() -> &'static str {
         r#"use autumn_web::prelude::*;
 
@@ -3626,8 +3713,12 @@ async fn main() {
         // plain `i64` and emits a number input; the scaffold overrides the
         // reference to a `Select` whose options (the referenced table's ids)
         // are loaded by every handler that renders the form and threaded
-        // through the shared `comment_form_for` helper.
+        // through the shared `comment_form_for` helper. The `Post` target
+        // model exists, so the promotion applies (a missing target falls
+        // back to the derived number input — see
+        // `execute_references_column_with_missing_target_falls_back_to_number_input`).
         let tmp = project_with_main(default_main());
+        write_target_model(&tmp, "post", "Post");
         let plan = plan_scaffold(
             tmp.path(),
             "Comment",
@@ -3694,6 +3785,7 @@ async fn main() {
     #[test]
     fn execute_nullable_references_column_gets_unset_placeholder() {
         let tmp = project_with_main(default_main());
+        write_target_model(&tmp, "post", "Post");
         let plan = plan_scaffold(
             tmp.path(),
             "Comment",
@@ -3709,6 +3801,135 @@ async fn main() {
                 "let mut post_id_select = vec![(String::new(), \"— Unset —\".to_string())];"
             ),
             "nullable reference must get an '— Unset —' placeholder: {routes}"
+        );
+    }
+
+    #[test]
+    fn execute_references_column_with_missing_target_falls_back_to_number_input() {
+        // Regression test (issue #1135 review): a missing reference target has
+        // always been a warning, not an error — the scaffold assumes the table
+        // exists out-of-band (or gets generated later) and its output must
+        // still compile. The references→select promotion needs the target's
+        // `src/schema.rs` entry, so with no `Post` model in the project the
+        // `post_id` column must skip the whole select pipeline (schema
+        // import, options loader, Select override, threaded options) and keep
+        // the derived numeric id input.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Comment",
+            &["body:Text".into(), "post:references".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/comments.rs")).unwrap();
+        assert!(
+            routes.contains("use crate::schema::comments;"),
+            "only the resource's own schema module may be imported: {routes}"
+        );
+        assert!(
+            !routes.contains("posts::"),
+            "the missing target's schema module must never be referenced: {routes}"
+        );
+        assert!(
+            !routes.contains("post_id_select_options"),
+            "no options loader may be emitted for a missing target: {routes}"
+        );
+        assert!(
+            !routes.contains(".override_field(\"post_id\""),
+            "the column must keep the derived number input, not a Select: {routes}"
+        );
+        assert!(
+            !routes.contains("post_id_options"),
+            "the form helper must not take options for a missing target: {routes}"
+        );
+        // Without reference selects, `new_form` keeps its no-DB signature.
+        assert!(
+            !routes.contains("pub async fn new_form(\n    mut db: Db,"),
+            "new_form must not gain a DB handle when no options are loaded: {routes}"
+        );
+    }
+
+    #[test]
+    fn execute_mixed_reference_targets_keeps_select_only_for_present_target() {
+        // One reference whose target exists (`author` → src/models/author.rs)
+        // and one whose target is missing (`post`): only the present target
+        // gets the select promotion; the missing one falls back to the
+        // derived number input and stays out of the schema import.
+        let tmp = project_with_main(default_main());
+        write_target_model(&tmp, "author", "Author");
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Comment",
+            &["author:references".into(), "post:references".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/comments.rs")).unwrap();
+        assert!(
+            routes.contains("use crate::schema::{comments, authors};")
+                || routes.contains("use crate::schema::{authors, comments};"),
+            "only the present target may join the schema import: {routes}"
+        );
+        assert!(
+            routes.contains(
+                ".override_field(\"author_id\", autumn_web::form::FieldControl::Select { options: author_id_select })"
+            ),
+            "the present target must keep its Select promotion: {routes}"
+        );
+        assert!(
+            routes.contains("async fn author_id_select_options"),
+            "the present target must keep its options loader: {routes}"
+        );
+        assert!(
+            !routes.contains("posts::") && !routes.contains("post_id_select_options"),
+            "the missing target must not produce select machinery: {routes}"
+        );
+        assert!(
+            !routes.contains(".override_field(\"post_id\""),
+            "the missing target's column must keep the derived number input: {routes}"
+        );
+    }
+
+    #[test]
+    fn execute_self_referential_reference_keeps_select_without_target_model() {
+        // A self-referential column targets the scaffold's own table, whose
+        // schema entry this very command generates — it is never "missing",
+        // so the select promotion applies even though no `src/models/
+        // category.rs` exists beforehand.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Category",
+            &["name:String".into(), "category:references".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        assert!(
+            plan.warnings.is_empty(),
+            "a self-reference must not warn: {:?}",
+            plan.warnings
+        );
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/categories.rs")).unwrap();
+        assert!(
+            routes.contains(
+                ".override_field(\"category_id\", autumn_web::form::FieldControl::Select { options: category_id_select })"
+            ),
+            "self-referential column must keep the Select promotion: {routes}"
+        );
+        assert!(
+            routes.contains("async fn category_id_select_options"),
+            "self-referential column must keep its options loader: {routes}"
+        );
+        assert!(
+            routes.contains("use crate::schema::categories;"),
+            "own table needs no extra schema import: {routes}"
         );
     }
 
@@ -6343,8 +6564,22 @@ async fn main() {
             "20260427000000",
         )
         .unwrap();
-        assert_eq!(plan.warnings.len(), 1, "warnings: {:?}", plan.warnings);
+        // Two warnings: the shared "assuming table exists" one from
+        // `check_reference_targets`, plus the scaffold-specific note that the
+        // form falls back to a numeric id input (no schema entry to load
+        // select options from) and how to get the select instead.
+        assert_eq!(plan.warnings.len(), 2, "warnings: {:?}", plan.warnings);
         assert!(plan.warnings[0].contains("posts"));
+        assert!(
+            plan.warnings[1].contains("numeric id input"),
+            "warnings: {:?}",
+            plan.warnings
+        );
+        assert!(
+            plan.warnings[1].contains("Generate the 'post' model first"),
+            "warnings: {:?}",
+            plan.warnings
+        );
     }
 
     #[test]

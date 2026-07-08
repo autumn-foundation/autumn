@@ -38,9 +38,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ids via a per-column `{column}_select_options` loader and thread them into
   the shared form helper — option labels are the raw id (which column makes a
   human-friendly label is a display decision the generator can't know; the
-  generated loader's doc comment says where to swap one in). This requires
-  the referenced resource's `src/schema.rs` entry to exist, i.e. generate the
-  referenced model first — the same ordering the FOREIGN KEY already imposes.
+  generated loader's doc comment says where to swap one in). The select needs
+  the referenced resource's `src/schema.rs` entry, so it applies when the
+  referenced model is already in the project (generate it first — the same
+  ordering the FOREIGN KEY already imposes); when the target is missing (a
+  warning-only situation: the table is assumed to exist out-of-band), the
+  column falls back to the derived numeric id input so the generated code
+  still compiles, and the scaffold warns that generating the referenced model
+  first (or re-running the scaffold afterwards) yields the select.
   Adding a column no longer requires any view edits.
   `--live-validation` scaffolds keep the per-field emission (their htmx
   inline-validation inputs have no `FieldControl` equivalent).

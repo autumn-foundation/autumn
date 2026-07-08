@@ -62,8 +62,24 @@ const WIDGET_COLUMNS: &[&str] = &[
     "notes:Option<String>",
 ];
 
+/// `autumn new` + `generate model Post` + `generate scaffold Widget`: the
+/// `post:references` column's select promotion requires the referenced
+/// model (and its `src/schema.rs` entry) to exist at scaffold time —
+/// otherwise the column falls back to a plain numeric id input (see
+/// `scaffold_references_column_with_missing_target_falls_back_to_number_input`).
+fn scaffold_widget_project(project_name: &str) -> (tempfile::TempDir, PathBuf) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    run_autumn(tmp.path(), &["new", project_name]);
+    let project = tmp.path().join(project_name);
+    run_autumn(&project, &["generate", "model", "Post", "title:String"]);
+    let mut args = vec!["generate", "scaffold", "Widget"];
+    args.extend_from_slice(WIDGET_COLUMNS);
+    run_autumn(&project, &args);
+    (tmp, project)
+}
+
 fn scaffold_widget() -> (tempfile::TempDir, String) {
-    let (tmp, project) = scaffold_project("form-for-app", "Widget", WIDGET_COLUMNS);
+    let (tmp, project) = scaffold_widget_project("form-for-app");
     let routes = fs::read_to_string(project.join("src/routes/widgets.rs")).unwrap();
     (tmp, routes)
 }
@@ -223,14 +239,19 @@ fn scaffold_decimal_column_overrides_number_step() {
 #[test]
 #[ignore = "slow: cargo-checks a fresh project — run with `cargo test -p autumn-cli -- --ignored`"]
 fn generated_form_for_scaffold_cargo_checks() {
-    let (_tmp, project) = scaffold_project("form-for-check", "Widget", WIDGET_COLUMNS);
-
     // The `post:references` column's select options are loaded from the
-    // referenced table, so its schema entry must exist — generate the `Post`
-    // model the reference points at (same ordering the FOREIGN KEY imposes at
-    // the database level).
-    run_autumn(&project, &["generate", "model", "Post", "title:String"]);
+    // referenced table, so its schema entry must exist at scaffold time —
+    // `scaffold_widget_project` generates the `Post` model the reference
+    // points at before scaffolding (same ordering the FOREIGN KEY imposes at
+    // the database level). A missing target downgrades the column to a
+    // numeric id input instead (covered by the sibling ignored test below).
+    let (_tmp, project) = scaffold_widget_project("form-for-check");
+    assert_project_cargo_checks(&project);
+}
 
+/// Patch the generated project to use this workspace's `autumn-web`, then
+/// `cargo check --tests` it, asserting success.
+fn assert_project_cargo_checks(project: &Path) {
     // Point the generated project at the local autumn-web crate so the check
     // exercises this workspace's `form_for`, not a published version.
     let cargo_toml_path = project.join("Cargo.toml");
@@ -248,15 +269,61 @@ fn generated_form_for_scaffold_cargo_checks() {
 
     let check = Command::new("cargo")
         .args(["check", "--tests"])
-        .current_dir(&project)
+        .current_dir(project)
         .output()
         .unwrap();
     assert!(
         check.status.success(),
-        "cargo check on generated form_for scaffold failed:\nstdout:\n{}\nstderr:\n{}",
+        "cargo check on generated scaffold failed:\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&check.stdout),
         String::from_utf8_lossy(&check.stderr),
     );
+}
+
+#[test]
+fn scaffold_references_column_with_missing_target_falls_back_to_number_input() {
+    // Regression test (issue #1135 review): a `references` column whose
+    // target model hasn't been generated has always been a warning, not an
+    // error — the scaffold assumes the table exists out-of-band and its
+    // output must still compile. Without the `Post` model there is no
+    // `posts` entry in `src/schema.rs`, so the scaffold must skip the whole
+    // select pipeline for `post_id` (schema import, options loader, Select
+    // override) and keep the derived numeric id input.
+    let (_tmp, project) = scaffold_project("missing-target-app", "Widget", WIDGET_COLUMNS);
+    let routes = fs::read_to_string(project.join("src/routes/widgets.rs")).unwrap();
+
+    assert!(
+        routes.contains("use crate::schema::widgets;"),
+        "only the resource's own schema module may be imported: {routes}"
+    );
+    assert!(
+        !routes.contains("posts::") && !routes.contains("post_id_select_options"),
+        "the missing target must not produce select machinery: {routes}"
+    );
+    assert!(
+        !routes.contains(".override_field(\"post_id\""),
+        "the column must keep the derived number input, not a Select: {routes}"
+    );
+    // The other schema-specific overrides are unaffected by the fallback.
+    assert!(
+        routes.contains(".override_field(\"status\""),
+        "the enum Select override must survive the reference fallback: {routes}"
+    );
+}
+
+/// Slow end-to-end sibling of `generated_form_for_scaffold_cargo_checks`:
+/// the warning-only missing-reference-target path must still produce a
+/// project that type-checks (the review regression this guards against was
+/// an unconditional `use crate::schema::{widgets, posts};` import plus a
+/// `posts::table` option loader with no `posts` schema entry to satisfy
+/// them).
+///
+/// Ignored by default; run with `cargo test -p autumn-cli -- --ignored`.
+#[test]
+#[ignore = "slow: cargo-checks a fresh project — run with `cargo test -p autumn-cli -- --ignored`"]
+fn generated_scaffold_with_missing_reference_target_cargo_checks() {
+    let (_tmp, project) = scaffold_project("missing-target-check", "Widget", WIDGET_COLUMNS);
+    assert_project_cargo_checks(&project);
 }
 
 #[test]
