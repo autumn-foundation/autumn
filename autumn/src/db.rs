@@ -2197,12 +2197,98 @@ mod tls {
                 })
                 .unwrap_or_default()
         } else {
-            database_url
-                .split_whitespace()
-                .filter_map(|token| token.split_once('='))
-                .map(|(k, v)| (k.to_owned(), v.to_owned()))
-                .collect()
+            keyword_value_pairs(database_url).unwrap_or_default()
         }
+    }
+
+    /// Parse a libpq-style `key = value` connection string into its pairs,
+    /// mirroring tokio-postgres's (private) connection-string parser:
+    /// whitespace is allowed around `=`, values may be single-quoted, and
+    /// `\` escapes the next character both inside and outside quotes
+    /// (`host=db sslmode = require sslrootcert='/pki/my ca.pem'`). Naive
+    /// whitespace splitting would miss `sslmode` in such strings and
+    /// silently downgrade the TLS posture to [`TlsPosture::Off`].
+    ///
+    /// Returns `None` for strings tokio-postgres itself would reject
+    /// (missing `=`, empty unquoted value, unterminated quote), so callers
+    /// keep the default path and surface tokio-postgres's own parse error
+    /// at connect time. Like tokio-postgres, parsing stops silently at an
+    /// empty keyword (e.g. a stray leading `=`).
+    fn keyword_value_pairs(s: &str) -> Option<Vec<(String, String)>> {
+        let mut pairs = Vec::new();
+        let mut it = s.chars().peekable();
+        loop {
+            while it.next_if(|c| c.is_whitespace()).is_some() {}
+            let mut key = String::new();
+            while let Some(&c) = it.peek() {
+                if c.is_whitespace() || c == '=' {
+                    break;
+                }
+                key.push(c);
+                it.next();
+            }
+            if key.is_empty() {
+                return Some(pairs);
+            }
+            while it.next_if(|c| c.is_whitespace()).is_some() {}
+            if it.next() != Some('=') {
+                return None;
+            }
+            while it.next_if(|c| c.is_whitespace()).is_some() {}
+            let mut value = String::new();
+            if it.next_if_eq(&'\'').is_some() {
+                loop {
+                    // `?`: EOF inside quotes (also right after `\`) is an
+                    // unterminated value.
+                    match it.next()? {
+                        '\'' => break,
+                        '\\' => value.push(it.next()?),
+                        c => value.push(c),
+                    }
+                }
+            } else {
+                while let Some(&c) = it.peek() {
+                    if c.is_whitespace() {
+                        break;
+                    }
+                    it.next();
+                    if c == '\\' {
+                        match it.next() {
+                            Some(c2) => value.push(c2),
+                            None => break,
+                        }
+                    } else {
+                        value.push(c);
+                    }
+                }
+                if value.is_empty() {
+                    // `key=` followed by whitespace/EOF: tokio-postgres
+                    // rejects the empty unquoted value (use `key=''`).
+                    return None;
+                }
+            }
+            pairs.push((key, value));
+        }
+    }
+
+    /// Serialize one value of a keyword/value connection string, quoting it
+    /// whenever it would not survive re-parsing as a bare token.
+    fn quote_keyword_value(value: &str) -> String {
+        if !value.is_empty()
+            && !value.contains(|c: char| c.is_whitespace() || c == '\'' || c == '\\')
+        {
+            return value.to_owned();
+        }
+        let mut quoted = String::with_capacity(value.len() + 2);
+        quoted.push('\'');
+        for c in value.chars() {
+            if c == '\'' || c == '\\' {
+                quoted.push('\\');
+            }
+            quoted.push(c);
+        }
+        quoted.push('\'');
+        quoted
     }
 
     /// Rewrite a `verify-full` connection string into one tokio-postgres can
@@ -2237,12 +2323,17 @@ mod tls {
             }
             parsed.to_string()
         } else {
-            database_url
-                .split_whitespace()
-                .filter_map(|token| match token.split_once('=') {
-                    Some(("sslmode", _)) => Some("sslmode=require".to_owned()),
-                    Some(("sslrootcert", _)) => None,
-                    _ => Some(token.to_owned()),
+            let Some(pairs) = keyword_value_pairs(database_url) else {
+                // Malformed: pass through so tokio-postgres reports its own
+                // parse error instead of us inventing a different string.
+                return database_url.to_owned();
+            };
+            pairs
+                .into_iter()
+                .filter_map(|(k, v)| match k.as_str() {
+                    "sslmode" => Some("sslmode=require".to_owned()),
+                    "sslrootcert" => None,
+                    _ => Some(format!("{k}={}", quote_keyword_value(&v))),
                 })
                 .collect::<Vec<_>>()
                 .join(" ")
@@ -2369,6 +2460,72 @@ mod tls {
         }
 
         #[test]
+        fn keyword_strings_with_spaces_around_equals_are_parsed() {
+            // Regression: whitespace-splitting missed `sslmode` here and
+            // silently downgraded the posture to Off (plaintext).
+            assert_eq!(
+                TlsPosture::from_database_url("host=db user=u sslmode = require"),
+                TlsPosture::Require
+            );
+            assert_eq!(
+                TlsPosture::from_database_url("sslmode = require"),
+                TlsPosture::Require
+            );
+            assert_eq!(
+                TlsPosture::from_database_url("host = db sslmode\t=\nverify-full user=u"),
+                TlsPosture::VerifyFull { root_cert: None }
+            );
+        }
+
+        #[test]
+        fn keyword_strings_with_quoted_values_are_parsed() {
+            assert_eq!(
+                TlsPosture::from_database_url("sslmode='verify-full'"),
+                TlsPosture::VerifyFull { root_cert: None }
+            );
+            assert_eq!(
+                TlsPosture::from_database_url(
+                    "host=db sslmode='verify-full' sslrootcert='/path with space/ca.pem'"
+                ),
+                TlsPosture::VerifyFull {
+                    root_cert: Some("/path with space/ca.pem".to_owned())
+                }
+            );
+            // Backslash escapes work inside and outside quotes, as in
+            // tokio-postgres/libpq.
+            assert_eq!(
+                TlsPosture::from_database_url(r"sslmode=verify-full sslrootcert='/pki/it\'s.pem'"),
+                TlsPosture::VerifyFull {
+                    root_cert: Some("/pki/it's.pem".to_owned())
+                }
+            );
+            assert_eq!(
+                TlsPosture::from_database_url(r"sslmode=verify-full sslrootcert=/pki/my\ ca.pem"),
+                TlsPosture::VerifyFull {
+                    root_cert: Some("/pki/my ca.pem".to_owned())
+                }
+            );
+        }
+
+        #[test]
+        fn malformed_keyword_strings_keep_the_default_path_and_its_errors() {
+            // tokio-postgres rejects these at connect time; the posture must
+            // not guess a different TLS decision for them.
+            for url in [
+                "host=db sslmode",            // missing `=` and value
+                "host=db sslmode=",           // empty unquoted value
+                "host=db sslmode='require",   // unterminated quote
+                r"host=db sslmode='require\", // EOF right after escape
+            ] {
+                assert_eq!(
+                    TlsPosture::from_database_url(url),
+                    TlsPosture::Off,
+                    "{url:?} must keep the default NoTls path"
+                );
+            }
+        }
+
+        #[test]
         fn verify_ca_and_require_with_rootcert_fail_loudly() {
             assert!(matches!(
                 TlsPosture::from_database_url("postgres://u@h/db?sslmode=verify-ca"),
@@ -2404,6 +2561,13 @@ mod tls {
                 "host=h user=u sslmode=verify-full sslrootcert=/etc/ca.pem dbname=db",
             );
             assert_eq!(kv, "host=h user=u sslmode=require dbname=db");
+
+            // Whitespace/quoting variants normalize to a string
+            // tokio-postgres parses to the same parameters.
+            let kv = sanitize_for_verify_full(
+                r"host=h sslmode = 'verify-full' sslrootcert='/path with space/ca.pem' password='it\'s'",
+            );
+            assert_eq!(kv, r"host=h sslmode=require password='it\'s'");
         }
 
         #[test]
