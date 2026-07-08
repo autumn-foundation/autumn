@@ -306,7 +306,7 @@ struct AppMeta {
 /// A deliberately small, self-contained reader: the mobile shell has no
 /// sidecar, so — unlike the desktop generator — it needs no binary-target or
 /// dependency-key resolution. `version` resolves workspace inheritance
-/// (`version.workspace = true`) by walking up the directory tree.
+/// (`version.workspace = true`) against the app's effective workspace root.
 /// `lib_ident` honors a custom `[lib] name = "…"`: Cargo exposes the library
 /// crate to the app binary and to path dependents under that name, so the
 /// generated `<lib_ident>::serve()` calls must use it — the dash-to-underscore
@@ -367,26 +367,25 @@ fn read_app_meta(project_root: &Path) -> Result<AppMeta, GenerateError> {
     })
 }
 
-/// Walk from `project_root` upward looking for a `Cargo.toml` that declares
-/// `[workspace.package] version = "…"`.  Returns `None` if not found.
+/// The `[workspace.package] version` of the app's EFFECTIVE workspace root
+/// — the member's own `[workspace]`, the target of an explicit
+/// `[package] workspace = "…"` pointer, or the nearest non-excluding
+/// ancestor (the same single root resolution the dependency-value,
+/// dep-key, and patch lookups use, so all the walks agree). An
+/// ancestor-only walk would miss a pointer target that is not an ancestor
+/// and silently fall back to "0.1.0" — stamping the generated
+/// tauri.conf.json (the mobile BUNDLE version) with the wrong release
+/// number and breaking upgrade/store flows. Returns `None` when the root
+/// declares no `[workspace.package] version`.
 fn resolve_workspace_version(project_root: &Path) -> Option<String> {
-    let mut dir: Option<&Path> = Some(project_root);
-    while let Some(d) = dir {
-        let cargo = d.join("Cargo.toml");
-        if cargo.is_file()
-            && let Ok(content) = std::fs::read_to_string(&cargo)
-            && let Ok(doc) = toml::from_str::<toml::Value>(&content)
-            && let Some(v) = doc
-                .get("workspace")
-                .and_then(|w| w.get("package"))
-                .and_then(|p| p.get("version"))
-                .and_then(|v| v.as_str())
-        {
-            return Some(v.to_owned());
-        }
-        dir = d.parent();
-    }
-    None
+    let root = effective_workspace_root(project_root);
+    let content = std::fs::read_to_string(root.join("Cargo.toml")).ok()?;
+    let doc = toml::from_str::<toml::Value>(&content).ok()?;
+    doc.get("workspace")?
+        .get("package")?
+        .get("version")?
+        .as_str()
+        .map(str::to_owned)
 }
 
 /// The shell's own `autumn-web` dependency (offline sync only), mirroring
@@ -2219,6 +2218,51 @@ mod tests {
         assert!(
             !meta.has_embed_assets,
             "no [features] table means no embed-assets feature"
+        );
+    }
+
+    #[test]
+    fn read_app_meta_resolves_workspace_version_through_a_pointer_root() {
+        // `[package] workspace = "…"` may name a NON-ANCESTOR root — an
+        // ancestor-only walk never reads its [workspace.package] and falls
+        // back to "0.1.0", stamping the generated tauri.conf.json (the
+        // mobile bundle version) with the wrong release number.
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(
+            ws.join("Cargo.toml"),
+            "[workspace]\nmembers = []\n[workspace.package]\nversion = \"2.3.4\"\n",
+        )
+        .unwrap();
+        let app = tmp.path().join("app");
+        std::fs::create_dir_all(app.join("src")).unwrap();
+        std::fs::write(
+            app.join("Cargo.toml"),
+            "[package]\nname = \"app\"\nversion.workspace = true\nworkspace = \"../ws\"\n",
+        )
+        .unwrap();
+
+        let meta = read_app_meta(&app).unwrap();
+        assert_eq!(
+            meta.version, "2.3.4",
+            "the POINTED root's [workspace.package] version must win"
+        );
+    }
+
+    #[test]
+    fn read_app_meta_version_falls_back_without_any_workspace() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"app\"\nversion.workspace = true\n",
+        )
+        .unwrap();
+        let meta = read_app_meta(tmp.path()).unwrap();
+        assert_eq!(
+            meta.version, "0.1.0",
+            "no resolvable workspace version keeps the documented fallback"
         );
     }
 
