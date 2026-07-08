@@ -2935,7 +2935,10 @@ mod tests {
 /// [`diesel_async::pooled_connection::ManagerConfig::custom_setup`] when the
 /// URL asks for TLS. Both URL (`postgres://…?sslmode=require`) and
 /// keyword/value (`host=… sslmode=require`) connection strings are
-/// recognized.
+/// recognized. The synchronous migration/startup-wait path shares the same
+/// connector through [`super::establish_migration_connection`] — the
+/// bundled libpq has no SSL support, so the native `PgConnection` path
+/// cannot reach TLS-only servers at all.
 ///
 /// | `sslmode`                     | behavior |
 /// | ----------------------------- | -------- |
@@ -3032,27 +3035,35 @@ mod tls {
         Box::new(move |url: &str| {
             let posture = posture.clone();
             let url = url.to_owned();
-            async move {
-                match posture {
-                    // Defensive: `build_pool` never installs the callback for
-                    // `Off`, but fall back to the stock path if it ever does.
-                    TlsPosture::Off => AsyncPgConnection::establish(&url).await,
-                    TlsPosture::Require => connect_with(&url, relaxed_connector()?).await,
-                    TlsPosture::VerifyFull { root_cert } => {
-                        // tokio-postgres's own connection-string parser
-                        // rejects `verify-*` and `sslrootcert`, so hand it a
-                        // sanitized string; the real verification lives in
-                        // the rustls config.
-                        let sanitized = sanitize_for_verify_full(&url);
-                        connect_with(&sanitized, verifying_connector(root_cert.as_deref())?).await
-                    }
-                    TlsPosture::Unsupported { reason } => {
-                        Err(ConnectionError::InvalidConnectionUrl(reason))
-                    }
-                }
-            }
-            .boxed()
+            async move { establish(&url, posture).await }.boxed()
         })
+    }
+
+    /// Establish an [`AsyncPgConnection`] honoring `posture` — the single
+    /// connect path shared by the pool's setup callback and the synchronous
+    /// migration/wait-check wrapper
+    /// ([`super::establish_migration_connection`]).
+    pub(super) async fn establish(
+        url: &str,
+        posture: TlsPosture,
+    ) -> ConnectionResult<AsyncPgConnection> {
+        match posture {
+            // Defensive: `build_pool` never installs the callback for
+            // `Off`, but fall back to the stock path if it ever does.
+            TlsPosture::Off => AsyncPgConnection::establish(url).await,
+            TlsPosture::Require => connect_with(url, relaxed_connector()?).await,
+            TlsPosture::VerifyFull { root_cert } => {
+                // tokio-postgres's own connection-string parser
+                // rejects `verify-*` and `sslrootcert`, so hand it a
+                // sanitized string; the real verification lives in
+                // the rustls config.
+                let sanitized = sanitize_for_verify_full(url);
+                connect_with(&sanitized, verifying_connector(root_cert.as_deref())?).await
+            }
+            TlsPosture::Unsupported { reason } => {
+                Err(ConnectionError::InvalidConnectionUrl(reason))
+            }
+        }
     }
 
     async fn connect_with(
@@ -3499,6 +3510,134 @@ mod tls {
         #[test]
         fn relaxed_connector_builds() {
             assert!(relaxed_connector().is_ok());
+        }
+    }
+}
+
+// ── Synchronous TLS-aware connections (migrations, wait checks) ───────────────
+
+/// A synchronous diesel Pg connection for migrations and startup wait
+/// checks, honoring the connection string's `sslmode` (issue #1585 review).
+///
+/// diesel's native [`diesel::PgConnection`] connects through libpq, and the
+/// workspace bundles libpq **without** SSL support (`pq-sys`'s
+/// `bundled_without_openssl`) — so with `sslmode=require`/`verify-full` the
+/// async pool (rustls) connects fine while the sync migration path fails at
+/// startup before the app ever serves. For those postures this wraps an
+/// [`AsyncPgConnection`] established through the pool's own rustls connector
+/// in diesel-async's [`AsyncConnectionWrapper`], which provides the full
+/// sync diesel API including `MigrationHarness`. With TLS off the native
+/// `PgConnection` path is kept byte-identical to the historical behavior.
+///
+/// [`AsyncConnectionWrapper`]:
+///     diesel_async::async_connection_wrapper::AsyncConnectionWrapper
+#[allow(clippy::large_enum_variant)] // short-lived, one per migration target
+pub(crate) enum MigrationConnection {
+    /// The historical libpq-backed connection (TLS posture `Off`).
+    Native(diesel::PgConnection),
+    /// rustls-backed sync wrapper (TLS posture `Require`/`VerifyFull`).
+    Rustls {
+        /// Runtime owning the connection's tokio driver task when none was
+        /// ambient (plain sync contexts like the CLI); `None` when an
+        /// ambient runtime drives it (`spawn_blocking` contexts). Callers
+        /// must keep this alive as long as `conn` — dropping the runtime
+        /// kills the driver and every query after that hangs or errors.
+        runtime: Option<tokio::runtime::Runtime>,
+        conn: diesel_async::async_connection_wrapper::AsyncConnectionWrapper<AsyncPgConnection>,
+    },
+}
+
+/// Whether migrations/wait checks for `database_url` must go through the
+/// rustls wrapper rather than the native libpq path. Split out of
+/// [`establish_migration_connection`] so the path selection is unit-testable
+/// without a server.
+fn migration_connection_needs_rustls(database_url: &str) -> bool {
+    !matches!(
+        tls::TlsPosture::from_database_url(database_url),
+        tls::TlsPosture::Off
+    )
+}
+
+/// Establish a [`MigrationConnection`] for `database_url`.
+///
+/// **Never call from an async executor thread**: the rustls arm `block_on`s
+/// connection setup. Sync contexts (the CLI) and `spawn_blocking` tasks (the
+/// startup migration path) are both fine.
+///
+/// # Errors
+///
+/// Returns the underlying [`diesel::ConnectionError`] when the connection
+/// cannot be established (including [`TlsPosture::Unsupported`] postures,
+/// which fail with their documented guidance).
+///
+/// [`TlsPosture::Unsupported`]: tls::TlsPosture::Unsupported
+pub(crate) fn establish_migration_connection(
+    database_url: &str,
+) -> Result<MigrationConnection, diesel::ConnectionError> {
+    use diesel::Connection as _;
+    if !migration_connection_needs_rustls(database_url) {
+        return diesel::PgConnection::establish(database_url).map(MigrationConnection::Native);
+    }
+    let posture = tls::TlsPosture::from_database_url(database_url);
+    // The driver task tokio::spawn()ed during establish must stay driven for
+    // the connection's lifetime: reuse the ambient runtime when there is one
+    // (spawn_blocking context), otherwise create one and keep it alive
+    // alongside the connection.
+    let (runtime, handle) = if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        (None, handle)
+    } else {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .map_err(|e| {
+                diesel::ConnectionError::BadConnection(format!(
+                    "failed to build a tokio runtime for the TLS migration connection: {e}"
+                ))
+            })?;
+        let handle = runtime.handle().clone();
+        (Some(runtime), handle)
+    };
+    let inner = handle.block_on(tls::establish(database_url, posture))?;
+    Ok(MigrationConnection::Rustls {
+        runtime,
+        conn: diesel_async::async_connection_wrapper::AsyncConnectionWrapper::from(inner),
+    })
+}
+
+#[cfg(test)]
+mod migration_connection_tests {
+    use super::migration_connection_needs_rustls;
+
+    #[test]
+    fn migration_path_selection_follows_the_tls_posture() {
+        // NoTls URLs keep the historical native libpq path byte-identical.
+        for url in [
+            "postgres://u@h/db",
+            "postgres://u@h/db?sslmode=disable",
+            "postgres://u@h/db?sslmode=prefer",
+            "host=db user=u",
+        ] {
+            assert!(
+                !migration_connection_needs_rustls(url),
+                "must stay on the native path: {url}"
+            );
+        }
+        // TLS-requiring strings (URL and keyword forms) — and unsupported
+        // postures, which must fail with the TLS module's guidance instead
+        // of libpq's — go through the rustls wrapper.
+        for url in [
+            "postgres://u@h/db?sslmode=require",
+            "postgres://u@h/db?sslmode=verify-full",
+            "postgres://u@h/db?sslmode=verify-full&sslrootcert=/etc/ca.pem",
+            "postgres://u@h/db?sslmode=verify-ca",
+            "host=db user=u sslmode=require",
+            "host=db sslmode = 'verify-full'",
+        ] {
+            assert!(
+                migration_connection_needs_rustls(url),
+                "must use the rustls wrapper: {url}"
+            );
         }
     }
 }
