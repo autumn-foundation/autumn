@@ -544,6 +544,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   previously gitignored) so builds are reproducible and dependency updates
   are reviewable.
 
+### Fixed
+
+- **jobs:** fixed a first-initialization race in the process-global job
+  client (supersedes #1491): `init_global_job_client` /
+  `clear_global_job_client` used a get-then-set pattern on the backing
+  `OnceLock`, so two threads racing the very first install/clear could have
+  one side's `OnceLock::set` lose and be silently dropped — leaving a job
+  runtime that had just installed its client invisible to `global_job_client()`
+  (free-function `enqueue` and `#[job]` handlers would see no runtime). Both
+  functions now use `OnceLock::get_or_init` so the slot is created exactly
+  once and every install/clear lands through the `RwLock`.
+
 ## [0.6.0] - 2026-06-30
 
 ### Added

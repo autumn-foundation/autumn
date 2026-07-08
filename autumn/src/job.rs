@@ -1841,22 +1841,16 @@ pub(crate) fn install_job_client(state: &AppState, client: JobClient) {
 }
 
 pub(crate) fn init_global_job_client(client: JobClient) {
-    if let Some(lock) = GLOBAL_JOB_CLIENT.get() {
-        if let Ok(mut guard) = lock.write() {
-            *guard = Some(Arc::new(client));
-        }
-        return;
+    let lock = GLOBAL_JOB_CLIENT.get_or_init(|| RwLock::new(None));
+    if let Ok(mut guard) = lock.write() {
+        *guard = Some(Arc::new(client));
     }
-    let _ = GLOBAL_JOB_CLIENT.set(RwLock::new(Some(Arc::new(client))));
 }
 
 pub fn clear_global_job_client() {
-    if let Some(lock) = GLOBAL_JOB_CLIENT.get() {
-        if let Ok(mut guard) = lock.write() {
-            *guard = None;
-        }
-    } else {
-        let _ = GLOBAL_JOB_CLIENT.set(RwLock::new(None));
+    let lock = GLOBAL_JOB_CLIENT.get_or_init(|| RwLock::new(None));
+    if let Ok(mut guard) = lock.write() {
+        *guard = None;
     }
     crate::job_tracking::clear_global_tracking_store();
 }
@@ -7584,6 +7578,59 @@ mod tests {
             .expect("snapshot after operations");
         assert!(snapshot.failed.records.is_empty());
         assert!(snapshot.enqueued.records.is_empty());
+    }
+
+    #[tokio::test]
+    async fn global_job_client_survives_concurrent_init_and_clear() {
+        fn make_client() -> JobClient {
+            JobClient {
+                local_sender: None,
+                local_coordination: None,
+                #[cfg(feature = "redis")]
+                redis: None,
+                #[cfg(feature = "db")]
+                pg_pool: None,
+                registry: crate::actuator::JobRegistry::new(),
+                job_admin: JobAdminMemoryBackend::new_for_test(32),
+                default_max_attempts: 3,
+                default_initial_backoff_ms: 250,
+                per_job_settings: HashMap::new(),
+                interceptor: None,
+                resilience_config: None,
+            }
+        }
+
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+
+        // Hammer the global slot from several std threads at once: installs,
+        // reads, and clears must never panic or poison the lock, no matter
+        // how they interleave.
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let client = make_client();
+            handles.push(std::thread::spawn(move || init_global_job_client(client)));
+            handles.push(std::thread::spawn(|| {
+                let _ = global_job_client();
+            }));
+            handles.push(std::thread::spawn(clear_global_job_client));
+        }
+        for handle in handles {
+            handle.join().expect("concurrent global client op panicked");
+        }
+
+        // Whatever the interleaving above, an install performed after every
+        // concurrent operation has finished must always be observable. The
+        // old get-then-set code could silently drop a client whose losing
+        // `OnceLock::set` raced a concurrent first-time init/clear.
+        init_global_job_client(make_client());
+        assert!(
+            global_job_client().is_some(),
+            "install after concurrent init/clear must win"
+        );
+
+        clear_global_job_client();
+        assert!(global_job_client().is_none());
     }
 
     #[tokio::test]
