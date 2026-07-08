@@ -548,8 +548,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **cli:** the generators' `main.rs` editing no longer matches inside
   comments (supersedes #1516): route-registration edits skip `routes![`
-  occurrences on `//`/`///`/`//!` comment lines instead of injecting route
-  entries into the comment text, and the PWA generator inserts its handlers
+  occurrences on `//`/`///`/`//!` comment lines (a `//` inside a string
+  literal on the line — e.g. a `https://` URL — is code, not a comment
+  marker) instead of injecting route entries into the comment text, and
+  the PWA generator inserts its handlers
   before the line that is exactly `#[autumn_web::main]` rather than before
   any comment that merely mentions the macro — both used to produce
   uncompilable `main.rs` output when such comments were present.

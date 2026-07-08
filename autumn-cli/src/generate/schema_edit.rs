@@ -943,9 +943,29 @@ pub fn remove_main_mod_declarations(existing: &str, names: &[&str]) -> String {
 /// i.e. the match at `pos` lives inside a line comment (`//`, `///`, or `//!`).
 /// Used to skip `routes![` occurrences that appear in comments (e.g. a doc
 /// comment explaining the macro) rather than in real code.
+///
+/// A `//` inside a double-quoted string literal is content, not a comment
+/// marker — e.g. the URL in
+/// `let url = "https://example.com"; app.routes(routes![index])` must not
+/// make the line look commented out. This stays a line-local heuristic: it
+/// tracks `"…"` state with `\`-escape handling but does not understand raw
+/// strings (`r#"…"#`), char literals containing `"`, or block comments.
 fn is_on_comment_line(text: &str, pos: usize) -> bool {
     let line_start = text[..pos].rfind('\n').map_or(0, |nl| nl + 1);
-    text[line_start..pos].contains("//")
+    let mut in_string = false;
+    let mut chars = text[line_start..pos].chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' if in_string => {
+                // Skip the escaped character so `\"` doesn't end the string.
+                chars.next();
+            }
+            '"' => in_string = !in_string,
+            '/' if !in_string && chars.peek() == Some(&'/') => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Locate the body span (byte offsets, exclusive of the enclosing
@@ -5058,6 +5078,57 @@ fn main() {
         let original = "//! Add handlers via routes![].\nfn main() {}\n";
         let updated = ensure_routes_entries(original, &["foo".into()]);
         assert_eq!(updated, original);
+    }
+
+    #[test]
+    fn ensure_routes_entries_url_in_string_before_macro_is_code() {
+        // The `//` in the URL string literal is content, not a comment
+        // marker — the `routes![` on the same line is real code and must
+        // receive the injected entry.
+        let original =
+            "fn main() {\n    let url = \"https://example.com\"; app.routes(routes![index]);\n}\n";
+        let updated = ensure_routes_entries(original, &["foo".into()]);
+        assert!(
+            updated.contains("foo"),
+            "routes![ after a URL string must be edited as code: {updated}"
+        );
+        assert!(
+            updated.contains("\"https://example.com\""),
+            "the string literal must be untouched: {updated}"
+        );
+    }
+
+    #[test]
+    fn ensure_routes_entries_genuinely_commented_macro_still_skipped() {
+        // A real line comment before `routes![` must still be skipped, even
+        // when the comment itself contains quotes.
+        let original = "\
+// see \"docs\": routes![index]
+fn main() {
+    routes![]
+}
+";
+        let updated = ensure_routes_entries(original, &["foo".into()]);
+        assert!(
+            updated.contains("// see \"docs\": routes![index]"),
+            "comment must be untouched: {updated}"
+        );
+        assert!(
+            updated.rfind("foo").unwrap() > updated.find("fn main()").unwrap(),
+            "entry must land in the real macro, not the comment: {updated}"
+        );
+    }
+
+    #[test]
+    fn ensure_routes_entries_slashes_in_string_with_macro_on_line() {
+        // A string literal containing `//` followed by a real macro use on
+        // the same line: the escaped quote must not flip the string state.
+        let original = "fn main() {\n    let s = \"say \\\"// not a comment\\\"\"; app.routes(routes![index]);\n}\n";
+        let updated = ensure_routes_entries(original, &["foo".into()]);
+        assert!(
+            updated.contains("foo"),
+            "escaped quotes in a string must not hide the real macro: {updated}"
+        );
     }
 
     #[test]
