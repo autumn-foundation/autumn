@@ -3352,31 +3352,29 @@ pub async fn reset_password(
     let revoke_existing_sessions = state.config().auth.sessions.revoke_on_credential_change;
     let {snake_name}_id = {snake_name}.id;
     (*db)
-        .transaction::<_, diesel::result::Error, _>(|conn| {{
-            Box::pin(async move {{
-                diesel::update({table}::table.find({snake_name}_id))
-                    .set((
-                        {table}::password_digest.eq(&new_digest),
-                        {table}::reset_token_digest.eq(None::<String>),
-                        {table}::reset_token_expires_at.eq(None::<chrono::NaiveDateTime>),
-                    ))
-                    .execute(conn)
-                    .await?;
-                // Revoke before inserting so the bulk delete cannot eat the
-                // fresh row.
-                if revoke_existing_sessions {{
-                    diesel::delete(
-                        {sess_table}::table.filter({sess_table}::user_id.eq({snake_name}_id)),
-                    )
-                    .execute(conn)
-                    .await?;
-                }}
-                diesel::insert_into({sess_table}::table)
-                    .values(&new_session_row)
-                    .execute(conn)
-                    .await?;
-                Ok(())
-            }})
+        .transaction::<_, diesel::result::Error, _>(async move |conn| {{
+            diesel::update({table}::table.find({snake_name}_id))
+                .set((
+                    {table}::password_digest.eq(&new_digest),
+                    {table}::reset_token_digest.eq(None::<String>),
+                    {table}::reset_token_expires_at.eq(None::<chrono::NaiveDateTime>),
+                ))
+                .execute(conn)
+                .await?;
+            // Revoke before inserting so the bulk delete cannot eat the
+            // fresh row.
+            if revoke_existing_sessions {{
+                diesel::delete(
+                    {sess_table}::table.filter({sess_table}::user_id.eq({snake_name}_id)),
+                )
+                .execute(conn)
+                .await?;
+            }}
+            diesel::insert_into({sess_table}::table)
+                .values(&new_session_row)
+                .execute(conn)
+                .await?;
+            Ok(())
         }})
         .await
         .map_err(|e| {{
@@ -6432,8 +6430,7 @@ pub async fn two_factor_confirm(
     let revoke_other_sessions_in_txn = state.config().auth.sessions.revoke_on_credential_change;
     let current_token_digest = session_token_digest(&session).await;
     let txn_result = (*db)
-        .transaction::<_, diesel::result::Error, _>(|conn| {
-        Box::pin(async move {
+        .transaction::<_, diesel::result::Error, _>(async move |conn| {
             diesel::update(__TABLE__::table.find(user_id))
                 .set((
                     __TABLE__::totp_secret_encrypted.eq(Some(pending_secret)),
@@ -6484,7 +6481,6 @@ pub async fn two_factor_confirm(
                 .await?;
             }
             Ok(())
-        })
         })
         .await;
     match txn_result {
@@ -6582,30 +6578,28 @@ pub async fn two_factor_disable(
     let revoke_other_sessions_in_txn = state.config().auth.sessions.revoke_on_credential_change;
     let current_token_digest = session_token_digest(&session).await;
     (*db)
-        .transaction::<_, diesel::result::Error, _>(|conn| {
-            Box::pin(async move {
-                diesel::update(__TABLE__::table.find(user_id))
-                    .set((
-                        __TABLE__::totp_enabled.eq(false),
-                        __TABLE__::totp_secret_encrypted.eq(None::<String>),
-                        __TABLE__::totp_last_used_step.eq(None::<i64>),
-                    ))
-                    .execute(conn)
-                    .await?;
-                diesel::delete(recovery_codes::table.filter(recovery_codes::user_id.eq(user_id)))
-                    .execute(conn)
-                    .await?;
-                if revoke_other_sessions_in_txn {
-                    diesel::delete(
-                        __SESSTABLE__::table
-                            .filter(__SESSTABLE__::user_id.eq(user_id))
-                            .filter(__SESSTABLE__::token_digest.ne(current_token_digest)),
-                    )
-                    .execute(conn)
-                    .await?;
-                }
-                Ok(())
-            })
+        .transaction::<_, diesel::result::Error, _>(async move |conn| {
+            diesel::update(__TABLE__::table.find(user_id))
+                .set((
+                    __TABLE__::totp_enabled.eq(false),
+                    __TABLE__::totp_secret_encrypted.eq(None::<String>),
+                    __TABLE__::totp_last_used_step.eq(None::<i64>),
+                ))
+                .execute(conn)
+                .await?;
+            diesel::delete(recovery_codes::table.filter(recovery_codes::user_id.eq(user_id)))
+                .execute(conn)
+                .await?;
+            if revoke_other_sessions_in_txn {
+                diesel::delete(
+                    __SESSTABLE__::table
+                        .filter(__SESSTABLE__::user_id.eq(user_id))
+                        .filter(__SESSTABLE__::token_digest.ne(current_token_digest)),
+                )
+                .execute(conn)
+                .await?;
+            }
+            Ok(())
         })
         .await
         .map_err(|_| AutumnError::internal_server_error_msg("Failed to disable two-factor."))?;
@@ -6751,31 +6745,29 @@ pub async fn login_verify(
                 state.config().auth.sessions.revoke_on_credential_change;
             let user_id = __SNAKE__.id;
             (*db)
-                .transaction::<_, diesel::result::Error, _>(|conn| {
-                    Box::pin(async move {
-                        let updated = diesel::update(__TABLE__::table.find(user_id))
-                            .filter(__TABLE__::reset_token_digest.eq(Some(token.as_str())))
-                            .filter(__TABLE__::reset_token_expires_at.gt(now))
-                            .set((
-                                __TABLE__::password_digest.eq(&new_digest),
-                                __TABLE__::reset_token_digest.eq(None::<String>),
-                                __TABLE__::reset_token_expires_at.eq(None::<chrono::NaiveDateTime>),
-                            ))
-                            .execute(conn)
-                            .await?;
-                        // Password changed: revoke every existing session in
-                        // the same transaction (defaulted on, configurable via
-                        // [auth.sessions].revoke_on_credential_change). The
-                        // fresh login is recorded below.
-                        if updated == 1 && revoke_existing_sessions {
-                            diesel::delete(
-                                __SESSTABLE__::table.filter(__SESSTABLE__::user_id.eq(user_id)),
-                            )
-                            .execute(conn)
-                            .await?;
-                        }
-                        Ok(updated == 1)
-                    })
+                .transaction::<_, diesel::result::Error, _>(async move |conn| {
+                    let updated = diesel::update(__TABLE__::table.find(user_id))
+                        .filter(__TABLE__::reset_token_digest.eq(Some(token.as_str())))
+                        .filter(__TABLE__::reset_token_expires_at.gt(now))
+                        .set((
+                            __TABLE__::password_digest.eq(&new_digest),
+                            __TABLE__::reset_token_digest.eq(None::<String>),
+                            __TABLE__::reset_token_expires_at.eq(None::<chrono::NaiveDateTime>),
+                        ))
+                        .execute(conn)
+                        .await?;
+                    // Password changed: revoke every existing session in
+                    // the same transaction (defaulted on, configurable via
+                    // [auth.sessions].revoke_on_credential_change). The
+                    // fresh login is recorded below.
+                    if updated == 1 && revoke_existing_sessions {
+                        diesel::delete(
+                            __SESSTABLE__::table.filter(__SESSTABLE__::user_id.eq(user_id)),
+                        )
+                        .execute(conn)
+                        .await?;
+                    }
+                    Ok(updated == 1)
                 })
                 .await
                 .unwrap_or(false)
@@ -7272,28 +7264,26 @@ pub async fn passkey_register_finish(
     let revoke_other_sessions_in_txn = state.config().auth.sessions.revoke_on_credential_change;
     let current_token_digest = crate::routes::auth::session_token_digest(&session).await;
     (*db)
-        .transaction::<_, diesel::result::Error, _>(|conn| {
-            Box::pin(async move {
-                diesel::insert_into(crate::schema::webauthn_credentials::table)
-                    .values((
-                        crate::schema::webauthn_credentials::user_id.eq(__SNAKE___id),
-                        crate::schema::webauthn_credentials::credential_id.eq(&cred_id),
-                        crate::schema::webauthn_credentials::credential_json.eq(&cred_json),
-                        crate::schema::webauthn_credentials::name.eq("Passkey"),
-                    ))
-                    .execute(conn)
-                    .await?;
-                if revoke_other_sessions_in_txn {
-                    diesel::delete(
-                        crate::schema::__SESSTABLE__::table
-                            .filter(crate::schema::__SESSTABLE__::user_id.eq(__SNAKE___id))
-                            .filter(crate::schema::__SESSTABLE__::token_digest.ne(current_token_digest)),
-                    )
-                    .execute(conn)
-                    .await?;
-                }
-                Ok(())
-            })
+        .transaction::<_, diesel::result::Error, _>(async move |conn| {
+            diesel::insert_into(crate::schema::webauthn_credentials::table)
+                .values((
+                    crate::schema::webauthn_credentials::user_id.eq(__SNAKE___id),
+                    crate::schema::webauthn_credentials::credential_id.eq(&cred_id),
+                    crate::schema::webauthn_credentials::credential_json.eq(&cred_json),
+                    crate::schema::webauthn_credentials::name.eq("Passkey"),
+                ))
+                .execute(conn)
+                .await?;
+            if revoke_other_sessions_in_txn {
+                diesel::delete(
+                    crate::schema::__SESSTABLE__::table
+                        .filter(crate::schema::__SESSTABLE__::user_id.eq(__SNAKE___id))
+                        .filter(crate::schema::__SESSTABLE__::token_digest.ne(current_token_digest)),
+                )
+                .execute(conn)
+                .await?;
+            }
+            Ok(())
         })
         .await
         .map_err(|_| AutumnError::internal_server_error_msg("Failed to store passkey."))?;
@@ -7579,26 +7569,24 @@ pub async fn passkey_revoke(
     let revoke_other_sessions_in_txn = state.config().auth.sessions.revoke_on_credential_change;
     let current_token_digest = crate::routes::auth::session_token_digest(&session).await;
     (*db)
-        .transaction::<_, diesel::result::Error, _>(|conn| {
-            Box::pin(async move {
+        .transaction::<_, diesel::result::Error, _>(async move |conn| {
+            diesel::delete(
+                crate::schema::webauthn_credentials::table
+                    .filter(crate::schema::webauthn_credentials::id.eq(credential_id))
+                    .filter(crate::schema::webauthn_credentials::user_id.eq(user_id)),
+            )
+            .execute(conn)
+            .await?;
+            if revoke_other_sessions_in_txn {
                 diesel::delete(
-                    crate::schema::webauthn_credentials::table
-                        .filter(crate::schema::webauthn_credentials::id.eq(credential_id))
-                        .filter(crate::schema::webauthn_credentials::user_id.eq(user_id)),
+                    crate::schema::__SESSTABLE__::table
+                        .filter(crate::schema::__SESSTABLE__::user_id.eq(user_id))
+                        .filter(crate::schema::__SESSTABLE__::token_digest.ne(current_token_digest)),
                 )
                 .execute(conn)
                 .await?;
-                if revoke_other_sessions_in_txn {
-                    diesel::delete(
-                        crate::schema::__SESSTABLE__::table
-                            .filter(crate::schema::__SESSTABLE__::user_id.eq(user_id))
-                            .filter(crate::schema::__SESSTABLE__::token_digest.ne(current_token_digest)),
-                    )
-                    .execute(conn)
-                    .await?;
-                }
-                Ok(())
-            })
+            }
+            Ok(())
         })
         .await
         .map_err(|_| AutumnError::internal_server_error_msg("Failed to revoke passkey."))?;
