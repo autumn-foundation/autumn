@@ -529,6 +529,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **deps(security):** dependency-vulnerability upgrades (supersedes PR #1557;
+  `diesel-async` was already handled separately). `aws-sdk-s3` floored at
+  1.122 (1.119.0 → 1.122.0, the last MSRV-1.88 release) with
+  `default-features = false` to drop the deprecated legacy hyper 0.14 /
+  rustls 0.21 connector stack — this removes `rustls-webpki` 0.101.7
+  (RUSTSEC-2026-0104 / GHSA-82j2-j2ch-gfr8 high, RUSTSEC-2026-0098 /
+  GHSA-965h-392x-2mh5 and RUSTSEC-2026-0099 / GHSA-xgp8-3hg3-c2mh low),
+  `rustls` 0.21.12, `hyper` 0.14.32, and `h2` 0.3.27 from `Cargo.lock`
+  entirely (the modern hyper 1.x / rustls 0.23 `default-https-client` stack,
+  which is what the SDK actually uses at runtime, stays enabled); transitive
+  `lru` 0.12.5 → 0.16.4 (RUSTSEC-2026-0002 / GHSA-rhfx-m35p-ff5j);
+  `opentelemetry_sdk` 0.31.0 → 0.32.1 (CVE-2026-48504 / GHSA-w9wp-h8wv-79jx,
+  unbounded memory allocation in W3C Baggage propagation) together with the
+  matching `opentelemetry` / `opentelemetry-otlp` 0.32.0 and
+  `tracing-opentelemetry` 0.33.0. `rsa` 0.9.10 (RUSTSEC-2023-0071, Marvin
+  attack) remains: no fixed release exists on its 0.9.x line.
 - **deps:** bumped `diesel-async` from 0.8 to 0.9 (resolving 0.9.2, with
   `diesel` at 2.3.10) and `libsqlite3-sys` from 0.36 to 0.37 — 0.37 is the
   newest release line diesel 2.3 accepts (`<0.38`). diesel-async 0.9 changed
