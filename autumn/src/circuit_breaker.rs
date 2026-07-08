@@ -133,6 +133,15 @@ impl CircuitBreakerInner {
         failures as f64 / self.history.len() as f64
     }
 
+    /// Records a state transition and logs it.
+    ///
+    /// Must be the *last* mutation of every transition: callers set all
+    /// associated fields (`open_until`, half-open counters, history) before
+    /// calling this. The `tracing` call below can panic in a user-provided
+    /// subscriber, and because [`CircuitBreaker::lock_inner`] recovers
+    /// poisoned state, a mid-transition panic must still leave the breaker
+    /// fully consistent (the state write below precedes the log, so the new
+    /// state is complete by the time anything can panic).
     fn transition_to(&mut self, name: &str, new_state: CircuitState, failure_ratio: f64) {
         let old_state = self.state;
         self.state = new_state;
@@ -184,11 +193,11 @@ impl CircuitBreaker {
         if inner.state == CircuitState::Open {
             if let Some(until) = inner.open_until {
                 if now >= until {
-                    inner.transition_to(&self.name, CircuitState::HalfOpen, 1.0);
                     inner.half_open_successes = 0;
                     inner.half_open_failures = 0;
                     inner.half_open_in_flight = 0;
                     inner.open_until = None;
+                    inner.transition_to(&self.name, CircuitState::HalfOpen, 1.0);
                 }
             }
         }
@@ -221,11 +230,11 @@ impl CircuitBreaker {
         if inner.state == CircuitState::Open {
             if let Some(until) = inner.open_until {
                 if now >= until {
-                    inner.transition_to(&self.name, CircuitState::HalfOpen, 1.0);
                     inner.half_open_successes = 0;
                     inner.half_open_failures = 0;
                     inner.half_open_in_flight = 0;
                     inner.open_until = None;
+                    inner.transition_to(&self.name, CircuitState::HalfOpen, 1.0);
                 }
             }
         }
@@ -263,8 +272,8 @@ impl CircuitBreaker {
                 if inner.history.len() as u64 >= min_sample {
                     let ratio = inner.failure_ratio();
                     if ratio >= failure_ratio_threshold {
-                        inner.transition_to(&self.name, CircuitState::Open, ratio);
                         inner.open_until = Some(now + open_duration);
+                        inner.transition_to(&self.name, CircuitState::Open, ratio);
                     }
                 }
             }
@@ -277,13 +286,13 @@ impl CircuitBreaker {
                 if success {
                     inner.half_open_successes += 1;
                     if inner.half_open_successes >= trial_count {
-                        inner.transition_to(&self.name, CircuitState::Closed, 0.0);
                         inner.history.clear();
+                        inner.transition_to(&self.name, CircuitState::Closed, 0.0);
                     }
                 } else {
                     inner.half_open_failures += 1;
-                    inner.transition_to(&self.name, CircuitState::Open, 1.0);
                     inner.open_until = Some(now + open_duration);
+                    inner.transition_to(&self.name, CircuitState::Open, 1.0);
                 }
             }
             CircuitState::Open => {}
@@ -763,5 +772,55 @@ mod tests {
         assert_eq!(registry.all_breakers().len(), 1);
         registry.clear();
         assert!(registry.all_breakers().is_empty());
+    }
+
+    #[test]
+    fn test_circuit_breaker_survives_panic_during_state_transition() {
+        // A tracing subscriber that panics on every event, simulating a
+        // user-provided subscriber panicking inside `transition_to`'s log.
+        struct PanickingSubscriber;
+        impl tracing::Subscriber for PanickingSubscriber {
+            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, _: &tracing::Event<'_>) {
+                panic!("subscriber panic during circuit breaker transition");
+            }
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+
+        let policy = CircuitBreakerPolicy {
+            failure_ratio_threshold: 0.5,
+            sample_window: Duration::from_secs(10),
+            minimum_sample_count: 1,
+            open_duration: Duration::ZERO,
+            half_open_trial_count: 1,
+        };
+        let breaker = CircuitBreaker::new("transition_panic_test", policy);
+
+        // Panic mid-transition (Closed -> Open) while holding the lock; this
+        // both poisons the mutex and interrupts `transition_to`.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            tracing::subscriber::with_default(PanickingSubscriber, || {
+                breaker.after_call(false);
+            });
+        }));
+        assert!(result.is_err());
+        assert!(breaker.inner.is_poisoned());
+
+        // The interrupted transition must still be complete: `open_until` was
+        // set before `transition_to`, so the breaker recovers to HalfOpen
+        // (instantly, since open_duration is zero) instead of being stuck
+        // permanently Open with `open_until == None`.
+        assert_eq!(breaker.state(), CircuitState::HalfOpen);
+        assert!(breaker.before_call().is_ok());
+        breaker.after_call(true);
+        assert_eq!(breaker.state(), CircuitState::Closed);
     }
 }
