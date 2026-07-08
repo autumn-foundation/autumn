@@ -17,7 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`capabilities/remote-app.json`, plus `remote-app-mobile.json` restricting
   the biometric grant to Android/iOS so desktop smoke-test builds still
   pass), and `autumn destroy tauri --remote-url <URL>` reverts the
-  scaffold. Desktop `autumn generate tauri` output is unchanged. See
+  scaffold. Desktop `autumn generate tauri` output is unchanged. Generating
+  one Tauri mode over the other's files is rejected (even with `--force`,
+  which only overwrites within the same mode) with a pointer at the matching
+  `autumn destroy tauri [--remote-url <URL>]` to run first — mixing modes
+  would leave stale files that break the new scaffold's build. See
   `docs/guide/tauri-mobile-thin-client.md`.
 
 - **generator:** `autumn generate scaffold`'s `create`/`update` handlers now

@@ -2871,10 +2871,29 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
         } => {
             let flags = generate::Flags { dry_run, force };
             let project_root = resolve_cwd();
-            let plan = remote_url.as_ref().map_or_else(
-                || generate::tauri::plan_tauri(&project_root),
-                |url| generate::tauri::plan_tauri_thin_client(&project_root, url),
-            );
+            // Mixed-mode guard (issue #1506): generating one Tauri mode over
+            // the other's files is rejected outright, even with --force —
+            // --force means "overwrite within the same mode", and the other
+            // mode's leftovers would actively break the new scaffold's build
+            // (stale capability files fail tauri-build validation on desktop;
+            // stale per-OS overlays keep running the sidecar staging scripts
+            // for a thin client). Destroy is exempt: `autumn destroy tauri
+            // [--remote-url <URL>]` is the documented remedy and must keep
+            // working on a mixed tree.
+            let guard = if mode == ApplyMode::Generate {
+                generate::tauri::ensure_no_opposite_mode_scaffold(
+                    &project_root,
+                    remote_url.is_some(),
+                )
+            } else {
+                Ok(())
+            };
+            let plan = guard.and_then(|()| {
+                remote_url.as_ref().map_or_else(
+                    || generate::tauri::plan_tauri(&project_root),
+                    |url| generate::tauri::plan_tauri_thin_client(&project_root, url),
+                )
+            });
             let result = plan.and_then(|p| match mode {
                 ApplyMode::Generate => p.execute(flags),
                 ApplyMode::Destroy => p.revert(flags),

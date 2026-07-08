@@ -106,6 +106,28 @@ network-security-config scoped to your dev host) on the `<application>`
 element under `src-tauri/gen/android/`, and remove it before shipping.
 Release builds should always point at the `https://` production URL.
 
+### Switching between desktop and thin-client scaffolds
+
+Both modes write to `src-tauri/`, but their file sets only partially overlap,
+so generating one mode on top of the other would leave stale files behind:
+Tauri loads *every* capability file under `src-tauri/capabilities/`, so
+leftover thin-client grants fail `tauri-build` validation against the desktop
+shell crate; in the other direction, leftover per-OS `tauri.*.conf.json`
+overlays keep running the sidecar staging scripts on every
+`cargo tauri build`. The generator therefore refuses to scaffold one mode
+while the other's marker files are present — even with `--force`, which only
+overwrites files within the same mode. Destroy the existing scaffold first:
+
+```bash
+# thin client → desktop
+autumn destroy tauri --remote-url https://app.example.com
+autumn generate tauri
+
+# desktop → thin client
+autumn destroy tauri
+autumn generate tauri --remote-url https://app.example.com
+```
+
 ## Routing the webview to a remote HTTPS domain
 
 The generated `src/lib.rs` opens the main window directly on your server using

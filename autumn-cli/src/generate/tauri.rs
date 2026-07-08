@@ -133,6 +133,94 @@ fn plan_icons(plan: &mut Plan, project_root: &Path, tauri: &Path) -> Result<(), 
     Ok(())
 }
 
+// ── Mixed-mode guard (issue #1506) ────────────────────────────────────────────
+
+/// Files only the mobile thin-client scaffold (`--remote-url`) emits, relative
+/// to `src-tauri/` — checked before scaffolding the desktop mode.
+///
+/// The capability files are the actively harmful leftovers: Tauri loads
+/// *every* file under `src-tauri/capabilities/`, and the desktop shell crate
+/// compiles none of the notification/store/biometric plugins those grants
+/// name, so `tauri-build` fails permission validation. `Info.ios.plist` is
+/// merely dead on desktop but is equally unambiguous evidence of a
+/// thin-client scaffold.
+const THIN_CLIENT_MARKERS: [&str; 3] = [
+    "capabilities/remote-app.json",
+    "capabilities/remote-app-mobile.json",
+    "Info.ios.plist",
+];
+
+/// Files only the desktop (sidecar) scaffold emits, relative to `src-tauri/`
+/// — checked before scaffolding the thin-client mode.
+///
+/// The per-OS overlay confs are the actively harmful leftovers: Tauri CLI
+/// merges `tauri.<platform>.conf.json` on top of `tauri.conf.json`
+/// automatically, so a stale overlay keeps running the sidecar staging script
+/// as `beforeBuildCommand`/`beforeDevCommand` on every `cargo tauri
+/// build`/`dev` of the thin client.
+const DESKTOP_MARKERS: [&str; 5] = [
+    "stage-sidecar.sh",
+    "stage-sidecar.ps1",
+    "tauri.linux.conf.json",
+    "tauri.macos.conf.json",
+    "tauri.windows.conf.json",
+];
+
+/// Refuse to scaffold one Tauri mode on top of the other's files.
+///
+/// `autumn generate tauri` (desktop sidecar) and `autumn generate tauri
+/// --remote-url` (mobile thin client) both write to `src-tauri/`, but their
+/// file sets only partially overlap — `--force` would overwrite the shared
+/// files and leave the other mode's leftovers behind, some of which actively
+/// break the new mode's build (see [`THIN_CLIENT_MARKERS`] /
+/// [`DESKTOP_MARKERS`]). `--force` means "overwrite within the same mode",
+/// never "silently mix modes", so this check runs regardless of `--force`.
+///
+/// Called only for `autumn generate` — never for `autumn destroy`, which is
+/// the documented remedy and must keep working on a mixed tree.
+///
+/// # Errors
+/// Returns [`GenerateError::Config`] naming the conflicting marker file and
+/// the matching `autumn destroy tauri [--remote-url <URL>]` command to run
+/// first.
+pub fn ensure_no_opposite_mode_scaffold(
+    project_root: &Path,
+    thin_client: bool,
+) -> Result<(), GenerateError> {
+    let tauri = project_root.join("src-tauri");
+    let first_existing = |markers: &[&str]| -> Option<String> {
+        markers
+            .iter()
+            .find(|m| tauri.join(m).is_file())
+            .map(|m| format!("src-tauri/{m}"))
+    };
+    if thin_client {
+        if let Some(marker) = first_existing(&DESKTOP_MARKERS) {
+            return Err(GenerateError::Config(format!(
+                "src-tauri/ already contains a desktop (sidecar) Tauri scaffold \
+                 ({marker} exists); refusing to scaffold the mobile thin client on \
+                 top of it — stale per-OS tauri.*.conf.json overlays would keep \
+                 running the sidecar staging scripts on every `cargo tauri build`. \
+                 Run `autumn destroy tauri` first, then re-run `autumn generate \
+                 tauri --remote-url <URL>`. --force only overwrites files within \
+                 the same mode; it never mixes modes."
+            )));
+        }
+    } else if let Some(marker) = first_existing(&THIN_CLIENT_MARKERS) {
+        return Err(GenerateError::Config(format!(
+            "src-tauri/ already contains a mobile thin-client Tauri scaffold \
+             ({marker} exists); refusing to scaffold the desktop mode on top of \
+             it — Tauri loads every capability file under src-tauri/capabilities/, \
+             so the stale thin-client grants would fail validation against the \
+             desktop shell crate. Run `autumn destroy tauri --remote-url <URL>` \
+             (the URL the thin client was generated with) first, then re-run \
+             `autumn generate tauri`. --force only overwrites files within the \
+             same mode; it never mixes modes."
+        )));
+    }
+    Ok(())
+}
+
 // ── Package metadata helper ───────────────────────────────────────────────────
 
 /// Returns `(package_name, version, bin_name)`.
@@ -2216,6 +2304,81 @@ mod tests {
         assert!(
             matches!(err, GenerateError::Config(_)),
             "expected Config error, got: {err:?}"
+        );
+    }
+
+    // ── Mixed-mode guard (issue #1506) ────────────────────────────────────────
+
+    /// Create an empty file at `src-tauri/<rel>` under `root`.
+    fn touch_tauri_file(root: &Path, rel: &str) {
+        let path = root.join("src-tauri").join(rel);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, "").unwrap();
+    }
+
+    #[test]
+    fn guard_rejects_desktop_generation_over_each_thin_client_marker() {
+        for marker in THIN_CLIENT_MARKERS {
+            let tmp = TempDir::new().unwrap();
+            touch_tauri_file(tmp.path(), marker);
+            let err = ensure_no_opposite_mode_scaffold(tmp.path(), false)
+                .expect_err("desktop generation over a thin-client marker must be rejected");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(marker),
+                "error must name the conflicting file '{marker}':\n{msg}"
+            );
+            assert!(
+                msg.contains("destroy tauri --remote-url"),
+                "error must point at the matching destroy command:\n{msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn guard_rejects_thin_client_generation_over_each_desktop_marker() {
+        for marker in DESKTOP_MARKERS {
+            let tmp = TempDir::new().unwrap();
+            touch_tauri_file(tmp.path(), marker);
+            let err = ensure_no_opposite_mode_scaffold(tmp.path(), true)
+                .expect_err("thin-client generation over a desktop marker must be rejected");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(marker),
+                "error must name the conflicting file '{marker}':\n{msg}"
+            );
+            assert!(
+                msg.contains("`autumn destroy tauri`"),
+                "error must point at the matching destroy command:\n{msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn guard_allows_clean_trees_and_same_mode_regeneration() {
+        // Clean tree (no src-tauri/ at all): both modes may scaffold.
+        let clean = TempDir::new().unwrap();
+        assert!(ensure_no_opposite_mode_scaffold(clean.path(), false).is_ok());
+        assert!(ensure_no_opposite_mode_scaffold(clean.path(), true).is_ok());
+
+        // A mode's own files are never a conflict — `--force` re-generation
+        // within the same mode must stay possible.
+        let desktop = TempDir::new().unwrap();
+        for marker in DESKTOP_MARKERS {
+            touch_tauri_file(desktop.path(), marker);
+        }
+        assert!(
+            ensure_no_opposite_mode_scaffold(desktop.path(), false).is_ok(),
+            "desktop regeneration over desktop files must be allowed"
+        );
+
+        let thin = TempDir::new().unwrap();
+        for marker in THIN_CLIENT_MARKERS {
+            touch_tauri_file(thin.path(), marker);
+        }
+        assert!(
+            ensure_no_opposite_mode_scaffold(thin.path(), true).is_ok(),
+            "thin-client regeneration over thin-client files must be allowed"
         );
     }
 

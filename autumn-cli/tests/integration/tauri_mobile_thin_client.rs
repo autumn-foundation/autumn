@@ -239,6 +239,176 @@ fn destroy_tauri_remote_url_reverts_thin_client_scaffold() {
 }
 
 #[test]
+fn generate_tauri_desktop_over_thin_client_is_rejected_even_with_force() {
+    let (_tmp, project) = fresh_project("switch-to-desktop-app");
+    let thin = run_autumn(
+        &project,
+        &[
+            "generate",
+            "tauri",
+            "--remote-url",
+            "https://app.example.com",
+        ],
+    );
+    assert_success(&thin, "autumn generate tauri --remote-url");
+
+    // Both a plain run and a --force run must refuse: --force means
+    // "overwrite within the same mode", never "silently mix modes" —
+    // stale capability files would break the desktop shell build
+    // (tauri-build loads every file under src-tauri/capabilities/).
+    for args in [
+        &["generate", "tauri"][..],
+        &["generate", "tauri", "--force"][..],
+    ] {
+        let output = run_autumn(&project, args);
+        assert!(
+            !output.status.success(),
+            "`autumn {}` over a thin-client scaffold must fail:\nstdout: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stdout),
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("destroy tauri --remote-url"),
+            "the error must point at the matching destroy command:\n{stderr}"
+        );
+    }
+
+    // The rejection must leave the existing thin-client scaffold untouched
+    // and write no desktop files.
+    assert!(
+        project
+            .join("src-tauri/capabilities/remote-app.json")
+            .is_file(),
+        "rejection must not delete the existing thin-client scaffold"
+    );
+    assert!(
+        !project.join("src-tauri/stage-sidecar.sh").exists(),
+        "rejection must not write any desktop files"
+    );
+
+    // The prescribed remedy works: destroy the thin client, then desktop
+    // generates cleanly with no stale capability files left over.
+    let destroy = run_autumn(
+        &project,
+        &[
+            "destroy",
+            "tauri",
+            "--remote-url",
+            "https://app.example.com",
+        ],
+    );
+    assert_success(&destroy, "autumn destroy tauri --remote-url");
+    let desktop = run_autumn(&project, &["generate", "tauri"]);
+    assert_success(&desktop, "autumn generate tauri after destroy");
+    assert!(
+        !project.join("src-tauri/capabilities").exists(),
+        "mode switch via destroy must leave no stale capability files"
+    );
+    assert!(project.join("src-tauri/stage-sidecar.sh").is_file());
+}
+
+#[test]
+fn generate_tauri_thin_client_over_desktop_is_rejected_even_with_force() {
+    let (_tmp, project) = fresh_project("switch-to-thin-app");
+    let desktop = run_autumn(&project, &["generate", "tauri"]);
+    assert_success(&desktop, "autumn generate tauri");
+
+    for args in [
+        &[
+            "generate",
+            "tauri",
+            "--remote-url",
+            "https://app.example.com",
+        ][..],
+        &[
+            "generate",
+            "tauri",
+            "--force",
+            "--remote-url",
+            "https://app.example.com",
+        ][..],
+    ] {
+        let output = run_autumn(&project, args);
+        assert!(
+            !output.status.success(),
+            "`autumn {}` over a desktop scaffold must fail:\nstdout: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stdout),
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("`autumn destroy tauri`"),
+            "the error must point at the matching destroy command:\n{stderr}"
+        );
+    }
+
+    // The rejection must leave the desktop scaffold untouched and write no
+    // thin-client files.
+    assert!(
+        project.join("src-tauri/stage-sidecar.sh").is_file(),
+        "rejection must not delete the existing desktop scaffold"
+    );
+    assert!(
+        !project.join("src-tauri/capabilities").exists(),
+        "rejection must not write any thin-client files"
+    );
+
+    // The prescribed remedy works: destroy the desktop scaffold, then the
+    // thin client generates cleanly with no stale sidecar files left over.
+    let destroy = run_autumn(&project, &["destroy", "tauri"]);
+    assert_success(&destroy, "autumn destroy tauri");
+    let thin = run_autumn(
+        &project,
+        &[
+            "generate",
+            "tauri",
+            "--remote-url",
+            "https://app.example.com",
+        ],
+    );
+    assert_success(&thin, "autumn generate tauri --remote-url after destroy");
+    for stale in [
+        "src-tauri/stage-sidecar.sh",
+        "src-tauri/stage-sidecar.ps1",
+        "src-tauri/tauri.linux.conf.json",
+        "src-tauri/tauri.macos.conf.json",
+        "src-tauri/tauri.windows.conf.json",
+    ] {
+        assert!(
+            !project.join(stale).exists(),
+            "mode switch via destroy must leave no stale desktop file {stale}"
+        );
+    }
+    assert!(
+        project
+            .join("src-tauri/capabilities/remote-app.json")
+            .is_file()
+    );
+}
+
+#[test]
+fn destroy_tauri_still_works_on_a_mixed_tree() {
+    // Users who mixed modes with an older autumn (before the guard) need the
+    // documented remedy to actually run — destroy must never be blocked by
+    // the other mode's leftovers.
+    let (_tmp, project) = fresh_project("mixed-tree-destroy-app");
+    let desktop = run_autumn(&project, &["generate", "tauri"]);
+    assert_success(&desktop, "autumn generate tauri");
+    // Simulate the old bug: thin-client capability files alongside the
+    // desktop scaffold.
+    fs::create_dir_all(project.join("src-tauri/capabilities")).unwrap();
+    fs::write(project.join("src-tauri/capabilities/remote-app.json"), "{}").unwrap();
+
+    let destroy = run_autumn(&project, &["destroy", "tauri"]);
+    assert_success(&destroy, "autumn destroy tauri on a mixed tree");
+    assert!(
+        !project.join("src-tauri/stage-sidecar.sh").exists(),
+        "destroy must remove the desktop scaffold despite thin-client leftovers"
+    );
+}
+
+#[test]
 fn thin_client_docs_page_covers_required_topics() {
     // The docs page is a co-equal deliverable of issue #1506; this pins it to
     // the generator so they cannot drift apart silently.
@@ -261,6 +431,7 @@ fn thin_client_docs_page_covers_required_topics() {
         "SameSite=None",
         "Authorization",
         "Guideline 4.2",
+        "Switching between desktop and thin-client scaffolds",
     ] {
         assert!(
             doc.contains(anchor),
