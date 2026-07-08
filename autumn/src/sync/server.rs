@@ -303,6 +303,10 @@ fn gc_tombstone_row(change: &Change, version: Version) -> RemoteRow {
 /// - **Everything else** (base matches the current version, or a base-0
 ///   create/recreate against no row): a clean apply. `base_version == 0`
 ///   never takes a server-winning arm.
+///
+/// `horizon` must be the REQUESTING SCOPE's tombstone horizon: horizons
+/// are tracked per scope, so another tenant's GC can never route this
+/// tenant's ordinary conflicts into the server-winning arms.
 fn apply_change_row(
     change: &Change,
     device_id: &str,
@@ -349,12 +353,15 @@ fn apply_change_row(
 /// row. Versions still come from ONE global sequence shared by every scope
 /// — that is per-scope-safe (each scope's feed is a filtered subsequence,
 /// so "version > cursor" with a scope predicate never skips that scope's
-/// rows) and keeps the cursor/horizon semantics unchanged. The GC and
-/// introspection methods ([`Self::gc_tombstones`], [`Self::gc_applied`],
-/// [`Self::tombstone_horizon`], [`Self::latest_version`]) are maintenance
-/// operations spanning all scopes; the single global tombstone horizon is
-/// conservative but safe per scope (a GC may force a full resync on scopes
-/// whose own tombstones were untouched — never the reverse).
+/// rows) and keeps the cursor semantics unchanged. The GC methods
+/// ([`Self::gc_tombstones`], [`Self::gc_applied`]) are maintenance
+/// operations SWEEPING all scopes, but tombstone horizons are tracked
+/// **per scope**: a scope's horizon only advances when its own tombstones
+/// are dropped. That matters beyond politeness — with a shared horizon,
+/// one tenant's GC would both force other tenants' full resyncs and,
+/// worse, push their perfectly ordinary stale-base conflicts into the
+/// pre-horizon server-winning arms, silently discarding edits their
+/// configured resolver should have settled.
 pub trait SyncBackend: Send + Sync + 'static {
     /// Apply one push batch atomically **within `scope`**, returning one outcome per change
     /// (request order). Conflicts are settled via `resolver` and assigned a
@@ -417,23 +424,25 @@ pub trait SyncBackend: Send + Sync + 'static {
     ) -> Result<PullResponse, SyncError>;
 
     /// Physically drop tombstone rows (across ALL scopes) with version at
-    /// or below `up_to` and
-    /// advance the tombstone horizon. Returns the number of rows removed.
-    /// Clients whose cursor then trails the horizon get a full resync.
-    /// Never runs implicitly — call it deliberately (e.g. from a scheduled
-    /// task) once all active devices are expected to have synced past
-    /// `up_to`.
+    /// or below `up_to` and advance each affected scope's tombstone
+    /// horizon. Returns the number of rows removed. Clients whose session
+    /// then trails their scope's horizon get a full resync. Never runs
+    /// implicitly — call it deliberately (e.g. from a scheduled task) once
+    /// all active devices are expected to have synced past `up_to`
+    /// (`i64::MAX` means "everything so far").
     ///
-    /// The **persisted horizon is clamped to the newest committed
-    /// version**: a maintenance job may pass an arbitrarily large `up_to`
-    /// (e.g. `i64::MAX`) to mean "everything so far", and without the clamp
-    /// the horizon would run ahead of the change feed — clients set their
-    /// cursor to `max(next_cursor, tombstone_horizon)` after a completed
-    /// pull, so an ahead-of-feed horizon would push cursors past versions
-    /// not yet visible and those clients would permanently miss rows. On
-    /// Postgres the GC also takes the push advisory lock: the version
-    /// sequence is non-transactional, so only committed state observed
-    /// under that lock is a safe bound.
+    /// Each scope's persisted horizon becomes the **highest tombstone
+    /// version actually dropped in that scope** — never `up_to` itself.
+    /// That value is tight and safe by construction: it is a committed
+    /// version (clients setting their cursor to `max(next_cursor,
+    /// tombstone_horizon)` after a completed pull can never jump past
+    /// unseen rows), a session at or above it has provably seen every
+    /// dropped tombstone of its scope, and scopes whose tombstones were
+    /// untouched keep their horizon — no forced resyncs and no suppressed
+    /// conflict resolution in other tenants. On Postgres the sweep takes
+    /// the push advisory lock so no push is in flight mid-sweep (an
+    /// allocated-but-uncommitted version below a dropped tombstone could
+    /// otherwise be skipped by a concurrent pull's cursor jump).
     ///
     /// # Errors
     ///
@@ -458,12 +467,13 @@ pub trait SyncBackend: Send + Sync + 'static {
     /// Returns [`SyncError::Backend`] on storage failure.
     fn gc_applied(&self, older_than: DateTime<Utc>) -> Result<u64, SyncError>;
 
-    /// The current tombstone GC horizon (`0` if GC never ran).
+    /// `scope`'s current tombstone GC horizon (`0` if no tombstone of that
+    /// scope was ever dropped).
     ///
     /// # Errors
     ///
     /// Returns [`SyncError::Backend`] on storage failure.
-    fn tombstone_horizon(&self) -> Result<Version, SyncError>;
+    fn tombstone_horizon(&self, scope: &str) -> Result<Version, SyncError>;
 
     /// The most recently assigned version (`0` if nothing was ever pushed).
     ///
@@ -504,7 +514,11 @@ struct MemoryState {
     /// read its resolved-row snapshot).
     applied: HashMap<(String, String, String), AppliedRecord>,
     next_version: Version,
-    horizon: Version,
+    /// PER-SCOPE tombstone horizons: the highest tombstone version ever
+    /// dropped in each scope (absent = 0). Per scope so one tenant's GC
+    /// neither forces other tenants' full resyncs nor routes their
+    /// ordinary conflicts into the pre-horizon server-winning arms.
+    horizons: HashMap<String, Version>,
 }
 
 impl MemoryState {
@@ -546,7 +560,8 @@ impl SyncBackend for MemorySyncBackend {
         validate_push(request)?;
         // One lock scope = one atomic batch, mirroring the PG transaction.
         let mut state = self.lock()?;
-        let horizon = state.horizon;
+        // The REQUESTING SCOPE's horizon (see MemoryState::horizons).
+        let horizon = state.horizons.get(scope).copied().unwrap_or(0);
         let mut outcomes = Vec::with_capacity(request.changes.len());
         for change in &request.changes {
             let dedup_key = (
@@ -621,9 +636,12 @@ impl SyncBackend for MemorySyncBackend {
         // snapshot (a GC can only run entirely before or entirely after
         // this pull, never between its two reads).
         let state = self.lock()?;
-        if session_start > 0 && session_start < state.horizon {
+        // The REQUESTING SCOPE's horizon — both for the staleness check
+        // and the per-page value the client's GC-race guard reads.
+        let horizon = state.horizons.get(scope).copied().unwrap_or(0);
+        if session_start > 0 && session_start < horizon {
             return Ok(PullResponse::FullResyncRequired {
-                tombstone_horizon: state.horizon,
+                tombstone_horizon: horizon,
             });
         }
         let mut rows: Vec<RemoteRow> = state
@@ -632,34 +650,42 @@ impl SyncBackend for MemorySyncBackend {
             .filter(|((row_scope, _, _), row)| row_scope == scope && row.version > cursor)
             .map(|(_, row)| row.clone())
             .collect();
+        drop(state);
         rows.sort_by_key(|row| row.version);
         rows.truncate(usize::try_from(limit.max(0)).unwrap_or(usize::MAX));
         let next_cursor = rows.last().map_or(cursor, |row| row.version);
         Ok(PullResponse::Ok {
             rows,
             next_cursor,
-            tombstone_horizon: state.horizon,
+            tombstone_horizon: horizon,
         })
     }
 
     fn gc_tombstones(&self, up_to: Version) -> Result<u64, SyncError> {
         let mut state = self.lock()?;
-        // Clamp to the newest committed version (see the trait docs).
-        // Unlike Postgres, `next_version` here IS the committed max: one
-        // mutex serializes whole apply_push batches with GC, and a version
-        // is allocated and its row inserted under the same lock scope — so
-        // there is no window where the counter is ahead of committed rows
-        // (the analogue of Postgres's non-transactional `nextval`, which
-        // the PG backend guards with the push advisory lock).
-        let up_to = up_to.min(state.next_version);
-        let before = state.rows.len();
-        state
-            .rows
-            .retain(|_, row| !(row.deleted && row.version <= up_to));
-        let removed = before - state.rows.len();
-        state.horizon = state.horizon.max(up_to);
+        // Global sweep, PER-SCOPE horizons: each scope's horizon advances
+        // to the highest tombstone version actually dropped in THAT scope
+        // (see the trait docs) — inherently a committed version under this
+        // mutex, so no clamp is needed, and untouched scopes keep their
+        // horizon.
+        let mut per_scope: HashMap<String, Version> = HashMap::new();
+        let mut removed = 0u64;
+        state.rows.retain(|(row_scope, _, _), row| {
+            if row.deleted && row.version <= up_to {
+                let max = per_scope.entry(row_scope.clone()).or_insert(0);
+                *max = (*max).max(row.version);
+                removed += 1;
+                false
+            } else {
+                true
+            }
+        });
+        for (gc_scope, dropped_max) in per_scope {
+            let horizon = state.horizons.entry(gc_scope).or_insert(0);
+            *horizon = (*horizon).max(dropped_max);
+        }
         drop(state);
-        Ok(removed as u64)
+        Ok(removed)
     }
 
     fn gc_applied(&self, older_than: DateTime<Utc>) -> Result<u64, SyncError> {
@@ -673,8 +699,8 @@ impl SyncBackend for MemorySyncBackend {
         Ok(removed as u64)
     }
 
-    fn tombstone_horizon(&self) -> Result<Version, SyncError> {
-        Ok(self.lock()?.horizon)
+    fn tombstone_horizon(&self, scope: &str) -> Result<Version, SyncError> {
+        Ok(self.lock()?.horizons.get(scope).copied().unwrap_or(0))
     }
 
     fn latest_version(&self) -> Result<Version, SyncError> {
@@ -719,13 +745,15 @@ CREATE TABLE IF NOT EXISTS autumn_sync_applied (
     resolved_row JSONB,
     PRIMARY KEY (scope, device_id, change_id)
 );
-CREATE TABLE IF NOT EXISTS autumn_sync_meta (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL
+CREATE TABLE IF NOT EXISTS autumn_sync_horizons (
+    -- Per-scope tombstone GC horizon: the highest tombstone version ever
+    -- physically dropped in that scope. Tracked PER SCOPE so one tenant's
+    -- GC neither forces other tenants' full resyncs nor routes their
+    -- ordinary conflicts into the pre-horizon server-winning arms.
+    scope TEXT PRIMARY KEY,
+    horizon BIGINT NOT NULL
 );
 ";
-
-const META_HORIZON: &str = "tombstone_horizon";
 
 /// Well-known key for the transaction-scoped Postgres advisory lock
 /// ([`pg_advisory_xact_lock`]) taken at the top of every
@@ -804,10 +832,14 @@ struct PgAppliedRecord {
     resolved_row: Option<serde_json::Value>,
 }
 
+/// One dropped tombstone from the GC sweep's `DELETE … RETURNING`: enough
+/// to advance the dropped row's scope's horizon.
 #[derive(QueryableByName)]
-struct PgMetaRecord {
+struct PgDroppedRecord {
     #[diesel(sql_type = Text)]
-    value: String,
+    scope: String,
+    #[diesel(sql_type = BigInt)]
+    version: i64,
 }
 
 #[derive(QueryableByName)]
@@ -850,12 +882,14 @@ fn pg_next_version(conn: &mut PgConnection) -> Result<Version, diesel::result::E
         .map(|record| record.version)
 }
 
-fn pg_horizon(conn: &mut PgConnection) -> Result<Version, diesel::result::Error> {
-    let record = sql_query("SELECT value FROM autumn_sync_meta WHERE key = $1")
-        .bind::<Text, _>(META_HORIZON)
-        .get_result::<PgMetaRecord>(conn)
+/// The scope's tombstone GC horizon — `0` when no tombstone of that scope
+/// was ever dropped.
+fn pg_horizon(conn: &mut PgConnection, scope: &str) -> Result<Version, diesel::result::Error> {
+    let record = sql_query("SELECT horizon AS version FROM autumn_sync_horizons WHERE scope = $1")
+        .bind::<Text, _>(scope)
+        .get_result::<PgVersionRecord>(conn)
         .optional()?;
-    Ok(record.and_then(|r| r.value.parse().ok()).unwrap_or(0))
+    Ok(record.map_or(0, |r| r.version))
 }
 
 /// The most recently assigned version — the sequence's `last_value` once it
@@ -873,7 +907,7 @@ fn pg_latest_version(conn: &mut PgConnection) -> Result<Version, diesel::result:
 /// Postgres-backed [`SyncBackend`] persisting into shadow tables.
 ///
 /// State lives in `autumn_sync_rows` / `autumn_sync_applied` /
-/// `autumn_sync_meta`. Each push batch applies in one transaction;
+/// `autumn_sync_horizons`. Each push batch applies in one transaction;
 /// versions come from the `autumn_sync_version_seq` sequence, making the
 /// row table itself the change feed.
 #[derive(Debug, Clone)]
@@ -928,9 +962,10 @@ impl SyncBackend for PgSyncBackend {
             sql_query("SELECT pg_advisory_xact_lock($1)")
                 .bind::<BigInt, _>(PG_PUSH_ADVISORY_LOCK_KEY)
                 .execute(conn)?;
-            // Stable for the whole batch: GC serializes on the same
-            // advisory lock, so the horizon cannot move mid-transaction.
-            let horizon = pg_horizon(conn)?;
+            // The REQUESTING SCOPE's horizon, stable for the whole batch:
+            // GC serializes on the same advisory lock, so it cannot move
+            // mid-transaction.
+            let horizon = pg_horizon(conn, scope)?;
             let mut outcomes = Vec::with_capacity(request.changes.len());
             for change in &request.changes {
                 let duplicate = sql_query(
@@ -1045,7 +1080,7 @@ impl SyncBackend for PgSyncBackend {
             .read_only()
             .repeatable_read()
             .run::<_, diesel::result::Error, _>(|conn| {
-                let horizon = pg_horizon(conn)?;
+                let horizon = pg_horizon(conn, scope)?;
                 if session_start > 0 && session_start < horizon {
                     return Ok(PullResponse::FullResyncRequired {
                         tombstone_horizon: horizon,
@@ -1077,39 +1112,44 @@ impl SyncBackend for PgSyncBackend {
         let mut conn = self.connect()?;
         conn.transaction::<_, diesel::result::Error, _>(|conn| {
             // Serialize with pushes (the SAME advisory lock apply_push
-            // takes): `nextval` is visible to other transactions BEFORE the
-            // allocating push commits, so a GC clamping against the raw
-            // sequence could persist a horizon covering an uncommitted
-            // version — a client pulling before that push commits would
-            // store a cursor past the row and miss it forever. Holding the
-            // push lock, no push is in flight while we read.
+            // takes): with an in-flight push holding an allocated-but-
+            // uncommitted version below a tombstone this sweep drops, the
+            // persisted horizon could cover that version before its row is
+            // visible — a client pulling in between would jump its cursor
+            // past the row and miss it forever. Holding the push lock, no
+            // push is in flight while we sweep, so every version at or
+            // below anything we drop is committed.
             sql_query("SELECT pg_advisory_xact_lock($1)")
                 .bind::<BigInt, _>(PG_PUSH_ADVISORY_LOCK_KEY)
                 .execute(conn)?;
-            // Clamp to the newest COMMITTED version (see the trait docs):
-            // the max over surviving rows, floored by the already-persisted
-            // horizon (earlier GCs may have removed the top tombstones, so
-            // the row max alone can sit below it). Deliberately NOT the raw
-            // sequence — even under the lock it can exceed the committed
-            // max via rolled-back pushes (harmless, but the committed max
-            // is the tight, provably-safe bound).
-            let horizon_before = pg_horizon(conn)?;
-            let committed_max =
-                sql_query("SELECT COALESCE(MAX(version), 0) AS version FROM autumn_sync_rows")
-                    .get_result::<PgVersionRecord>(conn)?
-                    .version;
-            let up_to = up_to.min(committed_max.max(horizon_before));
-            let removed = sql_query("DELETE FROM autumn_sync_rows WHERE deleted AND version <= $1")
-                .bind::<BigInt, _>(up_to)
-                .execute(conn)?;
-            let horizon = horizon_before.max(up_to);
-            sql_query(
-                "INSERT INTO autumn_sync_meta (key, value) VALUES ($1, $2) \
-                 ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+            // Global sweep, PER-SCOPE horizons: each scope's horizon
+            // advances to the highest tombstone version actually dropped
+            // in THAT scope (see the trait docs) — inherently a committed
+            // version, so no explicit clamp is needed, and scopes whose
+            // tombstones were untouched keep their horizon (no forced
+            // resyncs, no suppressed conflict resolution elsewhere).
+            let dropped = sql_query(
+                "DELETE FROM autumn_sync_rows WHERE deleted AND version <= $1 \
+                 RETURNING scope, version",
             )
-            .bind::<Text, _>(META_HORIZON)
-            .bind::<Text, _>(horizon.to_string())
-            .execute(conn)?;
+            .bind::<BigInt, _>(up_to)
+            .get_results::<PgDroppedRecord>(conn)?;
+            let removed = dropped.len();
+            let mut per_scope: HashMap<String, Version> = HashMap::new();
+            for record in dropped {
+                let max = per_scope.entry(record.scope).or_insert(0);
+                *max = (*max).max(record.version);
+            }
+            for (scope, horizon) in per_scope {
+                sql_query(
+                    "INSERT INTO autumn_sync_horizons (scope, horizon) VALUES ($1, $2) \
+                     ON CONFLICT (scope) DO UPDATE SET \
+                     horizon = GREATEST(autumn_sync_horizons.horizon, excluded.horizon)",
+                )
+                .bind::<Text, _>(&scope)
+                .bind::<BigInt, _>(horizon)
+                .execute(conn)?;
+            }
             Ok(removed as u64)
         })
         .map_err(backend_err)
@@ -1124,9 +1164,9 @@ impl SyncBackend for PgSyncBackend {
         Ok(removed as u64)
     }
 
-    fn tombstone_horizon(&self) -> Result<Version, SyncError> {
+    fn tombstone_horizon(&self, scope: &str) -> Result<Version, SyncError> {
         let mut conn = self.connect()?;
-        pg_horizon(&mut conn).map_err(backend_err)
+        pg_horizon(&mut conn, scope).map_err(backend_err)
     }
 
     fn latest_version(&self) -> Result<Version, SyncError> {

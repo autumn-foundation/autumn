@@ -44,7 +44,7 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
 
     // ── Fresh backend ────────────────────────────────────────────────────
     assert_eq!(backend.latest_version().expect("latest"), 0);
-    assert_eq!(backend.tombstone_horizon().expect("horizon"), 0);
+    assert_eq!(backend.tombstone_horizon(SCOPE).expect("horizon"), 0);
 
     // ── Push applies with strictly increasing versions ───────────────────
     let seed = push(
@@ -255,7 +255,7 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
     let latest = backend.latest_version().expect("latest");
     let removed = backend.gc_tombstones(latest).expect("gc");
     assert_eq!(removed, 1);
-    assert_eq!(backend.tombstone_horizon().expect("horizon"), latest);
+    assert_eq!(backend.tombstone_horizon(SCOPE).expect("horizon"), latest);
     // GC is idempotent.
     assert_eq!(backend.gc_tombstones(latest).expect("re-gc"), 0);
 
@@ -288,24 +288,27 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
         "a from-0 session paging past a sub-horizon cursor must get rows, got {mid_page:?}"
     );
 
-    // ── GC horizon is clamped to the newest committed version ────────────
+    // ── The horizon never runs ahead of the change feed ──────────────────
     // A maintenance job may pass an arbitrarily large up_to ("everything so
-    // far"). The persisted horizon must not run ahead of the change feed:
-    // clients set cursor = max(next_cursor, tombstone_horizon) after a
-    // completed pull, so an ahead-of-feed horizon would push cursors past
-    // rows they have not seen — rows created later (versions <= horizon)
-    // would then be permanently invisible to those clients. On Postgres
-    // the bound must come from COMMITTED state observed under the push
-    // advisory lock (the sequence is non-transactional: a concurrent
-    // in-flight push's nextval is visible before its row commits); this
-    // sequential suite pins the clamp value itself, and the lock-site
-    // comment in sync/server.rs documents the concurrency guarantee.
+    // far"). The persisted horizon must not run ahead of the feed: clients
+    // set cursor = max(next_cursor, tombstone_horizon) after a completed
+    // pull, so an ahead-of-feed horizon would push cursors past rows they
+    // have not seen — rows created later (versions <= horizon) would then
+    // be permanently invisible to those clients. The horizon is defined as
+    // the highest tombstone version ACTUALLY DROPPED in the scope, so the
+    // bound holds by construction (a dropped row is a committed row): with
+    // no tombstones left to drop, a huge-up_to GC must leave the horizon
+    // exactly where it is — here, at the previous GC's dropped tombstone,
+    // which was also the newest committed version. On Postgres the sweep
+    // runs under the push advisory lock so an in-flight push cannot hold
+    // an uncommitted version below a dropped tombstone; the lock-site
+    // comment in sync/server.rs documents that guarantee.
     let latest_before_gc = backend.latest_version().expect("latest");
     backend.gc_tombstones(i64::MAX).expect("gc with huge up_to");
     assert_eq!(
-        backend.tombstone_horizon().expect("horizon"),
+        backend.tombstone_horizon(SCOPE).expect("horizon"),
         latest_before_gc,
-        "the horizon must be clamped to the newest committed version"
+        "the horizon must never exceed the newest committed version"
     );
 
     // A client that completed a pull right after that GC sits at
@@ -1033,6 +1036,98 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
                 .and_then(|v| v.as_str())
                 == Some("alpha"),
         "tenant-a's row must be untouched by tenant-b's writes, got {rows:?}"
+    );
+
+    // ── Per-scope horizons: one tenant's GC never bleeds into another ────
+    // At this point tenant-b holds the only remaining tombstone (its s1
+    // delete above). A GC sweep must advance ONLY tenant-b's horizon:
+    // with a shared horizon, tenant-b's GC would force tenant-a resyncs
+    // and — worse — route tenant-a's perfectly ordinary stale-base
+    // conflicts into the pre-horizon server-winning arms, silently
+    // discarding edits the configured resolver should have settled.
+    let horizon_a_before = backend
+        .tombstone_horizon("tenant-a")
+        .expect("tenant-a horizon");
+    let horizon_global_before = backend.tombstone_horizon(SCOPE).expect("global horizon");
+    let removed = backend
+        .gc_tombstones(backend.latest_version().expect("latest"))
+        .expect("tenant-b gc");
+    assert!(removed >= 1, "tenant-b's tombstone must be dropped");
+    let horizon_b = backend
+        .tombstone_horizon("tenant-b")
+        .expect("tenant-b horizon");
+    assert!(
+        horizon_b > version_a,
+        "tenant-b's horizon must cover its dropped tombstone"
+    );
+    assert_eq!(
+        backend
+            .tombstone_horizon("tenant-a")
+            .expect("tenant-a horizon"),
+        horizon_a_before,
+        "another scope's GC must not move tenant-a's horizon"
+    );
+    assert_eq!(
+        backend.tombstone_horizon(SCOPE).expect("global horizon"),
+        horizon_global_before,
+        "another scope's GC must not move the global scope's horizon"
+    );
+
+    // Tenant-a's ordinary conflicts still reach the resolver, even though
+    // its stale base sits far below TENANT-B's horizon. First move
+    // tenant-a's row forward…
+    let mut update_a = tenant_change("00000000-0000-4000-8000-000000000023", "alpha 2");
+    update_a.base_version = version_a;
+    let response = backend
+        .apply_push("tenant-a", &push("device-a", vec![update_a]), &resolver)
+        .expect("tenant-a update");
+    assert!(matches!(
+        response.outcomes[0],
+        ChangeOutcome::Applied { .. }
+    ));
+    // …then push a conflicting edit based on the OLD tenant-a version
+    // (non-zero, far below tenant-b's horizon, above tenant-a's own 0).
+    // Under a shared horizon this would be forced KeepServer; per-scope it
+    // must run the LWW resolver, where the newer timestamp wins.
+    let mut conflict_a = tenant_change("00000000-0000-4000-8000-000000000024", "alpha 3");
+    conflict_a.base_version = version_a;
+    conflict_a.updated_at = Utc::now() + Duration::seconds(60);
+    let response = backend
+        .apply_push("tenant-a", &push("device-y", vec![conflict_a]), &resolver)
+        .expect("tenant-a conflict");
+    let ChangeOutcome::Resolved { row } = &response.outcomes[0] else {
+        panic!(
+            "tenant-a's stale base must resolve, got {:?}",
+            response.outcomes[0]
+        );
+    };
+    assert_eq!(
+        row.payload
+            .as_ref()
+            .and_then(|p| p.get("title"))
+            .and_then(|v| v.as_str()),
+        Some("alpha 3"),
+        "tenant-a's resolver must still run (and LWW take the client) — \
+         tenant-b's horizon must not force KeepServer here"
+    );
+
+    // The pull staleness check is scoped the same way: a tenant-a session
+    // parked at its own old version (far below tenant-b's horizon) is NOT
+    // told to resync…
+    let pull = backend
+        .pull_since("tenant-a", version_a, 100, version_a)
+        .expect("tenant-a stale-session pull");
+    assert!(
+        matches!(pull, PullResponse::Ok { .. }),
+        "tenant-b's GC must not force tenant-a resyncs, got {pull:?}"
+    );
+    // …while a tenant-b session from before ITS dropped tombstone is.
+    let pull = backend
+        .pull_since("tenant-b", version_b, 100, version_b)
+        .expect("tenant-b stale-session pull");
+    assert!(
+        matches!(pull, PullResponse::FullResyncRequired { .. }),
+        "tenant-b's own stale session must still resync, got {pull:?}"
     );
 
     // ── Dedup-record GC bounds the applied table ──────────────────────────

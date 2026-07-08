@@ -57,7 +57,7 @@ applies to non-Tauri occasionally-connected clients.
 │     │                                                     │
 │  PgSyncBackend → PostgreSQL shadow tables                 │
 │     autumn_sync_rows / autumn_sync_applied /              │
-│     autumn_sync_meta  (+ sequence autumn_sync_version_seq)│
+│     autumn_sync_horizons (+ seq autumn_sync_version_seq)  │
 └───────────────────────────────────────────────────────────┘
 ```
 
@@ -222,14 +222,16 @@ change feed — that is how a delete on one device propagates to every other
 device instead of silently resurrecting on the next push.
 
 Tombstones accumulate. `SyncBackend::gc_tombstones(up_to)` physically drops
-tombstones with `version <= up_to` and records that version as the
-**`tombstone_horizon`** in `autumn_sync_meta`. The persisted horizon is
-**clamped to the newest committed version** (and GC serializes with pushes
-via the same advisory lock), so a maintenance job may pass an arbitrarily
-large `up_to` (e.g. `i64::MAX`) to mean "everything so far" without pushing
-client cursors past rows they have not seen. GC is an
-explicit server-side operation (a job or admin task you schedule); it is
-**off by default**.
+tombstones with `version <= up_to` and advances each affected scope's
+**`tombstone_horizon`** in `autumn_sync_horizons` to the highest tombstone
+version actually dropped in that scope. Horizons are **per scope**, so one
+tenant's GC never forces another tenant's resyncs or overrides its conflict
+resolution — and the per-scope value never runs ahead of the change feed (a
+dropped row is a committed row; GC also serializes with pushes via the same
+advisory lock), so a maintenance job may pass an arbitrarily large `up_to`
+(e.g. `i64::MAX`) to mean "everything so far" without pushing client
+cursors past rows they have not seen. GC is an explicit server-side
+operation (a job or admin task you schedule); it is **off by default**.
 
 The horizon exists to keep long-offline clients correct: a client whose
 sync session *started* behind the horizon might have missed a tombstone
@@ -364,7 +366,7 @@ async fn mount_offline_sync(app: autumn_web::app::AppBuilder) -> autumn_web::app
 ```
 
 `ensure_schema()` creates the shadow tables (`autumn_sync_rows`,
-`autumn_sync_applied`, `autumn_sync_meta`) idempotently. They are
+`autumn_sync_applied`, `autumn_sync_horizons`) idempotently. They are
 deliberately **not** part of autumn's framework migrations — apps without
 offline sync see zero schema churn. Rows and push-dedup records carry a
 `scope` column partitioning data per tenant — the single-tenant mount

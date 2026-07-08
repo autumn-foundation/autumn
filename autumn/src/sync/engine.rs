@@ -213,10 +213,10 @@ impl SyncEngine {
     /// would keep the stale row forever while the cursor lands past the new
     /// horizon). Detection restarts the snapshot from scratch —
     /// [`MAX_SNAPSHOT_RESTARTS`] times at most, then errs out so a
-    /// pathological GC schedule cannot starve the sync loop. The horizon is
-    /// global across scopes (see the sync server), so this check is
-    /// conservative-safe under scoped mounts: an unrelated scope's GC can
-    /// only cause a spurious restart, never a missed deletion.
+    /// pathological GC schedule cannot starve the sync loop. The server
+    /// tracks horizons PER SCOPE and each page reports the requesting
+    /// scope's value, so under scoped mounts only this tenant's own GC can
+    /// move it — an unrelated tenant's GC causes no restart at all.
     async fn resync_from_snapshot(&self, report: &mut SyncReport) -> Result<(), SyncError> {
         let limit = self.config.pull_batch_size.clamp(1, MAX_PULL_LIMIT);
         let mut snapshot: Vec<RemoteRow> = Vec::new();

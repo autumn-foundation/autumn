@@ -351,7 +351,12 @@ async fn gc_horizon_forces_full_resync_preserving_pending() {
     let latest = backend.latest_version().expect("latest");
     let removed = backend.gc_tombstones(latest).expect("gc");
     assert_eq!(removed, 1, "the tombstone was physically dropped");
-    assert!(store_b.cursor().expect("b cursor") < backend.tombstone_horizon().expect("horizon"));
+    assert!(
+        store_b.cursor().expect("b cursor")
+            < backend
+                .tombstone_horizon(SyncScope::GLOBAL)
+                .expect("horizon")
+    );
 
     // B queues an offline write BEFORE discovering it needs a full resync.
     store_b
@@ -712,7 +717,10 @@ async fn server_demanded_resync_never_drops_rows_while_snapshot_pull_fails() {
     assert!(pks.contains(&"two"), "A's newer row arrives: {pks:?}");
     assert!(pks.contains(&"b-note"), "B's own row survives: {pks:?}");
     assert!(
-        store_b.cursor().expect("b cursor") >= backend.tombstone_horizon().expect("horizon"),
+        store_b.cursor().expect("b cursor")
+            >= backend
+                .tombstone_horizon(SyncScope::GLOBAL)
+                .expect("horizon"),
         "the reconciled cursor lands at/above the horizon"
     );
 
@@ -901,7 +909,10 @@ async fn synced_rows_with_zero_cursor_heal_via_full_resync() {
     );
     assert!(pks.contains(&"keep"), "live rows survive the heal: {pks:?}");
     assert!(
-        store_b.cursor().expect("b cursor") >= backend.tombstone_horizon().expect("horizon"),
+        store_b.cursor().expect("b cursor")
+            >= backend
+                .tombstone_horizon(SyncScope::GLOBAL)
+                .expect("horizon"),
         "the healed cursor must land at/above the horizon"
     );
 
@@ -934,7 +945,9 @@ async fn post_gc_steady_state_does_not_loop_full_resyncs() {
     engine_a.sync_once().await.expect("a sync 2");
     let latest = backend.latest_version().expect("latest");
     backend.gc_tombstones(latest).expect("gc");
-    let horizon = backend.tombstone_horizon().expect("horizon");
+    let horizon = backend
+        .tombstone_horizon(SyncScope::GLOBAL)
+        .expect("horizon");
     assert!(
         horizon > 1,
         "precondition: horizon sits above the surviving row version"
@@ -1045,11 +1058,11 @@ impl GcInjectingBackend {
         self.pulls.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    fn push_one(&self, change: Change) -> Version {
+    fn push_one(&self, scope: &str, change: Change) -> Version {
         let response = self
             .inner
             .apply_push(
-                SyncScope::GLOBAL,
+                scope,
                 &PushRequest {
                     device_id: "gc-injector".to_owned(),
                     changes: vec![change],
@@ -1077,15 +1090,18 @@ impl GcInjectingBackend {
             .iter()
             .find(|r| r.pk == pk && !r.deleted)
             .expect("live row to delete");
-        self.push_one(Change {
-            change_id: format!("gc-inject-delete-{pk}"),
-            collection: row.collection.clone(),
-            pk: pk.to_owned(),
-            op: Op::Delete,
-            payload: None,
-            base_version: row.version,
-            updated_at: Utc::now(),
-        });
+        self.push_one(
+            SyncScope::GLOBAL,
+            Change {
+                change_id: format!("gc-inject-delete-{pk}"),
+                collection: row.collection.clone(),
+                pk: pk.to_owned(),
+                op: Op::Delete,
+                payload: None,
+                base_version: row.version,
+                updated_at: Utc::now(),
+            },
+        );
         let latest = self.inner.latest_version().expect("latest");
         assert!(
             self.inner.gc_tombstones(latest).expect("gc") >= 1,
@@ -1096,24 +1112,30 @@ impl GcInjectingBackend {
     /// Create a throwaway row, delete it, and GC — advancing the horizon
     /// without touching the payload rows.
     fn churn_once(&self, n: usize) {
-        let version = self.push_one(Change {
-            change_id: format!("churn-up-{n}"),
-            collection: "churn".to_owned(),
-            pk: format!("churn-{n}"),
-            op: Op::Upsert,
-            payload: Some(json!({"churn": n})),
-            base_version: 0,
-            updated_at: Utc::now(),
-        });
-        self.push_one(Change {
-            change_id: format!("churn-del-{n}"),
-            collection: "churn".to_owned(),
-            pk: format!("churn-{n}"),
-            op: Op::Delete,
-            payload: None,
-            base_version: version,
-            updated_at: Utc::now(),
-        });
+        let version = self.push_one(
+            SyncScope::GLOBAL,
+            Change {
+                change_id: format!("churn-up-{n}"),
+                collection: "churn".to_owned(),
+                pk: format!("churn-{n}"),
+                op: Op::Upsert,
+                payload: Some(json!({"churn": n})),
+                base_version: 0,
+                updated_at: Utc::now(),
+            },
+        );
+        self.push_one(
+            SyncScope::GLOBAL,
+            Change {
+                change_id: format!("churn-del-{n}"),
+                collection: "churn".to_owned(),
+                pk: format!("churn-{n}"),
+                op: Op::Delete,
+                payload: None,
+                base_version: version,
+                updated_at: Utc::now(),
+            },
+        );
         let latest = self.inner.latest_version().expect("latest");
         self.inner.gc_tombstones(latest).expect("churn gc");
     }
@@ -1151,8 +1173,8 @@ impl SyncBackend for GcInjectingBackend {
     fn gc_applied(&self, older_than: chrono::DateTime<Utc>) -> Result<u64, SyncError> {
         self.inner.gc_applied(older_than)
     }
-    fn tombstone_horizon(&self) -> Result<Version, SyncError> {
-        self.inner.tombstone_horizon()
+    fn tombstone_horizon(&self, scope: &str) -> Result<Version, SyncError> {
+        self.inner.tombstone_horizon(scope)
     }
     fn latest_version(&self) -> Result<Version, SyncError> {
         self.inner.latest_version()
@@ -1165,15 +1187,18 @@ async fn gc_race_fixture(
     backend: &Arc<GcInjectingBackend>,
 ) -> (String, tokio::task::JoinHandle<()>, SyncConfig) {
     for i in 1..=5 {
-        backend.push_one(Change {
-            change_id: format!("00000000-0000-4000-8000-0000000000a{i}"),
-            collection: "notes".to_owned(),
-            pk: format!("n{i}"),
-            op: Op::Upsert,
-            payload: Some(json!({"title": format!("note {i}")})),
-            base_version: 0,
-            updated_at: Utc::now(),
-        });
+        backend.push_one(
+            SyncScope::GLOBAL,
+            Change {
+                change_id: format!("00000000-0000-4000-8000-0000000000a{i}"),
+                collection: "notes".to_owned(),
+                pk: format!("n{i}"),
+                op: Op::Upsert,
+                payload: Some(json!({"title": format!("note {i}")})),
+                base_version: 0,
+                updated_at: Utc::now(),
+            },
+        );
     }
     let (url, srv) = start_sync_server(
         backend.clone() as Arc<dyn SyncBackend>,
@@ -1336,6 +1361,92 @@ async fn stable_horizon_multi_page_catchup_never_restarts() {
         3,
         "three pages, no restarts (2 + 2 + 1 rows)"
     );
+}
+
+/// Horizons are per scope, so ANOTHER tenant's GC churn between the pages
+/// of a scoped tenant's from-zero sync must cause no snapshot restarts and
+/// no resync: the per-page `tombstone_horizon` the client's GC-race guard
+/// reads is the requesting scope's own (stable) value.
+#[tokio::test]
+async fn other_scope_gc_churn_never_restarts_a_scoped_sync() {
+    use axum::middleware::Next;
+
+    /// Attach a fixed tenant scope (the auth part is exercised elsewhere).
+    async fn attach_alice_scope(
+        mut request: axum::extract::Request,
+        next: Next,
+    ) -> axum::response::Response {
+        request
+            .extensions_mut()
+            .insert(SyncScope::new("user:alice"));
+        next.run(request).await
+    }
+
+    let backend = Arc::new(GcInjectingBackend::new(MemorySyncBackend::new()));
+    // Seed alice's rows; the churn cycles (create+delete+GC before every
+    // later pull) run in the GLOBAL scope and advance ONLY its horizon.
+    for i in 1..=5 {
+        backend.push_one(
+            "user:alice",
+            Change {
+                change_id: format!("00000000-0000-4000-8000-0000000000b{i}"),
+                collection: "notes".to_owned(),
+                pk: format!("n{i}"),
+                op: Op::Upsert,
+                payload: Some(json!({"title": format!("note {i}")})),
+                base_version: 0,
+                updated_at: Utc::now(),
+            },
+        );
+    }
+    backend
+        .churn
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let router: axum::Router = axum::Router::new().nest(
+        "/sync",
+        server::scoped_router(
+            backend.clone() as Arc<dyn SyncBackend>,
+            Arc::new(LwwResolver),
+        )
+        .layer(axum::middleware::from_fn(attach_alice_scope)),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback");
+    let addr = listener.local_addr().expect("local addr");
+    let _srv = tokio::spawn(async move {
+        axum::serve(listener, router).await.expect("serve");
+    });
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = open_store(&dir, "alice.db");
+    let mut config = SyncConfig::new(format!("http://{addr}/sync"));
+    config.pull_batch_size = 2;
+    let report = SyncEngine::new(store.clone(), config)
+        .sync_once()
+        .await
+        .expect("alice's sync must complete despite global-scope GC churn");
+    assert!(
+        !report.full_resync,
+        "another scope's GC must not trigger alice's resync"
+    );
+    assert_eq!(report.pulled, 5);
+    assert_eq!(
+        backend.pull_count(),
+        3,
+        "three pages, zero restarts — the per-page horizon alice reads is \
+         her scope's own"
+    );
+    for i in 1..=5 {
+        assert!(
+            store
+                .get::<Note>("notes", &format!("n{i}"))
+                .expect("get")
+                .is_some(),
+            "live row n{i} must arrive"
+        );
+    }
 }
 
 /// Overlapping `sync_once` calls (the Tauri shell's resume kick racing the
@@ -1962,8 +2073,8 @@ async fn spawn_background_backs_off_then_recovers() {
         fn gc_applied(&self, older_than: chrono::DateTime<Utc>) -> Result<u64, SyncError> {
             self.inner.gc_applied(older_than)
         }
-        fn tombstone_horizon(&self) -> Result<Version, SyncError> {
-            self.inner.tombstone_horizon()
+        fn tombstone_horizon(&self, scope: &str) -> Result<Version, SyncError> {
+            self.inner.tombstone_horizon(scope)
         }
         fn latest_version(&self) -> Result<Version, SyncError> {
             self.inner.latest_version()
