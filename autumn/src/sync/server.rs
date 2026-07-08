@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use axum::Json;
-use axum::extract::Query;
+use axum::extract::{FromRequestParts, OptionalFromRequestParts, Query};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
@@ -39,6 +39,120 @@ use super::resolver::{ConflictResolver, Resolution};
 fn backend_err(err: impl std::fmt::Display) -> SyncError {
     SyncError::Backend(err.to_string())
 }
+
+/// The tenant/principal scope key partitioning synced data server-side.
+///
+/// Every synced row, tombstone, and push-dedup record belongs to exactly
+/// one scope: pushes write into the scope derived from the request, pulls
+/// return only that scope's rows, and the same `(collection, pk)` in two
+/// scopes is two **distinct** rows. Without scoping, every authenticated
+/// device would read and write one shared data set.
+///
+/// The scope is **never client-supplied** — the wire protocol
+/// ([`PushRequest`], [`PullQuery`]) carries no scope field, so a client
+/// cannot name another tenant's partition. It is derived server-side from
+/// the authenticated request: authentication middleware inserts a
+/// `SyncScope` request extension (e.g. built from the user id the bearer
+/// token authenticated), and [`scoped_router`] reads it, **failing
+/// closed** (`500`) when it is missing. [`router`] instead defaults
+/// requests without the extension to the constant [`Self::GLOBAL`] scope —
+/// the single-tenant/local deployment mode where all devices deliberately
+/// share one data set.
+///
+/// ```rust,no_run
+/// # async fn authenticate(_r: &axum::extract::Request) -> Result<String, axum::http::StatusCode> { unimplemented!() }
+/// use autumn_web::sync::SyncScope;
+///
+/// async fn attach_sync_scope(
+///     mut request: axum::extract::Request,
+///     next: axum::middleware::Next,
+/// ) -> Result<axum::response::Response, axum::http::StatusCode> {
+///     let user_id = authenticate(&request).await?; // 401 on failure
+///     request.extensions_mut().insert(SyncScope::new(user_id));
+///     Ok(next.run(request).await)
+/// }
+/// ```
+///
+/// As an extractor (the [`CsrfToken`](crate::security::CsrfToken)
+/// convention: extension-carried, fail-closed), `SyncScope` is also
+/// available to the app's own handlers.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SyncScope(String);
+
+impl SyncScope {
+    /// The constant scope [`router`] assigns when no auth middleware
+    /// inserted a `SyncScope` extension: one shared, single-tenant data
+    /// set.
+    pub const GLOBAL: &'static str = "global";
+
+    /// A scope keyed by `scope` — derive it from the **authenticated**
+    /// principal (user id, tenant id), never from client-supplied request
+    /// data.
+    #[must_use]
+    pub fn new(scope: impl Into<String>) -> Self {
+        Self(scope.into())
+    }
+
+    /// The single-tenant [`Self::GLOBAL`] scope.
+    #[must_use]
+    pub fn global() -> Self {
+        Self(Self::GLOBAL.to_owned())
+    }
+
+    /// The scope key string, as passed to [`SyncBackend`] methods.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for SyncScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl<S> FromRequestParts<S> for SyncScope
+where
+    S: Send + Sync,
+{
+    type Rejection = (StatusCode, &'static str);
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        parts
+            .extensions
+            .get::<Self>()
+            .cloned()
+            .ok_or(SCOPE_MISSING_REJECTION)
+    }
+}
+
+impl<S> OptionalFromRequestParts<S> for SyncScope
+where
+    S: Send + Sync,
+{
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Option<Self>, Self::Rejection> {
+        Ok(parts.extensions.get::<Self>().cloned())
+    }
+}
+
+/// Fail-closed rejection for a missing scope: a `scoped_router` deployment
+/// whose auth middleware forgot to insert the extension is MISCONFIGURED —
+/// falling back to a shared scope would silently merge tenants' data.
+const SCOPE_MISSING_REJECTION: (StatusCode, &str) = (
+    StatusCode::INTERNAL_SERVER_ERROR,
+    "sync scope missing: this deployment requires authentication middleware \
+     to insert a SyncScope request extension (see \
+     autumn_web::sync::server::scoped_router)",
+);
 
 /// Validate a push batch before applying anything: every upsert must carry
 /// `Some(payload)`. An upsert with a missing payload would create a **live**
@@ -146,10 +260,26 @@ fn gc_tombstone_row(change: &Change, version: Version) -> RemoteRow {
 /// Storage backend for the server sync endpoints.
 ///
 /// Implementations must apply each push batch atomically (all-or-nothing)
-/// and dedup on `(device_id, change_id)` so retries are idempotent.
+/// and dedup on `(scope, device_id, change_id)` so retries are idempotent.
 /// Methods are synchronous; the router runs them on the blocking pool.
+///
+/// # Scoping
+///
+/// `apply_push` and `pull_since` take a `scope` key (see [`SyncScope`] for
+/// where it comes from) that partitions ALL synced state: rows, tombstones,
+/// and dedup records. The same `(collection, pk)` under two scopes is two
+/// independent rows, and a push can never read or modify another scope's
+/// row. Versions still come from ONE global sequence shared by every scope
+/// — that is per-scope-safe (each scope's feed is a filtered subsequence,
+/// so "version > cursor" with a scope predicate never skips that scope's
+/// rows) and keeps the cursor/horizon semantics unchanged. The GC and
+/// introspection methods ([`Self::gc_tombstones`], [`Self::gc_applied`],
+/// [`Self::tombstone_horizon`], [`Self::latest_version`]) are maintenance
+/// operations spanning all scopes; the single global tombstone horizon is
+/// conservative but safe per scope (a GC may force a full resync on scopes
+/// whose own tombstones were untouched — never the reverse).
 pub trait SyncBackend: Send + Sync + 'static {
-    /// Apply one push batch atomically, returning one outcome per change
+    /// Apply one push batch atomically **within `scope`**, returning one outcome per change
     /// (request order). Conflicts are settled via `resolver` and assigned a
     /// new version. Retries of an already-applied change REPLAY the
     /// original outcome: clean applies answer `AlreadyApplied` with the
@@ -174,13 +304,14 @@ pub trait SyncBackend: Send + Sync + 'static {
     /// back).
     fn apply_push(
         &self,
+        scope: &str,
         request: &PushRequest,
         resolver: &dyn ConflictResolver,
     ) -> Result<PushResponse, SyncError>;
 
-    /// Return rows with version greater than `cursor` (ascending, at most
-    /// `limit`), or `FullResyncRequired` when a non-zero `session_start`
-    /// predates the tombstone GC horizon.
+    /// Return `scope`'s rows with version greater than `cursor` (ascending,
+    /// at most `limit`), or `FullResyncRequired` when a non-zero
+    /// `session_start` predates the tombstone GC horizon.
     ///
     /// `session_start` is the cursor the client's sync session started
     /// from (all pages of one paginated catch-up pass the same value). The
@@ -194,12 +325,14 @@ pub trait SyncBackend: Send + Sync + 'static {
     /// Returns [`SyncError::Backend`] on storage failure.
     fn pull_since(
         &self,
+        scope: &str,
         cursor: Version,
         limit: i64,
         session_start: Version,
     ) -> Result<PullResponse, SyncError>;
 
-    /// Physically drop tombstone rows with version at or below `up_to` and
+    /// Physically drop tombstone rows (across ALL scopes) with version at
+    /// or below `up_to` and
     /// advance the tombstone horizon. Returns the number of rows removed.
     /// Clients whose cursor then trails the horizon get a full resync.
     /// Never runs implicitly — call it deliberately (e.g. from a scheduled
@@ -277,8 +410,14 @@ struct AppliedRecord {
 
 #[derive(Debug, Default)]
 struct MemoryState {
-    rows: BTreeMap<(String, String), RemoteRow>,
-    applied: HashMap<(String, String), AppliedRecord>,
+    /// Rows keyed by `(scope, collection, pk)` — the scope prefix is the
+    /// partition, mirroring the Postgres primary key.
+    rows: BTreeMap<(String, String, String), RemoteRow>,
+    /// Dedup records keyed by `(scope, device_id, change_id)`: `device_id`
+    /// and `change_id` are client-supplied, so without the scope prefix a
+    /// client in another scope could replay a foreign record's outcome (and
+    /// read its resolved-row snapshot).
+    applied: HashMap<(String, String, String), AppliedRecord>,
     next_version: Version,
     horizon: Version,
 }
@@ -315,6 +454,7 @@ impl MemorySyncBackend {
 impl SyncBackend for MemorySyncBackend {
     fn apply_push(
         &self,
+        scope: &str,
         request: &PushRequest,
         resolver: &dyn ConflictResolver,
     ) -> Result<PushResponse, SyncError> {
@@ -324,7 +464,11 @@ impl SyncBackend for MemorySyncBackend {
         let horizon = state.horizon;
         let mut outcomes = Vec::with_capacity(request.changes.len());
         for change in &request.changes {
-            let dedup_key = (request.device_id.clone(), change.change_id.clone());
+            let dedup_key = (
+                scope.to_owned(),
+                request.device_id.clone(),
+                change.change_id.clone(),
+            );
             if let Some(record) = state.applied.get(&dedup_key) {
                 // Replay the ORIGINAL outcome: a Resolved result must come
                 // back as the same Resolved row, not a clean-looking
@@ -337,7 +481,11 @@ impl SyncBackend for MemorySyncBackend {
                 ));
                 continue;
             }
-            let row_key = (change.collection.clone(), change.pk.clone());
+            let row_key = (
+                scope.to_owned(),
+                change.collection.clone(),
+                change.pk.clone(),
+            );
             let current = state.rows.get(&row_key).cloned();
             let (outcome, version) = match current {
                 // Pre-horizon stale edit hitting a TOMBSTONE: same
@@ -409,6 +557,7 @@ impl SyncBackend for MemorySyncBackend {
 
     fn pull_since(
         &self,
+        scope: &str,
         cursor: Version,
         limit: i64,
         session_start: Version,
@@ -426,9 +575,9 @@ impl SyncBackend for MemorySyncBackend {
         }
         let mut rows: Vec<RemoteRow> = state
             .rows
-            .values()
-            .filter(|row| row.version > cursor)
-            .cloned()
+            .iter()
+            .filter(|((row_scope, _, _), row)| row_scope == scope && row.version > cursor)
+            .map(|(_, row)| row.clone())
             .collect();
         rows.sort_by_key(|row| row.version);
         rows.truncate(usize::try_from(limit.max(0)).unwrap_or(usize::MAX));
@@ -488,6 +637,9 @@ impl SyncBackend for MemorySyncBackend {
 const PG_SCHEMA_DDL: &str = "
 CREATE SEQUENCE IF NOT EXISTS autumn_sync_version_seq;
 CREATE TABLE IF NOT EXISTS autumn_sync_rows (
+    -- Tenant/principal partition key, derived server-side from the
+    -- authenticated request (see SyncScope) — never client-supplied.
+    scope TEXT NOT NULL,
     collection TEXT NOT NULL,
     pk TEXT NOT NULL,
     payload JSONB,
@@ -495,11 +647,15 @@ CREATE TABLE IF NOT EXISTS autumn_sync_rows (
     deleted BOOLEAN NOT NULL DEFAULT FALSE,
     updated_at TIMESTAMPTZ NOT NULL,
     device_id TEXT NOT NULL DEFAULT '',
-    PRIMARY KEY (collection, pk)
+    PRIMARY KEY (scope, collection, pk)
 );
-CREATE INDEX IF NOT EXISTS autumn_sync_rows_version_idx
-    ON autumn_sync_rows (version);
+CREATE INDEX IF NOT EXISTS autumn_sync_rows_scope_version_idx
+    ON autumn_sync_rows (scope, version);
 CREATE TABLE IF NOT EXISTS autumn_sync_applied (
+    -- Scope prefix on the dedup key too: device_id/change_id are
+    -- client-supplied, so without it a client in another scope could
+    -- replay a foreign record's outcome (and read its resolved_row).
+    scope TEXT NOT NULL,
     device_id TEXT NOT NULL,
     change_id TEXT NOT NULL,
     version BIGINT NOT NULL DEFAULT 0,
@@ -508,7 +664,7 @@ CREATE TABLE IF NOT EXISTS autumn_sync_applied (
     -- so retries replay the resolution instead of a clean-looking
     -- AlreadyApplied ack (NULL for clean applies).
     resolved_row JSONB,
-    PRIMARY KEY (device_id, change_id)
+    PRIMARY KEY (scope, device_id, change_id)
 );
 CREATE TABLE IF NOT EXISTS autumn_sync_meta (
     key TEXT PRIMARY KEY,
@@ -609,16 +765,21 @@ struct PgSequenceRecord {
     is_called: bool,
 }
 
-fn pg_upsert_row(conn: &mut PgConnection, row: &RemoteRow) -> Result<(), diesel::result::Error> {
+fn pg_upsert_row(
+    conn: &mut PgConnection,
+    scope: &str,
+    row: &RemoteRow,
+) -> Result<(), diesel::result::Error> {
     sql_query(
         "INSERT INTO autumn_sync_rows \
-         (collection, pk, payload, version, deleted, updated_at, device_id) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7) \
-         ON CONFLICT (collection, pk) DO UPDATE SET \
+         (scope, collection, pk, payload, version, deleted, updated_at, device_id) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+         ON CONFLICT (scope, collection, pk) DO UPDATE SET \
          payload = excluded.payload, version = excluded.version, \
          deleted = excluded.deleted, updated_at = excluded.updated_at, \
          device_id = excluded.device_id",
     )
+    .bind::<Text, _>(scope)
     .bind::<Text, _>(&row.collection)
     .bind::<Text, _>(&row.pk)
     .bind::<Nullable<Jsonb>, _>(&row.payload)
@@ -701,6 +862,7 @@ impl PgSyncBackend {
 impl SyncBackend for PgSyncBackend {
     fn apply_push(
         &self,
+        scope: &str,
         request: &PushRequest,
         resolver: &dyn ConflictResolver,
     ) -> Result<PushResponse, SyncError> {
@@ -720,8 +882,9 @@ impl SyncBackend for PgSyncBackend {
             for change in &request.changes {
                 let duplicate = sql_query(
                     "SELECT version, resolved_row FROM autumn_sync_applied \
-                     WHERE device_id = $1 AND change_id = $2",
+                     WHERE scope = $1 AND device_id = $2 AND change_id = $3",
                 )
+                .bind::<Text, _>(scope)
                 .bind::<Text, _>(&request.device_id)
                 .bind::<Text, _>(&change.change_id)
                 .get_result::<PgAppliedRecord>(conn)
@@ -745,8 +908,10 @@ impl SyncBackend for PgSyncBackend {
 
                 let current = sql_query(
                     "SELECT collection, pk, payload, version, deleted, updated_at, device_id \
-                     FROM autumn_sync_rows WHERE collection = $1 AND pk = $2 FOR UPDATE",
+                     FROM autumn_sync_rows \
+                     WHERE scope = $1 AND collection = $2 AND pk = $3 FOR UPDATE",
                 )
+                .bind::<Text, _>(scope)
                 .bind::<Text, _>(&change.collection)
                 .bind::<Text, _>(&change.pk)
                 .get_result::<PgRowRecord>(conn)
@@ -768,7 +933,7 @@ impl SyncBackend for PgSyncBackend {
                     {
                         let version = pg_next_version(conn)?;
                         let row = gc_tombstone_row(change, version);
-                        pg_upsert_row(conn, &row)?;
+                        pg_upsert_row(conn, scope, &row)?;
                         (ChangeOutcome::Resolved { row }, version)
                     }
                     Some(server) if server.version != change.base_version => {
@@ -776,7 +941,7 @@ impl SyncBackend for PgSyncBackend {
                         let version = pg_next_version(conn)?;
                         let row =
                             resolved_row(resolution, change, &request.device_id, &server, version);
-                        pg_upsert_row(conn, &row)?;
+                        pg_upsert_row(conn, scope, &row)?;
                         (ChangeOutcome::Resolved { row }, version)
                     }
                     // Absent row with a pre-horizon base claim: the base
@@ -789,13 +954,13 @@ impl SyncBackend for PgSyncBackend {
                     None if change.base_version > 0 && change.base_version <= horizon => {
                         let version = pg_next_version(conn)?;
                         let row = gc_tombstone_row(change, version);
-                        pg_upsert_row(conn, &row)?;
+                        pg_upsert_row(conn, scope, &row)?;
                         (ChangeOutcome::Resolved { row }, version)
                     }
                     _ => {
                         let version = pg_next_version(conn)?;
                         let row = row_from_change(change, &request.device_id, version);
-                        pg_upsert_row(conn, &row)?;
+                        pg_upsert_row(conn, scope, &row)?;
                         (ChangeOutcome::Applied { version }, version)
                     }
                 };
@@ -809,9 +974,10 @@ impl SyncBackend for PgSyncBackend {
                 };
                 sql_query(
                     "INSERT INTO autumn_sync_applied \
-                     (device_id, change_id, version, resolved_row) \
-                     VALUES ($1, $2, $3, $4)",
+                     (scope, device_id, change_id, version, resolved_row) \
+                     VALUES ($1, $2, $3, $4, $5)",
                 )
+                .bind::<Text, _>(scope)
                 .bind::<Text, _>(&request.device_id)
                 .bind::<Text, _>(&change.change_id)
                 .bind::<BigInt, _>(version)
@@ -826,6 +992,7 @@ impl SyncBackend for PgSyncBackend {
 
     fn pull_since(
         &self,
+        scope: &str,
         cursor: Version,
         limit: i64,
         session_start: Version,
@@ -862,8 +1029,10 @@ impl SyncBackend for PgSyncBackend {
                 }
                 let rows: Vec<RemoteRow> = sql_query(
                     "SELECT collection, pk, payload, version, deleted, updated_at, device_id \
-                     FROM autumn_sync_rows WHERE version > $1 ORDER BY version LIMIT $2",
+                     FROM autumn_sync_rows \
+                     WHERE scope = $1 AND version > $2 ORDER BY version LIMIT $3",
                 )
+                .bind::<Text, _>(scope)
                 .bind::<BigInt, _>(cursor)
                 .bind::<BigInt, _>(limit.max(0))
                 .get_results::<PgRowRecord>(conn)?
@@ -944,13 +1113,25 @@ impl SyncBackend for PgSyncBackend {
 
 // ── Router ───────────────────────────────────────────────────────────────
 
-/// Build the sync router (`POST /push`, `GET /pull`).
+/// Build the **single-tenant** sync router (`POST /push`, `GET /pull`).
 ///
 /// Generic over the host router's state so it mounts both on an Autumn app
 /// (`AppBuilder::nest("/sync", router(...))` shares [`crate::AppState`] and
 /// the app's global middleware) and on a bare `axum::Router` in tests.
 /// **Mount it behind authentication** — the endpoints trust `device_id` as
-/// sent, and anyone who can reach them can read and write every synced row.
+/// sent, and anyone who can reach them can read and write every synced row
+/// in scope.
+///
+/// # Scoping: this constructor is single-tenant
+///
+/// Requests without a [`SyncScope`] request extension read and write the
+/// one shared [`SyncScope::GLOBAL`] scope — appropriate for single-user or
+/// local deployments where every authenticated device deliberately sees
+/// the same data set. When auth middleware DOES insert a `SyncScope`
+/// extension, it is honored. **Multi-user deployments must use
+/// [`scoped_router`]** (which fails closed when the extension is missing)
+/// and derive the scope from the authenticated principal, or every user
+/// silently shares the global partition.
 ///
 /// Request bounds and validation: push batches larger than
 /// [`MAX_PUSH_CHANGES`](crate::sync::protocol::MAX_PUSH_CHANGES) changes
@@ -966,46 +1147,111 @@ pub fn router<S>(
 where
     S: Clone + Send + Sync + 'static,
 {
+    build_router(backend, resolver, false)
+}
+
+/// Build the **multi-tenant** sync router.
+///
+/// Like [`router`], but every request must carry a [`SyncScope`] request
+/// extension inserted by the deployment's authentication middleware
+/// (derived from the authenticated principal — e.g. the user id the
+/// bearer token proved). Requests without one are rejected with `500` and
+/// nothing is read or written: a missing scope here is a server
+/// misconfiguration, and falling back to a shared scope would silently
+/// merge tenants' data (same fail-closed posture as the auth middleware
+/// itself).
+///
+/// See [`SyncScope`] for a middleware example, and [`router`] for the
+/// request bounds shared by both constructors.
+pub fn scoped_router<S>(
+    backend: Arc<dyn SyncBackend>,
+    resolver: Arc<dyn ConflictResolver>,
+) -> axum::Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    build_router(backend, resolver, true)
+}
+
+/// Resolve the request's scope: the extension when present, else the
+/// GLOBAL default ([`router`]) or a fail-closed rejection
+/// ([`scoped_router`]).
+fn request_scope(extension: Option<SyncScope>, require_scope: bool) -> Result<SyncScope, ()> {
+    match extension {
+        Some(scope) => Ok(scope),
+        None if require_scope => Err(()),
+        None => Ok(SyncScope::global()),
+    }
+}
+
+fn scope_missing_response() -> axum::response::Response {
+    tracing::error!(
+        "sync request reached scoped_router without a SyncScope request \
+         extension — the deployment's auth middleware must insert one \
+         (rejecting, fail-closed)"
+    );
+    SCOPE_MISSING_REJECTION.into_response()
+}
+
+fn build_router<S>(
+    backend: Arc<dyn SyncBackend>,
+    resolver: Arc<dyn ConflictResolver>,
+    require_scope: bool,
+) -> axum::Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
     let push_backend = Arc::clone(&backend);
     axum::Router::new()
         .route(
             "/push",
-            post(move |Json(request): Json<PushRequest>| {
-                let backend = Arc::clone(&push_backend);
-                let resolver = Arc::clone(&resolver);
-                async move {
-                    if request.changes.len() > MAX_PUSH_CHANGES {
-                        return (
-                            StatusCode::PAYLOAD_TOO_LARGE,
-                            format!(
-                                "push batch of {} changes exceeds the limit of {MAX_PUSH_CHANGES}",
-                                request.changes.len()
-                            ),
-                        )
-                            .into_response();
+            post(
+                move |scope: Option<SyncScope>, Json(request): Json<PushRequest>| {
+                    let backend = Arc::clone(&push_backend);
+                    let resolver = Arc::clone(&resolver);
+                    async move {
+                        let Ok(scope) = request_scope(scope, require_scope) else {
+                            return scope_missing_response();
+                        };
+                        if request.changes.len() > MAX_PUSH_CHANGES {
+                            return (
+                                StatusCode::PAYLOAD_TOO_LARGE,
+                                format!(
+                                    "push batch of {} changes exceeds the limit of \
+                                     {MAX_PUSH_CHANGES}",
+                                    request.changes.len()
+                                ),
+                            )
+                                .into_response();
+                        }
+                        let result = tokio::task::spawn_blocking(move || {
+                            backend.apply_push(scope.as_str(), &request, resolver.as_ref())
+                        })
+                        .await;
+                        respond(result)
                     }
-                    let result = tokio::task::spawn_blocking(move || {
-                        backend.apply_push(&request, resolver.as_ref())
-                    })
-                    .await;
-                    respond(result)
-                }
-            }),
+                },
+            ),
         )
         .route(
             "/pull",
-            get(move |Query(query): Query<PullQuery>| {
-                let backend = Arc::clone(&backend);
-                async move {
-                    let limit = query.limit.clamp(1, MAX_PULL_LIMIT);
-                    let session_start = query.session_start();
-                    let result = tokio::task::spawn_blocking(move || {
-                        backend.pull_since(query.cursor, limit, session_start)
-                    })
-                    .await;
-                    respond(result)
-                }
-            }),
+            get(
+                move |scope: Option<SyncScope>, Query(query): Query<PullQuery>| {
+                    let backend = Arc::clone(&backend);
+                    async move {
+                        let Ok(scope) = request_scope(scope, require_scope) else {
+                            return scope_missing_response();
+                        };
+                        let limit = query.limit.clamp(1, MAX_PULL_LIMIT);
+                        let session_start = query.session_start();
+                        let result = tokio::task::spawn_blocking(move || {
+                            backend.pull_since(scope.as_str(), query.cursor, limit, session_start)
+                        })
+                        .await;
+                        respond(result)
+                    }
+                },
+            ),
         )
 }
 

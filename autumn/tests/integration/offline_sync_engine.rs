@@ -9,7 +9,7 @@ use std::sync::Arc;
 use autumn_web::sync::{
     Change, ChangeOutcome, ConflictResolver, LwwResolver, MAX_PUSH_CHANGES, MemorySyncBackend, Op,
     PullResponse, PushRequest, PushResponse, RemoteRow, Resolution, SyncBackend, SyncConfig,
-    SyncEngine, SyncError, SyncStore, Version, server,
+    SyncEngine, SyncError, SyncScope, SyncStore, Version, server,
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -52,7 +52,10 @@ fn engine_for(store: &SyncStore, base_url: &str) -> SyncEngine {
 }
 
 fn backend_rows(backend: &dyn SyncBackend) -> Vec<RemoteRow> {
-    match backend.pull_since(0, 10_000, 0).expect("backend pull") {
+    match backend
+        .pull_since(SyncScope::GLOBAL, 0, 10_000, 0)
+        .expect("backend pull")
+    {
         PullResponse::Ok { rows, .. } => rows,
         PullResponse::FullResyncRequired { .. } => panic!("unexpected full resync from cursor 0"),
     }
@@ -764,7 +767,7 @@ async fn heal_never_drops_acked_rows_while_pull_keeps_failing() {
         }],
     };
     backend
-        .apply_push(&seed, &LwwResolver)
+        .apply_push(SyncScope::GLOBAL, &seed, &LwwResolver)
         .expect("seed other device's row");
 
     let flaky: axum::Router = axum::Router::new().nest(
@@ -1065,7 +1068,7 @@ async fn already_applied_retry_then_edit_does_not_false_conflict() {
         changes: store.pending_changes(10).expect("pending"),
     };
     backend
-        .apply_push(&request, &LwwResolver)
+        .apply_push(SyncScope::GLOBAL, &request, &LwwResolver)
         .expect("server-side apply");
     assert_eq!(store.pending_count().expect("pending"), 1);
 
@@ -1307,6 +1310,188 @@ async fn bearer_token_authenticates_against_a_guarded_router() {
     assert_eq!(store.pending_count().expect("pending"), 0);
 }
 
+/// The documented multi-user wiring works end-to-end: auth middleware
+/// derives a `SyncScope` from the authenticated principal (here: the
+/// bearer token) and `server::scoped_router` partitions all data by it —
+/// two users writing the same `(collection, pk)` never see or clobber each
+/// other's rows. The scope is never client-supplied: the engines send only
+/// their credential, and the wire protocol carries no scope field.
+#[tokio::test]
+async fn scoped_router_partitions_data_by_authenticated_principal() {
+    use axum::middleware::Next;
+
+    /// Authenticate the bearer token and attach the principal's scope —
+    /// the middleware shape documented in
+    /// docs/guide/tauri-mobile-offline-sync.md.
+    async fn auth_and_scope(
+        mut request: axum::extract::Request,
+        next: Next,
+    ) -> Result<axum::response::Response, axum::http::StatusCode> {
+        let user = request
+            .headers()
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .and_then(|token| match token {
+                "alice-token" => Some("user:alice"),
+                "bob-token" => Some("user:bob"),
+                _ => None,
+            })
+            .ok_or(axum::http::StatusCode::UNAUTHORIZED)?;
+        request.extensions_mut().insert(SyncScope::new(user));
+        Ok(next.run(request).await)
+    }
+
+    let backend = Arc::new(MemorySyncBackend::new());
+    let router: axum::Router = axum::Router::new().nest(
+        "/sync",
+        server::scoped_router(backend.clone(), Arc::new(LwwResolver))
+            .layer(axum::middleware::from_fn(auth_and_scope)),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback");
+    let addr = listener.local_addr().expect("local addr");
+    let _srv = tokio::spawn(async move {
+        axum::serve(listener, router).await.expect("serve");
+    });
+    let url = format!("http://{addr}/sync");
+
+    let engine_as = |store: &SyncStore, token: &str| {
+        let mut config = SyncConfig::new(&url);
+        config.bearer_token = Some(token.to_owned());
+        SyncEngine::new(store.clone(), config)
+    };
+
+    // Both users write the SAME collection/pk — offline, independently.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let alice = open_store(&dir, "alice.db");
+    alice
+        .put("notes", "n1", &note("alice's note"))
+        .expect("put");
+    let bob = open_store(&dir, "bob.db");
+    bob.put("notes", "n1", &note("bob's note")).expect("put");
+
+    let report = engine_as(&alice, "alice-token")
+        .sync_once()
+        .await
+        .expect("alice sync");
+    assert_eq!(report.pushed, 1);
+    // Bob's identical pk clean-applies in HIS scope (a distinct row): no
+    // conflict against alice's row, no resolver involvement.
+    let report = engine_as(&bob, "bob-token")
+        .sync_once()
+        .await
+        .expect("bob sync");
+    assert_eq!(report.pushed, 1);
+
+    // Each principal pulls only its own scope: a second sync leaves each
+    // store holding exactly its own document.
+    engine_as(&alice, "alice-token")
+        .sync_once()
+        .await
+        .expect("alice re-sync");
+    engine_as(&bob, "bob-token")
+        .sync_once()
+        .await
+        .expect("bob re-sync");
+    assert_eq!(
+        alice.get::<Note>("notes", "n1").expect("alice get"),
+        Some(note("alice's note")),
+        "bob's write must never reach alice's scope"
+    );
+    assert_eq!(
+        bob.get::<Note>("notes", "n1").expect("bob get"),
+        Some(note("bob's note")),
+        "alice's write must never reach bob's scope"
+    );
+
+    // And server-side the two scopes hold two distinct rows.
+    let scope_rows = |scope: &str| match backend
+        .pull_since(scope, 0, 10_000, 0)
+        .expect("backend pull")
+    {
+        PullResponse::Ok { rows, .. } => rows,
+        PullResponse::FullResyncRequired { .. } => panic!("unexpected resync from cursor 0"),
+    };
+    assert_eq!(scope_rows("user:alice").len(), 1);
+    assert_eq!(scope_rows("user:bob").len(), 1);
+    assert_eq!(
+        scope_rows(SyncScope::GLOBAL).len(),
+        0,
+        "nothing may leak into the single-tenant default scope"
+    );
+}
+
+/// `scoped_router` fails CLOSED: a deployment whose middleware forgot to
+/// insert the `SyncScope` extension is misconfigured, and requests are
+/// rejected with 500 before touching the backend — falling back to a
+/// shared scope would silently merge tenants' data.
+#[tokio::test]
+async fn scoped_router_fails_closed_without_scope_extension() {
+    let backend = Arc::new(MemorySyncBackend::new());
+    // No middleware inserts a SyncScope: every request must be rejected.
+    let router: axum::Router = axum::Router::new().nest(
+        "/sync",
+        server::scoped_router(backend.clone(), Arc::new(LwwResolver)),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback");
+    let addr = listener.local_addr().expect("local addr");
+    let _srv = tokio::spawn(async move {
+        axum::serve(listener, router).await.expect("serve");
+    });
+    let url = format!("http://{addr}/sync");
+    let client = reqwest::Client::new();
+
+    let push = PushRequest {
+        device_id: "device-a".to_owned(),
+        changes: vec![Change {
+            change_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+            collection: "notes".to_owned(),
+            pk: "n1".to_owned(),
+            op: Op::Upsert,
+            payload: Some(json!({"title": "rejected"})),
+            base_version: 0,
+            updated_at: Utc::now(),
+        }],
+    };
+    let response = client
+        .post(format!("{url}/push"))
+        .json(&push)
+        .send()
+        .await
+        .expect("send push");
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+        "a scope-less push against scoped_router must fail closed"
+    );
+    let body = response.text().await.expect("error body");
+    assert!(
+        body.contains("SyncScope"),
+        "the rejection must name the missing extension, got: {body}"
+    );
+
+    let response = client
+        .get(format!("{url}/pull?cursor=0&limit=10"))
+        .send()
+        .await
+        .expect("send pull");
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+        "a scope-less pull against scoped_router must fail closed"
+    );
+
+    assert_eq!(
+        backend.latest_version().expect("latest"),
+        0,
+        "nothing may be applied by rejected scope-less requests"
+    );
+}
+
 /// `spawn_background` behavior: while the backend errors, passes back off
 /// and keep retrying; once it heals, the loop converges the store without
 /// intervention. Bounds are generous — no wall-clock exactness.
@@ -1342,20 +1527,22 @@ async fn spawn_background_backs_off_then_recovers() {
     impl SyncBackend for FlakyBackend {
         fn apply_push(
             &self,
+            scope: &str,
             request: &PushRequest,
             resolver: &dyn ConflictResolver,
         ) -> Result<PushResponse, SyncError> {
             self.gate()?;
-            self.inner.apply_push(request, resolver)
+            self.inner.apply_push(scope, request, resolver)
         }
         fn pull_since(
             &self,
+            scope: &str,
             cursor: Version,
             limit: i64,
             session_start: Version,
         ) -> Result<PullResponse, SyncError> {
             self.gate()?;
-            self.inner.pull_since(cursor, limit, session_start)
+            self.inner.pull_since(scope, cursor, limit, session_start)
         }
         fn gc_tombstones(&self, up_to: Version) -> Result<u64, SyncError> {
             self.inner.gc_tombstones(up_to)
@@ -1381,6 +1568,7 @@ async fn spawn_background_backs_off_then_recovers() {
     backend
         .inner
         .apply_push(
+            SyncScope::GLOBAL,
             &PushRequest {
                 device_id: "seeder".to_owned(),
                 changes: vec![Change {

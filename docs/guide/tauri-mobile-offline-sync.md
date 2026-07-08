@@ -139,7 +139,7 @@ One `SyncEngine::sync_once()` pass does:
 
 Delivery is **at-least-once**: every journal entry carries a
 client-generated `change_id`, and the server dedups per
-`(device_id, change_id)` in `autumn_sync_applied`. A retry after a lost
+`(scope, device_id, change_id)` in `autumn_sync_applied`. A retry after a lost
 response returns `already_applied` with the originally assigned version
 (so the client can record the ack it never received) and never
 double-applies. `SyncBackend::gc_applied(older_than)` prunes old dedup
@@ -366,7 +366,10 @@ async fn mount_offline_sync(app: autumn_web::app::AppBuilder) -> autumn_web::app
 `ensure_schema()` creates the shadow tables (`autumn_sync_rows`,
 `autumn_sync_applied`, `autumn_sync_meta`) idempotently. They are
 deliberately **not** part of autumn's framework migrations — apps without
-offline sync see zero schema churn.
+offline sync see zero schema churn. Rows and push-dedup records carry a
+`scope` column partitioning data per tenant — the single-tenant mount
+above stores everything under the constant `"global"` scope (see "Scope
+data per user" below).
 
 ### Authentication on `/sync` is a requirement, not a suggestion
 
@@ -431,8 +434,61 @@ nested router, so an app-wide auth layer covers `/sync` too.) This
 end-to-end wiring — guarded router rejects a token-less engine, accepts a
 configured one — is pinned by the
 `bearer_token_authenticates_against_a_guarded_router` integration test.
-And scope data **per user server-side**: `device_id` identifies an
-installation, not an account.
+
+### Scope data per user (multi-user apps)
+
+> **Warning — the default mount is single-tenant.** `server::router`
+> stores every synced row in one shared `"global"` scope: **any**
+> authenticated user reads and writes **all** synced data. That is correct
+> for a single-user/local deployment (one person's devices sharing one
+> data set) and wrong for anything with accounts. Authentication alone
+> does not partition data — `device_id` identifies an installation, not
+> an account, and the server trusts it as sent.
+
+Multi-user deployments mount `server::scoped_router` instead and derive a
+**scope** — the key partitioning rows, tombstones, and push-dedup records
+— from the authenticated principal. The scope is **never client-supplied**
+(the wire protocol carries no scope field, so a client cannot name another
+user's partition): auth middleware inserts an
+`autumn_web::sync::SyncScope` request extension once the credential has
+been verified. Extending `require_sync_auth` from above:
+
+```rust
+use autumn_web::sync::SyncScope;
+
+async fn require_sync_auth(
+    mut request: axum::extract::Request,
+    next: Next,
+) -> Result<axum::response::Response, StatusCode> {
+    // ... the fail-closed token validation from the previous section,
+    //     yielding the authenticated user ...
+    let user_id = authenticated_user_id.ok_or(StatusCode::UNAUTHORIZED)?;
+    // Attach the scope of the user the CREDENTIAL proved — never a value
+    // taken from the request body or query.
+    request
+        .extensions_mut()
+        .insert(SyncScope::new(format!("user:{user_id}")));
+    Ok(next.run(request).await)
+}
+
+// In serve(), swap the single-tenant constructor for the scoped one:
+//     app.nest(
+//         "/sync",
+//         server::scoped_router(backend, Arc::new(LwwResolver))
+//             .layer(middleware::from_fn(require_sync_auth)),
+//     )
+```
+
+Under a scoped mount, the same `(collection, pk)` written by two users is
+two independent rows: pulls return only the requesting user's rows,
+pushes can never read or modify another user's data, and retried pushes
+dedup within their own scope. `scoped_router` keeps the same fail-closed
+posture as the token check: a request that reaches it without a
+`SyncScope` extension (misconfigured middleware) is rejected with `500`
+and touches nothing — falling back to a shared scope would silently merge
+users' data. This wiring is pinned end-to-end by the
+`scoped_router_partitions_data_by_authenticated_principal` integration
+test.
 
 ### The shell: local store + background engine
 
@@ -618,8 +674,11 @@ journal) — run
 - **Auth is required, not optional**: the `/sync` endpoints ship
   unauthenticated, like every scaffold route, and they trust `device_id`
   as sent — unguarded they expose read/write access to every synced row.
-  Apply the middleware + `bearer_token` wiring from §6, enforce per-user
-  scoping server-side, and never expose them without TLS.
+  Apply the middleware + `bearer_token` wiring from §6, and never expose
+  them without TLS. **Multi-user apps must also partition data per user**:
+  the generated mount is single-tenant (one shared scope) — swap it for
+  `server::scoped_router` with a `SyncScope` derived from the
+  authenticated user (§6, "Scope data per user").
 - **Clock skew** only influences the default LWW resolver's choice between
   two conflicting writes; feed ordering is immune. If that is still too
   much trust, ship a custom resolver.

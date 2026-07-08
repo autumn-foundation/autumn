@@ -2,16 +2,21 @@
 //!
 //! Run against `MemorySyncBackend` here (always) and `PgSyncBackend` in
 //! `offline_sync_pg` (docker-gated), so both backends prove the same
-//! push/pull/dedup/conflict/GC semantics.
+//! push/pull/dedup/conflict/GC and scope-isolation semantics.
 
 #![cfg(feature = "offline-sync")]
 
 use autumn_web::sync::{
     Change, ChangeOutcome, LwwResolver, MemorySyncBackend, Op, PullResponse, PushRequest,
-    SyncBackend,
+    SyncBackend, SyncScope,
 };
 use chrono::{Duration, Utc};
 use serde_json::json;
+
+/// The single-tenant scope the linear script below runs in — what
+/// `server::router` assigns when no auth middleware inserts a `SyncScope`.
+/// The scope-isolation section at the end uses two extra tenant scopes.
+const SCOPE: &str = SyncScope::GLOBAL;
 
 fn change(change_id: &str, pk: &str, op: Op, payload: Option<serde_json::Value>) -> Change {
     Change {
@@ -59,7 +64,9 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
             ),
         ],
     );
-    let response = backend.apply_push(&seed, &resolver).expect("seed push");
+    let response = backend
+        .apply_push(SCOPE, &seed, &resolver)
+        .expect("seed push");
     let versions: Vec<i64> = response
         .outcomes
         .iter()
@@ -77,7 +84,9 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
     // that lost the first response can still record its acks (otherwise its
     // next edit of the same row pushes a stale base_version and
     // false-conflicts).
-    let retry = backend.apply_push(&seed, &resolver).expect("retry push");
+    let retry = backend
+        .apply_push(SCOPE, &seed, &resolver)
+        .expect("retry push");
     let retry_versions: Vec<i64> = retry
         .outcomes
         .iter()
@@ -97,7 +106,7 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
         rows,
         next_cursor,
         tombstone_horizon,
-    } = backend.pull_since(0, 100, 0).expect("pull all")
+    } = backend.pull_since(SCOPE, 0, 100, 0).expect("pull all")
     else {
         panic!("cursor 0 never requires a resync");
     };
@@ -109,7 +118,7 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
     let PullResponse::Ok {
         rows, next_cursor, ..
     } = backend
-        .pull_since(versions[1], 100, versions[1])
+        .pull_since(SCOPE, versions[1], 100, versions[1])
         .expect("pull caught-up")
     else {
         panic!("caught-up cursor never requires a resync");
@@ -117,7 +126,8 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
     assert!(rows.is_empty());
     assert_eq!(next_cursor, versions[1], "empty page keeps the cursor");
 
-    let PullResponse::Ok { rows, .. } = backend.pull_since(0, 1, 0).expect("pull limited") else {
+    let PullResponse::Ok { rows, .. } = backend.pull_since(SCOPE, 0, 1, 0).expect("pull limited")
+    else {
         panic!("cursor 0 never requires a resync");
     };
     assert_eq!(rows.len(), 1, "limit caps the page");
@@ -139,7 +149,7 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
     winner.updated_at = Utc::now() + Duration::seconds(30);
     let winner_request = push("device-b", vec![winner]);
     let response = backend
-        .apply_push(&winner_request, &resolver)
+        .apply_push(SCOPE, &winner_request, &resolver)
         .expect("conflict push");
     let ChangeOutcome::Resolved { row } = &response.outcomes[0] else {
         panic!(
@@ -167,7 +177,7 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
     // over the resolution (e.g. resurrect a server-winning delete).
     let latest_before_replay = backend.latest_version().expect("latest");
     let replay = backend
-        .apply_push(&winner_request, &resolver)
+        .apply_push(SCOPE, &winner_request, &resolver)
         .expect("replay push");
     let ChangeOutcome::Resolved { row } = &replay.outcomes[0] else {
         panic!(
@@ -195,7 +205,7 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
     loser.base_version = versions[0]; // stale again
     loser.updated_at = Utc::now() - Duration::seconds(3600);
     let response = backend
-        .apply_push(&push("device-c", vec![loser]), &resolver)
+        .apply_push(SCOPE, &push("device-c", vec![loser]), &resolver)
         .expect("losing conflict push");
     let ChangeOutcome::Resolved { row } = &response.outcomes[0] else {
         panic!(
@@ -225,13 +235,15 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
     );
     delete.base_version = versions[1];
     let response = backend
-        .apply_push(&push("device-a", vec![delete]), &resolver)
+        .apply_push(SCOPE, &push("device-a", vec![delete]), &resolver)
         .expect("delete push");
     assert!(matches!(
         response.outcomes[0],
         ChangeOutcome::Applied { .. }
     ));
-    let PullResponse::Ok { rows, .. } = backend.pull_since(0, 100, 0).expect("pull with tombstone")
+    let PullResponse::Ok { rows, .. } = backend
+        .pull_since(SCOPE, 0, 100, 0)
+        .expect("pull with tombstone")
     else {
         panic!("cursor 0 never requires a resync");
     };
@@ -247,14 +259,15 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
     // GC is idempotent.
     assert_eq!(backend.gc_tombstones(latest).expect("re-gc"), 0);
 
-    let PullResponse::Ok { rows, .. } = backend.pull_since(0, 100, 0).expect("pull post-gc") else {
+    let PullResponse::Ok { rows, .. } = backend.pull_since(SCOPE, 0, 100, 0).expect("pull post-gc")
+    else {
         panic!("cursor 0 never requires a resync");
     };
     assert!(rows.iter().all(|r| !r.deleted), "GC'd tombstones are gone");
     let live_version = rows.first().expect("a live row survives GC").version;
 
     let stale = backend
-        .pull_since(versions[0], 100, versions[0])
+        .pull_since(SCOPE, versions[0], 100, versions[0])
         .expect("stale pull");
     assert!(
         matches!(stale, PullResponse::FullResyncRequired { tombstone_horizon } if tombstone_horizon == latest),
@@ -268,7 +281,7 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
     // allowed to keep paging instead of being trapped in resync-from-0
     // forever.
     let mid_page = backend
-        .pull_since(live_version, 100, 0)
+        .pull_since(SCOPE, live_version, 100, 0)
         .expect("mid-pagination pull");
     assert!(
         matches!(mid_page, PullResponse::Ok { .. }),
@@ -300,6 +313,7 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
     // GC must still reach it.
     let response = backend
         .apply_push(
+            SCOPE,
             &push(
                 "device-a",
                 vec![change(
@@ -320,7 +334,7 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
         "new versions must land above the clamped horizon"
     );
     let PullResponse::Ok { rows, .. } = backend
-        .pull_since(latest_before_gc, 100, latest_before_gc)
+        .pull_since(SCOPE, latest_before_gc, 100, latest_before_gc)
         .expect("post-gc pull")
     else {
         panic!("a cursor at the horizon never requires a resync");
@@ -356,7 +370,7 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
         ],
     );
     let err = backend
-        .apply_push(&bad_batch, &resolver)
+        .apply_push(SCOPE, &bad_batch, &resolver)
         .expect_err("an upsert without a payload must be rejected");
     assert!(
         matches!(err, autumn_web::sync::SyncError::Protocol(_)),
@@ -368,7 +382,7 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
         "a rejected batch must not assign versions"
     );
     let PullResponse::Ok { rows, .. } = backend
-        .pull_since(latest_before_reject, 100, latest_before_reject)
+        .pull_since(SCOPE, latest_before_reject, 100, latest_before_reject)
         .expect("pull after rejected push")
     else {
         panic!("a caught-up cursor never requires a resync");
@@ -381,6 +395,7 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
     // applies cleanly instead of echoing AlreadyApplied.
     let response = backend
         .apply_push(
+            SCOPE,
             &push("device-a", vec![bad_batch.changes[0].clone()]),
             &resolver,
         )
@@ -410,7 +425,7 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
     stale_edit.updated_at = Utc::now() - Duration::seconds(3600);
     let stale_request = push("device-offline", vec![stale_edit]);
     let response = backend
-        .apply_push(&stale_request, &resolver)
+        .apply_push(SCOPE, &stale_request, &resolver)
         .expect("stale push");
     let ChangeOutcome::Resolved { row } = &response.outcomes[0] else {
         panic!(
@@ -431,7 +446,7 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
     // A retry of the stale push (lost response) replays the SAME
     // server-winning tombstone — never a clean-looking AlreadyApplied.
     let replay = backend
-        .apply_push(&stale_request, &resolver)
+        .apply_push(SCOPE, &stale_request, &resolver)
         .expect("stale replay");
     let ChangeOutcome::Resolved { row } = &replay.outcomes[0] else {
         panic!(
@@ -444,7 +459,7 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
         "the replay must carry the original tombstone"
     );
     let PullResponse::Ok { rows, .. } = backend
-        .pull_since(latest_before_stale, 100, latest_before_stale)
+        .pull_since(SCOPE, latest_before_stale, 100, latest_before_stale)
         .expect("pull after stale push")
     else {
         panic!("an at-horizon cursor never requires a resync");
@@ -472,7 +487,7 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
     skewed_edit.base_version = versions[1];
     skewed_edit.updated_at = Utc::now() + Duration::days(365);
     let response = backend
-        .apply_push(&push("device-skewed", vec![skewed_edit]), &resolver)
+        .apply_push(SCOPE, &push("device-skewed", vec![skewed_edit]), &resolver)
         .expect("skewed push");
     let ChangeOutcome::Resolved { row } = &response.outcomes[0] else {
         panic!(
@@ -506,7 +521,7 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
         repeat_edit.base_version = versions[1];
         repeat_edit.updated_at = Utc::now() + Duration::days(365);
         let response = backend
-            .apply_push(&push("device-skewed", vec![repeat_edit]), &resolver)
+            .apply_push(SCOPE, &push("device-skewed", vec![repeat_edit]), &resolver)
             .expect("repeat stale push");
         let ChangeOutcome::Resolved { row } = &response.outcomes[0] else {
             panic!(
@@ -526,6 +541,7 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
     // on the base-version claim, not on mere absence.
     let response = backend
         .apply_push(
+            SCOPE,
             &push(
                 "device-offline",
                 vec![change(
@@ -551,6 +567,7 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
     // as an absent row.
     let response = backend
         .apply_push(
+            SCOPE,
             &push(
                 "device-a",
                 vec![change(
@@ -573,7 +590,7 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
         );
     };
     let PullResponse::Ok { rows, .. } = backend
-        .pull_since(null_version - 1, 100, null_version - 1)
+        .pull_since(SCOPE, null_version - 1, 100, null_version - 1)
         .expect("pull null row")
     else {
         panic!("an at-feed cursor never requires a resync");
@@ -601,7 +618,7 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
     null_conflict.updated_at = Utc::now() + Duration::seconds(60);
     let null_request = push("device-b", vec![null_conflict]);
     let response = backend
-        .apply_push(&null_request, &resolver)
+        .apply_push(SCOPE, &null_request, &resolver)
         .expect("null conflict push");
     let ChangeOutcome::Resolved { row } = &response.outcomes[0] else {
         panic!("stale base must resolve, got {:?}", response.outcomes[0]);
@@ -609,7 +626,7 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
     assert_eq!(row.payload, Some(serde_json::Value::Null));
     let resolved_null_row = row.clone();
     let replay = backend
-        .apply_push(&null_request, &resolver)
+        .apply_push(SCOPE, &null_request, &resolver)
         .expect("null replay");
     let ChangeOutcome::Resolved { row } = &replay.outcomes[0] else {
         panic!(
@@ -620,6 +637,164 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
     assert_eq!(
         row, &resolved_null_row,
         "the dedup snapshot must round-trip a null payload"
+    );
+
+    // ── Scope isolation: tenants never see or touch each other's data ────
+    // Everything above ran in the single-tenant GLOBAL scope. The scope is
+    // derived server-side from the authenticated request (never
+    // client-supplied), and it partitions rows, tombstones, AND dedup
+    // records: the same (collection, pk) in two scopes is two independent
+    // rows, and the same client-supplied (device_id, change_id) in two
+    // scopes is two independent changes.
+    let tenant_change = |change_id: &str, title: &str| Change {
+        collection: "scoped".to_owned(),
+        ..change(change_id, "s1", Op::Upsert, Some(json!({"title": title})))
+    };
+    let shared_change_id = "00000000-0000-4000-8000-000000000020";
+    let response = backend
+        .apply_push(
+            "tenant-a",
+            &push("device-a", vec![tenant_change(shared_change_id, "alpha")]),
+            &resolver,
+        )
+        .expect("tenant-a push");
+    let ChangeOutcome::Applied { version: version_a } = response.outcomes[0] else {
+        panic!(
+            "tenant-a push must clean-apply, got {:?}",
+            response.outcomes[0]
+        );
+    };
+    // Same device_id AND change_id, same collection/pk — but ANOTHER scope:
+    // a fresh change (scoped dedup — no AlreadyApplied echo of tenant-a's
+    // record) creating a fresh row (scoped pk — no conflict against
+    // tenant-a's row, whose version differs from this base-0 claim).
+    let response = backend
+        .apply_push(
+            "tenant-b",
+            &push("device-a", vec![tenant_change(shared_change_id, "beta")]),
+            &resolver,
+        )
+        .expect("tenant-b push");
+    let ChangeOutcome::Applied { version: version_b } = response.outcomes[0] else {
+        panic!(
+            "the same device/change/pk in another scope is a distinct fresh \
+             row and change, got {:?}",
+            response.outcomes[0]
+        );
+    };
+    assert!(version_b > version_a, "one global sequence spans scopes");
+
+    // Pull from cursor 0 returns ONLY the requesting scope's rows — never
+    // the GLOBAL-scope rows above, never the sibling tenant's row.
+    for (scope, version, title) in [
+        ("tenant-a", version_a, "alpha"),
+        ("tenant-b", version_b, "beta"),
+    ] {
+        let PullResponse::Ok {
+            rows, next_cursor, ..
+        } = backend.pull_since(scope, 0, 100, 0).expect("tenant pull")
+        else {
+            panic!("cursor 0 never requires a resync");
+        };
+        assert_eq!(
+            rows.len(),
+            1,
+            "{scope} must see exactly its own row, got {rows:?}"
+        );
+        assert_eq!(rows[0].version, version);
+        assert_eq!(
+            rows[0]
+                .payload
+                .as_ref()
+                .and_then(|p| p.get("title"))
+                .and_then(|v| v.as_str()),
+            Some(title),
+            "{scope} must pull its own payload"
+        );
+        assert_eq!(next_cursor, version);
+    }
+
+    // A dedup replay stays within its scope: retrying tenant-a's change
+    // echoes tenant-a's original version, not tenant-b's.
+    let replay = backend
+        .apply_push(
+            "tenant-a",
+            &push("device-a", vec![tenant_change(shared_change_id, "alpha")]),
+            &resolver,
+        )
+        .expect("tenant-a replay");
+    assert!(
+        matches!(
+            replay.outcomes[0],
+            ChangeOutcome::AlreadyApplied { version } if version == version_a
+        ),
+        "the dedup record must be scope-local, got {:?}",
+        replay.outcomes[0]
+    );
+
+    // A push can never touch another scope's row: a conflicting edit in
+    // tenant-b (its base_version even names tenant-a's version) resolves
+    // against tenant-b's OWN row only.
+    let mut cross = tenant_change("00000000-0000-4000-8000-000000000021", "tenant-b wins");
+    cross.base_version = version_a; // stale IN TENANT-B (its row is at version_b)
+    cross.updated_at = Utc::now() + Duration::seconds(60);
+    let response = backend
+        .apply_push("tenant-b", &push("device-x", vec![cross]), &resolver)
+        .expect("cross-scope-shaped push");
+    let ChangeOutcome::Resolved { row } = &response.outcomes[0] else {
+        panic!(
+            "a stale edit must resolve within its own scope, got {:?}",
+            response.outcomes[0]
+        );
+    };
+    let tenant_b_version = row.version;
+
+    // Deletes are scoped tombstones: deleting s1 in tenant-b leaves
+    // tenant-a's s1 live.
+    let del = Change {
+        collection: "scoped".to_owned(),
+        base_version: tenant_b_version,
+        ..change(
+            "00000000-0000-4000-8000-000000000022",
+            "s1",
+            Op::Delete,
+            None,
+        )
+    };
+    let response = backend
+        .apply_push("tenant-b", &push("device-a", vec![del]), &resolver)
+        .expect("tenant-b delete");
+    assert!(matches!(
+        response.outcomes[0],
+        ChangeOutcome::Applied { .. }
+    ));
+    let PullResponse::Ok { rows, .. } = backend
+        .pull_since("tenant-b", 0, 100, 0)
+        .expect("tenant-b post-delete pull")
+    else {
+        panic!("cursor 0 never requires a resync");
+    };
+    assert!(
+        rows.len() == 1 && rows[0].deleted,
+        "tenant-b's row is a tombstone, got {rows:?}"
+    );
+    let PullResponse::Ok { rows, .. } = backend
+        .pull_since("tenant-a", 0, 100, 0)
+        .expect("tenant-a post-delete pull")
+    else {
+        panic!("cursor 0 never requires a resync");
+    };
+    assert!(
+        rows.len() == 1
+            && !rows[0].deleted
+            && rows[0].version == version_a
+            && rows[0]
+                .payload
+                .as_ref()
+                .and_then(|p| p.get("title"))
+                .and_then(|v| v.as_str())
+                == Some("alpha"),
+        "tenant-a's row must be untouched by tenant-b's writes, got {rows:?}"
     );
 
     // ── Dedup-record GC bounds the applied table ──────────────────────────

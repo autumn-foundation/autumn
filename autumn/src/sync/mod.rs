@@ -28,6 +28,13 @@
 //! clients pull "rows with version greater than my cursor". Device clocks
 //! never order the change feed.
 //!
+//! Server-side data is partitioned per tenant/principal by a scope key
+//! ([`SyncScope`]) derived from the **authenticated** request — never
+//! client-supplied. The default [`server::router`] is single-tenant (every
+//! request shares one constant "global" scope); multi-user deployments
+//! mount [`server::scoped_router`] and have their auth middleware insert a
+//! `SyncScope` derived from the authenticated user.
+//!
 //! # Client wiring
 //!
 //! ```rust,no_run
@@ -73,7 +80,7 @@ pub use protocol::{
     PushRequest, PushResponse, RemoteRow, Version,
 };
 pub use resolver::{ConflictResolver, LwwResolver, Resolution};
-pub use server::{MemorySyncBackend, PgSyncBackend, SyncBackend};
+pub use server::{MemorySyncBackend, PgSyncBackend, SyncBackend, SyncScope};
 pub use store::SyncStore;
 
 /// Errors produced by the sync store, engine, and server backends.

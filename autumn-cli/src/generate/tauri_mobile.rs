@@ -890,16 +890,28 @@ fn plan_app_offline_sync_feature(project_root: &Path, plan: &mut Plan) {
 
     let cargo_path = project_root.join("Cargo.toml");
     let content = read_or_empty(&cargo_path);
+    let doc = toml::from_str::<toml::Value>(&content).ok();
     // Cargo feature syntax names the DEPENDENCY KEY, not the package: a
     // renamed dep (`autumn = { package = "autumn-web", ... }`) must be
     // referenced as `autumn/offline-sync` — `autumn-web/offline-sync` would
     // be rejected by cargo as an unknown dependency.
-    let dep_key = toml::from_str::<toml::Value>(&content).ok().map_or_else(
+    let dep_key = doc.as_ref().map_or_else(
         || "autumn-web".to_owned(),
-        |doc| super::tauri::resolve_dep_key(project_root, &doc, "autumn-web"),
+        |doc| super::tauri::resolve_dep_key(project_root, doc, "autumn-web"),
     );
     let feature_line = format!("offline-sync = [\"{dep_key}/offline-sync\"]\n");
-    if content.contains("offline-sync = [") {
+    // Detect an existing feature via the PARSED [features] table (the same
+    // source of truth `offline_sync_enabled_by_default` reads), never a
+    // substring scan: `offline-sync=[]` (no spaces) or a multiline array
+    // would slip past a textual `"offline-sync = ["` check into the
+    // fresh-insert branch below, which would then write a DUPLICATE
+    // `offline-sync` key under [features] — a manifest cargo rejects.
+    let feature_defined = doc
+        .as_ref()
+        .and_then(|doc| doc.get("features"))
+        .and_then(toml::Value::as_table)
+        .is_some_and(|features| features.contains_key("offline-sync"));
+    if feature_defined {
         // The feature exists — but "wired" also requires it to be ENABLED
         // by `default`: the extracted serve() mounts /sync behind
         // #[cfg(feature = "offline-sync")], and the documented flow assumes
@@ -1015,6 +1027,14 @@ const SYNC_MOUNT_HELPER: &str = r#"
 /// serve them over HTTPS only. They trust `device_id` as sent, and anyone
 /// who can reach them can read and write every synced row — see the
 /// middleware example in docs/guide/tauri-mobile-offline-sync.md.
+///
+/// MULTI-USER apps additionally need per-user data partitioning: the
+/// `server::router` call below is SINGLE-TENANT — every authenticated
+/// device reads and writes one shared "global" scope. Swap it for
+/// `server::scoped_router` and have your auth middleware insert an
+/// `autumn_web::sync::SyncScope` derived from the authenticated user (the
+/// scope is derived server-side and never client-supplied) — see the
+/// "Scope data per user" section of the guide.
 #[cfg(feature = "offline-sync")]
 async fn mount_offline_sync(app: autumn_web::app::AppBuilder) -> autumn_web::app::AppBuilder {
     use std::sync::Arc;
@@ -2810,6 +2830,104 @@ mod tests {
                  doesn't enable it"
             ) || w.contains("doesn't enable it")),
             "got {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn offline_feature_detection_survives_spacing_and_layout_variants() {
+        // Detection must key on the parsed [features] TABLE, not on the
+        // exact `offline-sync = [` byte sequence: `offline-sync=[]` (no
+        // spaces) or a multiline array are the same manifest to cargo, and
+        // a substring miss would route them into the fresh-insert branch —
+        // which would write a DUPLICATE `offline-sync` key that cargo
+        // rejects outright.
+        fn manifest(features: &str) -> TempDir {
+            let tmp = TempDir::new().unwrap();
+            std::fs::write(
+                tmp.path().join("Cargo.toml"),
+                format!(
+                    "[package]\nname = \"my-app\"\nversion = \"0.2.3\"\n\n\
+                     [dependencies]\nautumn-web = \"0.9.1\"\n\n\
+                     [features]\n{features}"
+                ),
+            )
+            .unwrap();
+            tmp
+        }
+        fn planned_edit(tmp: &TempDir) -> (Option<String>, Vec<String>) {
+            let mut plan = Plan::new(tmp.path());
+            plan_app_offline_sync_feature(tmp.path(), &mut plan);
+            let edit = plan.actions.iter().find_map(|a| match a {
+                Action::Modify { contents, .. } => Some(contents.clone()),
+                _ => None,
+            });
+            (edit, plan.warnings)
+        }
+
+        // No-spaces spelling, already wired: silent no-op, no duplicate.
+        let tmp = manifest(
+            "default = [\"flash\", \"offline-sync\"]\nflash = []\n\
+             offline-sync=[\"autumn-web/offline-sync\"]\n",
+        );
+        let (edit, warnings) = planned_edit(&tmp);
+        assert!(
+            edit.is_none(),
+            "`offline-sync=[…]` (no spaces) must be detected as already \
+             defined, got:\n{edit:?}"
+        );
+        assert!(warnings.is_empty(), "got {warnings:?}");
+
+        // No-spaces spelling, not in default: only the stock default line
+        // gains the feature — the declaration is not re-inserted.
+        let tmp = manifest(
+            "default = [\"flash\"]\nflash = []\n\
+             offline-sync=[\"autumn-web/offline-sync\"]\n",
+        );
+        let (edit, warnings) = planned_edit(&tmp);
+        let edited = edit.expect("the stock default line must gain the feature");
+        assert!(warnings.is_empty(), "got {warnings:?}");
+        assert!(
+            edited.contains(r#"default = ["flash", "offline-sync"]"#),
+            "got:\n{edited}"
+        );
+        // A duplicated key would fail to parse — the sharpest duplicate check.
+        toml::from_str::<toml::Value>(&edited)
+            .expect("the edited manifest must stay valid TOML (no duplicate keys)");
+        assert_eq!(
+            edited.matches("offline-sync=[").count() + edited.matches("offline-sync = [").count(),
+            1,
+            "the existing declaration must not be duplicated:\n{edited}"
+        );
+
+        // Multiline array form, not in default: same — detected, no
+        // duplicate declaration inserted.
+        let tmp = manifest(
+            "default = [\"flash\"]\nflash = []\n\
+             offline-sync = [\n    \"autumn-web/offline-sync\",\n]\n",
+        );
+        let (edit, warnings) = planned_edit(&tmp);
+        let edited = edit.expect("the stock default line must gain the feature");
+        assert!(warnings.is_empty(), "got {warnings:?}");
+        assert!(
+            edited.contains(r#"default = ["flash", "offline-sync"]"#),
+            "got:\n{edited}"
+        );
+        toml::from_str::<toml::Value>(&edited)
+            .expect("the edited manifest must stay valid TOML (no duplicate keys)");
+
+        // Regression: a manifest WITHOUT the feature still gets the fresh
+        // insert (detection must not report false positives either).
+        let tmp = manifest("default = [\"flash\"]\nflash = []\n");
+        let (edit, warnings) = planned_edit(&tmp);
+        let edited = edit.expect("an absent feature must still be inserted");
+        assert!(warnings.is_empty(), "got {warnings:?}");
+        assert!(
+            edited.contains(r#"offline-sync = ["autumn-web/offline-sync"]"#),
+            "got:\n{edited}"
+        );
+        assert!(
+            edited.contains(r#"default = ["flash", "offline-sync"]"#),
+            "got:\n{edited}"
         );
     }
 
