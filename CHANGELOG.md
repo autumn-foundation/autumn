@@ -544,6 +544,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   previously gitignored) so builds are reproducible and dependency updates
   are reviewable.
 
+### Fixed
+
+- **circuit_breaker:** the breaker and its registry now recover from a
+  poisoned mutex (`lock().unwrap_or_else(PoisonError::into_inner)`) instead
+  of panicking on every subsequent call once a single lock holder has
+  panicked; breaker state is a self-correcting sliding window, so the
+  recovered data is safe to keep using. Supersedes #1207. [no-plugin]
+
 ## [0.6.0] - 2026-06-30
 
 ### Added

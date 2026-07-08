@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
@@ -168,8 +168,18 @@ impl CircuitBreaker {
         &self.name
     }
 
+    /// Locks the inner state, recovering from a poisoned mutex.
+    ///
+    /// Circuit breaker state is simple and self-correcting (a sliding sample
+    /// window plus counters), so the data behind a poisoned lock is still
+    /// safe to use. Recovering here keeps a single panicking lock holder from
+    /// permanently poisoning the breaker and panicking every subsequent call.
+    fn lock_inner(&self) -> MutexGuard<'_, CircuitBreakerInner> {
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     pub fn state(&self) -> CircuitState {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.lock_inner();
         let now = Instant::now();
         if inner.state == CircuitState::Open {
             if let Some(until) = inner.open_until {
@@ -186,18 +196,18 @@ impl CircuitBreaker {
     }
 
     pub fn config(&self) -> CircuitBreakerPolicy {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.lock_inner();
         inner.config.clone()
     }
 
     pub fn update_config(&self, mut config: CircuitBreakerPolicy) {
         config.failure_ratio_threshold = config.failure_ratio_threshold.clamp(0.000_1, 1.0);
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.lock_inner();
         inner.config = config;
     }
 
     pub fn failure_ratio(&self) -> f64 {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.lock_inner();
         let window = inner.config.sample_window;
         inner.clean_history(window, Instant::now());
         inner.failure_ratio()
@@ -205,7 +215,7 @@ impl CircuitBreaker {
 
     #[allow(clippy::significant_drop_tightening)]
     pub(crate) fn before_call(&self) -> Result<(), CircuitBreakerError<()>> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.lock_inner();
         let now = Instant::now();
 
         if inner.state == CircuitState::Open {
@@ -236,7 +246,7 @@ impl CircuitBreaker {
     }
 
     pub(crate) fn after_call(&self, success: bool) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.lock_inner();
         let now = Instant::now();
         let window = inner.config.sample_window;
         inner.clean_history(window, now);
@@ -336,7 +346,7 @@ impl CircuitBreakerGuard {
 impl Drop for CircuitBreakerGuard {
     fn drop(&mut self) {
         if !self.completed {
-            let mut inner = self.breaker.inner.lock().unwrap();
+            let mut inner = self.breaker.lock_inner();
             if inner.state == CircuitState::HalfOpen {
                 if inner.half_open_in_flight > 0 {
                     inner.half_open_in_flight -= 1;
@@ -357,8 +367,17 @@ impl CircuitBreakerRegistry {
         }
     }
 
+    /// Locks the registry map, recovering from a poisoned mutex.
+    ///
+    /// See [`CircuitBreaker::lock_inner`] for the rationale: the map is
+    /// always left in a consistent state, so a panicking lock holder must
+    /// not permanently break every subsequent registry call.
+    fn lock_breakers(&self) -> MutexGuard<'_, HashMap<String, CircuitBreaker>> {
+        self.breakers.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     pub fn get_or_create(&self, name: &str, config: CircuitBreakerPolicy) -> CircuitBreaker {
-        let mut breakers = self.breakers.lock().unwrap();
+        let mut breakers = self.lock_breakers();
         breakers
             .entry(name.to_owned())
             .or_insert_with(|| CircuitBreaker::new(name, config))
@@ -370,7 +389,7 @@ impl CircuitBreakerRegistry {
         name: &str,
         config: CircuitBreakerPolicy,
     ) -> CircuitBreaker {
-        let mut breakers = self.breakers.lock().unwrap();
+        let mut breakers = self.lock_breakers();
         if let Some(breaker) = breakers.get(name) {
             breaker.update_config(config);
             breaker.clone()
@@ -382,22 +401,14 @@ impl CircuitBreakerRegistry {
     }
 
     /// Returns a list of all currently registered circuit breakers.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal registry lock is poisoned.
     pub fn all_breakers(&self) -> Vec<CircuitBreaker> {
-        let breakers = self.breakers.lock().unwrap();
+        let breakers = self.lock_breakers();
         breakers.values().cloned().collect()
     }
 
     /// Clears all registered circuit breakers from the registry.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal registry lock is poisoned.
     pub fn clear(&self) {
-        let mut breakers = self.breakers.lock().unwrap();
+        let mut breakers = self.lock_breakers();
         breakers.clear();
     }
 }
@@ -712,5 +723,45 @@ mod tests {
             assert!(res.is_ok());
         }
         assert_eq!(breaker.state(), CircuitState::Closed);
+    }
+
+    #[test]
+    fn test_circuit_breaker_recovers_from_poisoned_mutex() {
+        let breaker = CircuitBreaker::new("poison_test", CircuitBreakerPolicy::default());
+
+        // Poison the inner mutex by panicking while holding the lock.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = breaker.inner.lock().unwrap();
+            panic!("poison the circuit breaker mutex");
+        }));
+        assert!(result.is_err());
+        assert!(breaker.inner.is_poisoned());
+
+        // Every breaker method must keep working instead of panicking.
+        assert_eq!(breaker.state(), CircuitState::Closed);
+        assert!(breaker.before_call().is_ok());
+        breaker.after_call(true);
+        assert!(breaker.failure_ratio() < f64::EPSILON);
+        let config = breaker.config();
+        breaker.update_config(config);
+
+        // The guard's Drop path (cancellation) must not panic either.
+        drop(CircuitBreakerGuard::new(breaker.clone()));
+
+        // Registry locks recover from poisoning too.
+        let registry = CircuitBreakerRegistry::new();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = registry.breakers.lock().unwrap();
+            panic!("poison the registry mutex");
+        }));
+        assert!(result.is_err());
+        assert!(registry.breakers.is_poisoned());
+
+        let b = registry.get_or_create("poison_reg", CircuitBreakerPolicy::default());
+        let b2 = registry.get_or_create_with_config("poison_reg", CircuitBreakerPolicy::default());
+        assert_eq!(b.name(), b2.name());
+        assert_eq!(registry.all_breakers().len(), 1);
+        registry.clear();
+        assert!(registry.all_breakers().is_empty());
     }
 }
