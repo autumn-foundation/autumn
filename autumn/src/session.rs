@@ -110,6 +110,15 @@ impl Session {
         Self::new_cookie_backed(id, data)
     }
 
+    /// Create a fresh, non-cookie-backed session for testing purposes (i.e.
+    /// as [`Session::is_cookie_backed`] would report for a request with no
+    /// prior session cookie).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn new_for_test_without_cookie(id: String, data: HashMap<String, String>) -> Self {
+        Self::new(id, data)
+    }
+
     fn new(id: String, data: HashMap<String, String>) -> Self {
         Self::with_cookie_state(id, data, false)
     }
@@ -140,6 +149,20 @@ impl Session {
     /// than being generated for the current request.
     pub async fn is_cookie_backed(&self) -> bool {
         self.inner.read().await.cookie_backed
+    }
+
+    /// Force this session to be persisted and its cookie (re)issued on the
+    /// response, even though no session data was read or written.
+    ///
+    /// `SessionLayer` only saves the session and sends `Set-Cookie` when it
+    /// is dirty; a request that only calls [`Session::id`] never dirties it.
+    /// Call this before handing [`Session::id`]'s value to something that
+    /// will later be used to identify this session (e.g. binding an external
+    /// capability to it) — otherwise, for a session with no cookie yet, the
+    /// browser never receives the cookie needed to present that same id on a
+    /// later request.
+    pub async fn touch(&self) {
+        self.inner.write().await.dirty = true;
     }
 
     pub(crate) async fn has_pending_changes(&self) -> bool {
@@ -921,6 +944,27 @@ mod tests {
     use axum::routing::get;
     use http::Request as HttpRequest;
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn touch_marks_the_session_dirty_without_reading_or_writing_data() {
+        let session = Session::new_for_test_without_cookie("fresh-id".to_owned(), HashMap::new());
+        assert!(
+            !session.has_pending_changes().await,
+            "sanity: not dirty yet"
+        );
+
+        session.touch().await;
+
+        assert!(
+            session.has_pending_changes().await,
+            "touch() must dirty the session so SessionLayer persists it and sets the cookie"
+        );
+        assert_eq!(
+            session.id().await,
+            "fresh-id",
+            "touch() must not change the id"
+        );
+    }
 
     /// Sentinel store for verifying that the type-erased `BoxedSessionStore`
     /// bridge actually delegates back to the user's `SessionStore` impl

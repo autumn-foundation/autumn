@@ -46,6 +46,7 @@ pub fn layout_with_seo(locale: &Locale, seo: SeoMeta, content: Markup) -> Markup
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 (seo.render())
+                link rel="stylesheet" href=(autumn_web::ui::WIDGETS_CSS_PATH);
                 link rel="stylesheet" href=(asset_url("css/autumn.css"));
                 script src=(asset_url("js/htmx.min.js")) {}
             }

@@ -15,6 +15,8 @@
 //! | `breadcrumb` | Accessible `<nav>` breadcrumb trail |
 //! | `hero` | Landing-page banner: headline, optional subtitle, and CTAs |
 //! | `nav_link` | Navigation anchor, auto-marked active + `aria-current` |
+//! | `nav_bar` | Top-bar/sidebar `<nav>` landmark: brand, links, dropdowns, responsive toggle |
+//! | `tabs` | No-JS `tablist`/`tab`/`tabpanel` switcher with `:target` deep-linking |
 //!
 //! # Interactive / search widgets
 //!
@@ -24,6 +26,13 @@
 //! | Select a single related record and store its ID | `autocomplete_input` |
 //! | Plain `GET` form is sufficient | `axum::extract::Query` |
 //! | You need unusual htmx wiring | Hand-write `hx-*` attributes |
+//!
+//! # Modals & confirmation
+//!
+//! | Situation | Use |
+//! |-----------|-----|
+//! | Custom dialog content | `modal` |
+//! | Confirm a destructive action (delete, etc.) without `window.confirm()` | `confirm_action` |
 //!
 //! # Integration with the repository full-text search feature
 //!
@@ -223,6 +232,12 @@ pub struct AutocompleteConfig<'a> {
     /// `false` (the default) for ID-based lookups where the hidden field should
     /// only carry a value selected from the option list.
     pub free_text: bool,
+    /// Pre-fill the widget from a previous submission (e.g. re-rendering a
+    /// form after a validation error), so free-text input the user already
+    /// typed isn't silently dropped. Seeds both the visible query input's
+    /// `value` and the hidden field's `value`. Leave unset (the default) for a
+    /// blank widget.
+    pub initial_value: Option<&'a str>,
 }
 
 impl<'a> AutocompleteConfig<'a> {
@@ -242,6 +257,7 @@ impl<'a> AutocompleteConfig<'a> {
             placeholder: None,
             fallback_options: None,
             free_text: false,
+            initial_value: None,
         }
     }
 
@@ -297,6 +313,14 @@ impl<'a> AutocompleteConfig<'a> {
     #[must_use]
     pub const fn free_text(mut self) -> Self {
         self.free_text = true;
+        self
+    }
+
+    /// Pre-fill the widget from a previous submission (e.g. re-rendering after
+    /// a validation error), so already-typed input isn't silently dropped.
+    #[must_use]
+    pub const fn initial_value(mut self, value: &'a str) -> Self {
+        self.initial_value = Some(value);
         self
     }
 }
@@ -472,6 +496,10 @@ pub fn active_search_empty_state(message: &str) -> maud::Markup {
 /// - A `<div role="listbox">` where the server renders option partials.
 /// - A `<noscript>` fallback `<select>`.
 ///
+/// Set [`AutocompleteConfig::initial_value`] to pre-fill both inputs — e.g.
+/// re-rendering a form with this widget after a validation error, so text the
+/// user already typed isn't silently dropped.
+///
 /// Use [`autocomplete_option`] and [`autocomplete_empty_state`] to render
 /// option partials returned by your handler.
 ///
@@ -525,6 +553,7 @@ pub fn autocomplete_input(id: &str, label: &str, config: &AutocompleteConfig<'_>
                 aria-expanded="false"
                 aria-autocomplete="list"
                 aria-controls=(options_id)
+                value=(config.initial_value.unwrap_or(""))
                 placeholder=[config.placeholder]
                 class="autumn-autocomplete__input"
                 data-ac-query
@@ -536,7 +565,7 @@ pub fn autocomplete_input(id: &str, label: &str, config: &AutocompleteConfig<'_>
             input
                 type="hidden"
                 id=(value_id)
-                value="";
+                value=(config.initial_value.unwrap_or(""));
             div
                 id=(options_id)
                 role="listbox"
@@ -548,7 +577,7 @@ pub fn autocomplete_input(id: &str, label: &str, config: &AutocompleteConfig<'_>
                     option value="" { "— select —" }
                     @if let Some(opts) = config.fallback_options {
                         @for (val, lbl) in opts {
-                            option value=(val) { (lbl) }
+                            option value=(val) selected[config.initial_value == Some(*val)] { (lbl) }
                         }
                     }
                 }
@@ -1211,6 +1240,432 @@ fn nav_link_is_active(current_path: &str, href: &str, mode: NavLinkMatch) -> boo
     }
 }
 
+// ── nav_bar ──────────────────────────────────────────────────────────────────
+
+/// Layout variant for [`nav_bar`] — selects a modifier class on the root
+/// `<nav>` element.
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NavBarLayout {
+    /// Horizontal top navigation bar (default).
+    #[default]
+    Horizontal,
+    /// Vertical sidebar / dashboard nav — adds `.autumn-nav--sidebar`.
+    Sidebar,
+}
+
+/// A single navigation link, as rendered inside a [`nav_bar`] or [`NavMenu`].
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone)]
+pub struct NavLinkItem {
+    href: String,
+    label: String,
+    match_mode: Option<NavLinkMatch>,
+}
+
+#[cfg(feature = "maud")]
+impl NavLinkItem {
+    /// Build from anything convertible to `String` — an owned `String`
+    /// (e.g. a `format!()` result) moves in for free via `.into()`, while a
+    /// `&str` literal still works ergonomically.
+    fn new(
+        href: impl Into<String>,
+        label: impl Into<String>,
+        match_mode: Option<NavLinkMatch>,
+    ) -> Self {
+        Self {
+            href: href.into(),
+            label: label.into(),
+            match_mode,
+        }
+    }
+}
+
+/// A dropdown navigation item: a `<button>` trigger plus a `<ul>` of
+/// sub-links. Build with [`NavMenu::new`] and chain `.link()` / `.link_matched()`
+/// / `.plain_link()` for each sub-item.
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone)]
+pub struct NavMenu {
+    label: String,
+    links: Vec<NavLinkItem>,
+}
+
+#[cfg(feature = "maud")]
+impl NavMenu {
+    /// Create a new dropdown menu with the given trigger label and no sub-items.
+    #[must_use]
+    pub fn new(label: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            links: Vec::new(),
+        }
+    }
+
+    /// Append a sub-link using [`NavLinkMatch::Exact`] matching.
+    #[must_use]
+    pub fn link(self, href: impl Into<String>, label: impl Into<String>) -> Self {
+        self.link_matched(href, label, NavLinkMatch::Exact)
+    }
+
+    /// Append a sub-link with an explicit [`NavLinkMatch`] mode.
+    #[must_use]
+    pub fn link_matched(
+        mut self,
+        href: impl Into<String>,
+        label: impl Into<String>,
+        mode: NavLinkMatch,
+    ) -> Self {
+        self.links.push(NavLinkItem::new(href, label, Some(mode)));
+        self
+    }
+
+    /// Append a sub-link that never becomes active (e.g. an external link).
+    #[must_use]
+    pub fn plain_link(mut self, href: impl Into<String>, label: impl Into<String>) -> Self {
+        self.links.push(NavLinkItem::new(href, label, None));
+        self
+    }
+}
+
+/// One item in a [`nav_bar`]'s primary or trailing item list.
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone)]
+pub enum NavItem {
+    /// A single navigation link.
+    Link(NavLinkItem),
+    /// A dropdown menu of sub-links.
+    Menu(NavMenu),
+    /// A non-interactive group label (e.g. `"Models"` in a sidebar nav).
+    Section(String),
+}
+
+#[cfg(feature = "maud")]
+impl NavItem {
+    /// A link using [`NavLinkMatch::Exact`] matching against the current path.
+    #[must_use]
+    pub fn link(href: impl Into<String>, label: impl Into<String>) -> Self {
+        Self::link_matched(href, label, NavLinkMatch::Exact)
+    }
+
+    /// A link with an explicit [`NavLinkMatch`] mode.
+    #[must_use]
+    pub fn link_matched(
+        href: impl Into<String>,
+        label: impl Into<String>,
+        mode: NavLinkMatch,
+    ) -> Self {
+        Self::Link(NavLinkItem::new(href, label, Some(mode)))
+    }
+
+    /// A link that never becomes active regardless of the current path —
+    /// e.g. a link to an unrelated tool (an admin actuator page) that should
+    /// never claim `aria-current`.
+    #[must_use]
+    pub fn plain_link(href: impl Into<String>, label: impl Into<String>) -> Self {
+        Self::Link(NavLinkItem::new(href, label, None))
+    }
+
+    /// A dropdown menu item.
+    #[must_use]
+    pub const fn menu(menu: NavMenu) -> Self {
+        Self::Menu(menu)
+    }
+
+    /// A non-interactive group label.
+    #[must_use]
+    pub fn section(label: impl Into<String>) -> Self {
+        Self::Section(label.into())
+    }
+}
+
+/// Configuration for [`nav_bar`]. Build with [`NavBarConfig::new`].
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone)]
+pub struct NavBarConfig {
+    id: String,
+    aria_label: String,
+    brand: Option<(maud::Markup, Option<String>)>,
+    items: Vec<NavItem>,
+    trailing: Vec<NavItem>,
+    layout: NavBarLayout,
+    toggle_label: String,
+    class: Option<String>,
+}
+
+#[cfg(feature = "maud")]
+impl Default for NavBarConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "maud")]
+impl NavBarConfig {
+    /// Create a new nav bar configuration: no brand or items, `aria-label`
+    /// `"Main"`, id `"autumn-nav"`, toggle label `"Menu"`, horizontal layout.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            id: "autumn-nav".to_string(),
+            aria_label: "Main".to_string(),
+            brand: None,
+            items: Vec::new(),
+            trailing: Vec::new(),
+            layout: NavBarLayout::Horizontal,
+            toggle_label: "Menu".to_string(),
+            class: None,
+        }
+    }
+
+    /// Set the brand/logo slot from plain text linking to `href`. The text is
+    /// HTML-escaped by Maud.
+    #[must_use]
+    pub fn brand(self, label: &str, href: &str) -> Self {
+        self.brand_html(maud::html! { (label) }, Some(href))
+    }
+
+    /// Set the brand/logo slot from pre-built [`maud::Markup`]. When `href`
+    /// is `Some`, the brand renders as an anchor; when `None`, it renders as
+    /// a `<span>` (e.g. for a plain wordmark with no link).
+    ///
+    /// Callers are responsible for escaping any user-supplied content inside `brand`.
+    #[must_use]
+    pub fn brand_html(mut self, brand: maud::Markup, href: Option<&str>) -> Self {
+        self.brand = Some((brand, href.map(str::to_string)));
+        self
+    }
+
+    /// Append a primary navigation item.
+    #[must_use]
+    pub fn item(mut self, item: NavItem) -> Self {
+        self.items.push(item);
+        self
+    }
+
+    /// Append multiple primary navigation items at once — convenient when
+    /// building the list from a dynamic source (e.g. a loop over registered models).
+    #[must_use]
+    pub fn items(mut self, items: impl IntoIterator<Item = NavItem>) -> Self {
+        self.items.extend(items);
+        self
+    }
+
+    /// Append an item to the right-aligned trailing slot (account menu, CTA, etc.).
+    #[must_use]
+    pub fn trailing(mut self, item: NavItem) -> Self {
+        self.trailing.push(item);
+        self
+    }
+
+    /// Set the `aria-label` on the `<nav>` landmark (default `"Main"`). Give
+    /// each `nav_bar` on a page a distinct label so screen-reader users can
+    /// tell them apart.
+    #[must_use]
+    pub fn aria_label(mut self, label: &str) -> Self {
+        self.aria_label = label.to_string();
+        self
+    }
+
+    /// Set the layout variant (default [`NavBarLayout::Horizontal`]).
+    #[must_use]
+    pub const fn layout(mut self, layout: NavBarLayout) -> Self {
+        self.layout = layout;
+        self
+    }
+
+    /// Set the element `id` used to derive `aria-controls` target ids
+    /// (default `"autumn-nav"`). Give a second `nav_bar` on the same page a
+    /// distinct id so their collapse/menu ids don't collide.
+    #[must_use]
+    pub fn id(mut self, id: &str) -> Self {
+        self.id = id.to_string();
+        self
+    }
+
+    /// Set the visible/accessible text of the hamburger toggle button
+    /// (default `"Menu"`).
+    #[must_use]
+    pub fn toggle_label(mut self, label: &str) -> Self {
+        self.toggle_label = label.to_string();
+        self
+    }
+
+    /// Add extra CSS class(es) to the root `autumn-nav` element.
+    #[must_use]
+    pub fn class(mut self, class: impl Into<String>) -> Self {
+        self.class = Some(class.into());
+        self
+    }
+}
+
+/// Render an accessible top navigation bar (or sidebar, via [`NavBarLayout::Sidebar`]).
+///
+/// Emits a labelled `<nav>` landmark containing an optional brand, primary
+/// items, a hidden-until-enhanced hamburger toggle, and an optional
+/// right-aligned trailing item list.
+///
+/// Every [`NavItem::Link`] built with [`NavItem::link`] / `link_matched`
+/// renders through [`nav_link_matched`], so it carries `class="active"` and
+/// `aria-current="page"` when its `href` matches `current_path` — pair with
+/// the [`CurrentPath`](crate::extract::CurrentPath) extractor to get
+/// `current_path` from the incoming request. [`NavItem::plain_link`] never
+/// becomes active, for links to unrelated tools that shouldn't claim
+/// "you are here" (e.g. an external or admin-actuator link).
+///
+/// [`NavItem::menu`] renders a `<button>` trigger plus a `<ul>` of sub-links.
+/// Before JavaScript enhances the page, the hamburger toggle is hidden (a
+/// horizontal bar with no toggle has nothing to hide) and every dropdown is
+/// rendered open (`aria-expanded="true"`, no `hidden` attribute) so **all
+/// links stay visible with JavaScript off** — the framework's
+/// `/static/js/autumn-widgets.js` runtime (same-origin, CSP-safe under the
+/// default `script-src 'self'`) then reveals the hamburger and wires the
+/// toggle/dropdown/Escape-to-close behavior. No app-authored JavaScript, and
+/// no inline `<script>` or `style=` attributes, are ever required.
+///
+/// # CSS hooks
+///
+/// | Selector | Element |
+/// |---|---|
+/// | `.autumn-nav` | Root `<nav>` landmark |
+/// | `.autumn-nav--sidebar` | Modifier added by [`NavBarLayout::Sidebar`] |
+/// | `.autumn-nav--enhanced` | Added by the JS runtime once initialized |
+/// | `.autumn-nav__brand` | Brand link (`<a>`) or wordmark (`<span>`) |
+/// | `.autumn-nav__toggle` | Hamburger `<button>` |
+/// | `.autumn-nav__collapse` | Collapsible container wrapping the item lists |
+/// | `.autumn-nav__collapse--open` | Added by the JS runtime while expanded |
+/// | `.autumn-nav__items` | Primary or trailing `<ul>` |
+/// | `.autumn-nav__items--trailing` | Added to the trailing `<ul>` only |
+/// | `.autumn-nav__item` | Every `<li>` wrapping a link |
+/// | `.autumn-nav__item--menu` | `<li>` wrapping a dropdown menu |
+/// | `.autumn-nav__section` | Non-interactive group-label `<li>` |
+/// | `.autumn-nav__menu-toggle` | Dropdown trigger `<button>` |
+/// | `.autumn-nav__menu` | Dropdown sub-item `<ul>` |
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_web::widgets::{NavBarConfig, NavItem, NavLinkMatch, NavMenu, nav_bar};
+///
+/// let config = NavBarConfig::new()
+///     .brand("Acme", "/")
+///     .item(NavItem::link("/", "Home"))
+///     .item(NavItem::link_matched("/posts", "Posts", NavLinkMatch::Prefix))
+///     .item(NavItem::link("/about", "About"))
+///     .item(NavItem::menu(
+///         NavMenu::new("Products")
+///             .link("/widgets", "Widgets")
+///             .link("/gadgets", "Gadgets"),
+///     ))
+///     .trailing(NavItem::plain_link("/login", "Log in"));
+///
+/// let html = nav_bar("/posts/3", &config).into_string();
+/// assert!(html.contains(r#"aria-current="page""#));
+/// assert!(!html.contains("style="));
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn nav_bar(current_path: &str, config: &NavBarConfig) -> maud::Markup {
+    let root_class = merge_class(
+        match config.layout {
+            NavBarLayout::Horizontal => "autumn-nav",
+            NavBarLayout::Sidebar => "autumn-nav autumn-nav--sidebar",
+        },
+        config.class.as_deref(),
+    );
+    let collapse_id = format!("{}-collapse", config.id);
+    let mut menu_counter = 0usize;
+
+    maud::html! {
+        nav id=(config.id) class=(root_class) aria-label=(config.aria_label) data-autumn-nav {
+            @if let Some((brand, href)) = &config.brand {
+                @if let Some(href) = href {
+                    a class="autumn-nav__brand" href=(href) { (brand) }
+                } @else {
+                    span class="autumn-nav__brand" { (brand) }
+                }
+            }
+            button type="button" class="autumn-nav__toggle" aria-expanded="false"
+                aria-controls=(collapse_id) hidden data-nav-toggle {
+                (config.toggle_label)
+            }
+            div id=(collapse_id) class="autumn-nav__collapse" {
+                @if !config.items.is_empty() {
+                    ul class="autumn-nav__items" {
+                        (render_nav_items(current_path, &config.items, &config.id, &mut menu_counter))
+                    }
+                }
+                @if !config.trailing.is_empty() {
+                    ul class="autumn-nav__items autumn-nav__items--trailing" {
+                        (render_nav_items(current_path, &config.trailing, &config.id, &mut menu_counter))
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Render the `<li>` items for one [`nav_bar`] item list (primary or trailing).
+#[cfg(feature = "maud")]
+fn render_nav_items(
+    current_path: &str,
+    items: &[NavItem],
+    id: &str,
+    menu_counter: &mut usize,
+) -> maud::Markup {
+    maud::html! {
+        @for item in items {
+            @match item {
+                NavItem::Link(link) => {
+                    li class="autumn-nav__item" { (render_nav_link_item(current_path, link)) }
+                }
+                NavItem::Section(label) => {
+                    li class="autumn-nav__section" { (label) }
+                }
+                NavItem::Menu(menu) => {
+                    (render_nav_menu(current_path, menu, id, menu_counter))
+                }
+            }
+        }
+    }
+}
+
+/// Render a single nav link: through [`nav_link_matched`] when it has a
+/// [`NavLinkMatch`] mode, or as a plain never-active anchor otherwise.
+#[cfg(feature = "maud")]
+fn render_nav_link_item(current_path: &str, link: &NavLinkItem) -> maud::Markup {
+    if let Some(mode) = link.match_mode {
+        return nav_link_matched(current_path, &link.href, &link.label, mode);
+    }
+    maud::html! { a href=(link.href) { (link.label) } }
+}
+
+/// Render a dropdown menu `<li>`: a trigger `<button>` plus its `<ul>` of
+/// sub-links, using and incrementing `menu_counter` to derive a unique id.
+#[cfg(feature = "maud")]
+fn render_nav_menu(
+    current_path: &str,
+    menu: &NavMenu,
+    id: &str,
+    menu_counter: &mut usize,
+) -> maud::Markup {
+    *menu_counter += 1;
+    let menu_id = format!("{id}-menu-{menu_counter}");
+    maud::html! {
+        li class="autumn-nav__item autumn-nav__item--menu" {
+            button type="button" class="autumn-nav__menu-toggle" aria-expanded="true"
+                aria-controls=(menu_id) data-nav-menu-toggle {
+                (menu.label)
+            }
+            ul id=(menu_id) class="autumn-nav__menu" {
+                @for link in &menu.links {
+                    li class="autumn-nav__item" { (render_nav_link_item(current_path, link)) }
+                }
+            }
+        }
+    }
+}
+
 // ── card ──────────────────────────────────────────────────────────────────
 
 /// Heading level for the title element inside a [`card`].
@@ -1344,18 +1799,25 @@ fn merge_class(base: &str, extra: Option<&str>) -> String {
 }
 
 /// Render `content` inside the `<h1>`–`<h6>` element selected by `level`, with
-/// `class` applied. Shared by every widget with a configurable heading level
-/// (`card`, `hero`, ...) so an `HeadingLevel` variant is matched in one place.
+/// `class` applied and an optional `id` (used by [`modal`] so `aria-labelledby`
+/// has a target). Shared by every widget with a configurable heading level
+/// (`card`, `hero`, `modal`, ...) so an `HeadingLevel` variant is matched in
+/// one place.
 #[cfg(feature = "maud")]
-fn heading(level: HeadingLevel, class: &str, content: &maud::Markup) -> maud::Markup {
+fn heading(
+    level: HeadingLevel,
+    id: Option<&str>,
+    class: &str,
+    content: &maud::Markup,
+) -> maud::Markup {
     maud::html! {
         @match level {
-            HeadingLevel::H1 => h1 class=(class) { (content) },
-            HeadingLevel::H2 => h2 class=(class) { (content) },
-            HeadingLevel::H3 => h3 class=(class) { (content) },
-            HeadingLevel::H4 => h4 class=(class) { (content) },
-            HeadingLevel::H5 => h5 class=(class) { (content) },
-            HeadingLevel::H6 => h6 class=(class) { (content) },
+            HeadingLevel::H1 => h1 id=[id] class=(class) { (content) },
+            HeadingLevel::H2 => h2 id=[id] class=(class) { (content) },
+            HeadingLevel::H3 => h3 id=[id] class=(class) { (content) },
+            HeadingLevel::H4 => h4 id=[id] class=(class) { (content) },
+            HeadingLevel::H5 => h5 id=[id] class=(class) { (content) },
+            HeadingLevel::H6 => h6 id=[id] class=(class) { (content) },
         }
     }
 }
@@ -1425,7 +1887,7 @@ pub fn card(body: &maud::Markup, config: &CardConfig<'_>) -> maud::Markup {
             @if has_header {
                 div class="card-header" {
                     @if let Some(title) = &config.title {
-                        (heading(config.level, "card-title", title))
+                        (heading(config.level, None, "card-title", title))
                     }
                     @if let Some(action) = &config.header_action {
                         (action)
@@ -1675,7 +2137,7 @@ pub fn hero(config: &HeroConfig) -> maud::Markup {
     let root_class = merge_class("autumn-hero", config.class.as_deref());
     maud::html! {
         section class=(root_class) {
-            (heading(config.level, "autumn-hero__title", &config.title))
+            (heading(config.level, None, "autumn-hero__title", &config.title))
             @if let Some(subtitle) = &config.subtitle {
                 p class="autumn-hero__subtitle" { (subtitle) }
             }
@@ -1691,6 +2153,641 @@ pub fn hero(config: &HeroConfig) -> maud::Markup {
                             }
                         }
                     }
+                }
+            }
+        }
+    }
+}
+
+// ── modal / confirm_action ───────────────────────────────────────────────
+
+/// Configuration for a [`modal`] dialog.
+///
+/// Build with [`ModalConfig::new`] and chain builder methods for optional slots.
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_web::widgets::{ModalConfig, modal};
+/// use maud::html;
+///
+/// let body = html! { p { "Are you sure you want to continue?" } };
+/// let footer = html! { button { "OK" } };
+/// let config = ModalConfig::new().footer(footer);
+/// let dialog = modal("confirm-dialog", "Confirm", &body, &config);
+/// ```
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone, Default)]
+pub struct ModalConfig {
+    /// Optional footer content (e.g. action buttons) rendered in
+    /// `<div class="autumn-modal__footer">`.
+    footer: Option<maud::Markup>,
+    /// Heading level for the title element (default [`HeadingLevel::H2`]).
+    level: HeadingLevel,
+    /// Extra CSS class(es) appended to the root `autumn-modal` element.
+    class: Option<String>,
+    /// When `true`, emits `closedby="any"` so clicking the backdrop or
+    /// pressing Escape dismisses the dialog. Off by default so a
+    /// destructive confirm isn't accidentally dismissed by a stray click.
+    light_dismiss: bool,
+}
+
+#[cfg(feature = "maud")]
+impl ModalConfig {
+    /// Create a new modal configuration with no footer, `<h2>` title, and
+    /// light-dismiss disabled.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            footer: None,
+            level: HeadingLevel::H2,
+            class: None,
+            light_dismiss: false,
+        }
+    }
+
+    /// Set the footer content (e.g. action buttons) rendered in
+    /// `<div class="autumn-modal__footer">`.
+    #[must_use]
+    pub fn footer(mut self, footer: maud::Markup) -> Self {
+        self.footer = Some(footer);
+        self
+    }
+
+    /// Set the heading level for the title element (default [`HeadingLevel::H2`]).
+    #[must_use]
+    pub const fn level(mut self, level: HeadingLevel) -> Self {
+        self.level = level;
+        self
+    }
+
+    /// Add extra CSS class(es) to the root `autumn-modal` element.
+    #[must_use]
+    pub fn class(mut self, class: impl Into<String>) -> Self {
+        self.class = Some(class.into());
+        self
+    }
+
+    /// When `true`, emits `closedby="any"` on the `<dialog>` so the backdrop
+    /// and Escape dismiss it (default `false`). Escape-to-close is universal
+    /// `<dialog>` behavior; `closedby="any"` itself has limited browser
+    /// support (unsupported in Firefox and Safari as of this writing), so
+    /// `autumn-widgets.js` ships a backdrop-click polyfill scoped to
+    /// `dialog[closedby="any"]` for browsers that don't honor the attribute
+    /// natively yet.
+    #[must_use]
+    pub const fn light_dismiss(mut self, light_dismiss: bool) -> Self {
+        self.light_dismiss = light_dismiss;
+        self
+    }
+}
+
+/// Render a native `<dialog>` modal: an `id`, a labelled title, `aria-modal`,
+/// a body slot, and an optional footer/actions slot.
+///
+/// Opened via `showModal()` — either the native HTML Invoker Commands API
+/// (`command="show-modal"` / `commandfor`, see [`modal_trigger`]) or the
+/// framework-shipped fallback in `autumn-widgets.js` — the dialog gets ESC-close,
+/// a focus trap, focus-into-dialog on open, and focus-return-to-trigger on
+/// close for free from the browser: no app-authored JavaScript is required.
+///
+/// # CSS hooks
+///
+/// | Selector | Element |
+/// |---|---|
+/// | `.autumn-modal` | Root `<dialog>` |
+/// | `.autumn-modal__content` | Inner content wrapper |
+/// | `.autumn-modal__title` | Title heading |
+/// | `.autumn-modal__body` | Body wrapper |
+/// | `.autumn-modal__footer` | Footer wrapper (only present when configured) |
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_web::widgets::{ModalConfig, modal};
+/// use maud::html;
+///
+/// let body = html! { p { "This action cannot be undone." } };
+/// let html = modal("delete-confirm", "Delete this post?", &body, &ModalConfig::new())
+///     .into_string();
+/// assert!(html.contains("<dialog"));
+/// assert!(html.contains(r#"aria-labelledby="delete-confirm-title""#));
+/// assert!(html.contains(r#"aria-modal="true""#));
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn modal(id: &str, title: &str, body: &maud::Markup, config: &ModalConfig) -> maud::Markup {
+    let root_class = merge_class("autumn-modal", config.class.as_deref());
+    let title_id = format!("{id}-title");
+    let closedby = config.light_dismiss.then_some("any");
+    maud::html! {
+        dialog id=(id) class=(root_class) role="dialog" aria-modal="true"
+            aria-labelledby=(title_id) closedby=[closedby] {
+            div class="autumn-modal__content" {
+                (heading(config.level, Some(title_id.as_str()), "autumn-modal__title", &maud::html! { (title) }))
+                div class="autumn-modal__body" { (body) }
+                @if let Some(footer) = &config.footer {
+                    div class="autumn-modal__footer" { (footer) }
+                }
+            }
+        }
+    }
+}
+
+/// Render a `<button>` that opens the `<dialog>` identified by `dialog_id`.
+///
+/// Uses the native HTML Invoker Commands API (`command="show-modal"` +
+/// `commandfor`) with a `data-modal-open` fallback attribute wired by
+/// `autumn-widgets.js` for browsers that don't yet support it — no
+/// app-authored JavaScript is required either way.
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_web::widgets::modal_trigger;
+///
+/// let html = modal_trigger("Delete", "delete-confirm", Some("btn btn-danger")).into_string();
+/// assert!(html.contains(r#"commandfor="delete-confirm""#));
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn modal_trigger(label: &str, dialog_id: &str, class: Option<&str>) -> maud::Markup {
+    maud::html! {
+        button type="button" class=[class]
+            command="show-modal" commandfor=(dialog_id) data-modal-open=(dialog_id) {
+            (label)
+        }
+    }
+}
+
+/// Render a `<button>` that closes the `<dialog>` identified by `dialog_id`.
+///
+/// Uses the native HTML Invoker Commands API (`command="close"` +
+/// `commandfor`) with a `data-modal-close` fallback attribute wired by
+/// `autumn-widgets.js` for browsers that don't yet support it.
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_web::widgets::modal_close_button;
+///
+/// let html = modal_close_button("Cancel", "delete-confirm", None).into_string();
+/// assert!(html.contains(r#"command="close""#));
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn modal_close_button(label: &str, dialog_id: &str, class: Option<&str>) -> maud::Markup {
+    maud::html! {
+        button type="button" class=[class]
+            command="close" commandfor=(dialog_id) data-modal-close=(dialog_id) {
+            (label)
+        }
+    }
+}
+
+/// Configuration for a [`confirm_action`] confirmation dialog.
+///
+/// Build with [`ConfirmActionConfig::new`] and chain builder methods for
+/// optional overrides. `title` defaults to `"Are you sure?"`, `cancel_label`
+/// to `"Cancel"`, and `danger` (the confirm button's semantic styling) to
+/// `true`.
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_web::widgets::ConfirmActionConfig;
+/// use maud::html;
+///
+/// let config = ConfirmActionConfig::new()
+///     .title("Delete this post?")
+///     .message(html! { p { "This action cannot be undone." } })
+///     .trigger_class("btn btn-danger")
+///     .confirm_class("btn btn-danger");
+/// ```
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone)]
+pub struct ConfirmActionConfig<'a> {
+    /// Dialog title (default `"Are you sure?"`).
+    title: &'a str,
+    /// Optional body content rendered above the confirm/cancel actions.
+    message: Option<maud::Markup>,
+    /// Confirm button label; defaults to the trigger's label when unset.
+    confirm_label: Option<&'a str>,
+    /// Cancel button label (default `"Cancel"`).
+    cancel_label: &'a str,
+    /// `class` attribute for the trigger button that opens the dialog.
+    trigger_class: Option<&'a str>,
+    /// Extra `class`(es) appended to the confirm button, alongside
+    /// `autumn-modal__confirm` and (when [`ConfirmActionConfig::danger`] is
+    /// `true`) `autumn-modal__confirm--danger`.
+    confirm_class: Option<&'a str>,
+    /// Whether the confirm button carries the danger semantic class
+    /// (default `true` — most uses of `confirm_action` are destructive).
+    danger: bool,
+    /// CSRF form field name; defaults to `"_csrf"`. Pass the configured
+    /// [`CsrfFormField`](crate::security::CsrfFormField) value when
+    /// `security.csrf.form_field` is customized.
+    csrf_field: Option<&'a str>,
+    /// Extra attributes rendered on the confirm `<button>`, e.g. `hx-*`, `data-*`.
+    attrs: &'a [(&'a str, &'a str)],
+    /// Heading level for the dialog title, forwarded to [`ModalConfig::level`]
+    /// (default [`HeadingLevel::H2`]).
+    level: HeadingLevel,
+    /// Extra CSS class(es) appended to the dialog's root `autumn-modal`
+    /// element, forwarded to [`ModalConfig::class`].
+    modal_class: Option<&'a str>,
+    /// When `true`, the dialog's backdrop and Escape dismiss it, forwarded
+    /// to [`ModalConfig::light_dismiss`] (default `false`).
+    light_dismiss: bool,
+}
+
+#[cfg(feature = "maud")]
+impl<'a> ConfirmActionConfig<'a> {
+    /// Create a confirm-action configuration with default title ("Are you
+    /// sure?"), cancel label ("Cancel"), and `danger` styling enabled.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            title: "Are you sure?",
+            message: None,
+            confirm_label: None,
+            cancel_label: "Cancel",
+            trigger_class: None,
+            confirm_class: None,
+            danger: true,
+            csrf_field: None,
+            attrs: &[],
+            level: HeadingLevel::H2,
+            modal_class: None,
+            light_dismiss: false,
+        }
+    }
+
+    /// Set the dialog title (default `"Are you sure?"`).
+    #[must_use]
+    pub const fn title(mut self, title: &'a str) -> Self {
+        self.title = title;
+        self
+    }
+
+    /// Set optional body content rendered above the confirm/cancel actions.
+    #[must_use]
+    pub fn message(mut self, message: maud::Markup) -> Self {
+        self.message = Some(message);
+        self
+    }
+
+    /// Override the confirm button's label (defaults to the trigger's label).
+    #[must_use]
+    pub const fn confirm_label(mut self, label: &'a str) -> Self {
+        self.confirm_label = Some(label);
+        self
+    }
+
+    /// Set the cancel button's label (default `"Cancel"`).
+    #[must_use]
+    pub const fn cancel_label(mut self, label: &'a str) -> Self {
+        self.cancel_label = label;
+        self
+    }
+
+    /// Set the `class` attribute for the trigger button that opens the dialog.
+    #[must_use]
+    pub const fn trigger_class(mut self, class: &'a str) -> Self {
+        self.trigger_class = Some(class);
+        self
+    }
+
+    /// Add extra `class`(es) to the confirm button, alongside the built-in
+    /// `autumn-modal__confirm`(`--danger`) classes.
+    #[must_use]
+    pub const fn confirm_class(mut self, class: &'a str) -> Self {
+        self.confirm_class = Some(class);
+        self
+    }
+
+    /// Set whether the confirm button carries the danger semantic class
+    /// (default `true`).
+    #[must_use]
+    pub const fn danger(mut self, danger: bool) -> Self {
+        self.danger = danger;
+        self
+    }
+
+    /// Override the CSRF hidden-input field name (default `"_csrf"`).
+    #[must_use]
+    pub const fn csrf_field(mut self, csrf_field: &'a str) -> Self {
+        self.csrf_field = Some(csrf_field);
+        self
+    }
+
+    /// Set extra attributes rendered on the confirm `<button>` (e.g.
+    /// `hx-*`, `data-*`). Values are HTML-escaped; names must be valid
+    /// attribute names (see [`crate::links::button_to_with`] panics).
+    #[must_use]
+    pub const fn attrs(mut self, attrs: &'a [(&'a str, &'a str)]) -> Self {
+        self.attrs = attrs;
+        self
+    }
+
+    /// Set the heading level for the dialog title (default [`HeadingLevel::H2`]).
+    #[must_use]
+    pub const fn level(mut self, level: HeadingLevel) -> Self {
+        self.level = level;
+        self
+    }
+
+    /// Add extra CSS class(es) to the dialog's root `autumn-modal` element.
+    #[must_use]
+    pub const fn modal_class(mut self, class: &'a str) -> Self {
+        self.modal_class = Some(class);
+        self
+    }
+
+    /// When `true`, the dialog's backdrop and Escape dismiss it (default
+    /// `false` — a destructive confirm isn't accidentally dismissed by a
+    /// stray click). See [`ModalConfig::light_dismiss`] for browser support
+    /// notes on the underlying `closedby="any"` attribute.
+    #[must_use]
+    pub const fn light_dismiss(mut self, light_dismiss: bool) -> Self {
+        self.light_dismiss = light_dismiss;
+        self
+    }
+}
+
+#[cfg(feature = "maud")]
+impl Default for ConfirmActionConfig<'_> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Render a trigger button plus a confirmation `<dialog>` for a
+/// state-changing action.
+///
+/// Opening the dialog requires no app-authored JavaScript
+/// ([`modal_trigger`]/[`modal_close_button`]), and the confirm
+/// button is a [`crate::links::button_to_with`] submit — the correct HTTP
+/// method (via the `_method` override) and CSRF token are always present. A
+/// `<noscript>` fallback renders the same submit button directly (no
+/// confirmation, matching plain HTML forms), so the action stays reachable
+/// with JavaScript disabled — before JS runs, the trigger's `command`
+/// attribute alone can't open the dialog.
+///
+/// This is the framework's answer to `window.confirm()` / htmx's
+/// `hx-confirm`: the whole confirmation UI is server-rendered, so a
+/// [`crate::test::TestClient`] test can assert the dialog, its title, and
+/// the confirm button's action/method/CSRF token — impossible with the
+/// native browser dialog.
+///
+/// # CSS hooks
+///
+/// | Selector | Element |
+/// |---|---|
+/// | `.autumn-confirm` | Root wrapper (trigger + dialog) |
+/// | `.autumn-modal__confirm-form` | The confirm `<form>` |
+/// | `.autumn-modal__confirm` | The confirm `<button>` |
+/// | `.autumn-modal__confirm--danger` | Added to the confirm button when [`ConfirmActionConfig::danger`] is `true` (the default) |
+/// | `.autumn-modal__cancel` | The cancel `<button>` |
+///
+/// # Example
+///
+/// Confirm-delete on a scaffolded resource — a `Post` detail page's delete
+/// button, with zero lines of app-authored JavaScript:
+///
+/// ```rust,ignore
+/// use autumn_web::prelude::*;
+/// use autumn_web::widgets::{ConfirmActionConfig, confirm_action};
+/// use http::Method;
+///
+/// #[get("/posts/{id}")]
+/// async fn show(Path(id): Path<i64>, csrf: CsrfToken, repo: PgPostRepository) -> AutumnResult<Markup> {
+///     let post = repo.find(id).await?;
+///     let action = format!("/posts/{id}");
+///     let config = ConfirmActionConfig::new()
+///         .title("Delete this post?")
+///         .message(html! { p { "This action cannot be undone." } })
+///         .trigger_class("btn btn-danger")
+///         .confirm_class("btn btn-danger");
+///     Ok(html! {
+///         h1 { (post.title) }
+///         (confirm_action("delete-post", "Delete", &action, Method::DELETE, csrf.token(), &config))
+///     })
+/// }
+/// ```
+///
+/// ```rust
+/// use autumn_web::widgets::{ConfirmActionConfig, confirm_action};
+/// use http::Method;
+///
+/// let html = confirm_action(
+///     "delete-post",
+///     "Delete",
+///     "/posts/42",
+///     Method::DELETE,
+///     "tok123",
+///     &ConfirmActionConfig::new()
+///         .title("Delete this post?")
+///         .trigger_class("btn btn-danger")
+///         .confirm_class("btn btn-danger"),
+/// )
+/// .into_string();
+/// assert!(html.contains(r#"<dialog id="delete-post""#));
+/// assert!(html.contains("Delete this post?"));
+/// assert!(html.contains(r#"<form action="/posts/42" method="post""#));
+/// assert!(html.contains(r#"name="_method" value="DELETE""#));
+/// assert!(html.contains(r#"name="_csrf" value="tok123""#));
+/// assert!(html.contains("autumn-modal__confirm--danger"));
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+#[allow(clippy::needless_pass_by_value)]
+pub fn confirm_action(
+    id: &str,
+    trigger_label: &str,
+    action: &str,
+    method: http::Method,
+    csrf_token: &str,
+    config: &ConfirmActionConfig<'_>,
+) -> maud::Markup {
+    let confirm_label = config.confirm_label.unwrap_or(trigger_label);
+
+    let danger_class = config.danger.then_some("autumn-modal__confirm--danger");
+    let confirm_class = merge_class(
+        &merge_class("autumn-modal__confirm", danger_class),
+        config.confirm_class,
+    );
+
+    let mut button_options = crate::links::ButtonToOptions::new()
+        .class(confirm_class.as_str())
+        .form_class("autumn-modal__confirm-form")
+        .attrs(config.attrs);
+    if let Some(field) = config.csrf_field {
+        button_options = button_options.csrf_field(field);
+    }
+
+    let confirm_button = crate::links::button_to_with(
+        confirm_label,
+        action,
+        method.clone(),
+        csrf_token,
+        &button_options,
+    );
+
+    let footer = maud::html! {
+        (modal_close_button(config.cancel_label, id, Some("autumn-modal__cancel")))
+        (confirm_button)
+    };
+
+    let body = config.message.clone().unwrap_or_else(|| maud::html! {});
+    let mut modal_config = ModalConfig::new()
+        .footer(footer)
+        .level(config.level)
+        .light_dismiss(config.light_dismiss);
+    if let Some(class) = config.modal_class {
+        modal_config = modal_config.class(class);
+    }
+
+    // No-JS / no-Invoker-Commands fallback: the trigger above can't open the
+    // dialog without either the native `command`/`commandfor` API or the
+    // `autumn-widgets.js` fallback running, so this plain, always-working
+    // (unconfirmed) submit button keeps the action reachable — the same
+    // fallback pattern `active_search`/`autocomplete_input` use.
+    let mut noscript_options = crate::links::ButtonToOptions::new().attrs(config.attrs);
+    if let Some(class) = config.trigger_class {
+        noscript_options = noscript_options.class(class);
+    }
+    if let Some(field) = config.csrf_field {
+        noscript_options = noscript_options.csrf_field(field);
+    }
+    let noscript_button =
+        crate::links::button_to_with(trigger_label, action, method, csrf_token, &noscript_options);
+
+    maud::html! {
+        div class="autumn-confirm" {
+            (modal_trigger(trigger_label, id, config.trigger_class))
+            noscript { (noscript_button) }
+            (modal(id, config.title, &body, &modal_config))
+        }
+    }
+}
+
+// ── tabs ─────────────────────────────────────────────────────────────────
+
+/// Render a no-JavaScript tabs widget: a `tablist` strip plus its panels,
+/// from an ordered list of `(id, label, panel_body)` tuples.
+///
+/// Switching is pure CSS: each tab is an `<a href="#panel-id">` and each
+/// panel is targeted by `:target` in `input.css`, so URL fragments
+/// (`/settings#security`) select a tab with zero JavaScript. The first
+/// panel additionally carries `autumn-tabs__panel--active` so a panel is
+/// always visible even when no fragment is present, and the active-tab
+/// highlight tracks the actually-`:target`ed panel by position for up to
+/// the first 6 tabs (see `input.css` — ids are arbitrary caller strings, so
+/// this can only be done positionally in a shared stylesheet).
+///
+/// # CSS hooks
+///
+/// | Selector | Element |
+/// |---|---|
+/// | `.autumn-tabs` | Root wrapper |
+/// | `.autumn-tabs__list` | Tab strip (`role="tablist"`) |
+/// | `.autumn-tabs__tab` | Individual tab link |
+/// | `.autumn-tabs__tab--active` | The initially-selected tab |
+/// | `.autumn-tabs__panel` | Individual panel |
+/// | `.autumn-tabs__panel--active` | The initially-visible panel |
+///
+/// # Accessibility
+///
+/// The tab strip carries `role="tablist"`; each tab carries `role="tab"`,
+/// `aria-controls` pointing at its panel's `id`, and `aria-selected`; each
+/// panel carries `role="tabpanel"`, `aria-labelledby` pointing at its tab's
+/// `id`, and `tabindex="0"` so it can receive keyboard focus directly.
+///
+/// `aria-selected` reflects the *server's default selection* (the first
+/// tab) only. The server never sees the URL fragment (fragments aren't
+/// sent in HTTP requests), so it cannot know which tab a client-side
+/// `:target` navigation actually landed on — correcting `aria-selected` on
+/// navigation would require JavaScript, which this widget deliberately has
+/// none of. This is a known, accepted limitation of fragment-based no-JS
+/// tabs: a screen reader always hears the first tab announced as
+/// "selected", even when a different panel is what's visually shown.
+///
+/// # Panel `id`s
+///
+/// A panel's `id` is the raw id from its tuple (not namespaced by `id`) so
+/// it can be targeted directly by a URL fragment. Each tab's own element
+/// `id` is `"{id}-tab-{panel_id}"`. Duplicate panel ids within one call are
+/// rendered as given — the caller is responsible for uniqueness if
+/// fragment targeting of a specific panel matters.
+///
+/// **Rendering more than one `tabs()` widget on the same page:** panel ids
+/// must be unique across the *entire page*, not just within one call —
+/// two different `tabs()` calls that both use a panel id like `"overview"`
+/// will emit two elements with `id="overview"`, which is invalid duplicate-id
+/// HTML and makes `:target`/`aria-controls`/`aria-labelledby` lookups
+/// ambiguous. Prefix panel ids per widget instance (e.g. `"post-overview"`,
+/// `"related-overview"`) if more than one `tabs()` appears on a page.
+///
+/// # Nesting a `tabs()` widget inside another `tabs()` panel
+///
+/// This is supported for panel *visibility*: `input.css` reveals the whole
+/// ancestor chain down to a deep-linked inner panel, so content nested
+/// inside any outer panel (not just the outer widget's default one) is
+/// reachable via its own fragment. The outer widget's *active-tab visual
+/// highlight*, however, can only be synced when the shown outer panel is
+/// itself the direct `:target` — CSS forbids nesting `:has()` inside
+/// another `:has()`, so a panel that's shown only because it *contains* a
+/// nested target (rather than being the target itself) can't be
+/// attributed to a specific outer tab position. In that case no outer tab
+/// is highlighted as active (a graceful degrade — no tab looks active,
+/// rather than the wrong one looking active).
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_web::widgets::tabs;
+/// use maud::html;
+///
+/// let panels = [
+///     ("profile", "Profile", html! { p { "Profile settings" } }),
+///     ("security", "Security", html! { p { "Security settings" } }),
+///     ("billing", "Billing", html! { p { "Billing settings" } }),
+/// ];
+/// let widget = tabs("settings-tabs", &panels).into_string();
+/// assert!(widget.contains(r#"role="tablist""#));
+/// assert!(widget.contains(r#"aria-controls="security""#));
+/// assert!(widget.contains(r##"href="#billing""##));
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn tabs(id: &str, panels: &[(&str, &str, maud::Markup)]) -> maud::Markup {
+    let tab_ids: Vec<String> = panels
+        .iter()
+        .map(|(panel_id, _, _)| format!("{id}-tab-{panel_id}"))
+        .collect();
+    maud::html! {
+        div id=(id) class="autumn-tabs" {
+            div class="autumn-tabs__list" role="tablist" {
+                @for (i, (panel_id, label, _)) in panels.iter().enumerate() {
+                    @let tab_class = merge_class(
+                        "autumn-tabs__tab",
+                        (i == 0).then_some("autumn-tabs__tab--active"),
+                    );
+                    a id=(tab_ids[i]) class=(tab_class) role="tab" href=(format!("#{panel_id}"))
+                        aria-controls=(panel_id) aria-selected=(if i == 0 { "true" } else { "false" }) {
+                        (label)
+                    }
+                }
+            }
+            @for (i, (panel_id, _, body)) in panels.iter().enumerate() {
+                @let panel_class = merge_class(
+                    "autumn-tabs__panel",
+                    (i == 0).then_some("autumn-tabs__panel--active"),
+                );
+                section id=(panel_id) class=(panel_class) role="tabpanel"
+                    aria-labelledby=(tab_ids[i]) tabindex="0" {
+                    (body)
                 }
             }
         }
@@ -2179,6 +3276,26 @@ mod tests {
     }
 
     #[test]
+    fn autocomplete_noscript_select_marks_initial_value_selected() {
+        // ID-mode (default, non-free-text): a prior selection seeded via
+        // `initial_value` must survive a no-JS resubmission too, not just the
+        // JS-driven hidden-input path.
+        let opts: &[(&str, &str)] = &[("1", "Alpha"), ("2", "Beta")];
+        let config = AutocompleteConfig::new("/ac", "value_field")
+            .fallback_options(opts)
+            .initial_value("2");
+        let html = autocomplete_input("x", "Label", &config).into_string();
+        assert!(
+            html.contains(r#"value="2" selected"#),
+            "the option matching initial_value must be marked selected: {html}"
+        );
+        assert!(
+            !html.contains(r#"value="1" selected"#),
+            "only the matching option should be selected: {html}"
+        );
+    }
+
+    #[test]
     fn autocomplete_has_hx_get() {
         let config = AutocompleteConfig::new("/ac", "value_field");
         let html = autocomplete_input("x", "Label", &config).into_string();
@@ -2534,6 +3651,233 @@ mod tests {
         let html = nav_link("/somewhere/else", "/admin/posts", "Posts").into_string();
         assert!(html.contains(r#"href="/admin/posts""#), "{html}");
         assert!(html.contains(">Posts<"), "{html}");
+    }
+
+    // ── nav_bar ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn nav_bar_renders_single_nav_landmark_with_default_label() {
+        let config = NavBarConfig::new();
+        let html = nav_bar("/", &config).into_string();
+        assert_eq!(html.matches("<nav").count(), 1, "{html}");
+        assert!(html.contains(r#"aria-label="Main""#), "{html}");
+        assert!(html.contains(r#"class="autumn-nav""#), "{html}");
+        assert!(html.contains("data-autumn-nav"), "{html}");
+    }
+
+    #[test]
+    fn nav_bar_custom_aria_label() {
+        let config = NavBarConfig::new().aria_label("Admin navigation");
+        let html = nav_bar("/", &config).into_string();
+        assert!(html.contains(r#"aria-label="Admin navigation""#), "{html}");
+    }
+
+    #[test]
+    fn nav_bar_brand_text_renders_brand_link() {
+        let config = NavBarConfig::new().brand("Acme", "/");
+        let html = nav_bar("/", &config).into_string();
+        assert!(
+            html.contains(r#"<a class="autumn-nav__brand" href="/">Acme</a>"#),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn nav_bar_brand_html_without_href_renders_span() {
+        let config = NavBarConfig::new().brand_html(maud::html! { "Acme" }, None);
+        let html = nav_bar("/", &config).into_string();
+        assert!(
+            html.contains(r#"<span class="autumn-nav__brand">Acme</span>"#),
+            "{html}"
+        );
+        assert!(!html.contains("<a class=\"autumn-nav__brand\""), "{html}");
+    }
+
+    #[test]
+    fn nav_bar_without_brand_omits_brand_element() {
+        let config = NavBarConfig::new();
+        let html = nav_bar("/", &config).into_string();
+        assert!(!html.contains("autumn-nav__brand"), "{html}");
+    }
+
+    #[test]
+    fn nav_bar_active_link_gets_aria_current() {
+        let config = NavBarConfig::new().item(NavItem::link("/posts", "Posts"));
+        let html = nav_bar("/posts", &config).into_string();
+        assert_eq!(html.matches(r#"aria-current="page""#).count(), 1, "{html}");
+        assert!(html.contains(r#"class="active""#), "{html}");
+    }
+
+    #[test]
+    fn nav_bar_prefix_match_mode_activates_on_subpath() {
+        let config = NavBarConfig::new().item(NavItem::link_matched(
+            "/posts",
+            "Posts",
+            NavLinkMatch::Prefix,
+        ));
+        let html = nav_bar("/posts/3/edit", &config).into_string();
+        assert!(html.contains(r#"aria-current="page""#), "{html}");
+    }
+
+    #[test]
+    fn nav_bar_plain_link_never_active() {
+        let config = NavBarConfig::new().item(NavItem::plain_link("/actuator/ui", "Actuator"));
+        let html = nav_bar("/actuator/ui", &config).into_string();
+        assert!(!html.contains("aria-current"), "{html}");
+        assert!(!html.contains(r#"class="active""#), "{html}");
+        assert!(html.contains(r#"href="/actuator/ui""#), "{html}");
+    }
+
+    #[test]
+    fn nav_bar_section_renders_label_li() {
+        let config = NavBarConfig::new().item(NavItem::section("System"));
+        let html = nav_bar("/", &config).into_string();
+        assert!(
+            html.contains(r#"<li class="autumn-nav__section">System</li>"#),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn nav_bar_menu_renders_button_controlling_ul() {
+        let config = NavBarConfig::new().item(NavItem::menu(
+            NavMenu::new("Products").link("/widgets", "Widgets"),
+        ));
+        let html = nav_bar("/", &config).into_string();
+        assert!(html.contains(r#"type="button""#), "{html}");
+        assert!(html.contains("data-nav-menu-toggle"), "{html}");
+        assert!(html.contains(r#"aria-expanded="true""#), "{html}");
+        assert!(
+            html.contains(r#"aria-controls="autumn-nav-menu-1""#),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"<ul id="autumn-nav-menu-1" class="autumn-nav__menu""#),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn nav_bar_menu_sub_link_active_gets_aria_current() {
+        let config = NavBarConfig::new().item(NavItem::menu(
+            NavMenu::new("Products").link("/widgets", "Widgets"),
+        ));
+        let html = nav_bar("/widgets", &config).into_string();
+        assert!(html.contains(r#"aria-current="page""#), "{html}");
+    }
+
+    #[test]
+    fn nav_bar_menu_ids_unique_and_respect_custom_id() {
+        let config = NavBarConfig::new()
+            .item(NavItem::menu(NavMenu::new("A").link("/a", "A")))
+            .item(NavItem::menu(NavMenu::new("B").link("/b", "B")))
+            .id("top");
+        let html = nav_bar("/", &config).into_string();
+        assert!(html.contains(r#"aria-controls="top-menu-1""#), "{html}");
+        assert!(html.contains(r#"id="top-menu-1""#), "{html}");
+        assert!(html.contains(r#"aria-controls="top-menu-2""#), "{html}");
+        assert!(html.contains(r#"id="top-menu-2""#), "{html}");
+        assert!(html.contains(r#"id="top-collapse""#), "{html}");
+    }
+
+    #[test]
+    fn nav_bar_toggle_button_is_hidden_with_accessible_name() {
+        let config = NavBarConfig::new();
+        let html = nav_bar("/", &config).into_string();
+        assert!(html.contains("data-nav-toggle"), "{html}");
+        assert!(html.contains("hidden"), "{html}");
+        assert!(html.contains(r#"aria-expanded="false""#), "{html}");
+        assert!(
+            html.contains(r#"aria-controls="autumn-nav-collapse""#),
+            "{html}"
+        );
+        assert!(html.contains(">Menu<"), "{html}");
+
+        let config = NavBarConfig::new().toggle_label("Navigation");
+        let html = nav_bar("/", &config).into_string();
+        assert!(html.contains(">Navigation<"), "{html}");
+    }
+
+    #[test]
+    fn nav_bar_trailing_slot_renders_separate_list() {
+        let config = NavBarConfig::new().trailing(NavItem::plain_link("/login", "Log in"));
+        let html = nav_bar("/", &config).into_string();
+        assert!(html.contains("autumn-nav__items--trailing"), "{html}");
+        assert!(html.contains(r#"href="/login""#), "{html}");
+
+        let config = NavBarConfig::new();
+        let html = nav_bar("/", &config).into_string();
+        assert!(!html.contains("autumn-nav__items--trailing"), "{html}");
+    }
+
+    #[test]
+    fn nav_bar_sidebar_layout_adds_modifier() {
+        let config = NavBarConfig::new().layout(NavBarLayout::Sidebar);
+        let html = nav_bar("/", &config).into_string();
+        assert!(html.contains("autumn-nav--sidebar"), "{html}");
+
+        let config = NavBarConfig::new();
+        let html = nav_bar("/", &config).into_string();
+        assert!(!html.contains("autumn-nav--sidebar"), "{html}");
+    }
+
+    #[test]
+    fn nav_bar_class_merges_extra() {
+        let config = NavBarConfig::new().class("admin-sidebar");
+        let html = nav_bar("/", &config).into_string();
+        assert!(
+            html.contains(r#"class="autumn-nav admin-sidebar""#),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn nav_item_constructors_accept_owned_strings_without_extra_copy() {
+        // href/label should accept `impl Into<String>` (like Cta::primary),
+        // not force callers with an already-owned String (e.g. from
+        // format!()) through an extra borrow-then-reallocate round trip.
+        let post_id = 3;
+        let href: String = format!("/posts/{post_id}");
+        let label: String = "Posts".to_string();
+        let config = NavBarConfig::new()
+            .item(NavItem::link(href, label))
+            .item(NavItem::plain_link("/x".to_string(), "X".to_string()))
+            .item(NavItem::section("System".to_string()))
+            .item(NavItem::menu(
+                NavMenu::new("Products".to_string())
+                    .link(format!("/widgets/{post_id}"), "Widgets".to_string())
+                    .plain_link("/external".to_string(), "External".to_string()),
+            ));
+        let html = nav_bar("/posts/3", &config).into_string();
+        assert!(html.contains(r#"href="/posts/3""#), "{html}");
+        assert!(html.contains(r#"aria-current="page""#), "{html}");
+    }
+
+    #[test]
+    fn nav_bar_escapes_labels() {
+        let config = NavBarConfig::new()
+            .brand("<script>alert(1)</script>", "/")
+            .item(NavItem::link("/posts", "<script>alert(2)</script>"))
+            .item(NavItem::menu(
+                NavMenu::new("<script>alert(3)</script>").link("/x", "<script>alert(4)</script>"),
+            ));
+        let html = nav_bar("/", &config).into_string();
+        assert!(!html.contains("<script>"), "{html}");
+        assert!(html.contains("&lt;script&gt;"), "{html}");
+    }
+
+    #[test]
+    fn nav_bar_emits_no_inline_style_or_script() {
+        let config = NavBarConfig::new()
+            .brand("Acme", "/")
+            .item(NavItem::link("/", "Home"))
+            .item(NavItem::menu(
+                NavMenu::new("Products").link("/widgets", "Widgets"),
+            ))
+            .trailing(NavItem::plain_link("/login", "Log in"));
+        let html = nav_bar("/", &config).into_string();
+        assert!(!html.contains("style="), "{html}");
+        assert!(!html.contains("<script"), "{html}");
     }
 
     // ── property_list ──────────────────────────────────────────────────

@@ -89,14 +89,19 @@ impl AdminRegistry {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use crate::traits::*;
     use serde_json::Value;
 
-    struct DummyModel {
-        slug: &'static str,
-        name: &'static str,
+    /// Minimal no-op [`AdminModel`] fixture shared by `registry`'s and
+    /// `templates`'s test suites — reused rather than duplicated so its
+    /// mock behavior can't silently drift between them. `pub` (not
+    /// `pub(crate)`) because `registry` itself is a private module, so
+    /// this is already crate-scoped in effect.
+    pub struct DummyModel {
+        pub slug: &'static str,
+        pub name: &'static str,
     }
 
     impl AdminModel for DummyModel {

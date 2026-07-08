@@ -57,6 +57,9 @@ pub use crate::canary::CanaryRoute;
 /// Database connection extractor.
 #[cfg(feature = "db")]
 pub use crate::db::Db;
+/// Transaction isolation levels and retry options for [`crate::db::Db::tx_with`].
+#[cfg(feature = "db")]
+pub use crate::db::{IsolationLevel, TxOptions};
 /// Typed domain event bus publisher extractor. The `Event` trait it works with
 /// lives at [`crate::events::Event`] (kept out of the prelude to avoid clashing
 /// with [`crate::sse::Event`]).
@@ -94,8 +97,9 @@ pub use crate::live::LiveFragment;
 /// Transactional email types and extractor.
 #[cfg(feature = "mail")]
 pub use crate::mail::{
-    Mail, MailConfig, MailDeliveryQueue, MailDeliveryQueueHandle, MailError, MailPreview,
-    MailPreviewError, MailPreviewRegistry, MailTransport, Mailer, SmtpConfig, TlsMode, Transport,
+    Mail, MailAttachment, MailConfig, MailDeliveryQueue, MailDeliveryQueueHandle, MailError,
+    MailPreview, MailPreviewError, MailPreviewRegistry, MailTransport, Mailer, SmtpConfig, TlsMode,
+    Transport,
 };
 #[cfg(all(feature = "presence", feature = "maud"))]
 pub use crate::presence_badge;
@@ -126,6 +130,8 @@ pub use crate::{Presence, PresenceEntry, PresenceEvent, PresenceHandle};
 pub use axum::extract::State;
 /// Trait for types that can be converted into an HTTP response.
 pub use axum::response::IntoResponse;
+/// HTTP methods — pass to [`crate::links::button_to`]/[`crate::links::button_to_with`].
+pub use http::Method;
 /// HTTP status codes.
 pub use http::StatusCode;
 
@@ -177,11 +183,35 @@ pub use crate::form::{Changeset, ChangesetForm, IntoChangeset};
 /// See [`crate::widgets`] for the full API.
 #[cfg(feature = "maud")]
 pub use crate::widgets::{
-    ActiveSearchConfig, AutocompleteConfig, CardConfig, Column, Crumb, Cta, CtaStyle,
-    DataTableConfig, HeadingLevel, HeroConfig, NavLinkMatch, SearchMethod, SortDir, active_search,
+    ActiveSearchConfig, AutocompleteConfig, CardConfig, Column, ConfirmActionConfig, Crumb, Cta,
+    CtaStyle, DataTableConfig, HeadingLevel, HeroConfig, ModalConfig, NavBarConfig, NavBarLayout,
+    NavItem, NavLinkMatch, NavMenu, SearchMethod, SortDir, active_search,
     active_search_empty_state, active_search_input, active_search_results,
     autocomplete_empty_state, autocomplete_input, autocomplete_option, breadcrumb, card,
-    data_table, hero, nav_link, nav_link_matched, property_list, stat_card,
+    confirm_action, data_table, hero, modal, modal_close_button, modal_trigger, nav_bar, nav_link,
+    nav_link_matched, property_list, stat_card, tabs,
+};
+
+// ── Widget stories ───────────────────────────────────────────────
+/// Widget story macro for the `/_stories` gallery: `story!{ "Group", "Name", { ... } }`.
+#[cfg(feature = "maud")]
+pub use crate::stories::story;
+/// Widget story gallery types (registered via `AppBuilder::with_story_gallery`)
+/// and the error returned by `Story::render`.
+///
+/// See [`crate::stories`] for the full API.
+#[cfg(feature = "maud")]
+pub use crate::stories::{Story, StoryGallery, StoryRegistry, StoryRenderError};
+
+// ── Link helpers ─────────────────────────────────────────────────
+/// Safe, method-aware `<a>`/`<form>` link helpers: [`crate::links::link_to`]
+/// for GET navigation and [`crate::links::button_to`] for CSRF-protected,
+/// method-override action buttons.
+///
+/// See [`crate::links`] for the full API.
+#[cfg(feature = "maud")]
+pub use crate::links::{
+    ButtonToOptions, LinkToOptions, button_to, button_to_with, link_to, link_to_with,
 };
 
 // ── Hooks ───────────────────────────────────────────────────────

@@ -220,6 +220,8 @@ pub struct SentMail {
     pub html: Option<String>,
     /// Plain-text body, if provided.
     pub text: Option<String>,
+    /// Files attached to this message, in declared order.
+    pub attachments: Vec<crate::mail::MailAttachment>,
 }
 
 #[cfg(feature = "mail")]
@@ -232,6 +234,7 @@ impl From<&crate::mail::Mail> for SentMail {
             subject: m.subject.clone(),
             html: m.html.clone(),
             text: m.text.clone(),
+            attachments: m.attachments.clone(),
         }
     }
 }

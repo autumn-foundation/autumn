@@ -545,6 +545,11 @@ with the default per-function Moka caches.
 The `memory` default produces a startup warning in the `prod` profile — the
 same pattern as sessions and file storage.
 
+For read-through fills that coalesce concurrent misses into a single
+recompute (in-process single-flight, plus an opt-in distributed fill lock and
+stale-while-revalidate on the Redis backend), see [Cache Stampede
+Protection](cache-stampede.md).
+
 ## Concurrent Writes
 
 ### The lost-update problem
