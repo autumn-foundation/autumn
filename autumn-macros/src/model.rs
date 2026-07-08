@@ -792,7 +792,7 @@ fn emit_association_items(
                                 __ids.sort_unstable();
                                 __ids.dedup();
                                 let mut conn = self.__autumn_m2m_write_conn().await?;
-                                conn.transaction::<(), ::autumn_web::AutumnError, _>(|conn| {
+                                ::autumn_web::__private::scoped_transaction::<(), ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                                     async move {
                                         ::autumn_web::reexports::diesel::delete(
                                             #join_mod_ident::#join_table_ident::table.filter(

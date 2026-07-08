@@ -6368,27 +6368,23 @@ async fn pg_claim_next_job(
 ) -> Option<PgJobRow> {
     use diesel::OptionalExtension as _;
     use diesel_async::{AsyncConnection as _, RunQueryDsl as _};
-    use scoped_futures::ScopedFutureExt as _;
 
     let mut conn = pool.get().await.ok()?;
     let sql = pg_claim_sql();
     let queue_order = queue_order.to_vec();
     let claimed = if serialize_claims {
         let worker_id = worker_id.to_owned();
-        conn.transaction::<Option<PgJobRow>, diesel::result::Error, _>(move |conn| {
-            async move {
-                diesel::sql_query("SELECT pg_advisory_xact_lock($1)")
-                    .bind::<diesel::sql_types::BigInt, _>(PG_CLAIM_ADVISORY_LOCK_KEY)
-                    .execute(conn)
-                    .await?;
-                diesel::sql_query(sql)
-                    .bind::<diesel::sql_types::Text, _>(worker_id)
-                    .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queue_order)
-                    .get_result::<PgJobRow>(conn)
-                    .await
-                    .optional()
-            }
-            .scope_boxed()
+        conn.transaction::<Option<PgJobRow>, diesel::result::Error, _>(async move |conn| {
+            diesel::sql_query("SELECT pg_advisory_xact_lock($1)")
+                .bind::<diesel::sql_types::BigInt, _>(PG_CLAIM_ADVISORY_LOCK_KEY)
+                .execute(conn)
+                .await?;
+            diesel::sql_query(sql)
+                .bind::<diesel::sql_types::Text, _>(worker_id)
+                .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queue_order)
+                .get_result::<PgJobRow>(conn)
+                .await
+                .optional()
         })
         .await
     } else {

@@ -85,7 +85,15 @@ by hand in the generated migration's `up.sql`. On trunk-dev, use `:unique` /
 build a `Changeset` and, on a rejected submission, respond **422** and
 re-render the form with all submitted values preserved and per-field inline
 errors — do not "fix" this by adding a redirect-to-error-page. The published
-0.5.0 scaffold returns a 400 error page instead.
+0.5.0 scaffold returns a 400 error page instead. Trunk-dev create/edit views
+(and both 422 branches) render through one shared `{snake}_form_for` helper —
+a single `autumn_web::form::form_for` call driven by the `#[model]`-derived
+`FormModel` (enum columns get a `Select` override with their variants,
+`decimal` columns pin the browser `step` to the declared scale, `references`
+columns render a `<select>` of the referenced table's ids when that model
+exists in the project, attachment columns append a file input at the end of
+the form) — adding a column needs no view edits. `--live-validation` keeps the
+per-field htmx emission instead.
 
 ## Execution flow
 

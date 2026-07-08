@@ -144,6 +144,44 @@ app skeleton, substitutes the candidate crate set (by path, simulating a crates.
 install), and verifies it compiles. This proves the published `autumn-web` is
 usable from a fresh project without workspace path dependencies.
 
+### 7 · Published Quickstart Gate (`quickstart-gate` workflow, post-publish)
+
+Workflow: `.github/workflows/quickstart-gate.yml` · Script: `scripts/check-quickstart.sh`
+
+Runs the README quickstart verbatim against the crates **published on
+crates.io** — `cargo install autumn-cli`, `autumn new`, `autumn setup`, build,
+serve, first 200 from `GET /`, then the README's scaffold path
+(`autumn generate scaffold Post ...` → build → `autumn migrate` → `GET /posts`
+responds) — and records the install→first-200 funnel time in the job summary.
+
+Unlike gates 1–6, this one cannot run against the release candidate before
+publication: it installs from crates.io, so it can only validate crates that
+are actually there. It is therefore a **post-publish, pre-announce** gate:
+
+- [ ] After `cargo publish` completes for the release candidate, trigger the
+  `Quickstart Gate` workflow manually (Actions → Quickstart Gate → *Run
+  workflow*) with the `cli-version` input set to the candidate version
+  (e.g. `0.6.0`), or via the CLI:
+
+  ```bash
+  gh workflow run quickstart-gate.yml -f cli-version=X.Y.Z
+  ```
+
+- [ ] The dispatched run must be **green against the release candidate**
+  before the release is announced. A red run is a release blocker for both
+  `autumn-web` and `autumn-cli`: fix (or yank and re-publish), re-dispatch,
+  and only announce once the gate passes.
+- [ ] Confirm the README quickstart's pinned `cargo install autumn-cli
+  --version` matches the version just published — the scheduled/push runs of
+  the gate install exactly what the README says, so a stale pin turns the
+  gate red for every new user.
+
+The gate also runs on every push to `trunk-dev` and on a daily schedule. Those
+runs validate the README against the *currently published* crates (never the
+pushed code — the workspace `[patch.crates-io]` override means no other CI job
+sees the published `autumn-web`), so a red push run means new users are broken
+today, not that the commit is bad.
+
 ## Version Alignment
 
 - [ ] `Cargo.toml` workspace `version` and `rust-version` match the README
@@ -205,6 +243,12 @@ Before pushing the release tag:
    cargo publish -p autumn-storage-s3
    cargo publish -p autumn-cache-redis
    ```
+7. **Gate the published quickstart** (see
+   [Published Quickstart Gate](#7--published-quickstart-gate-quickstart-gate-workflow-post-publish)):
+   ```bash
+   gh workflow run quickstart-gate.yml -f cli-version=X.Y.Z
+   ```
+   The dispatched run must be green before the release is announced.
 
 > Publishing to crates.io is a manual step; no crates.io credentials are stored
 > in CI. See the Out of Scope section in [issue #594](https://github.com/madmax983/autumn/issues/594).
