@@ -384,6 +384,72 @@ async fn gc_horizon_forces_full_resync_preserving_pending() {
     assert!(rows.iter().any(|r| r.pk == "b-note" && !r.deleted));
 }
 
+/// A device offline past a tombstone GC still holds a pending edit of the
+/// deleted row — and the engine pushes pending changes BEFORE the pull that
+/// would demand a full resync. The server must route that edit through the
+/// resolver against a synthesized tombstone (deletion wins under LWW), the
+/// engine must converge on the delete without losing other data, and the
+/// pass after that must be steady (no resync loop).
+#[tokio::test]
+async fn offline_edit_of_a_gcd_row_does_not_resurrect_it() {
+    let backend = Arc::new(MemorySyncBackend::new());
+    let (url, _srv) = start_sync_server(backend.clone(), Arc::new(LwwResolver)).await;
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    let store_a = open_store(&dir, "a.db");
+    let engine_a = engine_for(&store_a, &url);
+    let store_b = open_store(&dir, "b.db");
+    let engine_b = engine_for(&store_b, &url);
+
+    // A creates "doomed" and "keep"; B syncs both.
+    store_a
+        .put("notes", "doomed", &note("original"))
+        .expect("put");
+    store_a.put("notes", "keep", &note("kept")).expect("put");
+    engine_a.sync_once().await.expect("a sync 1");
+    engine_b.sync_once().await.expect("b sync 1");
+
+    // B goes offline and edits "doomed" (pending, based on its synced
+    // version). Meanwhile A deletes it and the server GCs the tombstone.
+    store_b
+        .put("notes", "doomed", &note("offline edit"))
+        .expect("b offline edit");
+    store_a.delete("notes", "doomed").expect("a delete");
+    engine_a.sync_once().await.expect("a sync 2");
+    let removed = backend
+        .gc_tombstones(backend.latest_version().expect("latest"))
+        .expect("gc");
+    assert_eq!(removed, 1, "the tombstone was physically dropped");
+
+    // B reconnects. The push happens first: the server must NOT recreate
+    // the row; B converges on the deletion (and full-resyncs its stale
+    // cursor afterwards).
+    engine_b.sync_once().await.expect("b sync 2");
+    let listed: Vec<(String, Note)> = store_b.list("notes").expect("b list");
+    let pks: Vec<&str> = listed.iter().map(|(pk, _)| pk.as_str()).collect();
+    assert!(
+        !pks.contains(&"doomed"),
+        "the GC'd deletion must win over the offline edit: {pks:?}"
+    );
+    assert!(pks.contains(&"keep"), "unrelated rows survive: {pks:?}");
+    assert_eq!(
+        store_b.pending_count().expect("b pending"),
+        0,
+        "the pending edit must be settled (resolved), not lost silently or stuck"
+    );
+    assert!(
+        backend_rows(backend.as_ref())
+            .iter()
+            .all(|r| r.pk != "doomed" || r.deleted),
+        "the server must not hold a live resurrected row"
+    );
+
+    // Steady state: the next pass neither resyncs nor re-pushes anything.
+    let next = engine_b.sync_once().await.expect("b steady");
+    assert!(!next.full_resync, "the stale-push handling must not loop");
+    assert_eq!(next.pushed, 0);
+}
+
 /// Regression for the "synced rows but cursor 0" crash state: a crash
 /// between materializing pulled rows and persisting the cursor (possible
 /// before the two became one transaction, or via a store written by an

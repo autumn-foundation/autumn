@@ -255,6 +255,16 @@ Two details make the horizon check safe in the corner cases:
 Pair `gc_tombstones` with `gc_applied` (see §3) so the dedup table is
 bounded too.
 
+One more corner the horizon guards: a device offline past a GC can still
+**push** an edit based on the deleted row's old version (pushes run before
+the pull that would demand a resync). The row is gone and its tombstone
+GC'd, but the pre-horizon `base_version` claim dates the edit — the server
+routes it through the conflict resolver against a **synthesized tombstone**
+instead of silently recreating the row. Under the default LWW resolver the
+deletion wins (the pusher converges on the delete via its `Resolved`
+outcome); a custom resolver can knowingly recreate. Genuinely new inserts
+(`base_version = 0`) are unaffected.
+
 ## 6. What the generator emits
 
 Run it on an app that already has (or alongside) the mobile scaffold:

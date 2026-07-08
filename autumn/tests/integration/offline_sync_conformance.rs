@@ -363,6 +363,74 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
         response.outcomes[0]
     );
 
+    // ── Offline-past-GC pushes cannot silently resurrect deleted rows ────
+    // n2 was deleted and its tombstone GC'd. A device offline since before
+    // the GC can still push an edit of n2 based on its old version — and
+    // pushes run BEFORE the pull that would demand a full resync. The row
+    // is absent server-side, but the pre-horizon base_version claim dates
+    // the edit: it must conflict against a synthesized tombstone (deletion
+    // wins under LWW — the synthesized stamp is the server's "now", newer
+    // than any client edit), never clean-apply.
+    let latest_before_stale = backend.latest_version().expect("latest");
+    let mut stale_edit = change(
+        "00000000-0000-4000-8000-00000000000c",
+        "n2",
+        Op::Upsert,
+        Some(json!({"title": "resurrected?"})),
+    );
+    stale_edit.base_version = versions[1]; // n2's pre-delete version (< horizon)
+    stale_edit.updated_at = Utc::now() - Duration::seconds(3600);
+    let response = backend
+        .apply_push(&push("device-offline", vec![stale_edit]), &resolver)
+        .expect("stale push");
+    let ChangeOutcome::Resolved { row } = &response.outcomes[0] else {
+        panic!(
+            "an offline-past-GC edit must resolve, not clean-apply, got {:?}",
+            response.outcomes[0]
+        );
+    };
+    assert!(
+        row.deleted && row.payload.is_none(),
+        "the GC'd deletion must win under LWW, got {row:?}"
+    );
+    assert!(
+        row.version > latest_before_stale,
+        "the resolution gets a fresh version so every device converges"
+    );
+    let PullResponse::Ok { rows, .. } = backend
+        .pull_since(latest_before_stale, 100, latest_before_stale)
+        .expect("pull after stale push")
+    else {
+        panic!("an at-horizon cursor never requires a resync");
+    };
+    assert!(
+        rows.iter().all(|r| r.pk != "n2" || r.deleted),
+        "n2 must not come back as a live row: {rows:?}"
+    );
+
+    // A genuinely NEW insert from the same offline device (base_version = 0,
+    // pk the server never saw) must still clean-apply — the rejection keys
+    // on the base-version claim, not on mere absence.
+    let response = backend
+        .apply_push(
+            &push(
+                "device-offline",
+                vec![change(
+                    "00000000-0000-4000-8000-00000000000d",
+                    "brand-new",
+                    Op::Upsert,
+                    Some(json!({"title": "fresh insert"})),
+                )],
+            ),
+            &resolver,
+        )
+        .expect("fresh insert push");
+    assert!(
+        matches!(response.outcomes[0], ChangeOutcome::Applied { .. }),
+        "a base-0 insert must stay a clean apply, got {:?}",
+        response.outcomes[0]
+    );
+
     // ── Dedup-record GC bounds the applied table ──────────────────────────
     // Every applied change so far left one dedup record; an age-based GC
     // with a future cutoff removes them all, and re-running is a no-op.
