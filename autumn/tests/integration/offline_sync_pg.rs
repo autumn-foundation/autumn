@@ -1,8 +1,20 @@
 //! Postgres conformance for `PgSyncBackend` — the same shared suite the
 //! in-memory backend passes, against real shadow tables.
 //!
-//! **Requires Docker** to be running (CI-only, like the other
-//! testcontainers-backed suites).
+//! **Requires Docker** to be running. CI runs it in the Docker-dependent
+//! step of the Linux test job (`-- --ignored offline_sync_pg`); it is also
+//! runnable manually wherever Docker is available.
+//!
+//! Note on concurrency: this suite is a sequential script, so it cannot
+//! observe the two races `apply_push`'s `pg_advisory_xact_lock` guards
+//! against — (1) sequence versions committing out of order, letting a
+//! READ COMMITTED pull skip an in-flight lower version forever, and
+//! (2) concurrent first-inserts of one pk bypassing the conflict resolver
+//! because `SELECT … FOR UPDATE` locks nothing for absent rows. Those
+//! guarantees are encoded (and documented) at the lock site in
+//! `autumn/src/sync/server.rs`; the suite still pins the *sequential*
+//! semantics both races would corrupt (clean version prefixes on pull and
+//! resolver engagement for base-version-0 pushes onto existing pks).
 
 #![cfg(feature = "offline-sync")]
 

@@ -252,6 +252,28 @@ fn current_server_version(
     Ok(row.map_or(0, |record| record.server_version))
 }
 
+/// Record a server-acknowledged version for `(collection, pk)` without
+/// touching the payload. Guarded (`server_version < ?`) so a stale ack —
+/// e.g. an `AlreadyApplied` retry answered after a newer pull already
+/// advanced the row — can never regress the recorded version.
+fn record_acked_version(
+    conn: &mut SqliteConnection,
+    collection: &str,
+    pk: &str,
+    version: Version,
+) -> Result<(), diesel::result::Error> {
+    sql_query(
+        "UPDATE autumn_sync_rows SET server_version = ? \
+         WHERE collection = ? AND pk = ? AND server_version < ?",
+    )
+    .bind::<BigInt, _>(version)
+    .bind::<Text, _>(collection)
+    .bind::<Text, _>(pk)
+    .bind::<BigInt, _>(version)
+    .execute(conn)
+    .map(|_| ())
+}
+
 fn has_pending(
     conn: &mut SqliteConnection,
     collection: &str,
@@ -275,8 +297,17 @@ fn has_pending(
 /// replay it to the server later. Deletes are recorded as tombstone rows so
 /// they replicate too.
 ///
-/// Cheap to clone: all clones share one WAL-mode connection behind a mutex,
-/// which serializes concurrent in-process writers.
+/// # Concurrency
+///
+/// Cheap to clone: all clones share one WAL-mode connection behind a
+/// mutex, which serializes concurrent writers *within* that instance —
+/// **prefer opening the store once and cloning it** (e.g. from a
+/// `OnceLock`) over calling [`Self::open`] per use. Separate
+/// [`Self::open`] calls on the same path are still safe: each write runs
+/// in a `BEGIN IMMEDIATE` transaction, so cross-connection writers queue
+/// on the 5 s busy timeout instead of failing mid-transaction with
+/// `SQLITE_BUSY_SNAPSHOT`, but every `open` pays connection + schema
+/// setup and adds lock contention.
 #[derive(Clone)]
 pub struct SyncStore {
     conn: Arc<Mutex<SqliteConnection>>,
@@ -313,22 +344,33 @@ impl SyncStore {
             .ok_or_else(|| SyncError::Store("store path is not valid UTF-8".into()))?;
 
         let mut conn = SqliteConnection::establish(path_str).map_err(store_err)?;
+        // busy_timeout FIRST: concurrent opens of the same file contend on
+        // the journal-mode switch and the schema DDL below, and must wait
+        // rather than fail with "database is locked".
         conn.batch_execute(
-            "PRAGMA journal_mode = WAL; \
-             PRAGMA busy_timeout = 5000; \
+            "PRAGMA busy_timeout = 5000; \
+             PRAGMA journal_mode = WAL; \
              PRAGMA synchronous = NORMAL; \
              PRAGMA foreign_keys = ON;",
         )
         .map_err(store_err)?;
         conn.batch_execute(SCHEMA_DDL).map_err(store_err)?;
 
-        let device_id = if let Some(id) = get_state(&mut conn, STATE_DEVICE_ID)? {
-            id
-        } else {
-            let id = uuid::Uuid::new_v4().to_string();
-            set_state(&mut conn, STATE_DEVICE_ID, &id).map_err(store_err)?;
-            id
-        };
+        // Race-safe first-open id generation: concurrent opens of a fresh
+        // file each offer a candidate id, exactly one INSERT wins
+        // (`DO NOTHING` on conflict), and every opener reads back the
+        // winning value — no instance can end up caching a device id that
+        // was never persisted.
+        sql_query(
+            "INSERT INTO autumn_sync_state (key, value) VALUES (?, ?) \
+             ON CONFLICT (key) DO NOTHING",
+        )
+        .bind::<Text, _>(STATE_DEVICE_ID)
+        .bind::<Text, _>(uuid::Uuid::new_v4().to_string())
+        .execute(&mut conn)
+        .map_err(store_err)?;
+        let device_id = get_state(&mut conn, STATE_DEVICE_ID)?
+            .ok_or_else(|| SyncError::Store("device id was not persisted".into()))?;
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -357,7 +399,12 @@ impl SyncStore {
             Op::Delete => "delete",
         };
         let mut conn = self.lock()?;
-        conn.transaction::<_, diesel::result::Error, _>(|conn| {
+        // BEGIN IMMEDIATE: take the write lock up front so a concurrent
+        // writer on ANOTHER connection to the same file (a second
+        // SyncStore::open) makes this transaction queue on the busy
+        // timeout, instead of failing its read→write snapshot upgrade
+        // with SQLITE_BUSY_SNAPSHOT (which bypasses the busy handler).
+        conn.immediate_transaction::<_, diesel::result::Error, _>(|conn| {
             let base_version = base_version_for(conn, collection, pk)?;
             let server_version = current_server_version(conn, collection, pk)?;
             upsert_row(
@@ -543,34 +590,43 @@ impl SyncStore {
 
     /// Settle a pushed batch: journal entries are cleared **by change id**
     /// (a newer coalesced write keeps its own entry), acked versions are
-    /// recorded, and conflict resolutions are applied locally.
+    /// recorded — including for `AlreadyApplied` retries, so a later local
+    /// edit doesn't push a stale `base_version` and false-conflict — and
+    /// conflict resolutions are applied locally *unless* the row gained a
+    /// newer pending local write in the meantime (the resolved row must
+    /// not clobber it; the newer write pushes next and settles normally).
     pub(crate) fn confirm_pushed(
         &self,
         changes: &[Change],
         outcomes: &[ChangeOutcome],
     ) -> Result<(), SyncError> {
         let mut conn = self.lock()?;
-        conn.transaction::<_, diesel::result::Error, _>(|conn| {
+        conn.immediate_transaction::<_, diesel::result::Error, _>(|conn| {
             for (change, outcome) in changes.iter().zip(outcomes) {
-                match outcome {
-                    ChangeOutcome::Applied { version } => {
-                        sql_query(
-                            "UPDATE autumn_sync_rows SET server_version = ? \
-                             WHERE collection = ? AND pk = ?",
-                        )
-                        .bind::<BigInt, _>(*version)
-                        .bind::<Text, _>(&change.collection)
-                        .bind::<Text, _>(&change.pk)
-                        .execute(conn)?;
-                    }
-                    ChangeOutcome::AlreadyApplied => {}
-                    ChangeOutcome::Resolved { row } => {
-                        upsert_remote_row(conn, row)?;
-                    }
-                }
+                // Clear this batch's entry first: a newer coalesced write
+                // replaced it with a fresh change_id, so `has_pending`
+                // below is true exactly when such a newer write exists.
                 sql_query("DELETE FROM autumn_sync_pending WHERE change_id = ?")
                     .bind::<Text, _>(&change.change_id)
                     .execute(conn)?;
+                match outcome {
+                    // AlreadyApplied is the ack a lost response withheld:
+                    // record it exactly like a fresh Applied ack.
+                    ChangeOutcome::Applied { version }
+                    | ChangeOutcome::AlreadyApplied { version } => {
+                        record_acked_version(conn, &change.collection, &change.pk, *version)?;
+                    }
+                    ChangeOutcome::Resolved { row } => {
+                        if has_pending(conn, &row.collection, &row.pk)? {
+                            // Read-your-writes: keep the newer local
+                            // payload; just record the resolved version so
+                            // future (post-journal) writes base correctly.
+                            record_acked_version(conn, &row.collection, &row.pk, row.version)?;
+                        } else {
+                            upsert_remote_row(conn, row)?;
+                        }
+                    }
+                }
             }
             Ok(())
         })
@@ -582,7 +638,7 @@ impl SyncStore {
     /// until its push settles the conflict). Returns how many rows applied.
     pub(crate) fn apply_remote_rows(&self, rows: &[RemoteRow]) -> Result<usize, SyncError> {
         let mut conn = self.lock()?;
-        conn.transaction::<_, diesel::result::Error, _>(|conn| {
+        conn.immediate_transaction::<_, diesel::result::Error, _>(|conn| {
             let mut applied = 0;
             for row in rows {
                 if has_pending(conn, &row.collection, &row.pk)? {
@@ -604,7 +660,7 @@ impl SyncStore {
     /// writes survive and get replayed.
     pub(crate) fn begin_full_resync(&self) -> Result<(), SyncError> {
         let mut conn = self.lock()?;
-        conn.transaction::<_, diesel::result::Error, _>(|conn| {
+        conn.immediate_transaction::<_, diesel::result::Error, _>(|conn| {
             sql_query(
                 "DELETE FROM autumn_sync_rows WHERE NOT EXISTS (\
                  SELECT 1 FROM autumn_sync_pending p \
@@ -615,5 +671,236 @@ impl SyncStore {
             set_state(conn, STATE_CURSOR, "0")
         })
         .map_err(store_err)
+    }
+
+    /// Drop local tombstone rows whose deletion the server has already
+    /// GC'd (acked `server_version <= horizon`). Safe because the server
+    /// physically removed those tombstones — no future pull can carry a
+    /// version at or below the horizon for these pks, and a recreation
+    /// arrives as a normal row with a newer version. Tombstones with a
+    /// pending journal entry (the delete not yet acked) are kept. Called by
+    /// the engine after each completed pull, so local storage stays
+    /// proportional to live data plus not-yet-GC'd tombstones.
+    pub(crate) fn prune_acked_tombstones(&self, horizon: Version) -> Result<u64, SyncError> {
+        let mut conn = self.lock()?;
+        conn.immediate_transaction::<_, diesel::result::Error, _>(|conn| {
+            let removed = sql_query(
+                "DELETE FROM autumn_sync_rows \
+                 WHERE deleted = 1 AND server_version > 0 AND server_version <= ? \
+                 AND NOT EXISTS (\
+                 SELECT 1 FROM autumn_sync_pending p \
+                 WHERE p.collection = autumn_sync_rows.collection \
+                 AND p.pk = autumn_sync_rows.pk)",
+            )
+            .bind::<BigInt, _>(horizon)
+            .execute(conn)?;
+            Ok(removed as u64)
+        })
+        .map_err(store_err)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::Utc;
+    use serde_json::json;
+
+    use super::*;
+
+    fn open_temp() -> (tempfile::TempDir, SyncStore) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SyncStore::open(dir.path().join("sync.db")).expect("open");
+        (dir, store)
+    }
+
+    fn remote_row(collection: &str, pk: &str, version: Version, deleted: bool) -> RemoteRow {
+        RemoteRow {
+            collection: collection.to_owned(),
+            pk: pk.to_owned(),
+            payload: (!deleted).then(|| json!({"title": format!("server v{version}")})),
+            version,
+            deleted,
+            updated_at: Utc::now(),
+            device_id: "server-device".to_owned(),
+        }
+    }
+
+    #[test]
+    fn already_applied_records_the_original_acked_version() {
+        // A retry after a lost response must record the version the change
+        // was assigned the first time, so the NEXT local edit is based on
+        // it instead of pushing base_version = 0 (a false conflict).
+        let (_dir, store) = open_temp();
+        store
+            .put("notes", "n1", &json!({"title": "v1"}))
+            .expect("put");
+        let changes = store.pending_changes(10).expect("pending");
+        assert_eq!(changes.len(), 1);
+
+        store
+            .confirm_pushed(&changes, &[ChangeOutcome::AlreadyApplied { version: 7 }])
+            .expect("confirm");
+        assert_eq!(store.pending_count().expect("count"), 0);
+
+        store
+            .put("notes", "n1", &json!({"title": "v2"}))
+            .expect("re-put");
+        let next = store.pending_changes(10).expect("pending");
+        assert_eq!(
+            next[0].base_version, 7,
+            "the next edit must be based on the acked version, not 0"
+        );
+    }
+
+    #[test]
+    fn stale_already_applied_ack_never_regresses_the_recorded_version() {
+        let (_dir, store) = open_temp();
+        store
+            .put("notes", "n1", &json!({"title": "v1"}))
+            .expect("put");
+        let changes = store.pending_changes(10).expect("pending");
+        // The row advanced to version 9 (e.g. via a pull that raced the
+        // retry); a late AlreadyApplied ack for version 7 must not regress.
+        store
+            .confirm_pushed(&changes, &[ChangeOutcome::Applied { version: 9 }])
+            .expect("confirm applied");
+        store
+            .put("notes", "n1", &json!({"title": "v2"}))
+            .expect("re-put");
+        let retry = store.pending_changes(10).expect("pending");
+        store
+            .confirm_pushed(&retry, &[ChangeOutcome::AlreadyApplied { version: 7 }])
+            .expect("stale ack");
+        store
+            .put("notes", "n1", &json!({"title": "v3"}))
+            .expect("third put");
+        let next = store.pending_changes(10).expect("pending");
+        assert_eq!(next[0].base_version, 9, "acked version must never regress");
+    }
+
+    #[test]
+    fn resolved_outcome_does_not_clobber_a_newer_pending_local_write() {
+        // The user edits the row between the engine reading the push batch
+        // and confirming it: the journal coalesces to a NEW change_id, and
+        // the server's resolved row must not overwrite the newer payload.
+        let (_dir, store) = open_temp();
+        store
+            .put("notes", "n1", &json!({"title": "pushed"}))
+            .expect("put");
+        let batch = store.pending_changes(10).expect("batch");
+
+        // Concurrent local edit while the push is in flight.
+        store
+            .put("notes", "n1", &json!({"title": "newer local"}))
+            .expect("concurrent put");
+
+        let resolved = remote_row("notes", "n1", 5, false);
+        store
+            .confirm_pushed(&batch, &[ChangeOutcome::Resolved { row: resolved }])
+            .expect("confirm");
+
+        let visible: Option<serde_json::Value> = store.get("notes", "n1").expect("get");
+        assert_eq!(
+            visible.and_then(|v| v["title"].as_str().map(str::to_owned)),
+            Some("newer local".to_owned()),
+            "read-your-writes: the newer pending write must stay visible"
+        );
+        assert_eq!(
+            store.pending_count().expect("count"),
+            1,
+            "the newer write's journal entry must survive the confirmation"
+        );
+        let next = store.pending_changes(10).expect("pending");
+        assert_ne!(
+            next[0].change_id, batch[0].change_id,
+            "the surviving entry is the newer coalesced write"
+        );
+    }
+
+    #[test]
+    fn resolved_outcome_applies_when_no_newer_write_exists() {
+        let (_dir, store) = open_temp();
+        store
+            .put("notes", "n1", &json!({"title": "mine"}))
+            .expect("put");
+        let batch = store.pending_changes(10).expect("batch");
+        let resolved = remote_row("notes", "n1", 5, false);
+        store
+            .confirm_pushed(&batch, &[ChangeOutcome::Resolved { row: resolved }])
+            .expect("confirm");
+        let visible: Option<serde_json::Value> = store.get("notes", "n1").expect("get");
+        assert_eq!(
+            visible.and_then(|v| v["title"].as_str().map(str::to_owned)),
+            Some("server v5".to_owned()),
+            "with no newer pending write the resolved row applies locally"
+        );
+        assert_eq!(store.pending_count().expect("count"), 0);
+    }
+
+    #[test]
+    fn prune_acked_tombstones_drops_only_gcd_acked_tombstones() {
+        let (_dir, store) = open_temp();
+        // An acked tombstone at version 3 (below the horizon): prunable.
+        store
+            .apply_remote_rows(&[remote_row("notes", "gone", 3, true)])
+            .expect("apply tombstone");
+        // An acked tombstone above the horizon: kept.
+        store
+            .apply_remote_rows(&[remote_row("notes", "recent", 9, true)])
+            .expect("apply recent tombstone");
+        // A local, not-yet-acked delete (pending journal entry): kept.
+        store
+            .put("notes", "pending", &json!({"title": "x"}))
+            .expect("put");
+        store.delete("notes", "pending").expect("delete");
+        // A live row: kept.
+        store
+            .apply_remote_rows(&[remote_row("notes", "live", 4, false)])
+            .expect("apply live");
+
+        let removed = store.prune_acked_tombstones(5).expect("prune");
+        assert_eq!(removed, 1, "only the acked sub-horizon tombstone goes");
+
+        let live: Vec<(String, serde_json::Value)> = store.list("notes").expect("list");
+        assert_eq!(live.len(), 1, "live rows survive pruning");
+        assert_eq!(live[0].0, "live");
+        assert_eq!(
+            store.pending_count().expect("count"),
+            1,
+            "the pending (coalesced put+delete) journal entry is untouched"
+        );
+        // Pruning is idempotent.
+        assert_eq!(store.prune_acked_tombstones(5).expect("re-prune"), 0);
+    }
+
+    #[test]
+    // The intermediate Vec is load-bearing: all four openers must be
+    // spawned (racing) before any is joined.
+    #[allow(clippy::needless_collect)]
+    fn concurrent_first_opens_agree_on_one_device_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("sync.db");
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    SyncStore::open(&path)
+                        .expect("open")
+                        .device_id()
+                        .expect("device id")
+                })
+            })
+            .collect();
+        let ids: Vec<String> = handles
+            .into_iter()
+            .map(|h| h.join().expect("join"))
+            .collect();
+        assert!(
+            ids.windows(2).all(|w| w[0] == w[1]),
+            "every concurrent opener must see the same persisted device id: {ids:?}"
+        );
+        // And a reopen still agrees.
+        let reopened = SyncStore::open(&path).expect("reopen");
+        assert_eq!(reopened.device_id().expect("device id"), ids[0]);
     }
 }

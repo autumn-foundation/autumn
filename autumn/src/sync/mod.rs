@@ -69,8 +69,8 @@ pub mod store;
 
 pub use engine::{SyncConfig, SyncEngine, SyncReport, SyncStatus};
 pub use protocol::{
-    Change, ChangeOutcome, Op, PullQuery, PullResponse, PushRequest, PushResponse, RemoteRow,
-    Version,
+    Change, ChangeOutcome, MAX_PULL_LIMIT, MAX_PUSH_CHANGES, Op, PullQuery, PullResponse,
+    PushRequest, PushResponse, RemoteRow, Version,
 };
 pub use resolver::{ConflictResolver, LwwResolver, Resolution};
 pub use server::{MemorySyncBackend, PgSyncBackend, SyncBackend};

@@ -16,7 +16,7 @@
 //! # }
 //! ```
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use axum::Json;
@@ -31,8 +31,8 @@ use diesel::sql_types::{BigInt, Bool, Jsonb, Nullable, Text, Timestamptz};
 
 use super::SyncError;
 use super::protocol::{
-    Change, ChangeOutcome, Op, PullQuery, PullResponse, PushRequest, PushResponse, RemoteRow,
-    Version,
+    Change, ChangeOutcome, MAX_PULL_LIMIT, MAX_PUSH_CHANGES, Op, PullQuery, PullResponse,
+    PushRequest, PushResponse, RemoteRow, Version,
 };
 use super::resolver::{ConflictResolver, Resolution};
 
@@ -107,13 +107,25 @@ pub trait SyncBackend: Send + Sync + 'static {
     ) -> Result<PushResponse, SyncError>;
 
     /// Return rows with version greater than `cursor` (ascending, at most
-    /// `limit`), or `FullResyncRequired` when a non-zero `cursor` predates
-    /// the tombstone GC horizon.
+    /// `limit`), or `FullResyncRequired` when a non-zero `session_start`
+    /// predates the tombstone GC horizon.
+    ///
+    /// `session_start` is the cursor the client's sync session started
+    /// from (all pages of one paginated catch-up pass the same value). The
+    /// staleness check keys on it — not on the per-page `cursor` — so a
+    /// multi-page catch-up from `0` is never mistaken for a stale client
+    /// just because an intermediate page cursor is still below the
+    /// horizon. Single-shot callers pass `session_start == cursor`.
     ///
     /// # Errors
     ///
     /// Returns [`SyncError::Backend`] on storage failure.
-    fn pull_since(&self, cursor: Version, limit: i64) -> Result<PullResponse, SyncError>;
+    fn pull_since(
+        &self,
+        cursor: Version,
+        limit: i64,
+        session_start: Version,
+    ) -> Result<PullResponse, SyncError>;
 
     /// Physically drop tombstone rows with version at or below `up_to` and
     /// advance the tombstone horizon. Returns the number of rows removed.
@@ -126,6 +138,20 @@ pub trait SyncBackend: Send + Sync + 'static {
     ///
     /// Returns [`SyncError::Backend`] on storage failure.
     fn gc_tombstones(&self, up_to: Version) -> Result<u64, SyncError>;
+
+    /// Drop push-dedup records older than `older_than` so the dedup store
+    /// (`autumn_sync_applied` on Postgres) does not grow forever. Returns
+    /// the number of records removed. Never runs implicitly — pair it with
+    /// your [`Self::gc_tombstones`] schedule, and keep the retention window
+    /// **longer than any client's plausible offline retry horizon**: a
+    /// device retrying a change whose dedup record was GC'd will re-apply
+    /// it (content-idempotent for upserts/deletes, but it bumps the row
+    /// version and, under a custom resolver, may re-run resolution).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SyncError::Backend`] on storage failure.
+    fn gc_applied(&self, older_than: DateTime<Utc>) -> Result<u64, SyncError>;
 
     /// The current tombstone GC horizon (`0` if GC never ran).
     ///
@@ -142,10 +168,18 @@ pub trait SyncBackend: Send + Sync + 'static {
     fn latest_version(&self) -> Result<Version, SyncError>;
 }
 
+/// Push-dedup record: the version a change was assigned when first
+/// applied, and when — mirrors a row of `autumn_sync_applied` on Postgres.
+#[derive(Debug, Clone, Copy)]
+struct AppliedRecord {
+    version: Version,
+    applied_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Default)]
 struct MemoryState {
     rows: BTreeMap<(String, String), RemoteRow>,
-    applied: HashSet<(String, String)>,
+    applied: HashMap<(String, String), AppliedRecord>,
     next_version: Version,
     horizon: Version,
 }
@@ -190,38 +224,51 @@ impl SyncBackend for MemorySyncBackend {
         let mut outcomes = Vec::with_capacity(request.changes.len());
         for change in &request.changes {
             let dedup_key = (request.device_id.clone(), change.change_id.clone());
-            if state.applied.contains(&dedup_key) {
-                outcomes.push(ChangeOutcome::AlreadyApplied);
+            if let Some(record) = state.applied.get(&dedup_key) {
+                outcomes.push(ChangeOutcome::AlreadyApplied {
+                    version: record.version,
+                });
                 continue;
             }
             let row_key = (change.collection.clone(), change.pk.clone());
             let current = state.rows.get(&row_key).cloned();
-            let outcome = match current {
+            let (outcome, version) = match current {
                 Some(server) if server.version != change.base_version => {
                     let resolution = resolver.resolve(&request.device_id, change, &server);
                     let version = state.allocate_version();
                     let row =
                         resolved_row(resolution, change, &request.device_id, &server, version);
                     state.rows.insert(row_key, row.clone());
-                    ChangeOutcome::Resolved { row }
+                    (ChangeOutcome::Resolved { row }, version)
                 }
                 _ => {
                     let version = state.allocate_version();
                     let row = row_from_change(change, &request.device_id, version);
                     state.rows.insert(row_key, row);
-                    ChangeOutcome::Applied { version }
+                    (ChangeOutcome::Applied { version }, version)
                 }
             };
-            state.applied.insert(dedup_key);
+            state.applied.insert(
+                dedup_key,
+                AppliedRecord {
+                    version,
+                    applied_at: Utc::now(),
+                },
+            );
             outcomes.push(outcome);
         }
         drop(state);
         Ok(PushResponse { outcomes })
     }
 
-    fn pull_since(&self, cursor: Version, limit: i64) -> Result<PullResponse, SyncError> {
+    fn pull_since(
+        &self,
+        cursor: Version,
+        limit: i64,
+        session_start: Version,
+    ) -> Result<PullResponse, SyncError> {
         let state = self.lock()?;
-        if cursor > 0 && cursor < state.horizon {
+        if session_start > 0 && session_start < state.horizon {
             return Ok(PullResponse::FullResyncRequired {
                 tombstone_horizon: state.horizon,
             });
@@ -250,6 +297,17 @@ impl SyncBackend for MemorySyncBackend {
             .retain(|_, row| !(row.deleted && row.version <= up_to));
         let removed = before - state.rows.len();
         state.horizon = state.horizon.max(up_to);
+        drop(state);
+        Ok(removed as u64)
+    }
+
+    fn gc_applied(&self, older_than: DateTime<Utc>) -> Result<u64, SyncError> {
+        let mut state = self.lock()?;
+        let before = state.applied.len();
+        state
+            .applied
+            .retain(|_, record| record.applied_at >= older_than);
+        let removed = before - state.applied.len();
         drop(state);
         Ok(removed as u64)
     }
@@ -285,6 +343,7 @@ CREATE INDEX IF NOT EXISTS autumn_sync_rows_version_idx
 CREATE TABLE IF NOT EXISTS autumn_sync_applied (
     device_id TEXT NOT NULL,
     change_id TEXT NOT NULL,
+    version BIGINT NOT NULL DEFAULT 0,
     applied_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (device_id, change_id)
 );
@@ -295,6 +354,35 @@ CREATE TABLE IF NOT EXISTS autumn_sync_meta (
 ";
 
 const META_HORIZON: &str = "tombstone_horizon";
+
+/// Well-known key for the transaction-scoped Postgres advisory lock
+/// ([`pg_advisory_xact_lock`]) taken at the top of every
+/// [`PgSyncBackend::apply_push`] transaction. The value is the ASCII bytes
+/// `"ATMNSYNC"` as a big-endian `i64` — stable, documented, and unlikely to
+/// collide with application locks.
+///
+/// The lock serializes push batches, which is **load-bearing** for two
+/// correctness guarantees that Postgres READ COMMITTED semantics alone do
+/// not give:
+///
+/// 1. **No skipped versions on pull.** Versions come from a sequence, and
+///    sequences are non-transactional: without the lock, a push holding
+///    version 5 can commit *after* a push holding version 6, and a pull in
+///    between sees only 6, persists `cursor = 6`, and never receives row 5.
+///    With the lock, pushes commit in version order, so any READ COMMITTED
+///    pull observes a clean version prefix and `max(version seen)` is a
+///    safe cursor.
+/// 2. **Concurrent first-inserts of one pk engage the resolver.** `SELECT
+///    … FOR UPDATE` locks nothing for a row that does not exist yet, so two
+///    concurrent transactions both creating pk X would each take the clean
+///    `Applied` path and the later `ON CONFLICT … DO UPDATE` would silently
+///    overwrite the earlier write without running the [`ConflictResolver`].
+///    Serialized pushes make the second transaction see the first's
+///    committed row and route through the conflict path.
+///
+/// [`pg_advisory_xact_lock`]:
+///     https://www.postgresql.org/docs/current/functions-admin.html#FUNCTIONS-ADVISORY-LOCKS
+const PG_PUSH_ADVISORY_LOCK_KEY: i64 = 0x4154_4D4E_5359_4E43; // "ATMNSYNC"
 
 #[derive(QueryableByName)]
 struct PgRowRecord {
@@ -326,12 +414,6 @@ impl PgRowRecord {
             device_id: self.device_id,
         }
     }
-}
-
-#[derive(QueryableByName)]
-struct PgCountRecord {
-    #[diesel(sql_type = BigInt)]
-    count: i64,
 }
 
 #[derive(QueryableByName)]
@@ -439,17 +521,26 @@ impl SyncBackend for PgSyncBackend {
     ) -> Result<PushResponse, SyncError> {
         let mut conn = self.connect()?;
         conn.transaction::<_, diesel::result::Error, _>(|conn| {
+            // Serialize push batches (held until commit). See the doc
+            // comment on PG_PUSH_ADVISORY_LOCK_KEY for why this is
+            // required for correctness, not just politeness.
+            sql_query("SELECT pg_advisory_xact_lock($1)")
+                .bind::<BigInt, _>(PG_PUSH_ADVISORY_LOCK_KEY)
+                .execute(conn)?;
             let mut outcomes = Vec::with_capacity(request.changes.len());
             for change in &request.changes {
                 let duplicate = sql_query(
-                    "SELECT COUNT(*) AS count FROM autumn_sync_applied \
+                    "SELECT version FROM autumn_sync_applied \
                      WHERE device_id = $1 AND change_id = $2",
                 )
                 .bind::<Text, _>(&request.device_id)
                 .bind::<Text, _>(&change.change_id)
-                .get_result::<PgCountRecord>(conn)?;
-                if duplicate.count > 0 {
-                    outcomes.push(ChangeOutcome::AlreadyApplied);
+                .get_result::<PgVersionRecord>(conn)
+                .optional()?;
+                if let Some(record) = duplicate {
+                    outcomes.push(ChangeOutcome::AlreadyApplied {
+                        version: record.version,
+                    });
                     continue;
                 }
 
@@ -463,27 +554,31 @@ impl SyncBackend for PgSyncBackend {
                 .optional()?
                 .map(PgRowRecord::into_remote_row);
 
-                let outcome = match current {
+                let (outcome, version) = match current {
                     Some(server) if server.version != change.base_version => {
                         let resolution = resolver.resolve(&request.device_id, change, &server);
                         let version = pg_next_version(conn)?;
                         let row =
                             resolved_row(resolution, change, &request.device_id, &server, version);
                         pg_upsert_row(conn, &row)?;
-                        ChangeOutcome::Resolved { row }
+                        (ChangeOutcome::Resolved { row }, version)
                     }
                     _ => {
                         let version = pg_next_version(conn)?;
                         let row = row_from_change(change, &request.device_id, version);
                         pg_upsert_row(conn, &row)?;
-                        ChangeOutcome::Applied { version }
+                        (ChangeOutcome::Applied { version }, version)
                     }
                 };
 
-                sql_query("INSERT INTO autumn_sync_applied (device_id, change_id) VALUES ($1, $2)")
-                    .bind::<Text, _>(&request.device_id)
-                    .bind::<Text, _>(&change.change_id)
-                    .execute(conn)?;
+                sql_query(
+                    "INSERT INTO autumn_sync_applied (device_id, change_id, version) \
+                     VALUES ($1, $2, $3)",
+                )
+                .bind::<Text, _>(&request.device_id)
+                .bind::<Text, _>(&change.change_id)
+                .bind::<BigInt, _>(version)
+                .execute(conn)?;
                 outcomes.push(outcome);
             }
             Ok(PushResponse { outcomes })
@@ -491,11 +586,16 @@ impl SyncBackend for PgSyncBackend {
         .map_err(backend_err)
     }
 
-    fn pull_since(&self, cursor: Version, limit: i64) -> Result<PullResponse, SyncError> {
+    fn pull_since(
+        &self,
+        cursor: Version,
+        limit: i64,
+        session_start: Version,
+    ) -> Result<PullResponse, SyncError> {
         let mut conn = self.connect()?;
         conn.transaction::<_, diesel::result::Error, _>(|conn| {
             let horizon = pg_horizon(conn)?;
-            if cursor > 0 && cursor < horizon {
+            if session_start > 0 && session_start < horizon {
                 return Ok(PullResponse::FullResyncRequired {
                     tombstone_horizon: horizon,
                 });
@@ -539,6 +639,15 @@ impl SyncBackend for PgSyncBackend {
         .map_err(backend_err)
     }
 
+    fn gc_applied(&self, older_than: DateTime<Utc>) -> Result<u64, SyncError> {
+        let mut conn = self.connect()?;
+        let removed = sql_query("DELETE FROM autumn_sync_applied WHERE applied_at < $1")
+            .bind::<Timestamptz, _>(older_than)
+            .execute(&mut conn)
+            .map_err(backend_err)?;
+        Ok(removed as u64)
+    }
+
     fn tombstone_horizon(&self) -> Result<Version, SyncError> {
         let mut conn = self.connect()?;
         pg_horizon(&mut conn).map_err(backend_err)
@@ -564,8 +673,14 @@ impl SyncBackend for PgSyncBackend {
 /// Generic over the host router's state so it mounts both on an Autumn app
 /// (`AppBuilder::nest("/sync", router(...))` shares [`crate::AppState`] and
 /// the app's global middleware) and on a bare `axum::Router` in tests.
-/// Mount it behind authentication — the endpoints trust `device_id` as
-/// sent.
+/// **Mount it behind authentication** — the endpoints trust `device_id` as
+/// sent, and anyone who can reach them can read and write every synced row.
+///
+/// Request bounds: push batches larger than
+/// [`MAX_PUSH_CHANGES`](crate::sync::protocol::MAX_PUSH_CHANGES) changes
+/// are rejected with `413` (request bodies are additionally capped by
+/// axum's default body limit), and the pull `limit` is clamped to at most
+/// [`MAX_PULL_LIMIT`](crate::sync::protocol::MAX_PULL_LIMIT) (minimum 1).
 pub fn router<S>(
     backend: Arc<dyn SyncBackend>,
     resolver: Arc<dyn ConflictResolver>,
@@ -581,6 +696,16 @@ where
                 let backend = Arc::clone(&push_backend);
                 let resolver = Arc::clone(&resolver);
                 async move {
+                    if request.changes.len() > MAX_PUSH_CHANGES {
+                        return (
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            format!(
+                                "push batch of {} changes exceeds the limit of {MAX_PUSH_CHANGES}",
+                                request.changes.len()
+                            ),
+                        )
+                            .into_response();
+                    }
                     let result = tokio::task::spawn_blocking(move || {
                         backend.apply_push(&request, resolver.as_ref())
                     })
@@ -594,8 +719,10 @@ where
             get(move |Query(query): Query<PullQuery>| {
                 let backend = Arc::clone(&backend);
                 async move {
+                    let limit = query.limit.clamp(1, MAX_PULL_LIMIT);
+                    let session_start = query.session_start();
                     let result = tokio::task::spawn_blocking(move || {
-                        backend.pull_since(query.cursor, query.limit)
+                        backend.pull_since(query.cursor, limit, session_start)
                     })
                     .await;
                     respond(result)

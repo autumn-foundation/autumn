@@ -7,9 +7,9 @@
 use std::sync::Arc;
 
 use autumn_web::sync::{
-    Change, ChangeOutcome, ConflictResolver, LwwResolver, MemorySyncBackend, Op, PullResponse,
-    PushRequest, PushResponse, RemoteRow, Resolution, SyncBackend, SyncConfig, SyncEngine,
-    SyncError, SyncStore, server,
+    Change, ChangeOutcome, ConflictResolver, LwwResolver, MAX_PUSH_CHANGES, MemorySyncBackend, Op,
+    PullResponse, PushRequest, PushResponse, RemoteRow, Resolution, SyncBackend, SyncConfig,
+    SyncEngine, SyncError, SyncStore, Version, server,
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -52,7 +52,7 @@ fn engine_for(store: &SyncStore, base_url: &str) -> SyncEngine {
 }
 
 fn backend_rows(backend: &dyn SyncBackend) -> Vec<RemoteRow> {
-    match backend.pull_since(0, 10_000).expect("backend pull") {
+    match backend.pull_since(0, 10_000, 0).expect("backend pull") {
         PullResponse::Ok { rows, .. } => rows,
         PullResponse::FullResyncRequired { .. } => panic!("unexpected full resync from cursor 0"),
     }
@@ -135,10 +135,21 @@ async fn push_retry_is_idempotent() {
     let version_after_first = backend.latest_version().expect("latest");
 
     // Simulated lost response: the client re-sends the identical batch.
+    // The dedup outcome must echo the version assigned on first apply so
+    // the client can record the ack it never received.
+    let ChangeOutcome::Applied {
+        version: first_version,
+    } = first.outcomes[0]
+    else {
+        unreachable!("asserted Applied above");
+    };
     let second = push(request).await;
     assert!(
-        matches!(second.outcomes.as_slice(), [ChangeOutcome::AlreadyApplied]),
-        "retry must dedup, got: {second:?}"
+        matches!(
+            second.outcomes.as_slice(),
+            [ChangeOutcome::AlreadyApplied { version }] if *version == first_version
+        ),
+        "retry must dedup and echo the original version {first_version}, got: {second:?}"
     );
     assert_eq!(
         backend.latest_version().expect("latest"),
@@ -371,6 +382,402 @@ async fn gc_horizon_forces_full_resync_preserving_pending() {
     // ... and the server received B's preserved pending change.
     let rows = backend_rows(backend.as_ref());
     assert!(rows.iter().any(|r| r.pk == "b-note" && !r.deleted));
+}
+
+/// Regression for the perpetual post-GC full-resync loop: GC naturally
+/// leaves the horizon ABOVE the newest surviving row version whenever the
+/// most recent change was a delete. A completed catch-up must land the
+/// cursor at/above the horizon so subsequent passes are normal — not
+/// re-download the world every 30 s forever.
+#[tokio::test]
+async fn post_gc_steady_state_does_not_loop_full_resyncs() {
+    let backend = Arc::new(MemorySyncBackend::new());
+    let (url, _srv) = start_sync_server(backend.clone(), Arc::new(LwwResolver)).await;
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // Server ends up: one@1 live; two created@2, deleted@3; gc(3) → horizon
+    // 3 with max surviving row version 1.
+    let store_a = open_store(&dir, "a.db");
+    let engine_a = engine_for(&store_a, &url);
+    store_a.put("notes", "one", &note("keep")).expect("put one");
+    store_a
+        .put("notes", "two", &note("doomed"))
+        .expect("put two");
+    engine_a.sync_once().await.expect("a sync 1");
+    store_a.delete("notes", "two").expect("delete two");
+    engine_a.sync_once().await.expect("a sync 2");
+    let latest = backend.latest_version().expect("latest");
+    backend.gc_tombstones(latest).expect("gc");
+    let horizon = backend.tombstone_horizon().expect("horizon");
+    assert!(
+        horizon > 1,
+        "precondition: horizon sits above the surviving row version"
+    );
+
+    // A fresh device syncs cleanly and reaches a steady state.
+    let store_b = open_store(&dir, "b.db");
+    let engine_b = engine_for(&store_b, &url);
+    let first = engine_b.sync_once().await.expect("b first sync");
+    assert!(!first.full_resync, "a fresh device never needs a resync");
+    assert!(
+        store_b.cursor().expect("cursor") >= horizon,
+        "a completed catch-up must land the cursor at/above the horizon"
+    );
+
+    // Steady state: no pass after the first may demand a full resync.
+    for pass in 0..5 {
+        let report = engine_b.sync_once().await.expect("steady-state pass");
+        assert!(
+            !report.full_resync,
+            "pass {pass} looped back into a full resync"
+        );
+        assert_eq!(report.pulled, 0, "pass {pass} re-downloaded data");
+    }
+    let n1: Option<Note> = store_b.get("notes", "one").expect("get");
+    assert_eq!(n1, Some(note("keep")));
+}
+
+/// Regression for the mid-pagination full-resync trap: after any GC, live
+/// rows below the horizon are the norm. A fresh device whose first sync
+/// needs more than one page must be able to complete it — its intermediate
+/// page cursors are below the horizon, but its session started from 0.
+#[tokio::test]
+async fn multi_page_initial_sync_completes_after_gc() {
+    let backend = Arc::new(MemorySyncBackend::new());
+    let (url, _srv) = start_sync_server(backend.clone(), Arc::new(LwwResolver)).await;
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // Server: a@1, b@2 live; c created@3, deleted@4; gc(4) → horizon 4.
+    let store_a = open_store(&dir, "a.db");
+    let engine_a = engine_for(&store_a, &url);
+    store_a.put("notes", "a", &note("first")).expect("put a");
+    store_a.put("notes", "b", &note("second")).expect("put b");
+    store_a.put("notes", "c", &note("doomed")).expect("put c");
+    engine_a.sync_once().await.expect("a sync 1");
+    store_a.delete("notes", "c").expect("delete c");
+    engine_a.sync_once().await.expect("a sync 2");
+    let latest = backend.latest_version().expect("latest");
+    backend.gc_tombstones(latest).expect("gc");
+
+    // Fresh device with a 1-row page size: two live rows below the horizon
+    // force multi-page pagination through sub-horizon cursors.
+    let store_b = open_store(&dir, "b.db");
+    let mut config = SyncConfig::new(&url);
+    config.pull_batch_size = 1;
+    let engine_b = SyncEngine::new(store_b.clone(), config);
+
+    let report = engine_b
+        .sync_once()
+        .await
+        .expect("multi-page initial sync must complete");
+    assert!(!report.full_resync, "a fresh device never needs a resync");
+    assert_eq!(
+        store_b.get::<Note>("notes", "a").expect("get a"),
+        Some(note("first"))
+    );
+    assert_eq!(
+        store_b.get::<Note>("notes", "b").expect("get b"),
+        Some(note("second")),
+        "every live page must arrive, including those past the first"
+    );
+    assert!(store_b.cursor().expect("cursor") >= latest);
+
+    // And the steady state holds afterwards.
+    let next = engine_b.sync_once().await.expect("steady-state pass");
+    assert!(!next.full_resync);
+}
+
+/// Overlapping `sync_once` calls (the Tauri shell's resume kick racing the
+/// background loop) must serialize: the journal batch is pushed exactly
+/// once across both passes.
+#[tokio::test]
+async fn concurrent_sync_once_passes_serialize() {
+    let backend = Arc::new(MemorySyncBackend::new());
+    let (url, _srv) = start_sync_server(backend.clone(), Arc::new(LwwResolver)).await;
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    let store = open_store(&dir, "a.db");
+    store.put("notes", "n1", &note("one")).expect("put");
+    store.put("notes", "n2", &note("two")).expect("put");
+    store.put("notes", "n3", &note("three")).expect("put");
+
+    let engine = engine_for(&store, &url);
+    let (r1, r2) = tokio::join!(engine.sync_once(), engine.sync_once());
+    let (r1, r2) = (r1.expect("pass 1"), r2.expect("pass 2"));
+    assert_eq!(
+        r1.pushed + r2.pushed,
+        3,
+        "the batch must be pushed exactly once across overlapping passes"
+    );
+    assert_eq!(store.pending_count().expect("pending"), 0);
+    assert_eq!(backend_rows(backend.as_ref()).len(), 3);
+}
+
+/// End-to-end m2 regression: a retry that gets `already_applied` records
+/// the acked version, so the NEXT edit of the same row pushes a correct
+/// `base_version` and does not trip the conflict resolver. The resolver
+/// here always keeps the server row, so a false conflict would visibly
+/// reject the second edit.
+#[tokio::test]
+async fn already_applied_retry_then_edit_does_not_false_conflict() {
+    struct KeepServerResolver;
+    impl ConflictResolver for KeepServerResolver {
+        fn resolve(&self, _device: &str, _client: &Change, _server: &RemoteRow) -> Resolution {
+            Resolution::KeepServer
+        }
+    }
+
+    let backend = Arc::new(MemorySyncBackend::new());
+    let (url, _srv) = start_sync_server(backend.clone(), Arc::new(KeepServerResolver)).await;
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    let store = open_store(&dir, "a.db");
+    let engine = engine_for(&store, &url);
+    store.put("notes", "n1", &note("first")).expect("put");
+
+    // Simulate a lost push response: the server applies the batch, but the
+    // client never records the ack (journal still holds the change).
+    let request = PushRequest {
+        device_id: store.device_id().expect("device id"),
+        changes: store.pending_changes(10).expect("pending"),
+    };
+    backend
+        .apply_push(&request, &LwwResolver)
+        .expect("server-side apply");
+    assert_eq!(store.pending_count().expect("pending"), 1);
+
+    // The engine retries → already_applied → the ack is recorded now.
+    engine.sync_once().await.expect("retry sync");
+    assert_eq!(store.pending_count().expect("pending"), 0);
+
+    // A subsequent edit must apply cleanly. Under the old behavior its
+    // base_version stayed 0 → conflict → KeepServer would discard it.
+    store.put("notes", "n1", &note("second")).expect("edit");
+    engine.sync_once().await.expect("edit sync");
+    let rows = backend_rows(backend.as_ref());
+    assert_eq!(
+        rows.iter()
+            .find(|r| r.pk == "n1")
+            .and_then(|r| r.payload.as_ref())
+            .and_then(|p| p.get("title"))
+            .and_then(|v| v.as_str()),
+        Some("second"),
+        "the follow-up edit must not be treated as a conflict"
+    );
+}
+
+/// `pull_batch_size = 0` (or negative) must be clamped, never spin
+/// `sync_once` in an infinite empty-page loop.
+#[tokio::test]
+async fn pull_batch_size_zero_is_clamped_not_an_infinite_loop() {
+    let backend = Arc::new(MemorySyncBackend::new());
+    let (url, _srv) = start_sync_server(backend.clone(), Arc::new(LwwResolver)).await;
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    let store_a = open_store(&dir, "a.db");
+    store_a.put("notes", "n1", &note("one")).expect("put");
+    store_a.put("notes", "n2", &note("two")).expect("put");
+    engine_for(&store_a, &url).sync_once().await.expect("seed");
+
+    let store_b = open_store(&dir, "b.db");
+    let mut config = SyncConfig::new(&url);
+    config.pull_batch_size = 0;
+    let engine_b = SyncEngine::new(store_b.clone(), config);
+
+    let report = tokio::time::timeout(std::time::Duration::from_secs(30), engine_b.sync_once())
+        .await
+        .expect("sync_once must terminate with a zero batch size")
+        .expect("sync");
+    assert_eq!(report.pulled, 2);
+    let listed: Vec<(String, Note)> = store_b.list("notes").expect("list");
+    assert_eq!(listed.len(), 2);
+}
+
+/// Server-side request bounds: oversized push batches are rejected with
+/// 413, and absurd pull limits are clamped instead of honored.
+#[tokio::test]
+async fn server_bounds_push_batch_size_and_pull_limit() {
+    let backend = Arc::new(MemorySyncBackend::new());
+    let (url, _srv) = start_sync_server(backend.clone(), Arc::new(LwwResolver)).await;
+    let client = reqwest::Client::new();
+
+    let oversized = PushRequest {
+        device_id: "device-a".to_owned(),
+        changes: (0..=MAX_PUSH_CHANGES)
+            .map(|i| Change {
+                change_id: format!("00000000-0000-4000-8000-{i:012}"),
+                collection: "notes".to_owned(),
+                pk: format!("n{i}"),
+                op: Op::Delete,
+                payload: None,
+                base_version: 0,
+                updated_at: Utc::now(),
+            })
+            .collect(),
+    };
+    let response = client
+        .post(format!("{url}/push"))
+        .json(&oversized)
+        .send()
+        .await
+        .expect("send oversized push");
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::PAYLOAD_TOO_LARGE,
+        "a push batch beyond MAX_PUSH_CHANGES must be rejected"
+    );
+    assert!(
+        backend_rows(backend.as_ref()).is_empty(),
+        "a rejected batch must not be applied"
+    );
+
+    let response = client
+        .get(format!("{url}/pull?cursor=0&limit=999999999"))
+        .send()
+        .await
+        .expect("send oversized pull");
+    assert!(response.status().is_success(), "pull limits are clamped");
+    let pull: PullResponse = response.json().await.expect("pull json");
+    assert!(matches!(pull, PullResponse::Ok { .. }));
+}
+
+/// `spawn_background` behavior: while the backend errors, passes back off
+/// and keep retrying; once it heals, the loop converges the store without
+/// intervention. Bounds are generous — no wall-clock exactness.
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one linear outage→recovery script + fake backend
+async fn spawn_background_backs_off_then_recovers() {
+    /// A backend that fails every call until `failures_left` drains, then
+    /// delegates to the inner memory backend.
+    struct FlakyBackend {
+        inner: MemorySyncBackend,
+        failures_left: std::sync::atomic::AtomicUsize,
+        attempts: std::sync::atomic::AtomicUsize,
+    }
+    impl FlakyBackend {
+        fn gate(&self) -> Result<(), SyncError> {
+            self.attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let failed = self
+                .failures_left
+                .fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |n| n.checked_sub(1),
+                )
+                .is_ok();
+            if failed {
+                Err(SyncError::Backend("injected outage".into()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+    impl SyncBackend for FlakyBackend {
+        fn apply_push(
+            &self,
+            request: &PushRequest,
+            resolver: &dyn ConflictResolver,
+        ) -> Result<PushResponse, SyncError> {
+            self.gate()?;
+            self.inner.apply_push(request, resolver)
+        }
+        fn pull_since(
+            &self,
+            cursor: Version,
+            limit: i64,
+            session_start: Version,
+        ) -> Result<PullResponse, SyncError> {
+            self.gate()?;
+            self.inner.pull_since(cursor, limit, session_start)
+        }
+        fn gc_tombstones(&self, up_to: Version) -> Result<u64, SyncError> {
+            self.inner.gc_tombstones(up_to)
+        }
+        fn gc_applied(&self, older_than: chrono::DateTime<Utc>) -> Result<u64, SyncError> {
+            self.inner.gc_applied(older_than)
+        }
+        fn tombstone_horizon(&self) -> Result<Version, SyncError> {
+            self.inner.tombstone_horizon()
+        }
+        fn latest_version(&self) -> Result<Version, SyncError> {
+            self.inner.latest_version()
+        }
+    }
+
+    const INJECTED_FAILURES: usize = 3;
+    let backend = Arc::new(FlakyBackend {
+        inner: MemorySyncBackend::new(),
+        failures_left: std::sync::atomic::AtomicUsize::new(INJECTED_FAILURES),
+        attempts: std::sync::atomic::AtomicUsize::new(0),
+    });
+    // Seed the healthy inner state the loop should eventually deliver.
+    backend
+        .inner
+        .apply_push(
+            &PushRequest {
+                device_id: "seeder".to_owned(),
+                changes: vec![Change {
+                    change_id: "00000000-0000-4000-8000-00000000feed".to_owned(),
+                    collection: "notes".to_owned(),
+                    pk: "n1".to_owned(),
+                    op: Op::Upsert,
+                    payload: Some(json!({"title": "recovered"})),
+                    base_version: 0,
+                    updated_at: Utc::now(),
+                }],
+            },
+            &LwwResolver,
+        )
+        .expect("seed");
+
+    let (url, _srv) = start_sync_server(backend.clone(), Arc::new(LwwResolver)).await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = open_store(&dir, "a.db");
+    store
+        .put("notes", "local", &note("queued while flaky"))
+        .expect("put");
+
+    let mut config = SyncConfig::new(&url);
+    config.min_backoff = std::time::Duration::from_millis(10);
+    config.max_backoff = std::time::Duration::from_millis(50);
+    let engine = SyncEngine::new(store.clone(), config);
+    let task = engine.spawn_background(std::time::Duration::from_millis(20));
+
+    // The loop must ride out the outage (backing off, not exiting) and
+    // converge once the backend heals. Generous 30 s ceiling; typical
+    // completion is tens of milliseconds.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let pulled: Option<Note> = store.get("notes", "n1").expect("get");
+        if pulled.is_some() && store.pending_count().expect("pending") == 0 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "background loop failed to recover after the injected outage"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    task.abort();
+
+    let attempts = backend.attempts.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        attempts > INJECTED_FAILURES,
+        "the loop must retry through the outage (attempts: {attempts})"
+    );
+    assert_eq!(
+        backend
+            .failures_left
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "every injected failure must have been consumed by a retry"
+    );
+    let rows = backend_rows(&backend.inner);
+    assert!(
+        rows.iter().any(|r| r.pk == "local"),
+        "the offline write must reach the server after recovery"
+    );
 }
 
 #[tokio::test]

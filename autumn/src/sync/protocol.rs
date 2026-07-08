@@ -14,6 +14,20 @@ use serde::{Deserialize, Serialize};
 /// Server-assigned change sequence number. `0` means "never synced".
 pub type Version = i64;
 
+/// Server-side cap on the number of changes accepted in one push batch.
+///
+/// Requests with more changes are rejected with `413 Payload Too Large`
+/// (request body size is additionally bounded by axum's default body
+/// limit). The client engine clamps its `push_batch_size` to this.
+pub const MAX_PUSH_CHANGES: usize = 1000;
+
+/// Server-side cap on the pull page size.
+///
+/// The router clamps the requested `limit` into `1..=MAX_PULL_LIMIT`; the
+/// client engine clamps its `pull_batch_size` to the same bound so its
+/// "short page means caught up" termination stays valid.
+pub const MAX_PULL_LIMIT: i64 = 1000;
+
 /// The kind of local write a [`Change`] carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -89,8 +103,15 @@ pub enum ChangeOutcome {
         version: Version,
     },
     /// This `change_id` was already applied earlier (retry of a lost
-    /// response); the server state is unchanged.
-    AlreadyApplied,
+    /// response); the server state is unchanged. `version` is the version
+    /// the change was assigned when it was first applied, so the client can
+    /// record the ack it never received — without it, the client's next
+    /// edit of the same row would push a stale `base_version` and trigger a
+    /// spurious conflict.
+    AlreadyApplied {
+        /// The version assigned when this change was originally applied.
+        version: Version,
+    },
     /// The change conflicted with a newer server row; the resolver ran and
     /// `row` is the winning row state (with a **new** version, so every
     /// device converges on it via its next pull).
@@ -116,10 +137,27 @@ pub struct PullQuery {
     /// Page size cap.
     #[serde(default = "default_pull_limit")]
     pub limit: i64,
+    /// The cursor this sync session *started* from. All pages of one
+    /// paginated catch-up send the same value, so the server can tell a
+    /// genuinely stale cursor (session started behind the tombstone GC
+    /// horizon → `FullResyncRequired`) from mid-pagination progress whose
+    /// per-page cursor is legitimately still below the horizon. Omitted →
+    /// defaults to `cursor` (single-shot pulls behave as before).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<Version>,
 }
 
 const fn default_pull_limit() -> i64 {
     500
+}
+
+impl PullQuery {
+    /// The cursor the resync check applies to: the explicit session-start
+    /// cursor when given, otherwise the page cursor itself.
+    #[must_use]
+    pub fn session_start(&self) -> Version {
+        self.session.unwrap_or(self.cursor)
+    }
 }
 
 impl Default for PullQuery {
@@ -127,6 +165,7 @@ impl Default for PullQuery {
         Self {
             cursor: 0,
             limit: default_pull_limit(),
+            session: None,
         }
     }
 }
@@ -203,8 +242,12 @@ mod tests {
         let applied = serde_json::to_value(ChangeOutcome::Applied { version: 7 }).unwrap();
         assert_eq!(applied["status"], "applied");
         assert_eq!(applied["version"], 7);
-        let deduped = serde_json::to_value(ChangeOutcome::AlreadyApplied).unwrap();
+        let deduped = serde_json::to_value(ChangeOutcome::AlreadyApplied { version: 7 }).unwrap();
         assert_eq!(deduped["status"], "already_applied");
+        assert_eq!(
+            deduped["version"], 7,
+            "already_applied must carry the originally assigned version"
+        );
     }
 
     #[test]
@@ -240,8 +283,22 @@ mod tests {
         assert_eq!(query, PullQuery::default());
         assert_eq!(query.cursor, 0);
         assert_eq!(query.limit, 500);
+        assert_eq!(query.session, None);
+        assert_eq!(
+            query.session_start(),
+            0,
+            "no session marker means the page cursor is the session start"
+        );
         let query: PullQuery = serde_urlencoded::from_str("cursor=12&limit=50").unwrap();
         assert_eq!(query.cursor, 12);
         assert_eq!(query.limit, 50);
+        assert_eq!(query.session_start(), 12);
+        let query: PullQuery = serde_urlencoded::from_str("cursor=12&limit=50&session=3").unwrap();
+        assert_eq!(query.session, Some(3));
+        assert_eq!(
+            query.session_start(),
+            3,
+            "an explicit session-start cursor wins over the page cursor"
+        );
     }
 }

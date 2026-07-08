@@ -155,6 +155,48 @@ fn writes_journal_pending_changes_atomically() {
     assert_eq!(n1.op, Op::Delete);
 }
 
+/// Two `SyncStore` instances on ONE file (the generated wiring's shape:
+/// the shell's background engine plus the app's routes) writing
+/// concurrently: every write must succeed. Write transactions use
+/// `BEGIN IMMEDIATE`, so cross-connection writers queue on the busy
+/// timeout instead of failing their read→write snapshot upgrade with
+/// "database is locked" (`SQLITE_BUSY_SNAPSHOT` bypasses the busy
+/// handler for deferred transactions).
+#[test]
+fn concurrent_stores_on_one_file_never_fail_writes() {
+    const WRITES_PER_THREAD: usize = 500;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("sync.db");
+    let store1 = SyncStore::open(&path).expect("open 1");
+    let store2 = SyncStore::open(&path).expect("open 2");
+
+    let worker = |store: SyncStore, prefix: &'static str| {
+        std::thread::spawn(move || {
+            for i in 0..WRITES_PER_THREAD {
+                store
+                    .put("notes", &format!("{prefix}-{i}"), &format!("payload {i}"))
+                    .unwrap_or_else(|e| panic!("{prefix} write {i} failed: {e}"));
+            }
+        })
+    };
+    let t1 = worker(store1.clone(), "a");
+    let t2 = worker(store2, "b");
+    t1.join().expect("thread a");
+    t2.join().expect("thread b");
+
+    let listed: Vec<(String, String)> = store1.list("notes").expect("list");
+    assert_eq!(
+        listed.len(),
+        2 * WRITES_PER_THREAD,
+        "all concurrent writes from both connections must land"
+    );
+    assert_eq!(
+        store1.pending_count().expect("pending"),
+        2 * WRITES_PER_THREAD as u64,
+        "every write must have journaled its pending change"
+    );
+}
+
 #[test]
 fn reads_reflect_local_writes_before_any_sync() {
     let dir = tempfile::tempdir().expect("tempdir");
