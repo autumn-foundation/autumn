@@ -52,6 +52,7 @@ mod experiments_pg_integration;
 mod extractors;
 mod factory_integration;
 mod feature_flags_integration;
+mod form_for_derive;
 mod form_search_widgets;
 #[cfg(all(feature = "maud", feature = "cache-moka"))]
 mod fragment_cache_integration;
