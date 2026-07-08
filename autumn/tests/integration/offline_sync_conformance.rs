@@ -622,6 +622,182 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
         response.outcomes[0]
     );
 
+    // ── GC'd-then-RECREATED rows: stale pre-horizon bases stay server-won ─
+    // delete → GC → another device legitimately recreates the pk (base 0).
+    // A still-offline device's edit or delete based on the OLD incarnation
+    // has base_version <= horizon but now hits a LIVE row — previously the
+    // ordinary resolver arm, where a fast client clock (LWW) could clobber
+    // or delete the new incarnation before that device is forced to
+    // resync. The GC horizon must keep protecting recreated rows: the
+    // outcome is deterministically server-winning (the live row, fresh
+    // version), the resolver gets no say.
+    let response = backend
+        .apply_push(
+            SCOPE,
+            &push(
+                "device-a",
+                vec![change(
+                    "00000000-0000-4000-8000-000000000040",
+                    "reborn",
+                    Op::Upsert,
+                    Some(json!({"title": "first life"})),
+                )],
+            ),
+            &resolver,
+        )
+        .expect("first-life push");
+    let ChangeOutcome::Applied {
+        version: first_life,
+    } = response.outcomes[0]
+    else {
+        panic!(
+            "first life must clean-apply, got {:?}",
+            response.outcomes[0]
+        );
+    };
+    let mut kill = change(
+        "00000000-0000-4000-8000-000000000041",
+        "reborn",
+        Op::Delete,
+        None,
+    );
+    kill.base_version = first_life;
+    backend
+        .apply_push(SCOPE, &push("device-a", vec![kill]), &resolver)
+        .expect("first-life delete");
+    let removed = backend
+        .gc_tombstones(backend.latest_version().expect("latest"))
+        .expect("gc before rebirth");
+    assert!(removed >= 1, "the first-life tombstone must be GC'd");
+
+    // Regression: the base-0 RECREATE after the GC still clean-applies.
+    let response = backend
+        .apply_push(
+            SCOPE,
+            &push(
+                "device-b",
+                vec![change(
+                    "00000000-0000-4000-8000-000000000042",
+                    "reborn",
+                    Op::Upsert,
+                    Some(json!({"title": "second life"})),
+                )],
+            ),
+            &resolver,
+        )
+        .expect("rebirth push");
+    let ChangeOutcome::Applied {
+        version: second_life,
+    } = response.outcomes[0]
+    else {
+        panic!(
+            "a base-0 recreate must stay a clean apply, got {:?}",
+            response.outcomes[0]
+        );
+    };
+
+    // Stale EDIT from the old incarnation, with a fast clock: server wins,
+    // the new incarnation is untouched (only re-versioned).
+    let mut ghost_edit = change(
+        "00000000-0000-4000-8000-000000000043",
+        "reborn",
+        Op::Upsert,
+        Some(json!({"title": "ghost edit"})),
+    );
+    ghost_edit.base_version = first_life; // <= horizon
+    ghost_edit.updated_at = Utc::now() + Duration::days(365);
+    let response = backend
+        .apply_push(SCOPE, &push("device-a", vec![ghost_edit]), &resolver)
+        .expect("ghost edit push");
+    let ChangeOutcome::Resolved { row } = &response.outcomes[0] else {
+        panic!(
+            "a pre-horizon stale edit must resolve, got {:?}",
+            response.outcomes[0]
+        );
+    };
+    assert!(
+        !row.deleted
+            && row.version > second_life
+            && row
+                .payload
+                .as_ref()
+                .and_then(|p| p.get("title"))
+                .and_then(|v| v.as_str())
+                == Some("second life"),
+        "the recreated row must win over a pre-horizon stale edit, got {row:?}"
+    );
+    let after_ghost_edit = row.version;
+
+    // Stale DELETE from the old incarnation: same — the new incarnation
+    // must not be deleted by a ghost.
+    let mut ghost_delete = change(
+        "00000000-0000-4000-8000-000000000044",
+        "reborn",
+        Op::Delete,
+        None,
+    );
+    ghost_delete.base_version = first_life;
+    ghost_delete.updated_at = Utc::now() + Duration::days(365);
+    let response = backend
+        .apply_push(SCOPE, &push("device-a", vec![ghost_delete]), &resolver)
+        .expect("ghost delete push");
+    let ChangeOutcome::Resolved { row } = &response.outcomes[0] else {
+        panic!(
+            "a pre-horizon stale delete must resolve, got {:?}",
+            response.outcomes[0]
+        );
+    };
+    assert!(
+        !row.deleted && row.version > after_ghost_edit,
+        "a pre-horizon stale delete must not kill the new incarnation, got {row:?}"
+    );
+    let after_ghosts = row.version;
+    let PullResponse::Ok { rows, .. } = backend
+        .pull_since(SCOPE, after_ghosts - 1, 100, after_ghosts - 1)
+        .expect("pull the reborn row")
+    else {
+        panic!("an at-feed cursor never requires a resync");
+    };
+    assert!(
+        rows.iter().any(|r| r.pk == "reborn"
+            && !r.deleted
+            && r.payload
+                .as_ref()
+                .and_then(|p| p.get("title"))
+                .and_then(|v| v.as_str())
+                == Some("second life")),
+        "the second life must still be pulled intact, got {rows:?}"
+    );
+
+    // Stale bases ABOVE the horizon still engage the resolver: an edit
+    // based on the (post-horizon) second life conflicts normally and wins
+    // under LWW with the newer timestamp.
+    let mut third_life = change(
+        "00000000-0000-4000-8000-000000000045",
+        "reborn",
+        Op::Upsert,
+        Some(json!({"title": "third life"})),
+    );
+    third_life.base_version = second_life; // stale (row moved on) but > horizon
+    third_life.updated_at = Utc::now() + Duration::seconds(120);
+    let response = backend
+        .apply_push(SCOPE, &push("device-c", vec![third_life]), &resolver)
+        .expect("post-horizon conflict push");
+    let ChangeOutcome::Resolved { row } = &response.outcomes[0] else {
+        panic!(
+            "a post-horizon stale edit must resolve, got {:?}",
+            response.outcomes[0]
+        );
+    };
+    assert_eq!(
+        row.payload
+            .as_ref()
+            .and_then(|p| p.get("title"))
+            .and_then(|v| v.as_str()),
+        Some("third life"),
+        "post-horizon conflicts must still reach the (LWW) resolver"
+    );
+
     // ── Explicit-null payloads are real documents ─────────────────────────
     // `store.put(&None::<T>)` journals the JSON document `null`. On the
     // wire that is a PRESENT null — it must clean-apply (not be rejected as
