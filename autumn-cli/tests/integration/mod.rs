@@ -4,6 +4,7 @@ mod db_pull;
 mod generate_references_postgres;
 mod migrate_down;
 mod repo_hygiene;
+mod scaffold_form_for;
 #[cfg(unix)]
 mod serve;
 mod webhook_sim;
