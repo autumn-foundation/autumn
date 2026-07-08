@@ -25,9 +25,9 @@
 //! }
 //! ```
 
+use diesel::RunQueryDsl;
 use diesel::migration::{Migration, MigrationSource};
 use diesel::pg::Pg;
-use diesel::{Connection, RunQueryDsl};
 use diesel_migrations::{FileBasedMigrations, HarnessWithOutput, MigrationHarness};
 use std::path::Path;
 
@@ -525,8 +525,12 @@ fn framework_migration_versions() -> Result<std::collections::BTreeSet<String>, 
 /// Classify the database's applied migrations into user migrations (ascending
 /// by version), excluding framework-owned ones and resolving each to its local
 /// directory via Diesel's `name()`/`version()` metadata.
-fn resolve_applied_user_migrations(
-    conn: &mut diesel::PgConnection,
+///
+/// Generic over the connection so it works with both the native
+/// `PgConnection` and the rustls migration wrapper (see
+/// [`crate::db::MigrationConnection`]).
+fn resolve_applied_user_migrations<C: MigrationHarness<Pg>>(
+    conn: &mut C,
     all_migrations: &[Box<dyn Migration<Pg>>],
     migrations_dir: &Path,
 ) -> Result<Vec<AppliedUserMigration>, MigrationError> {
@@ -621,16 +625,18 @@ pub fn applied_user_migrations(
     database_url: &str,
     migrations_dir: &Path,
 ) -> Result<Vec<AppliedUserMigration>, MigrationError> {
-    let mut conn = diesel::PgConnection::establish(database_url)
-        .map_err(|e| MigrationError::Connection(e.to_string()))?;
+    // TLS-aware: honors the URL's sslmode (`autumn migrate status` rollback
+    // availability must work against TLS-only servers too).
+    with_migration_connection!(database_url, |conn| {
+        let source = FileBasedMigrations::from_path(migrations_dir).map_err(|e| {
+            MigrationError::Migration(format!("failed to read migrations dir: {e}"))
+        })?;
+        let all_migrations: Vec<Box<dyn Migration<Pg>>> = source
+            .migrations()
+            .map_err(|e| MigrationError::Migration(e.to_string()))?;
 
-    let source = FileBasedMigrations::from_path(migrations_dir)
-        .map_err(|e| MigrationError::Migration(format!("failed to read migrations dir: {e}")))?;
-    let all_migrations: Vec<Box<dyn Migration<Pg>>> = source
-        .migrations()
-        .map_err(|e| MigrationError::Migration(e.to_string()))?;
-
-    resolve_applied_user_migrations(&mut conn, &all_migrations, migrations_dir)
+        resolve_applied_user_migrations(conn, &all_migrations, migrations_dir)
+    })
 }
 
 /// Plan and execute a user-migration rollback atomically under the migration
@@ -669,56 +675,58 @@ where
 {
     let timeout = wait_timeout.unwrap_or(DEFAULT_LOCK_WAIT_TIMEOUT);
 
-    let mut conn = diesel::PgConnection::establish(database_url)
-        .map_err(|e| MigrationError::Connection(e.to_string()))?;
+    // TLS-aware: honors the URL's sslmode (`autumn migrate down` must work
+    // against TLS-only servers too).
+    with_migration_connection!(database_url, |conn| {
+        let source = FileBasedMigrations::from_path(migrations_dir).map_err(|e| {
+            MigrationError::Migration(format!("failed to read migrations dir: {e}"))
+        })?;
+        let all_migrations: Vec<Box<dyn Migration<Pg>>> = source
+            .migrations()
+            .map_err(|e| MigrationError::Migration(e.to_string()))?;
 
-    let source = FileBasedMigrations::from_path(migrations_dir)
-        .map_err(|e| MigrationError::Migration(format!("failed to read migrations dir: {e}")))?;
-    let all_migrations: Vec<Box<dyn Migration<Pg>>> = source
-        .migrations()
-        .map_err(|e| MigrationError::Migration(e.to_string()))?;
+        acquire_migration_lock_on(conn, timeout)?;
 
-    acquire_migration_lock(&mut conn, timeout)?;
+        let result: Result<usize, MigrationError> = (|| {
+            let applied_user =
+                resolve_applied_user_migrations(&mut *conn, &all_migrations, migrations_dir)?;
+            let versions = plan(&applied_user)?;
 
-    let result: Result<usize, MigrationError> = (|| {
-        let applied_user =
-            resolve_applied_user_migrations(&mut conn, &all_migrations, migrations_dir)?;
-        let versions = plan(&applied_user)?;
+            let mut count = 0;
+            for version in &versions {
+                // Build a borrowed `MigrationVersion` once per version (no heap
+                // allocation) instead of allocating a `String` for every migration.
+                let target = diesel::migration::MigrationVersion::from(version.as_str());
+                let migration = all_migrations
+                    .iter()
+                    .find(|m| m.name().version() == target)
+                    .ok_or_else(|| {
+                        MigrationError::Migration(format!(
+                            "migration version {version} is applied but not present in {} — \
+                             cannot revert (its down.sql is unavailable)",
+                            migrations_dir.display()
+                        ))
+                    })?;
 
-        let mut count = 0;
-        for version in &versions {
-            // Build a borrowed `MigrationVersion` once per version (no heap
-            // allocation) instead of allocating a `String` for every migration.
-            let target = diesel::migration::MigrationVersion::from(version.as_str());
-            let migration = all_migrations
-                .iter()
-                .find(|m| m.name().version() == target)
-                .ok_or_else(|| {
-                    MigrationError::Migration(format!(
-                        "migration version {version} is applied but not present in {} — \
-                         cannot revert (its down.sql is unavailable)",
-                        migrations_dir.display()
-                    ))
-                })?;
+                let started = std::time::Instant::now();
+                conn.revert_migration(migration.as_ref())
+                    .map_err(|e| MigrationError::Migration(e.to_string()))?;
+                let duration = started.elapsed();
 
-            let started = std::time::Instant::now();
-            conn.revert_migration(migration.as_ref())
-                .map_err(|e| MigrationError::Migration(e.to_string()))?;
-            let duration = started.elapsed();
+                on_reverted(&RevertedMigration {
+                    version: version.clone(),
+                    name: migration.name().to_string(),
+                    duration,
+                });
+                count += 1;
+            }
+            Ok(count)
+        })();
 
-            on_reverted(&RevertedMigration {
-                version: version.clone(),
-                name: migration.name().to_string(),
-                duration,
-            });
-            count += 1;
-        }
-        Ok(count)
-    })();
+        release_migration_lock_on(conn);
 
-    release_migration_lock(&mut conn);
-
-    result
+        result
+    })
 }
 
 // ── Startup wait-for-database ─────────────────────────────────────────────────

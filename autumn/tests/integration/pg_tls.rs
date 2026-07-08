@@ -237,6 +237,34 @@ fn hold_migration_lock_negotiates_tls_for_sslmode_require() {
     );
 }
 
+/// `autumn migrate status` (rollback availability) and `autumn migrate
+/// down` list applied user migrations over a synchronous connection — that
+/// path must negotiate TLS for sslmode=require too. The stub cannot answer
+/// the applied-migrations query, but a completed handshake carrying the
+/// startup message proves the listing path went through rustls rather than
+/// libpq. Plain `#[test]`: the path is synchronous (CLI context).
+#[test]
+fn applied_user_migrations_negotiates_tls_for_sslmode_require() {
+    let (port, rx) = spawn_stub(true);
+    let url = format!("postgres://app_user:secret@127.0.0.1:{port}/app?sslmode=require");
+    let migrations_dir = tempfile::tempdir().expect("tempdir");
+
+    let result = autumn_web::migrate::applied_user_migrations(&url, migrations_dir.path());
+    assert!(result.is_err(), "the stub cannot answer the query");
+
+    let observed = rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the stub must observe a connection from the listing path");
+    let Observed::TlsStartup(startup) = observed else {
+        panic!("applied_user_migrations must negotiate TLS, got {observed:?}");
+    };
+    let haystack = String::from_utf8_lossy(&startup);
+    assert!(
+        haystack.contains("app_user"),
+        "startup message must arrive over the encrypted stream, got: {haystack}"
+    );
+}
+
 #[tokio::test]
 async fn keyword_value_connection_string_passes_validation_and_negotiates_tls() {
     // The libpq keyword/value form (with quoting and whitespace around `=`)
