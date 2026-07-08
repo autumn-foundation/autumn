@@ -958,11 +958,14 @@ struct PgSequenceRecord {
     is_called: bool,
 }
 
-fn pg_upsert_row(
-    conn: &mut PgConnection,
+fn pg_upsert_row<C>(
+    conn: &mut C,
     scope: &str,
     stored: &ServerRow,
-) -> Result<(), diesel::result::Error> {
+) -> Result<(), diesel::result::Error>
+where
+    C: diesel::connection::LoadConnection<Backend = diesel::pg::Pg>,
+{
     let row = &stored.row;
     sql_query(
         "INSERT INTO autumn_sync_rows \
@@ -988,7 +991,10 @@ fn pg_upsert_row(
     .map(|_| ())
 }
 
-fn pg_next_version(conn: &mut PgConnection) -> Result<Version, diesel::result::Error> {
+fn pg_next_version<C>(conn: &mut C) -> Result<Version, diesel::result::Error>
+where
+    C: diesel::connection::LoadConnection<Backend = diesel::pg::Pg>,
+{
     sql_query("SELECT nextval('autumn_sync_version_seq') AS version")
         .get_result::<PgVersionRecord>(conn)
         .map(|record| record.version)
@@ -996,7 +1002,10 @@ fn pg_next_version(conn: &mut PgConnection) -> Result<Version, diesel::result::E
 
 /// The scope's tombstone GC horizon — `0` when no tombstone of that scope
 /// was ever dropped.
-fn pg_horizon(conn: &mut PgConnection, scope: &str) -> Result<Version, diesel::result::Error> {
+fn pg_horizon<C>(conn: &mut C, scope: &str) -> Result<Version, diesel::result::Error>
+where
+    C: diesel::connection::LoadConnection<Backend = diesel::pg::Pg>,
+{
     let record = sql_query("SELECT horizon AS version FROM autumn_sync_horizons WHERE scope = $1")
         .bind::<Text, _>(scope)
         .get_result::<PgVersionRecord>(conn)
@@ -1006,7 +1015,10 @@ fn pg_horizon(conn: &mut PgConnection, scope: &str) -> Result<Version, diesel::r
 
 /// The most recently assigned version — the sequence's `last_value` once it
 /// has been called, `0` on a fresh backend.
-fn pg_latest_version(conn: &mut PgConnection) -> Result<Version, diesel::result::Error> {
+fn pg_latest_version<C>(conn: &mut C) -> Result<Version, diesel::result::Error>
+where
+    C: diesel::connection::LoadConnection<Backend = diesel::pg::Pg>,
+{
     let record = sql_query("SELECT last_value, is_called FROM autumn_sync_version_seq")
         .get_result::<PgSequenceRecord>(conn)?;
     Ok(if record.is_called {
@@ -1022,9 +1034,57 @@ fn pg_latest_version(conn: &mut PgConnection) -> Result<Version, diesel::result:
 /// `autumn_sync_horizons`. Each push batch applies in one transaction;
 /// versions come from the `autumn_sync_version_seq` sequence, making the
 /// row table itself the change feed.
+///
+/// Connections honor the URL's `sslmode` through the crate's shared
+/// TLS-aware path (see `with_sync_pg_connection!`): `sslmode=require` /
+/// `verify-full` URLs — the production posture — connect through the same
+/// rustls connector as the app's pool, because the workspace bundles
+/// libpq WITHOUT SSL support and a raw [`PgConnection`] cannot reach
+/// TLS-only servers at all.
 #[derive(Debug, Clone)]
 pub struct PgSyncBackend {
     database_url: String,
+}
+
+/// Run `$body` with a `&mut` sync diesel connection to `$url` that honors
+/// the connection string's `sslmode` — the SAME TLS-aware path the app
+/// pool and the migration/wait checks use (see
+/// [`crate::db::establish_migration_connection`], issue #1585 review):
+/// TLS-off URLs keep the historical native [`PgConnection`], while
+/// `sslmode=require` / `verify-full` URLs connect through the pool's
+/// rustls connector wrapped in diesel-async's sync
+/// `AsyncConnectionWrapper` — the workspace bundles libpq without SSL
+/// (`pq-sys` `bundled_without_openssl`), so the native path cannot reach
+/// TLS-only servers even though the async pool connects fine.
+///
+/// The body is expanded once per concrete connection type, so it may only
+/// use the sync diesel APIs both provide: queries, `transaction()`, and
+/// `SimpleConnection::batch_execute` — which covers everything this
+/// backend needs. Advisory locks are plain SQL, and the pull path's READ
+/// ONLY REPEATABLE READ posture is set via `SET TRANSACTION` as the first
+/// statement inside `transaction()` (semantically identical to
+/// `build_transaction()`, which is an inherent `PgConnection` method the
+/// wrapper does not expose).
+macro_rules! with_sync_pg_connection {
+    ($url:expr, |$conn:ident| $body:expr) => {
+        match crate::db::establish_migration_connection($url).map_err(backend_err)? {
+            crate::db::MigrationConnection::Native(mut native) => {
+                let $conn = &mut native;
+                $body
+            }
+            crate::db::MigrationConnection::Rustls { mut conn, runtime } => {
+                let result = {
+                    let $conn = &mut conn;
+                    $body
+                };
+                // The runtime (when owned) drives the connection's tokio
+                // driver task: it must outlive every use of `conn`.
+                drop(conn);
+                drop(runtime);
+                result
+            }
+        }
+    };
 }
 
 impl PgSyncBackend {
@@ -1035,10 +1095,6 @@ impl PgSyncBackend {
         Self {
             database_url: database_url.into(),
         }
-    }
-
-    fn connect(&self) -> Result<PgConnection, SyncError> {
-        PgConnection::establish(&self.database_url).map_err(backend_err)
     }
 
     /// Create the shadow tables and the version sequence if they do not
@@ -1053,8 +1109,9 @@ impl PgSyncBackend {
     /// cannot be applied.
     pub fn ensure_schema(&self) -> Result<(), SyncError> {
         use diesel::connection::SimpleConnection;
-        let mut conn = self.connect()?;
-        conn.batch_execute(PG_SCHEMA_DDL).map_err(backend_err)
+        with_sync_pg_connection!(&self.database_url, |conn| {
+            conn.batch_execute(PG_SCHEMA_DDL).map_err(backend_err)
+        })
     }
 }
 
@@ -1066,100 +1123,101 @@ impl SyncBackend for PgSyncBackend {
         resolver: &dyn ConflictResolver,
     ) -> Result<PushResponse, SyncError> {
         validate_push(request)?;
-        let mut conn = self.connect()?;
-        conn.transaction::<_, diesel::result::Error, _>(|conn| {
-            // Serialize push batches (held until commit). See the doc
-            // comment on PG_PUSH_ADVISORY_LOCK_KEY for why this is
-            // required for correctness, not just politeness.
-            sql_query("SELECT pg_advisory_xact_lock($1)")
-                .bind::<BigInt, _>(PG_PUSH_ADVISORY_LOCK_KEY)
-                .execute(conn)?;
-            // The REQUESTING SCOPE's horizon, stable for the whole batch:
-            // GC serializes on the same advisory lock, so it cannot move
-            // mid-transaction.
-            let horizon = pg_horizon(conn, scope)?;
-            let mut outcomes = Vec::with_capacity(request.changes.len());
-            for change in &request.changes {
-                let duplicate = sql_query(
-                    "SELECT version, resolved_row FROM autumn_sync_applied \
+        with_sync_pg_connection!(&self.database_url, |conn| {
+            conn.transaction::<_, diesel::result::Error, _>(|conn| {
+                // Serialize push batches (held until commit). See the doc
+                // comment on PG_PUSH_ADVISORY_LOCK_KEY for why this is
+                // required for correctness, not just politeness.
+                sql_query("SELECT pg_advisory_xact_lock($1)")
+                    .bind::<BigInt, _>(PG_PUSH_ADVISORY_LOCK_KEY)
+                    .execute(conn)?;
+                // The REQUESTING SCOPE's horizon, stable for the whole batch:
+                // GC serializes on the same advisory lock, so it cannot move
+                // mid-transaction.
+                let horizon = pg_horizon(conn, scope)?;
+                let mut outcomes = Vec::with_capacity(request.changes.len());
+                for change in &request.changes {
+                    let duplicate = sql_query(
+                        "SELECT version, resolved_row FROM autumn_sync_applied \
                      WHERE scope = $1 AND device_id = $2 AND change_id = $3",
-                )
-                .bind::<Text, _>(scope)
-                .bind::<Text, _>(&request.device_id)
-                .bind::<Text, _>(&change.change_id)
-                .get_result::<PgAppliedRecord>(conn)
-                .optional()?;
-                if let Some(record) = duplicate {
-                    // Replay the ORIGINAL outcome: a Resolved result must
-                    // come back as the same Resolved row, not a
-                    // clean-looking AlreadyApplied ack (see AppliedRecord).
-                    outcomes.push(match record.resolved_row {
-                        Some(value) => ChangeOutcome::Resolved {
-                            row: serde_json::from_value(value).map_err(|e| {
-                                diesel::result::Error::DeserializationError(e.into())
-                            })?,
-                        },
-                        None => ChangeOutcome::AlreadyApplied {
-                            version: record.version,
-                        },
-                    });
-                    continue;
-                }
+                    )
+                    .bind::<Text, _>(scope)
+                    .bind::<Text, _>(&request.device_id)
+                    .bind::<Text, _>(&change.change_id)
+                    .get_result::<PgAppliedRecord>(conn)
+                    .optional()?;
+                    if let Some(record) = duplicate {
+                        // Replay the ORIGINAL outcome: a Resolved result must
+                        // come back as the same Resolved row, not a
+                        // clean-looking AlreadyApplied ack (see AppliedRecord).
+                        outcomes.push(match record.resolved_row {
+                            Some(value) => ChangeOutcome::Resolved {
+                                row: serde_json::from_value(value).map_err(|e| {
+                                    diesel::result::Error::DeserializationError(e.into())
+                                })?,
+                            },
+                            None => ChangeOutcome::AlreadyApplied {
+                                version: record.version,
+                            },
+                        });
+                        continue;
+                    }
 
-                let current = sql_query(
-                    "SELECT collection, pk, payload, version, deleted, updated_at, device_id, \
+                    let current = sql_query(
+                        "SELECT collection, pk, payload, version, deleted, updated_at, device_id, \
                      created_version \
                      FROM autumn_sync_rows \
                      WHERE scope = $1 AND collection = $2 AND pk = $3 FOR UPDATE",
-                )
-                .bind::<Text, _>(scope)
-                .bind::<Text, _>(&change.collection)
-                .bind::<Text, _>(&change.pk)
-                .get_result::<PgRowRecord>(conn)
-                .optional()?
-                .map(PgRowRecord::into_server_row);
+                    )
+                    .bind::<Text, _>(scope)
+                    .bind::<Text, _>(&change.collection)
+                    .bind::<Text, _>(&change.pk)
+                    .get_result::<PgRowRecord>(conn)
+                    .optional()?
+                    .map(PgRowRecord::into_server_row);
 
-                let version = pg_next_version(conn)?;
-                // The conflict-arm policy is the shared apply_change_row —
-                // one authoritative copy for both backends.
-                let (stored, clean) = apply_change_row(
-                    change,
-                    &request.device_id,
-                    current.as_ref(),
-                    horizon,
-                    resolver,
-                    version,
-                );
-                pg_upsert_row(conn, scope, &stored)?;
-                let outcome = if clean {
-                    ChangeOutcome::Applied { version }
-                } else {
-                    ChangeOutcome::Resolved { row: stored.row }
-                };
+                    let version = pg_next_version(conn)?;
+                    // The conflict-arm policy is the shared apply_change_row —
+                    // one authoritative copy for both backends.
+                    let (stored, clean) = apply_change_row(
+                        change,
+                        &request.device_id,
+                        current.as_ref(),
+                        horizon,
+                        resolver,
+                        version,
+                    );
+                    pg_upsert_row(conn, scope, &stored)?;
+                    let outcome = if clean {
+                        ChangeOutcome::Applied { version }
+                    } else {
+                        ChangeOutcome::Resolved { row: stored.row }
+                    };
 
-                let resolved_row = match &outcome {
-                    ChangeOutcome::Resolved { row } => Some(
-                        serde_json::to_value(row)
-                            .map_err(|e| diesel::result::Error::SerializationError(e.into()))?,
-                    ),
-                    _ => None,
-                };
-                sql_query(
-                    "INSERT INTO autumn_sync_applied \
+                    let resolved_row = match &outcome {
+                        ChangeOutcome::Resolved { row } => Some(
+                            serde_json::to_value(row)
+                                .map_err(|e| diesel::result::Error::SerializationError(e.into()))?,
+                        ),
+                        _ => None,
+                    };
+                    sql_query(
+                        "INSERT INTO autumn_sync_applied \
                      (scope, device_id, change_id, version, resolved_row) \
                      VALUES ($1, $2, $3, $4, $5)",
-                )
-                .bind::<Text, _>(scope)
-                .bind::<Text, _>(&request.device_id)
-                .bind::<Text, _>(&change.change_id)
-                .bind::<BigInt, _>(version)
-                .bind::<Nullable<Jsonb>, _>(resolved_row)
-                .execute(conn)?;
-                outcomes.push(outcome);
-            }
-            Ok(PushResponse { outcomes })
+                    )
+                    .bind::<Text, _>(scope)
+                    .bind::<Text, _>(&request.device_id)
+                    .bind::<Text, _>(&change.change_id)
+                    .bind::<BigInt, _>(version)
+                    .bind::<Nullable<Jsonb>, _>(resolved_row)
+                    .execute(conn)?;
+                    outcomes.push(outcome);
+                }
+                Ok(PushResponse { outcomes })
+            })
+            .map_err(backend_err)
         })
-        .map_err(backend_err)
     }
 
     fn pull_since(
@@ -1169,7 +1227,6 @@ impl SyncBackend for PgSyncBackend {
         limit: i64,
         session_start: Version,
     ) -> Result<PullResponse, SyncError> {
-        let mut conn = self.connect()?;
         // REPEATABLE READ is load-bearing: the horizon read and the row
         // scan must observe ONE MVCC snapshot. Under the default READ
         // COMMITTED each statement snapshots independently, so a concurrent
@@ -1189,10 +1246,19 @@ impl SyncBackend for PgSyncBackend {
         // is needed, and unlike taking the GC/push advisory lock this
         // serializes nothing: pulls, pushes, and GC all keep running
         // concurrently.
-        conn.build_transaction()
-            .read_only()
-            .repeatable_read()
-            .run::<_, diesel::result::Error, _>(|conn| {
+        //
+        // The posture is set via `SET TRANSACTION ISOLATION LEVEL
+        // REPEATABLE READ, READ ONLY` as the FIRST statement inside
+        // `transaction()` — semantically identical to Postgres's
+        // `BEGIN READ ONLY ISOLATION LEVEL REPEATABLE READ` (SET
+        // TRANSACTION applies when it precedes any query in the
+        // transaction), and unlike `build_transaction()` (an inherent
+        // PgConnection method) it works on both connection types the
+        // TLS-aware macro dispatches to.
+        with_sync_pg_connection!(&self.database_url, |conn| {
+            conn.transaction::<_, diesel::result::Error, _>(|conn| {
+                sql_query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+                    .execute(conn)?;
                 let horizon = pg_horizon(conn, scope)?;
                 if session_start > 0 && session_start < horizon {
                     return Ok(PullResponse::FullResyncRequired {
@@ -1220,72 +1286,77 @@ impl SyncBackend for PgSyncBackend {
                 })
             })
             .map_err(backend_err)
+        })
     }
 
     fn gc_tombstones(&self, up_to: Version) -> Result<u64, SyncError> {
-        let mut conn = self.connect()?;
-        conn.transaction::<_, diesel::result::Error, _>(|conn| {
-            // Serialize with pushes (the SAME advisory lock apply_push
-            // takes): with an in-flight push holding an allocated-but-
-            // uncommitted version below a tombstone this sweep drops, the
-            // persisted horizon could cover that version before its row is
-            // visible — a client pulling in between would jump its cursor
-            // past the row and miss it forever. Holding the push lock, no
-            // push is in flight while we sweep, so every version at or
-            // below anything we drop is committed.
-            sql_query("SELECT pg_advisory_xact_lock($1)")
-                .bind::<BigInt, _>(PG_PUSH_ADVISORY_LOCK_KEY)
-                .execute(conn)?;
-            // Global sweep, PER-SCOPE horizons: each scope's horizon
-            // advances to the highest tombstone version actually dropped
-            // in THAT scope (see the trait docs) — inherently a committed
-            // version, so no explicit clamp is needed, and scopes whose
-            // tombstones were untouched keep their horizon (no forced
-            // resyncs, no suppressed conflict resolution elsewhere).
-            let dropped = sql_query(
-                "DELETE FROM autumn_sync_rows WHERE deleted AND version <= $1 \
+        with_sync_pg_connection!(&self.database_url, |conn| {
+            conn.transaction::<_, diesel::result::Error, _>(|conn| {
+                // Serialize with pushes (the SAME advisory lock apply_push
+                // takes): with an in-flight push holding an allocated-but-
+                // uncommitted version below a tombstone this sweep drops, the
+                // persisted horizon could cover that version before its row is
+                // visible — a client pulling in between would jump its cursor
+                // past the row and miss it forever. Holding the push lock, no
+                // push is in flight while we sweep, so every version at or
+                // below anything we drop is committed.
+                sql_query("SELECT pg_advisory_xact_lock($1)")
+                    .bind::<BigInt, _>(PG_PUSH_ADVISORY_LOCK_KEY)
+                    .execute(conn)?;
+                // Global sweep, PER-SCOPE horizons: each scope's horizon
+                // advances to the highest tombstone version actually dropped
+                // in THAT scope (see the trait docs) — inherently a committed
+                // version, so no explicit clamp is needed, and scopes whose
+                // tombstones were untouched keep their horizon (no forced
+                // resyncs, no suppressed conflict resolution elsewhere).
+                let dropped = sql_query(
+                    "DELETE FROM autumn_sync_rows WHERE deleted AND version <= $1 \
                  RETURNING scope, version",
-            )
-            .bind::<BigInt, _>(up_to)
-            .get_results::<PgDroppedRecord>(conn)?;
-            let removed = dropped.len();
-            let mut per_scope: HashMap<String, Version> = HashMap::new();
-            for record in dropped {
-                let max = per_scope.entry(record.scope).or_insert(0);
-                *max = (*max).max(record.version);
-            }
-            for (scope, horizon) in per_scope {
-                sql_query(
-                    "INSERT INTO autumn_sync_horizons (scope, horizon) VALUES ($1, $2) \
+                )
+                .bind::<BigInt, _>(up_to)
+                .get_results::<PgDroppedRecord>(conn)?;
+                let removed = dropped.len();
+                let mut per_scope: HashMap<String, Version> = HashMap::new();
+                for record in dropped {
+                    let max = per_scope.entry(record.scope).or_insert(0);
+                    *max = (*max).max(record.version);
+                }
+                for (scope, horizon) in per_scope {
+                    sql_query(
+                        "INSERT INTO autumn_sync_horizons (scope, horizon) VALUES ($1, $2) \
                      ON CONFLICT (scope) DO UPDATE SET \
                      horizon = GREATEST(autumn_sync_horizons.horizon, excluded.horizon)",
-                )
-                .bind::<Text, _>(&scope)
-                .bind::<BigInt, _>(horizon)
-                .execute(conn)?;
-            }
-            Ok(removed as u64)
+                    )
+                    .bind::<Text, _>(&scope)
+                    .bind::<BigInt, _>(horizon)
+                    .execute(conn)?;
+                }
+                Ok(removed as u64)
+            })
+            .map_err(backend_err)
         })
-        .map_err(backend_err)
     }
 
     fn gc_applied(&self, older_than: DateTime<Utc>) -> Result<u64, SyncError> {
-        let mut conn = self.connect()?;
-        let removed = sql_query("DELETE FROM autumn_sync_applied WHERE applied_at < $1")
-            .bind::<Timestamptz, _>(older_than)
-            .execute(&mut conn)
-            .map_err(backend_err)?;
-        Ok(removed as u64)
+        with_sync_pg_connection!(&self.database_url, |conn| {
+            let removed = sql_query("DELETE FROM autumn_sync_applied WHERE applied_at < $1")
+                .bind::<Timestamptz, _>(older_than)
+                .execute(conn)
+                .map_err(backend_err)?;
+            Ok(removed as u64)
+        })
     }
 
     fn tombstone_horizon(&self, scope: &str) -> Result<Version, SyncError> {
-        let mut conn = self.connect()?;
-        pg_horizon(&mut conn, scope).map_err(backend_err)
+        with_sync_pg_connection!(&self.database_url, |conn| {
+            pg_horizon(conn, scope).map_err(backend_err)
+        })
     }
 
     fn latest_version(&self) -> Result<Version, SyncError> {
-        let mut conn = self.connect()?;
-        pg_latest_version(&mut conn).map_err(backend_err)
+        with_sync_pg_connection!(&self.database_url, |conn| {
+            pg_latest_version(conn).map_err(backend_err)
+        })
     }
 }
 
