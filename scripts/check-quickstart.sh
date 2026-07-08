@@ -28,14 +28,14 @@
 #   setup            `autumn setup`
 #   build            `cargo build`, then asserts `autumn-web` resolved from
 #                    the crates.io registry (no path/patch leakage).
-#   serve            `cargo run` + poll `GET /` until 200. Records the tracked
-#                    funnel number: elapsed seconds from the start of
+#   serve            `autumn dev` + poll `GET /` until 200. Records the
+#                    tracked funnel number: elapsed seconds from the start of
 #                    `cargo install` to the first 200 response.
 #   scaffold         `autumn generate scaffold Post title:String body:Text published:bool`
 #   scaffold-build   `cargo build`
 #   scaffold-migrate `autumn migrate` (requires $DATABASE_URL and the diesel
 #                    CLI on PATH; see docs/guide/generators.md)
-#   scaffold-serve   `cargo run` + poll `GET /posts` until 200.
+#   scaffold-serve   `autumn dev` + poll `GET /posts` until 200.
 #
 # Environment:
 #   QUICKSTART_CLI_VERSION        Override the autumn-cli version to install
@@ -50,7 +50,7 @@
 #   QUICKSTART_PORT               Port the generated app serves on (default
 #                                 3000, the README's documented port).
 #   QUICKSTART_SERVE_TIMEOUT_SECS Deadline for the first response after
-#                                 `cargo run` starts (default 180).
+#                                 `autumn dev` starts (default 180).
 #   DATABASE_URL                  Postgres URL for the scaffold migrate/serve
 #                                 phases (CI provides a postgres:16 service
 #                                 container).
@@ -137,9 +137,14 @@ kill_tree() {
 }
 
 start_server() {
-  # `cargo run` is the README's documented non-watch way to start the app
-  # ("Or run without watch mode"). `autumn dev` adds a file watcher and
-  # browser livereload that are meaningless headless in CI.
+  # `autumn dev` is the README quickstart's run command (and how the
+  # generators guide ends the scaffold path), so the gate starts the app
+  # exactly that way — a regression in the published CLI's dev
+  # startup/watch path would otherwise slip past the gate while every new
+  # user hits it. Verified to run headless (no tty needed); the watcher
+  # spawns the app server as a child process, and env vars set here pass
+  # through to it. stop_server/kill_tree tears down the whole
+  # watcher → server tree.
   #
   # $2 selects the runtime configuration the README path actually exercises:
   #   no-db    The quickstart up to `GET /` configures no database, so the
@@ -163,9 +168,9 @@ start_server() {
     cd "$app_dir" || exit 1
     if [[ "$db_mode" == "with-db" ]]; then
       export AUTUMN_DATABASE__URL="$DATABASE_URL"
-      exec cargo run
+      exec autumn dev
     else
-      exec env -u DATABASE_URL -u AUTUMN_DATABASE__URL cargo run
+      exec env -u DATABASE_URL -u AUTUMN_DATABASE__URL autumn dev
     fi
   ) >"$log" 2>&1 &
   server_pid=$!
@@ -207,7 +212,7 @@ wait_for_200() {
       echo "---- server log tail ($log) ----" >&2
       tail -n 60 "$log" >&2 || true
       stop_server
-      fail "no 200 from ${url} within ${serve_timeout}s of 'cargo run' (last status: ${code:-none}) — see the server log tail above"
+      fail "no 200 from ${url} within ${serve_timeout}s of 'autumn dev' (last status: ${code:-none}) — see the server log tail above"
     fi
     sleep 1
   done
@@ -314,8 +319,8 @@ phase_serve() {
   wait_for_200 "$base_url/" "$log"
   local t200 t_install elapsed
   t200=$(date +%s)
-  # Stop the server before any fail() below can exit — otherwise the cargo
-  # run tree would be leaked holding port ${port}.
+  # Stop the server before any fail() below can exit — otherwise the
+  # autumn dev tree would be leaked holding port ${port}.
   stop_server
   t_install="$(cat "$state/t_install_start" 2>/dev/null || true)"
   [[ -n "$t_install" ]] || fail "missing funnel start time — the 'install' phase did not run"
