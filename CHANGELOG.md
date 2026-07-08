@@ -548,10 +548,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **security:** CSRF and CAPTCHA exempt-path matching now normalizes the
   request path (resolving `.`/`..` dot-segments — including percent-encoded
-  `%2e` forms — and collapsing duplicate slashes) before comparing it against
-  exemption prefixes, so a request like `POST /api/../submit` can no longer
-  satisfy an `/api/` exemption while targeting a protected route through a
-  downstream component that resolves dot-segments (supersedes #1229).
+  `%2e` forms — treating percent-encoded slashes (`%2f`) as segment
+  separators, and collapsing duplicate slashes) before comparing it against
+  exemption prefixes, so a request like `POST /api/../submit` or
+  `POST /api/%2e%2e%2fsubmit` can no longer satisfy an `/api/` exemption
+  while targeting a protected route through a downstream component that
+  percent-decodes or resolves dot-segments (supersedes #1229).
 
 ## [0.6.0] - 2026-06-30
 

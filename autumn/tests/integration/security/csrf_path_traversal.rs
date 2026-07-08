@@ -58,6 +58,31 @@ async fn encoded_dot_segment_path_does_not_match_exemption() {
 }
 
 #[tokio::test]
+async fn encoded_slash_dot_segment_path_does_not_match_exemption() {
+    // `%2f` must count as a segment separator: `/api/%2e%2e%2fsubmit` would
+    // otherwise remain a single opaque segment under `/api/` (exempt) while a
+    // downstream that percent-decodes before resolving dot-segments routes it
+    // to the protected `/submit`.
+    assert_eq!(
+        post_status("/api/%2e%2e%2fsubmit").await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        post_status("/api/%2E%2E%2Fsubmit").await,
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn encoded_slash_without_dot_segments_stays_exempt() {
+    // A path with an encoded slash but no dot-segments normalizes to its
+    // decoded form (`/api/file/name`), which still sits under the `/api/`
+    // exemption prefix, so the tokenless POST passes CSRF and reaches the
+    // router (404: no such route, but not 403).
+    assert_eq!(post_status("/api/file%2fname").await, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn nested_dot_segments_do_not_match_exemption() {
     // Even with extra segments and duplicate slashes mixed in, the
     // normalized path (`/submit`) decides the exemption.
