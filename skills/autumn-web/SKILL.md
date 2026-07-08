@@ -52,7 +52,8 @@ the framework almost certainly already generates or ships it:
 | Raw Diesel queries for CRUD, lookups, pagination, or bulk writes | `#[repository]`-generated methods: `find_by_id`, `find_all`, `save`, `update`, `delete_by_id`, derived `find_by_*`, `page(&PageRequest)`, `cursor_page(&CursorRequest)`, bulk `save_many`/`update_many`/`delete_many`/`upsert_many`. See `docs/guide/repositories.md`, `docs/guide/pagination.md` |
 | Manual per-item queries in a loop (N+1) or hand-written JOINs to fetch associations | `#[belongs_to]`/`#[has_many]`/`#[has_one]` + `repo.preload(records, Model::preload()...)` (unreleased) |
 | Hand-rolled auth, session, or token checks in handler bodies | `#[secured]` / `#[secured("role")]`, `#[authorize]`, repository `policy =`/`scope =`; `#[secured(scopes = [...])]` for service tokens (unreleased) |
-| Hand-assembled `<form>` markup with manual value re-fill and error display | `autumn_web::form` helpers — `form_tag`, `method_input`, `text_input` (published); `number_input`, `datetime_input`, `date_input`, `checkbox_input`, `select_input` + `Changeset` 422 re-render (unreleased). A whole-form `form_for` builder is in-flight (PR #1587, unmerged — do not use) |
+| Hand-assembled `<form>` markup with manual value re-fill and error display | `autumn_web::form::form_for(&changeset, action, method)` + the `#[model]`-derived `FormModel` (unreleased — trunk-dev, not in published 0.5.0) renders the whole form — CSRF, `_method` override, one pre-filled control per column, inline errors, submit — in one call; see "Whole-form rendering" below. Compose the per-field helpers only when its escape hatches don't fit: `form_tag`, `method_input`, `text_input` (published); `number_input`, `datetime_input`, `date_input`, `checkbox_input`, `select_input` + `Changeset` 422 re-render (unreleased) |
+| `find_all()` + a loop (or raw Diesel `LIMIT`/`OFFSET` paging) to sweep a whole table in a task/job/backfill | `repo.find_in_batches(n)` / `repo.find_each(n)` (unreleased — trunk-dev) — bounded-memory primary-key keyset iteration. See "Generated repository surface" below and `docs/guide/pagination.md` |
 | Ad-hoc `tokio::spawn` / background threads for deferred work | `#[job]` (+ retries, backends, uniqueness/concurrency caps), `#[scheduled]` for recurring, `#[task]` for operator CLI work |
 | Hand-written memoization or cache-aside code | `#[cached]` on functions; `cache::get_or_compute` / `get_or_compute_with` for stampede-safe read-through fills (unreleased) |
 | Hand-written transaction retry loops for serialization failures | `Db::tx(...)`; `Db::tx_with(TxOptions::serializable(), ...)` auto-retries 40001 (unreleased) |
@@ -415,7 +416,7 @@ raw Diesel:
 | `soft_delete`, `tenant_scoped` (attrs), `across_tenants()` | Soft deletion and tenant scoping |
 | `hooks = MyHooks` (attr) | `before_/after_create/update/delete` + `after_*_commit` lifecycle hooks with `MutationContext` |
 | `from_shard(&ShardedDb)`, `with_pool_untracked(pool)` | **(unreleased)** shard-scoped construction; `with_pool_untracked` is new on trunk-dev — published 0.5.0 repositories have **no** pool constructor at all |
-| `find_in_batches(n)` / `find_each(n)` | **In flight (PR #1592, unmerged) — do not use until merged**: bounded-memory keyset iteration |
+| `find_in_batches(batch_size)`, `find_each(batch_size)` | **(unreleased)** Bounded-memory whole-table iteration via a primary-key keyset cursor (`WHERE id > last ORDER BY id ASC LIMIT batch_size` — never `LIMIT`/`OFFSET`), generated on every repository. `find_in_batches` returns a `FindInBatches` handle — drive with `while let Some(chunk) = b.next_batch().await?`; `find_each` returns `FindEach` yielding one model per `next().await?`. Inherits soft-delete filtering, tenant scoping, and read routing like `find_all`; errors are retryable (cursor advances only on success; `Ok(None)` always means completion); `batch_size == 0` errors instead of spinning; `batch_size` is **not** clamped to `MAX_PAGE_SIZE`; sharded repos reject cross-shard `across_tenants()` iteration (iterate per shard via `from_shard`). Handle types: `autumn_web::batches::{FindInBatches, FindEach, BatchSource}` (not in the prelude). See "Batched iteration" in `docs/guide/pagination.md` |
 
 Read routing: with `database.replica_url` set, all generated reads use the
 replica automatically; writes always hit the primary. See
@@ -652,6 +653,53 @@ for the common cases:
 | `modal(id, title, &body, &ModalConfig)` / `confirm_action(...)` | Native `<dialog>` confirm for destructive actions — replaces `hx-confirm`/`window.confirm()` |
 | `pagination_nav(&page, &PagerOptions::new("/posts"))` / `cursor_pagination_nav` | Accessible, filter-preserving, htmx-opt-in pager from a `Page`/`CursorPage` (prelude re-export) |
 | `autumn_web::ui::WIDGETS_CSS` / `WIDGETS_CSS_PATH` | One shipped stylesheet backing every `autumn-*` widget class — link `href=(WIDGETS_CSS_PATH)` instead of copying widget CSS into `input.css`. Accent now follows `var(--primary)` (violet), not the old hardcoded indigo (`docs/guide/widget-styling.md`) |
+
+### Whole-form rendering — `form_for` (unreleased — trunk-dev, not in published 0.5.0)
+
+`#[model]` derives `autumn_web::form::FormModel` (one `FormField` per
+`NewX`-editable column: humanized label, type-appropriate `FieldControl`,
+`required` = non-`Option`), and `form_for` renders the entire `<form>` from a
+`Changeset` in one call — opening tag with CSRF and hidden `_method` override
+(same audited path as `form_tag`), pre-filled controls with inline per-field
+errors, and a submit button. Import from `autumn_web::form` (not in the
+prelude):
+
+```rust
+use autumn_web::form::{form_for, FieldControl};
+
+// changeset: Changeset<Post> — blank for `new`, error-carrying on 422 re-render
+let markup = form_for(&changeset, "/posts", "post") // non-GET/POST method emits hidden _method
+    .csrf(&csrf_token)                              // .csrf_field_name(...) overrides "_csrf"
+    .exclude("internal_notes")
+    .override_field("status", FieldControl::Select {
+        options: vec![("draft".into(), "Draft".into()), ("published".into(), "Published".into())],
+    })                                              // last call wins per field
+    .override_label("body", "Content")
+    .submit_label("Publish")                        // default "Save"
+    .render();
+```
+
+Derived control mapping: strings/`Uuid`/unknown types → `Text` (promote enums
+via `.override_field`), integers → `Number` (step 1), floats/`Decimal` →
+`Number` (step any), `bool` → `Checkbox` (nullable `bool` → tri-state
+`Select`), `NaiveDate` → `Date`, `NaiveDateTime`/`DateTime<Utc>`/
+`DateTime<Local>` → `DateTime`, any other `DateTime` zone → `Text` (an
+offsetless `datetime-local` value is ambiguous there). Any
+`FieldControl::File` field (or `.multipart()`) makes `render()` emit
+`enctype="multipart/form-data"`.
+
+Round-trip contracts are handled by the `#[model]`-generated `NewX`: unchecked
+checkboxes decode as `false` (`#[serde(default)]` — `checkbox_input` emits no
+hidden false fallback), and `datetime-local` submissions decode via the
+`deserialize_datetime_local_utc[_option]` /
+`deserialize_datetime_local_local[_option]` /
+`deserialize_naive_datetime_local[_option]` helpers (which also still accept
+RFC 3339 JSON bodies). Serde-renamed columns pre-fill correctly via
+`FormField::value_name` (set automatically by the derive; hand-written
+`FormModel` impls use `FormField::new(...).with_value_name(...)`). Trunk-dev
+`autumn generate scaffold` views render through a single shared
+`{snake}_form_for` helper built on this (except `--live-validation`, which
+keeps per-field htmx emission).
 
 ## Configuration
 
