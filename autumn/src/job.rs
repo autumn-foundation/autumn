@@ -1842,14 +1842,18 @@ pub(crate) fn install_job_client(state: &AppState, client: JobClient) {
 
 pub(crate) fn init_global_job_client(client: JobClient) {
     let lock = GLOBAL_JOB_CLIENT.get_or_init(|| RwLock::new(None));
-    if let Ok(mut guard) = lock.write() {
-        *guard = Some(Arc::new(client));
-    }
+    let mut guard = lock
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *guard = Some(Arc::new(client));
 }
 
 pub fn clear_global_job_client() {
     let lock = GLOBAL_JOB_CLIENT.get_or_init(|| RwLock::new(None));
-    if let Ok(mut guard) = lock.write() {
+    {
+        let mut guard = lock
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         *guard = None;
     }
     crate::job_tracking::clear_global_tracking_store();

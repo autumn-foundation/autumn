@@ -554,7 +554,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   runtime that had just installed its client invisible to `global_job_client()`
   (free-function `enqueue` and `#[job]` handlers would see no runtime). Both
   functions now use `OnceLock::get_or_init` so the slot is created exactly
-  once and every install/clear lands through the `RwLock`.
+  once and every install/clear lands through the `RwLock`. Both functions now
+  also recover from a poisoned lock (`PoisonError::into_inner`) instead of
+  silently skipping the write, and a loom model-check
+  (`chaos_job_client_loom`) exercises the first-init race across all
+  interleavings.
 
 ## [0.6.0] - 2026-06-30
 
