@@ -6406,24 +6406,20 @@ pub async fn run_shard_map_guard(
     // partial rows would cause a spurious mismatch error on the next boot attempt.
     if stored.is_empty() {
         use diesel_async::AsyncConnection as _;
-        use scoped_futures::ScopedFutureExt as _;
         let assignments: Vec<_> = computed.to_vec();
-        conn.transaction::<(), diesel::result::Error, _>(move |conn| {
-            async move {
-                for assignment in &assignments {
-                    diesel::sql_query(
-                        "INSERT INTO _autumn_shard_map (shard_name, slots) VALUES ($1, $2) \
-                         ON CONFLICT (shard_name) DO UPDATE \
-                         SET slots = EXCLUDED.slots, updated_at = NOW()",
-                    )
-                    .bind::<diesel::sql_types::Text, _>(&assignment.name)
-                    .bind::<diesel::sql_types::Text, _>(&assignment.ranges)
-                    .execute(conn)
-                    .await?;
-                }
-                Ok(())
+        conn.transaction::<(), diesel::result::Error, _>(async move |conn| {
+            for assignment in &assignments {
+                diesel::sql_query(
+                    "INSERT INTO _autumn_shard_map (shard_name, slots) VALUES ($1, $2) \
+                     ON CONFLICT (shard_name) DO UPDATE \
+                     SET slots = EXCLUDED.slots, updated_at = NOW()",
+                )
+                .bind::<diesel::sql_types::Text, _>(&assignment.name)
+                .bind::<diesel::sql_types::Text, _>(&assignment.ranges)
+                .execute(conn)
+                .await?;
             }
-            .scope_boxed()
+            Ok(())
         })
         .await
         .map_err(|e| format!("shard-map guard could not persist map: {e}"))?;

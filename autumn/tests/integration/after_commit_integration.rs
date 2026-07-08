@@ -232,22 +232,19 @@ mod tests {
             let result: Result<(), diesel::result::Error> = AFTER_COMMIT_REGISTRY
                 .scope(
                     registry.clone(),
-                    conn.transaction(|c| {
-                        let cc = cc.clone();
-                        Box::pin(async move {
-                            diesel::sql_query("INSERT INTO ac_test (name) VALUES ('committed')")
-                                .execute(c)
-                                .await?;
+                    conn.transaction(async move |c| {
+                        diesel::sql_query("INSERT INTO ac_test (name) VALUES ('committed')")
+                            .execute(c)
+                            .await?;
 
-                            // Registers a deferred callback because the scope is active.
-                            register_after_commit(move || async move {
-                                *cc.lock().expect("counter lock") += 1;
-                                Ok(())
-                            })
-                            .await;
-
-                            Ok::<_, diesel::result::Error>(())
+                        // Registers a deferred callback because the scope is active.
+                        register_after_commit(move || async move {
+                            *cc.lock().expect("counter lock") += 1;
+                            Ok(())
                         })
+                        .await;
+
+                        Ok::<_, diesel::result::Error>(())
                     }),
                 )
                 .await;
@@ -297,24 +294,19 @@ mod tests {
             let result: Result<(), diesel::result::Error> = AFTER_COMMIT_REGISTRY
                 .scope(
                     registry.clone(),
-                    conn.transaction(|c| {
-                        let cc = cc.clone();
-                        Box::pin(async move {
-                            diesel::sql_query(
-                                "INSERT INTO ac_test (name) VALUES ('should-roll-back')",
-                            )
+                    conn.transaction(async move |c| {
+                        diesel::sql_query("INSERT INTO ac_test (name) VALUES ('should-roll-back')")
                             .execute(c)
                             .await?;
 
-                            register_after_commit(move || async move {
-                                *cc.lock().expect("counter lock") += 1;
-                                Ok(())
-                            })
-                            .await;
-
-                            // Force rollback.
-                            Err::<(), _>(diesel::result::Error::RollbackTransaction)
+                        register_after_commit(move || async move {
+                            *cc.lock().expect("counter lock") += 1;
+                            Ok(())
                         })
+                        .await;
+
+                        // Force rollback.
+                        Err::<(), _>(diesel::result::Error::RollbackTransaction)
                     }),
                 )
                 .await;
@@ -368,25 +360,22 @@ mod tests {
             let result: Result<(), diesel::result::Error> = AFTER_COMMIT_REGISTRY
                 .scope(
                     registry.clone(),
-                    conn.transaction(|c| {
-                        let cbc = cbc.clone();
-                        Box::pin(async move {
-                            diesel::sql_query(
+                    conn.transaction(async move |c| {
+                        diesel::sql_query(
                             "INSERT INTO ac_test (name) VALUES ('committed-despite-bad-callback')",
                         )
                         .execute(c)
                         .await?;
 
-                            register_after_commit(move || async move {
-                                *cbc.lock().expect("flag lock") = true;
-                                Err(autumn_web::AutumnError::internal_server_error_msg(
-                                    "intentional callback error for testing",
-                                ))
-                            })
-                            .await;
-
-                            Ok::<_, diesel::result::Error>(())
+                        register_after_commit(move || async move {
+                            *cbc.lock().expect("flag lock") = true;
+                            Err(autumn_web::AutumnError::internal_server_error_msg(
+                                "intentional callback error for testing",
+                            ))
                         })
+                        .await;
+
+                        Ok::<_, diesel::result::Error>(())
                     }),
                 )
                 .await;
