@@ -3980,7 +3980,9 @@ pub struct DatabaseConfig {
     /// Compatibility alias for the primary/write role. New multi-role
     /// deployments should prefer [`primary_url`](Self::primary_url).
     ///
-    /// Must start with `postgres://` or `postgresql://` when present.
+    /// When present, must start with `postgres://` or `postgresql://`, or be
+    /// a libpq-style keyword/value connection string
+    /// (`host=db user=app dbname=app sslmode=require`).
     #[serde(default)]
     pub url: Option<String>,
 
@@ -4375,7 +4377,7 @@ impl DatabaseConfig {
     ///
     /// # Errors
     ///
-    /// Returns a validation error if a URL has an invalid scheme or a
+    /// Returns a validation error if a connection string is malformed or a
     /// shard declaration is malformed.
     pub fn validate(&self) -> Result<(), ConfigError> {
         for (field, url) in [
@@ -4384,8 +4386,7 @@ impl DatabaseConfig {
             ("database.replica_url", self.replica_url.as_deref()),
         ] {
             if let Some(url) = url
-                && !url.starts_with("postgres://")
-                && !url.starts_with("postgresql://")
+                && !is_pg_connection_string(url)
             {
                 let label = if field == "database.url" {
                     "database URL"
@@ -4393,7 +4394,9 @@ impl DatabaseConfig {
                     field
                 };
                 return Err(ConfigError::Validation(format!(
-                    "Invalid {label}: must start with postgres:// or postgresql://, got {url:?}"
+                    "Invalid {label}: must start with postgres:// or postgresql://, or be a \
+                     keyword/value connection string \
+                     (e.g. \"host=db user=app dbname=app sslmode=require\"), got {url:?}"
                 )));
             }
         }
@@ -4434,12 +4437,13 @@ impl DatabaseConfig {
                 ("replica_url", shard.replica_url.as_deref()),
             ] {
                 if let Some(url) = url
-                    && !url.starts_with("postgres://")
-                    && !url.starts_with("postgresql://")
+                    && !is_pg_connection_string(url)
                 {
                     return Err(ConfigError::Validation(format!(
                         "Invalid database.shards[{idx}].{field}: must start with \
-                         postgres:// or postgresql://, got {url:?}"
+                         postgres:// or postgresql://, or be a keyword/value \
+                         connection string \
+                         (e.g. \"host=db user=app dbname=app sslmode=require\"), got {url:?}"
                     )));
                 }
             }
@@ -4447,6 +4451,16 @@ impl DatabaseConfig {
         self.resolved_slot_map()?;
         Ok(())
     }
+}
+
+/// Whether `s` is an acceptable Postgres connection string: a
+/// `postgres://`/`postgresql://` URL, or a libpq-style keyword/value string
+/// (`host=db user=app sslmode=require`) — recognized with the SAME parser
+/// the pool's TLS module uses ([`crate::pg_conn_str`]), so every string the
+/// pool supports also passes config validation (issue #1585 review: the
+/// keyword form was rejected here before ever reaching the pool).
+fn is_pg_connection_string(s: &str) -> bool {
+    crate::pg_conn_str::is_url(s) || crate::pg_conn_str::is_keyword_value(s)
 }
 
 /// Logging configuration.
@@ -7804,6 +7818,78 @@ path = "/healthz"
     fn validate_accepts_no_url() {
         let config = DatabaseConfig::default();
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_keyword_value_connection_strings() {
+        // The pool's TLS support parses libpq keyword/value strings, so
+        // validation must let them through (issue #1585 review) — including
+        // quoted values and whitespace around `=`.
+        for url in [
+            "host=db user=app dbname=app",
+            "host=db user=app sslmode=require",
+            "host=db sslmode = require",
+            "host=db password='p w' sslmode='verify-full'",
+            "host=db password=https://looks-like-a-url sslmode=require",
+        ] {
+            let config = DatabaseConfig {
+                url: Some(url.to_owned()),
+                ..Default::default()
+            };
+            assert!(
+                config.validate().is_ok(),
+                "keyword/value string must validate: {url}"
+            );
+        }
+        // primary_url and shard URLs accept the same forms.
+        let config = DatabaseConfig {
+            primary_url: Some("host=db user=app sslmode=require".to_owned()),
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+        let config = DatabaseConfig {
+            primary_url: Some("postgres://db-control/app".to_owned()),
+            shards: vec![ShardConfig {
+                name: "s0".to_owned(),
+                primary_url: "host=db-shard0 user=app dbname=app".to_owned(),
+                replica_url: None,
+                slots: None,
+                primary_pool_size: None,
+                replica_pool_size: None,
+                replica_fallback: None,
+            }],
+            ..Default::default()
+        };
+        assert!(
+            config.validate().is_ok(),
+            "shard URLs accept the keyword form too: {:?}",
+            config.validate()
+        );
+    }
+
+    #[test]
+    fn validate_still_rejects_garbage_connection_strings() {
+        for url in [
+            "mysql://localhost/test",
+            "mysql://localhost/test?a=b",
+            "not a connection string",
+            "localhost",
+            "host=",
+            "host='unterminated",
+        ] {
+            let config = DatabaseConfig {
+                url: Some(url.to_owned()),
+                ..Default::default()
+            };
+            let err = config
+                .validate()
+                .expect_err(&format!("garbage must be rejected: {url:?}"))
+                .to_string();
+            assert!(
+                err.contains("must start with postgres:// or postgresql://"),
+                "the error must stay clear about accepted forms, got: {err}"
+            );
+        }
     }
 
     // ── Profile tests ──────────────────────────────────────────

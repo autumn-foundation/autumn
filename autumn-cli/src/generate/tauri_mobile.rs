@@ -418,9 +418,11 @@ fn render_thin_app_main_rs(crate_ident: &str) -> String {
 // ── Content renderers ─────────────────────────────────────────────────────────
 
 fn render_mobile_tauri_conf(package_name: &str, version: &str) -> String {
-    // Bundle identifier: reverse-DNS with underscores replaced by hyphens.
-    // Apple's spec allows only alphanumerics, hyphens, and periods.
-    let identifier = format!("com.example.{}", package_name.replace('_', "-"));
+    // Bundle identifier: reverse-DNS, valid on BOTH stores. Android forbids
+    // hyphens in application-id segments (`cargo tauri android init` panics,
+    // tauri-apps/tauri#9707) and Apple forbids underscores, so both are
+    // stripped — the same normalization as the thin-client generator.
+    let identifier = super::tauri::derive_mobile_identifier(package_name);
     // Display title: capitalise first letter of each word; split on both '-'
     // and '_' so kebab-case and snake_case both work.
     let title: String = package_name
@@ -952,7 +954,10 @@ mod tests {
     fn conf_has_identifier_product_name_and_no_external_bin() {
         let conf = render_mobile_tauri_conf("my-app", "1.2.3");
         let parsed: serde_json::Value = serde_json::from_str(&conf).unwrap();
-        assert_eq!(parsed["identifier"], "com.example.my-app");
+        // Hyphens are stripped: Android forbids them in application-id
+        // segments (`cargo tauri android init` panics on them), Apple
+        // forbids underscores — same normalization as the thin client.
+        assert_eq!(parsed["identifier"], "com.example.myapp");
         assert_eq!(parsed["productName"], "My App");
         assert_eq!(parsed["version"], "1.2.3");
         assert!(parsed["bundle"].get("externalBin").is_none());
@@ -960,11 +965,17 @@ mod tests {
     }
 
     #[test]
-    fn conf_identifier_replaces_underscores() {
+    fn conf_identifier_is_android_and_ios_safe() {
+        // Underscores (Apple-forbidden) and hyphens (Android-forbidden) are
+        // both stripped from the identifier segment.
         let conf = render_mobile_tauri_conf("my_app", "0.1.0");
         let parsed: serde_json::Value = serde_json::from_str(&conf).unwrap();
-        assert_eq!(parsed["identifier"], "com.example.my-app");
+        assert_eq!(parsed["identifier"], "com.example.myapp");
         assert_eq!(parsed["productName"], "My App");
+
+        let conf = render_mobile_tauri_conf("my-kebab_mix", "0.1.0");
+        let parsed: serde_json::Value = serde_json::from_str(&conf).unwrap();
+        assert_eq!(parsed["identifier"], "com.example.mykebabmix");
     }
 
     #[test]

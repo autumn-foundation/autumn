@@ -177,9 +177,14 @@ fn generate_tauri_mobile_conf_has_no_external_bin() {
     let conf: serde_json::Value =
         serde_json::from_str(&conf_raw).expect("tauri.conf.json must be valid JSON");
 
-    assert!(
-        conf.get("identifier").and_then(|v| v.as_str()).is_some(),
-        "tauri.conf.json must set identifier"
+    // Kebab-case package → hyphens stripped from the identifier segment:
+    // Android forbids hyphens in application ids (`cargo tauri android init`
+    // panics on them) and Apple forbids underscores, so only alphanumerics
+    // survive (same normalization as the thin-client generator).
+    assert_eq!(
+        conf.get("identifier").and_then(|v| v.as_str()),
+        Some("com.example.mobileconfapp"),
+        "the identifier must be Android- and iOS-safe"
     );
     assert!(
         conf.get("productName").and_then(|v| v.as_str()).is_some(),

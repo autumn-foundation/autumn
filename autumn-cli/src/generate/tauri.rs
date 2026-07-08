@@ -1641,8 +1641,9 @@ fn mobile_lib_name(package_name: &str) -> String {
     package_name.replace('-', "_") + "_mobile"
 }
 
-/// Bundle identifier for the mobile thin client: reverse-DNS with `-` and `_`
-/// stripped from the package name (`demo-app` → `com.example.demoapp`).
+/// Bundle identifier for the mobile modes (thin client here, in-process in
+/// `tauri_mobile.rs`): reverse-DNS with `-` and `_` stripped from the
+/// package name (`demo-app` → `com.example.demoapp`).
 ///
 /// Unlike the desktop derivation ([`derive_identifier`], which hyphenates for
 /// Apple), the mobile identifier must satisfy *both* stores: Android forbids
@@ -1650,7 +1651,7 @@ fn mobile_lib_name(package_name: &str) -> String {
 /// (tauri-apps/tauri#9707) — and Apple forbids underscores. Alphanumeric
 /// segments are valid on both. Users should replace the `com.example.*`
 /// placeholder with their real identifier before running `android`/`ios init`.
-fn derive_mobile_identifier(package_name: &str) -> String {
+pub fn derive_mobile_identifier(package_name: &str) -> String {
     format!("com.example.{}", package_name.replace(['-', '_'], ""))
 }
 

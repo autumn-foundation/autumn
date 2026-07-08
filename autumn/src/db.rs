@@ -3127,16 +3127,20 @@ mod tls {
         Ok(MakeRustlsConnect::new(config))
     }
 
-    /// Whether tokio-postgres would parse this connection string as a URL.
-    /// Its `Config::from_str` only treats `postgres://`/`postgresql://`
-    /// prefixes as URLs; everything else is keyword/value syntax. A substring
-    /// check like `contains("://")` would send keyword strings whose values
-    /// embed URL-like tokens (`password=https://…`) down the URL path, where
-    /// `url::Url::parse` fails and the TLS posture silently falls back to
-    /// [`TlsPosture::Off`].
-    fn is_url_connection_string(database_url: &str) -> bool {
-        database_url.starts_with("postgres://") || database_url.starts_with("postgresql://")
-    }
+    /// Whether tokio-postgres would parse this connection string as a URL —
+    /// see [`crate::pg_conn_str::is_url`]. Getting this wrong would send
+    /// keyword strings whose values embed URL-like tokens
+    /// (`password=https://…`) down the URL path, where `url::Url::parse`
+    /// fails and the TLS posture silently falls back to [`TlsPosture::Off`].
+    /// Shared with config validation so the two never disagree about which
+    /// strings are reachable.
+    use crate::pg_conn_str::is_url as is_url_connection_string;
+    /// Parse a libpq-style `key = value` connection string, mirroring
+    /// tokio-postgres's (private) parser — see
+    /// [`crate::pg_conn_str::keyword_value_pairs`]. Naive whitespace
+    /// splitting would miss `sslmode` in quoted/spaced strings and silently
+    /// downgrade the TLS posture to [`TlsPosture::Off`].
+    use crate::pg_conn_str::keyword_value_pairs;
 
     /// Extract query/keyword parameters relevant to TLS from either a
     /// `postgres://…` URL or a `key=value …` connection string.
@@ -3151,76 +3155,6 @@ mod tls {
                 .unwrap_or_default()
         } else {
             keyword_value_pairs(database_url).unwrap_or_default()
-        }
-    }
-
-    /// Parse a libpq-style `key = value` connection string into its pairs,
-    /// mirroring tokio-postgres's (private) connection-string parser:
-    /// whitespace is allowed around `=`, values may be single-quoted, and
-    /// `\` escapes the next character both inside and outside quotes
-    /// (`host=db sslmode = require sslrootcert='/pki/my ca.pem'`). Naive
-    /// whitespace splitting would miss `sslmode` in such strings and
-    /// silently downgrade the TLS posture to [`TlsPosture::Off`].
-    ///
-    /// Returns `None` for strings tokio-postgres itself would reject
-    /// (missing `=`, empty unquoted value, unterminated quote), so callers
-    /// keep the default path and surface tokio-postgres's own parse error
-    /// at connect time. Like tokio-postgres, parsing stops silently at an
-    /// empty keyword (e.g. a stray leading `=`).
-    fn keyword_value_pairs(s: &str) -> Option<Vec<(String, String)>> {
-        let mut pairs = Vec::new();
-        let mut it = s.chars().peekable();
-        loop {
-            while it.next_if(|c| c.is_whitespace()).is_some() {}
-            let mut key = String::new();
-            while let Some(&c) = it.peek() {
-                if c.is_whitespace() || c == '=' {
-                    break;
-                }
-                key.push(c);
-                it.next();
-            }
-            if key.is_empty() {
-                return Some(pairs);
-            }
-            while it.next_if(|c| c.is_whitespace()).is_some() {}
-            if it.next() != Some('=') {
-                return None;
-            }
-            while it.next_if(|c| c.is_whitespace()).is_some() {}
-            let mut value = String::new();
-            if it.next_if_eq(&'\'').is_some() {
-                loop {
-                    // `?`: EOF inside quotes (also right after `\`) is an
-                    // unterminated value.
-                    match it.next()? {
-                        '\'' => break,
-                        '\\' => value.push(it.next()?),
-                        c => value.push(c),
-                    }
-                }
-            } else {
-                while let Some(&c) = it.peek() {
-                    if c.is_whitespace() {
-                        break;
-                    }
-                    it.next();
-                    if c == '\\' {
-                        match it.next() {
-                            Some(c2) => value.push(c2),
-                            None => break,
-                        }
-                    } else {
-                        value.push(c);
-                    }
-                }
-                if value.is_empty() {
-                    // `key=` followed by whitespace/EOF: tokio-postgres
-                    // rejects the empty unquoted value (use `key=''`).
-                    return None;
-                }
-            }
-            pairs.push((key, value));
         }
     }
 
