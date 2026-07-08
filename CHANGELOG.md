@@ -695,9 +695,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the `references`/`enum{...}`/`decimal`/`:unique` generator DSL, scoped
   tokens, observability defaults, and load shedding. Features merged on
   trunk-dev but absent from the published 0.5.0 crates are explicitly marked
-  "(unreleased)", and in-flight PRs (#1587 `form_for`, #1592
-  `find_in_batches`) are flagged as unmerged rather than documented as
-  available. Fixes stale claims (foreign keys/unique "not in the DSL", the
+  "(unreleased)". Follow-up: once #1587 (`form_for`) and #1592
+  (`find_in_batches`) merged, their in-flight/do-not-use flags were replaced
+  with real coverage — `form_for`/`FormModel`/`FieldControl` (builder methods,
+  derived control mapping, checkbox/datetime/serde-rename decode contracts,
+  scaffold `{snake}_form_for` emission) and
+  `find_in_batches`/`find_each`/`autumn_web::batches` (keyset semantics,
+  retryable errors, scoping/routing inheritance, sharding limits) — each
+  marked "(unreleased)". Fixes stale claims (foreign keys/unique "not in the DSL", the
   removed `--test repo_hygiene` target) and documents that published 0.5.0
   repositories have no pool constructor (`with_pool_untracked` is
   trunk-dev-only).
