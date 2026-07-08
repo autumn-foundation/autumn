@@ -4856,6 +4856,46 @@ enabled = true
         );
     }
 
+    /// Review follow-up (#1526): with `security.headers.csp_nonce.enabled =
+    /// true` the default CSP's `style-src` drops `'unsafe-inline'` in favor of
+    /// a per-request nonce, so the gallery's inline `<style>` must carry the
+    /// exact nonce the CSP header advertises or browsers block all of the
+    /// gallery chrome CSS.
+    #[cfg(feature = "maud")]
+    #[tokio::test]
+    async fn story_pages_inline_style_carries_csp_header_nonce() {
+        let mut config = story_gallery_config();
+        config.security.headers.csp_nonce.enabled = true;
+
+        let router = build_router(Vec::new(), &config, stories_state_with_builtin());
+
+        for uri in ["/_stories", "/_stories/data-table"] {
+            let response = get_with_host(router.clone(), uri).await;
+            assert_eq!(response.status(), StatusCode::OK);
+
+            let csp = response
+                .headers()
+                .get("content-security-policy")
+                .expect("CSP header must be present")
+                .to_str()
+                .unwrap()
+                .to_owned();
+            let nonce = csp
+                .split("'nonce-")
+                .nth(1)
+                .and_then(|rest| rest.split('\'').next())
+                .unwrap_or_else(|| panic!("CSP header must advertise a nonce: {csp}"))
+                .to_owned();
+            assert!(!nonce.is_empty(), "advertised nonce must be non-empty");
+
+            let body = response_text(response).await;
+            assert!(
+                body.contains(&format!(r#"<style nonce="{nonce}">"#)),
+                "{uri} inline style must carry the CSP header nonce {nonce}: {body}"
+            );
+        }
+    }
+
     /// T17 (AC5, R12): enabled config but no registry extension (the user
     /// forgot `with_story_gallery`) serves a friendly empty state, not a 500.
     #[cfg(feature = "maud")]

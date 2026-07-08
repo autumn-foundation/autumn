@@ -337,8 +337,9 @@ where
         .route(
             STORIES_PATH,
             axum::routing::get(
-                |axum::extract::State(state): axum::extract::State<AppState>| async move {
-                    story_index_response(&state)
+                |axum::extract::State(state): axum::extract::State<AppState>,
+                 nonce: Option<crate::security::CspNonce>| async move {
+                    story_index_response(&state, nonce.as_ref())
                 },
             ),
         )
@@ -346,8 +347,9 @@ where
             STORY_DETAIL_PATH,
             axum::routing::get(
                 |axum::extract::Path(slug): axum::extract::Path<String>,
-                 axum::extract::State(state): axum::extract::State<AppState>| async move {
-                    story_detail_response(&state, &slug)
+                 axum::extract::State(state): axum::extract::State<AppState>,
+                 nonce: Option<crate::security::CspNonce>| async move {
+                    story_detail_response(&state, &slug, nonce.as_ref())
                 },
             ),
         )
@@ -360,11 +362,15 @@ fn registry_from_state(state: &AppState) -> StoryRegistry {
         .unwrap_or_default()
 }
 
-fn story_index_response(state: &AppState) -> Response {
-    Html(render_story_index(&registry_from_state(state)).into_string()).into_response()
+fn story_index_response(state: &AppState, nonce: Option<&crate::security::CspNonce>) -> Response {
+    Html(render_story_index(&registry_from_state(state), nonce).into_string()).into_response()
 }
 
-fn story_detail_response(state: &AppState, slug: &str) -> Response {
+fn story_detail_response(
+    state: &AppState,
+    slug: &str,
+    nonce: Option<&crate::security::CspNonce>,
+) -> Response {
     let registry = registry_from_state(state);
     let Some(story) = registry.find(slug) else {
         let page = story_page(
@@ -378,12 +384,15 @@ fn story_detail_response(state: &AppState, slug: &str) -> Response {
                     }
                 }
             },
+            nonce,
         );
         return (http::StatusCode::NOT_FOUND, Html(page.into_string())).into_response();
     };
 
     match story.render() {
-        Ok(rendered) => Html(render_story_detail(story, &rendered).into_string()).into_response(),
+        Ok(rendered) => {
+            Html(render_story_detail(story, &rendered, nonce).into_string()).into_response()
+        }
         Err(error) => {
             let page = story_page(
                 "Story failed to render",
@@ -394,6 +403,7 @@ fn story_detail_response(state: &AppState, slug: &str) -> Response {
                         p { a href=(STORIES_PATH) { "Back to the gallery" } }
                     }
                 },
+                nonce,
             );
             (
                 http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -419,7 +429,17 @@ body { margin: 0; font-family: system-ui, sans-serif; color: #1f2933; }
 ";
 
 /// Full HTML document shell: framework widget stylesheet + gallery chrome.
-fn story_page(title: &str, body: &maud::Markup) -> maud::Markup {
+///
+/// When the security layer's per-request CSP nonce is active
+/// (`security.headers.csp_nonce.enabled = true`, which drops
+/// `'unsafe-inline'` from `style-src`), the inline gallery stylesheet carries
+/// the request's nonce so browsers don't block it; without the layer no
+/// `nonce` attribute is emitted.
+fn story_page(
+    title: &str,
+    body: &maud::Markup,
+    nonce: Option<&crate::security::CspNonce>,
+) -> maud::Markup {
     maud::html! {
         (maud::DOCTYPE)
         html lang="en" {
@@ -428,7 +448,9 @@ fn story_page(title: &str, body: &maud::Markup) -> maud::Markup {
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { (title) " — Autumn stories" }
                 link rel="stylesheet" href=(crate::ui::WIDGETS_CSS_PATH);
-                style { (maud::PreEscaped(STORY_GALLERY_CSS)) }
+                style nonce=[nonce.map(crate::security::CspNonce::value)] {
+                    (maud::PreEscaped(STORY_GALLERY_CSS))
+                }
             }
             body { (body) }
         }
@@ -436,7 +458,10 @@ fn story_page(title: &str, body: &maud::Markup) -> maud::Markup {
 }
 
 /// Render the grouped `/_stories` index page.
-fn render_story_index(registry: &StoryRegistry) -> maud::Markup {
+fn render_story_index(
+    registry: &StoryRegistry,
+    nonce: Option<&crate::security::CspNonce>,
+) -> maud::Markup {
     story_page(
         "Widget stories",
         &maud::html! {
@@ -478,6 +503,7 @@ fn render_story_index(registry: &StoryRegistry) -> maud::Markup {
                 }
             }
         },
+        nonce,
     )
 }
 
@@ -487,7 +513,11 @@ fn render_story_index(registry: &StoryRegistry) -> maud::Markup {
 /// `rendered` is the story's markup, rendered exactly once by the caller
 /// (which also owns the render-failure response), so the preview and the
 /// Rendered HTML tab always show the same output.
-fn render_story_detail(story: &Story, rendered: &maud::Markup) -> maud::Markup {
+fn render_story_detail(
+    story: &Story,
+    rendered: &maud::Markup,
+    nonce: Option<&crate::security::CspNonce>,
+) -> maud::Markup {
     let rendered_html = rendered.clone().into_string();
     story_page(
         story.name(),
@@ -516,6 +546,7 @@ fn render_story_detail(story: &Story, rendered: &maud::Markup) -> maud::Markup {
                 ))
             }
         },
+        nonce,
     )
 }
 
@@ -657,7 +688,7 @@ mod tests {
             demo_story("Display", "Data table"),
             demo_story("Forms", "Active search"),
         ]);
-        let page = render_story_index(&registry).into_string();
+        let page = render_story_index(&registry, None).into_string();
         let dom = crate::test_html::parse(&page);
 
         let css_selector = crate::test_html::SelectorList::parse(&format!(
@@ -696,7 +727,7 @@ mod tests {
             }
         };
         let rendered = story.render().expect("proof story renders");
-        let page = render_story_detail(&story, &rendered).into_string();
+        let page = render_story_detail(&story, &rendered, None).into_string();
         let dom = crate::test_html::parse(&page);
 
         let preview = crate::test_html::SelectorList::parse(".story-preview .proof-marker")
@@ -731,7 +762,7 @@ mod tests {
     // state pointing at AppBuilder::with_story_gallery, not a 500/blank page.
     #[test]
     fn index_empty_state_mentions_with_story_gallery() {
-        let page = render_story_index(&StoryRegistry::default()).into_string();
+        let page = render_story_index(&StoryRegistry::default(), None).into_string();
         assert!(
             page.contains("with_story_gallery"),
             "empty state must explain how to register stories: {page}"
@@ -871,11 +902,11 @@ mod tests {
     fn gallery_index_and_detail_pages_render_balanced_html() {
         let registry = builtin();
         assert_balanced_html(
-            &render_story_index(&registry).into_string(),
+            &render_story_index(&registry, None).into_string(),
             "story index page",
         );
         assert_balanced_html(
-            &render_story_index(&StoryRegistry::default()).into_string(),
+            &render_story_index(&StoryRegistry::default(), None).into_string(),
             "empty-state index page",
         );
         for story in registry.stories() {
@@ -883,9 +914,39 @@ mod tests {
                 .render()
                 .unwrap_or_else(|err| panic!("builtin story `{}` failed: {err}", story.slug()));
             assert_balanced_html(
-                &render_story_detail(story, &rendered).into_string(),
+                &render_story_detail(story, &rendered, None).into_string(),
                 &format!("detail page for `{}`", story.slug()),
             );
         }
+    }
+
+    // U10 (review follow-up): when the security layer's per-request CSP nonce
+    // is active, `style-src` drops `'unsafe-inline'`, so the gallery's inline
+    // stylesheet must carry the request nonce or browsers block it. Without
+    // the layer no nonce attribute is emitted.
+    #[test]
+    fn story_pages_apply_csp_nonce_to_inline_style() {
+        let nonce = crate::security::CspNonce::new_for_tests("test-nonce-value");
+        let registry = StoryRegistry::new(vec![demo_story("Display", "Card")]);
+
+        let index = render_story_index(&registry, Some(&nonce)).into_string();
+        assert!(
+            index.contains(r#"<style nonce="test-nonce-value">"#),
+            "index inline style must carry the CSP nonce: {index}"
+        );
+
+        let story = &registry.stories()[0];
+        let rendered = story.render().expect("demo story renders");
+        let detail = render_story_detail(story, &rendered, Some(&nonce)).into_string();
+        assert!(
+            detail.contains(r#"<style nonce="test-nonce-value">"#),
+            "detail inline style must carry the CSP nonce: {detail}"
+        );
+
+        let plain = render_story_index(&registry, None).into_string();
+        assert!(
+            plain.contains("<style>") && !plain.contains("nonce="),
+            "without the security layer no nonce attribute is emitted: {plain}"
+        );
     }
 }
