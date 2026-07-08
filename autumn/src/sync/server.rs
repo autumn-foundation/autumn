@@ -358,6 +358,11 @@ impl SyncBackend for MemorySyncBackend {
         limit: i64,
         session_start: Version,
     ) -> Result<PullResponse, SyncError> {
+        // One MutexGuard covers BOTH the horizon read and the row scan, so
+        // they observe a single consistent state — the mutex is this
+        // backend's analogue of the Postgres pull's REPEATABLE READ
+        // snapshot (a GC can only run entirely before or entirely after
+        // this pull, never between its two reads).
         let state = self.lock()?;
         if session_start > 0 && session_start < state.horizon {
             return Ok(PullResponse::FullResyncRequired {
@@ -721,31 +726,53 @@ impl SyncBackend for PgSyncBackend {
         session_start: Version,
     ) -> Result<PullResponse, SyncError> {
         let mut conn = self.connect()?;
-        conn.transaction::<_, diesel::result::Error, _>(|conn| {
-            let horizon = pg_horizon(conn)?;
-            if session_start > 0 && session_start < horizon {
-                return Ok(PullResponse::FullResyncRequired {
+        // REPEATABLE READ is load-bearing: the horizon read and the row
+        // scan must observe ONE MVCC snapshot. Under the default READ
+        // COMMITTED each statement snapshots independently, so a concurrent
+        // gc_tombstones committing between the two would let this pull pass
+        // the staleness check against the OLD horizon while the row scan
+        // already misses the GC'd tombstones — the client would advance its
+        // cursor past deletions it never received (and never be told to
+        // resync), keeping a stale row visible forever. With one snapshot
+        // the response is internally consistent: the client either sees the
+        // tombstones or (on its next pull, against the advanced horizon)
+        // gets FullResyncRequired.
+        //
+        // Cost: none worth noting. A READ ONLY REPEATABLE READ transaction
+        // in Postgres cannot fail with a serialization error (40001 arises
+        // from write-write conflicts; plain SELECTs have none — only
+        // SERIALIZABLE can abort read-only transactions), so no retry loop
+        // is needed, and unlike taking the GC/push advisory lock this
+        // serializes nothing: pulls, pushes, and GC all keep running
+        // concurrently.
+        conn.build_transaction()
+            .read_only()
+            .repeatable_read()
+            .run::<_, diesel::result::Error, _>(|conn| {
+                let horizon = pg_horizon(conn)?;
+                if session_start > 0 && session_start < horizon {
+                    return Ok(PullResponse::FullResyncRequired {
+                        tombstone_horizon: horizon,
+                    });
+                }
+                let rows: Vec<RemoteRow> = sql_query(
+                    "SELECT collection, pk, payload, version, deleted, updated_at, device_id \
+                     FROM autumn_sync_rows WHERE version > $1 ORDER BY version LIMIT $2",
+                )
+                .bind::<BigInt, _>(cursor)
+                .bind::<BigInt, _>(limit.max(0))
+                .get_results::<PgRowRecord>(conn)?
+                .into_iter()
+                .map(PgRowRecord::into_remote_row)
+                .collect();
+                let next_cursor = rows.last().map_or(cursor, |row| row.version);
+                Ok(PullResponse::Ok {
+                    rows,
+                    next_cursor,
                     tombstone_horizon: horizon,
-                });
-            }
-            let rows: Vec<RemoteRow> = sql_query(
-                "SELECT collection, pk, payload, version, deleted, updated_at, device_id \
-                 FROM autumn_sync_rows WHERE version > $1 ORDER BY version LIMIT $2",
-            )
-            .bind::<BigInt, _>(cursor)
-            .bind::<BigInt, _>(limit.max(0))
-            .get_results::<PgRowRecord>(conn)?
-            .into_iter()
-            .map(PgRowRecord::into_remote_row)
-            .collect();
-            let next_cursor = rows.last().map_or(cursor, |row| row.version);
-            Ok(PullResponse::Ok {
-                rows,
-                next_cursor,
-                tombstone_horizon: horizon,
+                })
             })
-        })
-        .map_err(backend_err)
+            .map_err(backend_err)
     }
 
     fn gc_tombstones(&self, up_to: Version) -> Result<u64, SyncError> {

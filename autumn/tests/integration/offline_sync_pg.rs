@@ -6,15 +6,24 @@
 //! runnable manually wherever Docker is available.
 //!
 //! Note on concurrency: this suite is a sequential script, so it cannot
-//! observe the two races `apply_push`'s `pg_advisory_xact_lock` guards
-//! against — (1) sequence versions committing out of order, letting a
-//! READ COMMITTED pull skip an in-flight lower version forever, and
-//! (2) concurrent first-inserts of one pk bypassing the conflict resolver
-//! because `SELECT … FOR UPDATE` locks nothing for absent rows. Those
-//! guarantees are encoded (and documented) at the lock site in
+//! observe the races the backend guards against — (1) sequence versions
+//! committing out of order, letting a READ COMMITTED pull skip an
+//! in-flight lower version forever, and (2) concurrent first-inserts of
+//! one pk bypassing the conflict resolver because `SELECT … FOR UPDATE`
+//! locks nothing for absent rows (both closed by `apply_push`'s
+//! `pg_advisory_xact_lock`), nor (3) a `gc_tombstones` committing between
+//! a pull's horizon read and its row scan, which would let a client
+//! advance past GC'd deletions it never saw (closed by running the pull
+//! at READ ONLY REPEATABLE READ — one MVCC snapshot for both reads).
+//! Race (3) in particular cannot be forced deterministically through the
+//! `SyncBackend` trait: `pull_since` is one opaque call with no hook to
+//! pause between its two statements, and reproducing the SQL outside the
+//! backend would test a copy rather than the code. The guarantees are
+//! encoded (and documented) at the lock/isolation sites in
 //! `autumn/src/sync/server.rs`; the suite still pins the *sequential*
-//! semantics both races would corrupt (clean version prefixes on pull and
-//! resolver engagement for base-version-0 pushes onto existing pks).
+//! semantics those races would corrupt (clean version prefixes on pull,
+//! resolver engagement for base-version-0 pushes onto existing pks, and
+//! the pull/GC horizon cases of the shared conformance script).
 
 #![cfg(feature = "offline-sync")]
 
