@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use super::SyncError;
 use super::protocol::{
-    MAX_PULL_LIMIT, MAX_PUSH_CHANGES, PullResponse, PushRequest, PushResponse, Version,
+    MAX_PULL_LIMIT, MAX_PUSH_CHANGES, PullResponse, PushRequest, PushResponse, RemoteRow, Version,
 };
 use super::store::SyncStore;
 
@@ -144,17 +144,22 @@ impl SyncEngine {
         // Crash-state healing: synced rows alongside a cursor of 0 mean a
         // previous pass persisted rows without the cursor (impossible via
         // today's atomic `apply_remote_page`, but reachable through stores
-        // written by older builds — or a device that pushed and then never
-        // completed a pull). A from-0 session is exempt from the server's
-        // tombstone-horizon check (it looks like a fresh device), so
-        // deletions GC'd since those rows were written would never arrive
-        // and stale rows would stay visible forever while the cursor
-        // advances past them. Treat the state as a full resync: drop the
-        // synced rows (pending local writes survive and are replayed) and
-        // re-pull from scratch.
+        // written by older builds — or, routinely, a device whose first
+        // sync pushed fine and then lost the radio before the pull). A
+        // from-0 session is exempt from the server's tombstone-horizon
+        // check (it looks like a fresh device), so deletions GC'd since
+        // those rows were written would never arrive and stale rows would
+        // stay visible forever while the cursor advances past them.
+        //
+        // The heal is reconcile-shaped, NOT clear-first: the full from-zero
+        // snapshot is fetched before anything local is touched, and one
+        // store transaction then applies it, drops synced rows absent from
+        // it, and lands the cursor. Clearing up front would delete
+        // acknowledged-but-never-pulled local rows while still offline —
+        // transport failures must leave local state untouched, and the
+        // push-ok-pull-failed first sync is exactly a transport failure.
         if self.store.cursor()? == 0 && self.store.has_synced_rows()? {
-            self.store.begin_full_resync()?;
-            report.full_resync = true;
+            self.heal_zero_cursor_state(&mut report).await?;
         }
         self.push_pending(&mut report).await?;
         if self.pull_updates(&mut report).await? {
@@ -173,6 +178,63 @@ impl SyncEngine {
             self.push_pending(&mut report).await?;
         }
         Ok(report)
+    }
+
+    /// Heal the "synced rows but cursor 0" state (see `sync_once`): fetch
+    /// the COMPLETE from-zero snapshot first — buffered in memory, a
+    /// deliberate trade for the all-or-nothing reconcile; this is a rare
+    /// recovery path over device-sized datasets — then reconcile local
+    /// state against it in one store transaction
+    /// ([`SyncStore::reconcile_snapshot`]). A transport failure at any
+    /// point leaves local rows untouched and the cursor at 0, so the heal
+    /// simply re-runs on the next (possibly still offline) pass with zero
+    /// data loss.
+    async fn heal_zero_cursor_state(&self, report: &mut SyncReport) -> Result<(), SyncError> {
+        let limit = self.config.pull_batch_size.clamp(1, MAX_PULL_LIMIT);
+        let mut snapshot: Vec<RemoteRow> = Vec::new();
+        let mut cursor: Version = 0;
+        let (final_cursor, tombstone_horizon) = loop {
+            let response = self
+                .authorized(self.client.get(format!(
+                    "{}/pull?cursor={cursor}&limit={limit}&session=0",
+                    self.config.remote_base_url
+                )))
+                .send()
+                .await
+                .map_err(transport_err)?;
+            let response = check_status(response).await?;
+            let pull: PullResponse = response
+                .json()
+                .await
+                .map_err(|err| SyncError::Server(format!("invalid pull response: {err}")))?;
+            match pull {
+                PullResponse::FullResyncRequired { .. } => {
+                    return Err(SyncError::Server(
+                        "server demanded a full resync from cursor 0".into(),
+                    ));
+                }
+                PullResponse::Ok {
+                    rows,
+                    next_cursor,
+                    tombstone_horizon,
+                } => {
+                    let page_len = rows.len();
+                    snapshot.extend(rows);
+                    let caught_up =
+                        page_len == 0 || i64::try_from(page_len).unwrap_or(i64::MAX) < limit;
+                    if caught_up {
+                        break (next_cursor.max(tombstone_horizon), tombstone_horizon);
+                    }
+                    cursor = next_cursor;
+                }
+            }
+        };
+        report.pulled += self.store.reconcile_snapshot(&snapshot, final_cursor)?;
+        if tombstone_horizon > 0 {
+            self.store.prune_acked_tombstones(tombstone_horizon)?;
+        }
+        report.full_resync = true;
+        Ok(())
     }
 
     /// Push journaled changes in batches until the journal is drained.

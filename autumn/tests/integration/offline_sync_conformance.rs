@@ -368,9 +368,9 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
     // the GC can still push an edit of n2 based on its old version — and
     // pushes run BEFORE the pull that would demand a full resync. The row
     // is absent server-side, but the pre-horizon base_version claim dates
-    // the edit: it must conflict against a synthesized tombstone (deletion
-    // wins under LWW — the synthesized stamp is the server's "now", newer
-    // than any client edit), never clean-apply.
+    // the edit: the outcome is DETERMINISTICALLY server-winning (the
+    // resolver is bypassed — its input would be fabricated, and clock-based
+    // policies could be gamed), never a clean apply.
     let latest_before_stale = backend.latest_version().expect("latest");
     let mut stale_edit = change(
         "00000000-0000-4000-8000-00000000000c",
@@ -406,6 +406,37 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
     assert!(
         rows.iter().all(|r| r.pk != "n2" || r.deleted),
         "n2 must not come back as a live row: {rows:?}"
+    );
+
+    // Clock skew cannot resurrect either: GC the fresh tombstone away
+    // again, then push an edit stamped FAR in the future. Under the default
+    // LWW resolver a fast client clock would win a normal conflict — but
+    // the GC'd-tombstone shape bypasses the resolver entirely, so the
+    // deletion still sticks.
+    let removed = backend
+        .gc_tombstones(backend.latest_version().expect("latest"))
+        .expect("re-gc the fresh tombstone");
+    assert_eq!(removed, 1, "the resolution tombstone is GC'd again");
+    let mut skewed_edit = change(
+        "00000000-0000-4000-8000-00000000000e",
+        "n2",
+        Op::Upsert,
+        Some(json!({"title": "clock cheat"})),
+    );
+    skewed_edit.base_version = versions[1];
+    skewed_edit.updated_at = Utc::now() + Duration::days(365);
+    let response = backend
+        .apply_push(&push("device-skewed", vec![skewed_edit]), &resolver)
+        .expect("skewed push");
+    let ChangeOutcome::Resolved { row } = &response.outcomes[0] else {
+        panic!(
+            "a future-clocked stale edit must still resolve, got {:?}",
+            response.outcomes[0]
+        );
+    };
+    assert!(
+        row.deleted && row.payload.is_none(),
+        "a clock ahead of the server must not resurrect the GC'd row, got {row:?}"
     );
 
     // A genuinely NEW insert from the same offline device (base_version = 0,

@@ -73,6 +73,14 @@ struct ListRecord {
 }
 
 #[derive(QueryableByName)]
+struct RowKeyRecord {
+    #[diesel(sql_type = Text)]
+    collection: String,
+    #[diesel(sql_type = Text)]
+    pk: String,
+}
+
+#[derive(QueryableByName)]
 struct CountRecord {
     #[diesel(sql_type = BigInt)]
     count: i64,
@@ -767,6 +775,56 @@ impl SyncStore {
         .map_err(store_err)?;
         drop(conn);
         Ok(count.count > 0)
+    }
+
+    /// Reconcile local state against a COMPLETE from-zero server snapshot,
+    /// in one transaction: apply every snapshot row (same per-row semantics
+    /// as [`Self::apply_remote_rows`]), delete synced (non-pending) rows
+    /// absent from the snapshot, and land the cursor. Returns how many rows
+    /// applied.
+    ///
+    /// The all-or-nothing shape is the point (see `SyncEngine`'s
+    /// zero-cursor heal): nothing local is touched until the entire
+    /// snapshot has been fetched, so a transport failure mid-heal leaves
+    /// the pre-heal state — including acknowledged-but-never-pulled local
+    /// rows — fully intact, and the cursor stays at 0 so the heal re-runs
+    /// on the next pass.
+    pub(crate) fn reconcile_snapshot(
+        &self,
+        rows: &[RemoteRow],
+        cursor: Version,
+    ) -> Result<usize, SyncError> {
+        let mut conn = self.lock()?;
+        conn.immediate_transaction::<_, diesel::result::Error, _>(|conn| {
+            let applied = apply_remote_rows_inner(conn, rows)?;
+            // Drop synced rows the snapshot no longer contains (their
+            // deletions may have been tombstone-GC'd server-side). Rows
+            // with a pending journal entry are preserved — unsynced local
+            // writes always survive and get replayed.
+            let snapshot_keys: std::collections::HashSet<(&str, &str)> = rows
+                .iter()
+                .map(|row| (row.collection.as_str(), row.pk.as_str()))
+                .collect();
+            let existing = sql_query(
+                "SELECT collection, pk FROM autumn_sync_rows \
+                 WHERE server_version > 0 AND NOT EXISTS (\
+                 SELECT 1 FROM autumn_sync_pending p \
+                 WHERE p.collection = autumn_sync_rows.collection \
+                 AND p.pk = autumn_sync_rows.pk)",
+            )
+            .get_results::<RowKeyRecord>(conn)?;
+            for record in existing {
+                if !snapshot_keys.contains(&(record.collection.as_str(), record.pk.as_str())) {
+                    sql_query("DELETE FROM autumn_sync_rows WHERE collection = ? AND pk = ?")
+                        .bind::<Text, _>(&record.collection)
+                        .bind::<Text, _>(&record.pk)
+                        .execute(conn)?;
+                }
+            }
+            set_state(conn, STATE_CURSOR, &cursor.to_string())?;
+            Ok(applied)
+        })
+        .map_err(store_err)
     }
 
     /// Drop all synced local state ahead of a full re-pull from cursor `0`.

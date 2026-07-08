@@ -259,11 +259,14 @@ One more corner the horizon guards: a device offline past a GC can still
 **push** an edit based on the deleted row's old version (pushes run before
 the pull that would demand a resync). The row is gone and its tombstone
 GC'd, but the pre-horizon `base_version` claim dates the edit — the server
-routes it through the conflict resolver against a **synthesized tombstone**
-instead of silently recreating the row. Under the default LWW resolver the
-deletion wins (the pusher converges on the delete via its `Resolved`
-outcome); a custom resolver can knowingly recreate. Genuinely new inserts
-(`base_version = 0`) are unaffected.
+answers with a **deterministic server-winning tombstone** instead of
+silently recreating the row. The conflict resolver is deliberately
+**bypassed** for this shape: the deleted row's payload and deletion time
+were GC'd, so any resolver input would be fabricated — and a clock-based
+policy could be gamed by a device with a fast clock. The pusher converges
+on the delete via its `Resolved` outcome. Genuinely new inserts
+(`base_version = 0`) are unaffected — re-creating the row deliberately is
+done with a fresh insert.
 
 ## 6. What the generator emits
 

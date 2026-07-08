@@ -110,7 +110,7 @@ fn resolved_row(
     }
 }
 
-/// The synthesized server row for a change whose base row is absent AND
+/// The tombstone written back for a change whose base row is absent AND
 /// whose claimed `base_version` predates the tombstone GC horizon: the row
 /// was deleted and its tombstone physically dropped, so there is nothing to
 /// conflict against — yet the change is, semantically, an edit of a deleted
@@ -118,20 +118,24 @@ fn resolved_row(
 /// the row: `SyncEngine` pushes pending changes BEFORE its pull can learn
 /// it needs a full resync, so the clean-apply path was reachable first.
 ///
-/// The synthesized tombstone routes the change through the ordinary
-/// [`ConflictResolver`]: `updated_at` is "now" (the real deletion time was
-/// GC'd with the tombstone; any client edit's stamp predates the server
-/// processing it, so under the default LWW resolver the deletion wins and
-/// the pusher converges on the delete via its `Resolved` outcome), while a
-/// custom resolver can still choose `TakeClient`/`Merge` to knowingly
-/// recreate. A genuinely new insert (`base_version == 0`) never takes this
-/// path — it clean-applies as before.
-fn gc_tombstone_row(change: &Change, horizon: Version) -> RemoteRow {
+/// This shape is **deterministically server-winning** — the
+/// [`ConflictResolver`] is deliberately bypassed. The deleted row's payload
+/// and deletion timestamp were GC'd with the tombstone, so any resolver
+/// input would have to be fabricated (and a clock-based policy like the
+/// default LWW would let a device with a fast clock resurrect the row).
+/// Custom resolvers therefore get **no say** on GC'd-tombstone conflicts:
+/// the deletion sticks, the pusher receives the tombstone as its
+/// `Resolved` outcome and converges on the delete. `updated_at` is the
+/// server's processing time (informational only — never compared). A
+/// genuinely new insert (`base_version == 0`) never takes this path — it
+/// clean-applies as before, and a client that deliberately re-creates the
+/// row does so with a fresh base-0 insert.
+fn gc_tombstone_row(change: &Change, version: Version) -> RemoteRow {
     RemoteRow {
         collection: change.collection.clone(),
         pk: change.pk.clone(),
         payload: None,
-        version: horizon,
+        version,
         deleted: true,
         updated_at: Utc::now(),
         device_id: String::new(),
@@ -146,12 +150,14 @@ fn gc_tombstone_row(change: &Change, horizon: Version) -> RemoteRow {
 pub trait SyncBackend: Send + Sync + 'static {
     /// Apply one push batch atomically, returning one outcome per change
     /// (request order). Conflicts are settled via `resolver` and assigned a
-    /// new version — including changes whose base row was deleted and its
-    /// tombstone already GC'd (`base_version > 0` but at or below the
-    /// tombstone horizon, row absent): those conflict against a synthesized
-    /// tombstone so an offline-past-GC device cannot silently resurrect a
-    /// deleted row, while `base_version == 0` inserts still clean-apply
-    /// (see [`gc_tombstone_row`]).
+    /// new version. Changes whose base row was deleted and its tombstone
+    /// already GC'd (`base_version > 0` but at or below the tombstone
+    /// horizon, row absent) are **deterministically server-winning** — the
+    /// resolver is bypassed for this shape (its input would be fabricated;
+    /// clock-based policies could otherwise resurrect the row) and the
+    /// pusher receives a fresh tombstone as its `Resolved` outcome, while
+    /// `base_version == 0` inserts still clean-apply (see
+    /// [`gc_tombstone_row`]).
     ///
     /// # Errors
     ///
@@ -315,16 +321,14 @@ impl SyncBackend for MemorySyncBackend {
                     (ChangeOutcome::Resolved { row }, version)
                 }
                 // Absent row with a pre-horizon base claim: the base row was
-                // deleted and its tombstone GC'd — conflict against a
-                // synthesized tombstone instead of silently resurrecting it
-                // (see gc_tombstone_row). base_version == 0 (a genuinely new
-                // insert) never matches.
+                // deleted and its tombstone GC'd — deterministically
+                // server-winning, the resolver is bypassed (its input would
+                // be fabricated and clock-based policies could resurrect the
+                // row; see gc_tombstone_row). base_version == 0 (a genuinely
+                // new insert) never matches.
                 None if change.base_version > 0 && change.base_version <= horizon => {
-                    let server = gc_tombstone_row(change, horizon);
-                    let resolution = resolver.resolve(&request.device_id, change, &server);
                     let version = state.allocate_version();
-                    let row =
-                        resolved_row(resolution, change, &request.device_id, &server, version);
+                    let row = gc_tombstone_row(change, version);
                     state.rows.insert(row_key, row.clone());
                     (ChangeOutcome::Resolved { row }, version)
                 }
@@ -674,18 +678,16 @@ impl SyncBackend for PgSyncBackend {
                         pg_upsert_row(conn, &row)?;
                         (ChangeOutcome::Resolved { row }, version)
                     }
-                    // Absent row with a pre-horizon base claim: the base row
-                    // was deleted and its tombstone GC'd — conflict against
-                    // a synthesized tombstone instead of silently
-                    // resurrecting it (see gc_tombstone_row).
-                    // base_version == 0 (a genuinely new insert) never
-                    // matches.
+                    // Absent row with a pre-horizon base claim: the base
+                    // row was deleted and its tombstone GC'd —
+                    // deterministically server-winning, the resolver is
+                    // bypassed (its input would be fabricated and
+                    // clock-based policies could resurrect the row; see
+                    // gc_tombstone_row). base_version == 0 (a genuinely new
+                    // insert) never matches.
                     None if change.base_version > 0 && change.base_version <= horizon => {
-                        let server = gc_tombstone_row(change, horizon);
-                        let resolution = resolver.resolve(&request.device_id, change, &server);
                         let version = pg_next_version(conn)?;
-                        let row =
-                            resolved_row(resolution, change, &request.device_id, &server, version);
+                        let row = gc_tombstone_row(change, version);
                         pg_upsert_row(conn, &row)?;
                         (ChangeOutcome::Resolved { row }, version)
                     }

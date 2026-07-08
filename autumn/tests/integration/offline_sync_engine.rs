@@ -386,10 +386,11 @@ async fn gc_horizon_forces_full_resync_preserving_pending() {
 
 /// A device offline past a tombstone GC still holds a pending edit of the
 /// deleted row — and the engine pushes pending changes BEFORE the pull that
-/// would demand a full resync. The server must route that edit through the
-/// resolver against a synthesized tombstone (deletion wins under LWW), the
-/// engine must converge on the delete without losing other data, and the
-/// pass after that must be steady (no resync loop).
+/// would demand a full resync. The server must settle that edit with a
+/// deterministic server-winning tombstone (the resolver gets no say on
+/// GC'd-tombstone conflicts), the engine must converge on the delete
+/// without losing other data, and the pass after that must be steady (no
+/// resync loop).
 #[tokio::test]
 async fn offline_edit_of_a_gcd_row_does_not_resurrect_it() {
     let backend = Arc::new(MemorySyncBackend::new());
@@ -448,6 +449,120 @@ async fn offline_edit_of_a_gcd_row_does_not_resurrect_it() {
     let next = engine_b.sync_once().await.expect("b steady");
     assert!(!next.full_resync, "the stale-push handling must not loop");
     assert_eq!(next.pushed, 0);
+}
+
+/// Regression for the heal path destroying acknowledged local data while
+/// offline: a fresh device's first sync pushes fine (journal cleared,
+/// server versions recorded, cursor still 0), then the radio drops before
+/// the pull. Every subsequent OFFLINE retry enters the zero-cursor heal —
+/// which used to clear the acked rows up front, before any server contact,
+/// deleting local data that only existed server-side. The heal must fetch
+/// the full replacement snapshot FIRST and only then reconcile: transport
+/// failures leave local state untouched, and connectivity's return
+/// converges with zero loss.
+#[tokio::test]
+async fn heal_never_drops_acked_rows_while_pull_keeps_failing() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use axum::middleware::Next;
+
+    // A server whose /pull can be switched off: pushes always succeed,
+    // pulls return 503 until the flag flips (a radio drop between the
+    // push and the pull of one pass, persisting across retries).
+    static PULL_UP: AtomicBool = AtomicBool::new(false);
+    async fn flaky_pull(
+        request: axum::extract::Request,
+        next: Next,
+    ) -> Result<axum::response::Response, axum::http::StatusCode> {
+        if request.uri().path().ends_with("/pull") && !PULL_UP.load(Ordering::SeqCst) {
+            return Err(axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        }
+        Ok(next.run(request).await)
+    }
+    PULL_UP.store(false, Ordering::SeqCst);
+
+    let backend = Arc::new(MemorySyncBackend::new());
+    // Another device's row is already on the server, so convergence has
+    // something to pull besides our own writes.
+    let seed = PushRequest {
+        device_id: "device-a".to_owned(),
+        changes: vec![Change {
+            change_id: "00000000-0000-4000-8000-0000000000aa".to_owned(),
+            collection: "notes".to_owned(),
+            pk: "other".to_owned(),
+            op: Op::Upsert,
+            payload: Some(json!({"title": "from a"})),
+            base_version: 0,
+            updated_at: Utc::now(),
+        }],
+    };
+    backend
+        .apply_push(&seed, &LwwResolver)
+        .expect("seed other device's row");
+
+    let flaky: axum::Router = axum::Router::new().nest(
+        "/sync",
+        server::router(backend.clone(), Arc::new(LwwResolver))
+            .layer(axum::middleware::from_fn(flaky_pull)),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback");
+    let addr = listener.local_addr().expect("local addr");
+    let _srv = tokio::spawn(async move {
+        axum::serve(listener, flaky).await.expect("serve");
+    });
+    let url = format!("http://{addr}/sync");
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store_b = open_store(&dir, "b.db");
+    let engine_b = engine_for(&store_b, &url);
+    store_b.put("notes", "mine", &note("acked")).expect("put");
+
+    // First sync: push succeeds, pull fails.
+    let err = engine_b.sync_once().await.expect_err("pull is down");
+    assert!(matches!(err, SyncError::Server(_)), "got {err:?}");
+    assert_eq!(store_b.pending_count().expect("pending"), 0, "push acked");
+    assert_eq!(store_b.cursor().expect("cursor"), 0, "pull never completed");
+
+    // Offline retries: each pass enters the zero-cursor heal (synced rows,
+    // cursor 0) and fails at the pull — the acked row must survive every
+    // single one.
+    for attempt in 0..3 {
+        let mine: Option<Note> = store_b.get("notes", "mine").expect("get");
+        assert!(
+            mine.is_some(),
+            "acked local data must survive offline retry #{attempt}"
+        );
+        let err = engine_b.sync_once().await.expect_err("still offline");
+        assert!(matches!(err, SyncError::Server(_)), "got {err:?}");
+        assert_eq!(
+            store_b.cursor().expect("cursor"),
+            0,
+            "a failed heal must leave the cursor at 0 so it re-runs"
+        );
+    }
+    assert!(
+        store_b.get::<Note>("notes", "mine").expect("get").is_some(),
+        "acked local data must still be present after every offline retry"
+    );
+
+    // Connectivity returns: the heal completes and everything converges.
+    PULL_UP.store(true, Ordering::SeqCst);
+    let report = engine_b.sync_once().await.expect("heal completes");
+    assert!(report.full_resync, "the zero-cursor heal ran");
+    let listed: Vec<(String, Note)> = store_b.list("notes").expect("list");
+    let pks: Vec<&str> = listed.iter().map(|(pk, _)| pk.as_str()).collect();
+    assert!(pks.contains(&"mine"), "own acked row survives: {pks:?}");
+    assert!(
+        pks.contains(&"other"),
+        "the other device's row arrives: {pks:?}"
+    );
+    assert!(store_b.cursor().expect("cursor") > 0, "cursor landed");
+
+    // Steady state afterwards.
+    let next = engine_b.sync_once().await.expect("steady");
+    assert!(!next.full_resync, "the heal must not loop");
 }
 
 /// Regression for the "synced rows but cursor 0" crash state: a crash
