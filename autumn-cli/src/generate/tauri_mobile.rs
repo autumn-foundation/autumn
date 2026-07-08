@@ -542,6 +542,21 @@ fn mirror_autumn_web_patch(project_root: &Path, plan: &mut Plan) -> Option<Strin
 fn shell_autumn_web_dep(project_root: &Path, plan: &mut Plan) -> ShellAutumnWebDep {
     let (dep_value, manifest_dir) = resolve_app_autumn_web_value(project_root);
 
+    // `default-features = false` must survive the mirroring: cargo unifies
+    // features per dependency EDGE, so a shell edge without it would
+    // re-enable the framework's default features across the whole src-tauri
+    // build even though the app opted out (`default_features` is the
+    // pre-2021 spelling cargo still accepts).
+    let disables_default_features = |t: &toml::value::Table| {
+        ["default-features", "default_features"]
+            .iter()
+            .any(|key| t.get(*key).and_then(toml::Value::as_bool) == Some(false))
+    };
+    let default_features_part = match &dep_value {
+        Some(toml::Value::Table(t)) if disables_default_features(t) => "default-features = false, ",
+        _ => "",
+    };
+
     // Path/git sources are mirrored directly onto the shell's edge.
     if let Some(toml::Value::Table(t)) = &dep_value
         && let Some(source) = dep_source_from_table(t, &manifest_dir, project_root)
@@ -552,7 +567,8 @@ fn shell_autumn_web_dep(project_root: &Path, plan: &mut Plan) -> ShellAutumnWebD
             .map_or_else(String::new, |v| format!("version = \"{v}\", "));
         return ShellAutumnWebDep {
             dep_entry: format!(
-                "autumn-web = {{ {version_part}{source}, features = [\"offline-sync\"] }}"
+                "autumn-web = {{ {version_part}{source}, \
+                 {default_features_part}features = [\"offline-sync\"] }}"
             ),
             patch_entry: None,
         };
@@ -569,7 +585,10 @@ fn shell_autumn_web_dep(project_root: &Path, plan: &mut Plan) -> ShellAutumnWebD
         _ => None,
     };
     let registry_entry = |req: &str| {
-        format!("autumn-web = {{ version = \"{req}\", features = [\"offline-sync\"] }}")
+        format!(
+            "autumn-web = {{ version = \"{req}\", \
+             {default_features_part}features = [\"offline-sync\"] }}"
+        )
     };
     let Some(version) = version else {
         plan.warn(format!(
@@ -2152,6 +2171,42 @@ mod tests {
             r#"autumn-web = { git = "https://github.com/madmax983/autumn", rev = "abc123", features = ["offline-sync"] }"#,
         );
         assert!(warnings.is_empty(), "got {warnings:?}");
+    }
+
+    #[test]
+    fn offline_shell_dep_preserves_default_features_false() {
+        // Feature unification is per dependency edge: a shell edge without
+        // `default-features = false` would re-enable the framework's default
+        // features across the whole src-tauri build.
+        let (dep, warnings) = shell_dep_for(
+            "autumn-web = { version = \"0.9.1\", default-features = false, \
+             features = [\"maud\"] }",
+            "",
+        );
+        assert_eq!(
+            dep.dep_entry,
+            r#"autumn-web = { version = "0.9.1", default-features = false, features = ["offline-sync"] }"#,
+        );
+        assert!(warnings.is_empty(), "got {warnings:?}");
+
+        // Path deps preserve it too, and the pre-2021 `default_features`
+        // spelling cargo still accepts is recognized.
+        let (dep, _) = shell_dep_for(
+            "autumn-web = { path = \"../autumn\", default_features = false }",
+            "",
+        );
+        assert_eq!(
+            dep.dep_entry,
+            r#"autumn-web = { path = "../../autumn", default-features = false, features = ["offline-sync"] }"#,
+        );
+
+        // And an edge that does NOT opt out stays unchanged.
+        let (dep, _) = shell_dep_for("autumn-web = { version = \"0.9.1\" }", "");
+        assert!(
+            !dep.dep_entry.contains("default-features"),
+            "got: {}",
+            dep.dep_entry
+        );
     }
 
     #[test]

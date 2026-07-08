@@ -274,6 +274,38 @@ fn record_acked_version(
     .map(|_| ())
 }
 
+/// After a clean ack (`Applied`/`AlreadyApplied`) for `change`, re-base the
+/// surviving coalesced pending entry onto the acknowledged version.
+///
+/// A local edit made while the push was in flight replaced the journal
+/// entry (see [`replace_pending`]) and inherited the in-flight change's
+/// `base_version`; once the server acknowledges that change, the inherited
+/// base is stale — pushing it would false-conflict against this device's
+/// own acknowledged write (harmless under LWW, wrong under custom
+/// resolvers). Only the entry created on top of the acked change is
+/// touched (same row AND the inherited base), and only forward
+/// (`base_version < ?`) so a stale retry ack can never regress a base.
+/// `Resolved` outcomes deliberately do NOT re-base: a write made without
+/// knowledge of the resolution must still conflict and go through the
+/// resolver.
+fn rebase_surviving_pending(
+    conn: &mut SqliteConnection,
+    change: &Change,
+    acked_version: Version,
+) -> Result<(), diesel::result::Error> {
+    sql_query(
+        "UPDATE autumn_sync_pending SET base_version = ? \
+         WHERE collection = ? AND pk = ? AND base_version = ? AND base_version < ?",
+    )
+    .bind::<BigInt, _>(acked_version)
+    .bind::<Text, _>(&change.collection)
+    .bind::<Text, _>(&change.pk)
+    .bind::<BigInt, _>(change.base_version)
+    .bind::<BigInt, _>(acked_version)
+    .execute(conn)
+    .map(|_| ())
+}
+
 fn has_pending(
     conn: &mut SqliteConnection,
     collection: &str,
@@ -286,6 +318,28 @@ fn has_pending(
     .bind::<Text, _>(pk)
     .get_result::<CountRecord>(conn)?;
     Ok(count.count > 0)
+}
+
+/// Row-application body shared by [`SyncStore::apply_remote_rows`] and
+/// [`SyncStore::apply_remote_page`]: idempotent versioned upsert, skipping
+/// rows with a pending local change (the local write wins until its push
+/// settles the conflict).
+fn apply_remote_rows_inner(
+    conn: &mut SqliteConnection,
+    rows: &[RemoteRow],
+) -> Result<usize, diesel::result::Error> {
+    let mut applied = 0;
+    for row in rows {
+        if has_pending(conn, &row.collection, &row.pk)? {
+            continue;
+        }
+        if current_server_version(conn, &row.collection, &row.pk)? > row.version {
+            continue;
+        }
+        upsert_remote_row(conn, row)?;
+        applied += 1;
+    }
+    Ok(applied)
 }
 
 /// The local, in-process `SQLite` store for offline data.
@@ -600,18 +654,15 @@ impl SyncStore {
         Ok(value.and_then(|v| v.parse().ok()).unwrap_or(0))
     }
 
-    pub(crate) fn set_cursor(&self, cursor: Version) -> Result<(), SyncError> {
-        let mut conn = self.lock()?;
-        set_state(&mut conn, STATE_CURSOR, &cursor.to_string()).map_err(store_err)
-    }
-
     /// Settle a pushed batch: journal entries are cleared **by change id**
     /// (a newer coalesced write keeps its own entry), acked versions are
     /// recorded — including for `AlreadyApplied` retries, so a later local
-    /// edit doesn't push a stale `base_version` and false-conflict — and
-    /// conflict resolutions are applied locally *unless* the row gained a
-    /// newer pending local write in the meantime (the resolved row must
-    /// not clobber it; the newer write pushes next and settles normally).
+    /// edit doesn't push a stale `base_version` and false-conflict — a
+    /// surviving coalesced write is re-based onto a clean ack's version
+    /// (see [`rebase_surviving_pending`]), and conflict resolutions are
+    /// applied locally *unless* the row gained a newer pending local write
+    /// in the meantime (the resolved row must not clobber it; the newer
+    /// write pushes next and settles through the resolver normally).
     pub(crate) fn confirm_pushed(
         &self,
         changes: &[Change],
@@ -632,6 +683,11 @@ impl SyncStore {
                     ChangeOutcome::Applied { version }
                     | ChangeOutcome::AlreadyApplied { version } => {
                         record_acked_version(conn, &change.collection, &change.pk, *version)?;
+                        // A coalesced write made while this push was in
+                        // flight inherited this change's (now acked) base —
+                        // re-base it so it doesn't false-conflict against
+                        // our own acknowledged write.
+                        rebase_surviving_pending(conn, change, *version)?;
                     }
                     ChangeOutcome::Resolved { row } => {
                         if has_pending(conn, &row.collection, &row.pk)? {
@@ -650,26 +706,67 @@ impl SyncStore {
         .map_err(store_err)
     }
 
-    /// Apply a pulled page of remote rows. Idempotent versioned upsert;
-    /// rows with a pending local change are skipped (the local write wins
-    /// until its push settles the conflict). Returns how many rows applied.
+    /// Apply a pulled page of remote rows without touching the cursor.
+    /// Idempotent versioned upsert; rows with a pending local change are
+    /// skipped (the local write wins until its push settles the conflict).
+    /// Returns how many rows applied.
+    ///
+    /// Test-only: the engine's pull path always goes through
+    /// [`Self::apply_remote_page`] so rows and cursor persist atomically;
+    /// unit tests use this to materialize rows without a cursor opinion.
+    #[cfg(test)]
     pub(crate) fn apply_remote_rows(&self, rows: &[RemoteRow]) -> Result<usize, SyncError> {
         let mut conn = self.lock()?;
         conn.immediate_transaction::<_, diesel::result::Error, _>(|conn| {
-            let mut applied = 0;
-            for row in rows {
-                if has_pending(conn, &row.collection, &row.pk)? {
-                    continue;
-                }
-                if current_server_version(conn, &row.collection, &row.pk)? > row.version {
-                    continue;
-                }
-                upsert_remote_row(conn, row)?;
-                applied += 1;
-            }
+            apply_remote_rows_inner(conn, rows)
+        })
+        .map_err(store_err)
+    }
+
+    /// Apply a pulled page of remote rows AND persist the advanced cursor
+    /// in the **same transaction** (semantics per row as
+    /// [`Self::apply_remote_rows`]).
+    ///
+    /// The atomicity is load-bearing: applying rows first and persisting
+    /// the cursor separately leaves a crash window where synced rows exist
+    /// with a stale cursor. At cursor `0` that state is indistinguishable
+    /// from a fresh device, so the next pull's `session=0` is exempt from
+    /// the server's tombstone-horizon check — tombstones GC'd in the
+    /// meantime would never arrive and stale local rows would stay visible
+    /// forever (the engine also heals pre-existing states like this; see
+    /// `SyncEngine::sync_once`).
+    pub(crate) fn apply_remote_page(
+        &self,
+        rows: &[RemoteRow],
+        cursor: Version,
+    ) -> Result<usize, SyncError> {
+        let mut conn = self.lock()?;
+        conn.immediate_transaction::<_, diesel::result::Error, _>(|conn| {
+            let applied = apply_remote_rows_inner(conn, rows)?;
+            set_state(conn, STATE_CURSOR, &cursor.to_string())?;
             Ok(applied)
         })
         .map_err(store_err)
+    }
+
+    /// Whether any **synced** row exists — a materialized row with an
+    /// acknowledged server version and no pending journal entry. Together
+    /// with a cursor of `0` this is the inconsistent crash state
+    /// [`Self::apply_remote_page`] prevents (rows persisted, cursor not),
+    /// which `SyncEngine::sync_once` heals with a full resync.
+    pub(crate) fn has_synced_rows(&self) -> Result<bool, SyncError> {
+        let mut conn = self.lock()?;
+        let count = sql_query(
+            "SELECT COUNT(*) AS count FROM autumn_sync_rows \
+             WHERE server_version > 0 AND NOT EXISTS (\
+             SELECT 1 FROM autumn_sync_pending p \
+             WHERE p.collection = autumn_sync_rows.collection \
+             AND p.pk = autumn_sync_rows.pk)",
+        )
+        .get_result::<CountRecord>(&mut *conn)
+        .map_err(store_err)?;
+        drop(conn);
+        Ok(count.count > 0)
     }
 
     /// Drop all synced local state ahead of a full re-pull from cursor `0`.
@@ -832,6 +929,87 @@ mod tests {
             next[0].change_id, batch[0].change_id,
             "the surviving entry is the newer coalesced write"
         );
+        assert_eq!(
+            next[0].base_version, batch[0].base_version,
+            "a Resolved outcome must NOT re-base the survivor: it was written \
+             without knowledge of the resolution and must go through the \
+             resolver on its own push"
+        );
+    }
+
+    #[test]
+    fn clean_ack_rebases_the_surviving_coalesced_write() {
+        // The user edits the row while a clean push is in flight: the
+        // journal coalesces to a NEW change_id that inherited the in-flight
+        // change's base_version (0). After the server acks Applied, the
+        // survivor must be re-based onto the acked version — pushing the
+        // stale base would false-conflict against this device's own
+        // acknowledged write (wrong under non-LWW resolvers).
+        let (_dir, store) = open_temp();
+        store
+            .put("notes", "n1", &json!({"title": "pushed"}))
+            .expect("put");
+        let batch = store.pending_changes(10).expect("batch");
+        assert_eq!(batch[0].base_version, 0);
+
+        // Concurrent local edit while the push is in flight.
+        store
+            .put("notes", "n1", &json!({"title": "newer local"}))
+            .expect("concurrent put");
+
+        store
+            .confirm_pushed(&batch, &[ChangeOutcome::Applied { version: 5 }])
+            .expect("confirm");
+
+        let next = store.pending_changes(10).expect("pending");
+        assert_eq!(next.len(), 1, "the coalesced write survives");
+        assert_eq!(
+            next[0].base_version, 5,
+            "the survivor must be re-based onto the acked version so it \
+             applies cleanly instead of false-conflicting"
+        );
+        // A clean apply of the survivor settles without leftovers.
+        store
+            .confirm_pushed(&next, &[ChangeOutcome::Applied { version: 6 }])
+            .expect("confirm survivor");
+        assert_eq!(store.pending_count().expect("count"), 0);
+        // And the next edit bases on the latest acked version.
+        store
+            .put("notes", "n1", &json!({"title": "v3"}))
+            .expect("third put");
+        assert_eq!(
+            store.pending_changes(10).expect("pending")[0].base_version,
+            6
+        );
+    }
+
+    #[test]
+    fn clean_ack_rebases_only_the_entry_built_on_the_acked_change() {
+        // A pending entry whose base does NOT match the acked change's base
+        // was not created on top of it — it must keep its own base.
+        let (_dir, store) = open_temp();
+        // Row already synced at version 9 (e.g. from a pull).
+        store
+            .apply_remote_rows(&[remote_row("notes", "n1", 9, false)])
+            .expect("apply");
+        // A pushed change for a DIFFERENT row acked at version 12.
+        store
+            .put("notes", "other", &json!({"title": "x"}))
+            .expect("put other");
+        let batch = store.pending_changes(10).expect("batch");
+        // Meanwhile n1 gains a pending edit based on 9.
+        store
+            .put("notes", "n1", &json!({"title": "edit"}))
+            .expect("put n1");
+        store
+            .confirm_pushed(&batch, &[ChangeOutcome::Applied { version: 12 }])
+            .expect("confirm");
+        let pending = store.pending_changes(10).expect("pending");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].base_version, 9,
+            "an unrelated row's pending base must be untouched"
+        );
     }
 
     #[test]
@@ -852,6 +1030,44 @@ mod tests {
             "with no newer pending write the resolved row applies locally"
         );
         assert_eq!(store.pending_count().expect("count"), 0);
+    }
+
+    #[test]
+    fn apply_remote_page_persists_rows_and_cursor_together() {
+        let (_dir, store) = open_temp();
+        let applied = store
+            .apply_remote_page(&[remote_row("notes", "n1", 4, false)], 4)
+            .expect("apply page");
+        assert_eq!(applied, 1);
+        assert_eq!(
+            store.cursor().expect("cursor"),
+            4,
+            "the cursor must advance in the same transaction as the rows"
+        );
+        // An empty caught-up page still lands the cursor (e.g. at the
+        // tombstone horizon).
+        store.apply_remote_page(&[], 9).expect("empty page");
+        assert_eq!(store.cursor().expect("cursor"), 9);
+    }
+
+    #[test]
+    fn has_synced_rows_sees_only_acked_rows_without_pending_entries() {
+        let (_dir, store) = open_temp();
+        assert!(!store.has_synced_rows().expect("fresh store"));
+        // A purely local (pending) write is not a synced row.
+        store
+            .put("notes", "mine", &json!({"title": "local"}))
+            .expect("put");
+        assert!(!store.has_synced_rows().expect("pending only"));
+        // A pulled row is.
+        store
+            .apply_remote_rows(&[remote_row("notes", "n1", 4, false)])
+            .expect("apply");
+        assert!(store.has_synced_rows().expect("synced row"));
+        // A full resync clears it (the pending write survives).
+        store.begin_full_resync().expect("resync");
+        assert!(!store.has_synced_rows().expect("after resync"));
+        assert_eq!(store.pending_count().expect("count"), 1);
     }
 
     #[test]

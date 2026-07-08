@@ -384,6 +384,81 @@ async fn gc_horizon_forces_full_resync_preserving_pending() {
     assert!(rows.iter().any(|r| r.pk == "b-note" && !r.deleted));
 }
 
+/// Regression for the "synced rows but cursor 0" crash state: a crash
+/// between materializing pulled rows and persisting the cursor (possible
+/// before the two became one transaction, or via a store written by an
+/// older build) leaves a device that LOOKS fresh to the server — its
+/// session=0 pull is exempt from the tombstone-horizon check — so
+/// deletions GC'd in the meantime would never arrive and the stale rows
+/// would stay visible forever while the cursor advances past them. The
+/// engine must detect the state and heal it with a full resync.
+#[tokio::test]
+async fn synced_rows_with_zero_cursor_heal_via_full_resync() {
+    let backend = Arc::new(MemorySyncBackend::new());
+    let (url, _srv) = start_sync_server(backend.clone(), Arc::new(LwwResolver)).await;
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    let store_a = open_store(&dir, "a.db");
+    let engine_a = engine_for(&store_a, &url);
+    let store_b = open_store(&dir, "b.db");
+    let engine_b = engine_for(&store_b, &url);
+
+    // A creates two rows; B syncs them.
+    store_a.put("notes", "keep", &note("kept")).expect("put");
+    store_a.put("notes", "gone", &note("doomed")).expect("put");
+    engine_a.sync_once().await.expect("a sync 1");
+    engine_b.sync_once().await.expect("b sync 1");
+    assert!(store_b.cursor().expect("b cursor") > 0);
+
+    // Simulate the crash state on B: rows are materialized but the cursor
+    // was never persisted. (Today's apply path persists both atomically, so
+    // reach into the SQLite file the way an older build's crash would have
+    // left it.)
+    {
+        use diesel::prelude::*;
+        let path = dir.path().join("b.db");
+        let mut conn =
+            diesel::sqlite::SqliteConnection::establish(path.to_str().expect("utf-8 path"))
+                .expect("open raw sqlite");
+        diesel::sql_query("UPDATE autumn_sync_state SET value = '0' WHERE key = 'cursor'")
+            .execute(&mut conn)
+            .expect("reset cursor");
+    }
+    assert_eq!(store_b.cursor().expect("b cursor"), 0);
+
+    // Meanwhile the row is deleted remotely and the tombstone is GC'd —
+    // no future pull can ever carry the deletion again.
+    store_a.delete("notes", "gone").expect("delete");
+    engine_a.sync_once().await.expect("a sync 2");
+    let removed = backend
+        .gc_tombstones(backend.latest_version().expect("latest"))
+        .expect("gc");
+    assert_eq!(removed, 1, "the tombstone was physically dropped");
+
+    // B's next pass must NOT slip through the session=0 exemption with its
+    // stale rows: the engine detects synced-rows-at-cursor-0 and resyncs.
+    let report = engine_b.sync_once().await.expect("b heal");
+    assert!(
+        report.full_resync,
+        "synced rows with a zero cursor must trigger a full resync"
+    );
+    let listed: Vec<(String, Note)> = store_b.list("notes").expect("b list");
+    let pks: Vec<&str> = listed.iter().map(|(pk, _)| pk.as_str()).collect();
+    assert!(
+        !pks.contains(&"gone"),
+        "the GC'd deletion must reach B via the resync: {pks:?}"
+    );
+    assert!(pks.contains(&"keep"), "live rows survive the heal: {pks:?}");
+    assert!(
+        store_b.cursor().expect("b cursor") >= backend.tombstone_horizon().expect("horizon"),
+        "the healed cursor must land at/above the horizon"
+    );
+
+    // Steady state afterwards: no resync loop.
+    let next = engine_b.sync_once().await.expect("b steady");
+    assert!(!next.full_resync, "the heal must not loop");
+}
+
 /// Regression for the perpetual post-GC full-resync loop: GC naturally
 /// leaves the horizon ABOVE the newest surviving row version whenever the
 /// most recent change was a delete. A completed catch-up must land the

@@ -211,6 +211,43 @@ fn offline_sync_shell_cargo_toml_mirrors_path_dependency() {
     toml::from_str::<toml::Value>(&shell_cargo).expect("generated Cargo.toml must parse");
 }
 
+#[test]
+fn offline_sync_shell_cargo_toml_preserves_no_default_features() {
+    // Feature unification is per dependency edge: if the app disables the
+    // framework's default features, a mirrored shell edge without
+    // `default-features = false` would silently re-enable them for the
+    // whole src-tauri build.
+    let (_tmp, project) = fresh_project("offsync-nodefault-app");
+    let cargo_path = project.join("Cargo.toml");
+    let rewritten = read(&cargo_path)
+        .lines()
+        .map(|l| {
+            l.strip_prefix("autumn-web = \"")
+                .and_then(|rest| rest.strip_suffix('"'))
+                .map_or_else(
+                    || l.to_owned(),
+                    |version| {
+                        format!(
+                            "autumn-web = {{ version = \"{version}\", default-features = false }}"
+                        )
+                    },
+                )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&cargo_path, rewritten).unwrap();
+
+    run_autumn(&project, &["generate", "tauri-mobile", "--offline-sync"]);
+
+    let shell_cargo = read(&project.join("src-tauri/Cargo.toml"));
+    assert!(
+        shell_cargo.contains(r#"autumn-web = { version = ""#)
+            && shell_cargo.contains(r#", default-features = false, features = ["offline-sync"] }"#),
+        "the shell's autumn-web edge must preserve default-features = false, got:\n{shell_cargo}"
+    );
+    toml::from_str::<toml::Value>(&shell_cargo).expect("generated Cargo.toml must parse");
+}
+
 // ── The app-side (server) wiring ────────────────────────────────────────────
 
 #[test]

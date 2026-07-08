@@ -141,6 +141,21 @@ impl SyncEngine {
     pub async fn sync_once(&self) -> Result<SyncReport, SyncError> {
         let _pass = self.sync_lock.lock().await;
         let mut report = SyncReport::default();
+        // Crash-state healing: synced rows alongside a cursor of 0 mean a
+        // previous pass persisted rows without the cursor (impossible via
+        // today's atomic `apply_remote_page`, but reachable through stores
+        // written by older builds — or a device that pushed and then never
+        // completed a pull). A from-0 session is exempt from the server's
+        // tombstone-horizon check (it looks like a fresh device), so
+        // deletions GC'd since those rows were written would never arrive
+        // and stale rows would stay visible forever while the cursor
+        // advances past them. Treat the state as a full resync: drop the
+        // synced rows (pending local writes survive and are replayed) and
+        // re-pull from scratch.
+        if self.store.cursor()? == 0 && self.store.has_synced_rows()? {
+            self.store.begin_full_resync()?;
+            report.full_resync = true;
+        }
         self.push_pending(&mut report).await?;
         if self.pull_updates(&mut report).await? {
             // Stale cursor: reset synced state (pending survives), re-pull
@@ -241,21 +256,30 @@ impl SyncEngine {
                     tombstone_horizon,
                 } => {
                     let page_len = rows.len();
-                    report.pulled += self.store.apply_remote_rows(&rows)?;
                     let caught_up =
                         rows.is_empty() || i64::try_from(page_len).unwrap_or(i64::MAX) < limit;
+                    // End of pagination lands at/above the horizon so a
+                    // horizon left above the newest surviving row (GC right
+                    // after a delete) cannot strand the cursor in a
+                    // perpetual full-resync loop. Rows and cursor persist
+                    // in ONE store transaction: a crash between them would
+                    // leave synced rows with a stale cursor — at cursor 0
+                    // that state pulls with session=0, which the server
+                    // exempts from the horizon check, so GC'd deletions
+                    // would never reach this device (see
+                    // `SyncStore::apply_remote_page`).
+                    let new_cursor = if caught_up {
+                        next_cursor.max(tombstone_horizon)
+                    } else {
+                        next_cursor
+                    };
+                    report.pulled += self.store.apply_remote_page(&rows, new_cursor)?;
                     if caught_up {
-                        // End of pagination: land at/above the horizon so a
-                        // horizon left above the newest surviving row (GC
-                        // right after a delete) cannot strand the cursor in
-                        // a perpetual full-resync loop.
-                        self.store.set_cursor(next_cursor.max(tombstone_horizon))?;
                         if tombstone_horizon > 0 {
                             self.store.prune_acked_tombstones(tombstone_horizon)?;
                         }
                         return Ok(false);
                     }
-                    self.store.set_cursor(next_cursor)?;
                 }
             }
         }
