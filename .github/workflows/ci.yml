@@ -120,7 +120,7 @@ jobs:
           cargo llvm-cov --no-report -p autumn-cli --test experiments -- --ignored
           cargo llvm-cov report --lcov --output-path lcov.info
       - name: Upload to Codecov
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@v7
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: lcov.info
