@@ -50,6 +50,40 @@ fn read_workspace_manifest(root: &Path) -> toml::Value {
     toml::from_str(&root_manifest).expect("workspace Cargo.toml should parse as TOML")
 }
 
+fn semver_triple(version: &str) -> (u64, u64, u64) {
+    let mut parts = version.splitn(3, '.').map(|part| {
+        part.parse::<u64>().unwrap_or_else(|err| {
+            panic!("version component `{part}` of `{version}` should be numeric: {err}")
+        })
+    });
+    let mut next = |name: &str| {
+        parts
+            .next()
+            .unwrap_or_else(|| panic!("version `{version}` should have a {name} component"))
+    };
+    (next("major"), next("minor"), next("patch"))
+}
+
+/// The CLI version the README quickstart pins, e.g. `0.5.0` out of
+/// `cargo install autumn-cli --version 0.5.0`. The README is the source of
+/// truth for what new users install (scripts/check-quickstart.sh parses the
+/// same line), and it tracks the latest *published* release, which can lag
+/// the workspace version between a version bump and the crates.io publish.
+fn readme_pinned_cli_version(docs: &[(&'static str, String)]) -> String {
+    let readme = docs
+        .iter()
+        .find(|(doc, _)| *doc == "README.md")
+        .map(|(_, content)| content)
+        .expect("README.md should be included in FIRST_RUN_DOCS");
+    let pinned = readme
+        .split("cargo install autumn-cli --version ")
+        .nth(1)
+        .and_then(|rest| rest.split(|c: char| c.is_whitespace() || c == '`').next())
+        .filter(|version| !version.is_empty())
+        .expect("README.md must pin `cargo install autumn-cli --version X.Y.Z` in the quickstart");
+    pinned.to_owned()
+}
+
 fn read_docs_once(root: &Path) -> Vec<(&'static str, String)> {
     FIRST_RUN_DOCS
         .iter()
@@ -144,13 +178,23 @@ fn workspace_test_profile_keeps_ci_artifacts_bounded() {
 fn first_run_docs_match_current_release_line() {
     let root = workspace_root();
     let root_toml = read_workspace_manifest(&root);
-    let current_version = workspace_package_value(&root_toml, "version");
-    let current_series = current_version
-        .rsplit_once('.')
-        .map_or(current_version.as_str(), |(series, _)| series);
+    let workspace_version = workspace_package_value(&root_toml, "version");
     let rust_version = workspace_package_value(&root_toml, "rust-version");
-    let current_health_json = format!(r#"{{ "status": "ok", "version": "{current_version}" }}"#);
     let docs = read_docs_once(&root);
+
+    // Docs pin the latest *published* CLI release (README is the source of
+    // truth), which may lag the workspace version between a version bump and
+    // the crates.io publish — but must never run ahead of it.
+    let pinned_version = readme_pinned_cli_version(&docs);
+    assert!(
+        semver_triple(&pinned_version) <= semver_triple(&workspace_version),
+        "README.md pins autumn-cli {pinned_version}, which is newer than the workspace \
+         version {workspace_version}; docs must pin a published release",
+    );
+    let pinned_series = pinned_version
+        .rsplit_once('.')
+        .map_or(pinned_version.as_str(), |(series, _)| series);
+    let pinned_health_json = format!(r#"{{ "status": "ok", "version": "{pinned_version}" }}"#);
 
     for (doc, content) in &docs {
         for stale in [
@@ -190,26 +234,26 @@ fn first_run_docs_match_current_release_line() {
         if content.contains("cargo install autumn-cli") {
             assert!(
                 content.contains(&format!(
-                    "cargo install autumn-cli --version {current_version}"
+                    "cargo install autumn-cli --version {pinned_version}"
                 )),
-                "{doc} must show the published CLI install command for autumn-cli {current_version}"
+                "{doc} must show the published CLI install command for autumn-cli {pinned_version} (the version pinned in README.md)"
             );
         }
 
         if content.contains("autumn-web =") {
             assert!(
-                content.contains(&format!("autumn-web = \"{current_series}\""))
-                    || content.contains(&format!("autumn-web = \"{current_version}\""))
-                    || content.contains(&format!("version = \"{current_series}\""))
-                    || content.contains(&format!("version = \"{current_version}\"")),
-                "{doc} must show the current autumn-web release line ({current_series} or {current_version})",
+                content.contains(&format!("autumn-web = \"{pinned_series}\""))
+                    || content.contains(&format!("autumn-web = \"{pinned_version}\""))
+                    || content.contains(&format!("version = \"{pinned_series}\""))
+                    || content.contains(&format!("version = \"{pinned_version}\"")),
+                "{doc} must show the published autumn-web release line ({pinned_series} or {pinned_version})",
             );
         }
 
         if content.contains(r#""status": "ok""#) {
             assert!(
-                content.contains(&current_health_json),
-                "{doc} must show the current JSON health version {current_version}"
+                content.contains(&pinned_health_json),
+                "{doc} must show the published JSON health version {pinned_version}"
             );
         }
     }
@@ -224,8 +268,8 @@ fn first_run_docs_match_current_release_line() {
         "docs-smoke must expect the root page generated by `autumn new smoke-app`"
     );
     assert!(
-        docs_smoke.contains(&current_health_json),
-        "docs-smoke must show the exact health JSON with version {current_version}"
+        docs_smoke.contains(&pinned_health_json),
+        "docs-smoke must show the exact health JSON with version {pinned_version}"
     );
 }
 
