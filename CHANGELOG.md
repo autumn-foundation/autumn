@@ -458,25 +458,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Accept-Encoding` accepts them, instead of relying solely on the
   general-purpose compression middleware to redo that work on every request.
 
-## [0.6.0] - 2026-06-30
-
-### Added
-
-- **ui:** reusable `card` and `stat_card` Maud widget helpers in
-  `autumn_web::widgets`, re-exported from the prelude. `card()` renders a
-  titled content panel with an optional header-action slot, footer, and
-  configurable heading level (`HeadingLevel::H1`–`H6`, default `H2`);
-  `stat_card()` renders a metric tile with label, value, and optional link.
-  Both are CSP-safe and HTML-escape caller-supplied text via Maud.
-  `CardConfig` uses a builder pattern with `const fn` and private fields
-  so the `title()` / `title_html()` escape path cannot be bypassed.
-  The admin plugin's 12 hand-rolled card blocks and dashboard stat tiles are
-  migrated to the new helpers, removing the duplication (#1122).
-
-## [0.5.0] - 2026-06-16
-
-### Added
-
+- **ci:** plugin freshness gate (`scripts/check-plugin-freshness.sh` +
+  `.github/workflows/plugin-freshness.yml`) — a PR that adds entries to this
+  changelog's Unreleased `Added`/`Changed` sections without touching the
+  Claude plugin (`skills/`, `agents/`, `.claude-plugin/`) fails a fast,
+  toolchain-free check; exempt individual bullets with a bracketed
+  `no-plugin` marker, or the whole PR via the same marker in the PR body or
+  the `plugin-exempt` label. The same job sanity-checks that
+  `plugin.json` parses and that every `docs/guide/*.md` path referenced from
+  the plugin exists. Run `scripts/check-plugin-freshness.sh --self-test`
+  locally.
 
 - **daemon:** `autumn serve` — run an app as a production (non-watch) local
   daemon, with an optional managed local Postgres (#1119)
@@ -595,6 +586,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     unsharded control role — enforced at config validation. New
     `examples/bookmarks-sharded` Docker Compose stack and
     `docs/guide/sharding.md`.
+
+### Documentation
+
+- **plugin:** refresh the Claude plugin to current framework state. Adds
+  prominent `#[state_machine]` coverage (attribute syntax, generated
+  `can_transition_{field}_to` / `transition_{field}_to`, guards, and a
+  `before_update` example replacing hand-rolled status validation), a
+  "Prefer framework idioms over raw Diesel/Axum" steering table, the
+  generated-repository method surface (pagination, bulk ops, read routing,
+  hooks), `Db::tx_with`/`TxOptions`, jobs additions (uniqueness/concurrency,
+  named queues, tracked jobs), events/listeners, cache stampede protection,
+  view widgets + `WIDGETS_CSS`, sharding, `autumn serve`, `autumn destroy`,
+  the `references`/`enum{...}`/`decimal`/`:unique` generator DSL, scoped
+  tokens, observability defaults, and load shedding. Features merged on
+  trunk-dev but absent from the published 0.5.0 crates are explicitly marked
+  "(unreleased)", and in-flight PRs (#1587 `form_for`, #1592
+  `find_in_batches`) are flagged as unmerged rather than documented as
+  available. Fixes stale claims (foreign keys/unique "not in the DSL", the
+  removed `--test repo_hygiene` target) and documents that published 0.5.0
+  repositories have no pool constructor (`with_pool_untracked` is
+  trunk-dev-only).
+
+## [0.6.0] - 2026-06-30
+
+### Added
+
+- **ui:** reusable `card` and `stat_card` Maud widget helpers in
+  `autumn_web::widgets`, re-exported from the prelude. `card()` renders a
+  titled content panel with an optional header-action slot, footer, and
+  configurable heading level (`HeadingLevel::H1`–`H6`, default `H2`);
+  `stat_card()` renders a metric tile with label, value, and optional link.
+  Both are CSP-safe and HTML-escape caller-supplied text via Maud.
+  `CardConfig` uses a builder pattern with `const fn` and private fields
+  so the `title()` / `title_html()` escape path cannot be bypassed.
+  The admin plugin's 12 hand-rolled card blocks and dashboard stat tiles are
+  migrated to the new helpers, removing the duplication (#1122).
+
+## [0.5.0] - 2026-06-16
+
+### Added
 
 - **auth:** Active session management with device list and revocation in the auth starter (#819)
   - `autumn generate auth` now persists a `{user}_sessions` row per login
