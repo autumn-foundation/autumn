@@ -132,6 +132,7 @@
 //! | `AUTUMN_DEV__INSPECTOR_CAPACITY` | `dev.inspector_capacity` | `usize` |
 //! | `AUTUMN_DEV__INSPECTOR_N_PLUS_ONE_THRESHOLD` | `dev.inspector_n_plus_one_threshold` | `usize` |
 //! | `AUTUMN_COMPRESSION__ENABLED` | `compression.enabled` | `bool` |
+//! | `AUTUMN_STORIES__ENABLED` | `stories.enabled` | `bool` |
 //! | `AUTUMN_AUTH__LOCKOUT__ENABLED` | `auth.lockout.enabled` | `bool` |
 //! | `AUTUMN_AUTH__LOCKOUT__THRESHOLD` | `auth.lockout.threshold` | `i32` |
 //! | `AUTUMN_AUTH__LOCKOUT__WINDOW_SECS` | `auth.lockout.window_secs` | `u64` |
@@ -967,6 +968,15 @@ pub struct AutumnConfig {
     /// These settings have no effect outside the `dev` profile.
     #[serde(default)]
     pub dev: DevConfig,
+
+    /// Widget story gallery settings (`[stories]` section in `autumn.toml`).
+    ///
+    /// Off by default; opt-in per profile (e.g. `[profile.dev.stories]
+    /// enabled = true` for a dev-only gallery, or a prod profile for a
+    /// public showcase). See `docs/guide/stories.md`.
+    #[cfg(feature = "maud")]
+    #[serde(default)]
+    pub stories: crate::stories::StoriesConfig,
 
     /// Error-reporting settings (`[reporting]` section in `autumn.toml`).
     ///
@@ -2550,6 +2560,8 @@ impl AutumnConfig {
         self.apply_storage_env_overrides_with_env(env);
         #[cfg(feature = "mail")]
         self.apply_mail_env_overrides_with_env(env);
+        #[cfg(feature = "maud")]
+        self.apply_stories_env_overrides_with_env(env);
         self.apply_resilience_env_overrides_with_env(env);
         self.apply_time_zone_env_overrides_with_env(env);
     }
@@ -2600,6 +2612,11 @@ impl AutumnConfig {
             "AUTUMN_COMPRESSION__ENABLED",
             &mut self.compression.enabled,
         );
+    }
+
+    #[cfg(feature = "maud")]
+    fn apply_stories_env_overrides_with_env(&mut self, env: &dyn Env) {
+        parse_env_bool(env, "AUTUMN_STORIES__ENABLED", &mut self.stories.enabled);
     }
 
     fn apply_actuator_env_overrides_with_env(&mut self, env: &dyn Env) {

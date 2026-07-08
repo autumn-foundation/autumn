@@ -17,6 +17,11 @@ allowed-tools:
 Wrap `autumn generate <subcommand>` commands. Always show a redacted command
 preview and get confirmation before executing any mutating generator.
 
+**Version check first**: rows and tokens marked **(trunk-dev)** below exist
+only on the trunk-dev CLI, NOT in the published `autumn-cli 0.5.0`. Run
+`autumn --version` (or check how the CLI was installed) before suggesting
+them; on 0.5.0 fall back to the documented manual alternative.
+
 ## Supported subcommands
 
 | Subcommand | Example | What it creates |
@@ -31,6 +36,14 @@ preview and get confirmation before executing any mutating generator.
 | `system-test` | `system-test checkout_flow` | System test fixture (name must be `snake_case` or `PascalCase` — no hyphens) |
 | `pwa` | `pwa` | PWA scaffolding — manifest, service worker, offline shell, icons, route handlers, smoke test |
 | `wizard` | `wizard checkout shipping payment review` | Session-backed multi-step form — step structs, GET/POST handlers, confirm/commit/cancel, and ignored integration test skeletons |
+| `tauri` **(trunk-dev)** | `tauri` | `src-tauri/` desktop sidecar project; purely additive; then `cargo tauri build` |
+| `plugin` **(trunk-dev)** | `plugin my-plugin` | Installable/conformant Autumn plugin crate |
+
+**Reversing a generator (trunk-dev)**: `autumn destroy <subcommand> <args>`
+mirrors `autumn generate` argument-for-argument and cleanly removes what it
+created (`autumn destroy scaffold Post title:String`, `--dry-run` supported).
+It never touches a database — only generated files/migrations. On the
+published 0.5.0 CLI, revert by hand (git) instead.
 
 ## Field type reference
 
@@ -52,16 +65,27 @@ accept aliases like `Integer` or `Boolean`.
 | `Bytea` | `BYTEA NOT NULL` | `Vec<u8>` |
 | `Attachment` | `JSONB NULL` (blob metadata) | `Option<Blob>` (always nullable) — **requires `storage` feature in Cargo.toml**; generator does not add it automatically |
 | `Option<T>` | Nullable version of any above | `Option<T>` |
+| `references` **(trunk-dev)** | `post:references` → `post_id BIGINT NOT NULL REFERENCES posts(id)` + auto index | `i64` (field name gets `_id` appended; `post:references?` for `Option<i64>`) |
+| `enum{a,b,c}` **(trunk-dev)** | `TEXT` + `CHECK (col IN (...))` | Generated PascalCase Rust enum with Diesel/serde impls + `<select>` widget; `--default field=variant` sets SQL DEFAULT + `#[default]`. Quote the token in bash/zsh (brace expansion) |
+| `decimal` / `decimal{10,2}` **(trunk-dev)** | `NUMERIC(12,2)` default, or explicit precision/scale | `rust_decimal::Decimal` (dependency added automatically); use for money, never `f64` |
+| `:unique` modifier **(trunk-dev)** | `email:String:unique` → `CREATE UNIQUE INDEX` in the migration | Also generates a free `find_by_<field>` lookup and 23505 → 422 inline "already exists" form error. `--unique FIELD` is the flag equivalent |
 
-**Indexes and UNIQUE constraints are not field tokens.** Add them by hand in the
-generated migration's `up.sql` after scaffolding.
+**Foreign keys** (published 0.5.0 CLI only — no `references` token): scaffold
+an `i64` field and hand-edit the generated migration to add
+`REFERENCES users(id)` and an index. On trunk-dev, use `user:references`.
 
-**Foreign keys are not in the DSL.** To add an FK column (e.g. `user_id`), scaffold the
-model with an `i64` field and then hand-edit the generated migration to add
-`REFERENCES users(id)` and an index.
+**Indexes/UNIQUE** (published 0.5.0 CLI only — no `:unique` token): add them
+by hand in the generated migration's `up.sql`. On trunk-dev, use `:unique` /
+`--unique FIELD` / `--index FIELD`.
 
 **Do not use UUID as a primary key.** Primary keys are always `i64` /
 `BIGSERIAL`. Use `Uuid` as a secondary column for external correlation only.
+
+**Scaffold form behavior (trunk-dev)**: generated `create`/`update` handlers
+build a `Changeset` and, on a rejected submission, respond **422** and
+re-render the form with all submitted values preserved and per-field inline
+errors — do not "fix" this by adding a redirect-to-error-page. The published
+0.5.0 scaffold returns a 400 error page instead.
 
 ## Execution flow
 
@@ -211,6 +235,9 @@ Next steps:
 - `--passkeys`: For `auth` — add WebAuthn passkeys
 - `--dry-run`: Print what would be written without touching the filesystem (supported by `wizard`)
 - `--force`: Overwrite existing files without prompting (supported by `wizard`)
+- `--live` **(trunk-dev)**: For `scaffold` — repository broadcasts, a `LiveFragment` impl, an SSE stream route, and an SSE-wired index list
+- `--live-validation` **(trunk-dev)**: For `scaffold` — per-field inline validation endpoints with `hx-post` inputs (implies `--live`)
+- `--unique FIELD` / `--index FIELD` / `--default field=variant` **(trunk-dev)**: Constraint/index/default markers (see field table)
 
 ## Wizard name constraints
 
