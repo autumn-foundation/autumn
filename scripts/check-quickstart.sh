@@ -123,6 +123,20 @@ readme_cli_version() {
   sed -n 's/^cargo install autumn-cli --version \([0-9][0-9A-Za-z.+-]*\).*$/\1/p' "$repo_root/README.md" | head -n 1
 }
 
+remove_prebuilt_binary() {
+  # README users go straight from `autumn setup` to `autumn dev` — the
+  # quickstart has no discrete build step. Our build phases run `cargo build`
+  # anyway (for step attribution and the lockfile source assertion), which
+  # leaves a target/debug/my-app binary on disk — and `autumn dev`
+  # (autumn-cli/src/dev.rs) only LOGS an initial-build failure before
+  # starting whatever binary find_binary locates, so a stale prebuilt binary
+  # would mask a regression in the published CLI's dev build path. Delete it
+  # so `autumn dev` must build and start the app itself, exactly as it must
+  # for a new user. (Dependency artifacts stay cached; only the app binary
+  # is removed, so funnel timing is barely affected.)
+  rm -f "${CARGO_TARGET_DIR:-$app_dir/target}/debug/my-app"
+}
+
 
 # ── Server lifecycle ─────────────────────────────────────────────────────────
 
@@ -315,6 +329,7 @@ phase_serve() {
   local log="$state/server-serve.log"
   # The README path up to `GET /` has no database configured — serve in
   # no-db mode so this phase exercises the same runtime a README user gets.
+  remove_prebuilt_binary
   start_server "$log" no-db
   wait_for_200 "$base_url/" "$log"
   local t200 t_install elapsed
@@ -362,6 +377,7 @@ phase_scaffold_serve() {
   require_app
   [[ -n "${DATABASE_URL:-}" ]] || fail "DATABASE_URL is not set — the scaffolded /posts route needs a Postgres"
   local log="$state/server-scaffold-serve.log"
+  remove_prebuilt_binary
   start_server "$log" with-db
   # docs/guide/generators.md: "Visit http://localhost:3000/posts to see the
   # generated index page."
