@@ -701,10 +701,27 @@ fn shell_autumn_web_dep(project_root: &Path, plan: &mut Plan) -> ShellAutumnWebD
             .map(str::to_owned),
         _ => None,
     };
+    // An alternate-registry selection must survive the mirroring too: a
+    // bare version requirement would make the shell workspace resolve
+    // autumn-web from crates.io — failing outright for private registries,
+    // or silently compiling a different framework. `registry` only combines
+    // with version deps (Cargo rejects it on path/git sources, and member
+    // manifests cannot override it on workspace-inherited entries), so
+    // reading it from the RESOLVED table covers both direct and
+    // workspace-inherited shapes.
+    let registry_part = match &dep_value {
+        Some(toml::Value::Table(t)) => t
+            .get("registry")
+            .and_then(toml::Value::as_str)
+            .map_or_else(String::new, |registry| {
+                format!("registry = \"{registry}\", ")
+            }),
+        _ => String::new(),
+    };
     let registry_entry = |req: &str| {
         format!(
             "autumn-web = {{ version = \"{req}\", \
-             {default_features_part}features = [\"offline-sync\"] }}"
+             {registry_part}{default_features_part}features = [\"offline-sync\"] }}"
         )
     };
     let Some(version) = version else {
@@ -2536,6 +2553,65 @@ mod tests {
             !dep.dep_entry.contains("default-features"),
             "got: {}",
             dep.dep_entry
+        );
+    }
+
+    #[test]
+    fn offline_shell_dep_mirrors_alternate_registry_selection() {
+        // A private-registry dep must not collapse into a bare crates.io
+        // version requirement on the shell edge.
+        let (dep, warnings) = shell_dep_for(
+            "autumn-web = { version = \"0.9.1\", registry = \"internal\" }",
+            "",
+        );
+        assert_eq!(
+            dep.dep_entry,
+            r#"autumn-web = { version = "0.9.1", registry = "internal", features = ["offline-sync"] }"#,
+        );
+        assert!(warnings.is_empty(), "got {warnings:?}");
+
+        // Combined with a default-features opt-out, both survive.
+        let (dep, _) = shell_dep_for(
+            "autumn-web = { version = \"0.9.1\", registry = \"internal\", default-features = false }",
+            "",
+        );
+        assert_eq!(
+            dep.dep_entry,
+            r#"autumn-web = { version = "0.9.1", registry = "internal", default-features = false, features = ["offline-sync"] }"#,
+        );
+
+        // Workspace-inherited entries carry their registry key through the
+        // inheritance walk (members cannot override it, so the resolved
+        // workspace table is authoritative).
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"app\"]\n\n\
+             [workspace.dependencies]\n\
+             autumn-web = { version = \"0.9.1\", registry = \"internal\" }\n",
+        )
+        .unwrap();
+        let app = tmp.path().join("app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(
+            app.join("Cargo.toml"),
+            "[package]\nname = \"my-app\"\nversion = \"0.2.3\"\n\n\
+             [dependencies]\nautumn-web = { workspace = true }\n",
+        )
+        .unwrap();
+        let mut plan = Plan::new(&app);
+        let dep = shell_autumn_web_dep(&app, &mut plan);
+        assert_eq!(
+            dep.dep_entry,
+            r#"autumn-web = { version = "0.9.1", registry = "internal", features = ["offline-sync"] }"#,
+        );
+        assert!(plan.warnings.is_empty(), "got {:?}", plan.warnings);
+
+        // No registry key: output stays byte-identical to before.
+        let (dep, _) = shell_dep_for("autumn-web = { version = \"0.9.1\" }", "");
+        assert_eq!(
+            dep.dep_entry,
+            r#"autumn-web = { version = "0.9.1", features = ["offline-sync"] }"#,
         );
     }
 
