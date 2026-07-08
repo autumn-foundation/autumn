@@ -57,7 +57,7 @@ async fn test_case_insensitive_bearer_and_valid_jwt() {
     config.tenancy.enabled = true;
     config.tenancy.source = "jwt".to_string();
     config.tenancy.jwt_claim = "company".to_string();
-    config.tenancy.jwt_secret = Some("my-secret".to_string());
+    config.tenancy.jwt_secret = Some("my-secret".to_string().into());
     config.tenancy.jwt_issuer = Some("my-issuer".to_string());
 
     let token = generate_jwt("tenant123", "my-secret", false, Some("my-issuer"));
@@ -103,7 +103,7 @@ async fn test_jwt_verification_signature_and_expiration() {
     config.tenancy.enabled = true;
     config.tenancy.source = "jwt".to_string();
     config.tenancy.jwt_claim = "company".to_string();
-    config.tenancy.jwt_secret = Some("my-secret".to_string());
+    config.tenancy.jwt_secret = Some("my-secret".to_string().into());
     config.tenancy.jwt_issuer = Some("my-issuer".to_string());
 
     // 1. Untrusted signature (forged payload)
@@ -304,7 +304,7 @@ async fn jwt_audience_valid_passes() {
     config.tenancy.enabled = true;
     config.tenancy.source = "jwt".to_string();
     config.tenancy.jwt_claim = "company".to_string();
-    config.tenancy.jwt_secret = Some("secret".to_string());
+    config.tenancy.jwt_secret = Some("secret".to_string().into());
     config.tenancy.jwt_audience = Some("my-api".to_string());
 
     let token = generate_jwt_with_audience("acme", "secret", Some("my-api"));
@@ -327,7 +327,7 @@ async fn jwt_audience_mismatch_fails() {
     config.tenancy.enabled = true;
     config.tenancy.source = "jwt".to_string();
     config.tenancy.jwt_claim = "company".to_string();
-    config.tenancy.jwt_secret = Some("secret".to_string());
+    config.tenancy.jwt_secret = Some("secret".to_string().into());
     config.tenancy.jwt_audience = Some("my-api".to_string());
 
     // Token carries audience "wrong-api" — should be rejected
@@ -357,7 +357,7 @@ async fn jwt_audience_missing_claim_fails() {
     config.tenancy.enabled = true;
     config.tenancy.source = "jwt".to_string();
     config.tenancy.jwt_claim = "company".to_string();
-    config.tenancy.jwt_secret = Some("secret".to_string());
+    config.tenancy.jwt_secret = Some("secret".to_string().into());
     config.tenancy.jwt_audience = Some("my-api".to_string());
 
     // Token has aud: None — skip_serializing_if means the field is absent
@@ -385,7 +385,7 @@ async fn jwt_malformed_bearer_boundary_handling_does_not_panic() {
     config.tenancy.enabled = true;
     config.tenancy.source = "jwt".to_string();
     config.tenancy.jwt_claim = "company".to_string();
-    config.tenancy.jwt_secret = Some("secret".to_string());
+    config.tenancy.jwt_secret = Some("secret".to_string().into());
 
     let req = Request::builder()
         .header("Authorization", "aaaaaaé...")
@@ -449,4 +449,46 @@ async fn tenant_propagating_body_sets_context_during_poll() {
     let mut cx = Context::from_waker(&waker);
     let res = Pin::new(&mut wrapped).poll_frame(&mut cx);
     assert!(res.is_ready());
+}
+
+// `jwt_secret` is stored as a `secrecy::SecretString`: Debug-formatting the
+// config must never reveal the raw secret value.
+#[test]
+fn debug_output_redacts_jwt_secret() {
+    let mut config = AutumnConfig::default();
+    config.tenancy.jwt_secret = Some("super-secret-signing-key".to_string().into());
+
+    let debugged = format!("{:?}", config.tenancy);
+    assert!(
+        !debugged.contains("super-secret-signing-key"),
+        "Debug output must not contain the raw JWT secret, got: {debugged}"
+    );
+    assert!(
+        debugged.contains("REDACTED"),
+        "Debug output should show the redaction placeholder, got: {debugged}"
+    );
+}
+
+// Config deserialization still accepts a plain string for `jwt_secret`, and
+// the value is recoverable (only) via `expose_secret` at the point of use.
+#[test]
+fn jwt_secret_deserializes_from_plain_config_string() {
+    use secrecy::ExposeSecret;
+
+    let cfg: autumn_web::config::TenancyConfig = toml::from_str(
+        r#"
+            enabled = true
+            source = "jwt"
+            jwt_secret = "from-config-file"
+        "#,
+    )
+    .expect("tenancy config with a plain-string jwt_secret must deserialize");
+
+    assert_eq!(
+        cfg.jwt_secret
+            .as_ref()
+            .expect("jwt_secret should be set")
+            .expose_secret(),
+        "from-config-file"
+    );
 }
