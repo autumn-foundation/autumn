@@ -1574,6 +1574,93 @@ async fn server_rejects_payloadless_upsert_with_422() {
     assert!(matches!(push.outcomes[0], ChangeOutcome::Applied { .. }));
 }
 
+/// Protocol validation over HTTP: a batch repeating one `change_id` is
+/// rejected with 422 and nothing is applied. Without the check, the second
+/// occurrence would replay the first's dedup record without ever being
+/// applied — while the pushing client would treat that outcome as the ack
+/// for its own pending entry and clear it, leaving the row local-only
+/// forever.
+#[tokio::test]
+async fn server_rejects_duplicate_change_ids_with_422() {
+    let backend = Arc::new(MemorySyncBackend::new());
+    let (url, _srv) = start_sync_server(backend.clone(), Arc::new(LwwResolver)).await;
+    let client = reqwest::Client::new();
+
+    let make_change = |pk: &str, title: &str| Change {
+        change_id: "00000000-0000-4000-8000-00000000dup1".to_owned(),
+        collection: "notes".to_owned(),
+        pk: pk.to_owned(),
+        op: Op::Upsert,
+        payload: Some(json!({ "title": title })),
+        base_version: 0,
+        updated_at: Utc::now(),
+    };
+    let bad = PushRequest {
+        device_id: "device-a".to_owned(),
+        changes: vec![make_change("a", "one"), make_change("b", "two")],
+    };
+    let response = client
+        .post(format!("{url}/push"))
+        .json(&bad)
+        .send()
+        .await
+        .expect("send duplicate-id push");
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "a repeated change_id within one batch must be rejected as a \
+         protocol error"
+    );
+    let body = response.text().await.expect("error body");
+    assert!(
+        body.contains("more than once"),
+        "the error must explain the duplicate id, got: {body}"
+    );
+    assert!(
+        backend_rows(backend.as_ref()).is_empty(),
+        "a rejected batch must not be applied"
+    );
+    assert_eq!(
+        backend.latest_version().expect("latest"),
+        0,
+        "a rejected batch must not assign versions"
+    );
+
+    // Distinct ids keep working (regression guard for the new check).
+    let good = PushRequest {
+        device_id: "device-a".to_owned(),
+        changes: vec![
+            Change {
+                change_id: "00000000-0000-4000-8000-00000000dup2".to_owned(),
+                ..make_change("a", "one")
+            },
+            Change {
+                change_id: "00000000-0000-4000-8000-00000000dup3".to_owned(),
+                ..make_change("b", "two")
+            },
+        ],
+    };
+    let response = client
+        .post(format!("{url}/push"))
+        .json(&good)
+        .send()
+        .await
+        .expect("send distinct-id push");
+    assert!(
+        response.status().is_success(),
+        "distinct change_ids must keep applying, got {}",
+        response.status()
+    );
+    let push: PushResponse = response.json().await.expect("push json");
+    assert!(
+        push.outcomes
+            .iter()
+            .all(|o| matches!(o, ChangeOutcome::Applied { .. })),
+        "got {:?}",
+        push.outcomes
+    );
+}
+
 /// The documented auth wiring works end-to-end: an auth middleware layer
 /// on the sync router rejects unauthenticated engines, and
 /// `SyncConfig::bearer_token` gets an engine through it.

@@ -155,16 +155,27 @@ const SCOPE_MISSING_REJECTION: (StatusCode, &str) = (
 );
 
 /// Validate a push batch before applying anything: every upsert must carry
-/// `Some(payload)`. An upsert with a missing payload would create a **live**
-/// server row with a NULL payload — clients pulling it materialize an
-/// invisible row (the store's `get`/`list` treat a `None` payload as absent)
-/// while still advancing their cursor past it, so the bad state silently
-/// replicates everywhere. Rejected up front as a protocol violation; the
-/// batch is atomic, so nothing is applied.
+/// `Some(payload)`, and every change must carry a batch-unique `change_id`.
 ///
-/// Shared by both backends so they stay conformant (see the conformance
-/// suite), and surfaced by the router as a 4xx response.
+/// An upsert with a missing payload would create a **live** server row
+/// with a NULL payload — clients pulling it materialize an invisible row
+/// (the store's `get`/`list` treat a `None` payload as absent) while still
+/// advancing their cursor past it, so the bad state silently replicates
+/// everywhere.
+///
+/// A `change_id` repeated WITHIN one batch is just as corrupting: the
+/// first occurrence would insert the dedup record and the second would hit
+/// it and take the replay path — answered like a completed ack while the
+/// change was **never applied**. `SyncStore::confirm_pushed` treats that
+/// outcome as the ack for its own pending entry, clears it, and records a
+/// version, so the second change's data would stay local-only forever.
+///
+/// Both shapes are rejected up front as protocol violations; the batch is
+/// atomic, so nothing is applied (no rows, no dedup records, no versions
+/// burned). Shared by both backends so they stay conformant (see the
+/// conformance suite), and surfaced by the router as a 4xx response.
 fn validate_push(request: &PushRequest) -> Result<(), SyncError> {
+    let mut seen = std::collections::HashSet::with_capacity(request.changes.len());
     for change in &request.changes {
         if change.op == Op::Upsert && change.payload.is_none() {
             return Err(SyncError::Protocol(format!(
@@ -172,6 +183,16 @@ fn validate_push(request: &PushRequest) -> Result<(), SyncError> {
                  a JSON payload (only deletes may omit it); nothing from this \
                  batch was applied",
                 change.change_id, change.collection, change.pk
+            )));
+        }
+        if !seen.insert(change.change_id.as_str()) {
+            return Err(SyncError::Protocol(format!(
+                "change_id {} appears more than once in this push batch — \
+                 each change must carry a unique id (a repeat would replay \
+                 the first occurrence's outcome instead of applying, while \
+                 the pushing client records the ack as its own); nothing \
+                 from this batch was applied",
+                change.change_id
             )));
         }
     }
@@ -298,7 +319,8 @@ pub trait SyncBackend: Send + Sync + 'static {
     /// # Errors
     ///
     /// Returns [`SyncError::Protocol`] when the batch violates the protocol
-    /// — an [`Op::Upsert`] change without `Some(payload)` — with nothing
+    /// — an [`Op::Upsert`] change without `Some(payload)`, or a `change_id`
+    /// repeated within the batch (see [`validate_push`]) — with nothing
     /// applied (the router surfaces this as a 4xx response), or
     /// [`SyncError::Backend`] on storage failure (the whole batch rolls
     /// back).
@@ -1137,7 +1159,8 @@ impl SyncBackend for PgSyncBackend {
 /// [`MAX_PUSH_CHANGES`](crate::sync::protocol::MAX_PUSH_CHANGES) changes
 /// are rejected with `413` (request bodies are additionally capped by
 /// axum's default body limit), batches containing an upsert without a
-/// payload are rejected with `422` (nothing applied — see
+/// payload — or a `change_id` repeated within the batch — are rejected
+/// with `422` (nothing applied — see
 /// [`SyncBackend::apply_push`]), and the pull `limit` is clamped to at most
 /// [`MAX_PULL_LIMIT`](crate::sync::protocol::MAX_PULL_LIMIT) (minimum 1).
 pub fn router<S>(

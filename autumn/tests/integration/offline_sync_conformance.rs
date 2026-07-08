@@ -406,6 +406,68 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
         response.outcomes[0]
     );
 
+    // ── Duplicate change_ids within one batch are protocol violations ────
+    // The first occurrence would insert the dedup record and the second
+    // would take the REPLAY path without ever being applied — while the
+    // pushing client treats that outcome as the ack for its own pending
+    // entry, clears it, and records a version, so the second change's data
+    // would stay local-only forever. Rejected atomically like the
+    // payload-less batch above: no rows, no dedup records, no versions.
+    let latest_before_dup = backend.latest_version().expect("latest");
+    let dup_batch = push(
+        "device-a",
+        vec![
+            change(
+                "00000000-0000-4000-8000-000000000030",
+                "dup-a",
+                Op::Upsert,
+                Some(json!({"title": "first"})),
+            ),
+            change(
+                "00000000-0000-4000-8000-000000000030",
+                "dup-b",
+                Op::Upsert,
+                Some(json!({"title": "second"})),
+            ),
+        ],
+    );
+    let err = backend
+        .apply_push(SCOPE, &dup_batch, &resolver)
+        .expect_err("duplicate change_ids within one batch must be rejected");
+    assert!(
+        matches!(err, autumn_web::sync::SyncError::Protocol(_)),
+        "duplicate change_ids are protocol errors, got {err:?}"
+    );
+    assert_eq!(
+        backend.latest_version().expect("latest"),
+        latest_before_dup,
+        "a rejected batch must not assign versions"
+    );
+    let PullResponse::Ok { rows, .. } = backend
+        .pull_since(SCOPE, latest_before_dup, 100, latest_before_dup)
+        .expect("pull after rejected duplicate batch")
+    else {
+        panic!("a caught-up cursor never requires a resync");
+    };
+    assert!(
+        rows.is_empty(),
+        "nothing from a rejected batch may be applied, got {rows:?}"
+    );
+    // No dedup record was written either: re-pushing the first change
+    // alone applies cleanly instead of echoing AlreadyApplied.
+    let response = backend
+        .apply_push(
+            SCOPE,
+            &push("device-a", vec![dup_batch.changes[0].clone()]),
+            &resolver,
+        )
+        .expect("re-push after the rejected duplicate batch");
+    assert!(
+        matches!(response.outcomes[0], ChangeOutcome::Applied { .. }),
+        "a change from a rejected batch must apply cleanly on retry, got {:?}",
+        response.outcomes[0]
+    );
+
     // ── Offline-past-GC pushes cannot silently resurrect deleted rows ────
     // n2 was deleted and its tombstone GC'd. A device offline since before
     // the GC can still push an edit of n2 based on its old version — and
