@@ -173,6 +173,43 @@ async fn sslmode_require_negotiates_tls_and_sends_startup_encrypted() {
 }
 
 #[tokio::test]
+async fn keyword_value_connection_string_passes_validation_and_negotiates_tls() {
+    // The libpq keyword/value form (with quoting and whitespace around `=`)
+    // must survive config validation (issue #1585 review: it used to be
+    // rejected as "must start with postgres://" before ever reaching the
+    // pool) AND drive the same TLS path as the URL form.
+    let (port, rx) = spawn_stub(true);
+    let url = format!(
+        "host=127.0.0.1 port={port} user=app_user password='secret' dbname=app sslmode = require"
+    );
+
+    let config = pool_config(url.clone());
+    config
+        .validate()
+        .expect("a keyword/value connection string must pass config validation");
+
+    let error = checkout_error(url).await;
+    assert!(
+        !error.contains("no TLS implementation configured"),
+        "keyword-form sslmode=require must not hit the NoTls path, got: {error}"
+    );
+
+    // The stub completed a rustls handshake and decrypted the startup
+    // message carrying the user from the keyword string.
+    let observed = rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the stub must observe a connection");
+    let Observed::TlsStartup(startup) = observed else {
+        panic!("expected a TLS startup message, got {observed:?}");
+    };
+    let haystack = String::from_utf8_lossy(&startup);
+    assert!(
+        haystack.contains("app_user"),
+        "startup message must carry the user over TLS, got: {haystack}"
+    );
+}
+
+#[tokio::test]
 async fn sslmode_require_fails_clearly_when_server_refuses_tls() {
     let (port, rx) = spawn_stub(false);
     let error = checkout_error(format!(
