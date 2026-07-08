@@ -105,6 +105,46 @@ fn form_for_renders_full_form_from_derived_model() {
 }
 
 #[test]
+fn derived_new_struct_decodes_unchecked_checkbox_as_false() {
+    // Regression test (Codex P2 on #1587): `form_for` renders a non-nullable
+    // `bool` as a checkbox, and `checkbox_input` deliberately emits no hidden
+    // `false` fallback (serde_urlencoded rejects duplicate keys, so a hidden
+    // sibling would 400 every *checked* submission). An unchecked box thus
+    // submits no `published` key at all — the `#[model]`-generated insert
+    // struct must decode that as `false` via `#[serde(default)]`, not reject
+    // the whole submission with "missing field `published`".
+    let changeset = Changeset::new(Article {
+        id: 1,
+        title: "Hello".into(),
+        body: None,
+        views: 3,
+        rating: 4.5,
+        published: false,
+    });
+    let html = form_for(&changeset, "/articles", "post")
+        .csrf("tok")
+        .render()
+        .into_string();
+    // Exactly one control carries the field name (no hidden fallback input).
+    assert_eq!(html.matches(r#"name="published""#).count(), 1, "{html}");
+
+    // A browser submitting this form with the box UNCHECKED sends every other
+    // field but omits `published` entirely. Decode through the same
+    // serde_urlencoded machinery axum's `Form` extractor and ChangesetForm
+    // use, straight into the generated insert struct.
+    let new_article: NewArticle =
+        serde_urlencoded::from_str("title=Hello&body=&views=3&rating=4.5")
+            .expect("unchecked checkbox submission must decode, not 400");
+    assert!(!new_article.published);
+    assert_eq!(new_article.title, "Hello");
+
+    // And a CHECKED box submits `published=true` exactly once.
+    let new_article: NewArticle =
+        serde_urlencoded::from_str("title=Hello&body=&views=3&rating=4.5&published=true").unwrap();
+    assert!(new_article.published);
+}
+
+#[test]
 fn form_for_override_promotes_field_to_select() {
     // The scaffold uses this exact escape hatch to turn an enum column into a
     // <select>; here we prove it works on a derived model.

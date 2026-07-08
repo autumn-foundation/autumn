@@ -44,6 +44,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Adding a column no longer requires any view edits.
   `--live-validation` scaffolds keep the per-field emission (their htmx
   inline-validation inputs have no `FieldControl` equivalent).
+  Non-nullable `bool` columns: the `#[model]`-generated `NewX` insert struct
+  now marks them `#[serde(default)]`, so an unchecked `form_for` checkbox
+  (which submits no key at all — `checkbox_input` deliberately emits no hidden
+  `false` fallback because serde_urlencoded rejects duplicate keys) decodes as
+  `false` instead of rejecting the submission with a missing-field error,
+  matching the scaffold's `{Model}Form` convention. Side effect: a JSON create
+  body that omits a non-nullable `bool` now also decodes it as `false` rather
+  than erroring.
   `FieldControl` is `#[non_exhaustive]` (new control kinds won't be
   semver-major); duplicate `.override_field`/`.override_label` calls on the
   same field now resolve last-wins; `FieldControl::File` renders the same

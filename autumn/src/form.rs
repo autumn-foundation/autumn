@@ -1913,6 +1913,19 @@ pub trait FormModel {
 /// control or label, inject a CSRF token, append extra markup before the
 /// submit button, or force a `multipart/form-data` encoding.
 ///
+/// # Checkboxes and `bool` fields
+///
+/// A [`FieldControl::Checkbox`] field renders via [`checkbox_input`], which
+/// deliberately emits **no** hidden `false` fallback (`serde_urlencoded` — used
+/// by axum's `Form` and [`ChangesetForm`] — rejects duplicate keys, so a
+/// hidden sibling would 400 every *checked* submission). An unchecked box
+/// therefore submits no key at all, and the struct the form posts into must
+/// decode a missing key as `false` via `#[serde(default)]` on the `bool`
+/// field. The `#[model]`-generated `NewX` insert struct already does this for
+/// non-nullable `bool` columns (matching the scaffold's `{Model}Form`
+/// convention); hand-written form targets must add the attribute themselves —
+/// see [`checkbox_input`]'s documentation.
+///
 /// # Example
 ///
 /// ```rust

@@ -2214,7 +2214,17 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 parse_field_encrypted_mode(f).unwrap_or(EncryptedMode::None),
             )
             .map(|w| quote! { #[diesel(serialize_as = #w)] });
-            quote! { #(#val_attrs)* #enc pub #ident: #ty }
+            // Non-nullable `bool` columns render as a checkbox in `form_for`
+            // (see `emit_form_model_impl`), and an unchecked HTML checkbox
+            // submits *no* key at all — a hidden `false` sibling is not an
+            // option because serde_urlencoded rejects duplicate keys (see
+            // `checkbox_input`'s doc in autumn/src/form.rs). Mark the field
+            // `#[serde(default)]` so a missing key decodes as `false` instead
+            // of failing with "missing field", mirroring the scaffold's
+            // `{Model}Form` convention.
+            let bool_default = (!is_option_type(ty) && type_name_str(ty) == "bool")
+                .then(|| quote! { #[serde(default)] });
+            quote! { #(#val_attrs)* #enc #bool_default pub #ident: #ty }
         })
         .collect();
 
