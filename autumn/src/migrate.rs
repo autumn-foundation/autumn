@@ -443,7 +443,11 @@ where
 /// not need cross-process serialization (they are single-process by nature).
 /// Skip this guard when running against those backends.
 pub struct MigrationLockGuard {
-    conn: diesel::PgConnection,
+    // TLS-aware (issue #1585 review): `autumn migrate` acquires this lock
+    // BEFORE spawning the external diesel CLI, so the lock connection itself
+    // must honor the URL's sslmode — the bundled libpq cannot reach
+    // TLS-only servers at all.
+    conn: crate::db::MigrationConnection,
 }
 
 impl std::fmt::Debug for MigrationLockGuard {
@@ -454,7 +458,10 @@ impl std::fmt::Debug for MigrationLockGuard {
 
 impl Drop for MigrationLockGuard {
     fn drop(&mut self) {
-        release_migration_lock(&mut self.conn);
+        match &mut self.conn {
+            crate::db::MigrationConnection::Native(conn) => release_migration_lock_on(conn),
+            crate::db::MigrationConnection::Rustls { conn, .. } => release_migration_lock_on(conn),
+        }
     }
 }
 
@@ -879,27 +886,42 @@ pub(crate) fn wait_for_database_inner(
 }
 
 fn with_connect_timeout(url: &str, timeout_secs: u64) -> String {
-    // Splice `connect_timeout` directly into the raw percent-encoded query
-    // string so existing parameters (e.g. `options=-c%20search_path%3Dapp`)
-    // are preserved byte-for-byte.  Using query_pairs() / append_pair() would
-    // decode and re-encode them via form encoding (spaces → `+`), which libpq
-    // does not accept.
-    url::Url::parse(url).map_or_else(
-        |_| url.to_owned(),
-        |mut parsed| {
-            let pair = format!("connect_timeout={timeout_secs}");
-            let raw = parsed
-                .query()
-                .unwrap_or("")
-                .split('&')
-                .filter(|p| !p.is_empty() && !p.starts_with("connect_timeout="))
-                .chain(std::iter::once(pair.as_str()))
-                .collect::<Vec<_>>()
-                .join("&");
-            parsed.set_query(Some(&raw));
-            parsed.to_string()
-        },
-    )
+    if crate::pg_conn_str::is_url(url) {
+        // Splice `connect_timeout` directly into the raw percent-encoded query
+        // string so existing parameters (e.g. `options=-c%20search_path%3Dapp`)
+        // are preserved byte-for-byte.  Using query_pairs() / append_pair() would
+        // decode and re-encode them via form encoding (spaces → `+`), which libpq
+        // does not accept.
+        return url::Url::parse(url).map_or_else(
+            |_| url.to_owned(),
+            |mut parsed| {
+                let pair = format!("connect_timeout={timeout_secs}");
+                let raw = parsed
+                    .query()
+                    .unwrap_or("")
+                    .split('&')
+                    .filter(|p| !p.is_empty() && !p.starts_with("connect_timeout="))
+                    .chain(std::iter::once(pair.as_str()))
+                    .collect::<Vec<_>>()
+                    .join("&");
+                parsed.set_query(Some(&raw));
+                parsed.to_string()
+            },
+        );
+    }
+    // Keyword/value form (accepted by config validation since the keyword
+    // parser landed): without this, a `--wait` attempt against a blackholed
+    // host gets no per-attempt connect_timeout and a single hung connect can
+    // outlive the whole wait budget. Append the parameter — unless the user
+    // already set their own connect_timeout, which is respected as-is.
+    match crate::pg_conn_str::keyword_value_pairs(url) {
+        Some(pairs) if !pairs.iter().any(|(key, _)| key == "connect_timeout") => {
+            format!("{url} connect_timeout={timeout_secs}")
+        }
+        // User-provided timeout, or a string tokio-postgres itself would
+        // reject: pass through untouched so connect reports its own error.
+        _ => url.to_owned(),
+    }
 }
 
 /// Wait for the database at `database_url` to accept connections, retrying
@@ -980,10 +1002,21 @@ pub fn hold_migration_lock(
     database_url: &str,
     wait_timeout: std::time::Duration,
 ) -> Result<MigrationLockGuard, MigrationError> {
-    let mut conn = diesel::PgConnection::establish(database_url)
+    // TLS-aware: honors the URL's sslmode, exactly like `run_pending_locked`
+    // (see `crate::db::establish_migration_connection`) — this lock is taken
+    // before spawning the external diesel CLI, so it must reach TLS-only
+    // servers too.
+    let mut conn = crate::db::establish_migration_connection(database_url)
         .map_err(|e| MigrationError::Connection(e.to_string()))?;
 
-    acquire_migration_lock(&mut conn, wait_timeout)?;
+    match &mut conn {
+        crate::db::MigrationConnection::Native(conn) => {
+            acquire_migration_lock_on(conn, wait_timeout)?;
+        }
+        crate::db::MigrationConnection::Rustls { conn, .. } => {
+            acquire_migration_lock_on(conn, wait_timeout)?;
+        }
+    }
 
     Ok(MigrationLockGuard { conn })
 }
@@ -1235,6 +1268,52 @@ pub(crate) fn auto_migrate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Per-attempt connect_timeout injection (`--wait`) ───────────────────
+
+    #[test]
+    fn with_connect_timeout_appends_to_keyword_strings() {
+        // Keyword/value strings pass config validation, so the wait loop
+        // must bound their connect attempts too — a blackholed host must
+        // not hang one attempt past the whole wait budget.
+        assert_eq!(
+            with_connect_timeout("host=db user=app sslmode=require", 7),
+            "host=db user=app sslmode=require connect_timeout=7"
+        );
+        // Quoted/spaced variants still gain the parameter.
+        assert_eq!(
+            with_connect_timeout("host=db password='p w' sslmode = require", 7),
+            "host=db password='p w' sslmode = require connect_timeout=7"
+        );
+    }
+
+    #[test]
+    fn with_connect_timeout_respects_a_user_provided_keyword_timeout() {
+        assert_eq!(
+            with_connect_timeout("host=db connect_timeout=42 user=app", 7),
+            "host=db connect_timeout=42 user=app",
+            "an explicit user timeout must not be overridden"
+        );
+    }
+
+    #[test]
+    fn with_connect_timeout_url_behavior_is_unchanged() {
+        assert_eq!(
+            with_connect_timeout("postgres://u@h/db", 7),
+            "postgres://u@h/db?connect_timeout=7"
+        );
+        // Existing raw query params survive byte-for-byte; a stale
+        // connect_timeout is replaced (the wait loop shrinks it per attempt).
+        assert_eq!(
+            with_connect_timeout(
+                "postgres://u@h/db?options=-c%20search_path%3Dapp&connect_timeout=99",
+                7
+            ),
+            "postgres://u@h/db?options=-c%20search_path%3Dapp&connect_timeout=7"
+        );
+        // Malformed strings pass through so connect reports its own error.
+        assert_eq!(with_connect_timeout("host=", 7), "host=");
+    }
 
     // ── Red-phase tests for advisory-lock API (fail until implemented) ─────
 

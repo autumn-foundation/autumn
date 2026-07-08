@@ -210,6 +210,33 @@ fn wait_for_database_negotiates_tls_for_sslmode_require() {
     );
 }
 
+/// `autumn migrate` takes its advisory lock via `hold_migration_lock`
+/// BEFORE spawning the external diesel CLI — that lock connection must
+/// negotiate TLS for sslmode=require too (the bundled libpq cannot). The
+/// stub is not a real Postgres so the lock query fails, but a completed
+/// handshake carrying the startup message proves the lock path went
+/// through rustls. Plain `#[test]`: the path is synchronous (CLI context).
+#[test]
+fn hold_migration_lock_negotiates_tls_for_sslmode_require() {
+    let (port, rx) = spawn_stub(true);
+    let url = format!("postgres://app_user:secret@127.0.0.1:{port}/app?sslmode=require");
+
+    let result = autumn_web::migrate::hold_migration_lock(&url, std::time::Duration::from_secs(1));
+    assert!(result.is_err(), "the stub cannot grant an advisory lock");
+
+    let observed = rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the stub must observe a connection from the lock path");
+    let Observed::TlsStartup(startup) = observed else {
+        panic!("hold_migration_lock must negotiate TLS, got {observed:?}");
+    };
+    let haystack = String::from_utf8_lossy(&startup);
+    assert!(
+        haystack.contains("app_user"),
+        "startup message must arrive over the encrypted stream, got: {haystack}"
+    );
+}
+
 #[tokio::test]
 async fn keyword_value_connection_string_passes_validation_and_negotiates_tls() {
     // The libpq keyword/value form (with quoting and whitespace around `=`)
