@@ -544,6 +544,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   previously gitignored) so builds are reproducible and dependency updates
   are reviewable.
 
+### Fixed
+
+- **mail:** the SMTP password can no longer leak into startup error messages.
+  When `mail.smtp.password_env` names an environment variable whose contents
+  are not valid unicode, the raw `std::env::VarError::NotUnicode` value (which
+  carries the password itself) was formatted into the
+  `MailError::InvalidMessage` text; the error now reports a static reason
+  ("environment variable is not set" / "contains non-unicode data") alongside
+  the variable *name* only, never its value. Supersedes PR #887.
+
 ## [0.6.0] - 2026-06-30
 
 ### Added
