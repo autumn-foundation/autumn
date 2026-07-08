@@ -1034,6 +1034,245 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
          GC involved, got {row:?}"
     );
 
+    // ── At-horizon recreates proceed; strictly-pre-horizon bases do not ──
+    // The horizon is the NEWEST DROPPED tombstone version, and the pull
+    // path's staleness check is strict (`session_start < horizon`), so a
+    // device that pulled the delete at exactly the horizon is CURRENT. Its
+    // intentional recreate over its own local tombstone is journaled with
+    // base_version == horizon — the absent-row guard must let it proceed
+    // as a fresh-incarnation apply rather than answering yet another
+    // tombstone (which would silently discard the recreate).
+    let response = backend
+        .apply_push(
+            SCOPE,
+            &push(
+                "device-a",
+                vec![change(
+                    "00000000-0000-4000-8000-000000000060",
+                    "lazarus",
+                    Op::Upsert,
+                    Some(json!({"title": "first life"})),
+                )],
+            ),
+            &resolver,
+        )
+        .expect("lazarus create");
+    let ChangeOutcome::Applied {
+        version: lazarus_v1,
+    } = response.outcomes[0]
+    else {
+        panic!("lazarus must clean-apply, got {:?}", response.outcomes[0]);
+    };
+    let lazarus_kill = Change {
+        base_version: lazarus_v1,
+        ..change(
+            "00000000-0000-4000-8000-000000000061",
+            "lazarus",
+            Op::Delete,
+            None,
+        )
+    };
+    let response = backend
+        .apply_push(SCOPE, &push("device-b", vec![lazarus_kill]), &resolver)
+        .expect("lazarus delete");
+    let ChangeOutcome::Applied {
+        version: lazarus_tomb,
+    } = response.outcomes[0]
+    else {
+        panic!(
+            "the delete must clean-apply, got {:?}",
+            response.outcomes[0]
+        );
+    };
+    let removed = backend
+        .gc_tombstones(backend.latest_version().expect("latest"))
+        .expect("gc lazarus tombstone");
+    assert_eq!(removed, 1, "exactly the lazarus tombstone is dropped");
+    assert_eq!(
+        backend.tombstone_horizon(SCOPE).expect("horizon"),
+        lazarus_tomb,
+        "the horizon is the newest dropped tombstone version"
+    );
+    // Pull-path consistency: a session AT the horizon is current, not
+    // stale.
+    let pull = backend
+        .pull_since(SCOPE, lazarus_tomb, 100, lazarus_tomb)
+        .expect("at-horizon pull");
+    assert!(
+        matches!(pull, PullResponse::Ok { .. }),
+        "a session at the horizon must not be told to resync, got {pull:?}"
+    );
+    // The device that pulled the delete recreates with base == horizon:
+    // this must APPLY as a fresh incarnation.
+    let risen = Change {
+        base_version: lazarus_tomb,
+        ..change(
+            "00000000-0000-4000-8000-000000000062",
+            "lazarus",
+            Op::Upsert,
+            Some(json!({"title": "risen"})),
+        )
+    };
+    let response = backend
+        .apply_push(SCOPE, &push("device-b", vec![risen]), &resolver)
+        .expect("at-horizon recreate");
+    let ChangeOutcome::Applied {
+        version: lazarus_v2,
+    } = response.outcomes[0]
+    else {
+        panic!(
+            "a recreate based on the GC'd delete it pulled must apply, got {:?}",
+            response.outcomes[0]
+        );
+    };
+    let PullResponse::Ok { rows, .. } = backend
+        .pull_since(SCOPE, lazarus_v2 - 1, 100, lazarus_v2 - 1)
+        .expect("pull risen lazarus")
+    else {
+        panic!("an at-feed cursor never requires a resync");
+    };
+    assert!(
+        rows.iter().any(|r| r.pk == "lazarus" && !r.deleted),
+        "the recreate must be live, got {rows:?}"
+    );
+    // The fresh incarnation was stamped: a ghost edit from the FIRST life
+    // is server-winning (created_version = the recreate's version).
+    let mut lazarus_ghost = change(
+        "00000000-0000-4000-8000-000000000063",
+        "lazarus",
+        Op::Upsert,
+        Some(json!({"title": "ghost"})),
+    );
+    lazarus_ghost.base_version = lazarus_v1;
+    lazarus_ghost.updated_at = Utc::now() + Duration::days(365);
+    let response = backend
+        .apply_push(SCOPE, &push("device-c", vec![lazarus_ghost]), &resolver)
+        .expect("lazarus ghost edit");
+    let ChangeOutcome::Resolved { row } = &response.outcomes[0] else {
+        panic!(
+            "a first-life base must resolve, got {:?}",
+            response.outcomes[0]
+        );
+    };
+    assert!(
+        !row.deleted
+            && row
+                .payload
+                .as_ref()
+                .and_then(|p| p.get("title"))
+                .and_then(|v| v.as_str())
+                == Some("risen"),
+        "the at-horizon recreate must be a REAL new incarnation, got {row:?}"
+    );
+
+    // A base STRICTLY below the horizon (the pusher never saw the delete)
+    // stays server-winning on an absent row.
+    let response = backend
+        .apply_push(
+            SCOPE,
+            &push(
+                "device-a",
+                vec![change(
+                    "00000000-0000-4000-8000-000000000064",
+                    "mummy",
+                    Op::Upsert,
+                    Some(json!({"title": "wrapped"})),
+                )],
+            ),
+            &resolver,
+        )
+        .expect("mummy create");
+    let ChangeOutcome::Applied { version: mummy_v1 } = response.outcomes[0] else {
+        panic!("mummy must clean-apply, got {:?}", response.outcomes[0]);
+    };
+    let mummy_kill = Change {
+        base_version: mummy_v1,
+        ..change(
+            "00000000-0000-4000-8000-000000000065",
+            "mummy",
+            Op::Delete,
+            None,
+        )
+    };
+    backend
+        .apply_push(SCOPE, &push("device-a", vec![mummy_kill]), &resolver)
+        .expect("mummy delete");
+    backend
+        .gc_tombstones(backend.latest_version().expect("latest"))
+        .expect("gc mummy tombstone");
+    let mut mummy_stale = change(
+        "00000000-0000-4000-8000-000000000066",
+        "mummy",
+        Op::Upsert,
+        Some(json!({"title": "unwrapped?"})),
+    );
+    mummy_stale.base_version = mummy_v1; // strictly below the horizon
+    mummy_stale.updated_at = Utc::now() + Duration::days(365);
+    let response = backend
+        .apply_push(SCOPE, &push("device-b", vec![mummy_stale]), &resolver)
+        .expect("mummy stale push");
+    let ChangeOutcome::Resolved { row } = &response.outcomes[0] else {
+        panic!(
+            "a strictly-pre-horizon base must resolve, got {:?}",
+            response.outcomes[0]
+        );
+    };
+    assert!(
+        row.deleted && row.payload.is_none(),
+        "a base that never saw the delete must stay server-winning, got {row:?}"
+    );
+    let mummy_tombstone = row.version;
+    // Materialized-tombstone boundary (incarnation evidence governs while
+    // the tombstone exists): a base EQUAL to the tombstone's version means
+    // the client saw the delete — the recreate clean-applies as a new
+    // incarnation.
+    let mummy_recreate = Change {
+        base_version: mummy_tombstone,
+        ..change(
+            "00000000-0000-4000-8000-000000000067",
+            "mummy",
+            Op::Upsert,
+            Some(json!({"title": "second wrapping"})),
+        )
+    };
+    let response = backend
+        .apply_push(SCOPE, &push("device-b", vec![mummy_recreate]), &resolver)
+        .expect("mummy recreate over the materialized tombstone");
+    assert!(
+        matches!(response.outcomes[0], ChangeOutcome::Applied { .. }),
+        "a base equal to the tombstone's version saw the delete, got {:?}",
+        response.outcomes[0]
+    );
+    // …and a first-incarnation base against the recreated row is still
+    // server-winning.
+    let mut mummy_ghost = change(
+        "00000000-0000-4000-8000-000000000068",
+        "mummy",
+        Op::Upsert,
+        Some(json!({"title": "ancient curse"})),
+    );
+    mummy_ghost.base_version = mummy_v1;
+    mummy_ghost.updated_at = Utc::now() + Duration::days(365);
+    let response = backend
+        .apply_push(SCOPE, &push("device-c", vec![mummy_ghost]), &resolver)
+        .expect("mummy ghost edit");
+    let ChangeOutcome::Resolved { row } = &response.outcomes[0] else {
+        panic!(
+            "a first-incarnation base must resolve, got {:?}",
+            response.outcomes[0]
+        );
+    };
+    assert!(
+        !row.deleted
+            && row
+                .payload
+                .as_ref()
+                .and_then(|p| p.get("title"))
+                .and_then(|v| v.as_str())
+                == Some("second wrapping"),
+        "the recreate must survive the ghost, got {row:?}"
+    );
+
     // ── Explicit-null payloads are real documents ─────────────────────────
     // `store.put(&None::<T>)` journals the JSON document `null`. On the
     // wire that is a PRESENT null — it must clean-apply (not be rejected as

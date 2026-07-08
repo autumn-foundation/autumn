@@ -245,14 +245,15 @@ fn resolved_row(
     }
 }
 
-/// The tombstone written back for a change whose claimed `base_version`
-/// predates the tombstone GC horizon while the row is either ABSENT (its
+/// The tombstone written back for a change whose claimed `base_version` is,
+/// provably, an edit of a deleted row: either the row is ABSENT with a
+/// non-zero base STRICTLY below the scope's tombstone horizon (its
 /// tombstone was physically dropped, so there is nothing to conflict
-/// against) or present only as a TOMBSTONE (typically one materialized by a
-/// previous stale push of the same shape) — in both cases the change is,
-/// semantically, an edit of a deleted row. Without this a device offline past a GC would silently resurrect
-/// the row: `SyncEngine` pushes pending changes BEFORE its pull can learn
-/// it needs a full resync, so the clean-apply path was reachable first.
+/// against), or the row is present only as a TOMBSTONE and the base
+/// predates that tombstone's incarnation (see [`ServerRow`]). Without this
+/// a device offline past a GC would silently resurrect the row:
+/// `SyncEngine` pushes pending changes BEFORE its pull can learn it needs
+/// a full resync, so the clean-apply path was reachable first.
 ///
 /// This shape is **deterministically server-winning** — the
 /// [`ConflictResolver`] is deliberately bypassed. The deleted row's payload
@@ -264,8 +265,9 @@ fn resolved_row(
 /// `Resolved` outcome and converges on the delete. `updated_at` is the
 /// server's processing time (informational only — never compared). A
 /// genuinely new insert (`base_version == 0`) never takes this path — it
-/// clean-applies as before, and a client that deliberately re-creates the
-/// row does so with a fresh base-0 insert.
+/// clean-applies as before, and a client that saw the delete recreates
+/// cleanly (base equal to the tombstone's version, or — after the
+/// tombstone was GC'd — equal to the scope's horizon).
 fn gc_tombstone_row(change: &Change, version: Version) -> RemoteRow {
     RemoteRow {
         collection: change.collection.clone(),
@@ -325,16 +327,23 @@ struct ServerRow {
 ///   ordinary conflict, the resolver decides — regardless of any GC
 ///   horizon. A revival this produces (tombstone → live) starts a new
 ///   incarnation.
-/// - **Absent row with a pre-horizon base** (`base_version > 0`, at or
-///   below the REQUESTING SCOPE's tombstone horizon): the base row's
-///   tombstone was physically GC'd — no incarnation evidence survives, so
-///   the per-scope horizon is the proof, and the deletion sticks via a
-///   fresh [`gc_tombstone_row`].
-/// - **Everything else** (base matches the current version, or a base-0
-///   create against no row): a clean apply. A recreate over a seen
-///   tombstone or a fresh insert starts a new incarnation; an update or
-///   delete of the live row continues the current one. `base_version ==
-///   0` never takes a server-winning arm.
+/// - **Absent row with a STRICTLY pre-horizon base** (`base_version > 0`,
+///   below the REQUESTING SCOPE's tombstone horizon): tombstones the
+///   pusher never saw may have been dropped in `(base, horizon]` — no
+///   incarnation evidence survives, so the per-scope horizon is the
+///   proof, and the deletion sticks via a fresh [`gc_tombstone_row`].
+///   The comparison is deliberately STRICT, mirroring the pull path's
+///   `session_start < horizon` staleness check: the horizon is the
+///   newest DROPPED tombstone version, so a base EQUAL to it means the
+///   pusher pulled that very delete before going offline — its
+///   intentional recreate over its own local tombstone must proceed, not
+///   be answered with another tombstone.
+/// - **Everything else** (base matches the current version, a base-0
+///   create against no row, or an at-horizon base against an absent
+///   row): a clean apply. A recreate over a seen tombstone, a fresh
+///   insert, or an at-horizon recreate starts a new incarnation; an
+///   update or delete of the live row continues the current one.
+///   `base_version == 0` never takes a server-winning arm.
 fn apply_change_row(
     change: &Change,
     device_id: &str,
@@ -377,7 +386,7 @@ fn apply_change_row(
                 false,
             )
         }
-        None if change.base_version > 0 && change.base_version <= horizon => (
+        None if change.base_version > 0 && change.base_version < horizon => (
             ServerRow {
                 row: gc_tombstone_row(change, version),
                 created_version: version,
@@ -449,8 +458,12 @@ pub trait SyncBackend: Send + Sync + 'static {
     /// settles normally, **regardless of any GC horizon** (an unrelated
     /// same-scope GC can never suppress ordinary conflict resolution).
     /// Only an ABSENT row still needs the per-scope tombstone horizon: a
-    /// non-zero base at or below it means the base row's tombstone was
-    /// physically dropped, and the deletion sticks. `base_version == 0`
+    /// non-zero base STRICTLY below it means tombstones the pusher never
+    /// saw may have been dropped, and the deletion sticks — while a base
+    /// EQUAL to the horizon (the newest dropped tombstone's version,
+    /// mirroring the pull path's strict `session_start < horizon` check)
+    /// means the pusher pulled that very delete, so its intentional
+    /// recreate proceeds as a fresh-incarnation apply. `base_version == 0`
     /// creates/recreates always clean-apply or conflict normally.
     ///
     /// # Errors
