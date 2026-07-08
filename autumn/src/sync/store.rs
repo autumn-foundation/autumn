@@ -344,17 +344,34 @@ impl SyncStore {
             .ok_or_else(|| SyncError::Store("store path is not valid UTF-8".into()))?;
 
         let mut conn = SqliteConnection::establish(path_str).map_err(store_err)?;
-        // busy_timeout FIRST: concurrent opens of the same file contend on
-        // the journal-mode switch and the schema DDL below, and must wait
-        // rather than fail with "database is locked".
-        conn.batch_execute(
-            "PRAGMA busy_timeout = 5000; \
-             PRAGMA journal_mode = WAL; \
-             PRAGMA synchronous = NORMAL; \
-             PRAGMA foreign_keys = ON;",
-        )
-        .map_err(store_err)?;
-        conn.batch_execute(SCHEMA_DDL).map_err(store_err)?;
+        // busy_timeout FIRST: everything after it queues on the timeout
+        // instead of failing with "database is locked".
+        conn.batch_execute("PRAGMA busy_timeout = 5000;")
+            .map_err(store_err)?;
+        // Converting a database into WAL mode needs a moment of exclusive
+        // access, and SQLite returns SQLITE_BUSY for that WITHOUT
+        // consulting the busy handler when another connection holds any
+        // lock (a deliberate deadlock-avoidance rule). Concurrent first
+        // opens of one file hit exactly this, so retry the conversion +
+        // schema DDL briefly instead of failing the open.
+        let mut attempts = 0;
+        loop {
+            let result = conn
+                .batch_execute(
+                    "PRAGMA journal_mode = WAL; \
+                     PRAGMA synchronous = NORMAL; \
+                     PRAGMA foreign_keys = ON;",
+                )
+                .and_then(|()| conn.batch_execute(SCHEMA_DDL));
+            match result {
+                Ok(()) => break,
+                Err(err) if attempts < 100 && err.to_string().contains("database is locked") => {
+                    attempts += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(err) => return Err(store_err(err)),
+            }
+        }
 
         // Race-safe first-open id generation: concurrent opens of a fresh
         // file each offer a candidate id, exactly one INSERT wins
