@@ -57,7 +57,12 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   QUICKSTART_CLI_VERSION: ${{ inputs.cli-version }}
-  DATABASE_URL: postgres://autumn:autumn@localhost:5432/quickstart
+  # DATABASE_URL is deliberately NOT set job-wide: the README path up to
+  # `GET /` configures no database, and the base serve phase must exercise
+  # that no-DB runtime. Only the scaffold migrate/serve steps get it (and
+  # the script additionally strips DB env from the base serve phase's
+  # server process as a belt-and-braces guarantee).
+  QUICKSTART_DATABASE_URL: postgres://autumn:autumn@localhost:5432/quickstart
 
 jobs:
   quickstart:
@@ -116,7 +121,11 @@ jobs:
         run: ./scripts/check-quickstart.sh scaffold-build
 
       - name: "Scaffold: migrate (autumn migrate)"
+        env:
+          DATABASE_URL: ${{ env.QUICKSTART_DATABASE_URL }}
         run: ./scripts/check-quickstart.sh scaffold-migrate
 
       - name: "Scaffold: first request (GET /posts → 200)"
+        env:
+          DATABASE_URL: ${{ env.QUICKSTART_DATABASE_URL }}
         run: ./scripts/check-quickstart.sh scaffold-serve

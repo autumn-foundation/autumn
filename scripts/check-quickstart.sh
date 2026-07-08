@@ -141,22 +141,32 @@ start_server() {
   # ("Or run without watch mode"). `autumn dev` adds a file watcher and
   # browser livereload that are meaningless headless in CI.
   #
-  # AUTUMN_DATABASE__URL: the generated autumn.toml ships with [database]
-  # commented out, and the runtime configures no pool from a bare
-  # DATABASE_URL on a fresh app. Injecting the URL through the framework's
-  # documented `AUTUMN_*` config-override env var is how a CI user supplies
-  # their Postgres without editing files — it stands in for the "uncomment
-  # [database] in autumn.toml" step, it does not change any README command.
-  local log="$1"
+  # $2 selects the runtime configuration the README path actually exercises:
+  #   no-db    The quickstart up to `GET /` configures no database, so the
+  #            server must run with NO DB env at all — strip DATABASE_URL /
+  #            AUTUMN_DATABASE__URL even if the CI job env carries them,
+  #            otherwise a regression that only affects the no-DB runtime
+  #            could slip through while the gate exercises a DB-configured
+  #            app.
+  #   with-db  The scaffolded /posts route needs Postgres. The generated
+  #            autumn.toml ships with [database] commented out, and the
+  #            runtime configures no pool from a bare DATABASE_URL on a
+  #            fresh app; injecting the URL through the framework's
+  #            documented `AUTUMN_*` config-override env var stands in for
+  #            the "uncomment [database] in autumn.toml" step — it does not
+  #            change any README command.
+  local log="$1" db_mode="$2"
   if curl -fsS -o /dev/null --max-time 2 "$base_url/" 2>/dev/null; then
     fail "port ${port} is already serving before the app started — port collision on the runner"
   fi
   (
     cd "$app_dir" || exit 1
-    if [[ -n "${DATABASE_URL:-}" ]]; then
+    if [[ "$db_mode" == "with-db" ]]; then
       export AUTUMN_DATABASE__URL="$DATABASE_URL"
+      exec cargo run
+    else
+      exec env -u DATABASE_URL -u AUTUMN_DATABASE__URL cargo run
     fi
-    exec cargo run
   ) >"$log" 2>&1 &
   server_pid=$!
   echo "$server_pid" >"$state/server.pid"
@@ -298,7 +308,9 @@ phase_build() {
 phase_serve() {
   require_app
   local log="$state/server-serve.log"
-  start_server "$log"
+  # The README path up to `GET /` has no database configured — serve in
+  # no-db mode so this phase exercises the same runtime a README user gets.
+  start_server "$log" no-db
   wait_for_200 "$base_url/" "$log"
   local t200 t_install elapsed
   t200=$(date +%s)
@@ -345,7 +357,7 @@ phase_scaffold_serve() {
   require_app
   [[ -n "${DATABASE_URL:-}" ]] || fail "DATABASE_URL is not set — the scaffolded /posts route needs a Postgres"
   local log="$state/server-scaffold-serve.log"
-  start_server "$log"
+  start_server "$log" with-db
   # docs/guide/generators.md: "Visit http://localhost:3000/posts to see the
   # generated index page."
   wait_for_200 "$base_url/posts" "$log"
