@@ -16,6 +16,7 @@
 //! | `hero` | Landing-page banner: headline, optional subtitle, and CTAs |
 //! | `nav_link` | Navigation anchor, auto-marked active + `aria-current` |
 //! | `nav_bar` | Top-bar/sidebar `<nav>` landmark: brand, links, dropdowns, responsive toggle |
+//! | `tabs` | No-JS `tablist`/`tab`/`tabpanel` switcher with `:target` deep-linking |
 //!
 //! # Interactive / search widgets
 //!
@@ -231,6 +232,12 @@ pub struct AutocompleteConfig<'a> {
     /// `false` (the default) for ID-based lookups where the hidden field should
     /// only carry a value selected from the option list.
     pub free_text: bool,
+    /// Pre-fill the widget from a previous submission (e.g. re-rendering a
+    /// form after a validation error), so free-text input the user already
+    /// typed isn't silently dropped. Seeds both the visible query input's
+    /// `value` and the hidden field's `value`. Leave unset (the default) for a
+    /// blank widget.
+    pub initial_value: Option<&'a str>,
 }
 
 impl<'a> AutocompleteConfig<'a> {
@@ -250,6 +257,7 @@ impl<'a> AutocompleteConfig<'a> {
             placeholder: None,
             fallback_options: None,
             free_text: false,
+            initial_value: None,
         }
     }
 
@@ -305,6 +313,14 @@ impl<'a> AutocompleteConfig<'a> {
     #[must_use]
     pub const fn free_text(mut self) -> Self {
         self.free_text = true;
+        self
+    }
+
+    /// Pre-fill the widget from a previous submission (e.g. re-rendering after
+    /// a validation error), so already-typed input isn't silently dropped.
+    #[must_use]
+    pub const fn initial_value(mut self, value: &'a str) -> Self {
+        self.initial_value = Some(value);
         self
     }
 }
@@ -480,6 +496,10 @@ pub fn active_search_empty_state(message: &str) -> maud::Markup {
 /// - A `<div role="listbox">` where the server renders option partials.
 /// - A `<noscript>` fallback `<select>`.
 ///
+/// Set [`AutocompleteConfig::initial_value`] to pre-fill both inputs — e.g.
+/// re-rendering a form with this widget after a validation error, so text the
+/// user already typed isn't silently dropped.
+///
 /// Use [`autocomplete_option`] and [`autocomplete_empty_state`] to render
 /// option partials returned by your handler.
 ///
@@ -533,6 +553,7 @@ pub fn autocomplete_input(id: &str, label: &str, config: &AutocompleteConfig<'_>
                 aria-expanded="false"
                 aria-autocomplete="list"
                 aria-controls=(options_id)
+                value=(config.initial_value.unwrap_or(""))
                 placeholder=[config.placeholder]
                 class="autumn-autocomplete__input"
                 data-ac-query
@@ -544,7 +565,7 @@ pub fn autocomplete_input(id: &str, label: &str, config: &AutocompleteConfig<'_>
             input
                 type="hidden"
                 id=(value_id)
-                value="";
+                value=(config.initial_value.unwrap_or(""));
             div
                 id=(options_id)
                 role="listbox"
@@ -556,7 +577,7 @@ pub fn autocomplete_input(id: &str, label: &str, config: &AutocompleteConfig<'_>
                     option value="" { "— select —" }
                     @if let Some(opts) = config.fallback_options {
                         @for (val, lbl) in opts {
-                            option value=(val) { (lbl) }
+                            option value=(val) selected[config.initial_value == Some(*val)] { (lbl) }
                         }
                     }
                 }
@@ -2651,6 +2672,128 @@ pub fn confirm_action(
     }
 }
 
+// ── tabs ─────────────────────────────────────────────────────────────────
+
+/// Render a no-JavaScript tabs widget: a `tablist` strip plus its panels,
+/// from an ordered list of `(id, label, panel_body)` tuples.
+///
+/// Switching is pure CSS: each tab is an `<a href="#panel-id">` and each
+/// panel is targeted by `:target` in `input.css`, so URL fragments
+/// (`/settings#security`) select a tab with zero JavaScript. The first
+/// panel additionally carries `autumn-tabs__panel--active` so a panel is
+/// always visible even when no fragment is present, and the active-tab
+/// highlight tracks the actually-`:target`ed panel by position for up to
+/// the first 6 tabs (see `input.css` — ids are arbitrary caller strings, so
+/// this can only be done positionally in a shared stylesheet).
+///
+/// # CSS hooks
+///
+/// | Selector | Element |
+/// |---|---|
+/// | `.autumn-tabs` | Root wrapper |
+/// | `.autumn-tabs__list` | Tab strip (`role="tablist"`) |
+/// | `.autumn-tabs__tab` | Individual tab link |
+/// | `.autumn-tabs__tab--active` | The initially-selected tab |
+/// | `.autumn-tabs__panel` | Individual panel |
+/// | `.autumn-tabs__panel--active` | The initially-visible panel |
+///
+/// # Accessibility
+///
+/// The tab strip carries `role="tablist"`; each tab carries `role="tab"`,
+/// `aria-controls` pointing at its panel's `id`, and `aria-selected`; each
+/// panel carries `role="tabpanel"`, `aria-labelledby` pointing at its tab's
+/// `id`, and `tabindex="0"` so it can receive keyboard focus directly.
+///
+/// `aria-selected` reflects the *server's default selection* (the first
+/// tab) only. The server never sees the URL fragment (fragments aren't
+/// sent in HTTP requests), so it cannot know which tab a client-side
+/// `:target` navigation actually landed on — correcting `aria-selected` on
+/// navigation would require JavaScript, which this widget deliberately has
+/// none of. This is a known, accepted limitation of fragment-based no-JS
+/// tabs: a screen reader always hears the first tab announced as
+/// "selected", even when a different panel is what's visually shown.
+///
+/// # Panel `id`s
+///
+/// A panel's `id` is the raw id from its tuple (not namespaced by `id`) so
+/// it can be targeted directly by a URL fragment. Each tab's own element
+/// `id` is `"{id}-tab-{panel_id}"`. Duplicate panel ids within one call are
+/// rendered as given — the caller is responsible for uniqueness if
+/// fragment targeting of a specific panel matters.
+///
+/// **Rendering more than one `tabs()` widget on the same page:** panel ids
+/// must be unique across the *entire page*, not just within one call —
+/// two different `tabs()` calls that both use a panel id like `"overview"`
+/// will emit two elements with `id="overview"`, which is invalid duplicate-id
+/// HTML and makes `:target`/`aria-controls`/`aria-labelledby` lookups
+/// ambiguous. Prefix panel ids per widget instance (e.g. `"post-overview"`,
+/// `"related-overview"`) if more than one `tabs()` appears on a page.
+///
+/// # Nesting a `tabs()` widget inside another `tabs()` panel
+///
+/// This is supported for panel *visibility*: `input.css` reveals the whole
+/// ancestor chain down to a deep-linked inner panel, so content nested
+/// inside any outer panel (not just the outer widget's default one) is
+/// reachable via its own fragment. The outer widget's *active-tab visual
+/// highlight*, however, can only be synced when the shown outer panel is
+/// itself the direct `:target` — CSS forbids nesting `:has()` inside
+/// another `:has()`, so a panel that's shown only because it *contains* a
+/// nested target (rather than being the target itself) can't be
+/// attributed to a specific outer tab position. In that case no outer tab
+/// is highlighted as active (a graceful degrade — no tab looks active,
+/// rather than the wrong one looking active).
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_web::widgets::tabs;
+/// use maud::html;
+///
+/// let panels = [
+///     ("profile", "Profile", html! { p { "Profile settings" } }),
+///     ("security", "Security", html! { p { "Security settings" } }),
+///     ("billing", "Billing", html! { p { "Billing settings" } }),
+/// ];
+/// let widget = tabs("settings-tabs", &panels).into_string();
+/// assert!(widget.contains(r#"role="tablist""#));
+/// assert!(widget.contains(r#"aria-controls="security""#));
+/// assert!(widget.contains(r##"href="#billing""##));
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn tabs(id: &str, panels: &[(&str, &str, maud::Markup)]) -> maud::Markup {
+    let tab_ids: Vec<String> = panels
+        .iter()
+        .map(|(panel_id, _, _)| format!("{id}-tab-{panel_id}"))
+        .collect();
+    maud::html! {
+        div id=(id) class="autumn-tabs" {
+            div class="autumn-tabs__list" role="tablist" {
+                @for (i, (panel_id, label, _)) in panels.iter().enumerate() {
+                    @let tab_class = merge_class(
+                        "autumn-tabs__tab",
+                        (i == 0).then_some("autumn-tabs__tab--active"),
+                    );
+                    a id=(tab_ids[i]) class=(tab_class) role="tab" href=(format!("#{panel_id}"))
+                        aria-controls=(panel_id) aria-selected=(if i == 0 { "true" } else { "false" }) {
+                        (label)
+                    }
+                }
+            }
+            @for (i, (panel_id, _, body)) in panels.iter().enumerate() {
+                @let panel_class = merge_class(
+                    "autumn-tabs__panel",
+                    (i == 0).then_some("autumn-tabs__panel--active"),
+                );
+                section id=(panel_id) class=(panel_class) role="tabpanel"
+                    aria-labelledby=(tab_ids[i]) tabindex="0" {
+                    (body)
+                }
+            }
+        }
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(all(test, feature = "maud"))]
@@ -3130,6 +3273,26 @@ mod tests {
         assert!(html.contains("Beta"), "{html}");
         assert!(html.contains(r#"value="1""#), "{html}");
         assert!(html.contains(r#"value="2""#), "{html}");
+    }
+
+    #[test]
+    fn autocomplete_noscript_select_marks_initial_value_selected() {
+        // ID-mode (default, non-free-text): a prior selection seeded via
+        // `initial_value` must survive a no-JS resubmission too, not just the
+        // JS-driven hidden-input path.
+        let opts: &[(&str, &str)] = &[("1", "Alpha"), ("2", "Beta")];
+        let config = AutocompleteConfig::new("/ac", "value_field")
+            .fallback_options(opts)
+            .initial_value("2");
+        let html = autocomplete_input("x", "Label", &config).into_string();
+        assert!(
+            html.contains(r#"value="2" selected"#),
+            "the option matching initial_value must be marked selected: {html}"
+        );
+        assert!(
+            !html.contains(r#"value="1" selected"#),
+            "only the matching option should be selected: {html}"
+        );
     }
 
     #[test]

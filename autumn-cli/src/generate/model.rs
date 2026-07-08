@@ -18,6 +18,11 @@ use super::{GenerateError, ensure_project_root, read_or_empty};
 pub struct ModelOptions {
     /// Field names that should receive `#[indexed]` and SQL indexes.
     pub indexes: Vec<String>,
+    /// Field names that should receive a `CREATE UNIQUE INDEX` (issue
+    /// #1032), mirroring `--index`'s ergonomics. Equivalent to marking the
+    /// field with the DSL's inline `:unique` modifier — both converge on
+    /// [`Field::unique`].
+    pub uniques: Vec<String>,
     /// Validation specs in `field=rule` form.
     pub validations: Vec<String>,
     /// Default specs in `field=value` form.
@@ -95,6 +100,11 @@ pub fn plan_model(
 ///
 /// # Errors
 /// Surfaces project-layout, DSL, naming, and metadata errors before any file is written.
+#[allow(
+    clippy::too_many_lines,
+    reason = "linear sequence of independent file/revert steps mirroring the files this \
+              generator emits; splitting it up would not make any single step clearer"
+)]
 pub fn plan_model_with_options(
     project_root: &Path,
     name: &str,
@@ -104,7 +114,8 @@ pub fn plan_model_with_options(
 ) -> Result<Plan, GenerateError> {
     ensure_project_root(project_root)?;
     validate_resource_name(name)?;
-    let fields = parse_fields(field_tokens)?;
+    let mut fields = parse_fields(field_tokens)?;
+    apply_unique_flags(&mut fields, &options.uniques)?;
     validate_field_names(&fields)?;
     let pascal_name = pascal(name);
     validate_enum_field_collisions(&pascal_name, &fields)?;
@@ -148,7 +159,14 @@ pub fn plan_model_with_options(
 
     let mod_path = models_dir.join("mod.rs");
     let mod_existing = read_or_empty(&mod_path);
-    plan.modify(mod_path, add_mod_declaration(&mod_existing, &snake_name));
+    plan.modify(
+        mod_path.clone(),
+        add_mod_declaration(&mod_existing, &snake_name),
+    );
+    plan.push_revert(crate::generate::emit::Revert::ModDecl {
+        path: mod_path,
+        name: snake_name,
+    });
 
     // (b) Diesel migration
     let migration_dir_name = format!("{timestamp}_create_{table}");
@@ -177,9 +195,14 @@ pub fn plan_model_with_options(
     let schema_path = project_root.join("src").join("schema.rs");
     let schema_existing = read_or_empty(&schema_path);
     plan.modify(
-        schema_path,
+        schema_path.clone(),
         append_schema_table_with_id(&schema_existing, &table, &schema_fields, options.id_type),
     );
+    plan.push_revert(crate::generate::emit::Revert::SchemaTable {
+        path: schema_path,
+        table: table.clone(),
+        expected_block: append_schema_table_with_id("", &table, &schema_fields, options.id_type),
+    });
 
     // (d) `Cargo.toml` deps — `#[autumn_web::model]` expands to references
     // for `diesel`, `serde`, `serde_json`, `chrono`, and supported field crates
@@ -191,7 +214,25 @@ pub fn plan_model_with_options(
             "{ version = \"0.20\", features = [\"derive\"] }",
         ));
     }
-    plan_cargo_deps(&mut plan, project_root, &deps);
+    if schema_fields.iter().any(|f| f.kind.is_decimal()) {
+        deps.push((
+            "rust_decimal",
+            "{ version = \"1\", features = [\"db-diesel2-postgres\", \"serde\"] }",
+        ));
+        let existing_cargo_toml = read_or_empty(&project_root.join("Cargo.toml"));
+        warn_if_existing_dep_missing_features(
+            &mut plan,
+            &existing_cargo_toml,
+            "rust_decimal",
+            &["db-diesel2-postgres", "serde"],
+        );
+    }
+    plan_cargo_deps(
+        &mut plan,
+        project_root,
+        &deps,
+        &project_root.join("src/models"),
+    );
 
     Ok(plan)
 }
@@ -204,7 +245,13 @@ pub fn plan_model_with_options(
 /// single-file `src/models.rs` (only counts if its content actually declares
 /// the resource's table, via a word-boundary-aware check so `posts` isn't
 /// confused with a longer table name like `posts_tags`).
-fn model_file_exists(project_root: &Path, table: &str, base: &str) -> bool {
+///
+/// Shared with the scaffold generator (`pub(super)`): the same presence test
+/// that decides whether [`check_reference_targets`] warns also decides
+/// whether a scaffolded `references` column can render as a `<select>` of
+/// the target table's ids (which needs the target's `src/schema.rs` entry)
+/// or must fall back to the derived numeric id input.
+pub(super) fn model_file_exists(project_root: &Path, table: &str, base: &str) -> bool {
     let per_resource = project_root
         .join("src")
         .join("models")
@@ -455,6 +502,7 @@ pub(super) fn augment_fields_for_soft_delete(
         kind: FieldKind::NaiveDateTime,
         nullable: true,
         variants: Vec::new(),
+        unique: false,
     });
     Ok(std::borrow::Cow::Owned(augmented))
 }
@@ -468,7 +516,7 @@ pub(super) const MODEL_DEPS: &[(&str, &str)] = &[
     ),
     (
         "diesel-async",
-        "{ version = \"0.8\", features = [\"postgres\"] }",
+        "{ version = \"0.9\", features = [\"postgres\"] }",
     ),
     (
         "pq-sys",
@@ -483,14 +531,69 @@ pub(super) const MODEL_DEPS: &[(&str, &str)] = &[
 /// Append a `Modify` action to `plan` that ensures every `(crate, version_spec)`
 /// in `deps` is present under `[dependencies]` in the project's `Cargo.toml`.
 /// Existing entries are left untouched.
-pub(super) fn plan_cargo_deps(plan: &mut Plan, project_root: &Path, deps: &[(&str, &str)]) {
+///
+/// `owner_dir` is the directory this call's resource files live in (e.g.
+/// `src/models`, `src/jobs`) — `autumn destroy` only removes these deps once
+/// no OTHER file remains in `owner_dir`, so a sibling resource of the same
+/// generator that still needs one of `deps` (e.g. a second `model` also
+/// using `uuid`) survives destroying just one of them.
+pub(super) fn plan_cargo_deps(
+    plan: &mut Plan,
+    project_root: &Path,
+    deps: &[(&str, &str)],
+    owner_dir: &Path,
+) {
     let cargo_toml_path = project_root.join("Cargo.toml");
     let existing = read_or_empty(&cargo_toml_path);
     let updated = ensure_cargo_dependencies(&existing, deps);
     if updated != existing {
-        plan.modify(cargo_toml_path, updated);
+        plan.modify(cargo_toml_path.clone(), updated);
+    }
+    // Recorded unconditionally — mirroring every other `push_revert` call in
+    // this module — so `autumn destroy` (issue #1048), which recomputes
+    // this same plan against the *already-generated* Cargo.toml (where
+    // these deps are, by definition, already present), still knows to
+    // remove them. Gating this on "did the Modify actually change
+    // anything" would make it a no-op at destroy time, since re-running
+    // this same idempotent transform against post-generate disk never
+    // produces a diff.
+    //
+    // `TEMPLATE_SHIPPED_CARGO_DEPS` names are excluded: `autumn new`'s own
+    // template already declares them (see `templates/Cargo.toml.tmpl`), so
+    // `ensure_cargo_dependencies` never actually adds them for a real
+    // project — they're only in `MODEL_DEPS`/`SCAFFOLD_EXTRA_DEPS` as a
+    // safety net for a hand-rolled Cargo.toml missing them. Reverting them
+    // unconditionally would strip a framework dependency the project needs
+    // regardless of any generated resource.
+    //
+    // Known limitation (documented, out of scope per issue #1048): for any
+    // *other* name, if a *different* resource's generator also depends on
+    // it, destroying this resource still removes it — reverting a shared
+    // dependency across multiple generated resources needs the multi-step
+    // undo history the issue explicitly scopes out.
+    let names: Vec<String> = deps
+        .iter()
+        .map(|(name, _)| *name)
+        .filter(|name| !TEMPLATE_SHIPPED_CARGO_DEPS.contains(name))
+        .map(str::to_owned)
+        .collect();
+    if !names.is_empty() {
+        plan.push_revert(crate::generate::emit::Revert::CargoDeps {
+            path: cargo_toml_path,
+            names,
+            owner_dir: owner_dir.to_path_buf(),
+        });
     }
 }
+
+/// Crate dependencies `autumn new`'s own template already declares (see
+/// `templates/Cargo.toml.tmpl`) that also happen to appear in
+/// [`MODEL_DEPS`]/[`super::scaffold::SCAFFOLD_EXTRA_DEPS`] as a safety net
+/// for a hand-rolled project missing them. [`plan_cargo_deps`] never
+/// includes these in a `Revert::CargoDeps`, since a real project needs them
+/// regardless of whether any resource was ever generated.
+pub(super) const TEMPLATE_SHIPPED_CARGO_DEPS: &[&str] =
+    &["autumn-web", "maud", "diesel_migrations"];
 
 /// Insert each `(crate, version_spec)` pair at the end of the `[dependencies]`
 /// section, skipping entries already present. Pure string transformation —
@@ -587,6 +690,71 @@ pub(super) fn ensure_cargo_dependencies(existing: &str, deps: &[(&str, &str)]) -
     out
 }
 
+/// Inverse of [`ensure_cargo_dependencies`] (`autumn destroy`, issue #1048).
+///
+/// Removes the exact `<name> = <spec>` shorthand line for each crate in
+/// `names` from `[dependencies]`, leaving every other entry (and the rest of
+/// the file) byte-for-byte intact. A no-op for any crate not present in that
+/// exact shorthand form — already destroyed, hand-edited into a subtable, or
+/// never added by this generator — destroy only reverses lines `generate`
+/// itself would have written.
+#[must_use]
+pub(super) fn remove_cargo_dependencies(existing: &str, names: &[&str]) -> String {
+    let mut lines: Vec<&str> = existing.lines().collect();
+    let Some(deps_idx) = lines
+        .iter()
+        .position(|l| is_table_header(l, "dependencies"))
+    else {
+        return existing.to_owned();
+    };
+    let mut scan_end = lines[deps_idx + 1..]
+        .iter()
+        .position(|l| is_any_table_header(l) && !is_dep_subtable_boundary_marker(l))
+        .map_or(lines.len(), |off| deps_idx + 1 + off);
+
+    let mut removed_any = false;
+    let mut i = deps_idx + 1;
+    while i < scan_end {
+        let trimmed = lines[i].trim_start();
+        let is_target = names.iter().any(|name| {
+            trimmed
+                .strip_prefix(name)
+                .is_some_and(|rest| rest.trim_start().starts_with('='))
+        });
+        if is_target {
+            lines.remove(i);
+            scan_end -= 1;
+            removed_any = true;
+            continue;
+        }
+        i += 1;
+    }
+    if !removed_any {
+        return existing.to_owned();
+    }
+    // If removing these deps emptied the whole `[dependencies]` section
+    // (allowing for a residual blank line — e.g. the separator a later
+    // `[dev-dependencies]` insertion added right after the last real entry),
+    // drop the header, every blank line in its now-empty body, and the
+    // blank separator line before it, if any — restoring the file to what
+    // it looked like before `ensure_cargo_dependencies` ever created this
+    // section from scratch.
+    if lines[deps_idx + 1..scan_end]
+        .iter()
+        .all(|l| l.trim().is_empty())
+    {
+        lines.drain(deps_idx..scan_end);
+        if deps_idx > 0 && lines[deps_idx - 1].trim().is_empty() {
+            lines.remove(deps_idx - 1);
+        }
+    }
+    let mut out = lines.join("\n");
+    if existing.ends_with('\n') && !out.is_empty() {
+        out.push('\n');
+    }
+    out
+}
+
 fn is_table_header(line: &str, table: &str) -> bool {
     let trimmed = line.trim_start();
     let Some(rest) = trimmed.strip_prefix('[') else {
@@ -670,6 +838,103 @@ fn dep_section_has(dep_section: &[&str], crate_name: &str) -> bool {
         t.split_once('=')
             .is_some_and(|(name, _)| name.trim() == crate_name)
     })
+}
+
+/// `true` if `existing` Cargo.toml text already declares `crate_name` as a
+/// dependency, but that existing declaration doesn't (as far as this
+/// string-only check can tell) already list `feature`.
+///
+/// [`ensure_cargo_dependencies`] skips any crate name it finds already
+/// present — regardless of that entry's version or features — so a project
+/// that added `crate_name` for its own reasons (or inherited it from a
+/// workspace) before ever running a generator that needs `feature` would
+/// otherwise silently get code that fails to compile with no indication why
+/// (PR review, issue #1038: `rust_decimal = "1"` without
+/// `db-diesel2-postgres` lacks the Diesel `ToSql`/`FromSql` impls a
+/// generated `decimal` field's `#[model]` struct needs).
+///
+/// Checks the common single-line shorthand form (`crate = "1"` or
+/// `crate = { version = "1", features = [...] }`) and the
+/// `[dependencies.crate]` subtable form. Doesn't attempt to resolve
+/// `{ workspace = true }` inheritance or a `features` array split across
+/// multiple lines — those are rarer shapes this heuristic can't see through
+/// from Cargo.toml text alone, so it may occasionally warn when the feature
+/// is in fact present; a false-positive warning is far cheaper than the
+/// silent compile failure this check exists to catch.
+fn existing_dep_declared_without_feature(existing: &str, crate_name: &str, feature: &str) -> bool {
+    let lines: Vec<&str> = existing.lines().collect();
+    let Some(deps_idx) = lines
+        .iter()
+        .position(|l| is_table_header(l, "dependencies"))
+    else {
+        return false;
+    };
+    let scan_end = lines[deps_idx + 1..]
+        .iter()
+        .position(|l| is_any_table_header(l) && !is_dep_subtable_boundary_marker(l))
+        .map_or(lines.len(), |off| deps_idx + 1 + off);
+    let dep_section = &lines[deps_idx + 1..scan_end];
+
+    if let Some(sub_idx) = dep_section
+        .iter()
+        .position(|l| dep_subtable_crate_name(l) == Some(crate_name))
+    {
+        let sub_body_end = dep_section[sub_idx + 1..]
+            .iter()
+            .position(|l| is_any_table_header(l))
+            .map_or(dep_section.len(), |off| sub_idx + 1 + off);
+        let sub_body = dep_section[sub_idx + 1..sub_body_end].join("\n");
+        return !sub_body.contains(feature);
+    }
+
+    dep_section
+        .iter()
+        .find(|l| {
+            let t = l.trim_start();
+            !t.starts_with('#')
+                && t.split_once('=')
+                    .is_some_and(|(name, _)| name.trim() == crate_name)
+        })
+        .is_some_and(|line| !line.contains(feature))
+}
+
+/// If `existing` Cargo.toml text already declares `crate_name` without one
+/// or more of `features`, record a single `plan` warning naming exactly
+/// which ones to add by hand. See [`existing_dep_declared_without_feature`]
+/// for why this check exists.
+///
+/// Checked against the *full* feature set a generator needs — not just one
+/// of them — because `ensure_cargo_dependencies` only ever gets one shot at
+/// a crate name: once it's present, no generator will ever revisit it again.
+/// A partial check (e.g. only `db-diesel2-postgres`, missing `serde`) would
+/// pass a project that already added `rust_decimal` with *some* but not all
+/// of the required features, still leaving the generated code unable to
+/// compile.
+pub(super) fn warn_if_existing_dep_missing_features(
+    plan: &mut Plan,
+    existing_cargo_toml: &str,
+    crate_name: &str,
+    features: &[&str],
+) {
+    let missing: Vec<&str> = features
+        .iter()
+        .copied()
+        .filter(|feature| {
+            existing_dep_declared_without_feature(existing_cargo_toml, crate_name, feature)
+        })
+        .collect();
+    if !missing.is_empty() {
+        let feature_list = missing
+            .iter()
+            .map(|f| format!("\"{f}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        plan.warn(format!(
+            "Cargo.toml already declares '{crate_name}' without the generated code's \
+             required feature(s) — add {feature_list} to its `features` list by hand \
+             or the generated code may fail to compile."
+        ));
+    }
 }
 
 /// Reserved resource names whose snake-case form would collide with a special
@@ -872,6 +1137,27 @@ pub fn parse_model_metadata(
                 token: default.clone(),
                 reason: format!("unknown field '{field_name}'"),
             })?;
+        // `unique` + `--default` is rejected outright (issue #1032 review
+        // follow-up) rather than half-supported: a scaffold's `--default`
+        // fields are excluded from the generated HTML form (see
+        // `scaffold::plan_scaffold`'s `form_fields` filter), so a defaulted
+        // `unique` column would have no input to show a duplicate-value
+        // error against even if `UNIQUE_CONSTRAINTS` did list it. Worse, a
+        // *constant* default value collides with itself on every insert
+        // after the first, so the combination rarely means what it looks
+        // like it means.
+        if field.unique {
+            return Err(GenerateError::InvalidField {
+                token: default.clone(),
+                reason: format!(
+                    "field '{field_name}' cannot be both `unique` and have a `--default` \
+                     value — a defaulted unique column either only supports one row ever \
+                     (a constant default collides with itself on every later insert) or \
+                     has no form control to show a duplicate-value error against (the \
+                     generated form omits defaulted fields). Remove one of the two."
+                ),
+            });
+        }
         let sql =
             sql_default_literal(field, value).map_err(|reason| GenerateError::InvalidField {
                 token: default.clone(),
@@ -903,6 +1189,26 @@ fn split_key_value(token: &str, sep: char) -> Result<(&str, &str), GenerateError
 
 pub fn field_by_name<'a>(fields: &'a [Field], name: &str) -> Option<&'a Field> {
     fields.iter().find(|field| field.name == name)
+}
+
+/// Apply `--unique FIELD` flags (issue #1032) to already-parsed fields,
+/// mirroring `--index`'s validate-then-apply shape. Unlike `--index`
+/// (tracked externally in `ModelMetadata.indexes`), `unique` is carried on
+/// the field itself ([`Field::unique`]) — the DSL's inline `:unique`
+/// modifier and this flag converge on the same bit, so every SQL-emission
+/// and repository-derive call site only ever needs to check `field.unique`.
+///
+/// # Errors
+/// Returns [`GenerateError::InvalidField`] for an unknown field name.
+pub fn apply_unique_flags(fields: &mut [Field], uniques: &[String]) -> Result<(), GenerateError> {
+    for unique in uniques {
+        let field_name = unique.trim();
+        validate_known_field(fields, field_name, unique)?;
+        if let Some(field) = fields.iter_mut().find(|f| f.name == field_name) {
+            field.unique = true;
+        }
+    }
+    Ok(())
 }
 
 fn validate_known_field(
@@ -953,6 +1259,17 @@ fn render_validation_attr(field: &Field, rule: &str) -> Result<String, String> {
     if min.is_none() && max.is_none() {
         return Err("length validation needs at least min=N or max=N".to_owned());
     }
+    // A `min` greater than `max` is a self-contradictory rule that no string
+    // can ever satisfy: not a mistake to silently accept and generate an
+    // always-invalid field, one for which the generated smoke test's own
+    // "valid submission" would fail (issue #1124 review).
+    if let (Some(min), Some(max)) = (min, max)
+        && min > max
+    {
+        return Err(format!(
+            "length validation's min ({min}) cannot be greater than its max ({max})"
+        ));
+    }
 
     let mut args = Vec::new();
     if let Some(min) = min {
@@ -980,6 +1297,45 @@ fn unquote_default_value(value: &str) -> &str {
         .unwrap_or(value)
 }
 
+/// Check that a `--default` value's *significant* digits fit a
+/// `NUMERIC(precision,scale)` column, so a decimal default never generates a
+/// migration that fails at apply time with a Postgres "numeric field
+/// overflow" (integer part too wide) — or silently gets rounded away
+/// (fractional part too precise), which would defeat the entire point of a
+/// field type that exists to avoid silent precision loss.
+///
+/// `value` is assumed to already be a plain (non-scientific-notation),
+/// finite numeric string — the caller checks that first. Trailing/leading
+/// zeros are trimmed before counting: `"1.500"` has one significant
+/// fractional digit (5), not three, and `"007"` has one significant integer
+/// digit, matching Postgres's own `NUMERIC` digit-counting semantics.
+fn validate_decimal_default_fits(value: &str, precision: u32, scale: u32) -> Result<(), String> {
+    let unsigned = value
+        .strip_prefix('-')
+        .or_else(|| value.strip_prefix('+'))
+        .unwrap_or(value);
+    let (int_part, frac_part) = unsigned.split_once('.').unwrap_or((unsigned, ""));
+
+    let frac_digits = frac_part.trim_end_matches('0').len();
+    if frac_digits > scale as usize {
+        return Err(format!(
+            "decimal default '{value}' has {frac_digits} fractional digit(s), but \
+             decimal{{{precision},{scale}}} only allows {scale}"
+        ));
+    }
+
+    let int_digits = int_part.trim_start_matches('0').len();
+    let max_int_digits = precision - scale;
+    if int_digits > max_int_digits as usize {
+        return Err(format!(
+            "decimal default '{value}' has {int_digits} integer digit(s), but \
+             decimal{{{precision},{scale}}} only allows {max_int_digits}"
+        ));
+    }
+
+    Ok(())
+}
+
 fn sql_default_literal(field: &Field, value: &str) -> Result<String, String> {
     match field.kind {
         FieldKind::Bool => match value.to_ascii_lowercase().as_str() {
@@ -1003,6 +1359,28 @@ fn sql_default_literal(field: &Field, value: &str) -> Result<String, String> {
             .parse::<f64>()
             .map(|_| value.to_owned())
             .map_err(|_| "float defaults must be valid numbers".to_owned()),
+        FieldKind::Decimal { precision, scale } => {
+            let parsed: f64 = value
+                .parse()
+                .map_err(|_| "decimal defaults must be valid numbers".to_owned())?;
+            if !parsed.is_finite() {
+                return Err("decimal defaults must be finite numbers (not NaN/infinity)".to_owned());
+            }
+            if value.contains(['e', 'E']) {
+                return Err(
+                    "decimal defaults must be written in plain notation (e.g. '19.99'), \
+                     not scientific notation"
+                        .to_owned(),
+                );
+            }
+            validate_decimal_default_fits(value, precision, scale)?;
+            // Emitted as the original string, not `parsed.to_string()` —
+            // `autumn-cli` doesn't depend on `rust_decimal` itself, and an
+            // unquoted numeric literal is valid Postgres `NUMERIC` SQL
+            // whether or not it round-trips exactly through `f64` (this arm
+            // only used `f64` to reject non-numeric garbage above).
+            Ok(value.to_owned())
+        }
         FieldKind::Uuid
         | FieldKind::NaiveDateTime
         | FieldKind::DateTime
@@ -1308,6 +1686,176 @@ mod tests {
     }
 
     #[test]
+    fn plan_records_reverts_for_mod_decl_schema_table_and_cargo_deps() {
+        let tmp = project();
+        let plan = plan_model(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        assert!(plan.reverts.iter().any(|r| matches!(
+            r,
+            crate::generate::emit::Revert::ModDecl { name, .. } if name == "post"
+        )));
+        assert!(plan.reverts.iter().any(|r| matches!(
+            r,
+            crate::generate::emit::Revert::SchemaTable { table, .. } if table == "posts"
+        )));
+        assert!(plan.reverts.iter().any(|r| matches!(
+            r,
+            crate::generate::emit::Revert::CargoDeps { names, .. } if names.iter().any(|n| n == "diesel")
+        )));
+    }
+
+    #[test]
+    fn generate_then_destroy_model_round_trips_to_original_project_state() {
+        // Mirrors a real `autumn new` project's Cargo.toml: `[dependencies]`
+        // already exists (autumn-web, diesel_migrations) before any
+        // generator runs — `diesel_migrations` is template-shipped (see
+        // `TEMPLATE_SHIPPED_CARGO_DEPS`) so `Revert::CargoDeps` never
+        // targets it, matching a real project where it always predates
+        // any `generate` call.
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"x\"\n\n[dependencies]\nautumn-web = \"0.6.0\"\ndiesel_migrations = \"2\"\n",
+        )
+        .unwrap();
+        let cargo_path = tmp.path().join("Cargo.toml");
+        let original_cargo = fs::read_to_string(&cargo_path).unwrap();
+
+        let plan = plan_model(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+        assert!(tmp.path().join("src/models/post.rs").exists());
+
+        // Destroy recomputes the plan from the same params (a fresh
+        // timestamp doesn't matter here since the migration dir is matched
+        // by suffix), then reverts it.
+        let destroy_plan = plan_model(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "99999999999999",
+        )
+        .unwrap();
+        destroy_plan.revert(Flags::default()).unwrap();
+
+        assert!(!tmp.path().join("src/models/post.rs").exists());
+        assert!(!tmp.path().join("src/models/mod.rs").exists());
+        assert!(!tmp.path().join("src/schema.rs").exists());
+        assert!(
+            fs::read_dir(tmp.path().join("migrations")).map_or(true, |mut d| d.next().is_none()),
+            "migration directory must be removed"
+        );
+        assert_eq!(fs::read_to_string(&cargo_path).unwrap(), original_cargo);
+    }
+
+    #[test]
+    fn destroying_one_of_two_models_keeps_shared_dep_the_other_still_needs() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"x\"\n\n[dependencies]\nautumn-web = \"0.6.0\"\ndiesel_migrations = \"2\"\n",
+        )
+        .unwrap();
+        let cargo_path = tmp.path().join("Cargo.toml");
+
+        plan_model(tmp.path(), "Post", &["owner:Uuid".into()], "20260427000000")
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+        plan_model(
+            tmp.path(),
+            "Comment",
+            &["owner:Uuid".into()],
+            "20260427000001",
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+        assert!(fs::read_to_string(&cargo_path).unwrap().contains("uuid"));
+
+        // Destroying Post alone must NOT strip `uuid` — Comment's model file
+        // still uses it.
+        plan_model(tmp.path(), "Post", &["owner:Uuid".into()], "99999999999999")
+            .unwrap()
+            .revert(Flags::default())
+            .unwrap();
+
+        assert!(!tmp.path().join("src/models/post.rs").exists());
+        assert!(tmp.path().join("src/models/comment.rs").exists());
+        let cargo_after = fs::read_to_string(&cargo_path).unwrap();
+        assert!(
+            cargo_after.contains("uuid"),
+            "uuid must survive — Comment's model still uses it: {cargo_after}"
+        );
+
+        // Now destroy the last remaining model — `uuid` must finally go.
+        plan_model(
+            tmp.path(),
+            "Comment",
+            &["owner:Uuid".into()],
+            "99999999999998",
+        )
+        .unwrap()
+        .revert(Flags::default())
+        .unwrap();
+        assert!(!tmp.path().join("src/models/comment.rs").exists());
+        assert!(
+            !fs::read_to_string(&cargo_path).unwrap().contains("uuid"),
+            "uuid must be removed once no model uses it anymore"
+        );
+    }
+
+    #[test]
+    fn destroying_last_model_keeps_dep_still_used_by_hand_written_code() {
+        // Codex PR review (issue #1048): a project can hand-add a dependency
+        // for its own reasons, unrelated to any generated resource. Destroy
+        // must not strip it just because the last model that also happened
+        // to need it is gone.
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"x\"\n\n[dependencies]\nautumn-web = \"0.6.0\"\ndiesel_migrations = \"2\"\n",
+        )
+        .unwrap();
+        let cargo_path = tmp.path().join("Cargo.toml");
+
+        plan_model(tmp.path(), "Post", &["owner:Uuid".into()], "20260427000000")
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+        // Hand-written code elsewhere in the project also uses `uuid`,
+        // independent of the generated model.
+        fs::create_dir_all(tmp.path().join("src/tasks")).unwrap();
+        fs::write(
+            tmp.path().join("src/tasks/cleanup.rs"),
+            "pub fn new_id() -> uuid::Uuid {\n    uuid::Uuid::new_v4()\n}\n",
+        )
+        .unwrap();
+        assert!(fs::read_to_string(&cargo_path).unwrap().contains("uuid"));
+
+        plan_model(tmp.path(), "Post", &["owner:Uuid".into()], "99999999999999")
+            .unwrap()
+            .revert(Flags::default())
+            .unwrap();
+
+        assert!(!tmp.path().join("src/models/post.rs").exists());
+        assert!(
+            fs::read_to_string(&cargo_path).unwrap().contains("uuid"),
+            "uuid must survive — hand-written src/tasks/cleanup.rs still uses it"
+        );
+    }
+
+    #[test]
     fn plan_rejects_lowercase_first_char() {
         let tmp = project();
         let err = plan_model(tmp.path(), "123Bad", &[], "20260427000000").unwrap_err();
@@ -1371,7 +1919,7 @@ mod tests {
         let err = plan_model(
             tmp.path(),
             "Post",
-            &["price:Decimal".into()],
+            &["price:Money".into()],
             "20260427000000",
         )
         .unwrap_err();
@@ -1584,6 +2132,247 @@ mod tests {
         }
     }
 
+    // ── decimal field: --default (issue #1038 PR review) ────────────────────
+
+    #[test]
+    fn decimal_default_within_precision_and_scale_is_accepted() {
+        let fields = parse_fields(&["price:decimal{12,2}".into()]).unwrap();
+        let metadata = parse_model_metadata(
+            &fields,
+            &ModelOptions {
+                defaults: vec!["price=19.99".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            metadata.defaults().get("price").map(String::as_str),
+            Some("19.99")
+        );
+    }
+
+    #[test]
+    fn decimal_default_rejected_when_integer_part_overflows_precision() {
+        // decimal{2,2} has 0 integer digits of budget (precision - scale ==
+        // 0), so any value with magnitude >= 1 must be rejected rather than
+        // generating a migration Postgres fails at apply time with a
+        // "numeric field overflow".
+        let fields = parse_fields(&["amount:decimal{2,2}".into()]).unwrap();
+        let err = parse_model_metadata(
+            &fields,
+            &ModelOptions {
+                defaults: vec!["amount=1".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("integer digit"), "got: {msg}");
+    }
+
+    #[test]
+    fn decimal_default_rejected_when_fractional_part_exceeds_scale() {
+        // decimal{3,2} only allows 2 fractional digits; a third significant
+        // digit would silently round away rather than storing exactly.
+        let fields = parse_fields(&["amount:decimal{3,2}".into()]).unwrap();
+        let err = parse_model_metadata(
+            &fields,
+            &ModelOptions {
+                defaults: vec!["amount=1.999".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("fractional digit"), "got: {msg}");
+    }
+
+    #[test]
+    fn decimal_default_tolerates_insignificant_trailing_zeros() {
+        // "1.500" has one significant fractional digit (5), not three — it
+        // must not be rejected for a scale-2 column just because the source
+        // string happens to have an extra trailing zero.
+        let fields = parse_fields(&["amount:decimal{4,2}".into()]).unwrap();
+        let metadata = parse_model_metadata(
+            &fields,
+            &ModelOptions {
+                defaults: vec!["amount=1.500".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            metadata.defaults().get("amount").map(String::as_str),
+            Some("1.500")
+        );
+    }
+
+    #[test]
+    fn decimal_default_tolerates_leading_zeros_in_integer_part() {
+        let fields = parse_fields(&["amount:decimal{2,2}".into()]).unwrap();
+        let metadata = parse_model_metadata(
+            &fields,
+            &ModelOptions {
+                defaults: vec!["amount=0.5".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            metadata.defaults().get("amount").map(String::as_str),
+            Some("0.5")
+        );
+    }
+
+    #[test]
+    fn decimal_default_accepts_negative_value_within_range() {
+        let fields = parse_fields(&["amount:decimal{2,2}".into()]).unwrap();
+        let metadata = parse_model_metadata(
+            &fields,
+            &ModelOptions {
+                defaults: vec!["amount=-0.75".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            metadata.defaults().get("amount").map(String::as_str),
+            Some("-0.75")
+        );
+    }
+
+    #[test]
+    fn decimal_default_rejects_non_numeric_value() {
+        let fields = parse_fields(&["price:decimal".into()]).unwrap();
+        let err = parse_model_metadata(
+            &fields,
+            &ModelOptions {
+                defaults: vec!["price=abc".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("valid numbers"));
+    }
+
+    #[test]
+    fn decimal_default_rejects_scientific_notation() {
+        let fields = parse_fields(&["price:decimal".into()]).unwrap();
+        let err = parse_model_metadata(
+            &fields,
+            &ModelOptions {
+                defaults: vec!["price=1e2".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("scientific notation"));
+    }
+
+    #[test]
+    fn decimal_default_rejects_nan_and_infinity() {
+        let fields = parse_fields(&["price:decimal".into()]).unwrap();
+        for bad in ["nan", "inf", "infinity"] {
+            let err = parse_model_metadata(
+                &fields,
+                &ModelOptions {
+                    defaults: vec![format!("price={bad}")],
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("finite"),
+                "'{bad}' should be rejected as non-finite: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn decimal_field_warns_when_existing_rust_decimal_dep_lacks_diesel_feature() {
+        // Regression test (PR review, issue #1038): `ensure_cargo_dependencies`
+        // skips a crate that's already declared, regardless of its features —
+        // so a project that already had `rust_decimal = "1"` (e.g. for its own
+        // business logic) before ever using a `decimal` field would silently
+        // keep that feature-less entry, and the generated `#[model]` field's
+        // Diesel `ToSql`/`FromSql` impls (behind `db-diesel2-postgres`) would
+        // be missing, failing to compile with no indication why.
+        let tmp = project();
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname=\"x\"\n\n[dependencies]\nrust_decimal = \"1\"\n",
+        )
+        .unwrap();
+        let plan = plan_model(
+            tmp.path(),
+            "Product",
+            &["price:decimal".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        assert_eq!(plan.warnings.len(), 1, "warnings: {:?}", plan.warnings);
+        assert!(plan.warnings[0].contains("rust_decimal"));
+        assert!(plan.warnings[0].contains("db-diesel2-postgres"));
+    }
+
+    #[test]
+    fn decimal_field_no_warning_when_existing_rust_decimal_dep_already_has_feature() {
+        let tmp = project();
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname=\"x\"\n\n[dependencies]\n\
+             rust_decimal = { version = \"1\", features = [\"db-diesel2-postgres\", \"serde\"] }\n",
+        )
+        .unwrap();
+        let plan = plan_model(
+            tmp.path(),
+            "Product",
+            &["price:decimal".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        assert!(plan.warnings.is_empty(), "warnings: {:?}", plan.warnings);
+    }
+
+    #[test]
+    fn decimal_field_warns_naming_only_the_missing_feature() {
+        // Regression test (PR review, issue #1038): the earlier version of
+        // this check only verified `db-diesel2-postgres`, missing that the
+        // generated `#[model]` struct also derives Serialize/Deserialize and
+        // so needs `serde` too — a project with `rust_decimal` already
+        // declared with `db-diesel2-postgres` but not `serde` would pass the
+        // old single-feature check and still fail to compile.
+        let tmp = project();
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname=\"x\"\n\n[dependencies]\n\
+             rust_decimal = { version = \"1\", features = [\"db-diesel2-postgres\"] }\n",
+        )
+        .unwrap();
+        let plan = plan_model(
+            tmp.path(),
+            "Product",
+            &["price:decimal".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        assert_eq!(plan.warnings.len(), 1, "warnings: {:?}", plan.warnings);
+        assert!(plan.warnings[0].contains("serde"));
+    }
+
+    #[test]
+    fn decimal_field_no_warning_when_rust_decimal_not_already_declared() {
+        let tmp = project();
+        let plan = plan_model(
+            tmp.path(),
+            "Product",
+            &["price:decimal".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        assert!(plan.warnings.is_empty(), "warnings: {:?}", plan.warnings);
+    }
+
     // ── enum field: --default (issue #1030) ─────────────────────────────────
 
     #[test]
@@ -1641,6 +2430,49 @@ mod tests {
         assert!(msg.contains("draft"), "got: {msg}");
         assert!(msg.contains("published"), "got: {msg}");
         assert!(msg.contains("archived"), "got: {msg}");
+    }
+
+    #[test]
+    fn unique_field_with_default_is_rejected() {
+        // issue #1032 review follow-up: a `--default` field is excluded from
+        // the generated HTML form (see `scaffold::plan_scaffold`'s
+        // `form_fields` filter), so a `unique` column that also has a
+        // `--default` would have no `UNIQUE_CONSTRAINTS` entry (and, even if
+        // it did, no form input to show a duplicate-value error against).
+        // Reject the combination outright instead of silently emitting a
+        // scaffold whose duplicate handling doesn't work for that field.
+        let fields = parse_fields(&["email:String:unique".into()]).unwrap();
+        let err = parse_model_metadata(
+            &fields,
+            &ModelOptions {
+                defaults: vec!["email='a@b.com'".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("email"), "got: {msg}");
+        assert!(msg.contains("unique"), "got: {msg}");
+        assert!(msg.contains("default"), "got: {msg}");
+    }
+
+    #[test]
+    fn unique_flag_field_with_default_is_rejected() {
+        // Same rejection, but for the `--unique FIELD` flag path rather than
+        // the inline `:unique` DSL marker — `apply_unique_flags` must run
+        // before `parse_model_metadata` sees the `--default` token for this
+        // to catch it (it does, in `plan_model_with_options`).
+        let mut fields = parse_fields(&["email:String".into()]).unwrap();
+        apply_unique_flags(&mut fields, &["email".to_owned()]).unwrap();
+        let err = parse_model_metadata(
+            &fields,
+            &ModelOptions {
+                defaults: vec!["email='a@b.com'".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, GenerateError::InvalidField { .. }));
     }
 
     #[test]
@@ -1840,6 +2672,53 @@ autumn-web = \"0.3\"\n";
         assert!(updated.contains("autumn-web = \"0.3\""));
         assert!(updated.contains("chrono = \"0.4\""));
         assert_eq!(updated.matches("autumn-web =").count(), 1);
+    }
+
+    #[test]
+    fn remove_cargo_dependencies_restores_original() {
+        let original = "[package]\n\
+name = \"x\"\n\
+\n\
+[dependencies]\n\
+autumn-web = \"0.3\"\n";
+        let updated = ensure_cargo_dependencies(original, &[("chrono", "\"0.4\"")]);
+        assert_ne!(updated, original);
+        let reverted = remove_cargo_dependencies(&updated, &["chrono"]);
+        assert_eq!(reverted, original);
+    }
+
+    #[test]
+    fn remove_cargo_dependencies_removes_only_named_crates() {
+        let original = "[dependencies]\nautumn-web = \"0.3\"\n";
+        let updated =
+            ensure_cargo_dependencies(original, &[("chrono", "\"0.4\""), ("serde", "\"1\"")]);
+        let reverted = remove_cargo_dependencies(&updated, &["chrono"]);
+        assert!(!reverted.contains("chrono"));
+        assert!(reverted.contains("serde = \"1\""));
+        assert!(reverted.contains("autumn-web = \"0.3\""));
+    }
+
+    #[test]
+    fn remove_cargo_dependencies_is_idempotent_when_absent() {
+        let original = "[dependencies]\nautumn-web = \"0.3\"\n";
+        assert_eq!(remove_cargo_dependencies(original, &["chrono"]), original);
+    }
+
+    #[test]
+    fn remove_cargo_dependencies_does_not_touch_prefix_sharing_crate() {
+        let original = "[dependencies]\ndiesel-async = \"0.8\"\n";
+        assert_eq!(remove_cargo_dependencies(original, &["diesel"]), original);
+    }
+
+    #[test]
+    fn remove_cargo_dependencies_collapses_now_empty_section_created_from_scratch() {
+        // Mirrors `ensure_cargo_dependencies`'s "no [dependencies] section
+        // yet" branch: a minimal project with none at all.
+        let original = "[package]\nname = \"x\"\n";
+        let updated = ensure_cargo_dependencies(original, &[("chrono", "\"0.4\"")]);
+        assert_ne!(updated, original);
+        let reverted = remove_cargo_dependencies(&updated, &["chrono"]);
+        assert_eq!(reverted, original);
     }
 
     #[test]

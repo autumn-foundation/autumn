@@ -13,7 +13,7 @@ bytes = "1"
 tokio-stream = { workspace = true }
 chrono = { version = "0.4", features = ["serde"] }
 diesel = { version = "2", features = ["postgres", "chrono", "serde_json"] }
-diesel-async = { version = "0.8", features = ["postgres"] }
+diesel-async = { version = "0.9", features = ["postgres"] }
 pq-sys = { version = "0.7", features = ["bundled_without_openssl"] }
 redis = { version = "1.2", features = ["aio", "tokio-comp"] }
 diesel_migrations = "2"

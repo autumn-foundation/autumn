@@ -16,7 +16,7 @@ use super::schema_edit::{
     parse_model_search_config_for_table, remove_columns_down_sql, remove_columns_up_sql,
     singularize,
 };
-use super::{Flags, GenerateError, ensure_project_root, timestamp_now};
+use super::{GenerateError, ensure_project_root};
 
 fn collect_rs_files_recursive(dir: &Path, candidates: &mut Vec<std::path::PathBuf>) {
     if let Ok(entries) = std::fs::read_dir(dir) {
@@ -38,15 +38,34 @@ fn collect_rs_files_recursive(dir: &Path, candidates: &mut Vec<std::path::PathBu
 ///
 /// # Errors
 /// Project layout, name, and DSL errors surface here.
+#[allow(dead_code)]
 pub fn plan_migration(
     project_root: &Path,
     name: &str,
     field_tokens: &[String],
     timestamp: &str,
 ) -> Result<Plan, GenerateError> {
+    plan_migration_with_options(project_root, name, field_tokens, timestamp, &[])
+}
+
+/// [`plan_migration`], plus `--unique FIELD` flags (issue #1032) — mirrors
+/// the DSL's inline `:unique` modifier, which already works via
+/// [`parse_fields`] alone (no options struct needed, unlike `generate
+/// model`/`scaffold`'s `ModelOptions`).
+///
+/// # Errors
+/// Project layout, name, DSL, and unknown-field errors surface here.
+pub fn plan_migration_with_options(
+    project_root: &Path,
+    name: &str,
+    field_tokens: &[String],
+    timestamp: &str,
+    uniques: &[String],
+) -> Result<Plan, GenerateError> {
     ensure_project_root(project_root)?;
     super::model::validate_resource_name(name)?;
-    let fields = parse_fields(field_tokens)?;
+    let mut fields = parse_fields(field_tokens)?;
+    super::model::apply_unique_flags(&mut fields, uniques)?;
 
     // The directory uses snake_case (`add_title_to_posts`) but the shape is
     // detected from the original PascalCase form because the keywords `To`
@@ -69,8 +88,16 @@ pub fn plan_migration(
             // anywhere the generator can see — a self-reference here is left
             // unvalidated rather than guessed at.
             super::model::check_reference_targets(&mut plan, project_root, &fields, table, None)?;
+            // `src/schema.rs`'s current content, so a `unique` field being
+            // added here can't pick an index name that coincidentally
+            // collides with a plain index on some other, already-existing
+            // column from an earlier migration this one has no other way to
+            // see (issue #1032 review follow-up). Empty string (no
+            // collision-check widening) if the file doesn't exist yet.
+            let existing_schema =
+                std::fs::read_to_string(project_root.join("src/schema.rs")).unwrap_or_default();
             (
-                add_columns_up_sql(table, &fields),
+                add_columns_up_sql(table, &fields, &existing_schema),
                 add_columns_down_sql(table, &fields),
             )
         }
@@ -81,9 +108,11 @@ pub fn plan_migration(
             // target with a UUID primary key still produces a `down.sql`
             // that fails to apply on rollback.
             super::model::check_reference_targets(&mut plan, project_root, &fields, table, None)?;
+            let existing_schema =
+                std::fs::read_to_string(project_root.join("src/schema.rs")).unwrap_or_default();
             (
                 remove_columns_up_sql(table, &fields),
-                remove_columns_down_sql(table, &fields),
+                remove_columns_down_sql(table, &fields, &existing_schema),
             )
         }
         MigrationShape::EncryptColumns {
@@ -166,6 +195,43 @@ pub fn plan_migration(
     Ok(plan)
 }
 
+/// Fallback destroy-only plan for `autumn destroy migration <name>` when
+/// [`plan_migration_with_options`] can't be recomputed — e.g. an
+/// `AddSearchTo<Table>` migration whose model file (or its `#[searchable]`
+/// config) is already gone by the time destroy runs, a common cleanup order
+/// like deleting/destroying the model first (issue #1048 PR review).
+/// `plan_migration_with_options` needs that config to render the right SQL,
+/// which is meaningless (and an error) once it's gone.
+///
+/// Locates the migration directory by suffix only — the same
+/// `{timestamp}_{suffix}` naming [`plan_migration_with_options`] uses, which
+/// is all [`Plan::revert`] actually needs to find it (destroy always
+/// recomputes a fresh timestamp anyway, so exact SQL content was never
+/// load-bearing for *locating* the directory). Its expected content is
+/// unknowable without re-deriving the search config, so `up.sql`/`down.sql`
+/// are recorded with an empty placeholder — real content (never empty)
+/// always counts as diverged, so they're only removed with `--force`,
+/// exactly like [`super::admin::plan_admin_destroy_fallback`].
+///
+/// # Errors
+/// Returns [`GenerateError`] when `project_root` isn't a valid project, or
+/// `name` fails validation.
+pub fn plan_migration_destroy_fallback(
+    project_root: &Path,
+    name: &str,
+    timestamp: &str,
+) -> Result<Plan, GenerateError> {
+    ensure_project_root(project_root)?;
+    super::model::validate_resource_name(name)?;
+
+    let dir_name = format!("{timestamp}_{}", snake_or_pascal_to_snake(name));
+    let migration_dir = project_root.join("migrations").join(&dir_name);
+    let mut plan = Plan::new(project_root);
+    plan.create(migration_dir.join("up.sql"), String::new());
+    plan.create(migration_dir.join("down.sql"), String::new());
+    Ok(plan)
+}
+
 /// Convert a name like `AddTitleToPosts` → `add_title_to_posts`, while
 /// leaving an already-snake-case name untouched.
 fn snake_or_pascal_to_snake(name: &str) -> String {
@@ -186,28 +252,10 @@ fn pascalish(name: &str) -> String {
     }
 }
 
-/// CLI entry point.
-pub fn run(name: &str, field_tokens: &[String], flags: Flags) {
-    let cwd = match std::env::current_dir() {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("Error: cannot determine current directory: {e}");
-            std::process::exit(1);
-        }
-    };
-    let timestamp = timestamp_now();
-    match plan_migration(&cwd, name, field_tokens, &timestamp).and_then(|p| p.execute(flags)) {
-        Ok(()) => {}
-        Err(e) => {
-            eprintln!("Error: {e}");
-            std::process::exit(1);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::generate::Flags;
     use std::fs;
     use tempfile::TempDir;
 
@@ -229,6 +277,114 @@ mod tests {
         let down = fs::read_to_string(dir.join("down.sql")).unwrap();
         assert!(up.is_empty());
         assert!(down.is_empty());
+    }
+
+    #[test]
+    fn generate_then_destroy_migration_round_trips_to_original_project_state() {
+        temp_env::with_vars(
+            [
+                ("AUTUMN_DATABASE__PRIMARY_URL", None::<&str>),
+                ("AUTUMN_DATABASE__URL", None::<&str>),
+                ("DATABASE_URL", None::<&str>),
+            ],
+            || {
+                let tmp = project();
+                let plan = plan_migration(
+                    tmp.path(),
+                    "AddTitleToPosts",
+                    &["title:String".into()],
+                    "20260427000000",
+                )
+                .unwrap();
+                plan.execute(Flags::default()).unwrap();
+                let dir = tmp
+                    .path()
+                    .join("migrations/20260427000000_add_title_to_posts");
+                assert!(dir.exists());
+
+                // Destroy recomputes the plan with a FRESH timestamp; the
+                // real on-disk directory must still be found by suffix.
+                let destroy_plan = plan_migration(
+                    tmp.path(),
+                    "AddTitleToPosts",
+                    &["title:String".into()],
+                    "99999999999999",
+                )
+                .unwrap();
+                destroy_plan.revert(Flags::default()).unwrap();
+
+                assert!(!dir.exists());
+                assert!(
+                    fs::read_dir(tmp.path().join("migrations"))
+                        .map_or(true, |mut d| d.next().is_none())
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn destroy_migration_refuses_directory_with_unplanned_file_unless_forced() {
+        // issue #1048 PR review: a developer may drop a README.md or an
+        // auxiliary fixture alongside the generated up.sql/down.sql. Destroy
+        // must treat that extra file as divergence rather than silently
+        // sweeping it up with `remove_dir_all`.
+        temp_env::with_vars(
+            [
+                ("AUTUMN_DATABASE__PRIMARY_URL", None::<&str>),
+                ("AUTUMN_DATABASE__URL", None::<&str>),
+                ("DATABASE_URL", None::<&str>),
+            ],
+            || {
+                let tmp = project();
+                let plan = plan_migration(
+                    tmp.path(),
+                    "AddTitleToPosts",
+                    &["title:String".into()],
+                    "20260427000000",
+                )
+                .unwrap();
+                plan.execute(Flags::default()).unwrap();
+                let dir = tmp
+                    .path()
+                    .join("migrations/20260427000000_add_title_to_posts");
+                assert!(dir.exists());
+                fs::write(dir.join("README.md"), "hand-authored notes\n").unwrap();
+
+                let destroy_plan = plan_migration(
+                    tmp.path(),
+                    "AddTitleToPosts",
+                    &["title:String".into()],
+                    "99999999999999",
+                )
+                .unwrap();
+                let err = destroy_plan
+                    .revert(Flags {
+                        dry_run: false,
+                        force: false,
+                    })
+                    .unwrap_err();
+                assert!(matches!(err, GenerateError::Diverged(_)));
+                assert!(
+                    dir.join("README.md").exists(),
+                    "hand-authored file must survive without --force"
+                );
+
+                let destroy_plan = plan_migration(
+                    tmp.path(),
+                    "AddTitleToPosts",
+                    &["title:String".into()],
+                    "99999999999999",
+                )
+                .unwrap();
+                destroy_plan
+                    .revert(Flags {
+                        dry_run: false,
+                        force: true,
+                    })
+                    .unwrap();
+                assert!(!dir.exists(), "--force must still remove the directory");
+            },
+        );
     }
 
     #[test]
@@ -414,6 +570,93 @@ pub struct Post {
         );
         assert!(down.contains("DROP INDEX IF EXISTS idx_posts_search_vector;"));
         assert!(down.contains("ALTER TABLE posts DROP COLUMN IF EXISTS search_vector;"));
+    }
+
+    // ── `plan_migration_destroy_fallback` (issue #1048 PR review) ───────────
+
+    #[test]
+    fn destroy_add_search_migration_after_model_already_destroyed_still_removes_it() {
+        // A common cleanup order — destroying the model before destroying
+        // an `AddSearchTo<Table>` migration that depended on its
+        // `#[searchable]` config — must not strand the migration directory
+        // just because `plan_migration_with_options` can no longer read it.
+        temp_env::with_vars(
+            [
+                ("AUTUMN_DATABASE__PRIMARY_URL", None::<&str>),
+                ("AUTUMN_DATABASE__URL", None::<&str>),
+                ("DATABASE_URL", None::<&str>),
+            ],
+            || {
+                let tmp = project();
+                let models_dir = tmp.path().join("src/models");
+                fs::create_dir_all(&models_dir).unwrap();
+                let model_src = r#"
+#[autumn_web::model(table = "posts")]
+#[searchable(language = "english")]
+pub struct Post {
+    #[id]
+    pub id: i64,
+    #[searchable(weight = "A")]
+    pub title: String,
+}
+"#;
+                fs::write(models_dir.join("post.rs"), model_src).unwrap();
+
+                let plan =
+                    plan_migration(tmp.path(), "AddSearchToPosts", &[], "20260427000000").unwrap();
+                plan.execute(Flags::default()).unwrap();
+                let dir = tmp
+                    .path()
+                    .join("migrations/20260427000000_add_search_to_posts");
+                assert!(dir.exists());
+
+                // Simulate `autumn destroy model Post` having already run.
+                fs::remove_file(models_dir.join("post.rs")).unwrap();
+                assert!(
+                    plan_migration(tmp.path(), "AddSearchToPosts", &[], "99999999999999").is_err()
+                );
+
+                let fallback_plan = plan_migration_destroy_fallback(
+                    tmp.path(),
+                    "AddSearchToPosts",
+                    "99999999999999",
+                )
+                .unwrap();
+                // Without --force: content is unverifiable (the search
+                // config is gone), so it's treated as diverged and left in
+                // place.
+                let err = fallback_plan
+                    .revert(Flags {
+                        dry_run: false,
+                        force: false,
+                    })
+                    .unwrap_err();
+                assert!(matches!(err, GenerateError::Diverged(_)));
+                assert!(dir.exists());
+
+                let fallback_plan = plan_migration_destroy_fallback(
+                    tmp.path(),
+                    "AddSearchToPosts",
+                    "99999999999999",
+                )
+                .unwrap();
+                fallback_plan
+                    .revert(Flags {
+                        dry_run: false,
+                        force: true,
+                    })
+                    .unwrap();
+                assert!(!dir.exists());
+            },
+        );
+    }
+
+    #[test]
+    fn plan_migration_destroy_fallback_fails_outside_project() {
+        let tmp = TempDir::new().unwrap();
+        let err = plan_migration_destroy_fallback(tmp.path(), "AddSearchToPosts", "20260427000000")
+            .unwrap_err();
+        assert!(matches!(err, GenerateError::NotInProject));
     }
 
     // ── references field: parity with `generate model` (issue #1026) ───────

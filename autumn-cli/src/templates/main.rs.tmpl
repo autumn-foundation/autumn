@@ -29,6 +29,7 @@ pub fn layout(title: &str, current_path: &str, flash: maud::Markup, content: mau
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { (title) }
                 link rel="stylesheet" href=(autumn_web::flash::FLASH_CSS_PATH);
+                link rel="stylesheet" href=(autumn_web::ui::WIDGETS_CSS_PATH);
                 link rel="stylesheet" href="/static/css/app.css";
                 (javascript_include_tag("htmx"))
                 script src=(autumn_web::htmx::AUTUMN_WIDGETS_JS_PATH) defer {}

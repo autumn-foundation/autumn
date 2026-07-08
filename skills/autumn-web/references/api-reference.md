@@ -1,8 +1,11 @@
-# autumn-web 0.5.0 API Reference
+# autumn-web API Reference (published 0.5.0 + trunk-dev)
 
 Use this file as a quick map for public names, features, dependency versions,
-and config keys. Source of truth is the workspace at version 0.5.0; verify
-against current source when exact code matters.
+and config keys. Verify against current source when exact code matters.
+
+Version identity: crates.io serves **0.5.0** (the latest published release);
+the `trunk-dev` workspace is versioned **0.6.0 (unpublished)**. Entries marked
+**(unreleased)** exist on trunk-dev but NOT in the published 0.5.0 crates.
 
 ## Published crates
 
@@ -15,7 +18,8 @@ against current source when exact code matters.
 | `autumn-storage-s3` | `autumn-storage-s3/` | S3-compatible `BlobStore` plugin |
 | `autumn-cache-redis` | `autumn-cache-redis/` | Redis cache plugin |
 
-All publishable crates share `[workspace.package].version = "0.5.0"`.
+All publishable crates share the `[workspace.package]` version and release
+together (`0.5.0` published; `0.6.0` on trunk-dev, unpublished).
 
 ## Top-level exports
 
@@ -74,16 +78,145 @@ All publishable crates share `[workspace.package].version = "0.5.0"`.
 | `paths![...]` | Typed route path helper module |
 | `#[mailer]`, `#[mailer_preview]`, `mail_previews![...]` | Mail helpers (`mail`) |
 | `t!(...)` | Compile-time checked translation lookup (`i18n`) |
+| `#[feature_flag]` | Feature-flag definition |
+| `#[inbound_mail]` | Inbound mail handler |
+| `#[step_up]` | Step-up authentication guard |
+| `#[event]`, `#[listener]`, `listeners![...]` | Typed domain event bus (**unreleased**) — publish via the `Events` extractor, register with `.listeners(...)` |
 
 `#[model]` also recognizes `#[belongs_to]` / `#[has_many]` / `#[has_one]`
-struct-level attributes for declarative associations with batched eager
+struct-level attributes (**unreleased** — trunk-dev, not in published 0.5.0)
+for declarative associations with batched eager
 preloading (`Model::preload()`, `repo.preload(records, spec)`); these are
 consumed by `#[model]` itself, not separately-registered proc macros.
-`#[has_many(Target, through = join_table)]` declares a many-to-many
-association through a join table, adding `add_{singular}` /
+`#[has_many(Target, through = join_table)]` declares a
+many-to-many association through a join table, adding `add_{singular}` /
 `remove_{singular}` / `set_{plural}` mutation helpers to the generated
 `#[repository]`. See the `#[model]` doc comment in `autumn-macros/src/lib.rs`
 and `docs/adr/0008-associations-and-eager-loading.md`.
+
+`#[model]` also consumes the `#[state_machine(transitions(from -> to,
+from -> to: "guard", ...))]` field attribute on `String` fields, generating
+`can_transition_{field}_to(&self, &str) -> bool`,
+`transition_{field}_to(&self, &str) -> AutumnResult<String>`, and a
+`__AUTUMN_SM_{FIELD}_TRANSITIONS` edge-list constant. See
+`docs/guide/state-machines.md`.
+
+## Repository-generated methods (`#[repository]`)
+
+Published 0.5.0: `find_by_id`, `find_all`, `count`, `exists_by_id`, `save`,
+`update`, `delete_by_id`, derived `find_by_*`/`count_by_*`/`exists_by_*`,
+`page(&PageRequest)`, `cursor_page(&CursorRequest)` (with `cursor_key =` /
+`cursor_key_type =` attr keys), bulk `save_many` / `save_many_skip_invalid` /
+`update_many` / `delete_many` / `upsert_many` (compile error on hooked repos),
+`with_lock`, `on_primary()`. Attr keys: `api =`, `policy =`,
+`scope =`, `primary_reads`, `soft_delete`, `tenant_scoped`, `hooks =`,
+`mcp` / `mcp = "read"`.
+
+**(unreleased)**: `preload(records, spec)` (declarative associations);
+`from_shard(&ShardedDb)`; `with_pool_untracked` (new on
+trunk-dev — published 0.5.0 repositories have no pool constructor);
+`find_in_batches(batch_size)` / `find_each(batch_size)` — bounded-memory
+whole-table iteration on every repository via a primary-key keyset cursor
+(`WHERE id > last ORDER BY id ASC LIMIT batch_size`, never `LIMIT`/`OFFSET`).
+Handle types live in `autumn_web::batches`: `FindInBatches`
+(`next_batch().await? -> Option<Vec<Model>>`), `FindEach`
+(`next().await? -> Option<Model>`), and the macro-implemented `BatchSource`
+trait. Inherits soft-delete/tenant-scoping/read-routing like `find_all`;
+errors are retryable (keyset cursor advances only on success — `Ok(None)`
+always means completion); `batch_size == 0` is an error; `batch_size` is not
+clamped to `MAX_PAGE_SIZE`; sharded repositories reject cross-shard
+`across_tenants()` iteration like `cursor_page`. See "Batched iteration" in
+`docs/guide/pagination.md`.
+
+## Db transactions
+
+- `Db::tx(f)` — READ COMMITTED, one attempt (published 0.5.0).
+- `Db::tx_with(opts: TxOptions, f) -> Result<T, AutumnError>`
+  (**unreleased**) — closure gets `&mut AsyncPgConnection`; auto-retries
+  SQLSTATE 40001 with capped exponential backoff.
+- `autumn_web::db::IsolationLevel` {`ReadCommitted` (default),
+  `RepeatableRead`, `Serializable`}; `TxOptions` builders
+  `::read_committed()` / `::repeatable_read()` / `::serializable()` +
+  `.read_only()` / `.deferrable()` / `.max_attempts(n)` /
+  `.initial_backoff(d)` / `.max_backoff(d)`; retrying constructors default
+  to 5 attempts.
+
+## Form helpers (`autumn_web::form`)
+
+Free functions rendering changeset-aware, accessible inputs:
+
+- Published 0.5.0: `form_tag`, `method_input`, `text_input`,
+  `text_input_htmx`; `Changeset`-bound methods (`form.form_tag(...)`,
+  `form.text_input(...)`).
+- **(unreleased)**: `checkbox_input`, `number_input`, `date_input`,
+  `datetime_input`, `select_input`.
+- **(unreleased — trunk-dev, not in published 0.5.0)**: `form_for(&changeset,
+  action, method) -> FormFor` whole-form builder. Renders the opening
+  `<form>` (audited CSRF injection + hidden `_method` override, as
+  `form_tag`), one pre-filled control with inline errors per
+  `FormModel::form_fields()` entry, and a submit button. `FormFor` builder
+  methods: `.csrf(token)`, `.csrf_field_name(name)` (default `"_csrf"`),
+  `.exclude(field)`, `.override_field(field, FieldControl)`,
+  `.override_label(field, label)` (repeat calls on one field: last wins),
+  `.append(markup)` (extra markup before the submit button),
+  `.submit_label(label)` (default `"Save"`), `.multipart()`, `.render()`.
+  `FormModel` (`fn form_fields() -> Vec<FormField>`) is implemented by
+  `#[model]` for the same user-editable columns as `NewX`; hand-written
+  impls build `FormField::new(name, label, control, required)` and use
+  `.with_value_name(serialized_key)` when the data type serde-renames the
+  field (the derive resolves `rename`/`rename_all` automatically —
+  `value_name` affects only value pre-fill; input `name`/`id`, error
+  lookup, and builder matching keep the Rust identifier).
+  `FieldControl` variants (`#[non_exhaustive]`): `Text`, `Textarea`,
+  `Password`, `Number { step: Option<String> }`, `Checkbox`, `Date`,
+  `DateTime`, `Select { options: Vec<(String, String)> }`, `File` (any
+  `File` field ⇒ `enctype="multipart/form-data"`).
+  Decode-side contracts handled by the `#[model]`-generated `NewX`:
+  non-nullable `bool` columns are `#[serde(default)]` (unchecked checkbox ⇒
+  `false`); datetime columns attach `deserialize_datetime_local_utc[_option]`
+  / `deserialize_datetime_local_local[_option]` /
+  `deserialize_naive_datetime_local[_option]` (offsetless `datetime-local`
+  values decode; RFC 3339 still accepted). `DateTime` columns with a zone
+  other than `Utc`/`Local` render as `Text` (RFC 3339 string), not a picker.
+
+## View widgets and UI (all unreleased — trunk-dev only)
+
+- `autumn_web::widgets`: `card(&body, &CardConfig)`,
+  `stat_card(label, value, link)`, `tabs(id, &[(id, label, markup)])`,
+  `modal(id, title, &body, &ModalConfig)`, `modal_trigger`,
+  `modal_close_button`, `confirm_action(...)`.
+- `autumn_web::links`: `link_to`, `link_to_with`, `button_to(label, href,
+  Method, csrf_token)`, `button_to_with(..., &ButtonToOptions)`.
+- `autumn_web::ui::pagination`: `pagination_nav(&Page, &PagerOptions)`,
+  `cursor_pagination_nav(&CursorPage, &PagerOptions)`, `PagerOptions::new(base)
+  .query(qs).hx_target(sel).hx_push_url()` (prelude re-exports).
+- `autumn_web::ui::{WIDGETS_CSS, WIDGETS_CSS_PATH}` widget stylesheet.
+
+## Cache read-through (unreleased)
+
+`autumn_web::cache::{get_or_compute, get_or_compute_with,
+GetOrComputeOptions, CacheFillError, jittered_ttl}` — single-flight fills,
+optional `.distributed_fill_lock(true)` / `.stale_while_revalidate(grace)`.
+
+## Jobs additions
+
+- Published 0.5.0 `#[job]` keys: `name`, `max_attempts`, `backoff_ms`,
+  `unique`, `unique_by`, `unique_window`, `unique_for_ms`, `concurrency`,
+  `concurrency_key`.
+- **(unreleased)**: `queue = "name"` + `[jobs] queues` strict-priority list or
+  `[jobs.queues]` weight table; tracked jobs (`job::enqueue_tracked`,
+  `enqueue_tracked_for`, `TrackedJobHandle`, optional third `JobContext`
+  handler arg, `GET /_autumn/jobs/{token}`, `jobs.tracking.*` config).
+
+## Auth additions
+
+- Published 0.5.0: `autumn generate auth` session management (`{user}_sessions`
+  table, `sessions()` / `revoke_session` / `revoke_other_sessions` /
+  `revoke_all_sessions`, `/account/sessions` page, `[auth.sessions]` config).
+- **(unreleased)**: scoped service tokens — `IssueTokenSpec`,
+  `issue_scoped_api_token`, `#[secured(scopes = [...])]`,
+  `PolicyContext::has_scope/has_any_scope/has_all_scopes`, `autumn token
+  issue --name/--scope/--expires-at | list | rotate`, admin `TokenAdminModel`.
 
 ## Prelude contents
 
@@ -141,6 +274,9 @@ and `docs/adr/0008-associations-and-eager-loading.md`.
 | `with_audit_sink(sink)` | Structured audit sink |
 | `policy::<R, P>(policy)`, `scope::<R, S>(scope)` | Repository authorization |
 | `plugin(plugin)`, `plugins(tuple)` | Plugin install |
+| `listeners(listeners![...])` | Event listeners (**unreleased**) |
+| `static_gate(layer)`, `has_static_gate::<L>()`, `get_static_gate_types()` | Static pre-render gating middleware (**unreleased**) |
+| `with_shard_router(router)` | Sharding router (**unreleased**) |
 | `run()` | Start server |
 
 ## Cargo features
