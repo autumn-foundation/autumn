@@ -51,7 +51,11 @@ fn read_workspace_manifest(root: &Path) -> toml::Value {
 }
 
 fn semver_triple(version: &str) -> (u64, u64, u64) {
-    let mut parts = version.splitn(3, '.').map(|part| {
+    // Ignore any pre-release/build-metadata suffix (e.g. `0.6.0-beta.1`).
+    let core = version
+        .split_once(['-', '+'])
+        .map_or(version, |(core, _)| core);
+    let mut parts = core.splitn(3, '.').map(|part| {
         part.parse::<u64>().unwrap_or_else(|err| {
             panic!("version component `{part}` of `{version}` should be numeric: {err}")
         })
