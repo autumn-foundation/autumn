@@ -409,17 +409,71 @@ struct ShellAutumnWebDep {
     patch_entry: Option<String>,
 }
 
+/// Lexically compute `target` relative to `dir` — no filesystem access, so
+/// neither path needs to exist. `.`/`..` components are folded first;
+/// returns `None` when the paths cannot be lexically related (different
+/// roots/prefixes, or a `..` chain that escapes them).
+fn lexical_relative(target: &Path, dir: &Path) -> Option<std::path::PathBuf> {
+    use std::path::Component;
+    fn normalize(p: &Path) -> Option<Vec<Component<'_>>> {
+        let mut out: Vec<Component<'_>> = Vec::new();
+        for component in p.components() {
+            match component {
+                Component::CurDir => {}
+                Component::ParentDir => match out.last() {
+                    Some(Component::Normal(_)) => {
+                        out.pop();
+                    }
+                    // `..` above the root (or of a bare relative path)
+                    // cannot be folded lexically.
+                    _ => return None,
+                },
+                other => out.push(other),
+            }
+        }
+        Some(out)
+    }
+    let target = normalize(target)?;
+    let dir = normalize(dir)?;
+    // Roots/prefixes must match for a relative walk to exist at all.
+    if target.first() != dir.first() {
+        return None;
+    }
+    let common = target
+        .iter()
+        .zip(dir.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let mut relative = std::path::PathBuf::new();
+    for _ in common..dir.len() {
+        relative.push("..");
+    }
+    for component in &target[common..] {
+        relative.push(component.as_os_str());
+    }
+    if relative.as_os_str().is_empty() {
+        relative.push(".");
+    }
+    Some(relative)
+}
+
 /// Render the `path = "…"` or `git = "…"[, rev/branch/tag = "…"]` source part
 /// of a dependency (or patch) table, adjusted so it stays valid when written
 /// into `src-tauri/Cargo.toml`:
 ///
-/// - absolute paths are kept as-is,
+/// - absolute paths the USER wrote are kept as-is,
 /// - paths relative to the app's own manifest gain a `../` prefix
 ///   (`src-tauri/` sits one level below the project root),
-/// - paths declared in an ancestor manifest (workspace root) are made
-///   absolute against that manifest's directory.
+/// - paths declared in an ancestor manifest (workspace root) are resolved
+///   against that manifest's directory and then re-relativized against the
+///   generated `src-tauri/` — `src-tauri/Cargo.toml` is a CHECKED-IN file,
+///   so baking the generating machine's absolute path into it would break
+///   every other checkout (teammates, CI); the absolute form is only a
+///   fallback when no lexical relative path exists.
 ///
-/// Returns `None` when the table names neither a path nor a git source.
+/// Emitted paths always use forward slashes (valid on Windows too, and the
+/// generator's convention). Returns `None` when the table names neither a
+/// path nor a git source.
 fn dep_source_from_table(
     table: &toml::value::Table,
     manifest_dir: &Path,
@@ -431,8 +485,10 @@ fn dep_source_from_table(
         } else if manifest_dir == project_root {
             format!("../{path}")
         } else {
-            manifest_dir
-                .join(path)
+            let target = manifest_dir.join(path);
+            let src_tauri = project_root.join("src-tauri");
+            lexical_relative(&target, &src_tauri)
+                .unwrap_or(target)
                 .display()
                 .to_string()
                 .replace('\\', "/")
@@ -2204,6 +2260,45 @@ mod tests {
     }
 
     #[test]
+    fn lexical_relative_handles_ancestors_dotdots_and_foreign_roots() {
+        use std::path::Path;
+        // Ancestor workspace root → up out of src-tauri/ and the app dir.
+        assert_eq!(
+            lexical_relative(
+                Path::new("/ws/vendor/autumn"),
+                Path::new("/ws/app/src-tauri")
+            ),
+            Some(std::path::PathBuf::from("../../vendor/autumn"))
+        );
+        // `..` chains in the declared path fold before diffing.
+        assert_eq!(
+            lexical_relative(
+                Path::new("/ws/vendor/../autumn/./core"),
+                Path::new("/ws/app/src-tauri")
+            ),
+            Some(std::path::PathBuf::from("../../autumn/core"))
+        );
+        // Identical directories resolve to `.`.
+        assert_eq!(
+            lexical_relative(Path::new("/ws/app"), Path::new("/ws/app")),
+            Some(std::path::PathBuf::from("."))
+        );
+        // Nested target below the base needs no `..` at all.
+        assert_eq!(
+            lexical_relative(
+                Path::new("/ws/app/src-tauri/gen"),
+                Path::new("/ws/app/src-tauri")
+            ),
+            Some(std::path::PathBuf::from("gen"))
+        );
+        // A `..` escaping the root cannot be folded lexically.
+        assert_eq!(
+            lexical_relative(Path::new("/../etc"), Path::new("/ws")),
+            None
+        );
+    }
+
+    #[test]
     fn offline_shell_dep_mirrors_path_source_relative_to_src_tauri() {
         let (dep, warnings) = shell_dep_for(
             "autumn-web = { path = \"../autumn\", version = \"0.9.1\" }",
@@ -2494,20 +2589,17 @@ mod tests {
         .unwrap();
         let mut plan = Plan::new(&app);
         let dep = shell_autumn_web_dep(&app, &mut plan);
-        let expected = tmp
-            .path()
-            .join("vendor/autumn")
-            .display()
-            .to_string()
-            .replace('\\', "/");
         let patch = dep
             .patch_entry
             .expect("the ancestor workspace's renamed patch must be mirrored");
         assert!(
-            patch.contains(&format!(
-                r#"aw_local = {{ package = "autumn-web", path = "{expected}" }}"#
-            )),
-            "got: {patch}"
+            patch
+                .contains(r#"aw_local = { package = "autumn-web", path = "../../vendor/autumn" }"#),
+            "the mirrored patch path must be relative to src-tauri/, got: {patch}"
+        );
+        assert!(
+            !patch.contains(&tmp.path().display().to_string()),
+            "no machine-specific absolute prefix may leak into the manifest"
         );
         assert!(plan.warnings.is_empty(), "got {:?}", plan.warnings);
     }
@@ -2531,16 +2623,16 @@ mod tests {
         .unwrap();
         let mut plan = Plan::new(&app);
         let dep = shell_autumn_web_dep(&app, &mut plan);
-        // Declared in the workspace root: made absolute against that root.
-        let expected = tmp
-            .path()
-            .join("vendor/autumn")
-            .display()
-            .to_string()
-            .replace('\\', "/");
+        // Declared in the workspace root: re-relativized against the
+        // generated src-tauri/ — src-tauri/Cargo.toml is checked in, so an
+        // absolute path would break every other checkout.
         assert_eq!(
             dep.dep_entry,
-            format!(r#"autumn-web = {{ path = "{expected}", features = ["offline-sync"] }}"#),
+            r#"autumn-web = { path = "../../vendor/autumn", features = ["offline-sync"] }"#,
+        );
+        assert!(
+            !dep.dep_entry.contains(&tmp.path().display().to_string()),
+            "no machine-specific absolute prefix may leak into the manifest"
         );
         assert!(plan.warnings.is_empty(), "got {:?}", plan.warnings);
     }

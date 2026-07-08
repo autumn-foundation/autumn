@@ -382,17 +382,27 @@ use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 
 /// Reject sync requests without the expected bearer token. Swap the token
-/// check for your app's real session/token validation.
+/// check for your app's real session/token validation — and prefer a
+/// constant-time comparison over `==` to avoid timing side channels (e.g.
+/// the `subtle` crate's `ConstantTimeEq`, which autumn itself uses for
+/// webhook signature checks).
 async fn require_sync_auth(
     request: axum::extract::Request,
     next: Next,
 ) -> Result<axum::response::Response, StatusCode> {
+    // Fail CLOSED when the server is misconfigured: with an unset/empty
+    // SYNC_TOKEN the expected value would be "" and a bare
+    // `Authorization: Bearer ` header would authenticate.
+    let expected = std::env::var("SYNC_TOKEN").unwrap_or_default();
+    if expected.is_empty() {
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
     let authorized = request
         .headers()
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
-        .is_some_and(|token| token == std::env::var("SYNC_TOKEN").as_deref().unwrap_or(""));
+        .is_some_and(|token| token == expected);
     if authorized {
         Ok(next.run(request).await)
     } else {
