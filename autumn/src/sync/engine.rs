@@ -29,6 +29,12 @@ pub struct SyncConfig {
     pub min_backoff: Duration,
     /// Backoff ceiling for the background loop.
     pub max_backoff: Duration,
+    /// Optional bearer token sent as `Authorization: Bearer <token>` on
+    /// every push/pull request. Pair it with authentication middleware on
+    /// the server's `/sync` mount — the endpoints must never ship open
+    /// (see the offline-sync guide). For anything richer than a bearer
+    /// token, front the deployment with an authenticating proxy.
+    pub bearer_token: Option<String>,
 }
 
 impl SyncConfig {
@@ -42,6 +48,7 @@ impl SyncConfig {
             request_timeout: Duration::from_secs(30),
             min_backoff: Duration::from_secs(1),
             max_backoff: Duration::from_secs(300),
+            bearer_token: None,
         }
     }
 }
@@ -168,8 +175,10 @@ impl SyncEngine {
                 changes,
             };
             let response = self
-                .client
-                .post(format!("{}/push", self.config.remote_base_url))
+                .authorized(
+                    self.client
+                        .post(format!("{}/push", self.config.remote_base_url)),
+                )
                 .json(&request)
                 .send()
                 .await
@@ -212,11 +221,10 @@ impl SyncEngine {
         loop {
             let cursor = self.store.cursor()?;
             let response = self
-                .client
-                .get(format!(
+                .authorized(self.client.get(format!(
                     "{}/pull?cursor={cursor}&limit={limit}&session={session_start}",
                     self.config.remote_base_url
-                ))
+                )))
                 .send()
                 .await
                 .map_err(transport_err)?;
@@ -250,6 +258,14 @@ impl SyncEngine {
                     self.store.set_cursor(next_cursor)?;
                 }
             }
+        }
+    }
+
+    /// Attach the configured bearer token (if any) to an outgoing request.
+    fn authorized(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.config.bearer_token {
+            Some(token) => request.bearer_auth(token),
+            None => request,
         }
     }
 

@@ -74,6 +74,11 @@ jobs:
           cargo test -p autumn-cli --test flags -- --ignored
           cargo test -p autumn-cli --test config -- --ignored
           cargo test -p autumn-cli --test experiments -- --ignored
+          # offline-sync is not a default feature, so the workspace test run
+          # above compiles these out; run them (plus the Docker-gated PG
+          # conformance suite) here.
+          cargo test -p autumn-web --features offline-sync --test integration_tests offline_sync
+          cargo test -p autumn-web --features offline-sync --test integration_tests -- --ignored offline_sync_pg
 
   coverage:
     name: Coverage

@@ -145,15 +145,22 @@ fn offline_sync_app_lib_mounts_sync_router_behind_db_guard() {
 
     // The sync endpoints are mounted feature-gated and only when a database
     // is actually configured: the remote (server) deployment serves /sync,
-    // while the same code running in-process on a device (no
-    // AUTUMN_DATABASE__URL) starts fine fully offline as a sync CLIENT.
+    // while the same code running in-process on a device (no database in
+    // its resolved config) starts fine fully offline as a sync CLIENT.
     assert!(lib_rs.contains(r#"#[cfg(feature = "offline-sync")]"#));
     assert!(
         lib_rs.contains("let app = mount_offline_sync(app).await;"),
         "serve() must route through the sync mounting helper"
     );
-    assert!(lib_rs.contains(r#"let Ok(database_url) = std::env::var("AUTUMN_DATABASE__URL")"#));
+    // The guard resolves the database through the app's layered config
+    // (files + profiles + env), not one raw env var.
+    assert!(lib_rs.contains("autumn_web::config::AutumnConfig::load()"));
+    assert!(lib_rs.contains("config.database.effective_primary_url()"));
     assert!(lib_rs.contains("PgSyncBackend::new(database_url)"));
+    assert!(
+        lib_rs.contains("REQUIRED before shipping"),
+        "the generated helper must present /sync authentication as a requirement"
+    );
     assert!(
         lib_rs.contains("ensure_schema()"),
         "the sync shadow-table DDL must run at startup"
@@ -248,11 +255,31 @@ fn default_output_has_no_sync_wiring() {
         !shell.contains("offline-sync") && !shell.contains("offline_sync"),
         "no offline-sync references may be emitted without the flag"
     );
+    for marker in [
+        "SyncStore",
+        "SyncEngine",
+        "spawn_background",
+        "sync_once",
+        "SYNC_KICK",
+        "RunEvent::Resumed",
+    ] {
+        assert!(
+            !shell.contains(marker),
+            "no `{marker}` may be emitted without the flag"
+        );
+    }
+    assert!(
+        shell.contains(".run(tauri::generate_context!())"),
+        "the default shell must keep the simple run(context) tail, not the \
+         offline shell's build().run(callback) shape"
+    );
     let app_lib = read(&project.join("src/lib.rs"));
     assert!(
         !app_lib.contains("mount_offline_sync") && !app_lib.contains("offline-sync"),
         "the extracted app lib must not gain sync mounting without the flag"
     );
+    // Byte-level identity of the default shell lib.rs is pinned by the
+    // golden-snapshot unit test in generate/tauri_mobile.rs.
 }
 
 #[test]

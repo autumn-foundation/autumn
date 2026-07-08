@@ -641,6 +641,67 @@ async fn server_bounds_push_batch_size_and_pull_limit() {
     assert!(matches!(pull, PullResponse::Ok { .. }));
 }
 
+/// The documented auth wiring works end-to-end: an auth middleware layer
+/// on the sync router rejects unauthenticated engines, and
+/// `SyncConfig::bearer_token` gets an engine through it.
+#[tokio::test]
+async fn bearer_token_authenticates_against_a_guarded_router() {
+    use axum::middleware::Next;
+
+    async fn require_sync_auth(
+        request: axum::extract::Request,
+        next: Next,
+    ) -> Result<axum::response::Response, axum::http::StatusCode> {
+        let authorized = request
+            .headers()
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .is_some_and(|token| token == "sync-secret");
+        if authorized {
+            Ok(next.run(request).await)
+        } else {
+            Err(axum::http::StatusCode::UNAUTHORIZED)
+        }
+    }
+
+    let backend: Arc<dyn SyncBackend> = Arc::new(MemorySyncBackend::new());
+    let guarded: axum::Router = axum::Router::new().nest(
+        "/sync",
+        server::router(backend, Arc::new(LwwResolver))
+            .layer(axum::middleware::from_fn(require_sync_auth)),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback");
+    let addr = listener.local_addr().expect("local addr");
+    let _srv = tokio::spawn(async move {
+        axum::serve(listener, guarded).await.expect("serve");
+    });
+    let url = format!("http://{addr}/sync");
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = open_store(&dir, "a.db");
+    store.put("notes", "n1", &note("private")).expect("put");
+
+    // Without a token the engine is rejected (and loses no local state).
+    let unauthenticated = engine_for(&store, &url);
+    let err = unauthenticated.sync_once().await.expect_err("401 expected");
+    assert!(
+        matches!(&err, SyncError::Server(msg) if msg.contains("401")),
+        "expected a 401 server error, got {err:?}"
+    );
+    assert_eq!(store.pending_count().expect("pending"), 1);
+
+    // With the token the same engine wiring syncs.
+    let mut config = SyncConfig::new(&url);
+    config.bearer_token = Some("sync-secret".to_owned());
+    let authenticated = SyncEngine::new(store.clone(), config);
+    let report = authenticated.sync_once().await.expect("authorized sync");
+    assert_eq!(report.pushed, 1);
+    assert_eq!(store.pending_count().expect("pending"), 0);
+}
+
 /// `spawn_background` behavior: while the backend errors, passes back off
 /// and keep retrying; once it heals, the loop converges the store without
 /// intervention. Bounds are generous — no wall-clock exactness.

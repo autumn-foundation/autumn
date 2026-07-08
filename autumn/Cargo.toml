@@ -258,7 +258,7 @@ features = [
   "maud", "htmx", "tailwind", "db", "cache-moka",
   "ws", "flash", "multipart", "http-client", "oauth2", "openapi", "mcp",
   "redis", "i18n", "storage", "variants", "mail", "seed", "system-info", "markdown",
-  "reporting", "csv", "embed-assets",
+  "reporting", "csv", "embed-assets", "offline-sync",
 ]
 rustdoc-args = ["--cfg", "docsrs"]
 

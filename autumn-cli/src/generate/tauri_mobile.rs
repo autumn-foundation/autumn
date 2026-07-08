@@ -28,9 +28,10 @@
 //! endpoints (`AUTUMN_SYNC__REMOTE_URL`; plus an immediate pass on
 //! `RunEvent::Resumed`), and the app crate gains a default `offline-sync`
 //! feature and a `/sync` router mounted in the extracted `serve()` — only
-//! when `AUTUMN_DATABASE__URL` is configured, so the same binary boots
-//! fully offline on a device and serves sync on the server. Without the
-//! flag the emitted scaffold is byte-identical to the plain #1507 output.
+//! when the app's resolved config has a database URL (e.g.
+//! `AUTUMN_DATABASE__URL`), so the same binary boots fully offline on a
+//! device and serves sync on the server. Without the flag the emitted
+//! scaffold is byte-identical to the plain #1507 output.
 //! See `docs/guide/tauri-mobile-offline-sync.md`.
 //!
 //! # Generated files
@@ -372,7 +373,7 @@ const RUN_CALL_ANCHOR: &str = "    app\n        .run()\n        .await;";
 /// The `--offline-sync` call inserted into `serve()` before
 /// [`RUN_CALL_ANCHOR`].
 const SYNC_MOUNT_CALL: &str = r#"    // Offline sync (issue #1508): mount the /sync endpoints when a database
-    // is configured; on a device (no AUTUMN_DATABASE__URL) this is a no-op —
+    // is configured; on a device (no database configured) this is a no-op —
     // the app boots fully offline as a sync CLIENT (see src-tauri/src/lib.rs).
     #[cfg(feature = "offline-sync")]
     let app = mount_offline_sync(app).await;
@@ -385,12 +386,15 @@ const SYNC_MOUNT_HELPER: &str = r#"
 /// Mount the offline-sync server endpoints (`POST /sync/push`, `GET /sync/pull`).
 ///
 /// Added by `autumn generate tauri-mobile --offline-sync`. The endpoints are
-/// mounted only when `AUTUMN_DATABASE__URL` is set: the REMOTE deployment of
-/// this app (the one with Postgres) serves `/sync` for every device, while
-/// the same code running in-process on a phone has no database and syncs as
-/// a client instead (see `src-tauri/src/lib.rs`). Before shipping, mount
-/// these endpoints behind authentication — they trust `device_id` as sent
-/// (see docs/guide/tauri-mobile-offline-sync.md).
+/// mounted only when the app's resolved configuration has a database URL:
+/// the REMOTE deployment of this app (the one with Postgres) serves `/sync`
+/// for every device, while the same code running in-process on a phone has
+/// no database and syncs as a client instead (see `src-tauri/src/lib.rs`).
+///
+/// REQUIRED before shipping: put these endpoints behind authentication and
+/// serve them over HTTPS only. They trust `device_id` as sent, and anyone
+/// who can reach them can read and write every synced row — see the
+/// middleware example in docs/guide/tauri-mobile-offline-sync.md.
 #[cfg(feature = "offline-sync")]
 async fn mount_offline_sync(app: autumn_web::app::AppBuilder) -> autumn_web::app::AppBuilder {
     use std::sync::Arc;
@@ -400,9 +404,23 @@ async fn mount_offline_sync(app: autumn_web::app::AppBuilder) -> autumn_web::app
 
     // Diagnostics below use stderr: this helper runs BEFORE AppBuilder::run()
     // installs the tracing subscriber, so tracing events here would be lost.
-    let Ok(database_url) = std::env::var("AUTUMN_DATABASE__URL") else {
+    //
+    // The database URL is resolved through the SAME layered configuration
+    // the app itself boots with (autumn.toml, profile files, and the
+    // AUTUMN_DATABASE__URL / AUTUMN_DATABASE__PRIMARY_URL env overrides) —
+    // not from one raw env var. Caveat: a custom loader installed via
+    // `with_config_loader` is NOT consulted here; deployments that must
+    // serve /sync need their database URL visible to AutumnConfig::load().
+    let database_url = match autumn_web::config::AutumnConfig::load() {
+        Ok(config) => config.database.effective_primary_url().map(str::to_owned),
+        Err(e) => {
+            eprintln!("offline-sync: config load failed ({e}); /sync not mounted");
+            return app;
+        }
+    };
+    let Some(database_url) = database_url else {
         eprintln!(
-            "offline-sync: AUTUMN_DATABASE__URL is not set — running as a \
+            "offline-sync: no database is configured — running as a \
              sync client only; the remote deployment serves /sync"
         );
         return app;
@@ -689,8 +707,10 @@ const SYNC_ENV_BLOCK: &str = r#"    // ── Offline sync (issue #1508) ──�
 /// path needs the sandbox data dir).
 const SYNC_SETUP_BLOCK: &str = r#"    // Offline sync: local-first app data lives in a SyncStore-backed SQLite
     // file inside the sandbox. AUTUMN_SYNC__DB_PATH is exported so the app's
-    // routes open the SAME store the background engine syncs (see
-    // start_background_sync below).
+    // routes reach the SAME file the background engine syncs (see
+    // start_background_sync below). In your routes, open the store ONCE
+    // (e.g. behind a OnceLock) and clone it per use — clones share one
+    // connection; repeated SyncStore::open calls pay setup every time.
     let sync_db = data_root.join("sync.db");
     std::env::set_var("AUTUMN_SYNC__DB_PATH", sync_db.to_string_lossy().as_ref());
 "#;
@@ -1509,6 +1529,29 @@ mod tests {
         assert!(lib.contains("docs/guide/tauri-mobile-offline-sync.md"));
         // Offline startup: the direct database URL stays a commented example.
         assert!(!lib.contains("\n    std::env::set_var(\"AUTUMN_DATABASE__URL\""));
+    }
+
+    /// The CHANGELOG promises the no-flag emission is byte-identical to the
+    /// pre-#1508 scaffold; `render_mobile_lib_rs` now assembles the file
+    /// from conditionals, so pin the default output byte-for-byte.
+    #[test]
+    fn default_lib_rs_matches_the_golden_snapshot() {
+        let generated = render_mobile_lib_rs("golden-app", false);
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/golden/tauri_mobile_default_lib.rs.golden"
+        );
+        if std::env::var("UPDATE_GOLDEN").is_ok() {
+            std::fs::write(path, &generated).expect("write golden");
+        }
+        let golden = std::fs::read_to_string(path).expect("golden snapshot file");
+        assert_eq!(
+            generated, golden,
+            "the DEFAULT (no --offline-sync) shell lib.rs emission changed. If \
+             this is intentional, regenerate the snapshot with \
+             `UPDATE_GOLDEN=1 cargo test -p autumn-cli default_lib_rs_matches` \
+             and mention the template change in the commit"
+        );
     }
 
     #[test]

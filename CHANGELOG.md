@@ -390,9 +390,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Postgres shadow tables with idempotent DDL (`PgSyncBackend`) or an
   in-memory backend for tests. Conflicts are settled server-side by a
   pluggable `ConflictResolver` (default: last-write-wins on the conflicting
-  writes' `updated_at`, device-id tiebreak); resolved rows get a new version
-  so every device converges. Zero new dependencies — builds on the `db` and
-  `http-client` features already in the graph.
+  writes' `updated_at`; exact ties break to the lexicographically greater
+  device id); resolved rows get a new version so every device converges.
+  Postgres pushes serialize under an advisory lock (in-order version
+  visibility for pulls; concurrent first-inserts of one pk engage the
+  resolver), pull sessions carry a session-start cursor so multi-page
+  catch-ups survive tombstone GC, completed catch-ups land the cursor at
+  the GC horizon and prune GC'd local tombstones, `already_applied` acks
+  return the originally assigned version, push/pull request sizes are
+  bounded server-side, dedup records are GC-able via
+  `SyncBackend::gc_applied`, and `SyncConfig::bearer_token` authenticates
+  the engine against an auth-guarded `/sync` mount. Zero new
+  dependencies — builds on the `db` and `http-client` features already in
+  the graph.
 - **generator:** `autumn generate tauri-mobile --offline-sync` (issue #1508)
   wires the offline-sync engine into the mobile scaffold: the shell opens a
   `SyncStore`-backed SQLite database in the app sandbox (exported as
@@ -401,10 +411,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   offline, plus an immediate pass on `RunEvent::Resumed` when the app
   returns to the foreground), and the app crate gains a default
   `offline-sync` feature and a `/sync` router mounted in the extracted
-  `serve()` — only when `AUTUMN_DATABASE__URL` is configured, and with
-  log-and-continue schema DDL, so the same binary boots fully offline on a
-  device (no database at all) and serves sync on the server. Without the
-  flag the emitted scaffold is byte-identical to before. Docs:
+  `serve()` — only when the app's resolved config has a database URL (e.g.
+  `AUTUMN_DATABASE__URL`), and with log-and-continue schema DDL, so the
+  same binary boots fully offline on a device (no database at all) and
+  serves sync on the server. Without the flag the emitted scaffold is
+  byte-identical to before (pinned by a golden snapshot test). Docs:
   architecture, change tracking, tombstoning/GC, conflict resolution, and
   an airplane-mode walkthrough in
   [docs/guide/tauri-mobile-offline-sync.md](docs/guide/tauri-mobile-offline-sync.md).
