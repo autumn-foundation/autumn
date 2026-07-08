@@ -7,4 +7,5 @@ mod repo_hygiene;
 mod scaffold_form_for;
 #[cfg(unix)]
 mod serve;
+mod tauri_mobile_thin_client;
 mod webhook_sim;

@@ -78,23 +78,8 @@ pub fn plan_tauri(project_root: &Path) -> Result<Plan, GenerateError> {
         render_shell_lib_rs(&package_name, &bin_name),
     );
 
-    // Icons — reuse the PWA icon when the user already ran `autumn generate pwa`
-    let icons_dir = tauri.join("icons");
-    let pwa_icon_src = project_root.join("static").join("icons").join("icon.svg");
-    if pwa_icon_src.is_file() {
-        let contents = std::fs::read_to_string(&pwa_icon_src).map_err(GenerateError::Io)?;
-        plan.create_if_absent(icons_dir.join("icon.svg"), contents);
-    } else {
-        plan.create_if_absent(icons_dir.join("icon.svg"), render_placeholder_icon_svg());
-    }
-    // Placeholder raster icons so `cargo tauri build` works immediately.
-    // Replace with proper icons by running: cargo tauri icon static/icons/icon.svg
-    plan.create_bytes(icons_dir.join("32x32.png"), PLACEHOLDER_PNG);
-    plan.create_bytes(icons_dir.join("128x128.png"), PLACEHOLDER_PNG);
-    plan.create_bytes(icons_dir.join("128x128@2x.png"), PLACEHOLDER_PNG);
-    plan.create_bytes(icons_dir.join("icon.png"), PLACEHOLDER_PNG);
-    plan.create_bytes(icons_dir.join("icon.ico"), PLACEHOLDER_ICO);
-    plan.create_bytes(icons_dir.join("icon.icns"), PLACEHOLDER_ICNS);
+    // Icons — shared with the thin-client plan.
+    plan_icons(&mut plan, project_root, &tauri)?;
 
     // Platform-specific Tauri config overlays — Tauri CLI merges them at build/dev time.
     // beforeBuildCommand and beforeDevCommand live here so tauri.conf.json is
@@ -124,6 +109,116 @@ pub fn plan_tauri(project_root: &Path) -> Result<Plan, GenerateError> {
     plan.create(tauri.join(".gitignore"), render_gitignore());
 
     Ok(plan)
+}
+
+/// Register the icon actions shared by the desktop and thin-client plans:
+/// reuse the PWA icon when the user already ran `autumn generate pwa`, then
+/// add placeholder raster icons so `cargo tauri build` works immediately.
+/// Replace them with proper icons by running: `cargo tauri icon static/icons/icon.svg`
+fn plan_icons(plan: &mut Plan, project_root: &Path, tauri: &Path) -> Result<(), GenerateError> {
+    let icons_dir = tauri.join("icons");
+    let pwa_icon_src = project_root.join("static").join("icons").join("icon.svg");
+    if pwa_icon_src.is_file() {
+        let contents = std::fs::read_to_string(&pwa_icon_src).map_err(GenerateError::Io)?;
+        plan.create_if_absent(icons_dir.join("icon.svg"), contents);
+    } else {
+        plan.create_if_absent(icons_dir.join("icon.svg"), render_placeholder_icon_svg());
+    }
+    plan.create_bytes(icons_dir.join("32x32.png"), PLACEHOLDER_PNG);
+    plan.create_bytes(icons_dir.join("128x128.png"), PLACEHOLDER_PNG);
+    plan.create_bytes(icons_dir.join("128x128@2x.png"), PLACEHOLDER_PNG);
+    plan.create_bytes(icons_dir.join("icon.png"), PLACEHOLDER_PNG);
+    plan.create_bytes(icons_dir.join("icon.ico"), PLACEHOLDER_ICO);
+    plan.create_bytes(icons_dir.join("icon.icns"), PLACEHOLDER_ICNS);
+    Ok(())
+}
+
+// ── Mixed-mode guard (issue #1506) ────────────────────────────────────────────
+
+/// Files only the mobile thin-client scaffold (`--remote-url`) emits, relative
+/// to `src-tauri/` — checked before scaffolding the desktop mode.
+///
+/// The capability files are the actively harmful leftovers: Tauri loads
+/// *every* file under `src-tauri/capabilities/`, and the desktop shell crate
+/// compiles none of the notification/store/biometric plugins those grants
+/// name, so `tauri-build` fails permission validation. `Info.ios.plist` is
+/// merely dead on desktop but is equally unambiguous evidence of a
+/// thin-client scaffold.
+const THIN_CLIENT_MARKERS: [&str; 3] = [
+    "capabilities/remote-app.json",
+    "capabilities/remote-app-mobile.json",
+    "Info.ios.plist",
+];
+
+/// Files only the desktop (sidecar) scaffold emits, relative to `src-tauri/`
+/// — checked before scaffolding the thin-client mode.
+///
+/// The per-OS overlay confs are the actively harmful leftovers: Tauri CLI
+/// merges `tauri.<platform>.conf.json` on top of `tauri.conf.json`
+/// automatically, so a stale overlay keeps running the sidecar staging script
+/// as `beforeBuildCommand`/`beforeDevCommand` on every `cargo tauri
+/// build`/`dev` of the thin client.
+const DESKTOP_MARKERS: [&str; 5] = [
+    "stage-sidecar.sh",
+    "stage-sidecar.ps1",
+    "tauri.linux.conf.json",
+    "tauri.macos.conf.json",
+    "tauri.windows.conf.json",
+];
+
+/// Refuse to scaffold one Tauri mode on top of the other's files.
+///
+/// `autumn generate tauri` (desktop sidecar) and `autumn generate tauri
+/// --remote-url` (mobile thin client) both write to `src-tauri/`, but their
+/// file sets only partially overlap — `--force` would overwrite the shared
+/// files and leave the other mode's leftovers behind, some of which actively
+/// break the new mode's build (see [`THIN_CLIENT_MARKERS`] /
+/// [`DESKTOP_MARKERS`]). `--force` means "overwrite within the same mode",
+/// never "silently mix modes", so this check runs regardless of `--force`.
+///
+/// Called only for `autumn generate` — never for `autumn destroy`, which is
+/// the documented remedy and must keep working on a mixed tree.
+///
+/// # Errors
+/// Returns [`GenerateError::Config`] naming the conflicting marker file and
+/// the matching `autumn destroy tauri [--remote-url <URL>]` command to run
+/// first.
+pub fn ensure_no_opposite_mode_scaffold(
+    project_root: &Path,
+    thin_client: bool,
+) -> Result<(), GenerateError> {
+    let tauri = project_root.join("src-tauri");
+    let first_existing = |markers: &[&str]| -> Option<String> {
+        markers
+            .iter()
+            .find(|m| tauri.join(m).is_file())
+            .map(|m| format!("src-tauri/{m}"))
+    };
+    if thin_client {
+        if let Some(marker) = first_existing(&DESKTOP_MARKERS) {
+            return Err(GenerateError::Config(format!(
+                "src-tauri/ already contains a desktop (sidecar) Tauri scaffold \
+                 ({marker} exists); refusing to scaffold the mobile thin client on \
+                 top of it — stale per-OS tauri.*.conf.json overlays would keep \
+                 running the sidecar staging scripts on every `cargo tauri build`. \
+                 Run `autumn destroy tauri` first, then re-run `autumn generate \
+                 tauri --remote-url <URL>`. --force only overwrites files within \
+                 the same mode; it never mixes modes."
+            )));
+        }
+    } else if let Some(marker) = first_existing(&THIN_CLIENT_MARKERS) {
+        return Err(GenerateError::Config(format!(
+            "src-tauri/ already contains a mobile thin-client Tauri scaffold \
+             ({marker} exists); refusing to scaffold the desktop mode on top of \
+             it — Tauri loads every capability file under src-tauri/capabilities/, \
+             so the stale thin-client grants would fail validation against the \
+             desktop shell crate. Run `autumn destroy tauri --remote-url <URL>` \
+             (the URL the thin client was generated with) first, then re-run \
+             `autumn generate tauri`. --force only overwrites files within the \
+             same mode; it never mixes modes."
+        )));
+    }
+    Ok(())
 }
 
 // ── Package metadata helper ───────────────────────────────────────────────────
@@ -384,9 +479,19 @@ fn resolve_bin_name(
     )))
 }
 
-fn read_package_meta(
+/// Parse `Cargo.toml` and return `(package_name, version, parsed_doc)` — the
+/// subset of package metadata that does **not** require a resolvable binary
+/// target. The thin-client planner uses this directly: it never builds or
+/// spawns a sidecar, so a library-only package or a multi-`[[bin]]` package
+/// without `default-run` is a perfectly fine thin-client host and must not
+/// be blocked by sidecar-target validation (issue #1506 review).
+///
+/// `version` resolves workspace inheritance: if `[package] version.workspace
+/// = true` the function walks up the directory tree to find
+/// `[workspace.package] version` in an ancestor `Cargo.toml`.
+fn read_package_name_version(
     project_root: &Path,
-) -> Result<(String, String, String, bool, String), GenerateError> {
+) -> Result<(String, String, toml::Value), GenerateError> {
     let cargo_path = project_root.join("Cargo.toml");
     let content = std::fs::read_to_string(&cargo_path).map_err(GenerateError::Io)?;
     let doc: toml::Value = toml::from_str(&content)
@@ -410,6 +515,17 @@ fn read_package_meta(
         }
         _ => "0.1.0".to_owned(),
     };
+
+    Ok((name, version, doc))
+}
+
+fn read_package_meta(
+    project_root: &Path,
+) -> Result<(String, String, String, bool, String), GenerateError> {
+    let (name, version, doc) = read_package_name_version(project_root)?;
+    let pkg = doc
+        .get("package")
+        .ok_or_else(|| GenerateError::Config("Cargo.toml missing [package].name".to_owned()))?;
 
     let default_run = pkg
         .get("default-run")
@@ -464,13 +580,16 @@ fn resolve_workspace_version(project_root: &Path) -> Option<String> {
 
 // ── Content renderers ─────────────────────────────────────────────────────────
 
-fn render_tauri_conf(package_name: &str, version: &str, bin_name: &str) -> String {
-    // Bundle identifier: reverse-DNS with underscores replaced by hyphens.
-    // Apple's spec allows only alphanumerics, hyphens, and periods — underscores are invalid.
-    let identifier = format!("com.example.{}", package_name.replace('_', "-"));
-    // Display title: capitalise first letter of each word; split on both '-' and '_'
-    // so kebab-case (`my-app` → `My App`) and snake_case (`my_app` → `My App`) both work.
-    let title: String = package_name
+/// Bundle identifier: reverse-DNS with underscores replaced by hyphens.
+/// Apple's spec allows only alphanumerics, hyphens, and periods — underscores are invalid.
+fn derive_identifier(package_name: &str) -> String {
+    format!("com.example.{}", package_name.replace('_', "-"))
+}
+
+/// Display title: capitalise first letter of each word; split on both '-' and '_'
+/// so kebab-case (`my-app` → `My App`) and `snake_case` (`my_app` → `My App`) both work.
+fn derive_title(package_name: &str) -> String {
+    package_name
         .split(['-', '_'])
         .map(|word| {
             let mut chars = word.chars();
@@ -479,7 +598,12 @@ fn render_tauri_conf(package_name: &str, version: &str, bin_name: &str) -> Strin
             })
         })
         .collect::<Vec<_>>()
-        .join(" ");
+        .join(" ")
+}
+
+fn render_tauri_conf(package_name: &str, version: &str, bin_name: &str) -> String {
+    let identifier = derive_identifier(package_name);
+    let title = derive_title(package_name);
     // beforeBuildCommand and beforeDevCommand are declared in the platform-specific
     // overlay files (tauri.linux.conf.json, tauri.macos.conf.json,
     // tauri.windows.conf.json) that Tauri CLI merges at build/dev time.
@@ -1357,6 +1481,451 @@ Required prerequisites for `cargo tauri build`:\n\
         .to_owned()
 }
 
+// ── Thin-client (mobile) mode — issue #1506 ──────────────────────────────────
+
+/// Compute the file actions for `autumn generate tauri --remote-url <URL>` —
+/// the **mobile thin-client** mode: the webview loads a remote HTTPS Autumn
+/// server directly (no sidecar binary, no staging scripts, no local database),
+/// and capability files (`capabilities/remote-app.json` plus the
+/// mobile-platform-restricted `remote-app-mobile.json`) grant the remote
+/// origin access to the notification/biometric/store plugins.
+///
+/// # Errors
+/// Returns [`GenerateError::NotInProject`] when not at a project root, or
+/// [`GenerateError::Config`] when `remote_url` is not an acceptable HTTPS URL
+/// (plain `http` is allowed only for `localhost` / `127.0.0.1` / `::1` /
+/// `10.0.2.2` dev servers; URLs with embedded userinfo are rejected) or when
+/// `Cargo.toml` is missing `[package].name`.
+pub fn plan_tauri_thin_client(
+    project_root: &Path,
+    remote_url: &str,
+) -> Result<Plan, GenerateError> {
+    ensure_project_root(project_root)?;
+    let validated = validate_remote_url(remote_url)?;
+    // The capability grant is scoped to the URL's *origin* (scheme://host[:port],
+    // no path, no trailing slash) — the exact form Tauri matches remote pages
+    // against. The webview itself loads the full URL, so a path component
+    // (e.g. https://example.com/app) still lands on the right page.
+    let remote_origin = validated.origin().ascii_serialization();
+    // Everywhere the URL lands in generated source, embed the parser's
+    // normalized serialization — it percent-encodes quotes/braces/spaces and
+    // strips newlines, so it is always safe inside a Rust string literal or
+    // doc comment. The raw flag value is not.
+    let normalized_url = validated.as_str();
+
+    // Deliberately not read_package_meta: that helper also resolves the
+    // sidecar binary target, which a thin client neither builds nor spawns —
+    // requiring one would wrongly reject lib-only and multi-bin packages.
+    let (package_name, package_version, _doc) = read_package_name_version(project_root)?;
+    let mut plan = Plan::new(project_root);
+    let tauri = project_root.join("src-tauri");
+
+    // Core Tauri project files — no sidecar config, no staging scripts,
+    // no per-OS overlay confs: a thin client has nothing to build or stage.
+    plan.create(
+        tauri.join("tauri.conf.json"),
+        render_thin_client_tauri_conf(&package_name, &package_version),
+    );
+    plan.create(
+        tauri.join("Cargo.toml"),
+        render_thin_client_cargo_toml(&package_name),
+    );
+    plan.create(tauri.join("build.rs"), render_build_rs());
+    plan.create(
+        tauri.join("src").join("main.rs"),
+        render_thin_client_main_rs(&package_name),
+    );
+    plan.create(
+        tauri.join("src").join("lib.rs"),
+        render_thin_client_lib_rs(&package_name, normalized_url),
+    );
+
+    // Capability grants: pages served from the remote origin may invoke the
+    // permitted plugin commands. Auto-discovered by tauri-build from
+    // src-tauri/capabilities/. The biometric grant lives in a separate,
+    // platform-restricted capability because tauri-build validates every
+    // applicable capability's permissions against the plugins compiled for
+    // the current target — and tauri-plugin-biometric is target-gated to
+    // Android/iOS in the generated Cargo.toml, so an unrestricted
+    // `biometric:default` would break desktop smoke-test builds.
+    plan.create(
+        tauri.join("capabilities").join("remote-app.json"),
+        render_thin_client_capability(&remote_origin),
+    );
+    plan.create(
+        tauri.join("capabilities").join("remote-app-mobile.json"),
+        render_thin_client_capability_mobile(&remote_origin),
+    );
+
+    // iOS usage-description plist — the biometric plugin hard-requires
+    // NSFaceIDUsageDescription; without it the app crashes on first Face ID use.
+    plan.create(
+        tauri.join("Info.ios.plist"),
+        render_thin_client_ios_plist(&package_name),
+    );
+
+    // Icons — identical to the desktop path (shared helper): reuse the PWA
+    // icon when the user already ran `autumn generate pwa`, placeholder
+    // bytes otherwise.
+    plan_icons(&mut plan, project_root, &tauri)?;
+
+    // /gen covers the `cargo tauri android init` / `ios init` output.
+    plan.create(tauri.join(".gitignore"), render_gitignore());
+
+    Ok(plan)
+}
+
+/// Validate a `--remote-url` value: require `https`, allow `http` only for
+/// dev hosts (`localhost`, `127.0.0.1`, `::1`, and `10.0.2.2` — the Android
+/// emulator's alias for the host machine's loopback), and reject URLs
+/// carrying embedded userinfo (`https://user:pass@…`).
+fn validate_remote_url(raw: &str) -> Result<url::Url, GenerateError> {
+    let parsed = url::Url::parse(raw).map_err(|e| {
+        GenerateError::Config(format!(
+            "--remote-url must be an https:// URL (got '{raw}'): {e}"
+        ))
+    })?;
+    // Belt and braces: the serialization is interpolated into generated Rust
+    // source, so refuse anything the parser somehow leaves unsafe there. The
+    // WHATWG serialization percent-encodes quotes and strips control
+    // characters, so this should be unreachable — but a parser upgrade must
+    // never silently turn into generated-code injection.
+    if parsed
+        .as_str()
+        .chars()
+        .any(|c| c == '"' || c == '\\' || c.is_ascii_control())
+    {
+        return Err(GenerateError::Config(format!(
+            "--remote-url contains characters that cannot be embedded in generated \
+             code (got '{}')",
+            raw.escape_debug()
+        )));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(GenerateError::Config(format!(
+            "--remote-url must not embed userinfo (got '{raw}'): credentials do not \
+             belong in the webview URL — use the session/auth handoff patterns in \
+             docs/guide/tauri-mobile-thin-client.md instead"
+        )));
+    }
+    match parsed.scheme() {
+        "https" => Ok(parsed),
+        "http" => {
+            // Plain http is only acceptable against a local dev server —
+            // a shipped mobile app must talk TLS to its remote origin.
+            // `Url::host_str` always returns IPv6 hosts bracketed, so only
+            // the `[::1]` form can occur. `10.0.2.2` is how an Android
+            // emulator reaches the host machine's loopback.
+            let host = parsed.host_str().unwrap_or("");
+            if matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "10.0.2.2") {
+                Ok(parsed)
+            } else {
+                Err(GenerateError::Config(format!(
+                    "--remote-url must be an https:// URL (got '{raw}'): plain http is \
+                     allowed only for localhost / 127.0.0.1 / ::1 / 10.0.2.2 \
+                     (Android emulator) dev servers"
+                )))
+            }
+        }
+        other => Err(GenerateError::Config(format!(
+            "--remote-url must be an https:// URL (got '{raw}'): unsupported scheme '{other}'"
+        ))),
+    }
+}
+
+/// Library target name for the thin-client shell crate: `{package_name}_mobile`
+/// with hyphens underscored (Cargo library target names cannot contain hyphens).
+fn mobile_lib_name(package_name: &str) -> String {
+    package_name.replace('-', "_") + "_mobile"
+}
+
+/// Bundle identifier for the mobile thin client: reverse-DNS with `-` and `_`
+/// stripped from the package name (`demo-app` → `com.example.demoapp`).
+///
+/// Unlike the desktop derivation ([`derive_identifier`], which hyphenates for
+/// Apple), the mobile identifier must satisfy *both* stores: Android forbids
+/// hyphens in application ids — `cargo tauri android init` panics on them
+/// (tauri-apps/tauri#9707) — and Apple forbids underscores. Alphanumeric
+/// segments are valid on both. Users should replace the `com.example.*`
+/// placeholder with their real identifier before running `android`/`ios init`.
+fn derive_mobile_identifier(package_name: &str) -> String {
+    format!("com.example.{}", package_name.replace(['-', '_'], ""))
+}
+
+/// `tauri.conf.json` for the thin client: productName/version/identifier and
+/// bundle icons only — no `externalBin` (no sidecar binary) and no `resources`
+/// (config files live on the remote server, not in the app bundle).
+///
+/// `withGlobalTauri` is enabled because the pages come from a server-rendered
+/// Autumn app with no npm bundler: the injected `window.__TAURI__` global is
+/// how those remote pages call the granted plugins.
+///
+/// `csp` stays `null`: the webview renders remote pages, which carry the
+/// server's own Content-Security-Policy headers.
+fn render_thin_client_tauri_conf(package_name: &str, version: &str) -> String {
+    let identifier = derive_mobile_identifier(package_name);
+    let title = derive_title(package_name);
+    format!(
+        r#"{{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "{title}",
+  "version": "{version}",
+  "identifier": "{identifier}",
+  "bundle": {{
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.png",
+      "icons/icon.ico",
+      "icons/icon.icns"
+    ]
+  }},
+  "app": {{
+    "withGlobalTauri": true,
+    "security": {{
+      "csp": null
+    }}
+  }}
+}}
+"#
+    )
+}
+
+/// Standalone shell crate for the mobile thin client. `staticlib`/`cdylib`
+/// crate types are required by `cargo tauri android init` / `ios init` — the
+/// mobile projects link the Rust core as a library, not a binary.
+fn render_thin_client_cargo_toml(package_name: &str) -> String {
+    let mobile_name = format!("{package_name}-mobile");
+    let lib_name = mobile_lib_name(package_name);
+    format!(
+        r#"[package]
+name = "{mobile_name}"
+version = "0.0.1"
+edition = "2021"
+
+# Standalone workspace so this crate is independent from the autumn app workspace —
+# no change to the root Cargo.toml is needed.
+[workspace]
+
+# staticlib (iOS) and cdylib (Android) are required by `cargo tauri ios init` /
+# `cargo tauri android init`; rlib keeps the desktop smoke-test build working.
+[lib]
+name = "{lib_name}"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = {{ version = "2", features = [] }}
+
+[dependencies]
+tauri = {{ version = "2", features = [] }}
+tauri-plugin-notification = "2"
+tauri-plugin-store = "2"
+
+# The biometric plugin only exists on Android/iOS — target-gate it so the
+# thin-client shell still builds on desktop for local smoke-testing.
+[target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
+tauri-plugin-biometric = "2"
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true
+"#
+    )
+}
+
+fn render_thin_client_main_rs(package_name: &str) -> String {
+    let lib_name = mobile_lib_name(package_name);
+    format!(
+        "#![cfg_attr(not(debug_assertions), windows_subsystem = \"windows\")]\n\
+         \n\
+         fn main() {{\n\
+         \x20   {lib_name}::run();\n\
+         }}\n"
+    )
+}
+
+/// The thin-client `src/lib.rs`: register the native-capability plugins and
+/// open the webview directly on the remote HTTPS Autumn server. No sidecar,
+/// no port logic, no shutdown supervision — the server lives in the cloud.
+fn render_thin_client_lib_rs(package_name: &str, remote_url: &str) -> String {
+    let title = derive_title(package_name);
+    format!(
+        r#"//! Tauri mobile thin-client shell for {package_name}.
+//!
+//! The webview loads the remote Autumn server at {remote_url} directly —
+//! there is no local sidecar binary, no local database, and no staging step.
+//! Native device capabilities (notifications, biometric authentication,
+//! key-value storage) are exposed to the remote pages through the files in
+//! `capabilities/` (biometric is granted only on Android/iOS, where the
+//! plugin exists).
+//!
+//! Trust model: pages served from the remote origin can invoke every plugin
+//! command that capability permits — the origin is fully trusted. Keep the
+//! grant scoped to exactly one origin you control and never widen it to a
+//! wildcard.
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {{
+    tauri::Builder::default()
+        .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_store::Builder::new().build())
+        .setup(|app| {{
+            // The biometric plugin only exists on Android/iOS; its dependency
+            // is target-gated in Cargo.toml and its registration is gated here
+            // so this shell also builds on desktop for local smoke-testing
+            // (notifications and the store work there too).
+            #[cfg(mobile)]
+            app.handle().plugin(tauri_plugin_biometric::init())?;
+
+            tauri::WebviewWindowBuilder::new(
+                app,
+                "main",
+                tauri::WebviewUrl::External(
+                    "{remote_url}"
+                        .parse()
+                        .expect("remote URL was validated at generate time"),
+                ),
+            )
+            .title("{title}")
+            .build()?;
+            Ok(())
+        }})
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}}
+"#
+    )
+}
+
+/// `capabilities/remote-app.json` — grants pages served from exactly
+/// `remote_origin` access to the core APIs and the notification and store
+/// plugin commands. Never emit a wildcard here: any page the listed origins
+/// serve can invoke these device APIs.
+///
+/// `core:default` is kept (rather than a narrower core subset) because the
+/// injected `window.__TAURI__` API relies on the core event/window plumbing
+/// it permits; prune it only after verifying the trimmed set on a device.
+///
+/// The biometric grant is deliberately absent — it lives in the
+/// platform-restricted [`render_thin_client_capability_mobile`] file, because
+/// tauri-build rejects permissions of plugins not compiled for the current
+/// target and tauri-plugin-biometric only exists on Android/iOS.
+fn render_thin_client_capability(remote_origin: &str) -> String {
+    format!(
+        r#"{{
+  "identifier": "remote-autumn-app",
+  "description": "Allow pages served by the remote Autumn server to use the native device plugins (notifications, key-value storage).",
+  "windows": ["main"],
+  "remote": {{
+    "urls": ["{remote_origin}"]
+  }},
+  "permissions": [
+    "core:default",
+    "notification:default",
+    "store:default"
+  ]
+}}
+"#
+    )
+}
+
+/// `capabilities/remote-app-mobile.json` — the Android/iOS-only companion to
+/// [`render_thin_client_capability`]: grants the same single remote origin the
+/// biometric plugin commands. It is restricted via `platforms` because the
+/// capability schema has no per-permission platform scoping and tauri-build
+/// validates every applicable capability against the plugins compiled for the
+/// current target — tauri-plugin-biometric is target-gated to mobile in the
+/// generated Cargo.toml, so granting `biometric:default` in an unrestricted
+/// capability would fail desktop `cargo tauri dev`/`build` smoke tests.
+fn render_thin_client_capability_mobile(remote_origin: &str) -> String {
+    format!(
+        r#"{{
+  "identifier": "remote-autumn-app-mobile",
+  "description": "Allow pages served by the remote Autumn server to use biometric authentication (Android/iOS only — the plugin does not exist on desktop).",
+  "platforms": ["android", "iOS"],
+  "windows": ["main"],
+  "remote": {{
+    "urls": ["{remote_origin}"]
+  }},
+  "permissions": [
+    "biometric:default"
+  ]
+}}
+"#
+    )
+}
+
+/// Minimal iOS Info plist overlay declaring `NSFaceIDUsageDescription` —
+/// required by the biometric plugin before Face ID can be used; iOS kills
+/// the app on first Face ID prompt without it.
+fn render_thin_client_ios_plist(package_name: &str) -> String {
+    let title = derive_title(package_name);
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>NSFaceIDUsageDescription</key>
+  <string>{title} uses Face ID to unlock your account.</string>
+</dict>
+</plist>
+"#
+    )
+}
+
+/// Human-readable prerequisites message printed after a successful
+/// thin-client scaffold (`autumn generate tauri --remote-url <URL>`).
+pub fn render_thin_client_prerequisites(remote_url: &str) -> String {
+    // Echo the normalized serialization — the form actually embedded in the
+    // scaffold — rather than the raw flag value (which may differ in case or
+    // percent-encoding). The URL was already validated at plan time.
+    let remote_url =
+        url::Url::parse(remote_url).map_or_else(|_| remote_url.to_owned(), |u| u.to_string());
+    format!(
+        "\
+Next steps for the mobile thin client (webview → {remote_url}):\n\
+\n\
+  1. Tauri CLI:\n\
+       cargo install tauri-cli --version '^2'\n\
+\n\
+  2. Mobile Rust targets:\n\
+       Android: rustup target add aarch64-linux-android armv7-linux-androideabi \\\n\
+                  i686-linux-android x86_64-linux-android\n\
+       iOS:     rustup target add aarch64-apple-ios aarch64-apple-ios-sim\n\
+     (Android also needs the Android SDK/NDK; iOS needs Xcode on macOS.)\n\
+\n\
+  3. Set your real reverse-DNS bundle identifier in src-tauri/tauri.conf.json\n\
+     (the scaffold derives a com.example.* placeholder), then initialise the\n\
+     mobile projects (writes into src-tauri/gen/, which is .gitignore'd):\n\
+       cd src-tauri && cargo tauri android init\n\
+       cd src-tauri && cargo tauri ios init\n\
+\n\
+  4. Develop on a device or emulator:\n\
+       cd src-tauri && cargo tauri android dev\n\
+       cd src-tauri && cargo tauri ios dev\n\
+\n\
+  5. Serve your Autumn app at {remote_url} over HTTPS with a valid TLS\n\
+     certificate and `session.secure = true` (AUTUMN_SESSION__SECURE=true) in\n\
+     production. The capability files under src-tauri/capabilities/ grant\n\
+     exactly that origin access to the native device plugins (biometric is\n\
+     granted only on Android/iOS, where the plugin exists).\n\
+\n\
+  6. Replace the placeholder icons before shipping:\n\
+       cargo tauri icon static/icons/icon.svg   (from the app root)\n\
+\n\
+  7. App Store note — Guideline 4.2 (Minimum Functionality) rejects bare\n\
+     website wrappers. The scaffolded notification/biometric/store plugin\n\
+     integrations exist to make the app genuinely app-like; wire them into\n\
+     your pages before submitting. See docs/guide/tauri-mobile-thin-client.md.\n"
+    )
+}
+
 // ── Placeholder icon bytes ────────────────────────────────────────────────────
 // Minimal valid 1×1 RGBA PNG (autumn green #4F7942, opaque).
 // Replace with proper icons using: cargo tauri icon static/icons/icon.svg
@@ -1758,6 +2327,81 @@ mod tests {
         assert!(
             matches!(err, GenerateError::Config(_)),
             "expected Config error, got: {err:?}"
+        );
+    }
+
+    // ── Mixed-mode guard (issue #1506) ────────────────────────────────────────
+
+    /// Create an empty file at `src-tauri/<rel>` under `root`.
+    fn touch_tauri_file(root: &Path, rel: &str) {
+        let path = root.join("src-tauri").join(rel);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, "").unwrap();
+    }
+
+    #[test]
+    fn guard_rejects_desktop_generation_over_each_thin_client_marker() {
+        for marker in THIN_CLIENT_MARKERS {
+            let tmp = TempDir::new().unwrap();
+            touch_tauri_file(tmp.path(), marker);
+            let err = ensure_no_opposite_mode_scaffold(tmp.path(), false)
+                .expect_err("desktop generation over a thin-client marker must be rejected");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(marker),
+                "error must name the conflicting file '{marker}':\n{msg}"
+            );
+            assert!(
+                msg.contains("destroy tauri --remote-url"),
+                "error must point at the matching destroy command:\n{msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn guard_rejects_thin_client_generation_over_each_desktop_marker() {
+        for marker in DESKTOP_MARKERS {
+            let tmp = TempDir::new().unwrap();
+            touch_tauri_file(tmp.path(), marker);
+            let err = ensure_no_opposite_mode_scaffold(tmp.path(), true)
+                .expect_err("thin-client generation over a desktop marker must be rejected");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(marker),
+                "error must name the conflicting file '{marker}':\n{msg}"
+            );
+            assert!(
+                msg.contains("`autumn destroy tauri`"),
+                "error must point at the matching destroy command:\n{msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn guard_allows_clean_trees_and_same_mode_regeneration() {
+        // Clean tree (no src-tauri/ at all): both modes may scaffold.
+        let clean = TempDir::new().unwrap();
+        assert!(ensure_no_opposite_mode_scaffold(clean.path(), false).is_ok());
+        assert!(ensure_no_opposite_mode_scaffold(clean.path(), true).is_ok());
+
+        // A mode's own files are never a conflict — `--force` re-generation
+        // within the same mode must stay possible.
+        let desktop = TempDir::new().unwrap();
+        for marker in DESKTOP_MARKERS {
+            touch_tauri_file(desktop.path(), marker);
+        }
+        assert!(
+            ensure_no_opposite_mode_scaffold(desktop.path(), false).is_ok(),
+            "desktop regeneration over desktop files must be allowed"
+        );
+
+        let thin = TempDir::new().unwrap();
+        for marker in THIN_CLIENT_MARKERS {
+            touch_tauri_file(thin.path(), marker);
+        }
+        assert!(
+            ensure_no_opposite_mode_scaffold(thin.path(), true).is_ok(),
+            "thin-client regeneration over thin-client files must be allowed"
         );
     }
 
@@ -4367,5 +5011,526 @@ mod tests {
             version, None,
             "must return None when no ancestor has [workspace.package] version"
         );
+    }
+
+    // ── Thin-client (mobile) mode tests — issue #1506 ─────────────────────────
+
+    /// Fixture: a fresh project + its thin-client plan for the given remote URL.
+    fn thin_plan(url: &str) -> (TempDir, Plan) {
+        let tmp = project("my-app");
+        let plan = plan_tauri_thin_client(tmp.path(), url)
+            .expect("plan_tauri_thin_client must succeed for a valid https URL");
+        (tmp, plan)
+    }
+
+    /// The contents of the `Create` action whose path ends with `suffix`.
+    fn created_str<'a>(plan: &'a Plan, suffix: &str) -> &'a str {
+        plan.actions
+            .iter()
+            .find(|a| {
+                a.path()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+                    .ends_with(suffix)
+            })
+            .and_then(|a| {
+                if let crate::generate::emit::Action::Create { contents, .. } = a {
+                    Some(contents.as_str())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| panic!("expected a Create action for '{suffix}'"))
+    }
+
+    /// All planned action paths, relative to the project root, sorted.
+    fn planned_paths(plan: &Plan, root: &std::path::Path) -> Vec<String> {
+        let mut paths: Vec<String> = plan
+            .actions
+            .iter()
+            .map(|a| {
+                a.path()
+                    .strip_prefix(root)
+                    .expect("action paths are under the project root")
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        paths.sort();
+        paths
+    }
+
+    #[test]
+    fn thin_client_plan_creates_expected_file_set() {
+        let (tmp, plan) = thin_plan("https://app.example.com");
+        assert_eq!(
+            planned_paths(&plan, tmp.path()),
+            vec![
+                "src-tauri/.gitignore",
+                "src-tauri/Cargo.toml",
+                "src-tauri/Info.ios.plist",
+                "src-tauri/build.rs",
+                "src-tauri/capabilities/remote-app-mobile.json",
+                "src-tauri/capabilities/remote-app.json",
+                "src-tauri/icons/128x128.png",
+                "src-tauri/icons/128x128@2x.png",
+                "src-tauri/icons/32x32.png",
+                "src-tauri/icons/icon.icns",
+                "src-tauri/icons/icon.ico",
+                "src-tauri/icons/icon.png",
+                "src-tauri/icons/icon.svg",
+                "src-tauri/src/lib.rs",
+                "src-tauri/src/main.rs",
+                "src-tauri/tauri.conf.json",
+            ],
+            "thin-client plan must emit exactly the mobile file set — \
+             no staging scripts, no per-OS overlay confs"
+        );
+    }
+
+    #[test]
+    fn thin_client_capability_file_grants_remote_url() {
+        let (_tmp, plan) = thin_plan("https://app.example.com");
+        let cap = created_str(&plan, "capabilities/remote-app.json");
+        let parsed: serde_json::Value =
+            serde_json::from_str(cap).expect("capability file must be valid JSON");
+        assert_eq!(
+            parsed["remote"]["urls"],
+            serde_json::json!(["https://app.example.com"]),
+            "capability must grant exactly the given remote origin (no wildcard)"
+        );
+        assert_eq!(
+            parsed["windows"],
+            serde_json::json!(["main"]),
+            "capability must be scoped to the main window"
+        );
+    }
+
+    #[test]
+    fn thin_client_capability_file_grants_plugin_permissions() {
+        let (_tmp, plan) = thin_plan("https://app.example.com");
+        let cap = created_str(&plan, "capabilities/remote-app.json");
+        let parsed: serde_json::Value =
+            serde_json::from_str(cap).expect("capability file must be valid JSON");
+        assert_eq!(
+            parsed["permissions"],
+            serde_json::json!(["core:default", "notification:default", "store:default"]),
+            "base capability must grant exactly the plugins compiled on every \
+             target — biometric is mobile-only and lives in remote-app-mobile.json"
+        );
+        assert!(
+            parsed.get("platforms").is_none(),
+            "base capability must apply to all platforms (no 'platforms' key):\n{cap}"
+        );
+    }
+
+    #[test]
+    fn thin_client_mobile_capability_gates_biometric_to_mobile_platforms() {
+        // tauri-build validates every capability's permissions against the
+        // plugins compiled for the current target; tauri-plugin-biometric is
+        // target-gated to Android/iOS in the generated Cargo.toml, so a
+        // desktop build would fail on an unknown `biometric:default` unless
+        // the grant lives in a capability restricted to mobile platforms.
+        let (_tmp, plan) = thin_plan("https://app.example.com");
+        let cap = created_str(&plan, "capabilities/remote-app-mobile.json");
+        let parsed: serde_json::Value =
+            serde_json::from_str(cap).expect("mobile capability file must be valid JSON");
+        assert_eq!(
+            parsed["platforms"],
+            serde_json::json!(["android", "iOS"]),
+            "mobile capability must be restricted to the platforms that \
+             compile tauri-plugin-biometric"
+        );
+        assert_eq!(
+            parsed["permissions"],
+            serde_json::json!(["biometric:default"]),
+            "mobile capability must grant exactly the biometric permission"
+        );
+        assert_eq!(
+            parsed["remote"]["urls"],
+            serde_json::json!(["https://app.example.com"]),
+            "mobile capability must grant the same single remote origin"
+        );
+        assert_eq!(
+            parsed["windows"],
+            serde_json::json!(["main"]),
+            "mobile capability must be scoped to the main window"
+        );
+    }
+
+    #[test]
+    fn thin_client_conf_has_no_sidecar_config() {
+        let (_tmp, plan) = thin_plan("https://app.example.com");
+        let conf = created_str(&plan, "tauri.conf.json");
+        assert!(
+            !conf.contains("externalBin"),
+            "thin-client tauri.conf.json must not reference a sidecar externalBin:\n{conf}"
+        );
+        assert!(
+            !conf.contains("resources"),
+            "thin-client tauri.conf.json must not stage sidecar resources:\n{conf}"
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(conf).expect("tauri.conf.json must be valid JSON");
+        assert_eq!(parsed["productName"].as_str(), Some("My App"));
+        assert_eq!(parsed["version"].as_str(), Some("0.1.0"));
+        assert_eq!(
+            parsed["identifier"].as_str(),
+            Some("com.example.myapp"),
+            "mobile identifier must contain no hyphens (they break \
+             `cargo tauri android init` — tauri-apps/tauri#9707)"
+        );
+    }
+
+    #[test]
+    fn thin_client_identifier_strips_hyphens_and_underscores() {
+        // Hyphens in the bundle identifier make `cargo tauri android init`
+        // panic (tauri-apps/tauri#9707) and Apple forbids underscores — the
+        // mobile identifier must keep only alphanumeric segments.
+        for (package, expected) in [
+            ("demo-app", "com.example.demoapp"),
+            ("my_cool_app", "com.example.mycoolapp"),
+        ] {
+            let tmp = project(package);
+            let plan = plan_tauri_thin_client(tmp.path(), "https://app.example.com").unwrap();
+            let conf = created_str(&plan, "tauri.conf.json");
+            let parsed: serde_json::Value = serde_json::from_str(conf).unwrap();
+            assert_eq!(
+                parsed["identifier"].as_str(),
+                Some(expected),
+                "'{package}' must derive an identifier valid on both Android and iOS"
+            );
+        }
+    }
+
+    #[test]
+    fn thin_client_conf_enables_global_tauri() {
+        let (_tmp, plan) = thin_plan("https://app.example.com");
+        let conf = created_str(&plan, "tauri.conf.json");
+        let parsed: serde_json::Value = serde_json::from_str(conf).unwrap();
+        assert_eq!(
+            parsed["app"]["withGlobalTauri"],
+            serde_json::json!(true),
+            "remote server-rendered pages have no bundler — they call the \
+             plugins via the injected window.__TAURI__ global:\n{conf}"
+        );
+    }
+
+    #[test]
+    fn thin_client_lib_rs_points_webview_at_remote_url() {
+        let (_tmp, plan) = thin_plan("https://app.example.com");
+        let lib = created_str(&plan, "src/lib.rs");
+        assert!(
+            lib.contains("WebviewUrl::External"),
+            "thin-client lib.rs must open the webview on an external URL:\n{lib}"
+        );
+        assert!(
+            lib.contains("https://app.example.com"),
+            "thin-client lib.rs must embed the exact remote URL:\n{lib}"
+        );
+        for sidecar_marker in ["tauri_plugin_shell", "SidecarHandle", "AUTUMN_SERVER__PORT"] {
+            assert!(
+                !lib.contains(sidecar_marker),
+                "thin-client lib.rs must contain no sidecar machinery ('{sidecar_marker}')"
+            );
+        }
+    }
+
+    #[test]
+    fn thin_client_lib_rs_registers_plugins_and_mobile_entry() {
+        let (_tmp, plan) = thin_plan("https://app.example.com");
+        let lib = created_str(&plan, "src/lib.rs");
+        assert!(
+            lib.contains("tauri_plugin_notification::init()"),
+            "lib.rs must register the notification plugin:\n{lib}"
+        );
+        assert!(
+            lib.contains("tauri_plugin_store::Builder"),
+            "lib.rs must register the store plugin:\n{lib}"
+        );
+        assert!(
+            lib.contains("tauri_plugin_biometric"),
+            "lib.rs must register the biometric plugin:\n{lib}"
+        );
+        assert!(
+            lib.contains("#[cfg(mobile)]"),
+            "biometric registration must be #[cfg(mobile)]-gated (plugin is mobile-only):\n{lib}"
+        );
+        assert!(
+            lib.contains("#[cfg_attr(mobile, tauri::mobile_entry_point)]"),
+            "lib.rs must keep the mobile entry point attribute:\n{lib}"
+        );
+    }
+
+    #[test]
+    fn thin_client_cargo_toml_declares_mobile_plugins() {
+        let (_tmp, plan) = thin_plan("https://app.example.com");
+        let cargo = created_str(&plan, "src-tauri/Cargo.toml");
+        assert!(
+            cargo.contains("\"my-app-mobile\""),
+            "shell crate must be named '{{package}}-mobile', not '-desktop':\n{cargo}"
+        );
+        assert!(
+            cargo.contains("tauri-plugin-notification"),
+            "Cargo.toml must depend on tauri-plugin-notification:\n{cargo}"
+        );
+        assert!(
+            cargo.contains("tauri-plugin-store"),
+            "Cargo.toml must depend on tauri-plugin-store:\n{cargo}"
+        );
+        assert!(
+            cargo.contains(
+                "[target.'cfg(any(target_os = \"android\", target_os = \"ios\"))'.dependencies]"
+            ),
+            "biometric dependency must be target-gated to mobile:\n{cargo}"
+        );
+        assert!(
+            cargo.contains("tauri-plugin-biometric"),
+            "Cargo.toml must depend on tauri-plugin-biometric:\n{cargo}"
+        );
+        assert!(
+            !cargo.contains("tauri-plugin-shell"),
+            "thin client has no sidecar, so tauri-plugin-shell must be absent:\n{cargo}"
+        );
+    }
+
+    #[test]
+    fn thin_client_emits_ios_faceid_plist() {
+        let (_tmp, plan) = thin_plan("https://app.example.com");
+        let plist = created_str(&plan, "Info.ios.plist");
+        assert!(
+            plist.contains("NSFaceIDUsageDescription"),
+            "Info.ios.plist must declare NSFaceIDUsageDescription — the biometric \
+             plugin hard-requires it on iOS:\n{plist}"
+        );
+    }
+
+    #[test]
+    fn thin_client_rejects_plain_http_url() {
+        let tmp = project("my-app");
+        let err = plan_tauri_thin_client(tmp.path(), "http://app.example.com")
+            .expect_err("plain http remote URL must be rejected");
+        match err {
+            GenerateError::Config(msg) => assert!(
+                msg.contains("https"),
+                "error message must point at the https requirement: {msg}"
+            ),
+            other => panic!("expected GenerateError::Config, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn thin_client_allows_http_localhost_for_dev() {
+        let tmp = project("my-app");
+        // 10.0.2.2 is the Android emulator's alias for the host machine's
+        // loopback — the standard Android dev-loop target.
+        for url in [
+            "http://localhost:3000",
+            "http://127.0.0.1:8080",
+            "http://10.0.2.2:3000",
+        ] {
+            assert!(
+                plan_tauri_thin_client(tmp.path(), url).is_ok(),
+                "loopback http URL '{url}' must be accepted for dev"
+            );
+        }
+    }
+
+    #[test]
+    fn thin_client_rejects_unparseable_url_and_userinfo() {
+        let tmp = project("my-app");
+        for url in ["not a url", "https://user:pass@app.example.com"] {
+            let Err(err) = plan_tauri_thin_client(tmp.path(), url) else {
+                panic!("'{url}' must be rejected as a remote URL");
+            };
+            assert!(
+                matches!(err, GenerateError::Config(_)),
+                "expected GenerateError::Config for '{url}', got: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn thin_client_capability_scopes_grant_to_origin_not_full_url() {
+        // The capability grant must be the path-free origin, while the
+        // webview still loads the full URL including its path.
+        let (_tmp, plan) = thin_plan("https://app.example.com:8443/base/");
+        for capability_file in [
+            "capabilities/remote-app.json",
+            "capabilities/remote-app-mobile.json",
+        ] {
+            let cap = created_str(&plan, capability_file);
+            let parsed: serde_json::Value = serde_json::from_str(cap).unwrap();
+            assert_eq!(
+                parsed["remote"]["urls"],
+                serde_json::json!(["https://app.example.com:8443"]),
+                "{capability_file} must grant the origin only — no path, no trailing slash"
+            );
+        }
+        let lib = created_str(&plan, "src/lib.rs");
+        assert!(
+            lib.contains("https://app.example.com:8443/base/"),
+            "webview must load the full URL including its path:\n{lib}"
+        );
+    }
+
+    #[test]
+    fn thin_client_lib_rs_embeds_normalized_url_for_adversarial_inputs() {
+        // `url::Url::parse` accepts inputs whose *raw* form is unsafe inside
+        // a Rust string literal or `//!` doc comment (quotes, backslashes,
+        // raw newlines — the parser percent-encodes or strips them only in
+        // its own serialization). The generator must embed that normalized
+        // serialization, never the raw input — or reject the URL outright.
+        for raw in [
+            "https://app.example.com/pa\"th",
+            "https://app.example.com/x\\admin",
+            "https://app.example.com/a\nfn evil(){}//",
+            "https://app.example.com/{id}/x",
+            "HTTPS://App.Example.COM/Path",
+        ] {
+            let tmp = project("my-app");
+            let Ok(plan) = plan_tauri_thin_client(tmp.path(), raw) else {
+                continue; // clean rejection is equally acceptable
+            };
+            let lib = created_str(&plan, "src/lib.rs");
+            let normalized = url::Url::parse(raw)
+                .expect("an accepted URL must reparse")
+                .to_string();
+            assert!(
+                lib.contains(&normalized),
+                "lib.rs must embed the normalized serialization '{normalized}' \
+                 for raw input {raw:?}:\n{lib}"
+            );
+            if raw != normalized {
+                assert!(
+                    !lib.contains(raw),
+                    "lib.rs must not embed the raw input {raw:?}:\n{lib}"
+                );
+            }
+            assert!(
+                !lib.contains('\\'),
+                "generated lib.rs must contain no backslash (raw input {raw:?}):\n{lib}"
+            );
+            assert!(
+                !lib.contains("fn evil"),
+                "a raw newline in the URL must never break out of the doc \
+                 comment into top-level source:\n{lib}"
+            );
+        }
+    }
+
+    #[test]
+    fn thin_client_prerequisites_mention_mobile_init() {
+        let text = render_thin_client_prerequisites("https://app.example.com");
+        for anchor in [
+            "tauri android init",
+            "tauri ios init",
+            "https://app.example.com",
+            "4.2",
+        ] {
+            assert!(
+                text.contains(anchor),
+                "thin-client prerequisites must mention '{anchor}':\n{text}"
+            );
+        }
+        // The echoed URL must be the normalized form actually granted in the
+        // capability file, not the raw flag value.
+        let echoed = render_thin_client_prerequisites("HTTPS://App.Example.COM");
+        assert!(
+            echoed.contains("https://app.example.com/"),
+            "prerequisites must echo the normalized URL:\n{echoed}"
+        );
+    }
+
+    #[test]
+    fn desktop_plan_file_set_unchanged_by_thin_client_feature() {
+        // Regression pin (issue #1506): the no-flag desktop path must stay
+        // byte-identical in shape — exactly the pre-existing file list, and
+        // in particular no capabilities/ entry leaking in from thin-client mode.
+        let tmp = project("my-app");
+        let plan = plan_tauri(tmp.path()).unwrap();
+        assert_eq!(
+            planned_paths(&plan, tmp.path()),
+            vec![
+                "src-tauri/.gitignore",
+                "src-tauri/Cargo.toml",
+                "src-tauri/build.rs",
+                "src-tauri/icons/128x128.png",
+                "src-tauri/icons/128x128@2x.png",
+                "src-tauri/icons/32x32.png",
+                "src-tauri/icons/icon.icns",
+                "src-tauri/icons/icon.ico",
+                "src-tauri/icons/icon.png",
+                "src-tauri/icons/icon.svg",
+                "src-tauri/src/lib.rs",
+                "src-tauri/src/main.rs",
+                "src-tauri/stage-sidecar.ps1",
+                "src-tauri/stage-sidecar.sh",
+                "src-tauri/tauri.conf.json",
+                "src-tauri/tauri.linux.conf.json",
+                "src-tauri/tauri.macos.conf.json",
+                "src-tauri/tauri.windows.conf.json",
+            ],
+            "desktop `autumn generate tauri` (no --remote-url) must keep emitting \
+             exactly the sidecar file set — and never a capabilities/ file"
+        );
+    }
+
+    // ── Thin-client planning must not require a sidecar binary (#1506) ────────
+    //
+    // The thin client never builds or spawns a sidecar, so packages with no
+    // selectable binary target must still scaffold. The mirror-image desktop
+    // behaviour (plan_tauri *must* error on these layouts) is pinned above by
+    // `plan_errors_when_package_has_no_bin_target` and
+    // `plan_errors_on_multiple_explicit_bins_without_default_run`.
+
+    /// Fixture: a library-only package — no `src/main.rs`, no `[[bin]]`,
+    /// nothing under `src/bin/` — just `src/lib.rs`.
+    fn project_lib_only(pkg_name: &str) -> TempDir {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            format!(
+                "[package]\nname=\"{pkg_name}\"\nversion=\"0.3.0\"\nedition=\"2024\"\n\
+                 \n[dependencies]\nautumn-web = \"0.5.0\"\n"
+            ),
+        )
+        .unwrap();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(tmp.path().join("src/lib.rs"), "pub fn hello() {}\n").unwrap();
+        tmp
+    }
+
+    #[test]
+    fn thin_client_plan_succeeds_on_library_only_package() {
+        let tmp = project_lib_only("libonly-app");
+        let plan = plan_tauri_thin_client(tmp.path(), "https://app.example.com")
+            .expect("thin-client planning must not require a binary target");
+        // The package name and version must still flow into tauri.conf.json.
+        let conf: serde_json::Value =
+            serde_json::from_str(created_str(&plan, "src-tauri/tauri.conf.json")).unwrap();
+        assert_eq!(
+            conf["version"].as_str(),
+            Some("0.3.0"),
+            "package version must reach tauri.conf.json for a lib-only package"
+        );
+        assert_eq!(
+            conf["identifier"].as_str(),
+            Some("com.example.libonlyapp"),
+            "package name must reach tauri.conf.json for a lib-only package"
+        );
+    }
+
+    #[test]
+    fn thin_client_plan_succeeds_on_multi_bin_package_without_default_run() {
+        // Multiple explicit [[bin]] targets and no `default-run` is ambiguous
+        // for the *sidecar* — but a thin client has no sidecar, so planning
+        // must succeed without asking the user to pick one.
+        let tmp = project_with_multiple_bins_no_default("multibin-app", &["worker", "web"]);
+        let plan = plan_tauri_thin_client(tmp.path(), "https://app.example.com")
+            .expect("thin-client planning must not resolve a sidecar binary");
+        let conf: serde_json::Value =
+            serde_json::from_str(created_str(&plan, "src-tauri/tauri.conf.json")).unwrap();
+        assert_eq!(conf["identifier"].as_str(), Some("com.example.multibinapp"));
     }
 }

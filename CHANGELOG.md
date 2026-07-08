@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **generator:** `autumn generate tauri --remote-url <URL>` scaffolds a
+  **mobile thin-client** Tauri shell (issue #1506): the webview loads your
+  remote HTTPS Autumn server directly (https enforced; loopback and
+  Android-emulator hosts exempt for dev), capability files grant exactly
+  that origin access to the notification/biometric/store plugins
+  (`capabilities/remote-app.json`, plus `remote-app-mobile.json` restricting
+  the biometric grant to Android/iOS so desktop smoke-test builds still
+  pass), and `autumn destroy tauri --remote-url <URL>` reverts the
+  scaffold. Desktop `autumn generate tauri` output is unchanged. Generating
+  one Tauri mode over the other's files is rejected (even with `--force`,
+  which only overwrites within the same mode) with a pointer at the matching
+  `autumn destroy tauri [--remote-url <URL>]` to run first — mixing modes
+  would leave stale files that break the new scaffold's build. See
+  `docs/guide/tauri-mobile-thin-client.md`.
 - **views:** widget storybook (issue #1526) — a browsable gallery of every
   built-in maud widget plus a CI anti-rot harness. `autumn_web::stories`
   ships `Story`/`StoryRegistry`/`StoryGallery` (mirroring the mail-preview
