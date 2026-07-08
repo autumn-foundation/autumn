@@ -1616,7 +1616,25 @@ fn form_control_tokens(inner_ty: &syn::Type, nullable: bool) -> TokenStream {
             }
         },
         "NaiveDate" => quote! { ::autumn_web::form::FieldControl::Date },
-        "NaiveDateTime" | "DateTime" => quote! { ::autumn_web::form::FieldControl::DateTime },
+        "NaiveDateTime" => quote! { ::autumn_web::form::FieldControl::DateTime },
+        // `<input type="datetime-local">` posts an *offsetless* wall-clock
+        // value, so only zone parameters with a sound interpretation of that
+        // shape get the picker: `Utc` and the server's `Local` (each wired to
+        // a matching tolerant deserializer — see `datetime_local_serde_attr`).
+        // Any other zone (`FixedOffset`, chrono-tz zones, or a bare
+        // `DateTime` alias whose zone the derive can't see) falls back to a
+        // text input: the pre-filled value is the field's serialized RFC 3339
+        // string, which chrono's default `Deserialize` round-trips as-is —
+        // honest, if plainer, instead of a picker whose submission 400s.
+        "DateTime" => {
+            let picker_zone = crate::api_doc::unwrap_single_generic(inner_ty, "DateTime")
+                .is_some_and(|tz| matches!(type_name_str(&tz).as_str(), "Utc" | "Local"));
+            if picker_zone {
+                quote! { ::autumn_web::form::FieldControl::DateTime }
+            } else {
+                quote! { ::autumn_web::form::FieldControl::Text }
+            }
+        }
         // `String`/`str`/`Uuid` render as text, and so do unknown types
         // (user enums, JSON, custom newtypes) as a safe fallback; promote
         // via `.override_field(...)` where a richer control is known.
@@ -1633,13 +1651,16 @@ fn form_control_tokens(inner_ty: &syn::Type, nullable: bool) -> TokenStream {
 /// with seconds), which chrono's default `Deserialize` for `DateTime<Utc>`
 /// rejects — so a `form_for` submission would 400 before validation even when
 /// the pre-filled value is untouched. The referenced helpers accept both the
-/// browser shape (`YYYY-MM-DDTHH:MM[:SS[.f]]`, interpreted as UTC) *and*
-/// RFC 3339 (offset converted to UTC), so JSON API create bodies posted to
-/// the same `NewX` keep decoding.
+/// browser shape (`YYYY-MM-DDTHH:MM[:SS[.f]]`, interpreted as UTC for
+/// `DateTime<Utc>` columns and as the server's local wall clock for
+/// `DateTime<Local>` ones) *and* RFC 3339 (offset converted to the field's
+/// zone), so JSON API create bodies posted to the same `NewX` keep decoding.
 ///
 /// Returns `None` for non-datetime fields, and for `DateTime<Tz>` with a
-/// non-`Utc` zone parameter (the helper produces a `DateTime<Utc>`; other
-/// zone parameters keep chrono's default `Deserialize`).
+/// zone parameter other than `Utc`/`Local` — those columns don't render a
+/// `datetime-local` control in the first place (`form_control_tokens` falls
+/// back to a text input whose RFC 3339 value chrono's default `Deserialize`
+/// round-trips), so they keep that default.
 fn datetime_local_serde_attr(ty: &syn::Type) -> Option<TokenStream> {
     let nullable = is_option_type(ty);
     let inner = if nullable {
@@ -1651,10 +1672,11 @@ fn datetime_local_serde_attr(ty: &syn::Type) -> Option<TokenStream> {
         "NaiveDateTime" => "deserialize_naive_datetime_local",
         "DateTime" => {
             let tz = crate::api_doc::unwrap_single_generic(&inner, "DateTime")?;
-            if type_name_str(&tz) != "Utc" {
-                return None;
+            match type_name_str(&tz).as_str() {
+                "Utc" => "deserialize_datetime_local_utc",
+                "Local" => "deserialize_datetime_local_local",
+                _ => return None,
             }
-            "deserialize_datetime_local_utc"
         }
         _ => return None,
     };
@@ -4813,5 +4835,66 @@ mod tests {
             generated.contains("transition_priority_to"),
             "multi-sm model must emit `transition_priority_to`: {generated}"
         );
+    }
+
+    // ── Datetime control/deserializer selection per zone parameter (#1135) ─
+
+    /// Regression test (Codex P2 on #1587): only `DateTime<Utc>` and
+    /// `DateTime<Local>` — the zones whose offsetless `datetime-local`
+    /// submission has a matching tolerant deserializer — may render the
+    /// datetime picker. Any other zone parameter (`FixedOffset`, chrono-tz
+    /// zones, a bare un-parameterized `DateTime` alias) must fall back to a
+    /// text control whose RFC 3339 value round-trips through chrono's
+    /// default `Deserialize`; giving them the picker would 400 every
+    /// submission.
+    #[test]
+    fn form_control_tokens_gates_datetime_picker_on_zone_param() {
+        let control = |ty: syn::Type| form_control_tokens(&ty, false).to_string();
+
+        let utc = control(syn::parse_quote!(chrono::DateTime<chrono::Utc>));
+        assert!(utc.contains("FieldControl :: DateTime"), "{utc}");
+        let local = control(syn::parse_quote!(chrono::DateTime<chrono::Local>));
+        assert!(local.contains("FieldControl :: DateTime"), "{local}");
+
+        let fixed = control(syn::parse_quote!(chrono::DateTime<chrono::FixedOffset>));
+        assert!(fixed.contains("FieldControl :: Text"), "{fixed}");
+        let tz = control(syn::parse_quote!(chrono::DateTime<chrono_tz::Tz>));
+        assert!(tz.contains("FieldControl :: Text"), "{tz}");
+        // A bare alias hides the zone from the derive — no picker either.
+        let bare = control(syn::parse_quote!(DateTime));
+        assert!(bare.contains("FieldControl :: Text"), "{bare}");
+    }
+
+    /// The deserializer wiring must stay in lockstep with the control choice
+    /// above: `Utc`/`Local` get their zone-matching tolerant deserializer
+    /// (`_option` for nullable), everything else keeps chrono's default
+    /// `Deserialize` (fine — those columns render as text, whose RFC 3339
+    /// value the default parses).
+    #[test]
+    fn datetime_local_serde_attr_matches_zone_param() {
+        let attr = |ty: syn::Type| datetime_local_serde_attr(&ty).map(|t| t.to_string());
+
+        let utc = attr(syn::parse_quote!(chrono::DateTime<chrono::Utc>)).unwrap();
+        assert!(utc.contains("deserialize_datetime_local_utc"), "{utc}");
+
+        let local = attr(syn::parse_quote!(chrono::DateTime<chrono::Local>)).unwrap();
+        assert!(
+            local.contains("deserialize_datetime_local_local"),
+            "{local}"
+        );
+        assert!(!local.contains("_option"), "{local}");
+
+        let nullable = attr(syn::parse_quote!(Option<chrono::DateTime<chrono::Local>>)).unwrap();
+        assert!(
+            nullable.contains("deserialize_datetime_local_local_option"),
+            "{nullable}"
+        );
+        assert!(nullable.contains("default"), "{nullable}");
+
+        assert_eq!(
+            attr(syn::parse_quote!(chrono::DateTime<chrono::FixedOffset>)),
+            None
+        );
+        assert_eq!(attr(syn::parse_quote!(DateTime)), None);
     }
 }

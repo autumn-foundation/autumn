@@ -68,10 +68,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the offsetless browser value is interpreted as UTC, an empty nullable value
   decodes as `None`, and RFC 3339 JSON create bodies keep decoding — the
   `DateTime<Utc>` helpers now also accept RFC 3339 input, honoring an explicit
-  offset by converting to UTC. (`DateTime` columns with a non-`Utc` zone
-  parameter keep chrono's default `Deserialize`.) These four `form`
-  deserializer helpers, previously `maud`-gated, are now available
-  unconditionally. `UpdateX` is untouched: it has no `Validate` impl so no
+  offset by converting to UTC. These four `form` deserializer helpers,
+  previously `maud`-gated, are now available unconditionally.
+  `chrono::DateTime<Local>` columns (diesel's other `Timestamptz`-capable
+  zone) get the same treatment via new
+  `autumn_web::form::deserialize_datetime_local_local` /
+  `deserialize_datetime_local_local_option` helpers: the offsetless browser
+  value is interpreted as the server's local wall clock (a wall clock
+  repeated by a DST fall-back maps to the earlier instant; one skipped by a
+  spring-forward is a decode error), and RFC 3339 input converts the instant
+  to the local zone. `DateTime` columns with any *other* zone parameter
+  (e.g. `FixedOffset`, or a bare `DateTime` alias hiding its zone from the
+  derive) no longer render the `datetime-local` picker at all — an
+  offsetless wall clock is genuinely ambiguous there, and the picker's
+  submission used to 400 unconditionally; they fall back to a text input
+  pre-filled with the serialized RFC 3339 string, which chrono's default
+  `Deserialize` round-trips as-is. `UpdateX` is untouched: it has no `Validate` impl so no
   `ChangesetForm`/`form_for` round-trip reaches it, and its JSON PATCH bodies
   are RFC 3339, which already decodes. Required `NaiveDate` columns need no
   treatment (the browser's `YYYY-MM-DD` is exactly chrono's wire shape).
