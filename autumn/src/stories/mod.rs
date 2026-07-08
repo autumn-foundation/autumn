@@ -10,9 +10,11 @@
 //! Two switches gate the gallery:
 //!
 //! 1. **Registration** — `AppBuilder::with_story_gallery(StoryGallery::builtin())`
-//!    installs the [`StoryRegistry`] on [`AppState`](crate::AppState).
+//!    installs the [`StoryRegistry`](crate::stories::StoryRegistry) on
+//!    [`AppState`](crate::AppState).
 //! 2. **Config** — the routes mount only when the resolved config has
-//!    `[stories] enabled = true` ([`StoriesConfig`], default **false**).
+//!    `[stories] enabled = true` ([`StoriesConfig`](crate::stories::StoriesConfig),
+//!    default **false**).
 //!    Unlike the dev-only mail preview, stories may be enabled in *any*
 //!    profile (a public showcase is a supported use); safe because stories
 //!    only ever render synthetic demo data.
@@ -165,8 +167,8 @@ pub enum StoryRenderError {
 }
 
 /// Immutable collection of registered stories, stored on
-/// [`AppState`](crate::AppState) as an extension by
-/// [`AppBuilder::with_story_gallery`](crate::AppBuilder::with_story_gallery).
+/// [`AppState`] as an extension by
+/// [`AppBuilder::with_story_gallery`](crate::app::AppBuilder::with_story_gallery).
 #[derive(Debug, Clone, Default)]
 pub struct StoryRegistry {
     stories: Arc<Vec<Story>>,
@@ -238,7 +240,7 @@ pub fn builtin() -> StoryRegistry {
 }
 
 /// Builder-side collection of stories, registered with
-/// [`AppBuilder::with_story_gallery`](crate::AppBuilder::with_story_gallery).
+/// [`AppBuilder::with_story_gallery`](crate::app::AppBuilder::with_story_gallery).
 ///
 /// Start from [`StoryGallery::builtin`] to serve the framework widget set,
 /// or [`StoryGallery::new`] for an app-only gallery, then [`extend`](Self::extend)
@@ -281,8 +283,8 @@ impl StoryGallery {
     ///
     /// The framework mounts this automatically when the resolved config has
     /// `[stories] enabled = true`; handlers read the [`StoryRegistry`] from
-    /// the [`AppState`](crate::AppState) extension installed by
-    /// [`AppBuilder::with_story_gallery`](crate::AppBuilder::with_story_gallery),
+    /// the [`AppState`] extension installed by
+    /// [`AppBuilder::with_story_gallery`](crate::app::AppBuilder::with_story_gallery),
     /// so manual mounters must install that extension too.
     pub fn routes<S>() -> axum::Router<S>
     where
