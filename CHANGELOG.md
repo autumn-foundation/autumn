@@ -695,7 +695,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SyncBackend::gc_applied`, and `SyncConfig::bearer_token` authenticates
   the engine against an auth-guarded `/sync` mount. Zero new
   dependencies — builds on the `db` and `http-client` features already in
-  the graph.
+  the graph. [no-plugin]
 - **generator:** `autumn generate tauri-mobile --offline-sync` (issue #1508)
   wires the offline-sync engine into the mobile scaffold: the shell opens a
   `SyncStore`-backed SQLite database in the app sandbox (exported as
@@ -712,6 +712,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   architecture, change tracking, tombstoning/GC, conflict resolution, and
   an airplane-mode walkthrough in
   [docs/guide/tauri-mobile-offline-sync.md](docs/guide/tauri-mobile-offline-sync.md).
+  [no-plugin]
 
 ### Documentation
 
