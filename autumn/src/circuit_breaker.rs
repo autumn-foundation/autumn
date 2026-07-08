@@ -254,7 +254,10 @@ impl CircuitBreaker {
                     let ratio = inner.failure_ratio();
                     if ratio >= failure_ratio_threshold {
                         inner.transition_to(&self.name, CircuitState::Open, ratio);
-                        inner.open_until = Some(now + open_duration);
+                        inner.open_until =
+                            Some(now.checked_add(open_duration).unwrap_or_else(|| {
+                                now + std::time::Duration::from_secs(60 * 60 * 24 * 365 * 100)
+                            }));
                     }
                 }
             }
@@ -273,7 +276,9 @@ impl CircuitBreaker {
                 } else {
                     inner.half_open_failures += 1;
                     inner.transition_to(&self.name, CircuitState::Open, 1.0);
-                    inner.open_until = Some(now + open_duration);
+                    inner.open_until = Some(now.checked_add(open_duration).unwrap_or_else(|| {
+                        now + std::time::Duration::from_secs(60 * 60 * 24 * 365 * 100)
+                    }));
                 }
             }
             CircuitState::Open => {}
