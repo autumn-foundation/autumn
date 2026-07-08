@@ -171,7 +171,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@1.92.0
+      # Pinned toolchain for cargo-semver-checks — must stay in sync with
+      # AUTUMN_SEMVER_RUST_VERSION's default in scripts/check-semver.sh
+      # (1.94.1: aws-smithy MSRV floor; 1.96.0 ICEs — see script comment).
+      - uses: dtolnay/rust-toolchain@1.94.1
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-semver-checks
         uses: taiki-e/install-action@cargo-semver-checks

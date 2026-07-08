@@ -1609,6 +1609,12 @@ struct ActuatorHealth {
     uptime: String,
     #[cfg(feature = "db")]
     autumn_after_commit_failures_total: u64,
+    /// Total transaction retries triggered by a `40001`/`40P01` (issue #1202).
+    #[cfg(feature = "db")]
+    autumn_tx_retries_total: u64,
+    /// Total transactions that exhausted their retry budget (issue #1202).
+    #[cfg(feature = "db")]
+    autumn_tx_retry_exhausted_total: u64,
     /// Per-component health, keyed by indicator name.
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     components: HashMap<String, ComponentHealth>,
@@ -1762,6 +1768,12 @@ pub async fn health<S: ProvideActuatorState + Send + Sync + 'static>(
         uptime: state.uptime_display(),
         #[cfg(feature = "db")]
         autumn_after_commit_failures_total: crate::db::AFTER_COMMIT_FAILURES_TOTAL
+            .load(std::sync::atomic::Ordering::Relaxed),
+        #[cfg(feature = "db")]
+        autumn_tx_retries_total: crate::db::TX_RETRIES_TOTAL
+            .load(std::sync::atomic::Ordering::Relaxed),
+        #[cfg(feature = "db")]
+        autumn_tx_retry_exhausted_total: crate::db::TX_RETRY_EXHAUSTED_TOTAL
             .load(std::sync::atomic::Ordering::Relaxed),
         components,
         checks,
@@ -2291,6 +2303,18 @@ fn write_builtin_http_metrics(
         snapshot.read_your_writes_pins_total
     );
 
+    // autumn_requests_shed_total
+    out.push_str(
+        "# HELP autumn_requests_shed_total \
+         HTTP requests rejected by admission control because server.max_concurrent_requests was at its ceiling\n",
+    );
+    out.push_str("# TYPE autumn_requests_shed_total counter\n");
+    let _ = writeln!(
+        out,
+        "autumn_requests_shed_total{{version=\"{version}\"}} {}",
+        snapshot.http.requests_shed_total
+    );
+
     // by_route
     if !snapshot.http.by_route.is_empty() {
         out.push_str("# HELP autumn_http_route_requests_total HTTP requests by route and method\n");
@@ -2401,6 +2425,7 @@ pub(crate) async fn prometheus_endpoint<S: ProvideActuatorState + Send + Sync + 
             "autumn_shutdown_aborted_requests_total",
             "autumn_request_timeouts_total",
             "autumn_read_your_writes_pins_total",
+            "autumn_requests_shed_total",
             "autumn_http_route_requests_total",
             "autumn_metrics_source_errors_total",
             "autumn_cache_read_through_hits_total",
@@ -4379,6 +4404,10 @@ mod tests {
         assert!(text.contains("# HELP autumn_read_your_writes_pins_total"));
         assert!(text.contains("# TYPE autumn_read_your_writes_pins_total counter"));
         assert!(text.contains("autumn_read_your_writes_pins_total{version=\"stable\"} 0"));
+
+        assert!(text.contains("# HELP autumn_requests_shed_total"));
+        assert!(text.contains("# TYPE autumn_requests_shed_total counter"));
+        assert!(text.contains("autumn_requests_shed_total{version=\"stable\"} 0"));
     }
 
     #[cfg(feature = "cache-moka")]

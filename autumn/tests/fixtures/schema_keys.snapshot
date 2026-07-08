@@ -39,6 +39,7 @@ security
 seo
 server
 server.host
+server.max_concurrent_requests
 server.port
 server.prestop_grace_secs
 server.shutdown_timeout_secs
@@ -48,6 +49,7 @@ server.timeouts.request_timeout_ms
 server.unix_socket
 session
 storage
+stories
 telemetry
 tenancy
 time_zone

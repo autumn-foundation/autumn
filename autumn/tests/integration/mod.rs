@@ -52,6 +52,7 @@ mod experiments_pg_integration;
 mod extractors;
 mod factory_integration;
 mod feature_flags_integration;
+mod form_for_derive;
 mod form_search_widgets;
 #[cfg(all(feature = "maud", feature = "cache-moka"))]
 mod fragment_cache_integration;
@@ -72,6 +73,7 @@ mod job_tracking_route;
 mod job_tracking_stores_integration;
 #[cfg(all(feature = "ws", feature = "maud", feature = "htmx", feature = "db"))]
 mod live_broadcast;
+mod load_shed;
 #[cfg(feature = "mail")]
 mod mail;
 #[cfg(feature = "mail")]
@@ -99,6 +101,8 @@ mod openapi;
 mod pagination;
 mod path_helpers;
 #[cfg(feature = "db")]
+mod pg_tls;
+#[cfg(feature = "db")]
 mod preload_scoping;
 mod problem_details;
 mod rate_limit_pipeline;
@@ -112,6 +116,8 @@ mod read_your_writes_routing;
 mod repository_authorization;
 #[cfg(feature = "db")]
 mod repository_bulk_operations;
+#[cfg(feature = "db")]
+mod repository_find_in_batches;
 #[cfg(feature = "db")]
 mod repository_from_shard;
 #[cfg(all(feature = "db", feature = "openapi"))]
@@ -141,6 +147,8 @@ mod signed_webhooks;
 mod static_serving;
 #[cfg(feature = "storage")]
 mod storage_local_integration;
+#[cfg(feature = "maud")]
+mod stories;
 #[cfg(feature = "system-tests")]
 mod system_test_api;
 #[cfg(feature = "db")]
@@ -150,7 +158,10 @@ mod test_app_integration;
 mod test_db_integration;
 mod time_zone_integration;
 mod transactional_test_integration;
+mod tx_isolation_retry_integration;
 mod webhook_outbound;
+#[cfg(feature = "maud")]
+mod widget_css_coverage;
 mod widgets_modal;
 mod widgets_tabs;
 #[cfg(feature = "ws")]

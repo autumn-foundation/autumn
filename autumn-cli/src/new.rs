@@ -858,12 +858,15 @@ mod tests {
         // to a new row if the row itself is allowed to wrap. Without flex-wrap
         // on the enhanced root, the opened mobile menu squeezes/overflows onto
         // the same row as the brand and toggle instead of appearing below them.
-        let rule_body = css_rule_body(templates::INPUT_CSS, ".autumn-nav--enhanced {");
+        //
+        // This rule now ships from the framework itself (#1215), not the
+        // per-project input.css.tmpl — assert against the shared stylesheet.
+        let css = autumn_web::ui::WIDGETS_COMPONENT_CSS;
+        let rule_body = css_rule_body(css, ".autumn-nav--enhanced {");
         assert!(
             rule_body.contains("flex-wrap"),
             "the mobile media query must set flex-wrap on .autumn-nav--enhanced itself \
-             so .autumn-nav__collapse's basis-full can actually start a new row, got:\n{}",
-            templates::INPUT_CSS
+             so .autumn-nav__collapse's basis-full can actually start a new row, got:\n{css}"
         );
     }
 
@@ -894,13 +897,16 @@ mod tests {
         // against — the two lists just stack vertically as ordinary block
         // children instead of sitting side by side with trailing pinned to
         // the far right, as nav_bar's trailing-slot design intends.
-        let rule_body = css_rule_body(templates::INPUT_CSS, ".autumn-nav__collapse {");
+        //
+        // This rule now ships from the framework itself (#1215), not the
+        // per-project input.css.tmpl — assert against the shared stylesheet.
+        let css = autumn_web::ui::WIDGETS_COMPONENT_CSS;
+        let rule_body = css_rule_body(css, ".autumn-nav__collapse {");
         assert!(
             rule_body.contains("flex") && !rule_body.contains("flex-col"),
             "the base (non-mobile) .autumn-nav__collapse rule must be a flex row \
              so .autumn-nav__items--trailing's ml-auto can push it to the right \
-             edge of the nav, got:\n{}",
-            templates::INPUT_CSS
+             edge of the nav, got:\n{css}"
         );
     }
 

@@ -13,7 +13,7 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 use super::dsl::{Field, FieldKind, IdType, parse_fields};
-use super::emit::{Action, Plan};
+use super::emit::{Action, Plan, Revert};
 use super::model::{
     ModelOptions, augment_fields_for_soft_delete, field_by_name, parse_model_metadata,
     plan_cargo_deps, plan_model_with_options,
@@ -24,12 +24,12 @@ use super::schema_edit::{
     ensure_dev_dependency_test_support, ensure_dev_dependency_tokio_test_features,
     unique_index_name, update_main_rs,
 };
-use super::{Flags, GenerateError, ensure_project_root, read_or_empty, timestamp_now};
+use super::{GenerateError, ensure_project_root, read_or_empty};
 
 /// Extra dependencies the *scaffold* generator's output requires on top of
 /// [`super::model::MODEL_DEPS`] — `maud` for HTML rendering and URL-encoded
 /// form helpers for blank nullable-field normalization.
-const SCAFFOLD_EXTRA_DEPS: &[(&str, &str)] = &[
+pub(super) const SCAFFOLD_EXTRA_DEPS: &[(&str, &str)] = &[
     ("maud", "{ version = \"0.27\", features = [\"axum\"] }"),
     ("serde_urlencoded", "\"0.7\""),
     ("url", "\"2\""),
@@ -145,6 +145,52 @@ pub fn plan_scaffold_with_options(
     let snake_name = snake(name);
     let plural = pluralize(&snake_name);
 
+    // `references` columns whose target model can't be found in the project
+    // (same presence test `check_reference_targets` used for its warning —
+    // the table presumably exists out-of-band, or gets generated later).
+    // Their "select over the referenced table's ids" promotion (issue #1135
+    // AC 2) needs the target's `src/schema.rs` entry at compile time, so the
+    // routes renderer skips the select machinery for these columns and lets
+    // them fall back to the derived numeric id input — a warning-only missing
+    // target has always produced compilable output, and importing a
+    // nonexistent schema module would break that. A self-referential column
+    // (target == this scaffold's own table) is never "missing": its schema
+    // entry is being generated right now.
+    let missing_reference_targets: BTreeSet<String> = form_fields
+        .iter()
+        .filter(|f| f.kind.is_reference())
+        .filter_map(|f| {
+            let table = f.reference_table()?;
+            if table == plural {
+                return None;
+            }
+            let base = f.name.strip_suffix("_id").unwrap_or(&f.name);
+            if super::model::model_file_exists(project_root, &table, base) {
+                None
+            } else {
+                Some(f.name.clone())
+            }
+        })
+        .collect();
+    if !options_with_key.api && !options_with_key.live_validation {
+        for f in form_fields.iter().filter(|f| f.kind.is_reference()) {
+            if !missing_reference_targets.contains(&f.name) {
+                continue;
+            }
+            let Some(table) = f.reference_table() else {
+                continue;
+            };
+            let base = f.name.strip_suffix("_id").unwrap_or(&f.name);
+            plan.warn(format!(
+                "'{}' will render as a plain numeric id input in the generated form: \
+                 without the '{base}' model, table '{table}' has no `src/schema.rs` entry \
+                 to load select options from. Generate the '{base}' model first (or re-run \
+                 this scaffold once it exists) to get a select of {table} ids instead.",
+                f.name
+            ));
+        }
+    }
+
     // Repository file under `src/repositories/<snake>.rs`
     let repos_dir = project_root.join("src").join("repositories");
     plan.create(
@@ -164,6 +210,10 @@ pub fn plan_scaffold_with_options(
         repo_mod_path.clone(),
         add_mod_declaration(&read_or_empty(&repo_mod_path), &snake_name),
     );
+    plan.push_revert(Revert::ModDecl {
+        path: repo_mod_path,
+        name: snake_name.clone(),
+    });
 
     // Route file under `src/routes/<plural>.rs`
     if !options_with_key.api {
@@ -182,6 +232,7 @@ pub fn plan_scaffold_with_options(
                 options_with_key.live,
                 options_with_key.live_validation,
                 metadata.validations(),
+                &missing_reference_targets,
             ),
         );
         let route_mod_path = routes_dir.join("mod.rs");
@@ -189,6 +240,10 @@ pub fn plan_scaffold_with_options(
             route_mod_path.clone(),
             add_mod_declaration(&read_or_empty(&route_mod_path), &plural),
         );
+        plan.push_revert(Revert::ModDecl {
+            path: route_mod_path,
+            name: plural.clone(),
+        });
     }
 
     // Smoke test under `tests/<snake>.rs`. Uses the same soft-delete-augmented
@@ -235,7 +290,16 @@ pub fn plan_scaffold_with_options(
         mods.push("routes");
     }
     let updated = update_main_rs(&main_existing, &mods, &route_entries);
-    plan.modify(main_path, updated);
+    plan.modify(main_path.clone(), updated);
+    // `mod models;`/`mod schema;`/`mod repositories;`/`mod routes;` are
+    // shared infrastructure declarations, not owned by this resource — see
+    // `emit::sync_main_rs_mod_declarations`, which removes one only once its
+    // backing module no longer exists on disk. Only this resource's own
+    // `routes![]` entries are reverted here.
+    plan.push_revert(Revert::RoutesEntries {
+        path: main_path,
+        entries: route_entries,
+    });
 
     // The Maud `html!` macro pulls in a direct `maud` dep on top of the
     // model's deps. Both modify actions target Cargo.toml, so we combine
@@ -269,7 +333,12 @@ pub fn plan_scaffold_with_options(
             "{ version = \"1\", features = [\"db-diesel2-postgres\", \"serde\"] }",
         ));
     }
-    plan_cargo_deps(&mut plan, project_root, &combined);
+    plan_cargo_deps(
+        &mut plan,
+        project_root,
+        &combined,
+        &project_root.join("src/models"),
+    );
 
     // The generated HTML routes render through `autumn_web::form::*` helpers
     // (issue #1124), which are gated behind autumn-web's `maud` feature — enable
@@ -288,8 +357,17 @@ pub fn plan_scaffold_with_options(
         let updated = ensure_autumn_web_feature(&base, "maud");
         if updated != base {
             plan.actions.retain(|a| a.path() != cargo_path);
-            plan.modify(cargo_path, updated);
+            plan.modify(cargo_path.clone(), updated);
         }
+        // Pushed unconditionally — see `plan_cargo_deps`'s matching comment:
+        // at `destroy` time this same call recomputes the plan against the
+        // already-generated Cargo.toml, where "maud" is by definition
+        // already present, so `updated != base` above would never be true.
+        plan.push_revert(Revert::CargoAutumnWebFeature {
+            path: cargo_path,
+            feature: "maud".to_owned(),
+            owner_dir: Some(project_root.join("src").join("routes")),
+        });
     }
 
     // --live requires `ws` (sse::stream), `maud` (LiveFragment/Markup), and `htmx`.
@@ -317,7 +395,16 @@ pub fn plan_scaffold_with_options(
         }
         if updated != base {
             plan.actions.retain(|a| a.path() != cargo_path);
-            plan.modify(cargo_path, updated);
+            plan.modify(cargo_path.clone(), updated);
+        }
+        // Pushed unconditionally — see `plan_cargo_deps`'s matching comment.
+        let routes_dir = project_root.join("src").join("routes");
+        for feat in feats {
+            plan.push_revert(Revert::CargoAutumnWebFeature {
+                path: cargo_path.clone(),
+                feature: (*feat).to_owned(),
+                owner_dir: Some(routes_dir.clone()),
+            });
         }
     }
 
@@ -341,8 +428,17 @@ pub fn plan_scaffold_with_options(
         let updated = ensure_dev_dependency_test_support(&base, env!("CARGO_PKG_VERSION"));
         if updated != base {
             plan.actions.retain(|a| a.path() != cargo_path);
-            plan.modify(cargo_path, updated);
+            plan.modify(cargo_path.clone(), updated);
         }
+        // Pushed unconditionally — see `plan_cargo_deps`'s matching comment.
+        // `owner_dir` is `src/models` (not `src/routes`) because the smoke
+        // test — and thus `test-support` — is generated for EVERY scaffold,
+        // including `--api`-only ones that never get a routes file.
+        plan.push_revert(Revert::CargoAutumnWebDevFeature {
+            path: cargo_path,
+            feature: "test-support".to_owned(),
+            owner_dir: Some(project_root.join("src").join("models")),
+        });
     }
 
     // The generated smoke test also uses `#[tokio::test]`, which needs the
@@ -370,26 +466,6 @@ pub fn plan_scaffold_with_options(
     }
 
     Ok(plan)
-}
-
-/// CLI entry point.
-pub fn run(name: &str, field_tokens: &[String], flags: Flags, options: &ScaffoldOptions) {
-    let cwd = match std::env::current_dir() {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("Error: cannot determine current directory: {e}");
-            std::process::exit(1);
-        }
-    };
-    let timestamp = timestamp_now();
-    let plan = plan_scaffold_with_options(&cwd, name, field_tokens, &timestamp, options);
-    match plan.and_then(|p| p.execute(flags)) {
-        Ok(()) => {}
-        Err(e) => {
-            eprintln!("Error: {e}");
-            std::process::exit(1);
-        }
-    }
 }
 
 /// Fixed, unconditional (non-`--live`, non-attachment-gated) names the
@@ -1068,25 +1144,33 @@ fn render_routes_file(
     live: bool,
     live_validation: bool,
     validations: &BTreeMap<String, Vec<String>>,
+    missing_reference_targets: &BTreeSet<String>,
 ) -> String {
     let id_rust = id_type.rust_type();
     let validated_fields: Vec<&str> = validations.keys().map(String::as_str).collect();
-    // Issue #1124: `new_form`, `edit_form`, and both 422 re-render branches
-    // render the same inputs from a `Changeset<{Pascal}Form>` variable named
-    // `changeset`, so one renderer serves every site and the markup can never
-    // drift between them. Preserved values and inline errors come from the
-    // changeset via the shipped `autumn_web::form` helpers.
-    let changeset_inputs = render_changeset_form_inputs(
-        fields,
-        "changeset",
-        plural,
-        live_validation,
-        &validated_fields,
-    );
     let unique_fields: Vec<&Field> = fields.iter().filter(|f| f.unique).collect();
     let update_columns = render_update_columns(plural, fields);
     let nullable_field_match = render_nullable_field_match(fields);
     let has_attachments = has_attachment_fields(fields);
+    // `references` columns render as a `<select>` of the referenced table's
+    // ids (issue #1135 AC 2: "enum/references→select"). The options are
+    // runtime data, so the handlers that render the form load them and pass
+    // them into the shared `{snake}_form_for` helper. `--live-validation`
+    // keeps the old per-field emission (no `form_for`), so no options are
+    // loaded there. Columns in `missing_reference_targets` (their referenced
+    // model — and therefore its `src/schema.rs` entry — isn't in the project)
+    // are left out entirely: no loader, no schema import, no Select override,
+    // so they fall back to the derived numeric id input and the generated
+    // file still compiles (the caller warned about the downgrade).
+    let reference_fields: Vec<&Field> = if live_validation {
+        Vec::new()
+    } else {
+        fields
+            .iter()
+            .filter(|f| f.kind.is_reference() && !missing_reference_targets.contains(&f.name))
+            .collect()
+    };
+    let has_reference_selects = !reference_fields.is_empty();
     let model_form = render_model_form(pascal_name, fields, validations);
     // Enum fields need their generated Rust type in scope here — `into_new`
     // parses into it and the `From<&Row>` seed matches against its variants
@@ -1237,6 +1321,29 @@ fn render_routes_file(
         1,
     );
 
+    // Issue #1135: reference selects need a DB handle to load their options
+    // in every handler that renders the form. `create`/`update` already carry
+    // `mut db` except on the live non-sharded path (which uses the repository
+    // extractor); `new_form` never had one. Keep `body: Bytes` last — axum's
+    // `Handler` impl requires the body-consuming extractor in final position.
+    let (create_signature, update_signature) = if has_reference_selects && live && !sharded {
+        (
+            create_signature.replacen("body: Bytes", &format!("mut db: {db_ty}, body: Bytes"), 1),
+            update_signature.replacen(
+                "body: Bytes",
+                &format!("mut db: {db_ty},\n    body: Bytes"),
+                1,
+            ),
+        )
+    } else {
+        (create_signature, update_signature)
+    };
+    let new_form_db_param = if has_reference_selects {
+        format!("mut db: {db_ty},\n    ")
+    } else {
+        String::new()
+    };
+
     // `decode_form` always returns the `{Pascal}Form` (sync — attachment blob
     // resolution moved into `into_new`, which needs `&state`). `into_new`
     // converts the validated form into `New{Pascal}` on the success path.
@@ -1252,28 +1359,98 @@ fn render_routes_file(
     // emit, reused verbatim by the 422 branches so the form can't drift. Both
     // read from a `Changeset<{Pascal}Form>` named `changeset` and the CSRF
     // params now present on every create/update signature.
-    let new_form_body = format!(
-        "layout(\"New {pascal_name}\", flash.render().await, html! {{\n        \
-         h1 {{ \"New {pascal_name}\" }}\n        \
-         form action=\"/{plural}\" method=\"post\"{form_enctype} {{\n            \
-         (csrf_input(csrf.as_ref(), csrf_field.as_ref()))\n{changeset_inputs}            \
-         button type=\"submit\" {{ \"Create\" }}\n        \
-         }}\n    \
-         }})"
-    );
-    let edit_form_body = format!(
-        "layout(&format!(\"Edit {pascal_name} #{{}}\", *id), flash.render().await, html! {{\n        \
-         h1 {{ \"Edit {pascal_name} #\" (*id) }}\n        \
-         form action=(format!(\"/{plural}/{{}}/update\", *id)) method=\"post\"{form_enctype} {{\n            \
-         (csrf_input(csrf.as_ref(), csrf_field.as_ref()))\n{changeset_inputs}            \
-         button type=\"submit\" {{ \"Save\" }}\n        \
-         }}\n        \
-         form action=(format!(\"/{plural}/{{}}/delete\", *id)) method=\"post\" {{\n            \
-         (csrf_input(csrf.as_ref(), csrf_field.as_ref()))\n            \
-         button type=\"submit\" onclick=\"return confirm('Delete this {pascal_name}?')\" {{ \"Delete\" }}\n        \
-         }}\n    \
-         }})"
-    );
+    //
+    // Issue #1135: the standard scaffold renders the whole form through one
+    // shared `{snake}_form_for` helper (a single `form_for` call deriving
+    // every control from the `FormModel` descriptors), so the view bodies
+    // carry zero per-column code. `--live-validation` keeps the per-field
+    // emission path: its htmx inline-validation inputs (`text_input_htmx`)
+    // have no `FieldControl` equivalent for `form_for` to dispatch to.
+    let (new_form_body, edit_form_body, form_for_helper) = if live_validation {
+        // Issue #1124: `new_form`, `edit_form`, and both 422 re-render
+        // branches render the same inputs from a `Changeset<{Pascal}Form>`
+        // variable named `changeset`, so one renderer serves every site and
+        // the markup can never drift between them. Preserved values and
+        // inline errors come from the changeset via the shipped
+        // `autumn_web::form` helpers.
+        let changeset_inputs = render_changeset_form_inputs(
+            fields,
+            "changeset",
+            plural,
+            live_validation,
+            &validated_fields,
+        );
+        let new_form_body = format!(
+            "layout(\"New {pascal_name}\", flash.render().await, html! {{\n        \
+             h1 {{ \"New {pascal_name}\" }}\n        \
+             form action=\"/{plural}\" method=\"post\"{form_enctype} {{\n            \
+             (csrf_input(csrf.as_ref(), csrf_field.as_ref()))\n{changeset_inputs}            \
+             button type=\"submit\" {{ \"Create\" }}\n        \
+             }}\n    \
+             }})"
+        );
+        let edit_form_body = format!(
+            "layout(&format!(\"Edit {pascal_name} #{{}}\", *id), flash.render().await, html! {{\n        \
+             h1 {{ \"Edit {pascal_name} #\" (*id) }}\n        \
+             form action=(format!(\"/{plural}/{{}}/update\", *id)) method=\"post\"{form_enctype} {{\n            \
+             (csrf_input(csrf.as_ref(), csrf_field.as_ref()))\n{changeset_inputs}            \
+             button type=\"submit\" {{ \"Save\" }}\n        \
+             }}\n        \
+             form action=(format!(\"/{plural}/{{}}/delete\", *id)) method=\"post\" {{\n            \
+             (csrf_input(csrf.as_ref(), csrf_field.as_ref()))\n            \
+             button type=\"submit\" onclick=\"return confirm('Delete this {pascal_name}?')\" {{ \"Delete\" }}\n        \
+             }}\n    \
+             }})"
+        );
+        (new_form_body, edit_form_body, String::new())
+    } else {
+        // Reference selects: load the referenced ids before rendering and
+        // thread them into the shared helper (issue #1135, AC 2
+        // "references→select"). The loads live in a block expression wrapped
+        // around the `layout(...)` call so the same body splices into the GET
+        // handlers and the 422 re-render branches unchanged.
+        let mut option_loads = String::new();
+        let mut option_args = String::new();
+        for f in &reference_fields {
+            let name = &f.name;
+            let _ = writeln!(
+                option_loads,
+                "        let {name}_options = {name}_select_options(&mut db).await?;"
+            );
+            let _ = write!(option_args, ", &{name}_options");
+        }
+        let new_form_layout = format!(
+            "layout(\"New {pascal_name}\", flash.render().await, html! {{\n        \
+             h1 {{ \"New {pascal_name}\" }}\n        \
+             ({snake_name}_form_for(&changeset, \"/{plural}\".to_string(), \"Create\", csrf.as_ref(), csrf_field.as_ref(){option_args}))\n    \
+             }})"
+        );
+        let edit_form_layout = format!(
+            "layout(&format!(\"Edit {pascal_name} #{{}}\", *id), flash.render().await, html! {{\n        \
+             h1 {{ \"Edit {pascal_name} #\" (*id) }}\n        \
+             ({snake_name}_form_for(&changeset, format!(\"/{plural}/{{}}/update\", *id), \"Save\", csrf.as_ref(), csrf_field.as_ref(){option_args}))\n        \
+             form action=(format!(\"/{plural}/{{}}/delete\", *id)) method=\"post\" {{\n            \
+             (csrf_input(csrf.as_ref(), csrf_field.as_ref()))\n            \
+             button type=\"submit\" onclick=\"return confirm('Delete this {pascal_name}?')\" {{ \"Delete\" }}\n        \
+             }}\n    \
+             }})"
+        );
+        let (new_form_body, edit_form_body) = if has_reference_selects {
+            (
+                format!("{{\n{option_loads}        {new_form_layout}\n    }}"),
+                format!("{{\n{option_loads}        {edit_form_layout}\n    }}"),
+            )
+        } else {
+            (new_form_layout, edit_form_layout)
+        };
+        (
+            new_form_body,
+            edit_form_body,
+            render_form_for_helper(pascal_name, snake_name, fields, missing_reference_targets)
+                + &render_reference_option_loaders(&reference_fields, db_ty),
+        )
+    };
+    let form_model_impl = render_form_model_impl(pascal_name);
 
     // `unique` fields (issue #1032) still classify DB constraint violations,
     // but now feed the error into the *same* changeset renderer via
@@ -1562,6 +1739,30 @@ pub async fn index(
             .to_owned()
     };
 
+    // Schema imports: the resource's own table, plus — when reference selects
+    // are rendered — each referenced table so its ids can be loaded for the
+    // select options. Only targets that are actually present in the project
+    // reach this point (`reference_fields` already excludes
+    // `missing_reference_targets`): importing a table whose `diesel::table!`
+    // entry doesn't exist in `src/schema.rs` would fail to compile, and a
+    // missing target has always been a warning, not an error.
+    let schema_import = {
+        let mut extra_tables: BTreeSet<String> = reference_fields
+            .iter()
+            .filter_map(|f| f.reference_table())
+            .collect();
+        extra_tables.remove(plural);
+        if extra_tables.is_empty() {
+            plural.to_owned()
+        } else {
+            let mut list = plural.to_owned();
+            for table in extra_tables {
+                let _ = write!(list, ", {table}");
+            }
+            format!("{{{list}}}")
+        }
+    };
+
     // When `--live-validation`, emit one inline-validation handler per validated
     // field. Each handler decodes the *whole* submitted form (htmx's
     // `hx-include="closest form"` posts every field, not just the one that
@@ -1640,7 +1841,7 @@ use diesel_async::RunQueryDsl;
 
 use crate::models::{snake_name}::{{{pascal_name}, New{pascal_name}, Update{pascal_name}{enum_import_suffix}}};
 use crate::repositories::{snake_name}::{{{pascal_name}Repository, Pg{pascal_name}Repository}};
-use crate::schema::{plural};",
+use crate::schema::{schema_import};",
         attachment_note = if has_attachments {
             "//!\n\
              //! This scaffold includes file-attachment fields. File uploads are handled\n\
@@ -1738,7 +1939,7 @@ pub async fn show(id: Path<{id_rust}>, mut db: {db_ty}, flash: Flash) -> AutumnR
 #[secured]
 #[get("/{plural}/new")]
 pub async fn new_form(
-    flash: Flash,
+    {new_form_db_param}flash: Flash,
     csrf: Option<CsrfToken>,
     csrf_field: Option<CsrfFormField>,
 ) -> AutumnResult<Markup> {{
@@ -1799,7 +2000,9 @@ pub async fn destroy(
 
 {from_row_impl}
 
-{decode_form_sig} {{
+{form_model_impl}
+
+{form_for_helper}{decode_form_sig} {{
     let pairs: Vec<_> = url::form_urlencoded::parse(body.as_ref())
         .filter(|(key, value)| !(value.is_empty() && is_nullable_form_field(key)))
         .collect();
@@ -1888,8 +2091,231 @@ fn has_attachment_fields(fields: &[Field]) -> bool {
     fields.iter().any(|f| f.kind.is_attachment())
 }
 
-/// Render the form inputs for a scaffold's new/edit/re-render views through
-/// the shipped, changeset-aware `autumn_web::form` helpers (issue #1124).
+/// Emit the `FormModel` delegation impl for the generated `{Pascal}Form`
+/// (issue #1135). `form_for` derives its controls from the changeset's own
+/// type, and the `#[model]` derive already produces the field descriptors on
+/// `{Pascal}` — same field names, same declaration order, and both exclude
+/// the primary key and `#[default]` columns — so the form struct simply
+/// reuses the model's list instead of restating it.
+fn render_form_model_impl(pascal_name: &str) -> String {
+    format!(
+        "/// `form_for` field descriptors (issue #1135): delegate to the\n\
+         /// `#[model]`-derived implementation on `{pascal_name}` so the rendered form\n\
+         /// always tracks the model's columns.\n\
+         impl autumn_web::form::FormModel for {pascal_name}Form {{\n    \
+         fn form_fields() -> Vec<autumn_web::form::FormField> {{\n        \
+         <{pascal_name} as autumn_web::form::FormModel>::form_fields()\n    \
+         }}\n\
+         }}"
+    )
+}
+
+/// Render the shared `{snake}_form_for` helper the generated views call
+/// (issue #1135): one `form_for` call renders the open `<form>` tag, the CSRF
+/// hidden input, one type-appropriate control per `FormModel` field (with
+/// pre-filled values and inline errors from the changeset), and the submit
+/// button — so `new_form`, `edit_form`, and both 422 re-render branches carry
+/// zero per-column view code, and adding a model column requires no view
+/// edits.
+///
+/// The scaffold layers on only what the derive can't know statically:
+/// - enum columns are promoted to a `Select` with one option per declared
+///   variant plus a blank placeholder (the derive sees an opaque Rust enum
+///   type and falls back to a text control);
+/// - decimal columns pin the browser `step` to the column's declared scale
+///   (the derive emits a free `step="any"`, losing the column's actual
+///   smallest representable increment);
+/// - attachment columns are excluded from the derived list and re-appended
+///   as a hand-rolled file input plus a hidden input carrying the existing
+///   blob key — a file input can't be repopulated, and `FieldControl::File`
+///   would flip the form to `multipart/form-data` while scaffold forms stay
+///   URL-encoded (uploads go through direct-upload URLs; see
+///   docs/guide/storage.md#direct-uploads). The appended markup renders the
+///   same inline-error/ARIA skeleton as the derived controls, so changeset
+///   errors on the attachment key still surface;
+/// - `references` columns are promoted to a `Select` over the referenced
+///   table's ids (issue #1135 AC 2). The options are runtime data, so the
+///   helper takes one `{column}_options: &[(String, String)]` parameter per
+///   reference and the calling handlers load them (see the generated
+///   `{column}_select_options` loader). Columns named in
+///   `missing_reference_targets` (their referenced model isn't in the
+///   project, so there is no schema entry to load options from) keep the
+///   derived numeric id input instead — the plan carries a warning saying
+///   how to get the select.
+fn render_form_for_helper(
+    pascal_name: &str,
+    snake_name: &str,
+    fields: &[Field],
+    missing_reference_targets: &BTreeSet<String>,
+) -> String {
+    use std::fmt::Write as _;
+    let mut extra_params = String::new();
+    let mut preludes = String::new();
+    let mut builder_calls = String::new();
+    let mut appends = String::new();
+    for f in fields {
+        let name = &f.name;
+        match f.kind {
+            FieldKind::Attachment => {
+                let label = humanize_label(name);
+                let _ = write!(builder_calls, "\n        .exclude(\"{name}\")");
+                // The appended markup mirrors the inline-error/ARIA skeleton
+                // `FieldControl::File` renders (autumn-web's form.rs), so
+                // changeset errors on the attachment key surface next to the
+                // file input instead of being silently dropped — while still
+                // avoiding `FieldControl::File` itself, which would flip the
+                // form to `multipart/form-data`. Attachments are always
+                // `Option<String>`, so no `required`/`aria-required` signal.
+                let _ = write!(
+                    appends,
+                    "\n        .append(html! {{\n            \
+                     @let errors = changeset.errors_for(\"{name}\");\n            \
+                     div id=\"{name}-field\" class=\"autumn-field\" {{\n                \
+                     label for=\"{name}\" class=\"autumn-field__label\" {{ \"{label}\" }}\n                \
+                     input type=\"file\" id=\"{name}\" name=\"{name}\"\n                    \
+                     class=(if errors.is_empty() {{ \"autumn-field__input\" }} else {{ \"autumn-field__input autumn-field__input--invalid\" }})\n                    \
+                     aria-invalid=(if errors.is_empty() {{ \"false\" }} else {{ \"true\" }})\n                    \
+                     aria-describedby=(if errors.is_empty() {{ \"\" }} else {{ \"{name}-error\" }});\n                \
+                     input type=\"hidden\" name=\"{name}\" value=(changeset.field_value(\"{name}\").unwrap_or_default());\n                \
+                     @if !errors.is_empty() {{\n                    \
+                     div id=\"{name}-error\" role=\"alert\" class=\"autumn-field__errors\" {{\n                        \
+                     @for error in errors {{ p class=\"autumn-field__error\" {{ (error) }} }}\n                    \
+                     }}\n                \
+                     }}\n            \
+                     }}\n        \
+                     }})"
+                );
+            }
+            FieldKind::Enum => {
+                let placeholder = if f.nullable {
+                    "— Unset —"
+                } else {
+                    "— Select —"
+                };
+                let mut options = format!("(\"\".into(), \"{placeholder}\".into())");
+                for v in &f.variants {
+                    let vlabel = humanize_label(v);
+                    let _ = write!(options, ", (\"{v}\".into(), \"{vlabel}\".into())");
+                }
+                let _ = write!(
+                    builder_calls,
+                    "\n        .override_field(\"{name}\", autumn_web::form::FieldControl::Select {{ options: vec![{options}] }})"
+                );
+            }
+            FieldKind::Decimal { scale, .. } => {
+                let step = decimal_step(scale);
+                let _ = write!(
+                    builder_calls,
+                    "\n        .override_field(\"{name}\", autumn_web::form::FieldControl::Number {{ step: Some(\"{step}\".into()) }})"
+                );
+            }
+            FieldKind::References => {
+                // The derive sees a plain `i64` column and emits a number
+                // input; the reference renders as a select over the
+                // referenced table's ids instead. A blank first option gives
+                // required selects browser-native "please select" behavior
+                // (nullable references use it to unset the value). When the
+                // referenced model is missing from the project the select's
+                // option loader could not compile (no schema entry to query),
+                // so the column keeps the derived number input.
+                if missing_reference_targets.contains(name) {
+                    continue;
+                }
+                let placeholder = if f.nullable {
+                    "— Unset —"
+                } else {
+                    "— Select —"
+                };
+                let _ = write!(extra_params, ",\n    {name}_options: &[(String, String)]");
+                let _ = write!(
+                    preludes,
+                    "    let mut {name}_select = vec![(String::new(), \"{placeholder}\".to_string())];\n    \
+                     {name}_select.extend({name}_options.iter().cloned());\n"
+                );
+                let _ = write!(
+                    builder_calls,
+                    "\n        .override_field(\"{name}\", autumn_web::form::FieldControl::Select {{ options: {name}_select }})"
+                );
+            }
+            _ => {}
+        }
+    }
+    format!(
+        "/// Render the create/edit form in a single `form_for` call (issue #1135).\n\
+         ///\n\
+         /// Controls, labels, pre-filled values, and inline errors all derive from\n\
+         /// `{pascal_name}Form`'s `FormModel` field descriptors, so adding a model\n\
+         /// column requires no edits here — any enum/decimal/attachment overrides\n\
+         /// below are the only schema-specific lines, and regeneration maintains\n\
+         /// them.\n\
+         fn {snake_name}_form_for(\n    \
+         changeset: &Changeset<{pascal_name}Form>,\n    \
+         action: String,\n    \
+         submit_label: &str,\n    \
+         csrf: Option<&CsrfToken>,\n    \
+         csrf_field: Option<&CsrfFormField>{extra_params},\n\
+         ) -> Markup {{\n\
+         {preludes}    \
+         let mut form = autumn_web::form::form_for(changeset, action, \"post\")\n        \
+         .submit_label(submit_label){builder_calls}{appends};\n    \
+         if let Some(csrf) = csrf {{\n        \
+         form = form.csrf(csrf.token());\n    \
+         }}\n    \
+         if let Some(field) = csrf_field {{\n        \
+         form = form.csrf_field_name(field.0.as_str());\n    \
+         }}\n    \
+         form.render()\n\
+         }}\n\n"
+    )
+}
+
+/// Render one async `{column}_select_options` loader per `references` column
+/// (issue #1135 AC 2: "references→select"). Each loader queries the
+/// referenced table's ids and returns them as `(value, label)` pairs for the
+/// `Select` override in the shared `{snake}_form_for` helper. Every handler
+/// that renders the form (`new_form`, `edit_form`, and the `create`/`update`
+/// 422 re-render branches) calls the loaders before rendering.
+///
+/// Labels are the raw id rendered as a string: which referenced-table column
+/// makes a human-friendly label is a display decision the generator can't
+/// know, so the generated doc comment tells the author where to swap in a
+/// real label column.
+fn render_reference_option_loaders(reference_fields: &[&Field], db_ty: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    for f in reference_fields {
+        let name = &f.name;
+        let Some(table) = f.reference_table() else {
+            continue;
+        };
+        let _ = write!(
+            out,
+            "/// Load the `(value, label)` select options for the `{name}` reference —\n\
+             /// one option per `{table}` row, ordered by id (issue #1135).\n\
+             ///\n\
+             /// Labels are the row id rendered as a string: which `{table}` column makes\n\
+             /// a human-friendly label is a display decision the generator can't know —\n\
+             /// swap the `map` below to use a real label column.\n\
+             async fn {name}_select_options(db: &mut {db_ty}) -> AutumnResult<Vec<(String, String)>> {{\n    \
+             let ids: Vec<i64> = {table}::table\n        \
+             .select({table}::id)\n        \
+             .order({table}::id.asc())\n        \
+             .load(&mut **db)\n        \
+             .await?;\n    \
+             Ok(ids.into_iter().map(|id| (id.to_string(), id.to_string())).collect())\n\
+             }}\n\n"
+        );
+    }
+    out
+}
+
+/// Render the form inputs for a scaffold's `--live-validation` new/edit/
+/// re-render views through the shipped, changeset-aware `autumn_web::form`
+/// helpers (issue #1124). Standard scaffolds render through a single
+/// `form_for` call instead (issue #1135, see [`render_form_for_helper`]);
+/// this per-field path survives only for `--live-validation`, whose htmx
+/// inline-validation inputs (`text_input_htmx`) have no `FieldControl`
+/// equivalent.
 ///
 /// Every helper reads its value and any inline errors from the
 /// `Changeset<{Pascal}Form>` bound to `changeset_var` in the calling handler,
@@ -3175,6 +3601,7 @@ fn main_route_entries(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::generate::Flags;
     use std::fs;
     use tempfile::TempDir;
 
@@ -3184,6 +3611,22 @@ mod tests {
         fs::create_dir_all(tmp.path().join("src")).unwrap();
         fs::write(tmp.path().join("src/main.rs"), template).unwrap();
         tmp
+    }
+
+    /// Write a minimal existing `src/models/<base>.rs` (i64-keyed) so a
+    /// `references` column targeting it counts as present — both for
+    /// `check_reference_targets`' warning and for the scaffold's
+    /// references→select promotion (issue #1135 AC 2), which needs the
+    /// target's schema entry to exist.
+    fn write_target_model(tmp: &TempDir, base: &str, pascal: &str) {
+        fs::create_dir_all(tmp.path().join("src/models")).unwrap();
+        fs::write(
+            tmp.path().join(format!("src/models/{base}.rs")),
+            format!(
+                "#[autumn_web::model]\npub struct {pascal} {{\n    #[id]\n    pub id: i64,\n}}\n"
+            ),
+        )
+        .unwrap();
     }
 
     fn default_main() -> &'static str {
@@ -3250,6 +3693,79 @@ async fn main() {
     }
 
     #[test]
+    fn generate_then_destroy_scaffold_round_trips_to_original_project_state() {
+        temp_env::with_vars(
+            [
+                ("AUTUMN_DATABASE__PRIMARY_URL", None::<&str>),
+                ("AUTUMN_DATABASE__URL", None::<&str>),
+                ("DATABASE_URL", None::<&str>),
+            ],
+            || {
+                let tmp = project_with_main(default_main());
+                // Mirrors `autumn new`'s real template Cargo.toml (see
+                // `templates/Cargo.toml.tmpl`): `autumn-web`/`maud`/
+                // `diesel_migrations` and a `tokio` dev-dep with `rt`+`macros`
+                // already present, since a fresh project always ships them.
+                let cargo_path = tmp.path().join("Cargo.toml");
+                fs::write(
+                    &cargo_path,
+                    "[package]\nname = \"x\"\n\n\
+                     [dependencies]\n\
+                     autumn-web = \"0.6.0\"\n\
+                     maud = { version = \"0.27\", features = [\"axum\"] }\n\
+                     diesel_migrations = \"2\"\n\n\
+                     [dev-dependencies]\n\
+                     tokio = { version = \"1\", features = [\"rt\", \"macros\"] }\n",
+                )
+                .unwrap();
+                let main_path = tmp.path().join("src/main.rs");
+                let original_cargo = fs::read_to_string(&cargo_path).unwrap();
+                let original_main = fs::read_to_string(&main_path).unwrap();
+
+                let plan = plan_scaffold(
+                    tmp.path(),
+                    "Post",
+                    &["title:String".into()],
+                    "20260427000000",
+                )
+                .unwrap();
+                plan.execute(Flags::default()).unwrap();
+                assert!(tmp.path().join("src/models/post.rs").exists());
+                assert!(tmp.path().join("src/routes/posts.rs").exists());
+
+                let destroy_plan = plan_scaffold(
+                    tmp.path(),
+                    "Post",
+                    &["title:String".into()],
+                    "99999999999999",
+                )
+                .unwrap();
+                destroy_plan.revert(Flags::default()).unwrap();
+
+                for gone in [
+                    "src/models/post.rs",
+                    "src/models/mod.rs",
+                    "src/schema.rs",
+                    "src/repositories/post.rs",
+                    "src/repositories/mod.rs",
+                    "src/routes/posts.rs",
+                    "src/routes/mod.rs",
+                    "tests/post.rs",
+                ] {
+                    assert!(!tmp.path().join(gone).exists(), "{gone} should be removed");
+                }
+                assert!(
+                    fs::read_dir(tmp.path().join("migrations"))
+                        .map_or(true, |mut d| d.next().is_none()),
+                    "migration directory must be removed"
+                );
+                assert_eq!(fs::read_to_string(&main_path).unwrap(), original_main);
+                assert_eq!(fs::read_to_string(&cargo_path).unwrap(), original_cargo);
+            },
+        );
+    }
+
+    #[test]
     fn plan_errors_when_main_rs_missing() {
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join("Cargo.toml"), "").unwrap();
@@ -3258,14 +3774,12 @@ async fn main() {
     }
 
     #[test]
-    fn execute_writes_required_attribute_for_unvalidated_required_text_field() {
-        // Regression guard (issue #1124 review): the pre-#1124 generator added
-        // the HTML `required` attribute to every non-nullable field
-        // unconditionally, independent of whether a `--validate` rule was
-        // declared. `autumn generate scaffold Post title:String` (no
-        // `--validate` at all) must still mark `title` `required` — otherwise
-        // a blank browser submission is treated as valid and inserts `title =
-        // ""`, silently accepting empty required data.
+    fn execute_writes_form_for_helper_with_formmodel_delegation() {
+        // Issue #1135: per-column control selection (and the required /
+        // `aria-required` signal issue #1124 guarded here) now lives in the
+        // `#[model]`-derived `FormModel` descriptors — the routes file
+        // delegates `PostForm`'s fields to the model's derived impl and
+        // renders the whole form through one shared `form_for` helper.
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold(
             tmp.path(),
@@ -3278,11 +3792,247 @@ async fn main() {
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
         assert!(
+            routes.contains("impl autumn_web::form::FormModel for PostForm"),
+            "PostForm must implement FormModel: {routes}"
+        );
+        assert!(
+            routes.contains("<Post as autumn_web::form::FormModel>::form_fields()"),
+            "PostForm must delegate its descriptors to the derived model impl: {routes}"
+        );
+        assert!(routes.contains("fn post_form_for("), "{routes}");
+        assert!(
+            routes.contains("autumn_web::form::form_for(changeset, action, \"post\")"),
+            "the shared helper must render through form_for: {routes}"
+        );
+        assert!(
+            !routes.contains("autumn_web::form::required_text_input(&changeset"),
+            "no per-field input helpers may remain in the views: {routes}"
+        );
+    }
+
+    #[test]
+    fn execute_references_column_renders_select_with_loaded_options() {
+        // Issue #1135 AC 2: "references→select". The `#[model]` derive sees a
+        // plain `i64` and emits a number input; the scaffold overrides the
+        // reference to a `Select` whose options (the referenced table's ids)
+        // are loaded by every handler that renders the form and threaded
+        // through the shared `comment_form_for` helper. The `Post` target
+        // model exists, so the promotion applies (a missing target falls
+        // back to the derived number input — see
+        // `execute_references_column_with_missing_target_falls_back_to_number_input`).
+        let tmp = project_with_main(default_main());
+        write_target_model(&tmp, "post", "Post");
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Comment",
+            &["body:Text".into(), "post:references".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/comments.rs")).unwrap();
+        // The helper takes the loaded options and promotes the column.
+        assert!(
+            routes.contains("post_id_options: &[(String, String)],"),
+            "helper must take the reference options: {routes}"
+        );
+        assert!(
             routes.contains(
-                "autumn_web::form::required_text_input(&changeset, \"title\", \"Title\")"
+                "let mut post_id_select = vec![(String::new(), \"— Select —\".to_string())];"
             ),
-            "an unvalidated but required field must still render via \
-             required_text_input: {routes}"
+            "non-nullable reference must get a blank 'please select' placeholder: {routes}"
+        );
+        assert!(
+            routes.contains(
+                ".override_field(\"post_id\", autumn_web::form::FieldControl::Select { options: post_id_select })"
+            ),
+            "reference column must be promoted to a Select: {routes}"
+        );
+        // A shared loader queries the referenced table's ids.
+        assert!(
+            routes.contains(
+                "async fn post_id_select_options(db: &mut Db) -> AutumnResult<Vec<(String, String)>>"
+            ),
+            "must emit an options loader: {routes}"
+        );
+        assert!(
+            routes.contains("posts::table") && routes.contains(".select(posts::id)"),
+            "loader must query the referenced table's ids: {routes}"
+        );
+        assert!(
+            routes.contains("use crate::schema::{comments, posts};"),
+            "referenced table's schema module must be imported: {routes}"
+        );
+        // Every rendering handler loads the options: new_form/edit_form GETs
+        // plus the create/update 422 re-render branches.
+        assert_eq!(
+            routes
+                .matches("let post_id_options = post_id_select_options(&mut db).await?;")
+                .count(),
+            4,
+            "new_form, edit_form, create 422, and update 422 must all load options: {routes}"
+        );
+        // `new_form` gains the DB handle it previously didn't need.
+        assert!(
+            routes.contains("pub async fn new_form(\n    mut db: Db,"),
+            "new_form must take a DB handle to load reference options: {routes}"
+        );
+        // The helper call threads the options through.
+        assert!(
+            routes.contains("csrf_field.as_ref(), &post_id_options))"),
+            "view bodies must pass the loaded options to the helper: {routes}"
+        );
+    }
+
+    #[test]
+    fn execute_nullable_references_column_gets_unset_placeholder() {
+        let tmp = project_with_main(default_main());
+        write_target_model(&tmp, "post", "Post");
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Comment",
+            &["post:Option<references>".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/comments.rs")).unwrap();
+        assert!(
+            routes.contains(
+                "let mut post_id_select = vec![(String::new(), \"— Unset —\".to_string())];"
+            ),
+            "nullable reference must get an '— Unset —' placeholder: {routes}"
+        );
+    }
+
+    #[test]
+    fn execute_references_column_with_missing_target_falls_back_to_number_input() {
+        // Regression test (issue #1135 review): a missing reference target has
+        // always been a warning, not an error — the scaffold assumes the table
+        // exists out-of-band (or gets generated later) and its output must
+        // still compile. The references→select promotion needs the target's
+        // `src/schema.rs` entry, so with no `Post` model in the project the
+        // `post_id` column must skip the whole select pipeline (schema
+        // import, options loader, Select override, threaded options) and keep
+        // the derived numeric id input.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Comment",
+            &["body:Text".into(), "post:references".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/comments.rs")).unwrap();
+        assert!(
+            routes.contains("use crate::schema::comments;"),
+            "only the resource's own schema module may be imported: {routes}"
+        );
+        assert!(
+            !routes.contains("posts::"),
+            "the missing target's schema module must never be referenced: {routes}"
+        );
+        assert!(
+            !routes.contains("post_id_select_options"),
+            "no options loader may be emitted for a missing target: {routes}"
+        );
+        assert!(
+            !routes.contains(".override_field(\"post_id\""),
+            "the column must keep the derived number input, not a Select: {routes}"
+        );
+        assert!(
+            !routes.contains("post_id_options"),
+            "the form helper must not take options for a missing target: {routes}"
+        );
+        // Without reference selects, `new_form` keeps its no-DB signature.
+        assert!(
+            !routes.contains("pub async fn new_form(\n    mut db: Db,"),
+            "new_form must not gain a DB handle when no options are loaded: {routes}"
+        );
+    }
+
+    #[test]
+    fn execute_mixed_reference_targets_keeps_select_only_for_present_target() {
+        // One reference whose target exists (`author` → src/models/author.rs)
+        // and one whose target is missing (`post`): only the present target
+        // gets the select promotion; the missing one falls back to the
+        // derived number input and stays out of the schema import.
+        let tmp = project_with_main(default_main());
+        write_target_model(&tmp, "author", "Author");
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Comment",
+            &["author:references".into(), "post:references".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/comments.rs")).unwrap();
+        assert!(
+            routes.contains("use crate::schema::{comments, authors};")
+                || routes.contains("use crate::schema::{authors, comments};"),
+            "only the present target may join the schema import: {routes}"
+        );
+        assert!(
+            routes.contains(
+                ".override_field(\"author_id\", autumn_web::form::FieldControl::Select { options: author_id_select })"
+            ),
+            "the present target must keep its Select promotion: {routes}"
+        );
+        assert!(
+            routes.contains("async fn author_id_select_options"),
+            "the present target must keep its options loader: {routes}"
+        );
+        assert!(
+            !routes.contains("posts::") && !routes.contains("post_id_select_options"),
+            "the missing target must not produce select machinery: {routes}"
+        );
+        assert!(
+            !routes.contains(".override_field(\"post_id\""),
+            "the missing target's column must keep the derived number input: {routes}"
+        );
+    }
+
+    #[test]
+    fn execute_self_referential_reference_keeps_select_without_target_model() {
+        // A self-referential column targets the scaffold's own table, whose
+        // schema entry this very command generates — it is never "missing",
+        // so the select promotion applies even though no `src/models/
+        // category.rs` exists beforehand.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Category",
+            &["name:String".into(), "category:references".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        assert!(
+            plan.warnings.is_empty(),
+            "a self-reference must not warn: {:?}",
+            plan.warnings
+        );
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/categories.rs")).unwrap();
+        assert!(
+            routes.contains(
+                ".override_field(\"category_id\", autumn_web::form::FieldControl::Select { options: category_id_select })"
+            ),
+            "self-referential column must keep the Select promotion: {routes}"
+        );
+        assert!(
+            routes.contains("async fn category_id_select_options"),
+            "self-referential column must keep its options loader: {routes}"
+        );
+        assert!(
+            routes.contains("use crate::schema::categories;"),
+            "own table needs no extra schema import: {routes}"
         );
     }
 
@@ -3360,14 +4110,15 @@ async fn main() {
         plan_and_execute_post_scaffold_with_status_enum(&tmp);
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
 
-        // Enum fields render through the changeset-aware `select_input` helper
-        // (issue #1124), with one `(value, label)` option per variant plus a
-        // leading placeholder. The selected option is chosen by the helper from
-        // the changeset's current value, not a hand-rolled `selected[...]`.
-        // Required (non-nullable), so the `required_select_input` sibling.
+        // Enum fields are promoted to a `Select` control via a `form_for`
+        // override (issue #1135) — the `#[model]` derive sees only an opaque
+        // Rust enum type, but the scaffold knows the variants statically and
+        // emits one `(value, label)` option per variant plus a leading
+        // placeholder. The selected option is chosen by the shipped
+        // `select_input` helper from the changeset's current value.
         assert!(
             routes.contains(
-                "autumn_web::form::required_select_input(&changeset, \"status\", \"Status\", &[(\"\", \"— Select —\"), (\"draft\", \"Draft\"), (\"published\", \"Published\"), (\"archived\", \"Archived\")])"
+                ".override_field(\"status\", autumn_web::form::FieldControl::Select { options: vec![(\"\".into(), \"— Select —\".into()), (\"draft\".into(), \"Draft\".into()), (\"published\".into(), \"Published\".into()), (\"archived\".into(), \"Archived\".into())] })"
             ),
             "got:\n{routes}"
         );
@@ -3458,8 +4209,12 @@ async fn main() {
         plan.execute(Flags::default()).unwrap();
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        // A `--default` field is excluded from the derived `FormModel` list
+        // (the model marks it `#[default]`), so the scaffold must not emit a
+        // select override for it either — otherwise `form_for` would carry a
+        // dangling override for a field it never renders.
         assert!(
-            !routes.contains("select name=\"status\""),
+            !routes.contains(".override_field(\"status\""),
             "a --default field must be excluded from the create/edit forms: {routes}"
         );
     }
@@ -3606,7 +4361,7 @@ async fn main() {
 
         assert!(
             routes.contains(
-                "autumn_web::form::select_input(&changeset, \"status\", \"Status\", &[(\"\", \"— Unset —\"), (\"draft\", \"Draft\"), (\"published\", \"Published\")])"
+                ".override_field(\"status\", autumn_web::form::FieldControl::Select { options: vec![(\"\".into(), \"— Unset —\".into()), (\"draft\".into(), \"Draft\".into()), (\"published\".into(), \"Published\".into())] })"
             ),
             "got:\n{routes}"
         );
@@ -3769,7 +4524,7 @@ async fn main() {
     }
 
     #[test]
-    fn execute_new_and_edit_forms_use_changeset_helpers() {
+    fn execute_new_and_edit_forms_render_via_form_for() {
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold_with_options(
             tmp.path(),
@@ -3793,26 +4548,42 @@ async fn main() {
         plan.execute(Flags::default()).unwrap();
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
-        // AC6: new/edit render through the changeset-aware input helpers.
-        // Every field here is required (non-nullable), so each uses its
-        // `required_*` sibling helper (issue #1124 review).
-        assert!(
-            routes.contains("autumn_web::form::required_text_input(&changeset, \"title\""),
-            "string fields must render via required_text_input: {routes}"
+        // Issue #1135: new/edit render the whole form through one shared
+        // `form_for` helper — control selection per column (text/number/
+        // checkbox/datetime, required or not) lives in the derived
+        // `FormModel` descriptors, so the routes file carries no per-field
+        // input lines at all.
+        let new_form_start = routes
+            .find("pub async fn new_form")
+            .expect("new_form handler");
+        let create_start = routes.find("pub async fn create(").expect("create handler");
+        let new_form_body = &routes[new_form_start..create_start];
+        assert_eq!(
+            new_form_body.matches("post_form_for(&changeset").count(),
+            1,
+            "the new view must render via exactly one form_for call: {new_form_body}"
         );
-        assert!(
-            routes.contains("autumn_web::form::required_number_input(&changeset, \"rank\""),
-            "numeric fields must render via required_number_input: {routes}"
+        let edit_form_start = routes
+            .find("pub async fn edit_form")
+            .expect("edit_form handler");
+        let update_start = routes.find("pub async fn update(").expect("update handler");
+        let edit_form_body = &routes[edit_form_start..update_start];
+        assert_eq!(
+            edit_form_body.matches("post_form_for(&changeset").count(),
+            1,
+            "the edit view must render via exactly one form_for call: {edit_form_body}"
         );
-        assert!(
-            routes.contains("autumn_web::form::checkbox_input(&changeset, \"published\""),
-            "bool fields must render via checkbox_input: {routes}"
-        );
-        assert!(
-            routes
-                .contains("autumn_web::form::required_datetime_input(&changeset, \"published_at\""),
-            "datetime fields must render via required_datetime_input: {routes}"
-        );
+        for helper in [
+            "required_text_input",
+            "required_number_input",
+            "checkbox_input",
+            "required_datetime_input",
+        ] {
+            assert!(
+                !routes.contains(&format!("autumn_web::form::{helper}(&changeset")),
+                "no per-field {helper} lines may remain: {routes}"
+            );
+        }
         // The old hand-rolled bare-HTML text input must be gone for standard fields.
         assert!(
             !routes.contains(r#"input type="text" name="title""#),
@@ -3856,12 +4627,12 @@ async fn main() {
             routes.contains("views: row.views.clone(),"),
             "seed must copy nullable numeric fields from the loaded row: {routes}"
         );
-        // Both new and edit render the numeric field via the number helper.
+        // The nullable numeric control itself comes from the derived
+        // `FormModel` descriptors (Option<i64> → non-required number input);
+        // the routes file needs no per-field code or override for it.
         assert!(
-            routes.contains(
-                "autumn_web::form::number_input(&changeset, \"views\", \"Views\", Some(\"1\"))"
-            ),
-            "nullable numeric fields render via number_input: {routes}"
+            !routes.contains(".override_field(\"views\""),
+            "plain numeric fields need no form_for override: {routes}"
         );
     }
 
@@ -4083,6 +4854,42 @@ async fn main() {
         assert!(
             !deps_section.contains("test-support"),
             "test-support must stay out of [dependencies]: {cargo}"
+        );
+    }
+
+    #[test]
+    fn destroying_the_only_scaffold_keeps_pre_existing_test_support_another_test_still_uses() {
+        // issue #1048 PR review: a project may already have `autumn-web`
+        // under `[dev-dependencies]` with `test-support` enabled for its
+        // OWN hand-written tests, independent of any scaffold.
+        // `ensure_dev_dependency_test_support` makes no Cargo.toml edit in
+        // that case, but the revert is still recorded unconditionally —
+        // must not strip `test-support` out from under that unrelated test
+        // when destroying the only scaffold.
+        let tmp = project_with_main(default_main());
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname=\"x\"\n\n[dev-dependencies]\nautumn-web = { version = \"0.6\", features = [\"test-support\"] }\n",
+        )
+        .unwrap();
+        fs::create_dir_all(tmp.path().join("tests")).unwrap();
+        fs::write(
+            tmp.path().join("tests/hand_written.rs"),
+            "#[tokio::test]\nasync fn it_works() {\n    let _db = autumn_web::test::TestDb::shared().await;\n}\n",
+        )
+        .unwrap();
+
+        let plan = plan_scaffold(tmp.path(), "Post", &[], "20260427000000").unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let destroy_plan = plan_scaffold(tmp.path(), "Post", &[], "99999999999999").unwrap();
+        destroy_plan.revert(Flags::default()).unwrap();
+
+        let cargo_after = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+        assert!(
+            cargo_after.contains("test-support"),
+            "pre-existing test-support must survive — the hand-written test still uses \
+             TestDb: {cargo_after}"
         );
     }
 
@@ -4408,12 +5215,39 @@ async fn main() {
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
 
-        // Attachment fields keep a hand-rolled file input plus a hidden field
-        // carrying the existing blob key from the changeset (issue #1124).
-        assert!(routes.contains("input type=\"file\" name=\"avatar\""));
+        // Attachment fields are excluded from the derived `FormModel` list
+        // and re-appended to the `form_for` builder as a hand-rolled file
+        // input plus a hidden field carrying the existing blob key from the
+        // changeset (issues #1124/#1135) — `FieldControl::File` would flip
+        // the form to multipart, but scaffold forms stay URL-encoded.
+        assert!(routes.contains(".exclude(\"avatar\")"), "{routes}");
+        assert!(routes.contains(".append(html! {"), "{routes}");
+        assert!(routes.contains("input type=\"file\" id=\"avatar\" name=\"avatar\""));
         assert!(routes.contains(
             "input type=\"hidden\" name=\"avatar\" value=(changeset.field_value(\"avatar\").unwrap_or_default())"
         ));
+
+        // The hand-rolled file input renders the same inline-error/ARIA
+        // skeleton as the derived controls (mirroring `FieldControl::File`
+        // in autumn-web's form.rs), so changeset errors on the attachment
+        // key are not silently dropped.
+        assert!(
+            routes.contains("@let errors = changeset.errors_for(\"avatar\");"),
+            "{routes}"
+        );
+        assert!(
+            routes.contains("aria-invalid=(if errors.is_empty() { \"false\" } else { \"true\" })"),
+            "{routes}"
+        );
+        assert!(
+            routes
+                .contains("div id=\"avatar-error\" role=\"alert\" class=\"autumn-field__errors\""),
+            "{routes}"
+        );
+        assert!(
+            !routes.contains("enctype"),
+            "scaffold forms must stay URL-encoded even with attachments: {routes}"
+        );
 
         // The form struct carries the attachment key as an Option<String>.
         assert!(routes.contains("pub struct PostForm"));
@@ -4439,12 +5273,16 @@ async fn main() {
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
 
-        // Bool fields render through the changeset-aware `checkbox_input`
-        // helper (issue #1124), which reflects the value and emits exactly one
-        // `name="active"` input — no duplicate-key hidden fallback.
+        // Bool fields map to a checkbox in the derived `FormModel`
+        // descriptors (issue #1135) — no per-field helper line and no
+        // `form_for` override needed in the routes file.
         assert!(
-            routes.contains("autumn_web::form::checkbox_input(&changeset, \"active\", \"Active\")"),
+            !routes.contains("autumn_web::form::checkbox_input(&changeset"),
             "{routes}"
+        );
+        assert!(
+            !routes.contains(".override_field(\"active\""),
+            "bool fields need no form_for override: {routes}"
         );
         assert!(
             !routes.contains("input type=\"text\" name=\"active\""),
@@ -4479,13 +5317,16 @@ async fn main() {
             !routes.contains("input type=\"checkbox\" name=\"archived\""),
             "nullable bool must not render a checkbox: {routes}"
         );
-        // A nullable bool renders a 3-option `select_input` (unset/true/false);
-        // the changeset picks the current option (issue #1124).
+        // A nullable bool maps to a 3-option select (unset/true/false) in the
+        // derived `FormModel` descriptors (issue #1135) — no per-field helper
+        // line and no `form_for` override needed in the routes file.
         assert!(
-            routes.contains(
-                "autumn_web::form::select_input(&changeset, \"archived\", \"Archived\", &[(\"\", \"— Unset —\"), (\"true\", \"Yes\"), (\"false\", \"No\")])"
-            ),
+            !routes.contains("autumn_web::form::select_input(&changeset"),
             "{routes}"
+        );
+        assert!(
+            !routes.contains(".override_field(\"archived\""),
+            "nullable bool fields need no form_for override: {routes}"
         );
         // The form field is an Option<bool> so a blank submission stays None.
         assert!(routes.contains("pub archived: Option<bool>,"), "{routes}");
@@ -4505,20 +5346,19 @@ async fn main() {
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
 
-        // Both fields are required (non-nullable), so both use
-        // `required_number_input` (issue #1124 review).
+        // Integer fields map to a stepped number control in the derived
+        // `FormModel` descriptors (issue #1135) — no per-field helper line
+        // and no `form_for` override needed in the routes file.
         assert!(
-            routes.contains(
-                "autumn_web::form::required_number_input(&changeset, \"views\", \"Views\", Some(\"1\"))"
-            ),
+            !routes.contains("autumn_web::form::required_number_input(&changeset"),
             "{routes}"
         );
-        assert!(
-            routes.contains(
-                "autumn_web::form::required_number_input(&changeset, \"rank\", \"Rank\", Some(\"1\"))"
-            ),
-            "{routes}"
-        );
+        for field in ["views", "rank"] {
+            assert!(
+                !routes.contains(&format!(".override_field(\"{field}\"")),
+                "integer fields need no form_for override: {routes}"
+            );
+        }
         assert!(
             !routes.contains("input type=\"text\" name=\"views\""),
             "{routes}"
@@ -4543,20 +5383,19 @@ async fn main() {
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
 
-        // Both fields are required (non-nullable), so both use
-        // `required_number_input` (issue #1124 review).
+        // Float fields map to a free-step number control in the derived
+        // `FormModel` descriptors (issue #1135) — no per-field helper line
+        // and no `form_for` override needed in the routes file.
         assert!(
-            routes.contains(
-                "autumn_web::form::required_number_input(&changeset, \"price\", \"Price\", Some(\"any\"))"
-            ),
+            !routes.contains("autumn_web::form::required_number_input(&changeset"),
             "{routes}"
         );
-        assert!(
-            routes.contains(
-                "autumn_web::form::required_number_input(&changeset, \"weight\", \"Weight\", Some(\"any\"))"
-            ),
-            "{routes}"
-        );
+        for field in ["price", "weight"] {
+            assert!(
+                !routes.contains(&format!(".override_field(\"{field}\"")),
+                "float fields need no form_for override: {routes}"
+            );
+        }
     }
 
     #[test]
@@ -4582,12 +5421,6 @@ async fn main() {
         plan.execute(Flags::default()).unwrap();
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
-        assert!(
-            routes.contains(
-                "autumn_web::form::required_number_input(&changeset, \"price\", \"Price\", Some(\"any\"))"
-            ),
-            "{routes}"
-        );
         assert!(routes.contains("pub price: String,"), "{routes}");
         assert!(
             routes.contains(
@@ -4705,14 +5538,9 @@ async fn main() {
         plan.execute(Flags::default()).unwrap();
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
-        // The edit form seeds the changeset from the row; `required_number_input`
-        // (required, non-nullable field) reads the value back (issue #1124).
-        assert!(
-            routes.contains(
-                "autumn_web::form::required_number_input(&changeset, \"views\", \"Views\", Some(\"1\"))"
-            ),
-            "{routes}"
-        );
+        // The edit form seeds the changeset from the row; the number control
+        // (from the derived `FormModel` descriptors) reads the value back
+        // through `form_for` (issues #1124/#1135).
         assert!(routes.contains("views: row.views.to_string(),"), "{routes}");
     }
 
@@ -4730,13 +5558,16 @@ async fn main() {
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
 
-        // Datetime fields render via the `datetime_input` helper (issue #1124);
-        // required (non-nullable), so the `required_datetime_input` sibling.
+        // Datetime fields map to a datetime-local control in the derived
+        // `FormModel` descriptors (issue #1135) — no per-field helper line
+        // and no `form_for` override needed in the routes file.
         assert!(
-            routes.contains(
-                "autumn_web::form::required_datetime_input(&changeset, \"published_at\", \"Published At\")"
-            ),
+            !routes.contains("autumn_web::form::required_datetime_input(&changeset"),
             "{routes}"
+        );
+        assert!(
+            !routes.contains(".override_field(\"published_at\""),
+            "datetime fields need no form_for override: {routes}"
         );
         assert!(
             !routes.contains("input type=\"text\" name=\"published_at\""),
@@ -4775,11 +5606,10 @@ async fn main() {
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
 
-        // Required (non-nullable), so the `required_datetime_input` sibling.
+        // The datetime-local control comes from the derived `FormModel`
+        // descriptors (issue #1135) — no per-field line or override needed.
         assert!(
-            routes.contains(
-                "autumn_web::form::required_datetime_input(&changeset, \"scheduled_at\", \"Scheduled At\")"
-            ),
+            !routes.contains(".override_field(\"scheduled_at\""),
             "{routes}"
         );
         assert!(routes.contains("pub scheduled_at: String,"), "{routes}");
@@ -4842,33 +5672,25 @@ async fn main() {
         plan.execute(Flags::default()).unwrap();
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
-        // Genuine string fields (String/Text) render via `text_input`; every
-        // other kind uses its own changeset-aware helper (issue #1124). Every
-        // field here is required, so each uses its `required_*` sibling.
-        assert!(
-            routes.contains(
-                "autumn_web::form::required_text_input(&changeset, \"title\", \"Title\")"
-            ),
-            "{routes}"
-        );
-        assert!(
-            routes
-                .contains("autumn_web::form::required_text_input(&changeset, \"body\", \"Body\")"),
-            "{routes}"
-        );
-        assert!(
-            routes.contains("autumn_web::form::checkbox_input(&changeset, \"active\""),
-            "{routes}"
-        );
-        assert!(
-            routes.contains("autumn_web::form::required_number_input(&changeset, \"views\""),
-            "{routes}"
-        );
-        assert!(
-            routes
-                .contains("autumn_web::form::required_datetime_input(&changeset, \"published_at\""),
-            "{routes}"
-        );
+        // Control selection per kind (text vs checkbox vs number vs
+        // datetime-local, required or not) lives in the derived `FormModel`
+        // descriptors (issue #1135): the routes file renders everything
+        // through the single shared `form_for` helper, with no per-field
+        // helper lines and no overrides for these plain kinds.
+        assert!(routes.contains("fn post_form_for("), "{routes}");
+        for helper in [
+            "text_input",
+            "required_text_input",
+            "checkbox_input",
+            "required_number_input",
+            "required_datetime_input",
+        ] {
+            assert!(
+                !routes.contains(&format!("autumn_web::form::{helper}(&changeset")),
+                "no per-field {helper} lines may remain: {routes}"
+            );
+        }
+        assert!(!routes.contains(".override_field("), "{routes}");
         // No hand-rolled bare text inputs remain for the non-string fields.
         assert!(
             !routes.contains("input type=\"text\" name=\"active\""),
@@ -5881,8 +6703,22 @@ async fn main() {
             "20260427000000",
         )
         .unwrap();
-        assert_eq!(plan.warnings.len(), 1, "warnings: {:?}", plan.warnings);
+        // Two warnings: the shared "assuming table exists" one from
+        // `check_reference_targets`, plus the scaffold-specific note that the
+        // form falls back to a numeric id input (no schema entry to load
+        // select options from) and how to get the select instead.
+        assert_eq!(plan.warnings.len(), 2, "warnings: {:?}", plan.warnings);
         assert!(plan.warnings[0].contains("posts"));
+        assert!(
+            plan.warnings[1].contains("numeric id input"),
+            "warnings: {:?}",
+            plan.warnings
+        );
+        assert!(
+            plan.warnings[1].contains("Generate the 'post' model first"),
+            "warnings: {:?}",
+            plan.warnings
+        );
     }
 
     #[test]
