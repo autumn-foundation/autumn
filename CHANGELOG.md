@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **views:** widget storybook (issue #1526) — a browsable gallery of every
+  built-in maud widget plus a CI anti-rot harness. `autumn_web::stories`
+  ships `Story`/`StoryRegistry`/`StoryGallery` (mirroring the mail-preview
+  registry), a `story!{ group, name, { ... } }` macro whose block is **both**
+  executed for the live render and captured byte-for-byte (comments and
+  formatting included) as the displayed snippet — so the shown code is
+  provably the code that rendered — and `stories::builtin()` with a story for
+  every gallery-visible widget. Stories are zero-arg pure `fn() -> Markup`
+  pointers: capturing a `Db` handle, `AppState`, or any local is a compile
+  error. Mount with `.with_story_gallery(StoryGallery::builtin())` — routes
+  at `GET /_stories` (grouped index) and `GET /_stories/{slug}` (live render
+  + Source + Rendered HTML tabs, dogfooding the `tabs` widget and styled by
+  the framework widget stylesheet) are **off by default** and opt in per
+  profile via `[stories] enabled = true` (e.g. `[profile.dev.stories]` for a
+  dev-only gallery, or a prod profile for a public showcase; `/_stories` is
+  404 wherever the resolved flag is false; `AUTUMN_STORIES__ENABLED`
+  overrides from the environment). Apps register their own widgets with the
+  same `story!` macro via `StoryGallery::builtin().extend(...)` or a
+  builtin-free `StoryGallery::new()`. CI renders every builtin story
+  (panic-free, non-empty, balanced HTML, unique slugs) and a two-layer
+  coverage gate fails the build when a widget in `widgets.rs` gains no story.
+  See `docs/guide/stories.md`.
 - **repository:** bounded-memory batched iteration (#1395) — every
   `#[repository]` now generates `find_in_batches(batch_size)` (yielding
   successive `Vec<Model>` chunks of at most `batch_size`) and
