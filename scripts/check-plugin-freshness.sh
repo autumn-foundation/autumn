@@ -15,7 +15,9 @@
 #         (exempts that bullet only — other new bullets still need plugin
 #         coverage), or
 #       * include [no-plugin] in the PR body (deliberately PR-wide), or
-#       * apply the `plugin-exempt` label to the PR (workflow-level check).
+#       * apply the `plugin-exempt` label to the PR (the workflow passes it
+#         through as PLUGIN_EXEMPT_LABEL=true; it bypasses ONLY the drift
+#         gate — the static sanity checks below always run).
 #
 # WHAT IT CHECKS (single fast job, no Rust toolchain needed):
 #   1. Drift gate: diff against the merge base of $BASE_REF; if bullets were
@@ -24,12 +26,15 @@
 #      unless an escape hatch (above) applies.
 #   2. Static sanity: .claude-plugin/plugin.json parses as JSON, and every
 #      docs/guide/*.md path referenced from skills/ and agents/ exists.
+#      Always runs — no escape hatch skips it.
 #
 # USAGE:
 #   scripts/check-plugin-freshness.sh              # gate against $BASE_REF
 #                                                  #   (default origin/trunk-dev)
 #   BASE_REF=origin/trunk scripts/check-plugin-freshness.sh
 #   PR_BODY="..." scripts/check-plugin-freshness.sh   # PR body escape hatch
+#   PLUGIN_EXEMPT_LABEL=true scripts/check-plugin-freshness.sh
+#                                                  # skip drift gate only
 #   scripts/check-plugin-freshness.sh --static-only   # only check 2
 #   scripts/check-plugin-freshness.sh --self-test     # synthetic-repo tests
 #
@@ -153,6 +158,18 @@ run_static_checks() {
   echo "OK: static checks passed."
 }
 
+# Full check as CI runs it: static checks always; the drift gate is skipped
+# (with an explicit note) when the plugin-exempt label was applied.
+run_checks() {
+  local dir="$1" base_ref="$2" pr_body="${3-}" exempt_label="${4-false}"
+  run_static_checks "$dir"
+  if [[ "$exempt_label" == "true" ]]; then
+    echo "drift gate skipped: plugin-exempt label"
+    return 0
+  fi
+  run_gate "$dir" "$base_ref" "$pr_body"
+}
+
 self_test() {
   local tmp
   tmp="$(mktemp -d)"
@@ -270,6 +287,21 @@ EOF
   git -C "$r11" commit -qam "docs: rewrap bullet"
   check "pure rewrap of existing bullet passes" pass run_gate "$r11" base ""
 
+  # Scenario 12: plugin-exempt label skips ONLY the drift gate — the static
+  # checks still run, so a broken plugin.json fails even on an exempt PR.
+  local r12="$tmp/r12"; make_repo "$r12"
+  sed -i 's/- \*\*old:\*\* an existing bullet/- **old:** an existing bullet\n- **new:** shiny feature agents should know about/' "$r12/CHANGELOG.md"
+  printf '{ not json' > "$r12/.claude-plugin/plugin.json"
+  git -C "$r12" commit -qam "feat: exempt label, broken plugin.json"
+  check "exempt label still fails static checks on bad plugin.json" fail run_checks "$r12" base "" true
+
+  # Scenario 13: plugin-exempt label with a valid plugin passes despite a
+  # changelog-only change (drift gate is what gets skipped).
+  local r13="$tmp/r13"; make_repo "$r13"
+  sed -i 's/- \*\*old:\*\* an existing bullet/- **old:** an existing bullet\n- **new:** shiny feature agents should know about/' "$r13/CHANGELOG.md"
+  git -C "$r13" commit -qam "feat: exempt label, changelog only"
+  check "exempt label skips drift gate on changelog-only change" pass run_checks "$r13" base "" true
+
   echo "self-test: $pass/$total passed"
   [[ "$pass" -eq "$total" ]]
 }
@@ -282,7 +314,6 @@ case "${1-}" in
     run_static_checks "$root"
     ;;
   *)
-    run_static_checks "$root"
-    run_gate "$root" "${BASE_REF:-origin/trunk-dev}" "${PR_BODY-}"
+    run_checks "$root" "${BASE_REF:-origin/trunk-dev}" "${PR_BODY-}" "${PLUGIN_EXEMPT_LABEL:-false}"
     ;;
 esac
