@@ -75,6 +75,31 @@ fn generate_tauri_remote_url_scaffolds_thin_client() {
         capability.contains("https://app.example.com"),
         "capability file must grant the remote URL:\n{capability}"
     );
+    assert!(
+        !capability.contains("biometric:default"),
+        "base capability must not grant biometric — the plugin is not compiled \
+         on desktop, so tauri-build would reject the permission there:\n{capability}"
+    );
+
+    let mobile_capability_path = project.join("src-tauri/capabilities/remote-app-mobile.json");
+    let mobile_capability = fs::read_to_string(&mobile_capability_path).unwrap_or_else(|e| {
+        panic!(
+            "thin-client scaffold must write {}: {e}",
+            mobile_capability_path.display()
+        )
+    });
+    assert!(
+        mobile_capability.contains("https://app.example.com"),
+        "mobile capability file must grant the remote URL:\n{mobile_capability}"
+    );
+    assert!(
+        mobile_capability.contains("biometric:default"),
+        "mobile capability file must grant biometric:\n{mobile_capability}"
+    );
+    assert!(
+        mobile_capability.contains(r#""platforms": ["android", "iOS"]"#),
+        "mobile capability must be restricted to Android/iOS:\n{mobile_capability}"
+    );
 
     let lib = fs::read_to_string(project.join("src-tauri/src/lib.rs"))
         .expect("thin-client scaffold must write src-tauri/src/lib.rs");
@@ -202,6 +227,12 @@ fn destroy_tauri_remote_url_reverts_thin_client_scaffold() {
         "destroy must remove the generated capability file"
     );
     assert!(
+        !project
+            .join("src-tauri/capabilities/remote-app-mobile.json")
+            .exists(),
+        "destroy must remove the generated mobile capability file"
+    );
+    assert!(
         !project.join("src-tauri/src/lib.rs").exists(),
         "destroy must remove the generated shell sources"
     );
@@ -225,6 +256,8 @@ fn thin_client_docs_page_covers_required_topics() {
         "notification:default",
         "biometric:default",
         "store:default",
+        "remote-app-mobile.json",
+        "platforms",
         "SameSite=None",
         "Authorization",
         "Guideline 4.2",

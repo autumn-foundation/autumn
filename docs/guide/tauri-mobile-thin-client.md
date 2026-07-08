@@ -27,7 +27,7 @@ and shipping a server fix updates every installed app instantly. Choose the
 [desktop sidecar model](tauri.md) instead when the app must be fully
 self-contained on the user's machine.
 
-**Trust model, up front:** the generated capability file grants pages served
+**Trust model, up front:** the generated capability files grant pages served
 from your remote origin the right to invoke native device APIs on the phone.
 That origin is *fully trusted* — a compromised server can call every permitted
 plugin command. Keep the grant scoped to exactly one origin you control, keep
@@ -57,6 +57,7 @@ src-tauri/
   Info.ios.plist               — NSFaceIDUsageDescription for Face ID
   capabilities/
     remote-app.json            — grants the remote origin the plugin permissions
+    remote-app-mobile.json     — biometric grant, restricted to android/iOS
   src/
     main.rs                    — calls {app}_mobile::run()
     lib.rs                     — plugin registration + webview → remote URL
@@ -165,16 +166,17 @@ rejection risk by making the app app-like, but nothing guarantees approval —
 review is holistic, and the strongest defence is UX that feels like an app
 (native-feature use, offline handling, no browser chrome metaphors).
 
-### The capability file, field by field
+### The capability files, field by field
 
-`src-tauri/capabilities/remote-app.json` is what lets JavaScript served by your
-*remote* server call into the native plugins (by default, Tauri only trusts
-bundled local pages):
+The two files under `src-tauri/capabilities/` are what let JavaScript served
+by your *remote* server call into the native plugins (by default, Tauri only
+trusts bundled local pages). `remote-app.json` grants the plugins that are
+compiled on every target:
 
 ```json
 {
   "identifier": "remote-autumn-app",
-  "description": "Allow pages served by the remote Autumn server to use the native device plugins (notifications, biometric authentication, key-value storage).",
+  "description": "Allow pages served by the remote Autumn server to use the native device plugins (notifications, key-value storage).",
   "windows": ["main"],
   "remote": {
     "urls": ["https://app.example.com"]
@@ -182,22 +184,48 @@ bundled local pages):
   "permissions": [
     "core:default",
     "notification:default",
-    "biometric:default",
     "store:default"
   ]
 }
 ```
 
-- `identifier` — a unique name for this capability; tauri-build auto-discovers
+`remote-app-mobile.json` carries the biometric grant, restricted via
+`platforms` to Android and iOS:
+
+```json
+{
+  "identifier": "remote-autumn-app-mobile",
+  "description": "Allow pages served by the remote Autumn server to use biometric authentication (Android/iOS only — the plugin does not exist on desktop).",
+  "platforms": ["android", "iOS"],
+  "windows": ["main"],
+  "remote": {
+    "urls": ["https://app.example.com"]
+  },
+  "permissions": [
+    "biometric:default"
+  ]
+}
+```
+
+- `identifier` — a unique name for each capability; tauri-build auto-discovers
   every JSON file under `src-tauri/capabilities/`.
+- `platforms` — which build targets the capability applies to (valid values:
+  `linux`, `macOS`, `windows`, `android`, `iOS`; omitted means all). The
+  biometric grant lives in its own platform-restricted file because
+  tauri-build validates every applicable capability's permissions against the
+  plugins compiled for the current target — `tauri-plugin-biometric` is
+  target-gated to Android/iOS in the generated `Cargo.toml`, so an
+  unrestricted `biometric:default` would fail a desktop `cargo tauri dev`
+  smoke-test build. (Capabilities cannot scope *individual* permissions to
+  platforms — hence two files.)
 - `windows` — which webview windows the grant applies to (only `main` exists
   in this scaffold).
 - `remote.urls` — the origins whose pages may invoke the permitted commands.
   The generator emits exactly the origin you passed — never widen this to a
   wildcard: every origin listed here can drive the device APIs.
 - `permissions` — the default permission set of each plugin plus Tauri's core
-  APIs (`core:default`, `notification:default`, `biometric:default`,
-  `store:default`). `core:default` is kept because the injected
+  APIs (`core:default`, `notification:default`, `store:default`, and — on
+  mobile — `biometric:default`). `core:default` is kept because the injected
   `window.__TAURI__` API relies on the core event/window plumbing it permits;
   prune it to a narrower core subset only after verifying the trimmed set on
   a device.
@@ -246,8 +274,10 @@ if (granted) {
 ### Biometric authentication
 
 The biometric plugin exists only on Android and iOS — its Cargo dependency is
-target-gated and its registration in `lib.rs` is `#[cfg(mobile)]`-gated, so the
-shell still builds on desktop for local smoke-testing. On iOS the generated
+target-gated, its registration in `lib.rs` is `#[cfg(mobile)]`-gated, and its
+capability grant lives in the `platforms`-restricted
+`capabilities/remote-app-mobile.json`, so the shell still builds on desktop
+for local smoke-testing. On iOS the generated
 `Info.ios.plist` provides the required `NSFaceIDUsageDescription`; without it,
 the first Face ID prompt kills the app.
 

@@ -12,9 +12,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **generator:** `autumn generate tauri --remote-url <URL>` scaffolds a
   **mobile thin-client** Tauri shell (issue #1506): the webview loads your
   remote HTTPS Autumn server directly (https enforced; loopback and
-  Android-emulator hosts exempt for dev), a `capabilities/remote-app.json`
-  grants exactly that origin access to the notification/biometric/store
-  plugins, and `autumn destroy tauri --remote-url <URL>` reverts the
+  Android-emulator hosts exempt for dev), capability files grant exactly
+  that origin access to the notification/biometric/store plugins
+  (`capabilities/remote-app.json`, plus `remote-app-mobile.json` restricting
+  the biometric grant to Android/iOS so desktop smoke-test builds still
+  pass), and `autumn destroy tauri --remote-url <URL>` reverts the
   scaffold. Desktop `autumn generate tauri` output is unchanged. See
   `docs/guide/tauri-mobile-thin-client.md`.
 

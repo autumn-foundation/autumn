@@ -1377,8 +1377,9 @@ Required prerequisites for `cargo tauri build`:\n\
 /// Compute the file actions for `autumn generate tauri --remote-url <URL>` —
 /// the **mobile thin-client** mode: the webview loads a remote HTTPS Autumn
 /// server directly (no sidecar binary, no staging scripts, no local database),
-/// and a `capabilities/remote-app.json` grants the remote origin access to the
-/// notification/biometric/store plugins.
+/// and capability files (`capabilities/remote-app.json` plus the
+/// mobile-platform-restricted `remote-app-mobile.json`) grant the remote
+/// origin access to the notification/biometric/store plugins.
 ///
 /// # Errors
 /// Returns [`GenerateError::NotInProject`] when not at a project root, or
@@ -1428,12 +1429,21 @@ pub fn plan_tauri_thin_client(
         render_thin_client_lib_rs(&package_name, normalized_url),
     );
 
-    // Capability grant: pages served from the remote origin may invoke the
+    // Capability grants: pages served from the remote origin may invoke the
     // permitted plugin commands. Auto-discovered by tauri-build from
-    // src-tauri/capabilities/.
+    // src-tauri/capabilities/. The biometric grant lives in a separate,
+    // platform-restricted capability because tauri-build validates every
+    // applicable capability's permissions against the plugins compiled for
+    // the current target — and tauri-plugin-biometric is target-gated to
+    // Android/iOS in the generated Cargo.toml, so an unrestricted
+    // `biometric:default` would break desktop smoke-test builds.
     plan.create(
         tauri.join("capabilities").join("remote-app.json"),
         render_thin_client_capability(&remote_origin),
+    );
+    plan.create(
+        tauri.join("capabilities").join("remote-app-mobile.json"),
+        render_thin_client_capability_mobile(&remote_origin),
     );
 
     // iOS usage-description plist — the biometric plugin hard-requires
@@ -1640,8 +1650,9 @@ fn render_thin_client_lib_rs(package_name: &str, remote_url: &str) -> String {
 //! The webview loads the remote Autumn server at {remote_url} directly —
 //! there is no local sidecar binary, no local database, and no staging step.
 //! Native device capabilities (notifications, biometric authentication,
-//! key-value storage) are exposed to the remote pages through
-//! `capabilities/remote-app.json`.
+//! key-value storage) are exposed to the remote pages through the files in
+//! `capabilities/` (biometric is granted only on Android/iOS, where the
+//! plugin exists).
 //!
 //! Trust model: pages served from the remote origin can invoke every plugin
 //! command that capability permits — the origin is fully trusted. Keep the
@@ -1682,18 +1693,23 @@ pub fn run() {{
 }
 
 /// `capabilities/remote-app.json` — grants pages served from exactly
-/// `remote_origin` access to the core APIs and the notification, biometric,
-/// and store plugin commands. Never emit a wildcard here: any page the
-/// listed origins serve can invoke these device APIs.
+/// `remote_origin` access to the core APIs and the notification and store
+/// plugin commands. Never emit a wildcard here: any page the listed origins
+/// serve can invoke these device APIs.
 ///
 /// `core:default` is kept (rather than a narrower core subset) because the
 /// injected `window.__TAURI__` API relies on the core event/window plumbing
 /// it permits; prune it only after verifying the trimmed set on a device.
+///
+/// The biometric grant is deliberately absent — it lives in the
+/// platform-restricted [`render_thin_client_capability_mobile`] file, because
+/// tauri-build rejects permissions of plugins not compiled for the current
+/// target and tauri-plugin-biometric only exists on Android/iOS.
 fn render_thin_client_capability(remote_origin: &str) -> String {
     format!(
         r#"{{
   "identifier": "remote-autumn-app",
-  "description": "Allow pages served by the remote Autumn server to use the native device plugins (notifications, biometric authentication, key-value storage).",
+  "description": "Allow pages served by the remote Autumn server to use the native device plugins (notifications, key-value storage).",
   "windows": ["main"],
   "remote": {{
     "urls": ["{remote_origin}"]
@@ -1701,8 +1717,33 @@ fn render_thin_client_capability(remote_origin: &str) -> String {
   "permissions": [
     "core:default",
     "notification:default",
-    "biometric:default",
     "store:default"
+  ]
+}}
+"#
+    )
+}
+
+/// `capabilities/remote-app-mobile.json` — the Android/iOS-only companion to
+/// [`render_thin_client_capability`]: grants the same single remote origin the
+/// biometric plugin commands. It is restricted via `platforms` because the
+/// capability schema has no per-permission platform scoping and tauri-build
+/// validates every applicable capability against the plugins compiled for the
+/// current target — tauri-plugin-biometric is target-gated to mobile in the
+/// generated Cargo.toml, so granting `biometric:default` in an unrestricted
+/// capability would fail desktop `cargo tauri dev`/`build` smoke tests.
+fn render_thin_client_capability_mobile(remote_origin: &str) -> String {
+    format!(
+        r#"{{
+  "identifier": "remote-autumn-app-mobile",
+  "description": "Allow pages served by the remote Autumn server to use biometric authentication (Android/iOS only — the plugin does not exist on desktop).",
+  "platforms": ["android", "iOS"],
+  "windows": ["main"],
+  "remote": {{
+    "urls": ["{remote_origin}"]
+  }},
+  "permissions": [
+    "biometric:default"
   ]
 }}
 "#
@@ -1760,8 +1801,9 @@ Next steps for the mobile thin client (webview → {remote_url}):\n\
 \n\
   5. Serve your Autumn app at {remote_url} over HTTPS with a valid TLS\n\
      certificate and `session.secure = true` (AUTUMN_SESSION__SECURE=true) in\n\
-     production. The capability file src-tauri/capabilities/remote-app.json\n\
-     grants exactly that origin access to the native device plugins.\n\
+     production. The capability files under src-tauri/capabilities/ grant\n\
+     exactly that origin access to the native device plugins (biometric is\n\
+     granted only on Android/iOS, where the plugin exists).\n\
 \n\
   6. Replace the placeholder icons before shipping:\n\
        cargo tauri icon static/icons/icon.svg   (from the app root)\n\
@@ -4842,6 +4884,7 @@ mod tests {
                 "src-tauri/Cargo.toml",
                 "src-tauri/Info.ios.plist",
                 "src-tauri/build.rs",
+                "src-tauri/capabilities/remote-app-mobile.json",
                 "src-tauri/capabilities/remote-app.json",
                 "src-tauri/icons/128x128.png",
                 "src-tauri/icons/128x128@2x.png",
@@ -4881,17 +4924,52 @@ mod tests {
     fn thin_client_capability_file_grants_plugin_permissions() {
         let (_tmp, plan) = thin_plan("https://app.example.com");
         let cap = created_str(&plan, "capabilities/remote-app.json");
-        for permission in [
-            "core:default",
-            "notification:default",
-            "biometric:default",
-            "store:default",
-        ] {
-            assert!(
-                cap.contains(permission),
-                "capability file must grant '{permission}':\n{cap}"
-            );
-        }
+        let parsed: serde_json::Value =
+            serde_json::from_str(cap).expect("capability file must be valid JSON");
+        assert_eq!(
+            parsed["permissions"],
+            serde_json::json!(["core:default", "notification:default", "store:default"]),
+            "base capability must grant exactly the plugins compiled on every \
+             target — biometric is mobile-only and lives in remote-app-mobile.json"
+        );
+        assert!(
+            parsed.get("platforms").is_none(),
+            "base capability must apply to all platforms (no 'platforms' key):\n{cap}"
+        );
+    }
+
+    #[test]
+    fn thin_client_mobile_capability_gates_biometric_to_mobile_platforms() {
+        // tauri-build validates every capability's permissions against the
+        // plugins compiled for the current target; tauri-plugin-biometric is
+        // target-gated to Android/iOS in the generated Cargo.toml, so a
+        // desktop build would fail on an unknown `biometric:default` unless
+        // the grant lives in a capability restricted to mobile platforms.
+        let (_tmp, plan) = thin_plan("https://app.example.com");
+        let cap = created_str(&plan, "capabilities/remote-app-mobile.json");
+        let parsed: serde_json::Value =
+            serde_json::from_str(cap).expect("mobile capability file must be valid JSON");
+        assert_eq!(
+            parsed["platforms"],
+            serde_json::json!(["android", "iOS"]),
+            "mobile capability must be restricted to the platforms that \
+             compile tauri-plugin-biometric"
+        );
+        assert_eq!(
+            parsed["permissions"],
+            serde_json::json!(["biometric:default"]),
+            "mobile capability must grant exactly the biometric permission"
+        );
+        assert_eq!(
+            parsed["remote"]["urls"],
+            serde_json::json!(["https://app.example.com"]),
+            "mobile capability must grant the same single remote origin"
+        );
+        assert_eq!(
+            parsed["windows"],
+            serde_json::json!(["main"]),
+            "mobile capability must be scoped to the main window"
+        );
     }
 
     #[test]
@@ -5091,13 +5169,18 @@ mod tests {
         // The capability grant must be the path-free origin, while the
         // webview still loads the full URL including its path.
         let (_tmp, plan) = thin_plan("https://app.example.com:8443/base/");
-        let cap = created_str(&plan, "capabilities/remote-app.json");
-        let parsed: serde_json::Value = serde_json::from_str(cap).unwrap();
-        assert_eq!(
-            parsed["remote"]["urls"],
-            serde_json::json!(["https://app.example.com:8443"]),
-            "capability must grant the origin only — no path, no trailing slash"
-        );
+        for capability_file in [
+            "capabilities/remote-app.json",
+            "capabilities/remote-app-mobile.json",
+        ] {
+            let cap = created_str(&plan, capability_file);
+            let parsed: serde_json::Value = serde_json::from_str(cap).unwrap();
+            assert_eq!(
+                parsed["remote"]["urls"],
+                serde_json::json!(["https://app.example.com:8443"]),
+                "{capability_file} must grant the origin only — no path, no trailing slash"
+            );
+        }
         let lib = created_str(&plan, "src/lib.rs");
         assert!(
             lib.contains("https://app.example.com:8443/base/"),
