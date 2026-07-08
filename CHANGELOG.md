@@ -356,8 +356,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `.github/workflows/plugin-freshness.yml`) — a PR that adds entries to this
   changelog's Unreleased `Added`/`Changed` sections without touching the
   Claude plugin (`skills/`, `agents/`, `.claude-plugin/`) fails a fast,
-  toolchain-free check; exempt with a `[no-plugin]` token in the bullet or PR
-  body, or the `plugin-exempt` label. The same job sanity-checks that
+  toolchain-free check; exempt individual bullets with a bracketed
+  `no-plugin` marker, or the whole PR via the same marker in the PR body or
+  the `plugin-exempt` label. The same job sanity-checks that
   `plugin.json` parses and that every `docs/guide/*.md` path referenced from
   the plugin exists. Run `scripts/check-plugin-freshness.sh --self-test`
   locally.
@@ -379,8 +380,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   "(unreleased)", and in-flight PRs (#1587 `form_for`, #1592
   `find_in_batches`) are flagged as unmerged rather than documented as
   available. Fixes stale claims (foreign keys/unique "not in the DSL", the
-  removed `--test repo_hygiene` target, `with_pool` →
-  `with_pool_untracked`).
+  removed `--test repo_hygiene` target) and documents that published 0.5.0
+  repositories have no pool constructor (`with_pool_untracked` is
+  trunk-dev-only).
 
 ## [0.6.0] - 2026-06-30
 

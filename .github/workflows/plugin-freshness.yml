@@ -3,7 +3,8 @@ name: Plugin Freshness
 # Keeps the Claude plugin (skills/, agents/, .claude-plugin/) from drifting
 # behind the framework: a PR that adds entries to CHANGELOG.md's Unreleased
 # Added/Changed sections must also touch the plugin, carry a [no-plugin]
-# token (in the bullet or PR body), or wear the `plugin-exempt` label.
+# token (per-bullet in the changelog, or PR-wide in the PR body), or wear
+# the `plugin-exempt` label.
 # Also sanity-checks that plugin.json parses and every docs/guide/*.md path
 # referenced from skills/ and agents/ exists.
 #
@@ -13,6 +14,14 @@ name: Plugin Freshness
 on:
   pull_request:
     branches: [trunk, trunk-dev]
+    # Beyond the defaults (opened/synchronize/reopened): labeled/unlabeled so
+    # adding or removing `plugin-exempt` re-evaluates the gate, and edited so
+    # adding a [no-plugin] marker to the PR body does too — a plain re-run
+    # would reuse the stale event payload.
+    types: [opened, synchronize, reopened, labeled, unlabeled, edited]
+
+permissions:
+  contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}

@@ -111,8 +111,9 @@ Published 0.5.0: `find_by_id`, `find_all`, `count`, `exists_by_id`, `save`,
 `scope =`, `primary_reads`, `soft_delete`, `tenant_scoped`, `hooks =`,
 `mcp` / `mcp = "read"`.
 
-**(unreleased)**: `from_shard(&ShardedDb)`; `with_pool` **renamed**
-`with_pool_untracked`. **In flight (PR #1592, unmerged)**:
+**(unreleased)**: `from_shard(&ShardedDb)`; `with_pool_untracked` (new on
+trunk-dev — published 0.5.0 repositories have no pool constructor).
+**In flight (PR #1592, unmerged)**:
 `find_in_batches(n)` / `find_each(n)` — do not use until merged.
 
 ## Db transactions

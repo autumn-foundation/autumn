@@ -415,7 +415,7 @@ raw Diesel:
 | `primary_reads` (attr) / `on_primary()` | Pin reads to primary; read-your-writes after a save |
 | `soft_delete`, `tenant_scoped` (attrs), `across_tenants()` | Soft deletion and tenant scoping |
 | `hooks = MyHooks` (attr) | `before_/after_create/update/delete` + `after_*_commit` lifecycle hooks with `MutationContext` |
-| `from_shard(&ShardedDb)`, `with_pool_untracked(pool)` | **(unreleased)** shard-scoped construction; `with_pool` was **renamed** `with_pool_untracked` on trunk-dev |
+| `from_shard(&ShardedDb)`, `with_pool_untracked(pool)` | **(unreleased)** shard-scoped construction; `with_pool_untracked` is new on trunk-dev — published 0.5.0 repositories have **no** pool constructor at all |
 | `find_in_batches(n)` / `find_each(n)` | **In flight (PR #1592, unmerged) — do not use until merged**: bounded-memory keyset iteration |
 
 Read routing: with `database.replica_url` set, all generated reads use the
@@ -482,7 +482,8 @@ optionally-expiring API tokens carrying flat scopes via `IssueTokenSpec` +
 `#[secured(scopes = ["posts:write"])]` (no session required — default-deny,
 403 when missing) or `#[secured("admin", scopes = [...])]` for both; check in
 policies with `PolicyContext::has_scope/has_any_scope/has_all_scopes`; manage
-with `autumn token issue --name ... --scope ...` / `list` / `rotate`. The
+with `autumn token issue <principal> --name ... --scope ...` / `list` /
+`rotate`. The
 published 0.5.0 `autumn token` has only `issue <principal>` / `revoke`.
 
 Active session management ships with `autumn generate auth` (published 0.5.0):
@@ -708,8 +709,10 @@ and `docs/adr/0009-adopt-overload-protection-load-shedding.md`.
 
 Framework-native horizontal sharding: declare `[[database.shards]]` (each a
 full primary/replica topology), route by key → logical slot → shard. Prelude
-extractors `ShardedDb` (routed handle: `db_for`/`read_for`/`db_on`, bounded
-`each_shard` fan-out) and `Shards`; install custom routing with
+extractors: `ShardedDb` (auto-routed handle — resolves the routing key from
+the request, checks out the owning shard's primary, derefs to the connection
+like `Db`) and `Shards` (explicit routing: `db_for`/`read_for`/`db_on`, plus
+bounded `each_shard` fan-out); install custom routing with
 `AppBuilder::with_shard_router`; build repositories per shard with
 `from_shard(&ShardedDb)`. `autumn migrate` gains `--shard <name>` /
 `--control-only`; a boot-time shard-map guard fails fast on config drift.
@@ -822,7 +825,7 @@ autumn generate scaffold Post title:String status:enum{draft,published} price:de
 autumn generate scaffold Post title:String --live --live-validation
 autumn generate tauri            # desktop sidecar project (cargo tauri build)
 autumn generate plugin my-plugin # installable/conformant plugin crate
-autumn token issue --name ci --scope posts:write   # scoped tokens; also list, rotate
+autumn token issue service:ci --name ci --scope posts:write   # scoped tokens; also list, rotate
 ```
 
 `autumn destroy` mirrors `autumn generate` argument-for-argument and never
