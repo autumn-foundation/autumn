@@ -134,10 +134,12 @@ WARN autumn: Unknown profile "dvv", did you mean "dev"?
 
 ### Invalid database URL scheme
 
-Configuration validation catches it immediately:
+Configuration validation catches it immediately (both `postgres://` URLs and
+libpq-style keyword/value strings like `host=db user=app sslmode=require` are
+accepted; anything else is rejected):
 
 ```
-Failed to load configuration: database.primary_url must start with postgres:// or postgresql://
+Failed to load configuration: Invalid database.primary_url: must start with postgres:// or postgresql://, or be a keyword/value connection string
 ```
 
 ### Environment variable overrides

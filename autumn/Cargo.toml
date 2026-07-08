@@ -41,6 +41,10 @@ db = [
     "dep:pq-sys",
     "dep:scoped-futures",
     "dep:tokio-postgres",
+    "dep:tokio-postgres-rustls",
+    "dep:rustls",
+    "dep:rustls-pki-types",
+    "dep:webpki-roots",
     "diesel/postgres",
     "diesel/chrono",
     "diesel/serde_json",
@@ -133,6 +137,15 @@ diesel-async = { workspace = true, optional = true }
 diesel_migrations = { workspace = true, optional = true }
 scoped-futures = { version = "0.1.4", optional = true }
 tokio-postgres = { version = "0.7", optional = true }
+# TLS to Postgres (`sslmode=require`/`verify-full` in the database URL):
+# rustls-backed connector plugged into diesel-async's pool via a custom
+# setup callback. `ring` (not the aws-lc default) keeps cross-compilation
+# to mobile targets working; `webpki-roots` provides a deterministic root
+# store on platforms without an accessible native one.
+tokio-postgres-rustls = { version = "0.13", optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"], optional = true }
+rustls-pki-types = { version = "1", features = ["std"], optional = true }
+webpki-roots = { version = "1", optional = true }
 postgresql_embedded = { version = "0.19", optional = true, default-features = false, features = [
     "tokio",
     "theseus",
@@ -222,6 +235,10 @@ loom = "0.7.2"
 temp-env = { version = "0.3.6", features = ["async_closure"] }
 rustversion = "1"
 rusty-fork = "0.3.1"
+# TLS stub server for the Postgres sslmode integration tests (already in the
+# dependency graph via the db feature — no new crates).
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+rustls-pki-types = { version = "1", features = ["std"] }
 
 # docs.rs feature posture: include all features except those that require
 # system libraries unavailable in the docs.rs sandbox.

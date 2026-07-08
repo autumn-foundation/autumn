@@ -9,6 +9,181 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **ci:** README-quickstart gate against the published crates (issue #1586) —
+  `.github/workflows/quickstart-gate.yml` + `scripts/check-quickstart.sh`
+  install the README-pinned `autumn-cli` from crates.io (never the local
+  workspace), run `autumn new` / `autumn setup` / build / serve and assert a
+  200 from `GET /`, then run the README's
+  `autumn generate scaffold Post title:String body:Text published:bool` path
+  through build, `autumn migrate`, and a 200 from `GET /posts`. Runs on every
+  push to `trunk-dev`, on a daily schedule (catches upstream dependency
+  releases), and via `workflow_dispatch` with a `cli-version` input for gating
+  a freshly published release candidate (post-publish, pre-announce — see
+  `docs/release-checklist.md`). Each phase is a named CI step that emits
+  `::error::` on failure so a red run names the broken quickstart step, and
+  the job summary records the tracked install→first-200 funnel time.
+- **generator:** `autumn generate tauri --remote-url <URL>` scaffolds a
+  **mobile thin-client** Tauri shell (issue #1506): the webview loads your
+  remote HTTPS Autumn server directly (https enforced; loopback and
+  Android-emulator hosts exempt for dev), capability files grant exactly
+  that origin access to the notification/biometric/store plugins
+  (`capabilities/remote-app.json`, plus `remote-app-mobile.json` restricting
+  the biometric grant to Android/iOS so desktop smoke-test builds still
+  pass), and `autumn destroy tauri --remote-url <URL>` reverts the
+  scaffold. Desktop `autumn generate tauri` output is unchanged. Generating
+  one Tauri mode over the other's files is rejected (even with `--force`,
+  which only overwrites within the same mode) with a pointer at the matching
+  `autumn destroy tauri [--remote-url <URL>]` to run first — mixing modes
+  would leave stale files that break the new scaffold's build. See
+  `docs/guide/tauri-mobile-thin-client.md`.
+- **views:** widget storybook (issue #1526) — a browsable gallery of every
+  built-in maud widget plus a CI anti-rot harness. `autumn_web::stories`
+  ships `Story`/`StoryRegistry`/`StoryGallery` (mirroring the mail-preview
+  registry), a `story!{ group, name, { ... } }` macro whose block is **both**
+  executed for the live render and captured byte-for-byte (comments and
+  formatting included) as the displayed snippet — so the shown code is
+  provably the code that rendered — and `stories::builtin()` with a story for
+  every gallery-visible widget. Stories are zero-arg pure `fn() -> Markup`
+  pointers: capturing a `Db` handle, `AppState`, or any local is a compile
+  error. Mount with `.with_story_gallery(StoryGallery::builtin())` — routes
+  at `GET /_stories` (grouped index) and `GET /_stories/{slug}` (live render
+  + Source + Rendered HTML tabs, dogfooding the `tabs` widget and styled by
+  the framework widget stylesheet) are **off by default** and opt in per
+  profile via `[stories] enabled = true` (e.g. `[profile.dev.stories]` for a
+  dev-only gallery, or a prod profile for a public showcase; `/_stories` is
+  404 wherever the resolved flag is false; `AUTUMN_STORIES__ENABLED`
+  overrides from the environment). Apps register their own widgets with the
+  same `story!` macro via `StoryGallery::builtin().extend(...)` or a
+  builtin-free `StoryGallery::new()`. CI renders every builtin story
+  (panic-free, non-empty, balanced HTML, unique slugs) and a two-layer
+  coverage gate fails the build when a widget in `widgets.rs` gains no story.
+  See `docs/guide/stories.md`.
+- **repository:** bounded-memory batched iteration (#1395) — every
+  `#[repository]` now generates `find_in_batches(batch_size)` (yielding
+  successive `Vec<Model>` chunks of at most `batch_size`) and
+  `find_each(batch_size)` (yielding one `Model` at a time), the read-side
+  companion to the bulk writes from #841. Iteration is primary-key keyset-based
+  (`WHERE id > last ORDER BY id ASC LIMIT batch_size`), not `LIMIT`/`OFFSET`, so
+  walking a million-row table in a `#[autumn_web::task]`, job, or sweep holds
+  `O(batch_size)` models — never `O(table)` — and stays stable under concurrent
+  inserts. Unlike a `cursor_page` request, `batch_size` is not clamped to
+  `MAX_PAGE_SIZE`. The iterators reuse the same soft-delete filter and read
+  routing as `find_all`/`cursor_page` (trashed rows are skipped; a
+  replica-routed repo iterates off the replica), an error mid-iteration surfaces
+  on the failing batch and is retryable (the keyset cursor only advances on
+  success, so a retry resumes with no duplicated or skipped rows — `Ok(None)`
+  always means completion), a
+  `batch_size` of `0` errors rather than spinning, and sharded repositories
+  reject cross-shard `across_tenants()` iteration exactly as `cursor_page` does.
+  The generic handle types live in `autumn_web::batches`
+  (`FindInBatches`, `FindEach`, `BatchSource`). See the "Batched iteration"
+  section of the pagination guide.
+- **form:** `autumn_web::form::form_for` — a model-driven form builder that
+  renders a complete form in one call (issue #1135): opening `<form>` (hidden
+  `_method` override for `PUT`/`PATCH`/`DELETE` + auto-injected CSRF, via the
+  same audited path as `form_tag`), one type-appropriate control per field with
+  values pre-filled and inline per-field errors, and a submit button. Controls
+  come from a new `#[model]`-derived `FormModel`/`FormField`/`FieldControl`
+  descriptor, reusing the #1131 typed inputs — no per-field control selection in
+  caller code. Escape hatches: `.exclude`, `.override_field`, `.override_label`,
+  `.append`, `.submit_label`, `.multipart`. Plain no-JS HTML; htmx stays opt-in.
+  A required `FieldControl::Date` field now renders via a new
+  `required_date_input` helper (`required` + `aria-required="true"`), matching
+  the other `required_*` siblings. Public API addition (minor bump); existing
+  helpers unchanged.
+  `autumn generate scaffold` now consumes it: the generated create/edit views
+  (and both 422 re-render branches) render through one shared
+  `{snake}_form_for` helper instead of hand-emitting one input per column —
+  the generated `{Model}Form` delegates `FormModel` to the `#[model]`-derived
+  descriptors, enum columns get a `.override_field(...)` `Select` with their
+  variants, decimal columns pin the browser `step` to the declared scale, and
+  attachment columns stay a hand-rolled file input (appended before the submit
+  button, so attachment fields now always render at the end of the form
+  regardless of their declared column position, and the form remains
+  URL-encoded) that renders the same inline-error/ARIA skeleton as the derived
+  controls, so changeset errors on the attachment key surface next to the
+  file input. `references` columns render as a `<select>` of the referenced
+  table's ids (AC "enum/references→select"): the generated handlers load the
+  ids via a per-column `{column}_select_options` loader and thread them into
+  the shared form helper — option labels are the raw id (which column makes a
+  human-friendly label is a display decision the generator can't know; the
+  generated loader's doc comment says where to swap one in). The select needs
+  the referenced resource's `src/schema.rs` entry, so it applies when the
+  referenced model is already in the project (generate it first — the same
+  ordering the FOREIGN KEY already imposes); when the target is missing (a
+  warning-only situation: the table is assumed to exist out-of-band), the
+  column falls back to the derived numeric id input so the generated code
+  still compiles, and the scaffold warns that generating the referenced model
+  first (or re-running the scaffold afterwards) yields the select.
+  Adding a column no longer requires any view edits.
+  `--live-validation` scaffolds keep the per-field emission (their htmx
+  inline-validation inputs have no `FieldControl` equivalent).
+  Non-nullable `bool` columns: the `#[model]`-generated `NewX` insert struct
+  now marks them `#[serde(default)]`, so an unchecked `form_for` checkbox
+  (which submits no key at all — `checkbox_input` deliberately emits no hidden
+  `false` fallback because serde_urlencoded rejects duplicate keys) decodes as
+  `false` instead of rejecting the submission with a missing-field error,
+  matching the scaffold's `{Model}Form` convention. Side effect: a JSON create
+  body that omits a non-nullable `bool` now also decodes it as `false` rather
+  than erroring.
+  Datetime columns: `form_for` renders `chrono::DateTime<Utc>` and
+  `NaiveDateTime` columns as `<input type="datetime-local">`, whose submitted
+  value carries no timezone offset (and not always seconds) — chrono's default
+  `Deserialize` for `DateTime<Utc>` would reject even an untouched pre-filled
+  value as a 400 before validation. The `#[model]`-generated `NewX` insert
+  struct now attaches `autumn_web::form::deserialize_datetime_local_utc`
+  (`_option` for nullable) to `DateTime<Utc>` columns and
+  `deserialize_naive_datetime_local` (`_option`) to `NaiveDateTime` columns:
+  the offsetless browser value is interpreted as UTC, an empty nullable value
+  decodes as `None`, and RFC 3339 JSON create bodies keep decoding — the
+  `DateTime<Utc>` helpers now also accept RFC 3339 input, honoring an explicit
+  offset by converting to UTC. These four `form` deserializer helpers,
+  previously `maud`-gated, are now available unconditionally.
+  `chrono::DateTime<Local>` columns (diesel's other `Timestamptz`-capable
+  zone) get the same treatment via new
+  `autumn_web::form::deserialize_datetime_local_local` /
+  `deserialize_datetime_local_local_option` helpers: the offsetless browser
+  value is interpreted as the server's local wall clock (a wall clock
+  repeated by a DST fall-back maps to the earlier instant; one skipped by a
+  spring-forward is a decode error), and RFC 3339 input converts the instant
+  to the local zone. `DateTime` columns with any *other* zone parameter
+  (e.g. `FixedOffset`, or a bare `DateTime` alias hiding its zone from the
+  derive) no longer render the `datetime-local` picker at all — an
+  offsetless wall clock is genuinely ambiguous there, and the picker's
+  submission used to 400 unconditionally; they fall back to a text input
+  pre-filled with the serialized RFC 3339 string, which chrono's default
+  `Deserialize` round-trips as-is. `UpdateX` is untouched: it has no `Validate` impl so no
+  `ChangesetForm`/`form_for` round-trip reaches it, and its JSON PATCH bodies
+  are RFC 3339, which already decodes. Required `NaiveDate` columns need no
+  treatment (the browser's `YYYY-MM-DD` is exactly chrono's wire shape).
+  Serde-renamed columns: a model field carrying `#[serde(rename = "...")]`
+  (or covered by a struct-level `#[serde(rename_all = "...")]`, both of which
+  pass through to the emitted model struct's `Serialize` derive) serializes
+  under a key that differs from its Rust identifier, and `form_for`'s
+  pre-fill lookup (`Changeset::field_value`) indexes serialized data — so
+  edit forms for renamed fields rendered blank/unselected values despite the
+  data being present. `FormField` now carries the serde-effective serialized
+  key separately as a new `value_name: Option<String>` field (constructor
+  defaults it to `None` = same as `name`; set via the new
+  `FormField::with_value_name`), which the `#[model]` derive resolves
+  automatically — field-level `rename`/`rename(serialize = ...)` wins over
+  struct-level `rename_all`, mirroring serde, with all eight serde field
+  casings implemented. `form_for` uses `value_name` **only** for the value
+  pre-fill; the rendered input `name`/`id`, error lookup, and
+  `.exclude`/`.override_*` matching keep the Rust identifier, which is what
+  the generated `NewX`/`UpdateX` structs (which do not propagate serde
+  renames) decode by. Hand-written `FormModel` impls over renaming data
+  types should call `.with_value_name(...)` themselves. (`FormField` gains a
+  public field; code constructing it via struct literal instead of
+  `FormField::new` needs the extra field.)
+  `FieldControl` is `#[non_exhaustive]` (new control kinds won't be
+  semver-major); duplicate `.override_field`/`.override_label` calls on the
+  same field now resolve last-wins; `FieldControl::File` renders the same
+  inline-error/ARIA/required skeleton as the other controls; and the
+  multipart render path now flows through the same audited CSRF/
+  method-override code as every other form (`enctype` is threaded, not
+  duplicated).
+
 - **generator:** `autumn generate scaffold`'s `create`/`update` handlers now
   build a `Changeset` from the submission and re-render the `new`/`edit`
   form on a rejected submission (issue #1124). A failed submission responds
@@ -352,6 +527,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Accept-Encoding` accepts them, instead of relying solely on the
   general-purpose compression middleware to redo that work on every request.
 
+### Changed
+
+- **deps:** bumped `diesel-async` from 0.8 to 0.9 (resolving 0.9.2, with
+  `diesel` at 2.3.10) and `libsqlite3-sys` from 0.36 to 0.37 — 0.37 is the
+  newest release line diesel 2.3 accepts (`<0.38`). diesel-async 0.9 changed
+  `AsyncConnection::transaction` to take `AsyncFnOnce` closures instead of
+  `ScopedBoxFuture` callbacks; internal call sites and macro-generated code
+  were ported via a new semver-exempt `scoped_transaction` adapter, so the
+  public `Db::tx` / `Db::tx_with` / `savepoint` closure API (including
+  `.scope_boxed()` usage in app code) is unchanged. The CLI generators now
+  pin `diesel-async = "0.9"` in generated/starter `Cargo.toml`s and the
+  auth generator emits `async move |conn|` transaction closures instead of
+  `ScopedBoxFuture`-style `Box::pin` callbacks. [no-plugin]
+- **workspace:** `Cargo.lock` is now committed to the repository (it was
+  previously gitignored) so builds are reproducible and dependency updates
+  are reviewable.
+
 ## [0.6.0] - 2026-06-30
 
 ### Added
@@ -371,6 +563,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **ci:** plugin freshness gate (`scripts/check-plugin-freshness.sh` +
+  `.github/workflows/plugin-freshness.yml`) — a PR that adds entries to this
+  changelog's Unreleased `Added`/`Changed` sections without touching the
+  Claude plugin (`skills/`, `agents/`, `.claude-plugin/`) fails a fast,
+  toolchain-free check; exempt individual bullets with a bracketed
+  `no-plugin` marker, or the whole PR via the same marker in the PR body or
+  the `plugin-exempt` label. The same job sanity-checks that
+  `plugin.json` parses and that every `docs/guide/*.md` path referenced from
+  the plugin exists. Run `scripts/check-plugin-freshness.sh --self-test`
+  locally.
 
 - **daemon:** `autumn serve` — run an app as a production (non-watch) local
   daemon, with an optional managed local Postgres (#1119)
@@ -489,6 +691,79 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     unsharded control role — enforced at config validation. New
     `examples/bookmarks-sharded` Docker Compose stack and
     `docs/guide/sharding.md`.
+
+- **generate:** `autumn generate tauri-mobile` — Tauri v2 **mobile** scaffold
+  (iOS/Android) that runs the Autumn Axum server **in-process** on a
+  background thread against a remote Postgres database (issue #1507,
+  Option B). Mobile sandboxes forbid sidecar processes, so the shell crate
+  builds as staticlib/cdylib, links the app crate directly, spawns the server
+  from `tauri::Builder::default().setup(...)`, health-polls `/health`, and
+  opens the webview at `http://127.0.0.1:<port>`; a small pool
+  (`AUTUMN_DATABASE__POOL_SIZE=2`) is pinned for flaky mobile networks (and
+  `AUTUMN_DATABASE__CONNECT_TIMEOUT_SECS=5`, matching the framework default,
+  is pinned explicitly). The generator also extracts the stock
+  `src/main.rs` into `src/lib.rs::serve()` (anchored; skipped with a warning
+  when customised). Docs: mobile sandboxing restrictions, flaky-network pool
+  behavior, the loopback security model, and App Store / Google Play
+  guideline compliance in
+  [docs/guide/tauri-mobile-in-process.md](docs/guide/tauri-mobile-in-process.md).
+  [no-plugin]
+
+- **db:** TLS to Postgres. The connection pool now honors `sslmode` in the
+  database URL via a rustls-backed connector: `sslmode=require` encrypts the
+  connection (libpq parity — no certificate-identity check, so self-signed
+  and private-CA servers work), and `sslmode=verify-full` additionally
+  verifies the certificate chain and hostname against the Mozilla root store
+  (plus an `sslrootcert=<PEM file>` when given). URLs without `sslmode` (or
+  with `disable`/`prefer`) keep the previous plaintext behavior unchanged.
+  Previously the pool hardcoded `NoTls`, so `sslmode=require` failed every
+  connection with "no TLS implementation configured" and cleartext was the
+  only working configuration (issue #1507). [no-plugin]
+
+### Documentation
+
+- **plugin:** refresh the Claude plugin to current framework state. Adds
+  prominent `#[state_machine]` coverage (attribute syntax, generated
+  `can_transition_{field}_to` / `transition_{field}_to`, guards, and a
+  `before_update` example replacing hand-rolled status validation), a
+  "Prefer framework idioms over raw Diesel/Axum" steering table, the
+  generated-repository method surface (pagination, bulk ops, read routing,
+  hooks), `Db::tx_with`/`TxOptions`, jobs additions (uniqueness/concurrency,
+  named queues, tracked jobs), events/listeners, cache stampede protection,
+  view widgets + `WIDGETS_CSS`, sharding, `autumn serve`, `autumn destroy`,
+  the `references`/`enum{...}`/`decimal`/`:unique` generator DSL, scoped
+  tokens, observability defaults, and load shedding. Features merged on
+  trunk-dev but absent from the published 0.5.0 crates are explicitly marked
+  "(unreleased)". Follow-up: once #1587 (`form_for`) and #1592
+  (`find_in_batches`) merged, their in-flight/do-not-use flags were replaced
+  with real coverage — `form_for`/`FormModel`/`FieldControl` (builder methods,
+  derived control mapping, checkbox/datetime/serde-rename decode contracts,
+  scaffold `{snake}_form_for` emission) and
+  `find_in_batches`/`find_each`/`autumn_web::batches` (keyset semantics,
+  retryable errors, scoping/routing inheritance, sharding limits) — each
+  marked "(unreleased)". Fixes stale claims (foreign keys/unique "not in the DSL", the
+  removed `--test repo_hygiene` target) and documents that published 0.5.0
+  repositories have no pool constructor (`with_pool_untracked` is
+  trunk-dev-only).
+
+## [0.6.0] - 2026-06-30
+
+### Added
+
+- **ui:** reusable `card` and `stat_card` Maud widget helpers in
+  `autumn_web::widgets`, re-exported from the prelude. `card()` renders a
+  titled content panel with an optional header-action slot, footer, and
+  configurable heading level (`HeadingLevel::H1`–`H6`, default `H2`);
+  `stat_card()` renders a metric tile with label, value, and optional link.
+  Both are CSP-safe and HTML-escape caller-supplied text via Maud.
+  `CardConfig` uses a builder pattern with `const fn` and private fields
+  so the `title()` / `title_html()` escape path cannot be bypassed.
+  The admin plugin's 12 hand-rolled card blocks and dashboard stat tiles are
+  migrated to the new helpers, removing the duplication (#1122).
+
+## [0.5.0] - 2026-06-16
+
+### Added
 
 - **auth:** Active session management with device list and revocation in the auth starter (#819)
   - `autumn generate auth` now persists a `{user}_sessions` row per login

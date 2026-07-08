@@ -192,6 +192,17 @@ pub use crate::widgets::{
     nav_link_matched, property_list, stat_card, tabs,
 };
 
+// ── Widget stories ───────────────────────────────────────────────
+/// Widget story macro for the `/_stories` gallery: `story!{ "Group", "Name", { ... } }`.
+#[cfg(feature = "maud")]
+pub use crate::stories::story;
+/// Widget story gallery types (registered via `AppBuilder::with_story_gallery`)
+/// and the error returned by `Story::render`.
+///
+/// See [`crate::stories`] for the full API.
+#[cfg(feature = "maud")]
+pub use crate::stories::{Story, StoryGallery, StoryRegistry, StoryRenderError};
+
 // ── Link helpers ─────────────────────────────────────────────────
 /// Safe, method-aware `<a>`/`<form>` link helpers: [`crate::links::link_to`]
 /// for GET navigation and [`crate::links::button_to`] for CSRF-protected,

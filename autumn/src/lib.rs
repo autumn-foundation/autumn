@@ -72,6 +72,7 @@ pub mod assets;
 pub mod audit;
 pub mod auth;
 pub mod authorization;
+pub mod batches;
 pub mod cache;
 #[cfg(feature = "ws")]
 pub mod channels;
@@ -120,6 +121,7 @@ pub mod maintenance;
 pub mod managed_pg;
 #[cfg(feature = "db")]
 pub mod migrate;
+pub(crate) mod pg_conn_str;
 pub mod plugin;
 pub mod plugin_conformance;
 pub mod probe;
@@ -328,6 +330,12 @@ pub mod links;
 pub mod runtime_config;
 #[cfg(feature = "seed")]
 pub mod seed;
+/// Widget story gallery (issue #1526).
+///
+/// Browsable `/_stories` UI plus a CI anti-rot registry of zero-arg widget
+/// render examples.
+#[cfg(feature = "maud")]
+pub mod stories;
 pub mod task;
 pub mod telemetry;
 pub mod ui;
@@ -361,6 +369,8 @@ pub mod ws;
 /// This module is semver-exempt. Do not use it directly.
 #[doc(hidden)]
 pub mod __private {
+    #[cfg(feature = "db")]
+    pub use crate::db::scoped_transaction;
     #[cfg(all(feature = "db", feature = "ws"))]
     pub use crate::repository_commit_hooks::CURRENT_CHANNELS;
     #[cfg(feature = "db")]
@@ -596,6 +606,12 @@ pub use autumn_macros::mailer_preview;
 /// }
 /// ```
 pub use autumn_macros::main;
+/// Author a widget story for the `/_stories` gallery:
+/// `story!{ "Group", "Name", { ... } }`.
+///
+/// Also available as [`stories::story`], the macro's module home.
+#[cfg(feature = "maud")]
+pub use autumn_macros::story;
 
 /// Derive Diesel and Serde traits for a database model struct.
 ///

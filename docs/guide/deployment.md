@@ -27,7 +27,7 @@ internet connection.
 - **Rust 1.88.0+** with `cargo`
 - **Docker** (or Docker Desktop) — `docker --version`
 - **PostgreSQL** accessible at a connection string you control (local or remote)
-- The `autumn` CLI - `cargo install autumn-cli --version 0.6.0`
+- The `autumn` CLI - `cargo install autumn-cli --version 0.5.0`
 
 ---
 
@@ -121,7 +121,7 @@ Visit [http://localhost:3000/health](http://localhost:3000/health) — a healthy
 response looks like:
 
 ```json
-{ "status": "ok", "version": "0.6.0" }
+{ "status": "ok", "version": "0.5.0" }
 ```
 
 > **Migration failure stops the rollout.** If the primary URL is wrong or the

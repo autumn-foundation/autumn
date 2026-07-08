@@ -792,7 +792,7 @@ fn emit_association_items(
                                 __ids.sort_unstable();
                                 __ids.dedup();
                                 let mut conn = self.__autumn_m2m_write_conn().await?;
-                                conn.transaction::<(), ::autumn_web::AutumnError, _>(|conn| {
+                                ::autumn_web::__private::scoped_transaction::<(), ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                                     async move {
                                         ::autumn_web::reexports::diesel::delete(
                                             #join_mod_ident::#join_table_ident::table.filter(
@@ -1164,6 +1164,118 @@ fn field_has_serde_rename(field: &syn::Field) -> bool {
     renamed
 }
 
+/// The struct-level `#[serde(rename_all = "...")]` casing rule that applies
+/// to *serialization*, if any. Handles both the plain form and the split
+/// `rename_all(serialize = "...", deserialize = "...")` form (taking the
+/// `serialize` side — that is what `Changeset::field_value` indexes by).
+///
+/// Same parsing convention as `field_has_serde_rename`: a `#[serde(...)]`
+/// list this parser can't fully walk simply yields no rule (the real serde
+/// derive still validates the attribute itself).
+fn serde_rename_all_serialize_rule(attrs: &[syn::Attribute]) -> Option<String> {
+    let mut rule = None;
+    for attr in attrs.iter().filter(|a| a.path().is_ident("serde")) {
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("rename_all") {
+                if let Ok(value) = meta.value() {
+                    // rename_all = "camelCase"
+                    if let Ok(syn::Lit::Str(s)) = value.parse::<syn::Lit>() {
+                        rule = Some(s.value());
+                    }
+                } else {
+                    // rename_all(serialize = "...", deserialize = "...")
+                    let _ = meta.parse_nested_meta(|inner| {
+                        if let Ok(value) = inner.value()
+                            && let Ok(syn::Lit::Str(s)) = value.parse::<syn::Lit>()
+                            && inner.path.is_ident("serialize")
+                        {
+                            rule = Some(s.value());
+                        }
+                        Ok(())
+                    });
+                }
+            } else if let Ok(value) = meta.value() {
+                // Consume any `= value` so sibling metas keep parsing.
+                let _: syn::Result<syn::Lit> = value.parse();
+            }
+            Ok(())
+        });
+    }
+    rule
+}
+
+/// The field-level `#[serde(rename = "...")]` name that applies to
+/// *serialization*, if any. Handles both the plain form and the split
+/// `rename(serialize = "...", deserialize = "...")` form (taking the
+/// `serialize` side). Field-level `rename` overrides a struct-level
+/// `rename_all`, mirroring serde's own precedence.
+fn field_serde_serialize_rename(field: &syn::Field) -> Option<String> {
+    let mut renamed = None;
+    for attr in field.attrs.iter().filter(|a| a.path().is_ident("serde")) {
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("rename") {
+                if let Ok(value) = meta.value() {
+                    // rename = "headline"
+                    if let Ok(syn::Lit::Str(s)) = value.parse::<syn::Lit>() {
+                        renamed = Some(s.value());
+                    }
+                } else {
+                    // rename(serialize = "...", deserialize = "...")
+                    let _ = meta.parse_nested_meta(|inner| {
+                        if let Ok(value) = inner.value()
+                            && let Ok(syn::Lit::Str(s)) = value.parse::<syn::Lit>()
+                            && inner.path.is_ident("serialize")
+                        {
+                            renamed = Some(s.value());
+                        }
+                        Ok(())
+                    });
+                }
+            } else if let Ok(value) = meta.value() {
+                // Consume any `= value` so sibling metas keep parsing.
+                let _: syn::Result<syn::Lit> = value.parse();
+            }
+            Ok(())
+        });
+    }
+    renamed
+}
+
+/// Apply a struct-level `#[serde(rename_all = "...")]` casing rule to a
+/// (`snake_case`) field identifier, mirroring `serde_derive`'s
+/// `RenameRule::apply_to_field`. Returns `None` for a rule string serde
+/// itself would reject (the `Serialize` derive on the emitted struct then
+/// reports the error — no point duplicating it here).
+fn apply_serde_rename_all_rule(rule: &str, field: &str) -> Option<String> {
+    fn pascal(field: &str) -> String {
+        field
+            .split('_')
+            .map(|word| {
+                let mut chars = word.chars();
+                chars.next().map_or_else(String::new, |first| {
+                    first.to_uppercase().collect::<String>() + chars.as_str()
+                })
+            })
+            .collect()
+    }
+    match rule {
+        // serde treats fields as already snake_case/lowercase.
+        "lowercase" | "snake_case" => Some(field.to_owned()),
+        "UPPERCASE" | "SCREAMING_SNAKE_CASE" => Some(field.to_ascii_uppercase()),
+        "PascalCase" => Some(pascal(field)),
+        "camelCase" => {
+            let pascal = pascal(field);
+            let mut chars = pascal.chars();
+            chars
+                .next()
+                .map(|first| first.to_lowercase().collect::<String>() + chars.as_str())
+        }
+        "kebab-case" => Some(field.replace('_', "-")),
+        "SCREAMING-KEBAB-CASE" => Some(field.to_ascii_uppercase().replace('_', "-")),
+        _ => None,
+    }
+}
+
 /// Parse the struct-level language dictionary configuration from `#[searchable(language = "...")]`
 fn parse_model_searchable_lang(attrs: &[syn::Attribute]) -> syn::Result<Option<String>> {
     for attr in attrs {
@@ -1443,6 +1555,206 @@ fn is_option_type(ty: &syn::Type) -> bool {
 /// Return the final path segment name of a type (e.g. `foo::Bar` → `"Bar"`).
 fn type_name_str(ty: &syn::Type) -> String {
     crate::api_doc::last_segment_name(ty).unwrap_or_else(|| "unknown".to_owned())
+}
+
+/// Humanize a `snake_case` field name into a `<label>`-friendly title
+/// (e.g. `published_at` -> `"Published At"`). Mirrors the scaffold's
+/// `humanize_label` so a derived form and a hand-written one read alike.
+fn humanize_field_label(name: &str) -> String {
+    let name = name.strip_prefix("r#").unwrap_or(name);
+    name.split('_')
+        .filter(|word| !word.is_empty())
+        .map(|word| {
+            let mut chars = word.chars();
+            chars.next().map_or_else(String::new, |c| {
+                c.to_uppercase().to_string() + &chars.collect::<String>()
+            })
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Emit the `::autumn_web::form::FieldControl` expression for a model field,
+/// derived from its (Option-unwrapped) Rust type. `nullable` is `true` for
+/// `Option<...>` fields.
+///
+/// The mapping mirrors the scaffold's `render_changeset_form_inputs` control
+/// selection (#1131): strings/UUID -> text, integers -> stepped number,
+/// floats/decimals -> free-step number, `bool` -> checkbox (nullable `bool` ->
+/// a tri-state select so `NULL` stays reachable), dates/datetimes -> the
+/// corresponding pickers. Unrecognized types (e.g. user enums) fall back to a
+/// plain text control; callers can promote them to a `Select` via
+/// `FormFor::override_field` (which is exactly what the scaffold does for enum
+/// columns, whose variants it knows statically).
+fn form_control_tokens(inner_ty: &syn::Type, nullable: bool) -> TokenStream {
+    let name = type_name_str(inner_ty);
+    match name.as_str() {
+        "bool" => {
+            if nullable {
+                quote! {
+                    ::autumn_web::form::FieldControl::Select {
+                        options: ::std::vec![
+                            (::std::string::String::from(""), ::std::string::String::from("— Unset —")),
+                            (::std::string::String::from("true"), ::std::string::String::from("Yes")),
+                            (::std::string::String::from("false"), ::std::string::String::from("No")),
+                        ],
+                    }
+                }
+            } else {
+                quote! { ::autumn_web::form::FieldControl::Checkbox }
+            }
+        }
+        "i8" | "i16" | "i32" | "i64" | "i128" | "isize" | "u8" | "u16" | "u32" | "u64" | "u128"
+        | "usize" => quote! {
+            ::autumn_web::form::FieldControl::Number {
+                step: ::core::option::Option::Some(::std::string::String::from("1")),
+            }
+        },
+        "f32" | "f64" | "Decimal" | "BigDecimal" => quote! {
+            ::autumn_web::form::FieldControl::Number {
+                step: ::core::option::Option::Some(::std::string::String::from("any")),
+            }
+        },
+        "NaiveDate" => quote! { ::autumn_web::form::FieldControl::Date },
+        "NaiveDateTime" => quote! { ::autumn_web::form::FieldControl::DateTime },
+        // `<input type="datetime-local">` posts an *offsetless* wall-clock
+        // value, so only zone parameters with a sound interpretation of that
+        // shape get the picker: `Utc` and the server's `Local` (each wired to
+        // a matching tolerant deserializer — see `datetime_local_serde_attr`).
+        // Any other zone (`FixedOffset`, chrono-tz zones, or a bare
+        // `DateTime` alias whose zone the derive can't see) falls back to a
+        // text input: the pre-filled value is the field's serialized RFC 3339
+        // string, which chrono's default `Deserialize` round-trips as-is —
+        // honest, if plainer, instead of a picker whose submission 400s.
+        "DateTime" => {
+            let picker_zone = crate::api_doc::unwrap_single_generic(inner_ty, "DateTime")
+                .is_some_and(|tz| matches!(type_name_str(&tz).as_str(), "Utc" | "Local"));
+            if picker_zone {
+                quote! { ::autumn_web::form::FieldControl::DateTime }
+            } else {
+                quote! { ::autumn_web::form::FieldControl::Text }
+            }
+        }
+        // `String`/`str`/`Uuid` render as text, and so do unknown types
+        // (user enums, JSON, custom newtypes) as a safe fallback; promote
+        // via `.override_field(...)` where a richer control is known.
+        _ => quote! { ::autumn_web::form::FieldControl::Text },
+    }
+}
+
+/// For a `NewX` field whose column `form_for` renders as an HTML
+/// `datetime-local` control (see `form_control_tokens`), emit the serde
+/// attribute wiring the matching datetime-local-tolerant deserializer from
+/// `autumn_web::form`.
+///
+/// `<input type="datetime-local">` posts an offsetless value (and not always
+/// with seconds), which chrono's default `Deserialize` for `DateTime<Utc>`
+/// rejects — so a `form_for` submission would 400 before validation even when
+/// the pre-filled value is untouched. The referenced helpers accept both the
+/// browser shape (`YYYY-MM-DDTHH:MM[:SS[.f]]`, interpreted as UTC for
+/// `DateTime<Utc>` columns and as the server's local wall clock for
+/// `DateTime<Local>` ones) *and* RFC 3339 (offset converted to the field's
+/// zone), so JSON API create bodies posted to the same `NewX` keep decoding.
+///
+/// Returns `None` for non-datetime fields, and for `DateTime<Tz>` with a
+/// zone parameter other than `Utc`/`Local` — those columns don't render a
+/// `datetime-local` control in the first place (`form_control_tokens` falls
+/// back to a text input whose RFC 3339 value chrono's default `Deserialize`
+/// round-trips), so they keep that default.
+fn datetime_local_serde_attr(ty: &syn::Type) -> Option<TokenStream> {
+    let nullable = is_option_type(ty);
+    let inner = if nullable {
+        crate::api_doc::unwrap_single_generic(ty, "Option")?
+    } else {
+        ty.clone()
+    };
+    let base = match type_name_str(&inner).as_str() {
+        "NaiveDateTime" => "deserialize_naive_datetime_local",
+        "DateTime" => {
+            let tz = crate::api_doc::unwrap_single_generic(&inner, "DateTime")?;
+            match type_name_str(&tz).as_str() {
+                "Utc" => "deserialize_datetime_local_utc",
+                "Local" => "deserialize_datetime_local_local",
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    if nullable {
+        // `deserialize_with` disables serde's implicit missing-`Option`-field
+        // -is-`None` handling; `default` restores it so a JSON body may still
+        // omit the nullable column. (The `_option` helper itself maps a
+        // present-but-empty form value to `None`.)
+        let path = format!("::autumn_web::form::{base}_option");
+        Some(quote! { #[serde(default, deserialize_with = #path)] })
+    } else {
+        let path = format!("::autumn_web::form::{base}");
+        Some(quote! { #[serde(deserialize_with = #path)] })
+    }
+}
+
+/// Emit `impl ::autumn_web::form::FormModel for #name` (issue #1135), listing
+/// one `FormField` descriptor per user-editable column (the same
+/// `fields_for_new` set the insertable `NewX` struct uses -- i.e. excluding the
+/// primary key, `#[default]`, and `#[lock_version]` columns).
+///
+/// This is what lets `form_for::<T>(...)` render a whole form in one call: the
+/// descriptor carries each field's name (the Rust identifier — the POST key
+/// the generated `NewX`/`UpdateX` decode by), humanized label,
+/// type-appropriate control, and `required` flag (derived from non-`Option`).
+///
+/// `rename_all_rule` is the struct-level `#[serde(rename_all = "...")]`
+/// serialization rule, if any. When a column's serde-effective *serialized*
+/// key differs from its identifier (field-level `#[serde(rename)]` wins over
+/// `rename_all`, mirroring serde), the descriptor records that key as
+/// `FormField::value_name` so `form_for`'s pre-fill lookup
+/// (`Changeset::field_value`, which indexes the changeset's serialized data)
+/// still finds the value — while the rendered input `name` stays the
+/// identifier the insert struct expects.
+fn emit_form_model_impl(
+    name: &syn::Ident,
+    fields_for_new: &[&&Field],
+    rename_all_rule: Option<&str>,
+) -> TokenStream {
+    let field_exprs: Vec<TokenStream> = fields_for_new
+        .iter()
+        .filter_map(|f| {
+            let ident = f.ident.as_ref()?;
+            let field_name = ident.to_string();
+            let field_name = field_name.strip_prefix("r#").unwrap_or(&field_name);
+            let label = humanize_field_label(field_name);
+            let nullable = is_option_type(&f.ty);
+            let inner = crate::api_doc::unwrap_single_generic(&f.ty, "Option")
+                .unwrap_or_else(|| f.ty.clone());
+            let control = form_control_tokens(&inner, nullable);
+            let required = !nullable;
+            let serialized_name = field_serde_serialize_rename(f).or_else(|| {
+                rename_all_rule.and_then(|rule| apply_serde_rename_all_rule(rule, field_name))
+            });
+            let value_name = serialized_name
+                .filter(|serialized| serialized != field_name)
+                .map(|serialized| quote! { .with_value_name(#serialized) });
+            Some(quote! {
+                ::autumn_web::form::FormField::new(
+                    #field_name,
+                    #label,
+                    #control,
+                    #required,
+                )
+                #value_name
+            })
+        })
+        .collect();
+
+    quote! {
+        impl ::autumn_web::form::FormModel for #name {
+            fn form_fields() -> ::std::vec::Vec<::autumn_web::form::FormField> {
+                ::std::vec![
+                    #(#field_exprs),*
+                ]
+            }
+        }
+    }
 }
 
 /// Emit a `TokenStream` that evaluates (at runtime) to a `serde_json::Value`
@@ -2104,7 +2416,24 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 parse_field_encrypted_mode(f).unwrap_or(EncryptedMode::None),
             )
             .map(|w| quote! { #[diesel(serialize_as = #w)] });
-            quote! { #(#val_attrs)* #enc pub #ident: #ty }
+            // Non-nullable `bool` columns render as a checkbox in `form_for`
+            // (see `emit_form_model_impl`), and an unchecked HTML checkbox
+            // submits *no* key at all — a hidden `false` sibling is not an
+            // option because serde_urlencoded rejects duplicate keys (see
+            // `checkbox_input`'s doc in autumn/src/form.rs). Mark the field
+            // `#[serde(default)]` so a missing key decodes as `false` instead
+            // of failing with "missing field", mirroring the scaffold's
+            // `{Model}Form` convention.
+            let bool_default = (!is_option_type(ty) && type_name_str(ty) == "bool")
+                .then(|| quote! { #[serde(default)] });
+            // Datetime columns render as `<input type="datetime-local">` in
+            // `form_for`, whose submitted value carries no timezone offset —
+            // chrono's default `Deserialize` for `DateTime<Utc>` would reject
+            // even an unchanged pre-filled value as a 400. Wire the tolerant
+            // deserializer (which also still accepts RFC 3339 JSON bodies);
+            // see `datetime_local_serde_attr`.
+            let datetime_local = datetime_local_serde_attr(ty);
+            quote! { #(#val_attrs)* #enc #bool_default #datetime_local pub #ident: #ty }
         })
         .collect();
 
@@ -3109,6 +3438,17 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! { where #(#commit_hook_deserialize_bounds,)* }
     };
 
+    // `impl FormModel for #name` (issue #1135) -- one descriptor per editable
+    // column, driving the single-call `form_for::<#name>(...)` builder. The
+    // struct-level `rename_all` serialization rule (attrs pass through to the
+    // emitted query struct's `Serialize` derive) feeds the descriptors'
+    // pre-fill lookup keys for serde-renamed columns.
+    let form_model_impl = emit_form_model_impl(
+        name,
+        &fields_for_new,
+        serde_rename_all_serialize_rule(outer_attrs).as_deref(),
+    );
+
     quote! {
         #encrypted_use
 
@@ -3120,6 +3460,8 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             #(#query_fields,)*
         }
         #name_debug_impl
+
+        #form_model_impl
 
         #[derive(#new_debug_derive Clone, ::diesel::Insertable)]
         #[derive(::serde::Serialize, ::serde::Deserialize)]
@@ -3528,6 +3870,83 @@ pub fn pascal_to_snake(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Serde-rename resolution for FormField::value_name (#1135) ─────────
+
+    #[test]
+    fn field_serde_serialize_rename_parses_plain_and_split_forms() {
+        let field: syn::Field = syn::Field::parse_named
+            .parse2(quote! { #[serde(rename = "headline")] pub title: String })
+            .unwrap();
+        assert_eq!(
+            field_serde_serialize_rename(&field).as_deref(),
+            Some("headline")
+        );
+
+        let field: syn::Field = syn::Field::parse_named
+            .parse2(quote! {
+                #[serde(rename(serialize = "out", deserialize = "in"))]
+                pub title: String
+            })
+            .unwrap();
+        assert_eq!(field_serde_serialize_rename(&field).as_deref(), Some("out"));
+
+        // Deserialize-only rename leaves the serialized key alone.
+        let field: syn::Field = syn::Field::parse_named
+            .parse2(quote! { #[serde(rename(deserialize = "in"))] pub title: String })
+            .unwrap();
+        assert_eq!(field_serde_serialize_rename(&field), None);
+
+        let field: syn::Field = syn::Field::parse_named
+            .parse2(quote! { #[serde(default)] pub title: String })
+            .unwrap();
+        assert_eq!(field_serde_serialize_rename(&field), None);
+    }
+
+    #[test]
+    fn serde_rename_all_serialize_rule_parses_plain_and_split_forms() {
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[serde(rename_all = "camelCase")])];
+        assert_eq!(
+            serde_rename_all_serialize_rule(&attrs).as_deref(),
+            Some("camelCase")
+        );
+
+        let attrs: Vec<syn::Attribute> = vec![syn::parse_quote!(
+            #[serde(rename_all(serialize = "kebab-case", deserialize = "camelCase"))]
+        )];
+        assert_eq!(
+            serde_rename_all_serialize_rule(&attrs).as_deref(),
+            Some("kebab-case")
+        );
+
+        let attrs: Vec<syn::Attribute> = vec![syn::parse_quote!(#[serde(deny_unknown_fields)])];
+        assert_eq!(serde_rename_all_serialize_rule(&attrs), None);
+    }
+
+    #[test]
+    fn apply_serde_rename_all_rule_mirrors_serde_field_casings() {
+        let cases = [
+            ("lowercase", "word_count", "word_count"),
+            ("snake_case", "word_count", "word_count"),
+            ("UPPERCASE", "word_count", "WORD_COUNT"),
+            ("SCREAMING_SNAKE_CASE", "word_count", "WORD_COUNT"),
+            ("PascalCase", "word_count", "WordCount"),
+            ("camelCase", "word_count", "wordCount"),
+            ("camelCase", "title", "title"),
+            ("kebab-case", "word_count", "word-count"),
+            ("SCREAMING-KEBAB-CASE", "word_count", "WORD-COUNT"),
+        ];
+        for (rule, field, expected) in cases {
+            assert_eq!(
+                apply_serde_rename_all_rule(rule, field).as_deref(),
+                Some(expected),
+                "rule {rule} on {field}"
+            );
+        }
+        // A rule serde itself rejects resolves to no rename here.
+        assert_eq!(apply_serde_rename_all_rule("bogusCase", "word_count"), None);
+    }
 
     // ── RED: #[lock_version] detection ────────────────────────────────────
     // These tests cover the new `excluded_from_new` behaviour (must also
@@ -4416,5 +4835,66 @@ mod tests {
             generated.contains("transition_priority_to"),
             "multi-sm model must emit `transition_priority_to`: {generated}"
         );
+    }
+
+    // ── Datetime control/deserializer selection per zone parameter (#1135) ─
+
+    /// Regression test (Codex P2 on #1587): only `DateTime<Utc>` and
+    /// `DateTime<Local>` — the zones whose offsetless `datetime-local`
+    /// submission has a matching tolerant deserializer — may render the
+    /// datetime picker. Any other zone parameter (`FixedOffset`, chrono-tz
+    /// zones, a bare un-parameterized `DateTime` alias) must fall back to a
+    /// text control whose RFC 3339 value round-trips through chrono's
+    /// default `Deserialize`; giving them the picker would 400 every
+    /// submission.
+    #[test]
+    fn form_control_tokens_gates_datetime_picker_on_zone_param() {
+        let control = |ty: syn::Type| form_control_tokens(&ty, false).to_string();
+
+        let utc = control(syn::parse_quote!(chrono::DateTime<chrono::Utc>));
+        assert!(utc.contains("FieldControl :: DateTime"), "{utc}");
+        let local = control(syn::parse_quote!(chrono::DateTime<chrono::Local>));
+        assert!(local.contains("FieldControl :: DateTime"), "{local}");
+
+        let fixed = control(syn::parse_quote!(chrono::DateTime<chrono::FixedOffset>));
+        assert!(fixed.contains("FieldControl :: Text"), "{fixed}");
+        let tz = control(syn::parse_quote!(chrono::DateTime<chrono_tz::Tz>));
+        assert!(tz.contains("FieldControl :: Text"), "{tz}");
+        // A bare alias hides the zone from the derive — no picker either.
+        let bare = control(syn::parse_quote!(DateTime));
+        assert!(bare.contains("FieldControl :: Text"), "{bare}");
+    }
+
+    /// The deserializer wiring must stay in lockstep with the control choice
+    /// above: `Utc`/`Local` get their zone-matching tolerant deserializer
+    /// (`_option` for nullable), everything else keeps chrono's default
+    /// `Deserialize` (fine — those columns render as text, whose RFC 3339
+    /// value the default parses).
+    #[test]
+    fn datetime_local_serde_attr_matches_zone_param() {
+        let attr = |ty: syn::Type| datetime_local_serde_attr(&ty).map(|t| t.to_string());
+
+        let utc = attr(syn::parse_quote!(chrono::DateTime<chrono::Utc>)).unwrap();
+        assert!(utc.contains("deserialize_datetime_local_utc"), "{utc}");
+
+        let local = attr(syn::parse_quote!(chrono::DateTime<chrono::Local>)).unwrap();
+        assert!(
+            local.contains("deserialize_datetime_local_local"),
+            "{local}"
+        );
+        assert!(!local.contains("_option"), "{local}");
+
+        let nullable = attr(syn::parse_quote!(Option<chrono::DateTime<chrono::Local>>)).unwrap();
+        assert!(
+            nullable.contains("deserialize_datetime_local_local_option"),
+            "{nullable}"
+        );
+        assert!(nullable.contains("default"), "{nullable}");
+
+        assert_eq!(
+            attr(syn::parse_quote!(chrono::DateTime<chrono::FixedOffset>)),
+            None
+        );
+        assert_eq!(attr(syn::parse_quote!(DateTime)), None);
     }
 }
