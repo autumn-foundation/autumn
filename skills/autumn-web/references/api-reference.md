@@ -84,10 +84,11 @@ together (`0.5.0` published; `0.6.0` on trunk-dev, unpublished).
 | `#[event]`, `#[listener]`, `listeners![...]` | Typed domain event bus (**unreleased**) — publish via the `Events` extractor, register with `.listeners(...)` |
 
 `#[model]` also recognizes `#[belongs_to]` / `#[has_many]` / `#[has_one]`
-struct-level attributes for declarative associations with batched eager
+struct-level attributes (**unreleased** — trunk-dev, not in published 0.5.0)
+for declarative associations with batched eager
 preloading (`Model::preload()`, `repo.preload(records, spec)`); these are
 consumed by `#[model]` itself, not separately-registered proc macros.
-`#[has_many(Target, through = join_table)]` (**unreleased**) declares a
+`#[has_many(Target, through = join_table)]` declares a
 many-to-many association through a join table, adding `add_{singular}` /
 `remove_{singular}` / `set_{plural}` mutation helpers to the generated
 `#[repository]`. See the `#[model]` doc comment in `autumn-macros/src/lib.rs`
@@ -107,11 +108,12 @@ Published 0.5.0: `find_by_id`, `find_all`, `count`, `exists_by_id`, `save`,
 `page(&PageRequest)`, `cursor_page(&CursorRequest)` (with `cursor_key =` /
 `cursor_key_type =` attr keys), bulk `save_many` / `save_many_skip_invalid` /
 `update_many` / `delete_many` / `upsert_many` (compile error on hooked repos),
-`with_lock`, `on_primary()`, `preload`. Attr keys: `api =`, `policy =`,
+`with_lock`, `on_primary()`. Attr keys: `api =`, `policy =`,
 `scope =`, `primary_reads`, `soft_delete`, `tenant_scoped`, `hooks =`,
 `mcp` / `mcp = "read"`.
 
-**(unreleased)**: `from_shard(&ShardedDb)`; `with_pool_untracked` (new on
+**(unreleased)**: `preload(records, spec)` (declarative associations);
+`from_shard(&ShardedDb)`; `with_pool_untracked` (new on
 trunk-dev — published 0.5.0 repositories have no pool constructor).
 **In flight (PR #1592, unmerged)**:
 `find_in_batches(n)` / `find_each(n)` — do not use until merged.

@@ -50,7 +50,7 @@ the framework almost certainly already generates or ships it:
 | Status-transition validation written by hand in `before_create`/`before_update` hooks or handlers (`if old == "draft" && new == "published"` match blocks) | `#[state_machine(transitions(...))]` on the model field — generated `can_transition_{field}_to` / `transition_{field}_to` enforce the graph. See "Model state machines" below and `docs/guide/state-machines.md` |
 | Raw `axum::Router` routes and handlers, manual `.route("/x", get(...))` | `#[get]`/`#[post]`/`#[put]`/`#[patch]`/`#[delete]` + `routes![...]`, `.scoped(prefix, layer, routes)` for groups. `.merge()`/`.nest()` exist for the rare escape hatch only |
 | Raw Diesel queries for CRUD, lookups, pagination, or bulk writes | `#[repository]`-generated methods: `find_by_id`, `find_all`, `save`, `update`, `delete_by_id`, derived `find_by_*`, `page(&PageRequest)`, `cursor_page(&CursorRequest)`, bulk `save_many`/`update_many`/`delete_many`/`upsert_many`. See `docs/guide/repositories.md`, `docs/guide/pagination.md` |
-| Manual per-item queries in a loop (N+1) or hand-written JOINs to fetch associations | `#[belongs_to]`/`#[has_many]`/`#[has_one]` + `repo.preload(records, Model::preload()...)` |
+| Manual per-item queries in a loop (N+1) or hand-written JOINs to fetch associations | `#[belongs_to]`/`#[has_many]`/`#[has_one]` + `repo.preload(records, Model::preload()...)` (unreleased) |
 | Hand-rolled auth, session, or token checks in handler bodies | `#[secured]` / `#[secured("role")]`, `#[authorize]`, repository `policy =`/`scope =`; `#[secured(scopes = [...])]` for service tokens (unreleased) |
 | Hand-assembled `<form>` markup with manual value re-fill and error display | `autumn_web::form` helpers — `form_tag`, `method_input`, `text_input` (published); `number_input`, `datetime_input`, `date_input`, `checkbox_input`, `select_input` + `Changeset` 422 re-render (unreleased). A whole-form `form_for` builder is in-flight (PR #1587, unmerged — do not use) |
 | Ad-hoc `tokio::spawn` / background threads for deferred work | `#[job]` (+ retries, backends, uniqueness/concurrency caps), `#[scheduled]` for recurring, `#[task]` for operator CLI work |
@@ -293,7 +293,7 @@ pub trait PostRepository {}
 allow_unauthorized_repository_api = true # only when intentional
 ```
 
-### Associations and preloading
+### Associations and preloading (unreleased — trunk-dev, not in published 0.5.0)
 
 Declare `#[belongs_to]` / `#[has_many]` / `#[has_one]` on a `#[model]` for
 batched eager loading — no N+1, no lazy loading (un-preloaded access returns
@@ -320,8 +320,7 @@ for post in &posts {
 }
 ```
 
-`through = <join_table>` on `#[has_many]` **(unreleased — trunk-dev, not in
-published 0.5.0)** declares a many-to-many
+`through = <join_table>` on `#[has_many]` declares a many-to-many
 association: join columns default to `{source}_id` / `{target}_id`
 (`fk = ...` / `target_fk = ...` to override), the macro emits the join
 table's `diesel::table!` itself (only a migration with a composite primary

@@ -114,7 +114,7 @@ Check every file you review against these items. Report only items that fail.
 
 - **N+1 queries**: Loading a collection and then querying per item in a loop.
   Flag it — suggest `#[belongs_to]`/`#[has_many]` associations with
-  `repo.preload(...)`, or a JOIN.
+  `repo.preload(...)` (unreleased — trunk-dev only), or a JOIN.
 - **Missing index on FK column**: Any BIGINT FK column used in a WHERE clause
   should have an index (the trunk-dev `field:references` DSL adds one
   automatically; hand-added FK columns need one in the migration).
