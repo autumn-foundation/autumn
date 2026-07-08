@@ -30,15 +30,17 @@ fn main() {
 fn find_tailwind_cli() -> Option<std::path::PathBuf> {
     if let Ok(out_dir) = std::env::var("OUT_DIR") {
         let out_path = std::path::PathBuf::from(out_dir);
-        if let Some(target_dir) = out_path.ancestors().nth(4) {
-            let bin_name = if cfg!(windows) {
-                "tailwindcss.exe"
-            } else {
-                "tailwindcss"
-            };
-            let local = target_dir.join("autumn").join(bin_name);
-            if local.exists() {
-                return Some(local);
+        let bin_name = if cfg!(windows) {
+            "tailwindcss.exe"
+        } else {
+            "tailwindcss"
+        };
+        for ancestor in out_path.ancestors() {
+            if ancestor.file_name().and_then(|n| n.to_str()) == Some("target") {
+                let local = ancestor.join("autumn").join(bin_name);
+                if local.exists() {
+                    return Some(local);
+                }
             }
         }
     }

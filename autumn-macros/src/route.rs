@@ -130,7 +130,7 @@ pub fn route_macro(
     let request_body = api_doc::schema_option(api_doc::infer_request_body(&input_fn));
     let response_body = api_doc::schema_option(api_doc::infer_response_body(&input_fn));
     let query_schema = api_doc::schema_option(api_doc::infer_query_params(&input_fn));
-    let (secured, required_roles) = api_doc::extract_secured_info(&input_fn);
+    let (secured, required_roles, required_scopes) = api_doc::extract_secured_info(&input_fn);
     let has_feature_flag = has_feature_flag_attr || has_expanded_feature_flag_gate(&input_fn);
     let body_guarded_replay = secured
         || has_authorize_guard(&input_fn)
@@ -200,6 +200,7 @@ pub fn route_macro(
                     query_schema: #query_schema,
                     secured: #secured,
                     required_roles: #required_roles,
+                    required_scopes: #required_scopes,
                     register_schemas: ::core::option::Option::None,
                     api_version: #api_version_expr,
                     sunset_opt_out: #sunset_opt_out_val,

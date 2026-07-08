@@ -89,6 +89,14 @@ impl CspNonce {
     pub fn value(&self) -> &str {
         &self.0
     }
+
+    /// Construct a nonce with a known value for unit tests elsewhere in the
+    /// crate (e.g. the story gallery's nonce-threading tests); production
+    /// nonces are only ever minted by [`SecurityHeadersLayer`].
+    #[cfg(test)]
+    pub(crate) fn new_for_tests(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
 }
 
 impl<S> FromRequestParts<S> for CspNonce

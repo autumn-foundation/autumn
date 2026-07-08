@@ -14,6 +14,9 @@ diesel_migrations = "2"
 # Flash messages are on by default — the scaffold wires Flash into every handler.
 default = ["flash"]
 flash = ["autumn-web/flash"]
+# Enable single-binary asset embedding (autumn build --embed / autumn generate tauri).
+# Active only when explicitly requested; dev builds serve static/ from disk.
+embed-assets = ["autumn-web/embed-assets"]
 
 [dev-dependencies]
 # tokio runtime macros are needed for #[tokio::test] in integration tests.

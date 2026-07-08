@@ -51,6 +51,10 @@ on:
     - cron: "0 4 * * 1"
   workflow_dispatch: {}
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
@@ -67,6 +71,9 @@ jobs:
   #   generated_scaffold_config_cargo_checks      (generate.rs)
   #   generated_auth_totp_cargo_checks            (generate.rs)
   #   generated_job_cargo_checks                  (generate.rs)
+  #   generated_channel_cargo_checks              (generate.rs)
+  #   generated_channel_ws_cargo_checks           (generate.rs)
+  #   generated_channel_smoke_test_passes         (generate.rs)
   #
   # Each test scaffolds a project, patches Cargo.toml to point at the local
   # autumn-web crate, and runs `cargo build` / `cargo check`. Failures include
@@ -137,6 +144,21 @@ jobs:
         run: |
           cargo test -p autumn-cli --test generate \
             generated_job_cargo_checks -- --ignored --exact
+
+      - name: generated_channel_cargo_checks
+        run: |
+          cargo test -p autumn-cli --test generate \
+            generated_channel_cargo_checks -- --ignored --exact
+
+      - name: generated_channel_ws_cargo_checks
+        run: |
+          cargo test -p autumn-cli --test generate \
+            generated_channel_ws_cargo_checks -- --ignored --exact
+
+      - name: generated_channel_smoke_test_passes
+        run: |
+          cargo test -p autumn-cli --test generate \
+            generated_channel_smoke_test_passes -- --ignored --exact
 
   # ── Postgres e2e gate ────────────────────────────────────────────────────────
   #

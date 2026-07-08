@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [trunk, trunk-dev]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -64,6 +68,12 @@ jobs:
           cargo test -p autumn-web --test db_hooks_lifecycle -- --ignored
           cargo test -p autumn-web --test repository_shard_replica_routing -- --ignored
           cargo test -p autumn-web --all-features --test feature_flags_pg_integration -- --ignored
+          cargo test -p autumn-web --test scoped_tokens_db -- --ignored
+          cargo test -p autumn-admin-plugin --test token_admin_db -- --ignored
+          cargo test -p autumn-cache-redis -- --ignored
+          cargo test -p autumn-cli --test flags -- --ignored
+          cargo test -p autumn-cli --test config -- --ignored
+          cargo test -p autumn-cli --test experiments -- --ignored
 
   coverage:
     name: Coverage
@@ -100,6 +110,14 @@ jobs:
             --test repository_shard_replica_routing -- --ignored
           cargo llvm-cov --no-report -p autumn-web --all-features \
             --test feature_flags_pg_integration -- --ignored
+          cargo llvm-cov --no-report -p autumn-web --all-features \
+            --test scoped_tokens_db -- --ignored
+          cargo llvm-cov --no-report -p autumn-admin-plugin \
+            --test token_admin_db -- --ignored
+          cargo llvm-cov --no-report -p autumn-cache-redis -- --ignored
+          cargo llvm-cov --no-report -p autumn-cli --test flags -- --ignored
+          cargo llvm-cov --no-report -p autumn-cli --test config -- --ignored
+          cargo llvm-cov --no-report -p autumn-cli --test experiments -- --ignored
           cargo llvm-cov report --lcov --output-path lcov.info
       - name: Upload to Codecov
         uses: codecov/codecov-action@v6

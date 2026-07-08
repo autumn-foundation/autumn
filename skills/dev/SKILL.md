@@ -48,6 +48,12 @@ autumn dev --show-config
 `autumn dev` uses the `dev` profile automatically in debug builds
 (`AUTUMN_ENV=dev` is the default).
 
+On trunk-dev (unreleased — not in the published 0.5.0 CLI) there is also
+`autumn serve` for a non-watch local daemon: `autumn serve --daemon` /
+`stop` / `status` / `restart`, `--release`, and `--bundled-pg` for a managed
+local Postgres. See `docs/guide/daemon.md`. Do not suggest it to users on the
+published 0.5.0 CLI.
+
 ## What gets served
 
 Once running, tell the user what's available:

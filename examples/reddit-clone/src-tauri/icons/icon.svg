@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <!-- Placeholder app icon. Replace with your own, then run:
+       cargo tauri icon static/icons/icon.svg -->
+  <rect width="512" height="512" rx="64" fill="#4F7942"/>
+  <text x="256" y="370" font-size="280" text-anchor="middle" font-family="system-ui">&#x1F342;</text>
+</svg>

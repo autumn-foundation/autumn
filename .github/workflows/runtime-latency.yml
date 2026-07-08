@@ -49,6 +49,10 @@ on:
       - "benchmarks/runtime/seed/**"
       - ".github/workflows/runtime-latency.yml"
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 # Minimal token scope: the workflow only reads the repo and uploads artifacts
 # (artifact upload uses the job token without needing extra repo write scope).
 permissions:

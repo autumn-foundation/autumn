@@ -185,6 +185,128 @@ use diesel_async::RunQueryDsl;
 #[cfg(feature = "db")]
 use diesel_async::pooled_connection::deadpool::Pool;
 
+// ── Mail recording helpers ─────────────────────────────────────
+
+/// Snapshot of an email captured by the built-in test mail recorder.
+///
+/// Available on [`TestClient`] via [`TestClient::sent_mail()`] when the `mail`
+/// feature is enabled.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use autumn_web::test::TestApp;
+///
+/// let client = TestApp::new().config(cfg).routes(routes![handler]).build();
+/// client.post("/signup").json(&body).send().await.assert_ok();
+///
+/// // ≤ 3 lines to assert an email was sent:
+/// client.assert_email_count(1);
+/// client.assert_email_sent(|m| m.to.iter().any(|a| a == "alice@example.com"));
+/// client.assert_email_sent(|m| m.subject == "Welcome!");
+/// ```
+#[cfg(feature = "mail")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SentMail {
+    /// `From` header value (after mailer defaults are applied).
+    pub from: Option<String>,
+    /// `Reply-To` header value.
+    pub reply_to: Option<String>,
+    /// `To` recipients.
+    pub to: Vec<String>,
+    /// `Subject` header.
+    pub subject: String,
+    /// HTML body, if provided.
+    pub html: Option<String>,
+    /// Plain-text body, if provided.
+    pub text: Option<String>,
+    /// Files attached to this message, in declared order.
+    pub attachments: Vec<crate::mail::MailAttachment>,
+}
+
+#[cfg(feature = "mail")]
+impl From<&crate::mail::Mail> for SentMail {
+    fn from(m: &crate::mail::Mail) -> Self {
+        Self {
+            from: m.from.clone(),
+            reply_to: m.reply_to.clone(),
+            to: m.to.clone(),
+            subject: m.subject.clone(),
+            html: m.html.clone(),
+            text: m.text.clone(),
+            attachments: m.attachments.clone(),
+        }
+    }
+}
+
+/// Built-in per-`TestClient` recording mail interceptor.
+///
+/// Auto-installed by [`TestApp::build`] — no `.with_mail_interceptor()` needed.
+/// Composes with any user-supplied interceptor (the user's interceptor still runs).
+#[cfg(feature = "mail")]
+#[derive(Clone, Default)]
+struct MailRecorder {
+    mails: std::sync::Arc<std::sync::Mutex<Vec<SentMail>>>,
+}
+
+#[cfg(feature = "mail")]
+impl MailRecorder {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn get_sent(&self) -> Vec<SentMail> {
+        self.mails.lock().unwrap().clone()
+    }
+}
+
+#[cfg(feature = "mail")]
+impl crate::interceptor::MailInterceptor for MailRecorder {
+    fn intercept<'a>(
+        &'a self,
+        mail: &'a crate::mail::Mail,
+        next: std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), crate::mail::MailError>> + Send + 'a>,
+        >,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), crate::mail::MailError>> + Send + 'a>,
+    > {
+        let snapshot = SentMail::from(mail);
+        let mails = std::sync::Arc::clone(&self.mails);
+        Box::pin(async move {
+            let result = next.await;
+            if result.is_ok() {
+                mails.lock().unwrap().push(snapshot);
+            }
+            result
+        })
+    }
+}
+
+/// Chains two [`MailInterceptor`](crate::interceptor::MailInterceptor)s so that
+/// `first` runs before `second`, both before the underlying transport.
+#[cfg(feature = "mail")]
+struct ChainedMailInterceptor {
+    first: std::sync::Arc<dyn crate::interceptor::MailInterceptor>,
+    second: std::sync::Arc<dyn crate::interceptor::MailInterceptor>,
+}
+
+#[cfg(feature = "mail")]
+impl crate::interceptor::MailInterceptor for ChainedMailInterceptor {
+    fn intercept<'a>(
+        &'a self,
+        mail: &'a crate::mail::Mail,
+        next: std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), crate::mail::MailError>> + Send + 'a>,
+        >,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), crate::mail::MailError>> + Send + 'a>,
+    > {
+        let second_next = self.second.intercept(mail, next);
+        self.first.intercept(mail, second_next)
+    }
+}
+
 // ── TestApp ────────────────────────────────────────────────────
 
 /// Builder for constructing a fully-configured Autumn application in tests.
@@ -240,6 +362,8 @@ pub struct TestApp {
     forbidden_response_override: Option<crate::authorization::ForbiddenResponse>,
     #[cfg(feature = "mail")]
     mail_interceptor: Option<std::sync::Arc<dyn crate::interceptor::MailInterceptor>>,
+    #[cfg(feature = "mail")]
+    mail_recorder: MailRecorder,
     job_interceptor: Option<std::sync::Arc<dyn crate::interceptor::JobInterceptor>>,
     #[cfg(feature = "db")]
     db_interceptor: Option<std::sync::Arc<dyn crate::interceptor::DbConnectionInterceptor>>,
@@ -314,6 +438,8 @@ impl TestApp {
             forbidden_response_override: None,
             #[cfg(feature = "mail")]
             mail_interceptor: None,
+            #[cfg(feature = "mail")]
+            mail_recorder: MailRecorder::new(),
             job_interceptor: None,
             #[cfg(feature = "db")]
             db_interceptor: None,
@@ -586,6 +712,13 @@ impl TestApp {
     /// against a standard axum Router.  The probe state returned by
     /// [`TestClient::probes`] will be in the default ready state; it is not
     /// connected to any handler in the supplied router.
+    ///
+    /// **Note:** [`TestClient::sent_mail`] will always return an empty list for
+    /// clients built this way.  The built-in mail recorder is wired in during
+    /// [`TestApp::build`]; because `from_router` receives an already-constructed
+    /// `AppState` (with the mailer already installed), the recorder cannot be
+    /// injected into its interceptor chain.  Use [`TestApp::new().merge(router).build()`](TestApp::merge)
+    /// to get recording support.
     #[must_use]
     pub fn from_router(router: axum::Router, state: AppState) -> TestClient {
         TestClient {
@@ -594,6 +727,8 @@ impl TestApp {
             state,
             _job_runtime: None,
             clock_as_any: None,
+            #[cfg(feature = "mail")]
+            mail_recorder: None,
         }
     }
 
@@ -1172,9 +1307,21 @@ impl TestApp {
         state.insert_extension(self.config.clone());
 
         #[cfg(feature = "mail")]
-        if let Some(interceptor) = self.mail_interceptor {
-            state.insert_extension(interceptor);
-        }
+        let mail_recorder_for_client = {
+            let recorder_for_client = self.mail_recorder.clone();
+            let recorder = std::sync::Arc::new(self.mail_recorder);
+            let effective: std::sync::Arc<dyn crate::interceptor::MailInterceptor> =
+                if let Some(user) = self.mail_interceptor {
+                    std::sync::Arc::new(ChainedMailInterceptor {
+                        first: recorder,
+                        second: user,
+                    })
+                } else {
+                    recorder
+                };
+            state.insert_extension(effective);
+            recorder_for_client
+        };
         if let Some(interceptor) = self.job_interceptor {
             state.insert_extension(interceptor);
         }
@@ -1372,6 +1519,8 @@ impl TestApp {
             state,
             _job_runtime: job_runtime,
             clock_as_any: self.clock_as_any,
+            #[cfg(feature = "mail")]
+            mail_recorder: Some(mail_recorder_for_client),
         }
     }
 }
@@ -1420,6 +1569,10 @@ pub struct TestClient {
     _job_runtime: Option<TestJobRuntime>,
     /// Retained so `advance_clock` can downcast to [`crate::time::TickingClock`].
     clock_as_any: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
+    /// `None` when built via [`TestApp::from_router`], which bypasses recorder
+    /// wiring. `Some` for all clients produced by [`TestApp::build`].
+    #[cfg(feature = "mail")]
+    mail_recorder: Option<MailRecorder>,
 }
 
 struct TestJobRuntime {
@@ -1516,6 +1669,85 @@ impl TestClient {
     /// and verify the HTTP probe endpoints reflect state changes.
     pub const fn probes(&self) -> &crate::probe::ProbeState {
         &self.probes
+    }
+
+    /// Returns all emails sent during this test, in the order they were sent.
+    ///
+    /// The built-in recorder is installed automatically — no
+    /// `.with_mail_interceptor(…)` call is required.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// client.post("/signup").json(&body).send().await.assert_ok();
+    /// let mail = &client.sent_mail()[0];
+    /// assert_eq!(mail.subject, "Welcome!");
+    /// ```
+    #[cfg(feature = "mail")]
+    #[must_use]
+    pub fn sent_mail(&self) -> Vec<SentMail> {
+        self.mail_recorder
+            .as_ref()
+            .expect("sent_mail() is not available on a TestClient built via from_router(); use TestApp::new().merge(router).build() instead")
+            .get_sent()
+    }
+
+    /// Asserts that exactly `n` emails were sent, panicking with a list of
+    /// what was actually sent on failure.
+    ///
+    /// Returns `&self` for chaining.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the count does not match.
+    #[cfg(feature = "mail")]
+    pub fn assert_email_count(&self, n: usize) -> &Self {
+        let sent = self.sent_mail();
+        assert_eq!(
+            sent.len(),
+            n,
+            "expected {n} email(s) to have been sent, got {};\nactually sent: {sent:#?}",
+            sent.len(),
+        );
+        self
+    }
+
+    /// Asserts that no emails were sent.
+    ///
+    /// Returns `&self` for chaining.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any emails were sent.
+    #[cfg(feature = "mail")]
+    pub fn assert_no_email_sent(&self) -> &Self {
+        self.assert_email_count(0)
+    }
+
+    /// Asserts that at least one sent email satisfies `predicate`, panicking
+    /// with a list of what was actually sent on failure.
+    ///
+    /// Returns `&self` for chaining.
+    ///
+    /// # Panics
+    ///
+    /// Panics when no sent email matches.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// client
+    ///     .assert_email_sent(|m| m.to.iter().any(|a| a == "alice@example.com"))
+    ///     .assert_email_sent(|m| m.subject == "Welcome!");
+    /// ```
+    #[cfg(feature = "mail")]
+    pub fn assert_email_sent(&self, predicate: impl Fn(&SentMail) -> bool) -> &Self {
+        let sent = self.sent_mail();
+        assert!(
+            sent.iter().any(predicate),
+            "no sent email matched the predicate;\nactually sent: {sent:#?}",
+        );
+        self
     }
 
     /// Start building a GET request.

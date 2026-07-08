@@ -1,6 +1,6 @@
 use autumn_web::storage::Blob;
 
-use crate::schema::{comments, posts, subreddits, users, votes};
+use crate::schema::{comments, posts, subreddits, tags, users, votes};
 
 // Manual model -- password_hash should never be auto-exposed via API.
 
@@ -56,6 +56,7 @@ pub struct Subreddit {
 #[belongs_to(User, fk = author_id)]
 #[belongs_to(Subreddit)]
 #[has_many(Comment)]
+#[has_many(Tag, through = post_tags)]
 pub struct Post {
     #[id]
     pub id: i64,
@@ -79,6 +80,22 @@ pub struct Post {
     pub created_at: chrono::NaiveDateTime,
     #[default]
     pub updated_at: chrono::NaiveDateTime,
+}
+
+// Many-to-many (#1324): `#[has_many(Post, through = post_tags)]` is the
+// mirror image of `Post`'s `#[has_many(Tag, through = post_tags)]` --
+// mutual `through =` on the same join table, exercising the same Box'd
+// nested-spec plumbing belongs_to/has_many mutual recursion already needs
+// (`Post` belongs_to `Subreddit`, `Subreddit` has_many `Post`).
+#[autumn_web::model]
+#[has_many(Post, through = post_tags)]
+pub struct Tag {
+    #[id]
+    pub id: i64,
+    #[validate(length(min = 1, max = 40))]
+    pub name: String,
+    #[indexed]
+    pub slug: String,
 }
 
 #[autumn_web::model]

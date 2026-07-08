@@ -51,7 +51,8 @@ fn stmt_is_generated_replay_guard(stmt: &Stmt) -> bool {
 fn stmt_is_generated_auth_prologue(stmt: &Stmt) -> bool {
     if matches!(
         stmt,
-        Stmt::Item(Item::Const(item)) if item.ident == "__AUTUMN_SECURED_ROLES"
+        Stmt::Item(Item::Const(item))
+            if item.ident == "__AUTUMN_SECURED_ROLES" || item.ident == "__AUTUMN_SECURED_SCOPES"
     ) {
         return true;
     }
@@ -149,6 +150,20 @@ fn expr_is_generated_auth_check_call(expr: &Expr) -> bool {
         Expr::Call(call)
             if path_expr_matches(
                 &call.func,
+                &["autumn_web", "auth", "__check_secured_scopes"],
+            ) =>
+        {
+            // __check_secured_scopes(__autumn_token_scopes…, __AUTUMN_SECURED_SCOPES)
+            call.args.len() == 2
+                && call
+                    .args
+                    .iter()
+                    .nth(1)
+                    .is_some_and(|arg| path_expr_ends_with(arg, "__AUTUMN_SECURED_SCOPES"))
+        }
+        Expr::Call(call)
+            if path_expr_matches(
+                &call.func,
                 &["autumn_web", "authorization", "__check_policy"],
             ) =>
         {
@@ -165,10 +180,46 @@ fn expr_is_generated_auth_check_call(expr: &Expr) -> bool {
                 && call.args.iter().nth(2).is_some_and(expr_is_string_literal)
                 && call.args.iter().nth(3).is_some_and(expr_is_ref_to_path)
         }
+        Expr::Call(call)
+            if path_expr_matches(
+                &call.func,
+                &["autumn_web", "authorization", "__check_policy_scoped"],
+            ) =>
+        {
+            // __check_policy_scoped(&state, &session, scopes_map, "action", &resource)
+            call.args.len() == 5
+                && call
+                    .args
+                    .first()
+                    .is_some_and(|arg| expr_is_ref_to_ident(arg, "__autumn_state"))
+                && call
+                    .args
+                    .iter()
+                    .nth(1)
+                    .is_some_and(|arg| expr_is_ref_to_ident(arg, "__autumn_session"))
+                && call.args.iter().nth(2).is_some_and(expr_is_scopes_map_arg)
+                && call.args.iter().nth(3).is_some_and(expr_is_string_literal)
+                && call.args.iter().nth(4).is_some_and(expr_is_ref_to_path)
+        }
         Expr::Group(group) => expr_is_generated_auth_check_call(&group.expr),
         Expr::Paren(paren) => expr_is_generated_auth_check_call(&paren.expr),
         _ => false,
     }
+}
+
+/// Recognizes `__autumn_token_scopes.as_ref().map(|__e| &__e.0)` — the
+/// generated scopes argument emitted by `#[authorize]` for `__check_policy_scoped`.
+fn expr_is_scopes_map_arg(expr: &Expr) -> bool {
+    let Expr::MethodCall(outer) = expr else {
+        return false;
+    };
+    if outer.method != "map" {
+        return false;
+    }
+    let Expr::MethodCall(inner) = outer.receiver.as_ref() else {
+        return false;
+    };
+    inner.method == "as_ref" && path_expr_ends_with(&inner.receiver, "__autumn_token_scopes")
 }
 
 fn block_returns_ident(block: &Block, expected: &str) -> bool {
@@ -667,6 +718,34 @@ mod tests {
                 {
                     return __autumn_response;
                 }
+                return ::autumn_web::reexports::axum::response::IntoResponse::into_response(
+                    __autumn_error,
+                );
+            }
+            const __AUTUMN_IDEMPOTENCY_REPLAY_GUARD: () = ();
+            if let ::core::option::Option::Some(__autumn_response) =
+                ::autumn_web::idempotency::__replay_response(&__autumn_idempotency_replay)
+            {
+                return __autumn_response;
+            }
+        });
+
+        assert!(block_has_replay_guard(&block));
+    }
+
+    #[test]
+    fn generated_authorize_scoped_prologue_before_replay_guard_counts() {
+        let block: syn::Block = syn::parse_quote!({
+            if let ::core::result::Result::Err(__autumn_error) =
+                ::autumn_web::authorization::__check_policy_scoped::<Post>(
+                    &__autumn_state,
+                    &__autumn_session,
+                    __autumn_token_scopes.as_ref().map(|__e| &__e.0),
+                    "update",
+                    &post,
+                )
+                .await
+            {
                 return ::autumn_web::reexports::axum::response::IntoResponse::into_response(
                     __autumn_error,
                 );
