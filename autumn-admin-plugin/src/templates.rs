@@ -11,11 +11,15 @@ use autumn_web::job::{
 use autumn_web::pagination::Page;
 use autumn_web::runtime_config::{ConfigChangeRecord, ConfigEntry};
 use autumn_web::ui::pagination::{PagerOptions, pagination_nav};
-use autumn_web::widgets::{CardConfig, card, stat_card};
+use autumn_web::widgets::{
+    CardConfig, ConfirmActionConfig, ModalConfig, NavBarConfig, NavBarLayout, NavItem, card,
+    confirm_action, modal, modal_close_button, nav_bar, stat_card,
+};
+use http::Method;
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 use serde_json::Value;
 
-use crate::registry::AdminRegistry;
+use crate::registry::{AdminRegistry, JOBS_NAV_SLUG, RUNTIME_CONFIG_NAV_SLUG};
 use crate::routes::ADMIN_JS_PATH;
 use crate::traits::{
     AdminAction, AdminField, AdminFieldKind, AdminHistoryPage, AdminImportReport, CsvImportMode,
@@ -25,8 +29,6 @@ use crate::traits::{
 const HTMX_JS_PATH: &str = "/static/js/htmx.min.js";
 const HTMX_CSRF_JS_PATH: &str = "/static/js/autumn-htmx-csrf.js";
 const TOKENS_CSS: &str = include_str!("tokens.css");
-const JOBS_NAV_SLUG: &str = "__admin_jobs";
-const RUNTIME_CONFIG_NAV_SLUG: &str = "__admin_config";
 const FLASH_CSS: &str = "\
 .flash {
     padding: 0.75rem 1rem;
@@ -92,7 +94,8 @@ const ADMIN_CSS: &str = "
         padding: 2rem;
         min-width: 0;
     }
-    .admin-logo {
+    .admin-sidebar .autumn-nav__brand {
+        display: block;
         font-size: 1.125rem;
         font-weight: 700;
         padding: 0 1.5rem 1rem;
@@ -100,8 +103,8 @@ const ADMIN_CSS: &str = "
         margin-bottom: 1rem;
         color: var(--text);
     }
-    .admin-nav { list-style: none; }
-    .admin-nav li a {
+    .admin-sidebar .autumn-nav__items { list-style: none; }
+    .admin-sidebar .autumn-nav__item a {
         display: block;
         padding: 0.5rem 1.5rem;
         color: var(--text-muted);
@@ -110,23 +113,29 @@ const ADMIN_CSS: &str = "
         border-left: 3px solid transparent;
         transition: all 0.15s;
     }
-    .admin-nav li a:hover {
+    .admin-sidebar .autumn-nav__item a:hover {
         background: var(--bg);
         color: var(--text);
         text-decoration: none;
     }
-    .admin-nav li a.active {
+    .admin-sidebar .autumn-nav__item a.active {
         background: var(--primary-light);
         color: var(--primary);
         border-left-color: var(--primary);
     }
-    .admin-nav-section {
+    .admin-sidebar .autumn-nav__section {
         font-size: 0.7rem;
         text-transform: uppercase;
         letter-spacing: 0.05em;
         color: var(--text-muted);
         padding: 1rem 1.5rem 0.375rem;
         font-weight: 600;
+    }
+    /* The sidebar hides itself entirely below 768px (see the .admin-sidebar
+       rule in the Responsive section) instead of collapsing behind nav_bar's
+       own hamburger toggle, so the toggle stays hidden at every width. */
+    .admin-sidebar .autumn-nav__toggle {
+        display: none;
     }
 
     /* Cards */
@@ -143,6 +152,7 @@ const ADMIN_CSS: &str = "
         padding: 1rem 1.5rem 0.75rem;
         border-bottom: 1px solid var(--border);
     }
+    .header-actions form { display: inline; }
     .card-title {
         font-size: 1.125rem;
         font-weight: 600;
@@ -414,6 +424,43 @@ pub fn admin_layout(
     show_config: bool,
     content: &Markup,
 ) -> Markup {
+    // Each nav item's href is computed once here and reused both to
+    // synthesize current_path (so nav_link's own path-comparison logic
+    // decides which sidebar item is active) and as the anchor's href below —
+    // so the "/jobs" and "/config" route suffixes each appear as a literal
+    // exactly once.
+    let jobs_href = format!("{prefix}/jobs");
+    let config_href = format!("{prefix}/config");
+    let current_path = match active_slug {
+        None => prefix.to_owned(),
+        Some(JOBS_NAV_SLUG) => jobs_href.clone(),
+        Some(RUNTIME_CONFIG_NAV_SLUG) => config_href.clone(),
+        Some(slug) => format!("{prefix}/{slug}"),
+    };
+
+    let mut nav_items = vec![NavItem::link(prefix, "Dashboard")];
+    if registry.model_count() > 0 {
+        nav_items.push(NavItem::section("Models"));
+        nav_items.extend(registry.iter().map(|(slug, model)| {
+            NavItem::link(format!("{prefix}/{slug}"), model.display_name_plural())
+        }));
+    }
+    nav_items.push(NavItem::section("System"));
+    nav_items.push(NavItem::link(jobs_href, "Jobs"));
+    if show_config {
+        nav_items.push(NavItem::link(config_href, "Runtime Config"));
+    }
+    nav_items.push(NavItem::plain_link(
+        format!("{actuator_prefix}/ui"),
+        "Actuator",
+    ));
+    let sidebar_nav = NavBarConfig::new()
+        .brand_html(html! { "🍂 Autumn Admin" }, None)
+        .items(nav_items)
+        .aria_label("Admin navigation")
+        .layout(NavBarLayout::Sidebar)
+        .class("admin-sidebar");
+
     html! {
         (DOCTYPE)
         html lang="en" {
@@ -429,6 +476,11 @@ pub fn admin_layout(
                 title { (title) " — Autumn Admin" }
                 script src=(HTMX_JS_PATH) {}
                 script src=(HTMX_CSRF_JS_PATH) {}
+                // Reveals/wires up nav_bar's hamburger toggle and any future
+                // dropdown menu; the sidebar itself stays fully visible/hidden
+                // via the .admin-sidebar media-query rule below, not the
+                // toggle, so its own toggle button is kept CSS-hidden always.
+                script src=(autumn_web::htmx::AUTUMN_WIDGETS_JS_PATH) defer {}
                 // External so it runs under the default CSP `script-src 'self'`.
                 script src={ (prefix) (&**ADMIN_JS_PATH) } {}
                 style {
@@ -443,43 +495,7 @@ pub fn admin_layout(
                 div class="admin-layout" {
                     // Sidebar navigation landmark
                     header role="banner" {
-                        nav class="admin-sidebar" aria-label="Admin navigation" {
-                            div class="admin-logo" { "🍂 Autumn Admin" }
-                            ul class="admin-nav" {
-                                li {
-                                    a href=(prefix) class=[active_slug.is_none().then_some("active")] {
-                                        "Dashboard"
-                                    }
-                                }
-                                @if registry.model_count() > 0 {
-                                    li { div class="admin-nav-section" { "Models" } }
-                                    @for (slug, model) in registry.iter() {
-                                        li {
-                                            a href={ (prefix) "/" (slug) }
-                                              class=[(active_slug == Some(slug)).then_some("active")] {
-                                                (model.display_name_plural())
-                                            }
-                                        }
-                                    }
-                                }
-                                li { div class="admin-nav-section" { "System" } }
-                                li {
-                                    a href={ (prefix) "/jobs" }
-                                      class=[(active_slug == Some(JOBS_NAV_SLUG)).then_some("active")] {
-                                        "Jobs"
-                                    }
-                                }
-                                @if show_config {
-                                    li {
-                                        a href={ (prefix) "/config" }
-                                          class=[(active_slug == Some(RUNTIME_CONFIG_NAV_SLUG)).then_some("active")] {
-                                            "Runtime Config"
-                                        }
-                                    }
-                                }
-                                li { a href={ (actuator_prefix) "/ui" } { "Actuator" } }
-                            }
-                        }
+                        (nav_bar(&current_path, &sidebar_nav))
                     }
                     // Main content landmark
                     main id="admin-main" class="admin-main" {
@@ -1096,6 +1112,27 @@ pub fn model_list_page(
 
                 } // /form
 
+                // Shared confirm dialog for destructive bulk actions — rendered
+                // once per page when at least one declared action requires
+                // confirmation. admin.js intercepts the bulk form's submit,
+                // shows this dialog instead of window.confirm(), and fills in
+                // [data-bulk-confirm-detail] with the action/count description.
+                @if actions.iter().any(|a| a.confirm) {
+                    (modal(
+                        "admin-bulk-confirm",
+                        "Confirm bulk action",
+                        &html! { p data-bulk-confirm-detail {} },
+                        &ModalConfig::new().footer(html! {
+                            (modal_close_button("Cancel", "admin-bulk-confirm", Some("btn")))
+                            button type="button" class="btn btn-danger"
+                                command="close" commandfor="admin-bulk-confirm"
+                                data-modal-close="admin-bulk-confirm" data-bulk-confirm {
+                                "Confirm"
+                            }
+                        }),
+                    ))
+                }
+
                 // Pagination
                 @if result.total_pages() > 1 {
                     (render_pagination(result, model_slug, &search_enc, sort_by, sort_dir, &filters_enc, prefix))
@@ -1349,6 +1386,7 @@ pub fn model_detail_page(
     id: i64,
     messages: &[FlashMessage],
     csrf_token: &str,
+    csrf_form_field: &str,
     csrf_token_header: &str,
     prefix: &str,
     actuator_prefix: &str,
@@ -1365,8 +1403,11 @@ pub fn model_detail_page(
         }
 
         ({
+            let delete_url = format!("{prefix}/{model_slug}/{id}");
+            let delete_dialog_id = format!("delete-confirm-{id}");
+            let delete_title = format!("Delete this {model_name}?");
             let header_action = html! {
-                div {
+                div class="header-actions" {
                     @if has_history {
                         a href={ (prefix) "/" (model_slug) "/" (id) "/history" }
                             class="btn btn-secondary" { "History" }
@@ -1375,12 +1416,19 @@ pub fn model_detail_page(
                     a href={ (prefix) "/" (model_slug) "/" (id) "/edit" }
                         class="btn btn-primary" { "Edit" }
                     " "
-                    button class="btn btn-danger"
-                        hx-delete={ (prefix) "/" (model_slug) "/" (id) }
-                        hx-confirm={ "Are you sure you want to delete this " (model_name) "?" }
-                        hx-target="body" {
-                        "Delete"
-                    }
+                    (confirm_action(
+                        &delete_dialog_id,
+                        "Delete",
+                        &delete_url,
+                        Method::DELETE,
+                        csrf_token,
+                        &ConfirmActionConfig::new()
+                            .title(&delete_title)
+                            .message(html! { p { "This action cannot be undone." } })
+                            .trigger_class("btn btn-danger")
+                            .confirm_class("btn btn-danger")
+                            .csrf_field(csrf_form_field),
+                    ))
                 }
             };
             let body = html! {
@@ -2883,6 +2931,7 @@ mod tests {
             42,
             &[],
             "t",
+            "_csrf",
             "X-CSRF-Token",
             "/admin",
             "/actuator",
@@ -2895,12 +2944,101 @@ mod tests {
             "Edit link must use path id 42: {html}"
         );
         assert!(
-            html.contains(r#"hx-delete="/admin/widgets/42""#),
-            "Delete must target path id 42: {html}"
+            html.contains(r#"<form action="/admin/widgets/42" method="post""#),
+            "Delete confirm form must target path id 42: {html}"
         );
         assert!(
             !html.contains("widgets/99"),
             "payload id 99 must not route mutations: {html}"
+        );
+        // The delete button is now rendered via confirm_action (a server-rendered
+        // <dialog>), so a no-JS form submission also works: POST + _method=DELETE + CSRF.
+        assert!(
+            html.contains(r#"name="_method" value="DELETE""#),
+            "Delete form must carry a _method override: {html}"
+        );
+        assert!(
+            html.contains(r#"name="_csrf" value="t""#),
+            "Delete form must carry the CSRF token: {html}"
+        );
+    }
+
+    #[test]
+    fn detail_page_delete_uses_confirm_dialog_not_hx_confirm() {
+        // Issue #1233: the admin delete confirmation must be a server-rendered,
+        // testable <dialog> (autumn_web::widgets::confirm_action), not the
+        // native window.confirm() reached via hx-confirm.
+        let r = dummy_registry();
+        let fields = vec![AdminField::new("name", AdminFieldKind::Text)];
+        let record = serde_json::json!({"id": 42, "name": "x"});
+        let html = model_detail_page(
+            &r,
+            "widgets",
+            "Widget",
+            "Widgets",
+            &fields,
+            &record,
+            "#42",
+            42,
+            &[],
+            "t",
+            "_csrf",
+            "X-CSRF-Token",
+            "/admin",
+            "/actuator",
+            false,
+            false,
+        )
+        .into_string();
+        assert!(!html.contains("hx-confirm"), "{html}");
+        assert!(!html.contains("hx-delete"), "{html}");
+        assert!(html.contains("<dialog"), "{html}");
+        assert!(html.contains(r#"aria-modal="true""#), "{html}");
+        assert!(
+            html.contains("Widget"),
+            "confirm dialog title should mention the model name: {html}"
+        );
+        // The trigger button opens the dialog via the native invoker
+        // commands (with a JS-fallback data attribute) rather than hx-delete.
+        assert!(html.contains(r#"command="show-modal""#), "{html}");
+        assert!(html.contains("data-modal-open"), "{html}");
+    }
+
+    #[test]
+    fn detail_page_delete_button_honors_custom_csrf_form_field() {
+        // Regression: the delete button must emit the CSRF hidden input
+        // under the app's configured field name, not a hardcoded "_csrf" —
+        // otherwise a no-JS form submission fails CSRF validation whenever
+        // security.csrf.form_field is customized.
+        let r = dummy_registry();
+        let fields = vec![AdminField::new("name", AdminFieldKind::Text)];
+        let record = serde_json::json!({"id": 42, "name": "x"});
+        let html = model_detail_page(
+            &r,
+            "widgets",
+            "Widget",
+            "Widgets",
+            &fields,
+            &record,
+            "#42",
+            42,
+            &[],
+            "t",
+            "authenticity_token",
+            "X-CSRF-Token",
+            "/admin",
+            "/actuator",
+            false,
+            false,
+        )
+        .into_string();
+        assert!(
+            html.contains(r#"name="authenticity_token" value="t""#),
+            "Delete form must use the configured CSRF field name: {html}"
+        );
+        assert!(
+            !html.contains(r#"name="_csrf""#),
+            "Delete form must not fall back to the default CSRF field name: {html}"
         );
     }
 
@@ -2925,6 +3063,7 @@ mod tests {
             1,
             &[],
             "t",
+            "_csrf",
             "X-CSRF-Token",
             "/admin",
             "/actuator",
@@ -3370,6 +3509,71 @@ mod tests {
             html.contains(r#"data-confirm="1""#),
             "destructive action should set data-confirm: {html}"
         );
+        // Issue #1233: a shared confirm <dialog> is rendered because at
+        // least one action (delete) requires confirmation. admin.js
+        // intercepts the bulk submit and shows this dialog instead of
+        // calling window.confirm().
+        assert!(
+            html.contains(r#"<dialog id="admin-bulk-confirm""#),
+            "list view with a confirm-requiring action must render the bulk confirm dialog: {html}"
+        );
+        assert!(html.contains("data-bulk-confirm-detail"), "{html}");
+        // Regression: "data-bulk-confirm" is a substring of
+        // "data-bulk-confirm-detail", so a plain `.contains("data-bulk-confirm")`
+        // would pass even if the Confirm button's own attribute were removed.
+        // Require an occurrence NOT immediately followed by `-` (i.e. not part
+        // of `-detail`) so this actually verifies the button's bare attribute.
+        assert!(
+            html.match_indices("data-bulk-confirm")
+                .any(|(i, m)| html.as_bytes().get(i + m.len()) != Some(&b'-')),
+            "confirm button must carry a standalone data-bulk-confirm attribute: {html}"
+        );
+        assert!(!html.contains("window.confirm"), "{html}");
+    }
+
+    #[test]
+    fn list_page_skips_bulk_confirm_dialog_when_no_action_requires_confirm() {
+        use crate::traits::{ActionStyle, ListResult};
+        let r = dummy_registry();
+        let fields = vec![AdminField::new("name", AdminFieldKind::Text)];
+        let actions = vec![AdminAction {
+            name: "archive",
+            label: "Archive".to_owned(),
+            style: ActionStyle::Default,
+            confirm: false,
+        }];
+        let result = ListResult {
+            records: vec![serde_json::json!({"id": 1, "name": "x"})],
+            total: 1,
+            page: 1,
+            per_page: 25,
+        };
+        let html = model_list_page(
+            &r,
+            "widgets",
+            "Widgets",
+            &fields,
+            &actions,
+            &result,
+            "",
+            None,
+            SortDirection::Asc,
+            &[],
+            &[],
+            "tok",
+            "admin_csrf",
+            "X-CSRF-Token",
+            "/admin",
+            "/actuator",
+            false,
+            false,
+            false,
+        )
+        .into_string();
+        assert!(
+            !html.contains("admin-bulk-confirm"),
+            "no action requires confirmation, so no dialog should render: {html}"
+        );
     }
 
     #[test]
@@ -3596,7 +3800,7 @@ mod tests {
 
     #[test]
     fn admin_js_does_not_contain_inline_event_handlers() {
-        // Sanity-check the shipped JS: has the two behaviours we expect.
+        // Sanity-check the shipped JS: has the behaviours we expect.
         let js = include_str!("admin.js");
         assert!(
             js.contains("select-all"),
@@ -3605,6 +3809,142 @@ mod tests {
         assert!(
             js.contains("removeAttribute(\"name\")"),
             "admin.js should strip blank password input names"
+        );
+    }
+
+    #[test]
+    fn admin_js_uses_confirm_dialog_as_primary_path() {
+        // Issue #1233: the bulk-action confirm's primary path is the
+        // server-rendered #admin-bulk-confirm <dialog>
+        // (autumn_web::widgets::modal), not the native window.confirm().
+        let js = include_str!("admin.js");
+        assert!(js.contains("data-bulk-confirm"), "{js}");
+        assert!(js.contains("showModal"), "{js}");
+    }
+
+    #[test]
+    fn admin_js_window_confirm_only_reached_as_showmodal_fallback() {
+        // Code-review fix: window.confirm() must not be the primary confirm
+        // mechanism, but it IS kept as a fallback for browsers without
+        // <dialog>.showModal support — otherwise a destructive bulk action
+        // would submit with zero confirmation on those browsers (fail-open).
+        // Verify it's only reachable after the showModal support guard, not
+        // called unconditionally earlier in the file.
+        let js = include_str!("admin.js");
+        let guard_idx = js
+            .find("!dialog.showModal")
+            .unwrap_or_else(|| panic!("must feature-detect <dialog>.showModal support: {js}"));
+        // Search for the actual call site (not just the substring
+        // "window.confirm", which also appears in an explanatory comment
+        // earlier in the file).
+        let confirm_idx = js
+            .find("window.confirm(message)")
+            .unwrap_or_else(|| panic!("must keep a window.confirm() fallback: {js}"));
+        assert!(
+            confirm_idx > guard_idx,
+            "window.confirm() must only be reached after the showModal support guard: {js}"
+        );
+    }
+
+    #[test]
+    fn admin_js_defers_showmodal_fallback_resubmit() {
+        // Regression (caught by a real-browser Playwright check, not by any
+        // string-matching test): calling form.requestSubmit() synchronously
+        // from within that same form's still-dispatching `submit` event
+        // handler is a no-op per the HTML spec's reentrancy guard ("if
+        // form's firing submit event is true, then return"). The
+        // window.confirm() fallback branch runs inside that handler, so its
+        // resubmit must be deferred (e.g. via setTimeout) past the current
+        // dispatch — otherwise the confirmed action silently never submits.
+        let js = include_str!("admin.js");
+        let confirm_idx = js
+            .find("window.confirm(message)")
+            .unwrap_or_else(|| panic!("must keep a window.confirm() fallback: {js}"));
+        let defer_idx = js
+            .find("setTimeout")
+            .unwrap_or_else(|| panic!("fallback resubmit must be deferred: {js}"));
+        assert!(
+            defer_idx > confirm_idx,
+            "the deferred resubmit must be inside the window.confirm() fallback branch: {js}"
+        );
+    }
+
+    #[test]
+    fn admin_js_requestsubmit_has_form_submit_fallback() {
+        // PR review (gemini-code-assist): form.requestSubmit() shipped later
+        // than <dialog> support in some browsers (e.g. Safari 15.4-15.6 has
+        // <dialog> but not requestSubmit, which arrived in Safari 16) and
+        // may be absent in older headless test runners — calling it
+        // unguarded throws a TypeError. Both call sites must go through a
+        // feature-detected fallback to form.submit() instead of calling
+        // requestSubmit directly.
+        let js = include_str!("admin.js");
+        assert!(
+            js.contains(r#"typeof form.requestSubmit === "function""#),
+            "must feature-detect requestSubmit before calling it: {js}"
+        );
+        assert!(
+            js.contains("form.submit();"),
+            "must fall back to form.submit() when requestSubmit is unavailable: {js}"
+        );
+        // The only *call statement* invoking requestSubmit() should be
+        // inside the feature-detected submitForm() helper itself (matched
+        // with a trailing `;` so an explanatory comment mentioning the same
+        // method name doesn't also count) — every other resubmit call site
+        // routes through submitForm(form) instead.
+        assert_eq!(
+            js.matches("form.requestSubmit();").count(),
+            1,
+            "form.requestSubmit() should only be called from inside the \
+             feature-detected submitForm() helper, not unguarded elsewhere: {js}"
+        );
+        assert_eq!(
+            js.matches("submitForm(form);").count(),
+            2,
+            "both bulk-action resubmit call sites must route through submitForm(): {js}"
+        );
+    }
+
+    #[test]
+    fn admin_js_clears_bulk_confirmed_before_fallback_submit() {
+        // PR review (chatgpt-codex-connector): form.submit() (the
+        // requestSubmit-unavailable fallback) bypasses the 'submit' event
+        // entirely, so the top-level submit handler's `bulkConfirmed`
+        // cleanup never runs for that path. Without an explicit clear here,
+        // a bfcache-restored page after that fallback submit would carry a
+        // stale "confirmed" flag into the next, unrelated bulk-action
+        // attempt and skip its confirmation dialog. The clear must happen
+        // in the same branch as (and before) the form.submit() fallback
+        // call, not just "somewhere in the file".
+        let js = include_str!("admin.js");
+        let fallback_idx = js
+            .find("form.submit();")
+            .unwrap_or_else(|| panic!("must keep a form.submit() fallback: {js}"));
+        // `find` (first occurrence), not `rfind`: the top-level submit-event
+        // handler has its own, unrelated "delete ...;" later in the file
+        // (its normal one-shot-flag consumption on a genuine event) — this
+        // must find the one inside submitForm() itself, which comes first.
+        let clear_idx = js
+            .find("delete form.dataset.bulkConfirmed;")
+            .unwrap_or_else(|| {
+                panic!("must clear bulkConfirmed before the form.submit() fallback: {js}")
+            });
+        assert!(
+            clear_idx < fallback_idx,
+            "bulkConfirmed must be cleared BEFORE the form.submit() fallback call \
+             (form.submit() bypasses the submit event, so clearing it after — or \
+             relying on the submit-event listener to clear it — never happens): {js}"
+        );
+        // Clearing must live inside submitForm() itself, not just at one of
+        // its call sites, so it applies regardless of which call site
+        // triggers the fallback path.
+        let submit_form_idx = js
+            .find("function submitForm(form)")
+            .unwrap_or_else(|| panic!("submitForm() helper must exist: {js}"));
+        assert!(
+            submit_form_idx < clear_idx && clear_idx < fallback_idx,
+            "the bulkConfirmed clear must be inside submitForm(), immediately \
+             guarding its form.submit() fallback: {js}"
         );
     }
 
@@ -3904,5 +4244,171 @@ mod tests {
         // 2023-11-14 22:13:20 UTC
         let s = format_timestamp(1_700_000_000);
         assert!(s.contains("2023"), "expected 2023 in formatted output: {s}");
+    }
+
+    // ── admin_layout nav (#1134) ─────────────────────────────────────────
+
+    fn render_layout(active_slug: Option<&str>) -> String {
+        let registry = AdminRegistry::new();
+        admin_layout(
+            &registry,
+            active_slug,
+            "Title",
+            "/admin",
+            "/actuator",
+            "tok",
+            "X-CSRF-Token",
+            &[],
+            true,
+            &html! {},
+        )
+        .into_string()
+    }
+
+    #[test]
+    fn admin_layout_dashboard_active_has_aria_current() {
+        let html = render_layout(None);
+        assert_eq!(html.matches(r#"aria-current="page""#).count(), 1, "{html}");
+        assert!(
+            html.contains(r#"href="/admin" class="active" aria-current="page""#),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn admin_layout_jobs_active_has_aria_current() {
+        let html = render_layout(Some(JOBS_NAV_SLUG));
+        assert_eq!(html.matches(r#"aria-current="page""#).count(), 1, "{html}");
+        assert!(
+            html.contains(r#"href="/admin/jobs" class="active" aria-current="page""#),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn admin_layout_runtime_config_active_has_aria_current() {
+        let html = render_layout(Some(RUNTIME_CONFIG_NAV_SLUG));
+        assert_eq!(html.matches(r#"aria-current="page""#).count(), 1, "{html}");
+        assert!(
+            html.contains(r#"href="/admin/config" class="active" aria-current="page""#),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn admin_layout_no_active_slug_has_no_dashboard_aria_current() {
+        // active_slug = Some(...) for an unrelated slug: Dashboard must not
+        // claim the active state, and nothing else should either since the
+        // registry is empty (no model nav items).
+        let html = render_layout(Some(JOBS_NAV_SLUG));
+        assert!(
+            !html.contains(r#"href="/admin" class="active""#),
+            "dashboard must not be active: {html}"
+        );
+    }
+
+    // ── admin_layout nav_bar (#1137) ──────────────────────────────────────
+
+    use crate::registry::tests::DummyModel;
+
+    fn render_layout_with_registry(registry: &AdminRegistry, active_slug: Option<&str>) -> String {
+        admin_layout(
+            registry,
+            active_slug,
+            "Title",
+            "/admin",
+            "/actuator",
+            "tok",
+            "X-CSRF-Token",
+            &[],
+            true,
+            &html! {},
+        )
+        .into_string()
+    }
+
+    #[test]
+    fn admin_layout_renders_nav_bar_sidebar() {
+        let html = render_layout(None);
+        assert!(html.contains("autumn-nav--sidebar"), "{html}");
+        assert!(
+            html.contains(r#"class="autumn-nav autumn-nav--sidebar admin-sidebar""#),
+            "{html}"
+        );
+        assert!(html.contains(r#"aria-label="Admin navigation""#), "{html}");
+    }
+
+    #[test]
+    fn admin_layout_brand_uses_nav_brand_class() {
+        let html = render_layout(None);
+        assert!(html.contains("autumn-nav__brand"), "{html}");
+        assert!(html.contains("🍂 Autumn Admin"), "{html}");
+        assert!(!html.contains(r#"class="admin-logo""#), "{html}");
+    }
+
+    #[test]
+    fn admin_layout_sections_render_as_nav_sections_without_models() {
+        let html = render_layout(None);
+        assert!(
+            html.contains(r#"<li class="autumn-nav__section">System</li>"#),
+            "{html}"
+        );
+        assert!(!html.contains("Models"), "{html}");
+    }
+
+    #[test]
+    fn admin_layout_sections_render_as_nav_sections_with_models() {
+        let mut registry = AdminRegistry::new();
+        registry.register(DummyModel {
+            slug: "projects",
+            name: "Projects",
+        });
+        let html = render_layout_with_registry(&registry, None);
+        assert!(
+            html.contains(r#"<li class="autumn-nav__section">Models</li>"#),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"<li class="autumn-nav__section">System</li>"#),
+            "{html}"
+        );
+        assert!(html.contains(r#"href="/admin/projects""#), "{html}");
+    }
+
+    #[test]
+    fn admin_layout_actuator_link_is_plain() {
+        let html = render_layout(None);
+        assert!(html.contains(r#"href="/actuator/ui""#), "{html}");
+        // Only one aria-current in the whole page: Dashboard's. The Actuator
+        // link must never claim active state even though it's the last item.
+        assert_eq!(html.matches(r#"aria-current="page""#).count(), 1, "{html}");
+    }
+
+    #[test]
+    fn admin_layout_has_no_hand_rolled_nav_markup() {
+        let html = render_layout(None);
+        assert!(!html.contains(r#"class="admin-nav""#), "{html}");
+        assert!(!html.contains("admin-logo"), "{html}");
+    }
+
+    #[test]
+    fn admin_layout_loads_nav_bar_widget_runtime() {
+        // nav_bar's hamburger toggle and any future dropdown depend on
+        // autumn-widgets.js to reveal/wire them up; without it the toggle
+        // stays permanently hidden and dead.
+        let html = render_layout(None);
+        assert!(
+            html.contains(autumn_web::htmx::AUTUMN_WIDGETS_JS_PATH),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn admin_sidebar_toggle_stays_hidden() {
+        // The admin sidebar hides itself entirely below 768px (see the
+        // .admin-sidebar { display: none } media rule) rather than using
+        // nav_bar's own collapse-behind-a-hamburger UX, so the toggle must
+        // never become visible even once autumn-widgets.js unhides it.
+        assert!(ADMIN_CSS.contains(".autumn-nav__toggle"), "{ADMIN_CSS}");
     }
 }

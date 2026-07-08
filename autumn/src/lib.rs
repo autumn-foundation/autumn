@@ -72,6 +72,7 @@ pub mod assets;
 pub mod audit;
 pub mod auth;
 pub mod authorization;
+pub mod batches;
 pub mod cache;
 #[cfg(feature = "ws")]
 pub mod channels;
@@ -91,6 +92,11 @@ pub mod error;
 #[cfg(feature = "maud")]
 pub mod error_pages;
 pub mod extract;
+/// View-layer value formatting helpers (currency, delimited numbers,
+/// pluralize, truncate, relative/absolute dates) for Maud templates.
+///
+/// See [`mod@format`] for the full API.
+pub mod format;
 pub mod health;
 #[cfg(feature = "db")]
 pub mod hooks;
@@ -115,6 +121,7 @@ pub mod maintenance;
 pub mod managed_pg;
 #[cfg(feature = "db")]
 pub mod migrate;
+pub(crate) mod pg_conn_str;
 pub mod plugin;
 pub mod plugin_conformance;
 pub mod probe;
@@ -199,6 +206,15 @@ pub mod repository;
 pub(crate) mod repository_commit_hooks;
 #[cfg(feature = "db")]
 pub use repository::RepositoryError;
+
+/// Read-your-own-writes routing support.
+///
+/// When `database.read_your_writes` is `request` or `session`, generated
+/// repository read methods consult the per-request task-local at acquire time
+/// and redirect replica-eligible reads to the primary when a write has
+/// occurred in the same request (or within the session cookie window).
+#[cfg(feature = "db")]
+pub mod read_your_writes;
 
 /// Automatic record version history for `#[repository]` writes.
 ///
@@ -307,9 +323,19 @@ pub mod feature_flags;
 pub mod form;
 pub mod gdpr;
 pub mod job;
+pub mod job_tracking;
+/// Safe, method-aware link helpers: [`links::link_to`] anchors and
+/// [`links::button_to`] CSRF-protected action buttons.
+pub mod links;
 pub mod runtime_config;
 #[cfg(feature = "seed")]
 pub mod seed;
+/// Widget story gallery (issue #1526).
+///
+/// Browsable `/_stories` UI plus a CI anti-rot registry of zero-arg widget
+/// render examples.
+#[cfg(feature = "maud")]
+pub mod stories;
 pub mod task;
 pub mod telemetry;
 pub mod ui;
@@ -343,6 +369,8 @@ pub mod ws;
 /// This module is semver-exempt. Do not use it directly.
 #[doc(hidden)]
 pub mod __private {
+    #[cfg(feature = "db")]
+    pub use crate::db::scoped_transaction;
     #[cfg(all(feature = "db", feature = "ws"))]
     pub use crate::repository_commit_hooks::CURRENT_CHANNELS;
     #[cfg(feature = "db")]
@@ -358,7 +386,9 @@ pub mod __private {
         start_repository_commit_hook_worker,
     };
     #[cfg(feature = "db")]
-    pub use crate::repository_commit_hooks::{get_global_channels, set_global_channels};
+    pub use crate::repository_commit_hooks::{
+        clear_global_channels, get_global_channels, set_global_channels,
+    };
     #[cfg(feature = "db")]
     pub use crate::version_history::VersionedRepositoryDescriptor;
 
@@ -405,6 +435,11 @@ pub use app::{ApiVersion, RegisteredApiVersions};
 /// connection. See [`db::Db`] for full documentation and examples.
 #[cfg(feature = "db")]
 pub use db::Db;
+
+/// Transaction options (isolation level + retry policy) and the savepoint
+/// helper for [`Db::tx_with`]. See [`db::TxOptions`].
+#[cfg(feature = "db")]
+pub use db::{IsolationLevel, TxOptions, savepoint};
 
 /// Framework error type and result alias.
 ///
@@ -472,8 +507,8 @@ pub use htmx::{HtmxFragments, OobSwap};
 pub use live::LiveFragment;
 #[cfg(feature = "mail")]
 pub use mail::{
-    Mail, MailConfig, MailDeliveryQueue, MailDeliveryQueueHandle, MailError, MailTransport, Mailer,
-    SmtpConfig, TlsMode, Transport,
+    Mail, MailAttachment, MailConfig, MailDeliveryQueue, MailDeliveryQueueHandle, MailError,
+    MailTransport, Mailer, SmtpConfig, TlsMode, Transport,
 };
 /// Extension trait adding `.validate()` to all `validator::Validate` types.
 pub use validation::ValidateExt;
@@ -571,6 +606,12 @@ pub use autumn_macros::mailer_preview;
 /// }
 /// ```
 pub use autumn_macros::main;
+/// Author a widget story for the `/_stories` gallery:
+/// `story!{ "Group", "Name", { ... } }`.
+///
+/// Also available as [`stories::story`], the macro's module home.
+#[cfg(feature = "maud")]
+pub use autumn_macros::story;
 
 /// Derive Diesel and Serde traits for a database model struct.
 ///
@@ -1149,6 +1190,7 @@ pub mod reexports {
     pub use inventory;
     #[cfg(feature = "mail")]
     pub use lettre;
+    pub use rust_decimal;
     #[cfg(feature = "db")]
     pub use scoped_futures;
     pub use serde;

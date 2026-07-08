@@ -57,10 +57,15 @@ pub use crate::canary::CanaryRoute;
 /// Database connection extractor.
 #[cfg(feature = "db")]
 pub use crate::db::Db;
+/// Transaction isolation levels and retry options for [`crate::db::Db::tx_with`].
+#[cfg(feature = "db")]
+pub use crate::db::{IsolationLevel, TxOptions};
 /// Typed domain event bus publisher extractor. The `Event` trait it works with
 /// lives at [`crate::events::Event`] (kept out of the prelude to avoid clashing
 /// with [`crate::sse::Event`]).
 pub use crate::events::Events;
+/// Current request path extractor, for path-aware view helpers like `nav_link`.
+pub use crate::extract::CurrentPath;
 /// Form data extractor.
 pub use crate::extract::Form;
 /// JSON request/response type.
@@ -92,8 +97,9 @@ pub use crate::live::LiveFragment;
 /// Transactional email types and extractor.
 #[cfg(feature = "mail")]
 pub use crate::mail::{
-    Mail, MailConfig, MailDeliveryQueue, MailDeliveryQueueHandle, MailError, MailPreview,
-    MailPreviewError, MailPreviewRegistry, MailTransport, Mailer, SmtpConfig, TlsMode, Transport,
+    Mail, MailAttachment, MailConfig, MailDeliveryQueue, MailDeliveryQueueHandle, MailError,
+    MailPreview, MailPreviewError, MailPreviewRegistry, MailTransport, Mailer, SmtpConfig, TlsMode,
+    Transport,
 };
 #[cfg(all(feature = "presence", feature = "maud"))]
 pub use crate::presence_badge;
@@ -124,6 +130,8 @@ pub use crate::{Presence, PresenceEntry, PresenceEvent, PresenceHandle};
 pub use axum::extract::State;
 /// Trait for types that can be converted into an HTTP response.
 pub use axum::response::IntoResponse;
+/// HTTP methods — pass to [`crate::links::button_to`]/[`crate::links::button_to_with`].
+pub use http::Method;
 /// HTTP status codes.
 pub use http::StatusCode;
 
@@ -169,16 +177,41 @@ pub use validator::Validate;
 pub use crate::form::{Changeset, ChangesetForm, IntoChangeset};
 
 // ── Display & search widgets ───────────────────────────────────────
-/// Card, stat tile, active search, autocomplete, data table, property list,
-/// and breadcrumb configuration types and rendering helpers.
+/// Card, stat tile, hero, active search, autocomplete, data table, property
+/// list, and breadcrumb configuration types and rendering helpers.
 ///
 /// See [`crate::widgets`] for the full API.
 #[cfg(feature = "maud")]
 pub use crate::widgets::{
-    ActiveSearchConfig, AutocompleteConfig, CardConfig, Column, Crumb, DataTableConfig,
-    HeadingLevel, SearchMethod, SortDir, active_search, active_search_empty_state,
-    active_search_input, active_search_results, autocomplete_empty_state, autocomplete_input,
-    autocomplete_option, breadcrumb, card, data_table, property_list, stat_card,
+    ActiveSearchConfig, AutocompleteConfig, CardConfig, Column, ConfirmActionConfig, Crumb, Cta,
+    CtaStyle, DataTableConfig, HeadingLevel, HeroConfig, ModalConfig, NavBarConfig, NavBarLayout,
+    NavItem, NavLinkMatch, NavMenu, SearchMethod, SortDir, active_search,
+    active_search_empty_state, active_search_input, active_search_results,
+    autocomplete_empty_state, autocomplete_input, autocomplete_option, breadcrumb, card,
+    confirm_action, data_table, hero, modal, modal_close_button, modal_trigger, nav_bar, nav_link,
+    nav_link_matched, property_list, stat_card, tabs,
+};
+
+// ── Widget stories ───────────────────────────────────────────────
+/// Widget story macro for the `/_stories` gallery: `story!{ "Group", "Name", { ... } }`.
+#[cfg(feature = "maud")]
+pub use crate::stories::story;
+/// Widget story gallery types (registered via `AppBuilder::with_story_gallery`)
+/// and the error returned by `Story::render`.
+///
+/// See [`crate::stories`] for the full API.
+#[cfg(feature = "maud")]
+pub use crate::stories::{Story, StoryGallery, StoryRegistry, StoryRenderError};
+
+// ── Link helpers ─────────────────────────────────────────────────
+/// Safe, method-aware `<a>`/`<form>` link helpers: [`crate::links::link_to`]
+/// for GET navigation and [`crate::links::button_to`] for CSRF-protected,
+/// method-override action buttons.
+///
+/// See [`crate::links`] for the full API.
+#[cfg(feature = "maud")]
+pub use crate::links::{
+    ButtonToOptions, LinkToOptions, button_to, button_to_with, link_to, link_to_with,
 };
 
 // ── Hooks ───────────────────────────────────────────────────────
@@ -283,6 +316,41 @@ pub use crate::i18n::Locale;
 /// [`crate::i18n`] for usage.
 #[cfg(feature = "i18n")]
 pub use crate::i18n::t;
+
+// ── Formatting ───────────────────────────────────────────────────
+/// Currency, delimited-number, precision/separator configuration for
+/// [`number_to_currency`]. See [`crate::format`] for the full API.
+#[cfg(feature = "maud")]
+pub use crate::format::CurrencyOptions;
+/// Format a `chrono` UTC timestamp with a strftime-style absolute format string.
+#[cfg(feature = "maud")]
+pub use crate::format::format_datetime;
+/// Format a [`rust_decimal::Decimal`] as currency (`$1,234.50`) using sane defaults.
+#[cfg(feature = "maud")]
+pub use crate::format::number_to_currency;
+/// Render an integer or decimal with grouped thousands (`1,234,567`).
+#[cfg(feature = "maud")]
+pub use crate::format::number_with_delimiter;
+/// Render `"{count} {word}"`, pluralizing with a simple irregular-aware rule.
+#[cfg(feature = "maud")]
+pub use crate::format::pluralize;
+/// Render `"{count} {word}"`, choosing between an explicit singular and plural.
+#[cfg(feature = "maud")]
+pub use crate::format::pluralize_with;
+/// Render `"3 minutes ago"` / `"in 2 days"` relative to `now` (pass `clock.now()`
+/// from the [`Clock`] extractor, or a [`crate::time::ClockSource`]
+/// like [`crate::time::FixedClock`] in tests).
+#[cfg(feature = "maud")]
+pub use crate::format::time_ago_in_words;
+/// Shorten text to at most `len` characters without splitting a UTF-8 character mid-byte.
+#[cfg(feature = "maud")]
+pub use crate::format::{truncate, truncate_with};
+/// Shorten text to at most `n` whitespace-delimited words.
+#[cfg(feature = "maud")]
+pub use crate::format::{truncate_words, truncate_words_with};
+/// Exact-precision decimal type accepted by [`number_to_currency`] and
+/// [`number_with_delimiter`].
+pub use rust_decimal::Decimal;
 
 // ── Time zones ────────────────────────────────────────────────────
 /// Request-scoped time zone extractor (resolves from user extension,
@@ -391,5 +459,13 @@ mod tests {
     fn maud_types_work_through_prelude() {
         let markup: Markup = html! { "hello" };
         assert!(markup.into_string().contains("hello"));
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn format_helpers_work_through_prelude() {
+        let price: Decimal = "9.5".parse().unwrap();
+        assert_eq!(number_to_currency(price).into_string(), "$9.50");
+        assert_eq!(pluralize(1, "comment").into_string(), "1 comment");
     }
 }

@@ -146,6 +146,7 @@ impl McpRuntime {
 /// A single derived MCP tool plus the metadata needed to replay it as an
 /// in-process HTTP request.
 #[derive(Clone, Debug)]
+#[allow(clippy::struct_excessive_bools)] // independent dispatch flags mirroring ApiDoc metadata
 struct McpTool {
     name: String,
     description: Option<String>,
@@ -161,6 +162,12 @@ struct McpTool {
     /// True for a `#[api_doc(mcp, stream)]` tool whose handler returns an
     /// Autumn `Sse` stream, projected onto the Streamable-HTTP SSE channel.
     streams: bool,
+    /// True for a tool derived from an empty-body-contract route (declared
+    /// 204/205, no response schema). Dispatch enforces the contract by
+    /// returning empty text on success, so a route that mislabels its status
+    /// (e.g. an HTML handler tagged `status = 204`) can't leak its body into
+    /// the tool result.
+    empty_body: bool,
 }
 
 impl McpTool {
@@ -198,6 +205,14 @@ pub(crate) struct McpWiring {
     /// marked [`RateLimitExempt`](crate::security::RateLimitExempt) to avoid
     /// double-counting against the dispatch pipeline's own limiter.
     pub envelope_rate_limited: bool,
+    /// Whether a [`LoadShedLayer`](crate::middleware::LoadShedLayer) wraps the
+    /// `/mcp` envelope (true iff `server.max_concurrent_requests` is
+    /// configured). The dispatch clone (cloned from the already-middleware-
+    /// wrapped router) carries the SAME shared layer instance, so a
+    /// `tools/call` is counted once at the envelope; its replayed dispatch is
+    /// marked [`LoadShedExempt`](crate::middleware::LoadShedExempt) to avoid
+    /// consuming a second slot for the same logical request.
+    pub envelope_load_shed: bool,
 }
 
 /// The shared MCP server state attached to the endpoint handler. Holds the
@@ -233,6 +248,10 @@ pub struct McpServer {
     /// Whether the `/mcp` envelope is rate-limited; gates exempting the
     /// replayed `tools/call` dispatch from the pipeline limiter.
     envelope_rate_limited: bool,
+    /// Whether the `/mcp` envelope is load-shed gated; gates exempting the
+    /// replayed `tools/call` dispatch from double-counting against the same
+    /// shared `LoadShedLayer` instance.
+    envelope_load_shed: bool,
     server_name: String,
     server_version: String,
 }
@@ -365,7 +384,11 @@ fn should_expose(doc: &ApiDoc, expose_all: bool) -> bool {
     // here from a legitimately body-less route — both leave `request_body`
     // unset. Such routes are a documented non-target for MCP exposure (see
     // `AppBuilder::mount_mcp`): opting one in yields a tool with no body input.
-    if doc.response.is_none() {
+    // Exception: a status whose body is empty *by contract* (e.g. the
+    // repository macro's generated DELETE returning 204) is structurally
+    // distinct from an HTML route's schema-less 200-with-body. It stays
+    // eligible, and dispatch enforces the empty result (see `call_tool`).
+    if doc.response.is_none() && !has_empty_body_contract(doc.success_status) {
         return false;
     }
     if doc.mcp_tool {
@@ -380,6 +403,15 @@ fn should_expose(doc: &ApiDoc, expose_all: bool) -> bool {
 /// `GET` (and `HEAD`) are read-only; everything else mutates.
 fn is_read_only(method: &str) -> bool {
     matches!(method.to_ascii_uppercase().as_str(), "GET" | "HEAD")
+}
+
+/// A declared success status whose body is empty *by contract* (RFC 9110):
+/// `204 No Content` and `205 Reset Content`. For these, a missing response
+/// schema is the deliberate shape of the endpoint, not the signal of an
+/// HTML/Maud route. Shared by [`should_expose`] and the warn/skip gate in
+/// [`derive_tools`] so the exemption list lives in exactly one place.
+const fn has_empty_body_contract(status: u16) -> bool {
+    matches!(status, 204 | 205)
 }
 
 /// MCP safety annotations derived purely from the HTTP verb.
@@ -525,10 +557,12 @@ pub fn derive_tools(
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for doc in docs {
         // Surface the "opted in but ineligible" case as a build-time note.
-        // Streaming tools legitimately have no JSON response schema, so they
-        // are exempt from this "missing response" warning/skip.
+        // Streaming tools legitimately have no JSON response schema, and an
+        // empty-body status (204/205) makes the missing schema the route's
+        // contract, so both are exempt from this "missing response" warn/skip.
         if (doc.mcp_tool || (expose_all && is_read_only(doc.method)))
             && doc.response.is_none()
+            && !has_empty_body_contract(doc.success_status)
             && !doc.mcp_stream
             && !doc.mcp_exclude
             && !doc.hidden
@@ -537,8 +571,10 @@ pub fn derive_tools(
                 operation_id = doc.operation_id,
                 method = doc.method,
                 path = doc.path,
-                "skipping MCP exposure: endpoint has no JSON response schema \
-                 (HTML/Maud routes are not eligible as MCP tools)"
+                "skipping MCP exposure: endpoint has no JSON response schema; \
+                 eligible tools return Json<T>, declare an empty-body status \
+                 (204/205), or opt in as streaming (`stream`/`Route::mcp_stream`) \
+                 — HTML/Maud routes are not eligible"
             );
             continue;
         }
@@ -571,6 +607,9 @@ pub fn derive_tools(
             has_body: doc.request_body.is_some(),
             has_query: doc.query_schema.is_some(),
             streams: doc.mcp_stream,
+            empty_body: doc.response.is_none()
+                && has_empty_body_contract(doc.success_status)
+                && !doc.mcp_stream,
         });
     }
     tools
@@ -580,6 +619,7 @@ pub fn derive_tools(
 /// [`derive_tools`] and consumed by the framework when assembling the MCP
 /// endpoint router.
 #[derive(Clone, Debug)]
+#[allow(clippy::struct_excessive_bools)] // independent dispatch flags mirroring ApiDoc metadata
 pub struct McpToolInfo {
     name: String,
     description: Option<String>,
@@ -591,6 +631,54 @@ pub struct McpToolInfo {
     has_body: bool,
     has_query: bool,
     streams: bool,
+    empty_body: bool,
+}
+
+impl McpToolInfo {
+    /// Tool name advertised in `tools/list` (the route's operation id).
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Human-readable description derived from the route's
+    /// `description`/`summary`.
+    #[must_use]
+    pub fn description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
+
+    /// JSON Schema for the tool's arguments, built from the handler's typed
+    /// contract (path params, query, JSON body).
+    #[must_use]
+    pub const fn input_schema(&self) -> &Value {
+        &self.input_schema
+    }
+
+    /// MCP safety annotations (`readOnlyHint`, `destructiveHint`, `title`)
+    /// derived from the HTTP verb.
+    #[must_use]
+    pub const fn annotations(&self) -> &Value {
+        &self.annotations
+    }
+
+    /// HTTP method the tool dispatches with.
+    #[must_use]
+    pub fn method(&self) -> &str {
+        &self.method
+    }
+
+    /// Route path template the tool dispatches to (e.g. `/api/todos/{id}`).
+    #[must_use]
+    pub fn path_template(&self) -> &str {
+        &self.path_template
+    }
+
+    /// Whether this is a streaming (`Sse`) tool.
+    #[must_use]
+    pub const fn streams(&self) -> bool {
+        self.streams
+    }
 }
 
 impl McpServer {
@@ -611,6 +699,7 @@ impl McpServer {
                 has_body: t.has_body,
                 has_query: t.has_query,
                 streams: t.streams,
+                empty_body: t.empty_body,
             })
             .collect();
         let by_name = tools
@@ -627,6 +716,7 @@ impl McpServer {
             tenant_header: wiring.tenant_header,
             csrf_header: wiring.csrf_header,
             envelope_rate_limited: wiring.envelope_rate_limited,
+            envelope_load_shed: wiring.envelope_load_shed,
             server_name: "autumn-mcp".to_owned(),
             server_version: env!("CARGO_PKG_VERSION").to_owned(),
         }
@@ -1210,6 +1300,16 @@ async fn serve_tools_call(
             .extensions_mut()
             .insert(crate::security::RateLimitExempt);
     }
+    // Likewise for load shedding: the envelope and the dispatch pipeline
+    // share the SAME `LoadShedLayer` instance (same `Arc` in-flight
+    // counter), so without this a `tools/call` would acquire one slot at the
+    // envelope and a second at this replay for the same logical request —
+    // silently halving the effective ceiling for MCP traffic.
+    if server.envelope_load_shed {
+        request
+            .extensions_mut()
+            .insert(crate::middleware::LoadShedExempt);
+    }
 
     let response = match server.dispatch.clone().oneshot(request).await {
         Ok(resp) => resp,
@@ -1275,22 +1375,44 @@ async fn serve_tools_call(
         String::from_utf8_lossy(&bytes).into_owned()
     };
 
-    let value = if status.is_success() {
-        success(id, tool_ok(&text))
-    } else {
-        success(
-            id,
-            tool_error(&format!(
-                "handler returned HTTP {}: {text}",
-                status.as_u16()
-            )),
-        )
-    };
+    let value = buffered_tool_result(tool, id, status, &text);
     let mut resp = json_response(&value);
     for cookie in cookies {
         resp.headers_mut().append(header::SET_COOKIE, cookie);
     }
     resp
+}
+
+/// Package a buffered handler response as the JSON-RPC tool result.
+///
+/// An empty-body-contract tool (declared 204/205, no response schema)
+/// advertises "empty text on success". Enforce that here rather than
+/// trusting the declaration: a handler whose real response carries a body
+/// (e.g. an HTML route mislabeled `status = 204`) must not leak it into the
+/// tool result. Discarding silently would hide the mislabel, so surface it.
+fn buffered_tool_result(tool: &McpTool, id: Value, status: StatusCode, text: &str) -> Value {
+    if !status.is_success() {
+        return success(
+            id,
+            tool_error(&format!(
+                "handler returned HTTP {}: {text}",
+                status.as_u16()
+            )),
+        );
+    }
+    if tool.empty_body {
+        if !text.is_empty() {
+            tracing::warn!(
+                tool = %tool.name,
+                body_len = text.len(),
+                "empty-body-contract tool returned a non-empty body; \
+                 discarding it (the route's declared 204/205 status does \
+                 not match what its handler actually returns)"
+            );
+        }
+        return success(id, tool_ok(""));
+    }
+    success(id, tool_ok(text))
 }
 
 // ── Progressive (SSE) tool-result projection ──────────────────────
@@ -1881,6 +2003,81 @@ mod tests {
     }
 
     #[test]
+    fn no_content_delete_with_opt_in_is_eligible() {
+        // A 204 No Content route (e.g. the repository macro's generated
+        // DELETE) has no response schema *by contract*, not because it is an
+        // HTML route. An explicit opt-in must expose it.
+        let mut d = doc("DELETE", "/api/widgets/{id}", "widget_api_delete");
+        d.response = None;
+        d.success_status = 204;
+        d.mcp_tool = true;
+        assert!(
+            should_expose(&d, false),
+            "opted-in 204 route is a deliberate empty success contract"
+        );
+    }
+
+    #[test]
+    fn reset_content_205_with_opt_in_is_eligible() {
+        // 205 Reset Content is the other empty-body-by-contract status; the
+        // exemption is a shared predicate, not a hard-coded 204 literal.
+        let mut d = doc("POST", "/api/forms/clear", "clear_form");
+        d.response = None;
+        d.success_status = 205;
+        d.mcp_tool = true;
+        assert!(should_expose(&d, false));
+        let tools = derive_tools(&[d], false, None);
+        assert_eq!(tools.len(), 1, "opted-in 205 route must derive a tool");
+    }
+
+    #[test]
+    fn opted_in_202_is_skipped_not_exposed() {
+        // 202 Accepted does not guarantee an empty body, so a schema-less 202
+        // route stays behind the JSON-out gate even when opted in.
+        let mut d = doc("POST", "/api/enqueue", "enqueue");
+        d.response = None;
+        d.success_status = 202;
+        d.mcp_tool = true;
+        assert!(!should_expose(&d, false));
+        assert!(derive_tools(&[d], false, None).is_empty());
+    }
+
+    #[test]
+    fn no_content_without_opt_in_stays_hidden() {
+        let mut d = doc("DELETE", "/api/widgets/{id}", "widget_api_delete");
+        d.response = None;
+        d.success_status = 204;
+        assert!(!should_expose(&d, false), "no opt-in => hidden");
+    }
+
+    #[test]
+    fn no_content_under_hatch_pins_behavior() {
+        // A read-only, deliberately body-less endpoint under the whole-API
+        // hatch: 204 is a structural JSON-API signal (unlike an HTML route's
+        // 200-with-body), so the hatch includes it.
+        let mut d = doc("GET", "/api/ping", "ping");
+        d.response = None;
+        d.success_status = 204;
+        assert!(should_expose(&d, true));
+        assert!(!should_expose(&d, false), "still requires hatch or opt-in");
+    }
+
+    #[test]
+    fn derive_tools_keeps_opted_in_no_content_route() {
+        // The "opted in but no JSON response" warn/skip block in
+        // `derive_tools` must not silently drop a 204 route that
+        // `should_expose` accepts.
+        let mut d = doc("DELETE", "/api/widgets/{id}", "widget_api_delete");
+        d.response = None;
+        d.success_status = 204;
+        d.mcp_tool = true;
+        let tools = derive_tools(&[d], false, None);
+        assert_eq!(tools.len(), 1, "204 opt-in must derive a tool");
+        assert_eq!(tools[0].name, "widget_api_delete");
+        assert_eq!(tools[0].annotations["destructiveHint"], true);
+    }
+
+    #[test]
     fn streaming_tool_is_eligible_without_response_schema() {
         // A streaming tool returns `Sse` (no JSON response schema); the `stream`
         // flag exempts it from the JSON-out gate that excludes HTML routes.
@@ -2037,6 +2234,7 @@ mod tests {
             has_body,
             has_query,
             streams: false,
+            empty_body: false,
         }
     }
 
@@ -2270,6 +2468,7 @@ mod tests {
                 tenant_header: None,
                 csrf_header: "x-csrf-token".to_owned(),
                 envelope_rate_limited: false,
+                envelope_load_shed: false,
             },
         )
     }

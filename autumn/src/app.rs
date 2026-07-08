@@ -131,6 +131,8 @@ pub fn app() -> AppBuilder {
         mount_unsubscribe_endpoint: false,
         #[cfg(feature = "mail")]
         mail_previews: Vec::new(),
+        #[cfg(feature = "maud")]
+        story_gallery: None,
         declared_routes: Vec::new(),
         idempotency_enabled: false,
         #[cfg(feature = "mail")]
@@ -386,6 +388,9 @@ pub struct AppBuilder {
     /// Mail template previews registered for the dev preview UI.
     #[cfg(feature = "mail")]
     mail_previews: Vec<crate::mail::MailPreview>,
+    /// Widget story gallery registered for the `/_stories` UI (#1526).
+    #[cfg(feature = "maud")]
+    story_gallery: Option<crate::stories::StoryGallery>,
     /// Routes explicitly declared by plugins for listing purposes, to complement
     /// opaque `nest_routers`. Included in `autumn routes` output even though
     /// the underlying Axum router is not enumerable.
@@ -2151,6 +2156,21 @@ impl AppBuilder {
         self
     }
 
+    /// Register the widget story gallery served at `/_stories` (#1526).
+    ///
+    /// Routes mount only when the resolved config has `[stories] enabled =
+    /// true` (off by default, opt-in per profile). Start from
+    /// [`StoryGallery::builtin`](crate::stories::StoryGallery::builtin) for
+    /// the framework widget set and
+    /// [`extend`](crate::stories::StoryGallery::extend) it with your app's
+    /// own `story!{...}` entries. See `docs/guide/stories.md`.
+    #[cfg(feature = "maud")]
+    #[must_use]
+    pub fn with_story_gallery(mut self, gallery: crate::stories::StoryGallery) -> Self {
+        self.story_gallery = Some(gallery);
+        self
+    }
+
     /// Register an additional audit sink for structured audit events.
     ///
     /// Multiple calls accumulate sinks. Logged events are fanned out to all
@@ -2578,6 +2598,8 @@ impl AppBuilder {
             mount_unsubscribe_endpoint,
             #[cfg(feature = "mail")]
             mail_previews,
+            #[cfg(feature = "maud")]
+            story_gallery,
             declared_routes: _,
             idempotency_enabled,
             #[cfg(feature = "mail")]
@@ -2951,6 +2973,8 @@ impl AppBuilder {
         });
         #[cfg(feature = "mail")]
         state.insert_extension(crate::mail::MailPreviewRegistry::new(mail_previews));
+        #[cfg(feature = "maud")]
+        install_story_registry(&state, story_gallery);
         if let Some(logger) = audit_logger {
             state.insert_extension::<crate::audit::AuditLogger>((*logger).clone());
         }
@@ -3643,6 +3667,8 @@ impl AppBuilder {
             mount_unsubscribe_endpoint,
             #[cfg(feature = "mail")]
             mail_previews,
+            #[cfg(feature = "maud")]
+            story_gallery,
             declared_routes: _,
             idempotency_enabled,
             #[cfg(feature = "mail")]
@@ -3873,6 +3899,8 @@ impl AppBuilder {
         });
         #[cfg(feature = "mail")]
         state.insert_extension(crate::mail::MailPreviewRegistry::new(mail_previews));
+        #[cfg(feature = "maud")]
+        install_story_registry(&state, story_gallery);
         // run_build_mode used ProbeState::default(), which does not start as pending
         state.probes = crate::probe::ProbeState::default();
 
@@ -6378,24 +6406,20 @@ pub async fn run_shard_map_guard(
     // partial rows would cause a spurious mismatch error on the next boot attempt.
     if stored.is_empty() {
         use diesel_async::AsyncConnection as _;
-        use scoped_futures::ScopedFutureExt as _;
         let assignments: Vec<_> = computed.to_vec();
-        conn.transaction::<(), diesel::result::Error, _>(move |conn| {
-            async move {
-                for assignment in &assignments {
-                    diesel::sql_query(
-                        "INSERT INTO _autumn_shard_map (shard_name, slots) VALUES ($1, $2) \
-                         ON CONFLICT (shard_name) DO UPDATE \
-                         SET slots = EXCLUDED.slots, updated_at = NOW()",
-                    )
-                    .bind::<diesel::sql_types::Text, _>(&assignment.name)
-                    .bind::<diesel::sql_types::Text, _>(&assignment.ranges)
-                    .execute(conn)
-                    .await?;
-                }
-                Ok(())
+        conn.transaction::<(), diesel::result::Error, _>(async move |conn| {
+            for assignment in &assignments {
+                diesel::sql_query(
+                    "INSERT INTO _autumn_shard_map (shard_name, slots) VALUES ($1, $2) \
+                     ON CONFLICT (shard_name) DO UPDATE \
+                     SET slots = EXCLUDED.slots, updated_at = NOW()",
+                )
+                .bind::<diesel::sql_types::Text, _>(&assignment.name)
+                .bind::<diesel::sql_types::Text, _>(&assignment.ranges)
+                .execute(conn)
+                .await?;
             }
-            .scope_boxed()
+            Ok(())
         })
         .await
         .map_err(|e| format!("shard-map guard could not persist map: {e}"))?;
@@ -7206,6 +7230,17 @@ mod validate_repository_api_policies_tests {
             collect_unregistered_repository_handlers(&[], std::slice::from_ref(&group), &registry);
         assert_eq!(missing.len(), 1);
         assert_eq!(missing[0].0, "TestPost");
+    }
+}
+
+/// Publish the builder's story gallery (if any) as the [`StoryRegistry`]
+/// (`crate::stories::StoryRegistry`) `AppState` extension read by the
+/// `/_stories` handlers. Shared by the `run()` and build/SSG
+/// state-construction paths so the two stay in lockstep.
+#[cfg(feature = "maud")]
+fn install_story_registry(state: &AppState, story_gallery: Option<crate::stories::StoryGallery>) {
+    if let Some(gallery) = story_gallery {
+        state.insert_extension(gallery.into_registry());
     }
 }
 
@@ -10907,6 +10942,60 @@ mod tests {
                 .extension::<crate::http_client::SharedReqwestClient>()
                 .is_some(),
             "build_state must register a SharedReqwestClient for connection-pool sharing"
+        );
+    }
+
+    // AC5 plumbing (#1526): `with_story_gallery` stores the gallery on the
+    // builder, and `install_story_registry` — the single install step shared
+    // by both the run and build/SSG state-construction paths — publishes it
+    // as the StoryRegistry extension the `/_stories` handlers read.
+    #[cfg(feature = "maud")]
+    #[test]
+    fn with_story_gallery_installs_story_registry_extension() {
+        let builder = crate::app().with_story_gallery(crate::stories::StoryGallery::builtin());
+        let gallery = builder
+            .story_gallery
+            .expect("with_story_gallery must store the gallery on the builder");
+        let expected_count = gallery.stories().len();
+        assert!(expected_count > 0, "builtin gallery must not be empty");
+
+        let config = AutumnConfig::default();
+        let state = build_state(
+            &config,
+            #[cfg(feature = "db")]
+            None,
+            #[cfg(feature = "db")]
+            None,
+            #[cfg(feature = "ws")]
+            None,
+        );
+        install_story_registry(&state, Some(gallery));
+        let registry = state
+            .extension::<crate::stories::StoryRegistry>()
+            .expect("install_story_registry must publish the StoryRegistry extension");
+        assert_eq!(
+            registry.stories().len(),
+            expected_count,
+            "every registered story must reach the state extension"
+        );
+
+        // Without a registered gallery no extension is installed: the
+        // handlers fall back to the empty default and serve the empty state.
+        let bare_state = build_state(
+            &config,
+            #[cfg(feature = "db")]
+            None,
+            #[cfg(feature = "db")]
+            None,
+            #[cfg(feature = "ws")]
+            None,
+        );
+        install_story_registry(&bare_state, None);
+        assert!(
+            bare_state
+                .extension::<crate::stories::StoryRegistry>()
+                .is_none(),
+            "no gallery registered must mean no StoryRegistry extension"
         );
     }
 }

@@ -7,8 +7,8 @@
 //! - The `[cache]` config section selects the backend
 
 use std::convert::Infallible;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use autumn_web::AppState;
 use autumn_web::cache::{Cache, CacheResponseLayer, MokaCache, get, insert};
@@ -16,6 +16,11 @@ use axum::body::Body;
 use http::Request;
 use http::StatusCode;
 use tower::{Service, ServiceBuilder, ServiceExt};
+
+// The global cache is process-wide, so tests that manipulate it (via
+// `set_cache`/`clear_global_cache`) hold this mutex to prevent interference
+// from each other — mirrors the pattern in `tests/cached_global_backend.rs`.
+static GLOBAL_CACHE_LOCK: Mutex<()> = Mutex::new(());
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -131,6 +136,9 @@ async fn cache_response_layer_from_cache_still_works() {
 #[test]
 fn app_state_set_cache_installs_via_extension_map() {
     use autumn_web::cache::{clear_global_cache, global_cache};
+    let _g = GLOBAL_CACHE_LOCK
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
     clear_global_cache();
 
     let state = AppState::for_test();
@@ -157,6 +165,9 @@ fn app_state_set_cache_installs_via_extension_map() {
 #[test]
 fn set_cache_overrides_build_time_cache() {
     use autumn_web::cache::clear_global_cache;
+    let _g = GLOBAL_CACHE_LOCK
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
     clear_global_cache();
 
     let build_time = Arc::new(MokaCache::new(10, None));

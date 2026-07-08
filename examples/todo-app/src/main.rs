@@ -1,3 +1,4 @@
+mod jobs;
 mod models;
 mod routes;
 mod schema;
@@ -8,7 +9,7 @@ use std::sync::{Arc, OnceLock};
 
 use autumn_web::auth::{API_TOKEN_MIGRATIONS, ApiTokenStore, DbApiTokenStore, RequireApiToken};
 use autumn_web::migrate::{EmbeddedMigrations, embed_migrations};
-use autumn_web::{AutumnResult, routes};
+use autumn_web::{AutumnResult, jobs, routes};
 
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
 
@@ -95,8 +96,12 @@ async fn main() {
             routes::todos::validate_title,
             routes::todos::toggle,
             routes::todos::delete_todo,
+            routes::todos::start_export,
             routes::api::issue_token,
         ])
+        // Tracked background job powering the async CSV export (#1373):
+        // enqueue_tracked -> ctx.set_progress -> a polled download link.
+        .jobs(jobs![jobs::export_todos_csv])
         // Bearer-token-protected JSON API under `/api`. Using `.scoped(...)`
         // (rather than a merged raw router) keeps these routes in the route
         // registry, so their `#[api_doc(mcp)]` tags project them as MCP tools

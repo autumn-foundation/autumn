@@ -42,6 +42,7 @@
 //! | `AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS` | `server.shutdown_timeout_secs` | `u64` |
 //! | `AUTUMN_SERVER__PRESTOP_GRACE_SECS` | `server.prestop_grace_secs` | `u64` |
 //! | `AUTUMN_SERVER__TIMEOUTS__REQUEST_TIMEOUT_MS` | `server.timeouts.request_timeout_ms` | `u64` |
+//! | `AUTUMN_SERVER__MAX_CONCURRENT_REQUESTS` | `server.max_concurrent_requests` | `usize` |
 //! | `AUTUMN_DATABASE__URL` | `database.url` | `String` |
 //! | `AUTUMN_DATABASE__PRIMARY_URL` | `database.primary_url` | `String` |
 //! | `AUTUMN_DATABASE__REPLICA_URL` | `database.replica_url` | `String` |
@@ -104,6 +105,8 @@
 //! | `AUTUMN_JOBS__REDIS__KEY_PREFIX` | `jobs.redis.key_prefix` | `String` |
 //! | `AUTUMN_JOBS__REDIS__VISIBILITY_TIMEOUT_MS` | `jobs.redis.visibility_timeout_ms` | `u64` |
 //! | `AUTUMN_JOBS__POSTGRES__VISIBILITY_TIMEOUT_MS` | `jobs.postgres.visibility_timeout_ms` | `u64` |
+//! | `AUTUMN_JOBS__TRACKING__TTL_SECS` | `jobs.tracking.ttl_secs` | `u64` |
+//! | `AUTUMN_JOBS__TRACKING__ROUTE_ENABLED` | `jobs.tracking.route_enabled` | `bool` |
 //! | `AUTUMN_SCHEDULER__BACKEND` | `scheduler.backend` | `in_process` / `postgres` |
 //! | `AUTUMN_SCHEDULER__LEASE_TTL_SECS` | `scheduler.lease_ttl_secs` | `u64` |
 //! | `AUTUMN_SCHEDULER__REPLICA_ID` | `scheduler.replica_id` | `String` |
@@ -129,6 +132,7 @@
 //! | `AUTUMN_DEV__INSPECTOR_CAPACITY` | `dev.inspector_capacity` | `usize` |
 //! | `AUTUMN_DEV__INSPECTOR_N_PLUS_ONE_THRESHOLD` | `dev.inspector_n_plus_one_threshold` | `usize` |
 //! | `AUTUMN_COMPRESSION__ENABLED` | `compression.enabled` | `bool` |
+//! | `AUTUMN_STORIES__ENABLED` | `stories.enabled` | `bool` |
 //! | `AUTUMN_AUTH__LOCKOUT__ENABLED` | `auth.lockout.enabled` | `bool` |
 //! | `AUTUMN_AUTH__LOCKOUT__THRESHOLD` | `auth.lockout.threshold` | `i32` |
 //! | `AUTUMN_AUTH__LOCKOUT__WINDOW_SECS` | `auth.lockout.window_secs` | `u64` |
@@ -965,6 +969,15 @@ pub struct AutumnConfig {
     #[serde(default)]
     pub dev: DevConfig,
 
+    /// Widget story gallery settings (`[stories]` section in `autumn.toml`).
+    ///
+    /// Off by default; opt-in per profile (e.g. `[profile.dev.stories]
+    /// enabled = true` for a dev-only gallery, or a prod profile for a
+    /// public showcase). See `docs/guide/stories.md`.
+    #[cfg(feature = "maud")]
+    #[serde(default)]
+    pub stories: crate::stories::StoriesConfig,
+
     /// Error-reporting settings (`[reporting]` section in `autumn.toml`).
     ///
     /// Controls delivery of panic + 5xx [`ErrorEvent`](crate::reporting::ErrorEvent)s
@@ -1710,6 +1723,10 @@ pub struct JobConfig {
     /// Postgres backend options.
     #[serde(default)]
     pub postgres: JobPostgresConfig,
+    /// Tracked-job progress/result store options (`enqueue_tracked`, the
+    /// built-in `GET /_autumn/jobs/{token}` status route).
+    #[serde(default)]
+    pub tracking: JobTrackingConfig,
 }
 
 impl Default for JobConfig {
@@ -1722,6 +1739,7 @@ impl Default for JobConfig {
             queues: JobQueuesConfig::default(),
             redis: JobRedisConfig::default(),
             postgres: JobPostgresConfig::default(),
+            tracking: JobTrackingConfig::default(),
         }
     }
 }
@@ -1910,6 +1928,36 @@ impl Default for JobPostgresConfig {
             visibility_timeout_ms: default_jobs_pg_visibility_timeout_ms(),
         }
     }
+}
+
+/// Tracked-job progress/result store configuration.
+#[derive(Debug, Clone, Deserialize)]
+pub struct JobTrackingConfig {
+    /// How long a tracked job's progress/result record is retained after its
+    /// last write, in seconds. Default: 24 hours.
+    #[serde(default = "default_jobs_tracking_ttl_secs")]
+    pub ttl_secs: u64,
+    /// Whether the built-in `GET /_autumn/jobs/{token}` status route is
+    /// mounted. Default: `true`.
+    #[serde(default = "default_jobs_tracking_route_enabled")]
+    pub route_enabled: bool,
+}
+
+impl Default for JobTrackingConfig {
+    fn default() -> Self {
+        Self {
+            ttl_secs: default_jobs_tracking_ttl_secs(),
+            route_enabled: default_jobs_tracking_route_enabled(),
+        }
+    }
+}
+
+const fn default_jobs_tracking_ttl_secs() -> u64 {
+    86_400
+}
+
+const fn default_jobs_tracking_route_enabled() -> bool {
+    true
 }
 
 const fn default_jobs_pg_visibility_timeout_ms() -> u64 {
@@ -2474,6 +2522,8 @@ impl AutumnConfig {
     /// - `AUTUMN_JOBS__REDIS__URL` → `jobs.redis.url` (`String`)
     /// - `AUTUMN_JOBS__REDIS__KEY_PREFIX` → `jobs.redis.key_prefix` (`String`)
     /// - `AUTUMN_JOBS__REDIS__VISIBILITY_TIMEOUT_MS` → `jobs.redis.visibility_timeout_ms` (`u64`)
+    /// - `AUTUMN_JOBS__TRACKING__TTL_SECS` → `jobs.tracking.ttl_secs` (`u64`)
+    /// - `AUTUMN_JOBS__TRACKING__ROUTE_ENABLED` → `jobs.tracking.route_enabled` (`bool`)
     ///
     /// # Signed webhooks
     /// - `AUTUMN_SECURITY__WEBHOOKS__REPLAY__BACKEND` -> `security.webhooks.replay.backend` (`memory` / `redis`)
@@ -2510,6 +2560,8 @@ impl AutumnConfig {
         self.apply_storage_env_overrides_with_env(env);
         #[cfg(feature = "mail")]
         self.apply_mail_env_overrides_with_env(env);
+        #[cfg(feature = "maud")]
+        self.apply_stories_env_overrides_with_env(env);
         self.apply_resilience_env_overrides_with_env(env);
         self.apply_time_zone_env_overrides_with_env(env);
     }
@@ -2560,6 +2612,11 @@ impl AutumnConfig {
             "AUTUMN_COMPRESSION__ENABLED",
             &mut self.compression.enabled,
         );
+    }
+
+    #[cfg(feature = "maud")]
+    fn apply_stories_env_overrides_with_env(&mut self, env: &dyn Env) {
+        parse_env_bool(env, "AUTUMN_STORIES__ENABLED", &mut self.stories.enabled);
     }
 
     fn apply_actuator_env_overrides_with_env(&mut self, env: &dyn Env) {
@@ -2643,6 +2700,11 @@ impl AutumnConfig {
             "AUTUMN_SERVER__UNIX_SOCKET",
             &mut self.server.unix_socket,
         );
+        parse_env_option(
+            env,
+            "AUTUMN_SERVER__MAX_CONCURRENT_REQUESTS",
+            &mut self.server.max_concurrent_requests,
+        );
     }
 
     fn apply_database_env_overrides_with_env(&mut self, env: &dyn Env) {
@@ -2679,6 +2741,16 @@ impl AutumnConfig {
             env,
             "AUTUMN_DATABASE__REPLICA_FALLBACK",
             &mut self.database.replica_fallback,
+        );
+        parse_env(
+            env,
+            "AUTUMN_DATABASE__READ_YOUR_WRITES",
+            &mut self.database.read_your_writes,
+        );
+        parse_env(
+            env,
+            "AUTUMN_DATABASE__PIN_AFTER_WRITE_SECS",
+            &mut self.database.pin_after_write_secs,
         );
         parse_env(
             env,
@@ -2981,6 +3053,16 @@ impl AutumnConfig {
             env,
             "AUTUMN_JOBS__POSTGRES__VISIBILITY_TIMEOUT_MS",
             &mut self.jobs.postgres.visibility_timeout_ms,
+        );
+        parse_env(
+            env,
+            "AUTUMN_JOBS__TRACKING__TTL_SECS",
+            &mut self.jobs.tracking.ttl_secs,
+        );
+        parse_env_bool(
+            env,
+            "AUTUMN_JOBS__TRACKING__ROUTE_ENABLED",
+            &mut self.jobs.tracking.route_enabled,
         );
     }
 
@@ -3610,6 +3692,32 @@ pub struct ServerConfig {
     /// Configured via `AUTUMN_SERVER__UNIX_SOCKET`. Default: `None` (TCP).
     #[serde(default)]
     pub unix_socket: Option<String>,
+
+    /// Ceiling on concurrent in-flight requests (admission control / load
+    /// shedding). `None` or `0` (the default) disables the ceiling — today's
+    /// unlimited behavior — so no existing application silently changes
+    /// throughput.
+    ///
+    /// Once this many requests are admitted and still in flight, additional
+    /// requests receive an immediate `503 Service Unavailable` with a
+    /// `Retry-After` header, before the handler runs or the request body is
+    /// read. This bounds total concurrent work (and therefore memory) under
+    /// a traffic spike or a slow dependency, trading a fast, clean "try
+    /// another replica" signal for the alternative — admitted requests
+    /// piling up unbounded until the process is OOM-killed.
+    ///
+    /// Liveness/readiness/health probe routes (`health.*` paths and the
+    /// actuator prefix) are never shed, so a merely-busy replica is not
+    /// killed by its orchestrator.
+    ///
+    /// A reasonable starting point is the number of worker threads times a
+    /// small multiple (e.g. 2-4x), sized to keep admitted-request tail
+    /// latency stable under the expected peak concurrency; tune based on
+    /// observed `autumn_requests_shed_total` and per-route latency.
+    ///
+    /// Configured via `AUTUMN_SERVER__MAX_CONCURRENT_REQUESTS`.
+    #[serde(default)]
+    pub max_concurrent_requests: Option<usize>,
 }
 
 /// Behavior when a configured read replica is unavailable or stale.
@@ -3631,6 +3739,51 @@ impl std::str::FromStr for ReplicaFallback {
         match value.trim().to_ascii_lowercase().as_str() {
             "fail_readiness" | "fail-readiness" | "fail" => Ok(Self::FailReadiness),
             "primary" | "fallback_to_primary" | "fallback-to-primary" => Ok(Self::Primary),
+            _ => Err(()),
+        }
+    }
+}
+
+/// Strategy for routing reads that follow a write within the same request or
+/// client session.
+///
+/// Replication is asynchronous: a read immediately after a write can land on a
+/// lagging replica and return stale data (the read-your-own-writes anomaly).
+/// This setting lets Autumn pin such reads to the primary.
+///
+/// Configured via `database.read_your_writes` in `autumn.toml` or
+/// `AUTUMN_DATABASE__READ_YOUR_WRITES` in the environment.
+///
+/// Default: `off` (preserves today's behavior — no post-write pinning).
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ReadYourWrites {
+    /// No post-write read pinning. Replica reads are always served from the
+    /// replica. This is the default and preserves existing behavior exactly.
+    #[default]
+    Off,
+    /// Once the current request checks out a **primary** connection (via `Db`
+    /// or a generated mutating repository method), all subsequent
+    /// replica-eligible reads within the same request are redirected to the
+    /// primary. Analogous to Laravel's "sticky" behavior.
+    Request,
+    /// Like `request`, and additionally pins a client's reads to the primary
+    /// for [`pin_after_write_secs`](DatabaseConfig::pin_after_write_secs)
+    /// seconds after a write, via a signed `autumn.ryw` cookie. Reads within
+    /// that window are served from the primary even if the request itself
+    /// performed no write. Analogous to Rails' automatic role switching.
+    Session,
+}
+
+impl std::str::FromStr for ReadYourWrites {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "off" => Ok(Self::Off),
+            "request" => Ok(Self::Request),
+            "session" => Ok(Self::Session),
             _ => Err(()),
         }
     }
@@ -3827,7 +3980,9 @@ pub struct DatabaseConfig {
     /// Compatibility alias for the primary/write role. New multi-role
     /// deployments should prefer [`primary_url`](Self::primary_url).
     ///
-    /// Must start with `postgres://` or `postgresql://` when present.
+    /// When present, must start with `postgres://` or `postgresql://`, or be
+    /// a libpq-style keyword/value connection string
+    /// (`host=db user=app dbname=app sslmode=require`).
     #[serde(default)]
     pub url: Option<String>,
 
@@ -3864,6 +4019,26 @@ pub struct DatabaseConfig {
     /// reads. Default: fail readiness.
     #[serde(default)]
     pub replica_fallback: ReplicaFallback,
+
+    /// Post-write read pinning strategy. Default: `off` (no pinning).
+    ///
+    /// Set to `request` to pin reads to the primary for the remainder of the
+    /// request after the first write. Set to `session` to additionally pin
+    /// reads across requests via a signed cookie.
+    ///
+    /// Override via `AUTUMN_DATABASE__READ_YOUR_WRITES`.
+    #[serde(default)]
+    pub read_your_writes: ReadYourWrites,
+
+    /// Duration (seconds) for cross-request session pins.
+    ///
+    /// Only used when `read_your_writes = "session"`. A signed `autumn.ryw`
+    /// cookie pins the client's reads to the primary for this many seconds
+    /// after a write. Default: `5`.
+    ///
+    /// Override via `AUTUMN_DATABASE__PIN_AFTER_WRITE_SECS`.
+    #[serde(default = "default_pin_after_write_secs")]
+    pub pin_after_write_secs: u64,
 
     /// Seconds to wait while acquiring a pooled connection, including
     /// creating a new connection when the pool grows.
@@ -4202,7 +4377,7 @@ impl DatabaseConfig {
     ///
     /// # Errors
     ///
-    /// Returns a validation error if a URL has an invalid scheme or a
+    /// Returns a validation error if a connection string is malformed or a
     /// shard declaration is malformed.
     pub fn validate(&self) -> Result<(), ConfigError> {
         for (field, url) in [
@@ -4211,8 +4386,7 @@ impl DatabaseConfig {
             ("database.replica_url", self.replica_url.as_deref()),
         ] {
             if let Some(url) = url
-                && !url.starts_with("postgres://")
-                && !url.starts_with("postgresql://")
+                && !is_pg_connection_string(url)
             {
                 let label = if field == "database.url" {
                     "database URL"
@@ -4220,7 +4394,9 @@ impl DatabaseConfig {
                     field
                 };
                 return Err(ConfigError::Validation(format!(
-                    "Invalid {label}: must start with postgres:// or postgresql://, got {url:?}"
+                    "Invalid {label}: must start with postgres:// or postgresql://, or be a \
+                     keyword/value connection string \
+                     (e.g. \"host=db user=app dbname=app sslmode=require\"), got {url:?}"
                 )));
             }
         }
@@ -4261,12 +4437,13 @@ impl DatabaseConfig {
                 ("replica_url", shard.replica_url.as_deref()),
             ] {
                 if let Some(url) = url
-                    && !url.starts_with("postgres://")
-                    && !url.starts_with("postgresql://")
+                    && !is_pg_connection_string(url)
                 {
                     return Err(ConfigError::Validation(format!(
                         "Invalid database.shards[{idx}].{field}: must start with \
-                         postgres:// or postgresql://, got {url:?}"
+                         postgres:// or postgresql://, or be a keyword/value \
+                         connection string \
+                         (e.g. \"host=db user=app dbname=app sslmode=require\"), got {url:?}"
                     )));
                 }
             }
@@ -4274,6 +4451,16 @@ impl DatabaseConfig {
         self.resolved_slot_map()?;
         Ok(())
     }
+}
+
+/// Whether `s` is an acceptable Postgres connection string: a
+/// `postgres://`/`postgresql://` URL, or a libpq-style keyword/value string
+/// (`host=db user=app sslmode=require`) — recognized with the SAME parser
+/// the pool's TLS module uses ([`crate::pg_conn_str`]), so every string the
+/// pool supports also passes config validation (issue #1585 review: the
+/// keyword form was rejected here before ever reaching the pool).
+fn is_pg_connection_string(s: &str) -> bool {
+    crate::pg_conn_str::is_url(s) || crate::pg_conn_str::is_keyword_value(s)
 }
 
 /// Logging configuration.
@@ -4796,6 +4983,10 @@ const fn default_connect_timeout() -> u64 {
     5
 }
 
+const fn default_pin_after_write_secs() -> u64 {
+    5
+}
+
 fn default_log_level() -> String {
     "info".to_owned()
 }
@@ -4855,6 +5046,7 @@ impl Default for ServerConfig {
             prestop_grace_secs: default_prestop_grace(),
             timeouts: RequestTimeoutsConfig::default(),
             unix_socket: None,
+            max_concurrent_requests: None,
         }
     }
 }
@@ -4869,6 +5061,8 @@ impl Default for DatabaseConfig {
             primary_pool_size: None,
             replica_pool_size: None,
             replica_fallback: ReplicaFallback::default(),
+            read_your_writes: ReadYourWrites::default(),
+            pin_after_write_secs: default_pin_after_write_secs(),
             connect_timeout_secs: default_connect_timeout(),
             startup_wait_secs: 0,
             auto_migrate_in_production: false,
@@ -6813,6 +7007,30 @@ path = "/healthz"
     }
 
     #[test]
+    fn env_override_read_your_writes() {
+        let env = MockEnv::new().with("AUTUMN_DATABASE__READ_YOUR_WRITES", "request");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.database.read_your_writes, ReadYourWrites::Request);
+    }
+
+    #[test]
+    fn env_override_read_your_writes_session() {
+        let env = MockEnv::new().with("AUTUMN_DATABASE__READ_YOUR_WRITES", "session");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.database.read_your_writes, ReadYourWrites::Session);
+    }
+
+    #[test]
+    fn env_override_pin_after_write_secs() {
+        let env = MockEnv::new().with("AUTUMN_DATABASE__PIN_AFTER_WRITE_SECS", "10");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.database.pin_after_write_secs, 10);
+    }
+
+    #[test]
     fn env_override_invalid_pool_size_ignored() {
         let env = MockEnv::new().with("AUTUMN_DATABASE__POOL_SIZE", "not_a_number");
         let mut config = AutumnConfig::default();
@@ -6936,6 +7154,40 @@ path = "/healthz"
         );
         assert_eq!(config.jobs.redis.key_prefix, "myapp:jobs");
         assert_eq!(config.jobs.redis.visibility_timeout_ms, 45_000);
+    }
+
+    #[test]
+    fn job_tracking_config_defaults_ttl_86400_and_route_enabled() {
+        let config = AutumnConfig::default();
+        assert_eq!(config.jobs.tracking.ttl_secs, 86_400);
+        assert!(config.jobs.tracking.route_enabled);
+    }
+
+    #[test]
+    fn env_override_jobs_tracking_fields() {
+        let env = MockEnv::new()
+            .with("AUTUMN_JOBS__TRACKING__TTL_SECS", "3600")
+            .with("AUTUMN_JOBS__TRACKING__ROUTE_ENABLED", "false");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+
+        assert_eq!(config.jobs.tracking.ttl_secs, 3_600);
+        assert!(!config.jobs.tracking.route_enabled);
+    }
+
+    #[test]
+    fn jobs_toml_deserializes_tracking_fields() {
+        let config: AutumnConfig = toml::from_str(
+            r"
+            [jobs.tracking]
+            ttl_secs = 7200
+            route_enabled = false
+            ",
+        )
+        .unwrap();
+
+        assert_eq!(config.jobs.tracking.ttl_secs, 7_200);
+        assert!(!config.jobs.tracking.route_enabled);
     }
 
     #[test]
@@ -7371,6 +7623,54 @@ path = "/healthz"
         );
     }
 
+    // ── server.max_concurrent_requests (#1006) ────────────────────
+
+    #[test]
+    fn server_config_defaults_max_concurrent_requests_none() {
+        // Default must preserve today's unlimited behavior — no existing app
+        // silently changes throughput.
+        let config = AutumnConfig::default();
+        assert!(config.server.max_concurrent_requests.is_none());
+    }
+
+    #[test]
+    fn max_concurrent_requests_parses_from_toml() {
+        let config: AutumnConfig = toml::from_str(
+            r"
+            [server]
+            max_concurrent_requests = 64
+            ",
+        )
+        .expect("config with server.max_concurrent_requests should parse");
+        assert_eq!(config.server.max_concurrent_requests, Some(64));
+    }
+
+    #[test]
+    fn env_override_server_max_concurrent_requests() {
+        let env = MockEnv::new().with("AUTUMN_SERVER__MAX_CONCURRENT_REQUESTS", "128");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.server.max_concurrent_requests, Some(128));
+    }
+
+    #[test]
+    fn env_override_invalid_max_concurrent_requests_ignored() {
+        let env = MockEnv::new().with("AUTUMN_SERVER__MAX_CONCURRENT_REQUESTS", "not_a_number");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert!(config.server.max_concurrent_requests.is_none());
+    }
+
+    #[test]
+    fn env_override_empty_max_concurrent_requests_clears_to_none() {
+        // parse_env_option's documented convention: empty string clears to None.
+        let env = MockEnv::new().with("AUTUMN_SERVER__MAX_CONCURRENT_REQUESTS", "");
+        let mut config = AutumnConfig::default();
+        config.server.max_concurrent_requests = Some(64);
+        config.apply_env_overrides_with_env(&env);
+        assert!(config.server.max_concurrent_requests.is_none());
+    }
+
     // ── Log env override tests ───────────────────────────────────
 
     #[test]
@@ -7518,6 +7818,78 @@ path = "/healthz"
     fn validate_accepts_no_url() {
         let config = DatabaseConfig::default();
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_keyword_value_connection_strings() {
+        // The pool's TLS support parses libpq keyword/value strings, so
+        // validation must let them through (issue #1585 review) — including
+        // quoted values and whitespace around `=`.
+        for url in [
+            "host=db user=app dbname=app",
+            "host=db user=app sslmode=require",
+            "host=db sslmode = require",
+            "host=db password='p w' sslmode='verify-full'",
+            "host=db password=https://looks-like-a-url sslmode=require",
+        ] {
+            let config = DatabaseConfig {
+                url: Some(url.to_owned()),
+                ..Default::default()
+            };
+            assert!(
+                config.validate().is_ok(),
+                "keyword/value string must validate: {url}"
+            );
+        }
+        // primary_url and shard URLs accept the same forms.
+        let config = DatabaseConfig {
+            primary_url: Some("host=db user=app sslmode=require".to_owned()),
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+        let config = DatabaseConfig {
+            primary_url: Some("postgres://db-control/app".to_owned()),
+            shards: vec![ShardConfig {
+                name: "s0".to_owned(),
+                primary_url: "host=db-shard0 user=app dbname=app".to_owned(),
+                replica_url: None,
+                slots: None,
+                primary_pool_size: None,
+                replica_pool_size: None,
+                replica_fallback: None,
+            }],
+            ..Default::default()
+        };
+        assert!(
+            config.validate().is_ok(),
+            "shard URLs accept the keyword form too: {:?}",
+            config.validate()
+        );
+    }
+
+    #[test]
+    fn validate_still_rejects_garbage_connection_strings() {
+        for url in [
+            "mysql://localhost/test",
+            "mysql://localhost/test?a=b",
+            "not a connection string",
+            "localhost",
+            "host=",
+            "host='unterminated",
+        ] {
+            let config = DatabaseConfig {
+                url: Some(url.to_owned()),
+                ..Default::default()
+            };
+            let err = config
+                .validate()
+                .expect_err(&format!("garbage must be rejected: {url:?}"))
+                .to_string();
+            assert!(
+                err.contains("must start with postgres:// or postgresql://"),
+                "the error must stay clear about accepted forms, got: {err}"
+            );
+        }
     }
 
     // ── Profile tests ──────────────────────────────────────────
