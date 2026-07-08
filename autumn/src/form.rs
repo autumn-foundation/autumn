@@ -1333,7 +1333,6 @@ fn normalize_datetime_local_value(raw: &str) -> String {
 /// Pad an HTML `datetime-local` submission (`YYYY-MM-DDTHH:MM`, seconds
 /// omitted by the browser at minute granularity) to `YYYY-MM-DDTHH:MM:00` so
 /// chrono's parser — which requires the seconds component — accepts it.
-#[cfg(feature = "maud")]
 fn pad_datetime_local_seconds(raw: &str) -> String {
     if raw.chars().count() == 16 {
         format!("{raw}:00")
@@ -1342,16 +1341,40 @@ fn pad_datetime_local_seconds(raw: &str) -> String {
     }
 }
 
+/// Parse a submitted datetime string into `chrono::DateTime<Utc>`, accepting
+/// both wire shapes the same struct has to serve:
+///
+/// - RFC 3339 with an explicit offset (JSON API bodies) — the offset is
+///   honored and the instant converted to UTC;
+/// - the offsetless HTML `datetime-local` shape `YYYY-MM-DDTHH:MM[:SS[.f]]`
+///   (browser form posts) — interpreted as UTC wall-clock time.
+fn parse_datetime_local_or_rfc3339_utc(
+    raw: &str,
+) -> Result<chrono::DateTime<chrono::Utc>, chrono::ParseError> {
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(raw) {
+        return Ok(dt.with_timezone(&chrono::Utc));
+    }
+    chrono::NaiveDateTime::parse_from_str(&pad_datetime_local_seconds(raw), "%Y-%m-%dT%H:%M:%S%.f")
+        .map(|ndt| ndt.and_utc())
+}
+
 /// Deserialize an HTML `datetime-local` submission into `chrono::DateTime<Utc>`,
-/// treating the submitted wall-clock value as UTC.
+/// treating an offsetless submitted wall-clock value as UTC.
+///
+/// RFC 3339 input with an explicit offset is also accepted (converted to
+/// UTC), so a struct that doubles as a JSON API body keeps decoding.
 ///
 /// `<input type="datetime-local">` has no timezone concept, so [`datetime_input`]
 /// necessarily strips any offset when rendering a `DateTime<Utc>` field's
 /// current value — the browser then posts back an offsetless string (e.g.
 /// `2024-03-15T10:30:56`). Chrono's *default* `Deserialize` for
 /// `DateTime<Utc>` requires an RFC 3339 offset and rejects that string with
-/// "premature end of input" on every submission. Attach this function to any
-/// `DateTime<Utc>` field rendered with `datetime_input`:
+/// "premature end of input" on every submission. The `#[model]`-generated
+/// `NewX` insert struct attaches this deserializer to non-nullable
+/// `DateTime<Utc>` columns automatically (and
+/// [`deserialize_datetime_local_utc_option`] to nullable ones); attach it
+/// yourself on any hand-written form struct with a `DateTime<Utc>` field
+/// rendered via `datetime_input`:
 ///
 /// ```rust,ignore
 /// #[derive(serde::Deserialize)]
@@ -1367,9 +1390,9 @@ fn pad_datetime_local_seconds(raw: &str) -> String {
 ///
 /// # Errors
 ///
-/// Returns a deserializer error when the submitted value isn't a valid
-/// `YYYY-MM-DDTHH:MM[:SS[.f]]` local datetime string.
-#[cfg(feature = "maud")]
+/// Returns a deserializer error when the submitted value is neither a valid
+/// `YYYY-MM-DDTHH:MM[:SS[.f]]` local datetime string nor a valid RFC 3339
+/// timestamp.
 pub fn deserialize_datetime_local_utc<'de, D>(
     deserializer: D,
 ) -> Result<chrono::DateTime<chrono::Utc>, D::Error>
@@ -1377,20 +1400,25 @@ where
     D: serde::Deserializer<'de>,
 {
     let raw = <String as serde::Deserialize>::deserialize(deserializer)?;
-    chrono::NaiveDateTime::parse_from_str(&pad_datetime_local_seconds(&raw), "%Y-%m-%dT%H:%M:%S%.f")
-        .map(|ndt| ndt.and_utc())
-        .map_err(serde::de::Error::custom)
+    parse_datetime_local_or_rfc3339_utc(&raw).map_err(serde::de::Error::custom)
 }
 
 /// `Option<chrono::DateTime<Utc>>` counterpart to
-/// [`deserialize_datetime_local_utc`], for a nullable field — an absent or
-/// empty submitted value decodes as `None`.
+/// [`deserialize_datetime_local_utc`], for a nullable field — an absent,
+/// `null`, or empty submitted value decodes as `None`.
+///
+/// Like the required variant, both the offsetless `datetime-local` shape
+/// (interpreted as UTC) and RFC 3339 (offset converted to UTC) are accepted.
+///
+/// Pair it with `#[serde(default)]`: `deserialize_with` disables serde's
+/// implicit missing-`Option`-field-is-`None` handling, and `default` restores
+/// it (the `#[model]`-generated `NewX` struct emits both).
 ///
 /// # Errors
 ///
-/// Returns a deserializer error when a non-empty submitted value isn't a
-/// valid `YYYY-MM-DDTHH:MM[:SS[.f]]` local datetime string.
-#[cfg(feature = "maud")]
+/// Returns a deserializer error when a non-empty submitted value is neither
+/// a valid `YYYY-MM-DDTHH:MM[:SS[.f]]` local datetime string nor a valid
+/// RFC 3339 timestamp.
 pub fn deserialize_datetime_local_utc_option<'de, D>(
     deserializer: D,
 ) -> Result<Option<chrono::DateTime<chrono::Utc>>, D::Error>
@@ -1399,12 +1427,9 @@ where
 {
     let raw = <Option<String> as serde::Deserialize>::deserialize(deserializer)?;
     match raw {
-        Some(s) if !s.is_empty() => chrono::NaiveDateTime::parse_from_str(
-            &pad_datetime_local_seconds(&s),
-            "%Y-%m-%dT%H:%M:%S%.f",
-        )
-        .map(|ndt| Some(ndt.and_utc()))
-        .map_err(serde::de::Error::custom),
+        Some(s) if !s.is_empty() => parse_datetime_local_or_rfc3339_utc(&s)
+            .map(Some)
+            .map_err(serde::de::Error::custom),
         _ => Ok(None),
     }
 }
@@ -1418,7 +1443,11 @@ where
 /// browser's native picker isn't guaranteed to include seconds (`step="any"`
 /// only requests that the control *allow* seconds; it doesn't guarantee
 /// every browser's UI captures them), which would otherwise 400 with
-/// "premature end of input". Attach this function to defend against that:
+/// "premature end of input". The `#[model]`-generated `NewX` insert struct
+/// attaches this deserializer to non-nullable `NaiveDateTime` columns
+/// automatically (and [`deserialize_naive_datetime_local_option`] to nullable
+/// ones); attach it yourself on hand-written form structs to defend against
+/// that:
 ///
 /// ```rust,ignore
 /// #[derive(serde::Deserialize)]
@@ -1432,7 +1461,6 @@ where
 ///
 /// Returns a deserializer error when the submitted value isn't a valid
 /// `YYYY-MM-DDTHH:MM[:SS[.f]]` local datetime string.
-#[cfg(feature = "maud")]
 pub fn deserialize_naive_datetime_local<'de, D>(
     deserializer: D,
 ) -> Result<chrono::NaiveDateTime, D::Error>
@@ -1445,14 +1473,17 @@ where
 }
 
 /// `Option<chrono::NaiveDateTime>` counterpart to
-/// [`deserialize_naive_datetime_local`], for a nullable field — an absent or
-/// empty submitted value decodes as `None`.
+/// [`deserialize_naive_datetime_local`], for a nullable field — an absent,
+/// `null`, or empty submitted value decodes as `None`.
+///
+/// Pair it with `#[serde(default)]`: `deserialize_with` disables serde's
+/// implicit missing-`Option`-field-is-`None` handling, and `default` restores
+/// it (the `#[model]`-generated `NewX` struct emits both).
 ///
 /// # Errors
 ///
 /// Returns a deserializer error when a non-empty submitted value isn't a
 /// valid `YYYY-MM-DDTHH:MM[:SS[.f]]` local datetime string.
-#[cfg(feature = "maud")]
 pub fn deserialize_naive_datetime_local_option<'de, D>(
     deserializer: D,
 ) -> Result<Option<chrono::NaiveDateTime>, D::Error>
@@ -1925,6 +1956,25 @@ pub trait FormModel {
 /// non-nullable `bool` columns (matching the scaffold's `{Model}Form`
 /// convention); hand-written form targets must add the attribute themselves —
 /// see [`checkbox_input`]'s documentation.
+///
+/// # Datetime fields and `datetime-local` values
+///
+/// A [`FieldControl::DateTime`] field renders via [`datetime_input`], whose
+/// `<input type="datetime-local">` has no timezone concept: the pre-filled
+/// value is offsetless (`YYYY-MM-DDTHH:MM:SS`) and the browser posts back an
+/// offsetless string — not always with seconds. Chrono's default
+/// `Deserialize` for `DateTime<Utc>` demands an RFC 3339 offset, so a plain
+/// field would reject even an *untouched* submission as a 400 before
+/// validation. The `#[model]`-generated `NewX` insert struct therefore
+/// attaches [`deserialize_datetime_local_utc`] (or the `_option` variant) to
+/// `DateTime<Utc>` columns and [`deserialize_naive_datetime_local`] (or its
+/// `_option` variant) to `NaiveDateTime` columns: the offsetless value is
+/// interpreted as UTC, and RFC 3339 JSON API bodies posted to the same
+/// struct keep decoding (an explicit offset is converted to UTC).
+/// A required [`FieldControl::Date`] needs no such treatment — the browser's
+/// `YYYY-MM-DD` wire shape is exactly what chrono's `NaiveDate`
+/// `Deserialize` accepts. Hand-written form targets must attach the
+/// deserializers themselves — see each helper's documentation.
 ///
 /// # Example
 ///
@@ -3692,6 +3742,32 @@ mod tests {
                 chrono::Utc,
             )
         );
+    }
+
+    #[test]
+    fn deserialize_datetime_local_utc_accepts_rfc3339_with_offset() {
+        // The same struct often serves JSON API create bodies — the helper
+        // must keep accepting RFC 3339, honoring an explicit offset by
+        // converting to UTC.
+        #[derive(serde::Deserialize)]
+        struct Decoded {
+            #[serde(deserialize_with = "deserialize_datetime_local_utc")]
+            starts_at: chrono::DateTime<chrono::Utc>,
+        }
+        let expected = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+            chrono::NaiveDate::from_ymd_opt(2024, 3, 15)
+                .unwrap()
+                .and_hms_opt(10, 30, 56)
+                .unwrap(),
+            chrono::Utc,
+        );
+        let decoded: Decoded =
+            serde_json::from_str(r#"{"starts_at":"2024-03-15T10:30:56Z"}"#).unwrap();
+        assert_eq!(decoded.starts_at, expected);
+        // +09:00 wall clock 19:30:56 is the same instant.
+        let decoded: Decoded =
+            serde_json::from_str(r#"{"starts_at":"2024-03-15T19:30:56+09:00"}"#).unwrap();
+        assert_eq!(decoded.starts_at, expected);
     }
 
     #[cfg(feature = "maud")]

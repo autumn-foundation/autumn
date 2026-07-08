@@ -1512,6 +1512,53 @@ fn form_control_tokens(inner_ty: &syn::Type, nullable: bool) -> TokenStream {
     }
 }
 
+/// For a `NewX` field whose column `form_for` renders as an HTML
+/// `datetime-local` control (see `form_control_tokens`), emit the serde
+/// attribute wiring the matching datetime-local-tolerant deserializer from
+/// `autumn_web::form`.
+///
+/// `<input type="datetime-local">` posts an offsetless value (and not always
+/// with seconds), which chrono's default `Deserialize` for `DateTime<Utc>`
+/// rejects — so a `form_for` submission would 400 before validation even when
+/// the pre-filled value is untouched. The referenced helpers accept both the
+/// browser shape (`YYYY-MM-DDTHH:MM[:SS[.f]]`, interpreted as UTC) *and*
+/// RFC 3339 (offset converted to UTC), so JSON API create bodies posted to
+/// the same `NewX` keep decoding.
+///
+/// Returns `None` for non-datetime fields, and for `DateTime<Tz>` with a
+/// non-`Utc` zone parameter (the helper produces a `DateTime<Utc>`; other
+/// zone parameters keep chrono's default `Deserialize`).
+fn datetime_local_serde_attr(ty: &syn::Type) -> Option<TokenStream> {
+    let nullable = is_option_type(ty);
+    let inner = if nullable {
+        crate::api_doc::unwrap_single_generic(ty, "Option")?
+    } else {
+        ty.clone()
+    };
+    let base = match type_name_str(&inner).as_str() {
+        "NaiveDateTime" => "deserialize_naive_datetime_local",
+        "DateTime" => {
+            let tz = crate::api_doc::unwrap_single_generic(&inner, "DateTime")?;
+            if type_name_str(&tz) != "Utc" {
+                return None;
+            }
+            "deserialize_datetime_local_utc"
+        }
+        _ => return None,
+    };
+    if nullable {
+        // `deserialize_with` disables serde's implicit missing-`Option`-field
+        // -is-`None` handling; `default` restores it so a JSON body may still
+        // omit the nullable column. (The `_option` helper itself maps a
+        // present-but-empty form value to `None`.)
+        let path = format!("::autumn_web::form::{base}_option");
+        Some(quote! { #[serde(default, deserialize_with = #path)] })
+    } else {
+        let path = format!("::autumn_web::form::{base}");
+        Some(quote! { #[serde(deserialize_with = #path)] })
+    }
+}
+
 /// Emit `impl ::autumn_web::form::FormModel for #name` (issue #1135), listing
 /// one `FormField` descriptor per user-editable column (the same
 /// `fields_for_new` set the insertable `NewX` struct uses -- i.e. excluding the
@@ -2224,7 +2271,14 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             // `{Model}Form` convention.
             let bool_default = (!is_option_type(ty) && type_name_str(ty) == "bool")
                 .then(|| quote! { #[serde(default)] });
-            quote! { #(#val_attrs)* #enc #bool_default pub #ident: #ty }
+            // Datetime columns render as `<input type="datetime-local">` in
+            // `form_for`, whose submitted value carries no timezone offset —
+            // chrono's default `Deserialize` for `DateTime<Utc>` would reject
+            // even an unchanged pre-filled value as a 400. Wire the tolerant
+            // deserializer (which also still accepts RFC 3339 JSON bodies);
+            // see `datetime_local_serde_attr`.
+            let datetime_local = datetime_local_serde_attr(ty);
+            quote! { #(#val_attrs)* #enc #bool_default #datetime_local pub #ident: #ty }
         })
         .collect();
 

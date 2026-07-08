@@ -144,6 +144,124 @@ fn derived_new_struct_decodes_unchecked_checkbox_as_false() {
     assert!(new_article.published);
 }
 
+diesel::table! {
+    events (id) {
+        id -> Integer,
+        title -> Text,
+        published_at -> Timestamptz,
+        starts_at -> Timestamp,
+        ends_at -> Nullable<Timestamptz>,
+    }
+}
+
+#[autumn_web::model(table = "events")]
+pub struct Event {
+    pub id: i32,
+    pub title: String,
+    pub published_at: chrono::DateTime<chrono::Utc>,
+    pub starts_at: chrono::NaiveDateTime,
+    pub ends_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[test]
+fn derived_new_struct_decodes_datetime_local_submission() {
+    // Regression test (Codex P2 on #1587): `form_for` renders
+    // `DateTime<Utc>`/`NaiveDateTime` columns as `<input
+    // type="datetime-local">`, whose value has no timezone offset — chrono's
+    // default `Deserialize` for `DateTime<Utc>` demands an RFC 3339 offset,
+    // so without the generated `deserialize_with` wiring even an *untouched*
+    // pre-filled value would be rejected as a 400 before validation.
+    use chrono::TimeZone as _;
+    let published = chrono::Utc
+        .with_ymd_and_hms(2024, 3, 15, 10, 30, 56)
+        .unwrap();
+    let changeset = Changeset::new(Event {
+        id: 1,
+        title: "Launch".into(),
+        published_at: published,
+        starts_at: published.naive_utc(),
+        ends_at: None,
+    });
+    let html = form_for(&changeset, "/events", "post")
+        .csrf("tok")
+        .render()
+        .into_string();
+
+    // The pre-filled value is the offsetless datetime-local shape (browsers
+    // reject a trailing `Z`/offset in a datetime-local input).
+    assert!(html.contains(r#"value="2024-03-15T10:30:56""#), "{html}");
+    assert!(!html.contains("2024-03-15T10:30:56Z"), "{html}");
+
+    // A browser that round-trips the form untouched posts back exactly that
+    // offsetless value. Decode through the same serde_urlencoded machinery
+    // axum's `Form` and ChangesetForm use, straight into the generated
+    // insert struct — the wall clock is interpreted as UTC.
+    let body = "title=Launch\
+                &published_at=2024-03-15T10%3A30%3A56\
+                &starts_at=2024-03-15T10%3A30%3A56\
+                &ends_at=";
+    let new_event: NewEvent = serde_urlencoded::from_str(body)
+        .expect("untouched datetime-local submission must decode, not 400");
+    assert_eq!(new_event.published_at, published);
+    assert_eq!(new_event.starts_at, published.naive_utc());
+    // Empty nullable datetime decodes as None, not a parse error.
+    assert_eq!(new_event.ends_at, None);
+
+    // A value edited through the browser's native picker may drop the
+    // seconds component entirely (minute granularity).
+    let body = "title=Launch\
+                &published_at=2024-03-15T10%3A30\
+                &starts_at=2024-03-15T10%3A30\
+                &ends_at=2024-03-15T11%3A00";
+    let new_event: NewEvent = serde_urlencoded::from_str(body)
+        .expect("minute-granularity datetime-local submission must decode");
+    assert_eq!(
+        new_event.published_at,
+        chrono::Utc
+            .with_ymd_and_hms(2024, 3, 15, 10, 30, 0)
+            .unwrap()
+    );
+    assert_eq!(
+        new_event.ends_at,
+        Some(chrono::Utc.with_ymd_and_hms(2024, 3, 15, 11, 0, 0).unwrap())
+    );
+}
+
+#[test]
+fn derived_new_struct_still_decodes_rfc3339_json_bodies() {
+    // The generated `NewX` also serves JSON API create bodies — attaching the
+    // datetime-local deserializer must not break RFC 3339 input. An explicit
+    // offset is honored and normalized to UTC.
+    use chrono::TimeZone as _;
+    let expected = chrono::Utc
+        .with_ymd_and_hms(2024, 3, 15, 10, 30, 56)
+        .unwrap();
+
+    let json = r#"{
+        "title": "Launch",
+        "published_at": "2024-03-15T10:30:56Z",
+        "starts_at": "2024-03-15T10:30:56",
+        "ends_at": "2024-03-15T19:30:56+09:00"
+    }"#;
+    let new_event: NewEvent =
+        serde_json::from_str(json).expect("RFC 3339 JSON create body must keep decoding");
+    assert_eq!(new_event.published_at, expected);
+    assert_eq!(new_event.starts_at, expected.naive_utc());
+    assert_eq!(new_event.ends_at, Some(expected));
+
+    // A JSON body may still omit the nullable column entirely
+    // (`#[serde(default)]` restores the implicit-None handling that
+    // `deserialize_with` would otherwise disable).
+    let json = r#"{
+        "title": "Launch",
+        "published_at": "2024-03-15T10:30:56Z",
+        "starts_at": "2024-03-15T10:30:56"
+    }"#;
+    let new_event: NewEvent =
+        serde_json::from_str(json).expect("omitted nullable datetime must decode as None");
+    assert_eq!(new_event.ends_at, None);
+}
+
 #[test]
 fn form_for_override_promotes_field_to_select() {
     // The scaffold uses this exact escape hatch to turn an enum column into a

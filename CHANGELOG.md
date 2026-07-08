@@ -52,6 +52,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   matching the scaffold's `{Model}Form` convention. Side effect: a JSON create
   body that omits a non-nullable `bool` now also decodes it as `false` rather
   than erroring.
+  Datetime columns: `form_for` renders `chrono::DateTime<Utc>` and
+  `NaiveDateTime` columns as `<input type="datetime-local">`, whose submitted
+  value carries no timezone offset (and not always seconds) — chrono's default
+  `Deserialize` for `DateTime<Utc>` would reject even an untouched pre-filled
+  value as a 400 before validation. The `#[model]`-generated `NewX` insert
+  struct now attaches `autumn_web::form::deserialize_datetime_local_utc`
+  (`_option` for nullable) to `DateTime<Utc>` columns and
+  `deserialize_naive_datetime_local` (`_option`) to `NaiveDateTime` columns:
+  the offsetless browser value is interpreted as UTC, an empty nullable value
+  decodes as `None`, and RFC 3339 JSON create bodies keep decoding — the
+  `DateTime<Utc>` helpers now also accept RFC 3339 input, honoring an explicit
+  offset by converting to UTC. (`DateTime` columns with a non-`Utc` zone
+  parameter keep chrono's default `Deserialize`.) These four `form`
+  deserializer helpers, previously `maud`-gated, are now available
+  unconditionally. `UpdateX` is untouched: it has no `Validate` impl so no
+  `ChangesetForm`/`form_for` round-trip reaches it, and its JSON PATCH bodies
+  are RFC 3339, which already decodes. Required `NaiveDate` columns need no
+  treatment (the browser's `YYYY-MM-DD` is exactly chrono's wire shape).
   `FieldControl` is `#[non_exhaustive]` (new control kinds won't be
   semver-major); duplicate `.override_field`/`.override_label` calls on the
   same field now resolve last-wins; `FieldControl::File` renders the same
