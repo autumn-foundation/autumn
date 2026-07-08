@@ -452,12 +452,27 @@ fn dep_source_from_table(
     None
 }
 
+/// A dependency table's explicit `default-features` setting, honoring the
+/// pre-2021 `default_features` spelling cargo still accepts. `None` when the
+/// table doesn't set it.
+fn table_default_features(table: &toml::value::Table) -> Option<bool> {
+    ["default-features", "default_features"]
+        .iter()
+        .find_map(|key| table.get(*key).and_then(toml::Value::as_bool))
+}
+
 /// Resolve the app's `autumn-web` dependency VALUE, following
 /// `workspace = true` inheritance to the `[workspace.dependencies]` table of
-/// the nearest ancestor manifest that declares it. Returns the value and the
+/// the nearest ancestor manifest that declares it. Returns the value, the
 /// directory of the manifest that declared it (relative `path` sources
-/// resolve against that directory).
-fn resolve_app_autumn_web_value(project_root: &Path) -> (Option<toml::Value>, std::path::PathBuf) {
+/// resolve against that directory), and — for workspace-inherited deps — the
+/// MEMBER-level `default-features` setting, which the resolved workspace
+/// table would otherwise erase (Cargo lets the member re-enable defaults a
+/// workspace entry disabled, so the member-level value must survive
+/// resolution).
+fn resolve_app_autumn_web_value(
+    project_root: &Path,
+) -> (Option<toml::Value>, std::path::PathBuf, Option<bool>) {
     let parse = |dir: &Path| -> Option<toml::Value> {
         toml::from_str(&read_or_empty(&dir.join("Cargo.toml"))).ok()
     };
@@ -477,6 +492,9 @@ fn resolve_app_autumn_web_value(project_root: &Path) -> (Option<toml::Value>, st
     if let Some(toml::Value::Table(t)) = &dep
         && t.get("workspace").and_then(toml::Value::as_bool) == Some(true)
     {
+        // Capture the member-level default-features BEFORE the member table
+        // is replaced by the workspace entry.
+        let member_default_features = table_default_features(t);
         // Workspace-inherited: find the same dependency KEY in this
         // manifest's or the nearest ancestor's [workspace.dependencies].
         let mut dir: Option<&Path> = Some(project_root);
@@ -486,13 +504,13 @@ fn resolve_app_autumn_web_value(project_root: &Path) -> (Option<toml::Value>, st
                 .and_then(|doc| doc.get("workspace")?.get("dependencies")?.get(&dep_key))
                 .cloned()
             {
-                return (Some(v), d.to_path_buf());
+                return (Some(v), d.to_path_buf(), member_default_features);
             }
             dir = d.parent();
         }
-        return (None, project_root.to_path_buf());
+        return (None, project_root.to_path_buf(), member_default_features);
     }
-    (dep, project_root.to_path_buf())
+    (dep, project_root.to_path_buf(), None)
 }
 
 /// Find a `[patch.crates-io]` override of the `autumn-web` PACKAGE — the
@@ -574,22 +592,31 @@ fn mirror_autumn_web_patch(project_root: &Path, plan: &mut Plan) -> Option<Strin
 ///   `autumn new` scaffolds) with a loud warning telling the user to edit
 ///   the shell manifest by hand.
 fn shell_autumn_web_dep(project_root: &Path, plan: &mut Plan) -> ShellAutumnWebDep {
-    let (dep_value, manifest_dir) = resolve_app_autumn_web_value(project_root);
+    let (dep_value, manifest_dir, member_default_features) =
+        resolve_app_autumn_web_value(project_root);
 
     // `default-features = false` must survive the mirroring: cargo unifies
     // features per dependency EDGE, so a shell edge without it would
     // re-enable the framework's default features across the whole src-tauri
-    // build even though the app opted out (`default_features` is the
-    // pre-2021 spelling cargo still accepts).
-    let disables_default_features = |t: &toml::value::Table| {
-        ["default-features", "default_features"]
-            .iter()
-            .any(|key| t.get(*key).and_then(toml::Value::as_bool) == Some(false))
+    // build even though the app opted out. For workspace-inherited deps the
+    // MEMBER-level setting wins when present — that mirrors Cargo's
+    // re-enable rule (member `default-features = true` over a workspace
+    // `false`); for member `false` over workspace defaults-on Cargo today
+    // IGNORES the member key with a warning slated to become a hard error,
+    // and we honor the written opt-out instead — harmless either way, since
+    // the app's own edge still carries the workspace value and cargo
+    // unifies the edges by union. Otherwise the resolved (workspace or
+    // direct) table's setting applies.
+    let resolved_default_features = match &dep_value {
+        Some(toml::Value::Table(t)) => table_default_features(t),
+        _ => None,
     };
-    let default_features_part = match &dep_value {
-        Some(toml::Value::Table(t)) if disables_default_features(t) => "default-features = false, ",
-        _ => "",
-    };
+    let default_features_part =
+        if member_default_features.or(resolved_default_features) == Some(false) {
+            "default-features = false, "
+        } else {
+            ""
+        };
 
     // Path/git sources are mirrored directly onto the shell's edge.
     if let Some(toml::Value::Table(t)) = &dep_value
@@ -2340,6 +2367,81 @@ mod tests {
         let toml_src = render_mobile_cargo_toml("my-app", true, Some(&dep));
         assert!(toml_src.contains("[patch.crates-io]"));
         toml::from_str::<toml::Value>(&toml_src).expect("generated Cargo.toml must parse");
+    }
+
+    #[test]
+    fn offline_shell_dep_default_features_across_workspace_inheritance() {
+        // Build a workspace whose root declares the dep, with the member
+        // inheriting it via `workspace = true` plus `member_extra` keys.
+        fn workspace_dep(workspace_entry: &str, member_extra: &str) -> ShellAutumnWebDep {
+            let tmp = TempDir::new().unwrap();
+            std::fs::write(
+                tmp.path().join("Cargo.toml"),
+                format!(
+                    "[workspace]\nmembers = [\"app\"]\n\n\
+                     [workspace.dependencies]\nautumn-web = {workspace_entry}\n"
+                ),
+            )
+            .unwrap();
+            let app = tmp.path().join("app");
+            std::fs::create_dir_all(&app).unwrap();
+            std::fs::write(
+                app.join("Cargo.toml"),
+                format!(
+                    "[package]\nname = \"my-app\"\nversion = \"0.2.3\"\n\n\
+                     [dependencies]\nautumn-web = {{ workspace = true{member_extra} }}\n"
+                ),
+            )
+            .unwrap();
+            let mut plan = Plan::new(&app);
+            let dep = shell_autumn_web_dep(&app, &mut plan);
+            assert!(plan.warnings.is_empty(), "got {:?}", plan.warnings);
+            dep
+        }
+
+        // Member-level opt-out survives resolution even when the workspace
+        // entry leaves defaults on (previously erased by the inheritance
+        // walk replacing the member table).
+        let dep = workspace_dep(r#"{ version = "0.9.1" }"#, ", default-features = false");
+        assert_eq!(
+            dep.dep_entry,
+            r#"autumn-web = { version = "0.9.1", default-features = false, features = ["offline-sync"] }"#,
+        );
+        // Legacy spelling too.
+        let dep = workspace_dep(r#"{ version = "0.9.1" }"#, ", default_features = false");
+        assert!(
+            dep.dep_entry.contains("default-features = false"),
+            "got: {}",
+            dep.dep_entry
+        );
+
+        // Member sets nothing: the workspace-level value wins.
+        let dep = workspace_dep(r#"{ version = "0.9.1", default-features = false }"#, "");
+        assert!(
+            dep.dep_entry.contains("default-features = false"),
+            "workspace-level opt-out must apply, got: {}",
+            dep.dep_entry
+        );
+
+        // Member re-enables defaults over a workspace opt-out — Cargo's
+        // documented inheritance rule.
+        let dep = workspace_dep(
+            r#"{ version = "0.9.1", default-features = false }"#,
+            ", default-features = true",
+        );
+        assert!(
+            !dep.dep_entry.contains("default-features"),
+            "a member re-enable must win over the workspace opt-out, got: {}",
+            dep.dep_entry
+        );
+
+        // Neither side opts out: no default-features on the shell edge.
+        let dep = workspace_dep(r#"{ version = "0.9.1" }"#, "");
+        assert!(
+            !dep.dep_entry.contains("default-features"),
+            "got: {}",
+            dep.dep_entry
+        );
     }
 
     #[test]

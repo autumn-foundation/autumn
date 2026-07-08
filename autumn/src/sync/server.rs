@@ -110,11 +110,12 @@ fn resolved_row(
     }
 }
 
-/// The tombstone written back for a change whose base row is absent AND
-/// whose claimed `base_version` predates the tombstone GC horizon: the row
-/// was deleted and its tombstone physically dropped, so there is nothing to
-/// conflict against — yet the change is, semantically, an edit of a deleted
-/// row. Without this a device offline past a GC would silently resurrect
+/// The tombstone written back for a change whose claimed `base_version`
+/// predates the tombstone GC horizon while the row is either ABSENT (its
+/// tombstone was physically dropped, so there is nothing to conflict
+/// against) or present only as a TOMBSTONE (typically one materialized by a
+/// previous stale push of the same shape) — in both cases the change is,
+/// semantically, an edit of a deleted row. Without this a device offline past a GC would silently resurrect
 /// the row: `SyncEngine` pushes pending changes BEFORE its pull can learn
 /// it needs a full resync, so the clean-apply path was reachable first.
 ///
@@ -339,6 +340,28 @@ impl SyncBackend for MemorySyncBackend {
             let row_key = (change.collection.clone(), change.pk.clone());
             let current = state.rows.get(&row_key).cloned();
             let (outcome, version) = match current {
+                // Pre-horizon stale edit hitting a TOMBSTONE: same
+                // server-winning bypass as the absent-row arm below. The
+                // first stale push materializes a gc_tombstone_row as a
+                // real row, so a repeat stale push would otherwise fall
+                // into the ordinary conflict arm where a clock-based
+                // resolver (LWW with a fast client clock) could resurrect
+                // the row after all. Live-row conflicts and post-horizon
+                // edits still reach the resolver; a client that actually
+                // SAW the tombstone recreates cleanly via base_version ==
+                // server.version, and a deliberate base-0 recreate
+                // conflicts against the real tombstone as before.
+                Some(server)
+                    if server.deleted
+                        && change.base_version > 0
+                        && change.base_version <= horizon
+                        && server.version != change.base_version =>
+                {
+                    let version = state.allocate_version();
+                    let row = gc_tombstone_row(change, version);
+                    state.rows.insert(row_key, row.clone());
+                    (ChangeOutcome::Resolved { row }, version)
+                }
                 Some(server) if server.version != change.base_version => {
                     let resolution = resolver.resolve(&request.device_id, change, &server);
                     let version = state.allocate_version();
@@ -731,6 +754,23 @@ impl SyncBackend for PgSyncBackend {
                 .map(PgRowRecord::into_remote_row);
 
                 let (outcome, version) = match current {
+                    // Pre-horizon stale edit hitting a TOMBSTONE: same
+                    // server-winning bypass as the absent-row arm below —
+                    // a repeat stale push (after the first materialized a
+                    // gc_tombstone_row) must not reach a clock-based
+                    // resolver and resurrect the row. See the memory
+                    // backend's arm for the full guard rationale.
+                    Some(server)
+                        if server.deleted
+                            && change.base_version > 0
+                            && change.base_version <= horizon
+                            && server.version != change.base_version =>
+                    {
+                        let version = pg_next_version(conn)?;
+                        let row = gc_tombstone_row(change, version);
+                        pg_upsert_row(conn, &row)?;
+                        (ChangeOutcome::Resolved { row }, version)
+                    }
                     Some(server) if server.version != change.base_version => {
                         let resolution = resolver.resolve(&request.device_id, change, &server);
                         let version = pg_next_version(conn)?;

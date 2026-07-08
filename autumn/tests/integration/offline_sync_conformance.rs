@@ -485,6 +485,42 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
         "a clock ahead of the server must not resurrect the GC'd row, got {row:?}"
     );
 
+    // Repeat stale pushes hit the MATERIALIZED tombstone, not the absent
+    // row — they must take the same server-winning bypass, or a clock-based
+    // resolver would resurrect the row on the second attempt (the first
+    // stale push wrote a real tombstone row, so the absent-row arm no
+    // longer matches).
+    for (attempt, change_id) in [
+        "00000000-0000-4000-8000-000000000011",
+        "00000000-0000-4000-8000-000000000012",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let mut repeat_edit = change(
+            change_id,
+            "n2",
+            Op::Upsert,
+            Some(json!({"title": "resurrected via repeat?"})),
+        );
+        repeat_edit.base_version = versions[1];
+        repeat_edit.updated_at = Utc::now() + Duration::days(365);
+        let response = backend
+            .apply_push(&push("device-skewed", vec![repeat_edit]), &resolver)
+            .expect("repeat stale push");
+        let ChangeOutcome::Resolved { row } = &response.outcomes[0] else {
+            panic!(
+                "repeat stale push #{attempt} must resolve, got {:?}",
+                response.outcomes[0]
+            );
+        };
+        assert!(
+            row.deleted && row.payload.is_none(),
+            "repeat stale push #{attempt} must stay server-winning even with \
+             a fast clock, got {row:?}"
+        );
+    }
+
     // A genuinely NEW insert from the same offline device (base_version = 0,
     // pk the server never saw) must still clean-apply — the rejection keys
     // on the base-version claim, not on mere absence.
