@@ -2986,7 +2986,12 @@ impl LocalJobCoordination {
             }
         }
         let expires_at = match window {
-            JobUniquenessWindow::TtlMs(ms) => Some(now + std::time::Duration::from_millis(ms)),
+            JobUniquenessWindow::TtlMs(ms) => Some(
+                now.checked_add(std::time::Duration::from_millis(ms))
+                    .unwrap_or_else(|| {
+                        now + std::time::Duration::from_secs(60 * 60 * 24 * 365 * 100)
+                    }),
+            ),
             JobUniquenessWindow::Pending | JobUniquenessWindow::Running => None,
         };
         inner.unique_holds.insert(

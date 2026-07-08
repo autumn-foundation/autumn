@@ -504,7 +504,9 @@ impl IdempotencyStore for MemoryIdempotencyStore {
             key.to_owned(),
             MemoryInFlightLock {
                 owner: owner.to_owned(),
-                expires_at: now + ttl,
+                expires_at: now.checked_add(ttl).unwrap_or_else(|| {
+                    now + std::time::Duration::from_secs(60 * 60 * 24 * 365 * 100)
+                }),
             },
         );
         true

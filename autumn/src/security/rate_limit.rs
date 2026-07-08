@@ -1235,7 +1235,7 @@ mod tests {
         }
 
         // 5 seconds later, bucket.tokens = 0.5. Deficit = 0.5. Secs = 0.5 / 0.1 = 5.0
-        let later = now + Duration::from_secs(5);
+        let later = now.checked_add(Duration::from_secs(5)).unwrap_or(now);
         match store.decide("ip1", later, 1.0, 0.1) {
             Decision::Denied {
                 retry_after_secs, ..
@@ -1244,7 +1244,7 @@ mod tests {
         }
 
         // 9.5 seconds later, bucket.tokens = 0.95. Deficit = 0.05. Secs = 0.05 / 0.1 = 0.5 -> ceil -> 1.0
-        let even_later = now + Duration::from_millis(9500);
+        let even_later = now.checked_add(Duration::from_millis(9500)).unwrap_or(now);
         match store.decide("ip1", even_later, 1.0, 0.1) {
             Decision::Denied {
                 retry_after_secs, ..
