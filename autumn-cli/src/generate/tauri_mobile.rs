@@ -461,7 +461,14 @@ fn lexical_relative(target: &Path, dir: &Path) -> Option<std::path::PathBuf> {
 /// of a dependency (or patch) table, adjusted so it stays valid when written
 /// into `src-tauri/Cargo.toml`:
 ///
-/// - absolute paths the USER wrote are kept as-is,
+/// - ROOTED paths the USER wrote are kept as-is — they never resolve
+///   relative to a manifest directory, so re-anchoring them would change
+///   their meaning. Rooted is deliberately [`Path::has_root`], not
+///   `is_absolute`: on Windows a Unix-style `/src/framework` path has a
+///   root but no drive prefix, so `is_absolute` returns false there and
+///   the path would fall into the relative branches below and come out
+///   mangled (`..//src/framework`) — the same manifest must produce the
+///   same shell edge on every platform,
 /// - paths relative to the app's own manifest gain a `../` prefix
 ///   (`src-tauri/` sits one level below the project root),
 /// - paths declared in an ancestor manifest (workspace root) are resolved
@@ -480,7 +487,7 @@ fn dep_source_from_table(
     project_root: &Path,
 ) -> Option<String> {
     if let Some(path) = table.get("path").and_then(toml::Value::as_str) {
-        let adjusted = if Path::new(path).is_absolute() {
+        let adjusted = if Path::new(path).has_root() {
             path.replace('\\', "/")
         } else if manifest_dir == project_root {
             format!("../{path}")
