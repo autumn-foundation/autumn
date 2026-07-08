@@ -136,7 +136,8 @@ fn plan_icons(plan: &mut Plan, project_root: &Path, tauri: &Path) -> Result<(), 
 // ── Mixed-mode guard (issue #1506) ────────────────────────────────────────────
 
 /// Files only the mobile thin-client scaffold (`--remote-url`) emits, relative
-/// to `src-tauri/` — checked before scaffolding the desktop mode.
+/// to `src-tauri/` — checked before scaffolding the desktop mode (and, via
+/// `tauri_mobile::ensure_no_other_mode_scaffold`, the mobile in-process mode).
 ///
 /// The capability files are the actively harmful leftovers: Tauri loads
 /// *every* file under `src-tauri/capabilities/`, and the desktop shell crate
@@ -144,21 +145,22 @@ fn plan_icons(plan: &mut Plan, project_root: &Path, tauri: &Path) -> Result<(), 
 /// name, so `tauri-build` fails permission validation. `Info.ios.plist` is
 /// merely dead on desktop but is equally unambiguous evidence of a
 /// thin-client scaffold.
-const THIN_CLIENT_MARKERS: [&str; 3] = [
+pub const THIN_CLIENT_MARKERS: [&str; 3] = [
     "capabilities/remote-app.json",
     "capabilities/remote-app-mobile.json",
     "Info.ios.plist",
 ];
 
 /// Files only the desktop (sidecar) scaffold emits, relative to `src-tauri/`
-/// — checked before scaffolding the thin-client mode.
+/// — checked before scaffolding the thin-client mode (and, via
+/// `tauri_mobile::ensure_no_other_mode_scaffold`, the mobile in-process mode).
 ///
 /// The per-OS overlay confs are the actively harmful leftovers: Tauri CLI
 /// merges `tauri.<platform>.conf.json` on top of `tauri.conf.json`
 /// automatically, so a stale overlay keeps running the sidecar staging script
 /// as `beforeBuildCommand`/`beforeDevCommand` on every `cargo tauri
 /// build`/`dev` of the thin client.
-const DESKTOP_MARKERS: [&str; 5] = [
+pub const DESKTOP_MARKERS: [&str; 5] = [
     "stage-sidecar.sh",
     "stage-sidecar.ps1",
     "tauri.linux.conf.json",
@@ -1639,8 +1641,9 @@ fn mobile_lib_name(package_name: &str) -> String {
     package_name.replace('-', "_") + "_mobile"
 }
 
-/// Bundle identifier for the mobile thin client: reverse-DNS with `-` and `_`
-/// stripped from the package name (`demo-app` → `com.example.demoapp`).
+/// Bundle identifier for the mobile modes (thin client here, in-process in
+/// `tauri_mobile.rs`): reverse-DNS with `-` and `_` stripped from the
+/// package name (`demo-app` → `com.example.demoapp`).
 ///
 /// Unlike the desktop derivation ([`derive_identifier`], which hyphenates for
 /// Apple), the mobile identifier must satisfy *both* stores: Android forbids
@@ -1648,7 +1651,7 @@ fn mobile_lib_name(package_name: &str) -> String {
 /// (tauri-apps/tauri#9707) — and Apple forbids underscores. Alphanumeric
 /// segments are valid on both. Users should replace the `com.example.*`
 /// placeholder with their real identifier before running `android`/`ios init`.
-fn derive_mobile_identifier(package_name: &str) -> String {
+pub fn derive_mobile_identifier(package_name: &str) -> String {
     format!("com.example.{}", package_name.replace(['-', '_'], ""))
 }
 

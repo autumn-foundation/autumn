@@ -504,6 +504,8 @@ dependencies = [
  "reqwest 0.12.28",
  "rsa",
  "rust_decimal",
+ "rustls 0.23.41",
+ "rustls-pki-types",
  "rustversion",
  "rusty-fork",
  "scoped-futures",
@@ -524,6 +526,7 @@ dependencies = [
  "tokio",
  "tokio-cron-scheduler",
  "tokio-postgres",
+ "tokio-postgres-rustls",
  "tokio-stream",
  "tokio-tungstenite",
  "tokio-util",
@@ -538,6 +541,7 @@ dependencies = [
  "uuid",
  "validator",
  "webauthn-rs",
+ "webpki-roots 1.0.8",
 ]
 
 [[package]]

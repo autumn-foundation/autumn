@@ -1815,6 +1815,41 @@ enum GenerateCommands {
         #[arg(long, value_name = "URL")]
         remote_url: Option<String>,
     },
+    /// Scaffold a Tauri mobile shell (iOS/Android) that runs the autumn server in-process.
+    ///
+    /// Uses the **in-process model** (issue #1507, Option B): mobile sandboxes forbid
+    /// spawning child processes, so — unlike the desktop sidecar of `generate tauri` —
+    /// the Autumn Axum server runs on a background thread inside the app process
+    /// itself, connecting to a REMOTE Postgres database over the device network.
+    ///
+    /// Also extracts your app's `src/main.rs` into `src/lib.rs::serve()` (only when
+    /// the stock scaffold layout is detected; skipped with a warning otherwise) so
+    /// the shell crate can call the server as a library.
+    ///
+    /// Creates:
+    ///   - `src-tauri/`                 — standalone Tauri mobile shell crate
+    ///     (staticlib/cdylib; no externalBin, no sidecar, no staging scripts)
+    ///   - `src-tauri/src/lib.rs`       — spawns the server thread inside
+    ///     `tauri::Builder::default().setup(...)`, polls /health, then opens the
+    ///     webview at `http://127.0.0.1:<port>`
+    ///   - `src-tauri/icons/`           — placeholder icons for immediate buildability
+    ///
+    /// See docs/guide/tauri-mobile-in-process.md for mobile sandboxing restrictions,
+    /// remote-Postgres pool tuning for flaky networks, and App Store compliance.
+    ///
+    /// Example:
+    ///
+    ///   autumn generate tauri-mobile
+    ///   autumn generate tauri-mobile --dry-run
+    #[command(verbatim_doc_comment)]
+    TauriMobile {
+        /// Print the file plan and exit without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Overwrite existing files instead of erroring on collision.
+        #[arg(long)]
+        force: bool,
+    },
     /// Scaffold a multi-step form wizard with session-backed state and per-step validation.
     ///
     /// Emits step structs, GET + POST handlers, progress rendering, commit and
@@ -2908,6 +2943,42 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
                             ),
                             None => println!("\n{}", generate::tauri::render_prerequisites()),
                         }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        GenerateCommands::TauriMobile { dry_run, force } => {
+            let flags = generate::Flags { dry_run, force };
+            let project_root = resolve_cwd();
+            // Mixed-mode guard (mirrors the `tauri` arm above): generating
+            // the mobile in-process shell over a desktop-sidecar or
+            // thin-client src-tauri/ is rejected outright, even with --force
+            // — the other mode's leftovers (per-OS overlay confs, staging
+            // scripts, capability files) actively break the mobile build.
+            // Destroy is exempt: it is the documented remedy and must keep
+            // working on a mixed tree.
+            let guard = if mode == ApplyMode::Generate {
+                generate::tauri_mobile::ensure_no_other_mode_scaffold(&project_root)
+            } else {
+                Ok(())
+            };
+            let plan =
+                guard.and_then(|()| generate::tauri_mobile::plan_tauri_mobile(&project_root));
+            let result = plan.and_then(|p| match mode {
+                ApplyMode::Generate => p.execute(flags),
+                ApplyMode::Destroy => p.revert(flags),
+            });
+            match result {
+                Ok(()) => {
+                    if mode == ApplyMode::Generate && !dry_run {
+                        println!(
+                            "\n{}",
+                            generate::tauri_mobile::render_mobile_prerequisites()
+                        );
                     }
                 }
                 Err(e) => {
@@ -6086,6 +6157,42 @@ mod tests {
             remote_url.is_none(),
             "--remote-url must default to None so the desktop sidecar path stays the default"
         );
+    }
+
+    // ── autumn generate tauri-mobile ───────────────────────────────────────
+
+    #[test]
+    fn parse_generate_tauri_mobile() {
+        let cli = Cli::try_parse_from(["autumn", "generate", "tauri-mobile"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Generate(GenerateCommands::TauriMobile {
+                dry_run: false,
+                force: false
+            })
+        ));
+    }
+
+    #[test]
+    fn parse_generate_tauri_mobile_dry_run() {
+        let cli = Cli::try_parse_from(["autumn", "generate", "tauri-mobile", "--dry-run"]).unwrap();
+        let Commands::Generate(GenerateCommands::TauriMobile { dry_run, force }) = cli.command
+        else {
+            panic!("expected TauriMobile variant");
+        };
+        assert!(dry_run);
+        assert!(!force);
+    }
+
+    #[test]
+    fn parse_generate_tauri_mobile_force() {
+        let cli = Cli::try_parse_from(["autumn", "generate", "tauri-mobile", "--force"]).unwrap();
+        let Commands::Generate(GenerateCommands::TauriMobile { dry_run, force }) = cli.command
+        else {
+            panic!("expected TauriMobile variant");
+        };
+        assert!(!dry_run);
+        assert!(force);
     }
 
     #[test]

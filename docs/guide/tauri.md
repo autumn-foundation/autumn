@@ -210,3 +210,5 @@ don't require re-staging; re-run to pick them up once the binary is rebuilt.
 `autumn generate tauri` and `autumn generate pwa` are independent. Running both
 gives you a Progressive Web App installable from the browser **and** a native
 desktop installer from the same server-rendered codebase — no code duplication.
+
+For iOS/Android — where sandboxes prohibit sidecar processes entirely — see the [Tauri mobile in-process guide](tauri-mobile-in-process.md) (`autumn generate tauri-mobile`).

@@ -2,6 +2,7 @@ mod cloud_native_scaffold;
 mod db;
 mod db_pull;
 mod generate_references_postgres;
+mod generate_tauri_mobile;
 mod migrate_down;
 mod repo_hygiene;
 mod scaffold_form_for;
