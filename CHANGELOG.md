@@ -543,9 +543,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `opentelemetry_sdk` 0.31.0 → 0.32.1 (CVE-2026-48504 / GHSA-w9wp-h8wv-79jx,
   unbounded memory allocation in W3C Baggage propagation) together with the
   matching `opentelemetry` / `opentelemetry-otlp` 0.32.0 and
-  `tracing-opentelemetry` 0.33.0 (with the `tls-aws-lc` feature enabled on
-  `opentelemetry-otlp`, since 0.32 rejects `https://` gRPC collector
-  endpoints at exporter build time unless a TLS provider feature is on).
+  `tracing-opentelemetry` 0.33.0 (with the `tls-aws-lc` and `reqwest-rustls`
+  features enabled on `opentelemetry-otlp`, since 0.32 rejects `https://`
+  gRPC collector endpoints at exporter build time unless a TLS provider
+  feature is on, and its new reqwest 0.13 HTTP client ships without TLS
+  under `reqwest-client` alone — reqwest 0.12 feature unification no longer
+  covers it).
   `rsa` 0.9.10 (RUSTSEC-2023-0071, Marvin
   attack) remains: no fixed release exists on its 0.9.x line. [no-plugin]
 - **deps:** bumped `diesel-async` from 0.8 to 0.9 (resolving 0.9.2, with
