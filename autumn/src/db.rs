@@ -64,6 +64,226 @@ tokio::task_local! {
     pub static AFTER_COMMIT_REGISTRY: Arc<Mutex<Vec<CommitCallback>>>;
 }
 
+/// Per-request accumulator for database query timing, used by the
+/// `Server-Timing` middleware to surface `db;dur=…;desc="N queries"`.
+///
+/// Populated by the [`RequestQueryTimer`] connection instrumentation, which
+/// [`Db::checkout`] installs only on connections checked out while this
+/// task-local is scoped (i.e. while the `ServerTimingLayer` has scoped the
+/// request — see [`request_db_timing_active`]). The timer only *records* when
+/// the task-local is scoped; a stale one left on a reused connection has an
+/// `on_start` that is a cheap bool-probe no-op formatting and recording nothing. It
+/// fires on every diesel-async query (including the raw `.load()`/`.execute()`
+/// calls generated repositories run). The connection instrumentation is the
+/// sole writer during a request — helpers like [`run_instrumented`]
+/// deliberately do *not* record here, to avoid double-counting the same
+/// statement. When the middleware is disabled the scope is absent, so opted-out
+/// requests pay only that per-query bool probe (no `DebugQuery` formatting, no
+/// allocation).
+#[derive(Default, Debug)]
+pub(crate) struct RequestDbTimings {
+    /// Total elapsed time across all DB queries for this request, in
+    /// microseconds. Microseconds keep the header format (`f64` ms rounded
+    /// to three decimals) consistent with the access-log clock without an
+    /// f64 atomic.
+    pub(crate) total_us: AtomicU64,
+    /// Number of instrumented DB queries this request performed.
+    pub(crate) query_count: std::sync::atomic::AtomicUsize,
+}
+
+tokio::task_local! {
+    /// Task-local accumulator populated by DB instrumentation and read by
+    /// the `Server-Timing` middleware. See [`RequestDbTimings`].
+    pub(crate) static REQUEST_DB_TIMINGS: Arc<RequestDbTimings>;
+}
+
+/// Record one instrumented DB query into the current request's
+/// [`REQUEST_DB_TIMINGS`], if any. No-op when the task-local is unset —
+/// which is the case whenever the `Server-Timing` middleware is disabled
+/// or the query runs outside a request (e.g. background job).
+pub(crate) fn record_request_db_query(elapsed: Duration) {
+    let _ = REQUEST_DB_TIMINGS.try_with(|t| {
+        let micros = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+        t.total_us.fetch_add(micros, Ordering::Relaxed);
+        t.query_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    });
+}
+
+/// Whether the current task is inside a [`REQUEST_DB_TIMINGS`] scope — i.e.
+/// whether the `ServerTimingLayer` (only active when `[observability]
+/// server_timing` is enabled) has wrapped this request's handler future.
+///
+/// Cheap: probes the task-local without cloning the `Arc`, allocating, or
+/// formatting anything. Probed by [`RequestQueryTimer::on_start`] on every
+/// query: when no scope is active (the production default, `server_timing`
+/// unset), the timer records nothing and skips the `DebugQuery` formatting, so
+/// an always-installed timer costs opted-out requests only this bool probe per
+/// query — no per-statement allocation.
+#[cfg(feature = "db")]
+pub(crate) fn request_db_timing_active() -> bool {
+    REQUEST_DB_TIMINGS.try_with(|_| ()).is_ok()
+}
+
+/// diesel-async [`Instrumentation`](diesel::connection::Instrumentation)
+/// that feeds every executed statement into the per-request
+/// [`REQUEST_DB_TIMINGS`] accumulator for the `Server-Timing` `db` metric.
+///
+/// Installed on a pooled connection at [`Db::checkout`] only when a
+/// [`REQUEST_DB_TIMINGS`] scope is active (see [`request_db_timing_active`]),
+/// i.e. only for requests the `ServerTimingLayer` is measuring — so opted-out
+/// requests never install it and pay no per-query overhead. Because generated
+/// repositories run raw `diesel-async` `.load()`/`.execute()` (they do not go
+/// through [`run_instrumented`]), the connection-level instrumentation is the
+/// only thing that observes those queries. It brackets each statement between
+/// the `StartQuery`/`FinishQuery` events the connection emits and records the
+/// elapsed wall time via [`record_request_db_query`], which is a no-op when no
+/// request has scoped the task-local (background jobs, or the middleware being
+/// disabled) — so it never panics off-request.
+///
+/// Only genuine application statements are timed. The dedicated
+/// connection-establish, prepared-statement-cache, and
+/// `BeginTransaction`/`CommitTransaction`/`RollbackTransaction` events are
+/// ignored outright. Crucially, diesel-async runs the transaction-control SQL
+/// itself (`BEGIN`, `COMMIT`, `ROLLBACK`, and the `SAVEPOINT`/`RELEASE`
+/// variants for nested transactions) through `batch_execute`, which emits a
+/// `StartQuery`/`FinishQuery` pair with that SQL — exactly like a real query.
+/// Left unfiltered, a transaction wrapping a single `SELECT` would report
+/// `desc="3 queries"` (BEGIN + SELECT + COMMIT) and fold begin/commit latency
+/// into `db;dur`. Likewise [`Db::checkout`] issues a `SET statement_timeout`
+/// housekeeping statement on every checkout, which would otherwise add a bogus
+/// `+1 query` to every request before any app SQL runs. So at `StartQuery` we
+/// inspect the statement text and skip timing when it is a housekeeping /
+/// transaction-control command (see
+/// [`RequestQueryTimer::is_uncounted_statement`]). Queries on a single
+/// connection are strictly sequential (`&mut conn`), so a single
+/// `Option<Instant>` slot is sufficient — there is no overlap between a start
+/// and its finish, and skipping a start leaves the slot empty so the matching
+/// finish is a no-op.
+///
+/// The timer is installed at [`Db::checkout`] (before the housekeeping `SET`)
+/// **only when a `REQUEST_DB_TIMINGS` scope is active** — i.e. only for requests
+/// the `ServerTimingLayer` is measuring. This gate matters because
+/// `set_instrumentation` wholesale replaces the connection's instrumentation:
+/// installing unconditionally would clobber any global default an application
+/// registered via `diesel::connection::set_default_instrumentation` (query
+/// logging, tracing, metrics), even when `server_timing` is disabled. Gating on
+/// the scope leaves an opted-out app's instrumentation fully intact. When the
+/// scope *is* active, installing a fresh timer per checkout also clears any
+/// stale timer a pooled connection carried from a prior timed request. A stale
+/// timer left on a connection later reused by an opted-out request is a cheap
+/// no-op: `on_start` probes [`request_db_timing_active`] before doing any work,
+/// so it never formats SQL or allocates off-scope.
+///
+/// Autumn does not currently *compose* with an app-registered
+/// `set_default_instrumentation` — while `server_timing` is enabled its timer
+/// replaces the app's on measured checkouts. This is a documented limitation
+/// (`server_timing` is a dev/off-by-default feature); apps needing both should
+/// keep it disabled in that environment.
+#[cfg(feature = "db")]
+#[derive(Default, Debug)]
+pub(crate) struct RequestQueryTimer {
+    /// Start instant of the currently in-flight statement, if any.
+    started_at: Option<std::time::Instant>,
+}
+
+#[cfg(feature = "db")]
+impl RequestQueryTimer {
+    /// Whether `sql` is a statement that must **not** be counted as an
+    /// application query in the `Server-Timing` `db` metric. Two kinds reach
+    /// the connection instrumentation but are not application work:
+    ///
+    /// * **Transaction control** that diesel-async runs via `batch_execute`
+    ///   (which emits a `StartQuery`/`FinishQuery` pair just like a real
+    ///   query): `BEGIN`, `COMMIT`, `ROLLBACK`, the `SAVEPOINT`/`RELEASE`
+    ///   nested-transaction variants, and the two-word `START TRANSACTION` form.
+    /// * **Session/config housekeeping** — any leading-token `SET`. This covers
+    ///   the `SET statement_timeout` that [`Db::checkout`] issues on every
+    ///   checkout before handing the connection to the request, as well as
+    ///   `SET TRANSACTION`. None of these are application queries.
+    ///
+    /// Matches a case-insensitive leading token in
+    /// `{BEGIN, COMMIT, ROLLBACK, SAVEPOINT, RELEASE, SET}`, plus the two-word
+    /// `START TRANSACTION` form. See the type-level docs.
+    fn is_uncounted_statement(sql: &str) -> bool {
+        let mut tokens = sql.split_whitespace();
+        let Some(first) = tokens.next() else {
+            return false;
+        };
+        match first.to_ascii_uppercase().as_str() {
+            "BEGIN" | "COMMIT" | "ROLLBACK" | "SAVEPOINT" | "RELEASE" | "SET" => true,
+            "START" => tokens
+                .next()
+                .is_some_and(|second| second.eq_ignore_ascii_case("TRANSACTION")),
+            _ => false,
+        }
+    }
+
+    /// Record the start of a statement.
+    ///
+    /// Probes [`request_db_timing_active`] first: when no `REQUEST_DB_TIMINGS`
+    /// scope is active (the opted-out / off-request path) the timer does
+    /// nothing and — crucially — never invokes `sql`, so the caller's
+    /// `DebugQuery` `to_string()` allocation is skipped entirely. This is what
+    /// makes it safe to leave a `RequestQueryTimer` installed on a pooled
+    /// connection that a later opted-out request reuses: the stale timer is a
+    /// cheap bool-probe no-op, not a per-query allocator.
+    ///
+    /// When a scope *is* active, the SQL text is materialised and inspected:
+    /// housekeeping / transaction-control statements (see
+    /// [`Self::is_uncounted_statement`], e.g. the checkout `SET
+    /// statement_timeout`) leave the slot empty so they are excluded from the
+    /// accumulator; genuine application statements record their start instant.
+    /// Clearing the slot keeps the matching `FinishQuery` a no-op.
+    ///
+    /// `sql` is a closure so the (allocating) formatting is deferred until we
+    /// know the statement will be counted. Extracted from the event handler so
+    /// the start/finish accounting is unit-testable without constructing a
+    /// (non-exhaustive, unstable-to-build) `InstrumentationEvent`.
+    fn on_start(&mut self, now: std::time::Instant, sql: impl FnOnce() -> String) {
+        if !request_db_timing_active() {
+            self.started_at = None;
+            return;
+        }
+        self.started_at = if Self::is_uncounted_statement(&sql()) {
+            None
+        } else {
+            Some(now)
+        };
+    }
+
+    /// Record the completion of the in-flight statement, accumulating its
+    /// elapsed time into the per-request accumulator. A `FinishQuery` without
+    /// a matching `StartQuery` is ignored.
+    fn on_finish(&mut self, now: std::time::Instant) {
+        if let Some(start) = self.started_at.take() {
+            record_request_db_query(now.saturating_duration_since(start));
+        }
+    }
+}
+
+#[cfg(feature = "db")]
+impl diesel::connection::Instrumentation for RequestQueryTimer {
+    fn on_connection_event(&mut self, event: diesel::connection::InstrumentationEvent<'_>) {
+        use diesel::connection::InstrumentationEvent;
+        match event {
+            InstrumentationEvent::StartQuery { query, .. } => {
+                // `query` is an opaque `&dyn DebugQuery`; its `Display` impl
+                // renders the SQL text, which we inspect to skip housekeeping /
+                // transaction-control statements (see the type-level docs). The
+                // `to_string()` is deferred behind a closure so an installed but
+                // opted-out timer never pays the allocation — see `on_start`.
+                self.on_start(std::time::Instant::now(), || query.to_string());
+            }
+            InstrumentationEvent::FinishQuery { .. } => self.on_finish(std::time::Instant::now()),
+            // Ignore connection-establish, prepared-statement cache, and the
+            // dedicated Begin/Commit/RollbackTransaction events — see the
+            // type-level docs.
+            _ => {}
+        }
+    }
+}
+
 /// Total count of after-commit callback errors since process start.
 ///
 /// Incremented each time a callback registered via [`register_after_commit`]
@@ -529,6 +749,11 @@ where
     let verb = sql.split_whitespace().next().unwrap_or("?");
     let metric_key = format!("{route_key} {verb}");
     metrics.record_db_query(&metric_key, elapsed_ms);
+    // NOTE: deliberately *not* recorded into the per-request Server-Timing
+    // accumulator. The connection-level `RequestQueryTimer` instrumentation
+    // (installed at `Db::checkout`) already brackets every executed statement
+    // — including any query run through this helper — so recording here too
+    // would double-count it in `db;dur` and `desc="N queries"`.
 
     // Log slow queries with scrubbed SQL
     if elapsed >= slow_threshold {
@@ -1697,6 +1922,42 @@ impl Db {
                 .min(PG_TIMEOUT_MAX_MS)
         });
 
+        // Install a fresh per-request query timer, but ONLY when a
+        // `REQUEST_DB_TIMINGS` scope is active — i.e. only for requests the
+        // `ServerTimingLayer` (enabled by `[observability] server_timing`) is
+        // measuring. Installed BEFORE the `SET statement_timeout` housekeeping
+        // statement below.
+        //
+        // `set_instrumentation` WHOLESALE REPLACES the connection's
+        // instrumentation, so it must not run unconditionally: an application
+        // that registered a global default via
+        // `diesel::connection::set_default_instrumentation` (query logging,
+        // tracing, metrics) would have it silently clobbered on the first
+        // checkout and never restored — even when `server_timing` is disabled.
+        // Gating on `request_db_timing_active()` preserves the app's
+        // instrumentation whenever `server_timing` is off (the scope is never
+        // entered, so we never install), and only overwrites it for the
+        // duration the feature is measuring.
+        //
+        // Installing a *fresh* timer on every measured checkout also clears any
+        // stale `RequestQueryTimer` a pooled connection carried from a prior
+        // request (diesel-async's deadpool manager never resets instrumentation
+        // on recycle), so a stale timer can never record the upcoming
+        // housekeeping `SET` (or later app queries) into a *different* request's
+        // accumulator. Installing BEFORE the `SET` (which
+        // `is_uncounted_statement` classifies as housekeeping) keeps that
+        // statement out of the `Server-Timing` `db` count regardless. Any stale
+        // timer left on a connection later reused by an opted-out request is a
+        // cheap no-op: `on_start` probes `request_db_timing_active()` before
+        // formatting or recording anything, so it never allocates off-scope.
+        #[cfg(feature = "db")]
+        {
+            use diesel_async::AsyncConnection as _;
+            if request_db_timing_active() {
+                conn.set_instrumentation(RequestQueryTimer::default());
+            }
+        }
+
         diesel::sql_query(format!("SET statement_timeout = {timeout_ms}"))
             .execute(&mut conn)
             .await
@@ -1827,6 +2088,15 @@ impl Drop for Db {
             // Record DB query metric
             let metric_key = format!("{route_key} SELECT");
             metrics.record_db_query(&metric_key, elapsed_ms);
+            // NOTE: deliberately *not* recorded into the Server-Timing
+            // per-request accumulator. `elapsed` here is the whole
+            // connection checkout-to-release window (see `start_time` /
+            // the `span` doc above), not a single query's wall time. Every
+            // request that extracts `Db` would otherwise add its entire
+            // connection-hold time as one bogus "query", inflating both
+            // `db;dur` and the `desc="N queries"` count (and double-counting
+            // against real queries recorded by `run_instrumented`). The
+            // accumulator must reflect only genuine instrumented queries.
 
             // Log slow query if it exceeds the threshold
             if elapsed >= self.slow_query_threshold {
@@ -1980,6 +2250,312 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::time::Duration;
+
+    // ── RequestQueryTimer / Server-Timing db accumulator tests ───
+
+    /// The connection instrumentation records one query per completed
+    /// `StartQuery`/`FinishQuery` pair into the request accumulator, summing
+    /// elapsed time. Drives the extracted `on_start`/`on_finish` accounting
+    /// (the `InstrumentationEvent` itself is non-exhaustive and its
+    /// constructors are gated behind an unstable diesel feature, so it cannot
+    /// be built in a test). Deterministic: derives finish instants from the
+    /// start via `Instant + Duration`, no sleeps.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn request_query_timer_accumulates_finished_queries() {
+        let timings = Arc::new(RequestDbTimings::default());
+        REQUEST_DB_TIMINGS
+            .scope(Arc::clone(&timings), async {
+                let mut timer = RequestQueryTimer::default();
+
+                // Query 1: 1200µs.
+                let t0 = std::time::Instant::now();
+                timer.on_start(t0, || "SELECT 1".to_string());
+                timer.on_finish(t0 + Duration::from_micros(1_200));
+
+                // Query 2: 800µs.
+                let t1 = std::time::Instant::now();
+                timer.on_start(t1, || "UPDATE users SET name = $1".to_string());
+                timer.on_finish(t1 + Duration::from_micros(800));
+
+                // A stray FinishQuery with no matching StartQuery is ignored.
+                timer.on_finish(std::time::Instant::now());
+            })
+            .await;
+
+        assert_eq!(
+            timings.query_count.load(Ordering::Relaxed),
+            2,
+            "only completed StartQuery/FinishQuery pairs are counted"
+        );
+        assert_eq!(
+            timings.total_us.load(Ordering::Relaxed),
+            2_000,
+            "elapsed times accumulate (1200µs + 800µs)"
+        );
+    }
+
+    /// Outside a `REQUEST_DB_TIMINGS` scope the timer records nothing and does
+    /// not panic — the off-request / middleware-disabled path.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn request_query_timer_is_noop_off_request() {
+        let mut timer = RequestQueryTimer::default();
+        let t0 = std::time::Instant::now();
+        timer.on_start(t0, || "SELECT 1".to_string());
+        // Must not panic even though no task-local accumulator is scoped.
+        timer.on_finish(t0 + Duration::from_micros(500));
+    }
+
+    /// Approach-(b) guarantee: when no `REQUEST_DB_TIMINGS` scope is active,
+    /// `on_start` must be a cheap no-op — it must not invoke the (allocating)
+    /// SQL-formatting closure, and must leave no in-flight statement. This is
+    /// what makes it safe to leave a `RequestQueryTimer` installed on a pooled
+    /// connection that a later opted-out request reuses.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn request_query_timer_on_start_is_cheap_noop_off_request() {
+        let mut timer = RequestQueryTimer::default();
+        let invoked = std::cell::Cell::new(false);
+        let t0 = std::time::Instant::now();
+        timer.on_start(t0, || {
+            invoked.set(true);
+            "SELECT 1".to_string()
+        });
+        assert!(
+            !invoked.get(),
+            "off-request, on_start must not format the SQL (no allocation)"
+        );
+        // No in-flight statement was recorded, so on_finish is a no-op.
+        timer.on_finish(t0 + Duration::from_micros(500));
+    }
+
+    /// Regression for the stale-timer / housekeeping-`SET` bug: a pooled
+    /// connection reused across requests keeps a `RequestQueryTimer` installed,
+    /// and `Db::checkout` runs a `SET statement_timeout` before handing the
+    /// connection over. That housekeeping `SET` must NOT be counted, or every
+    /// `Server-Timing` request would report a bogus `+1 query` before any app
+    /// SQL. After the `SET`, the first real `SELECT` increments the count to
+    /// exactly 1 and only its latency accumulates.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn request_query_timer_excludes_checkout_statement_timeout_set() {
+        let timings = Arc::new(RequestDbTimings::default());
+        REQUEST_DB_TIMINGS
+            .scope(Arc::clone(&timings), async {
+                // A timer as it would be freshly installed at checkout.
+                let mut timer = RequestQueryTimer::default();
+
+                // Checkout housekeeping `SET` — must not be counted.
+                let t0 = std::time::Instant::now();
+                timer.on_start(t0, || "SET statement_timeout = 5000".to_string());
+                timer.on_finish(t0 + Duration::from_millis(3));
+
+                assert_eq!(
+                    timings.query_count.load(Ordering::Relaxed),
+                    0,
+                    "the checkout SET statement_timeout must not be counted"
+                );
+                assert_eq!(
+                    timings.total_us.load(Ordering::Relaxed),
+                    0,
+                    "the checkout SET contributes no latency to db;dur"
+                );
+
+                // First real application query: 600µs.
+                let t1 = std::time::Instant::now();
+                timer.on_start(t1, || "SELECT * FROM users".to_string());
+                timer.on_finish(t1 + Duration::from_micros(600));
+
+                assert_eq!(
+                    timings.query_count.load(Ordering::Relaxed),
+                    1,
+                    "the real SELECT is the first counted query"
+                );
+                assert_eq!(
+                    timings.total_us.load(Ordering::Relaxed),
+                    600,
+                    "only the SELECT's 600µs accumulates; the SET is excluded"
+                );
+            })
+            .await;
+    }
+
+    /// `request_db_timing_active` — the predicate `RequestQueryTimer::on_start`
+    /// probes to decide whether to record — must report `false` outside a
+    /// `REQUEST_DB_TIMINGS` scope (the production / `server_timing` disabled
+    /// default) and `true` inside one (the `ServerTimingLayer`-scoped request).
+    /// This predicate gates two things: whether `Db::checkout` installs the
+    /// timer at all (skipped off-scope so an app's own instrumentation is not
+    /// clobbered), and whether a stale timer left on a reused connection does
+    /// any work — with the probe `false`, `on_start` is a cheap no-op.
+    ///
+    /// NOTE: the real `Db::checkout` path needs a live Postgres connection,
+    /// which the sandbox cannot provide, so this exercises the predicate
+    /// directly.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn request_db_timing_active_reflects_scope() {
+        assert!(
+            !request_db_timing_active(),
+            "no REQUEST_DB_TIMINGS scope active outside the ServerTimingLayer: \
+             the timer records nothing"
+        );
+
+        let timings = Arc::new(RequestDbTimings::default());
+        REQUEST_DB_TIMINGS
+            .scope(Arc::clone(&timings), async {
+                assert!(
+                    request_db_timing_active(),
+                    "inside a REQUEST_DB_TIMINGS scope the probe is active: \
+                     the timer records queries"
+                );
+            })
+            .await;
+
+        // Scope has ended; the gate reads false again.
+        assert!(
+            !request_db_timing_active(),
+            "the gate is false again once the scope is dropped"
+        );
+    }
+
+    /// A transaction wraps its inner statements in `BEGIN`/`COMMIT`, which
+    /// diesel-async runs through `batch_execute` — emitting a
+    /// `StartQuery`/`FinishQuery` pair with that transaction-control SQL, just
+    /// like a real query. The timer must skip those so a transaction with one
+    /// real `SELECT` reports `desc="1 query"`, not `"3 queries"`, and excludes
+    /// begin/commit latency from `db;dur`.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn request_query_timer_excludes_transaction_control_statements() {
+        let timings = Arc::new(RequestDbTimings::default());
+        REQUEST_DB_TIMINGS
+            .scope(Arc::clone(&timings), async {
+                let mut timer = RequestQueryTimer::default();
+
+                // BEGIN — must not be counted (10_000µs, would dominate if it
+                // leaked into the total).
+                let t0 = std::time::Instant::now();
+                timer.on_start(t0, || "BEGIN".to_string());
+                timer.on_finish(t0 + Duration::from_millis(10));
+
+                // The single real query: 700µs.
+                let t1 = std::time::Instant::now();
+                timer.on_start(t1, || "SELECT * FROM users".to_string());
+                timer.on_finish(t1 + Duration::from_micros(700));
+
+                // COMMIT — must not be counted.
+                let t2 = std::time::Instant::now();
+                timer.on_start(t2, || "COMMIT".to_string());
+                timer.on_finish(t2 + Duration::from_millis(10));
+            })
+            .await;
+
+        assert_eq!(
+            timings.query_count.load(Ordering::Relaxed),
+            1,
+            "only the real SELECT is counted; BEGIN/COMMIT are excluded"
+        );
+        assert_eq!(
+            timings.total_us.load(Ordering::Relaxed),
+            700,
+            "only the SELECT's 700µs accumulates; begin/commit latency is excluded"
+        );
+    }
+
+    /// The checkout install gate: `Db::checkout` calls `set_instrumentation`
+    /// (which WHOLESALE REPLACES the connection's instrumentation — clobbering
+    /// any app-registered `diesel::connection::set_default_instrumentation`)
+    /// ONLY when `request_db_timing_active()` is true. Outside a
+    /// `REQUEST_DB_TIMINGS` scope (the `server_timing`-disabled production
+    /// default) the gate is false, so the guarded install is skipped and a
+    /// pre-existing sentinel instrumentation is left intact. Inside a scope the
+    /// timer is installed.
+    ///
+    /// NOTE: the real `Db::checkout` path needs a live Postgres connection the
+    /// sandbox cannot provide, so this models the connection's single
+    /// instrumentation slot and drives the exact gate expression from
+    /// `Db::checkout`.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn checkout_installs_timer_only_when_scope_active() {
+        // Models the connection's single instrumentation slot. "app" stands for
+        // an application-registered default (`set_default_instrumentation`);
+        // "timer" is autumn's `RequestQueryTimer`. Mirrors the guarded block in
+        // `Db::checkout`: `if request_db_timing_active() { install timer }`.
+        fn run_checkout_gate(slot: &mut &'static str) {
+            if request_db_timing_active() {
+                *slot = "timer";
+            }
+        }
+
+        // Off-scope (server_timing disabled / production default): the gate is
+        // false, so the app's instrumentation must survive untouched.
+        assert!(!request_db_timing_active());
+        let mut slot = "app";
+        run_checkout_gate(&mut slot);
+        assert_eq!(
+            slot, "app",
+            "off-scope checkout must NOT clobber the app's instrumentation"
+        );
+
+        // Inside a scope (server_timing enabled, handler wrapped by the layer):
+        // the gate is true, so autumn installs its RequestQueryTimer.
+        let timings = Arc::new(RequestDbTimings::default());
+        REQUEST_DB_TIMINGS
+            .scope(Arc::clone(&timings), async {
+                let mut slot = "app";
+                run_checkout_gate(&mut slot);
+                assert_eq!(
+                    slot, "timer",
+                    "inside a REQUEST_DB_TIMINGS scope autumn installs its timer"
+                );
+            })
+            .await;
+    }
+
+    /// Unit coverage for the uncounted-statement classifier used by the timer:
+    /// leading-token match is case-insensitive and covers savepoint/release, the
+    /// two-word `START TRANSACTION` form, and any leading `SET` (both
+    /// `SET TRANSACTION` and the checkout `SET statement_timeout` housekeeping),
+    /// while real application queries are counted. `UPDATE ... SET ...` is
+    /// counted because `SET` is not its leading token.
+    #[cfg(feature = "db")]
+    #[test]
+    fn is_uncounted_statement_classifies_statements() {
+        for sql in [
+            "BEGIN",
+            "begin",
+            "  COMMIT",
+            "ROLLBACK",
+            "ROLLBACK TO SAVEPOINT diesel_savepoint_0",
+            "SAVEPOINT diesel_savepoint_1",
+            "RELEASE SAVEPOINT diesel_savepoint_0",
+            "start transaction",
+            "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+            "SET statement_timeout = 5000",
+            "set statement_timeout = 0",
+        ] {
+            assert!(
+                RequestQueryTimer::is_uncounted_statement(sql),
+                "{sql:?} should be treated as an uncounted housekeeping/tx statement"
+            );
+        }
+
+        for sql in [
+            "SELECT 1",
+            "UPDATE users SET name = $1",
+            "INSERT INTO t VALUES (1)",
+            "DELETE FROM t WHERE id = 1",
+            "",
+        ] {
+            assert!(
+                !RequestQueryTimer::is_uncounted_statement(sql),
+                "{sql:?} should be treated as a countable query"
+            );
+        }
+    }
 
     // ── after_commit tests ───────────────────────────────────────
 

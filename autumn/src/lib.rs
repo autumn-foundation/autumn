@@ -73,6 +73,7 @@ pub mod audit;
 pub mod auth;
 pub mod authorization;
 pub mod batches;
+pub mod build_info;
 pub mod cache;
 #[cfg(feature = "ws")]
 pub mod channels;
@@ -87,11 +88,13 @@ pub mod config;
 pub mod credentials;
 #[cfg(feature = "db")]
 pub mod db;
+pub mod download;
 pub mod encryption;
 pub mod error;
 #[cfg(feature = "maud")]
 pub mod error_pages;
 pub mod extract;
+pub mod feed;
 /// View-layer value formatting helpers (currency, delimited numbers,
 /// pluralize, truncate, relative/absolute dates) for Maud templates.
 ///
@@ -216,6 +219,14 @@ pub use repository::RepositoryError;
 #[cfg(feature = "db")]
 pub mod read_your_writes;
 
+/// Offline-first local SQLite store and background sync engine for
+/// occasionally-connected apps (e.g. Tauri mobile).
+///
+/// See the [`sync`] module documentation for the architecture (change
+/// tracking, tombstoning, conflict resolution) and wiring examples.
+#[cfg(feature = "offline-sync")]
+pub mod sync;
+
 /// Automatic record version history for `#[repository]` writes.
 ///
 /// See [`version_history`] module documentation for the full API.
@@ -256,6 +267,7 @@ pub mod htmx;
 /// `ws`, `maud`, and `htmx` features.
 #[cfg(all(feature = "htmx", feature = "maud"))]
 pub mod live;
+pub mod lock;
 pub mod log;
 pub(crate) mod logging;
 /// Project typed JSON endpoints as Model Context Protocol (MCP) tools so AI
@@ -357,6 +369,7 @@ pub use form::ChangesetForm;
 /// Trait implemented for all `validator::Validate` types to produce a [`Changeset`].
 pub use form::IntoChangeset;
 pub mod data;
+pub mod normalize;
 pub mod validation;
 pub mod webhook;
 #[cfg(feature = "http-client")]
@@ -962,6 +975,35 @@ pub use autumn_macros::secured;
 /// }
 /// ```
 pub use autumn_macros::step_up;
+
+/// Apply a per-route rate limit that composes with the global limiter.
+///
+/// # Forms
+///
+/// - `#[throttle(limit = 5, per = "1m")]` — inline limit; keying strategy
+///   matches the global limiter (`[security.rate_limit]`).
+/// - `#[throttle(limit = 5, per = "1m", key = "ip" | "principal" | "token")]`
+///   — inline limit with an explicit key strategy.
+/// - `#[throttle("login")]` — reference a named limiter defined in
+///   `[security.rate_limit.named.login]`.
+///
+/// Requests denied by the per-route bucket receive `429 Too Many Requests`
+/// with a `Retry-After` header and the standard `x-ratelimit-*` headers.
+/// [`RateLimitExempt`](crate::security::RateLimitExempt) still bypasses the
+/// per-route throttle.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use autumn_web::prelude::*;
+///
+/// #[post("/login")]
+/// #[throttle(limit = 5, per = "1m", key = "ip")]
+/// async fn login() -> AutumnResult<&'static str> {
+///     Ok("welcome back")
+/// }
+/// ```
+pub use autumn_macros::throttle;
 
 /// Gate a route handler on a named feature flag. If the flag is disabled for
 /// the current actor the handler responds with `404 Not Found` (default) or

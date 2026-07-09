@@ -141,6 +141,7 @@ pub mod captcha;
 pub(crate) mod config;
 pub(crate) mod csrf;
 pub(crate) mod headers;
+pub(crate) mod path;
 pub mod proxy;
 pub mod rate_limit;
 pub(crate) mod trusted_proxies;
@@ -154,7 +155,7 @@ pub use captcha::{
 };
 pub use config::{
     CspNonceConfig, CsrfConfig, HeadersConfig, KeyStrategy, RateLimitBackend, RateLimitConfig,
-    RateLimitTierConfig, SecurityConfig, TrustedProxiesConfig, UploadConfig,
+    RateLimitNamedConfig, RateLimitTierConfig, SecurityConfig, TrustedProxiesConfig, UploadConfig,
     default_content_security_policy, hmac_sha256_hex,
 };
 #[cfg(feature = "redis")]
@@ -162,5 +163,10 @@ pub use config::{RateLimitBackendFailure, RateLimitRedisConfig};
 pub use csrf::{CsrfFormField, CsrfLayer, CsrfToken, CsrfTokenHeader};
 pub use headers::{CspNonce, SecurityHeadersLayer};
 pub use proxy::TrustedProxy;
-pub use rate_limit::{RateLimitExempt, RateLimitLayer, RateLimitOverride, RateLimitPrincipal};
+#[doc(hidden)]
+pub use rate_limit::{__check_throttle, __throttle_registry_reset};
+pub use rate_limit::{
+    RateLimitEnvelopeCounted, RateLimitExempt, RateLimitLayer, RateLimitOverride,
+    RateLimitPrincipal, ThrottleSpec,
+};
 pub use trusted_proxies::{ProxyResolver, ResolvedClientIdentity, TrustedProxiesLayer};

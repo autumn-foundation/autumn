@@ -49,6 +49,15 @@ db = [
     "diesel/chrono",
     "diesel/serde_json",
 ]
+# Offline-first local store + background sync engine for occasionally-
+# connected apps (e.g. Tauri mobile, issue #1508). Local state lives in an
+# in-process SQLite database (`sync::SyncStore`, change-tracked with
+# tombstones); a `sync::SyncEngine` pushes/pulls changes to a remote Autumn
+# app that mounts `sync::server::router()` over Postgres shadow tables.
+# Builds entirely on dependencies the `db` + `http-client` features already
+# compile (diesel's sqlite backend and the bundled libsqlite3-sys are
+# already in the graph) — zero new dependencies.
+offline-sync = ["db", "http-client"]
 test-support = ["dep:testcontainers", "dep:testcontainers-modules"]
 telemetry-otlp = [
     "dep:opentelemetry",
@@ -156,6 +165,14 @@ http.workspace = true
 indexmap.workspace = true
 inventory.workspace = true
 libsqlite3-sys = { workspace = true, optional = true }
+# Conflict oracle for the #1012 duplicate-route preflight. axum 0.8 routes
+# through matchit, so we delegate path-shape conflict detection to the SAME
+# engine axum uses. This version MUST stay pinned to whatever axum resolves in
+# Cargo.lock (currently axum 0.8.9 → matchit 0.8.4); moving axum without moving
+# this in lockstep risks the oracle silently diverging from axum's real accept/
+# panic behavior. The `matchit_agrees_with_axum_route_conflicts` parity test in
+# `router.rs` is the guard — it fails loudly if the two ever disagree.
+matchit = "=0.8.4"
 maud = { workspace = true, optional = true }
 moka = { workspace = true, optional = true }
 pin-project-lite = "0.2"
@@ -164,7 +181,7 @@ serde_json = "1"
 thiserror.workspace = true
 tokio.workspace = true
 tokio-stream = { workspace = true, optional = true }
-tokio-util.workspace = true
+tokio-util = { workspace = true, features = ["io"] }
 toml.workspace = true
 tower.workspace = true
 tower-http.workspace = true
@@ -195,6 +212,7 @@ percent-encoding = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
 webauthn-rs = { version = "0.5", features = ["danger-allow-state-serialisation"], optional = true }
 jsonwebtoken = { version = "10.1.0", default-features = false, features = ["rust_crypto"] }
+secrecy = { version = "0.10.3", features = ["serde"] }
 lru = "0.18.0"
 hmac = "0.12"
 sha2 = "0.10"
@@ -249,7 +267,7 @@ features = [
   "maud", "htmx", "tailwind", "db", "cache-moka",
   "ws", "flash", "multipart", "http-client", "oauth2", "openapi", "mcp",
   "redis", "i18n", "storage", "variants", "mail", "seed", "system-info", "markdown",
-  "reporting", "csv", "embed-assets",
+  "reporting", "csv", "embed-assets", "offline-sync",
 ]
 rustdoc-args = ["--cfg", "docsrs"]
 
@@ -268,6 +286,12 @@ harness = false
 [[test]]
 name = "integration_tests"
 path = "tests/integration_tests.rs"
+
+# Isolated: installs the process-global tracing subscriber (issue #1044), a
+# process-wide side-effect that cannot share the consolidated binary.
+[[test]]
+name = "actuator_live_logger_reload"
+path = "tests/actuator_live_logger_reload.rs"
 
 [[test]]
 name = "db_hooks_lifecycle"

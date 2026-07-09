@@ -128,6 +128,8 @@ pub fn app() -> AppBuilder {
         #[cfg(feature = "mail")]
         suppression_store: None,
         #[cfg(feature = "mail")]
+        mail_suppression_store: None,
+        #[cfg(feature = "mail")]
         mount_unsubscribe_endpoint: false,
         #[cfg(feature = "mail")]
         mail_previews: Vec::new(),
@@ -383,6 +385,8 @@ pub struct AppBuilder {
     mail_delivery_queue_factory: Option<MailDeliveryQueueFactory>,
     #[cfg(feature = "mail")]
     pub(crate) suppression_store: Option<crate::mail::SuppressionStoreHandle>,
+    #[cfg(feature = "mail")]
+    pub(crate) mail_suppression_store: Option<crate::mail::suppression::SuppressionStoreHandle>,
     #[cfg(feature = "mail")]
     pub(crate) mount_unsubscribe_endpoint: bool,
     /// Mail template previews registered for the dev preview UI.
@@ -2092,6 +2096,27 @@ impl AppBuilder {
         self
     }
 
+    /// Register a bounce/complaint
+    /// [`SuppressionStore`](crate::mail::suppression::SuppressionStore) so
+    /// [`Mailer::send`](crate::mail::Mailer::send) skips addresses that have
+    /// hard-bounced or complained (issue #1247).
+    ///
+    /// Zero-config apps need not call this: the framework wires an in-memory
+    /// default store automatically. Use this to plug the durable
+    /// [`PgSuppressionStore`](crate::mail::suppression::PgSuppressionStore) (or
+    /// a custom backend) for multi-instance deploys that must share suppression
+    /// across replicas. Mirrors [`Self::with_suppression_store`].
+    #[cfg(feature = "mail")]
+    #[must_use]
+    pub fn with_mail_suppression_store(
+        mut self,
+        store: impl crate::mail::suppression::SuppressionStore + 'static,
+    ) -> Self {
+        self.mail_suppression_store =
+            Some(crate::mail::suppression::SuppressionStoreHandle::new(store));
+        self
+    }
+
     /// Mount the framework's default RFC 8058 one-click unsubscribe endpoint at
     /// `/_autumn/unsubscribe` (`GET` confirmation page + `POST` one-click).
     ///
@@ -2595,6 +2620,8 @@ impl AppBuilder {
             #[cfg(feature = "mail")]
             suppression_store,
             #[cfg(feature = "mail")]
+            mail_suppression_store,
+            #[cfg(feature = "mail")]
             mount_unsubscribe_endpoint,
             #[cfg(feature = "mail")]
             mail_previews,
@@ -2807,6 +2834,12 @@ impl AppBuilder {
         if let Some(buf) = telemetry_guard.log_buffer.clone() {
             state.insert_extension(buf);
         }
+        // Wire the live-subscriber reload handle into the loggers actuator so
+        // `PUT /actuator/loggers/{name}` affects the running subscriber, not
+        // just an in-memory map (issue #1044).
+        if let Some(handle) = telemetry_guard.filter_reload.clone() {
+            state.log_levels().attach_reload_handle(handle);
+        }
 
         // Instantiate MaintenanceState, load flag synchronously at startup, insert as extension, and start background poller task
         let maintenance_state = crate::maintenance::MaintenanceState::new();
@@ -2957,6 +2990,10 @@ impl AppBuilder {
         validate_repository_policies_registered(&all_routes, &scoped_groups, &state, &config);
         #[cfg(feature = "mail")]
         if let Some(handle) = suppression_store {
+            state.insert_extension(handle);
+        }
+        #[cfg(feature = "mail")]
+        if let Some(handle) = mail_suppression_store {
             state.insert_extension(handle);
         }
         #[cfg(feature = "mail")]
@@ -3664,6 +3701,8 @@ impl AppBuilder {
             #[cfg(feature = "mail")]
             suppression_store,
             #[cfg(feature = "mail")]
+            mail_suppression_store,
+            #[cfg(feature = "mail")]
             mount_unsubscribe_endpoint,
             #[cfg(feature = "mail")]
             mail_previews,
@@ -3831,6 +3870,12 @@ impl AppBuilder {
         if let Some(buf) = telemetry_guard.log_buffer.clone() {
             state.insert_extension(buf);
         }
+        // Wire the live-subscriber reload handle into the loggers actuator so
+        // `PUT /actuator/loggers/{name}` affects the running subscriber, not
+        // just an in-memory map (issue #1044).
+        if let Some(handle) = telemetry_guard.filter_reload.clone() {
+            state.log_levels().attach_reload_handle(handle);
+        }
         state.insert_extension(RegisteredApiVersions(api_versions.clone()));
         #[cfg(feature = "mail")]
         if let Some(interceptor) = mail_interceptor {
@@ -3883,6 +3928,10 @@ impl AppBuilder {
         // routes that extract `Mailer` for immediate `send` calls resolve.
         #[cfg(feature = "mail")]
         if let Some(handle) = suppression_store {
+            state.insert_extension(handle);
+        }
+        #[cfg(feature = "mail")]
+        if let Some(handle) = mail_suppression_store {
             state.insert_extension(handle);
         }
         #[cfg(feature = "mail")]
@@ -4239,6 +4288,8 @@ impl AppBuilder {
             #[cfg(feature = "mail")]
             suppression_store,
             #[cfg(feature = "mail")]
+            mail_suppression_store,
+            #[cfg(feature = "mail")]
                 mount_unsubscribe_endpoint: _,
             #[cfg(feature = "mail")]
             mail_interceptor,
@@ -4341,6 +4392,12 @@ impl AppBuilder {
         if let Some(buf) = telemetry_guard.log_buffer.clone() {
             state.insert_extension(buf);
         }
+        // Wire the live-subscriber reload handle into the loggers actuator so
+        // `PUT /actuator/loggers/{name}` affects the running subscriber, not
+        // just an in-memory map (issue #1044).
+        if let Some(handle) = telemetry_guard.filter_reload.clone() {
+            state.log_levels().attach_reload_handle(handle);
+        }
         #[cfg(feature = "mail")]
         if let Some(interceptor) = mail_interceptor {
             state.insert_extension(interceptor);
@@ -4387,6 +4444,10 @@ impl AppBuilder {
 
         #[cfg(feature = "mail")]
         if let Some(handle) = suppression_store {
+            state.insert_extension(handle);
+        }
+        #[cfg(feature = "mail")]
+        if let Some(handle) = mail_suppression_store {
             state.insert_extension(handle);
         }
         #[cfg(feature = "mail")]
@@ -7294,6 +7355,7 @@ fn build_state(
         auth_session_key: config.auth.session_key.clone(),
         shared_cache: None,
         clock: std::sync::Arc::new(crate::time::SystemClock),
+        app_id: AppState::next_app_id(),
     };
     #[cfg(feature = "db")]
     if state.replica_pool.is_some() {
@@ -7618,6 +7680,7 @@ mod tests {
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
+            app_id: AppState::next_app_id(),
         };
         crate::router::build_router(routes, &config, state)
     }
@@ -8850,6 +8913,7 @@ mod tests {
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
+            app_id: AppState::next_app_id(),
         };
         let router =
             crate::router::build_router(vec![test_get_route("/dummy", "dummy")], &config, state);
@@ -8962,6 +9026,7 @@ mod tests {
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
+            app_id: AppState::next_app_id(),
         };
         let router = crate::router::build_router(post_routes, &config, state);
 
@@ -9314,6 +9379,7 @@ mod tests {
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
+            app_id: AppState::next_app_id(),
         };
         let router = crate::router::build_router_with_static(
             vec![test_get_route("/other", "other_page")],
@@ -9631,6 +9697,7 @@ mod tests {
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
+            app_id: AppState::next_app_id(),
         };
         crate::router::build_router(routes, config, state)
     }
@@ -9784,6 +9851,7 @@ mod tests {
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
+            app_id: AppState::next_app_id(),
         };
         let router = crate::router::build_router_with_static(
             vec![test_get_route("/test", "test")],
@@ -9835,6 +9903,7 @@ mod tests {
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
+            app_id: AppState::next_app_id(),
         };
         let router = crate::router::build_router_with_static(
             vec![test_get_route("/test", "test")],
@@ -10092,6 +10161,7 @@ mod tests {
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
+            app_id: AppState::next_app_id(),
             metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
             health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
         };
@@ -10167,6 +10237,7 @@ mod tests {
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
+            app_id: AppState::next_app_id(),
             metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
             health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
         };
