@@ -256,6 +256,50 @@ async fn cancelled_acquire_does_not_leak_lock() {
         .expect("cleanup release");
 }
 
+/// Cancellation safety on the *release* path (P1, issue #1387): if a
+/// `release()` future is dropped while `pg_advisory_unlock` is still in-flight
+/// — here by wrapping it in a zero-duration `tokio::time::timeout`, which polls
+/// the unlock query once (it returns `Pending` on the first DB round-trip) and
+/// then cancels — the still-checked-out session must be force-closed rather than
+/// recycled into the pool while it could still be holding the advisory lock. We
+/// prove the lock did not leak by re-acquiring it from a fresh connection.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn cancelled_release_does_not_leak_lock() {
+    let (pool, _container) = setup_pool().await;
+
+    let lock = Lock::new(pool.clone(), "test-cancel-release");
+    let guard = lock.lock().await.expect("acquire should succeed");
+
+    // Cancel the release while the unlock query is still awaiting: the first
+    // poll dispatches `pg_advisory_unlock` (Pending on the DB round-trip), then
+    // the already-elapsed zero timeout drops the future. Dropping it runs the
+    // internal release guard's `Drop`, which force-closes the session so the
+    // advisory lock is released instead of riding a recycled connection back
+    // into the pool.
+    let cancelled = tokio::time::timeout(Duration::ZERO, guard.release()).await;
+    assert!(
+        cancelled.is_err(),
+        "the release should have been cancelled by the zero-duration timeout"
+    );
+
+    // The lock must be genuinely free: a fresh handle on a new pooled
+    // connection must be able to acquire it.
+    let reacquired = Lock::new(pool.clone(), "test-cancel-release")
+        .try_lock()
+        .await
+        .expect("post-cancellation try_lock should not error");
+    assert!(
+        reacquired.is_some(),
+        "a cancelled mid-release future must not leak the distributed lock"
+    );
+    reacquired
+        .expect("guard present")
+        .release()
+        .await
+        .expect("cleanup release");
+}
+
 /// A panicking guarded section must not leak the lock: the next contender can
 /// still acquire it.
 #[tokio::test]

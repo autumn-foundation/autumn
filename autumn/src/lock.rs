@@ -590,8 +590,9 @@ mod db_impl {
         /// Explicitly release the lock, issuing `pg_advisory_unlock`.
         ///
         /// On success the healthy connection is **recycled back to the pool**
-        /// for reuse. If the unlock query errors the session is force-closed
-        /// (detached from the pool and dropped) instead, so a
+        /// for reuse. If the unlock query errors — or the release future is
+        /// cancelled while `pg_advisory_unlock` is still awaiting — the session
+        /// is force-closed (detached from the pool and dropped) instead, so a
         /// possibly-still-locked connection never returns to the shared pool.
         ///
         /// # Errors
@@ -599,36 +600,45 @@ mod db_impl {
         /// Returns [`LockError::Database`] if the unlock query failed. The lock
         /// is still released regardless, because the session is force-closed.
         pub async fn release(mut self) -> Result<(), LockError> {
-            let Some(mut conn) = self.conn.take() else {
+            let Some(obj) = self.conn.take() else {
                 return Ok(());
             };
+            // Own the connection in an *armed* `AcquireConn` for the duration of
+            // the unlock `await`. If this future is cancelled mid-`await` (e.g. a
+            // timeout or shutdown wrapping `release`, including a
+            // `with`/`try_with` auto-release), the guard's drop force-closes the
+            // session — so a lock whose `pg_advisory_unlock` had not yet
+            // completed is released by closing the connection rather than riding
+            // a recycled, possibly-still-locked connection back into the shared
+            // pool. Mirrors the acquire-side cancellation safety. `self.conn` is
+            // now `None`, so `LockGuard`'s own `Drop` is a no-op.
+            let mut rc = AcquireConn::new(obj);
             let result = diesel::sql_query("SELECT pg_advisory_unlock($1) AS released")
                 .bind::<diesel::sql_types::BigInt, _>(self.key)
-                .get_result::<ReleasedRow>(&mut *conn)
+                .get_result::<ReleasedRow>(rc.as_mut())
                 .await;
             match result {
-                Ok(row) if row.released => {
-                    // Clean release: recycle the healthy pooled connection.
-                    drop(conn);
-                    Ok(())
-                }
-                Ok(_) => {
-                    // Unlock returned false: the lock was not held, so the
-                    // session is clean — recycle it back to the pool.
-                    drop(conn);
-                    tracing::warn!(
-                        lock_name = %self.name,
-                        lock_key = self.key,
-                        "distributed lock unlock returned false (lock was not held)"
-                    );
+                Ok(row) => {
+                    if !row.released {
+                        // Unlock returned false: the lock was not held, so the
+                        // session is still clean.
+                        tracing::warn!(
+                            lock_name = %self.name,
+                            lock_key = self.key,
+                            "distributed lock unlock returned false (lock was not held)"
+                        );
+                    }
+                    // Definitive unlock result: recycle the healthy pooled
+                    // connection back to the pool (no churn).
+                    rc.recycle();
                     Ok(())
                 }
                 Err(e) => {
                     // Unlock errored: we cannot prove the session no longer
-                    // holds the lock, so force-close it (detach from the pool
-                    // and drop the raw connection) rather than recycle a
-                    // possibly-lock-bearing connection.
-                    let _ = Object::take(conn);
+                    // holds the lock. Dropping the still-armed `rc` here
+                    // force-closes the session (detach + drop the raw
+                    // connection) rather than recycling a possibly-lock-bearing
+                    // connection.
                     Err(LockError::Database(e.to_string()))
                 }
             }
