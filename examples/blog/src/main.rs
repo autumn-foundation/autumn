@@ -60,7 +60,8 @@ async fn main() {
             routes::about::about, // #[static_get] — pre-rendered
             routes::posts::index,
             routes::posts::show,
-            routes::greet::greet, // i18n demo
+            routes::greet::greet,   // i18n demo
+            routes::feed::feed_xml, // Atom feed of published posts
             // Admin routes
             routes::posts::admin_list,
             routes::posts::new_form,
