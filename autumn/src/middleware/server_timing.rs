@@ -42,7 +42,9 @@
 use std::fmt::Write as _;
 use std::future::Future;
 use std::pin::Pin;
+#[cfg(feature = "db")]
 use std::sync::Arc;
+#[cfg(feature = "db")]
 use std::sync::atomic::Ordering;
 use std::task::{Context, Poll};
 use std::time::Instant;
@@ -51,7 +53,76 @@ use axum::http::{HeaderName, HeaderValue, Request, Response};
 use pin_project_lite::pin_project;
 use tower::{Layer, Service};
 
+#[cfg(feature = "db")]
 use crate::db::{REQUEST_DB_TIMINGS, RequestDbTimings};
+
+/// Per-request DB-timing accumulator carried alongside the `Enabled` future.
+///
+/// With the `db` feature it is a shared [`RequestDbTimings`] the query
+/// instrumentation records into via the task-local; without `db` there is
+/// nothing to record, so it collapses to `()`.
+#[cfg(feature = "db")]
+type DbTimings = Arc<RequestDbTimings>;
+#[cfg(not(feature = "db"))]
+type DbTimings = ();
+
+/// The inner future for the enabled path.
+///
+/// With the `db` feature the inner service future is wrapped in the
+/// [`REQUEST_DB_TIMINGS`] task-local scope so DB query instrumentation can
+/// record into the accumulator; without `db` it is the bare service future.
+#[cfg(feature = "db")]
+type ScopedInner<F> = tokio::task::futures::TaskLocalFuture<Arc<RequestDbTimings>, F>;
+#[cfg(not(feature = "db"))]
+type ScopedInner<F> = F;
+
+/// Wrap the inner service future so DB query timings can be accumulated.
+///
+/// With the `db` feature this establishes the [`REQUEST_DB_TIMINGS`]
+/// task-local scope and returns the accumulator to read back after poll;
+/// without `db` it is a no-op passing the future through untouched.
+#[cfg(feature = "db")]
+fn scope_inner<F: Future>(fut: F) -> (DbTimings, ScopedInner<F>) {
+    let timings = Arc::new(RequestDbTimings::default());
+    // Scope the inner future so any DB query instrumentation that runs
+    // during it can record into `timings` via the task-local. We keep a
+    // clone of the Arc outside the scope to read back after poll.
+    let scope = REQUEST_DB_TIMINGS.scope(Arc::clone(&timings), fut);
+    (timings, scope)
+}
+
+#[cfg(not(feature = "db"))]
+const fn scope_inner<F>(fut: F) -> (DbTimings, ScopedInner<F>) {
+    ((), fut)
+}
+
+/// Snapshot the accumulated DB timing for a completed request.
+///
+/// Returns `(db_ms, query_count)`, with `db_ms` present only when at least
+/// one instrumented query ran. Without the `db` feature the query
+/// instrumentation is compiled out, so the snapshot is always `(None, 0)`.
+#[cfg(feature = "db")]
+fn read_db_snapshot(timings: &DbTimings) -> (Option<f64>, usize) {
+    let query_count = timings.query_count.load(Ordering::Relaxed);
+    let db_micros = timings.total_us.load(Ordering::Relaxed);
+    let db_ms = if query_count == 0 {
+        None
+    } else {
+        // Match the `total` formula: microseconds → f64 ms.
+        #[allow(clippy::cast_precision_loss)]
+        Some((db_micros as f64) / 1000.0)
+    };
+    (db_ms, query_count)
+}
+
+// Without the `db` feature there is no query instrumentation, so the snapshot
+// is always empty. The `&DbTimings` (a `&()`) parameter keeps the signature
+// identical to the `db` variant so the call site needs no feature gate.
+#[cfg(not(feature = "db"))]
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn read_db_snapshot(_timings: &DbTimings) -> (Option<f64>, usize) {
+    (None, 0)
+}
 
 /// Header name for the `Server-Timing` response header.
 static SERVER_TIMING: HeaderName = HeaderName::from_static("server-timing");
@@ -114,15 +185,11 @@ where
                 inner: self.inner.call(req),
             };
         }
-        let timings = Arc::new(RequestDbTimings::default());
-        // Scope the inner future so any DB query instrumentation that runs
-        // during it can record into `timings` via the task-local. We keep
-        // a clone of the Arc outside the scope to read back after poll.
-        let scope = REQUEST_DB_TIMINGS.scope(Arc::clone(&timings), self.inner.call(req));
+        let (timings, inner) = scope_inner(self.inner.call(req));
         ServerTimingFuture::Enabled {
             start: Instant::now(),
             timings,
-            inner: scope,
+            inner,
         }
     }
 }
@@ -140,8 +207,8 @@ pin_project! {
         },
         Enabled {
             start: Instant,
-            timings: Arc<RequestDbTimings>,
-            #[pin] inner: tokio::task::futures::TaskLocalFuture<Arc<RequestDbTimings>, F>,
+            timings: DbTimings,
+            #[pin] inner: ScopedInner<F>,
         },
     }
 }
@@ -162,15 +229,7 @@ where
             } => match inner.poll(cx) {
                 Poll::Ready(Ok(mut response)) => {
                     let total_ms = start.elapsed().as_secs_f64() * 1000.0;
-                    let query_count = timings.query_count.load(Ordering::Relaxed);
-                    let db_micros = timings.total_us.load(Ordering::Relaxed);
-                    let db_ms = if query_count == 0 {
-                        None
-                    } else {
-                        // Match the `total` formula: microseconds → f64 ms.
-                        #[allow(clippy::cast_precision_loss)]
-                        Some((db_micros as f64) / 1000.0)
-                    };
+                    let (db_ms, query_count) = read_db_snapshot(timings);
                     let streaming = is_streaming_response(&response);
                     let value = build_header_value(total_ms, db_ms, query_count, streaming);
                     if let Ok(hv) = HeaderValue::from_str(&value) {
@@ -270,6 +329,7 @@ mod tests {
     /// `run_instrumented` calls, snapshot the accumulator, then feed it into
     /// [`build_header_value`] and assert the emitted `db;dur=…;desc="N
     /// queries"` metric. This mirrors what a real DB request produces.
+    #[cfg(feature = "db")]
     #[tokio::test]
     async fn db_accumulator_feeds_header_value() {
         use std::time::Duration;
