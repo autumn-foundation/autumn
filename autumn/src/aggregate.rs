@@ -53,6 +53,10 @@
 //! a group whose values are all `NULL` yields `None`, and an empty result set
 //! is an empty `Vec`.
 //!
+//! The **group (key) column must be `NOT NULL`**: a nullable group key
+//! (`K = Option<T>`) is unsupported and rejected at compile time. Nullable
+//! **value** columns are fine — an all-`NULL` group yields `(key, None)`.
+//!
 //! ## Scoping
 //!
 //! The generated query composes the repository's soft-delete filter, tenant
@@ -198,6 +202,12 @@ impl<'a, K, V> GroupedAggregate<'a, K, V> {
 
     /// Keep only rows whose group column equals `value`, applied **before**
     /// grouping (AC4). Bound as a query parameter.
+    ///
+    /// The predicate is on the **raw** group column, even when [`bucket`](Self::bucket)
+    /// is set. Under a bucket, `filter_eq(bucket_start)` therefore matches only
+    /// rows whose raw timestamp is *exactly* the bucket boundary, not the whole
+    /// bucket — to window a bucketed time series you almost always want
+    /// [`filter_range`](Self::filter_range) over the raw timestamps instead.
     #[must_use]
     pub fn filter_eq(mut self, value: K) -> Self {
         self.opts.eq = Some(value);
@@ -207,6 +217,12 @@ impl<'a, K, V> GroupedAggregate<'a, K, V> {
     /// Keep only rows whose group column falls in the inclusive range
     /// `[low, high]`, applied **before** grouping (AC4). Works for date/time
     /// ranges too. Both bounds are bound as query parameters.
+    ///
+    /// Like [`filter_eq`](Self::filter_eq), the predicate is on the **raw** group
+    /// column even when [`bucket`](Self::bucket) is set. This is what you want
+    /// for a bucketed time series: pass the raw timestamp window (e.g.
+    /// `filter_range(window_start, window_end)`) to bound which rows feed the
+    /// `date_trunc` buckets.
     #[must_use]
     pub fn filter_range(mut self, low: K, high: K) -> Self {
         self.opts.range = Some((low, high));

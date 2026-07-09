@@ -114,6 +114,40 @@ pub trait AggSoftEventRepository {
     fn sum_value_grouped_by_bucket() -> Vec<(String, Option<i64>)>;
 }
 
+// ── Nullable-value model (AC7 all-NULL group → None) ──────────────────────────
+//
+// The group key (`post_id`) stays NOT NULL — nullable group keys are
+// unsupported — but the aggregated `score` column is genuinely NULLABLE, so a
+// group with only NULL scores exercises the null-safe `→ None` path.
+
+diesel::table! {
+    test_agg_nullable_events (id) {
+        id -> Int8,
+        post_id -> Int8,
+        score -> Nullable<Int4>,
+    }
+}
+
+#[autumn_web::model(table = "test_agg_nullable_events")]
+pub struct AggNullableEvent {
+    #[id]
+    pub id: i64,
+    pub post_id: i64,
+    pub score: Option<i32>,
+}
+
+#[autumn_web::repository(AggNullableEvent, table = "test_agg_nullable_events")]
+pub trait AggNullableEventRepository {
+    /// SUM(score) GROUP BY post_id over a NULLABLE column.
+    fn sum_score_grouped_by_post_id() -> Vec<(i64, Option<i64>)>;
+    /// MIN(score) GROUP BY post_id over a NULLABLE column.
+    fn min_score_grouped_by_post_id() -> Vec<(i64, Option<i32>)>;
+    /// MAX(score) GROUP BY post_id over a NULLABLE column.
+    fn max_score_grouped_by_post_id() -> Vec<(i64, Option<i32>)>;
+    /// AVG(score) GROUP BY post_id over a NULLABLE column.
+    fn avg_score_grouped_by_post_id() -> Vec<(i64, Option<f64>)>;
+}
+
 // ── Setup & helpers ───────────────────────────────────────────────────────────
 
 async fn setup_pool() -> (
@@ -157,6 +191,13 @@ async fn setup_pool() -> (
     .execute(&mut conn)
     .await
     .expect("create test_agg_soft_events");
+    diesel::sql_query(
+        "CREATE TABLE IF NOT EXISTS test_agg_nullable_events \
+         (id BIGSERIAL PRIMARY KEY, post_id BIGINT NOT NULL, score INT)",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("create test_agg_nullable_events");
 
     (pool, container)
 }
@@ -192,6 +233,16 @@ fn build_soft_repo(pool: Pool<AsyncPgConnection>) -> PgAggSoftEventRepository {
     }
 }
 
+fn build_nullable_repo(pool: Pool<AsyncPgConnection>) -> PgAggNullableEventRepository {
+    PgAggNullableEventRepository {
+        pool,
+        __autumn_read_route: ReadRoute::Primary,
+        __autumn_statement_timeout_ms: 0,
+        __autumn_slow_threshold: std::time::Duration::from_millis(500),
+        __autumn_route: None,
+    }
+}
+
 fn ts(secs: i64) -> chrono::NaiveDateTime {
     chrono::DateTime::from_timestamp(secs, 0)
         .expect("valid timestamp")
@@ -217,6 +268,11 @@ fn grouped_aggregate_methods_are_generated() {
     assert_is_fn(PgAggTenantEventRepository::count_grouped_by_kind);
     // Soft-delete branch (`deleted_at IS NULL` predicate).
     assert_is_fn(PgAggSoftEventRepository::sum_value_grouped_by_bucket);
+    // Nullable-value branch (all-NULL group → None).
+    assert_is_fn(PgAggNullableEventRepository::sum_score_grouped_by_post_id);
+    assert_is_fn(PgAggNullableEventRepository::min_score_grouped_by_post_id);
+    assert_is_fn(PgAggNullableEventRepository::max_score_grouped_by_post_id);
+    assert_is_fn(PgAggNullableEventRepository::avg_score_grouped_by_post_id);
 }
 
 // ── Tests (require Docker) ────────────────────────────────────────────────────
@@ -386,8 +442,9 @@ async fn grouped_aggregate_routes_through_read_role() {
     assert_eq!(got, vec![(1, 1)]);
 }
 
-/// AC7: an empty table yields an empty `Vec`, and a `sum`/`min`/`max` over a
-/// NULL column is null-safe (`None`).
+/// AC7 (empty half): an empty table yields an empty `Vec`. The null-safe
+/// `→ None` half is covered by `grouped_all_null_group_yields_none` below (which
+/// needs a genuinely NULLABLE value column).
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn grouped_empty_and_null_safe() {
@@ -404,6 +461,59 @@ async fn grouped_empty_and_null_safe() {
 
     let empty_count = repo.count_grouped_by_post_id().load().await.expect("empty");
     assert!(empty_count.is_empty());
+}
+
+/// AC7 (null-safe half): a group whose numeric column is entirely NULL yields
+/// `(key, None)` for `sum`/`min`/`max`/`avg` — never `(key, Some(0))`. Uses a
+/// genuinely NULLABLE `score` column (the other fixtures are all NOT NULL), so
+/// the group key is present but every aggregated value is NULL.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn grouped_all_null_group_yields_none() {
+    let (pool, _container) = setup_pool().await;
+    let repo = build_nullable_repo(pool);
+
+    // One group (post_id = 1) with two rows, both with a NULL score.
+    repo.save_many(&[
+        NewAggNullableEvent {
+            post_id: 1,
+            score: None,
+        },
+        NewAggNullableEvent {
+            post_id: 1,
+            score: None,
+        },
+    ])
+    .await
+    .expect("seed all-NULL group");
+
+    let sum = repo
+        .sum_score_grouped_by_post_id()
+        .load()
+        .await
+        .expect("sum");
+    assert_eq!(sum, vec![(1, None)], "SUM over an all-NULL group is None");
+
+    let min = repo
+        .min_score_grouped_by_post_id()
+        .load()
+        .await
+        .expect("min");
+    assert_eq!(min, vec![(1, None)], "MIN over an all-NULL group is None");
+
+    let max = repo
+        .max_score_grouped_by_post_id()
+        .load()
+        .await
+        .expect("max");
+    assert_eq!(max, vec![(1, None)], "MAX over an all-NULL group is None");
+
+    let avg = repo
+        .avg_score_grouped_by_post_id()
+        .load()
+        .await
+        .expect("avg");
+    assert_eq!(avg, vec![(1, None)], "AVG over an all-NULL group is None");
 }
 
 /// Tenant scoping: the aggregate only sees the routed tenant's rows, matching

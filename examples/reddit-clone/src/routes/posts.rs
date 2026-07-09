@@ -20,7 +20,7 @@ use crate::jobs::{PostPublicationArgs, PostPublicationJob};
 use crate::models::{
     Comment, CommentAssociations, NewTag, Post, PostAssociations, PostTagsMutations, Subreddit, Tag,
 };
-use crate::repositories::{PgPostRepository, PostRepository};
+use crate::repositories::{PgPostRepository, PgVoteRepository, PostRepository};
 use crate::schema::{posts, subreddits, tags};
 use crate::slugify::slugify;
 
@@ -37,11 +37,13 @@ use super::layout::{layout, time_ago, vote_controls};
 // ── Front page — hot posts across all subreddits ───────────────
 
 #[get("/")]
+#[allow(clippy::too_many_arguments)]
 pub async fn front_page(
     session: Session,
     csrf: CsrfToken,
     mut db: Db,
     repo: PgPostRepository,
+    votes_repo: PgVoteRepository,
     flags: Flags,
     exps: Experiments,
     flash: Flash,
@@ -63,6 +65,31 @@ pub async fn front_page(
         .select(Post::as_select())
         .load(&mut *db)
         .await?;
+
+    // "Top posts by votes" leaderboard (#1364, AC3): a single typed
+    // grouped-aggregate call — `SUM(value) GROUP BY post_id`, ordered by the
+    // aggregate descending, top 5 — replacing what would otherwise be a
+    // hand-written `SUM ... GROUP BY ... ORDER BY ... LIMIT` string. This is a
+    // *read*, so it is replica-eligible (routes through the repository's read
+    // route). The score-maintenance path in `routes::votes` stays an atomic
+    // primary-side WRITE — see the note there.
+    let top_by_votes: Vec<(i64, Option<i64>)> = votes_repo
+        .sum_value_grouped_by_post_id()
+        .order_by_aggregate_desc()
+        .limit(5)
+        .load()
+        .await?;
+    // Resolve the leaderboard entries' titles in one query (order preserved via
+    // the `top_by_votes` iteration below).
+    let top_ids: Vec<i64> = top_by_votes.iter().map(|(id, _)| *id).collect();
+    let top_titles: HashMap<i64, String> = posts::table
+        .filter(posts::id.eq_any(&top_ids))
+        .select((posts::id, posts::title))
+        .load::<(i64, String)>(&mut *db)
+        .await?
+        .into_iter()
+        .collect();
+
     // Release the base-query connection before `preload` checks one out, so the
     // two never contend on a single-connection pool. The base rows were read
     // from the primary via `Db`, so pin the preload to the primary too
@@ -100,6 +127,31 @@ pub async fn front_page(
                 }
                 a href="/?sort=new" class="text-gray-500 hover:text-orange-600 px-3 py-1.5" {
                     "New"
+                }
+            }
+
+            // Top posts by votes — rendered from the typed grouped-aggregate
+            // leaderboard read (#1364, AC3). Empty until posts have votes.
+            @if !top_by_votes.is_empty() {
+                div class="mb-4 px-4 py-3 bg-white rounded-lg shadow-sm border border-gray-200" {
+                    div class="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2" {
+                        "Top posts by votes"
+                    }
+                    ol class="space-y-1 text-sm" {
+                        @for (post_id, sum) in &top_by_votes {
+                            @if let Some(title) = top_titles.get(post_id) {
+                                li class="flex items-center gap-2" {
+                                    span class="font-semibold text-gray-500 w-8 text-right shrink-0" {
+                                        (sum.unwrap_or(0))
+                                    }
+                                    a href=(format!("/posts/{}", post_id))
+                                       class="text-gray-900 hover:text-orange-600 line-clamp-1" {
+                                        (title)
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
 

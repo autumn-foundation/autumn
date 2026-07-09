@@ -316,14 +316,21 @@ The trait method **must** declare its pair return type; the macro reads `K` and
 timestamp's type). `sum`/`min`/`max`/`avg` are **null-safe**: a group whose
 values are all `NULL` yields `None`, and an empty result set is an empty `Vec`.
 
+The **group (key) column must be `NOT NULL`**. A nullable group key
+(`K = Option<T>`) is unsupported and rejected at compile time. Nullable **value**
+columns are fine — an all-`NULL` group simply yields `(key, None)`.
+
 ### Builder chain
 
 - `.order_by_aggregate_desc()` / `.order_by_aggregate_asc()` — order by the
   aggregated value; combine with `.limit(n)` for a top-N roll-up.
 - `.limit(n)` — cap the number of groups returned.
 - `.filter_eq(v)` / `.filter_range(lo, hi)` — scope rows **before** grouping;
-  both filter the *group column* and are bound as query parameters (never
+  both filter the *raw group column* and are bound as query parameters (never
   interpolated). `filter_range` is inclusive and works for date/time windows.
+  Note they filter the **raw** column even under `.bucket(..)`, so to window a
+  bucketed time series pass the raw-timestamp range to `.filter_range(lo, hi)` —
+  `.filter_eq(bucket_start)` would match only rows on the exact bucket boundary.
 - `.bucket(DateBucket::{Day, Week, Month})` — group by
   `date_trunc('<unit>', <col>)`, producing a time series keyed by bucket start.
 

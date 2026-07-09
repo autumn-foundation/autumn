@@ -59,9 +59,12 @@ pub trait PostRepository {
 
 // Typed grouped aggregate (#1364): `sum_value_grouped_by_post_id` rolls the
 // votes table up to `SUM(value) GROUP BY post_id`, returning one
-// `(post_id, Option<sum>)` pair per post. `cast_vote` scopes it to a single
-// post with `.filter_eq(post_id)` to recompute that post's score without a
-// hand-written `SUM` subquery -- the read is replica-routed automatically.
+// `(post_id, Option<sum>)` pair per post. The front-page "Top posts by votes"
+// leaderboard (`routes::posts::front_page`) chains
+// `.order_by_aggregate_desc().limit(5)` for a top-N roll-up in a single call —
+// a *read*, so it is replica-eligible via the repository's read route. Note the
+// score-maintenance path in `routes::votes` is deliberately NOT this API: score
+// upkeep is an atomic primary-side `UPDATE`, not a read-then-write.
 #[autumn_web::repository(Vote, table = "votes")]
 pub trait VoteRepository {
     /// SUM(value) GROUP BY post_id -> `Vec<(post_id, Option<sum>)>`.

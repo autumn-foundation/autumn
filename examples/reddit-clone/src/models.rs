@@ -119,7 +119,8 @@ pub struct Comment {
 
 // `Vote` is an `#[autumn_web::model]` so `VoteRepository` (see
 // `crate::repositories`) can expose the typed grouped-aggregate roll-up
-// `sum_value_grouped_by_post_id` (#1364) used to recompute a post's score.
+// `sum_value_grouped_by_post_id` (#1364), which the front-page "Top posts by
+// votes" leaderboard uses as a replica-eligible top-N read.
 // A vote references *either* a post or a comment, so both FKs are nullable.
 #[autumn_web::model(table = "votes")]
 pub struct Vote {

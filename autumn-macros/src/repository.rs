@@ -514,6 +514,26 @@ fn option_inner_type(ty: &syn::Type) -> Option<&syn::Type> {
     }
 }
 
+/// True if `ty` is exactly the bare path identifier `ident` (e.g. `i64`), with
+/// no generic arguments — used to enforce the exact width a `count`/`avg`
+/// aggregate deserializes into (#1364 review).
+fn type_is_bare_ident(ty: &syn::Type, ident: &str) -> bool {
+    let syn::Type::Path(p) = ty else { return false };
+    if p.qself.is_some() {
+        return false;
+    }
+    p.path
+        .segments
+        .last()
+        .is_some_and(|s| s.ident == ident && s.arguments.is_empty())
+}
+
+/// True if `ty` is exactly `Option<inner>` where `inner` is the bare ident
+/// `inner_ident` (e.g. `Option<f64>`).
+fn type_is_option_of(ty: &syn::Type, inner_ident: &str) -> bool {
+    option_inner_type(ty).is_some_and(|inner| type_is_bare_ident(inner, inner_ident))
+}
+
 /// Map a supported Rust type to its diesel `sql_types` path token, threading
 /// `Option<T>` to `Nullable<…>`. Returns `None` for unsupported types.
 fn diesel_sql_type_for(ty: &syn::Type) -> Option<TokenStream> {
@@ -1070,6 +1090,47 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             )),
                             _ => None,
                         };
+
+                        // Nullable group keys are unsupported (#1364 review): a
+                        // `K = Option<T>` makes `key_sql_type` `Nullable<T>`, and
+                        // then filter binds wrap it again into
+                        // `Nullable<Nullable<T>>`, producing an opaque diesel
+                        // type error. The group column must be NOT NULL.
+                        if error.is_none() && option_inner_type(&k).is_some() {
+                            error = Some(format!(
+                                "`{method_name}`: nullable group keys are unsupported — \
+                                 the group column must be NOT NULL, so declare `K` as `T`, \
+                                 not `Option<T>`"
+                            ));
+                        }
+
+                        // The declared value type must EXACTLY match the type the
+                        // aggregate casts to (#1364 review). `count` always
+                        // produces `bigint` (i64) and `avg` always produces
+                        // `double precision` (f64); QueryableByName does not check
+                        // column OIDs, so a mismatched width silently reinterprets
+                        // the raw bytes as garbage (e.g. float bytes read as i64).
+                        if error.is_none() {
+                            match kind {
+                                AggKind::Count if !type_is_bare_ident(&v, "i64") => {
+                                    error = Some(format!(
+                                        "`{method_name}`: count must declare its value type as \
+                                         `i64` (it produces `COUNT(*)` → bigint); a different \
+                                         width silently misreads the result, e.g. \
+                                         `fn {method_name}() -> Vec<(K, i64)>;`"
+                                    ));
+                                }
+                                AggKind::Avg if !type_is_option_of(&v, "f64") => {
+                                    error = Some(format!(
+                                        "`{method_name}`: avg must declare its value type as \
+                                         `Option<f64>` (it always casts to double precision); a \
+                                         different width silently reinterprets the float bytes as \
+                                         garbage, e.g. `fn {method_name}() -> Vec<(K, Option<f64>)>;`"
+                                    ));
+                                }
+                                _ => {}
+                            }
+                        }
 
                         // Build the aggregate SQL, casting so the result
                         // deserializes back into the declared value type
@@ -12031,6 +12092,79 @@ mod tests {
         assert!(
             generated.contains("must declare its result type"),
             "compile_error must explain the missing `-> Vec<(K, V)>`: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_grouped_avg_wrong_value_type_is_error() {
+        // §1364 review: `avg` always casts to double precision, so declaring a
+        // non-`Option<f64>` value type must be a compile error (QueryableByName
+        // would otherwise silently reinterpret the float bytes).
+        let generated = repository_macro(
+            quote! { Event, table = "events" },
+            quote! {
+                pub trait EventRepository {
+                    fn avg_score_grouped_by_post_id() -> Vec<(i64, Option<i64>)>;
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "avg with a non-Option<f64> value must emit a compile_error: {generated}"
+        );
+        assert!(
+            generated.contains("avg must declare its value type as"),
+            "compile_error must name the avg value-type rule: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_grouped_count_wrong_value_type_is_error() {
+        // §1364 review: `count` always produces bigint (i64); a mis-declared
+        // width is a compile error rather than a runtime width mismatch.
+        let generated = repository_macro(
+            quote! { Event, table = "events" },
+            quote! {
+                pub trait EventRepository {
+                    fn count_grouped_by_kind() -> Vec<(String, i32)>;
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "count with a non-i64 value must emit a compile_error: {generated}"
+        );
+        assert!(
+            generated.contains("count must declare its value type as"),
+            "compile_error must name the count value-type rule: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_grouped_nullable_key_is_error() {
+        // §1364 review: a nullable group key (`K = Option<T>`) is unsupported —
+        // it would nest into `Nullable<Nullable<T>>` on filter binds.
+        let generated = repository_macro(
+            quote! { Event, table = "events" },
+            quote! {
+                pub trait EventRepository {
+                    fn count_grouped_by_post_id() -> Vec<(Option<i64>, i64)>;
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "nullable group key must emit a compile_error: {generated}"
+        );
+        assert!(
+            generated.contains("nullable group keys are unsupported"),
+            "compile_error must explain nullable group keys are unsupported: {generated}"
         );
     }
 

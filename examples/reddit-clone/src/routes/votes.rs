@@ -10,7 +10,6 @@ use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 
 use crate::models::Post;
-use crate::repositories::PgVoteRepository;
 use crate::schema::{posts, votes};
 
 use super::layout::vote_controls;
@@ -21,10 +20,9 @@ pub async fn upvote(
     Path(post_id): Path<i64>,
     session: Session,
     mut db: Db,
-    votes_repo: PgVoteRepository,
     State(state): State<AppState>,
 ) -> AutumnResult<Markup> {
-    cast_vote(post_id, 1, &session, &mut db, &votes_repo, &state).await
+    cast_vote(post_id, 1, &session, &mut db, &state).await
 }
 
 /// Downvote a post (-1). Returns updated vote controls HTML via htmx.
@@ -33,10 +31,9 @@ pub async fn downvote(
     Path(post_id): Path<i64>,
     session: Session,
     mut db: Db,
-    votes_repo: PgVoteRepository,
     State(state): State<AppState>,
 ) -> AutumnResult<Markup> {
-    cast_vote(post_id, -1, &session, &mut db, &votes_repo, &state).await
+    cast_vote(post_id, -1, &session, &mut db, &state).await
 }
 
 /// Cast a vote on a post. Handles insert-or-update and score recalculation.
@@ -45,7 +42,6 @@ async fn cast_vote(
     value: i16,
     session: &Session,
     db: &mut Db,
-    votes_repo: &PgVoteRepository,
     state: &AppState,
 ) -> AutumnResult<Markup> {
     let user_id: i64 = session
@@ -110,27 +106,22 @@ async fn cast_vote(
         }
     }
 
-    // Recompute the post's score from the typed grouped-aggregate roll-up
-    // (#1364) instead of a hand-written `SUM` subquery. Grouping votes by
-    // post_id and scoping to this post yields a single `(post_id, Option<sum>)`
-    // row; an absent row (no votes left) means a score of 0. The read is
-    // replica-routed automatically.
-    let new_score = votes_repo
-        .sum_value_grouped_by_post_id()
-        .filter_eq(post_id)
-        .load()
-        .await?
-        .into_iter()
-        .next()
-        .and_then(|(_, sum)| sum)
-        .unwrap_or(0);
-    diesel::update(posts::table.find(post_id))
-        .set(posts::score.eq(new_score))
-        .execute(&mut **db)
-        .await?;
+    // Recompute the score atomically in a single statement on the request's
+    // primary `db` connection — no read-then-write race. Score maintenance is a
+    // WRITE: it must see this transaction's just-written vote and stay atomic
+    // with it, so it must NOT be a replica-eligible read. (For a replica-routed
+    // *read* of vote tallies via the typed grouped-aggregate API (#1364), see
+    // the "Top posts by votes" leaderboard on the front page — routes::posts.)
+    diesel::sql_query(
+        "UPDATE posts SET score = COALESCE((SELECT SUM(value::bigint) FROM votes WHERE post_id = $1), 0) WHERE id = $1"
+    )
+    .bind::<diesel::sql_types::BigInt, _>(post_id)
+    .execute(&mut **db)
+    .await?;
 
-    // Load the updated post to broadcast it (its score now equals `new_score`).
+    // Load the updated post to broadcast it.
     let post: Post = posts::table.find(post_id).first(&mut **db).await?;
+    let new_score = post.score;
 
     // Load the subreddit to get its slug
     let sub: crate::models::Subreddit = crate::schema::subreddits::table

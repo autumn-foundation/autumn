@@ -17,8 +17,11 @@ use crate::{
 // A typed `#[repository]` over `autumn_experiment_changes` so the per-experiment
 // audit-trail size is computed with the grouped-aggregate API
 // (`count_grouped_by_experiment().filter_eq(name)`) instead of a hand-written
-// `SELECT COUNT(*) … WHERE experiment = $1`. The read is replica-routed by the
-// generated executor — a dashboard win the raw `diesel::sql_query` skipped.
+// `SELECT COUNT(*) … WHERE experiment = $1`. The repo is built here via
+// `with_pool_untracked`, which is pool-aware but pins `ReadRoute::Primary` (it
+// carries no request/`AppState` read-route context) — so this read runs on the
+// primary, NOT a replica. A request-scoped constructor would let the same query
+// route to a replica for free.
 
 diesel::table! {
     autumn_experiment_changes (id) {
