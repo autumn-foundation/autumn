@@ -60,3 +60,106 @@ a user's first `autumn generate scaffold`.
 The tests capture and print the full `cargo build` / `cargo check`
 stdout+stderr on failure, so the breakage is diagnosable directly from the
 CI summary.
+
+## Fuzzing
+
+Autumn coverage-guides a set of [cargo-fuzz][cargo-fuzz] (libFuzzer) harnesses
+over the untrusted request-parsing surface — the code paths that turn raw
+bytes off the wire into typed values. The harnesses live in the `fuzz/` crate
+at the workspace root and drive framework code through `#[cfg(fuzzing)]` seams
+so the fuzzers exercise the real parsers, not stubs.
+
+### Targets
+
+There are five targets, one per parsing surface:
+
+| Target | Surface under test |
+|--------|--------------------|
+| `idempotency` | idempotency-key header parsing + replay bookkeeping |
+| `routing` | path/router matching and extraction |
+| `headers` | request header parsing |
+| `session` | session cookie decode/verify |
+| `body` | request body decoding |
+
+Each target has a committed seed corpus at `fuzz/corpus/<target>/`.
+
+### Running locally
+
+Fuzzing needs a nightly toolchain and `cargo-fuzz`:
+
+```sh
+rustup toolchain install nightly
+cargo install cargo-fuzz          # once
+
+# Run a single target (Ctrl-C to stop); it seeds from
+# fuzz/corpus/<target>/ automatically and writes new coverage-increasing
+# inputs back into that directory.
+cargo +nightly fuzz run idempotency
+
+# Bound the run the way CI does (per-PR gate = 30s, nightly long-run = 300s):
+cargo +nightly fuzz run routing -- -max_total_time=30 -timeout=10
+
+# List all targets
+cargo +nightly fuzz list
+```
+
+CI runs these two ways (see `.github/workflows/`):
+
+- **`fuzz.yml`** — per-PR crash gate. Every target runs a 30s burst seeded
+  from the committed corpus on each push/PR to `trunk`/`trunk-dev`. A crash
+  fails the check and uploads the minimized reproducer under
+  `fuzz/artifacts/**`.
+- **`fuzz-nightly.yml`** — a nightly (03:00 UTC) + on-demand 5-minute-per-target
+  long-run whose corpus is persisted across runs (it only grows), so coverage
+  compounds over time.
+
+### Crash triage contract
+
+When a fuzzer finds a crash — locally or in CI (download the `fuzz-artifacts-*`
+reproducer from the failed run) — the fix is not complete until the crash is
+turned into a permanent regression guard:
+
+1. **Reproduce and minimize.** Replay the reproducer and shrink it to the
+   smallest input that still triggers the crash:
+
+   ```sh
+   cargo +nightly fuzz run <target> fuzz/artifacts/<target>/<crash-file>
+   cargo +nightly fuzz tmin <target> fuzz/artifacts/<target>/<crash-file>
+   ```
+
+2. **Fix the parser**, not the harness.
+
+3. **Commit the minimized input into the seed corpus.** Add the minimized
+   reproducer to `fuzz/corpus/<target>/` and re-minimize the whole corpus so
+   the seed set stays lean:
+
+   ```sh
+   cargo +nightly fuzz cmin <target>
+   ```
+
+   The committed seed makes the per-PR gate replay this exact input forever, so
+   the bug can never silently regress.
+
+4. **Extend the [#1611][issue-1611] request-path lint gate for the crash's
+   class.** If the crash represents a class of mistake the lint could catch
+   (e.g. an un-bounded allocation from a length field, an un-validated
+   percent-decode), add or extend the corresponding #1611 lint so the pattern
+   is rejected at the source level, not just caught at runtime. If the class is
+   already covered, note the existing lint in the PR.
+
+### New request-path modules
+
+Any new #1611 request-path module — anything that parses untrusted bytes into
+typed values on the request hot path — must ship with either:
+
+- a **fuzz target** in `fuzz/` covering its parser (add a `fuzz_targets/<name>.rs`
+  binary, a `fuzz/corpus/<name>/` seed dir, and the target name to the matrices
+  in `fuzz.yml` and `fuzz-nightly.yml` and to the table above), **or**
+- a **documented exemption** in the PR explaining why the module is not on the
+  untrusted-input path (e.g. it only ever sees framework-internal, already-typed
+  values).
+
+Reviewers should treat a new request-path parser with neither as incomplete.
+
+[cargo-fuzz]: https://github.com/rust-fuzz/cargo-fuzz
+[issue-1611]: https://github.com/madmax983/autumn/issues/1611
