@@ -74,6 +74,18 @@ fn cloud_native_scaffold_generates_readme_golden_path() {
         "README.md DB-bootstrap must offer a working `docker run … postgres:16` one-liner \
          (not dead-end on `release init`), got:\n{readme}"
     );
+    // Codex P2: a freshly-started `postgres:16` container accepts connections
+    // only after first-time initialization finishes, but `autumn db create`
+    // connects immediately with no retry. The README must document an explicit
+    // readiness wait (e.g. `pg_isready`) AFTER starting the container and BEFORE
+    // `autumn db create`, so the golden path doesn't fail with a connection error.
+    let pg_isready_at = readme.find("pg_isready");
+    let db_create_at = readme.find("autumn db create");
+    assert!(
+        matches!((pg_isready_at, db_create_at), (Some(r), Some(c)) if r < c),
+        "README.md must wait for Postgres readiness (e.g. `pg_isready`) before \
+         `autumn db create`, got:\n{readme}"
+    );
     // AC #3's pointer to `release init --target docker-compose` is still present
     // (reframed as a deployment-asset generator, not the local DB path).
     assert!(

@@ -24,7 +24,13 @@ Run these steps top-to-bottom on a clean checkout to get a route serving.
   ```sh
   docker run -d --rm --name {{crate_name}}-pg -e POSTGRES_PASSWORD=postgres \
     -e POSTGRES_DB={{crate_name}} -p 5432:5432 postgres:16
+
+  # Wait until Postgres is ready to accept connections before creating the DB
+  until docker exec {{crate_name}}-pg pg_isready -U postgres >/dev/null 2>&1; do sleep 1; done
   ```
+  First-time Postgres initialization takes a few seconds after the container
+  launches, and `autumn db create` connects immediately without retrying, so let
+  the readiness loop finish before continuing.
   To generate a full deployment/compose stack instead, see
   `autumn release init --target docker-compose` in the CLI reference below.
 - **The PostgreSQL client library (`libpq`).** The default scaffold keeps the
@@ -60,7 +66,15 @@ with `docker stop {{crate_name}}-pg`:
 ```sh
 docker run -d --rm --name {{crate_name}}-pg -e POSTGRES_PASSWORD=postgres \
   -e POSTGRES_DB={{crate_name}} -p 5432:5432 postgres:16
+
+# Wait until Postgres is ready to accept connections
+until docker exec {{crate_name}}-pg pg_isready -U postgres >/dev/null 2>&1; do sleep 1; done
 ```
+
+The container reports "started" the instant it launches, but first-time Postgres
+initialization takes a few seconds before it accepts connections. `autumn db
+create` connects immediately and does not retry, so wait for the readiness loop
+above to finish before running it.
 
 Then create the database on its server (idempotent — safe to re-run; harmless if
 the container above already created it):

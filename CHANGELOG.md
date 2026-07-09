@@ -22,7 +22,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that matches the generated `url` (the earlier `autumn release init --target
   docker-compose` pointer file-errored on a fresh scaffold, which already ships a
   `Dockerfile`/`.dockerignore`, before any compose file was written; that pointer
-  is retained for generating deployment/compose assets). The golden path is also
+  is retained for generating deployment/compose assets). After the `docker run`
+  the README now waits for Postgres to accept connections
+  (`until docker exec …-pg pg_isready …; do sleep 1; done`) before `autumn db
+  create`/`autumn migrate`, since first-time container initialization takes a few
+  seconds and those commands connect immediately without retrying. The golden path is also
   tailored to the generated app shape: `--daemon` scaffolds a database-free
   `autumn serve` app, so its README drops the Postgres/`libpq`/`autumn migrate`
   steps; `--bundled-pg` embeds and manages its own Postgres, so its README runs
