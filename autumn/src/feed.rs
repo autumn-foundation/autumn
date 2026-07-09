@@ -451,3 +451,74 @@ const fn is_xml_char(c: char) -> bool {
             | '\u{10000}'..='\u{10FFFF}'
     )
 }
+
+#[cfg(test)]
+mod proptests {
+    //! Property-based invariants for XML escaping and feed rendering. `escape`
+    //! is private, so it is exercised in-crate here.
+    use super::*;
+    use proptest::prelude::*;
+
+    /// Reverse the five entities `escape` emits. `&amp;` is decoded LAST so a
+    /// payload like `&lt;` is not double-decoded.
+    fn unescape(s: &str) -> String {
+        s.replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&apos;", "'")
+            .replace("&amp;", "&")
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// `escape` never emits a raw `<` or `>`: these are always turned into
+        /// entities, so an escaped value can never open or close a tag. This is
+        /// the core XML-injection-safety invariant.
+        #[test]
+        fn escape_has_no_raw_angle_brackets(s in ".*") {
+            let out = escape(&s);
+            prop_assert!(!out.contains('<'));
+            prop_assert!(!out.contains('>'));
+        }
+
+        /// Escaping is a lossless, reversible transform over the XML-legal
+        /// characters of the input: un-escaping the output recovers exactly the
+        /// input with non-XML characters dropped.
+        #[test]
+        fn escape_round_trips_over_xml_chars(s in ".*") {
+            let filtered: String = s.chars().filter(|&c| is_xml_char(c)).collect();
+            prop_assert_eq!(unescape(&escape(&s)), filtered);
+        }
+
+        /// `Feed::render` (both formats) never panics on arbitrary field values,
+        /// always produces the XML prolog, and never lets an injected `<` from a
+        /// field body appear raw in the output.
+        #[test]
+        fn render_never_panics_and_escapes_fields(
+            title in ".*",
+            body in ".*",
+            rss in any::<bool>(),
+        ) {
+            // Salt the fields with tag-like markers to prove they are escaped.
+            let marked_title = format!("<x>{title}");
+            let marked_body = format!("</feed>{body}");
+            let feed = if rss {
+                Feed::rss(marked_title, "https://example.com/", "https://example.com/feed.xml")
+            } else {
+                Feed::atom(marked_title, "https://example.com/", "https://example.com/feed.xml")
+            }
+            .description("d")
+            .entry(FeedEntry::new("id-1", "entry title", "https://example.com/1").content(marked_body));
+
+            let out = feed.render();
+            prop_assert!(out.starts_with("<?xml version=\"1.0\""));
+            // The injected markers must not survive as raw tags.
+            prop_assert!(!out.contains("<x>"));
+            // Structural `</feed>` appears exactly once (Atom) / zero times
+            // (RSS) — the injected copy in the body must not add another.
+            let expected_close = if rss { 0 } else { 1 };
+            prop_assert_eq!(out.matches("</feed>").count(), expected_close);
+        }
+    }
+}

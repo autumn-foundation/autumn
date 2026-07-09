@@ -109,6 +109,8 @@ mod mcp_streaming;
 mod middleware_introspection;
 mod middleware_pipeline;
 #[cfg(feature = "db")]
+mod migrate_checksum_proptest;
+#[cfg(feature = "db")]
 mod model_field_attrs;
 #[cfg(feature = "offline-sync")]
 mod offline_sync_conformance;
@@ -121,6 +123,7 @@ mod offline_sync_store;
 #[cfg(feature = "openapi")]
 mod openapi;
 mod pagination;
+mod pagination_cursor_proptest;
 mod path_helpers;
 #[cfg(feature = "db")]
 mod pg_tls;
