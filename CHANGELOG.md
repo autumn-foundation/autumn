@@ -26,8 +26,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `.scoped(prefix, …)` prefix resolution now fail app build with a structured
   `RouterBuildError::DuplicateUserRoute` **before any router is mounted**,
   instead of an `axum::routing::MethodRouter::merge` panic at startup. The
-  error names BOTH handlers, the HTTP method, and the resolved path. Distinct
-  methods on the same path (`GET /admin` + `POST /admin`) are unaffected;
+  error names BOTH handlers, the HTTP method, and the resolved path. The key is
+  normalized to the same shape axum's matcher conflicts on, so collisions that
+  differ only by capture NAME (`/users/{id}` vs `/users/{slug}`) or by the
+  synthetic `WS` method a `#[ws]` handler mounts as `GET` (`#[get("/live")]` +
+  `#[ws("/live")]`) are caught too, instead of slipping past to an axum panic.
+  Distinct methods on the same path (`GET /admin` + `POST /admin`) and genuinely
+  different shapes (`/users/{id}` vs `/users/{id}/posts`) are unaffected;
   `#[repository]`-generated API routes are covered because they land in the
   normal `Route` list. Opaque `AppBuilder::merge` and `AppBuilder::nest`
   routers cannot be introspected — a non-empty opaque table emits a

@@ -1377,6 +1377,51 @@ fn check_openapi_path_against(
     Ok(())
 }
 
+/// The HTTP method axum actually mounts a handler under — the effective verb the
+/// duplicate preflight and the request-timeout table must both key on so the two
+/// never drift.
+///
+/// `#[ws]` records the synthetic `WS` method, but the macro builds its handler
+/// with `axum::routing::get` and [`group_and_mount_routes`] merges it as a `GET`
+/// `MethodRouter`. So a `#[ws("/p")]` and a `#[get("/p")]` are the SAME mount as
+/// far as axum is concerned and would panic on merge. Every other method mounts
+/// under itself.
+fn effective_mount_method(method: &http::Method) -> http::Method {
+    if method.as_str() == "WS" {
+        http::Method::GET
+    } else {
+        method.clone()
+    }
+}
+
+/// Canonicalize a route path into the "shape" axum's matcher keys a conflict on,
+/// so the duplicate preflight collides exactly when `Router::route` would panic.
+///
+/// Verified against axum 0.8 (matchit) by building `axum::Router` directly:
+/// * capture NAMES are irrelevant — `/u/{id}` conflicts with `/u/{slug}`;
+/// * a normal capture and a catch-all at the same position ALSO conflict —
+///   `/u/{id}` conflicts with `/u/{*rest}`;
+/// * but a static segment stays distinct from a capture — `/u/{id}` does NOT
+///   conflict with `/u/foo`, and `/u/{id}` does NOT conflict with `/u/{id}/x`.
+///
+/// So every capture segment (normal `{name}` or catch-all `{*name}`) collapses to
+/// a single placeholder, and static segments are left untouched. Only the KEY is
+/// normalized; the error still reports the original template for readability.
+fn normalize_route_shape(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for (i, seg) in path.split('/').enumerate() {
+        if i > 0 {
+            out.push('/');
+        }
+        if seg.len() >= 2 && seg.starts_with('{') && seg.ends_with('}') {
+            out.push_str("{\u{0}}");
+        } else {
+            out.push_str(seg);
+        }
+    }
+    out
+}
+
 /// Fail-fast preflight for issue #1012: reject two user- or plugin-registered
 /// routes that resolve to the same `(method, path)` before
 /// [`group_and_mount_routes`] hands overlapping method routes to
@@ -1416,27 +1461,34 @@ fn reject_duplicate_user_routes(
     let mut claimed: std::collections::HashMap<(String, String), String> =
         std::collections::HashMap::new();
 
-    let mut record = |method: String, path: String, name: &str| -> Result<(), RouterBuildError> {
-        let key = (method.clone(), path.clone());
-        if let Some(existing) = claimed.get(&key) {
-            return Err(RouterBuildError::DuplicateUserRoute {
-                method,
-                path,
-                existing: existing.clone(),
-                incoming: name.to_owned(),
-            });
-        }
-        claimed.insert(key, name.to_owned());
-        Ok(())
-    };
+    // Key on the EFFECTIVE mount method (`WS` → `GET`) and the normalized path
+    // SHAPE (capture names collapsed) so the preflight collides exactly when
+    // axum's `MethodRouter::merge` / `Router::route` would panic. The error
+    // still carries the effective method and the ORIGINAL path template so the
+    // diagnostic stays readable.
+    let mut record =
+        |method: &http::Method, path: String, name: &str| -> Result<(), RouterBuildError> {
+            let effective_method = effective_mount_method(method).to_string();
+            let key = (effective_method.clone(), normalize_route_shape(&path));
+            if let Some(existing) = claimed.get(&key) {
+                return Err(RouterBuildError::DuplicateUserRoute {
+                    method: effective_method,
+                    path,
+                    existing: existing.clone(),
+                    incoming: name.to_owned(),
+                });
+            }
+            claimed.insert(key, name.to_owned());
+            Ok(())
+        };
 
     for route in route_list {
-        record(route.method.to_string(), route.path.to_owned(), route.name)?;
+        record(&route.method, route.path.to_owned(), route.name)?;
     }
     for group in scoped_groups {
         for route in &group.routes {
             record(
-                route.method.to_string(),
+                &route.method,
                 join_nested_path(&group.prefix, route.path),
                 route.name,
             )?;
@@ -2297,17 +2349,15 @@ fn build_route_timeout_table(
         // Each (effective method, path) pair is still unique across the router, so
         // `insert` cannot lose a competing entry.
         let by_method = table.entry(path).or_default();
-        match method.as_str() {
-            "WS" => {
-                by_method.insert(http::Method::GET, timeout);
-            }
-            _ if *method == http::Method::GET => {
-                by_method.insert(http::Method::GET, timeout);
-                by_method.insert(http::Method::HEAD, timeout);
-            }
-            _ => {
-                by_method.insert(method.clone(), timeout);
-            }
+        // Key under the same effective verb the router mounts the handler as, so
+        // a `#[ws]` override lands on the GET the upgrade actually arrives as
+        // (shared with the duplicate-route preflight via `effective_mount_method`
+        // so the two mappings can never drift).
+        by_method.insert(effective_mount_method(method), timeout);
+        // A real `#[get]` is also served for HEAD in axum; a WS upgrade is not,
+        // so only expand HEAD for a genuine GET (not the WS→GET alias).
+        if *method == http::Method::GET {
+            by_method.insert(http::Method::HEAD, timeout);
         }
     };
     for route in route_list {
@@ -6144,6 +6194,123 @@ enabled = true
         ctx.nest_routers.push(("/plugin".to_owned(), nested));
         let _router = super::try_build_router_inner(vec![ok_route], &config, test_state(), ctx)
             .expect("opaque nest routers must not fail the duplicate preflight");
+    }
+
+    /// Finding 1 (issue #1012 review): two handlers that differ ONLY by capture
+    /// name — `/users/{id}` vs `/users/{slug}` — key by literal template so they
+    /// look distinct to a naive preflight, but axum's matcher (verified against
+    /// axum 0.8: matchit reports a "conflict") rejects the second route shape at
+    /// mount. Normalizing capture names into a shared placeholder makes the
+    /// preflight catch the collision as `DuplicateUserRoute` instead.
+    #[tokio::test]
+    async fn try_build_router_rejects_duplicate_capture_name_paths() {
+        let config = AutumnConfig::default();
+        let a = duplicate_test_route(http::Method::GET, "/users/{id}", "by_id");
+        let b = duplicate_test_route(http::Method::GET, "/users/{slug}", "by_slug");
+        let err =
+            super::try_build_router_inner(vec![a, b], &config, test_state(), duplicate_test_ctx())
+                .expect_err("capture-name-only difference must be rejected before mount");
+        match err {
+            RouterBuildError::DuplicateUserRoute {
+                ref existing,
+                ref incoming,
+                ..
+            } => {
+                assert_eq!(existing, "by_id");
+                assert_eq!(incoming, "by_slug");
+            }
+            other => panic!("expected DuplicateUserRoute, got {other:?}"),
+        }
+        // The diagnostic must show an ORIGINAL template, not the normalized key.
+        let display = err.to_string();
+        assert!(
+            display.contains("/users/{id}") || display.contains("/users/{slug}"),
+            "error must show an original path template; got: {display}"
+        );
+    }
+
+    /// Finding 1, scoped-group variant: the capture-name normalization must run
+    /// AFTER `join_nested_path` prefix resolution, so a scoped `/users/{slug}`
+    /// under `/api` collides with a top-level `/api/users/{id}`.
+    #[tokio::test]
+    async fn try_build_router_rejects_duplicate_capture_name_across_scoped_group() {
+        let config = AutumnConfig::default();
+        let top = duplicate_test_route(http::Method::GET, "/api/users/{id}", "top_by_id");
+        let scoped_child =
+            duplicate_test_route(http::Method::GET, "/users/{slug}", "scoped_by_slug");
+        let group = crate::app::ScopedGroup {
+            prefix: "/api".to_owned(),
+            routes: vec![scoped_child],
+            source: crate::route_listing::RouteSource::User,
+            apply_layer: Box::new(|r| r),
+        };
+        let mut ctx = duplicate_test_ctx();
+        ctx.scoped_groups.push(group);
+        let err = super::try_build_router_inner(vec![top], &config, test_state(), ctx)
+            .expect_err("scoped capture-name collision must be rejected before mount");
+        assert!(
+            matches!(
+                err,
+                RouterBuildError::DuplicateUserRoute { ref existing, ref incoming, .. }
+                    if existing == "top_by_id" && incoming == "scoped_by_slug"
+            ),
+            "expected DuplicateUserRoute naming both handlers, got {err:?}"
+        );
+    }
+
+    /// Finding 1 NEGATIVE guard: normalization must not over-flag. Two genuinely
+    /// different shapes that axum's matcher accepts (verified: `/users/{id}` and
+    /// `/users/{id}/posts` do NOT conflict) must still build cleanly.
+    #[tokio::test]
+    async fn try_build_router_allows_distinct_route_shapes() {
+        let config = AutumnConfig::default();
+        let a = duplicate_test_route(http::Method::GET, "/users/{id}", "show");
+        let b = duplicate_test_route(http::Method::GET, "/users/{id}/posts", "posts");
+        let _router =
+            super::try_build_router_inner(vec![a, b], &config, test_state(), duplicate_test_ctx())
+                .expect("distinct route shapes must not be flagged as duplicates");
+    }
+
+    /// Finding 2 (issue #1012 review): `#[ws]` records the synthetic `WS` method
+    /// but `group_and_mount_routes` mounts its handler via `axum::routing::get`,
+    /// so `#[get("/live")]` + `#[ws("/live")]` produce two overlapping `GET`
+    /// `MethodRouter`s that panic on merge. Normalizing `WS` to its effective
+    /// `GET` before keying makes the preflight catch it as `DuplicateUserRoute`.
+    ///
+    /// Not `#[cfg(feature = "ws")]`-gated: the synthetic `WS` method is a plain
+    /// `http::Method` string, and the sibling `build_route_timeout_table_*` test
+    /// exercises the same normalization ungated — gating would hide this from the
+    /// default `cargo test` run since `ws` is not a default feature.
+    #[tokio::test]
+    async fn try_build_router_rejects_ws_get_collision() {
+        let config = AutumnConfig::default();
+        let get = duplicate_test_route(http::Method::GET, "/live", "live_poll");
+        let ws = duplicate_test_route(
+            http::Method::from_bytes(b"WS").unwrap(),
+            "/live",
+            "live_socket",
+        );
+        let err = super::try_build_router_inner(
+            vec![get, ws],
+            &config,
+            test_state(),
+            duplicate_test_ctx(),
+        )
+        .expect_err("GET + WS on the same path must be rejected before mount");
+        match err {
+            RouterBuildError::DuplicateUserRoute {
+                ref method,
+                ref path,
+                ref existing,
+                ref incoming,
+            } => {
+                assert_eq!(method, "GET", "WS must be normalized to its effective GET");
+                assert_eq!(path, "/live");
+                assert_eq!(existing, "live_poll");
+                assert_eq!(incoming, "live_socket");
+            }
+            other => panic!("expected DuplicateUserRoute, got {other:?}"),
+        }
     }
 
     // --- Static file serving (SSG/ISG) tests ---
