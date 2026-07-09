@@ -5309,8 +5309,12 @@ pub struct TenancyConfig {
     pub jwt_claim: String,
 
     /// JWT secret key used to verify the JWT signature.
+    ///
+    /// Stored as a [`secrecy::SecretString`] so the raw value is redacted
+    /// from `Debug` output and zeroized on drop. Call
+    /// [`secrecy::ExposeSecret::expose_secret`] at the point of use.
     #[serde(default)]
-    pub jwt_secret: Option<String>,
+    pub jwt_secret: Option<secrecy::SecretString>,
 
     /// Expected JWT issuer to validate.
     #[serde(default)]

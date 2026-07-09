@@ -21,6 +21,7 @@ mod chaos_channels_loom;
 mod chaos_channels_proptest;
 #[cfg(feature = "ws")]
 mod chaos_channels_subscribe_loom;
+mod chaos_job_client_loom;
 mod chaos_metrics_compute_percentiles_proptest;
 mod chaos_metrics_leak;
 mod chaos_metrics_leak_loom;
@@ -96,6 +97,14 @@ mod mcp_repository;
 mod mcp_streaming;
 mod middleware_introspection;
 mod middleware_pipeline;
+#[cfg(feature = "offline-sync")]
+mod offline_sync_conformance;
+#[cfg(feature = "offline-sync")]
+mod offline_sync_engine;
+#[cfg(feature = "offline-sync")]
+mod offline_sync_pg;
+#[cfg(feature = "offline-sync")]
+mod offline_sync_store;
 #[cfg(feature = "openapi")]
 mod openapi;
 mod pagination;

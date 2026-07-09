@@ -2,24 +2,29 @@
 //! route them to one or more configured reporters.
 //!
 //! When an Autumn handler panics or returns a server error, the failure is
-//! turned into a structured [`ErrorEvent`] and delivered to every registered
-//! [`ErrorReporter`]. This is the "where do my errors go?" seam: ship events to
+//! turned into a structured [`ErrorEvent`](crate::reporting::ErrorEvent) and
+//! delivered to every registered
+//! [`ErrorReporter`](crate::reporting::ErrorReporter). This is the "where do my
+//! errors go?" seam: ship events to
 //! Sentry, Honeycomb, Slack, or a custom sink by implementing a single trait
 //! and wiring it once with
 //! [`AppBuilder::with_error_reporter`](crate::app::AppBuilder::with_error_reporter).
 //!
 //! The design mirrors Rails' [Error Reporter] and Autumn's other pluggable
 //! backends ([`BlobStore`](crate::storage::BlobStore),
-//! [`Cache`](crate::cache::Cache)): a built-in [`LogReporter`] (which uses
+//! [`Cache`](crate::cache::Cache)): a built-in
+//! [`LogReporter`](crate::reporting::LogReporter) (which uses
 //! `tracing`) ships as the default so the feature is useful with zero extra
 //! dependencies, and one builder call swaps in your own sink.
 //!
 //! # What gets reported
 //!
-//! - **Handler panics.** A [`ReportingLayer`] catches unwinding panics at the
+//! - **Handler panics.** A [`ReportingLayer`](crate::reporting::ReportingLayer)
+//!   catches unwinding panics at the
 //!   HTTP layer (so a single panicking handler can never abort the worker
 //!   task), converts them into a sanitized [`AutumnError`](crate::AutumnError)
-//!   `500` Problem Details response, and reports an [`ErrorEvent`] carrying the
+//!   `500` Problem Details response, and reports an
+//!   [`ErrorEvent`](crate::reporting::ErrorEvent) carrying the
 //!   panic payload and (when `RUST_BACKTRACE` is set) a backtrace.
 //! - **Server errors.** Any response with a `5xx` status is reported with its
 //!   status, message, and Problem Details type.
