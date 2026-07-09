@@ -267,10 +267,15 @@ fn scan_stream(stream: &TokenStream, file: &str, result: &mut ScanResult) {
                     }
                     // Associated call `Locale::t(&loc, "key")`: the `::` path
                     // separator tokenizes as two `:` puncts, so the token before
-                    // `t` is `:`. The receiver comes first, so the key is the
-                    // first string-literal argument.
+                    // `t` is `:`. The `&self` receiver occupies argument 0, so the
+                    // key is argument 1 — the same slot as the `t!` macro form.
+                    // Reading the fixed key slot (rather than the first literal
+                    // anywhere) means a dynamic key like `&format!("status.{s}")`
+                    // records the KEY argument's `status.` prefix instead of
+                    // mistaking the receiver for a fully-dynamic (empty-prefix)
+                    // key and suppressing every Unused warning project-wide.
                     Some(':') => {
-                        record_first_literal_key(&group.stream(), file, result);
+                        record_key_at(&group.stream(), 1, file, result);
                         i += 2;
                         continue;
                     }
@@ -319,17 +324,6 @@ fn split_top_level_args(args: &TokenStream) -> Vec<TokenStream> {
 fn record_key_at(args: &TokenStream, index: usize, file: &str, result: &mut ScanResult) {
     if let Some(segment) = split_top_level_args(args).get(index) {
         record_key_segment(segment, file, result);
-    }
-}
-
-/// Treat the first string-literal argument as the key; if there is none, record
-/// the first argument as a dynamic site.
-fn record_first_literal_key(args: &TokenStream, file: &str, result: &mut ScanResult) {
-    let segments = split_top_level_args(args);
-    if let Some(segment) = segments.iter().find(|s| segment_str_lit(s).is_some()) {
-        record_key_segment(segment, file, result);
-    } else if let Some(first) = segments.first() {
-        record_dynamic_segment(first, file, result);
     }
 }
 
@@ -1139,6 +1133,76 @@ mod tests {
         assert!(report.has_warnings());
         assert_eq!(report.exit_code(false), 0);
         assert_eq!(report.exit_code(true), 1);
+    }
+
+    #[test]
+    fn associated_dynamic_key_records_key_arg_not_receiver() {
+        // `Locale::t(&locale, &format!("status.{state}"))` is an associated call:
+        // the receiver `&locale` is argument 0 and the key is argument 1. The
+        // scanner must classify the KEY argument, deriving prefix `status.` — not
+        // fall back to the receiver (empty prefix), which would suppress every
+        // Unused warning project-wide. So `status.*` is suppressed but an
+        // unrelated `footer.legacy` still fails `--strict`.
+        let src = r#"
+            fn view(locale: &Locale, state: &str) {
+                let _ = Locale::t(&locale, "nav.home");
+                let _ = Locale::t(&locale, &format!("status.{state}"));
+                let _ = Locale::t_with(&locale, &format!("status.{state}"), &[("n", "1")]);
+            }
+        "#;
+        let mut scan = ScanResult::default();
+        scan_source(src, "view.rs", &mut scan);
+
+        // The literal associated key is recorded as referenced (no regression).
+        assert!(scan.referenced.contains("nav.home"));
+        // Both dynamic associated sites derive the `status.` prefix from their
+        // KEY argument, never the receiver.
+        assert_eq!(scan.dynamic.len(), 2);
+        assert!(scan.dynamic.iter().all(|d| d.key_prefix == "status."));
+
+        let mut per_locale = BTreeMap::new();
+        per_locale.insert(
+            "en".to_owned(),
+            keys(&["nav.home", "status.open", "status.closed", "footer.legacy"]),
+        );
+        let report = build_report(&scan, &cfg("en", &[]), &per_locale);
+
+        assert!(!report.unused_suppressed_by_dynamic);
+        let en = &report.locales[0];
+        assert_eq!(
+            en.unused,
+            vec!["footer.legacy".to_owned()],
+            "associated dynamic prefix `status.` must suppress status.* but keep footer.legacy"
+        );
+        // Genuinely-unused key still fails under --strict.
+        assert!(report.has_warnings());
+        assert_eq!(report.exit_code(false), 0);
+        assert_eq!(report.exit_code(true), 1);
+    }
+
+    #[test]
+    fn associated_fully_dynamic_key_still_suppresses_entirely() {
+        // A bare-variable key in the associated form `Locale::t(&locale, key)`
+        // yields an empty prefix (could reference any key), so Unused reporting is
+        // suppressed wholesale — confirming index-1 classification does not read
+        // the receiver, which would also (wrongly) yield an empty prefix.
+        let src = r#"
+            fn view(locale: &Locale, key: &str) {
+                let _ = Locale::t(&locale, "nav.home");
+                let _ = Locale::t(&locale, key);
+            }
+        "#;
+        let mut scan = ScanResult::default();
+        scan_source(src, "view.rs", &mut scan);
+        assert_eq!(scan.dynamic.len(), 1);
+        assert_eq!(scan.dynamic[0].key_prefix, "");
+        assert!(scan.dynamic[0].snippet.contains("key"));
+
+        let mut per_locale = BTreeMap::new();
+        per_locale.insert("en".to_owned(), keys(&["nav.home", "footer.legacy"]));
+        let report = build_report(&scan, &cfg("en", &[]), &per_locale);
+        assert!(report.unused_suppressed_by_dynamic);
+        assert_eq!(report.exit_code(true), 0);
     }
 
     #[test]
