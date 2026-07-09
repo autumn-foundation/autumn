@@ -69,6 +69,8 @@ jobs:
   #   generated_project_compiles_runs_and_serves  (e2e.rs)
   #   generated_scaffold_cargo_checks             (generate.rs)
   #   generated_scaffold_config_cargo_checks      (generate.rs)
+  #   controller_generates_compiles_and_lists_routes (generate.rs)
+  #   controller_api_generates_json               (generate.rs)
   #   generated_auth_totp_cargo_checks            (generate.rs)
   #   generated_job_cargo_checks                  (generate.rs)
   #   generated_channel_cargo_checks              (generate.rs)
@@ -115,6 +117,16 @@ jobs:
         run: |
           cargo test -p autumn-cli --test generate \
             generated_scaffold_config_cargo_checks -- --ignored --exact
+
+      - name: controller_generates_compiles_and_lists_routes
+        run: |
+          cargo test -p autumn-cli --test generate \
+            controller_generates_compiles_and_lists_routes -- --ignored --exact
+
+      - name: controller_api_generates_json
+        run: |
+          cargo test -p autumn-cli --test generate \
+            controller_api_generates_json -- --ignored --exact
 
       - name: Pre-fetch TOTP deps (absent from workspace Cargo.lock)
         # totp-rs is not a workspace dep, so it is absent from the workspace

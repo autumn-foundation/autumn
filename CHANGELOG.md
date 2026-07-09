@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **generator:** `autumn generate controller <name> <action>...` scaffolds a handler-only module (named actions, wired routes, Maud stub views) for non-CRUD pages/endpoints — no model, migration, or DB; `--api` emits JSON actions. (issue #1050)
 - **download:** typed `Download` `IntoResponse` (`autumn_web::download::Download`)
   for serving files from a handler without hand-rolling headers. Construct it
   from owned bytes, an async byte stream, an `AsyncRead`, or a stored blob
