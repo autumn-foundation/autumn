@@ -33,7 +33,7 @@ pub use autumn_macros::ws;
 pub use autumn_macros::{
     api_doc, authorize, cached, delete, event, feature_flag, get, job, jobs, listener, listeners,
     main, oauth2_callback, one_off_tasks, patch, paths, post, put, routes, scheduled, secured,
-    service, static_get, static_routes, step_up, task, tasks,
+    service, static_get, static_routes, step_up, task, tasks, throttle,
 };
 #[cfg(feature = "mail")]
 pub use autumn_macros::{mail_previews, mailer, mailer_preview};
@@ -413,6 +413,7 @@ mod tests {
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
+            app_id: AppState::next_app_id(),
         };
         #[cfg(not(feature = "db"))]
         let _state = AppState {
@@ -441,6 +442,7 @@ mod tests {
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
+            app_id: AppState::next_app_id(),
         };
         let _err: AutumnResult<()> = Ok(());
     }

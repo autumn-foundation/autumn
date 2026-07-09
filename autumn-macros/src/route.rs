@@ -81,7 +81,23 @@ pub fn route_macro(
             .last()
             .is_some_and(|s| s.ident == "feature_flag")
     });
-    let primitive_wrapper = if should_stringify_primitive_output(&input_fn.sig.output) {
+    // Body guards that rewrite the handler's return type to `Response` (and
+    // inject hidden extractors): #[throttle], #[step_up], #[authorize], and
+    // #[secured]. This route macro is outermost, so when one of these guards is
+    // still present as an attribute it has not expanded yet — the signature we
+    // see here still declares the original primitive return type, but the guard
+    // will lower it to `Response`. Emitting the primitive `.to_string()` wrapper
+    // (which calls the handler with only the user's original args and stringifies
+    // the result) would then fail to compile, so skip it and route through the
+    // normal `Response` path. (#[feature_flag] does NOT rewrite the return type;
+    // it propagates its gate param instead, so the primitive wrapper is kept.)
+    let has_response_rewriting_guard = has_throttle_guard(&input_fn)
+        || has_step_up_guard(&input_fn)
+        || has_secured_attr(&input_fn)
+        || has_authorize_attr(&input_fn);
+    let primitive_wrapper = if should_stringify_primitive_output(&input_fn.sig.output)
+        && !has_response_rewriting_guard
+    {
         let wrapper_name = format_ident!("__autumn_primitive_handler_{}", fn_name);
         let mut wrapper_inputs = Vec::new();
         let mut call_args = Vec::new();
@@ -135,7 +151,8 @@ pub fn route_macro(
     let body_guarded_replay = secured
         || has_authorize_guard(&input_fn)
         || has_feature_flag
-        || has_step_up_guard(&input_fn);
+        || has_step_up_guard(&input_fn)
+        || has_throttle_guard(&input_fn);
     let intercepted_route = !interceptors.is_empty();
     let handler_expr = build_handler_expr(
         &routing_fn,
@@ -261,6 +278,42 @@ fn has_step_up_guard(input_fn: &syn::ItemFn) -> bool {
             .segments
             .last()
             .is_some_and(|segment| segment.ident == "step_up")
+    })
+}
+
+fn has_throttle_guard(input_fn: &syn::ItemFn) -> bool {
+    input_fn.attrs.iter().any(|attr| {
+        attr.path()
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == "throttle")
+    })
+}
+
+/// Whether a `#[secured]` attribute is still present on the handler (i.e. it has
+/// not expanded yet because this route macro is outermost). Used to disable the
+/// primitive-output wrapper, since `#[secured]` rewrites the return type to
+/// `Response`.
+fn has_secured_attr(input_fn: &syn::ItemFn) -> bool {
+    input_fn.attrs.iter().any(|attr| {
+        attr.path()
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == "secured")
+    })
+}
+
+/// Whether an `#[authorize]` attribute is still present on the handler. Used to
+/// disable the primitive-output wrapper, since `#[authorize]` rewrites the
+/// return type to `Response`. This is intentionally narrower than
+/// [`has_authorize_guard`], which also matches inline policy checks that do not
+/// rewrite the return type.
+fn has_authorize_attr(input_fn: &syn::ItemFn) -> bool {
+    input_fn.attrs.iter().any(|attr| {
+        attr.path()
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == "authorize")
     })
 }
 
@@ -410,7 +463,12 @@ fn positional_format_string(path: &str) -> String {
     result
 }
 
-fn should_stringify_primitive_output(output: &ReturnType) -> bool {
+/// Whether a route handler's declared return type is a bare numeric/bool
+/// primitive that Autumn serves by stringifying it (primitives do not implement
+/// axum's `IntoResponse`). Shared with the `#[throttle]` macro so a throttled
+/// primitive-returning handler stringifies its result the same way the plain
+/// primitive-output wrapper does.
+pub fn should_stringify_primitive_output(output: &ReturnType) -> bool {
     let ReturnType::Type(_, ty) = output else {
         return false;
     };
@@ -552,6 +610,52 @@ mod tests {
         assert!(
             !generated.contains("IdempotencyReplayLayer"),
             "intercepted routes must not advertise an implicit replay stop: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_suppresses_replay_layer_when_throttle_attribute_present() {
+        // Ordering A: `#[post]` outermost, `#[throttle]` still an attribute below
+        // it. The route macro detects the attribute (`has_throttle_guard`) and
+        // must NOT add the outer IdempotencyReplayLayer — replay handling moves
+        // into the (later-expanded) throttle body, after the throttle check.
+        let generated = route_macro(
+            "POST",
+            "post",
+            quote! { "/items" },
+            quote! {
+                #[throttle(limit = 1, per = "60s", key = "ip")]
+                async fn create_item() -> &'static str { "created" }
+            },
+        )
+        .to_string();
+
+        assert!(
+            !generated.contains("IdempotencyReplayLayer"),
+            "throttled route (route outermost) must not add the outer replay layer: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_suppresses_replay_layer_for_expanded_throttle_prologue() {
+        // Ordering B: `#[throttle]` written ABOVE `#[post]`, so the throttle macro
+        // expands FIRST — it removes its own attribute and injects the throttle
+        // prologue into the body. The route macro no longer sees a `#[throttle]`
+        // attribute and must instead recognize the generated throttle prologue in
+        // the body to suppress the outer IdempotencyReplayLayer; otherwise a
+        // cached replay would be served before the in-body throttle check.
+        let throttled = crate::throttle::throttle_macro(
+            quote! { limit = 1, per = "60s", key = "ip" },
+            quote! {
+                async fn create_item() -> &'static str { "created" }
+            },
+        );
+        let generated = route_macro("POST", "post", quote! { "/items" }, throttled).to_string();
+
+        assert!(
+            !generated.contains("IdempotencyReplayLayer"),
+            "throttled route (throttle expanded first) must not add the outer replay layer: \
+             {generated}"
         );
     }
 
