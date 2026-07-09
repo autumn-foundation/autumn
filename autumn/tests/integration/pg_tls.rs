@@ -369,3 +369,83 @@ async fn sslmode_verify_ca_fails_loudly_with_guidance() {
         "verify-ca must fail with guidance, got: {error}"
     );
 }
+
+/// `PgSyncBackend` (offline sync's server-side shadow-table store) holds
+/// SYNCHRONOUS connections, and the bundled libpq has no SSL support — a
+/// raw `PgConnection` would fail on every production TLS URL even though
+/// the app pool connects fine. The backend must therefore route through
+/// the crate's shared TLS-aware path (the same one the migration/wait
+/// checks use). The stub is not a real Postgres so `ensure_schema` fails,
+/// but a completed rustls handshake carrying the startup message proves
+/// the DDL path negotiated TLS. (A full push/pull round-trip would need a
+/// real TLS-terminating Postgres, which this dockerless harness
+/// deliberately avoids — the round-trip semantics are pinned by the
+/// docker-gated PG conformance suite over the same connection type's
+/// TLS-off arm.) Plain `#[test]`: the path is synchronous
+/// (`spawn_blocking` context in production).
+#[cfg(feature = "offline-sync")]
+#[test]
+fn offline_sync_pg_backend_schema_negotiates_tls_for_sslmode_require() {
+    let (port, rx) = spawn_stub(true);
+    let url = format!("postgres://app_user:secret@127.0.0.1:{port}/app?sslmode=require");
+
+    let backend = autumn_web::sync::PgSyncBackend::new(url);
+    let result = backend.ensure_schema();
+    assert!(result.is_err(), "the stub cannot apply the DDL");
+
+    let observed = rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the stub must observe a connection from ensure_schema");
+    let Observed::TlsStartup(startup) = observed else {
+        panic!("PgSyncBackend::ensure_schema must negotiate TLS, got {observed:?}");
+    };
+    let haystack = String::from_utf8_lossy(&startup);
+    assert!(
+        haystack.contains("app_user"),
+        "startup message must arrive over the encrypted stream, got: {haystack}"
+    );
+}
+
+/// The query paths negotiate TLS too — `apply_push` (the router's write
+/// path) opens its own connection per call, so pin it separately from the
+/// one-time schema setup.
+#[cfg(feature = "offline-sync")]
+#[test]
+fn offline_sync_pg_backend_push_negotiates_tls_for_sslmode_require() {
+    use autumn_web::sync::SyncBackend as _;
+
+    let (port, rx) = spawn_stub(true);
+    let url = format!("postgres://app_user:secret@127.0.0.1:{port}/app?sslmode=require");
+
+    let backend = autumn_web::sync::PgSyncBackend::new(url);
+    let request = autumn_web::sync::PushRequest {
+        device_id: "device-tls".to_owned(),
+        changes: vec![autumn_web::sync::Change {
+            change_id: "00000000-0000-4000-8000-0000000007ee".to_owned(),
+            collection: "notes".to_owned(),
+            pk: "n1".to_owned(),
+            op: autumn_web::sync::Op::Upsert,
+            payload: Some(serde_json::json!({"title": "over tls"})),
+            base_version: 0,
+            updated_at: chrono::Utc::now(),
+        }],
+    };
+    let result = backend.apply_push(
+        autumn_web::sync::SyncScope::GLOBAL,
+        &request,
+        &autumn_web::sync::LwwResolver,
+    );
+    assert!(result.is_err(), "the stub cannot apply the push");
+
+    let observed = rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the stub must observe a connection from apply_push");
+    let Observed::TlsStartup(startup) = observed else {
+        panic!("PgSyncBackend::apply_push must negotiate TLS, got {observed:?}");
+    };
+    let haystack = String::from_utf8_lossy(&startup);
+    assert!(
+        haystack.contains("app_user"),
+        "startup message must arrive over the encrypted stream, got: {haystack}"
+    );
+}
