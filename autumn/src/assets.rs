@@ -33,9 +33,9 @@
 //! ```
 
 use std::collections::HashMap;
-#[cfg(feature = "embed-assets")]
-use std::sync::Mutex;
 use std::sync::OnceLock;
+#[cfg(feature = "embed-assets")]
+use std::sync::RwLock;
 
 /// Filename of the fingerprint manifest within the `static/` tree.
 #[cfg(any(not(debug_assertions), feature = "embed-assets"))]
@@ -466,7 +466,7 @@ pub(crate) fn content_type_for(path: &str) -> &'static str {
 /// Two empty assets can share a pointer, but their content hash is identical, so
 /// a collision still returns the correct tag.
 #[cfg(feature = "embed-assets")]
-static EMBEDDED_ETAG_CACHE: OnceLock<Mutex<HashMap<usize, crate::etag::ETag>>> = OnceLock::new();
+static EMBEDDED_ETAG_CACHE: OnceLock<RwLock<HashMap<usize, crate::etag::ETag>>> = OnceLock::new();
 
 /// Return the strong content-hash `ETag` for an embedded asset, computing it on
 /// the first serve and reusing the cached value thereafter.
@@ -476,14 +476,12 @@ static EMBEDDED_ETAG_CACHE: OnceLock<Mutex<HashMap<usize, crate::etag::ETag>>> =
 #[cfg(feature = "embed-assets")]
 fn embedded_etag_cached(bytes: &[u8]) -> crate::etag::ETag {
     let key = bytes.as_ptr() as usize;
-    let cache = EMBEDDED_ETAG_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(etag) = cache.lock().unwrap().get(&key) {
+    let cache = EMBEDDED_ETAG_CACHE.get_or_init(|| RwLock::new(HashMap::new()));
+    if let Some(etag) = cache.read().unwrap().get(&key) {
         return etag.clone();
     }
-    // Compute outside the lock is unnecessary here (hash is cheap relative to
-    // contention on a per-asset key), but keep the critical sections short.
     let etag = embedded_etag(bytes);
-    cache.lock().unwrap().insert(key, etag.clone());
+    cache.write().unwrap().insert(key, etag.clone());
     etag
 }
 
