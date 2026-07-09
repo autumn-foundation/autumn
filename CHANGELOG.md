@@ -19,7 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The README is flag-aware: `--with-i18n` and `--with-seed` add sections for the
   extra steps they introduce (issue #1052). The DB-bootstrap step bootstraps a
   throwaway local Postgres with a copy-paste `docker run … postgres:16` one-liner
-  that matches the generated `url` (the earlier `autumn release init --target
+  that matches the generated `url`; this runnable helper lives in exactly one
+  place (the "Configure the database" step), with the prerequisites section
+  cross-referencing it instead of repeating the command — a top-to-bottom reader
+  no longer starts the `…-pg` container twice and dead-ends on a
+  container-name-in-use error (the earlier `autumn release init --target
   docker-compose` pointer file-errored on a fresh scaffold, which already ships a
   `Dockerfile`/`.dockerignore`, before any compose file was written; that pointer
   is retained for generating deployment/compose assets). After the `docker run`

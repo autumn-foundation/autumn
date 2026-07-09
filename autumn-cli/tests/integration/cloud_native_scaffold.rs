@@ -74,6 +74,18 @@ fn cloud_native_scaffold_generates_readme_golden_path() {
         "README.md DB-bootstrap must offer a working `docker run … postgres:16` one-liner \
          (not dead-end on `release init`), got:\n{readme}"
     );
+    // Codex P2: the runnable Postgres Docker helper must appear EXACTLY ONCE (in
+    // the step-2 "Configure the database" section). It previously also lived in
+    // the prerequisites block, so a user following the README top-to-bottom
+    // started the `{crate}-pg` container, then hit the identical command in step 2
+    // — which fails because the container name is already in use. The
+    // prerequisites now only cross-reference step 2 instead of repeating it.
+    assert_eq!(
+        readme.matches("docker run -d").count(),
+        1,
+        "README.md must contain the runnable `docker run -d …` Postgres helper exactly once \
+         (de-duplicated between prerequisites and step 2), got:\n{readme}"
+    );
     // Codex P2: a freshly-started `postgres:16` container accepts connections
     // only after first-time initialization finishes, but `autumn db create`
     // connects immediately with no retry. The README must document an explicit

@@ -1231,6 +1231,15 @@ mod tests {
             readme.contains("docker run") && readme.contains("postgres:16"),
             "default README must offer a `docker run … postgres:16` DB bootstrap, got:\n{readme}"
         );
+        // Codex P2: the runnable `docker run -d …` helper must appear exactly once
+        // (in step 2), not be duplicated in the prerequisites — a second identical
+        // command dead-ends on a `{crate}-pg` container-name-in-use error.
+        assert_eq!(
+            readme.matches("docker run -d").count(),
+            1,
+            "default README must contain the runnable `docker run -d …` helper exactly once, \
+             got:\n{readme}"
+        );
         assert!(
             readme.contains("autumn release init --target docker-compose"),
             "default README must still point at `release init --target docker-compose`, \

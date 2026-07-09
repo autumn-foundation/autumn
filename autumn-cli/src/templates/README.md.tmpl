@@ -17,21 +17,11 @@ Run these steps top-to-bottom on a clean checkout to get a route serving.
   ```sh
   autumn setup
   ```
-- **A reachable Postgres** for database features. Don't have one? Start a
-  throwaway local instance with Docker (matches the `url` in step 2 below). The
-  `-d` flag runs it in the background so your terminal stays free; stop it later
-  with `docker stop {{crate_name}}-pg`:
-  ```sh
-  docker run -d --rm --name {{crate_name}}-pg -e POSTGRES_PASSWORD=postgres \
-    -e POSTGRES_DB={{crate_name}} -p 5432:5432 postgres:16
-
-  # Wait until Postgres is ready to accept connections before creating the DB
-  until docker exec {{crate_name}}-pg pg_isready -U postgres >/dev/null 2>&1; do sleep 1; done
-  ```
-  First-time Postgres initialization takes a few seconds after the container
-  launches, and `autumn db create` connects immediately without retrying, so let
-  the readiness loop finish before continuing.
-  To generate a full deployment/compose stack instead, see
+- **A reachable Postgres** for database features. Don't have one? The golden
+  path in step 2 below ("Configure the database") includes a one-line Docker
+  option that matches the connection `url` you set there — no need to start a
+  container here; just follow that step in order. To generate a full
+  deployment/compose stack instead, see
   `autumn release init --target docker-compose` in the CLI reference below.
 - **The PostgreSQL client library (`libpq`).** The default scaffold keeps the
   `db` feature, so the base app links `libpq` at build time — it must be
