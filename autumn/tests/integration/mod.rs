@@ -174,6 +174,12 @@ mod tx_isolation_retry_integration;
 mod webhook_outbound;
 #[cfg(feature = "maud")]
 mod widget_css_coverage;
+#[cfg(feature = "maud")]
+mod widgets_alert;
+#[cfg(feature = "maud")]
+mod widgets_avatar;
+#[cfg(feature = "maud")]
+mod widgets_badge;
 mod widgets_modal;
 mod widgets_tabs;
 #[cfg(feature = "ws")]
