@@ -1068,6 +1068,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **docs:** documented the `system_info` module (PR #1502) [no-plugin] —
+  module-level overview explaining why host environment metrics matter across
+  deployment architectures, field-level docs on `SystemInfo`, handler docs,
+  and a runnable doctest demonstrating basic usage.
 - **generator:** scaffolded `create`/`update`/`destroy` handlers now redirect
   with `autumn_web::Redirect::to(...)` — a real **303 See Other** with a
   `Location` header — instead of the hand-rolled 200 meta-refresh HTML page,

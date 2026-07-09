@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 
 /// Represents the host system's hardware and operating system environment.
 ///
-/// This struct is serialized into JSON and returned by the [`system_info_handler`].
+/// This struct is serialized into JSON and returned by the crate-private `system_info_handler`.
 /// It contains basic metrics that do not change during the lifetime of the process.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct SystemInfo {
