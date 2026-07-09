@@ -874,7 +874,34 @@ autumn generate scaffold Post title:String --live --live-validation
 autumn generate tauri            # desktop sidecar project (cargo tauri build)
 autumn generate plugin my-plugin # installable/conformant plugin crate
 autumn token issue service:ci --name ci --scope posts:write   # scoped tokens; also list, rotate
+autumn migrate baseline          # record content hashes for legacy applied migrations (issue #1203)
+autumn migrate baseline --force <version>  # escape hatch: overwrite one version's stored hash (WARN-logged)
 ```
+
+### Migration content checksums (issue #1203)
+
+The framework hashes every migration's `up.sql` (SHA-256, with `\r\n`/`\r`
+→ `\n` normalisation and `trim_end()`) into `autumn_migration_checksums`
+the first time it's applied, and re-validates the hash before every
+subsequent `autumn migrate` run and startup auto-migrate. Editing an
+already-applied migration flips its state to `changed` and the next
+`autumn migrate` refuses to run:
+
+```
+migration <version> checksum mismatch: recorded <hex-a> but on-disk
+content hashes to <hex-b>. Migrations must never be edited after being
+applied — add a new migration instead, or run the documented re-baseline
+command if this change was deliberate.
+```
+
+Rule of thumb: **never edit an applied migration.** Add a new one. If the
+user asks you to edit an applied migration, push back with this rule and
+propose a follow-up migration. `autumn migrate status` reports each
+applied migration's state as `ok`, `changed`, or `unrecorded`. Use
+`autumn migrate baseline` (additive, idempotent) to record hashes for
+legacy migrations applied before the checksum feature existed; use
+`autumn migrate baseline --force <version>` only when a deliberate edit
+is intended and the fork risk is accepted.
 
 `autumn destroy` mirrors `autumn generate` argument-for-argument and never
 touches a database — it only reverses generated files/migrations.

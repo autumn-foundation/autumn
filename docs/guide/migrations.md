@@ -137,6 +137,82 @@ function returns `MigrationError::Connection`.
 
 ---
 
+## Content checksums — never edit an applied migration
+
+Autumn records a SHA-256 of every migration's `up.sql` in a framework-owned
+table, `autumn_migration_checksums`, the first time that migration is applied.
+Before every subsequent apply (both `autumn migrate` and startup auto-migrate)
+each applied migration's on-disk `up.sql` is re-hashed and compared against the
+recorded value. A mismatch means the migration was **edited after being
+applied** — the deployed schema silently forks from what a fresh build would
+produce — so the run refuses to continue with a fail-fast error:
+
+```
+migration 20260101000000 checksum mismatch: recorded <hex-a> but on-disk
+content hashes to <hex-b>. Migrations must never be edited after being
+applied — add a new migration instead, or run the documented re-baseline
+command if this change was deliberate.
+```
+
+The rule is simple: **never edit an applied migration.** Add a new migration
+that expresses the change instead — that keeps every environment reproducible
+from the same source tree.
+
+> **Note:** startup auto-migrate validation is **best-effort** and requires the
+> `migrations/` directory to be present on disk at runtime (production binaries
+> often ship without the source tree, in which case startup validation is
+> skipped rather than failing); authoritative enforcement is `autumn migrate
+> run` / `autumn migrate status` in CI or your deploy job, which check against
+> an explicit migrations directory.
+
+Line-ending and trailing-whitespace differences are normalised before hashing
+(CRLF/CR/LF all collapse to LF, then `trim_end()`), so a Windows checkout and
+a Linux one produce identical checksums and an editor that adds or removes a
+final newline doesn't trip the guard.
+
+### Legacy migrations: the `unrecorded` state
+
+Migrations that were applied *before* the checksum table existed (or before
+the app upgraded to a version that tracks them) show up as `unrecorded` — no
+recorded checksum, no error. Record their current hashes with:
+
+```bash
+autumn migrate baseline
+```
+
+The command is additive and idempotent: it records checksums only for
+applied-but-unrecorded versions, so it is safe to re-run at any time. After a
+successful baseline, every applied migration is in either the `ok` or
+`unrecorded` state; a subsequent edit to any of them will flip to `changed`
+on the next `autumn migrate` and fail with the message above.
+
+### Re-baseline escape hatch (deliberate edits only)
+
+If you have deliberately edited an applied migration and accept that other
+environments running the previous content will now report a mismatch, use:
+
+```bash
+autumn migrate baseline --force <version>
+```
+
+This overwrites the stored checksum for that single version with the current
+on-disk hash. It is logged at `WARN` so the change is unambiguous in deploy
+logs. Never the default — the `--force <version>` flag is the deliberate
+signal that you understand the consequences.
+
+### Checking status
+
+`autumn migrate status` reports each applied migration's checksum state:
+
+* `ok` — the current on-disk `up.sql` still matches the recorded hash.
+* `changed` — the migration was edited after being applied; `autumn migrate`
+  will refuse to run until this is resolved (add a new migration or
+  re-baseline).
+* `unrecorded` — legacy migration with no stored hash; run
+  `autumn migrate baseline`.
+
+---
+
 ## Log output
 
 | Level   | Event                                           |

@@ -51,6 +51,17 @@ pub struct DownArgs {
     pub yes_i_mean_prod: bool,
 }
 
+/// Arguments for `autumn migrate baseline`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BaselineArgs {
+    /// Re-baseline the checksum for a single applied version, overwriting
+    /// whatever hash is currently recorded. The **escape hatch** for
+    /// deliberate edits to an applied migration — logged loudly, never the
+    /// default. When `None`, `baseline` runs in additive mode and records
+    /// hashes only for applied migrations that don't already have one.
+    pub force_version: Option<String>,
+}
+
 /// Subcommands for `autumn migrate`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MigrateAction {
@@ -63,6 +74,12 @@ pub enum MigrateAction {
     Check,
     /// Revert the most recently applied user migration(s).
     Down(DownArgs),
+    /// Record content hashes for applied migrations (issue #1203).
+    ///
+    /// Additive by default (records only applied-but-unrecorded versions —
+    /// the legacy backfill). Pass `force_version` to overwrite one version's
+    /// stored hash (the escape hatch for a deliberate edit).
+    Baseline(BaselineArgs),
 }
 
 /// Per-migration safety report returned by [`check_migrations_in_dir`].
@@ -111,6 +128,10 @@ pub fn run(
             run_down(args, with_maintenance, target, profile);
             return;
         }
+        MigrateAction::Baseline(args) => {
+            run_baseline(args, target, profile);
+            return;
+        }
         _ => {}
     }
 
@@ -148,7 +169,9 @@ pub fn run(
                 eprintln!();
             }
         }
-        MigrateAction::Check | MigrateAction::Down(_) => unreachable!("handled above"),
+        MigrateAction::Check | MigrateAction::Down(_) | MigrateAction::Baseline(_) => {
+            unreachable!("handled above")
+        }
     }
 }
 
@@ -395,8 +418,18 @@ fn run_single_target(
         }
     };
 
-    eprintln!("  Running pending migrations...\n");
+    // Content-checksum guard (issue #1203): before applying any pending
+    // migrations, validate that every already-applied migration's recorded
+    // hash still matches its on-disk `up.sql`. A mismatch means the migration
+    // was edited after being applied — the schema in this database silently
+    // forks from what a fresh build would produce. Fail fast rather than
+    // compounding the drift.
     let dir = std::path::Path::new(migrations_dir);
+    if !validate_checksums_before_apply(database_url, dir) {
+        return false;
+    }
+
+    eprintln!("  Running pending migrations...\n");
     let status = Command::new("diesel")
         .args(["migration", "run", "--migration-dir"])
         .arg(dir)
@@ -420,10 +453,103 @@ fn run_single_target(
         }
     }
 
-    if is_shard {
+    let framework_ok = if is_shard {
         run_shard_framework_migrations(database_url)
     } else {
         run_framework_migrations(database_url)
+    };
+    if !framework_ok {
+        return false;
+    }
+
+    // Post-apply: record checksums for newly-applied migrations so any
+    // future edit trips the guard on the next run.
+    record_checksums_after_apply(database_url, dir);
+    true
+}
+
+/// Fail-fast validation of every applied migration's checksum against its
+/// on-disk `up.sql` (issue #1203). Prints a helpful error and returns
+/// `false` on mismatch so `run_single_target` can propagate the failure.
+///
+/// Returns `true` when validation passes OR when the checksum table doesn't
+/// yet exist — a fresh database that hasn't run the framework migration
+/// which creates the table is not itself an error.
+fn validate_checksums_before_apply(database_url: &str, migrations_dir: &std::path::Path) -> bool {
+    match autumn_web::migrate::validate_recorded_checksums_against_dir(database_url, migrations_dir)
+    {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("\u{274C} {e}");
+            false
+        }
+    }
+}
+
+/// After a successful apply, record content hashes for every applied
+/// migration that doesn't yet have a stored checksum (issue #1203).
+/// Silent when the migrations dir is unreadable — this backfills the CLI
+/// path when the framework's checksum table wasn't present before.
+fn record_checksums_after_apply(database_url: &str, migrations_dir: &std::path::Path) {
+    match autumn_web::migrate::record_checksums_from_dir(database_url, migrations_dir) {
+        Ok(0) => {}
+        Ok(n) => {
+            eprintln!(
+                "  \u{2713} Recorded content checksum(s) for {n} newly-applied migration(s)."
+            );
+        }
+        Err(e) => {
+            eprintln!(
+                "  \u{26A0}\u{FE0F}  Could not record migration checksums: {e}. Applied \
+                 migrations will show as `unrecorded` until `autumn migrate baseline` is run."
+            );
+        }
+    }
+}
+
+/// Run `autumn migrate baseline` against every configured target.
+///
+/// * Default (additive) — records on-disk `up.sql` hashes for every applied
+///   migration that does not yet have a stored checksum. Idempotent; safe to
+///   re-run. This is the answer to "we adopted the checksum feature on a live
+///   database with already-applied migrations".
+///
+/// * `--force <version>` — overwrites the stored checksum for one applied
+///   version with the current on-disk hash. The **escape hatch** for a
+///   deliberate re-baseline (an operator edited an applied migration, accepts
+///   the fork risk, and wants future runs to compare against the new bytes).
+///   Emits a WARN log.
+fn run_baseline(args: &BaselineArgs, target: &MigrateTarget, profile: Option<&str>) {
+    let (targets, _) = resolve_targets(target, profile);
+    let migrations_dir = resolve_migrations_dir();
+    let dir = std::path::Path::new(&migrations_dir);
+
+    for (label, url) in &targets {
+        eprintln!("\u{2500}\u{2500} Baselining {label} \u{2500}\u{2500}");
+        if let Some(version) = args.force_version.as_deref() {
+            eprintln!(
+                "  \u{26A0}\u{FE0F}  Re-baselining checksum for {version} \u{2014} the new on-disk \
+                 hash will replace the previously recorded one. Other environments running the \
+                 previous content will now report a mismatch."
+            );
+            match autumn_web::migrate::rebaseline_checksum_from_dir(url, dir, version) {
+                Ok(()) => eprintln!("  \u{2713} Re-baselined {version}."),
+                Err(e) => {
+                    eprintln!("\u{274C} Re-baseline failed for {label}: {e}");
+                    std::process::exit(1);
+                }
+            }
+        } else {
+            match autumn_web::migrate::record_checksums_from_dir(url, dir) {
+                Ok(0) => eprintln!("  All applied migrations already have recorded checksums."),
+                Ok(n) => eprintln!("  \u{2713} Recorded checksum(s) for {n} migration(s)."),
+                Err(e) => {
+                    eprintln!("\u{274C} Baseline failed for {label}: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        eprintln!();
     }
 }
 
@@ -1530,6 +1656,64 @@ fn show_rollback_availability(database_url: &str, migrations_dir: &str) {
 fn show_status(database_url: &str, migrations_dir: &str) {
     eprintln!("  Checking migration status...\n");
     show_diesel_migration_status(database_url, Path::new(migrations_dir));
+    show_checksum_status(database_url, Path::new(migrations_dir));
+}
+
+/// Print each applied migration's content-hash state (issue #1203).
+///
+/// * `ok` — the on-disk `up.sql` still hashes to the recorded value.
+/// * `changed` — an applied migration's content was edited after being applied;
+///   running `autumn migrate` would refuse to continue with the same message.
+/// * `unrecorded` — legacy applied migration with no recorded checksum; run
+///   `autumn migrate baseline` to record the current hash.
+fn show_checksum_status(database_url: &str, migrations_dir: &Path) {
+    eprintln!("\n  Checking migration checksum status...\n");
+    match autumn_web::migrate::checksum_status(database_url, migrations_dir) {
+        Ok(entries) if entries.is_empty() => {
+            eprintln!("  No applied migrations.");
+        }
+        Ok(entries) => {
+            let mut changed = 0;
+            let mut unrecorded = 0;
+            for (version, state) in &entries {
+                match state {
+                    autumn_web::migrate::ChecksumState::Ok => {
+                        eprintln!("  \u{2713} {version}  [ok]");
+                    }
+                    autumn_web::migrate::ChecksumState::Changed { recorded, actual } => {
+                        changed += 1;
+                        eprintln!(
+                            "  \u{2717} {version}  [changed]  recorded={recorded} \
+                             actual={actual}"
+                        );
+                    }
+                    autumn_web::migrate::ChecksumState::Unrecorded => {
+                        unrecorded += 1;
+                        eprintln!("  \u{2022} {version}  [unrecorded]");
+                    }
+                }
+            }
+            if changed > 0 {
+                eprintln!(
+                    "\n  \u{2717} {changed} migration(s) were EDITED after being applied. \
+                     `autumn migrate` will refuse to run until this is resolved. Never edit \
+                     an applied migration \u{2014} add a new one, or re-baseline deliberately \
+                     with `autumn migrate baseline --force <version>`."
+                );
+            }
+            if unrecorded > 0 {
+                eprintln!(
+                    "  {unrecorded} migration(s) have no recorded checksum (applied before \
+                     content-hash tracking existed). Run `autumn migrate baseline` to record \
+                     their current hashes."
+                );
+            }
+        }
+        Err(e) => {
+            eprintln!("  \u{26A0}\u{FE0F}  Could not read checksum status: {e}");
+        }
+    }
+    eprintln!();
 }
 
 fn show_framework_status(database_url: &str, is_shard: bool) {
@@ -1639,6 +1823,39 @@ mod tests {
         assert_eq!(MigrateAction::Check, MigrateAction::Check);
         assert_ne!(MigrateAction::Run, MigrateAction::Status);
         assert_ne!(MigrateAction::Run, MigrateAction::Check);
+    }
+
+    // ── Baseline args (issue #1203) ──────────────────────────────────────
+
+    #[test]
+    fn baseline_action_default_records_all_unrecorded() {
+        // No force_version → additive baseline (backfill hashes for legacy
+        // applied migrations only). This is the safe default and must never
+        // silently overwrite an existing recorded hash.
+        let action = MigrateAction::Baseline(BaselineArgs {
+            force_version: None,
+        });
+        assert!(matches!(
+            action,
+            MigrateAction::Baseline(BaselineArgs {
+                force_version: None
+            })
+        ));
+    }
+
+    #[test]
+    fn baseline_action_force_targets_one_version() {
+        // With force_version → escape hatch that overwrites a single stored
+        // hash. Must carry the explicit version.
+        let action = MigrateAction::Baseline(BaselineArgs {
+            force_version: Some("20260101000000".to_owned()),
+        });
+        match action {
+            MigrateAction::Baseline(args) => {
+                assert_eq!(args.force_version.as_deref(), Some("20260101000000"));
+            }
+            _ => panic!("expected Baseline"),
+        }
     }
 
     // ── check_migrations_in_dir ────────────────────────────────────────────

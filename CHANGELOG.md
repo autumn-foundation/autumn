@@ -21,6 +21,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `BlobStore::get_stream` without buffering the whole object in memory, so it
   serves large private files behind a `#[secured]` handler with no public
   presigned URL (#1141).
+- **migrations:** content checksums for applied migrations (issue #1203) —
+  the framework now records a SHA-256 of every migration's `up.sql` in a
+  new `autumn_migration_checksums` table (created by the framework
+  migration `20260709000000_create_migration_checksums`) the first time
+  the migration is applied. Before every subsequent `autumn migrate` run
+  and before startup auto-migrate, each applied migration's on-disk
+  `up.sql` is re-hashed and compared against the recorded value; a
+  mismatch fails fast with a message that names the version and both
+  hashes: `migration <version> checksum mismatch: recorded <hex-a> but
+  on-disk content hashes to <hex-b>. Migrations must never be edited
+  after being applied — add a new migration instead, or run the
+  documented re-baseline command if this change was deliberate.` Hashing
+  normalises line endings (`\r\n`/`\r` → `\n`) and trims trailing
+  whitespace so a Windows checkout and a Linux one produce identical
+  checksums. `autumn migrate status` reports each applied migration's
+  state (`ok`/`changed`/`unrecorded`); `autumn migrate baseline` records
+  hashes for legacy applied migrations that pre-date the checksum table
+  (idempotent, additive); `autumn migrate baseline --force <version>`
+  overwrites one version's stored hash — the deliberate escape hatch,
+  WARN-logged. See `docs/guide/migrations.md`.
 - **ci:** README-quickstart gate against the published crates (issue #1586) —
   `.github/workflows/quickstart-gate.yml` + `scripts/check-quickstart.sh`
   install the README-pinned `autumn-cli` from crates.io (never the local
