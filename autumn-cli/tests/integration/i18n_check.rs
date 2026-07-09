@@ -265,6 +265,46 @@ fn view(locale: &Locale, state: &str) -> String {
 }
 
 #[test]
+fn transformed_leading_literal_site_suppresses_unused_under_strict() {
+    // A dynamic site whose key starts with an UNPARENTHESIZED literal that is
+    // then transformed — `locale.t(" nav.home ".trim())` — must derive an EMPTY
+    // static prefix, not the spaced literal `" nav.home "`. The runtime looks up
+    // `nav.home` after `.trim()`, so with `nav.home` defined it must NOT be
+    // reported Unused and `--strict` must exit 0. (Deriving the raw `" nav.home "`
+    // prefix would leave the real `nav.home` entry flagged Unused → false
+    // `--strict` failure.)
+    let dir = clean_project();
+    write(
+        dir.path(),
+        "src/main.rs",
+        r#"
+fn view(locale: &Locale) -> String {
+    locale.t(" nav.home ".trim())
+}
+"#,
+    );
+    write(dir.path(), "i18n/en.ftl", "nav.home = Home\n");
+    write(dir.path(), "i18n/es.ftl", "nav.home = Inicio\n");
+
+    let strict = run_check(dir.path(), &["--strict"]);
+    let strict_stdout = String::from_utf8_lossy(&strict.stdout);
+    assert!(
+        strict.status.success(),
+        "transformed-literal site suppresses Unused, so --strict must pass\nstdout:\n{strict_stdout}"
+    );
+    assert!(
+        !strict_stdout.contains("FAIL"),
+        "nav.home must not fail --strict as Unused\n{strict_stdout}"
+    );
+    // The suppression note confirms the site was treated as fully dynamic
+    // (empty prefix) rather than deriving the raw `" nav.home "` literal prefix.
+    assert!(
+        strict_stdout.contains("suppressed"),
+        "expected the fully-dynamic Unused-suppression note\n{strict_stdout}"
+    );
+}
+
+#[test]
 fn wrapped_literal_key_is_referenced_so_deleting_it_is_missing() {
     // A literal key passed through a borrow or a parenthesized group —
     // `locale.t(&"nav.about")` / `locale.t(("nav.about"))` — must be recorded as

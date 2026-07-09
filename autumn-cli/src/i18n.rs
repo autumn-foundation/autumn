@@ -465,11 +465,18 @@ fn record_dynamic_segment(segment: &TokenStream, file: &str, result: &mut ScanRe
 /// - `format!("status.{state}")` → `"status."`
 /// - `&format!("nav.{}", x)`     → `"nav."`
 /// - `&(format!("status.{s}"))`  → `"status."`
-/// - `"status.".to_owned() + s`  → `"status."`
 /// - a bare variable / `&key` / `format!("{x}")` (no leading literal) → `""`
+/// - a leading construct *transformed* by trailing tokens → `""`:
+///   `" nav.home ".trim()`, `"footer.".to_owned() + s`,
+///   `format!("status.{s}").to_uppercase()`. The runtime key is a *derived*
+///   value, not the raw literal / format string, so no reliable static prefix
+///   exists — the site is treated as fully dynamic.
 ///
-/// An empty prefix means the site could reference *any* key, so the caller must
-/// treat the entire `Unused` set as untrustworthy.
+/// A prefix is only derived when the leading `format!` / string literal spans
+/// the ENTIRE normalized segment; a leading construct followed by any trailing
+/// tokens yields an empty prefix. An empty prefix means the site could
+/// reference *any* key, so the caller must treat the entire `Unused` set as
+/// untrustworthy — the safe direction, which avoids a false `--strict` failure.
 fn dynamic_key_prefix(segment: &TokenStream) -> String {
     let trees: Vec<TokenTree> = segment.clone().into_iter().collect();
     // Peel leading borrows/derefs and unwrap any group that merely *wraps* the
@@ -480,10 +487,13 @@ fn dynamic_key_prefix(segment: &TokenStream) -> String {
     // warning project-wide.
     let normalized = normalize_key_segment(&trees);
 
-    // Case 1: a leading `format!(...)` invocation (e.g. the `format!` in
-    // `&format!("nav.{}", x)`, now exposed at the front by normalization). Its
-    // first argument's format string supplies the static prefix — the text
-    // before the first `{` interpolation.
+    // Case 1: a `format!(...)` invocation that spans the whole segment (e.g. the
+    // `format!` in `&format!("nav.{}", x)`, now exposed at the front by
+    // normalization). Its first argument's format string supplies the static
+    // prefix — the text before the first `{` interpolation. A `format!` followed
+    // by trailing tokens (`format!("status.{s}").to_uppercase()`) is not
+    // whole-segment, so `leading_format_group` returns `None` and it falls
+    // through to an empty prefix.
     if let Some(group) = leading_format_group(&normalized) {
         return split_top_level_args(&group.stream())
             .first()
@@ -491,10 +501,12 @@ fn dynamic_key_prefix(segment: &TokenStream) -> String {
             .map_or_else(String::new, |fmt| format_static_prefix(&fmt));
     }
 
-    // Case 2: a leading string literal (e.g. `"status." + s`). A plain literal
-    // has no interpolation, so its whole value is static leading text. Only the
-    // *leading* literal counts; one in a later position must not masquerade as
-    // the key's prefix.
+    // Case 2: a string literal that spans the whole segment. In practice a lone
+    // literal is already classified as a *referenced* key, so this mainly guards
+    // against a literal that is the *receiver* of a transform
+    // (`" nav.home ".trim()`, `"footer.".to_owned() + s`): those have trailing
+    // tokens, so `leading_str_literal` returns an empty prefix rather than
+    // lifting the raw literal text out as a bogus static prefix.
     leading_str_literal(&normalized)
 }
 
@@ -542,9 +554,10 @@ fn normalize_key_segment(trees: &[TokenTree]) -> Vec<TokenTree> {
     rest.to_vec()
 }
 
-/// If `trees` begins with a `format!(...)` / `format!{...}` / `format![...]`
-/// invocation, return its argument group. Expects a [`normalize_key_segment`]-
-/// normalized stream, so the `format` ident is the leading meaningful token.
+/// If `trees` is *exactly* a `format!(...)` / `format!{...}` / `format![...]`
+/// invocation spanning the whole segment, return its argument group. Expects a
+/// [`normalize_key_segment`]-normalized stream, so the `format` ident is the
+/// leading meaningful token.
 ///
 /// A path-qualified form is also accepted: an optional leading `::` and any
 /// number of `ident ::` path segments preceding the macro name, so
@@ -553,6 +566,13 @@ fn normalize_key_segment(trees: &[TokenTree]) -> Vec<TokenTree> {
 /// *final* path segment ident must be exactly `format`, so an unrelated
 /// path-qualified macro like `std::println!` / `std::concat!` (or a custom
 /// `myfmt!`) is not mistaken for a format invocation.
+///
+/// The invocation must span the ENTIRE segment: the arg group must be the last
+/// token, with nothing after it. A `format!` followed by trailing tokens — a
+/// method call `format!("status.{s}").to_uppercase()`, an operator
+/// `format!(...) + x` — is part of a larger derived expression whose runtime
+/// value is not the raw format string, so it yields no prefix (the site stays
+/// fully dynamic) rather than a bogus static prefix.
 fn leading_format_group(trees: &[TokenTree]) -> Option<&Group> {
     let mut i = 0;
     // Optional leading `::` (absolute path). `::` tokenizes as two `:` puncts.
@@ -578,19 +598,28 @@ fn leading_format_group(trees: &[TokenTree]) -> Option<&Group> {
         && *id == "format"
         && matches!(trees.get(i), Some(TokenTree::Punct(p)) if p.as_char() == '!')
         && let Some(TokenTree::Group(group)) = trees.get(i + 1)
+        // Whole-segment guard: the arg group must be the final token. A trailing
+        // method call / operator after it (`format!(...).to_uppercase()`,
+        // `format!(...) + x`) means the runtime value is a derived expression,
+        // not the raw format string — so this is not a format prefix source.
+        && trees.get(i + 2).is_none()
     {
         return Some(group);
     }
     None
 }
 
-/// The value of the leading string literal of a
-/// [`normalize_key_segment`]-normalized expression. `None` when the expression
-/// does not begin with a string literal (a bare variable, a metavariable, a
-/// `format!`, a method-call receiver…), yielding an empty prefix.
+/// The value of a leading string literal that spans the WHOLE
+/// [`normalize_key_segment`]-normalized expression. Empty when the expression is
+/// not exactly a single string-literal token — a bare variable, a metavariable,
+/// a `format!`, a method-call receiver, or a literal followed by trailing tokens
+/// (`" nav.home ".trim()`, `"x".to_string()`, `"a" + b`). Such a leading literal
+/// is only the *receiver* of a transform, so the runtime key is not the raw
+/// literal text; yielding an empty prefix keeps the site fully dynamic (Unused
+/// fully suppressed) instead of lifting out a bogus static prefix.
 fn leading_str_literal(trees: &[TokenTree]) -> String {
-    match trees.first() {
-        Some(tt @ TokenTree::Literal(_)) => {
+    match trees {
+        [tt @ TokenTree::Literal(_)] => {
             segment_str_lit(&TokenStream::from(tt.clone())).unwrap_or_default()
         }
         _ => String::new(),
@@ -1543,8 +1572,10 @@ mod tests {
     #[test]
     fn dynamic_prefix_from_format_and_leading_literal() {
         // The static prefix is the text before the first `{` interpolation for a
-        // `format!`, the whole leading literal for a concat, and empty when no
-        // leading literal is discoverable.
+        // whole-segment `format!`. A leading literal that is only the *receiver*
+        // of a transform (`"footer.".to_owned() + x`) yields an EMPTY prefix —
+        // the runtime key is a derived value, not the raw literal — as does a
+        // `format!("{x}")` with no static head and a bare variable.
         let src = r#"
             fn view(locale: &Locale, state: &str, x: &str, key: &str) {
                 let _ = locale.t(&format!("status.{state}"));
@@ -1561,7 +1592,60 @@ mod tests {
             .iter()
             .map(|d| d.key_prefix.as_str())
             .collect();
-        assert_eq!(prefixes, vec!["status.", "nav.", "", "footer.", ""]);
+        assert_eq!(prefixes, vec!["status.", "nav.", "", "", ""]);
+    }
+
+    #[test]
+    fn dynamic_prefix_empty_for_transformed_leading_literal() {
+        // Regression for the direct (UNPARENTHESIZED) transformed-literal path:
+        // `t(" nav.home ".trim())` starts with a literal that is then transformed
+        // by `.trim()`, so the runtime key is `nav.home`, NOT the raw
+        // `" nav.home "`. The prefix must be EMPTY (fully dynamic) rather than the
+        // spaced literal, otherwise the real `nav.home` entry is falsely reported
+        // Unused and `--strict` fails. Likewise a directly-transformed `format!`
+        // (`format!("status.{s}").to_uppercase()`) yields an empty prefix.
+        let src = r#"
+            fn view(locale: &Locale, s: &str) {
+                let _ = locale.t(" nav.home ".trim());
+                let _ = locale.t(format!("status.{s}").to_uppercase());
+            }
+        "#;
+        let mut result = ScanResult::default();
+        scan_source(src, "view.rs", &mut result);
+        let prefixes: Vec<&str> = result
+            .dynamic
+            .iter()
+            .map(|d| d.key_prefix.as_str())
+            .collect();
+        assert_eq!(prefixes, vec!["", ""]);
+    }
+
+    #[test]
+    fn transformed_leading_literal_suppresses_unused() {
+        // End-to-end: an `.ftl` defines `nav.home`, and the only code site looks
+        // it up via a transformed literal `t(" nav.home ".trim())`. The empty
+        // prefix sets `unused_suppressed_by_dynamic`, so `nav.home` is NOT
+        // reported Unused and `--strict` does not falsely fail.
+        let src = r#"
+            fn view(locale: &Locale) {
+                let _ = locale.t(" nav.home ".trim());
+            }
+        "#;
+        let mut scan = ScanResult::default();
+        scan_source(src, "view.rs", &mut scan);
+        assert_eq!(scan.dynamic.len(), 1);
+        assert_eq!(scan.dynamic[0].key_prefix, "");
+
+        let mut per_locale = BTreeMap::new();
+        per_locale.insert("en".to_owned(), keys(&["nav.home"]));
+        let report = build_report(&scan, &cfg("en", &[]), &per_locale);
+
+        // The empty prefix sets the wholesale-suppression flag, so the (still
+        // listed, but informational) `nav.home` Unused entry does not count as a
+        // warning and `--strict` passes rather than falsely failing.
+        assert!(report.unused_suppressed_by_dynamic);
+        assert!(!report.has_warnings());
+        assert_eq!(report.exit_code(true), 0);
     }
 
     #[test]
