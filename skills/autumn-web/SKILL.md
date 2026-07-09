@@ -879,6 +879,40 @@ autumn generate scaffold Post title:String --live --live-validation
 autumn generate tauri            # desktop sidecar project (cargo tauri build)
 autumn generate plugin my-plugin # installable/conformant plugin crate
 autumn token issue service:ci --name ci --scope posts:write   # scoped tokens; also list, rotate
+autumn i18n check                # compare t!/t(...) keys vs i18n/*.ftl; --strict, --format json
+```
+
+`autumn i18n check` scans `**/*.rs` for string-literal keys passed to
+`t!(...)`, `.t(...)`, and `.t_with(...)`, loads every `i18n/<locale>.ftl` via
+the runtime `Bundle` loader, and reports per locale: **Missing** (referenced in
+code but absent from that locale's resolved fallback chain — the correctness
+failure, non-zero exit), **Untranslated** (present in the default locale but
+not a non-default one), and **Unused** (defined in a `.ftl` with no call site).
+Untranslated/Unused are warnings unless `--strict`. `--format json` feeds CI.
+Runtime-built keys like `t(&format!(...))` are listed as "dynamic — not
+checked" rather than flagged.
+
+**Known heuristic limits.** The scanner is a best-effort token/grammar
+heuristic over source text, not a type-resolved AST. Any key it cannot
+statically resolve to a string literal is treated as *dynamic — not checked*,
+so unsupported shapes are never falsely flagged as Missing/Unused and cannot
+break CI:
+
+- Only whole-key string literals (optionally in leading borrows/parens spanning
+  the entire key argument) are checked precisely. A literal transformed by a
+  chained method or operator (`t(" nav.home ".trim())`, `t("a" + b)`) is treated
+  as dynamic, not as the literal.
+- Dynamic keys are reported as "dynamic — not checked". A whole-key
+  `format!("status.{state}")` contributes its static `"status."` prefix so
+  matching `.ftl` keys aren't marked Unused; a fully-dynamic key (bare variable,
+  `format!("{x}")`) suppresses Unused reporting entirely.
+- Keys built through concatenation, helper functions, non-`format!` macros, or
+  deeper transformations are treated as dynamic and not validated — such `.ftl`
+  entries aren't checked for Missing/Unused.
+- No type resolution: it can't distinguish an unrelated local helper named
+  `t`/`t_with` from the real translation API beyond its syntactic
+  `t!(...)` / `receiver.t(...)` / `Type::t(...)` (real `::` path) checks; a bare
+  free-function `t("...")` is left alone.
 autumn migrate baseline          # record content hashes for legacy applied migrations (issue #1203)
 autumn migrate baseline --force <version>  # escape hatch: overwrite one version's stored hash (WARN-logged)
 ```

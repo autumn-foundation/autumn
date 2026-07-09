@@ -9,6 +9,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **cli:** `autumn i18n check` (issue #1252) — a read-only diagnostic that
+  compares the translation keys referenced in code (string literals passed to
+  `t!(...)`, `.t(...)`, and `.t_with(...)`) against the keys defined in each
+  `i18n/<locale>.ftl`, so a missing or untranslated string is caught in CI
+  instead of from a production `Bundle::miss_count()` warning. It loads the
+  bundle through the existing `Bundle::load_from_dir` loader and reports, per
+  locale, **Missing** keys (referenced in code but absent from that locale's
+  resolved fallback chain), **Untranslated** keys (defined in the default locale
+  but resolving all the way to it for this locale — neither the locale itself nor
+  any non-default locale in its fallback chain supplies them, so the user sees
+  default-language text; a key an intermediate parent locale like `pt` supplies
+  for `pt-BR` is not flagged), and **Unused** keys (defined in a `.ftl` with no call
+  site). Exit is non-zero when any locale has Missing keys; Untranslated/Unused
+  are warnings that become errors under `--strict`. `--format json` emits a
+  machine-readable report for `autumn check`/CI to consume. Dynamically-built
+  keys (e.g. `t(&format!(...))`) are listed as "dynamic — not checked" rather
+  than silently ignored or falsely flagged. The i18n config is resolved through
+  the same profile-aware loader the runtime uses (`AutumnConfig::load_with_env`),
+  so `AUTUMN_ENV` and `[profile.<env>.i18n]` / `autumn-<env>.toml` overlays are
+  honored — under `AUTUMN_ENV=prod` the check inspects the production locale
+  directory and `supported_locales` instead of the base defaults, so missing
+  production translations are no longer silently passed. A missing locale
+  directory only skips (exit 0) when the project has *no* i18n configuration at
+  all; when i18n *is* configured (a base `[i18n]` table or a
+  `[profile.<env>.i18n]` / `autumn-<env>.toml` overlay for the active profile)
+  but the resolved directory is absent, the check loads through
+  `Bundle::load_from_dir` and fails with the same `MissingDefaultLocale` error
+  the app would hit at startup, so CI no longer passes an app that cannot start.
+  A translation call nested in another call's arguments (e.g.
+  `t_with("message", &[("status", &locale.t("status.open"))])`) now has *both*
+  keys recorded — the scanner recurses into the outer call's argument group — so
+  removing the inner key from every `.ftl` is correctly reported as Missing
+  instead of slipping past with exit 0. The scanner's intentional heuristic
+  limits — the key-expression shapes treated as *dynamic — not checked* rather
+  than validated — are documented under "Known heuristic limits" in the command
+  module rustdoc and the plugin skill doc. See `autumn-cli/src/i18n.rs`.
 - **generator:** `autumn generate controller <name> <action>...` scaffolds a handler-only module (named actions, wired routes, Maud stub views) for non-CRUD pages/endpoints — no model, migration, or DB; `--api` emits JSON actions. (issue #1050)
 - **download:** typed `Download` `IntoResponse` (`autumn_web::download::Download`)
   for serving files from a handler without hand-rolling headers. Construct it
