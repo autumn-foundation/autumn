@@ -286,7 +286,7 @@ where
 {
     fn into_response(self) -> Response {
         let mut out = Vec::new();
-        if let Err(_) = export_csv(self.1, &mut out) {
+        if export_csv(self.1, &mut out).is_err() {
             return (
                 http::StatusCode::INTERNAL_SERVER_ERROR,
                 "Failed to generate CSV export",

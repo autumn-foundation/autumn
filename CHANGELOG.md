@@ -194,6 +194,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `BlobStore::get_stream` without buffering the whole object in memory, so it
   serves large private files behind a `#[secured]` handler with no public
   presigned URL (#1141).
+- **data/csv:** `CsvExport` response primitive (PR #1511) [no-plugin] —
+  `autumn_web::data::csv::CsvExport(filename, records)` wraps any iterator of
+  `CsvSchema` records and implements Axum `IntoResponse`, returning a fully
+  formed `text/csv; charset=utf-8` response with an attachment
+  `Content-Disposition` header, so a CSV export endpoint is a one-liner in any
+  handler.
 - **lock:** app-facing distributed lock for run-once-across-replicas work
   (issue #1387) — `autumn_web::lock::Lock` promotes the Postgres advisory-lock
   machinery that already gates migrations, `#[scheduled]` leader election, and
