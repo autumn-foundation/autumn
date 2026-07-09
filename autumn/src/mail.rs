@@ -1450,9 +1450,11 @@ impl Mailer {
         {
             let mut kept: Vec<String> = Vec::with_capacity(mail.to.len());
             for recipient in &mail.to {
-                let canonical = canonical_subscriber(recipient);
-                if store.is_suppressed(&canonical).await? {
-                    suppression::note_skip(&canonical);
+                // The store canonicalizes internally, so pass the raw recipient
+                // and only canonicalize on the (rare) suppressed path for the
+                // log line — no allocation for delivered recipients.
+                if store.is_suppressed(recipient).await? {
+                    suppression::note_skip(&canonical_subscriber(recipient));
                 } else {
                     kept.push(recipient.clone());
                 }
@@ -3795,7 +3797,13 @@ pub mod suppression {
                         })
                         .on_conflict(mail_suppressions::address)
                         .do_update()
-                        .set(mail_suppressions::reason.eq(reason_str))
+                        // Refresh both the reason and the timestamp so a
+                        // re-suppression (e.g. an old hard bounce now also a
+                        // complaint) reflects the latest event, not stale data.
+                        .set((
+                            mail_suppressions::reason.eq(reason_str),
+                            mail_suppressions::suppressed_at.eq(diesel::dsl::now),
+                        ))
                         .execute(&mut conn)
                         .await
                         .map_err(|e| {
