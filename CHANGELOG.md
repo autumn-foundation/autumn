@@ -16,8 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of from a production `Bundle::miss_count()` warning. It loads the
   bundle through the existing `Bundle::load_from_dir` loader and reports, per
   locale, **Missing** keys (referenced in code but absent from that locale's
-  resolved fallback chain), **Untranslated** keys (in the default locale but
-  not a non-default one), and **Unused** keys (defined in a `.ftl` with no call
+  resolved fallback chain), **Untranslated** keys (defined in the default locale
+  but resolving all the way to it for this locale — neither the locale itself nor
+  any non-default locale in its fallback chain supplies them, so the user sees
+  default-language text; a key an intermediate parent locale like `pt` supplies
+  for `pt-BR` is not flagged), and **Unused** keys (defined in a `.ftl` with no call
   site). Exit is non-zero when any locale has Missing keys; Untranslated/Unused
   are warnings that become errors under `--strict`. `--format json` emits a
   machine-readable report for `autumn check`/CI to consume. Dynamically-built

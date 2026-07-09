@@ -140,6 +140,111 @@ fn fallback_locale_supplies_key_so_not_missing() {
 }
 
 #[test]
+fn intermediate_fallback_locale_is_not_a_false_untranslated_under_strict() {
+    // Regional child `pt-BR` intentionally inherits from its parent `pt` (chain
+    // `pt-BR -> pt -> en`). It defines neither `nav.home` nor `nav.about`, but
+    // `pt` localizes both, so the runtime never serves default-language text for
+    // `pt-BR`. The check must agree: nothing Untranslated, and `--strict` passes
+    // — the false-failure this fix targets.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "autumn.toml",
+        "\
+[i18n]
+default_locale = \"en\"
+supported_locales = [\"en\", \"pt\", \"pt-BR\"]
+fallback_chain = [\"pt\", \"en\"]
+",
+    );
+    write(root, "src/main.rs", CALL_SITES);
+    write(root, "i18n/en.ftl", "nav.home = Home\nnav.about = About\n");
+    write(
+        root,
+        "i18n/pt.ftl",
+        "nav.home = In\u{ed}cio\nnav.about = Sobre\n",
+    );
+    // `pt-BR` intentionally empty — inherits everything from `pt`.
+    write(root, "i18n/pt-BR.ftl", "");
+
+    let output = run_check(root, &["--strict"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "pt-BR keys resolve to localized `pt`, so --strict must pass\nstdout:\n{stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // No warning markers at all — every locale's Untranslated list is `(none)`.
+    assert!(
+        stdout.contains("Result: PASS — all referenced keys are translated."),
+        "no key should be Untranslated — `pt` supplies them\nstdout:\n{stdout}"
+    );
+}
+
+#[test]
+fn default_only_key_is_untranslated_across_intermediate_fallback() {
+    // Contrast to the intermediate-fallback pass: `brand.tagline` is defined only
+    // by the default `en`, absent from both `pt` and `pt-BR`, so it falls all the
+    // way through to default-language text for `pt-BR`. That IS Untranslated (a
+    // warning that fails `--strict`) — but NOT Missing, since `en` supplies it.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "autumn.toml",
+        "\
+[i18n]
+default_locale = \"en\"
+supported_locales = [\"en\", \"pt\", \"pt-BR\"]
+fallback_chain = [\"pt\", \"en\"]
+",
+    );
+    write(
+        root,
+        "src/main.rs",
+        r#"
+fn view(locale: &Locale) -> String {
+    let a = t!(locale, "nav.home");
+    let b = locale.t("brand.tagline");
+    format!("{a}{b}")
+}
+"#,
+    );
+    write(
+        root,
+        "i18n/en.ftl",
+        "nav.home = Home\nbrand.tagline = Ship faster\n",
+    );
+    write(root, "i18n/pt.ftl", "nav.home = In\u{ed}cio\n");
+    write(root, "i18n/pt-BR.ftl", "");
+
+    // Warning only by default (exit 0), failure under --strict (exit 1).
+    let default_run = run_check(root, &[]);
+    let default_stdout = String::from_utf8_lossy(&default_run.stdout);
+    assert!(
+        default_run.status.success(),
+        "untranslated is a warning by default\nstdout:\n{default_stdout}"
+    );
+    // Untranslated keys render under a `⚠` marker; Missing under `✗`.
+    assert!(
+        default_stdout.contains("\u{26a0} brand.tagline"),
+        "default-only key must be flagged Untranslated\nstdout:\n{default_stdout}"
+    );
+    assert!(
+        !default_stdout.contains('\u{2717}'),
+        "default supplies the key, so nothing is Missing\nstdout:\n{default_stdout}"
+    );
+
+    let strict_run = run_check(root, &["--strict"]);
+    assert!(
+        !strict_run.status.success(),
+        "untranslated must fail under --strict\nstdout:\n{}",
+        String::from_utf8_lossy(&strict_run.stdout)
+    );
+}
+
+#[test]
 fn unused_key_is_warning_by_default_and_error_under_strict() {
     let dir = clean_project();
     // Add a defined-but-never-referenced key to the default locale.

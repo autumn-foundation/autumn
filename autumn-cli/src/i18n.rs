@@ -804,10 +804,39 @@ pub fn build_report(
                 .cloned()
                 .collect();
 
+            // **Untranslated** = a default-locale key that resolves all the way
+            // to the *default* locale for this locale — i.e. neither this locale
+            // nor any NON-default locale in its resolved fallback chain defines
+            // it, so the user sees default-language text. If an intermediate
+            // non-default fallback (e.g. `pt` for `pt-BR`) supplies the key, the
+            // user sees proper localized text, so it is NOT untranslated.
+            //
+            // Mirror the runtime `Bundle::lookup_template` resolution order: the
+            // locale itself first, then the shared resolved fallback chain
+            // (skipping the locale if it reappears), always ending at the default
+            // locale. A default key is untranslated exactly when the *first*
+            // locale in that order to define it is the default locale.
             let untranslated: Vec<String> = if is_default {
                 Vec::new()
             } else {
-                default_keys.difference(keys).cloned().collect()
+                let resolution_order = std::iter::once(locale.as_str()).chain(
+                    chain
+                        .iter()
+                        .map(String::as_str)
+                        .filter(|f| *f != locale.as_str()),
+                );
+                let resolution_order: Vec<&str> = resolution_order.collect();
+                default_keys
+                    .iter()
+                    .filter(|k| {
+                        resolution_order.iter().copied().find(|loc| {
+                            per_locale_keys
+                                .get(*loc)
+                                .is_some_and(|ks| ks.contains(k.as_str()))
+                        }) == Some(default_locale.as_str())
+                    })
+                    .cloned()
+                    .collect()
             };
 
             // Fluent terms (`-brand = …`) are only referenced from within other
@@ -2012,6 +2041,77 @@ mod tests {
         assert!(es.missing.is_empty(), "fallback should supply nav.about");
         assert!(!report.has_missing());
         assert_eq!(report.exit_code(false), 0);
+    }
+
+    #[test]
+    fn intermediate_fallback_locale_supplies_key_so_not_untranslated() {
+        // Three-locale fallback: default `en` and the regional-parent `pt` both
+        // define `nav.home`; the regional child `pt-BR` does NOT, with the
+        // resolved chain `pt-BR -> pt -> en`. Runtime `lookup_template` resolves
+        // `nav.home` from the localized `pt`, never the default `en`, so it must
+        // NOT be flagged Untranslated for `pt-BR` — and `--strict` passes.
+        let scan = scan_with(&["nav.home"]);
+        let mut per_locale = BTreeMap::new();
+        per_locale.insert("en".to_owned(), keys(&["nav.home"]));
+        per_locale.insert("pt".to_owned(), keys(&["nav.home"]));
+        per_locale.insert("pt-BR".to_owned(), keys(&[]));
+        let report = build_report(&scan, &cfg("en", &["pt", "en"]), &per_locale);
+
+        let pt_br = report.locales.iter().find(|l| l.locale == "pt-BR").unwrap();
+        assert!(
+            pt_br.missing.is_empty(),
+            "`pt` supplies nav.home via the chain: {:?}",
+            pt_br.missing
+        );
+        assert!(
+            !pt_br.untranslated.contains(&"nav.home".to_owned()),
+            "nav.home resolves to localized `pt`, not default `en`: {:?}",
+            pt_br.untranslated
+        );
+        // The intermediate parent `pt` defines nav.home itself → not untranslated.
+        let pt = report.locales.iter().find(|l| l.locale == "pt").unwrap();
+        assert!(pt.untranslated.is_empty(), "{:?}", pt.untranslated);
+
+        assert!(!report.has_missing());
+        assert!(!report.has_warnings());
+        assert_eq!(report.exit_code(true), 0, "no issues → --strict passes");
+    }
+
+    #[test]
+    fn default_only_key_is_untranslated_through_chain() {
+        // Contrast to the intermediate-fallback case: `brand.tagline` is defined
+        // ONLY by the default `en`, absent from both `pt` and `pt-BR`. It resolves
+        // all the way to the default for both non-default locales, so the user
+        // sees default-language text — Untranslated for `pt` and `pt-BR` (a
+        // warning that fails `--strict`), but NOT Missing (the default supplies
+        // it). The localized `nav.home` stays translated for `pt-BR` via `pt`.
+        let scan = scan_with(&["nav.home", "brand.tagline"]);
+        let mut per_locale = BTreeMap::new();
+        per_locale.insert("en".to_owned(), keys(&["nav.home", "brand.tagline"]));
+        per_locale.insert("pt".to_owned(), keys(&["nav.home"]));
+        per_locale.insert("pt-BR".to_owned(), keys(&[]));
+        let report = build_report(&scan, &cfg("en", &["pt", "en"]), &per_locale);
+
+        let pt_br = report.locales.iter().find(|l| l.locale == "pt-BR").unwrap();
+        assert!(pt_br.missing.is_empty(), "{:?}", pt_br.missing);
+        assert!(
+            pt_br.untranslated.contains(&"brand.tagline".to_owned()),
+            "default-only key falls through to `en`: {:?}",
+            pt_br.untranslated
+        );
+        assert!(
+            !pt_br.untranslated.contains(&"nav.home".to_owned()),
+            "nav.home is still supplied by `pt`: {:?}",
+            pt_br.untranslated
+        );
+
+        let pt = report.locales.iter().find(|l| l.locale == "pt").unwrap();
+        assert_eq!(pt.untranslated, vec!["brand.tagline".to_owned()]);
+
+        assert!(!report.has_missing());
+        assert!(report.has_warnings());
+        assert_eq!(report.exit_code(false), 0);
+        assert_eq!(report.exit_code(true), 1);
     }
 
     #[test]
