@@ -1131,8 +1131,16 @@ fn extract_throttle_key(
     limiter.extract_key(&req)
 }
 
-/// Build the shared 429 problem-details response used by both the global tower
-/// layer and the `#[throttle]` per-route guard.
+/// Build the 429 problem-details response returned by the `#[throttle]`
+/// per-route guard.
+///
+/// This mirrors the response the global tower layer emits on a denial
+/// (same status, `Retry-After`, `x-ratelimit-*` headers, and
+/// `application/problem+json` body via [`rate_limit_problem_json`]). The
+/// tower layer builds its own copy inline rather than calling this helper
+/// because `RateLimitService` is generic over the inner response body type,
+/// whereas this guard always returns an `axum` `Body`; keep the two in sync
+/// if either side changes.
 fn build_rate_limited_response(
     key_class: &str,
     retry_after_secs: u64,
