@@ -102,6 +102,33 @@ async fn named_login() -> &'static str {
     "named-ok"
 }
 
+// A SINGLE inline-throttled handler reused under two `scoped` prefixes. Both
+// mounts share the same compile-time route_id (`module::multi_mount`), so
+// per-route bucket isolation must come from the RUNTIME matched path. This
+// reproduces the #1662 P2 finding: without folding the matched path into the
+// throttle namespace, traffic to one mounted path would drain the other's
+// bucket.
+#[get("/shared")]
+#[throttle(limit = 1, per = "60s", key = "ip")]
+async fn multi_mount() -> &'static str {
+    "multi-mount-ok"
+}
+
+// Two DISTINCT handlers that both reference the same NAMED limiter. A named
+// limiter is a deliberately shared, centrally-named bucket, so these two routes
+// intentionally share one abuse budget regardless of their mounted paths.
+#[get("/named-share-a")]
+#[throttle("shared_login")]
+async fn named_share_a() -> &'static str {
+    "named-share-a-ok"
+}
+
+#[get("/named-share-b")]
+#[throttle("shared_login")]
+async fn named_share_b() -> &'static str {
+    "named-share-b-ok"
+}
+
 #[get("/trusted-proxy-ip")]
 #[throttle(limit = 1, per = "1s", key = "ip")]
 async fn trusted_proxy_ip() -> &'static str {
@@ -935,4 +962,110 @@ async fn throttle_redis_routes_do_not_share_bucket() {
         .send()
         .await
         .assert_status(429);
+}
+
+/// Regression (Codex P2, PR #1662): an INLINE `#[throttle]` handler mounted at
+/// two different paths must get INDEPENDENT buckets per mounted route path. The
+/// same handler reused under two `scoped` prefixes shares one compile-time
+/// `route_id`, so before folding the runtime `MatchedPath` into the throttle
+/// namespace, spending path A's bucket also spent path B's. Here path A is
+/// driven past its limit (→ 429) while path B — same handler, same client IP —
+/// must still return 200, proving the buckets are isolated by mounted path.
+#[tokio::test]
+async fn inline_throttle_isolates_same_handler_mounted_at_two_paths() {
+    let client = TestApp::new()
+        .scoped(
+            "/mount-a",
+            tower::layer::util::Identity::new(),
+            routes![multi_mount],
+        )
+        .scoped(
+            "/mount-b",
+            tower::layer::util::Identity::new(),
+            routes![multi_mount],
+        )
+        .config(base_config())
+        .build();
+
+    let ip = "198.51.100.150";
+
+    // Path A: limit = 1 — first hit allowed, second denied.
+    client
+        .get("/mount-a/shared")
+        .header("X-Forwarded-For", ip)
+        .send()
+        .await
+        .assert_status(200);
+    client
+        .get("/mount-a/shared")
+        .header("X-Forwarded-For", ip)
+        .send()
+        .await
+        .assert_status(429);
+
+    // Path B (same handler, same client IP) has its OWN bucket: still allowed.
+    // Under the bug this returned 429 because both mounts shared one bucket.
+    client
+        .get("/mount-b/shared")
+        .header("X-Forwarded-For", ip)
+        .send()
+        .await
+        .assert_status(200);
+    // And it independently enforces its own limit on the second hit.
+    client
+        .get("/mount-b/shared")
+        .header("X-Forwarded-For", ip)
+        .send()
+        .await
+        .assert_status(429);
+}
+
+/// Companion to the inline-isolation test: a NAMED limiter is a deliberately
+/// shared, centrally-named bucket. Two DISTINCT routes both referencing
+/// `#[throttle("shared_login")]` must SHARE one bucket (the matched path is
+/// intentionally NOT folded into a named limiter's key), so exhausting the
+/// budget on route A immediately throttles route B for the same client.
+#[tokio::test]
+async fn named_limiter_is_shared_across_two_routes() {
+    let mut config = base_config();
+    config.security.rate_limit.named.insert(
+        "shared_login".to_owned(),
+        RateLimitNamedConfig {
+            limit: 1,
+            per: "60s".to_owned(),
+            key: Some(KeyStrategy::Ip),
+        },
+    );
+
+    let client = TestApp::new()
+        .routes(routes![named_share_a, named_share_b])
+        .config(config)
+        .build();
+
+    let ip = "203.0.113.99";
+
+    // Route A consumes the single shared token.
+    client
+        .get("/named-share-a")
+        .header("X-Forwarded-For", ip)
+        .send()
+        .await
+        .assert_status(200);
+    // Route B — a different route, same client — is throttled because it shares
+    // the SAME named bucket. This is the intentional counterpart to the inline
+    // per-path isolation above.
+    client
+        .get("/named-share-b")
+        .header("X-Forwarded-For", ip)
+        .send()
+        .await
+        .assert_status(429);
+
+    // A different client gets its own shared-bucket allocation.
+    client
+        .get("/named-share-b")
+        .header("X-Forwarded-For", "203.0.113.100")
+        .send()
+        .await
+        .assert_status(200);
 }

@@ -88,8 +88,11 @@ async fn login(Form(input): Form<LoginForm>) -> AutumnResult<Redirect> {
 
 Two handlers that both use `#[throttle("login")]` share a single token bucket
 (useful when e.g. `POST /login` and `POST /login/2fa` should be combined for
-the same abuse budget). Inline `#[throttle(limit = …, per = …)]` forms get an
-isolated per-handler bucket.
+the same abuse budget); named limiters are intentionally shared by name across
+every route that references them, regardless of mounted path. Inline
+`#[throttle(limit = …, per = …)]` forms instead isolate per mounted route path —
+the same handler mounted at two paths (e.g. reused under two `scoped` prefixes)
+gets an independent bucket for each path.
 
 If the named entry is missing at runtime (typo, config not yet deployed), the
 limiter fails **open** with a `WARN` log — the route continues to serve

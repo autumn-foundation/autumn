@@ -1055,10 +1055,12 @@ pub enum ThrottleSpec {
 
 /// Per-route limiter registry shared across a process.
 ///
-/// Keyed by `route_id` for inline `#[throttle(...)]` forms and by `"named:{name}"`
-/// for `#[throttle("name")]` forms, so distinct routes pointing at the same
-/// named limiter share a single token bucket while inline throttles get an
-/// isolated bucket per handler.
+/// Keyed by `route:{route_id}@{matched_path}` for inline `#[throttle(...)]` forms
+/// (the runtime matched path isolates a handler mounted at multiple paths; it
+/// falls back to `route:{route_id}` when no `MatchedPath` is available) and by
+/// `"named:{name}"` for `#[throttle("name")]` forms, so distinct routes pointing
+/// at the same named limiter share a single token bucket while inline throttles
+/// get an isolated bucket per mounted route path.
 ///
 /// The route/name is further qualified by a
 /// [`throttle_config_fingerprint`] so that two `AppState`s with DIFFERENT
@@ -1248,6 +1250,7 @@ fn warn_once(key: String) -> bool {
 /// be applied, or `None` when the named entry is missing (fail-open with warn).
 fn resolve_throttle_params(
     route_id: &'static str,
+    matched_path: Option<&str>,
     spec: &ThrottleSpec,
     config: &RateLimitConfig,
 ) -> Option<(u32, u64, KeyStrategy, String)> {
@@ -1258,7 +1261,24 @@ fn resolve_throttle_params(
             key,
         } => {
             let key = key.unwrap_or(config.key_strategy);
-            Some((*limit, *per_secs, key, format!("route:{route_id}")))
+            // INLINE throttles isolate PER MOUNTED ROUTE PATH. The compile-time
+            // `route_id` (`module_path!()::fn_name`) is identical for a single
+            // handler mounted at more than one path — e.g. the same `routes![…]`
+            // reused under two `AppBuilder::scoped` prefixes, or versioned mounts
+            // — so keying on `route_id` alone would let traffic to one mounted
+            // path drain the other's bucket. Fold the RUNTIME matched path into
+            // the registry namespace so each mount gets its own bucket. When no
+            // `MatchedPath` is available (fallbacks / unnested routes) fall back
+            // to the bare `route_id`, preserving prior behavior.
+            //
+            // NAMED throttles do the OPPOSITE (see the `Named` arm below): a named
+            // limiter is a deliberately shared, centrally-named bucket, so it is
+            // keyed by name only and multiple routes referencing it share it.
+            let registry_key = matched_path.map_or_else(
+                || format!("route:{route_id}"),
+                |path| format!("route:{route_id}@{path}"),
+            );
+            Some((*limit, *per_secs, key, registry_key))
         }
         ThrottleSpec::Named(name) => {
             let Some(entry) = config.named.get(*name) else {
@@ -1305,6 +1325,12 @@ fn resolve_throttle_params(
             }
             let per_secs = duration.as_secs().max(1);
             let key = entry.key.unwrap_or(config.key_strategy);
+            // NAMED throttles are DELIBERATELY SHARED by name: the matched path is
+            // intentionally NOT folded into the key, so every route pointing at
+            // `#[throttle("<name>")]` shares one centrally-named bucket (e.g.
+            // `POST /login` and `POST /login/2fa` sharing one abuse budget). This
+            // is the deliberate counterpart to the per-path isolation the inline
+            // arm above applies.
             Some((entry.limit, per_secs, key, format!("named:{name}")))
         }
     }
@@ -1386,6 +1412,7 @@ fn build_rate_limited_response(
 pub async fn __check_throttle(
     state: &crate::AppState,
     route_id: &'static str,
+    matched_path: Option<&str>,
     spec: ThrottleSpec,
     headers: &axum::http::HeaderMap,
     peer: Option<std::net::SocketAddr>,
@@ -1405,7 +1432,7 @@ pub async fn __check_throttle(
     let trusted_proxies = &config.security.trusted_proxies;
 
     let Some((limit, per_secs, key_strategy, registry_key)) =
-        resolve_throttle_params(route_id, &spec, rl_config)
+        resolve_throttle_params(route_id, matched_path, &spec, rl_config)
     else {
         // Fail-open: named entry missing or unparseable (already logged).
         return Ok(());
@@ -2921,12 +2948,67 @@ mod tests {
             per_secs: 60,
             key: None,
         };
+        // No MatchedPath (fallback / unnested route): bare route_id, as before.
         let (limit, per, key, reg_key) =
-            resolve_throttle_params("m::h", &spec, &global).expect("params");
+            resolve_throttle_params("m::h", None, &spec, &global).expect("params");
         assert_eq!(limit, 5);
         assert_eq!(per, 60);
         assert_eq!(key, KeyStrategy::AuthenticatedPrincipal);
         assert_eq!(reg_key, "route:m::h");
+    }
+
+    #[test]
+    fn resolve_throttle_params_inline_folds_matched_path_into_registry_key() {
+        // An inline throttle mounted at two paths shares one compile-time
+        // route_id; folding the runtime matched path in gives each mount its
+        // own bucket namespace so their token buckets stay independent.
+        let global = RateLimitConfig::default();
+        let spec = ThrottleSpec::Inline {
+            limit: 5,
+            per_secs: 60,
+            key: None,
+        };
+        let (_, _, _, reg_key_a) =
+            resolve_throttle_params("m::h", Some("/a/thing"), &spec, &global).expect("params");
+        let (_, _, _, reg_key_b) =
+            resolve_throttle_params("m::h", Some("/b/thing"), &spec, &global).expect("params");
+        assert_eq!(reg_key_a, "route:m::h@/a/thing");
+        assert_eq!(reg_key_b, "route:m::h@/b/thing");
+        assert_ne!(
+            reg_key_a, reg_key_b,
+            "same handler at two mounted paths must get distinct registry namespaces"
+        );
+    }
+
+    #[test]
+    fn resolve_throttle_params_named_ignores_matched_path() {
+        // A NAMED limiter is a deliberately shared, centrally-named bucket, so
+        // its registry key is keyed by name only — the matched path must NOT be
+        // folded in, letting multiple routes share one bucket on purpose.
+        use super::super::config::RateLimitNamedConfig;
+        let mut named = std::collections::HashMap::new();
+        named.insert(
+            "login".to_owned(),
+            RateLimitNamedConfig {
+                limit: 3,
+                per: "30s".to_owned(),
+                key: None,
+            },
+        );
+        let global = RateLimitConfig {
+            named,
+            ..Default::default()
+        };
+        let spec = ThrottleSpec::Named("login");
+        let (_, _, _, reg_key_a) =
+            resolve_throttle_params("m::a", Some("/a/login"), &spec, &global).expect("params");
+        let (_, _, _, reg_key_b) =
+            resolve_throttle_params("m::b", Some("/b/login"), &spec, &global).expect("params");
+        assert_eq!(reg_key_a, "named:login");
+        assert_eq!(
+            reg_key_a, reg_key_b,
+            "named limiters stay shared by name regardless of mounted path"
+        );
     }
 
     #[test]
@@ -2947,7 +3029,7 @@ mod tests {
     fn resolve_throttle_params_named_missing_entry_fails_open() {
         let global = RateLimitConfig::default();
         let spec = ThrottleSpec::Named("nonexistent");
-        assert!(resolve_throttle_params("m::h", &spec, &global).is_none());
+        assert!(resolve_throttle_params("m::h", None, &spec, &global).is_none());
     }
 
     #[test]
@@ -2968,7 +3050,7 @@ mod tests {
         };
         let spec = ThrottleSpec::Named("login");
         let (limit, per, key, reg_key) =
-            resolve_throttle_params("m::h", &spec, &global).expect("params");
+            resolve_throttle_params("m::h", None, &spec, &global).expect("params");
         assert_eq!(limit, 3);
         assert_eq!(per, 30);
         assert_eq!(key, KeyStrategy::ApiToken);
@@ -2996,7 +3078,7 @@ mod tests {
         };
         let spec = ThrottleSpec::Named("zero");
         assert!(
-            resolve_throttle_params("m::h", &spec, &global).is_none(),
+            resolve_throttle_params("m::h", None, &spec, &global).is_none(),
             "a zero named `limit` must fail open, not enforce a budget of 1"
         );
         // A valid (limit >= 1) entry is unaffected.
@@ -3014,7 +3096,7 @@ mod tests {
             ..Default::default()
         };
         let (limit, _, _, _) =
-            resolve_throttle_params("m::h", &ThrottleSpec::Named("ok"), &global_ok)
+            resolve_throttle_params("m::h", None, &ThrottleSpec::Named("ok"), &global_ok)
                 .expect("valid entry resolves");
         assert_eq!(limit, 1, "a limit of 1 stays enforced");
     }
@@ -3038,7 +3120,8 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            resolve_throttle_params("m::h", &ThrottleSpec::Named("zeroper"), &global).is_none(),
+            resolve_throttle_params("m::h", None, &ThrottleSpec::Named("zeroper"), &global)
+                .is_none(),
             "a zero-length `per` window must fail open"
         );
     }
@@ -3069,6 +3152,7 @@ mod tests {
             let result = __check_throttle(
                 &state,
                 "test::check_throttle_named_zero_limit_allows_requests_fail_open",
+                None,
                 ThrottleSpec::Named("zero"),
                 &headers,
                 peer,
@@ -3099,6 +3183,7 @@ mod tests {
         let result = __check_throttle(
             &state,
             "test::check_throttle_named_missing_entry_returns_ok_fail_open",
+            None,
             ThrottleSpec::Named("does_not_exist"),
             &headers,
             Some("127.0.0.1:1234".parse().unwrap()),
@@ -3123,6 +3208,7 @@ mod tests {
         let result = __check_throttle(
             &state,
             "test::check_throttle_exempt_bypasses_limiter",
+            None,
             ThrottleSpec::Inline {
                 limit: 1,
                 per_secs: 3600,
@@ -3158,6 +3244,7 @@ mod tests {
         let r1 = __check_throttle(
             &state,
             "test::check_throttle_inline_denies_after_burst",
+            None,
             spec.clone(),
             &headers,
             Some(peer),
@@ -3172,6 +3259,7 @@ mod tests {
         let r2 = __check_throttle(
             &state,
             "test::check_throttle_inline_denies_after_burst",
+            None,
             spec,
             &headers,
             Some(peer),
@@ -3241,6 +3329,7 @@ mod tests {
         let a1 = __check_throttle(
             &app_a,
             route,
+            None,
             spec.clone(),
             &headers,
             Some(peer),
@@ -3253,6 +3342,7 @@ mod tests {
         let a2 = __check_throttle(
             &app_a,
             route,
+            None,
             spec.clone(),
             &headers,
             Some(peer),
@@ -3269,8 +3359,18 @@ mod tests {
 
         // App B shares config + route + client, yet its own bucket is untouched:
         // its first request must still succeed (proving buckets are independent).
-        let b1 =
-            __check_throttle(&app_b, route, spec, &headers, Some(peer), None, None, false).await;
+        let b1 = __check_throttle(
+            &app_b,
+            route,
+            None,
+            spec,
+            &headers,
+            Some(peer),
+            None,
+            None,
+            false,
+        )
+        .await;
         assert!(
             b1.is_ok(),
             "app B must have an independent bucket and still succeed after app A is exhausted"
@@ -3286,6 +3386,7 @@ mod tests {
         let result = __check_throttle(
             &state,
             "test::check_throttle_no_identifiable_peer",
+            None,
             ThrottleSpec::Inline {
                 limit: 1,
                 per_secs: 60,

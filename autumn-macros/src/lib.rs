@@ -728,11 +728,11 @@ pub fn step_up(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// Both orders enforce throttling correctly (including idempotency-replay
 /// accounting). However, only the method-attribute-outermost order lets the
-/// route macro see the handler's real return type for OpenAPI response-schema
+/// route macro see the handler's real return type for `OpenAPI` response-schema
 /// generation. When `#[throttle]` expands first it rewrites the return type to
 /// `Response` (like the sibling `#[secured]` / `#[step_up]` / `#[authorize]`
 /// guards), so a `Json<T>` response schema would be lost from the generated
-/// OpenAPI document.
+/// `OpenAPI` document.
 #[proc_macro_attribute]
 pub fn throttle(attr: TokenStream, item: TokenStream) -> TokenStream {
     throttle::throttle_macro(attr.into(), item.into()).into()

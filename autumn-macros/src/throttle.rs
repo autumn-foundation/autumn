@@ -188,6 +188,20 @@ fn inject_throttle_params(input_fn: &mut ItemFn) {
         };
         input_fn.sig.inputs.insert(0, p);
     }
+    if !has_input_named(input_fn, "__autumn_throttle_matched_path") {
+        // Optional because `MatchedPath` is absent for some routes (fallbacks,
+        // unnested handlers). When present, the runtime matched route pattern
+        // isolates an INLINE throttle's bucket per mounted path — a handler
+        // reused under two `scoped` prefixes maps to the same compile-time
+        // `route_id`, so folding the matched path in gives each mount its own
+        // bucket. `__check_throttle` consults it only for inline throttles.
+        let p: syn::FnArg = parse_quote! {
+            __autumn_throttle_matched_path: ::core::option::Option<
+                ::autumn_web::reexports::axum::extract::MatchedPath
+            >
+        };
+        input_fn.sig.inputs.insert(0, p);
+    }
     if !has_input_named(input_fn, "__autumn_throttle_peer") {
         // Wrap ConnectInfo in Extension so `Option<...>` is a valid extractor
         // even in tests that don't call `into_make_service_with_connect_info`.
@@ -351,6 +365,7 @@ pub fn throttle_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             ::autumn_web::security::__check_throttle(
                 &__autumn_state,
                 __AUTUMN_THROTTLE_ROUTE_ID,
+                __autumn_throttle_matched_path.as_ref().map(|__mp| __mp.as_str()),
                 #spec_tokens,
                 &__autumn_throttle_headers,
                 __autumn_throttle_peer
@@ -641,6 +656,25 @@ mod tests {
         assert!(
             generated.contains("__autumn_throttle_peer"),
             "should inject ConnectInfo extractor:\n{generated}"
+        );
+    }
+
+    #[test]
+    fn injects_matched_path_extractor() {
+        let generated = throttle_macro(
+            quote! { limit = 5, per = "1m" },
+            quote! {
+                async fn handler() -> &'static str { "ok" }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("__autumn_throttle_matched_path"),
+            "should inject MatchedPath extractor:\n{generated}"
+        );
+        assert!(
+            generated.contains("MatchedPath"),
+            "should reference axum MatchedPath:\n{generated}"
         );
     }
 
