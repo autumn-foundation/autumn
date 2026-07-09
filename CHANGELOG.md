@@ -145,6 +145,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   token — the real `form_for`-rendered forms (PR #1587) inject one for the
   browser, which the in-process harness does not require. Emitted for HTML
   scaffolds only (the `--api` JSON path is out of scope).
+- **cli:** `autumn routes --format postman` (PR #1567) [no-plugin] — exports
+  the app's route table as a Postman Collection v2.1.0 JSON document, ready to
+  import directly into Postman or Insomnia. Axum path parameters like
+  `/users/{id}` are translated to Postman's `/users/:id` syntax and requests
+  are addressed against a `{{base_url}}` collection variable.
 - **cli:** `autumn i18n check` (issue #1252) — a read-only diagnostic that
   compares the translation keys referenced in code (string literals passed to
   `t!(...)`, `.t(...)`, and `.t_with(...)`) against the keys defined in each
