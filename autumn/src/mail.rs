@@ -480,7 +480,9 @@ fn unwrap_synthetic_document(doc: &str) -> String {
 ///   Because the inlinable rules are removed from the retained block, running
 ///   this again is a no-op: inlining is idempotent.
 /// - Remote/`<link>` stylesheets are never fetched (the `css-inline` network
-///   feature is not compiled in) — only embedded `<style>` CSS is inlined.
+///   feature is not compiled in) — only embedded `<style>` CSS is inlined. The
+///   `<link rel="stylesheet">` tags themselves are preserved in the body so the
+///   linked CSS still reaches clients rather than being silently dropped.
 /// - A raw *fragment* body (no `<html>`/`<body>`/doctype) stays a fragment.
 ///   `css-inline`'s document mode wraps fragment output in synthetic
 ///   `<html>`/`<head>`/`<body>` tags; those wrappers are stripped back off (see
@@ -509,6 +511,10 @@ fn inline_css_html(html: &str) -> Result<String, MailError> {
         .remove_inlined_selectors(true)
         // Never reach out to the network for `<link>`ed stylesheets.
         .load_remote_stylesheets(false)
+        // …but since we do NOT fetch them, keep the `<link rel="stylesheet">`
+        // tags in the body (dropped by default) so the linked CSS still reaches
+        // clients rather than being silently discarded from the delivered body.
+        .keep_link_tags(true)
         .build();
     // Inline in document mode. Its fragment mode would avoid the `<html>`/`<body>`
     // wrapping but drops retained `@media`/at-rules (it re-homes them to `<head>`,
@@ -4275,6 +4281,38 @@ mod tests {
         let html = r#"<p style="color:red">Hello</p><a href="/x">link</a>"#;
         let out = inline_css_html(html).expect("no-op inlining succeeds");
         assert_eq!(out, html, "no-<style> body must be returned unchanged");
+    }
+
+    #[test]
+    #[allow(
+        clippy::literal_string_with_formatting_args,
+        reason = "CSS rule braces are literal HTML, not format placeholders"
+    )]
+    fn inline_css_retains_link_stylesheet_tags() {
+        // We never fetch `<link>` stylesheets, so the `<link rel="stylesheet">`
+        // tag must survive inlining rather than being silently dropped from the
+        // delivered body — otherwise a message combining an embedded `<style>`
+        // with a linked stylesheet would lose the linked CSS. The embedded rule
+        // is still inlined onto the element.
+        let html = r#"<style>.x{color:red}</style><link rel="stylesheet" href="https://example.com/app.css"><p class="x">Hi</p>"#;
+        let out = inline_css_html(html).expect("inlining succeeds");
+        assert!(
+            out.contains("<link") && out.contains(r#"rel="stylesheet""#),
+            "the <link rel=\"stylesheet\"> tag must be preserved; got: {out}"
+        );
+        assert!(
+            out.contains("app.css"),
+            "the linked stylesheet href must be preserved; got: {out}"
+        );
+        let para = out
+            .split("<p")
+            .nth(1)
+            .expect("a <p> tag is present in the output");
+        let para_open = &para[..para.find('>').expect("paragraph tag closes")];
+        assert!(
+            para_open.contains("style=") && para_open.contains("red"),
+            "the embedded rule must still be inlined onto the paragraph; got tag: {para_open}"
+        );
     }
 
     #[test]
