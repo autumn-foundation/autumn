@@ -795,6 +795,10 @@ commit / branch / time / version / dirty — never remote URLs or an env dump.
 Hand-rolled apps opt in by adding the generated `build.rs` provenance stanza
 and using `#[autumn_web::main]`.
 
+**Known limitation:** apps built from the scaffolded Dockerfile currently report
+null git provenance because the Docker build context excludes `.git` (tracked in
+#1676).
+
 ## Resilience: load shedding (unreleased — trunk-dev)
 
 Admission control caps concurrent in-flight requests; excess is shed
