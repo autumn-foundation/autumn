@@ -1128,6 +1128,22 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                          garbage, e.g. `fn {method_name}() -> Vec<(K, Option<f64>)>;`"
                                     ));
                                 }
+                                AggKind::Sum | AggKind::Min | AggKind::Max
+                                    if option_inner_type(&v).is_none() =>
+                                {
+                                    // SUM/MIN/MAX over an empty or all-NULL group
+                                    // returns SQL NULL, which QueryableByName
+                                    // cannot deserialize into a non-nullable
+                                    // value — it would fail at runtime. Force the
+                                    // declaration to be nullable (#1364 review).
+                                    error = Some(format!(
+                                        "`{method_name}`: {kw} must declare its value type as \
+                                         `Option<T>` for a numeric `T` (it returns SQL NULL over \
+                                         an empty or all-NULL group), e.g. \
+                                         `fn {method_name}() -> Vec<(K, Option<T>)>;`",
+                                        kw = kind.keyword()
+                                    ));
+                                }
                                 _ => {}
                             }
                         }
@@ -12141,6 +12157,32 @@ mod tests {
         assert!(
             generated.contains("count must declare its value type as"),
             "compile_error must name the count value-type rule: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_grouped_sum_wrong_value_type_is_error() {
+        // §1364 review: `sum`/`min`/`max` return SQL NULL over an empty or
+        // all-NULL group, so a non-`Option<T>` value type must be a compile
+        // error (QueryableByName cannot deserialize NULL into a non-nullable
+        // value — it would fail at runtime).
+        let generated = repository_macro(
+            quote! { Event, table = "events" },
+            quote! {
+                pub trait EventRepository {
+                    fn sum_value_grouped_by_post_id() -> Vec<(i64, i64)>;
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "sum with a non-Option value must emit a compile_error: {generated}"
+        );
+        assert!(
+            generated.contains("must declare its value type as"),
+            "compile_error must name the sum value-type rule: {generated}"
         );
     }
 

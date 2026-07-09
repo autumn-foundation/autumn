@@ -82,13 +82,19 @@ pub async fn front_page(
     // Resolve the leaderboard entries' titles in one query (order preserved via
     // the `top_by_votes` iteration below).
     let top_ids: Vec<i64> = top_by_votes.iter().map(|(id, _)| *id).collect();
-    let top_titles: HashMap<i64, String> = posts::table
-        .filter(posts::id.eq_any(&top_ids))
-        .select((posts::id, posts::title))
-        .load::<(i64, String)>(&mut *db)
-        .await?
-        .into_iter()
-        .collect();
+    // Skip the follow-up title lookup entirely when the leaderboard is empty —
+    // otherwise we'd issue a pointless `WHERE id = ANY('{}')` query.
+    let top_titles: HashMap<i64, String> = if top_ids.is_empty() {
+        HashMap::new()
+    } else {
+        posts::table
+            .filter(posts::id.eq_any(&top_ids))
+            .select((posts::id, posts::title))
+            .load::<(i64, String)>(&mut *db)
+            .await?
+            .into_iter()
+            .collect()
+    };
 
     // Release the base-query connection before `preload` checks one out, so the
     // two never contend on a single-connection pool. The base rows were read
