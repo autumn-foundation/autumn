@@ -306,6 +306,53 @@ fn view(locale: &Locale) -> String {
 }
 
 #[test]
+fn nested_translation_call_in_args_is_referenced_so_deleting_it_is_missing() {
+    // A translation call nested in another call's arguments —
+    // `t_with("message", &[("status", &locale.t("status.open"))])` — must record
+    // BOTH keys. Deleting the nested `status.open` from every locale must surface
+    // as Missing (non-zero exit), not silently pass because the outer branch
+    // skipped the argument group.
+    let dir = clean_project();
+    write(
+        dir.path(),
+        "src/main.rs",
+        r#"
+fn view(locale: &Locale) -> String {
+    locale.t_with("message", &[("status", &locale.t("status.open"))])
+}
+"#,
+    );
+    // Define both keys, then drop the nested `status.open` from every locale so
+    // it is genuinely missing across the fallback chain while `message` stays.
+    write(
+        dir.path(),
+        "i18n/en.ftl",
+        "message = Status is { $status }\n",
+    );
+    write(
+        dir.path(),
+        "i18n/es.ftl",
+        "message = Estado es { $status }\n",
+    );
+
+    let output = run_check(dir.path(), &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !output.status.success(),
+        "a nested translation key deleted from the .ftl must be Missing (non-zero exit)\nstdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("status.open"),
+        "should name the nested key\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Missing"),
+        "should label it Missing\n{stdout}"
+    );
+    assert!(stdout.contains("FAIL"), "stdout:\n{stdout}");
+}
+
+#[test]
 fn wrapped_literal_with_trailing_tokens_is_dynamic_not_a_false_missing() {
     // A parenthesized literal that CONTINUES after the group —
     // `locale.t((" nav.home ").trim())` — is a derived expression, not a literal

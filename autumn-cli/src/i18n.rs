@@ -238,6 +238,12 @@ fn scan_stream(stream: &TokenStream, file: &str, result: &mut ScanResult) {
                 )
             {
                 record_key_at(&group.stream(), 1, file, result);
+                // The key slot is recorded above; still descend into the whole
+                // argument group so a translation call NESTED in the args (e.g.
+                // `t!(locale, "a", t!(locale, "b"))`) is scanned too. The key
+                // slot is a string literal / format expr, never a `t!`/`.t`
+                // call pattern, so the recursion cannot re-extract the outer key.
+                scan_stream(&group.stream(), file, result);
                 i += 3;
                 continue;
             }
@@ -262,6 +268,11 @@ fn scan_stream(stream: &TokenStream, file: &str, result: &mut ScanResult) {
                     // the first argument.
                     Some('.') => {
                         record_key_at(&group.stream(), 0, file, result);
+                        // Recurse into the arg group so a nested translation
+                        // call in the args (e.g.
+                        // `t_with("m", &[("s", &locale.t("status.open"))])`) is
+                        // scanned too. The key slot cannot re-match as a call.
+                        scan_stream(&group.stream(), file, result);
                         i += 2;
                         continue;
                     }
@@ -276,6 +287,10 @@ fn scan_stream(stream: &TokenStream, file: &str, result: &mut ScanResult) {
                     // key and suppressing every Unused warning project-wide.
                     Some(':') => {
                         record_key_at(&group.stream(), 1, file, result);
+                        // Recurse into the arg group so a nested translation
+                        // call in the args is scanned too. The key slot cannot
+                        // re-match as a call.
+                        scan_stream(&group.stream(), file, result);
                         i += 2;
                         continue;
                     }
@@ -1046,6 +1061,55 @@ mod tests {
                 "nav.brand",
                 "nav.home",
             ])
+        );
+        assert!(result.dynamic.is_empty());
+    }
+
+    #[test]
+    fn nested_translation_call_in_args_is_recorded() {
+        // When a translation call carries ANOTHER translation call in its
+        // arguments — e.g. `t_with("message", &[("status", &locale.t("status.open"))])`
+        // — BOTH the outer key AND the nested key must be recorded. The outer
+        // branch records the outer key and then recurses into the argument group
+        // so the nested call is not skipped.
+        let src = r#"
+            fn view(locale: &Locale) {
+                let _ = locale.t_with("message", &[("status", &locale.t("status.open"))]);
+            }
+        "#;
+        let mut result = ScanResult::default();
+        scan_source(src, "view.rs", &mut result);
+        assert_eq!(
+            result.referenced,
+            keys(&["message", "status.open"]),
+            "both outer and nested keys must be referenced: {:?}",
+            result.referenced
+        );
+        assert!(
+            result.dynamic.is_empty(),
+            "the `&locale.t(\"status.open\")` arg is a real call, not a dynamic site: {:?}",
+            result.dynamic
+        );
+    }
+
+    #[test]
+    fn deeply_nested_translation_calls_are_recorded() {
+        // A translation call nested inside another call's arguments, in both the
+        // macro form and a method-in-args form, records every level's key.
+        let src = r#"
+            fn view(locale: &Locale) {
+                let _ = t!(locale, "a", t!(locale, "b"));
+                let _ = locale.t_with("c", &[("x", &t!(locale, "d"))]);
+                let _ = Locale::t_with(&locale, "e", &[("y", &locale.t("f"))]);
+            }
+        "#;
+        let mut result = ScanResult::default();
+        scan_source(src, "view.rs", &mut result);
+        assert_eq!(
+            result.referenced,
+            keys(&["a", "b", "c", "d", "e", "f"]),
+            "every nested key must be recorded exactly once: {:?}",
+            result.referenced
         );
         assert!(result.dynamic.is_empty());
     }
