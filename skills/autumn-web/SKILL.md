@@ -842,24 +842,30 @@ keeps per-field htmx emission).
 
 Don't hand-roll `Last-Event-ID` bookkeeping or a manual replay buffer for
 server-sent events. On trunk-dev the `ws`-gated channels backend keeps a
-**bounded per-topic replay ring buffer** and assigns every event a **monotonic
-per-topic `id` automatically** — no manual `.id(...)` in handler code.
+**bounded per-topic replay ring buffer** and assigns every event an
+**epoch-tagged per-topic `id` automatically** (wire format `epoch.seq`, opaque
+to clients) — no manual `.id(...)` in handler code.
 
 - `autumn_web::sse::stream_resumable(&state, topic, last_event_id)` is the route
-  primitive. It reads the client's `Last-Event-ID`, replays buffered events with
-  `id > last_event_id` in order, then continues live — no duplicated or skipped
-  events at the seam (publish assigns ids and broadcasts under one lock; resume
-  subscribes under that same lock and snapshots the buffer).
+  primitive. It reads the client's `Last-Event-ID`, replays the buffered events
+  the client missed in order, then continues live — no duplicated or skipped
+  events at the seam (publish assigns seqs and broadcasts under one lock; resume
+  subscribes under that same lock and snapshots the buffer). Within one epoch it
+  replays entries with `seq > last_event_id.seq`; across an epoch boundary it
+  gaps and replays the full retained current epoch (see Limitations).
 - Read the inbound header with `autumn_web::sse::last_event_id(&headers)` →
-  `Option<u64>`, or the `autumn_web::sse::LastEventId(pub Option<u64>)` extractor
-  (never fails; absent/unparseable → `None`).
+  `Option<EventId>` (`EventId { epoch: u64, seq: u64 }`, exported as
+  `autumn_web::sse::EventId` and re-exported `autumn_web::channels::EventId`), or
+  the `autumn_web::sse::LastEventId(pub Option<EventId>)` extractor (never fails;
+  absent/malformed/legacy-bare-integer → `None` → treated as a cold connection).
 - **Cold connection** (`None`) behaves exactly like `sse::stream`: no replay,
-  just live events, dense ids preserved.
+  just live events, dense seqs preserved.
 - **Gap sentinel:** when the requested id has aged out of the retained window
-  (the buffer overflowed), the stream emits one `gap` event
-  (`event: gap`, `data: {"gap":true}`, no `id`) *before* the partial replay so
-  clients can detect missed events rather than silently receiving a hole. A live
-  broadcast lag surfaces the same `gap` sentinel and advances the id counter.
+  (the buffer overflowed) **or belongs to a different epoch**, the stream emits
+  one `gap` event (`event: gap`, `data: {"gap":true}`, no `id`) *before* the
+  replay so clients can detect missed events rather than silently receiving a
+  hole. A live broadcast lag surfaces the same `gap` sentinel and advances the
+  seq counter.
 - The existing non-resumable helpers — `sse::stream`, `sse::stream_authorized`,
   `sse::from_subscriber`, `Channels::sse_stream` — are **unchanged and remain
   id-less**; `stream_resumable` is purely additive.
@@ -889,16 +895,21 @@ Scope") — the replay buffer is a same-process convenience, not a durable log:
 - The replay buffer lives in the topic's in-memory state, which is dropped when
   the topic is garbage-collected (a topic is retained only while it has a live
   receiver or an outstanding `Sender`). A topic with only transient SSE
-  subscribers can lose its buffer during the disconnect window, so a reconnect
-  may find nothing to replay.
-- On process restart the per-topic id counter resets to `1`, so a client
-  reconnecting with a stale-large `Last-Event-ID` gets an empty replay. This is
-  detected and reported as a gap sentinel (the resume point is in the future
-  relative to the current server state), but the buffered history from before
-  the restart is gone.
+  subscribers can lose its buffer during the disconnect window. The recreated
+  topic gets a **new epoch**, so a reconnect across the gap is not silently
+  corrupted: the epoch mismatch is signalled as a `gap` sentinel plus a full
+  replay of the current epoch (the old epoch's events themselves are gone).
+- On process restart (or any topic GC/recreation) the per-topic `seq` counter
+  resets to `1` under a fresh `epoch`. The epoch tag means a stale `Last-Event-ID`
+  from a previous epoch — even one whose `seq` the new epoch has already passed —
+  is always distinguishable from a current-epoch id, so the reconnect yields a
+  `gap` sentinel followed by a full replay of the current epoch rather than
+  silently dropping the new epoch's early events (the pre-epoch-tag hole, issue
+  #1356). The buffered history from before the restart is still gone (persist it
+  yourself for durability), but the client is never fed a corrupted partial.
 - Publishing through `channels.publish()` / `broadcast().publish()` /
   `channels.sender().send()` is safe on resumable topics: all three route
-  through the backend's `publish`, assigning an id and appending to the replay
+  through the backend's `publish`, assigning a seq and appending to the replay
   buffer. Only calling `.send()` directly on the raw `broadcast::Sender`
   (obtained from `channels.sender().keepalive` or the `ensure_topic` trait
   method) broadcasts without assigning an id or appending to the replay buffer,

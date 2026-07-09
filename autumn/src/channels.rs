@@ -19,11 +19,47 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use thiserror::Error;
 use tokio::sync::broadcast;
+
+/// Allocate the next per-topic epoch.
+///
+/// Each freshly-created [`TopicState`] gets a distinct epoch that is BOTH
+/// monotonic within a process AND (practically) unique across process restarts:
+/// a per-process nanosecond seed captured once, plus a monotonically increasing
+/// counter. A recreated/garbage-collected topic therefore always receives a
+/// strictly-new epoch, and a restart (which reseeds from the wall clock) will
+/// not reuse an old epoch. This lets [`EventId`] distinguish a stale id minted
+/// by a previous epoch from a current-epoch id even though the per-epoch `seq`
+/// counter restarts at `1` every time.
+#[allow(clippy::cast_possible_truncation)]
+fn next_topic_epoch() -> u64 {
+    static SEED: OnceLock<u64> = OnceLock::new();
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let seed = *SEED.get_or_init(|| {
+        // Truncating the u128 nanosecond count to its low 64 bits is fine: this
+        // value is only a per-process epoch seed, not a precise clock.
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0)
+    });
+    seed.wrapping_add(COUNTER.fetch_add(1, Ordering::Relaxed))
+}
+
+/// Re-export of the epoch-tagged event id type.
+///
+/// Defined in [`crate::sse`] because the `Last-Event-ID` parsing surface
+/// (`sse::last_event_id` / `sse::LastEventId`) is available without the `ws`
+/// feature, whereas this `channels` module is `ws`-gated. Re-exported here so it
+/// is importable alongside the rest of the resumable-SSE channel API as
+/// `autumn_web::channels::EventId`.
+pub use crate::sse::{EventId, EventIdParseError};
 
 #[cfg(feature = "redis")]
 const REDIS_PUBLISH_QUEUE_CAPACITY: usize = 1024;
@@ -56,7 +92,7 @@ pub trait ChannelsBackend: Send + Sync + 'static {
     /// The default implementation is live-only: it returns a fresh subscriber
     /// with no replay and no history, so backends without a replay buffer (such
     /// as the Redis fan-out backend) degrade gracefully to today's behaviour.
-    fn resume(&self, topic: &str, last_event_id: Option<u64>) -> ResumeHandle {
+    fn resume(&self, topic: &str, last_event_id: Option<EventId>) -> ResumeHandle {
         let _ = last_event_id;
         ResumeHandle {
             subscriber: self.subscribe(topic),
@@ -64,6 +100,7 @@ pub trait ChannelsBackend: Send + Sync + 'static {
             gap: false,
             next_live_id: 1,
             resumable: false,
+            epoch: 0,
         }
     }
 
@@ -101,6 +138,9 @@ const DEFAULT_REPLAY_CAPACITY: usize = 256;
 /// concurrent [`ChannelsBackend::resume`] can subscribe under that same lock
 /// and snapshot the buffer for a gapless seam.
 struct TopicState {
+    /// Per-topic epoch assigned once at creation (see [`EventId`]). Stable for
+    /// the lifetime of this `TopicState`; a recreated topic gets a new epoch.
+    epoch: u64,
     sender: Arc<broadcast::Sender<ChannelMessage>>,
     replay: Mutex<ReplayBuffer>,
 }
@@ -132,17 +172,23 @@ pub struct SequencedMessage {
 pub struct ResumeHandle {
     /// Live subscriber for messages published after the resume point.
     pub subscriber: Subscriber,
-    /// Buffered events with `id > last_event_id`, in ascending id order.
+    /// Buffered events the client missed, in ascending seq order. For a
+    /// same-epoch resume these are the entries with `seq > last_event_id.seq`;
+    /// for a cross-epoch resume (or a resume against a fresh topic) this is every
+    /// retained current-epoch event.
     pub replay: Vec<SequencedMessage>,
     /// `true` when the requested resume point predates the oldest retained id
     /// (the buffer overflowed), signalling missed events the replay cannot
     /// recover.
     pub gap: bool,
-    /// Id to assign to the first live message read from `subscriber`.
+    /// Seq to assign to the first live message read from `subscriber`.
     pub next_live_id: u64,
     /// `true` only for the in-process local backend, which actually retains a
     /// replay buffer. Other backends return a live-only handle.
     pub resumable: bool,
+    /// The topic's current epoch, used by the SSE layer to format every emitted
+    /// id as `"{epoch}.{seq}"`. Live-only backends report `0`.
+    pub epoch: u64,
 }
 
 /// A message sent through a broadcast channel.
@@ -622,6 +668,7 @@ impl LocalChannelsBackend {
         } else {
             let sender = Arc::new(broadcast::channel(self.inner.capacity).0);
             let state = Arc::new(TopicState {
+                epoch: next_topic_epoch(),
                 sender,
                 replay: Mutex::new(ReplayBuffer {
                     next_id: 1,
@@ -672,49 +719,69 @@ impl LocalChannelsBackend {
         }
     }
 
-    fn resume_local(&self, topic: &str, last_event_id: Option<u64>) -> ResumeHandle {
+    fn resume_local(&self, topic: &str, last_event_id: Option<EventId>) -> ResumeHandle {
         let state = self.get_or_create_topic(topic);
         self.inner.metrics.ensure_topic(topic);
+        let epoch = state.epoch;
 
         // Subscribe and snapshot under the replay lock so the seam is clean:
-        // publish holds this same lock while assigning ids and broadcasting, so
+        // publish holds this same lock while assigning seqs and broadcasting, so
         // `rx` can only ever observe messages published strictly after this
-        // point (ids `start_id + 1, start_id + 2, ...`), none of which are in
+        // point (seqs `start_seq + 1, start_seq + 2, ...`), none of which are in
         // the snapshot below.
         let replay_guard = state.replay.lock().expect("channel replay lock poisoned");
         let rx = state.sender.subscribe();
-        let start_id = replay_guard.next_id.saturating_sub(1);
-        let oldest = replay_guard.buf.front().map(|(id, _)| *id);
+        let start_seq = replay_guard.next_id.saturating_sub(1);
+        let oldest = replay_guard.buf.front().map(|(seq, _)| *seq);
 
-        let (replay, gap) = last_event_id.map_or_else(
+        let (replay, gap) = match last_event_id {
             // Cold connection: no replay, just live events.
-            || (Vec::new(), false),
-            |last| {
+            None => (Vec::new(), false),
+            // Epoch mismatch: the client last saw a DIFFERENT epoch (this topic
+            // was garbage-collected/recreated or the process restarted, resetting
+            // the seq counter). An old-epoch seq is meaningless against the
+            // current seq space, so EVERY retained current-epoch event is new to
+            // this client — replay all of them and flag the gap so the client
+            // knows its pre-reset history is unrecoverable. This is the fix for
+            // the epoch-reset collision where a stale seq the new epoch had
+            // already passed would otherwise drop the new epoch's early events.
+            Some(ev) if ev.epoch != epoch => {
                 let replay: Vec<SequencedMessage> = replay_guard
                     .buf
                     .iter()
-                    .filter(|(id, _)| *id > last)
-                    .map(|(id, message)| SequencedMessage {
-                        id: *id,
+                    .map(|(seq, message)| SequencedMessage {
+                        id: *seq,
+                        message: message.clone(),
+                    })
+                    .collect();
+                (replay, true)
+            }
+            // Same-epoch resume: replay buffered entries newer than the client's
+            // seq.
+            Some(ev) => {
+                let replay: Vec<SequencedMessage> = replay_guard
+                    .buf
+                    .iter()
+                    .filter(|(seq, _)| *seq > ev.seq)
+                    .map(|(seq, message)| SequencedMessage {
+                        id: *seq,
                         message: message.clone(),
                     })
                     .collect();
                 // Gap in two cases:
                 //  1. The requested resume point precedes the oldest retained
-                //     id: the client's next-expected id (`last + 1`) aged out of
-                //     the window, so the replay would be partial.
-                //  2. The client's `last` id is in the future relative to the
-                //     current server state (`last > start_id`): after a process
-                //     restart or topic GC the monotonic counter resets to `1`,
-                //     so a client reconnecting with a stale-large
-                //     `Last-Event-ID` would otherwise get an empty replay and no
-                //     signal that its history is unrecoverable. Flag the epoch
-                //     reset so the client can resynchronise.
-                let gap =
-                    oldest.is_some_and(|oldest| oldest > last.saturating_add(1)) || last > start_id;
+                //     seq: the client's next-expected seq (`ev.seq + 1`) aged out
+                //     of the window, so the replay would be partial.
+                //  2. The client's `ev.seq` is in the future relative to the
+                //     current server state (`ev.seq > start_seq`) — defensive:
+                //     within the same epoch this should not happen, but if it
+                //     does, flag it rather than silently returning an empty
+                //     replay.
+                let gap = oldest.is_some_and(|oldest| oldest > ev.seq.saturating_add(1))
+                    || ev.seq > start_seq;
                 (replay, gap)
-            },
-        );
+            }
+        };
         drop(replay_guard);
 
         let subscriber = Subscriber {
@@ -727,8 +794,9 @@ impl LocalChannelsBackend {
             subscriber,
             replay,
             gap,
-            next_live_id: start_id.saturating_add(1),
+            next_live_id: start_seq.saturating_add(1),
             resumable: true,
+            epoch,
         }
     }
 }
@@ -758,7 +826,7 @@ impl ChannelsBackend for LocalChannelsBackend {
         }
     }
 
-    fn resume(&self, topic: &str, last_event_id: Option<u64>) -> ResumeHandle {
+    fn resume(&self, topic: &str, last_event_id: Option<EventId>) -> ResumeHandle {
         self.resume_local(topic, last_event_id)
     }
 
@@ -1154,7 +1222,7 @@ impl ChannelsBackend for InterceptedChannelsBackend {
         self.inner.subscribe(topic)
     }
 
-    fn resume(&self, topic: &str, last_event_id: Option<u64>) -> ResumeHandle {
+    fn resume(&self, topic: &str, last_event_id: Option<EventId>) -> ResumeHandle {
         self.inner.resume(topic, last_event_id)
     }
 
@@ -1277,7 +1345,7 @@ impl Channels {
     /// backends return a live-only [`ResumeHandle`]. Prefer
     /// [`crate::sse::stream_resumable`] for the SSE route primitive.
     #[must_use]
-    pub fn resume(&self, topic: &str, last_event_id: Option<u64>) -> ResumeHandle {
+    pub fn resume(&self, topic: &str, last_event_id: Option<EventId>) -> ResumeHandle {
         self.backend.resume(topic, last_event_id)
     }
 
@@ -2062,7 +2130,7 @@ mod tests {
         assert!(handle.replay.is_empty(), "cold connect must not replay");
         assert!(!handle.gap);
         assert!(handle.resumable);
-        // Two messages published → next live id is 3.
+        // Two messages published → next live seq is 3.
         assert_eq!(handle.next_live_id, 3);
     }
 
@@ -2072,22 +2140,25 @@ mod tests {
         for i in 1..=5 {
             backend.publish_local("t", ChannelMessage::from(format!("m{i}")));
         }
-        let handle = backend.resume("t", Some(2));
+        let epoch = backend.get_or_create_topic("t").epoch;
+        let handle = backend.resume("t", Some(EventId { epoch, seq: 2 }));
         let ids: Vec<u64> = handle.replay.iter().map(|s| s.id).collect();
         assert_eq!(ids, vec![3, 4, 5]);
-        assert!(!handle.gap, "everything since id 2 is retained");
+        assert!(!handle.gap, "everything since seq 2 is retained");
         assert_eq!(handle.next_live_id, 6);
+        assert_eq!(handle.epoch, epoch);
     }
 
     #[test]
     fn resume_signals_gap_when_last_event_id_aged_out() {
-        // cap 3: after publishing 5, retained ids are 3,4,5.
+        // cap 3: after publishing 5, retained seqs are 3,4,5.
         let backend = LocalChannelsBackend::with_replay_capacity(16, 3);
         for i in 1..=5 {
             backend.publish_local("t", ChannelMessage::from(format!("m{i}")));
         }
-        // Client last saw id 1; id 2 has aged out → gap, replay starts at oldest.
-        let handle = backend.resume("t", Some(1));
+        let epoch = backend.get_or_create_topic("t").epoch;
+        // Client last saw seq 1; seq 2 has aged out → gap, replay starts at oldest.
+        let handle = backend.resume("t", Some(EventId { epoch, seq: 1 }));
         assert!(handle.gap, "aged-out resume point must signal a gap");
         let ids: Vec<u64> = handle.replay.iter().map(|s| s.id).collect();
         assert_eq!(ids, vec![3, 4, 5]);
@@ -2099,11 +2170,39 @@ mod tests {
         for i in 1..=5 {
             backend.publish_local("t", ChannelMessage::from(format!("m{i}")));
         }
-        // Client already saw the latest id (5): nothing to replay, no gap.
-        let handle = backend.resume("t", Some(5));
+        let epoch = backend.get_or_create_topic("t").epoch;
+        // Client already saw the latest seq (5): nothing to replay, no gap.
+        let handle = backend.resume("t", Some(EventId { epoch, seq: 5 }));
         assert!(handle.replay.is_empty());
         assert!(!handle.gap);
         assert_eq!(handle.next_live_id, 6);
+    }
+
+    #[test]
+    fn resume_cross_epoch_replays_full_epoch_and_gaps() {
+        // A stale id from a different epoch whose seq the current epoch has
+        // already passed must NOT drop the early current-epoch events: it gaps
+        // and replays the whole retained current epoch.
+        let backend = LocalChannelsBackend::with_replay_capacity(16, 8);
+        for i in 1..=5 {
+            backend.publish_local("t", ChannelMessage::from(format!("m{i}")));
+        }
+        let epoch = backend.get_or_create_topic("t").epoch;
+        let stale_epoch = epoch.wrapping_add(1);
+        let handle = backend.resume(
+            "t",
+            Some(EventId {
+                epoch: stale_epoch,
+                seq: 4,
+            }),
+        );
+        assert!(handle.gap, "cross-epoch resume must signal a gap");
+        let ids: Vec<u64> = handle.replay.iter().map(|s| s.id).collect();
+        assert_eq!(
+            ids,
+            vec![1, 2, 3, 4, 5],
+            "cross-epoch resume replays every retained current-epoch seq, not just seq > 4"
+        );
     }
 
     #[cfg(feature = "ws")]
@@ -2114,8 +2213,9 @@ mod tests {
         for i in 1..=3 {
             backend.publish_local("t", ChannelMessage::from(format!("m{i}")));
         }
-        // Resume from id 1: replay 2,3 then live 4,5.
-        let mut handle = backend.resume("t", Some(1));
+        // Resume from seq 1: replay 2,3 then live 4,5.
+        let epoch = backend.get_or_create_topic("t").epoch;
+        let mut handle = backend.resume("t", Some(EventId { epoch, seq: 1 }));
         assert_eq!(
             handle.replay.iter().map(|s| s.id).collect::<Vec<_>>(),
             vec![2, 3]
@@ -2161,11 +2261,12 @@ mod tests {
 
         let backend = LiveOnly(LocalChannelsBackend::new(16));
         backend.publish("t", ChannelMessage::from("a")).unwrap();
-        let handle = backend.resume("t", Some(0));
+        let handle = backend.resume("t", Some(EventId { epoch: 0, seq: 0 }));
         assert!(handle.replay.is_empty());
         assert!(!handle.gap);
         assert!(!handle.resumable, "default resume is live-only");
         assert_eq!(handle.next_live_id, 1);
+        assert_eq!(handle.epoch, 0, "live-only backends report epoch 0");
     }
 
     #[cfg(feature = "maud")]

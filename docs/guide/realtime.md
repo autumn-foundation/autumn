@@ -83,12 +83,19 @@ async fn private_events(
 ## Resumable SSE with `Last-Event-ID` (unreleased — trunk-dev, issue #1356)
 
 `sse::stream_resumable` is a drop-in upgrade to `sse::stream` that survives a
-brief client disconnect. Every event carries an automatic monotonic per-topic
-`id`, and Autumn keeps a bounded per-topic replay ring buffer. When the browser
-reconnects it echoes back the last id it saw in the `Last-Event-ID` header (the
-SSE spec does this automatically); Autumn replays the events that arrived while
-the client was gone, then continues live — with no duplicated or skipped events
-at the seam.
+brief client disconnect. Every event carries an automatic epoch-tagged per-topic
+`id` of the form `epoch.seq` (opaque to clients — the browser just stores it and
+echoes it back), and Autumn keeps a bounded per-topic replay ring buffer. When
+the browser reconnects it echoes back the last id it saw in the `Last-Event-ID`
+header (the SSE spec does this automatically); Autumn replays the events that
+arrived while the client was gone, then continues live — with no duplicated or
+skipped events at the seam.
+
+The `epoch` half of the id is a per-topic tag assigned when the topic's
+in-memory state is created; the `seq` half is a dense counter that restarts at
+`1` within each epoch. The epoch changes whenever the topic is
+garbage-collected/recreated or the process restarts, which lets Autumn tell a
+stale id from a previous epoch apart from a current-epoch id (see Limitations).
 
 ```rust,no_run
 use autumn_web::prelude::*;
@@ -128,13 +135,22 @@ scope of issue #1356, matching its "Out of Scope") — not a durable event log:
 - The buffer lives in the topic's in-memory state and is dropped when the topic
   is garbage-collected. A topic is kept only while it has a live receiver or an
   outstanding `Sender`, so a topic with only transient SSE subscribers can lose
-  its buffer during the disconnect window and have nothing to replay on
-  reconnect.
-- On process restart the per-topic id counter resets to `1`, so a client
-  reconnecting with a stale-large `Last-Event-ID` gets an empty replay. This is
-  detected and reported as a gap sentinel (the resume point is in the future
-  relative to the current server state), but the buffered history from before
-  the restart is gone.
+  its buffer during the disconnect window. Because the recreated topic gets a
+  new `epoch`, a client reconnecting across the gap is **not** silently fed a
+  corrupted partial: the epoch mismatch is detected, so the stream emits a `gap`
+  sentinel and then replays the full retained *current* epoch. The old epoch's
+  events themselves are gone (still best-effort), but the client is told to
+  resynchronise rather than receiving a hole.
+- On process restart (or any topic GC/recreation) the per-topic `seq` counter
+  resets to `1` under a fresh `epoch`. Before epoch tagging this was a real hole:
+  a client reconnecting with a stale `Last-Event-ID` whose `seq` the new epoch
+  had already passed (e.g. old `4`, new epoch already at `10`) received the new
+  epoch's later events while its earlier ones were silently dropped, because an
+  old id `4` was indistinguishable from a new id `4`. Now the epoch tag makes the
+  two id spaces distinct: a cross-epoch reconnect always yields a `gap` sentinel
+  followed by a full replay of the current epoch — never a silent partial. The
+  buffered history from before the restart is still gone (persist events
+  yourself for durability), but the client is never corrupted.
 - Publishing via `channels.publish()` / `broadcast().publish()` /
   `channels.sender().send()` is safe on resumable topics: all three route
   through the backend's `publish`, assigning ids and appending to the replay

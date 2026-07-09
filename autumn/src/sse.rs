@@ -62,19 +62,82 @@ const GAP_EVENT: &str = "gap";
 #[cfg(feature = "ws")]
 const GAP_MARKER: &str = "{\"gap\":true}";
 
-/// Read and parse an inbound `Last-Event-ID` header.
+/// An epoch-tagged event id: a per-topic `epoch` plus a dense per-epoch
+/// sequence number (`seq`).
 ///
-/// Returns the parsed id, or `None` when the header is absent, empty, or not a
-/// valid `u64`. This is the value clients echo back (per the SSE spec) after a
-/// dropped connection so the server can resume where they left off.
+/// The wire format a client echoes back in `Last-Event-ID` is `"{epoch}.{seq}"`
+/// (opaque to clients — browsers just store and re-send it). The `epoch` changes
+/// every time a topic's in-memory state is (re)created — on first use, after a
+/// garbage collection that removed the topic, or after a process restart — while
+/// `seq` restarts at `1` within each epoch. Tagging ids with the epoch means a
+/// stale id from a previous epoch is always distinguishable from a current-epoch
+/// id, so resuming across an epoch boundary is signalled as a gap (with a full
+/// replay of the current epoch) rather than silently mixing two id spaces and
+/// dropping early events.
+///
+/// Re-exported as `autumn_web::channels::EventId` for the `ws`-gated channel
+/// API; defined here because the header-parsing surface is available without the
+/// `ws` feature.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EventId {
+    /// Per-topic epoch tag (see [`EventId`]).
+    pub epoch: u64,
+    /// Dense per-epoch sequence number (starts at `1`).
+    pub seq: u64,
+}
+
+impl std::fmt::Display for EventId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}", self.epoch, self.seq)
+    }
+}
+
+/// Error returned when an [`EventId`] string is not the `"{epoch}.{seq}"` wire
+/// format (both halves parseable as `u64`). Legacy plain-integer ids (e.g.
+/// `"42"`) are treated as malformed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EventIdParseError;
+
+impl std::fmt::Display for EventIdParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("invalid event id: expected \"{epoch}.{seq}\"")
+    }
+}
+
+impl std::error::Error for EventIdParseError {}
+
+impl std::str::FromStr for EventId {
+    type Err = EventIdParseError;
+
+    /// Parse `"{epoch}.{seq}"`, splitting on the FIRST `.`. Both halves must
+    /// parse as `u64`; anything else (including a bare integer) is an error.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (epoch, seq) = s.split_once('.').ok_or(EventIdParseError)?;
+        Ok(Self {
+            epoch: epoch.parse().map_err(|_| EventIdParseError)?,
+            seq: seq.parse().map_err(|_| EventIdParseError)?,
+        })
+    }
+}
+
+/// Read and parse an inbound `Last-Event-ID` header as an [`EventId`].
+///
+/// Returns the parsed `"{epoch}.{seq}"` id, or `None` when the header is absent,
+/// empty, or malformed. This is the value clients echo back (per the SSE spec)
+/// after a dropped connection so the server can resume where they left off.
+///
+/// A malformed or legacy plain-integer value (e.g. `"42"` from before ids were
+/// epoch-tagged) parses to `None` and is therefore treated as a cold connection
+/// (no replay). That is intentional and conservative: an id whose epoch cannot
+/// be established must not be matched against the current epoch's seq space.
 #[must_use]
-pub fn last_event_id(headers: &axum::http::HeaderMap) -> Option<u64> {
+pub fn last_event_id(headers: &axum::http::HeaderMap) -> Option<EventId> {
     headers
         .get("last-event-id")?
         .to_str()
         .ok()?
         .trim()
-        .parse::<u64>()
+        .parse()
         .ok()
 }
 
@@ -83,20 +146,21 @@ pub fn last_event_id(headers: &axum::http::HeaderMap) -> Option<u64> {
 /// Never fails: an absent or unparseable header yields `LastEventId(None)`.
 ///
 /// ```rust
-/// use autumn_web::sse::{last_event_id, LastEventId};
+/// use autumn_web::sse::{last_event_id, EventId, LastEventId};
 ///
 /// // A browser reconnecting after a drop echoes back the last id it saw in the
-/// // `Last-Event-ID` header (the SSE spec does this automatically).
+/// // `Last-Event-ID` header (the SSE spec does this automatically). Ids are
+/// // epoch-tagged, so the wire format is `"{epoch}.{seq}"`.
 /// let mut headers = axum::http::HeaderMap::new();
-/// headers.insert("last-event-id", "42".parse().unwrap());
+/// headers.insert("last-event-id", "7.42".parse().unwrap());
 ///
 /// // `last_event_id` parses the header; the `LastEventId` extractor wraps the
 /// // same value so a handler can take it as an argument.
-/// assert_eq!(last_event_id(&headers), Some(42));
+/// assert_eq!(last_event_id(&headers), Some(EventId { epoch: 7, seq: 42 }));
 /// let LastEventId(last) = LastEventId(last_event_id(&headers));
-/// assert_eq!(last, Some(42));
+/// assert_eq!(last, Some(EventId { epoch: 7, seq: 42 }));
 /// ```
-pub struct LastEventId(pub Option<u64>);
+pub struct LastEventId(pub Option<EventId>);
 
 impl<S> axum::extract::FromRequestParts<S> for LastEventId
 where
@@ -114,7 +178,8 @@ where
 
 /// Subscribe to a channel topic and return a **resumable** SSE response stream.
 ///
-/// Unlike [`stream`], every event carries a monotonic per-topic `id`, and an
+/// Unlike [`stream`], every event carries an epoch-tagged per-topic `id`
+/// (`"{epoch}.{seq}"`, opaque to clients — browsers just echo it back), and an
 /// inbound `Last-Event-ID` (see [`last_event_id`] / [`LastEventId`]) replays the
 /// events a client missed during a brief disconnect before continuing live —
 /// with no duplicated or skipped events at the seam.
@@ -124,6 +189,11 @@ where
 /// - When the requested id has aged out of the retained replay window, a single
 ///   `gap` sentinel event (`event: gap`, `data: {"gap":true}`, no `id`) is
 ///   emitted before the partial replay so clients can detect missed events.
+/// - When the requested id belongs to a different epoch (the topic was
+///   garbage-collected/recreated or the process restarted, resetting the `seq`
+///   counter), the stream emits the `gap` sentinel and then replays every
+///   retained current-epoch event — the client is never silently fed a partial,
+///   epoch-crossed history.
 ///
 /// ```rust,no_run
 /// use autumn_web::prelude::*;
@@ -138,7 +208,7 @@ where
 pub fn stream_resumable(
     state: &crate::AppState,
     topic: &str,
-    last_event_id: Option<u64>,
+    last_event_id: Option<EventId>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>> + use<>> {
     use futures::StreamExt as _;
     use tokio::sync::broadcast::error::RecvError;
@@ -149,6 +219,7 @@ pub fn stream_resumable(
         gap,
         next_live_id,
         resumable,
+        epoch,
     } = state.channels().resume(topic, last_event_id);
 
     // A live-only backend (Redis fan-out, or any backend without a replay
@@ -158,33 +229,44 @@ pub fn stream_resumable(
     // unavailable instead of silently losing the events it missed.
     let missed_on_live_only = !resumable && last_event_id.is_some();
 
-    // Prefix: an optional gap sentinel, then each replayed event in order.
+    // Prefix: an optional gap sentinel, then each replayed event in order. Every
+    // id is formatted `"{epoch}.{seq}"` so a client that later echoes it back
+    // resumes against the right epoch.
     let mut prefix: Vec<Result<Event, Infallible>> = Vec::with_capacity(replay.len() + 1);
     if gap || missed_on_live_only {
         prefix.push(Ok(Event::default().event(GAP_EVENT).data(GAP_MARKER)));
     }
     for sequenced in replay {
         prefix.push(Ok(Event::default()
-            .id(sequenced.id.to_string())
+            .id(EventId {
+                epoch,
+                seq: sequenced.id,
+            }
+            .to_string())
             .data(sequenced.message.into_string())));
     }
 
-    // Live tail: assign ids from `next_live_id` upward. On a broadcast lag,
-    // advance the counter by the number of skipped messages (ids are dense) and
-    // surface a gap sentinel so clients can react.
+    // Live tail: assign seqs from `next_live_id` upward, formatting each id as
+    // `"{epoch}.{seq}"`. On a broadcast lag, advance the counter by the number
+    // of skipped messages (seqs are dense) and surface a gap sentinel so clients
+    // can react.
     let live = futures::stream::unfold(
         (subscriber, next_live_id),
-        |(mut subscriber, next_id)| async move {
+        move |(mut subscriber, next_seq)| async move {
             match subscriber.recv().await {
                 Ok(msg) => {
                     let event = Event::default()
-                        .id(next_id.to_string())
+                        .id(EventId {
+                            epoch,
+                            seq: next_seq,
+                        }
+                        .to_string())
                         .data(msg.into_string());
-                    Some((Ok(event), (subscriber, next_id.saturating_add(1))))
+                    Some((Ok(event), (subscriber, next_seq.saturating_add(1))))
                 }
                 Err(RecvError::Lagged(skipped)) => {
                     let event = Event::default().event(GAP_EVENT).data(GAP_MARKER);
-                    Some((Ok(event), (subscriber, next_id.saturating_add(skipped))))
+                    Some((Ok(event), (subscriber, next_seq.saturating_add(skipped))))
                 }
                 Err(RecvError::Closed) => None,
             }
@@ -282,15 +364,15 @@ mod tests {
     #[test]
     fn last_event_id_parses_valid_header() {
         let mut headers = axum::http::HeaderMap::new();
-        headers.insert("last-event-id", "42".parse().unwrap());
-        assert_eq!(last_event_id(&headers), Some(42));
+        headers.insert("last-event-id", "7.42".parse().unwrap());
+        assert_eq!(last_event_id(&headers), Some(EventId { epoch: 7, seq: 42 }));
     }
 
     #[test]
     fn last_event_id_trims_whitespace() {
         let mut headers = axum::http::HeaderMap::new();
-        headers.insert("last-event-id", "  7  ".parse().unwrap());
-        assert_eq!(last_event_id(&headers), Some(7));
+        headers.insert("last-event-id", "  3.7  ".parse().unwrap());
+        assert_eq!(last_event_id(&headers), Some(EventId { epoch: 3, seq: 7 }));
     }
 
     #[test]
@@ -301,13 +383,19 @@ mod tests {
         let mut bad = axum::http::HeaderMap::new();
         bad.insert("last-event-id", "not-a-number".parse().unwrap());
         assert_eq!(last_event_id(&bad), None);
+
+        // A legacy bare-integer id (from before ids were epoch-tagged) is
+        // malformed → None → treated as a cold connection.
+        let mut legacy = axum::http::HeaderMap::new();
+        legacy.insert("last-event-id", "42".parse().unwrap());
+        assert_eq!(last_event_id(&legacy), None);
     }
 
     #[cfg(feature = "ws")]
     #[tokio::test]
     async fn stream_resumable_builds_sse_from_app_state_channels() {
         let state = crate::AppState::for_test();
-        let _sse = stream_resumable(&state, "lobby", Some(3));
+        let _sse = stream_resumable(&state, "lobby", Some(EventId { epoch: 0, seq: 3 }));
         let _cold = stream_resumable(&state, "lobby", None);
     }
 
@@ -396,7 +484,7 @@ mod tests {
 
         // Reconnect *with* a Last-Event-ID against a backend that keeps no
         // history: the client must be told replay was unavailable.
-        let sse = stream_resumable(&state, "feed", Some(7));
+        let sse = stream_resumable(&state, "feed", Some(EventId { epoch: 1, seq: 7 }));
         let body = axum::response::IntoResponse::into_response(sse).into_body();
         let raw = collect_body(body, Duration::from_millis(150)).await;
 
@@ -450,13 +538,15 @@ mod tests {
             .unwrap_or_else(|| panic!("a broadcast lag must emit a gap sentinel: {raw:?}"));
         assert!(raw[gap_pos..].contains("\"gap\":true"));
 
-        // Post-lag frames keep dense ids (9, 10) matching the real published ids.
+        // Post-lag frames keep dense seqs (9, 10) matching the real published
+        // ids. Ids are now epoch-tagged (`"{epoch}.{seq}"`), so match the
+        // `.{seq}` suffix (the `.` only appears in an epoch-tagged id).
         let id9 = raw
-            .find("id: 9")
-            .unwrap_or_else(|| panic!("post-lag id 9 must appear: {raw:?}"));
+            .find(".9")
+            .unwrap_or_else(|| panic!("post-lag seq 9 must appear: {raw:?}"));
         let id10 = raw
-            .find("id: 10")
-            .unwrap_or_else(|| panic!("post-lag id 10 must appear: {raw:?}"));
+            .find(".10")
+            .unwrap_or_else(|| panic!("post-lag seq 10 must appear: {raw:?}"));
         assert!(
             gap_pos < id9 && id9 < id10,
             "gap must precede the dense post-lag ids, in order: {raw:?}"

@@ -10,9 +10,25 @@
 
 use std::time::Duration;
 
-use autumn_web::channels::{ChannelMessage, Channels};
+use autumn_web::channels::{ChannelMessage, Channels, EventId};
 use axum::response::IntoResponse as _;
 use tower::ServiceExt as _;
+
+/// Split an on-the-wire SSE id (`"{epoch}.{seq}"`) into its `(epoch, seq)` parts.
+fn parse_event_id(s: &str) -> (u64, u64) {
+    let (epoch, seq) = s
+        .split_once('.')
+        .unwrap_or_else(|| panic!("event id must be epoch.seq, got {s:?}"));
+    (
+        epoch.parse().expect("epoch is u64"),
+        seq.parse().expect("seq is u64"),
+    )
+}
+
+/// Read a topic's current epoch (subscribing then dropping the handle).
+fn topic_epoch(channels: &Channels, topic: &str) -> u64 {
+    channels.resume(topic, None).epoch
+}
 
 // ── SSE body parsing helpers ──────────────────────────────────────────────────
 
@@ -92,11 +108,12 @@ async fn kill_and_resume_delivers_full_sequence_zero_missed() {
 
     // First connection: read the two live events it sees.
     let mut first = channels.resume(topic, None);
+    let epoch = first.epoch;
     publish(&channels, topic, "e1");
     publish(&channels, topic, "e2");
     assert_eq!(first.subscriber.recv().await.unwrap().as_str(), "e1");
     assert_eq!(first.subscriber.recv().await.unwrap().as_str(), "e2");
-    let last_seen = 2; // ids are 1-based and dense
+    let last_seen = EventId { epoch, seq: 2 }; // seqs are 1-based and dense
 
     // Client disconnects.
     drop(first);
@@ -138,13 +155,14 @@ async fn stream_resumable_serializes_replay_then_live_frames() {
     let channels = state.channels().clone();
     let topic = "sse-orders";
 
-    // Seed three events (ids 1,2,3) before the client resumes.
+    // Seed three events (seqs 1,2,3) before the client resumes.
     publish(&channels, topic, "e1");
     publish(&channels, topic, "e2");
     publish(&channels, topic, "e3");
 
-    // Resume from id 1 — this subscribes live under the replay lock.
-    let sse = autumn_web::sse::stream_resumable(&state, topic, Some(1));
+    // Resume from seq 1 — this subscribes live under the replay lock.
+    let epoch = topic_epoch(&channels, topic);
+    let sse = autumn_web::sse::stream_resumable(&state, topic, Some(EventId { epoch, seq: 1 }));
 
     // Publish more after the resume subscription: these are live events.
     publish(&channels, topic, "e4");
@@ -153,21 +171,34 @@ async fn stream_resumable_serializes_replay_then_live_frames() {
     let response = sse.into_response();
     let frames = collect_sse(response.into_body(), Duration::from_millis(300)).await;
 
-    let seen: Vec<(Option<String>, String)> = frames
+    let seen: Vec<((u64, u64), String)> = frames
         .iter()
         .filter(|f| f.event.as_deref() != Some("gap"))
-        .map(|f| (f.id.clone(), f.data.clone()))
+        .map(|f| {
+            (
+                parse_event_id(f.id.as_deref().expect("replay/live frame has id")),
+                f.data.clone(),
+            )
+        })
         .collect();
 
+    // Every frame within the connection shares the topic epoch, and the seq
+    // parts are the expected 2,3 (replay) then 4,5 (live) — no dup/skip.
+    assert!(
+        seen.iter().all(|((e, _), _)| *e == epoch),
+        "all frames share the topic epoch {epoch}: {seen:?}"
+    );
+    let seqs_and_data: Vec<(u64, String)> =
+        seen.iter().map(|((_, seq), d)| (*seq, d.clone())).collect();
     assert_eq!(
-        seen,
+        seqs_and_data,
         vec![
-            (Some("2".to_owned()), "e2".to_owned()),
-            (Some("3".to_owned()), "e3".to_owned()),
-            (Some("4".to_owned()), "e4".to_owned()),
-            (Some("5".to_owned()), "e5".to_owned()),
+            (2, "e2".to_owned()),
+            (3, "e3".to_owned()),
+            (4, "e4".to_owned()),
+            (5, "e5".to_owned()),
         ],
-        "replayed (2,3) then live (4,5) with monotonic ids, no dup/skip at the seam"
+        "replayed (2,3) then live (4,5) with monotonic seqs, no dup/skip at the seam"
     );
 }
 
@@ -182,6 +213,7 @@ async fn router_oneshot_resumes_from_last_event_id_header() {
     publish(&channels, topic, "a");
     publish(&channels, topic, "b");
     publish(&channels, topic, "c");
+    let epoch = topic_epoch(&channels, topic);
 
     let handler_state = state.clone();
     let app = axum::Router::new().route(
@@ -195,11 +227,12 @@ async fn router_oneshot_resumes_from_last_event_id_header() {
         }),
     );
 
+    // The browser echoes back the full epoch-tagged id it last saw.
     let response = app
         .oneshot(
             axum::http::Request::builder()
                 .uri("/events")
-                .header("last-event-id", "1")
+                .header("last-event-id", EventId { epoch, seq: 1 }.to_string())
                 .body(axum::body::Body::empty())
                 .unwrap(),
         )
@@ -208,18 +241,26 @@ async fn router_oneshot_resumes_from_last_event_id_header() {
     assert_eq!(response.status(), axum::http::StatusCode::OK);
 
     let frames = collect_sse(response.into_body(), Duration::from_millis(300)).await;
-    let seen: Vec<(Option<String>, String)> = frames
+    let seen: Vec<((u64, u64), String)> = frames
         .iter()
         .filter(|f| f.event.as_deref() != Some("gap"))
-        .map(|f| (f.id.clone(), f.data.clone()))
+        .map(|f| {
+            (
+                parse_event_id(f.id.as_deref().expect("replay frame has id")),
+                f.data.clone(),
+            )
+        })
         .collect();
+    assert!(
+        seen.iter().all(|((e, _), _)| *e == epoch),
+        "all replay frames share the topic epoch: {seen:?}"
+    );
+    let seqs_and_data: Vec<(u64, String)> =
+        seen.iter().map(|((_, seq), d)| (*seq, d.clone())).collect();
     assert_eq!(
-        seen,
-        vec![
-            (Some("2".to_owned()), "b".to_owned()),
-            (Some("3".to_owned()), "c".to_owned()),
-        ],
-        "Last-Event-ID: 1 replays events 2 and 3"
+        seqs_and_data,
+        vec![(2, "b".to_owned()), (3, "c".to_owned())],
+        "Last-Event-ID epoch.1 replays events 2 and 3"
     );
 }
 
@@ -273,26 +314,32 @@ async fn wire_disconnect_then_resume_delivers_gap_events_exactly_once() {
     // Read what the first connection saw, then DROP the stream (disconnect):
     // `collect_sse` consumes the body by value and drops it here.
     let first_frames = collect_sse(first.into_body(), Duration::from_millis(300)).await;
-    let seen_first: Vec<(Option<String>, String)> = first_frames
+    let seen_first: Vec<((u64, u64), String)> = first_frames
         .iter()
         .filter(|f| f.event.as_deref() != Some("gap"))
-        .map(|f| (f.id.clone(), f.data.clone()))
+        .map(|f| {
+            (
+                parse_event_id(f.id.as_deref().expect("live frame has id")),
+                f.data.clone(),
+            )
+        })
+        .collect();
+    let seqs_first: Vec<(u64, String)> = seen_first
+        .iter()
+        .map(|((_, seq), d)| (*seq, d.clone()))
         .collect();
     assert_eq!(
-        seen_first,
-        vec![
-            (Some("3".to_owned()), "e3".to_owned()),
-            (Some("4".to_owned()), "e4".to_owned()),
-        ],
+        seqs_first,
+        vec![(3, "e3".to_owned()), (4, "e4".to_owned())],
         "cold first connection sees only the live events e3, e4"
     );
-    let last_seen: u64 = first_frames
+    // The browser echoes back the full epoch-tagged id string (highest seq).
+    let last_seen_id: String = first_frames
         .iter()
-        .filter_map(|f| f.id.as_deref())
-        .filter_map(|id| id.parse().ok())
-        .max()
+        .filter_map(|f| f.id.clone())
+        .max_by_key(|id| parse_event_id(id).1)
         .expect("first connection must have seen at least one id");
-    assert_eq!(last_seen, 4);
+    assert_eq!(parse_event_id(&last_seen_id).1, 4);
 
     // Events published *while disconnected* — the reconnect must recover these.
     publish(&channels, topic, "e5");
@@ -303,7 +350,7 @@ async fn wire_disconnect_then_resume_delivers_gap_events_exactly_once() {
         .oneshot(
             axum::http::Request::builder()
                 .uri("/events")
-                .header("last-event-id", last_seen.to_string())
+                .header("last-event-id", last_seen_id)
                 .body(axum::body::Body::empty())
                 .unwrap(),
         )
@@ -316,16 +363,18 @@ async fn wire_disconnect_then_resume_delivers_gap_events_exactly_once() {
         frames.iter().all(|f| f.event.as_deref() != Some("gap")),
         "buffer is deep enough to replay the gap without a sentinel: {frames:?}"
     );
-    let recovered: Vec<(Option<String>, String)> = frames
+    let recovered: Vec<(u64, String)> = frames
         .iter()
-        .map(|f| (f.id.clone(), f.data.clone()))
+        .map(|f| {
+            (
+                parse_event_id(f.id.as_deref().expect("recovered frame has id")).1,
+                f.data.clone(),
+            )
+        })
         .collect();
     assert_eq!(
         recovered,
-        vec![
-            (Some("5".to_owned()), "e5".to_owned()),
-            (Some("6".to_owned()), "e6".to_owned()),
-        ],
+        vec![(5, "e5".to_owned()), (6, "e6".to_owned())],
         "reconnect delivers every event published during the gap exactly once, in order, zero missed"
     );
 }
@@ -343,14 +392,15 @@ async fn overflowed_buffer_emits_gap_sentinel_and_replays_from_oldest() {
         publish(&channels, topic, &format!("m{i}"));
     }
 
-    // Client last saw id 1 → id 2 aged out (retained ids are 4,5,6).
-    let handle = channels.resume(topic, Some(1));
+    // Client last saw seq 1 → seq 2 aged out (retained seqs are 4,5,6).
+    let epoch = topic_epoch(&channels, topic);
+    let handle = channels.resume(topic, Some(EventId { epoch, seq: 1 }));
     assert!(handle.gap, "aged-out resume point must raise a gap");
     let ids: Vec<u64> = handle.replay.iter().map(|s| s.id).collect();
     assert_eq!(
         ids,
         vec![4, 5, 6],
-        "replay starts from the oldest retained id"
+        "replay starts from the oldest retained seq"
     );
 }
 
@@ -365,10 +415,11 @@ async fn stream_resumable_emits_gap_event_frame_on_overflow() {
     for i in 1..=total {
         publish(&channels, topic, &format!("m{i}"));
     }
-    // With cap 256, retained ids are (total-255)..=total.
+    // With cap 256, retained seqs are (total-255)..=total.
     let oldest_retained = total - 255;
+    let epoch = topic_epoch(&channels, topic);
 
-    let sse = autumn_web::sse::stream_resumable(&state, topic, Some(1));
+    let sse = autumn_web::sse::stream_resumable(&state, topic, Some(EventId { epoch, seq: 1 }));
     let frames = collect_sse(sse.into_response().into_body(), Duration::from_millis(300)).await;
 
     assert_eq!(
@@ -379,11 +430,14 @@ async fn stream_resumable_emits_gap_event_frame_on_overflow() {
     assert_eq!(frames[0].data, "{\"gap\":true}");
     assert!(frames[0].id.is_none(), "gap sentinel carries no id");
 
-    // Replay frames follow, starting at the oldest retained id.
+    // Replay frames follow, starting at the oldest retained seq, all in-epoch.
     assert_eq!(
-        frames.get(1).and_then(|f| f.id.clone()),
-        Some(oldest_retained.to_string()),
-        "replay must start at the oldest retained id after a gap"
+        frames
+            .get(1)
+            .and_then(|f| f.id.as_deref())
+            .map(parse_event_id),
+        Some((epoch, oldest_retained)),
+        "replay must start at the oldest retained seq (in-epoch) after a gap"
     );
     let replay_count = frames
         .iter()
@@ -392,57 +446,190 @@ async fn stream_resumable_emits_gap_event_frame_on_overflow() {
     assert_eq!(replay_count, 256, "replay retains exactly the capacity");
 }
 
-// ── Epoch reset: stale-large Last-Event-ID after a restart signals a gap ───────
+// ── Same-epoch future seq: defensive gap without dropping the replay ───────────
 
 #[tokio::test]
-async fn resume_after_epoch_reset_signals_gap() {
-    // Fresh channels model a process that just restarted: the per-topic id
-    // counter starts at 1, so `start_id` is small.
+async fn resume_with_future_same_epoch_seq_signals_gap() {
+    // Defensive: within the current epoch a client should never present a seq
+    // ahead of the server, but if it does we flag a gap rather than silently
+    // returning an empty replay.
     let channels = Channels::new(64);
     let topic = "epoch";
     publish(&channels, topic, "e1");
     publish(&channels, topic, "e2");
-    // start_id is now 2.
+    // start_seq is now 2.
+    let epoch = topic_epoch(&channels, topic);
 
-    // A client reconnects with a Last-Event-ID from a *previous* epoch that is
-    // far larger than the current server id. There is nothing to replay, and the
-    // client must be told its history is unrecoverable.
-    let handle = channels.resume(topic, Some(500));
+    let handle = channels.resume(topic, Some(EventId { epoch, seq: 500 }));
     assert!(
         handle.gap,
-        "a Last-Event-ID beyond the current server id must raise a gap"
+        "a same-epoch seq beyond the current server seq must raise a gap"
     );
     assert!(
         handle.replay.is_empty(),
-        "no retained id exceeds the stale-large resume point, so nothing replays"
+        "no retained seq exceeds the future resume point, so nothing replays"
     );
     assert_eq!(handle.next_live_id, 3);
 }
 
 #[tokio::test]
-async fn stream_resumable_emits_gap_event_frame_on_epoch_reset() {
+async fn stream_resumable_emits_gap_event_frame_on_future_same_epoch_seq() {
     let state = autumn_web::AppState::for_test();
     let channels = state.channels().clone();
     let topic = "sse-epoch";
     publish(&channels, topic, "e1");
     publish(&channels, topic, "e2");
+    let epoch = topic_epoch(&channels, topic);
 
-    // Resume with a future id (as if from a pre-restart epoch): the stream must
-    // lead with a gap sentinel and replay nothing.
-    let sse = autumn_web::sse::stream_resumable(&state, topic, Some(500));
+    // Resume with a future same-epoch seq: the stream must lead with a gap
+    // sentinel and replay nothing.
+    let sse = autumn_web::sse::stream_resumable(&state, topic, Some(EventId { epoch, seq: 500 }));
     let frames = collect_sse(sse.into_response().into_body(), Duration::from_millis(300)).await;
 
     assert_eq!(
         frames.first().and_then(|f| f.event.clone()).as_deref(),
         Some("gap"),
-        "the gap sentinel must lead the frame sequence after an epoch reset"
+        "the gap sentinel must lead the frame sequence"
     );
     assert_eq!(frames[0].data, "{\"gap\":true}");
     let replay_count = frames
         .iter()
         .filter(|f| f.event.as_deref() != Some("gap"))
         .count();
-    assert_eq!(replay_count, 0, "nothing to replay after an epoch reset");
+    assert_eq!(
+        replay_count, 0,
+        "nothing to replay for a future same-epoch seq"
+    );
+}
+
+// ── Codex regression: topic GC/epoch reset must NOT silently drop early events ─
+
+/// The headline fix. A topic is garbage-collected and recreated, resetting its
+/// per-topic seq counter to 1 under a NEW epoch. A client reconnects with a
+/// stale `Last-Event-ID` from the OLD epoch whose seq (4) the new epoch has
+/// already passed. Before epoch tagging, the old-epoch seq 4 was
+/// indistinguishable from the new-epoch seq 4, so the resume replayed only
+/// new-epoch seqs 5..10 and SILENTLY DROPPED new-epoch seqs 1..4. With epoch
+/// tagging the mismatch is detected: the stream gaps and replays the whole
+/// retained current epoch (1..10).
+#[tokio::test]
+async fn resume_after_topic_gc_epoch_reset_replays_full_epoch_not_partial() {
+    // Small replay cap (32) still retains all 10 new-epoch events.
+    let channels = Channels::with_shared_backend(std::sync::Arc::new(
+        autumn_web::channels::LocalChannelsBackend::with_replay_capacity(64, 32),
+    ));
+    let topic = "gc-epoch";
+
+    // Epoch E1: subscribe + publish so the topic exists with seqs E1.1..E1.4.
+    let handle1 = channels.resume(topic, None);
+    let e1 = handle1.epoch;
+    publish(&channels, topic, "old-1");
+    publish(&channels, topic, "old-2");
+    publish(&channels, topic, "old-3");
+    publish(&channels, topic, "old-4"); // the client "last saw" E1 seq 4
+    drop(handle1); // drop the only subscriber (and its receiver)
+
+    // Force the topic to be collected: no live receivers and no retained
+    // `Sender` keep it, so gc removes it (and its replay buffer + epoch).
+    channels.gc();
+    assert_eq!(
+        channels.channel_count(),
+        0,
+        "topic must be collected so it is recreated with a fresh epoch"
+    );
+
+    // Epoch E2: the next publish recreates the topic; the seq counter restarts
+    // at 1 under a brand-new epoch.
+    for i in 1..=10 {
+        publish(&channels, topic, &format!("new-{i}"));
+    }
+
+    // Stale reconnect from E1 seq 4 (a seq the new epoch E2 has already passed).
+    let handle = channels.resume(topic, Some(EventId { epoch: e1, seq: 4 }));
+    let e2 = handle.epoch;
+    println!("epoch-reset regression observed E1={e1} E2={e2}");
+    assert_ne!(
+        e1, e2,
+        "the recreated topic must have a distinct epoch (E1={e1}, E2={e2})"
+    );
+    assert!(handle.gap, "a cross-epoch resume must signal a gap");
+    let seqs: Vec<u64> = handle.replay.iter().map(|s| s.id).collect();
+    assert_eq!(
+        seqs,
+        (1..=10).collect::<Vec<_>>(),
+        "cross-epoch resume must replay ALL retained current-epoch events (1..10), \
+         NOT just seq > 4 — new-epoch seqs 1..4 must not be silently dropped"
+    );
+}
+
+/// The SSE-wire variant of the regression: after a topic GC/epoch reset, the
+/// stream must lead with a `gap` frame and then replay the full retained current
+/// epoch, all frames carrying the new epoch.
+#[tokio::test]
+async fn stream_resumable_after_topic_gc_leads_with_gap_then_full_epoch_replay() {
+    let state = autumn_web::AppState::for_test();
+    let channels = state.channels().clone();
+    let topic = "sse-gc-epoch";
+
+    // Epoch E1.
+    let handle1 = channels.resume(topic, None);
+    let e1 = handle1.epoch;
+    for i in 1..=4 {
+        publish(&channels, topic, &format!("old-{i}"));
+    }
+    drop(handle1);
+
+    channels.gc();
+    assert_eq!(
+        channels.channel_count(),
+        0,
+        "topic must be collected so it is recreated with a fresh epoch"
+    );
+
+    // Epoch E2: seqs 1..8 (default replay cap 256 retains them all).
+    for i in 1..=8 {
+        publish(&channels, topic, &format!("new-{i}"));
+    }
+
+    // Resume with the stale E1 id (seq 4, already passed by E2).
+    let sse = autumn_web::sse::stream_resumable(&state, topic, Some(EventId { epoch: e1, seq: 4 }));
+    let frames = collect_sse(sse.into_response().into_body(), Duration::from_millis(300)).await;
+
+    assert_eq!(
+        frames.first().and_then(|f| f.event.clone()).as_deref(),
+        Some("gap"),
+        "a cross-epoch resume must lead with a gap sentinel: {frames:?}"
+    );
+    assert!(frames[0].id.is_none(), "gap sentinel carries no id");
+
+    // The replay covers the full retained current epoch (seqs 1..8), and every
+    // replayed frame carries the same NEW epoch E2 (≠ E1).
+    let replay: Vec<(u64, u64, String)> = frames
+        .iter()
+        .filter(|f| f.event.as_deref() != Some("gap"))
+        .map(|f| {
+            let (e, seq) = parse_event_id(f.id.as_deref().expect("replay frame has id"));
+            (e, seq, f.data.clone())
+        })
+        .collect();
+    let e2 = replay
+        .first()
+        .map(|(e, _, _)| *e)
+        .expect("replay is non-empty");
+    assert_ne!(
+        e1, e2,
+        "replayed frames must carry the new epoch (E1={e1}, E2={e2})"
+    );
+    assert!(
+        replay.iter().all(|(e, _, _)| *e == e2),
+        "all replayed frames share the new epoch: {replay:?}"
+    );
+    let seqs: Vec<u64> = replay.iter().map(|(_, seq, _)| *seq).collect();
+    assert_eq!(
+        seqs,
+        (1..=8).collect::<Vec<_>>(),
+        "cross-epoch resume replays the full retained epoch (1..8), not just seq > 4: {replay:?}"
+    );
 }
 
 // ── AC#5: cold connection behaves like today ──────────────────────────────────
@@ -478,14 +665,12 @@ async fn stream_resumable_cold_serializes_only_live_events() {
     publish(&channels, topic, "new");
 
     let frames = collect_sse(sse.into_response().into_body(), Duration::from_millis(300)).await;
-    let seen: Vec<(Option<String>, String)> = frames
-        .iter()
-        .map(|f| (f.id.clone(), f.data.clone()))
-        .collect();
+    assert_eq!(frames.len(), 1, "cold stream replays nothing: {frames:?}");
+    let (_, seq) = parse_event_id(frames[0].id.as_deref().expect("live frame has id"));
     assert_eq!(
-        seen,
-        vec![(Some("2".to_owned()), "new".to_owned())],
-        "cold stream replays nothing; live event keeps its dense id"
+        (seq, frames[0].data.clone()),
+        (2, "new".to_owned()),
+        "cold stream replays nothing; live event keeps its dense seq"
     );
 }
 
@@ -522,8 +707,9 @@ async fn concurrent_publish_around_resume_has_no_dup_or_skip() {
                 publish(&channels, topic, "m11");
             })
         };
+        let epoch = topic_epoch(&channels, topic);
         barrier.wait();
-        let mut handle = channels.resume(topic, Some(10));
+        let mut handle = channels.resume(topic, Some(EventId { epoch, seq: 10 }));
         bg.await.unwrap();
 
         // m11 is delivered exactly once: either in the replay snapshot OR as the
@@ -576,18 +762,22 @@ async fn ids_are_monotonic_and_buffer_is_bounded() {
     }
 
     // Resume from the very beginning: buffer retains at most `cap` events and
-    // their ids are strictly increasing and dense (the newest `cap`).
-    let handle = channels.resume(topic, Some(0));
+    // their seqs are strictly increasing and dense (the newest `cap`).
+    let epoch = topic_epoch(&channels, topic);
+    let handle = channels.resume(topic, Some(EventId { epoch, seq: 0 }));
     assert!(
         handle.replay.len() <= cap,
         "replay retained {} > cap {cap}",
         handle.replay.len()
     );
-    assert!(handle.gap, "resuming from 0 after overflow signals a gap");
+    assert!(
+        handle.gap,
+        "resuming from seq 0 after overflow signals a gap"
+    );
     let ids: Vec<u64> = handle.replay.iter().map(|s| s.id).collect();
     assert_eq!(ids, vec![193, 194, 195, 196, 197, 198, 199, 200]);
     for pair in ids.windows(2) {
-        assert_eq!(pair[1], pair[0] + 1, "ids must be dense and monotonic");
+        assert_eq!(pair[1], pair[0] + 1, "seqs must be dense and monotonic");
     }
     assert_eq!(handle.next_live_id, 201);
 }
