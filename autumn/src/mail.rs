@@ -2491,7 +2491,15 @@ fn show_template_preview(state: &AppState, mailer: &str, method: &str) -> Respon
 
     match preview.render() {
         Ok(mail) => {
-            let mail = apply_preview_unsubscribe_headers(state, mailer, mail);
+            let mut mail = apply_preview_unsubscribe_headers(state, mailer, mail);
+            // Match Mailer::send: inline <style> CSS so the preview reflects what
+            // strict clients (Gmail/Outlook) actually receive. Reuses the send-time
+            // decision (per-message override vs. the mailer's inline_css_default).
+            if let Some(m) = state.extension::<Mailer>() {
+                // Dev preview: degrade gracefully on inliner error (leaves html un-inlined)
+                // rather than failing the preview; the inliner is effectively infallible here.
+                let _ = m.apply_css_inlining(&mut mail);
+            }
             let raw = render_eml(&mail);
             let parsed = parse_eml(&raw);
             html_response(render_mail_detail(&parsed, "Template preview"))
@@ -4262,6 +4270,101 @@ mod tests {
         assert!(
             anchor_open.contains("style=") && anchor_open.contains("#fff"),
             "computed styling must be carried inline so a style-stripped copy looks identical; got: {anchor_open}"
+        );
+    }
+
+    // ── Preview honours send-time CSS inlining (issue #1254) ──────────────
+
+    /// Render `show_template_preview` for a single registered preview and return
+    /// the full response body as a string. A [`Mailer`] is installed on the
+    /// state so the handler can reuse the send-time inlining decision — mirrors
+    /// the app build, where the mailer is always present before the preview
+    /// registry.
+    async fn preview_body_for(preview: MailPreview) -> String {
+        let state = crate::AppState::for_test();
+        state.insert_extension(MailPreviewRegistry::new(vec![preview]));
+        let mailer = Mailer::builder()
+            .build()
+            .expect("log-transport mailer builds");
+        state.insert_extension(mailer);
+
+        let response = show_template_preview(&state, "test", "styled");
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("preview body collects");
+        String::from_utf8(bytes.to_vec()).expect("preview body is utf-8")
+    }
+
+    /// Escaped opening `<a …>` tag of the email body as it appears in the
+    /// preview page (the email HTML is HTML-escaped into an `<iframe srcdoc>`).
+    /// Isolating the anchor keeps assertions discriminating: the colour rule
+    /// also lives in the retained/original `<style>` block.
+    fn escaped_anchor_open_tag(body: &str) -> String {
+        let after = body
+            .split("&lt;a")
+            .nth(1)
+            .expect("an <a> tag is present in the escaped preview body");
+        let open = &after[..after.find("&gt;").expect("anchor tag closes")];
+        open.to_owned()
+    }
+
+    #[tokio::test]
+    #[allow(
+        clippy::literal_string_with_formatting_args,
+        reason = "CSS rule braces are literal HTML, not format placeholders"
+    )]
+    async fn preview_inlines_style_block_when_inlining_enabled() {
+        // A preview whose Mail opts into inlining must reflect what strict
+        // clients receive: the `.btn` class rule inlined onto the anchor.
+        let preview = MailPreview::new("test", "styled", || {
+            Mail::builder()
+                .to("user@example.com")
+                .subject("Styled")
+                .html(r#"<style>.btn{color:#ff0000}</style><a class="btn">Go</a>"#)
+                .inline_css(true)
+                .build()
+                .expect("preview mail builds")
+        });
+
+        let body = preview_body_for(preview).await;
+        let anchor = escaped_anchor_open_tag(&body);
+        assert!(
+            anchor.contains("style="),
+            "preview must inline the <style> block onto the anchor; got tag: {anchor}"
+        );
+        assert!(
+            anchor.contains("#ff0000"),
+            "the .btn colour rule must be carried inline; got tag: {anchor}"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(
+        clippy::literal_string_with_formatting_args,
+        reason = "CSS rule braces are literal HTML, not format placeholders"
+    )]
+    async fn preview_leaves_style_block_raw_when_inlining_disabled() {
+        // The discriminating counterpart: with inlining off the anchor keeps no
+        // inline style and the raw `<style>` block survives untouched.
+        let preview = MailPreview::new("test", "styled", || {
+            Mail::builder()
+                .to("user@example.com")
+                .subject("Styled")
+                .html(r#"<style>.btn{color:#ff0000}</style><a class="btn">Go</a>"#)
+                .inline_css(false)
+                .build()
+                .expect("preview mail builds")
+        });
+
+        let body = preview_body_for(preview).await;
+        let anchor = escaped_anchor_open_tag(&body);
+        assert!(
+            !anchor.contains("style="),
+            "inlining is off, so the anchor must not gain an inline style; got tag: {anchor}"
+        );
+        assert!(
+            body.contains("&lt;style&gt;"),
+            "the raw <style> block must survive when inlining is off"
         );
     }
 
