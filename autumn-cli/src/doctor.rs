@@ -2866,27 +2866,43 @@ fn is_secret_dotenv_filename(name: &str) -> bool {
 /// Whether a `.gitignore` body ignores a project-root file named `filename`.
 ///
 /// Git-ignore semantics, restricted to the cases needed for root-level dotenv
-/// files: comment (`#…`), blank, and negation (`!…`) lines are skipped; every
-/// other line is treated as a glob matched against the file's basename, where
-/// `*` matches any run of non-`/` characters (including empty). An optional
-/// leading `**/` (match in any directory) then an optional leading `/` (anchor
-/// to the repository root) are accepted and stripped before matching. A pattern
-/// that still contains a `/` after stripping those prefixes — or ends in `/`
+/// files: comment (`#…`) and blank lines are skipped; every other line is a
+/// pattern matched against the file's basename, where `*` matches any run of
+/// non-`/` characters (including empty). A leading `!` marks a negation that
+/// **re-includes** a previously excluded file. An optional leading `**/` (match
+/// in any directory) then an optional leading `/` (anchor to the repository
+/// root) are accepted and stripped before matching. A pattern that still
+/// contains a `/` after stripping those prefixes — or ends in `/`
 /// (directory-only) — is a path/dir pattern that cannot match a bare root-level
-/// file and never counts as coverage.
+/// file and is skipped.
+///
+/// Per gitignore precedence, the **last** matching pattern decides: patterns
+/// are evaluated top-to-bottom while tracking a running ignored state, so
+/// `.env*` followed by `!.env` correctly reports `.env` as NOT covered, and
+/// `!.env` followed by `.env` reports it as covered.
 fn gitignore_covers(contents: &str, filename: &str) -> bool {
-    contents.lines().any(|line| {
+    let mut ignored = false;
+    for line in contents.lines() {
         let entry = line.trim();
-        if entry.is_empty() || entry.starts_with('#') || entry.starts_with('!') {
-            return false;
+        if entry.is_empty() || entry.starts_with('#') {
+            continue;
         }
-        let pattern = entry.strip_prefix("**/").unwrap_or(entry);
+        // A leading `!` re-includes (un-ignores) a matching file.
+        let (negation, body) = entry
+            .strip_prefix('!')
+            .map_or((false, entry), |rest| (true, rest));
+        let pattern = body.strip_prefix("**/").unwrap_or(body);
         let pattern = pattern.strip_prefix('/').unwrap_or(pattern);
         if pattern.ends_with('/') || pattern.contains('/') {
-            return false;
+            continue;
         }
-        glob_matches_basename(pattern, filename)
-    })
+        if glob_matches_basename(pattern, filename) {
+            // Last match wins: a normal pattern ignores, a `!` negation
+            // re-includes.
+            ignored = !negation;
+        }
+    }
+    ignored
 }
 
 /// Match a basename glob against `text`, anchored at both ends. The only special
@@ -5251,6 +5267,14 @@ redirect_uri = "http://localhost/callback"
         assert!(!gitignore_covers("config/.env\n", ".env"));
         // A directory-only pattern does not cover a regular file.
         assert!(!gitignore_covers(".env/\n", ".env"));
+        // Last-match-wins with `!` negations (gitignore precedence): a `!.env`
+        // re-include after a broader ignore means `.env` is NOT covered.
+        assert!(!gitignore_covers(".env*\n!.env\n", ".env"));
+        assert!(!gitignore_covers(".env\n!.env\n", ".env"));
+        // `.env*` still covers a sibling the negation does not re-include.
+        assert!(gitignore_covers(".env*\n!.env\n", ".env.local"));
+        // Order matters: a later ignore re-covers a file an earlier `!` freed.
+        assert!(gitignore_covers("!.env\n.env\n", ".env"));
     }
 
     #[test]

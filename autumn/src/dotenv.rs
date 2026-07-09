@@ -322,20 +322,45 @@ impl Env for DotenvOsEnv {
     }
 }
 
-/// Resolve `.env` vars for the current working directory using the real OS env
+/// The base directory `.env` files are resolved from — the SAME directory the
+/// config loader uses for `autumn.toml`.
+///
+/// `autumn.toml` is located via
+/// [`find_config_file_named`](crate::config), which prefers
+/// `AUTUMN_MANIFEST_DIR` (the crate root baked in by `#[autumn_web::main]`, or a
+/// launch-time override) when set and otherwise falls back to the process
+/// working directory. Resolving `.env` from the same base means a binary
+/// launched from outside its crate root (e.g. `cargo run -p app` from a
+/// workspace root) reads the `.env` next to its `autumn.toml` rather than the
+/// process CWD.
+///
+/// `AUTUMN_MANIFEST_DIR` must be read from the real/base [`Env`] (before the
+/// `.env` overlay is built), so the overlay can never redirect its own base
+/// directory.
+pub(crate) fn dotenv_base_dir(env: &dyn Env) -> PathBuf {
+    if let Ok(manifest_dir) = env.var("AUTUMN_MANIFEST_DIR") {
+        return PathBuf::from(manifest_dir);
+    }
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+/// Resolve `.env` vars for the config manifest directory using the real OS env
 /// and resolved profile.
 ///
+/// The base directory is [`dotenv_base_dir`] — `AUTUMN_MANIFEST_DIR` when set,
+/// else the process working directory — so `.env` is always read from the same
+/// place as `autumn.toml`.
+///
 /// Returns the `(key, value)` pairs to apply (empty when gating disables
-/// loading — see [`should_load`]). If the current directory cannot be
-/// determined, resolution falls back to `.`.
+/// loading — see [`should_load`]).
 ///
 /// # Errors
 /// Returns a [`DotenvError`] (with a `path:line` location) on a malformed or
 /// unreadable `.env` file.
-pub fn resolve_dotenv_for_cwd() -> Result<Vec<(String, String)>, DotenvError> {
+pub fn resolve_process_dotenv() -> Result<Vec<(String, String)>, DotenvError> {
     let base = OsEnv;
     let profile = resolve_profile(&base);
-    let dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let dir = dotenv_base_dir(&base);
     resolve_dotenv_vars(&dir, &profile, &base)
 }
 
@@ -347,7 +372,7 @@ pub fn resolve_dotenv_for_cwd() -> Result<Vec<(String, String)>, DotenvError> {
 /// read or parsed.
 pub fn os_env_with_dotenv() -> Result<DotenvOsEnv, DotenvError> {
     Ok(DotenvOsEnv {
-        overlay: resolve_dotenv_for_cwd()?.into_iter().collect(),
+        overlay: resolve_process_dotenv()?.into_iter().collect(),
     })
 }
 
@@ -805,6 +830,37 @@ export BAZ=qux
         // The real-env value is still what callers observe.
         assert_eq!(env.var("AUTUMN_ENV").unwrap(), "dev");
         assert_eq!(map.get("OTHER").map(String::as_str), Some("x"));
+    }
+
+    #[test]
+    fn dotenv_base_dir_prefers_manifest_dir() {
+        // The `.env` base directory tracks config's `autumn.toml` base:
+        // AUTUMN_MANIFEST_DIR wins over the process CWD when set.
+        let dir = tempfile::tempdir().unwrap();
+        let env = MockEnv::new().with("AUTUMN_MANIFEST_DIR", dir.path().to_str().unwrap());
+        assert_eq!(dotenv_base_dir(&env), dir.path().to_path_buf());
+    }
+
+    #[test]
+    fn dotenv_base_dir_falls_back_to_cwd_when_unset() {
+        let env = MockEnv::new();
+        let expected = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        assert_eq!(dotenv_base_dir(&env), expected);
+    }
+
+    #[test]
+    fn resolve_reads_env_from_manifest_dir_not_cwd() {
+        // With AUTUMN_MANIFEST_DIR pointing at a temp dir that contains a `.env`,
+        // resolution reads THAT file — proving the base directory is the manifest
+        // dir, not the process working directory.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".env"), "FROM_MANIFEST=yes\n").unwrap();
+        let env = MockEnv::new().with("AUTUMN_MANIFEST_DIR", dir.path().to_str().unwrap());
+        let base = dotenv_base_dir(&env);
+        assert_eq!(base, dir.path().to_path_buf());
+        let out = resolve_dotenv_vars(&base, "dev", &env).unwrap();
+        let map: std::collections::HashMap<_, _> = out.into_iter().collect();
+        assert_eq!(map.get("FROM_MANIFEST").map(String::as_str), Some("yes"));
     }
 
     #[test]

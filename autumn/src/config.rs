@@ -2290,7 +2290,11 @@ impl AutumnConfig {
         // developer-provided values.
         let base = OsEnv;
         let profile = resolve_profile(&base);
-        let dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        // Resolve `.env` from the same base directory config uses for
+        // `autumn.toml` (AUTUMN_MANIFEST_DIR when set, else the process CWD),
+        // so a binary launched from outside its crate root reads the `.env`
+        // next to its config instead of the process working directory.
+        let dir = crate::dotenv::dotenv_base_dir(&base);
         let vars = crate::dotenv::resolve_dotenv_vars(&dir, &profile, &base)
             .map_err(|e| ConfigError::Dotenv(e.to_string()))?;
         let env = crate::dotenv::DotenvEnv::new(&base, vars);
@@ -5292,7 +5296,11 @@ impl ConfigLoader for TomlEnvConfigLoader {
         // than silently skipping developer-provided values.
         let base = OsEnv;
         let profile = resolve_profile(&base);
-        let dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        // Resolve `.env` from the same base directory config uses for
+        // `autumn.toml` (AUTUMN_MANIFEST_DIR when set, else the process CWD),
+        // so a binary launched from outside its crate root reads the `.env`
+        // next to its config instead of the process working directory.
+        let dir = crate::dotenv::dotenv_base_dir(&base);
         let vars = crate::dotenv::resolve_dotenv_vars(&dir, &profile, &base)
             .map_err(|e| ConfigError::Dotenv(e.to_string()))?;
         let env = crate::dotenv::DotenvEnv::new(&base, vars);
