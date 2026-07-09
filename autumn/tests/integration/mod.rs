@@ -96,6 +96,14 @@ mod mcp_repository;
 mod mcp_streaming;
 mod middleware_introspection;
 mod middleware_pipeline;
+#[cfg(feature = "offline-sync")]
+mod offline_sync_conformance;
+#[cfg(feature = "offline-sync")]
+mod offline_sync_engine;
+#[cfg(feature = "offline-sync")]
+mod offline_sync_pg;
+#[cfg(feature = "offline-sync")]
+mod offline_sync_store;
 #[cfg(feature = "openapi")]
 mod openapi;
 mod pagination;

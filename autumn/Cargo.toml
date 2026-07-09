@@ -49,6 +49,15 @@ db = [
     "diesel/chrono",
     "diesel/serde_json",
 ]
+# Offline-first local store + background sync engine for occasionally-
+# connected apps (e.g. Tauri mobile, issue #1508). Local state lives in an
+# in-process SQLite database (`sync::SyncStore`, change-tracked with
+# tombstones); a `sync::SyncEngine` pushes/pulls changes to a remote Autumn
+# app that mounts `sync::server::router()` over Postgres shadow tables.
+# Builds entirely on dependencies the `db` + `http-client` features already
+# compile (diesel's sqlite backend and the bundled libsqlite3-sys are
+# already in the graph) — zero new dependencies.
+offline-sync = ["db", "http-client"]
 test-support = ["dep:testcontainers", "dep:testcontainers-modules"]
 telemetry-otlp = [
     "dep:opentelemetry",
@@ -250,7 +259,7 @@ features = [
   "maud", "htmx", "tailwind", "db", "cache-moka",
   "ws", "flash", "multipart", "http-client", "oauth2", "openapi", "mcp",
   "redis", "i18n", "storage", "variants", "mail", "seed", "system-info", "markdown",
-  "reporting", "csv", "embed-assets",
+  "reporting", "csv", "embed-assets", "offline-sync",
 ]
 rustdoc-args = ["--cfg", "docsrs"]
 
