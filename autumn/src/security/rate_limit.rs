@@ -1065,6 +1065,25 @@ fn throttle_rps(limit: u32, per_secs: u64) -> f64 {
     f64::from(limit) / (per_secs as f64).max(1.0)
 }
 
+/// De-dupe set of keys for which a throttle misconfiguration warning has
+/// already been emitted. A misconfigured named limiter (missing entry or
+/// invalid `per`) fails open on *every* request, so without this the warning
+/// would be logged on every request; instead it fires once per distinct
+/// route/name.
+static THROTTLE_WARNED: std::sync::OnceLock<Mutex<std::collections::HashSet<String>>> =
+    std::sync::OnceLock::new();
+
+/// Returns `true` the first time it is called with a given `key`, and `false`
+/// on every subsequent call with the same key, so a `tracing::warn!` guarded by
+/// it fires at most once per distinct misconfiguration.
+fn warn_once(key: String) -> bool {
+    let set = THROTTLE_WARNED.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+    let mut guard = set
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard.insert(key)
+}
+
 /// Resolve the effective inline parameters for a spec, given the global config.
 ///
 /// Returns `Some((limit, per_secs, key, registry_key))` when a limiter should
@@ -1085,20 +1104,24 @@ fn resolve_throttle_params(
         }
         ThrottleSpec::Named(name) => {
             let Some(entry) = config.named.get(*name) else {
-                tracing::warn!(
-                    name = %name,
-                    "#[throttle(\"{name}\")] references \
-                     [security.rate_limit.named.{name}] but no such entry exists in \
-                     config; failing open"
-                );
+                if warn_once(format!("missing:{route_id}:{name}")) {
+                    tracing::warn!(
+                        name = %name,
+                        "#[throttle(\"{name}\")] references \
+                         [security.rate_limit.named.{name}] but no such entry exists in \
+                         config; failing open"
+                    );
+                }
                 return None;
             };
             let Some(duration) = crate::task::parse_duration(&entry.per) else {
-                tracing::warn!(
-                    name = %name,
-                    per = %entry.per,
-                    "[security.rate_limit.named.{name}] has invalid `per`; failing open"
-                );
+                if warn_once(format!("badper:{route_id}:{name}")) {
+                    tracing::warn!(
+                        name = %name,
+                        per = %entry.per,
+                        "[security.rate_limit.named.{name}] has invalid `per`; failing open"
+                    );
+                }
                 return None;
             };
             let per_secs = duration.as_secs().max(1);
@@ -2340,6 +2363,20 @@ mod tests {
         assert_eq!(per, 60);
         assert_eq!(key, KeyStrategy::AuthenticatedPrincipal);
         assert_eq!(reg_key, "route:m::h");
+    }
+
+    #[test]
+    fn warn_once_dedupes_per_key() {
+        let key = "test::warn_once_dedupes_per_key:unique";
+        assert!(warn_once(key.to_owned()), "first call must return true");
+        assert!(
+            !warn_once(key.to_owned()),
+            "repeat call for same key must return false"
+        );
+        assert!(
+            warn_once(format!("{key}:other")),
+            "a distinct key must warn on its own first call"
+        );
     }
 
     #[test]

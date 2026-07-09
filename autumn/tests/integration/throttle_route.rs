@@ -25,10 +25,25 @@ async fn plain() -> &'static str {
     "plain-ok"
 }
 
-#[get("/quick")]
+// Each test gets its own uniquely-named handler so it maps to a distinct
+// `route_id` bucket in the process-global throttle registry. This keeps the
+// tests isolated under parallel `--test-threads` without any registry reset.
+#[get("/retry-headers")]
 #[throttle(limit = 1, per = "1s", key = "ip")]
-async fn quick() -> &'static str {
-    "quick-ok"
+async fn retry_headers() -> &'static str {
+    "retry-headers-ok"
+}
+
+#[get("/independent-ips")]
+#[throttle(limit = 1, per = "1s", key = "ip")]
+async fn independent_ips() -> &'static str {
+    "independent-ips-ok"
+}
+
+#[get("/exempt")]
+#[throttle(limit = 1, per = "1s", key = "ip")]
+async fn exempt_route() -> &'static str {
+    "exempt-ok"
 }
 
 #[get("/window")]
@@ -120,19 +135,19 @@ async fn throttled_route_429s_after_burst_while_sibling_route_unaffected() {
 #[tokio::test]
 async fn throttled_429_carries_retry_after_and_ratelimit_headers() {
     let client = TestApp::new()
-        .routes(routes![quick])
+        .routes(routes![retry_headers])
         .config(throttle_only_config())
         .build();
 
     client
-        .get("/quick")
+        .get("/retry-headers")
         .header("X-Forwarded-For", "198.51.100.7")
         .send()
         .await
         .assert_status(200);
 
     let denied = client
-        .get("/quick")
+        .get("/retry-headers")
         .header("X-Forwarded-For", "198.51.100.7")
         .send()
         .await;
@@ -222,25 +237,25 @@ async fn named_limiter_reads_from_config() {
 #[tokio::test]
 async fn independent_ips_have_independent_throttle_buckets() {
     let client = TestApp::new()
-        .routes(routes![quick])
+        .routes(routes![independent_ips])
         .config(base_config())
         .build();
 
     client
-        .get("/quick")
+        .get("/independent-ips")
         .header("X-Forwarded-For", "192.0.2.10")
         .send()
         .await
         .assert_status(200);
     client
-        .get("/quick")
+        .get("/independent-ips")
         .header("X-Forwarded-For", "192.0.2.10")
         .send()
         .await
         .assert_status(429);
     // Different IP: fresh bucket.
     client
-        .get("/quick")
+        .get("/independent-ips")
         .header("X-Forwarded-For", "192.0.2.11")
         .send()
         .await
@@ -258,15 +273,12 @@ async fn rate_limit_exempt_bypasses_per_route_throttle() {
     use std::net::SocketAddr;
     use tower::ServiceExt;
 
-    // Reset the process-wide throttle registry to avoid cross-test bleed.
-    autumn_web::security::__throttle_registry_reset();
-
     // Use the raw axum router built by the framework (via TestApp::router) so
     // the throttle attribute wiring is exercised end-to-end.
     let mut config = base_config();
     config.security.rate_limit.enabled = true;
     let app: Router = TestApp::new()
-        .routes(routes![quick])
+        .routes(routes![exempt_route])
         .config(config)
         .build()
         .into_router();
@@ -277,7 +289,7 @@ async fn rate_limit_exempt_bypasses_per_route_throttle() {
     let req = {
         let mut r = Request::builder()
             .method("GET")
-            .uri("/quick")
+            .uri("/exempt")
             .body(Body::empty())
             .expect("request builds");
         r.extensions_mut().insert(ConnectInfo(peer));
@@ -290,7 +302,7 @@ async fn rate_limit_exempt_bypasses_per_route_throttle() {
     let req = {
         let mut r = Request::builder()
             .method("GET")
-            .uri("/quick")
+            .uri("/exempt")
             .body(Body::empty())
             .expect("request builds");
         r.extensions_mut().insert(ConnectInfo(peer));
@@ -303,7 +315,7 @@ async fn rate_limit_exempt_bypasses_per_route_throttle() {
     let req = {
         let mut r = Request::builder()
             .method("GET")
-            .uri("/quick")
+            .uri("/exempt")
             .body(Body::empty())
             .expect("request builds");
         r.extensions_mut().insert(ConnectInfo(peer));
@@ -322,8 +334,6 @@ async fn principal_key_isolates_by_principal_extension() {
     use axum::http::{Request, StatusCode};
     use std::net::SocketAddr;
     use tower::ServiceExt;
-
-    autumn_web::security::__throttle_registry_reset();
 
     let mut config = base_config();
     // Use principal key strategy globally so populate_rate_limit_principal
