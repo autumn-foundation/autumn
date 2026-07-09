@@ -93,6 +93,7 @@ pub mod error;
 #[cfg(feature = "maud")]
 pub mod error_pages;
 pub mod extract;
+pub mod feed;
 /// View-layer value formatting helpers (currency, delimited numbers,
 /// pluralize, truncate, relative/absolute dates) for Maud templates.
 ///

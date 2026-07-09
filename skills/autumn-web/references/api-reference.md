@@ -438,6 +438,27 @@ Endpoint builders:
 - `raw_body() -> &[u8]`
 - `json<T>() -> Result<T, serde_json::Error>`
 
+## Feeds (Atom/RSS)
+
+`autumn_web::feed` renders syndication feeds and returns them straight from a
+`#[get]` handler:
+
+- `feed::Feed` — channel builder. `Feed::atom(title, site_link, self_link)` and
+  `Feed::rss(title, site_link, self_link)` (same signature) pick the format;
+  chain `.author(..)`, `.description(..)`, `.updated(DateTime<Utc>)`,
+  `.entry(FeedEntry)`, `.entries(iter)`.
+- `feed::FeedEntry` — per-item builder. `FeedEntry::new(id, title, link)` plus
+  `.summary(..)`, `.content(..)`, `.published(DateTime<Utc>)`,
+  `.updated(DateTime<Utc>)`.
+- `Feed` implements `IntoResponse`, setting `Content-Type: application/atom+xml`
+  (Atom) or `application/rss+xml` (RSS), UTF-8, and XML-escaping every text
+  field. `Feed::render() -> String` returns the raw XML.
+- `Feed::conditional(&headers) -> Response` reuses the `etag` module: it
+  computes the feed's ETag (also available via `Feed::etag()`) and returns a
+  `304 Not Modified` when the request's `If-None-Match` matches, otherwise the
+  full `200` feed. See `docs/guide/conditional-get.md`. The `blog` example
+  wires a `/feed.xml` route this way.
+
 ## Config layering and env keys
 
 Layering order, lowest to highest:
