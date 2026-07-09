@@ -29,6 +29,8 @@ use diesel::RunQueryDsl;
 use diesel::migration::{Migration, MigrationSource};
 use diesel::pg::Pg;
 use diesel_migrations::{FileBasedMigrations, HarnessWithOutput, MigrationHarness};
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::path::Path;
 
 /// Re-export `EmbeddedMigrations` so users can reference it without adding
@@ -522,6 +524,813 @@ fn framework_migration_versions() -> Result<std::collections::BTreeSet<String>, 
     Ok(versions)
 }
 
+/// SHA-256 content hash of a migration's `up.sql`, used to detect the case
+/// where a migration was edited **after** it was applied. Deterministic across
+/// platforms:
+///
+///   1. Line-ending normalisation: `\r\n` → `\n`, then any remaining `\r`
+///      → `\n`, so a Windows checkout matches a Linux one.
+///   2. `trim_end()` on the resulting string — trailing whitespace and the
+///      customary final newline are removed so tools that strip / re-append
+///      them cannot spuriously trip the mismatch guard.
+///   3. Lower-case hex of the SHA-256 of the normalised bytes.
+///
+/// The same normalisation is applied at record-time (`record_checksum` /
+/// `record_checksums`) and at validate-time (`validate_checksums`) so the
+/// hash a migration recorded when it was applied still compares equal to the
+/// hash of the same on-disk content later.
+#[must_use]
+pub fn migration_checksum(up_sql: &str) -> String {
+    let normalised = normalise_up_sql(up_sql);
+    let mut hasher = Sha256::new();
+    hasher.update(normalised.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+/// Bytes variant of [`migration_checksum`]: normalises the input via a
+/// lossy-UTF-8 decode and then hashes it exactly like [`migration_checksum`].
+///
+/// Non-UTF-8 bytes are decoded lossily so this call never fails, and it hashes
+/// identically to [`migration_checksum`] for valid UTF-8 input. It exists for
+/// callers that already hold raw `up.sql` bytes and is exercised by the
+/// checksum path/tests.
+///
+/// Note: it is **not** wired to embedded startup bytes. Startup auto-migrate
+/// validation re-hashes the on-disk `up.sql` (see
+/// [`validate_recorded_checksums_against_dir`]); Diesel's embedded `Migration`
+/// API does not expose each migration's raw SQL, so there is no embedded-bytes
+/// path to feed this function at startup.
+#[must_use]
+pub fn migration_checksum_bytes(up_sql: &[u8]) -> String {
+    // Lossy decode: mirror the CLI's on-disk read (`fs::read_to_string`),
+    // which itself rejects non-UTF-8 — the lossy path is only exercised
+    // when the embedded macro somehow ships non-UTF-8, which Diesel does
+    // not. Keeping the API infallible avoids a fallible checksum in the
+    // apply loop.
+    let s = String::from_utf8_lossy(up_sql);
+    migration_checksum(&s)
+}
+
+fn normalise_up_sql(up_sql: &str) -> String {
+    let mut normalised = up_sql.replace("\r\n", "\n");
+    if normalised.contains('\r') {
+        normalised = normalised.replace('\r', "\n");
+    }
+    let trimmed = normalised.trim_end();
+    trimmed.to_owned()
+}
+
+/// The recorded-vs-actual state of one applied migration's `up.sql`.
+///
+/// Produced by [`classify`] and consumed by [`validate_checksums`] and the
+/// CLI's `status` printer. `Ok` is the normal happy path; `Unrecorded`
+/// covers legacy migrations applied before the framework tracked
+/// checksums (baseline them with `autumn migrate baseline`); `Changed`
+/// and `Missing` are the failure modes. `Changed` is an applied migration
+/// whose on-disk `up.sql` no longer matches the checksum recorded when it
+/// was applied; `Missing` is an applied migration that *had* a recorded
+/// checksum (so it was once part of this source tree) but whose `up.sql`
+/// is now gone — deleted or renamed after being applied. Both mean the
+/// schema in production silently differs from what a fresh build would
+/// produce.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChecksumState {
+    /// The recorded checksum matches the current on-disk content — safe.
+    Ok,
+    /// A recorded checksum exists but disagrees with the current content:
+    /// the migration was edited after being applied.
+    Changed {
+        /// Hex-encoded SHA-256 of the `up.sql` at the time it was applied.
+        recorded: String,
+        /// Hex-encoded SHA-256 of the current on-disk `up.sql`.
+        actual: String,
+    },
+    /// A recorded checksum exists but the on-disk `up.sql` is gone — the
+    /// migration was deleted or renamed after being applied. Because a
+    /// checksum is only ever recorded for a migration whose `up.sql` was
+    /// present in *this* migrations dir at record time (see
+    /// [`record_checksums`]), a recorded-but-now-absent file is genuine
+    /// drift: a fresh DB built from the current source tree would no longer
+    /// run this migration. Embedded/framework migrations never receive a
+    /// recorded checksum against the user dir, so they can never land here.
+    Missing {
+        /// Hex-encoded SHA-256 of the `up.sql` at the time it was applied.
+        recorded: String,
+    },
+    /// The migration has no recorded checksum — either applied before
+    /// this feature existed, or its `up.sql` could not be resolved to
+    /// hash and it was never recorded. Never itself an error;
+    /// `autumn migrate baseline` records pending on-disk hashes so future
+    /// edits are caught.
+    Unrecorded,
+}
+
+/// Classify each applied migration's `up.sql` against its recorded checksum.
+///
+/// * `applied` — applied migration versions from `__diesel_schema_migrations`.
+/// * `up_sql_by_version` — the current on-disk `up.sql` text for each version
+///   the caller could resolve (may be missing entries for versions that were
+///   removed locally; a version whose `up.sql` is absent is reported as
+///   [`ChecksumState::Missing`] when it has a recorded checksum — genuine
+///   drift — and [`ChecksumState::Unrecorded`] when it has none).
+/// * `recorded` — the (version → hex checksum) map from
+///   `autumn_migration_checksums`.
+///
+/// Result order matches `applied`, so callers can iterate the classification
+/// alongside the applied list for status printing.
+#[must_use]
+pub fn classify<S1, S2>(
+    applied: &[String],
+    up_sql_by_version: &HashMap<String, String, S1>,
+    recorded: &HashMap<String, String, S2>,
+) -> Vec<(String, ChecksumState)>
+where
+    S1: std::hash::BuildHasher,
+    S2: std::hash::BuildHasher,
+{
+    applied
+        .iter()
+        .map(|version| {
+            let state = match (up_sql_by_version.get(version), recorded.get(version)) {
+                (Some(up_sql), Some(recorded_hash)) => {
+                    let actual = migration_checksum(up_sql);
+                    if &actual == recorded_hash {
+                        ChecksumState::Ok
+                    } else {
+                        ChecksumState::Changed {
+                            recorded: recorded_hash.clone(),
+                            actual,
+                        }
+                    }
+                }
+                // Recorded as applied but the on-disk up.sql is gone: the
+                // migration was deleted or renamed after being applied. The
+                // recorded checksum proves it once belonged to THIS dir (a
+                // checksum is only recorded for a file present at record
+                // time), so this is genuine drift — not the legacy case.
+                // Framework/embedded migrations never get a recorded checksum
+                // against the user dir, so they can never reach this arm.
+                (None, Some(recorded_hash)) => ChecksumState::Missing {
+                    recorded: recorded_hash.clone(),
+                },
+                // No recorded checksum (with or without on-disk up.sql):
+                // legacy migration applied before checksum tracking, or an
+                // unresolvable up.sql that was never recorded. Never an error.
+                (Some(_) | None, None) => ChecksumState::Unrecorded,
+            };
+            (version.clone(), state)
+        })
+        .collect()
+}
+
+/// Fail fast on the first drifted migration checksum.
+///
+/// Two failure modes are caught, both of which silently fork the schema
+/// between environments:
+///
+///   * [`ChecksumState::Changed`] — a migration was edited after being applied.
+///   * [`ChecksumState::Missing`] — a migration was deleted or renamed after
+///     being applied (its `up.sql` is gone but it still has a recorded
+///     checksum, so a fresh DB from the current source tree would no longer
+///     run it).
+///
+/// `Unrecorded` entries never fail — they are the legacy state before this
+/// feature existed, and `autumn migrate baseline` records their current hash
+/// so future edits are caught. Because `Missing` requires a recorded checksum,
+/// and a checksum is only recorded for a file that was present in this dir at
+/// record time, embedded/framework migrations (never recorded against the user
+/// dir) cannot trigger a false-positive `Missing`.
+///
+/// # Errors
+///
+/// Returns [`MigrationError::Migration`] with a message that names the version.
+/// For `Changed` it includes the recorded hex, the actual hex, and the remedy
+/// (never edit an applied migration — add a new one; the re-baseline command
+/// is the deliberate escape hatch). For `Missing` it explains that a migration
+/// must never be deleted or renamed after being applied.
+pub fn validate_checksums<S1, S2>(
+    applied: &[String],
+    up_sql_by_version: &HashMap<String, String, S1>,
+    recorded: &HashMap<String, String, S2>,
+) -> Result<(), MigrationError>
+where
+    S1: std::hash::BuildHasher,
+    S2: std::hash::BuildHasher,
+{
+    for (version, state) in classify(applied, up_sql_by_version, recorded) {
+        match state {
+            ChecksumState::Changed { recorded, actual } => {
+                return Err(MigrationError::Migration(format!(
+                    "migration {version} checksum mismatch: recorded {recorded} but on-disk \
+                     content hashes to {actual}. Migrations must never be edited after being \
+                     applied \u{2014} add a new migration instead, or run the documented \
+                     re-baseline command if this change was deliberate."
+                )));
+            }
+            ChecksumState::Missing { recorded } => {
+                return Err(MigrationError::Migration(format!(
+                    "migration {version} is recorded as applied (checksum {recorded}) but its \
+                     up.sql is missing from the source tree \u{2014} a migration must never be \
+                     deleted or renamed after being applied; add a new migration instead."
+                )));
+            }
+            ChecksumState::Ok | ChecksumState::Unrecorded => {}
+        }
+    }
+    Ok(())
+}
+
+// ── DB helpers: autumn_migration_checksums ───────────────────────────────
+
+#[derive(diesel::QueryableByName)]
+struct RecordedChecksumRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    version: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    checksum: String,
+}
+
+#[derive(diesel::QueryableByName)]
+struct TableExistsRow {
+    #[diesel(sql_type = diesel::sql_types::Bool)]
+    present: bool,
+}
+
+/// Ensure the framework-owned `autumn_migration_checksums` table exists on
+/// this connection, creating it idempotently if absent.
+///
+/// The same DDL ships as a framework migration
+/// (`20260709000000_create_migration_checksums`) so fresh databases get the
+/// managed path and a `down.sql` — but the checksum record/validate paths must
+/// **not** depend on that migration having run. The startup auto-migrate path
+/// (and shard targets) only apply the app-registered migration sets, which by
+/// default do not include [`FRAMEWORK_MIGRATIONS`]; without this helper the
+/// table would never be created there and every dev recording would warn while
+/// startup validation stayed vacuous (issue #1203 review, B1/S2). Creating the
+/// table here works identically on control and shard targets.
+///
+/// `CREATE TABLE IF NOT EXISTS` is safe and idempotent under autocommit (the
+/// [`with_migration_connection!`] connection has no surrounding transaction),
+/// and this only ever runs on the primary migration/write connection — never on
+/// a read replica (the replica parity path never touches the checksum table).
+///
+/// # Errors
+///
+/// Returns [`MigrationError::Migration`] if the `CREATE TABLE` cannot run (e.g.
+/// a read-only connection). Best-effort record callers log the warning and
+/// continue; validate callers surface it the same way they surface any other DB
+/// error, and it never masks a real checksum mismatch.
+fn ensure_checksum_table<C>(conn: &mut C) -> Result<(), MigrationError>
+where
+    C: diesel::connection::LoadConnection<Backend = Pg>,
+{
+    diesel::sql_query(
+        "CREATE TABLE IF NOT EXISTS autumn_migration_checksums (\
+             version    TEXT PRIMARY KEY, \
+             checksum   TEXT NOT NULL, \
+             algorithm  TEXT NOT NULL DEFAULT 'sha256', \
+             recorded_at TIMESTAMPTZ NOT NULL DEFAULT now()\
+         )",
+    )
+    .execute(conn)
+    .map_err(|e| MigrationError::Migration(e.to_string()))?;
+    Ok(())
+}
+
+/// Load the full `(version, checksum)` map from `autumn_migration_checksums`.
+///
+/// **Read-only.** This never creates the table: on a fresh database (before any
+/// apply/record path has created it) it probes for the relation with
+/// `to_regclass` and returns an empty map when absent. This keeps read paths —
+/// `autumn migrate status` and the pre-apply validation — from requiring DDL
+/// privileges or mutating the database just to display / check state (issue
+/// #1203 review, P2-A).
+///
+/// The table is created lazily by the *write* helpers ([`record_checksum`],
+/// [`record_checksums`], [`rebaseline_checksum`], [`delete_checksum`],
+/// [`delete_checksums`]), each of which calls [`ensure_checksum_table`] before
+/// writing. So the "validate → apply → record" sequence on the startup
+/// auto-migrate and shard paths still works: the pre-apply validate reads an
+/// empty map (nothing to fork from yet, no error), and the subsequent
+/// `record_checksums` creates the table and records the freshly-applied hashes.
+///
+/// `to_regclass` returns NULL for an unknown relation — an existence test that
+/// never errors and never depends on localized "does not exist" error text
+/// (which breaks under a non-English `lc_messages`).
+///
+/// # Errors
+///
+/// Returns [`MigrationError::Migration`] for any database error.
+pub fn recorded_checksums<C>(conn: &mut C) -> Result<HashMap<String, String>, MigrationError>
+where
+    C: diesel::connection::LoadConnection<Backend = Pg>,
+{
+    let present = diesel::sql_query(
+        "SELECT to_regclass('autumn_migration_checksums') IS NOT NULL AS present",
+    )
+    .get_result::<TableExistsRow>(conn)
+    .map_err(|e| MigrationError::Migration(e.to_string()))?
+    .present;
+    if !present {
+        return Ok(HashMap::new());
+    }
+    let rows: Vec<RecordedChecksumRow> =
+        diesel::sql_query("SELECT version, checksum FROM autumn_migration_checksums")
+            .load(conn)
+            .map_err(|e| MigrationError::Migration(e.to_string()))?;
+    Ok(rows.into_iter().map(|r| (r.version, r.checksum)).collect())
+}
+
+/// Record a migration's checksum. Idempotent — a repeat call for the same
+/// version is a no-op (ON CONFLICT DO NOTHING) so the normal apply path can
+/// be re-run without disturbing the historical record.
+///
+/// # Errors
+///
+/// Returns [`MigrationError::Migration`] on any database error.
+pub fn record_checksum<C>(conn: &mut C, version: &str, checksum: &str) -> Result<(), MigrationError>
+where
+    C: diesel::connection::LoadConnection<Backend = Pg>,
+{
+    ensure_checksum_table(conn)?;
+    diesel::sql_query(
+        "INSERT INTO autumn_migration_checksums (version, checksum) \
+         VALUES ($1, $2) ON CONFLICT (version) DO NOTHING",
+    )
+    .bind::<diesel::sql_types::Text, _>(version)
+    .bind::<diesel::sql_types::Text, _>(checksum)
+    .execute(conn)
+    .map_err(|e| MigrationError::Migration(e.to_string()))?;
+    Ok(())
+}
+
+/// Overwrite a previously recorded checksum for one version (escape hatch).
+///
+/// Invoked by `autumn migrate baseline --force <version>` when an operator
+/// has deliberately edited an applied migration and accepts the fork risk.
+/// Logged at `WARN` so the change is unambiguous in deploy logs.
+///
+/// The normal path is [`record_checksum`], which never rewrites. This function
+/// exists only for the re-baseline command; nothing in the framework calls it
+/// automatically.
+///
+/// # Errors
+///
+/// Returns [`MigrationError::Migration`] on any database error.
+pub fn rebaseline_checksum<C>(
+    conn: &mut C,
+    version: &str,
+    checksum: &str,
+) -> Result<(), MigrationError>
+where
+    C: diesel::connection::LoadConnection<Backend = Pg>,
+{
+    ensure_checksum_table(conn)?;
+    // Read the prior value so the WARN log can name old → new.
+    let prior: Vec<RecordedChecksumRow> = diesel::sql_query(
+        "SELECT version, checksum FROM autumn_migration_checksums WHERE version = $1",
+    )
+    .bind::<diesel::sql_types::Text, _>(version)
+    .load(conn)
+    .map_err(|e| MigrationError::Migration(e.to_string()))?;
+    let old = prior.into_iter().next().map(|r| r.checksum);
+
+    diesel::sql_query(
+        "INSERT INTO autumn_migration_checksums (version, checksum) VALUES ($1, $2) \
+         ON CONFLICT (version) DO UPDATE SET checksum = EXCLUDED.checksum, \
+         recorded_at = now()",
+    )
+    .bind::<diesel::sql_types::Text, _>(version)
+    .bind::<diesel::sql_types::Text, _>(checksum)
+    .execute(conn)
+    .map_err(|e| MigrationError::Migration(e.to_string()))?;
+
+    tracing::warn!(
+        version = %version,
+        old_checksum = %old.as_deref().unwrap_or("<none>"),
+        new_checksum = %checksum,
+        "Re-baselined migration checksum (escape hatch) \u{2014} the migration content \
+         has been declared canonical; other environments running the previous content will \
+         now report a mismatch."
+    );
+    Ok(())
+}
+
+/// Delete the recorded checksum row for a single version — the inverse of
+/// [`record_checksum`].
+///
+/// Called after a migration is rolled back (`autumn migrate down`) so the
+/// invariant "a row exists in `autumn_migration_checksums` for a version
+/// \u{21D4} that version is currently applied, and its hash matches the
+/// currently-applied bytes" is restored. Without this, the row from the
+/// *previous* application survives the rollback, and a later re-apply of an
+/// edited `up.sql` records nothing new (the additive [`record_checksums`] path
+/// skips versions that already have a row), leaving a stale hash that only
+/// trips a validate on some *later* migrate run.
+///
+/// [`ensure_checksum_table`] runs first (consistent with the other helpers,
+/// and safe/idempotent under autocommit). Idempotent: deleting an absent row
+/// is a no-op.
+///
+/// # Errors
+///
+/// Returns [`MigrationError::Migration`] on any database error.
+pub fn delete_checksum<C>(conn: &mut C, version: &str) -> Result<(), MigrationError>
+where
+    C: diesel::connection::LoadConnection<Backend = Pg>,
+{
+    ensure_checksum_table(conn)?;
+    diesel::sql_query("DELETE FROM autumn_migration_checksums WHERE version = $1")
+        .bind::<diesel::sql_types::Text, _>(version)
+        .execute(conn)
+        .map_err(|e| MigrationError::Migration(e.to_string()))?;
+    Ok(())
+}
+
+/// Delete the recorded checksum rows for several versions at once (bulk form of
+/// [`delete_checksum`]). Returns the number of rows actually removed.
+///
+/// [`ensure_checksum_table`] runs first; an empty `versions` slice is a no-op
+/// that returns `0`. Idempotent — versions with no recorded row are simply not
+/// counted.
+///
+/// # Errors
+///
+/// Returns [`MigrationError::Migration`] on any database error.
+pub fn delete_checksums<C>(conn: &mut C, versions: &[String]) -> Result<usize, MigrationError>
+where
+    C: diesel::connection::LoadConnection<Backend = Pg>,
+{
+    ensure_checksum_table(conn)?;
+    let mut deleted = 0usize;
+    for version in versions {
+        deleted += diesel::sql_query("DELETE FROM autumn_migration_checksums WHERE version = $1")
+            .bind::<diesel::sql_types::Text, _>(version)
+            .execute(conn)
+            .map_err(|e| MigrationError::Migration(e.to_string()))?;
+    }
+    Ok(deleted)
+}
+
+/// Record checksums for every applied version that has a resolvable `up.sql`
+/// and no existing recorded checksum. Idempotent: existing rows are left
+/// untouched.
+///
+/// This is used in two places:
+///
+///   * After a successful apply, to record the freshly-applied migrations
+///     (all three apply paths: startup, CLI framework, CLI user).
+///   * By `autumn migrate baseline` to backfill hashes for legacy migrations
+///     applied before the checksum table existed.
+///
+/// # Errors
+///
+/// Returns [`MigrationError::Migration`] on any database error.
+pub fn record_checksums<C, S>(
+    conn: &mut C,
+    applied: &[String],
+    up_sql_by_version: &HashMap<String, String, S>,
+) -> Result<usize, MigrationError>
+where
+    C: diesel::connection::LoadConnection<Backend = Pg>,
+    S: std::hash::BuildHasher,
+{
+    ensure_checksum_table(conn)?;
+    let existing = recorded_checksums(conn)?;
+    let mut recorded = 0usize;
+    for version in applied {
+        if existing.contains_key(version) {
+            continue;
+        }
+        let Some(up_sql) = up_sql_by_version.get(version) else {
+            continue;
+        };
+        record_checksum(conn, version, &migration_checksum(up_sql))?;
+        recorded += 1;
+    }
+    Ok(recorded)
+}
+
+/// Build `(version -> up.sql)` by scanning a migrations directory on disk.
+///
+/// Uses Diesel's own version normalisation (via [`FileBasedMigrations`]) so
+/// hyphenated directory names (`2026-01-01-000000_x`) resolve to the same
+/// version string as `__diesel_schema_migrations` records
+/// (`20260101000000`).
+///
+/// Missing / unreadable `up.sql` files are silently skipped — the caller
+/// treats absence as [`ChecksumState::Unrecorded`], which never fails
+/// validation.
+///
+/// # Errors
+///
+/// Returns [`MigrationError::Migration`] if `migrations_dir` itself cannot
+/// be read as a migration source.
+pub fn read_up_sql_by_version(
+    migrations_dir: &Path,
+) -> Result<HashMap<String, String>, MigrationError> {
+    let source = FileBasedMigrations::from_path(migrations_dir)
+        .map_err(|e| MigrationError::Migration(format!("failed to read migrations dir: {e}")))?;
+    let migrations: Vec<Box<dyn Migration<Pg>>> = source
+        .migrations()
+        .map_err(|e| MigrationError::Migration(e.to_string()))?;
+
+    let mut out = HashMap::new();
+    for migration in &migrations {
+        let version = migration.name().version().to_string();
+        let dir = migrations_dir.join(migration.name().to_string());
+        let up = dir.join("up.sql");
+        if let Ok(content) = std::fs::read_to_string(&up) {
+            out.insert(version, content);
+        }
+    }
+    Ok(out)
+}
+
+/// Validate recorded checksums for every applied migration.
+///
+/// Compares each applied migration's recorded checksum with the current
+/// on-disk `up.sql` in `migrations_dir`. This is a read-only check: on a fresh
+/// DB the checksum table may not exist yet, in which case [`recorded_checksums`]
+/// returns an empty map (without creating the table), so every applied migration
+/// classifies as `Unrecorded` and validation passes without error — the correct
+/// "nothing to fork from yet" outcome.
+///
+/// Intended to be called immediately **before** applying pending
+/// migrations — the fail-fast guard that catches "an already-applied
+/// migration was edited after it was applied and now the schema silently
+/// forks between environments".
+///
+/// # Errors
+///
+/// * [`MigrationError::Connection`] — the database is unreachable.
+/// * [`MigrationError::Migration`] — a mismatch was found (message names the
+///   offending version and both hashes), or the migrations dir cannot be read.
+pub fn validate_recorded_checksums_against_dir(
+    database_url: &str,
+    migrations_dir: &Path,
+) -> Result<(), MigrationError> {
+    let up_by_version = read_up_sql_by_version(migrations_dir)?;
+    with_migration_connection!(database_url, |conn| {
+        let recorded = recorded_checksums(conn)?;
+        let applied = load_applied_versions_lenient(conn)?;
+        validate_checksums(&applied, &up_by_version, &recorded)
+    })
+}
+
+/// Read `__diesel_schema_migrations`, returning an empty list when the table
+/// does not yet exist (the fresh-DB case, before Diesel's first apply creates
+/// it). Any other error is propagated.
+fn load_applied_versions_lenient<C>(conn: &mut C) -> Result<Vec<String>, MigrationError>
+where
+    C: diesel::connection::LoadConnection<Backend = Pg>,
+{
+    // We do NOT own `__diesel_schema_migrations` (Diesel creates it on its
+    // first apply), so it may be absent on a totally fresh DB. Probe for it
+    // with `to_regclass`, which returns NULL for an unknown relation — an
+    // existence test that never errors, and never depends on localized
+    // "does not exist" error text (which breaks under a non-English
+    // `lc_messages`). Only SELECT from the table once we know it's present.
+    let present = diesel::sql_query(
+        "SELECT to_regclass('__diesel_schema_migrations') IS NOT NULL AS present",
+    )
+    .get_result::<TableExistsRow>(conn)
+    .map_err(|e| MigrationError::Migration(e.to_string()))?
+    .present;
+    if !present {
+        return Ok(Vec::new());
+    }
+    let rows = diesel::sql_query("SELECT version FROM __diesel_schema_migrations ORDER BY version")
+        .load::<AppliedMigrationVersion>(conn)
+        .map_err(|e| MigrationError::Migration(e.to_string()))?;
+    Ok(rows.into_iter().map(|r| r.version).collect())
+}
+
+/// Record checksums for every applied migration whose on-disk `up.sql` is
+/// resolvable and does not yet have a stored hash. Returns the number of new
+/// rows written. Idempotent.
+///
+/// Called both **after** a successful apply (to record the freshly-applied
+/// migrations) and by `autumn migrate baseline` (to backfill legacy versions
+/// applied before this feature existed).
+///
+/// # Errors
+///
+/// * [`MigrationError::Connection`] — the database is unreachable.
+/// * [`MigrationError::Migration`] — the migrations dir cannot be read or a
+///   database error occurred.
+pub fn record_checksums_from_dir(
+    database_url: &str,
+    migrations_dir: &Path,
+) -> Result<usize, MigrationError> {
+    let up_by_version = read_up_sql_by_version(migrations_dir)?;
+    with_migration_connection!(database_url, |conn| {
+        let applied = load_applied_versions_lenient(conn)?;
+        record_checksums(conn, &applied, &up_by_version)
+    })
+}
+
+/// Overwrite the stored checksum for a single applied version, computed from
+/// the current on-disk `up.sql` in `migrations_dir`. Emits a `WARN` log.
+///
+/// This is the escape hatch behind `autumn migrate baseline --force <version>`
+/// — the operator has deliberately edited an applied migration and accepts
+/// that other environments running the previous content will now report a
+/// mismatch.
+///
+/// # Errors
+///
+/// * [`MigrationError::Connection`] — the database is unreachable.
+/// * [`MigrationError::Migration`] — the version isn't currently applied, its
+///   on-disk `up.sql` is unreadable, or a database error occurred.
+pub fn rebaseline_checksum_from_dir(
+    database_url: &str,
+    migrations_dir: &Path,
+    version: &str,
+) -> Result<(), MigrationError> {
+    let up_by_version = read_up_sql_by_version(migrations_dir)?;
+    let Some(up_sql) = up_by_version.get(version) else {
+        return Err(MigrationError::Migration(format!(
+            "cannot re-baseline {version}: its up.sql was not found in {}",
+            migrations_dir.display()
+        )));
+    };
+    let new_checksum = migration_checksum(up_sql);
+    with_migration_connection!(database_url, |conn| {
+        let is_applied =
+            !diesel::sql_query("SELECT version FROM __diesel_schema_migrations WHERE version = $1")
+                .bind::<diesel::sql_types::Text, _>(version)
+                .load::<AppliedMigrationVersion>(conn)
+                .map_err(|e| MigrationError::Migration(e.to_string()))?
+                .is_empty();
+        if !is_applied {
+            return Err(MigrationError::Migration(format!(
+                "cannot re-baseline {version}: it is not a currently applied migration"
+            )));
+        }
+        rebaseline_checksum(conn, version, &new_checksum)
+    })
+}
+
+/// [`record_checksums_from_dir`], serialized under the migration advisory lock.
+///
+/// This is the primitive `autumn migrate baseline` uses: unlike the bare
+/// [`record_checksums_from_dir`] (which is called by `autumn migrate run`
+/// *while it already holds* [`hold_migration_lock`] on a separate session, so
+/// re-locking there would self-deadlock), baseline runs standalone and must
+/// take the lock itself. It mirrors [`revert_user_migrations_locked`] exactly:
+/// acquire the lock, then read the applied set **and** record checksums on the
+/// *same* session inside the critical section, then release. Holding the lock
+/// across the read+write is what prevents a concurrent `autumn migrate down`
+/// from reverting a version between baseline's applied-versions read and its
+/// checksum write, which would otherwise let baseline re-insert a checksum row
+/// for a version that is no longer applied (issue #1203 review).
+///
+/// Pass `wait_timeout = None` to use [`DEFAULT_LOCK_WAIT_TIMEOUT`] (60 s).
+///
+/// # Errors
+///
+/// * [`MigrationError::Connection`] — the database is unreachable.
+/// * [`MigrationError::LockTimeout`] — the advisory lock cannot be acquired
+///   within `wait_timeout`.
+/// * [`MigrationError::Migration`] — the migrations dir cannot be read or a
+///   database error occurred.
+pub fn record_checksums_from_dir_locked(
+    database_url: &str,
+    migrations_dir: &Path,
+    wait_timeout: Option<std::time::Duration>,
+) -> Result<usize, MigrationError> {
+    let up_by_version = read_up_sql_by_version(migrations_dir)?;
+    let timeout = wait_timeout.unwrap_or(DEFAULT_LOCK_WAIT_TIMEOUT);
+    with_migration_connection!(database_url, |conn| {
+        acquire_migration_lock_on(conn, timeout)?;
+
+        // The applied-versions READ and the checksum WRITE both run here, under
+        // the advisory lock on THIS session, so a concurrent `down` cannot
+        // revert a version between them. Always release the lock afterwards.
+        let result: Result<usize, MigrationError> = (|| {
+            let applied = load_applied_versions_lenient(conn)?;
+            record_checksums(conn, &applied, &up_by_version)
+        })();
+
+        release_migration_lock_on(conn);
+        result
+    })
+}
+
+/// [`rebaseline_checksum_from_dir`], serialized under the migration advisory
+/// lock — the primitive behind `autumn migrate baseline --force <version>`.
+///
+/// See [`record_checksums_from_dir_locked`] for why baseline must take the lock
+/// itself. The applied-check for `version` and the overwrite both run on the
+/// *same* locked session so a concurrent `autumn migrate down` cannot revert
+/// `version` between the "is it applied?" probe and the write.
+///
+/// Pass `wait_timeout = None` to use [`DEFAULT_LOCK_WAIT_TIMEOUT`] (60 s).
+///
+/// # Errors
+///
+/// * [`MigrationError::Connection`] — the database is unreachable.
+/// * [`MigrationError::LockTimeout`] — the advisory lock cannot be acquired
+///   within `wait_timeout`.
+/// * [`MigrationError::Migration`] — the version isn't currently applied, its
+///   on-disk `up.sql` is unreadable, or a database error occurred.
+pub fn rebaseline_checksum_from_dir_locked(
+    database_url: &str,
+    migrations_dir: &Path,
+    version: &str,
+    wait_timeout: Option<std::time::Duration>,
+) -> Result<(), MigrationError> {
+    let up_by_version = read_up_sql_by_version(migrations_dir)?;
+    let Some(up_sql) = up_by_version.get(version) else {
+        return Err(MigrationError::Migration(format!(
+            "cannot re-baseline {version}: its up.sql was not found in {}",
+            migrations_dir.display()
+        )));
+    };
+    let new_checksum = migration_checksum(up_sql);
+    let timeout = wait_timeout.unwrap_or(DEFAULT_LOCK_WAIT_TIMEOUT);
+    with_migration_connection!(database_url, |conn| {
+        acquire_migration_lock_on(conn, timeout)?;
+
+        // The "is `version` currently applied?" READ and the overwrite WRITE
+        // both run here, under the advisory lock on THIS session. Always
+        // release the lock afterwards.
+        let result: Result<(), MigrationError> = (|| {
+            let is_applied = !diesel::sql_query(
+                "SELECT version FROM __diesel_schema_migrations WHERE version = $1",
+            )
+            .bind::<diesel::sql_types::Text, _>(version)
+            .load::<AppliedMigrationVersion>(conn)
+            .map_err(|e| MigrationError::Migration(e.to_string()))?
+            .is_empty();
+            if !is_applied {
+                return Err(MigrationError::Migration(format!(
+                    "cannot re-baseline {version}: it is not a currently applied migration"
+                )));
+            }
+            rebaseline_checksum(conn, version, &new_checksum)
+        })();
+
+        release_migration_lock_on(conn);
+        result
+    })
+}
+
+/// The recorded-vs-actual state of every applied migration, for status
+/// display. Returns `(version, state)` pairs in the same order as
+/// `__diesel_schema_migrations` (ascending by version).
+///
+/// # Errors
+///
+/// * [`MigrationError::Connection`] — the database is unreachable.
+/// * [`MigrationError::Migration`] — the migrations dir cannot be read or a
+///   database error occurred.
+pub fn checksum_status(
+    database_url: &str,
+    migrations_dir: &Path,
+) -> Result<Vec<(String, ChecksumState)>, MigrationError> {
+    let up_by_version = read_up_sql_by_version(migrations_dir)?;
+    let framework = framework_migration_versions()?;
+    with_migration_connection!(database_url, |conn| {
+        let recorded = recorded_checksums(conn)?;
+        let applied = load_applied_versions_lenient(conn)?;
+        // Framework-owned versions never record a checksum against the user dir
+        // and their up.sql is not in `migrations_dir`, so classifying them would
+        // report `Unrecorded` and prompt `baseline` — which cannot record them.
+        // Exclude them exactly as rollback does before classifying the rest.
+        let user_applied = user_applied_versions(&applied, &up_by_version, &framework);
+        Ok(classify(&user_applied, &up_by_version, &recorded))
+    })
+}
+
+/// Filter framework-owned versions out of the applied set before checksum
+/// classification, using the SAME definition rollback uses
+/// ([`framework_migration_versions`]): a version is excluded only when it is
+/// framework-owned **and** absent from the local dir. Local presence wins, so a
+/// user migration colliding with a framework shim version is still classified,
+/// and an applied user version absent from disk (a genuine `Missing`/
+/// `Unrecorded` problem) still surfaces — the filter keys on framework-set
+/// membership, never on "absent from the user dir".
+///
+/// This mirrors the rollback filter in [`classify_applied_user_migrations`]
+/// (`by_version.contains_key(v) || !framework.contains(v)`) so status and
+/// rollback share one definition of "framework-owned".
+fn user_applied_versions<S>(
+    applied: &[String],
+    up_sql_by_version: &HashMap<String, String, S>,
+    framework: &std::collections::BTreeSet<String>,
+) -> Vec<String>
+where
+    S: std::hash::BuildHasher,
+{
+    applied
+        .iter()
+        .filter(|v| up_sql_by_version.contains_key(*v) || !framework.contains(*v))
+        .cloned()
+        .collect()
+}
+
 /// Classify the database's applied migrations into user migrations (ascending
 /// by version), excluding framework-owned ones and resolving each to its local
 /// directory via Diesel's `name()`/`version()` metadata.
@@ -712,6 +1521,26 @@ where
                 conn.revert_migration(migration.as_ref())
                     .map_err(|e| MigrationError::Migration(e.to_string()))?;
                 let duration = started.elapsed();
+
+                // This version is no longer applied, so its recorded checksum
+                // row must go: reverting exactly this migration removes it from
+                // `__diesel_schema_migrations`, and `version` is the same key
+                // the row was recorded under. Deleting it restores the "row
+                // exists \u{21D4} version applied with matching bytes" invariant
+                // so a later re-apply of an edited `up.sql` records the NEW hash
+                // instead of leaving the stale one behind (issue #1203 review).
+                // Best-effort: the schema revert has already committed, so a
+                // failure to delete only warns — a subsequent `autumn migrate
+                // baseline` or re-apply reconciles it.
+                if let Err(e) = delete_checksum(&mut *conn, version) {
+                    tracing::warn!(
+                        version = %version,
+                        error = %e,
+                        "Rolled back migration but could not clear its recorded content \
+                         checksum; a later migrate may report drift for this version until \
+                         it is re-applied or re-baselined"
+                    );
+                }
 
                 on_reverted(&RevertedMigration {
                     version: version.clone(),
@@ -1058,26 +1887,117 @@ pub fn run_pending_locked(
     migrations: impl diesel::migration::MigrationSource<diesel::pg::Pg>,
     wait_timeout: Option<std::time::Duration>,
 ) -> Result<MigrationResult, MigrationError> {
+    run_pending_locked_inner(database_url, migrations, wait_timeout, None)
+}
+
+/// Shared engine for [`run_pending_locked`] that additionally performs
+/// content-checksum validation **inside** the advisory-locked critical section
+/// when `up_sql_by_version` is `Some` (issue #1203).
+///
+/// Passing the on-disk `up.sql` map runs, on the *same* Postgres session that
+/// holds the advisory lock and in this order:
+///
+/// 1. Acquire the advisory lock.
+/// 2. **Validate** every already-applied version's recorded checksum against
+///    its current on-disk `up.sql` (fail fast on `Changed`/`Missing`). This is
+///    the authoritative, race-free drift guard.
+/// 3. **Apply** pending migrations.
+/// 4. **Re-validate** after apply — belt-and-suspenders for the interleaving
+///    where a sibling replica applied and recorded THIS version's *original*
+///    content between our step 2 and our apply: the now-recorded hash is
+///    compared against our edited on-disk `up.sql` so the mismatch is caught
+///    before boot.
+/// 5. Release the lock.
+///
+/// This path deliberately does **not** record checksums for the freshly-applied
+/// versions. It applies the EMBEDDED migration set compiled into the binary,
+/// whereas `up_sql_by_version` is read from the on-disk `./migrations/` dir; the
+/// two can diverge (files edited/mounted after the build). Recording the disk
+/// bytes here would store a hash for content that was never applied, so recording
+/// is deferred to the CLI/baseline paths (`autumn migrate run` /
+/// `autumn migrate baseline`), where the applied bytes ARE the on-disk bytes
+/// (issue #1203 review). See the inline comment at step (4) for detail.
+///
+/// Holding the lock across steps 2–4 on one session is what closes the TOCTOU
+/// race a naive pre-lock check leaves open under a concurrent rolling deploy:
+/// with the check outside the lock, replica A (holding an edited `up.sql` for
+/// an as-yet-unapplied version) can validate successfully, then a sibling
+/// applies and records the original checksum, and A later finds nothing pending
+/// and boots without ever comparing its edited content. Running the compare
+/// under the lock removes every such interleaving.
+///
+/// `up_sql_by_version` is pre-read by the caller (best-effort), so a missing or
+/// unreadable migrations dir simply yields `None` and disables the checksum
+/// steps rather than failing the migration run.
+fn run_pending_locked_inner(
+    database_url: &str,
+    migrations: impl diesel::migration::MigrationSource<diesel::pg::Pg>,
+    wait_timeout: Option<std::time::Duration>,
+    up_sql_by_version: Option<&HashMap<String, String>>,
+) -> Result<MigrationResult, MigrationError> {
     let timeout = wait_timeout.unwrap_or(DEFAULT_LOCK_WAIT_TIMEOUT);
 
     with_migration_connection!(database_url, |conn| {
         acquire_migration_lock_on(conn, timeout)?;
 
-        // Collect migration names eagerly so the harness borrow on `conn` is
-        // dropped before we call release_migration_lock on the same connection.
-        let migration_result: Result<Vec<String>, MigrationError> = {
-            let mut harness = HarnessWithOutput::write_to_stdout(&mut *conn);
-            harness
-                .run_pending_migrations(migrations)
-                .map(|applied| applied.iter().map(|m| format!("{m}")).collect())
-                .map_err(|e| MigrationError::Migration(e.to_string()))
-        };
+        // Everything from here runs under the advisory lock on THIS session, so
+        // no concurrent runner can interleave between the validate, apply,
+        // record, and re-validate steps. Compute the outcome, then always
+        // release the lock (the immediately-invoked closure drops its borrow of
+        // `conn` before the release below).
+        let outcome: Result<MigrationResult, MigrationError> = (|| {
+            // (2) Authoritative pre-apply validation: every already-applied
+            //     version's recorded checksum vs its current on-disk up.sql.
+            if let Some(up) = up_sql_by_version {
+                let recorded = recorded_checksums(conn)?;
+                let applied = load_applied_versions_lenient(conn)?;
+                validate_checksums(&applied, up, &recorded)?;
+            }
+
+            // (3) Apply pending migrations. Collect names eagerly so the harness
+            //     borrow on `conn` is dropped before the checksum steps reuse it.
+            let applied: Vec<String> = {
+                let mut harness = HarnessWithOutput::write_to_stdout(&mut *conn);
+                harness
+                    .run_pending_migrations(migrations)
+                    .map(|applied| applied.iter().map(|m| format!("{m}")).collect())
+                    .map_err(|e| MigrationError::Migration(e.to_string()))?
+            };
+
+            // (5) Post-apply re-validation — still under the lock, on the same
+            //     session. This deliberately does NOT record checksums for the
+            //     freshly-applied versions.
+            //
+            //     This path applies the EMBEDDED migration set compiled into the
+            //     binary, but `up_sql_by_version` is read from the on-disk
+            //     `./migrations/` dir. When the dir is not byte-identical to the
+            //     embedded set (files edited or mounted after the binary was
+            //     built), recording the disk bytes here would store a hash for
+            //     content that was never applied — the DB actually holds the
+            //     embedded schema — silently making the edited file canonical and
+            //     defeating later drift checks. Diesel's `Migration` API does not
+            //     expose each embedded migration's raw `up.sql` bytes, so we
+            //     cannot hash what was actually applied. We therefore VALIDATE
+            //     only and defer authoritative recording to the CLI/baseline
+            //     paths (`autumn migrate run` / `autumn migrate baseline`), where
+            //     the applied bytes ARE the on-disk bytes (issue #1203 review).
+            //
+            //     Re-validating catches the interleaving where a sibling replica
+            //     applied and recorded THIS version's *original* content between
+            //     our step 2 and our apply: that now-recorded hash is compared
+            //     against our edited on-disk `up.sql` so the mismatch still fails
+            //     fast before boot.
+            if let Some(up) = up_sql_by_version {
+                let applied_versions = load_applied_versions_lenient(conn)?;
+                let recorded = recorded_checksums(conn)?;
+                validate_checksums(&applied_versions, up, &recorded)?;
+            }
+
+            Ok(MigrationResult { applied })
+        })();
 
         release_migration_lock_on(conn);
-
-        Ok(MigrationResult {
-            applied: migration_result?,
-        })
+        outcome
     })
 }
 
@@ -1216,7 +2136,48 @@ pub(crate) fn auto_migrate(
                 "Production auto-migration is enabled; running pending database migrations"
             );
         }
-        match run_pending_locked(database_url, EmbeddedMigrationsRef(migrations), None) {
+
+        // Content-checksum drift guard (issue #1203). If the local
+        // `./migrations/` directory is present, read every migration's on-disk
+        // `up.sql` so the locked apply path can, under the advisory lock and on
+        // the same Postgres session, validate already-applied versions against
+        // their recorded checksums (fail fast on drift), then re-validate after
+        // applying. Running the compare *inside* the lock — rather than in a
+        // pre-lock check — is what makes the guard race-free under a concurrent
+        // rolling deploy (see [`run_pending_locked_inner`]).
+        //
+        // This startup path VALIDATES only; it does NOT record new checksums.
+        // It applies the EMBEDDED migration set, which may not be byte-identical
+        // to the on-disk `up.sql` read here, so recording the disk bytes would
+        // store a hash for content that was never applied. Authoritative
+        // recording happens on the CLI/baseline paths (`autumn migrate run` /
+        // `autumn migrate baseline`), where applied bytes == on-disk bytes.
+        //
+        // Best-effort read: production binaries typically ship without the
+        // source tree, so an absent `./migrations/` is not an error (the map is
+        // `None` and the checksum steps are skipped — the CLI `autumn migrate`
+        // is the canonical strict apply path in prod). A present-but-unreadable
+        // dir likewise degrades to `None` with a warning rather than blocking
+        // boot; genuine drift on a readable dir still hard-fails, under the lock.
+        let migrations_dir = std::path::Path::new("migrations");
+        let up_by_version = if migrations_dir.is_dir() {
+            match read_up_sql_by_version(migrations_dir) {
+                Ok(map) => Some(map),
+                Err(e) => {
+                    tracing::warn!(error = %e, target = %target, "Could not read migrations dir for checksum validation; continuing without the drift guard");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        match run_pending_locked_inner(
+            database_url,
+            EmbeddedMigrationsRef(migrations),
+            None,
+            up_by_version.as_ref(),
+        ) {
             Ok(result) if result.applied.is_empty() => {
                 tracing::info!(target = %target, "No pending migrations");
             }
@@ -1229,6 +2190,21 @@ pub(crate) fn auto_migrate(
                     target = %target,
                     "All pending migrations applied"
                 );
+            }
+            // Hard-fail on genuine drift: an applied migration was either edited
+            // ("checksum mismatch") or deleted/renamed ("up.sql is missing from
+            // the source tree") after being applied. Both mean the deployed
+            // schema silently forks from a fresh build. The validation now runs
+            // under the advisory lock, so this is caught even in the rolling
+            // deploy race a pre-lock check would miss.
+            Err(MigrationError::Migration(msg))
+                if msg.contains("checksum mismatch")
+                    || msg.contains("up.sql is missing from the source tree") =>
+            {
+                tracing::error!(error = %msg, target = %target, "Applied migration has drifted from the source tree since it was applied");
+                #[cfg(feature = "managed-pg")]
+                crate::managed_pg::emergency_stop();
+                std::process::exit(1);
             }
             Err(e) => {
                 tracing::error!(error = %e, target = %target, "Failed to run migrations");
@@ -1364,6 +2340,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn run_pending_locked_inner_with_checksum_map_still_errors_on_bad_url() {
+        // The checksum-carrying locked path (the one `auto_migrate` uses) must
+        // reach the connection stage and surface a Connection error on an
+        // unreachable host — the under-lock validation never runs before the
+        // session exists, so the map does not change the failure mode.
+        const MIGRATIONS: EmbeddedMigrations =
+            diesel_migrations::embed_migrations!("../examples/todo-app/migrations");
+        let url = "postgres://invalid_user:invalid_password@0.0.0.0:1/invalid_db";
+        let mut up_by_version: HashMap<String, String> = HashMap::new();
+        up_by_version.insert("20260101000000".to_string(), "SELECT 1;".to_string());
+        let result = run_pending_locked_inner(url, MIGRATIONS, None, Some(&up_by_version));
+        assert!(
+            matches!(result.unwrap_err(), MigrationError::Connection(_)),
+            "unreachable host must produce Connection error even with a checksum map"
+        );
+    }
+
     /// Spawns 4 concurrent migration runners against a real Postgres container
     /// and asserts that exactly one applies the pending migrations while the
     /// rest find no pending work and exit successfully.
@@ -1426,6 +2420,334 @@ mod tests {
         );
     }
 
+    /// End-to-end proof of the migration-checksum loop (issue #1203) against a
+    /// live Postgres container. Exercises, in order: the fresh-DB behaviour of
+    /// [`recorded_checksums`] (read-only — empty map, connection not poisoned,
+    /// table still absent afterward — then created by the framework migration),
+    /// recording a freshly-applied migration's checksum, re-validating the same
+    /// content (Ok), detecting edited content (Err naming the version and both
+    /// hashes), the legacy/`Unrecorded` path (present in
+    /// `__diesel_schema_migrations` with no recorded checksum → never errors →
+    /// baselined by [`record_checksums`]), and the [`rebaseline_checksum`]
+    /// escape hatch.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn checksum_loop_records_validates_and_detects_edits_against_live_db() {
+        use testcontainers::runners::AsyncRunner as _;
+        use testcontainers_modules::postgres::Postgres;
+
+        let container = Postgres::default()
+            .start()
+            .await
+            .expect("failed to start Postgres testcontainer (is Docker running?)");
+
+        let host = container.get_host().await.unwrap();
+        let port = container.get_host_port_ipv4(5432).await.unwrap();
+        let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+
+        // Diesel's sync API is blocking; run it off the runtime thread. The
+        // container handle stays owned here so it outlives the blocking work.
+        tokio::task::spawn_blocking(move || checksum_loop_body(&url))
+            .await
+            .expect("checksum loop task panicked");
+    }
+
+    /// Whether `autumn_migration_checksums` currently exists, via the same
+    /// non-erroring `to_regclass` probe the production code uses.
+    #[cfg(feature = "test-support")]
+    fn checksum_table_exists(conn: &mut diesel::PgConnection) -> bool {
+        diesel::sql_query("SELECT to_regclass('autumn_migration_checksums') IS NOT NULL AS present")
+            .get_result::<TableExistsRow>(conn)
+            .expect("to_regclass probe must not error")
+            .present
+    }
+
+    /// Synchronous body of
+    /// [`checksum_loop_records_validates_and_detects_edits_against_live_db`],
+    /// factored out so the blocking diesel work runs on a `spawn_blocking`
+    /// thread.
+    #[cfg(feature = "test-support")]
+    #[allow(clippy::too_many_lines)] // Linear end-to-end walk of the checksum loop.
+    fn checksum_loop_body(url: &str) {
+        use diesel::Connection as _;
+
+        #[derive(diesel::QueryableByName)]
+        struct One {
+            #[diesel(sql_type = diesel::sql_types::Integer)]
+            one: i32,
+        }
+
+        let mut conn =
+            diesel::PgConnection::establish(url).expect("failed to connect to Postgres container");
+
+        // ── Step 7: fresh-DB behaviour (read-only contract) ─────────────────
+        // Before any framework migration runs, `autumn_migration_checksums`
+        // does not exist. `recorded_checksums` is READ-ONLY: it must return an
+        // empty map — never an error — WITHOUT creating the table and WITHOUT
+        // poisoning the session (issue #1203 review, P2-A). Read paths
+        // (`autumn migrate status`, pre-apply validation) must not require DDL
+        // privileges or mutate the DB just to display / check state.
+        assert!(
+            !checksum_table_exists(&mut conn),
+            "checksum table must be absent before the first checksum call"
+        );
+        let empty = recorded_checksums(&mut conn)
+            .expect("recorded_checksums must not error on a fresh DB (read-only, empty map)");
+        assert!(
+            empty.is_empty(),
+            "fresh DB must report no recorded checksums"
+        );
+        // The table must STILL be absent — `recorded_checksums` is read-only and
+        // must NOT create it (that is the write helpers' job on apply/record).
+        assert!(
+            !checksum_table_exists(&mut conn),
+            "recorded_checksums must NOT create the checksum table (read-only)"
+        );
+        // The connection must remain usable after the fresh-DB path — this is
+        // the highest-risk untested path.
+        let row = diesel::sql_query("SELECT 1 AS one")
+            .get_result::<One>(&mut conn)
+            .expect("connection must remain usable after the fresh-DB path");
+        assert_eq!(row.one, 1, "post-fresh-DB query must succeed");
+
+        // ── Step 1: run framework migrations, which create the checksum table ─
+        // The table is still absent (read-only reads above never created it);
+        // the framework migration set includes the managed
+        // `create_migration_checksums` DDL, so after applying it the table
+        // exists and starts empty.
+        run_pending(url, FRAMEWORK_MIGRATIONS).expect("framework migrations must apply");
+        assert!(
+            checksum_table_exists(&mut conn),
+            "framework migrations must create the checksum table"
+        );
+        assert!(
+            recorded_checksums(&mut conn)
+                .expect("table exists")
+                .is_empty(),
+            "checksum table must start empty"
+        );
+
+        // ── Step 2: simulate an applied migration + record its checksum ─────
+        let version = "20990101000000".to_string();
+        let up_sql = "CREATE TABLE checksum_demo (id BIGINT PRIMARY KEY);";
+        diesel::sql_query("INSERT INTO __diesel_schema_migrations (version) VALUES ($1)")
+            .bind::<diesel::sql_types::Text, _>(&version)
+            .execute(&mut conn)
+            .expect("record applied migration version");
+        let recorded_hash = migration_checksum(up_sql);
+        record_checksum(&mut conn, &version, &recorded_hash).expect("record_checksum");
+
+        let applied = vec![version.clone()];
+        let mut up_by_version: HashMap<String, String> = HashMap::new();
+        up_by_version.insert(version.clone(), up_sql.to_string());
+
+        // ── Step 3: re-validate the same content → Ok ──────────────────────
+        let recorded = recorded_checksums(&mut conn).expect("read recorded checksums");
+        assert_eq!(
+            recorded.get(&version).map(String::as_str),
+            Some(recorded_hash.as_str()),
+            "the recorded checksum must round-trip through the DB"
+        );
+        validate_checksums(&applied, &up_by_version, &recorded)
+            .expect("unedited content must validate Ok");
+        assert_eq!(
+            classify(&applied, &up_by_version, &recorded),
+            vec![(version.clone(), ChecksumState::Ok)],
+        );
+
+        // ── Step 4: edited content → Err naming version + both hashes ───────
+        let edited_sql = "CREATE TABLE checksum_demo (id BIGINT PRIMARY KEY, extra TEXT);";
+        let actual_hash = migration_checksum(edited_sql);
+        assert_ne!(
+            recorded_hash, actual_hash,
+            "edited content must hash differently"
+        );
+        let mut edited_by_version: HashMap<String, String> = HashMap::new();
+        edited_by_version.insert(version.clone(), edited_sql.to_string());
+        let err = validate_checksums(&applied, &edited_by_version, &recorded)
+            .expect_err("edited content must fail validation");
+        let msg = err.to_string();
+        assert!(msg.contains(&version), "error must name the version: {msg}");
+        assert!(
+            msg.contains(&recorded_hash),
+            "error must contain the recorded hash: {msg}"
+        );
+        assert!(
+            msg.contains(&actual_hash),
+            "error must contain the actual on-disk hash: {msg}"
+        );
+        assert_eq!(
+            classify(&applied, &edited_by_version, &recorded),
+            vec![(
+                version.clone(),
+                ChecksumState::Changed {
+                    recorded: recorded_hash.clone(),
+                    actual: actual_hash.clone(),
+                }
+            )],
+        );
+
+        // ── Step 5: legacy path — applied but with no recorded checksum ─────
+        let legacy = "20990102000000".to_string();
+        let legacy_sql = "CREATE TABLE checksum_legacy (id BIGINT PRIMARY KEY);";
+        diesel::sql_query("INSERT INTO __diesel_schema_migrations (version) VALUES ($1)")
+            .bind::<diesel::sql_types::Text, _>(&legacy)
+            .execute(&mut conn)
+            .expect("record legacy applied migration version");
+        up_by_version.insert(legacy.clone(), legacy_sql.to_string());
+        let applied_with_legacy = vec![version.clone(), legacy.clone()];
+
+        let recorded = recorded_checksums(&mut conn).expect("read recorded checksums");
+        assert!(
+            !recorded.contains_key(&legacy),
+            "legacy version must have no recorded checksum yet"
+        );
+        let states = classify(&applied_with_legacy, &up_by_version, &recorded);
+        assert_eq!(
+            states.iter().find(|(v, _)| v == &legacy).map(|(_, s)| s),
+            Some(&ChecksumState::Unrecorded),
+            "an applied migration with no recorded checksum must classify as Unrecorded"
+        );
+        validate_checksums(&applied_with_legacy, &up_by_version, &recorded)
+            .expect("an Unrecorded legacy migration must NOT fail validation");
+        // Baseline: record checksums for versions that lack them.
+        let newly = record_checksums(&mut conn, &applied_with_legacy, &up_by_version)
+            .expect("record_checksums baseline");
+        assert_eq!(
+            newly, 1,
+            "only the legacy version should be newly recorded (the other already has one)"
+        );
+        let recorded = recorded_checksums(&mut conn).expect("read recorded checksums");
+        assert_eq!(
+            classify(&applied_with_legacy, &up_by_version, &recorded)
+                .iter()
+                .find(|(v, _)| v == &legacy)
+                .map(|(_, s)| s),
+            Some(&ChecksumState::Ok),
+            "after baseline the legacy migration must validate Ok"
+        );
+
+        // ── Step 6: escape hatch — rebaseline overwrites, then validates ────
+        // Declare the EDITED content canonical for `version`.
+        rebaseline_checksum(&mut conn, &version, &actual_hash).expect("rebaseline_checksum");
+        let recorded = recorded_checksums(&mut conn).expect("read recorded checksums");
+        assert_eq!(
+            recorded.get(&version).map(String::as_str),
+            Some(actual_hash.as_str()),
+            "rebaseline must overwrite the stored checksum"
+        );
+        validate_checksums(&applied, &edited_by_version, &recorded)
+            .expect("edited content must validate Ok after re-baseline");
+
+        // ── Step 8: the drift guard runs UNDER the advisory lock ────────────
+        // Prove `run_pending_locked_inner` performs the checksum comparison
+        // *inside* its locked critical section — not only in the pre-lock
+        // caller. At this point `version` is recorded as `actual_hash` (step 6
+        // re-baseline), but `up_by_version[version]` still holds the ORIGINAL
+        // `up_sql` (hashing to `recorded_hash`), so the on-disk content and the
+        // recorded checksum disagree. Feeding that map to the locked apply path
+        // must fail fast with a "checksum mismatch" before any migration is
+        // applied. The framework migrations passed here are already applied, so
+        // the only way this errors is the under-lock validation firing.
+        assert_ne!(
+            migration_checksum(up_sql),
+            actual_hash,
+            "sanity: original up.sql must not match the re-baselined checksum"
+        );
+        let drift = run_pending_locked_inner(url, FRAMEWORK_MIGRATIONS, None, Some(&up_by_version))
+            .expect_err("under-lock validation must reject an applied migration that drifted");
+        assert!(
+            matches!(&drift, MigrationError::Migration(m) if m.contains("checksum mismatch") && m.contains(&version)),
+            "run_pending_locked_inner must validate checksums inside the locked section: {drift:?}"
+        );
+
+        // ── Step 9: rollback clears the checksum, re-apply records fresh ────
+        // Reproduces the PR review's P2: down + edit up.sql + re-apply must NOT
+        // leave a stale hash. Simulate `autumn migrate down` for `version` the
+        // same way the wired revert path does — remove it from
+        // `__diesel_schema_migrations` and call `delete_checksums` — then prove
+        // its checksum row is gone (so the version is neither applied nor
+        // recorded → no drift), that re-applying an EDITED up.sql records the
+        // NEW hash (not the stale one), and that a subsequent validate passes.
+        diesel::sql_query("DELETE FROM __diesel_schema_migrations WHERE version = $1")
+            .bind::<diesel::sql_types::Text, _>(&version)
+            .execute(&mut conn)
+            .expect("simulate down: remove applied version");
+        let deleted = delete_checksums(&mut conn, std::slice::from_ref(&version))
+            .expect("delete_checksums must succeed");
+        assert_eq!(
+            deleted, 1,
+            "the reverted version's checksum row must be deleted"
+        );
+        let recorded = recorded_checksums(&mut conn).expect("read recorded checksums");
+        assert!(
+            !recorded.contains_key(&version),
+            "after rollback the reverted version must have NO recorded checksum"
+        );
+
+        // Re-apply the EDITED up.sql: re-record the applied version and record
+        // checksums from the edited content. The additive `record_checksums`
+        // now writes a fresh row (the stale one was deleted on rollback) whose
+        // hash matches the edited bytes.
+        diesel::sql_query("INSERT INTO __diesel_schema_migrations (version) VALUES ($1)")
+            .bind::<diesel::sql_types::Text, _>(&version)
+            .execute(&mut conn)
+            .expect("re-apply: re-record applied version");
+        let newly = record_checksums(&mut conn, &applied, &edited_by_version)
+            .expect("record_checksums after re-apply");
+        assert_eq!(
+            newly, 1,
+            "re-apply after rollback must record a fresh checksum for the reverted version"
+        );
+        let recorded = recorded_checksums(&mut conn).expect("read recorded checksums");
+        assert_eq!(
+            recorded.get(&version).map(String::as_str),
+            Some(actual_hash.as_str()),
+            "re-apply must record the EDITED content's hash, not the stale original"
+        );
+        validate_checksums(&applied, &edited_by_version, &recorded)
+            .expect("edited content validates Ok after rollback + fresh re-apply");
+
+        // ── Step 10: the startup path VALIDATES but does NOT record ─────────
+        // The startup auto-migrate path (`run_pending_locked_inner` with a disk
+        // map) applies the EMBEDDED migration set, which may differ from the
+        // on-disk `up.sql` read into the map, so it must never record disk bytes
+        // for versions it "applies" (issue #1203 review). Authoritative
+        // recording is deferred to the CLI/baseline paths where applied == disk.
+        //
+        // Simulate a freshly-applied-but-unrecorded version exactly as the
+        // startup path would see it: present in `__diesel_schema_migrations` and
+        // in the disk map, but with NO recorded checksum. Running the locked path
+        // must leave it Unrecorded — it must NOT write a checksum row from the
+        // disk bytes.
+        let startup_version = "20990103000000".to_string();
+        let startup_sql = "CREATE TABLE checksum_startup (id BIGINT PRIMARY KEY);";
+        diesel::sql_query("INSERT INTO __diesel_schema_migrations (version) VALUES ($1)")
+            .bind::<diesel::sql_types::Text, _>(&startup_version)
+            .execute(&mut conn)
+            .expect("simulate startup-applied version");
+        let mut startup_by_version: HashMap<String, String> = HashMap::new();
+        startup_by_version.insert(startup_version.clone(), startup_sql.to_string());
+        assert!(
+            !recorded_checksums(&mut conn)
+                .expect("read recorded checksums")
+                .contains_key(&startup_version),
+            "precondition: the startup version must have no recorded checksum yet"
+        );
+        // FRAMEWORK_MIGRATIONS are all applied, so nothing pending; the map is
+        // used for validation only. Unrecorded → Ok, so this must succeed.
+        run_pending_locked_inner(url, FRAMEWORK_MIGRATIONS, None, Some(&startup_by_version))
+            .expect("startup path validates an Unrecorded version as Ok");
+        assert!(
+            !recorded_checksums(&mut conn)
+                .expect("read recorded checksums")
+                .contains_key(&startup_version),
+            "the startup auto-migrate path must NOT record checksums from disk bytes; \
+             recording is deferred to the CLI/baseline paths"
+        );
+    }
+
     // ── Existing tests ─────────────────────────────────────────────────────
 
     // ── applied_user_migrations / revert_user_migrations ─────────────────────
@@ -1467,6 +2789,61 @@ mod tests {
         assert!(
             !planned,
             "plan closure must not run when the connection fails"
+        );
+    }
+
+    #[test]
+    fn record_checksums_from_dir_locked_fails_with_connection_error_on_bad_url() {
+        // `autumn migrate baseline` primitive: it reads the migrations dir first,
+        // then establishes a connection to take the advisory lock before the
+        // read+write. An unreachable host must surface as a Connection error
+        // (never a panic or a silently-held lock).
+        let dir = std::path::Path::new("../examples/todo-app/migrations");
+        let result = record_checksums_from_dir_locked(
+            "postgres://invalid:invalid@0.0.0.0:1/invalid_db",
+            dir,
+            None,
+        );
+        assert!(
+            matches!(result.unwrap_err(), MigrationError::Connection(_)),
+            "unreachable host must produce Connection error"
+        );
+    }
+
+    #[test]
+    fn rebaseline_checksum_from_dir_locked_fails_with_connection_error_on_bad_url() {
+        // `autumn migrate baseline --force <version>` primitive. `00000000000000`
+        // exists on disk, so the up.sql lookup succeeds and the code proceeds to
+        // connect for the advisory lock — an unreachable host must produce a
+        // Connection error.
+        let dir = std::path::Path::new("../examples/todo-app/migrations");
+        let result = rebaseline_checksum_from_dir_locked(
+            "postgres://invalid:invalid@0.0.0.0:1/invalid_db",
+            dir,
+            "00000000000000",
+            None,
+        );
+        assert!(
+            matches!(result.unwrap_err(), MigrationError::Connection(_)),
+            "unreachable host must produce Connection error"
+        );
+    }
+
+    #[test]
+    fn rebaseline_checksum_from_dir_locked_errors_before_connecting_on_unknown_version() {
+        // The up.sql lookup is a pure disk read that runs BEFORE any connection
+        // or lock acquisition, so an unknown version fails fast with a Migration
+        // error and never opens a session (nothing to serialize).
+        let dir = std::path::Path::new("../examples/todo-app/migrations");
+        let result = rebaseline_checksum_from_dir_locked(
+            "postgres://invalid:invalid@0.0.0.0:1/invalid_db",
+            dir,
+            "99999999999999",
+            None,
+        );
+        assert!(
+            matches!(result.unwrap_err(), MigrationError::Migration(m) if m.contains("99999999999999")),
+            "an unknown version must fail fast with a Migration error naming it"
         );
     }
 
@@ -1975,6 +3352,328 @@ mod tests {
                 || msg.to_lowercase().contains("timeout")
                 || msg.to_lowercase().contains("timed out"),
             "error must describe the timeout: {msg}"
+        );
+    }
+
+    // ── Migration content checksums (issue #1203) ────────────────────────────
+
+    #[test]
+    fn migration_checksum_lf_and_crlf_hash_equally() {
+        // Line-ending normalization: CRLF, CR, and LF variants of the same
+        // logical source must produce the same checksum so a Windows checkout
+        // does not spuriously trip the mismatch guard.
+        let lf = "CREATE TABLE t (id INT);\nCREATE INDEX i ON t (id);\n";
+        let crlf = "CREATE TABLE t (id INT);\r\nCREATE INDEX i ON t (id);\r\n";
+        let cr = "CREATE TABLE t (id INT);\rCREATE INDEX i ON t (id);\r";
+        assert_eq!(migration_checksum(lf), migration_checksum(crlf));
+        assert_eq!(migration_checksum(lf), migration_checksum(cr));
+    }
+
+    #[test]
+    fn migration_checksum_ignores_trailing_whitespace() {
+        // trim_end strips trailing whitespace so an editor that appends /
+        // strips a final newline does not spuriously trip the mismatch guard.
+        let a = "SELECT 1;\n";
+        let b = "SELECT 1;";
+        let c = "SELECT 1;\n\n\n   \n";
+        assert_eq!(migration_checksum(a), migration_checksum(b));
+        assert_eq!(migration_checksum(a), migration_checksum(c));
+    }
+
+    #[test]
+    fn migration_checksum_differs_on_semantic_edit() {
+        // A real content change must change the checksum.
+        let orig = "CREATE TABLE t (id INT);\n";
+        let edited = "CREATE TABLE t (id BIGINT);\n";
+        assert_ne!(migration_checksum(orig), migration_checksum(edited));
+    }
+
+    #[test]
+    fn migration_checksum_is_hex_sha256() {
+        // Known SHA-256 vector: sha256("abc") is the standard test vector.
+        // Our normaliser leaves "abc" unchanged (no CRLF, no trailing ws),
+        // so the checksum equals the canonical sha256("abc") hex.
+        let expected = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        assert_eq!(migration_checksum("abc"), expected);
+    }
+
+    #[test]
+    fn migration_checksum_bytes_matches_string_form() {
+        // The bytes and string forms must agree for valid UTF-8 so the
+        // startup (embedded bytes) and CLI (on-disk string) paths hash
+        // identically.
+        let sql = "CREATE TABLE t (id INT);\r\n";
+        assert_eq!(
+            migration_checksum(sql),
+            migration_checksum_bytes(sql.as_bytes())
+        );
+    }
+
+    fn checksum_map(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(v, s)| ((*v).to_string(), (*s).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn classify_marks_matching_hash_ok() {
+        let up = "SELECT 1;\n";
+        let applied = vec!["20260101000000".to_string()];
+        let up_map = checksum_map(&[("20260101000000", up)]);
+        let recorded = checksum_map(&[("20260101000000", &migration_checksum(up))]);
+
+        let result = classify(&applied, &up_map, &recorded);
+        assert_eq!(result.len(), 1);
+        assert!(matches!(result[0].1, ChecksumState::Ok));
+    }
+
+    #[test]
+    fn classify_flags_edited_migration_as_changed() {
+        let original = "SELECT 1;\n";
+        let edited = "SELECT 2;\n";
+        let applied = vec!["20260101000000".to_string()];
+        let up_map = checksum_map(&[("20260101000000", edited)]);
+        let recorded = checksum_map(&[("20260101000000", &migration_checksum(original))]);
+
+        let result = classify(&applied, &up_map, &recorded);
+        assert_eq!(result.len(), 1);
+        match &result[0].1 {
+            ChecksumState::Changed { recorded, actual } => {
+                assert_eq!(recorded, &migration_checksum(original));
+                assert_eq!(actual, &migration_checksum(edited));
+            }
+            other => panic!("expected Changed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_marks_unrecorded_when_missing_from_recorded_map() {
+        // Legacy migrations applied before the checksum table existed have no
+        // recorded hash; they must show up as Unrecorded (never Changed).
+        let up = "SELECT 1;\n";
+        let applied = vec!["20260101000000".to_string()];
+        let up_map = checksum_map(&[("20260101000000", up)]);
+        let recorded = std::collections::HashMap::new();
+
+        let result = classify(&applied, &up_map, &recorded);
+        assert_eq!(result.len(), 1);
+        assert!(matches!(result[0].1, ChecksumState::Unrecorded));
+    }
+
+    #[test]
+    fn classify_marks_unrecorded_when_up_sql_unresolvable() {
+        // Applied migration whose local up.sql isn't available: treat as
+        // Unrecorded rather than a hard error so status/validation still runs.
+        let applied = vec!["20260101000000".to_string()];
+        let up_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let recorded = std::collections::HashMap::new();
+        let result = classify(&applied, &up_map, &recorded);
+        assert_eq!(result.len(), 1);
+        assert!(matches!(result[0].1, ChecksumState::Unrecorded));
+    }
+
+    #[test]
+    fn validate_checksums_returns_err_on_first_changed() {
+        let orig = "SELECT 1;\n";
+        let edited = "SELECT 2;\n";
+        let applied = vec!["20260101000000".to_string()];
+        let up_map = checksum_map(&[("20260101000000", edited)]);
+        let recorded = checksum_map(&[("20260101000000", &migration_checksum(orig))]);
+
+        let err = validate_checksums(&applied, &up_map, &recorded).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("checksum mismatch"),
+            "message must name the failure mode: {msg}"
+        );
+        assert!(
+            msg.contains("20260101000000"),
+            "message must include the version: {msg}"
+        );
+        assert!(
+            msg.contains(&migration_checksum(orig)),
+            "message must include the recorded hex: {msg}"
+        );
+        assert!(
+            msg.contains(&migration_checksum(edited)),
+            "message must include the actual hex: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_checksums_tolerates_unrecorded() {
+        let up = "SELECT 1;\n";
+        let applied = vec!["20260101000000".to_string()];
+        let up_map = checksum_map(&[("20260101000000", up)]);
+        let recorded = std::collections::HashMap::new();
+        assert!(validate_checksums(&applied, &up_map, &recorded).is_ok());
+    }
+
+    #[test]
+    fn classify_marks_missing_when_recorded_but_up_sql_gone() {
+        // A migration that WAS recorded (so it once belonged to this dir) but
+        // whose on-disk up.sql is now gone (deleted or renamed) must classify
+        // as Missing — genuine drift, NOT the tolerated Unrecorded legacy case.
+        let original = "SELECT 1;\n";
+        let applied = vec!["20260101000000".to_string()];
+        let up_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let recorded = checksum_map(&[("20260101000000", &migration_checksum(original))]);
+
+        let result = classify(&applied, &up_map, &recorded);
+        assert_eq!(result.len(), 1);
+        match &result[0].1 {
+            ChecksumState::Missing { recorded } => {
+                assert_eq!(recorded, &migration_checksum(original));
+            }
+            other => panic!("expected Missing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_checksums_fails_on_missing() {
+        // The Missing state must hard-fail validation (drift), with a message
+        // that names the version, the recorded hex, and the remedy.
+        let original = "SELECT 1;\n";
+        let version = "20260101000000";
+        let applied = vec![version.to_string()];
+        let up_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let recorded = checksum_map(&[(version, &migration_checksum(original))]);
+
+        let err = validate_checksums(&applied, &up_map, &recorded)
+            .expect_err("a recorded migration whose up.sql is gone must fail validation");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(version),
+            "message must name the version: {msg}"
+        );
+        assert!(
+            msg.contains(&migration_checksum(original)),
+            "message must include the recorded hex: {msg}"
+        );
+        assert!(
+            msg.contains("up.sql is missing from the source tree"),
+            "message must name the failure mode: {msg}"
+        );
+        // The auto_migrate startup guard matches on this exact substring to
+        // decide to hard-exit; keep them in lockstep.
+        assert!(
+            msg.contains("must never be deleted or renamed"),
+            "message must state the remedy: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_checksums_tolerates_absent_up_sql_without_recorded_checksum() {
+        // NEGATIVE / no-false-positive test: a version that is applied but has
+        // NO recorded checksum and NO on-disk up.sql — e.g. an embedded or
+        // framework migration whose SQL never lived in the validated dir, or a
+        // truly legacy migration — must classify Unrecorded and NOT hard-fail,
+        // even alongside a normal recorded+present migration. This proves the
+        // `recorded.is_some()` scoping keeps `Missing` from firing on
+        // migrations that never belonged to this dir.
+        let ok_up = "SELECT 1;\n";
+        let framework_version = "00000000000000".to_string();
+        let user_version = "20260101000000".to_string();
+        let applied = vec![framework_version.clone(), user_version];
+        // Only the user migration is present on disk / recorded; the framework
+        // version is applied but has neither a file nor a recorded checksum.
+        let up_map = checksum_map(&[("20260101000000", ok_up)]);
+        let recorded = checksum_map(&[("20260101000000", &migration_checksum(ok_up))]);
+
+        let states = classify(&applied, &up_map, &recorded);
+        assert_eq!(
+            states
+                .iter()
+                .find(|(v, _)| v == &framework_version)
+                .map(|(_, s)| s),
+            Some(&ChecksumState::Unrecorded),
+            "an applied version with no recorded checksum and no file must be Unrecorded"
+        );
+        validate_checksums(&applied, &up_map, &recorded)
+            .expect("an unrecorded absent migration must not hard-fail validation");
+    }
+
+    #[test]
+    fn checksum_status_excludes_framework_but_keeps_user_unrecorded() {
+        // Reproduces the status bug: an applied FRAMEWORK version (no local
+        // up.sql, no recorded checksum) must NOT be classified Unrecorded and
+        // prompt `baseline` (which cannot record it — its up.sql isn't in the
+        // user dir). A genuinely user-owned applied-but-unrecorded version must
+        // STILL classify Unrecorded. The status path filters framework versions
+        // via `user_applied_versions` BEFORE `classify`, so exercise that first.
+        let framework_version = "00000000000000".to_string();
+        let user_recorded_version = "20260101000000".to_string();
+        let user_unrecorded_version = "20260102000000".to_string();
+
+        let applied = vec![
+            framework_version.clone(),
+            user_recorded_version.clone(),
+            user_unrecorded_version.clone(),
+        ];
+
+        let ok_up = "SELECT 1;\n";
+        let pending_up = "SELECT 2;\n";
+        // The framework version has no on-disk up.sql; both user versions do.
+        let up_map = checksum_map(&[("20260101000000", ok_up), ("20260102000000", pending_up)]);
+        // Only the first user migration has a recorded checksum. The framework
+        // version is (correctly) never recorded against the user dir.
+        let recorded = checksum_map(&[("20260101000000", &migration_checksum(ok_up))]);
+        let framework = version_set(&["00000000000000"]);
+
+        let user_applied = user_applied_versions(&applied, &up_map, &framework);
+        // The framework version is filtered out entirely before classification.
+        assert!(
+            !user_applied.contains(&framework_version),
+            "applied framework version must be excluded from checksum status"
+        );
+
+        let states = classify(&user_applied, &up_map, &recorded);
+        // The framework version produces no status entry, so it can never
+        // recommend `baseline`.
+        assert!(
+            states.iter().all(|(v, _)| v != &framework_version),
+            "framework version must not appear in checksum status output"
+        );
+        // The recorded user migration is Ok.
+        assert_eq!(
+            states
+                .iter()
+                .find(|(v, _)| v == &user_recorded_version)
+                .map(|(_, s)| s),
+            Some(&ChecksumState::Ok),
+        );
+        // The user-owned applied-but-unrecorded migration STILL surfaces as
+        // Unrecorded — the filter must not over-reach.
+        assert_eq!(
+            states
+                .iter()
+                .find(|(v, _)| v == &user_unrecorded_version)
+                .map(|(_, s)| s),
+            Some(&ChecksumState::Unrecorded),
+            "a user-owned unrecorded migration must still classify Unrecorded"
+        );
+    }
+
+    #[test]
+    fn user_applied_versions_keeps_disk_missing_user_migration() {
+        // A user-owned applied version absent from disk AND not framework-owned
+        // must still be kept (it is a real problem to surface), while a
+        // framework version absent from disk is dropped. The filter keys on
+        // framework-set membership, never on "absent from the user dir".
+        let framework_version = "00000000000000".to_string();
+        let missing_user_version = "20260101000000".to_string();
+        let applied = vec![framework_version.clone(), missing_user_version.clone()];
+        // Neither version is present on disk.
+        let up_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let framework = version_set(&["00000000000000"]);
+
+        let user_applied = user_applied_versions(&applied, &up_map, &framework);
+
+        assert_eq!(user_applied, vec![missing_user_version]);
+        assert!(
+            !user_applied.contains(&framework_version),
+            "framework version absent from disk must be dropped"
         );
     }
 }
