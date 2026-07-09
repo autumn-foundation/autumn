@@ -142,6 +142,8 @@ pub use http::Method;
 pub use http::StatusCode;
 
 // ── Conditional GET / ETag ───────────────────────────────────────
+/// Declarative `Cache-Control` freshness builder — attach via a tuple or `.wrap(..)`.
+pub use crate::etag::CacheControl;
 /// `ETag` type for conditional-GET responses.
 pub use crate::etag::ETag;
 /// Tower middleware that auto-derives weak `ETag`s from response bodies.
@@ -150,6 +152,8 @@ pub use crate::etag::EtagLayer;
 pub use crate::etag::FreshWhen;
 /// Conversion trait — implemented for `String`, `&str`, `i64`, `(NaiveDateTime, i64)`, `ETag`.
 pub use crate::etag::IntoETag;
+/// Start a `Cache-Control` freshness directive (`max-age`); defaults to `private`.
+pub use crate::etag::cache_for;
 /// One-liner conditional-GET helper; returns a [`FreshWhen`] resolved with `.or(response)`.
 pub use crate::etag::fresh_when;
 /// Derive a weak `ETag` from any [`Hash`] value.

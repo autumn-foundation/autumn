@@ -31,6 +31,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   real deserialization round-trip) rather than swallowing them. The recorder is
   a per-`TestApp` instance and composes ahead of any user-supplied
   `with_job_interceptor`.
+- HTTP `Range`/`206 Partial Content` support for `Download` responses and
+  embedded static assets (seekable media, resumable downloads) via the new
+  `autumn_web::range` helper — RFC 7233 single-range parsing with a documented
+  multi-range single-range collapse, `Accept-Ranges`/`Content-Range`/`416`
+  handling, `If-Range` (strong `ETag` or `Last-Modified`), and
+  `Download::into_response_ranged`; blob ranges fetch only the requested slice
+  on the local store (S3/other backends fall back to a buffered slice) via the
+  additive `BlobStore::get_range`.
 - **generator:** `autumn new` now generates a `README.md` at the project root
   (listed in the "Created …" output) with explicit prerequisites and a
   golden-path quickstart — configure the `[database]` block in `autumn.toml`
@@ -248,6 +256,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   which brackets the endpoint's body buffering/JSON-RPC repackaging (the inner
   `total`, captured before that work, would under-report `/mcp` latency). See
   `docs/guide/observability/server-timing.md`.
+- **conditional-get:** declarative per-handler `Cache-Control` freshness helper
+  (issue #1344) — `cache_for(Duration)` builds a `CacheControl` that attaches
+  `Cache-Control` to any response either as a tuple
+  (`(cache_for(dur).public(), html!{…})`, via `IntoResponseParts`) or with
+  `.wrap(response)`. Chainable directives: `public`/`private`, `max_age`,
+  `s_maxage`, `stale_while_revalidate`, `no_store`, `no_cache`,
+  `must_revalidate`, `immutable`; `header_value()` renders a deterministic,
+  byte-for-byte value. Defaults to `private` so dropping it onto a
+  secured/authenticated page can't silently make it publicly cacheable —
+  `public` is an explicit opt-in. Composes with `fresh_when`
+  (`fresh_when(&headers, etag).or(cache_for(dur).public().wrap(markup))`): the
+  freshness directives ride along on both the `200` and the preserved `304`,
+  emitting exactly one `Cache-Control` header. Both re-exported from the
+  prelude. See `docs/guide/conditional-get.md`.
 - **Atom/RSS feed renderer** (`feed::Feed` / `feed::FeedEntry`): build an Atom 1.0 or RSS 2.0 feed from channel metadata plus an iterator of entries and return it directly from a `#[get]` handler — it implements `IntoResponse` with the correct `application/atom+xml`/`application/rss+xml` content type, XML-escapes every text field, and `Feed::conditional(&headers)` reuses the `etag` layer so feed pollers get a `304 Not Modified` on unchanged content. The `blog` example gains a `/feed.xml` route. (#1045)
 - **router:** duplicate-route preflight (issue #1012) — two user- or
   plugin-registered handlers that resolve to the same `(method, path)` after
