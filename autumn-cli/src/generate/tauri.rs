@@ -244,38 +244,31 @@ pub fn ensure_no_opposite_mode_scaffold(
 /// `--features autumn-web/embed-assets` (dep path only), so that the app's
 /// `#[cfg(feature = "embed-assets")]` guard on `.embedded_static()` is
 /// satisfied — mirroring what `autumn build --embed` does.
-/// Walk ancestor `Cargo.toml` files to find the `package` field of a
-/// workspace-inherited dependency entry.
+/// Find the `package` field of a workspace-inherited dependency entry in
+/// the app's EFFECTIVE workspace root.
 ///
 /// When a member has `autumn_web = { workspace = true }`, the `package` alias
-/// is recorded in `[workspace.dependencies]` of an ancestor, not the member.
+/// is recorded in `[workspace.dependencies]` of the workspace root, not the
+/// member. Cargo resolves that root as exactly one manifest — the member's
+/// own `[workspace]`, the target of an explicit `[package] workspace = "…"`
+/// pointer, or the nearest non-excluding ancestor — so this reuses
+/// [`super::tauri_mobile::effective_workspace_root`] rather than walking
+/// ancestors (an ancestor-only walk never finds a pointer target that is not
+/// an ancestor, so a renamed inherited dep would silently mis-resolve to the
+/// bare package name).
 /// Returns `None` when the dep key is not found or has no `package` field.
 fn resolve_workspace_dep_package(project_root: &Path, dep_key: &str) -> Option<String> {
-    let mut dir: Option<&Path> = Some(project_root);
-    while let Some(d) = dir {
-        let cargo = d.join("Cargo.toml");
-        if cargo.is_file()
-            && let Ok(content) = std::fs::read_to_string(&cargo)
-            && let Ok(ws_doc) = toml::from_str::<toml::Value>(&content)
-        {
-            if let Some(pkg_name) = ws_doc
-                .get("workspace")
-                .and_then(|w| w.get("dependencies"))
-                .and_then(|deps| deps.get(dep_key))
-                .and_then(toml::Value::as_table)
-                .and_then(|t| t.get("package"))
-                .and_then(toml::Value::as_str)
-            {
-                return Some(pkg_name.to_owned());
-            }
-            // Stop at the workspace root even when the dep is not there.
-            if ws_doc.get("workspace").is_some() {
-                return None;
-            }
-        }
-        dir = d.parent();
-    }
-    None
+    let root = super::tauri_mobile::effective_workspace_root(project_root);
+    let content = std::fs::read_to_string(root.join("Cargo.toml")).ok()?;
+    let ws_doc = toml::from_str::<toml::Value>(&content).ok()?;
+    ws_doc
+        .get("workspace")
+        .and_then(|w| w.get("dependencies"))
+        .and_then(|deps| deps.get(dep_key))
+        .and_then(toml::Value::as_table)
+        .and_then(|t| t.get("package"))
+        .and_then(toml::Value::as_str)
+        .map(str::to_owned)
 }
 
 /// Find the `[dependencies]` key used to depend on `package_name`.
@@ -286,7 +279,7 @@ fn resolve_workspace_dep_package(project_root: &Path, dep_key: &str) -> Option<S
 /// workspace-inherited deps (`autumn_web = { workspace = true }`) by walking
 /// up to the workspace `Cargo.toml` to read the effective `package` there.
 /// Returns `package_name` itself when no alias is found.
-fn resolve_dep_key(project_root: &Path, doc: &toml::Value, package_name: &str) -> String {
+pub fn resolve_dep_key(project_root: &Path, doc: &toml::Value, package_name: &str) -> String {
     let Some(deps) = doc.get("dependencies").and_then(toml::Value::as_table) else {
         return package_name.to_owned();
     };
