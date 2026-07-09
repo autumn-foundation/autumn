@@ -543,6 +543,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **security:** `TenancyConfig::jwt_secret` is now stored as a
+  `secrecy::SecretString` instead of a plain `String`, so the JWT signing
+  secret is redacted from `Debug` output (and any logs that format the
+  config) and zeroized on drop. Config-file deserialization is unchanged —
+  a plain TOML string still works. Breaking for code that read or set the
+  field directly: set it with `Some(value.into())` and read it via
+  `secrecy::ExposeSecret::expose_secret()` (supersedes #1304). [no-plugin]
 - **deps(security):** dependency-vulnerability upgrades (supersedes PR #1557;
   `diesel-async` was already handled separately). `aws-sdk-s3` floored at
   1.122 (1.119.0 → 1.122.0, the last MSRV-1.88 release) with
