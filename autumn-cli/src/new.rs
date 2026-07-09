@@ -531,6 +531,17 @@ const README_TAIL_ANCHOR: &str = "## CLI reference";
 /// / bundled-Postgres READMEs (a DB-free daemon has no migrations to apply, and
 /// a bundled-Postgres daemon applies them automatically inside the process).
 const README_MIGRATE_ROW: &str = "| `autumn migrate` | Apply pending database migrations. |\n";
+/// The CLI-reference row documenting `autumn generate scaffold`, stripped from
+/// the **DB-free daemon** README only. `generate scaffold` emits Diesel
+/// models/repositories/migrations and re-enables `db-diesel2-postgres`, so the
+/// code it produces cannot compile in a `--daemon` scaffold (which disables the
+/// `db` feature). The bundled-Postgres shape keeps the `db` feature, so the verb
+/// stays valid there and this row is retained.
+const README_SCAFFOLD_ROW: &str = "| `autumn generate scaffold <Name> field:Type …` | Scaffold a CRUD resource — model, migration, routes, and views. |\n";
+/// The project-layout row documenting the `migrations/` directory, stripped from
+/// the DB-free daemon README (that scaffold has no migrations directory).
+const README_MIGRATIONS_LAYOUT_ROW: &str =
+    "| `migrations/` | Diesel migrations — one directory per migration. |\n";
 
 /// Render the project README, tailoring the golden path to the app shape and
 /// appending flag-specific sections.
@@ -555,9 +566,12 @@ const README_MIGRATE_ROW: &str = "| `autumn migrate` | Apply pending database mi
 fn render_readme(rendered: String, opts: GenerateOptions, vars: &TemplateVars<'_>) -> String {
     // `--bundled-pg` implies `with_daemon`, so test it first.
     let mut readme = if opts.with_bundled_pg {
-        rewrite_readme_body(&rendered, &bundled_pg_readme_body(vars))
+        // Bundled Postgres keeps the `db` feature, so `generate scaffold` and the
+        // `migrations/` layout stay valid — only the hand-run `migrate` row goes.
+        rewrite_readme_body(&rendered, &bundled_pg_readme_body(vars), false)
     } else if opts.with_daemon {
-        rewrite_readme_body(&rendered, &daemon_readme_body(vars))
+        // Pure DB-free daemon: also strip the DB-coupled CLI/layout rows.
+        rewrite_readme_body(&rendered, &daemon_readme_body(vars), true)
     } else {
         rendered
     };
@@ -594,7 +608,14 @@ fn render_readme(rendered: String, opts: GenerateOptions, vars: &TemplateVars<'_
 /// [`README_DB_BODY_ANCHOR`] up to [`README_TAIL_ANCHOR`]) with `new_body`, then
 /// drop the CLI-reference `autumn migrate` row — neither daemon shape runs it by
 /// hand. `new_body` supplies the app-shape-specific prerequisites and run steps.
-fn rewrite_readme_body(rendered: &str, new_body: &str) -> String {
+///
+/// When `db_free` is set (the pure `--daemon` shape, which disables the `db`
+/// feature), the DB-coupled CLI/layout rows are stripped too: `generate scaffold`
+/// (it emits Diesel code that needs the disabled `db` feature) and the
+/// `migrations/` layout row (no migrations directory exists). The
+/// bundled-Postgres shape keeps `db`, so it passes `db_free = false` and retains
+/// those rows.
+fn rewrite_readme_body(rendered: &str, new_body: &str, db_free: bool) -> String {
     let start = rendered.find(README_DB_BODY_ANCHOR).unwrap_or_else(|| {
         panic!(
             "README.md.tmpl anchor not found: {README_DB_BODY_ANCHOR:?} — the template and \
@@ -610,7 +631,15 @@ fn rewrite_readme_body(rendered: &str, new_body: &str) -> String {
     let spliced = format!("{}{}{}", &rendered[..start], new_body, &rendered[tail..]);
     // The daemon shapes have no hand-run migration step; drop the reference row
     // so the CLI table stays consistent with the golden path above it.
-    spliced.replace(README_MIGRATE_ROW, "")
+    let mut out = spliced.replace(README_MIGRATE_ROW, "");
+    if db_free {
+        // The DB-free daemon disables the `db` feature, so `generate scaffold`
+        // would emit code that cannot compile, and there is no `migrations/`
+        // directory. Drop both rows so the reference matches what actually works.
+        out = out.replace(README_SCAFFOLD_ROW, "");
+        out = out.replace(README_MIGRATIONS_LAYOUT_ROW, "");
+    }
+    out
 }
 
 /// DB-free daemon (`--daemon`) golden-path body: no Postgres, no `libpq`, no
@@ -635,6 +664,11 @@ fn daemon_readme_body(vars: &TemplateVars<'_>) -> String {
          Run it in the background as a managed daemon with `autumn serve --daemon`\n\
          (`autumn serve status`, `autumn serve stop`, and `autumn serve restart` manage\n\
          the background process).\n\
+         \n\
+         Need a database later? Re-enable `autumn-web`'s default features (turn the\n\
+         `db` feature back on) in `Cargo.toml` to unlock the database-backed\n\
+         workflow — migrations and CRUD scaffolding — that the default (non-daemon)\n\
+         starter documents.\n\
          \n\
          ",
         project = vars.project_name,

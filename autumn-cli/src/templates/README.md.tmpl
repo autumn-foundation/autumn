@@ -27,15 +27,17 @@ Run these steps top-to-bottom on a clean checkout to get a route serving.
   ```
   To generate a full deployment/compose stack instead, see
   `autumn release init --target docker-compose` in the CLI reference below.
-- **Diesel CLI** for the database path:
-  ```sh
-  cargo install diesel_cli --no-default-features --features postgres
-  ```
 - **The PostgreSQL client library (`libpq`).** The default scaffold keeps the
   `db` feature, so the base app links `libpq` at build time — it must be
   installed for `cargo build` / `autumn dev` to succeed, even before you have a
-  running database configured. Install it with your package manager (e.g.
+  running database configured. It is also required by the Diesel CLI's
+  `postgres` feature installed below. Install it with your package manager (e.g.
   `libpq-dev` on Debian/Ubuntu, `libpq` via Homebrew on macOS).
+- **Diesel CLI** for the database path (its `postgres` feature needs the
+  `libpq` client library above):
+  ```sh
+  cargo install diesel_cli --no-default-features --features postgres
+  ```
 
 ### 2. Configure the database
 

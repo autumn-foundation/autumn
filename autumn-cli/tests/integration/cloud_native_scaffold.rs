@@ -81,6 +81,17 @@ fn cloud_native_scaffold_generates_readme_golden_path() {
         "README.md must still point at `autumn release init --target docker-compose` for \
          deployment assets, got:\n{readme}"
     );
+    // Finding 1: the `libpq` prerequisite must appear BEFORE the
+    // `cargo install diesel_cli … --features postgres` command, since that
+    // command's `postgres` feature (and the base `cargo build`, which links the
+    // `db` feature) needs the libpq client library.
+    let libpq_at = readme.find("libpq");
+    let diesel_at = readme.find("cargo install diesel_cli");
+    assert!(
+        matches!((libpq_at, diesel_at), (Some(l), Some(d)) if l < d),
+        "README.md must introduce the `libpq` prerequisite before the `cargo install \
+         diesel_cli … --features postgres` command that needs it, got:\n{readme}"
+    );
     // The project name must be substituted everywhere (AC #5) — no leftover
     // template tokens.
     assert!(
@@ -155,6 +166,20 @@ fn cloud_native_scaffold_daemon_readme_is_db_free() {
         "daemon README must not tell users to run `autumn migrate` (no DB / no migrations), \
          got:\n{readme}"
     );
+    // Finding 2: `generate scaffold` emits Diesel code that needs the `db`
+    // feature the daemon scaffold disables, so following the daemon README must
+    // not advertise it (it would leave the app non-compiling).
+    assert!(
+        !readme.contains("autumn generate scaffold"),
+        "daemon README must not advertise `autumn generate scaffold` (its output needs the \
+         disabled `db` feature), got:\n{readme}"
+    );
+    // The `migrations/` layout row references a directory a DB-free daemon
+    // scaffold does not have.
+    assert!(
+        !readme.contains("| `migrations/`"),
+        "daemon README must not list a `migrations/` layout row (no migrations dir), got:\n{readme}"
+    );
     assert!(
         !readme.contains("Configure the database"),
         "daemon README must not have a `Configure the database` step, got:\n{readme}"
@@ -204,6 +229,14 @@ fn cloud_native_scaffold_bundled_pg_readme_auto_provisions_db() {
     assert!(
         readme.contains("autumn serve --bundled-pg"),
         "bundled-pg README must document `autumn serve --bundled-pg`, got:\n{readme}"
+    );
+    // Finding 2 (guard against over-stripping): bundled-pg keeps the `db`
+    // feature and auto-applies migrations, so `generate scaffold` is still valid
+    // here and must remain in the CLI reference.
+    assert!(
+        readme.contains("autumn generate scaffold"),
+        "bundled-pg README must keep `autumn generate scaffold` (the `db` feature is on), \
+         got:\n{readme}"
     );
     assert!(
         !readme.contains("{{"),

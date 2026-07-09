@@ -546,6 +546,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Accept-Encoding` accepts them, instead of relying solely on the
   general-purpose compression middleware to redo that work on every request.
 
+### Fixed
+
+- **generator:** the generated `README.md` now orders the `libpq` prerequisite
+  before the `cargo install diesel_cli --features postgres` command, since that
+  command's `postgres` feature (and the base `cargo build`, which links the `db`
+  feature) needs the PostgreSQL client library. The DB-free `--daemon` README no
+  longer advertises `autumn generate scaffold` or the `migrations/` layout row:
+  that generator emits Diesel models/repositories/migrations requiring the `db`
+  feature the daemon scaffold disables, so following it would leave the app
+  non-compiling. `--bundled-pg` keeps the `db` feature and retains
+  `generate scaffold` (issue #1052).
+
 ### Changed
 
 - **deps:** bumped `diesel-async` from 0.8 to 0.9 (resolving 0.9.2, with
