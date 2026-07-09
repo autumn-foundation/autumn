@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **test:** opt-in channel broadcast recorder for integration tests (issue
+  #1043) — `TestApp::record_broadcasts()` installs a recorder through the
+  existing `ChannelsInterceptor` seam (no hand-written spy or `Arc<Mutex>`).
+  After a request runs, read captured publications in order with
+  `TestClient::broadcasts()` / `broadcasts_on(topic)` (both raw `publish` text
+  and `publish_html` HTML/OOB payloads are captured), or assert on them with
+  `assert_broadcast(topic, predicate)`, `assert_broadcast_count(topic, n)`, and
+  `assert_no_broadcasts(topic)` — each failure self-diagnoses by listing what
+  *was* published to that topic and nearby topics. The recorder is in-memory,
+  ordered, thread-safe, and scoped to the `TestClient` (no global state, no
+  cross-test leak); nothing is installed and production `Channels` behavior is
+  untouched unless the builder is called.
 - **ci:** README-quickstart gate against the published crates (issue #1586) —
   `.github/workflows/quickstart-gate.yml` + `scripts/check-quickstart.sh`
   install the README-pinned `autumn-cli` from crates.io (never the local

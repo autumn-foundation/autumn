@@ -9,6 +9,8 @@ mod authorization_integration;
 mod auto_broadcast;
 mod bot_protection_pipeline;
 mod boundary_hooks_integration;
+#[cfg(feature = "ws")]
+mod broadcast_recorder;
 #[cfg(feature = "cache-moka")]
 mod cache_stampede;
 #[cfg(feature = "ws")]
