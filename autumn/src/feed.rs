@@ -517,7 +517,7 @@ mod proptests {
             prop_assert!(!out.contains("<x>"));
             // Structural `</feed>` appears exactly once (Atom) / zero times
             // (RSS) — the injected copy in the body must not add another.
-            let expected_close = if rss { 0 } else { 1 };
+            let expected_close = usize::from(!rss);
             prop_assert_eq!(out.matches("</feed>").count(), expected_close);
         }
     }

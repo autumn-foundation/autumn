@@ -8584,7 +8584,7 @@ mod proptests {
         #[test]
         fn join_nested_path_root_child_is_identity(prefix in "/?[a-z0-9/]{0,20}", root in prop::sample::select(vec!["/", ""])) {
             let once = join_nested_path(&prefix, root);
-            let expected = if prefix.is_empty() { "/".to_owned() } else { prefix.clone() };
+            let expected = if prefix.is_empty() { "/".to_owned() } else { prefix };
             prop_assert_eq!(&once, &expected);
             let twice = join_nested_path(&once, root);
             prop_assert_eq!(once, twice);
