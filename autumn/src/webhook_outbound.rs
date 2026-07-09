@@ -774,6 +774,7 @@ impl crate::plugin::Plugin for OutboundWebhookPlugin {
             name: "autumn_webhook_delivery".to_string(),
             max_attempts: 10, // Retries are handled durably via the background job engine
             initial_backoff_ms,
+            queue: "default".to_string(),
             uniqueness: None,
             concurrency: None,
             handler: deliver_webhook_job,

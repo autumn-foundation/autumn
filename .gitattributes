@@ -15,3 +15,8 @@ autumn/src/**/*.md text eol=lf
 # introduce line-ending drift (mirrors the eol=lf rules above).
 autumn-cli/src/starters/saas/** text eol=lf
 examples/saas/** text eol=lf
+
+# Golden snapshots are compared byte-for-byte against generator output
+# (which always emits LF); force LF so Windows autocrlf does not fail the
+# comparison on checkout (same rationale as the saas rules above).
+autumn-cli/tests/golden/** text eol=lf

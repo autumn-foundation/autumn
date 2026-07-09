@@ -13,6 +13,17 @@
 //! An Autumn application runs with zero configuration -- every field
 //! has a sensible default value. Override only what you need.
 //!
+//! # Local-dev `.env` files
+//!
+//! A project-root `.env` file is a **local-dev feeder for the highest layer**
+//! (the `AUTUMN_*` env-var layer) -- it does *not* add a new precedence tier.
+//! Values parsed from `.env` populate env-layer keys that are still unset; a
+//! real environment variable of the same name always wins. Auto-loaded in the
+//! `dev` and `test` profiles and ignored in `prod` unless `AUTUMN_DOTENV=1`.
+//! Files load in order `.env` -> `.env.local` -> `.env.{profile}` ->
+//! `.env.{profile}.local`, and earlier files (and real env vars) win. See the
+//! [`dotenv`](crate::dotenv) module.
+//!
 //! # Profiles
 //!
 //! Profiles are resolved in precedence order:
@@ -42,6 +53,7 @@
 //! | `AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS` | `server.shutdown_timeout_secs` | `u64` |
 //! | `AUTUMN_SERVER__PRESTOP_GRACE_SECS` | `server.prestop_grace_secs` | `u64` |
 //! | `AUTUMN_SERVER__TIMEOUTS__REQUEST_TIMEOUT_MS` | `server.timeouts.request_timeout_ms` | `u64` |
+//! | `AUTUMN_SERVER__MAX_CONCURRENT_REQUESTS` | `server.max_concurrent_requests` | `usize` |
 //! | `AUTUMN_DATABASE__URL` | `database.url` | `String` |
 //! | `AUTUMN_DATABASE__PRIMARY_URL` | `database.primary_url` | `String` |
 //! | `AUTUMN_DATABASE__REPLICA_URL` | `database.replica_url` | `String` |
@@ -94,6 +106,7 @@
 //! | `AUTUMN_SESSION__REDIS__KEY_PREFIX` | `session.redis.key_prefix` | `String` |
 //! | `AUTUMN_CHANNELS__BACKEND` | `channels.backend` | `in_process` / `redis` |
 //! | `AUTUMN_CHANNELS__CAPACITY` | `channels.capacity` | `usize` |
+//! | `AUTUMN_CHANNELS__REPLAY_BUFFER` | `channels.replay_buffer` | `usize` |
 //! | `AUTUMN_CHANNELS__REDIS__URL` | `channels.redis.url` | `String` |
 //! | `AUTUMN_CHANNELS__REDIS__KEY_PREFIX` | `channels.redis.key_prefix` | `String` |
 //! | `AUTUMN_JOBS__BACKEND` | `jobs.backend` | `local` / `postgres` / `redis` |
@@ -104,6 +117,8 @@
 //! | `AUTUMN_JOBS__REDIS__KEY_PREFIX` | `jobs.redis.key_prefix` | `String` |
 //! | `AUTUMN_JOBS__REDIS__VISIBILITY_TIMEOUT_MS` | `jobs.redis.visibility_timeout_ms` | `u64` |
 //! | `AUTUMN_JOBS__POSTGRES__VISIBILITY_TIMEOUT_MS` | `jobs.postgres.visibility_timeout_ms` | `u64` |
+//! | `AUTUMN_JOBS__TRACKING__TTL_SECS` | `jobs.tracking.ttl_secs` | `u64` |
+//! | `AUTUMN_JOBS__TRACKING__ROUTE_ENABLED` | `jobs.tracking.route_enabled` | `bool` |
 //! | `AUTUMN_SCHEDULER__BACKEND` | `scheduler.backend` | `in_process` / `postgres` |
 //! | `AUTUMN_SCHEDULER__LEASE_TTL_SECS` | `scheduler.lease_ttl_secs` | `u64` |
 //! | `AUTUMN_SCHEDULER__REPLICA_ID` | `scheduler.replica_id` | `String` |
@@ -128,7 +143,9 @@
 //! | `AUTUMN_DEV__INSPECTOR_PATH` | `dev.inspector_path` | `String` |
 //! | `AUTUMN_DEV__INSPECTOR_CAPACITY` | `dev.inspector_capacity` | `usize` |
 //! | `AUTUMN_DEV__INSPECTOR_N_PLUS_ONE_THRESHOLD` | `dev.inspector_n_plus_one_threshold` | `usize` |
+//! | `AUTUMN_OBSERVABILITY__SERVER_TIMING` | `observability.server_timing` | `bool` |
 //! | `AUTUMN_COMPRESSION__ENABLED` | `compression.enabled` | `bool` |
+//! | `AUTUMN_STORIES__ENABLED` | `stories.enabled` | `bool` |
 //! | `AUTUMN_AUTH__LOCKOUT__ENABLED` | `auth.lockout.enabled` | `bool` |
 //! | `AUTUMN_AUTH__LOCKOUT__THRESHOLD` | `auth.lockout.threshold` | `i32` |
 //! | `AUTUMN_AUTH__LOCKOUT__WINDOW_SECS` | `auth.lockout.window_secs` | `u64` |
@@ -182,6 +199,12 @@ pub struct OsEnv;
 impl Env for OsEnv {
     fn var(&self, key: &str) -> Result<String, std::env::VarError> {
         if key == "AUTUMN_MANIFEST_DIR" {
+            // Process env takes priority over the compile-time baked-in path so
+            // installed apps (e.g. Tauri sidecars) can redirect config loading to
+            // their bundled resource dir by setting AUTUMN_MANIFEST_DIR at launch.
+            if let Ok(override_val) = std::env::var(key) {
+                return Ok(override_val);
+            }
             if let Some(dir) = MACRO_MANIFEST_DIR.get() {
                 return Ok(dir.clone());
             }
@@ -274,6 +297,12 @@ pub(crate) fn resolve_profile(env: &dyn Env) -> String {
 }
 
 /// Resolve the raw profile selector value (before normalization).
+///
+/// The env-var keys consulted here (`AUTUMN_ENV`, `AUTUMN_PROFILE`,
+/// `AUTUMN_IS_DEBUG`) are the profile *selectors*; they are deliberately
+/// excluded from the `.env` overlay (see [`crate::dotenv`]'s
+/// `PROFILE_SELECTOR_KEYS`) so a `.env` file cannot switch the active profile.
+/// Keep the two lists in sync.
 fn resolve_profile_input(env: &dyn Env) -> String {
     // 1. Preferred env var
     if let Ok(profile) = env.var("AUTUMN_ENV") {
@@ -801,6 +830,10 @@ pub enum ConfigError {
     /// The credentials file exists but could not be decrypted.
     #[error("credentials error: {0}")]
     Credentials(String),
+
+    /// A project-root `.env` file exists but could not be read or parsed.
+    #[error("dotenv error: {0}")]
+    Dotenv(String),
 }
 
 /// Top-level framework configuration.
@@ -959,6 +992,15 @@ pub struct AutumnConfig {
     #[serde(default)]
     pub dev: DevConfig,
 
+    /// Widget story gallery settings (`[stories]` section in `autumn.toml`).
+    ///
+    /// Off by default; opt-in per profile (e.g. `[profile.dev.stories]
+    /// enabled = true` for a dev-only gallery, or a prod profile for a
+    /// public showcase). See `docs/guide/stories.md`.
+    #[cfg(feature = "maud")]
+    #[serde(default)]
+    pub stories: crate::stories::StoriesConfig,
+
     /// Error-reporting settings (`[reporting]` section in `autumn.toml`).
     ///
     /// Controls delivery of panic + 5xx [`ErrorEvent`](crate::reporting::ErrorEvent)s
@@ -1017,6 +1059,71 @@ pub struct AutumnConfig {
     /// ```
     #[serde(default)]
     pub seo: SeoConfig,
+
+    /// Observability settings (`[observability]` section in `autumn.toml`).
+    ///
+    /// Controls opt-in framework-emitted telemetry that supplements the
+    /// access log — currently the `Server-Timing` response header. See
+    /// [`ObservabilityConfig`] and `docs/guide/observability/server-timing.md`.
+    #[serde(default)]
+    pub observability: ObservabilityConfig,
+}
+
+/// Observability configuration (`[observability]` section in `autumn.toml`).
+///
+/// Controls opt-in telemetry that supplements the default access log.
+///
+/// # Server-Timing header
+///
+/// When `server_timing = true`, Autumn emits a W3C-conformant
+/// [`Server-Timing`](https://www.w3.org/TR/server-timing/) header on every
+/// non-streaming response with at minimum a `total` metric (whole-request
+/// wall time, matching the access-log `duration_ms`) and a `db` metric
+/// summarising cumulative query time plus a query count (`db;dur=…;desc="N queries"`)
+/// when at least one query ran during the request.
+///
+/// The default is **off in production** and **on in the `dev` profile**;
+/// leave the field unset for that behavior, or pin it to `true` / `false`
+/// explicitly. Requires opt-in in prod because timings can leak
+/// infrastructure detail to anonymous clients.
+///
+/// # Example
+///
+/// ```toml
+/// # Force on in a staging profile where dev-team browsers inspect timings.
+/// [observability]
+/// server_timing = true
+/// ```
+///
+/// ```toml
+/// # Force off during a dev-profile perf comparison against production.
+/// [observability]
+/// server_timing = false
+/// ```
+#[derive(Debug, Clone, Default, Deserialize, serde::Serialize)]
+pub struct ObservabilityConfig {
+    /// Emit the `Server-Timing` response header on served requests.
+    ///
+    /// `None` (unset) means the effective value follows the profile default:
+    /// on in `dev`/`development`, off everywhere else. `Some(true)` or
+    /// `Some(false)` pin the choice explicitly.
+    #[serde(default)]
+    pub server_timing: Option<bool>,
+}
+
+/// Resolve the effective value of `[observability] server_timing` for a
+/// given [`AutumnConfig`].
+///
+/// The rules are:
+/// - Explicit `Some(true)` / `Some(false)` in config or env → returned as-is.
+/// - `None` (unset) → `true` iff the active profile is `"dev"` or
+///   `"development"`, otherwise `false`. This keeps production off by
+///   default so timings never leak to anonymous clients without opt-in.
+pub(crate) fn server_timing_enabled(cfg: &AutumnConfig) -> bool {
+    if let Some(explicit) = cfg.observability.server_timing {
+        return explicit;
+    }
+    matches!(cfg.profile.as_deref(), Some("dev" | "development"))
 }
 
 /// SEO configuration (`[seo]` section in `autumn.toml`).
@@ -1300,6 +1407,13 @@ pub struct ChannelConfig {
     /// Per-topic broadcast ring buffer capacity.
     #[serde(default = "default_channel_capacity")]
     pub capacity: usize,
+    /// Per-topic replay ring buffer capacity (`N`).
+    ///
+    /// Number of most-recent events retained per topic for `Last-Event-ID`
+    /// replay via [`crate::sse::stream_resumable`]. Memory is `O(N)` per topic
+    /// regardless of throughput.
+    #[serde(default = "default_channel_replay_buffer")]
+    pub replay_buffer: usize,
     /// Redis backend options.
     #[serde(default)]
     pub redis: ChannelRedisConfig,
@@ -1310,6 +1424,7 @@ impl Default for ChannelConfig {
         Self {
             backend: ChannelBackend::default(),
             capacity: default_channel_capacity(),
+            replay_buffer: default_channel_replay_buffer(),
             redis: ChannelRedisConfig::default(),
         }
     }
@@ -1337,6 +1452,10 @@ impl Default for ChannelRedisConfig {
 
 const fn default_channel_capacity() -> usize {
     32
+}
+
+const fn default_channel_replay_buffer() -> usize {
+    256
 }
 
 fn default_channels_redis_prefix() -> String {
@@ -1690,12 +1809,24 @@ pub struct JobConfig {
     /// Default initial retry backoff in milliseconds.
     #[serde(default = "default_job_backoff_ms")]
     pub initial_backoff_ms: u64,
+    /// Ordered/weighted list of queues workers drain, highest priority first.
+    ///
+    /// Unset = a single `default` queue (today's behavior). A TOML array such as
+    /// `queues = ["critical", "default", "low"]` is **strict priority**; a table
+    /// such as `[jobs.queues] critical = 4` / `default = 1` is **weighted**
+    /// (probabilistic fair draining that never starves lower queues).
+    #[serde(default)]
+    pub queues: JobQueuesConfig,
     /// Redis backend options.
     #[serde(default)]
     pub redis: JobRedisConfig,
     /// Postgres backend options.
     #[serde(default)]
     pub postgres: JobPostgresConfig,
+    /// Tracked-job progress/result store options (`enqueue_tracked`, the
+    /// built-in `GET /_autumn/jobs/{token}` status route).
+    #[serde(default)]
+    pub tracking: JobTrackingConfig,
 }
 
 impl Default for JobConfig {
@@ -1705,9 +1836,154 @@ impl Default for JobConfig {
             workers: default_job_workers(),
             max_attempts: default_job_max_attempts(),
             initial_backoff_ms: default_job_backoff_ms(),
+            queues: JobQueuesConfig::default(),
             redis: JobRedisConfig::default(),
             postgres: JobPostgresConfig::default(),
+            tracking: JobTrackingConfig::default(),
         }
+    }
+}
+
+/// A single named queue and its draining weight.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobQueue {
+    /// Queue name, as declared by `#[job(queue = "...")]`.
+    pub name: String,
+    /// Relative draining weight (used only for weighted draining; `1` for the
+    /// strict-priority list form).
+    pub weight: u32,
+}
+
+/// Worker queue drain configuration parsed from `[jobs] queues`.
+///
+/// Accepts **either** a TOML array (strict priority, in order) **or** a TOML
+/// table of `name = weight` (weighted, fair). Empty or unset falls back to a
+/// single `default` queue so an app that doesn't opt in behaves exactly as today.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobQueuesConfig {
+    /// Configured queues, highest priority first.
+    pub queues: Vec<JobQueue>,
+    /// `true` for the ordered-list form (strict priority); `false` for the
+    /// weighted-table form (deficit weighted round-robin).
+    pub strict: bool,
+}
+
+impl Default for JobQueuesConfig {
+    fn default() -> Self {
+        Self::single_default()
+    }
+}
+
+impl JobQueuesConfig {
+    /// The zero-config default: one strict `default` queue.
+    #[must_use]
+    pub fn single_default() -> Self {
+        Self {
+            queues: vec![JobQueue {
+                name: "default".to_string(),
+                weight: 1,
+            }],
+            strict: true,
+        }
+    }
+
+    /// Build a strict-priority schedule from an ordered list of queue names.
+    #[must_use]
+    pub fn strict_list<I, S>(names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let queues: Vec<JobQueue> = names
+            .into_iter()
+            .map(|name| JobQueue {
+                name: name.into(),
+                weight: 1,
+            })
+            .collect();
+        if queues.is_empty() {
+            Self::single_default()
+        } else {
+            Self {
+                queues,
+                strict: true,
+            }
+        }
+    }
+
+    /// Build a weighted schedule from `(name, weight)` pairs. Weights are
+    /// clamped to a minimum of `1` so every configured queue makes progress.
+    #[must_use]
+    pub fn weighted<I, S>(entries: I) -> Self
+    where
+        I: IntoIterator<Item = (S, u32)>,
+        S: Into<String>,
+    {
+        let queues: Vec<JobQueue> = entries
+            .into_iter()
+            .map(|(name, weight)| JobQueue {
+                name: name.into(),
+                weight: weight.max(1),
+            })
+            .collect();
+        if queues.is_empty() {
+            Self::single_default()
+        } else {
+            Self {
+                queues,
+                strict: false,
+            }
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for JobQueuesConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::{MapAccess, SeqAccess, Visitor};
+        use std::fmt;
+
+        struct JobQueuesVisitor;
+
+        impl<'de> Visitor<'de> for JobQueuesVisitor {
+            type Value = JobQueuesConfig;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str(
+                    "an ordered list of queue names (e.g. queues = [\"critical\", \"default\"]) \
+                     or a weight table (e.g. [jobs.queues] critical = 4, default = 1)",
+                )
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let mut names = Vec::new();
+                let mut seen = std::collections::HashSet::new();
+                while let Some(name) = seq.next_element::<String>()? {
+                    if !seen.insert(name.clone()) {
+                        return Err(serde::de::Error::custom(format!(
+                            "duplicate queue name '{name}' in queues list"
+                        )));
+                    }
+                    names.push(name);
+                }
+                Ok(JobQueuesConfig::strict_list(names))
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut entries: Vec<(String, u32)> = Vec::new();
+                while let Some((k, v)) = map.next_entry::<String, u32>()? {
+                    if v == 0 {
+                        return Err(serde::de::Error::custom(format!(
+                            "queue '{k}' weight must be at least 1 (got 0); \
+                             to disable a queue remove it from the list"
+                        )));
+                    }
+                    entries.push((k, v));
+                }
+                Ok(JobQueuesConfig::weighted(entries))
+            }
+        }
+
+        d.deserialize_any(JobQueuesVisitor)
     }
 }
 
@@ -1752,6 +2028,36 @@ impl Default for JobPostgresConfig {
             visibility_timeout_ms: default_jobs_pg_visibility_timeout_ms(),
         }
     }
+}
+
+/// Tracked-job progress/result store configuration.
+#[derive(Debug, Clone, Deserialize)]
+pub struct JobTrackingConfig {
+    /// How long a tracked job's progress/result record is retained after its
+    /// last write, in seconds. Default: 24 hours.
+    #[serde(default = "default_jobs_tracking_ttl_secs")]
+    pub ttl_secs: u64,
+    /// Whether the built-in `GET /_autumn/jobs/{token}` status route is
+    /// mounted. Default: `true`.
+    #[serde(default = "default_jobs_tracking_route_enabled")]
+    pub route_enabled: bool,
+}
+
+impl Default for JobTrackingConfig {
+    fn default() -> Self {
+        Self {
+            ttl_secs: default_jobs_tracking_ttl_secs(),
+            route_enabled: default_jobs_tracking_route_enabled(),
+        }
+    }
+}
+
+const fn default_jobs_tracking_ttl_secs() -> u64 {
+    86_400
+}
+
+const fn default_jobs_tracking_route_enabled() -> bool {
+    true
 }
 
 const fn default_jobs_pg_visibility_timeout_ms() -> u64 {
@@ -1989,7 +2295,23 @@ impl AutumnConfig {
     /// Panics if the internally-built TOML table fails to re-serialize
     /// (should never happen with well-formed profile defaults).
     pub fn load() -> Result<Self, ConfigError> {
-        Self::load_with_env(&OsEnv)
+        // Feed a project-root `.env` into the `AUTUMN_*` env layer before
+        // resolving config from the real environment. Rather than mutating the
+        // process environment, `.env` values are layered *under* the real
+        // environment via an overlay `Env`, so a real env var always wins. A
+        // malformed `.env` fails loudly here rather than silently skipping
+        // developer-provided values.
+        let base = OsEnv;
+        let profile = resolve_profile(&base);
+        // Resolve `.env` from the same base directory config uses for
+        // `autumn.toml` (AUTUMN_MANIFEST_DIR when set, else the process CWD),
+        // so a binary launched from outside its crate root reads the `.env`
+        // next to its config instead of the process working directory.
+        let dir = crate::dotenv::dotenv_base_dir(&base);
+        let vars = crate::dotenv::resolve_dotenv_vars(&dir, &profile, &base)
+            .map_err(|e| ConfigError::Dotenv(e.to_string()))?;
+        let env = crate::dotenv::DotenvEnv::new(&base, vars);
+        Self::load_with_env(&env)
     }
 
     /// Load configuration with profile-aware layering, using a provided
@@ -2316,6 +2638,8 @@ impl AutumnConfig {
     /// - `AUTUMN_JOBS__REDIS__URL` → `jobs.redis.url` (`String`)
     /// - `AUTUMN_JOBS__REDIS__KEY_PREFIX` → `jobs.redis.key_prefix` (`String`)
     /// - `AUTUMN_JOBS__REDIS__VISIBILITY_TIMEOUT_MS` → `jobs.redis.visibility_timeout_ms` (`u64`)
+    /// - `AUTUMN_JOBS__TRACKING__TTL_SECS` → `jobs.tracking.ttl_secs` (`u64`)
+    /// - `AUTUMN_JOBS__TRACKING__ROUTE_ENABLED` → `jobs.tracking.route_enabled` (`bool`)
     ///
     /// # Signed webhooks
     /// - `AUTUMN_SECURITY__WEBHOOKS__REPLAY__BACKEND` -> `security.webhooks.replay.backend` (`memory` / `redis`)
@@ -2344,6 +2668,7 @@ impl AutumnConfig {
         self.apply_bot_protection_env_overrides_with_env(env);
         self.apply_idempotency_env_overrides_with_env(env);
         self.apply_dev_env_overrides_with_env(env);
+        self.apply_observability_env_overrides_with_env(env);
         self.apply_compression_env_overrides_with_env(env);
         self.apply_actuator_env_overrides_with_env(env);
         #[cfg(feature = "reporting")]
@@ -2352,6 +2677,8 @@ impl AutumnConfig {
         self.apply_storage_env_overrides_with_env(env);
         #[cfg(feature = "mail")]
         self.apply_mail_env_overrides_with_env(env);
+        #[cfg(feature = "maud")]
+        self.apply_stories_env_overrides_with_env(env);
         self.apply_resilience_env_overrides_with_env(env);
         self.apply_time_zone_env_overrides_with_env(env);
     }
@@ -2402,6 +2729,19 @@ impl AutumnConfig {
             "AUTUMN_COMPRESSION__ENABLED",
             &mut self.compression.enabled,
         );
+    }
+
+    fn apply_observability_env_overrides_with_env(&mut self, env: &dyn Env) {
+        parse_env_option_bool(
+            env,
+            "AUTUMN_OBSERVABILITY__SERVER_TIMING",
+            &mut self.observability.server_timing,
+        );
+    }
+
+    #[cfg(feature = "maud")]
+    fn apply_stories_env_overrides_with_env(&mut self, env: &dyn Env) {
+        parse_env_bool(env, "AUTUMN_STORIES__ENABLED", &mut self.stories.enabled);
     }
 
     fn apply_actuator_env_overrides_with_env(&mut self, env: &dyn Env) {
@@ -2485,6 +2825,11 @@ impl AutumnConfig {
             "AUTUMN_SERVER__UNIX_SOCKET",
             &mut self.server.unix_socket,
         );
+        parse_env_option(
+            env,
+            "AUTUMN_SERVER__MAX_CONCURRENT_REQUESTS",
+            &mut self.server.max_concurrent_requests,
+        );
     }
 
     fn apply_database_env_overrides_with_env(&mut self, env: &dyn Env) {
@@ -2521,6 +2866,16 @@ impl AutumnConfig {
             env,
             "AUTUMN_DATABASE__REPLICA_FALLBACK",
             &mut self.database.replica_fallback,
+        );
+        parse_env(
+            env,
+            "AUTUMN_DATABASE__READ_YOUR_WRITES",
+            &mut self.database.read_your_writes,
+        );
+        parse_env(
+            env,
+            "AUTUMN_DATABASE__PIN_AFTER_WRITE_SECS",
+            &mut self.database.pin_after_write_secs,
         );
         parse_env(
             env,
@@ -2783,6 +3138,11 @@ impl AutumnConfig {
             "AUTUMN_CHANNELS__CAPACITY",
             &mut self.channels.capacity,
         );
+        parse_env(
+            env,
+            "AUTUMN_CHANNELS__REPLAY_BUFFER",
+            &mut self.channels.replay_buffer,
+        );
         parse_env_option_string(
             env,
             "AUTUMN_CHANNELS__REDIS__URL",
@@ -2823,6 +3183,16 @@ impl AutumnConfig {
             env,
             "AUTUMN_JOBS__POSTGRES__VISIBILITY_TIMEOUT_MS",
             &mut self.jobs.postgres.visibility_timeout_ms,
+        );
+        parse_env(
+            env,
+            "AUTUMN_JOBS__TRACKING__TTL_SECS",
+            &mut self.jobs.tracking.ttl_secs,
+        );
+        parse_env_bool(
+            env,
+            "AUTUMN_JOBS__TRACKING__ROUTE_ENABLED",
+            &mut self.jobs.tracking.route_enabled,
         );
     }
 
@@ -3452,6 +3822,32 @@ pub struct ServerConfig {
     /// Configured via `AUTUMN_SERVER__UNIX_SOCKET`. Default: `None` (TCP).
     #[serde(default)]
     pub unix_socket: Option<String>,
+
+    /// Ceiling on concurrent in-flight requests (admission control / load
+    /// shedding). `None` or `0` (the default) disables the ceiling — today's
+    /// unlimited behavior — so no existing application silently changes
+    /// throughput.
+    ///
+    /// Once this many requests are admitted and still in flight, additional
+    /// requests receive an immediate `503 Service Unavailable` with a
+    /// `Retry-After` header, before the handler runs or the request body is
+    /// read. This bounds total concurrent work (and therefore memory) under
+    /// a traffic spike or a slow dependency, trading a fast, clean "try
+    /// another replica" signal for the alternative — admitted requests
+    /// piling up unbounded until the process is OOM-killed.
+    ///
+    /// Liveness/readiness/health probe routes (`health.*` paths and the
+    /// actuator prefix) are never shed, so a merely-busy replica is not
+    /// killed by its orchestrator.
+    ///
+    /// A reasonable starting point is the number of worker threads times a
+    /// small multiple (e.g. 2-4x), sized to keep admitted-request tail
+    /// latency stable under the expected peak concurrency; tune based on
+    /// observed `autumn_requests_shed_total` and per-route latency.
+    ///
+    /// Configured via `AUTUMN_SERVER__MAX_CONCURRENT_REQUESTS`.
+    #[serde(default)]
+    pub max_concurrent_requests: Option<usize>,
 }
 
 /// Behavior when a configured read replica is unavailable or stale.
@@ -3473,6 +3869,51 @@ impl std::str::FromStr for ReplicaFallback {
         match value.trim().to_ascii_lowercase().as_str() {
             "fail_readiness" | "fail-readiness" | "fail" => Ok(Self::FailReadiness),
             "primary" | "fallback_to_primary" | "fallback-to-primary" => Ok(Self::Primary),
+            _ => Err(()),
+        }
+    }
+}
+
+/// Strategy for routing reads that follow a write within the same request or
+/// client session.
+///
+/// Replication is asynchronous: a read immediately after a write can land on a
+/// lagging replica and return stale data (the read-your-own-writes anomaly).
+/// This setting lets Autumn pin such reads to the primary.
+///
+/// Configured via `database.read_your_writes` in `autumn.toml` or
+/// `AUTUMN_DATABASE__READ_YOUR_WRITES` in the environment.
+///
+/// Default: `off` (preserves today's behavior — no post-write pinning).
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ReadYourWrites {
+    /// No post-write read pinning. Replica reads are always served from the
+    /// replica. This is the default and preserves existing behavior exactly.
+    #[default]
+    Off,
+    /// Once the current request checks out a **primary** connection (via `Db`
+    /// or a generated mutating repository method), all subsequent
+    /// replica-eligible reads within the same request are redirected to the
+    /// primary. Analogous to Laravel's "sticky" behavior.
+    Request,
+    /// Like `request`, and additionally pins a client's reads to the primary
+    /// for [`pin_after_write_secs`](DatabaseConfig::pin_after_write_secs)
+    /// seconds after a write, via a signed `autumn.ryw` cookie. Reads within
+    /// that window are served from the primary even if the request itself
+    /// performed no write. Analogous to Rails' automatic role switching.
+    Session,
+}
+
+impl std::str::FromStr for ReadYourWrites {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "off" => Ok(Self::Off),
+            "request" => Ok(Self::Request),
+            "session" => Ok(Self::Session),
             _ => Err(()),
         }
     }
@@ -3669,7 +4110,9 @@ pub struct DatabaseConfig {
     /// Compatibility alias for the primary/write role. New multi-role
     /// deployments should prefer [`primary_url`](Self::primary_url).
     ///
-    /// Must start with `postgres://` or `postgresql://` when present.
+    /// When present, must start with `postgres://` or `postgresql://`, or be
+    /// a libpq-style keyword/value connection string
+    /// (`host=db user=app dbname=app sslmode=require`).
     #[serde(default)]
     pub url: Option<String>,
 
@@ -3706,6 +4149,26 @@ pub struct DatabaseConfig {
     /// reads. Default: fail readiness.
     #[serde(default)]
     pub replica_fallback: ReplicaFallback,
+
+    /// Post-write read pinning strategy. Default: `off` (no pinning).
+    ///
+    /// Set to `request` to pin reads to the primary for the remainder of the
+    /// request after the first write. Set to `session` to additionally pin
+    /// reads across requests via a signed cookie.
+    ///
+    /// Override via `AUTUMN_DATABASE__READ_YOUR_WRITES`.
+    #[serde(default)]
+    pub read_your_writes: ReadYourWrites,
+
+    /// Duration (seconds) for cross-request session pins.
+    ///
+    /// Only used when `read_your_writes = "session"`. A signed `autumn.ryw`
+    /// cookie pins the client's reads to the primary for this many seconds
+    /// after a write. Default: `5`.
+    ///
+    /// Override via `AUTUMN_DATABASE__PIN_AFTER_WRITE_SECS`.
+    #[serde(default = "default_pin_after_write_secs")]
+    pub pin_after_write_secs: u64,
 
     /// Seconds to wait while acquiring a pooled connection, including
     /// creating a new connection when the pool grows.
@@ -3825,6 +4288,69 @@ fn format_slot_ranges(slots: &[usize]) -> String {
 /// short of 16384 physical shards.
 pub const SLOT_COUNT: u16 = 16384;
 
+/// The resolved slot assignment for a single shard, expressed as a name and a
+/// compact range string (e.g. `"0-8191"` or `"0-5460, 10923-16383"`).
+///
+/// Used by the boot-time shard-map guard to compare the freshly-computed
+/// auto-split against the map stored on first boot. An empty `ranges` string
+/// represents a drained shard (all slots moved away); that only arises in
+/// explicit-slot mode, where the guard is inert.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShardSlotAssignment {
+    pub name: String,
+    pub ranges: String,
+}
+
+/// Guard: compare the freshly-computed slot map against the stored map.
+///
+/// Returns `Ok(())` — no action required — when:
+/// - `auto_split` is `false` (explicit-slot mode: operator-managed, no guard),
+/// - `stored` is `None` (first boot: nothing to compare against), or
+/// - the computed and stored maps are identical (order-insensitive).
+///
+/// Returns `Err` with a human-readable message when auto-split is active, a
+/// stored map exists, and the maps differ.
+///
+/// Pure and sync so it can be unit-tested without a database.
+///
+/// # Errors
+///
+/// Returns a `String` description when the auto-split map differs from the
+/// stored map.
+pub fn check_stored_slot_map(
+    auto_split: bool,
+    computed: &[ShardSlotAssignment],
+    stored: Option<&[ShardSlotAssignment]>,
+) -> Result<(), String> {
+    fn to_map(assignments: &[ShardSlotAssignment]) -> std::collections::BTreeMap<&str, &str> {
+        assignments
+            .iter()
+            .map(|a| (a.name.as_str(), a.ranges.as_str()))
+            .collect()
+    }
+    if !auto_split {
+        return Ok(());
+    }
+    let Some(stored) = stored else {
+        return Ok(());
+    };
+    if to_map(computed) == to_map(stored) {
+        return Ok(());
+    }
+    let computed_names: Vec<&str> = computed.iter().map(|a| a.name.as_str()).collect();
+    let stored_names: Vec<&str> = stored.iter().map(|a| a.name.as_str()).collect();
+    Err(format!(
+        "shard slot map mismatch — auto-split with {} shards ({}) produces a different \
+         map than the stored map ({} shards: {}). Set explicit [[database.shards]] slot \
+         ranges matching the stored map, then move data between shards deliberately \
+         before changing the topology.",
+        computed.len(),
+        computed_names.join(", "),
+        stored.len(),
+        stored_names.join(", "),
+    ))
+}
+
 impl DatabaseConfig {
     /// Resolved primary/write database URL.
     #[must_use]
@@ -3937,11 +4463,51 @@ impl DatabaseConfig {
         Ok(map.into_iter().flatten().collect())
     }
 
+    /// Whether all shards are using auto-split (no shard declares `slots`).
+    ///
+    /// Returns `false` when no shards are configured or any shard has an
+    /// explicit `slots` declaration. Mixed declarations already error in
+    /// [`resolved_slot_map`](Self::resolved_slot_map), so this is a simple
+    /// all-or-none check.
+    #[must_use]
+    pub fn shards_auto_split(&self) -> bool {
+        self.has_shards() && self.shards.iter().all(|s| s.slots.is_none())
+    }
+
+    /// Resolve the per-shard slot assignment as compact range strings.
+    ///
+    /// Inverts [`resolved_slot_map`](Self::resolved_slot_map) (slot→shard-index)
+    /// into per-shard slot lists rendered via the same compact range notation
+    /// used in slot-map error messages. Agrees with runtime routing by
+    /// construction: the output derives from the same slot map that builds the
+    /// live [`ShardSet`](crate::sharding::ShardSet).
+    ///
+    /// # Errors
+    ///
+    /// Propagates any [`ConfigError`] from `resolved_slot_map`.
+    pub fn resolved_shard_assignments(&self) -> Result<Vec<ShardSlotAssignment>, ConfigError> {
+        let slot_map = self.resolved_slot_map()?;
+        let n = self.shards.len();
+        let mut per_shard: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for (slot, &owner) in slot_map.iter().enumerate() {
+            per_shard[owner].push(slot);
+        }
+        Ok(self
+            .shards
+            .iter()
+            .enumerate()
+            .map(|(idx, shard)| ShardSlotAssignment {
+                name: shard.name.clone(),
+                ranges: format_slot_ranges(&per_shard[idx]),
+            })
+            .collect())
+    }
+
     /// Validate database configuration.
     ///
     /// # Errors
     ///
-    /// Returns a validation error if a URL has an invalid scheme or a
+    /// Returns a validation error if a connection string is malformed or a
     /// shard declaration is malformed.
     pub fn validate(&self) -> Result<(), ConfigError> {
         for (field, url) in [
@@ -3950,8 +4516,7 @@ impl DatabaseConfig {
             ("database.replica_url", self.replica_url.as_deref()),
         ] {
             if let Some(url) = url
-                && !url.starts_with("postgres://")
-                && !url.starts_with("postgresql://")
+                && !is_pg_connection_string(url)
             {
                 let label = if field == "database.url" {
                     "database URL"
@@ -3959,7 +4524,9 @@ impl DatabaseConfig {
                     field
                 };
                 return Err(ConfigError::Validation(format!(
-                    "Invalid {label}: must start with postgres:// or postgresql://, got {url:?}"
+                    "Invalid {label}: must start with postgres:// or postgresql://, or be a \
+                     keyword/value connection string \
+                     (e.g. \"host=db user=app dbname=app sslmode=require\"), got {url:?}"
                 )));
             }
         }
@@ -4000,12 +4567,13 @@ impl DatabaseConfig {
                 ("replica_url", shard.replica_url.as_deref()),
             ] {
                 if let Some(url) = url
-                    && !url.starts_with("postgres://")
-                    && !url.starts_with("postgresql://")
+                    && !is_pg_connection_string(url)
                 {
                     return Err(ConfigError::Validation(format!(
                         "Invalid database.shards[{idx}].{field}: must start with \
-                         postgres:// or postgresql://, got {url:?}"
+                         postgres:// or postgresql://, or be a keyword/value \
+                         connection string \
+                         (e.g. \"host=db user=app dbname=app sslmode=require\"), got {url:?}"
                     )));
                 }
             }
@@ -4013,6 +4581,16 @@ impl DatabaseConfig {
         self.resolved_slot_map()?;
         Ok(())
     }
+}
+
+/// Whether `s` is an acceptable Postgres connection string: a
+/// `postgres://`/`postgresql://` URL, or a libpq-style keyword/value string
+/// (`host=db user=app sslmode=require`) — recognized with the SAME parser
+/// the pool's TLS module uses ([`crate::pg_conn_str`]), so every string the
+/// pool supports also passes config validation (issue #1585 review: the
+/// keyword form was rejected here before ever reaching the pool).
+fn is_pg_connection_string(s: &str) -> bool {
+    crate::pg_conn_str::is_url(s) || crate::pg_conn_str::is_keyword_value(s)
 }
 
 /// Logging configuration.
@@ -4535,6 +5113,10 @@ const fn default_connect_timeout() -> u64 {
     5
 }
 
+const fn default_pin_after_write_secs() -> u64 {
+    5
+}
+
 fn default_log_level() -> String {
     "info".to_owned()
 }
@@ -4594,6 +5176,7 @@ impl Default for ServerConfig {
             prestop_grace_secs: default_prestop_grace(),
             timeouts: RequestTimeoutsConfig::default(),
             unix_socket: None,
+            max_concurrent_requests: None,
         }
     }
 }
@@ -4608,6 +5191,8 @@ impl Default for DatabaseConfig {
             primary_pool_size: None,
             replica_pool_size: None,
             replica_fallback: ReplicaFallback::default(),
+            read_your_writes: ReadYourWrites::default(),
+            pin_after_write_secs: default_pin_after_write_secs(),
             connect_timeout_secs: default_connect_timeout(),
             startup_wait_secs: 0,
             auto_migrate_in_production: false,
@@ -4720,7 +5305,24 @@ impl TomlEnvConfigLoader {
 
 impl ConfigLoader for TomlEnvConfigLoader {
     async fn load(&self) -> Result<AutumnConfig, ConfigError> {
-        AutumnConfig::load_with_env(&OsEnv)
+        // Feed a project-root `.env` into the `AUTUMN_*` env layer before
+        // resolving config from the real environment. Rather than mutating the
+        // process environment (unsound on a live multi-threaded runtime), `.env`
+        // values are layered *under* the real environment via an overlay `Env`,
+        // so a real env var always wins. The sync file IO in `resolve_dotenv_vars`
+        // is fine on the async path. A malformed `.env` fails loudly here rather
+        // than silently skipping developer-provided values.
+        let base = OsEnv;
+        let profile = resolve_profile(&base);
+        // Resolve `.env` from the same base directory config uses for
+        // `autumn.toml` (AUTUMN_MANIFEST_DIR when set, else the process CWD),
+        // so a binary launched from outside its crate root reads the `.env`
+        // next to its config instead of the process working directory.
+        let dir = crate::dotenv::dotenv_base_dir(&base);
+        let vars = crate::dotenv::resolve_dotenv_vars(&dir, &profile, &base)
+            .map_err(|e| ConfigError::Dotenv(e.to_string()))?;
+        let env = crate::dotenv::DotenvEnv::new(&base, vars);
+        AutumnConfig::load_with_env(&env)
     }
 }
 
@@ -4854,8 +5456,12 @@ pub struct TenancyConfig {
     pub jwt_claim: String,
 
     /// JWT secret key used to verify the JWT signature.
+    ///
+    /// Stored as a [`secrecy::SecretString`] so the raw value is redacted
+    /// from `Debug` output and zeroized on drop. Call
+    /// [`secrecy::ExposeSecret::expose_secret`] at the point of use.
     #[serde(default)]
-    pub jwt_secret: Option<String>,
+    pub jwt_secret: Option<secrecy::SecretString>,
 
     /// Expected JWT issuer to validate.
     #[serde(default)]
@@ -6552,6 +7158,30 @@ path = "/healthz"
     }
 
     #[test]
+    fn env_override_read_your_writes() {
+        let env = MockEnv::new().with("AUTUMN_DATABASE__READ_YOUR_WRITES", "request");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.database.read_your_writes, ReadYourWrites::Request);
+    }
+
+    #[test]
+    fn env_override_read_your_writes_session() {
+        let env = MockEnv::new().with("AUTUMN_DATABASE__READ_YOUR_WRITES", "session");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.database.read_your_writes, ReadYourWrites::Session);
+    }
+
+    #[test]
+    fn env_override_pin_after_write_secs() {
+        let env = MockEnv::new().with("AUTUMN_DATABASE__PIN_AFTER_WRITE_SECS", "10");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.database.pin_after_write_secs, 10);
+    }
+
+    #[test]
     fn env_override_invalid_pool_size_ignored() {
         let env = MockEnv::new().with("AUTUMN_DATABASE__POOL_SIZE", "not_a_number");
         let mut config = AutumnConfig::default();
@@ -6678,6 +7308,40 @@ path = "/healthz"
     }
 
     #[test]
+    fn job_tracking_config_defaults_ttl_86400_and_route_enabled() {
+        let config = AutumnConfig::default();
+        assert_eq!(config.jobs.tracking.ttl_secs, 86_400);
+        assert!(config.jobs.tracking.route_enabled);
+    }
+
+    #[test]
+    fn env_override_jobs_tracking_fields() {
+        let env = MockEnv::new()
+            .with("AUTUMN_JOBS__TRACKING__TTL_SECS", "3600")
+            .with("AUTUMN_JOBS__TRACKING__ROUTE_ENABLED", "false");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+
+        assert_eq!(config.jobs.tracking.ttl_secs, 3_600);
+        assert!(!config.jobs.tracking.route_enabled);
+    }
+
+    #[test]
+    fn jobs_toml_deserializes_tracking_fields() {
+        let config: AutumnConfig = toml::from_str(
+            r"
+            [jobs.tracking]
+            ttl_secs = 7200
+            route_enabled = false
+            ",
+        )
+        .unwrap();
+
+        assert_eq!(config.jobs.tracking.ttl_secs, 7_200);
+        assert!(!config.jobs.tracking.route_enabled);
+    }
+
+    #[test]
     fn jobs_toml_deserializes_redis_visibility_timeout() {
         let config: AutumnConfig = toml::from_str(
             r#"
@@ -6702,11 +7366,120 @@ path = "/healthz"
     }
 
     #[test]
+    fn job_queues_defaults_to_single_default_queue() {
+        let config = AutumnConfig::default();
+        assert!(config.jobs.queues.strict);
+        assert_eq!(config.jobs.queues.queues.len(), 1);
+        assert_eq!(config.jobs.queues.queues[0].name, "default");
+        assert_eq!(config.jobs.queues.queues[0].weight, 1);
+    }
+
+    #[test]
+    fn jobs_without_queues_key_keeps_single_default_queue() {
+        let config: AutumnConfig = toml::from_str(
+            r#"
+            [jobs]
+            backend = "local"
+            workers = 4
+            "#,
+        )
+        .unwrap();
+        assert!(config.jobs.queues.strict);
+        assert_eq!(config.jobs.queues.queues.len(), 1);
+        assert_eq!(config.jobs.queues.queues[0].name, "default");
+    }
+
+    #[test]
+    fn job_queues_parse_ordered_list_as_strict_priority() {
+        let config: AutumnConfig = toml::from_str(
+            r#"
+            [jobs]
+            backend = "local"
+            queues = ["critical", "default", "low"]
+            "#,
+        )
+        .unwrap();
+        assert!(config.jobs.queues.strict, "list form is strict priority");
+        let names: Vec<&str> = config
+            .jobs
+            .queues
+            .queues
+            .iter()
+            .map(|q| q.name.as_str())
+            .collect();
+        assert_eq!(names, ["critical", "default", "low"]);
+        assert!(config.jobs.queues.queues.iter().all(|q| q.weight == 1));
+    }
+
+    #[test]
+    fn job_queues_parse_weight_map_as_weighted() {
+        let config: AutumnConfig = toml::from_str(
+            r#"
+            [jobs]
+            backend = "local"
+
+            [jobs.queues]
+            critical = 4
+            default = 2
+            low = 1
+            "#,
+        )
+        .unwrap();
+        assert!(!config.jobs.queues.strict, "map form is weighted");
+        let weight = |name: &str| {
+            config
+                .jobs
+                .queues
+                .queues
+                .iter()
+                .find(|q| q.name == name)
+                .map(|q| q.weight)
+        };
+        assert_eq!(weight("critical"), Some(4));
+        assert_eq!(weight("default"), Some(2));
+        assert_eq!(weight("low"), Some(1));
+    }
+
+    #[test]
+    fn job_queues_strict_list_rejects_duplicate_names() {
+        let err = toml::from_str::<AutumnConfig>(
+            r#"
+            [jobs]
+            queues = ["critical", "default", "critical"]
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("duplicate queue name") && err.contains("critical"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn job_queues_weighted_rejects_zero_weight() {
+        let err = toml::from_str::<AutumnConfig>(
+            r"
+            [jobs.queues]
+            critical = 4
+            default = 0
+            ",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("weight must be at least 1") && err.contains("default"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn channels_defaults_to_in_process_backend() {
         let config = AutumnConfig::default();
 
         assert_eq!(config.channels.backend, ChannelBackend::InProcess);
         assert_eq!(config.channels.capacity, 32);
+        assert_eq!(config.channels.replay_buffer, 256);
         assert_eq!(config.channels.redis.key_prefix, "autumn:channels");
         assert!(config.channels.redis.url.is_none());
     }
@@ -6716,6 +7489,7 @@ path = "/healthz"
         let env = MockEnv::new()
             .with("AUTUMN_CHANNELS__BACKEND", "redis")
             .with("AUTUMN_CHANNELS__CAPACITY", "128")
+            .with("AUTUMN_CHANNELS__REPLAY_BUFFER", "512")
             .with("AUTUMN_CHANNELS__REDIS__URL", "redis://channels:6379/4")
             .with("AUTUMN_CHANNELS__REDIS__KEY_PREFIX", "myapp:channels");
         let mut config = AutumnConfig::default();
@@ -6724,6 +7498,7 @@ path = "/healthz"
 
         assert_eq!(config.channels.backend, ChannelBackend::Redis);
         assert_eq!(config.channels.capacity, 128);
+        assert_eq!(config.channels.replay_buffer, 512);
         assert_eq!(
             config.channels.redis.url.as_deref(),
             Some("redis://channels:6379/4")
@@ -6811,6 +7586,65 @@ path = "/healthz"
         let mut target = "old".to_string();
         parse_env_string(&env, "SOME_STR", &mut target);
         assert_eq!(target, "val");
+    }
+
+    // ── server_timing_enabled resolver tests ────────────────────
+
+    fn cfg_with_profile(profile: Option<&str>) -> AutumnConfig {
+        AutumnConfig {
+            profile: profile.map(str::to_owned),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn server_timing_defaults_on_in_dev_profile() {
+        let cfg = cfg_with_profile(Some("dev"));
+        assert!(server_timing_enabled(&cfg));
+
+        let cfg = cfg_with_profile(Some("development"));
+        assert!(server_timing_enabled(&cfg));
+    }
+
+    #[test]
+    fn server_timing_defaults_off_in_prod_and_test_profiles() {
+        let cfg = cfg_with_profile(Some("prod"));
+        assert!(!server_timing_enabled(&cfg));
+
+        let cfg = cfg_with_profile(Some("production"));
+        assert!(!server_timing_enabled(&cfg));
+
+        let cfg = cfg_with_profile(Some("test"));
+        assert!(!server_timing_enabled(&cfg));
+
+        let cfg = cfg_with_profile(None);
+        assert!(!server_timing_enabled(&cfg));
+    }
+
+    #[test]
+    fn server_timing_explicit_config_overrides_profile_default() {
+        let mut cfg = cfg_with_profile(Some("prod"));
+        cfg.observability.server_timing = Some(true);
+        assert!(server_timing_enabled(&cfg));
+
+        let mut cfg = cfg_with_profile(Some("dev"));
+        cfg.observability.server_timing = Some(false);
+        assert!(!server_timing_enabled(&cfg));
+    }
+
+    #[test]
+    fn server_timing_env_override_wires_into_dispatcher() {
+        let env = MockEnv::new().with("AUTUMN_OBSERVABILITY__SERVER_TIMING", "true");
+        let mut config = cfg_with_profile(Some("prod"));
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.observability.server_timing, Some(true));
+        assert!(server_timing_enabled(&config));
+
+        let env = MockEnv::new().with("AUTUMN_OBSERVABILITY__SERVER_TIMING", "false");
+        let mut config = cfg_with_profile(Some("dev"));
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.observability.server_timing, Some(false));
+        assert!(!server_timing_enabled(&config));
     }
 
     #[test]
@@ -7002,6 +7836,54 @@ path = "/healthz"
         );
     }
 
+    // ── server.max_concurrent_requests (#1006) ────────────────────
+
+    #[test]
+    fn server_config_defaults_max_concurrent_requests_none() {
+        // Default must preserve today's unlimited behavior — no existing app
+        // silently changes throughput.
+        let config = AutumnConfig::default();
+        assert!(config.server.max_concurrent_requests.is_none());
+    }
+
+    #[test]
+    fn max_concurrent_requests_parses_from_toml() {
+        let config: AutumnConfig = toml::from_str(
+            r"
+            [server]
+            max_concurrent_requests = 64
+            ",
+        )
+        .expect("config with server.max_concurrent_requests should parse");
+        assert_eq!(config.server.max_concurrent_requests, Some(64));
+    }
+
+    #[test]
+    fn env_override_server_max_concurrent_requests() {
+        let env = MockEnv::new().with("AUTUMN_SERVER__MAX_CONCURRENT_REQUESTS", "128");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.server.max_concurrent_requests, Some(128));
+    }
+
+    #[test]
+    fn env_override_invalid_max_concurrent_requests_ignored() {
+        let env = MockEnv::new().with("AUTUMN_SERVER__MAX_CONCURRENT_REQUESTS", "not_a_number");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert!(config.server.max_concurrent_requests.is_none());
+    }
+
+    #[test]
+    fn env_override_empty_max_concurrent_requests_clears_to_none() {
+        // parse_env_option's documented convention: empty string clears to None.
+        let env = MockEnv::new().with("AUTUMN_SERVER__MAX_CONCURRENT_REQUESTS", "");
+        let mut config = AutumnConfig::default();
+        config.server.max_concurrent_requests = Some(64);
+        config.apply_env_overrides_with_env(&env);
+        assert!(config.server.max_concurrent_requests.is_none());
+    }
+
     // ── Log env override tests ───────────────────────────────────
 
     #[test]
@@ -7149,6 +8031,78 @@ path = "/healthz"
     fn validate_accepts_no_url() {
         let config = DatabaseConfig::default();
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_keyword_value_connection_strings() {
+        // The pool's TLS support parses libpq keyword/value strings, so
+        // validation must let them through (issue #1585 review) — including
+        // quoted values and whitespace around `=`.
+        for url in [
+            "host=db user=app dbname=app",
+            "host=db user=app sslmode=require",
+            "host=db sslmode = require",
+            "host=db password='p w' sslmode='verify-full'",
+            "host=db password=https://looks-like-a-url sslmode=require",
+        ] {
+            let config = DatabaseConfig {
+                url: Some(url.to_owned()),
+                ..Default::default()
+            };
+            assert!(
+                config.validate().is_ok(),
+                "keyword/value string must validate: {url}"
+            );
+        }
+        // primary_url and shard URLs accept the same forms.
+        let config = DatabaseConfig {
+            primary_url: Some("host=db user=app sslmode=require".to_owned()),
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+        let config = DatabaseConfig {
+            primary_url: Some("postgres://db-control/app".to_owned()),
+            shards: vec![ShardConfig {
+                name: "s0".to_owned(),
+                primary_url: "host=db-shard0 user=app dbname=app".to_owned(),
+                replica_url: None,
+                slots: None,
+                primary_pool_size: None,
+                replica_pool_size: None,
+                replica_fallback: None,
+            }],
+            ..Default::default()
+        };
+        assert!(
+            config.validate().is_ok(),
+            "shard URLs accept the keyword form too: {:?}",
+            config.validate()
+        );
+    }
+
+    #[test]
+    fn validate_still_rejects_garbage_connection_strings() {
+        for url in [
+            "mysql://localhost/test",
+            "mysql://localhost/test?a=b",
+            "not a connection string",
+            "localhost",
+            "host=",
+            "host='unterminated",
+        ] {
+            let config = DatabaseConfig {
+                url: Some(url.to_owned()),
+                ..Default::default()
+            };
+            let err = config
+                .validate()
+                .expect_err(&format!("garbage must be rejected: {url:?}"))
+                .to_string();
+            assert!(
+                err.contains("must start with postgres:// or postgresql://"),
+                "the error must stay clear about accepted forms, got: {err}"
+            );
+        }
     }
 
     // ── Profile tests ──────────────────────────────────────────
@@ -8624,5 +9578,141 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
             leaves.contains("session"),
             "session must appear as a root-level leaf"
         );
+    }
+
+    // ── ShardSlotAssignment / shards_auto_split / resolved_shard_assignments ──
+
+    #[test]
+    fn shards_auto_split_true_when_all_slots_none() {
+        let config = DatabaseConfig {
+            shards: vec![
+                shard("a", "postgres://a/app"),
+                shard("b", "postgres://b/app"),
+            ],
+            ..Default::default()
+        };
+        assert!(config.shards_auto_split());
+    }
+
+    #[test]
+    fn shards_auto_split_false_when_no_shards() {
+        assert!(!DatabaseConfig::default().shards_auto_split());
+    }
+
+    #[test]
+    fn shards_auto_split_false_when_any_shard_declares_slots() {
+        let config = DatabaseConfig {
+            shards: vec![
+                shard_with_slots("a", "postgres://a/app", &["0-8191"]),
+                shard_with_slots("b", "postgres://b/app", &["8192-16383"]),
+            ],
+            ..Default::default()
+        };
+        assert!(!config.shards_auto_split());
+    }
+
+    #[test]
+    fn resolved_shard_assignments_two_shards() {
+        let config = DatabaseConfig {
+            shards: vec![
+                shard("s0", "postgres://s0/app"),
+                shard("s1", "postgres://s1/app"),
+            ],
+            ..Default::default()
+        };
+        let assignments = config
+            .resolved_shard_assignments()
+            .expect("two-shard auto-split should resolve");
+        assert_eq!(assignments.len(), 2);
+        assert_eq!(assignments[0].name, "s0");
+        assert_eq!(assignments[0].ranges, "0-8191");
+        assert_eq!(assignments[1].name, "s1");
+        assert_eq!(assignments[1].ranges, "8192-16383");
+    }
+
+    #[test]
+    fn resolved_shard_assignments_three_shards() {
+        let config = DatabaseConfig {
+            shards: vec![
+                shard("s0", "postgres://s0/app"),
+                shard("s1", "postgres://s1/app"),
+                shard("s2", "postgres://s2/app"),
+            ],
+            ..Default::default()
+        };
+        let assignments = config
+            .resolved_shard_assignments()
+            .expect("three-shard auto-split should resolve");
+        assert_eq!(assignments.len(), 3);
+        assert_eq!(assignments[0].ranges, "0-5461");
+        assert_eq!(assignments[1].ranges, "5462-10922");
+        assert_eq!(assignments[2].ranges, "10923-16383");
+    }
+
+    // ── check_stored_slot_map ──────────────────────────────────────────────────
+
+    fn assignment(name: &str, ranges: &str) -> ShardSlotAssignment {
+        ShardSlotAssignment {
+            name: name.to_owned(),
+            ranges: ranges.to_owned(),
+        }
+    }
+
+    #[test]
+    fn check_stored_slot_map_explicit_mode_always_ok() {
+        // Even with a wildly different stored map, explicit mode is never blocked.
+        let computed = vec![assignment("s0", "0-8191"), assignment("s1", "8192-16383")];
+        let stored = vec![
+            assignment("s0", "0-5460"),
+            assignment("s1", "5461-10922"),
+            assignment("s2", "10923-16383"),
+        ];
+        assert!(check_stored_slot_map(false, &computed, Some(&stored)).is_ok());
+    }
+
+    #[test]
+    fn check_stored_slot_map_first_boot_no_stored_ok() {
+        let computed = vec![assignment("s0", "0-8191"), assignment("s1", "8192-16383")];
+        assert!(check_stored_slot_map(true, &computed, None).is_ok());
+    }
+
+    #[test]
+    fn check_stored_slot_map_matching_map_ok() {
+        let computed = vec![assignment("s0", "0-8191"), assignment("s1", "8192-16383")];
+        // Order-insensitive: stored in reverse order still matches.
+        let stored = vec![assignment("s1", "8192-16383"), assignment("s0", "0-8191")];
+        assert!(check_stored_slot_map(true, &computed, Some(&stored)).is_ok());
+    }
+
+    #[test]
+    fn check_stored_slot_map_mismatch_two_to_three_shards_returns_err() {
+        let computed = vec![
+            assignment("s0", "0-5460"),
+            assignment("s1", "5461-10922"),
+            assignment("s2", "10923-16383"),
+        ];
+        let stored = vec![assignment("s0", "0-8191"), assignment("s1", "8192-16383")];
+        let err = check_stored_slot_map(true, &computed, Some(&stored))
+            .expect_err("3-shard auto-split vs 2-shard stored map must fail");
+        assert!(err.contains("shard slot map mismatch"), "message: {err}");
+        assert!(err.contains("3 shards"), "message: {err}");
+        assert!(err.contains("2 shards"), "message: {err}");
+    }
+
+    #[test]
+    fn check_stored_slot_map_mismatch_shard_rename_returns_err() {
+        let computed = vec![
+            assignment("alpha", "0-8191"),
+            assignment("beta", "8192-16383"),
+        ];
+        let stored = vec![assignment("s0", "0-8191"), assignment("s1", "8192-16383")];
+        let err = check_stored_slot_map(true, &computed, Some(&stored))
+            .expect_err("renamed shards must be detected as mismatch");
+        assert!(err.contains("shard slot map mismatch"), "message: {err}");
+        assert!(
+            err.contains("alpha"),
+            "message must name computed shards: {err}"
+        );
+        assert!(err.contains("s0"), "message must name stored shards: {err}");
     }
 }

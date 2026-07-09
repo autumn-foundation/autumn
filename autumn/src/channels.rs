@@ -17,13 +17,49 @@
 //! # // In async context: let msg = rx.recv().await.expect("should receive");
 //! ```
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use thiserror::Error;
 use tokio::sync::broadcast;
+
+/// Allocate the next per-topic epoch.
+///
+/// Each freshly-created [`TopicState`] gets a distinct epoch that is BOTH
+/// monotonic within a process AND (practically) unique across process restarts:
+/// a per-process nanosecond seed captured once, plus a monotonically increasing
+/// counter. A recreated/garbage-collected topic therefore always receives a
+/// strictly-new epoch, and a restart (which reseeds from the wall clock) will
+/// not reuse an old epoch. This lets [`EventId`] distinguish a stale id minted
+/// by a previous epoch from a current-epoch id even though the per-epoch `seq`
+/// counter restarts at `1` every time.
+#[allow(clippy::cast_possible_truncation)]
+fn next_topic_epoch() -> u64 {
+    static SEED: OnceLock<u64> = OnceLock::new();
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let seed = *SEED.get_or_init(|| {
+        // Truncating the u128 nanosecond count to its low 64 bits is fine: this
+        // value is only a per-process epoch seed, not a precise clock.
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0)
+    });
+    seed.wrapping_add(COUNTER.fetch_add(1, Ordering::Relaxed))
+}
+
+/// Re-export of the epoch-tagged event id type.
+///
+/// Defined in [`crate::sse`] because the `Last-Event-ID` parsing surface
+/// (`sse::last_event_id` / `sse::LastEventId`) is available without the `ws`
+/// feature, whereas this `channels` module is `ws`-gated. Re-exported here so it
+/// is importable alongside the rest of the resumable-SSE channel API as
+/// `autumn_web::channels::EventId`.
+pub use crate::sse::{EventId, EventIdParseError};
 
 #[cfg(feature = "redis")]
 const REDIS_PUBLISH_QUEUE_CAPACITY: usize = 1024;
@@ -50,6 +86,24 @@ pub trait ChannelsBackend: Send + Sync + 'static {
     /// Subscribe to future messages on a topic.
     fn subscribe(&self, topic: &str) -> Subscriber;
 
+    /// Resume a subscription, replaying buffered events newer than
+    /// `last_event_id` before continuing live.
+    ///
+    /// The default implementation is live-only: it returns a fresh subscriber
+    /// with no replay and no history, so backends without a replay buffer (such
+    /// as the Redis fan-out backend) degrade gracefully to today's behaviour.
+    fn resume(&self, topic: &str, last_event_id: Option<EventId>) -> ResumeHandle {
+        let _ = last_event_id;
+        ResumeHandle {
+            subscriber: self.subscribe(topic),
+            replay: Vec::new(),
+            gap: false,
+            next_live_id: 1,
+            resumable: false,
+            epoch: 0,
+        }
+    }
+
     /// Return the number of topics known to this backend.
     fn channel_count(&self) -> usize;
 
@@ -68,8 +122,73 @@ pub struct LocalChannelsBackend {
 
 struct LocalChannelsInner {
     capacity: usize,
-    registry: Mutex<HashMap<String, Arc<broadcast::Sender<ChannelMessage>>>>,
+    replay_capacity: usize,
+    registry: Mutex<HashMap<String, Arc<TopicState>>>,
     metrics: Arc<ChannelMetrics>,
+}
+
+/// Default per-topic replay ring buffer capacity when none is configured.
+const DEFAULT_REPLAY_CAPACITY: usize = 256;
+
+/// Per-topic state shared by the publish and resume paths.
+///
+/// The `sender` (a broadcast fan-out handle) and the `replay` ring buffer live
+/// behind the same [`Arc`] so that a publish can assign the next monotonic id,
+/// append to the buffer, and broadcast — all under one lock — while a
+/// concurrent [`ChannelsBackend::resume`] can subscribe under that same lock
+/// and snapshot the buffer for a gapless seam.
+struct TopicState {
+    /// Per-topic epoch assigned once at creation (see [`EventId`]). Stable for
+    /// the lifetime of this `TopicState`; a recreated topic gets a new epoch.
+    epoch: u64,
+    sender: Arc<broadcast::Sender<ChannelMessage>>,
+    replay: Mutex<ReplayBuffer>,
+}
+
+/// Bounded per-topic ring buffer of recently published messages.
+struct ReplayBuffer {
+    /// Id to assign to the next published message (starts at 1).
+    next_id: u64,
+    /// Retention capacity, `N` (always `>= 1`).
+    cap: usize,
+    /// Retained `(id, message)` pairs in ascending id order.
+    buf: VecDeque<(u64, ChannelMessage)>,
+}
+
+/// A replayed message paired with its monotonic per-topic id.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SequencedMessage {
+    /// Monotonic per-topic event id.
+    pub id: u64,
+    /// The buffered message payload.
+    pub message: ChannelMessage,
+}
+
+/// Outcome of a [`ChannelsBackend::resume`] request.
+///
+/// Combines the buffered events a client missed (`replay`), a live
+/// `subscriber` for everything published afterwards, and the id bookkeeping the
+/// SSE layer needs to keep event ids monotonic across the replay/live seam.
+pub struct ResumeHandle {
+    /// Live subscriber for messages published after the resume point.
+    pub subscriber: Subscriber,
+    /// Buffered events the client missed, in ascending seq order. For a
+    /// same-epoch resume these are the entries with `seq > last_event_id.seq`;
+    /// for a cross-epoch resume (or a resume against a fresh topic) this is every
+    /// retained current-epoch event.
+    pub replay: Vec<SequencedMessage>,
+    /// `true` when the requested resume point predates the oldest retained id
+    /// (the buffer overflowed), signalling missed events the replay cannot
+    /// recover.
+    pub gap: bool,
+    /// Seq to assign to the first live message read from `subscriber`.
+    pub next_live_id: u64,
+    /// `true` only for the in-process local backend, which actually retains a
+    /// replay buffer. Other backends return a live-only handle.
+    pub resumable: bool,
+    /// The topic's current epoch, used by the SSE layer to format every emitted
+    /// id as `"{epoch}.{seq}"`. Live-only backends report `0`.
+    pub epoch: u64,
 }
 
 /// A message sent through a broadcast channel.
@@ -339,31 +458,9 @@ impl Broadcast {
         strategy: &crate::htmx::OobSwap,
         fragment: &maud::Markup,
     ) -> Result<usize, BroadcastError> {
-        use crate::htmx::{OobSwap, inject_hx_swap_oob};
-        let rendered = &fragment.0;
-        let envelope = if strategy == &OobSwap::Raw {
-            rendered.clone()
-        } else {
-            let value = strategy.format_value(id);
-            let escaped_value = crate::htmx::escape_attribute_string(&value);
-
-            let is_outer_html = matches!(
-                strategy,
-                OobSwap::True
-                    | OobSwap::OuterHTML
-                    | OobSwap::Target(crate::htmx::OobMethod::OuterHTML, _)
-            );
-
-            if is_outer_html {
-                inject_hx_swap_oob(rendered, &value).unwrap_or_else(|| {
-                    format!("<template hx-swap-oob=\"{escaped_value}\">{rendered}</template>")
-                })
-            } else if matches!(strategy, OobSwap::Delete) {
-                format!("<div hx-swap-oob=\"{escaped_value}\"></div>")
-            } else {
-                format!("<div hx-swap-oob=\"{escaped_value}\">{rendered}</div>")
-            }
-        };
+        use maud::Render;
+        let html = fragment.render().into_string();
+        let envelope = sse_oob_envelope(id, strategy, &html);
         self.publish(topic, envelope)
     }
 }
@@ -376,6 +473,78 @@ fn htmx_oob_envelope(fragment: &maud::Markup) -> String {
         .oob("", fragment.clone())
         .render()
         .into_string()
+}
+
+/// Format an OOB fragment for delivery over SSE.
+///
+/// Unlike HTTP responses (where htmx's full swap pipeline unwraps `<template>`
+/// elements), the SSE swap pipeline processes `hx-swap-oob` on the *element
+/// itself*. Wrapping in `<template hx-swap-oob="...">` causes the attribute to
+/// land on the template node, whose `childNodes` is always empty — so htmx
+/// performs the swap on nothing.
+///
+/// Correct SSE formats:
+/// - **`OobSwap::True`** (update) — inject `hx-swap-oob="true"` onto the root
+///   element; htmx replaces the matching DOM element via outerHTML.
+/// - **`OobSwap::Delete`** — emit a tombstone `<div id="{id}" hx-swap-oob="delete"></div>`;
+///   htmx deletes the matching element.
+/// - **All other strategies** — wrap the fragment in a `<div hx-swap-oob="…">`
+///   container so that htmx inserts the container's *children* at the target.
+#[cfg(feature = "maud")]
+fn sse_oob_envelope(id: &str, strategy: &crate::htmx::OobSwap, fragment_html: &str) -> String {
+    use crate::htmx::{OobMethod, OobSwap};
+    match strategy {
+        OobSwap::Delete => {
+            format!("<div id=\"{id}\" hx-swap-oob=\"delete\"></div>")
+        }
+        OobSwap::True => inject_oob_attr(fragment_html, "true"),
+        OobSwap::OuterHTML => inject_oob_attr(fragment_html, "outerHTML"),
+        // For targeted outerHTML, htmx replaces the CSS-selected element with
+        // whichever element carries hx-swap-oob. Inject the attribute onto the
+        // fragment root instead of wrapping it so the rendered row (not a synthetic
+        // div) becomes the replacement.
+        OobSwap::Target(OobMethod::OuterHTML, selector) => {
+            let value = format!("outerHTML:{selector}");
+            inject_oob_attr(fragment_html, &value)
+        }
+        OobSwap::Raw => fragment_html.to_string(),
+        // For outerHTML custom values inject the attribute on the fragment root
+        // so htmx replaces the selected element with this element directly.
+        // For all other strategies (beforeend, afterbegin, …) wrap in a <div>
+        // so htmx inserts the div's *children* at the target rather than the
+        // carrier element's children, which would strip the fragment's root tag.
+        OobSwap::Custom(val) if val == "outerHTML" || val.starts_with("outerHTML:") => {
+            inject_oob_attr(fragment_html, val)
+        }
+        OobSwap::Custom(val) => {
+            let escaped = val.replace('"', "&quot;");
+            format!("<div hx-swap-oob=\"{escaped}\">{fragment_html}</div>")
+        }
+        _ => {
+            let value = strategy.format_value(id).replace('"', "&quot;");
+            format!("<div hx-swap-oob=\"{value}\">{fragment_html}</div>")
+        }
+    }
+}
+
+/// Inject `hx-swap-oob="{value}"` into the opening tag of the root element.
+///
+/// Finds the first tag name boundary (space or `>`) and inserts the attribute
+/// before it, e.g. `<li id="x">` → `<li hx-swap-oob="true" id="x">`.
+#[cfg(feature = "maud")]
+pub(crate) fn inject_oob_attr(html: &str, value: &str) -> String {
+    if let Some(lt) = html.find('<') {
+        let after_lt = &html[lt + 1..];
+        if let Some(pos) = after_lt.find([' ', '>']) {
+            let insert_at = lt + 1 + pos;
+            return format!(
+                "{} hx-swap-oob=\"{value}\"{}",
+                &html[..insert_at],
+                &html[insert_at..]
+            );
+        }
+    }
+    html.to_string()
 }
 
 /// A sender handle for a broadcast channel.
@@ -464,28 +633,56 @@ impl Subscriber {
 
 impl LocalChannelsBackend {
     /// Create a local backend with the given per-topic buffer capacity.
+    ///
+    /// The replay ring buffer defaults to [`DEFAULT_REPLAY_CAPACITY`]. Use
+    /// [`LocalChannelsBackend::with_replay_capacity`] to override it.
     #[must_use]
     pub fn new(capacity: usize) -> Self {
+        Self::with_replay_capacity(capacity, DEFAULT_REPLAY_CAPACITY)
+    }
+
+    /// Create a local backend with explicit broadcast and replay capacities.
+    ///
+    /// `capacity` sizes the live [`tokio::sync::broadcast`] ring; `replay_capacity`
+    /// (`N`) is the number of most-recent events retained per topic for
+    /// `Last-Event-ID` replay. Memory is `O(N)` per topic regardless of
+    /// throughput.
+    #[must_use]
+    pub fn with_replay_capacity(capacity: usize, replay_capacity: usize) -> Self {
         Self {
             inner: Arc::new(LocalChannelsInner {
                 capacity: capacity.clamp(1, 16_384),
+                replay_capacity: replay_capacity.clamp(1, 1_048_576),
                 registry: Mutex::new(HashMap::new()),
                 metrics: Arc::new(ChannelMetrics::default()),
             }),
         }
     }
 
-    fn get_or_create_sender(&self, topic: &str) -> Arc<broadcast::Sender<ChannelMessage>> {
+    fn get_or_create_topic(&self, topic: &str) -> Arc<TopicState> {
         let mut registry = self.inner.registry.lock().expect("channels lock poisoned");
 
         #[allow(clippy::option_if_let_else)]
-        if let Some(tx) = registry.get(topic) {
-            Arc::clone(tx)
+        if let Some(state) = registry.get(topic) {
+            Arc::clone(state)
         } else {
-            let tx = Arc::new(broadcast::channel(self.inner.capacity).0);
-            registry.insert(topic.to_owned(), Arc::clone(&tx));
-            tx
+            let sender = Arc::new(broadcast::channel(self.inner.capacity).0);
+            let state = Arc::new(TopicState {
+                epoch: next_topic_epoch(),
+                sender,
+                replay: Mutex::new(ReplayBuffer {
+                    next_id: 1,
+                    cap: self.inner.replay_capacity.max(1),
+                    buf: VecDeque::new(),
+                }),
+            });
+            registry.insert(topic.to_owned(), Arc::clone(&state));
+            state
         }
+    }
+
+    fn get_or_create_sender(&self, topic: &str) -> Arc<broadcast::Sender<ChannelMessage>> {
+        Arc::clone(&self.get_or_create_topic(topic).sender)
     }
 
     fn publish_local(&self, topic: &str, msg: ChannelMessage) -> usize {
@@ -497,13 +694,109 @@ impl LocalChannelsBackend {
     }
 
     fn send_without_publish_metric(&self, topic: &str, msg: ChannelMessage) -> usize {
-        let tx = self.get_or_create_sender(topic);
-        match tx.send(msg) {
+        let state = self.get_or_create_topic(topic);
+        // Assign the id, append to the replay buffer, and broadcast — all while
+        // holding the replay lock. `resume` subscribes under this same lock, so
+        // every message a resumed subscriber receives is published strictly
+        // after its snapshot, keeping the replay/live seam gapless. The id is
+        // assigned even when there are zero receivers so ids stay dense.
+        let mut replay = state.replay.lock().expect("channel replay lock poisoned");
+        let id = replay.next_id;
+        replay.next_id = replay.next_id.saturating_add(1);
+        replay.buf.push_back((id, msg.clone()));
+        while replay.buf.len() > replay.cap {
+            replay.buf.pop_front();
+        }
+        let result = state.sender.send(msg);
+        drop(replay);
+
+        match result {
             Ok(count) => count,
             Err(_error) => {
                 self.inner.metrics.record_dropped(topic, 1);
                 0
             }
+        }
+    }
+
+    fn resume_local(&self, topic: &str, last_event_id: Option<EventId>) -> ResumeHandle {
+        let state = self.get_or_create_topic(topic);
+        self.inner.metrics.ensure_topic(topic);
+        let epoch = state.epoch;
+
+        // Subscribe and snapshot under the replay lock so the seam is clean:
+        // publish holds this same lock while assigning seqs and broadcasting, so
+        // `rx` can only ever observe messages published strictly after this
+        // point (seqs `start_seq + 1, start_seq + 2, ...`), none of which are in
+        // the snapshot below.
+        let replay_guard = state.replay.lock().expect("channel replay lock poisoned");
+        let rx = state.sender.subscribe();
+        let start_seq = replay_guard.next_id.saturating_sub(1);
+        let oldest = replay_guard.buf.front().map(|(seq, _)| *seq);
+
+        let (replay, gap) = match last_event_id {
+            // Cold connection: no replay, just live events.
+            None => (Vec::new(), false),
+            // Epoch mismatch: the client last saw a DIFFERENT epoch (this topic
+            // was garbage-collected/recreated or the process restarted, resetting
+            // the seq counter). An old-epoch seq is meaningless against the
+            // current seq space, so EVERY retained current-epoch event is new to
+            // this client — replay all of them and flag the gap so the client
+            // knows its pre-reset history is unrecoverable. This is the fix for
+            // the epoch-reset collision where a stale seq the new epoch had
+            // already passed would otherwise drop the new epoch's early events.
+            Some(ev) if ev.epoch != epoch => {
+                let replay: Vec<SequencedMessage> = replay_guard
+                    .buf
+                    .iter()
+                    .map(|(seq, message)| SequencedMessage {
+                        id: *seq,
+                        message: message.clone(),
+                    })
+                    .collect();
+                (replay, true)
+            }
+            // Same-epoch resume: replay buffered entries newer than the client's
+            // seq.
+            Some(ev) => {
+                let replay: Vec<SequencedMessage> = replay_guard
+                    .buf
+                    .iter()
+                    .filter(|(seq, _)| *seq > ev.seq)
+                    .map(|(seq, message)| SequencedMessage {
+                        id: *seq,
+                        message: message.clone(),
+                    })
+                    .collect();
+                // Gap in two cases:
+                //  1. The requested resume point precedes the oldest retained
+                //     seq: the client's next-expected seq (`ev.seq + 1`) aged out
+                //     of the window, so the replay would be partial.
+                //  2. The client's `ev.seq` is in the future relative to the
+                //     current server state (`ev.seq > start_seq`) — defensive:
+                //     within the same epoch this should not happen, but if it
+                //     does, flag it rather than silently returning an empty
+                //     replay.
+                let gap = oldest.is_some_and(|oldest| oldest > ev.seq.saturating_add(1))
+                    || ev.seq > start_seq;
+                (replay, gap)
+            }
+        };
+        drop(replay_guard);
+
+        let subscriber = Subscriber {
+            topic: topic.to_owned(),
+            inner: rx,
+            metrics: Arc::clone(&self.inner.metrics),
+        };
+
+        ResumeHandle {
+            subscriber,
+            replay,
+            gap,
+            next_live_id: start_seq.saturating_add(1),
+            resumable: true,
+            epoch,
         }
     }
 }
@@ -514,6 +807,12 @@ impl ChannelsBackend for LocalChannelsBackend {
     }
 
     fn ensure_topic(&self, topic: &str) -> Arc<broadcast::Sender<ChannelMessage>> {
+        // NOTE: this returns the RAW `broadcast::Sender`; sending directly on it
+        // bypasses replay-id assignment and the replay buffer. Publish via
+        // `Channels::publish` / `Broadcast::publish` / `Channels::sender().send()`
+        // (all of which route through `publish` and stay id-assigned) to keep
+        // resumable topics resumable (see the resumable-SSE limitations in
+        // docs/guide/realtime.md, issue #1356).
         self.inner.metrics.ensure_topic(topic);
         self.get_or_create_sender(topic)
     }
@@ -527,16 +826,27 @@ impl ChannelsBackend for LocalChannelsBackend {
         }
     }
 
+    fn resume(&self, topic: &str, last_event_id: Option<EventId>) -> ResumeHandle {
+        self.resume_local(topic, last_event_id)
+    }
+
     fn channel_count(&self) -> usize {
         let registry = self.inner.registry.lock().expect("channels lock poisoned");
         registry.len()
     }
 
     fn gc(&self) {
+        // NOTE: removing a topic here drops its replay buffer with it, so a
+        // topic kept alive only by transient SSE subscribers can lose its
+        // replay history during a disconnect window (resumable-SSE is in-process
+        // best-effort — see docs/guide/realtime.md, issue #1356).
         let mut registry = self.inner.registry.lock().expect("channels lock poisoned");
         let mut removed_topics = HashSet::new();
-        registry.retain(|topic, tx| {
-            let keep = tx.receiver_count() > 0 || Arc::strong_count(tx) > 1;
+        registry.retain(|topic, state| {
+            // Keep topics with live receivers, or with outstanding keepalive
+            // `Sender` handles (which hold clones of `state.sender`, bumping its
+            // strong count above the single reference held by `state`).
+            let keep = state.sender.receiver_count() > 0 || Arc::strong_count(&state.sender) > 1;
             if !keep {
                 removed_topics.insert(topic.clone());
             }
@@ -555,7 +865,7 @@ impl ChannelsBackend for LocalChannelsBackend {
             let registry = self.inner.registry.lock().expect("channels lock poisoned");
             registry
                 .iter()
-                .map(|(topic, sender)| (topic.clone(), sender.receiver_count()))
+                .map(|(topic, state)| (topic.clone(), state.sender.receiver_count()))
                 .collect()
         };
         let metric_counters = self.inner.metrics.snapshot();
@@ -633,7 +943,8 @@ impl RedisChannelsBackend {
             .ok_or(ChannelBackendConfigError::MissingRedisUrl)?;
         let client = redis::Client::open(url)
             .map_err(|error| ChannelBackendConfigError::InvalidRedisUrl(error.to_string()))?;
-        let local = LocalChannelsBackend::new(config.capacity);
+        let local =
+            LocalChannelsBackend::with_replay_capacity(config.capacity, config.replay_buffer);
         let (publisher, receiver) = tokio::sync::mpsc::channel(REDIS_PUBLISH_QUEUE_CAPACITY);
         let origin_id = uuid::Uuid::new_v4().to_string();
         let backend = Self {
@@ -911,6 +1222,10 @@ impl ChannelsBackend for InterceptedChannelsBackend {
         self.inner.subscribe(topic)
     }
 
+    fn resume(&self, topic: &str, last_event_id: Option<EventId>) -> ResumeHandle {
+        self.inner.resume(topic, last_event_id)
+    }
+
     fn channel_count(&self) -> usize {
         self.inner.channel_count()
     }
@@ -962,7 +1277,9 @@ impl Channels {
         shutdown: tokio_util::sync::CancellationToken,
     ) -> Result<Self, ChannelBackendConfigError> {
         match config.backend {
-            crate::config::ChannelBackend::InProcess => Ok(Self::new(config.capacity)),
+            crate::config::ChannelBackend::InProcess => Ok(Self::with_backend(
+                LocalChannelsBackend::with_replay_capacity(config.capacity, config.replay_buffer),
+            )),
             crate::config::ChannelBackend::Redis => Self::redis_from_config(config, shutdown),
         }
     }
@@ -1019,6 +1336,17 @@ impl Channels {
     #[must_use]
     pub fn subscribe(&self, name: &str) -> Subscriber {
         self.backend.subscribe(name)
+    }
+
+    /// Resume a subscription, replaying buffered events newer than
+    /// `last_event_id` before continuing live.
+    ///
+    /// Only the in-process local backend retains a replay buffer; other
+    /// backends return a live-only [`ResumeHandle`]. Prefer
+    /// [`crate::sse::stream_resumable`] for the SSE route primitive.
+    #[must_use]
+    pub fn resume(&self, topic: &str, last_event_id: Option<EventId>) -> ResumeHandle {
+        self.backend.resume(topic, last_event_id)
     }
 
     /// Authorize a channel subscription before allocating the subscriber.
@@ -1643,5 +1971,318 @@ mod tests {
             "<div hx-swap-oob=\"beforeend:#&quot;bad-id&quot;\"><li id=\"item-4\">Value</li></div>"
         );
         Ok(())
+    }
+
+    // ── sse_oob_envelope branch coverage ────────────────────────────────────────
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn oob_envelope_delete_emits_tombstone() {
+        let result = sse_oob_envelope("item-7", &crate::htmx::OobSwap::Delete, "");
+        assert_eq!(result, "<div id=\"item-7\" hx-swap-oob=\"delete\"></div>");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn oob_envelope_true_injects_on_root() {
+        let frag = "<li id=\"item-8\">X</li>";
+        let result = sse_oob_envelope("item-8", &crate::htmx::OobSwap::True, frag);
+        assert!(
+            result.contains("hx-swap-oob=\"true\""),
+            "missing attr: {result}"
+        );
+        assert!(result.contains("<li"), "root tag stripped: {result}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn oob_envelope_raw_passes_through_unchanged() {
+        let frag = "<custom-element>data</custom-element>";
+        let result = sse_oob_envelope("x", &crate::htmx::OobSwap::Raw, frag);
+        assert_eq!(result, frag);
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn oob_envelope_target_outerhtml_injects_on_root() {
+        use crate::htmx::{OobMethod, OobSwap};
+        let frag = "<li id=\"item-9\">X</li>";
+        let result = sse_oob_envelope(
+            "item-9",
+            &OobSwap::Target(OobMethod::OuterHTML, "#item-9".to_string()),
+            frag,
+        );
+        assert!(
+            result.contains("hx-swap-oob=\"outerHTML:#item-9\""),
+            "got: {result}"
+        );
+        assert!(result.contains("<li"), "root tag stripped: {result}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn oob_envelope_custom_outerhtml_injects_on_root() {
+        use crate::htmx::OobSwap;
+        let frag = "<li id=\"item-10\">X</li>";
+        let result = sse_oob_envelope("item-10", &OobSwap::Custom("outerHTML".to_string()), frag);
+        assert!(
+            result.contains("hx-swap-oob=\"outerHTML\""),
+            "got: {result}"
+        );
+        assert!(result.contains("<li"), "root tag stripped: {result}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn oob_envelope_custom_outerhtml_selector_injects_on_root() {
+        use crate::htmx::OobSwap;
+        let frag = "<li id=\"item-11\">X</li>";
+        let result = sse_oob_envelope(
+            "item-11",
+            &OobSwap::Custom("outerHTML:#item-11".to_string()),
+            frag,
+        );
+        assert!(
+            result.contains("hx-swap-oob=\"outerHTML:#item-11\""),
+            "got: {result}"
+        );
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn oob_envelope_custom_non_outerhtml_wraps_in_div() {
+        use crate::htmx::OobSwap;
+        let frag = "<li id=\"item-12\">X</li>";
+        let result = sse_oob_envelope(
+            "item-12",
+            &OobSwap::Custom("beforeend:#items".to_string()),
+            frag,
+        );
+        assert!(
+            result.starts_with("<div hx-swap-oob=\"beforeend:#items\">"),
+            "got: {result}"
+        );
+        assert!(
+            result.contains("<li id=\"item-12\">"),
+            "fragment missing: {result}"
+        );
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn oob_envelope_outerhtml_injects_on_root() {
+        use crate::htmx::OobSwap;
+        let frag = "<li id=\"item-13\">X</li>";
+        let result = sse_oob_envelope("item-13", &OobSwap::OuterHTML, frag);
+        assert!(
+            result.contains("hx-swap-oob=\"outerHTML\""),
+            "missing outerHTML attr: {result}"
+        );
+        assert!(result.contains("<li"), "root tag stripped: {result}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn oob_envelope_target_beforeend_uses_catchall() {
+        use crate::htmx::{OobMethod, OobSwap};
+        let frag = "<li>item</li>";
+        let result = sse_oob_envelope(
+            "item-14",
+            &OobSwap::Target(OobMethod::BeforeEnd, "#list".to_string()),
+            frag,
+        );
+        assert!(
+            result.starts_with("<div hx-swap-oob="),
+            "catch-all must wrap in div: {result}"
+        );
+        assert!(result.contains("beforeend:#list"), "got: {result}");
+    }
+
+    // ── replay buffer / resume ──────────────────────────────────────────────
+
+    #[test]
+    fn replay_buffer_is_bounded_and_ids_are_monotonic() {
+        let backend = LocalChannelsBackend::with_replay_capacity(16, 4);
+        for i in 0..10 {
+            backend.publish_local("topic", ChannelMessage::from(format!("m{i}")));
+        }
+        let state = backend.get_or_create_topic("topic");
+        let (len, ids, next_id) = {
+            let replay = state.replay.lock().expect("replay lock");
+            let ids: Vec<u64> = replay.buf.iter().map(|(id, _)| *id).collect();
+            (replay.buf.len(), ids, replay.next_id)
+        };
+        // Buffer never exceeds N.
+        assert_eq!(len, 4);
+        // Retains the most recent N (ids 7..=10), ascending.
+        assert_eq!(ids, vec![7, 8, 9, 10]);
+        // Next id keeps climbing densely.
+        assert_eq!(next_id, 11);
+    }
+
+    #[test]
+    fn resume_cold_connection_has_no_replay_or_gap() {
+        let backend = LocalChannelsBackend::with_replay_capacity(16, 8);
+        backend.publish_local("t", ChannelMessage::from("a"));
+        backend.publish_local("t", ChannelMessage::from("b"));
+
+        let handle = backend.resume("t", None);
+        assert!(handle.replay.is_empty(), "cold connect must not replay");
+        assert!(!handle.gap);
+        assert!(handle.resumable);
+        // Two messages published → next live seq is 3.
+        assert_eq!(handle.next_live_id, 3);
+    }
+
+    #[test]
+    fn resume_replays_only_newer_than_last_event_id() {
+        let backend = LocalChannelsBackend::with_replay_capacity(16, 8);
+        for i in 1..=5 {
+            backend.publish_local("t", ChannelMessage::from(format!("m{i}")));
+        }
+        let epoch = backend.get_or_create_topic("t").epoch;
+        let handle = backend.resume("t", Some(EventId { epoch, seq: 2 }));
+        let ids: Vec<u64> = handle.replay.iter().map(|s| s.id).collect();
+        assert_eq!(ids, vec![3, 4, 5]);
+        assert!(!handle.gap, "everything since seq 2 is retained");
+        assert_eq!(handle.next_live_id, 6);
+        assert_eq!(handle.epoch, epoch);
+    }
+
+    #[test]
+    fn resume_signals_gap_when_last_event_id_aged_out() {
+        // cap 3: after publishing 5, retained seqs are 3,4,5.
+        let backend = LocalChannelsBackend::with_replay_capacity(16, 3);
+        for i in 1..=5 {
+            backend.publish_local("t", ChannelMessage::from(format!("m{i}")));
+        }
+        let epoch = backend.get_or_create_topic("t").epoch;
+        // Client last saw seq 1; seq 2 has aged out → gap, replay starts at oldest.
+        let handle = backend.resume("t", Some(EventId { epoch, seq: 1 }));
+        assert!(handle.gap, "aged-out resume point must signal a gap");
+        let ids: Vec<u64> = handle.replay.iter().map(|s| s.id).collect();
+        assert_eq!(ids, vec![3, 4, 5]);
+    }
+
+    #[test]
+    fn resume_no_gap_when_last_event_id_is_current_tail() {
+        let backend = LocalChannelsBackend::with_replay_capacity(16, 3);
+        for i in 1..=5 {
+            backend.publish_local("t", ChannelMessage::from(format!("m{i}")));
+        }
+        let epoch = backend.get_or_create_topic("t").epoch;
+        // Client already saw the latest seq (5): nothing to replay, no gap.
+        let handle = backend.resume("t", Some(EventId { epoch, seq: 5 }));
+        assert!(handle.replay.is_empty());
+        assert!(!handle.gap);
+        assert_eq!(handle.next_live_id, 6);
+    }
+
+    #[test]
+    fn resume_cross_epoch_replays_full_epoch_and_gaps() {
+        // A stale id from a different epoch whose seq the current epoch has
+        // already passed must NOT drop the early current-epoch events: it gaps
+        // and replays the whole retained current epoch.
+        let backend = LocalChannelsBackend::with_replay_capacity(16, 8);
+        for i in 1..=5 {
+            backend.publish_local("t", ChannelMessage::from(format!("m{i}")));
+        }
+        let epoch = backend.get_or_create_topic("t").epoch;
+        let stale_epoch = epoch.wrapping_add(1);
+        let handle = backend.resume(
+            "t",
+            Some(EventId {
+                epoch: stale_epoch,
+                seq: 4,
+            }),
+        );
+        assert!(handle.gap, "cross-epoch resume must signal a gap");
+        let ids: Vec<u64> = handle.replay.iter().map(|s| s.id).collect();
+        assert_eq!(
+            ids,
+            vec![1, 2, 3, 4, 5],
+            "cross-epoch resume replays every retained current-epoch seq, not just seq > 4"
+        );
+    }
+
+    #[cfg(feature = "ws")]
+    #[tokio::test]
+    async fn resume_seam_delivers_replay_then_live_without_gap()
+    -> Result<(), broadcast::error::RecvError> {
+        let backend = LocalChannelsBackend::with_replay_capacity(16, 8);
+        for i in 1..=3 {
+            backend.publish_local("t", ChannelMessage::from(format!("m{i}")));
+        }
+        // Resume from seq 1: replay 2,3 then live 4,5.
+        let epoch = backend.get_or_create_topic("t").epoch;
+        let mut handle = backend.resume("t", Some(EventId { epoch, seq: 1 }));
+        assert_eq!(
+            handle.replay.iter().map(|s| s.id).collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        assert_eq!(handle.next_live_id, 4);
+
+        backend.publish_local("t", ChannelMessage::from("m4"));
+        backend.publish_local("t", ChannelMessage::from("m5"));
+
+        assert_eq!(handle.subscriber.recv().await?.as_str(), "m4");
+        assert_eq!(handle.subscriber.recv().await?.as_str(), "m5");
+        Ok(())
+    }
+
+    #[test]
+    fn resume_via_default_backend_is_live_only() {
+        // The trait default (used by Redis) is live-only, non-resumable.
+        struct LiveOnly(LocalChannelsBackend);
+        impl ChannelsBackend for LiveOnly {
+            fn publish(
+                &self,
+                topic: &str,
+                msg: ChannelMessage,
+            ) -> Result<usize, ChannelPublishError> {
+                self.0.publish(topic, msg)
+            }
+            fn ensure_topic(&self, topic: &str) -> Arc<broadcast::Sender<ChannelMessage>> {
+                self.0.ensure_topic(topic)
+            }
+            fn subscribe(&self, topic: &str) -> Subscriber {
+                self.0.subscribe(topic)
+            }
+            fn channel_count(&self) -> usize {
+                self.0.channel_count()
+            }
+            fn gc(&self) {
+                self.0.gc();
+            }
+            fn snapshot(&self) -> HashMap<String, ChannelStats> {
+                self.0.snapshot()
+            }
+        }
+
+        let backend = LiveOnly(LocalChannelsBackend::new(16));
+        backend.publish("t", ChannelMessage::from("a")).unwrap();
+        let handle = backend.resume("t", Some(EventId { epoch: 0, seq: 0 }));
+        assert!(handle.replay.is_empty());
+        assert!(!handle.gap);
+        assert!(!handle.resumable, "default resume is live-only");
+        assert_eq!(handle.next_live_id, 1);
+        assert_eq!(handle.epoch, 0, "live-only backends report epoch 0");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn inject_oob_attr_fallback_no_lt() {
+        let result = inject_oob_attr("no-tags-here", "true");
+        assert_eq!(
+            result, "no-tags-here",
+            "fallback must return html unchanged"
+        );
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn inject_oob_attr_fallback_no_boundary() {
+        let result = inject_oob_attr("<", "true");
+        assert_eq!(result, "<", "fallback must return html unchanged");
     }
 }

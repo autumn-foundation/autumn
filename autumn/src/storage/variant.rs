@@ -466,7 +466,7 @@ pub(crate) fn content_addressed_key(source_blob: &Blob, transforms: &[Transform]
         "_variants/{}/{}/{}",
         &hash_hex[..2],
         &hash_hex[2..4],
-        &hash_hex
+        hash_hex
     )
 }
 

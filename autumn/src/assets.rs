@@ -34,6 +34,8 @@
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
+#[cfg(feature = "embed-assets")]
+use std::sync::RwLock;
 
 /// Filename of the fingerprint manifest within the `static/` tree.
 #[cfg(any(not(debug_assertions), feature = "embed-assets"))]
@@ -110,14 +112,6 @@ fn load_vendor_manifest() -> Option<&'static VendorManifest> {
 /// vendored file (and its pinned integrity hash) is served by `ServeDir` instead.
 pub(crate) fn htmx_is_vendored() -> bool {
     load_vendor_manifest().is_some_and(|m| m.assets.contains_key("htmx"))
-}
-
-/// Returns `true` when the SSE extension has been pinned via `autumn assets add sse@…` or is present in the vendor manifest.
-///
-/// The router uses this to skip the built-in embedded sse handler so the
-/// vendored file is served by `ServeDir` instead.
-pub(crate) fn sse_is_vendored() -> bool {
-    load_vendor_manifest().is_some_and(|m| m.assets.contains_key("sse"))
 }
 
 #[cfg(feature = "embed-assets")]
@@ -462,14 +456,66 @@ pub(crate) fn content_type_for(path: &str) -> &'static str {
     }
 }
 
+/// Process-wide cache of computed embedded-asset `ETag`s, keyed by the stable
+/// `&'static` byte pointer of the asset's contents.
+///
+/// SHA-256-hashing a whole asset on every request is a hot-path CPU cost for
+/// large full `GET`s. Embedded asset bytes are `&'static`, so their start
+/// pointer is a stable per-asset identity for the process lifetime — memoizing
+/// the tag against it computes the hash once per asset and reuses it thereafter.
+/// Two empty assets can share a pointer, but their content hash is identical, so
+/// a collision still returns the correct tag.
+#[cfg(feature = "embed-assets")]
+static EMBEDDED_ETAG_CACHE: OnceLock<RwLock<HashMap<usize, crate::etag::ETag>>> = OnceLock::new();
+
+/// Return the strong content-hash `ETag` for an embedded asset, computing it on
+/// the first serve and reusing the cached value thereafter.
+///
+/// Preserves the exact tag value/format produced by [`embedded_etag`] so
+/// `If-Range` validation is unchanged.
+#[cfg(feature = "embed-assets")]
+fn embedded_etag_cached(bytes: &[u8]) -> crate::etag::ETag {
+    let key = bytes.as_ptr() as usize;
+    let cache = EMBEDDED_ETAG_CACHE.get_or_init(|| RwLock::new(HashMap::new()));
+    if let Some(etag) = cache.read().unwrap().get(&key) {
+        return etag.clone();
+    }
+    let etag = embedded_etag(bytes);
+    cache.write().unwrap().insert(key, etag.clone());
+    etag
+}
+
+/// Derive a stable **strong** `ETag` from an embedded asset's bytes.
+///
+/// A content hash gives embedded assets a meaningful `If-Range` (and
+/// conditional-GET) validator: the tag changes only when the bytes change, so a
+/// client's cached range stays valid across restarts of the same binary.
+#[cfg(feature = "embed-assets")]
+fn embedded_etag(bytes: &[u8]) -> crate::etag::ETag {
+    use sha2::{Digest as _, Sha256};
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = Sha256::digest(bytes);
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for b in digest {
+        hex.push(HEX[(b >> 4) as usize] as char);
+        hex.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    crate::etag::ETag::strong(hex)
+}
+
 /// Serve a single file from the registered embedded `static/` tree.
 ///
 /// Returns `404` for path-traversal attempts, the framework manifest
 /// (`.autumn-manifest.json`, which must never be exposed), missing files, or
 /// when no embedded dir is registered. Other files — including legitimate
 /// dotfile assets — are served, matching the on-disk `ServeDir` behavior.
+///
+/// Honours HTTP `Range` requests (RFC 7233) via [`crate::range`]: a satisfiable
+/// `Range` yields `206 Partial Content` with `Content-Range`, an unsatisfiable
+/// one yields `416`, and every response advertises `Accept-Ranges: bytes`. A
+/// strong content-hash `ETag` gates `If-Range`.
 #[cfg(feature = "embed-assets")]
-fn embedded_response(rel_path: &str) -> axum::response::Response {
+fn embedded_response(rel_path: &str, req_headers: &http::HeaderMap) -> axum::response::Response {
     use axum::response::IntoResponse;
 
     let is_traversal = rel_path
@@ -488,12 +534,21 @@ fn embedded_response(rel_path: &str) -> axum::response::Response {
     dir.0.get_file(rel_path).map_or_else(
         || http::StatusCode::NOT_FOUND.into_response(),
         |file| {
-            // `contents()` is `&'static [u8]`; serve it directly (no per-request copy).
-            (
-                [(http::header::CONTENT_TYPE, content_type_for(rel_path))],
-                file.contents(),
-            )
-                .into_response()
+            // `contents()` is `&'static [u8]`; wrap it without a per-request
+            // copy so a full response still serves the static bytes directly.
+            let bytes = bytes::Bytes::from_static(file.contents());
+            let total = bytes.len() as u64;
+            let etag = embedded_etag_cached(&bytes);
+            let validator = crate::range::Validator::new().with_etag(&etag);
+            let resolution = crate::range::resolve(req_headers, total, Some(validator));
+            let mut response = crate::range::partial_bytes_response(&resolution, bytes);
+            let headers = response.headers_mut();
+            headers.insert(
+                http::header::CONTENT_TYPE,
+                http::HeaderValue::from_static(content_type_for(rel_path)),
+            );
+            headers.insert(http::header::ETAG, etag.header_value());
+            response
         },
     )
 }
@@ -502,8 +557,9 @@ fn embedded_response(rel_path: &str) -> axum::response::Response {
 #[cfg(feature = "embed-assets")]
 pub(crate) async fn serve_embedded(
     axum::extract::Path(path): axum::extract::Path<String>,
+    headers: http::HeaderMap,
 ) -> axum::response::Response {
-    embedded_response(&path)
+    embedded_response(&path, &headers)
 }
 
 /// A standalone router that serves `/static/*` from the registered embedded

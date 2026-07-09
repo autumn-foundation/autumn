@@ -149,6 +149,7 @@ impl EventRegistry {
                     .expect("durable listener must carry a job_name"),
                 max_attempts: listener.max_attempts,
                 initial_backoff_ms: listener.initial_backoff_ms,
+                queue: "default".to_string(),
                 uniqueness: None,
                 concurrency: None,
                 handler: listener.handler,

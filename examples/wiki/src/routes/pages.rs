@@ -15,6 +15,7 @@ pub fn layout(title: &str, content: Markup) -> Markup {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { (title) " — Wiki" }
+                link rel="stylesheet" href=(autumn_web::ui::WIDGETS_CSS_PATH);
                 link rel="stylesheet" href="/static/css/autumn.css";
                 script src="/static/js/htmx.min.js" {}
             }
@@ -137,6 +138,10 @@ pub async fn show(
     Ok(layout(
         &page.title,
         html! {
+            (breadcrumb(&[
+                Crumb::link("Wiki", &paths::list()),
+                Crumb::current(&page.title),
+            ]))
             article {
                 div class="flex justify-between items-center mb-4" {
                     h1 class="text-3xl font-bold" { (page.title) }
@@ -191,6 +196,10 @@ pub async fn new_form() -> Markup {
     layout(
         "New Page",
         html! {
+            (breadcrumb(&[
+                Crumb::link("Wiki", &paths::list()),
+                Crumb::current("New Page"),
+            ]))
             h1 class="text-2xl font-bold mb-6" { "New Page" }
             form action=(paths::create()) method="post"
                  class="space-y-4 bg-white rounded shadow p-6" {
@@ -254,6 +263,11 @@ pub async fn edit_form(Path(slug): Path<String>, repo: PgPageRepository) -> Autu
     Ok(layout(
         &format!("Edit: {}", page.title),
         html! {
+            (breadcrumb(&[
+                Crumb::link("Wiki", &paths::list()),
+                Crumb::link(&page.title, &paths::show(page.slug.clone())),
+                Crumb::current("Edit"),
+            ]))
             h1 class="text-2xl font-bold mb-6" { "Edit: " (page.title) }
             form action=(paths::update(page.slug.clone())) method="post"
                  class="space-y-4 bg-white rounded shadow p-6" {
@@ -319,6 +333,21 @@ impl PageForm {
     }
 }
 
+pub(crate) fn generate_update_summary(
+    old_status: &str,
+    new_status: &str,
+    old_title: &str,
+    new_title: &str,
+) -> Option<String> {
+    if new_status != old_status {
+        Some(format!("Status changed: {} → {}", old_status, new_status))
+    } else if new_title != old_title {
+        Some(format!("Title changed: {} → {}", old_title, new_title))
+    } else {
+        None
+    }
+}
+
 #[post("/pages/{slug}")]
 pub async fn update(
     Path(slug): Path<String>,
@@ -330,16 +359,8 @@ pub async fn update(
     let update_page = form.0.into_update();
     let updated = repo.update(page.id, &update_page).await?;
 
-    let summary = if updated.status != page.status {
-        Some(format!(
-            "Status changed: {} → {}",
-            page.status, updated.status
-        ))
-    } else if updated.title != page.title {
-        Some(format!("Title changed: {} → {}", page.title, updated.title))
-    } else {
-        None
-    };
+    let summary =
+        generate_update_summary(&page.status, &updated.status, &page.title, &updated.title);
 
     diesel::insert_into(revisions::table)
         .values(&NewRevision {
@@ -375,6 +396,11 @@ pub async fn history(
     Ok(layout(
         &format!("History: {}", page.title),
         html! {
+            (breadcrumb(&[
+                Crumb::link("Wiki", &paths::list()),
+                Crumb::link(&page.title, &paths::show(page.slug.clone())),
+                Crumb::current("History"),
+            ]))
             div class="flex justify-between items-center mb-6" {
                 h1 class="text-2xl font-bold" { "History: " (page.title) }
                 a href=(paths::show(page.slug.clone()))

@@ -47,6 +47,8 @@ pub struct ScaffoldConfigEntry {
     #[serde(default)]
     pub indexes: Vec<String>,
     #[serde(default)]
+    pub uniques: Vec<String>,
+    #[serde(default)]
     pub validations: Vec<String>,
     #[serde(default)]
     pub defaults: Vec<String>,
@@ -66,6 +68,10 @@ pub struct ScaffoldConfigEntry {
     /// Inherits from `[generate] id` when absent.
     #[serde(default)]
     pub id: Option<String>,
+    /// Emit per-field inline validation endpoints and `hx-post` attributes on
+    /// form inputs.
+    #[serde(default)]
+    pub live_validation: bool,
 }
 
 /// Project-level generator defaults, read from `[generate]` in the config file.
@@ -273,6 +279,7 @@ pub fn merge_config_with_cli(
     config: ScaffoldConfigEntry,
     cli_fields: &[String],
     cli_indexes: &[String],
+    cli_uniques: &[String],
     cli_validations: &[String],
     cli_defaults: &[String],
     cli_queries: &[String],
@@ -282,12 +289,14 @@ pub fn merge_config_with_cli(
     cli_shard_key: Option<&str>,
     cli_live: bool,
     cli_id: Option<&str>,
+    cli_live_validation: bool,
 ) -> Result<(Vec<String>, ScaffoldOptions), GenerateError> {
     let pick = |cli: &[String], toml: Vec<String>| -> Vec<String> {
         if cli.is_empty() { toml } else { cli.to_vec() }
     };
     let fields = pick(cli_fields, config.fields);
     let indexes = pick(cli_indexes, config.indexes);
+    let uniques = pick(cli_uniques, config.uniques);
     let validations = pick(cli_validations, config.validations);
     let defaults = pick(cli_defaults, config.defaults);
     let queries = pick(cli_queries, config.queries);
@@ -297,6 +306,7 @@ pub fn merge_config_with_cli(
     let sharded = cli_sharded || config.sharded;
     let shard_key = cli_shard_key.map(str::to_owned).or(config.shard_key);
     let live = cli_live || config.live;
+    let live_validation = cli_live_validation || config.live_validation;
     // Precedence: CLI > per-resource TOML > project-default TOML > BigSerial.
     let id_type = if let Some(s) = cli_id {
         IdType::parse(s)?
@@ -310,6 +320,7 @@ pub fn merge_config_with_cli(
         ScaffoldOptions {
             model: ModelOptions {
                 indexes,
+                uniques,
                 validations,
                 defaults,
                 soft_delete,
@@ -320,6 +331,7 @@ pub fn merge_config_with_cli(
             queries,
             api,
             live,
+            live_validation,
         },
     ))
 }
@@ -603,6 +615,7 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
         ScaffoldConfigEntry {
             fields: vec!["url:String".into(), "tag:String".into()],
             indexes: vec!["url".into()],
+            uniques: vec![],
             validations: vec!["url=url".into()],
             defaults: vec![],
             queries: vec!["find_by_url:url".into()],
@@ -612,6 +625,7 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             shard_key: None,
             live: false,
             id: None,
+            live_validation: false,
         }
     }
 
@@ -623,12 +637,14 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             &[],
             &[],
             &[],
+            &[],
             false,
             false,
             false,
             None,
             false,
             None,
+            false,
         )
         .unwrap()
     }
@@ -652,12 +668,14 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             &[],
             &[],
             &[],
+            &[],
             false,
             false,
             false,
             None,
             false,
             None,
+            false,
         )
         .unwrap();
         assert_eq!(fields, vec!["title:String", "body:Text"]);
@@ -672,12 +690,14 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             &[],
             &[],
             &[],
+            &[],
             false,
             false,
             false,
             None,
             false,
             None,
+            false,
         )
         .unwrap();
         assert_eq!(opts.model.indexes, vec!["tag"]);
@@ -689,6 +709,7 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             bookmark_entry(),
             &[],
             &[],
+            &[],
             &["url=email".into()],
             &[],
             &[],
@@ -698,6 +719,7 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             None,
             false,
             None,
+            false,
         )
         .unwrap();
         assert_eq!(opts.model.validations, vec!["url=email"]);
@@ -712,6 +734,7 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             &[],
             &[],
             &[],
+            &[],
             &["tag=general".into()],
             &[],
             false,
@@ -720,6 +743,7 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             None,
             false,
             None,
+            false,
         )
         .unwrap();
         assert_eq!(opts.model.defaults, vec!["tag=general"]);
@@ -733,6 +757,7 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             &[],
             &[],
             &[],
+            &[],
             &["find_by_tag:tag".into()],
             false,
             false,
@@ -740,6 +765,7 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             None,
             false,
             None,
+            false,
         )
         .unwrap();
         assert_eq!(opts.queries, vec!["find_by_tag:tag"]);
@@ -755,12 +781,14 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             &[],
             &[],
             &[],
+            &[],
             false,
             false,
             false,
             None,
             false,
             None,
+            false,
         )
         .unwrap();
         assert!(fields.is_empty());
@@ -779,12 +807,14 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             &[],
             &[],
             &[],
+            &[],
             true,
             false,
             false,
             None,
             false,
             None,
+            false,
         )
         .unwrap();
         assert!(
@@ -838,12 +868,14 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             &[],
             &[],
             &[],
+            &[],
             false,
             true,
             false,
             None,
             false,
             None,
+            false,
         )
         .unwrap();
         assert!(opts.api);
@@ -882,12 +914,14 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             &[],
             &[],
             &[],
+            &[],
             false,
             false,
             true,
             None,
             false,
             None,
+            false,
         )
         .unwrap();
         assert!(
@@ -918,12 +952,14 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             &[],
             &[],
             &[],
+            &[],
             false,
             false,
             false,
             Some("user_id"),
             false,
             None,
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -977,12 +1013,14 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             &[],
             &[],
             &[],
+            &[],
             false,
             false,
             false,
             None,
             false,
             Some("uuid"),
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -1015,12 +1053,14 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             &[],
             &[],
             &[],
+            &[],
             false,
             false,
             false,
             None,
             false,
             Some("bigint"),
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -1049,12 +1089,14 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             &[],
             &[],
             &[],
+            &[],
             false,
             false,
             false,
             None,
             false,
             Some("guid"),
+            false,
         )
         .unwrap_err();
         let msg = err.to_string();

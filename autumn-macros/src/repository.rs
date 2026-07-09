@@ -118,6 +118,15 @@ fn generate_topic_format(topic: &str, record_ident: &TokenStream) -> syn::Result
     Ok(output)
 }
 
+/// Which of the generated CRUD routes the `mcp` key opts in as MCP tools.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum McpExpose {
+    /// Bare `mcp`: all five CRUD routes (list/get/create/update/delete).
+    All,
+    /// `mcp = "read"`: only the read routes (list/get).
+    Read,
+}
+
 #[allow(clippy::struct_excessive_bools)]
 struct RepoConfig {
     model_name: Ident,
@@ -125,6 +134,9 @@ struct RepoConfig {
     hooks_type: Option<Ident>,
     commit_hooks: bool,
     api_path: Option<String>,
+    /// Expose the generated CRUD routes as MCP tools (`mcp` / `mcp = "read"`).
+    /// `None` = not opted in. Requires `api = "/path"`.
+    mcp_expose: Option<McpExpose>,
     policy_type: Option<Ident>,
     scope_type: Option<Ident>,
     cursor_key: Option<String>,
@@ -176,6 +188,8 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
     let mut hooks_type: Option<Ident> = None;
     let mut commit_hooks = false;
     let mut api_path: Option<String> = None;
+    let mut mcp_expose: Option<McpExpose> = None;
+    let mut mcp_span: Option<proc_macro2::Span> = None;
     let mut policy_type: Option<Ident> = None;
     let mut scope_type: Option<Ident> = None;
     let mut cursor_key: Option<String> = None;
@@ -228,6 +242,45 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
             let value: LitStr = meta.value()?.parse()?;
             api_path = Some(value.value());
             Ok(())
+        } else if meta.path.is_ident("mcp") {
+            if mcp_expose.is_some() {
+                return Err(meta.error(
+                    "duplicate `mcp` key: specify `mcp` or `mcp = \"read\"` exactly once \
+                     (they don't compose — the last one would silently win)",
+                ));
+            }
+            mcp_span = Some(meta.path.segments[0].ident.span());
+            if meta.input.peek(syn::Token![=]) {
+                let lit: syn::Lit = meta.value()?.parse()?;
+                match &lit {
+                    syn::Lit::Str(value) => match value.value().as_str() {
+                        "read" => mcp_expose = Some(McpExpose::Read),
+                        other => {
+                            return Err(syn::Error::new(
+                                value.span(),
+                                format!(
+                                    "unknown mcp mode `{other}`; expected bare `mcp` (expose \
+                                     all five CRUD routes as MCP tools) or `mcp = \"read\"` \
+                                     (list/get only)"
+                                ),
+                            ));
+                        }
+                    },
+                    other => {
+                        return Err(syn::Error::new(
+                            // `mcp = false`/`true` is the natural guess coming from
+                            // `#[api_doc(mcp = false)]`; name the forms that exist here.
+                            other.span(),
+                            "mcp takes no boolean: use bare `mcp` (expose all five CRUD \
+                             routes as MCP tools), `mcp = \"read\"` (list/get only), or omit \
+                             the key to keep MCP exposure off (the default)",
+                        ));
+                    }
+                }
+            } else {
+                mcp_expose = Some(McpExpose::All);
+            }
+            Ok(())
         } else if meta.path.is_ident("policy") {
             let value: Ident = meta.value()?.parse()?;
             policy_type = Some(value);
@@ -274,7 +327,7 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
             Ok(())
         } else {
             Err(meta.error(
-                "expected model name, table = \"...\", hooks = Type, commit_hooks = true, api = \"/path\", policy = Type, scope = Type, cursor_key = field, cursor_key_type = Type, soft_delete, tenant_scoped, no_upsert_trait, searchable, versioned = true, no_versioned_record_impl, primary_reads, or sharded",
+                "expected model name, table = \"...\", hooks = Type, commit_hooks = true, api = \"/path\", mcp, mcp = \"read\", policy = Type, scope = Type, cursor_key = field, cursor_key_type = Type, soft_delete, tenant_scoped, no_upsert_trait, searchable, versioned = true, no_versioned_record_impl, primary_reads, sharded, broadcasts = true, topic = \"...\", render = fn, or container = \"...\"",
             ))
         }
     })
@@ -286,13 +339,16 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
             "expected model name: #[repository(ModelName)]",
         )
     })?;
-    if broadcasts {
-        commit_hooks = true;
-    }
     if commit_hooks && hooks_type.is_none() && !broadcasts {
         return Err(syn::Error::new(
             proc_macro2::Span::call_site(),
             "commit_hooks = true requires hooks = Type",
+        ));
+    }
+    if mcp_expose.is_some() && api_path.is_none() {
+        return Err(syn::Error::new(
+            mcp_span.unwrap_or_else(proc_macro2::Span::call_site),
+            "mcp requires api = \"/path\": MCP tools are derived from the generated CRUD routes",
         ));
     }
     let table = table_name.unwrap_or_else(|| infer_table_name(&model));
@@ -304,6 +360,7 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
         hooks_type,
         commit_hooks,
         api_path,
+        mcp_expose,
         policy_type,
         scope_type,
         cursor_key,
@@ -360,6 +417,29 @@ fn parse_query_name(name: &str) -> Option<DerivedQuery> {
     })
 }
 
+/// A parsed `find_or_create_by_<field>[_and_<field>...]` declaration (#1382).
+///
+/// Unlike the [`DerivedQuery`] finders, this is emitted as an inherent async
+/// method on the `Pg*` struct (it returns `(Model, bool)` and takes an extra
+/// `new` insert value), so it lives in its own spec list rather than the trait
+/// method surface.
+struct FindOrCreateSpec {
+    /// The declared method identifier, e.g. `find_or_create_by_slug`.
+    fn_ident: Ident,
+    /// Lookup fields in declaration order, paired with the parameter type the
+    /// user declared for each field.
+    lookup_params: Vec<(Ident, syn::Type)>,
+    /// Subset of lookup fields whose parameter type is a string — routed
+    /// through the encrypted-column registry encoder at runtime, matching the
+    /// `find_by` derived-query surface (#805).
+    string_fields: std::collections::HashSet<String>,
+    /// When set, generation emits a `compile_error!` with this message instead
+    /// of a method (e.g. `_or_` was used, or a field lacks a matching
+    /// parameter). Race-safety requires a single unique constraint, so `_or_`
+    /// (which spans constraints) is rejected.
+    error: Option<String>,
+}
+
 #[allow(clippy::too_many_lines)]
 fn generate_derived_query_for_source(
     query: &DerivedQuery,
@@ -388,9 +468,26 @@ fn generate_derived_query_for_source(
             if string_fields.contains(&field.to_string()) {
                 let field_str = field.to_string();
                 let enc_ident = format_ident!("__autumn_q_{field}");
+                let norm_ident = format_ident!("__autumn_qn_{field}");
+                // #1379 AC3: canonicalize the lookup argument for `#[normalize]`
+                // columns so `find_by_email("  FOO@X.com ")` matches the stored
+                // `foo@x.com` row. Dispatches through the autoref-specialization
+                // probe, so it returns the raw value for non-normalized columns
+                // and for hand-written models that don't implement
+                // `NormalizedModel`. Runs *before* the encrypted-column encoder
+                // (a normalized + deterministic-encrypted column matches on the
+                // canonical form).
                 encode_lets.push(quote! {
+                    let #norm_ident = {
+                        #[allow(unused_imports)]
+                        use ::autumn_web::normalize::{SpezLookupNo as _, SpezLookupYes as _};
+                        ::autumn_web::normalize::SpezLookup::<#model_name>(
+                            ::core::marker::PhantomData, #field_str, &#param,
+                        )
+                        .spez_lookup()
+                    };
                     let #enc_ident = ::autumn_web::encryption::encode_derived_query_param(
-                        #table_name_str, #field_str, &#param,
+                        #table_name_str, #field_str, &#norm_ident,
                     )
                     .map_err(|__e| ::autumn_web::AutumnError::internal_server_error_msg(
                         __e.to_string(),
@@ -701,6 +798,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // Parse derived query methods from trait body
     let mut derived_trait_methods = Vec::new();
     let mut derived_impl_methods = Vec::new();
+    // §1382: race-safe `find_or_create_by_*` declarations. Collected here and
+    // codegen'd near the batch-feature bindings (once `tenant_query_filter`
+    // is in scope), then spliced into the inherent `impl Pg*` block.
+    let mut find_or_create_specs: Vec<FindOrCreateSpec> = Vec::new();
     // §1d: per-shard helpers for derived read methods that fan out under
     // across_tenants. Emitted into the inherent impl (a trait impl cannot hold
     // non-trait members), so kept in a separate list.
@@ -728,6 +829,88 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     for item in &trait_def.items {
         if let TraitItem::Fn(method) = item {
             let method_name = method.sig.ident.to_string();
+
+            // §1382: `find_or_create_by_<field>[_and_<field>...]`. Parsed and
+            // codegen'd separately from the `find_by`/`count`/… derived-query
+            // surface: it is an inherent method returning `(Model, bool)`, not
+            // a trait finder. `parse_query_name` never matches these names
+            // (`find_or_create_by_slug` → strip `find` → `_or_create_by_slug`,
+            // which is not `_by_`-prefixed), but we handle them first and
+            // `continue` to keep the two paths cleanly separated.
+            if let Some(rest) = method_name.strip_prefix("find_or_create_by_") {
+                let fn_ident = method.sig.ident.clone();
+
+                // Map each declared parameter name to its type.
+                let param_map: Vec<(String, syn::Type)> = method
+                    .sig
+                    .inputs
+                    .iter()
+                    .filter_map(|arg| {
+                        let syn::FnArg::Typed(pat_type) = arg else {
+                            return None;
+                        };
+                        let syn::Pat::Ident(pat_ident) = pat_type.pat.as_ref() else {
+                            return None;
+                        };
+                        Some((pat_ident.ident.to_string(), (*pat_type.ty).clone()))
+                    })
+                    .collect();
+
+                // Determine the lookup fields (and reject `_or_`, which would
+                // span multiple unique constraints and defeat race-safety).
+                let mut error: Option<String> = if rest.is_empty() {
+                    Some(format!(
+                        "`{method_name}` has no lookup field: name it \
+                         `find_or_create_by_<field>` (optionally `_and_<field>`)"
+                    ))
+                } else if rest.contains("_or_") {
+                    Some(format!(
+                        "`{method_name}`: find_or_create_by does not support `_or_`. \
+                         Race-safety requires a single unique constraint, so only a \
+                         single field or an `_and_`-composite (matching one composite \
+                         unique index) is allowed."
+                    ))
+                } else {
+                    None
+                };
+
+                let field_names: Vec<String> = if error.is_some() {
+                    Vec::new()
+                } else {
+                    rest.split("_and_").map(String::from).collect()
+                };
+
+                let mut lookup_params: Vec<(Ident, syn::Type)> = Vec::new();
+                if error.is_none() {
+                    for fname in &field_names {
+                        if let Some((_, ty)) = param_map.iter().find(|(n, _)| n == fname) {
+                            lookup_params.push((format_ident!("{fname}"), ty.clone()));
+                        } else {
+                            error = Some(format!(
+                                "`{method_name}`: no parameter named `{fname}` was \
+                                 declared. Declare each lookup field as a parameter, \
+                                 e.g. `fn {method_name}({fname}: String, new: {new_name});`"
+                            ));
+                            break;
+                        }
+                    }
+                }
+
+                let string_fields: std::collections::HashSet<String> = lookup_params
+                    .iter()
+                    .filter(|(_, ty)| is_string_param_type(ty))
+                    .map(|(ident, _)| ident.to_string())
+                    .collect();
+
+                find_or_create_specs.push(FindOrCreateSpec {
+                    fn_ident,
+                    lookup_params,
+                    string_fields,
+                    error,
+                });
+                continue;
+            }
+
             if let Some(query) = parse_query_name(&method_name) {
                 let fn_ident = &method.sig.ident;
 
@@ -968,6 +1151,37 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {}
     };
 
+    // Broadcast field tokens — defined here so they are in scope for both
+    // `across_tenants_method` (below) and the main struct/constructor block
+    // (further down).  The full doc-comment version `bcast_struct_field` is
+    // used only in the struct definition; the clone/none/state variants are
+    // used in every constructor that builds a `Self { .. }` literal.
+    let has_broadcasts = config.broadcasts;
+    let bcast_struct_field = if has_broadcasts {
+        quote! {
+            /// Broadcast handle for live OOB fragment publishing (`broadcasts = "topic"`).
+            /// `None` when the repository was built without an `AppState` (e.g. `with_pool_untracked`).
+            __autumn_broadcast: ::std::option::Option<::autumn_web::channels::Broadcast>,
+        }
+    } else {
+        quote! {}
+    };
+    let bcast_clone_field = if has_broadcasts {
+        quote! { __autumn_broadcast: self.__autumn_broadcast.clone(), }
+    } else {
+        quote! {}
+    };
+    let bcast_field_none = if has_broadcasts {
+        quote! { __autumn_broadcast: ::core::option::Option::None, }
+    } else {
+        quote! {}
+    };
+    let bcast_field_some_state = if has_broadcasts {
+        quote! { __autumn_broadcast: ::std::option::Option::Some(state.broadcast()), }
+    } else {
+        quote! {}
+    };
+
     let across_tenants_method = if config.tenant_scoped {
         if let Some(hooks_ident) = &config.hooks_type {
             let idempotency_clone_field = if commit_hooks_enabled {
@@ -988,6 +1202,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         #idempotency_clone_field
                         across_tenants: true,
                         #shards_clone_field
+                        #bcast_clone_field
                         __autumn_read_route: self.__autumn_read_route.clone(),
                         __autumn_statement_timeout_ms: self.__autumn_statement_timeout_ms,
                         __autumn_slow_threshold: self.__autumn_slow_threshold,
@@ -1005,6 +1220,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         pool: self.pool.clone(),
                         across_tenants: true,
                         #shards_clone_field
+                        #bcast_clone_field
                         __autumn_read_route: self.__autumn_read_route.clone(),
                         __autumn_statement_timeout_ms: self.__autumn_statement_timeout_ms,
                         __autumn_slow_threshold: self.__autumn_slow_threshold,
@@ -1063,6 +1279,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         self.__autumn_route.as_deref(),
                         __shard.name(),
                     ),
+                    // Shard sub-repos are used for read fan-out only; mutations
+                    // broadcast from the parent, not the per-shard instance.
+                    #bcast_field_none
                 }
             }
         }
@@ -1103,6 +1322,28 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 impl #model_name {
                     #(#scope_fns)*
                 }
+            }
+        }
+    };
+
+    // Bridge this repository to the many-to-many mutation traits `#[model]`
+    // generates for `#[has_many(Target, through = ...)]` associations on
+    // `#model_name` (see `M2mConnSource`). Emitted unconditionally — cheap
+    // when the model has no `through =` associations (nothing calls it) —
+    // so it doesn't need to know which associations exist, only its own
+    // model and write-connection helper.
+    let m2m_conn_source_impl = quote! {
+        impl ::autumn_web::repository::M2mConnSource for #pg_name {
+            type Model = #model_name;
+
+            async fn __autumn_m2m_write_conn(
+                &self,
+            ) -> ::autumn_web::AutumnResult<
+                ::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Object<
+                    ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+                >,
+            > {
+                self.__autumn_acquire_conn().await
             }
         }
     };
@@ -1170,6 +1411,39 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 #[doc = "Read-only methods route to the shard's read replica when one is configured and healthy (honoring the shard's `replica_fallback` policy); mutating methods always use the shard's primary. Pin a single call chain to the primary with [`on_primary`](Self::on_primary)."]
             }
         };
+        // When `broadcasts` is configured the test-helper constructor must be
+        let test_ctor_method = if has_broadcasts {
+            quote! {
+                /// Construct this repository with an explicit broadcast handle.
+                ///
+                /// For use in tests only — simulates what `FromRequestParts<AppState>` does
+                /// when building a repository that can publish OOB live fragments.
+                #[doc(hidden)]
+                #[must_use]
+                pub fn __autumn_test_with_broadcast(
+                    pool: ::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Pool<
+                        ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+                    >,
+                    broadcast: ::autumn_web::channels::Broadcast,
+                ) -> Self {
+                    #register_hooks
+                    Self {
+                        pool,
+                        #hooks_field
+                        #idempotency_field
+                        #tenant_init_field
+                        #shards_none_field
+                        __autumn_read_route: ::autumn_web::repository::ReadRoute::Primary,
+                        __autumn_statement_timeout_ms: 0,
+                        __autumn_slow_threshold: ::std::time::Duration::from_millis(500),
+                        __autumn_route: ::core::option::Option::None,
+                        __autumn_broadcast: ::core::option::Option::Some(broadcast),
+                    }
+                }
+            }
+        } else {
+            quote! {}
+        };
         quote! {
             /// Construct this repository from a [`ShardedDb`](::autumn_web::sharding::ShardedDb)
             /// extractor, preserving the full request instrumentation — statement
@@ -1205,6 +1479,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     __autumn_statement_timeout_ms: __seed.statement_timeout_ms,
                     __autumn_slow_threshold: __seed.slow_query_threshold,
                     __autumn_route: ::core::clone::Clone::clone(&__seed.route),
+                    #bcast_field_none
                 }
             }
 
@@ -1238,8 +1513,11 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     __autumn_statement_timeout_ms: 0,
                     __autumn_slow_threshold: ::std::time::Duration::from_millis(500),
                     __autumn_route: ::core::option::Option::None,
+                    #bcast_field_none
                 }
             }
+
+            #test_ctor_method
         }
     };
 
@@ -1306,6 +1584,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             __autumn_slow_threshold: ::std::time::Duration,
             /// Route path from `MatchedPath` for metrics labels.
             __autumn_route: ::std::option::Option<::std::string::String>,
+            #bcast_struct_field
         };
 
         let clone_impl = quote! {
@@ -1321,6 +1600,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         __autumn_statement_timeout_ms: self.__autumn_statement_timeout_ms,
                         __autumn_slow_threshold: self.__autumn_slow_threshold,
                         __autumn_route: self.__autumn_route.clone(),
+                        #bcast_clone_field
                     }
                 }
             }
@@ -1362,6 +1642,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     __autumn_statement_timeout_ms: __autumn_timeout_ms,
                     __autumn_slow_threshold,
                     __autumn_route,
+                    #bcast_field_some_state
                 })
             }
         } else {
@@ -1376,6 +1657,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     __autumn_statement_timeout_ms: __autumn_timeout_ms,
                     __autumn_slow_threshold,
                     __autumn_route,
+                    #bcast_field_some_state
                 })
             }
         };
@@ -1407,22 +1689,30 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 .as_deref()
                 .unwrap_or(&default_container);
             let model_prefix = to_snake_case(&config.model_name.to_string());
-            let model_name_str = config.model_name.to_string();
-            let table_name = &config.table_name;
 
-            let render_expr = if let Some(ref render_path) = config.broadcast_render {
-                quote! { #render_path(__record_ref) }
-            } else {
-                quote! {
-                    ::autumn_web::html! {
-                        li id=(::std::format!("{}-{}", #model_prefix, ::autumn_web::repository::ModelPrimaryKey::primary_key_value(__record_ref))) {
-                            a href=(::std::format!("/{}/{}", #table_name, ::autumn_web::repository::ModelPrimaryKey::primary_key_value(__record_ref))) {
-                                (::std::format!("{} #{}", #model_name_str, ::autumn_web::repository::ModelPrimaryKey::primary_key_value(__record_ref)))
-                            }
-                        }
-                    }
-                }
-            };
+            let (render_expr, create_swap_id, create_swap_strategy, update_id_expr, delete_id_expr) =
+                if let Some(ref render_path) = config.broadcast_render {
+                    let extract_id = quote! {
+                        ::autumn_web::htmx::extract_html_id(&{#render_path(__record_ref)}.into_string())
+                            .unwrap_or_else(|| ::std::format!("{}-{}", #model_prefix, ::autumn_web::repository::ModelPrimaryKey::primary_key_value(__record_ref)))
+                    };
+                    (
+                        quote! { #render_path(__record_ref) },
+                        quote! { #container_expr.to_string() },
+                        quote! { ::autumn_web::htmx::OobSwap::BeforeEnd },
+                        extract_id.clone(),
+                        extract_id,
+                    )
+                } else {
+                    let dom_id = quote! { <#model_name as ::autumn_web::live::LiveFragment>::dom_id(__record_ref) };
+                    (
+                        quote! { <#model_name as ::autumn_web::live::LiveFragment>::render_fragment(__record_ref) },
+                        quote! { #container_expr.to_string() },
+                        quote! { <#model_name as ::autumn_web::live::LiveFragment>::insert_swap() },
+                        dom_id.clone(),
+                        dom_id,
+                    )
+                };
 
             let create = quote! {
                 {
@@ -1430,9 +1720,11 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     if let ::core::option::Option::Some(__channels) = ::autumn_web::__private::get_global_channels() {
                         let __topic = #topic_expr;
                         let __fragment = #render_expr;
+                        let __create_id = #create_swap_id;
+                        let __create_swap = #create_swap_strategy;
                         if let ::core::result::Result::Err(__err) = __channels
                             .broadcast()
-                            .publish_oob(&__topic, #container_expr, &::autumn_web::htmx::OobSwap::BeforeEnd, &__fragment)
+                            .publish_oob(&__topic, &__create_id, &__create_swap, &__fragment)
                         {
                             ::autumn_web::reexports::tracing::warn!(error = %__err, "auto-broadcast failed");
                         }
@@ -1446,8 +1738,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     if let ::core::option::Option::Some(__channels) = ::autumn_web::__private::get_global_channels() {
                         let __topic = #topic_expr;
                         let __fragment = #render_expr;
-                        let __id = ::autumn_web::htmx::extract_html_id(&__fragment.clone().into_string())
-                            .unwrap_or_else(|| ::std::format!("{}-{}", #model_prefix, ::autumn_web::repository::ModelPrimaryKey::primary_key_value(__record_ref)));
+                        let __id = #update_id_expr;
 
                         let __prev_id = __ctx_val
                             .get("__autumn_previous_id")
@@ -1475,7 +1766,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         }
 
                         let (__target_id, __swap_strategy) = if __topic_changed {
-                            (#container_expr, ::autumn_web::htmx::OobSwap::BeforeEnd)
+                            (#container_expr, <#model_name as ::autumn_web::live::LiveFragment>::insert_swap())
                         } else {
                             let __strategy = if let ::core::option::Option::Some(__prev_id_val) = __prev_id {
                                 if __prev_id_val != &__id {
@@ -1507,43 +1798,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     let __record_ref = &__record;
                     if let ::core::option::Option::Some(__channels) = ::autumn_web::__private::get_global_channels() {
                         let __topic = #topic_expr;
-                        let __id = {
-                            let __fragment = #render_expr;
-                            let __html = __fragment.into_string();
-                            (|| -> ::core::option::Option<::std::string::String> {
-                                let __start_tag_end = __html.find('>')?;
-                                let __start_tag = &__html[..__start_tag_end];
-                                let mut __id_idx = ::core::option::Option::None;
-                                let mut __search_start = 0;
-                                while let ::core::option::Option::Some(__offset) = __start_tag[__search_start..].find("id=") {
-                                    let __absolute_idx = __search_start + __offset;
-                                    if __absolute_idx > 0 {
-                                        let __prev_char = __start_tag.as_bytes()[__absolute_idx - 1];
-                                        if __prev_char == b' ' || __prev_char == b'\t' || __prev_char == b'\n' || __prev_char == b'\r' {
-                                            __id_idx = ::core::option::Option::Some(__absolute_idx);
-                                            break;
-                                        }
-                                    }
-                                    __search_start = __absolute_idx + 3;
-                                }
-                                let __idx = __id_idx?;
-                                let __after_id = &__start_tag[__idx + 3..];
-                                let mut __chars = __after_id.chars();
-                                let __quote = __chars.next()?;
-                                if __quote == '"' || __quote == '\'' {
-                                    let mut __val = ::std::string::String::new();
-                                    for __c in __chars {
-                                        if __c == __quote {
-                                            break;
-                                        }
-                                        __val.push(__c);
-                                    }
-                                    ::core::option::Option::Some(__val)
-                                } else {
-                                    ::core::option::Option::None
-                                }
-                            })().unwrap_or_else(|| ::std::format!("{}-{}", #model_prefix, ::autumn_web::repository::ModelPrimaryKey::primary_key_value(__record_ref)))
-                        };
+                        let __id = #delete_id_expr;
                         let __fragment = ::autumn_web::html! {};
                         if let ::core::result::Result::Err(__err) = __channels
                             .broadcast()
@@ -1586,21 +1841,13 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 base_topic_expr
             };
 
-            let model_prefix = to_snake_case(&config.model_name.to_string());
-            let model_name_str = config.model_name.to_string();
-            let table_name = &config.table_name;
-            let render_expr = if let Some(ref render_path) = config.broadcast_render {
-                quote! { #render_path(__record_ref) }
+            let prev_id_expr = if let Some(ref render_path) = config.broadcast_render {
+                quote! { {
+                    let __prev_fragment = #render_path(__record_ref);
+                    ::autumn_web::htmx::extract_html_id(&__prev_fragment.into_string())
+                } }
             } else {
-                quote! {
-                    ::autumn_web::html! {
-                        li id=(::std::format!("{}-{}", #model_prefix, ::autumn_web::repository::ModelPrimaryKey::primary_key_value(__record_ref))) {
-                            a href=(::std::format!("/{}/{}", #table_name, ::autumn_web::repository::ModelPrimaryKey::primary_key_value(__record_ref))) {
-                                (::std::format!("{} #{}", #model_name_str, ::autumn_web::repository::ModelPrimaryKey::primary_key_value(__record_ref)))
-                            }
-                        }
-                    }
-                }
+                quote! { ::core::option::Option::Some(<#model_name as ::autumn_web::live::LiveFragment>::dom_id(__record_ref)) }
             };
 
             (
@@ -1608,8 +1855,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     let (__autumn_previous_topic, __autumn_previous_id) = if let ::core::option::Option::Some(__record_val) = &__vh_before {
                         let __record_ref = __record_val;
                         let __prev_topic = #topic_expr;
-                        let __prev_fragment = #render_expr;
-                        let __prev_id = ::autumn_web::htmx::extract_html_id(&__prev_fragment.into_string());
+                        let __prev_id = #prev_id_expr;
                         (::core::option::Option::Some(__prev_topic), __prev_id)
                     } else {
                         (::core::option::Option::None, ::core::option::Option::None)
@@ -1813,8 +2059,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     };
                     Self::__autumn_register_repository_commit_hooks();
                     let mut conn = self.__autumn_acquire_conn().await?;
-                    let (record, mut ctx, __autumn_commit_hook_id, __autumn_commit_hook_owner, __autumn_commit_hook_record) = conn
-                        .transaction::<(#model_name, MutationContext, ::std::string::String, ::std::string::String, ::autumn_web::reexports::serde_json::Value), ::autumn_web::AutumnError, _>(|conn| {
+                    let (record, mut ctx, __autumn_commit_hook_id, __autumn_commit_hook_owner, __autumn_commit_hook_record) = ::autumn_web::__private::scoped_transaction::<(#model_name, MutationContext, ::std::string::String, ::std::string::String, ::autumn_web::reexports::serde_json::Value), ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                             async move {
                                 let mut input = new.clone();
                                 let mut ctx = MutationContext::new(MutationOp::Create);
@@ -1950,8 +2195,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         ::core::option::Option::Some(t)
                     };
                     let mut conn = self.__autumn_acquire_conn().await?;
-                    let (record, mut ctx) = conn
-                        .transaction::<(#model_name, MutationContext), ::autumn_web::AutumnError, _>(|conn| {
+                    let (record, mut ctx) = ::autumn_web::__private::scoped_transaction::<(#model_name, MutationContext), ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                             async move {
                                 let mut input = new.clone();
                                 let mut ctx = MutationContext::new(MutationOp::Create);
@@ -1995,8 +2239,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                     Self::__autumn_register_repository_commit_hooks();
                     let mut conn = self.__autumn_acquire_conn().await?;
-                    let (record, mut ctx, __autumn_commit_hook_id, __autumn_commit_hook_owner, __autumn_commit_hook_record) = conn
-                        .transaction::<(#model_name, MutationContext, ::std::string::String, ::std::string::String, ::autumn_web::reexports::serde_json::Value), ::autumn_web::AutumnError, _>(|conn| {
+                    let (record, mut ctx, __autumn_commit_hook_id, __autumn_commit_hook_owner, __autumn_commit_hook_record) = ::autumn_web::__private::scoped_transaction::<(#model_name, MutationContext, ::std::string::String, ::std::string::String, ::autumn_web::reexports::serde_json::Value), ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                             async move {
                                 let mut input = new.clone();
                                 let mut ctx = MutationContext::new(MutationOp::Create);
@@ -2127,8 +2370,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     use ::autumn_web::hooks::{MutationContext, MutationOp, MutationHooks};
 
                     let mut conn = self.__autumn_acquire_conn().await?;
-                    let (record, mut ctx) = conn
-                        .transaction::<(#model_name, MutationContext), ::autumn_web::AutumnError, _>(|conn| {
+                    let (record, mut ctx) = ::autumn_web::__private::scoped_transaction::<(#model_name, MutationContext), ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                             async move {
                                 let mut input = new.clone();
                                 let mut ctx = MutationContext::new(MutationOp::Create);
@@ -2162,8 +2404,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     use ::autumn_web::hooks::{MutationContext, MutationOp, MutationHooks};
 
                     let mut conn = self.__autumn_acquire_conn().await?;
-                    let (record, mut ctx) = conn
-                        .transaction::<(#model_name, MutationContext), ::autumn_web::AutumnError, _>(|conn| {
+                    let (record, mut ctx) = ::autumn_web::__private::scoped_transaction::<(#model_name, MutationContext), ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                             async move {
                                 let mut input = new.clone();
                                 let mut ctx = MutationContext::new(MutationOp::Create);
@@ -2227,8 +2468,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                     Self::__autumn_register_repository_commit_hooks();
                     let mut conn = self.__autumn_acquire_conn().await?;
-                    let (record, mut ctx, __autumn_commit_hook_id, __autumn_commit_hook_owner, __autumn_commit_hook_record, __autumn_previous_topic, __autumn_previous_id) = conn
-                        .transaction::<(#model_name, MutationContext, ::std::string::String, ::std::string::String, ::autumn_web::reexports::serde_json::Value, ::core::option::Option<::std::string::String>, ::core::option::Option<::std::string::String>), ::autumn_web::AutumnError, _>(|conn| {
+                    let (record, mut ctx, __autumn_commit_hook_id, __autumn_commit_hook_owner, __autumn_commit_hook_record, __autumn_previous_topic, __autumn_previous_id) = ::autumn_web::__private::scoped_transaction::<(#model_name, MutationContext, ::std::string::String, ::std::string::String, ::autumn_web::reexports::serde_json::Value, ::core::option::Option<::std::string::String>, ::core::option::Option<::std::string::String>), ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                             async move {
                                 let mut ctx = MutationContext::new(MutationOp::Update);
                                 let mut __autumn_commit_hook_discriminator: ::core::option::Option<::std::string::String> =
@@ -2446,8 +2686,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     };
 
                     let mut conn = self.__autumn_acquire_conn().await?;
-                    let (record, mut ctx) = conn
-                        .transaction::<(#model_name, MutationContext), ::autumn_web::AutumnError, _>(|conn| {
+                    let (record, mut ctx) = ::autumn_web::__private::scoped_transaction::<(#model_name, MutationContext), ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                             async move {
                                 let mut ctx = MutationContext::new(MutationOp::Update);
                                 let (record, __vh_before): (#model_name, ::core::option::Option<#model_name>) = if let ::core::option::Option::Some(expected_version) =
@@ -2571,8 +2810,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                     Self::__autumn_register_repository_commit_hooks();
                     let mut conn = self.__autumn_acquire_conn().await?;
-                    let (record, mut ctx, __autumn_commit_hook_id, __autumn_commit_hook_owner, __autumn_commit_hook_record, __autumn_previous_topic, __autumn_previous_id) = conn
-                        .transaction::<(#model_name, MutationContext, ::std::string::String, ::std::string::String, ::autumn_web::reexports::serde_json::Value, ::core::option::Option<::std::string::String>, ::core::option::Option<::std::string::String>), ::autumn_web::AutumnError, _>(|conn| {
+                    let (record, mut ctx, __autumn_commit_hook_id, __autumn_commit_hook_owner, __autumn_commit_hook_record, __autumn_previous_topic, __autumn_previous_id) = ::autumn_web::__private::scoped_transaction::<(#model_name, MutationContext, ::std::string::String, ::std::string::String, ::autumn_web::reexports::serde_json::Value, ::core::option::Option<::std::string::String>, ::core::option::Option<::std::string::String>), ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                             async move {
                                 let mut ctx = MutationContext::new(MutationOp::Update);
                                 let mut __autumn_commit_hook_discriminator: ::core::option::Option<::std::string::String> =
@@ -2765,8 +3003,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     use ::autumn_web::repository::{AutumnLockVersionModelExt as _, AutumnLockVersionUpdateExt as _};
 
                     let mut conn = self.__autumn_acquire_conn().await?;
-                    let (record, mut ctx) = conn
-                        .transaction::<(#model_name, MutationContext), ::autumn_web::AutumnError, _>(|conn| {
+                    let (record, mut ctx) = ::autumn_web::__private::scoped_transaction::<(#model_name, MutationContext), ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                             async move {
                                 let mut ctx = MutationContext::new(MutationOp::Update);
                                 let (record, __vh_before): (#model_name, #model_name) = if let ::core::option::Option::Some(expected_version) =
@@ -2854,8 +3091,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     use ::autumn_web::repository::{AutumnLockVersionModelExt as _, AutumnLockVersionUpdateExt as _};
 
                     let mut conn = self.__autumn_acquire_conn().await?;
-                    let (record, mut ctx) = conn
-                        .transaction::<(#model_name, MutationContext), ::autumn_web::AutumnError, _>(|conn| {
+                    let (record, mut ctx) = ::autumn_web::__private::scoped_transaction::<(#model_name, MutationContext), ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                             async move {
                                 let mut ctx = MutationContext::new(MutationOp::Update);
                                 let record: #model_name = if let ::core::option::Option::Some(expected_version) =
@@ -3003,8 +3239,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     #tenant_id_setup
                     Self::__autumn_register_repository_commit_hooks();
                     let mut conn = self.__autumn_acquire_conn().await?;
-                    conn
-                        .transaction::<(), ::autumn_web::AutumnError, _>(|conn| {
+                    ::autumn_web::__private::scoped_transaction::<(), ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                             async move {
                                 let mut ctx = MutationContext::new(MutationOp::Delete);
                                 let mut __autumn_commit_hook_discriminator: ::core::option::Option<::std::string::String> =
@@ -3068,8 +3303,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                     #tenant_id_setup
                     let mut conn = self.__autumn_acquire_conn().await?;
-                    conn
-                        .transaction::<(), ::autumn_web::AutumnError, _>(|conn| {
+                    ::autumn_web::__private::scoped_transaction::<(), ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                             async move {
                                 let mut ctx = MutationContext::new(MutationOp::Delete);
 
@@ -3111,8 +3345,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                 Self::__autumn_register_repository_commit_hooks();
                 let mut conn = self.__autumn_acquire_conn().await?;
-                conn
-                    .transaction::<(), ::autumn_web::AutumnError, _>(|conn| {
+                ::autumn_web::__private::scoped_transaction::<(), ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                         async move {
                             let mut ctx = MutationContext::new(MutationOp::Delete);
                             let mut __autumn_commit_hook_discriminator: ::core::option::Option<::std::string::String> =
@@ -3178,8 +3411,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 use ::autumn_web::hooks::{MutationContext, MutationOp, MutationHooks};
 
                 let mut conn = self.__autumn_acquire_conn().await?;
-                conn
-                    .transaction::<(), ::autumn_web::AutumnError, _>(|conn| {
+                ::autumn_web::__private::scoped_transaction::<(), ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                         async move {
                             let mut ctx = MutationContext::new(MutationOp::Delete);
 
@@ -3215,8 +3447,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 use ::autumn_web::hooks::{MutationContext, MutationOp, MutationHooks};
 
                 let mut conn = self.__autumn_acquire_conn().await?;
-                conn
-                    .transaction::<(), ::autumn_web::AutumnError, _>(|conn| {
+                ::autumn_web::__private::scoped_transaction::<(), ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                         async move {
                             let mut ctx = MutationContext::new(MutationOp::Delete);
 
@@ -3341,7 +3572,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                     let mut conn = self.__autumn_acquire_conn().await?;
                     let contexts_ref = &contexts;
-                    let (inserted_records, hook_infos, global_indices) = conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| {
+                    let (inserted_records, hook_infos, global_indices) = ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                         async move {
                             let mut inserted_records = Vec::new();
                             let mut hook_infos = Vec::new();
@@ -3526,7 +3757,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     let mut conn = self.__autumn_acquire_conn().await?;
                     let contexts_ref = &contexts;
                     let inputs_ref = &inputs;
-                    let inserted_records = conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| {
+                    let inserted_records = ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                         async move {
                             let mut inserted = Vec::new();
                             let mut offset = 0;
@@ -3664,7 +3895,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     let chunk_size = if cols == 0 { 1000 } else { (65535usize / cols).min(1000).max(1) };
                     let mut offset = 0;
                     for chunk in valid_items.chunks(chunk_size) {
-                        let batch_res = conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| {
+                        let batch_res = ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                             async move {
                                 let chunk_inserted = (#insert_expr)
                                     .map_err(::autumn_web::AutumnError::from)?;
@@ -3813,7 +4044,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 }
 
                                 for item in chunk {
-                                    let row_res = conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| {
+                                    let row_res = ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                                         async move {
                                             let record = #row_insert_expr
                                                 .map_err(::autumn_web::AutumnError::from)?;
@@ -3932,7 +4163,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     let cols = (&valid_items[0].0).__autumn_column_count() + #tenant_extra;
                     let chunk_size = if cols == 0 { 1000 } else { (65535usize / cols).min(1000).max(1) };
                     for chunk in valid_items.chunks(chunk_size) {
-                        let batch_res = conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| {
+                        let batch_res = ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                             async move {
                                 (#insert_expr)
                                     .map_err(::autumn_web::AutumnError::from)
@@ -3995,7 +4226,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 }
 
                                 for item in chunk {
-                                    let row_res = conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| {
+                                    let row_res = ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                                         async move {
                                             #row_insert_expr
                                                 .map_err(::autumn_web::AutumnError::from)
@@ -4181,21 +4412,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         base_topic_expr
                     };
 
-                    let model_prefix = to_snake_case(&config.model_name.to_string());
-                    let model_name_str = config.model_name.to_string();
-                    let table_name = &config.table_name;
-                    let render_expr = if let Some(ref render_path) = config.broadcast_render {
-                        quote! { #render_path(__record_ref) }
+                    let prev_id_expr_bulk = if let Some(ref render_path) = config.broadcast_render {
+                        quote! { ::autumn_web::htmx::extract_html_id(&{#render_path(__record_ref)}.into_string()) }
                     } else {
-                        quote! {
-                            ::autumn_web::html! {
-                                li id=(::std::format!("{}-{}", #model_prefix, ::autumn_web::repository::ModelPrimaryKey::primary_key_value(__record_ref))) {
-                                    a href=(::std::format!("/{}/{}", #table_name, ::autumn_web::repository::ModelPrimaryKey::primary_key_value(__record_ref))) {
-                                        (::std::format!("{} #{}", #model_name_str, ::autumn_web::repository::ModelPrimaryKey::primary_key_value(__record_ref)))
-                                    }
-                                }
-                            }
-                        }
+                        quote! { ::core::option::Option::Some(<#model_name as ::autumn_web::live::LiveFragment>::dom_id(__record_ref)) }
                     };
 
                     quote! {
@@ -4225,8 +4445,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             let __prev_topic = #topic_expr;
                             chunk_previous_topics.push(::core::option::Option::Some(__prev_topic.clone()));
 
-                            let __prev_fragment = #render_expr;
-                            let __prev_id = ::autumn_web::htmx::extract_html_id(&__prev_fragment.into_string());
+                            let __prev_id = #prev_id_expr_bulk;
                             chunk_previous_ids.push(__prev_id.clone());
 
                             if let ::core::option::Option::Some(__prev_id_val) = __prev_id {
@@ -4469,7 +4688,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                 #tenant_id_setup
                 let mut conn = self.__autumn_acquire_conn().await?;
-                let (updated_records, contexts, hook_infos) = conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| {
+                let (updated_records, contexts, hook_infos) = ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                     async move {
                         let mut current_rows = Vec::new();
                         for chunk in ids.chunks(1000) {
@@ -4817,7 +5036,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let mut conn = self.__autumn_acquire_conn().await?;
                 let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
 
-                conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| {
+                ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                     async move {
                         let mut current_rows = Vec::new();
                         for chunk in ids.chunks(1000) {
@@ -4886,6 +5105,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             __autumn_slow_threshold: ::std::time::Duration,
             /// Route path from `MatchedPath` for metrics labels.
             __autumn_route: ::std::option::Option<::std::string::String>,
+            #bcast_struct_field
         };
 
         let clone_impl = quote! {
@@ -4899,6 +5119,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         __autumn_statement_timeout_ms: self.__autumn_statement_timeout_ms,
                         __autumn_slow_threshold: self.__autumn_slow_threshold,
                         __autumn_route: self.__autumn_route.clone(),
+                        #bcast_clone_field
                     }
                 }
             }
@@ -4933,6 +5154,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 __autumn_statement_timeout_ms: __autumn_timeout_ms,
                 __autumn_slow_threshold,
                 __autumn_route,
+                #bcast_field_some_state
             })
         };
 
@@ -4959,7 +5181,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     ::core::option::Option::Some(t)
                 };
                 let mut conn = self.__autumn_acquire_conn().await?;
-                conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| async move {
+                ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| async move {
                     let record = if let ::core::option::Option::Some(ref t) = tenant_id {
                         ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                             .values(::autumn_web::tenancy::TenantInsertable::tenant_values(new.clone(), t))
@@ -5018,7 +5240,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 use ::autumn_web::reexports::diesel_async::AsyncConnection;
                 use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
                 let mut conn = self.__autumn_acquire_conn().await?;
-                conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| async move {
+                ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| async move {
                     let record = ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                         .values(new.clone())
                         .get_result::<#model_name>(conn)
@@ -5066,7 +5288,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     ::core::option::Option::Some(t)
                 };
                 let mut conn = self.__autumn_acquire_conn().await?;
-                conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| {
+                ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                     async move {
                         let load_query = #table_ident::table.find(id);
                         let current = if let ::core::option::Option::Some(expected_version) =
@@ -5150,7 +5372,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     use ::autumn_web::reexports::diesel_async::AsyncConnection;
                     use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
 
-                    conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| {
+                    ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                         async move {
                             // SELECT FOR UPDATE grabs an exclusive row lock so
                             // no concurrent writer can commit between our
@@ -5242,7 +5464,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 use ::autumn_web::repository::{AutumnLockVersionModelExt as _, AutumnLockVersionUpdateExt as _};
                 let mut conn = self.__autumn_acquire_conn().await?;
 
-                conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| {
+                ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                     async move {
                         let load_query = #table_ident::table.find(id);
                         let current = if let ::core::option::Option::Some(expected_version) =
@@ -5303,7 +5525,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     use ::autumn_web::reexports::diesel_async::AsyncConnection;
                     use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
 
-                    conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| {
+                    ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                         async move {
                             let load_query = #table_ident::table.find(id);
                             let current = load_query.for_update().first::<#model_name>(conn).await
@@ -5378,7 +5600,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     #tenant_id_setup
                     let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
                     let mut conn = self.__autumn_acquire_conn().await?;
-                    conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| async move {
+                    ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| async move {
                         let load_query = #table_ident::table.find(id).filter(#table_ident::deleted_at.is_null());
                         let record = if let ::core::option::Option::Some(ref t) = tenant_id {
                             load_query.filter(#table_ident::tenant_id.eq(t)).for_update().first::<#model_name>(conn).await
@@ -5457,7 +5679,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
                     #tenant_id_setup
                     let mut conn = self.__autumn_acquire_conn().await?;
-                    conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| async move {
+                    ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| async move {
                         let load_query = #table_ident::table.find(id);
                         let record = if let ::core::option::Option::Some(ref t) = tenant_id {
                             load_query.filter(#table_ident::tenant_id.eq(t)).for_update().first::<#model_name>(conn).await
@@ -5533,7 +5755,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
                     let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
                     let mut conn = self.__autumn_acquire_conn().await?;
-                    conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| async move {
+                    ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| async move {
                         let record = #table_ident::table.find(id)
                             .filter(#table_ident::deleted_at.is_null())
                             .for_update()
@@ -5597,7 +5819,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 use ::autumn_web::reexports::diesel_async::AsyncConnection;
                 use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
                 let mut conn = self.__autumn_acquire_conn().await?;
-                conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| async move {
+                ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| async move {
                     let record = #table_ident::table.find(id)
                         .for_update()
                         .first::<#model_name>(conn)
@@ -5670,7 +5892,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let tenant_id = tenant_id.as_ref();
                 let mut conn = self.__autumn_acquire_conn().await?;
 
-                conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| {
+                ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                     async move {
                         let mut inserted = Vec::new();
                         let cols = (&new[0]).__autumn_column_count() + #tenant_extra;
@@ -5721,7 +5943,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let tenant_id = tenant_id.as_ref();
                 let mut conn = self.__autumn_acquire_conn().await?;
 
-                conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| {
+                ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                     async move {
                         let mut inserted = Vec::new();
                         let cols = (&new[0]).__autumn_column_count() + #tenant_extra;
@@ -5770,7 +5992,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 }
                 let mut conn = self.__autumn_acquire_conn().await?;
 
-                conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| {
+                ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                     async move {
                         let mut inserted = Vec::new();
                         let cols = (&new[0]).__autumn_column_count() + #tenant_extra;
@@ -5805,7 +6027,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 }
                 let mut conn = self.__autumn_acquire_conn().await?;
 
-                conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| {
+                ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                     async move {
                         let mut inserted = Vec::new();
                         let cols = (&new[0]).__autumn_column_count() + #tenant_extra;
@@ -5940,7 +6162,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let cols = (&new[0]).__autumn_column_count() + #tenant_extra;
                 let chunk_size = if cols == 0 { 1000 } else { (65535usize / cols).min(1000).max(1) };
                 for chunk in new.chunks(chunk_size) {
-                    let batch_res = conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| {
+                    let batch_res = ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                         async move {
                             let results = (#insert_expr_conn)
                                 .map_err(::autumn_web::AutumnError::from)?;
@@ -5980,7 +6202,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             // Fallback to row-by-row insertion for this chunk
                             for (idx, item) in chunk.iter().enumerate() {
                                 let global_idx = offset + idx;
-                                let res = conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| {
+                                let res = ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                                     async move {
                                         let model = (#row_insert_expr_conn)
                                             .map_err(::autumn_web::AutumnError::from)?;
@@ -6150,7 +6372,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let mut conn = self.__autumn_acquire_conn().await?;
 
                 if let ::core::option::Option::Some(expected_version) = changes.__autumn_lock_version_expected() {
-                    conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| {
+                    ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                         async move {
                             // Load existing to verify versions
                             let mut current_rows = Vec::new();
@@ -6191,7 +6413,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     })
                     .await
                 } else {
-                    conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| {
+                    ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                         async move {
                             #vh_load_before_map_no_lock
 
@@ -6429,7 +6651,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let mut conn = self.__autumn_acquire_conn().await?;
                 let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
 
-                conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| {
+                ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                     async move {
                         #vh_delete_load_before
                         #delete_loop
@@ -6640,7 +6862,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 #tenant_id_setup
                 let mut conn = self.__autumn_acquire_conn().await?;
 
-                conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| {
+                ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                     async move {
                         let mut upserted = Vec::new();
                         let cols = (&records[0]).__autumn_column_count() + #tenant_extra;
@@ -6758,6 +6980,614 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             delete_many_body,
         )
     };
+
+    // Compute inline broadcast tokens for broadcasts-only repos (no commit_hooks).
+    // These mirror the commit-hook broadcast tokens but use the result value from
+    // the wrapped async block (`__autumn_result` / `__autumn_record`) instead of
+    // the deserialized commit-hook payload.
+    let (
+        inline_broadcast_create,
+        inline_broadcast_update,
+        inline_broadcast_delete,
+        inline_update_prefetch,
+        inline_delete_prefetch,
+        inline_broadcast_update_many,
+        inline_delete_many_prefetch,
+        inline_broadcast_delete_many,
+    ) = if config.broadcasts && !commit_hooks_enabled {
+        let base_topic_expr_outer = match generate_topic_format(
+            config
+                .broadcast_topic
+                .as_deref()
+                .unwrap_or(&config.table_name),
+            &quote! { __record_ref },
+        ) {
+            Ok(expr) => expr,
+            Err(err) => {
+                let compile_err = err.to_compile_error();
+                return quote! { #compile_err };
+            }
+        };
+
+        let topic_expr_outer = if config.tenant_scoped {
+            quote! {
+                ::std::format!(
+                    "tenant:{}:{}",
+                    ::autumn_web::tenancy::DisplayTenantId::tenant_id_str(
+                        &__record_ref.tenant_id
+                    ),
+                    #base_topic_expr_outer
+                )
+            }
+        } else {
+            base_topic_expr_outer
+        };
+
+        let model_prefix_outer = to_snake_case(&config.model_name.to_string());
+        let default_container_outer = format!("{}-list", config.table_name);
+        let container_expr_outer = config
+            .broadcast_container
+            .as_deref()
+            .unwrap_or(&default_container_outer);
+
+        let (render_expr_outer, create_swap_id_outer, create_swap_outer, update_id_outer) =
+            if let Some(ref render_path) = config.broadcast_render {
+                let extract_id = quote! {
+                    ::autumn_web::htmx::extract_html_id(
+                        &{#render_path(__record_ref)}.into_string()
+                    )
+                    .unwrap_or_else(|| ::std::format!(
+                        "{}-{}",
+                        #model_prefix_outer,
+                        ::autumn_web::repository::ModelPrimaryKey::primary_key_value(
+                            __record_ref
+                        )
+                    ))
+                };
+                (
+                    quote! { #render_path(__record_ref) },
+                    quote! { #container_expr_outer.to_string() },
+                    quote! { ::autumn_web::htmx::OobSwap::BeforeEnd },
+                    extract_id,
+                )
+            } else {
+                (
+                    quote! {
+                        <#model_name as ::autumn_web::live::LiveFragment>::render_fragment(
+                            __record_ref
+                        )
+                    },
+                    quote! { #container_expr_outer.to_string() },
+                    quote! {
+                        <#model_name as ::autumn_web::live::LiveFragment>::insert_swap()
+                    },
+                    quote! {
+                        <#model_name as ::autumn_web::live::LiveFragment>::dom_id(__record_ref)
+                    },
+                )
+            };
+
+        // Determine whether a pre-fetch is needed before the delete/update body.
+        // Pre-fetch is required when:
+        //  - the topic is dynamic (contains a field placeholder like "{category}"),
+        //    because after deletion the record is gone and the topic cannot be
+        //    interpolated; and for updates we need the pre-mutation topic to detect
+        //    topic changes and publish a delete on the old channel.
+        //  - broadcast_render is configured, because the custom render fn must run
+        //    on the live record to extract the real DOM id for delete broadcasts.
+        //
+        // The simple case (static topic, no broadcast_render — what `--live`
+        // scaffolds) keeps the existing fast, zero-extra-query path.
+        let raw_topic_outer = config
+            .broadcast_topic
+            .as_deref()
+            .unwrap_or(&config.table_name);
+        let topic_is_dynamic_outer = raw_topic_outer.contains('{');
+        // Tenant-scoped repos also need a prefetch on delete: the topic includes the
+        // record's tenant_id (`"tenant:{id}:table"`), which is only available from the
+        // live row, so we must read it before the DELETE.
+        let delete_needs_prefetch =
+            topic_is_dynamic_outer || config.broadcast_render.is_some() || config.tenant_scoped;
+        // broadcast_render is included: when a custom render fn encodes a mutable field
+        // in the element id, the pre-mutation id may differ from the post-mutation id.
+        // Capturing __autumn_prev_id lets the update broadcast target the old element
+        // even after its id has changed (OobSwap::Target(OuterHTML, "#old-id")).
+        let update_needs_prefetch = topic_is_dynamic_outer || config.broadcast_render.is_some();
+
+        // Static fallbacks retained for the non-prefetch path and as the
+        // graceful-degradation fallback when the pre-fetch returns None.
+        let static_delete_topic_outer: String = {
+            if topic_is_dynamic_outer {
+                config.table_name.clone()
+            } else {
+                raw_topic_outer.to_owned()
+            }
+        };
+        // Always fall back to dom_id_for: it uses the user's defined id scheme
+        // (e.g. "live-pf-post-{id}" with dashes) rather than the snake_case
+        // model_prefix approximation ("live_pf_post-{id}") which would miss its target.
+        let inline_delete_id_outer =
+            quote! { <#model_name as ::autumn_web::live::LiveFragment>::dom_id_for(id) };
+
+        let ic = quote! {
+            if let ::core::result::Result::Ok(ref __autumn_record) = __autumn_result {
+                let __record_ref = __autumn_record;
+                if let ::core::option::Option::Some(__channels) =
+                    ::autumn_web::__private::get_global_channels()
+                {
+                    let __topic = #topic_expr_outer;
+                    let __fragment = #render_expr_outer;
+                    let __create_id = #create_swap_id_outer;
+                    let __create_swap = #create_swap_outer;
+                    if let ::core::result::Result::Err(__err) = __channels
+                        .broadcast()
+                        .publish_oob(&__topic, &__create_id, &__create_swap, &__fragment)
+                    {
+                        ::autumn_web::reexports::tracing::warn!(
+                            error = %__err,
+                            "auto-broadcast create failed"
+                        );
+                    }
+                }
+            }
+        };
+
+        // ── Update broadcast ─────────────────────────────────────────────
+        // When the topic is dynamic, a pre-fetch captures the pre-mutation topic
+        // (via `inline_update_prefetch` below) so we can detect topic changes and
+        // publish a delete on the old channel before inserting on the new one —
+        // mirroring the commit-hook `__autumn_previous_topic` logic.
+        let inline_update_prefetch = if update_needs_prefetch {
+            quote! {
+                let (__autumn_prev_topic, __autumn_prev_id):
+                    (::core::option::Option<::std::string::String>,
+                     ::core::option::Option<::std::string::String>) =
+                    match self.find_by_id(id).await {
+                        ::core::result::Result::Ok(
+                            ::core::option::Option::Some(ref __record_ref),
+                        ) => (
+                            ::core::option::Option::Some(#topic_expr_outer),
+                            ::core::option::Option::Some(#update_id_outer),
+                        ),
+                        ::core::result::Result::Ok(::core::option::Option::None) => {
+                            (::core::option::Option::None, ::core::option::Option::None)
+                        }
+                        ::core::result::Result::Err(ref __pf_err) => {
+                            ::autumn_web::reexports::tracing::warn!(
+                                error = %__pf_err,
+                                "auto-broadcast update pre-fetch failed; \
+                                 topic-change detection skipped"
+                            );
+                            (::core::option::Option::None, ::core::option::Option::None)
+                        }
+                    };
+            }
+        } else {
+            quote! {}
+        };
+
+        let iu = if update_needs_prefetch {
+            quote! {
+                if let ::core::result::Result::Ok(ref __autumn_record) = __autumn_result {
+                    let __record_ref = __autumn_record;
+                    if let ::core::option::Option::Some(__channels) =
+                        ::autumn_web::__private::get_global_channels()
+                    {
+                        let __topic = #topic_expr_outer;
+                        let __fragment = #render_expr_outer;
+                        let __id = #update_id_outer;
+
+                        let __topic_changed = __autumn_prev_topic
+                            .as_deref()
+                            .map_or(false, |__prev| __prev != __topic);
+
+                        if __topic_changed {
+                            if let ::core::option::Option::Some(ref __prev_topic) =
+                                __autumn_prev_topic
+                            {
+                                let __delete_id =
+                                    __autumn_prev_id.as_deref().unwrap_or(&__id);
+                                let __delete_fragment = ::autumn_web::html! {};
+                                if let ::core::result::Result::Err(__err) = __channels
+                                    .broadcast()
+                                    .publish_oob(
+                                        __prev_topic,
+                                        __delete_id,
+                                        &::autumn_web::htmx::OobSwap::Delete,
+                                        &__delete_fragment,
+                                    )
+                                {
+                                    ::autumn_web::reexports::tracing::warn!(
+                                        error = %__err,
+                                        "auto-broadcast delete of old topic failed"
+                                    );
+                                }
+                            }
+                        }
+
+                        let (__target_id, __swap_strategy): (
+                            ::std::string::String,
+                            ::autumn_web::htmx::OobSwap,
+                        ) = if __topic_changed {
+                            (
+                                #container_expr_outer.to_string(),
+                                <#model_name as ::autumn_web::live::LiveFragment>::insert_swap(),
+                            )
+                        } else {
+                            let __strategy = if let ::core::option::Option::Some(
+                                ref __prev_id_val,
+                            ) = __autumn_prev_id
+                            {
+                                if __prev_id_val != &__id {
+                                    ::autumn_web::htmx::OobSwap::Target(
+                                        ::autumn_web::htmx::OobMethod::OuterHTML,
+                                        ::std::format!("#{}", __prev_id_val),
+                                    )
+                                } else {
+                                    ::autumn_web::htmx::OobSwap::OuterHTML
+                                }
+                            } else {
+                                ::autumn_web::htmx::OobSwap::OuterHTML
+                            };
+                            (__id.clone(), __strategy)
+                        };
+
+                        if let ::core::result::Result::Err(__err) = __channels
+                            .broadcast()
+                            .publish_oob(
+                                &__topic,
+                                &__target_id,
+                                &__swap_strategy,
+                                &__fragment,
+                            )
+                        {
+                            ::autumn_web::reexports::tracing::warn!(
+                                error = %__err,
+                                "auto-broadcast update failed"
+                            );
+                        }
+                    }
+                }
+            }
+        } else {
+            quote! {
+                if let ::core::result::Result::Ok(ref __autumn_record) = __autumn_result {
+                    let __record_ref = __autumn_record;
+                    if let ::core::option::Option::Some(__channels) =
+                        ::autumn_web::__private::get_global_channels()
+                    {
+                        let __topic = #topic_expr_outer;
+                        let __fragment = #render_expr_outer;
+                        let __id = #update_id_outer;
+                        if let ::core::result::Result::Err(__err) = __channels
+                            .broadcast()
+                            .publish_oob(
+                                &__topic,
+                                &__id,
+                                &::autumn_web::htmx::OobSwap::OuterHTML,
+                                &__fragment,
+                            )
+                        {
+                            ::autumn_web::reexports::tracing::warn!(
+                                error = %__err,
+                                "auto-broadcast update failed"
+                            );
+                        }
+                    }
+                }
+            }
+        };
+
+        // ── Delete broadcast ─────────────────────────────────────────────
+        // When the topic is dynamic or broadcast_render is set, a pre-fetch loads
+        // the record before the DELETE so that the correct topic and DOM id are
+        // available even after the row is gone.  The `inline_delete_prefetch` token
+        // stream (below) populates `__autumn_prefetched` before the body runs.
+        let inline_delete_prefetch = if delete_needs_prefetch {
+            quote! {
+                let __autumn_prefetched: ::core::option::Option<#model_name> =
+                    match self.find_by_id(id).await {
+                        ::core::result::Result::Ok(v) => v,
+                        ::core::result::Result::Err(ref __pf_err) => {
+                            ::autumn_web::reexports::tracing::warn!(
+                                error = %__pf_err,
+                                "auto-broadcast delete pre-fetch failed; \
+                                 static-topic fallback used"
+                            );
+                            ::core::option::Option::None
+                        }
+                    };
+            }
+        } else {
+            quote! {}
+        };
+
+        let id_ = if delete_needs_prefetch {
+            quote! {
+                if let ::core::result::Result::Ok(()) = __autumn_result {
+                    if let ::core::option::Option::Some(__channels) =
+                        ::autumn_web::__private::get_global_channels()
+                    {
+                        let (__del_topic, __del_id): (
+                            ::std::string::String,
+                            ::std::string::String,
+                        ) = if let ::core::option::Option::Some(ref __record_ref) =
+                            __autumn_prefetched
+                        {
+                            (#topic_expr_outer, #update_id_outer)
+                        } else {
+                            (
+                                #static_delete_topic_outer.to_string(),
+                                #inline_delete_id_outer,
+                            )
+                        };
+                        let __fragment = ::autumn_web::html! {};
+                        if let ::core::result::Result::Err(__err) = __channels
+                            .broadcast()
+                            .publish_oob(
+                                &__del_topic,
+                                &__del_id,
+                                &::autumn_web::htmx::OobSwap::Delete,
+                                &__fragment,
+                            )
+                        {
+                            ::autumn_web::reexports::tracing::warn!(
+                                error = %__err,
+                                "auto-broadcast delete failed"
+                            );
+                        }
+                    }
+                }
+            }
+        } else {
+            quote! {
+                if let ::core::result::Result::Ok(()) = __autumn_result {
+                    if let ::core::option::Option::Some(__channels) =
+                        ::autumn_web::__private::get_global_channels()
+                    {
+                        let __del_id = #inline_delete_id_outer;
+                        let __fragment = ::autumn_web::html! {};
+                        if let ::core::result::Result::Err(__err) = __channels
+                            .broadcast()
+                            .publish_oob(
+                                #static_delete_topic_outer,
+                                &__del_id,
+                                &::autumn_web::htmx::OobSwap::Delete,
+                                &__fragment,
+                            )
+                        {
+                            ::autumn_web::reexports::tracing::warn!(
+                                error = %__err,
+                                "auto-broadcast delete failed"
+                            );
+                        }
+                    }
+                }
+            }
+        };
+        // ── update_many broadcast ─────────────────────────────────────────
+        // Only broadcast OuterHTML for the simplest case: static topic + default render.
+        // Skipped when update_needs_prefetch (dynamic topic OR custom render) because:
+        // - dynamic topic: OuterHTML sent to the post-update topic leaves old-topic
+        //   subscribers with stale elements and new-topic clients with a failed swap.
+        // - custom render: the rendered element id may encode a mutable field; clients
+        //   hold the element under the pre-update id, so a swap keyed by the post-update
+        //   id misses its target.
+        // Both cases require N pre-fetches to handle correctly; use commit_hooks = true.
+        let ium = if update_needs_prefetch {
+            quote! {}
+        } else {
+            quote! {
+                if let ::core::result::Result::Ok(ref __autumn_result_vec) = __autumn_result {
+                    if let ::core::option::Option::Some(__channels) =
+                        ::autumn_web::__private::get_global_channels()
+                    {
+                        for __autumn_record in __autumn_result_vec {
+                            let __record_ref = __autumn_record;
+                            let __topic = #topic_expr_outer;
+                            let __fragment = #render_expr_outer;
+                            let __id = #update_id_outer;
+                            if let ::core::result::Result::Err(__err) = __channels
+                                .broadcast()
+                                .publish_oob(
+                                    &__topic,
+                                    &__id,
+                                    &::autumn_web::htmx::OobSwap::OuterHTML,
+                                    &__fragment,
+                                )
+                            {
+                                ::autumn_web::reexports::tracing::warn!(
+                                    error = %__err,
+                                    "auto-broadcast update_many failed"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }; // end if topic_is_dynamic_outer else branch
+
+        // ── delete_many broadcast ─────────────────────────────────────────
+        // When the topic is dynamic or broadcast_render is set, each record is
+        // pre-fetched (via find_by_id) before the bulk DELETE so the correct
+        // topic and DOM id are available after the rows are gone.
+        // NOTE: this is N sequential queries for N ids.  Use commit_hooks = true
+        // for better performance on large bulk deletes with dynamic topics.
+        let inline_delete_many_prefetch = if delete_needs_prefetch {
+            quote! {
+                let __autumn_dm_pf: ::std::vec::Vec<(
+                    ::std::string::String,
+                    ::std::string::String,
+                )> = {
+                    let mut __pf_results = ::std::vec::Vec::new();
+                    if ::autumn_web::__private::get_global_channels().is_some() {
+                        for &id in ids {
+                            match self.find_by_id(id).await {
+                                ::core::result::Result::Ok(
+                                    ::core::option::Option::Some(ref __record_ref),
+                                ) => {
+                                    __pf_results.push((#topic_expr_outer, #update_id_outer));
+                                }
+                                ::core::result::Result::Ok(
+                                    ::core::option::Option::None,
+                                ) => {}
+                                ::core::result::Result::Err(ref __pf_err) => {
+                                    ::autumn_web::reexports::tracing::warn!(
+                                        error = %__pf_err,
+                                        id,
+                                        "auto-broadcast delete_many pre-fetch failed for id; \
+                                         static-topic fallback used"
+                                    );
+                                    __pf_results.push((
+                                        #static_delete_topic_outer.to_string(),
+                                        <#model_name as ::autumn_web::live::LiveFragment>
+                                            ::dom_id_for(id),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    __pf_results
+                };
+            }
+        } else {
+            quote! {}
+        };
+
+        let idm = if delete_needs_prefetch {
+            quote! {
+                if let ::core::result::Result::Ok(()) = __autumn_result {
+                    if let ::core::option::Option::Some(__channels) =
+                        ::autumn_web::__private::get_global_channels()
+                    {
+                        let __fragment = ::autumn_web::html! {};
+                        for (__del_topic, __del_id) in &__autumn_dm_pf {
+                            if let ::core::result::Result::Err(__err) = __channels
+                                .broadcast()
+                                .publish_oob(
+                                    __del_topic,
+                                    __del_id,
+                                    &::autumn_web::htmx::OobSwap::Delete,
+                                    &__fragment,
+                                )
+                            {
+                                ::autumn_web::reexports::tracing::warn!(
+                                    error = %__err,
+                                    "auto-broadcast delete_many failed"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            quote! {
+                if let ::core::result::Result::Ok(()) = __autumn_result {
+                    if let ::core::option::Option::Some(__channels) =
+                        ::autumn_web::__private::get_global_channels()
+                    {
+                        let __fragment = ::autumn_web::html! {};
+                        for &id in ids {
+                            let __del_id = <#model_name as ::autumn_web::live::LiveFragment>
+                                ::dom_id_for(id);
+                            if let ::core::result::Result::Err(__err) = __channels
+                                .broadcast()
+                                .publish_oob(
+                                    #static_delete_topic_outer,
+                                    &__del_id,
+                                    &::autumn_web::htmx::OobSwap::Delete,
+                                    &__fragment,
+                                )
+                            {
+                                ::autumn_web::reexports::tracing::warn!(
+                                    error = %__err,
+                                    "auto-broadcast delete_many failed"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        };
+
+        (
+            ic,
+            iu,
+            id_,
+            inline_update_prefetch,
+            inline_delete_prefetch,
+            ium,
+            inline_delete_many_prefetch,
+            idm,
+        )
+    } else {
+        (
+            quote! {},
+            quote! {},
+            quote! {},
+            quote! {},
+            quote! {},
+            quote! {},
+            quote! {},
+            quote! {},
+        )
+    };
+
+    // For repos that declare `broadcasts = true` but have no commit_hooks, wire
+    // inline broadcasts directly into the save / update / delete method bodies.
+    // The commit-hook path already includes the broadcasts in the durable worker;
+    // this path fires them synchronously after each mutation instead.
+    //
+    // When the topic is dynamic or broadcast_render is set, a pre-fetch step runs
+    // before the mutation body so that topic interpolation and DOM-id extraction can
+    // operate on the live record (delete) or detect topic changes (update).
+    let (save_body, update_body, delete_body, update_many_body, delete_many_body) =
+        if config.broadcasts && !commit_hooks_enabled {
+            (
+                quote! {
+                    let __autumn_result: ::autumn_web::AutumnResult<#model_name> =
+                        async { #save_body }.await;
+                    #inline_broadcast_create
+                    __autumn_result
+                },
+                quote! {
+                    #inline_update_prefetch
+                    let __autumn_result: ::autumn_web::AutumnResult<#model_name> =
+                        async { #update_body }.await;
+                    #inline_broadcast_update
+                    __autumn_result
+                },
+                quote! {
+                    #inline_delete_prefetch
+                    let __autumn_result: ::autumn_web::AutumnResult<()> =
+                        async { #delete_body }.await;
+                    #inline_broadcast_delete
+                    __autumn_result
+                },
+                quote! {
+                    let __autumn_result: ::autumn_web::AutumnResult<
+                        ::std::vec::Vec<#model_name>,
+                    > = async { #update_many_body }.await;
+                    #inline_broadcast_update_many
+                    __autumn_result
+                },
+                quote! {
+                    #inline_delete_many_prefetch
+                    let __autumn_result: ::autumn_web::AutumnResult<()> =
+                        async { #delete_many_body }.await;
+                    #inline_broadcast_delete_many
+                    __autumn_result
+                },
+            )
+        } else {
+            (
+                save_body,
+                update_body,
+                delete_body,
+                update_many_body,
+                delete_many_body,
+            )
+        };
 
     let route_hook_registration = if commit_hooks_enabled {
         quote! { #pg_name::__autumn_register_repository_commit_hooks(); }
@@ -7050,6 +7880,582 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         (quote! {}, quote! {})
     };
 
+    // ── Batched iteration (find_in_batches / find_each), issue #1395 ─────────
+    //
+    // Generated for EVERY repository (not gated on cursor_key): a primary-key
+    // ascending keyset walk that streams the whole table in bounded-memory
+    // chunks. Each batch is `WHERE id > last ORDER BY id ASC LIMIT batch_size`
+    // (no id predicate on the first batch), reusing the same soft-delete
+    // filter, tenant scoping and read-routing as `find_all`/`cursor_page`, so
+    // those semantics come for free.
+    //
+    // The generic driver + handle types live in `autumn_web::batches`; the
+    // macro only emits a thin per-repo `BatchSource` impl (the keyset query)
+    // plus two inherent constructors. Sharded repos mirror `cursor_page`:
+    // cross-shard `across_tenants` iteration is rejected (shard fan-out is out
+    // of scope per #1395); a single routed shard iterates normally.
+    let batch_cross_shard_guard = if config.sharded && config.tenant_scoped {
+        quote! {
+            if self.across_tenants {
+                if self.__autumn_shards.is_some() {
+                    return ::core::result::Result::Err(
+                        ::autumn_web::AutumnError::bad_request_msg(
+                            "cross-shard batched iteration is not supported: \
+                             across_tenants() cannot fan find_in_batches/\
+                             find_each out across shards; iterate each shard \
+                             separately via from_shard(...) instead"
+                        )
+                    );
+                }
+            }
+        }
+    } else {
+        quote! {}
+    };
+
+    let batch_source_impl = quote! {
+        impl ::autumn_web::batches::BatchSource for #pg_name {
+            type Model = #model_name;
+
+            async fn fetch_batch_after(
+                &self,
+                after_id: ::core::option::Option<i64>,
+                limit: i64,
+            ) -> ::autumn_web::AutumnResult<::std::vec::Vec<#model_name>> {
+                #batch_cross_shard_guard
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                let mut conn = self.__autumn_acquire_read_conn().await?;
+                let mut query = #table_ident::table.into_boxed();
+                #tenant_query_filter
+                if let ::core::option::Option::Some(after) = after_id {
+                    query = query.filter(#table_ident::id.gt(after));
+                }
+                // Apply soft-delete filter when enabled.
+                #[allow(unused_mut)]
+                let mut query = query #sd_filter;
+                query
+                    .order(#table_ident::id.asc())
+                    .limit(limit)
+                    .select(#model_name::as_select())
+                    .load::<#model_name>(&mut conn)
+                    .await
+                    .map_err(::autumn_web::AutumnError::from)
+            }
+
+            fn batch_key(model: &#model_name) -> i64 {
+                model.id
+            }
+        }
+    };
+
+    let find_in_batches_methods = quote! {
+        /// Iterate the whole table in bounded-memory chunks of at most
+        /// `batch_size` rows, using a primary-key keyset cursor (not
+        /// `LIMIT`/`OFFSET`), so deep iteration stays flat and is stable under
+        /// concurrent inserts of rows ordered after the current position.
+        ///
+        /// Soft-delete filtering, tenant scoping and read routing match
+        /// `find_all`. Drive the returned handle with `next_batch()` in a
+        /// `while let` loop; drop each chunk before requesting the next to hold
+        /// at most `batch_size` models at a time.
+        ///
+        /// Iteration ends at the first short batch; rows inserted after that
+        /// point require a new iteration. Errors are retryable: the cursor
+        /// only advances on success, so calling `next_batch()` again after an
+        /// `Err` retries the same batch (`Ok(None)` always means completion).
+        /// A `batch_size` of `0` yields an error on every `next_batch()`.
+        ///
+        /// ```rust,ignore
+        /// let mut batches = repo.find_in_batches(1_000);
+        /// while let Some(chunk) = batches.next_batch().await? {
+        ///     repo.upsert_many(&recompute(chunk)).await?;
+        /// }
+        /// ```
+        ///
+        /// (`upsert_many` is not generated on repositories with hooks
+        /// configured; use per-row `update` there.)
+        #[must_use]
+        pub fn find_in_batches(
+            &self,
+            batch_size: usize,
+        ) -> ::autumn_web::batches::FindInBatches<'_, Self> {
+            ::autumn_web::batches::FindInBatches::new(self, batch_size)
+        }
+
+        /// Iterate the whole table one model at a time while still fetching in
+        /// bounded `batch_size` chunks — a convenience over
+        /// [`find_in_batches`](Self::find_in_batches).
+        ///
+        /// ```rust,ignore
+        /// let mut each = repo.find_each(500);
+        /// while let Some(row) = each.next().await? {
+        ///     repo.update(row.id, &patch).await?;
+        /// }
+        /// ```
+        #[must_use]
+        pub fn find_each(
+            &self,
+            batch_size: usize,
+        ) -> ::autumn_web::batches::FindEach<'_, Self> {
+            ::autumn_web::batches::FindEach::new(self, batch_size)
+        }
+    };
+
+    // ── Race-safe get-or-insert (find_or_create_by_*, issue #1382) ──────────
+    //
+    // Emitted as inherent async methods on the Pg* struct (parallel to
+    // find_in_batches) — they return `(Model, bool)` and take an extra `new`
+    // insert value, so they don't fit the trait finder surface. Recipe:
+    //   1. Preliminary lookup on the READ path (replica-eligible), honoring
+    //      tenant scoping + soft-delete. Found → `(row, false)`, no hooks.
+    //   2. Else INSERT on the PRIMARY with `ON CONFLICT DO NOTHING`, which
+    //      avoids the Postgres 23505 transaction abort entirely — no
+    //      unique-violation error ever escapes to a caller.
+    //        - Some(row) → a real insert happened → `(row, true)`; the same
+    //          before_create / after_create / commit-hook weaving as `save`
+    //          runs (only on this created path).
+    //        - None → a concurrent caller won the race → re-lookup on the
+    //          PRIMARY (read-your-writes) → `(row, false)`, no hooks.
+    // Unlike `upsert_many`, this is generated even on hooked repositories.
+    let foc_sd_boxed = if config.soft_delete {
+        quote! { query = query.filter(#table_ident::deleted_at.is_null()); }
+    } else {
+        quote! {}
+    };
+    let foc_tenant_id_let = if config.tenant_scoped {
+        quote! {
+            let tenant_id = if self.across_tenants {
+                ::autumn_web::tenancy::CURRENT_TENANT.try_with(|t| t.clone()).ok().flatten()
+            } else {
+                let t = ::autumn_web::tenancy::CURRENT_TENANT.try_with(|t| t.clone()).ok().flatten()
+                    .ok_or_else(|| ::autumn_web::AutumnError::internal_server_error_msg(
+                        "Query scoped to tenant, but no tenant context was established"
+                    ))?;
+                ::core::option::Option::Some(t)
+            };
+        }
+    } else {
+        quote! {}
+    };
+    // The `ON CONFLICT DO NOTHING` insert, returning `Option<Model>` (None on a
+    // conflict). `#values` is the insert value binding, `#conn` a `&mut`/owned
+    // connection expression matching the diesel-async surface at the call site.
+    let foc_insert_opt = |values: &TokenStream, conn: &TokenStream| -> TokenStream {
+        if config.tenant_scoped {
+            quote! {
+                if let ::core::option::Option::Some(ref __t) = tenant_id {
+                    ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                        .values(::autumn_web::tenancy::TenantInsertable::tenant_values(#values.clone(), __t))
+                        .on_conflict_do_nothing()
+                        .get_result::<#model_name>(#conn)
+                        .await
+                } else {
+                    ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                        .values(#values.clone())
+                        .on_conflict_do_nothing()
+                        .get_result::<#model_name>(#conn)
+                        .await
+                }
+                .optional()
+                .map_err(::autumn_web::AutumnError::from)?
+            }
+        } else {
+            quote! {
+                ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                    .values(#values.clone())
+                    .on_conflict_do_nothing()
+                    .get_result::<#model_name>(#conn)
+                    .await
+                    .optional()
+                    .map_err(::autumn_web::AutumnError::from)?
+            }
+        }
+    };
+    // Version-history INSERT snippets (empty unless `versioned`). `__record` is
+    // the freshly-inserted row; `conn` is the in-transaction connection.
+    let foc_vh_ctx = if config.versioned {
+        vh_insert_ts(
+            table_name,
+            "insert",
+            true,
+            &quote! { __record },
+            None,
+            &quote! { conn },
+            model_name,
+        )
+    } else {
+        quote! {}
+    };
+    let foc_vh_noctx = if config.versioned {
+        vh_insert_ts(
+            table_name,
+            "insert",
+            false,
+            &quote! { __record },
+            None,
+            &quote! { conn },
+            model_name,
+        )
+    } else {
+        quote! {}
+    };
+    // Post-commit hook machinery for the commit_hooks path (mirrors `save`):
+    // fires after_create, then finalizes the durable commit-hook row. Only
+    // reached on the created path. Ends by returning `(record, true)`.
+    let foc_commit_after_machinery = quote! {
+        let __autumn_pending_heartbeat =
+            ::autumn_web::__private::start_repository_commit_hook_pending_finalizer_heartbeat(
+                self.pool.clone(),
+                __autumn_commit_hook_id.clone(),
+                __autumn_commit_hook_owner.clone(),
+            );
+        let __autumn_after_create = ::autumn_web::__private::catch_repository_after_hook_unwind(
+            self.hooks.after_create(&mut ctx, &record)
+        )
+        .await;
+        match __autumn_after_create {
+            ::core::result::Result::Ok(::core::result::Result::Ok(())) => {}
+            ::core::result::Result::Ok(::core::result::Result::Err(__autumn_error)) => {
+                let __autumn_error_message = ::std::format!("{__autumn_error}");
+                ::autumn_web::__private::mark_repository_commit_hook_after_hook_failed(
+                    &self.pool,
+                    &__autumn_commit_hook_id,
+                    &__autumn_commit_hook_owner,
+                    __autumn_error_message,
+                )
+                .await;
+                __autumn_pending_heartbeat.cancel();
+                return ::core::result::Result::Err(
+                    ::autumn_web::idempotency::__cache_committed_error_response(__autumn_error)
+                );
+            }
+            ::core::result::Result::Err(__autumn_panic) => {
+                ::autumn_web::__private::mark_repository_commit_hook_after_hook_failed(
+                    &self.pool,
+                    &__autumn_commit_hook_id,
+                    &__autumn_commit_hook_owner,
+                    "after_create panicked",
+                )
+                .await;
+                __autumn_pending_heartbeat.cancel();
+                if self.idempotency.is_some() {
+                    return ::core::result::Result::Err(
+                        ::autumn_web::idempotency::__cache_committed_error_response(
+                            ::autumn_web::AutumnError::internal_server_error_msg("after_create panicked")
+                        )
+                    );
+                }
+                ::std::panic::resume_unwind(__autumn_panic);
+            }
+        }
+        let __autumn_finalize_result = ::autumn_web::__private::finalize_repository_commit_hook_after_hook(
+            &self.pool,
+            &__autumn_commit_hook_id,
+            &__autumn_commit_hook_owner,
+            &ctx,
+            &__autumn_commit_hook_record,
+        )
+        .await;
+        __autumn_pending_heartbeat.cancel();
+        match __autumn_finalize_result {
+            ::core::result::Result::Ok(()) => {
+                ::autumn_web::__private::kick_repository_commit_hook_dispatcher(&self.pool);
+            }
+            ::core::result::Result::Err(__autumn_error) => {
+                ::autumn_web::reexports::tracing::warn!(
+                    hook_id = %__autumn_commit_hook_id,
+                    error = %__autumn_error,
+                    "failed to finalize repository create commit hook after mutation commit; failing request closed"
+                );
+                return ::core::result::Result::Err(
+                    ::autumn_web::idempotency::__cache_committed_error_response(__autumn_error)
+                );
+            }
+        }
+        ::core::result::Result::Ok((record, true))
+    };
+
+    let find_or_create_by_methods = {
+        let mut __methods: Vec<TokenStream> = Vec::new();
+        for spec in &find_or_create_specs {
+            let fn_ident = &spec.fn_ident;
+            if let Some(msg) = &spec.error {
+                __methods.push(quote! { ::core::compile_error!(#msg); });
+                continue;
+            }
+
+            let sig_params: Vec<TokenStream> = spec
+                .lookup_params
+                .iter()
+                .map(|(name, ty)| quote! { #name: #ty })
+                .collect();
+
+            // Encrypted-column encoding (string fields) + boxed-query filters,
+            // matching the `find_by` derived-query surface (#805).
+            let table_name_str = table_ident.to_string();
+            let mut encode_lets: Vec<TokenStream> = Vec::new();
+            let mut filter_assigns: Vec<TokenStream> = Vec::new();
+            for (name, _ty) in &spec.lookup_params {
+                let fname = name.to_string();
+                if spec.string_fields.contains(&fname) {
+                    let enc_ident = format_ident!("__autumn_foc_{name}");
+                    encode_lets.push(quote! {
+                        let #enc_ident = ::autumn_web::encryption::encode_derived_query_param(
+                            #table_name_str, #fname, &#name,
+                        )
+                        .map_err(|__e| ::autumn_web::AutumnError::internal_server_error_msg(
+                            __e.to_string(),
+                        ))?;
+                    });
+                    filter_assigns.push(quote! {
+                        query = query.filter(#table_ident::#name.eq(&#enc_ident));
+                    });
+                } else {
+                    filter_assigns.push(quote! {
+                        query = query.filter(#table_ident::#name.eq(&#name));
+                    });
+                }
+            }
+
+            // A boxed lookup honoring tenant scoping, the eq-filters and
+            // soft-delete, returning `Option<Model>`. `#conn` is a `&mut` conn.
+            let make_lookup = |conn: TokenStream| -> TokenStream {
+                let filter_assigns = &filter_assigns;
+                quote! {
+                    {
+                        let mut query = #table_ident::table.into_boxed();
+                        #tenant_query_filter
+                        #(#filter_assigns)*
+                        #foc_sd_boxed
+                        query
+                            .select(#model_name::as_select())
+                            .first::<#model_name>(#conn)
+                            .await
+                            .optional()
+                            .map_err(::autumn_web::AutumnError::from)?
+                    }
+                }
+            };
+
+            let step1_lookup = make_lookup(quote! { &mut __rconn });
+            let relookup = make_lookup(quote! { &mut conn });
+            let none_branch_msg = if config.soft_delete {
+                "find_or_create_by: the insert hit a unique conflict but no matching \
+                 row was found on re-lookup. Two causes are possible: (1) the lookup \
+                 columns are not the ones backed by the unique constraint that fired \
+                 — find_or_create_by is only race-safe when its lookup columns match \
+                 a unique constraint; or (2) this is a soft_delete repository and the \
+                 unique index is a plain (non-partial) index, so a soft-deleted row is \
+                 still occupying the unique slot: the insert conflicts with it while \
+                 the `deleted_at IS NULL` lookup cannot see it. For soft_delete \
+                 repositories the unique index must be partial \
+                 (`... WHERE deleted_at IS NULL`) so soft-deleted rows free the slot."
+            } else {
+                "find_or_create_by: the insert hit a unique conflict but no matching \
+                 row was found on re-lookup. The lookup columns are likely not the \
+                 ones backed by the unique constraint that fired — find_or_create_by \
+                 is only race-safe when its lookup columns match a unique constraint."
+            };
+            let none_branch = quote! {
+                let __row: ::core::option::Option<#model_name> = #relookup;
+                match __row {
+                    ::core::option::Option::Some(__r) => ::core::result::Result::Ok((__r, false)),
+                    ::core::option::Option::None => ::core::result::Result::Err(
+                        ::autumn_web::AutumnError::internal_server_error_msg(
+                            #none_branch_msg
+                        )
+                    ),
+                }
+            };
+
+            let insert_new_conn = foc_insert_opt(&quote! { new }, &quote! { &mut conn });
+            let insert_input_txconn = foc_insert_opt(&quote! { input }, &quote! { conn });
+            let insert_new_txconn = foc_insert_opt(&quote! { new }, &quote! { conn });
+
+            // Step 2 varies by hook configuration (mirrors `save`).
+            let step2 = if commit_hooks_enabled {
+                quote! {
+                    use ::autumn_web::reexports::diesel_async::AsyncConnection;
+                    use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
+                    use ::autumn_web::hooks::{MutationContext, MutationOp, MutationHooks};
+                    #foc_tenant_id_let
+                    Self::__autumn_register_repository_commit_hooks();
+                    let mut conn = self.__autumn_acquire_conn().await?;
+                    let __outcome: ::core::option::Option<(#model_name, MutationContext, ::std::string::String, ::std::string::String, ::autumn_web::reexports::serde_json::Value)> =
+                        ::autumn_web::__private::scoped_transaction::<::core::option::Option<(#model_name, MutationContext, ::std::string::String, ::std::string::String, ::autumn_web::reexports::serde_json::Value)>, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
+                            async move {
+                                let mut input = new.clone();
+                                let mut ctx = MutationContext::new(MutationOp::Create);
+                                let mut __autumn_commit_hook_discriminator: ::core::option::Option<::std::string::String> =
+                                    ::core::option::Option::None;
+                                if let ::core::option::Option::Some(__autumn_idempotency) = &self.idempotency {
+                                    ctx.set_idempotency_key(__autumn_idempotency.scoped_key());
+                                    __autumn_commit_hook_discriminator =
+                                        ::core::option::Option::Some(__autumn_idempotency.next_mutation_discriminator());
+                                }
+                                self.hooks.before_create(&mut ctx, &mut input).await?;
+                                let __rec_opt: ::core::option::Option<#model_name> = #insert_input_txconn;
+                                match __rec_opt {
+                                    ::core::option::Option::Some(__record) => {
+                                        #foc_vh_ctx
+                                        let __autumn_commit_hook_record = __record.__autumn_commit_hook_to_value()?;
+                                        let (__autumn_commit_hook_id, __autumn_commit_hook_owner) = ::autumn_web::__private::enqueue_repository_commit_hook_pending_on_conn(
+                                            conn,
+                                            Self::__autumn_repository_commit_hook_key(),
+                                            "create",
+                                            ctx.idempotency_key.as_deref(),
+                                            __autumn_commit_hook_discriminator.as_deref(),
+                                            &ctx,
+                                            &__autumn_commit_hook_record,
+                                        )
+                                        .await?;
+                                        ::core::result::Result::Ok(::core::option::Option::Some((
+                                            __record, ctx, __autumn_commit_hook_id, __autumn_commit_hook_owner, __autumn_commit_hook_record,
+                                        )))
+                                    }
+                                    ::core::option::Option::None => ::core::result::Result::Ok(::core::option::Option::None),
+                                }
+                            }
+                            .scope_boxed()
+                        })
+                        .await?;
+                    match __outcome {
+                        ::core::option::Option::Some((record, mut ctx, __autumn_commit_hook_id, __autumn_commit_hook_owner, __autumn_commit_hook_record)) => {
+                            ::core::mem::drop(conn);
+                            #foc_commit_after_machinery
+                        }
+                        ::core::option::Option::None => { #none_branch }
+                    }
+                }
+            } else if config.hooks_type.is_some() {
+                quote! {
+                    use ::autumn_web::reexports::diesel_async::AsyncConnection;
+                    use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
+                    use ::autumn_web::hooks::{MutationContext, MutationOp, MutationHooks};
+                    #foc_tenant_id_let
+                    let mut conn = self.__autumn_acquire_conn().await?;
+                    let __outcome: ::core::option::Option<(#model_name, MutationContext)> =
+                        ::autumn_web::__private::scoped_transaction::<::core::option::Option<(#model_name, MutationContext)>, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
+                            async move {
+                                let mut input = new.clone();
+                                let mut ctx = MutationContext::new(MutationOp::Create);
+                                self.hooks.before_create(&mut ctx, &mut input).await?;
+                                let __rec_opt: ::core::option::Option<#model_name> = #insert_input_txconn;
+                                match __rec_opt {
+                                    ::core::option::Option::Some(__record) => {
+                                        #foc_vh_ctx
+                                        ::core::result::Result::Ok(::core::option::Option::Some((__record, ctx)))
+                                    }
+                                    ::core::option::Option::None => ::core::result::Result::Ok(::core::option::Option::None),
+                                }
+                            }
+                            .scope_boxed()
+                        })
+                        .await?;
+                    match __outcome {
+                        ::core::option::Option::Some((__record, mut ctx)) => {
+                            ::core::mem::drop(conn);
+                            self.hooks.after_create(&mut ctx, &__record).await?;
+                            ::core::result::Result::Ok((__record, true))
+                        }
+                        ::core::option::Option::None => { #none_branch }
+                    }
+                }
+            } else if config.versioned {
+                quote! {
+                    use ::autumn_web::reexports::diesel_async::AsyncConnection;
+                    use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
+                    #foc_tenant_id_let
+                    let mut conn = self.__autumn_acquire_conn().await?;
+                    let __inserted: ::core::option::Option<#model_name> =
+                        ::autumn_web::__private::scoped_transaction::<::core::option::Option<#model_name>, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
+                            async move {
+                                let __rec_opt: ::core::option::Option<#model_name> = #insert_new_txconn;
+                                if let ::core::option::Option::Some(ref __record) = __rec_opt {
+                                    #foc_vh_noctx
+                                }
+                                ::core::result::Result::Ok(__rec_opt)
+                            }
+                            .scope_boxed()
+                        })
+                        .await?;
+                    match __inserted {
+                        ::core::option::Option::Some(__record) => ::core::result::Result::Ok((__record, true)),
+                        ::core::option::Option::None => { #none_branch }
+                    }
+                }
+            } else {
+                quote! {
+                    #foc_tenant_id_let
+                    let mut conn = self.__autumn_acquire_conn().await?;
+                    let __inserted: ::core::option::Option<#model_name> = #insert_new_conn;
+                    match __inserted {
+                        ::core::option::Option::Some(__record) => ::core::result::Result::Ok((__record, true)),
+                        ::core::option::Option::None => { #none_branch }
+                    }
+                }
+            };
+
+            __methods.push(quote! {
+                /// Race-safe get-or-insert keyed on the lookup column(s).
+                ///
+                /// Returns `(model, created)`: `created == true` only when this
+                /// call actually inserted the row. When a matching row already
+                /// exists (or a concurrent caller wins the insert race), the
+                /// existing row is returned with `created == false`.
+                ///
+                /// Only the `after_create` and `after_create_commit` (commit)
+                /// hooks are guaranteed to fire **exclusively** on the created
+                /// path — they run only when a row is actually inserted
+                /// (`created == true`). `before_create` is different: it runs
+                /// *before* the `ON CONFLICT DO NOTHING` insert, so when a
+                /// concurrent caller loses the insert race the method returns
+                /// `created == false` yet that caller's `before_create` has
+                /// already executed — and any side effects (including DB writes
+                /// made inside the transaction) still occur. Keep
+                /// `before_create` side effects idempotent, or move create-only
+                /// work into `after_create`; do not rely on the found-path
+                /// semantics to suppress `before_create`.
+                ///
+                /// Race-safety relies on a unique constraint covering the lookup
+                /// column(s): the insert uses `ON CONFLICT DO NOTHING`, so under
+                /// concurrent callers exactly one row is created, exactly one
+                /// caller observes `created == true`, and no unique-violation
+                /// error is surfaced. Without such a constraint the method is
+                /// NOT race-safe (concurrent callers may each insert a row).
+                #[allow(clippy::let_and_return, unused_variables, clippy::used_underscore_binding)]
+                pub async fn #fn_ident(
+                    &self,
+                    #(#sig_params,)*
+                    new: &#new_name,
+                ) -> ::autumn_web::AutumnResult<(#model_name, bool)> {
+                    use ::autumn_web::reexports::diesel::prelude::*;
+                    use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                    // Cross-shard write guard: reject a get-or-insert issued via
+                    // across_tenants() on a sharded, tenant-scoped repository. The
+                    // lookup+insert cannot be fanned out safely across shards, so we
+                    // reject rather than silently write to a single shard while
+                    // matching rows on other shards go unseen. Same guard used by
+                    // save/update/delete; a no-op token on non-sharded repos.
+                    #cross_shard_write_guard
+                    #(#encode_lets)*
+                    // Step 1: preliminary lookup on the read path (replica-eligible).
+                    {
+                        let mut __rconn = self.__autumn_acquire_read_conn().await?;
+                        let __found: ::core::option::Option<#model_name> = #step1_lookup;
+                        if let ::core::option::Option::Some(__row) = __found {
+                            return ::core::result::Result::Ok((__row, false));
+                        }
+                    }
+                    // Step 2: create on the primary with ON CONFLICT DO NOTHING.
+                    #step2
+                }
+            });
+        }
+        quote! { #(#__methods)* }
+    };
+
     let tenant_scoped_traits = if config.tenant_scoped {
         quote! {
             impl ::autumn_web::tenancy::HasTenantIdColumn for #table_ident::table {
@@ -7111,12 +8517,28 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         let id_path = format!("{api_path}/{{id}}");
 
+        // MCP opt-in classified by each generated route's verb (mirroring the
+        // runtime read-only rule), not hand-placed per site — a future
+        // generated route picks up the right classification from the same
+        // `method:` literal it declares.
+        let mcp_for = |method: &str| match config.mcp_expose {
+            None => false,
+            Some(McpExpose::Read) => matches!(method, "GET" | "HEAD"),
+            Some(McpExpose::All) => true,
+        };
+        let mcp_list_op = mcp_for("GET");
+        let mcp_get_op = mcp_for("GET");
+        let mcp_create_op = mcp_for("POST");
+        let mcp_update_op = mcp_for("PUT");
+        let mcp_delete_op = mcp_for("DELETE");
+
         let has_policy = config.policy_type.is_some();
         let policy_check_show = if has_policy {
             quote! {
-                ::autumn_web::authorization::__check_policy::<#model_name>(
+                ::autumn_web::authorization::__check_policy_scoped::<#model_name>(
                     &__autumn_state,
                     &__autumn_session,
+                    __autumn_token_scopes.as_ref().map(|__e| &__e.0),
                     "show",
                     &record,
                 )
@@ -7131,9 +8553,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         // leaving the data behind.
         let policy_check_create_pre = if has_policy {
             quote! {
-                ::autumn_web::authorization::__check_policy_create_payload::<#model_name>(
+                ::autumn_web::authorization::__check_policy_create_payload_scoped::<#model_name>(
                     &__autumn_state,
                     &__autumn_session,
+                    __autumn_token_scopes.as_ref().map(|__e| &__e.0),
                     &__autumn_new_payload,
                 )
                 .await?;
@@ -7170,9 +8593,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             quote! {
                 let __existing = repo.on_primary().find_by_id(id).await?
                     .ok_or_else(|| ::autumn_web::AutumnError::not_found_msg("not found"))?;
-                ::autumn_web::authorization::__check_policy::<#model_name>(
+                ::autumn_web::authorization::__check_policy_scoped::<#model_name>(
                     &__autumn_state,
                     &__autumn_session,
+                    __autumn_token_scopes.as_ref().map(|__e| &__e.0),
                     "update",
                     &__existing,
                 )
@@ -7185,9 +8609,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             quote! {
                 let __existing = repo.on_primary().find_by_id(id).await?
                     .ok_or_else(|| ::autumn_web::AutumnError::not_found_msg("not found"))?;
-                ::autumn_web::authorization::__check_policy::<#model_name>(
+                ::autumn_web::authorization::__check_policy_scoped::<#model_name>(
                     &__autumn_state,
                     &__autumn_session,
+                    __autumn_token_scopes.as_ref().map(|__e| &__e.0),
                     "delete",
                     &__existing,
                 )
@@ -7201,6 +8626,11 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 ::autumn_web::reexports::axum::extract::State(__autumn_state):
                     ::autumn_web::reexports::axum::extract::State<::autumn_web::AppState>,
                 __autumn_session: ::autumn_web::session::Session,
+                __autumn_token_scopes: ::core::option::Option<
+                    ::autumn_web::reexports::axum::extract::Extension<
+                        ::autumn_web::auth::ApiTokenScopes
+                    >
+                >,
                 __autumn_idempotency_replay: ::core::option::Option<
                     ::autumn_web::reexports::axum::extract::Extension<
                         ::autumn_web::idempotency::IdempotencyReplayResponse
@@ -7229,9 +8659,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     .ok_or_else(|| ::autumn_web::AutumnError::internal_server_error_msg(
                         "missing scope registration"
                     ))?;
-                let __ctx = ::autumn_web::authorization::PolicyContext::from_request(
+                let __ctx = ::autumn_web::authorization::PolicyContext::from_request_parts(
                     &__autumn_state,
                     &__autumn_session,
+                    __autumn_token_scopes.as_ref().map(|__e| &__e.0),
                 ).await;
                 let mut __conn = repo.__autumn_acquire_read_conn().await?;
                 let records = __scope.list(&__ctx, &mut __conn).await?;
@@ -7244,9 +8675,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     .ok_or_else(|| ::autumn_web::AutumnError::internal_server_error_msg(
                         "missing policy registration"
                     ))?;
-                let __ctx = ::autumn_web::authorization::PolicyContext::from_request(
+                let __ctx = ::autumn_web::authorization::PolicyContext::from_request_parts(
                     &__autumn_state,
                     &__autumn_session,
+                    __autumn_token_scopes.as_ref().map(|__e| &__e.0),
                 ).await;
                 let __all = repo.find_all().await?;
                 let mut __filtered = ::std::vec::Vec::with_capacity(__all.len());
@@ -7270,6 +8702,11 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 ::autumn_web::reexports::axum::extract::State(__autumn_state):
                     ::autumn_web::reexports::axum::extract::State<::autumn_web::AppState>,
                 __autumn_session: ::autumn_web::session::Session,
+                __autumn_token_scopes: ::core::option::Option<
+                    ::autumn_web::reexports::axum::extract::Extension<
+                        ::autumn_web::auth::ApiTokenScopes
+                    >
+                >,
             }
         } else {
             quote! {}
@@ -7374,9 +8811,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     }
                 };
                 if let ::core::result::Result::Err(err) =
-                    ::autumn_web::authorization::__check_policy_create_payload::<#model_name>(
+                    ::autumn_web::authorization::__check_policy_create_payload_scoped::<#model_name>(
                         &__autumn_state,
                         &__autumn_session,
+                        __autumn_token_scopes.as_ref().map(|__e| &__e.0),
                         &__autumn_new_payload,
                     )
                     .await
@@ -7438,9 +8876,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     }
                 };
                 if let ::core::result::Result::Err(err) =
-                    ::autumn_web::authorization::__check_policy::<#model_name>(
+                    ::autumn_web::authorization::__check_policy_scoped::<#model_name>(
                         &__autumn_state,
                         &__autumn_session,
+                        __autumn_token_scopes.as_ref().map(|__e| &__e.0),
                         "update",
                         &__existing,
                     )
@@ -7521,9 +8960,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     }
                 };
                 if let ::core::result::Result::Err(err) =
-                    ::autumn_web::authorization::__check_policy::<#model_name>(
+                    ::autumn_web::authorization::__check_policy_scoped::<#model_name>(
                         &__autumn_state,
                         &__autumn_session,
+                        __autumn_token_scopes.as_ref().map(|__e| &__e.0),
                         "delete",
                         &__existing,
                     )
@@ -7646,6 +9086,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 ),
                             }
                         ),
+                        mcp_tool: #mcp_list_op,
                         ..::core::default::Default::default()
                     },
                     repository: ::core::option::Option::Some(::autumn_web::RepositoryApiMeta {
@@ -7698,6 +9139,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 kind: ::autumn_web::openapi::SchemaKind::Ref,
                             }
                         ),
+                        mcp_tool: #mcp_get_op,
                         ..::core::default::Default::default()
                     },
                     repository: ::core::option::Option::Some(::autumn_web::RepositoryApiMeta {
@@ -7747,6 +9189,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 kind: ::autumn_web::openapi::SchemaKind::Ref,
                             }
                         ),
+                        mcp_tool: #mcp_create_op,
                         ..::core::default::Default::default()
                     },
                     repository: ::core::option::Option::Some(::autumn_web::RepositoryApiMeta {
@@ -7798,6 +9241,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 kind: ::autumn_web::openapi::SchemaKind::Ref,
                             }
                         ),
+                        mcp_tool: #mcp_update_op,
                         ..::core::default::Default::default()
                     },
                     repository: ::core::option::Option::Some(::autumn_web::RepositoryApiMeta {
@@ -7836,6 +9280,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         operation_id: ::core::stringify!(#delete_fn),
                         path_params: &["id"],
                         success_status: 204,
+                        mcp_tool: #mcp_delete_op,
                         ..::core::default::Default::default()
                     },
                     repository: ::core::option::Option::Some(::autumn_web::RepositoryApiMeta {
@@ -9288,6 +10733,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         __autumn_statement_timeout_ms: __seed.statement_timeout_ms,
                         __autumn_slow_threshold: __seed.slow_query_threshold,
                         __autumn_route: ::core::clone::Clone::clone(&__seed.route),
+                        #bcast_field_some_state
                     })
                 }
             }
@@ -9355,6 +10801,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         __autumn_statement_timeout_ms: __seed.statement_timeout_ms,
                         __autumn_slow_threshold: __seed.slow_query_threshold,
                         __autumn_route: ::core::clone::Clone::clone(&__seed.route),
+                        #bcast_field_none
                     }
                 }
             }
@@ -9396,6 +10843,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         // generated `preload` retain (see `preload_scope_impl`).
         #preload_scope_impl
 
+        // Bridges this repository to `#model_name`'s many-to-many mutation
+        // traits (see `M2mConnSource`).
+        #m2m_conn_source_impl
+
         /// Postgres implementation of the repository.
         #vis struct #pg_name {
             #struct_fields
@@ -9406,6 +10857,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         #cross_shard_repository_impl
 
         #clone_impl
+
+        // Bounded-memory batched iteration (find_in_batches / find_each, #1395).
+        #batch_source_impl
 
         #[allow(clippy::useless_let_if_seq)]
         impl #trait_name for #pg_name {
@@ -9424,6 +10878,21 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
 
             async fn save(&self, new: &#new_name) -> ::autumn_web::AutumnResult<#model_name> {
+                // #1379: normalize `#[normalize]` columns on the insert path,
+                // before the `before_create` hook and the DB write, so
+                // validators and the database observe the canonical value.
+                // Dispatches through the autoref-specialization probe: the `Yes`
+                // arm clones and canonicalizes only for models whose `New*`
+                // implements `Normalize`; the `No` arm hands back the caller's
+                // borrow unchanged, so models with no `#[normalize]` columns (and
+                // hand-written `New*` types that don't implement `Normalize`) pay
+                // no clone. `Borrow` unifies the owned/borrowed arms to `&#new_name`.
+                #[allow(unused_imports)]
+                use ::autumn_web::normalize::{SpezNormalizeNo as _, SpezNormalizeYes as _};
+                #[allow(unused_imports)]
+                use ::std::borrow::Borrow as _;
+                let __autumn_normalized = ::autumn_web::normalize::SpezNormalize(new).spez_normalize();
+                let new: &#new_name = __autumn_normalized.borrow();
                 #save_body
             }
 
@@ -9455,6 +10924,17 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             #soft_delete_impl_methods
 
             async fn save_many(&self, new: &[#new_name]) -> ::autumn_web::AutumnResult<Vec<#model_name>> {
+                // #1379: normalize each `#[normalize]` column before the bulk
+                // insert path (mirrors `save`). The `Yes` arm clones+canonicalizes
+                // only for `Normalize` `New*` types; the `No` arm hands back the
+                // caller's slice unchanged (no clone) for everything else.
+                // `Borrow` unifies the owned `Vec`/borrowed slice arms.
+                #[allow(unused_imports)]
+                use ::autumn_web::normalize::{SpezNormalizeManyNo as _, SpezNormalizeManyYes as _};
+                #[allow(unused_imports)]
+                use ::std::borrow::Borrow as _;
+                let __autumn_normalized = ::autumn_web::normalize::SpezNormalize(new).spez_normalize_many();
+                let new: &[#new_name] = __autumn_normalized.borrow();
                 #save_many_body
             }
 
@@ -9508,6 +10988,11 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 repo.__autumn_read_route = ::autumn_web::repository::ReadRoute::Primary;
                 repo
             }
+
+            #find_in_batches_methods
+
+            // Race-safe get-or-insert (find_or_create_by_*, issue #1382).
+            #find_or_create_by_methods
 
             /// Eager-load associations for records returned by a finder.
             ///
@@ -9591,6 +11076,29 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 &self.__autumn_read_route
             }
 
+            /// The effective read route for the current request, applying any
+            /// read-your-own-writes pin from the task-local context.
+            ///
+            /// When the snapshot is `ReadPool(_)` and the RYWW task-local is
+            /// pinned (a primary write occurred earlier in this request or the
+            /// incoming session cookie is fresh), returns `Primary` and records
+            /// a pin-redirect metric/trace event. All other cases return the
+            /// snapshot unchanged.
+            ///
+            /// Exposed for tests; not a public API.
+            #[doc(hidden)]
+            pub fn __autumn_effective_read_route(&self) -> ::autumn_web::repository::ReadRoute {
+                match &self.__autumn_read_route {
+                    ::autumn_web::repository::ReadRoute::ReadPool(_)
+                        if ::autumn_web::read_your_writes::is_pinned() =>
+                    {
+                        ::autumn_web::read_your_writes::note_pin_redirect();
+                        ::autumn_web::repository::ReadRoute::Primary
+                    }
+                    other => ::core::clone::Clone::clone(other),
+                }
+            }
+
             /// The primary/write pool. Exposed for tests; not a public API.
             #[doc(hidden)]
             pub fn __autumn_write_pool(
@@ -9626,12 +11134,20 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     ::autumn_web::reexports::diesel_async::AsyncPgConnection,
                 >,
             > {
-                self.__autumn_acquire_from(&self.pool).await
+                let result = self.__autumn_acquire_from(&self.pool).await;
+                // Mark write only after a successful primary checkout, mirroring
+                // the guard in `Db::from_request_parts`. A failed acquire (pool
+                // exhausted, timeout) must not pin subsequent reads to primary.
+                if result.is_ok() {
+                    ::autumn_web::read_your_writes::mark_write();
+                }
+                result
             }
 
             /// Acquire a connection for a generated read-only method,
-            /// following the repository's read route: the replica pool when
-            /// one is configured and healthy, otherwise the primary (#971).
+            /// following the repository's effective read route: the replica pool
+            /// when one is configured and healthy (and no RYWW pin is active),
+            /// otherwise the primary (#971, #1201).
             #[doc(hidden)]
             pub async fn __autumn_acquire_read_conn(
                 &self,
@@ -9640,6 +11156,19 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     ::autumn_web::reexports::diesel_async::AsyncPgConnection,
                 >,
             > {
+                // Match by reference to avoid cloning `ReadRoute` on the common
+                // (non-pinned) path. The pin check is inlined here so that
+                // `__autumn_effective_read_route` (the test accessor) retains its
+                // own clone-based return without adding overhead to the hot path.
+                if ::autumn_web::read_your_writes::is_pinned() {
+                    if matches!(
+                        &self.__autumn_read_route,
+                        ::autumn_web::repository::ReadRoute::ReadPool(_)
+                    ) {
+                        ::autumn_web::read_your_writes::note_pin_redirect();
+                        return self.__autumn_acquire_from(&self.pool).await;
+                    }
+                }
                 match &self.__autumn_read_route {
                     ::autumn_web::repository::ReadRoute::Primary => {
                         self.__autumn_acquire_from(&self.pool).await
@@ -9731,7 +11260,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 #cross_shard_write_guard
 
                 let mut conn = self.__autumn_acquire_conn().await?;
-                conn.transaction::<T, ::autumn_web::AutumnError, _>(|conn| {
+                ::autumn_web::__private::scoped_transaction::<T, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                     async move {
                         let row = #table_ident::table
                             .find(id)
@@ -9865,6 +11394,34 @@ mod tests {
     }
 
     #[test]
+    fn repository_macro_implements_m2m_conn_source() {
+        // The many-to-many mutation traits generated by `#[model]`
+        // (`#[has_many(Tag, through = post_tags)]`) are blanket-implemented
+        // for `M2mConnSource<Model = Post>`; `#[repository(Post, ...)]` must
+        // emit exactly that impl on the generated `PgPostRepository`, wired
+        // to the same primary-pool connection helper mutating methods use.
+        let generated = repository_macro(
+            quote! { Post, table = "posts" },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        assert!(
+            generated
+                .contains("impl :: autumn_web :: repository :: M2mConnSource for PgPostRepository"),
+            "expected an M2mConnSource impl for the generated repository struct: {generated}"
+        );
+        assert!(
+            generated.contains("type Model = Post ;"),
+            "expected the M2mConnSource::Model associated type to be the repository's model: {generated}"
+        );
+        assert!(
+            generated.contains("__autumn_m2m_write_conn"),
+            "expected the M2mConnSource method to be generated"
+        );
+    }
+
+    #[test]
     fn repository_macro_api_mutation_prechecks_pin_reads_to_primary() {
         let generated = repository_macro(
             quote! { Post, api = "/api/posts", policy = PostPolicy },
@@ -9954,6 +11511,140 @@ mod tests {
         let config = parse_repo_args(tokens).unwrap();
         assert_eq!(config.model_name.to_string(), "Post");
         assert_eq!(config.api_path.as_deref(), Some("/api/posts"));
+    }
+
+    #[test]
+    fn parse_repo_args_with_mcp() {
+        let tokens: proc_macro2::TokenStream = r#"Post, api = "/api/posts", mcp"#.parse().unwrap();
+        let config = parse_repo_args(tokens).unwrap();
+        assert_eq!(
+            config.mcp_expose,
+            Some(McpExpose::All),
+            "bare `mcp` exposes all five CRUD routes"
+        );
+    }
+
+    #[test]
+    fn parse_repo_args_with_mcp_read() {
+        let tokens: proc_macro2::TokenStream =
+            r#"Post, api = "/api/posts", mcp = "read""#.parse().unwrap();
+        let config = parse_repo_args(tokens).unwrap();
+        assert_eq!(
+            config.mcp_expose,
+            Some(McpExpose::Read),
+            "`mcp = \"read\"` exposes only list/get"
+        );
+    }
+
+    #[test]
+    fn parse_repo_args_mcp_defaults_off() {
+        let tokens: proc_macro2::TokenStream = r#"Post, api = "/api/posts""#.parse().unwrap();
+        let config = parse_repo_args(tokens).unwrap();
+        assert_eq!(config.mcp_expose, None, "no `mcp` key => no MCP exposure");
+    }
+
+    #[test]
+    fn parse_repo_args_rejects_unknown_mcp_mode() {
+        let tokens: proc_macro2::TokenStream =
+            r#"Post, api = "/api/posts", mcp = "write""#.parse().unwrap();
+        let Err(err) = parse_repo_args(tokens) else {
+            panic!("unknown mcp mode must be rejected");
+        };
+        assert!(
+            err.to_string().contains("read"),
+            "error must name the accepted forms: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_repo_args_rejects_duplicate_mcp() {
+        // `mcp = "read", mcp` must not silently escalate a read-only opt-in
+        // to full write exposure via last-write-wins (nor silently narrow in
+        // the reverse order).
+        let tokens: proc_macro2::TokenStream =
+            r#"Post, api = "/api/posts", mcp = "read", mcp"#.parse().unwrap();
+        let Err(err) = parse_repo_args(tokens) else {
+            panic!("duplicate mcp keys must be rejected");
+        };
+        assert!(
+            err.to_string().contains("duplicate"),
+            "error must call out the duplicate key: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_repo_args_mcp_bool_gets_tailored_error() {
+        // The natural guess coming from `#[api_doc(mcp = false)]` — the error
+        // must name the forms that exist instead of syn's generic
+        // "expected string literal".
+        let tokens: proc_macro2::TokenStream =
+            r#"Post, api = "/api/posts", mcp = false"#.parse().unwrap();
+        let Err(err) = parse_repo_args(tokens) else {
+            panic!("mcp = false must be rejected");
+        };
+        assert!(
+            err.to_string().contains("mcp takes no boolean"),
+            "error must name the accepted forms: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_repo_args_mcp_requires_api() {
+        let tokens: proc_macro2::TokenStream = "Post, mcp".parse().unwrap();
+        let Err(err) = parse_repo_args(tokens) else {
+            panic!("mcp without api = \"/path\" generates no routes and must be rejected");
+        };
+        assert!(
+            err.to_string().contains("api"),
+            "error must point at the missing api key: {err}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_mcp_flags_all_five_crud_api_docs() {
+        let generated = repository_macro(
+            quote! { Post, api = "/api/posts", mcp },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert_eq!(
+            generated.matches("mcp_tool : true").count(),
+            5,
+            "bare `mcp` must flag list/get/create/update/delete"
+        );
+    }
+
+    #[test]
+    fn repository_macro_mcp_read_flags_only_reads() {
+        let generated = repository_macro(
+            quote! { Post, api = "/api/posts", mcp = "read" },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert_eq!(
+            generated.matches("mcp_tool : true").count(),
+            2,
+            "`mcp = \"read\"` must flag only list/get"
+        );
+        assert_eq!(
+            generated.matches("mcp_tool : false").count(),
+            3,
+            "create/update/delete must be explicitly off in read mode"
+        );
+    }
+
+    #[test]
+    fn repository_macro_without_mcp_emits_no_flags() {
+        let generated = repository_macro(
+            quote! { Post, api = "/api/posts" },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert_eq!(
+            generated.matches("mcp_tool : true").count(),
+            0,
+            "no `mcp` key => nothing opted in"
+        );
     }
 
     #[test]
@@ -10765,10 +12456,46 @@ mod tests {
         let impl_delete = generated
             .find("async fn delete_by_title")
             .expect("delete_by_title impl must be generated");
-        let section = &generated[impl_delete..impl_delete + 800];
+        let section = &generated[impl_delete..impl_delete + 1200];
         assert!(
             section.contains("deleted_at"),
             "derived delete_by_title must reference deleted_at in soft-delete mode: {section}"
+        );
+    }
+
+    // ── #1379: normalization wiring in the repository codegen ─────────────
+
+    #[test]
+    fn repository_macro_derived_finder_normalizes_string_lookup_arg() {
+        // AC3: a derived `find_by_email` must canonicalize its String argument
+        // through the model's `NormalizedModel` impl before filtering, so
+        // `find_by_email("FOO@X.COM")` matches the stored `foo@x.com` row.
+        let generated = repository_macro(
+            quote! { User },
+            quote! { pub trait UserRepository {
+                fn find_by_email(email: String) -> Vec<User>;
+            } },
+        )
+        .to_string();
+        assert!(
+            generated.contains("SpezLookup :: < User >"),
+            "derived finder must normalize its String lookup argument: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_save_normalizes_new_input() {
+        // AC2: the insert path (`save`/`save_many`) normalizes the `New*` input
+        // before the `before_create` hook and the DB write.
+        let generated =
+            repository_macro(quote! { User }, quote! { pub trait UserRepository {} }).to_string();
+        assert!(
+            generated.contains("SpezNormalize (new) . spez_normalize ()"),
+            "save must normalize the New input before persisting: {generated}"
+        );
+        assert!(
+            generated.contains("SpezNormalize (new) . spez_normalize_many ()"),
+            "save_many must normalize each New input before persisting: {generated}"
         );
     }
 

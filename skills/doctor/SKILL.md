@@ -67,6 +67,7 @@ These names match what `autumn doctor --json` actually emits in the `name` field
 | `trusted_hosts` | Set explicit `[security] trusted_hosts` in `autumn.toml` for production |
 | `rate_limit_key_strategy` | Set `rate_limit.key_strategy` to `"ip"`, `"api_token"`, or `"authenticated_principal"` |
 | `version_compat` | Upgrade `autumn-cli` to match the framework version: `cargo install autumn-cli --version 0.5.0` |
+| `dotenv` | Copy `.env.example` to `.env` and fill in local values, or add every present secret dotenv file (`.env`, `.env.local`, and any `.env.<profile>.local`) to `.gitignore` if it is not already ignored — committable `.env.<profile>` files are left alone (warns only; never fails) |
 
 ## Secrets redaction
 

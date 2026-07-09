@@ -8,6 +8,8 @@
 //! the running service. Graceful shutdown reuses the app's existing lame-duck
 //! drain via `SIGTERM`.
 
+#![allow(dead_code, clippy::missing_const_for_fn)]
+
 use crate::paths::RuntimePaths;
 use crate::process::{self, AcquireError};
 use serde::{Deserialize, Serialize};

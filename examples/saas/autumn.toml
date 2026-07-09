@@ -25,5 +25,5 @@ pool_size = 10
 enabled = true
 source = "session"
 session_key = "tenant_id"
-public_paths = ["/", "/login", "/signup", "/logout", "/static"]
+public_paths = ["/", "/login", "/signup", "/logout", "/static", "/favicon.ico"]
 login_redirect = "/login"

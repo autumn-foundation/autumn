@@ -2,7 +2,7 @@
 # running in debug mode (cargo run) or AUTUMN_PROFILE=dev.
 
 [database]
-url = "postgres://autumn:autumn@localhost:5432/reddit"
+url = "postgres://autumn:autumn@127.0.0.1:5433/reddit"
 
 [mail]
 transport = "file"

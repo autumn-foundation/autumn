@@ -8,9 +8,12 @@ single command. Four subcommands cover the cases you actually hit:
 | `autumn generate model`              | A `#[model]` struct, a Diesel `up.sql`/`down.sql` pair, a `schema.rs` entry      |
 | `autumn generate migration`          | A Diesel migration directory; columns are inferred when the name matches a verb |
 | `autumn generate task`               | A one-off operational `#[task]` skeleton under `tasks/`                         |
+| `autumn generate job`                | A `#[job]` background-job handler with args struct, `registered_jobs()` aggregator, and `.jobs(…)` wiring in `src/main.rs` |
+| `autumn generate channel`            | A real-time broadcast channel over the `Channels` API — an htmx SSE live view by default, or a raw `#[ws]` handler with `--ws` |
 | `autumn generate scaffold`           | Everything `model` does plus `#[repository]`, HTML routes, smoke test, `routes![]` registration |
 | `autumn generate wizard`             | A session-backed multi-step form wizard with per-step validation and a confirm/commit/cancel flow |
 | `autumn generate admin`              | An `AdminModel` adapter for an existing model, wired to `autumn-admin-plugin`   |
+| `autumn generate tauri`              | A complete `src-tauri/` sidecar project so the app ships as a native desktop installer (see [Tauri guide](tauri.md)) |
 
 The generators only emit code that uses macros and conventions Autumn already
 ships (`#[model]`, `#[repository]`, `#[get]/#[post]`, the `i64`-PK convention,
@@ -21,14 +24,33 @@ ordinary user code that you should edit freely.
 ## Five commands to a working CRUD app
 
 This is the path that every other batteries-included framework boasts about.
-On a fresh machine with Rust and Postgres installed:
+On a fresh machine with Rust and Postgres installed, there is one one-time
+prerequisite: `autumn migrate` delegates to the Diesel CLI, so install it
+once with `cargo install diesel_cli --no-default-features --features postgres`.
 
 ```bash
 autumn new my-app
 cd my-app
 autumn generate scaffold Post title:String body:Text published:bool
+# Before migrating: configure the database (see the note below) and
+# create it if it does not exist yet:
+createdb my_app
 autumn migrate
 autumn dev
+```
+
+One file edit belongs between `generate` and `migrate`: the generated
+`autumn.toml` ships with the database section commented out (look for
+"Uncomment to configure database:"). Uncomment it and point `url` at your
+Postgres so both `autumn migrate` and the running app can reach the
+database — without it, `autumn migrate` exits with `✗ No database URL found.`.
+`autumn migrate` runs migrations against that database but does not create
+it, hence the `createdb my_app` above (any equivalent, such as
+`CREATE DATABASE` in psql, works too):
+
+```toml
+[database]
+url = "postgres://user:pass@localhost:5432/my_app"
 ```
 
 Visit <http://localhost:3000/posts> to see the generated index page.
@@ -54,6 +76,7 @@ set.
 | `at:NaiveDateTime`| `chrono::NaiveDateTime`         | `Timestamp`        | `TIMESTAMP`         |
 | `at:DateTime`     | `chrono::DateTime<chrono::Utc>` | `Timestamptz`      | `TIMESTAMPTZ`       |
 | `data:Bytea` *(or `Vec<u8>`)* | `Vec<u8>`           | `Bytea`            | `BYTEA`             |
+| `post:references` | `i64`                           | `Int8`             | `BIGINT`            |
 
 Wrap any of the above in `Option<…>` to make the column nullable
 (`Option<String>`, `Option<i64>`, `Option<NaiveDateTime>`, …). The generator
@@ -65,6 +88,36 @@ Every generated table also includes:
   in Autumn).
 - `created_at TIMESTAMP NOT NULL DEFAULT NOW()` annotated `#[default]` on
   the model so it stays out of `NewX`.
+
+### Foreign keys with `references`
+
+`post:references` scaffolds a foreign-key column: the declared name is
+rewritten to end in `_id` (`post` -> `post_id`), the referenced table is
+derived by pluralising the base name (`post` -> `posts`, matching
+`naming::pluralize`), and the column is emitted as
+`post_id BIGINT NOT NULL REFERENCES posts(id)` with an automatic index
+(`CREATE INDEX idx_comments_post_id ON comments (post_id);`) — no `--index`
+flag required. Append `?` for a nullable foreign key
+(`post:references?` -> `post_id: Option<i64>`, column `NULL`):
+
+```bash
+autumn generate scaffold Comment body:Text post:references
+```
+
+If the referenced model doesn't exist yet (no `src/models/post.rs`, or a
+matching declaration in a single-file `src/models.rs`), the generator still
+scaffolds the column, constraint, and index — it just prints a warning that
+the referenced table is assumed to already exist.
+
+`references` only supports the i64/BIGSERIAL primary-key convention. If the
+referenced model *is* found but was generated with `--id uuid`, the generator
+fails fast with an error instead of emitting a migration that would break at
+`autumn migrate` time with a `BIGINT`-vs-`UUID` type mismatch — hand-write
+the migration for a UUID foreign key instead.
+
+Composite foreign keys, cascade policy (`ON DELETE`/`ON UPDATE`), and runtime
+association traversal (`belongs_to`/`has_many`) are not in scope for this
+token — see issue #835 for the latter.
 
 ## `autumn generate model`
 
@@ -305,6 +358,143 @@ pub async fn cleanup_users(TaskArgs(args): TaskArgs<CleanupUsersArgs>) -> Autumn
 Register the function with `.one_off_tasks(one_off_tasks![...])` before running
 it with `autumn task cleanup_users --dry-run`.
 
+## `autumn generate job`
+
+For background work that should survive process restarts, be retried on failure,
+and be visible in `/actuator/jobs`.
+
+```bash
+autumn generate job SendWelcomeEmail user_id:i64 email:String
+```
+
+Produces:
+
+```
+src/jobs/send_welcome_email.rs    # #[job] handler + SendWelcomeEmailArgs struct
+src/jobs/mod.rs                   # registered_jobs() aggregator (created or appended)
+src/main.rs                       # mod jobs; + .jobs(jobs::registered_jobs()) added in place
+```
+
+The generated `src/jobs/send_welcome_email.rs`:
+
+```rust
+use autumn_web::prelude::*;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SendWelcomeEmailArgs {
+    pub user_id: i64,
+    pub email: String,
+}
+
+#[job(name = "send_welcome_email", max_attempts = 5, backoff_ms = 500)]
+pub async fn send_welcome_email(
+    _state: AppState,
+    args: SendWelcomeEmailArgs,
+) -> AutumnResult<()> {
+    // TODO: implement send_welcome_email
+    let _ = args;
+    Ok(())
+}
+```
+
+The `#[job]` macro generates a companion struct `SendWelcomeEmailJob` with:
+- `SendWelcomeEmailJob::NAME` — the job's registered name (`"send_welcome_email"`).
+- `SendWelcomeEmailJob::enqueue(args).await?` — at-least-once enqueue (use from most handlers).
+- `autumn_web::job::enqueue_on_conn(SendWelcomeEmailJob::NAME, args, conn).await?` — transactional enqueue (enqueues only if the surrounding DB transaction commits; use when the job outcome must be atomic with a DB write).
+
+The generated `src/jobs/mod.rs` aggregator:
+
+```rust
+pub mod send_welcome_email;
+
+#[must_use]
+pub fn registered_jobs() -> Vec<autumn_web::job::JobInfo> {
+    autumn_web::jobs![send_welcome_email::send_welcome_email]
+}
+```
+
+Running `autumn generate job` a second time with a different name augments `mod.rs` and `registered_jobs()` in place — it never duplicates an entry.
+
+The `.jobs(jobs::registered_jobs())` call added to `src/main.rs` wires the aggregator into the job runtime and automatically populates `/actuator/jobs` with every registered job.
+
+### Slow live job verification
+
+```bash
+cargo test -p autumn-cli --test generate generated_job_cargo_checks -- --ignored --exact
+```
+
+This scaffolds a fresh project, runs `autumn generate job`, and asserts that `cargo check --tests` passes with no hand-editing required.
+
+## `autumn generate channel`
+
+For a live feature (chat, notifications, a live-updating list) built entirely
+on Autumn's existing realtime stack — the `Channels` pub/sub API, SSE, and
+`#[ws]` upgrade routes. No new transport is invented; the generator only
+wires up what already ships.
+
+```bash
+autumn generate channel Chat
+```
+
+Produces:
+
+```
+src/channels/chat.rs      # GET /chat (live view), GET /chat/events (SSE), POST /chat/messages
+src/channels/mod.rs       # pub mod chat; (created or appended)
+src/main.rs               # mod channels; + routes![...] entries added in place
+tests/chat_channel.rs     # smoke test: publishes a message, asserts a subscriber receives it
+```
+
+SSE-over-htmx is the default transport — `GET /chat` renders a view wired to
+htmx's `sse-connect`/`sse-swap`, so browser tabs update live with **zero
+client JS authored by the user**:
+
+```rust
+#[get("/chat/events")]
+pub async fn chat_events(State(state): State<AppState>) -> impl IntoResponse {
+    autumn_web::sse::stream(&state, TOPIC)
+}
+
+#[post("/chat/messages")]
+pub async fn chat_publish(
+    State(state): State<AppState>,
+    Form(form): Form<ChatForm>,
+) -> AutumnResult<&'static str> {
+    let fragment = message_fragment(&form.message).into_string();
+    state.broadcast().publish(TOPIC, fragment)?;
+    Ok("published")
+}
+```
+
+Pass `--ws` to emit a raw `#[ws]` WebSocket handler instead, for clients that
+need a bidirectional socket rather than SSE + form posts:
+
+```bash
+autumn generate channel Chat --ws
+```
+
+Either transport adds the `"ws"` feature to the `autumn-web` dependency in
+`Cargo.toml` — channels, SSE, and `#[ws]` are all gated behind it.
+
+The generated smoke test is a real assertion, not a stub: it publishes
+through the in-process `TestApp`, subscribes to the same topic, and asserts
+the message arrives — no Postgres/Docker required, so it runs on every
+`cargo test`.
+
+### Slow live channel verification
+
+```bash
+cargo test -p autumn-cli --test generate generated_channel_cargo_checks -- --ignored --exact
+cargo test -p autumn-cli --test generate generated_channel_ws_cargo_checks -- --ignored --exact
+cargo test -p autumn-cli --test generate generated_channel_smoke_test_passes -- --ignored --exact
+```
+
+These scaffold a fresh project, run `autumn generate channel` (both
+transports), and assert `cargo check --tests` passes with no hand-editing —
+plus one gate that actually runs the generated smoke test with `cargo test`
+to confirm it passes on first run.
+
 ## `autumn generate scaffold`
 
 Everything `model` produces, plus:
@@ -315,10 +505,14 @@ Everything `model` produces, plus:
 - `src/routes/<plural>.rs` — Maud HTML handlers for `index`, `show`, `new_form`,
   `create`, `edit_form`, and `update`. (Skipped if `--api` is set).
 - `src/routes/mod.rs` — module aggregator. (Skipped if `--api` is set).
-- `tests/<snake>.rs` — a smoke test that hits `GET /<plural>` against
-  a running server and asserts a 2xx response (skipped unless
-  `AUTUMN_TEST_BASE_URL` is set). For `--api` scaffolds, this performs a JSON-based
-  CRUD round-trip.
+- `tests/<snake>.rs` — a real, in-process smoke test built on
+  `autumn_web::test::{TestApp, TestClient, TestDb}`: it boots a throwaway
+  Postgres database, fires a request at a stand-in for the scaffolded index
+  route, and asserts a real response — no running server, no env var, no
+  silent skip. `cargo test` reports it as `ignored` with an explicit reason
+  (Docker isn't assumed to be available); run `cargo test -- --ignored` to
+  execute it for real. `--api` scaffolds get the JSON equivalent, asserting
+  against `GET /api/<plural>`.
 - `src/main.rs` — the `mod` declarations plus `routes![…]` entries get
   added in place. Existing entries are preserved; rerunning the generator
   with the same arguments is a no-op. By default, the scaffold registers only

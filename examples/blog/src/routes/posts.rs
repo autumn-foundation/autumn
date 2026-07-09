@@ -8,6 +8,7 @@ use autumn_web::cache::cache_fragment_global;
 use autumn_web::extract::{Form, Path};
 use autumn_web::i18n::Locale;
 use autumn_web::seo::SeoMeta;
+use autumn_web::widgets::{Crumb, HeroConfig, breadcrumb, hero};
 use autumn_web::{AutumnError, AutumnResult, Db, Markup, Redirect, delete, get, html, post, t};
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
@@ -45,6 +46,7 @@ pub fn layout_with_seo(locale: &Locale, seo: SeoMeta, content: Markup) -> Markup
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 (seo.render())
+                link rel="stylesheet" href=(autumn_web::ui::WIDGETS_CSS_PATH);
                 link rel="stylesheet" href=(asset_url("css/autumn.css"));
                 script src=(asset_url("js/htmx.min.js")) {}
             }
@@ -245,14 +247,10 @@ pub async fn index(locale: Locale, mut db: Db) -> AutumnResult<Markup> {
         &locale,
         "Autumn Blog",
         html! {
-            header class="mb-10" {
-                h1 class="text-3xl font-bold tracking-tight text-stone-900 mb-2" {
-                    "Welcome to the Blog"
-                }
-                p class="text-stone-600" {
-                    "Thoughts, tutorials, and stories — powered by Autumn."
-                }
-            }
+            (hero(
+                &HeroConfig::new(&t!(locale, "home.hero.title"))
+                    .subtitle(&t!(locale, "home.hero.subtitle"))
+            ))
 
             @if published_posts.is_empty() {
                 div class="text-center py-20" {
@@ -296,13 +294,11 @@ pub async fn show(locale: Locale, slug: Path<String>, mut db: Db) -> AutumnResul
         &locale,
         seo,
         html! {
+            (breadcrumb(&[
+                Crumb::link("Blog", &paths::index()),
+                Crumb::current(&p.title),
+            ]))
             article {
-                // Back link
-                a href=(paths::index())
-                   class="inline-flex items-center gap-1 text-sm text-stone-600 \
-                          hover:text-amber-700 transition-colors mb-8" {
-                    "\u{2190} Back to blog"
-                }
 
                 // Post header
                 header class="mb-8" {
@@ -427,11 +423,10 @@ pub async fn new_form(locale: Locale) -> Markup {
         &locale,
         "New Post \u{2022} Autumn Blog",
         html! {
-            a href=(paths::admin_list())
-               class="inline-flex items-center gap-1 text-sm text-stone-600 \
-                      hover:text-amber-700 transition-colors mb-6" {
-                "\u{2190} Back to admin"
-            }
+            (breadcrumb(&[
+                Crumb::link("Admin", &paths::admin_list()),
+                Crumb::current("New Post"),
+            ]))
             h1 class="text-2xl font-semibold tracking-tight text-stone-900 mb-6" {
                 "New Post"
             }
@@ -462,11 +457,10 @@ pub async fn edit_form(locale: Locale, id: Path<i64>, mut db: Db) -> AutumnResul
         &locale,
         &format!("Edit: {} \u{2022} Autumn Blog", p.title),
         html! {
-            a href=(paths::admin_list())
-               class="inline-flex items-center gap-1 text-sm text-stone-600 \
-                      hover:text-amber-700 transition-colors mb-6" {
-                "\u{2190} Back to admin"
-            }
+            (breadcrumb(&[
+                Crumb::link("Admin", &paths::admin_list()),
+                Crumb::current(&format!("Edit: {}", p.title)),
+            ]))
             h1 class="text-2xl font-semibold tracking-tight text-stone-900 mb-6" {
                 "Edit Post"
             }

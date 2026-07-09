@@ -286,6 +286,16 @@ pub const DEFAULT_DIRECTORY_CACHE_TTL: std::time::Duration = std::time::Duration
 pub const SHARD_DIRECTORY_MIGRATIONS: diesel_migrations::EmbeddedMigrations =
     diesel_migrations::embed_migrations!("shard_directory_migrations");
 
+/// The `_autumn_shard_map` table migration as a standalone embedded set.
+///
+/// Embedded separately so the boot-time shard-map guard can auto-create its
+/// control table at startup (the `migrations/` copy is applied by
+/// `autumn migrate`). The migration is `CREATE TABLE IF NOT EXISTS`, so
+/// applying it from either set is idempotent. Keep both copies in sync.
+#[cfg(feature = "db")]
+pub const SHARD_MAP_MIGRATIONS: diesel_migrations::EmbeddedMigrations =
+    diesel_migrations::embed_migrations!("shard_map_migrations");
+
 #[derive(Clone, Copy)]
 struct DirectoryCacheEntry {
     shard: ShardId,
@@ -1923,6 +1933,32 @@ impl ShardedDb {
         self.db.tx(f).await
     }
 
+    /// Run an async closure inside a transaction **on this shard** with explicit
+    /// [`TxOptions`](crate::db::TxOptions) (isolation level + retry). Same
+    /// semantics as [`Db::tx_with`](crate::db::Db::tx_with); the transaction
+    /// never spans shards.
+    ///
+    /// # Errors
+    ///
+    /// See [`Db::tx_with`](crate::db::Db::tx_with).
+    pub async fn tx_with<'a, T, E, F>(
+        &'a mut self,
+        opts: crate::db::TxOptions,
+        f: F,
+    ) -> Result<T, AutumnError>
+    where
+        T: Send + 'a,
+        E: From<diesel::result::Error> + Send + Sync + 'a,
+        AutumnError: From<E>,
+        F: for<'r> FnMut(
+                &'r mut diesel_async::AsyncPgConnection,
+            ) -> scoped_futures::ScopedBoxFuture<'a, 'r, Result<T, E>>
+            + Send
+            + 'a,
+    {
+        self.db.tx_with(opts, f).await
+    }
+
     /// Borrow the underlying [`Db`](crate::db::Db) (e.g. to pass to
     /// helpers written against the unsharded extractor).
     pub const fn db_mut(&mut self) -> &mut crate::db::Db {
@@ -2015,6 +2051,7 @@ impl axum::extract::FromRequestParts<crate::AppState> for ShardedDb {
         );
         let shard_set = shards.set.clone();
         let db = shards.checkout_primary(shard).await?;
+        crate::read_your_writes::mark_write();
         Ok(Self {
             db,
             shard_name,

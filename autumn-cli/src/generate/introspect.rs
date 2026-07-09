@@ -18,7 +18,7 @@ use super::dsl::FieldKind;
 use super::emit::Plan;
 use super::naming::{pascal, snake};
 use super::schema_edit::{add_mod_declaration, singularize, update_main_rs};
-use super::{GenerateError, ensure_project_root};
+use super::{GenerateError, ensure_project_root, read_or_empty};
 
 /// A single introspected column, in catalog (`ordinal_position`) order.
 // A flat catalog descriptor: each bool is an independent fact read straight from
@@ -548,10 +548,6 @@ fn unsupported_reason(table: &TableSchema, resource: &str) -> Option<String> {
         );
     }
     None
-}
-
-fn read_or_empty(path: &Path) -> String {
-    std::fs::read_to_string(path).unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -1533,16 +1529,22 @@ mod tests {
                 name: "title".into(),
                 kind: FieldKind::String,
                 nullable: false,
+                variants: Vec::new(),
+                unique: false,
             },
             Field {
                 name: "body".into(),
                 kind: FieldKind::Text,
                 nullable: false,
+                variants: Vec::new(),
+                unique: false,
             },
             Field {
                 name: "published".into(),
                 kind: FieldKind::Bool,
                 nullable: false,
+                variants: Vec::new(),
+                unique: false,
             },
         ];
         let greenfield = render_model_file_for_test("Post", "posts", &fields);

@@ -38,6 +38,7 @@ pub mod feature_flags;
 mod registry;
 mod routes;
 mod templates;
+pub mod tokens;
 mod traits;
 
 pub use registry::AdminRegistry;
@@ -313,7 +314,7 @@ pub(crate) fn admin_route_infos(prefix: &str, has_config: bool) -> Vec<RouteInfo
         ("GET", format!("{prefix}/{{slug}}/{{id}}/edit")),
         ("GET", format!("{prefix}/{{slug}}/{{id}}/history")),
         ("POST", format!("{prefix}/{{slug}}/actions")),
-        ("GET", format!("{prefix}{}", &*routes::ADMIN_JS_PATH)),
+        ("GET", format!("{prefix}{}", *routes::ADMIN_JS_PATH)),
     ]);
     entries
         .into_iter()

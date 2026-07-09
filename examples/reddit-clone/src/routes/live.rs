@@ -189,3 +189,35 @@ pub async fn subreddit_viewer_stream(
 
     Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())
 }
+
+/// SSE endpoint for real-time post OOB fragment updates.
+///
+/// Any mutation made through `PgPostRepository` (save / update_by_id /
+/// delete_by_id) publishes an `hx-swap-oob` fragment on the `"posts"` channel,
+/// which this stream relays to connected browsers.
+///
+/// Wire a list container with:
+/// ```html
+/// <ul id="posts-list"
+///     hx-ext="sse"
+///     sse-connect="/posts/stream"
+///     sse-swap="message">
+/// </ul>
+/// ```
+/// Each arriving fragment patches the matching `#post-{id}` element in place.
+#[get("/posts/stream")]
+pub async fn posts_stream(
+    State(state): State<AppState>,
+) -> Sse<impl tokio_stream::Stream<Item = Result<Event, std::convert::Infallible>>> {
+    autumn_web::sse::stream(&state, "posts")
+}
+
+/// SSE endpoint for subreddit-specific post OOB updates.
+#[get("/r/{slug}/posts/stream")]
+pub async fn subreddit_posts_stream(
+    State(state): State<AppState>,
+    slug: Path<String>,
+) -> Sse<impl tokio_stream::Stream<Item = Result<Event, std::convert::Infallible>>> {
+    let topic = format!("posts:r/{}", *slug);
+    autumn_web::sse::stream(&state, &topic)
+}

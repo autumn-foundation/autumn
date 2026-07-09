@@ -128,9 +128,13 @@ pub fn app() -> AppBuilder {
         #[cfg(feature = "mail")]
         suppression_store: None,
         #[cfg(feature = "mail")]
+        mail_suppression_store: None,
+        #[cfg(feature = "mail")]
         mount_unsubscribe_endpoint: false,
         #[cfg(feature = "mail")]
         mail_previews: Vec::new(),
+        #[cfg(feature = "maud")]
+        story_gallery: None,
         declared_routes: Vec::new(),
         idempotency_enabled: false,
         #[cfg(feature = "mail")]
@@ -382,10 +386,15 @@ pub struct AppBuilder {
     #[cfg(feature = "mail")]
     pub(crate) suppression_store: Option<crate::mail::SuppressionStoreHandle>,
     #[cfg(feature = "mail")]
+    pub(crate) mail_suppression_store: Option<crate::mail::suppression::SuppressionStoreHandle>,
+    #[cfg(feature = "mail")]
     pub(crate) mount_unsubscribe_endpoint: bool,
     /// Mail template previews registered for the dev preview UI.
     #[cfg(feature = "mail")]
     mail_previews: Vec<crate::mail::MailPreview>,
+    /// Widget story gallery registered for the `/_stories` UI (#1526).
+    #[cfg(feature = "maud")]
+    story_gallery: Option<crate::stories::StoryGallery>,
     /// Routes explicitly declared by plugins for listing purposes, to complement
     /// opaque `nest_routers`. Included in `autumn routes` output even though
     /// the underlying Axum router is not enumerable.
@@ -2087,6 +2096,27 @@ impl AppBuilder {
         self
     }
 
+    /// Register a bounce/complaint
+    /// [`SuppressionStore`](crate::mail::suppression::SuppressionStore) so
+    /// [`Mailer::send`](crate::mail::Mailer::send) skips addresses that have
+    /// hard-bounced or complained (issue #1247).
+    ///
+    /// Zero-config apps need not call this: the framework wires an in-memory
+    /// default store automatically. Use this to plug the durable
+    /// [`PgSuppressionStore`](crate::mail::suppression::PgSuppressionStore) (or
+    /// a custom backend) for multi-instance deploys that must share suppression
+    /// across replicas. Mirrors [`Self::with_suppression_store`].
+    #[cfg(feature = "mail")]
+    #[must_use]
+    pub fn with_mail_suppression_store(
+        mut self,
+        store: impl crate::mail::suppression::SuppressionStore + 'static,
+    ) -> Self {
+        self.mail_suppression_store =
+            Some(crate::mail::suppression::SuppressionStoreHandle::new(store));
+        self
+    }
+
     /// Mount the framework's default RFC 8058 one-click unsubscribe endpoint at
     /// `/_autumn/unsubscribe` (`GET` confirmation page + `POST` one-click).
     ///
@@ -2148,6 +2178,21 @@ impl AppBuilder {
         previews: impl IntoIterator<Item = crate::mail::MailPreview>,
     ) -> Self {
         self.mail_previews.extend(previews);
+        self
+    }
+
+    /// Register the widget story gallery served at `/_stories` (#1526).
+    ///
+    /// Routes mount only when the resolved config has `[stories] enabled =
+    /// true` (off by default, opt-in per profile). Start from
+    /// [`StoryGallery::builtin`](crate::stories::StoryGallery::builtin) for
+    /// the framework widget set and
+    /// [`extend`](crate::stories::StoryGallery::extend) it with your app's
+    /// own `story!{...}` entries. See `docs/guide/stories.md`.
+    #[cfg(feature = "maud")]
+    #[must_use]
+    pub fn with_story_gallery(mut self, gallery: crate::stories::StoryGallery) -> Self {
+        self.story_gallery = Some(gallery);
         self
     }
 
@@ -2575,9 +2620,13 @@ impl AppBuilder {
             #[cfg(feature = "mail")]
             suppression_store,
             #[cfg(feature = "mail")]
+            mail_suppression_store,
+            #[cfg(feature = "mail")]
             mount_unsubscribe_endpoint,
             #[cfg(feature = "mail")]
             mail_previews,
+            #[cfg(feature = "maud")]
+            story_gallery,
             declared_routes: _,
             idempotency_enabled,
             #[cfg(feature = "mail")]
@@ -2785,6 +2834,12 @@ impl AppBuilder {
         if let Some(buf) = telemetry_guard.log_buffer.clone() {
             state.insert_extension(buf);
         }
+        // Wire the live-subscriber reload handle into the loggers actuator so
+        // `PUT /actuator/loggers/{name}` affects the running subscriber, not
+        // just an in-memory map (issue #1044).
+        if let Some(handle) = telemetry_guard.filter_reload.clone() {
+            state.log_levels().attach_reload_handle(handle);
+        }
 
         // Instantiate MaintenanceState, load flag synchronously at startup, insert as extension, and start background poller task
         let maintenance_state = crate::maintenance::MaintenanceState::new();
@@ -2938,6 +2993,10 @@ impl AppBuilder {
             state.insert_extension(handle);
         }
         #[cfg(feature = "mail")]
+        if let Some(handle) = mail_suppression_store {
+            state.insert_extension(handle);
+        }
+        #[cfg(feature = "mail")]
         crate::mail::install_mailer_with_factory(
             &state,
             &config.mail,
@@ -2951,6 +3010,8 @@ impl AppBuilder {
         });
         #[cfg(feature = "mail")]
         state.insert_extension(crate::mail::MailPreviewRegistry::new(mail_previews));
+        #[cfg(feature = "maud")]
+        install_story_registry(&state, story_gallery);
         if let Some(logger) = audit_logger {
             state.insert_extension::<crate::audit::AuditLogger>((*logger).clone());
         }
@@ -3640,9 +3701,13 @@ impl AppBuilder {
             #[cfg(feature = "mail")]
             suppression_store,
             #[cfg(feature = "mail")]
+            mail_suppression_store,
+            #[cfg(feature = "mail")]
             mount_unsubscribe_endpoint,
             #[cfg(feature = "mail")]
             mail_previews,
+            #[cfg(feature = "maud")]
+            story_gallery,
             declared_routes: _,
             idempotency_enabled,
             #[cfg(feature = "mail")]
@@ -3805,6 +3870,12 @@ impl AppBuilder {
         if let Some(buf) = telemetry_guard.log_buffer.clone() {
             state.insert_extension(buf);
         }
+        // Wire the live-subscriber reload handle into the loggers actuator so
+        // `PUT /actuator/loggers/{name}` affects the running subscriber, not
+        // just an in-memory map (issue #1044).
+        if let Some(handle) = telemetry_guard.filter_reload.clone() {
+            state.log_levels().attach_reload_handle(handle);
+        }
         state.insert_extension(RegisteredApiVersions(api_versions.clone()));
         #[cfg(feature = "mail")]
         if let Some(interceptor) = mail_interceptor {
@@ -3860,6 +3931,10 @@ impl AppBuilder {
             state.insert_extension(handle);
         }
         #[cfg(feature = "mail")]
+        if let Some(handle) = mail_suppression_store {
+            state.insert_extension(handle);
+        }
+        #[cfg(feature = "mail")]
         crate::mail::install_mailer_with_factory(
             &state,
             &config.mail,
@@ -3873,6 +3948,8 @@ impl AppBuilder {
         });
         #[cfg(feature = "mail")]
         state.insert_extension(crate::mail::MailPreviewRegistry::new(mail_previews));
+        #[cfg(feature = "maud")]
+        install_story_registry(&state, story_gallery);
         // run_build_mode used ProbeState::default(), which does not start as pending
         state.probes = crate::probe::ProbeState::default();
 
@@ -4211,6 +4288,8 @@ impl AppBuilder {
             #[cfg(feature = "mail")]
             suppression_store,
             #[cfg(feature = "mail")]
+            mail_suppression_store,
+            #[cfg(feature = "mail")]
                 mount_unsubscribe_endpoint: _,
             #[cfg(feature = "mail")]
             mail_interceptor,
@@ -4313,6 +4392,12 @@ impl AppBuilder {
         if let Some(buf) = telemetry_guard.log_buffer.clone() {
             state.insert_extension(buf);
         }
+        // Wire the live-subscriber reload handle into the loggers actuator so
+        // `PUT /actuator/loggers/{name}` affects the running subscriber, not
+        // just an in-memory map (issue #1044).
+        if let Some(handle) = telemetry_guard.filter_reload.clone() {
+            state.log_levels().attach_reload_handle(handle);
+        }
         #[cfg(feature = "mail")]
         if let Some(interceptor) = mail_interceptor {
             state.insert_extension(interceptor);
@@ -4359,6 +4444,10 @@ impl AppBuilder {
 
         #[cfg(feature = "mail")]
         if let Some(handle) = suppression_store {
+            state.insert_extension(handle);
+        }
+        #[cfg(feature = "mail")]
+        if let Some(handle) = mail_suppression_store {
             state.insert_extension(handle);
         }
         #[cfg(feature = "mail")]
@@ -5998,6 +6087,8 @@ async fn setup_database(
         config.database.has_shards(),
         hook_queue_migration_mode,
     );
+    let shard_map_migration_required =
+        shard_map_migration_is_required(config.database.has_shards(), hook_queue_migration_mode);
     let check_replica_migrations = !migrations.is_empty();
     let topology = match pool_provider {
         Some(factory) => factory(config.database.clone()).await,
@@ -6050,6 +6141,7 @@ async fn setup_database(
         provider_migration_url,
         migrations,
         directory_migration_required,
+        shard_map_migration_required,
     )
     .await;
 
@@ -6081,6 +6173,25 @@ async fn setup_database(
         check_shard_replica_migration_parity(config, set).await;
     }
 
+    // Boot-time guard: compare the current auto-split slot map against the map
+    // persisted on first boot. Refuses to start if they differ, preventing
+    // silent data misrouting from topology changes. Inert during static builds,
+    // when no control DB is configured, and in explicit-slot mode.
+    #[allow(clippy::question_mark)]
+    if let Err(e) = Box::pin(enforce_shard_map_guard(
+        config,
+        topology.as_ref(),
+        runtime_boot,
+    ))
+    .await
+    {
+        // Needs explicit `if let` (not `?`) so the managed-pg child can be stopped
+        // before unwinding — `?` would skip the cfg-gated emergency stop call.
+        #[cfg(feature = "managed-pg")]
+        crate::managed_pg::emergency_stop_async().await;
+        return Err(e);
+    }
+
     Ok(DatabaseBootstrap {
         topology,
         shards,
@@ -6098,6 +6209,7 @@ async fn setup_database(
 /// contention), so the whole sequence runs off the Tokio worker threads in
 /// one blocking task that owns the embedded migration sets.
 #[cfg(feature = "db")]
+#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
 async fn run_startup_migrations(
     config: &AutumnConfig,
     control_configured: bool,
@@ -6105,6 +6217,7 @@ async fn run_startup_migrations(
     provider_migration_url: Option<String>,
     migrations: Vec<crate::migrate::EmbeddedMigrations>,
     directory_migration_required: bool,
+    shard_map_migration_required: bool,
 ) {
     let control_url = if control_configured {
         // Prefer a provider-resolved URL (e.g. managed Postgres, whose socket
@@ -6148,6 +6261,19 @@ async fn run_startup_migrations(
                     profile.as_deref(),
                     auto_in_prod,
                     &crate::sharding::SHARD_DIRECTORY_MIGRATIONS,
+                    "control",
+                );
+            }
+            // The shard-map guard table also lives on the control plane only.
+            // Always allow auto-applying this framework-internal table: the guard
+            // depends on it existing and returns a hard error when it's missing,
+            // so skipping the migration in production would block startup.
+            if shard_map_migration_required {
+                crate::migrate::auto_migrate(
+                    &url,
+                    profile.as_deref(),
+                    true,
+                    &crate::sharding::SHARD_MAP_MIGRATIONS,
                     "control",
                 );
             }
@@ -6239,6 +6365,158 @@ const fn directory_migration_is_required(
     directory_routing_enabled
         && has_shards
         && matches!(mode, RepositoryCommitHookQueueMigrationMode::Runtime)
+}
+
+/// Whether startup should create the control-plane `_autumn_shard_map` table.
+/// Required whenever shards are configured and we are in a real runtime boot —
+/// never during a static build (`autumn build`, `AUTUMN_BUILD_STATIC=1`).
+/// The guard itself is further gated to auto-split mode inside
+/// `enforce_shard_map_guard`; the table is always created when shards are
+/// present so an app can switch from explicit to auto-split later without a
+/// manual migration.
+#[cfg(feature = "db")]
+const fn shard_map_migration_is_required(
+    has_shards: bool,
+    mode: RepositoryCommitHookQueueMigrationMode,
+) -> bool {
+    has_shards && matches!(mode, RepositoryCommitHookQueueMigrationMode::Runtime)
+}
+
+/// Row type for reading `_autumn_shard_map`.
+#[cfg(feature = "db")]
+#[derive(diesel::QueryableByName)]
+struct ShardMapRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    shard_name: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    slots: String,
+}
+
+/// Check and persist the shard slot map in `_autumn_shard_map`.
+///
+/// This is the DB-backed core of the boot-time guard: it reads existing rows,
+/// delegates to the pure [`crate::config::check_stored_slot_map`] for the
+/// comparison, and persists the map on first boot (no rows yet). Factored out
+/// of `enforce_shard_map_guard` so integration tests can drive it directly
+/// without a full `AutumnConfig`.
+///
+/// # Errors
+///
+/// Returns a `String` error when the computed auto-split map differs from the
+/// stored map, indicating a topology change that would silently misroute data.
+#[cfg(feature = "db")]
+pub async fn run_shard_map_guard(
+    control_pool: &deadpool::managed::Pool<
+        diesel_async::pooled_connection::AsyncDieselConnectionManager<
+            diesel_async::AsyncPgConnection,
+        >,
+    >,
+    computed: &[crate::config::ShardSlotAssignment],
+    auto_split: bool,
+) -> Result<(), String> {
+    use diesel_async::RunQueryDsl as _;
+
+    if !auto_split {
+        return Ok(());
+    }
+
+    let mut conn = match control_pool.get().await {
+        Ok(conn) => conn,
+        Err(e) => {
+            return Err(format!(
+                "shard-map guard could not acquire a control connection: {e} — \
+                 ensure the control database is reachable to enforce topology \
+                 change detection"
+            ));
+        }
+    };
+
+    let rows: Vec<ShardMapRow> = match diesel::sql_query(
+        "SELECT shard_name, slots FROM _autumn_shard_map ORDER BY shard_name",
+    )
+    .load::<ShardMapRow>(&mut conn)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            return Err(format!(
+                "shard-map guard could not read _autumn_shard_map: {e} — \
+                 run `autumn migrate` to create the control schema before \
+                 starting with auto-split shards"
+            ));
+        }
+    };
+
+    let stored: Vec<crate::config::ShardSlotAssignment> = rows
+        .into_iter()
+        .map(|r| crate::config::ShardSlotAssignment {
+            name: r.shard_name,
+            ranges: r.slots,
+        })
+        .collect();
+    let stored_opt = if stored.is_empty() {
+        None
+    } else {
+        Some(stored.as_slice())
+    };
+
+    crate::config::check_stored_slot_map(auto_split, computed, stored_opt)?;
+
+    // First boot: persist the current map so future boots can compare against it.
+    // Wrapped in a transaction so a mid-loop failure leaves no partial rows —
+    // partial rows would cause a spurious mismatch error on the next boot attempt.
+    if stored.is_empty() {
+        use diesel_async::AsyncConnection as _;
+        let assignments: Vec<_> = computed.to_vec();
+        conn.transaction::<(), diesel::result::Error, _>(async move |conn| {
+            for assignment in &assignments {
+                diesel::sql_query(
+                    "INSERT INTO _autumn_shard_map (shard_name, slots) VALUES ($1, $2) \
+                     ON CONFLICT (shard_name) DO UPDATE \
+                     SET slots = EXCLUDED.slots, updated_at = NOW()",
+                )
+                .bind::<diesel::sql_types::Text, _>(&assignment.name)
+                .bind::<diesel::sql_types::Text, _>(&assignment.ranges)
+                .execute(conn)
+                .await?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| format!("shard-map guard could not persist map: {e}"))?;
+    }
+
+    Ok(())
+}
+
+/// Boot-time shard-map guard: compare the auto-split slot map against the
+/// persisted map and refuse to start if they differ.
+///
+/// No-op when:
+/// - not a runtime boot (static build),
+/// - no shards configured,
+/// - no control database topology, or
+/// - the slot map uses explicit `slots` declarations (auto-split is inactive).
+#[cfg(feature = "db")]
+async fn enforce_shard_map_guard(
+    config: &AutumnConfig,
+    topology: Option<&crate::db::DatabaseTopology>,
+    runtime_boot: bool,
+) -> Result<(), String> {
+    if !runtime_boot || !config.database.has_shards() {
+        return Ok(());
+    }
+    let Some(topology) = topology else {
+        return Ok(());
+    };
+    if !config.database.shards_auto_split() {
+        return Ok(());
+    }
+    let computed = config
+        .database
+        .resolved_shard_assignments()
+        .map_err(|e| format!("shard-map guard: {e}"))?;
+    run_shard_map_guard(topology.primary(), &computed, true).await
 }
 
 #[cfg(feature = "db")]
@@ -7016,6 +7294,17 @@ mod validate_repository_api_policies_tests {
     }
 }
 
+/// Publish the builder's story gallery (if any) as the [`StoryRegistry`]
+/// (`crate::stories::StoryRegistry`) `AppState` extension read by the
+/// `/_stories` handlers. Shared by the `run()` and build/SSG
+/// state-construction paths so the two stay in lockstep.
+#[cfg(feature = "maud")]
+fn install_story_registry(state: &AppState, story_gallery: Option<crate::stories::StoryGallery>) {
+    if let Some(gallery) = story_gallery {
+        state.insert_extension(gallery.into_registry());
+    }
+}
+
 fn build_state(
     config: &AutumnConfig,
     #[cfg(feature = "db")] database_topology: Option<&crate::db::DatabaseTopology>,
@@ -7066,6 +7355,7 @@ fn build_state(
         auth_session_key: config.auth.session_key.clone(),
         shared_cache: None,
         clock: std::sync::Arc::new(crate::time::SystemClock),
+        app_id: AppState::next_app_id(),
     };
     #[cfg(feature = "db")]
     if state.replica_pool.is_some() {
@@ -7390,6 +7680,7 @@ mod tests {
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
+            app_id: AppState::next_app_id(),
         };
         crate::router::build_router(routes, &config, state)
     }
@@ -7548,7 +7839,7 @@ mod tests {
             crate::config::ShardConfig {
                 name: "shard0".to_owned(),
                 primary_url: "postgres://localhost/shard0".to_owned(),
-                slots: None,
+                slots: Some(vec![crate::config::SlotSpec::Range("0-8191".to_owned())]),
                 replica_url: None,
                 primary_pool_size: Some(3),
                 replica_pool_size: None,
@@ -7557,7 +7848,9 @@ mod tests {
             crate::config::ShardConfig {
                 name: "shard1".to_owned(),
                 primary_url: "postgres://localhost/shard1".to_owned(),
-                slots: None,
+                slots: Some(vec![crate::config::SlotSpec::Range(
+                    "8192-16383".to_owned(),
+                )]),
                 replica_url: Some("postgres://localhost/shard1_ro".to_owned()),
                 primary_pool_size: None,
                 replica_pool_size: Some(2),
@@ -7879,6 +8172,20 @@ mod tests {
         // Routing disabled, or no shards, means no directory table at all.
         assert!(!directory_migration_is_required(false, true, Runtime));
         assert!(!directory_migration_is_required(true, false, Runtime));
+    }
+
+    #[test]
+    fn shard_map_migration_required_only_at_runtime_with_shards() {
+        use RepositoryCommitHookQueueMigrationMode::{Runtime, StaticBuild};
+
+        // The happy path: shards present, real runtime boot.
+        assert!(shard_map_migration_is_required(true, Runtime));
+
+        // A static build must never create the shard-map table.
+        assert!(!shard_map_migration_is_required(true, StaticBuild));
+
+        // No shards means no shard-map table.
+        assert!(!shard_map_migration_is_required(false, Runtime));
     }
 
     #[cfg(feature = "db")]
@@ -8430,6 +8737,7 @@ mod tests {
                 name: "startup-seed".to_string(),
                 max_attempts: 1,
                 initial_backoff_ms: 1,
+                queue: "default".to_string(),
                 uniqueness: None,
                 concurrency: None,
                 handler: startup_noop_job_handler,
@@ -8489,6 +8797,7 @@ mod tests {
                 name: "startup-seed".to_string(),
                 max_attempts: 1,
                 initial_backoff_ms: 1,
+                queue: "default".to_string(),
                 uniqueness: None,
                 concurrency: None,
                 handler: startup_noop_job_handler,
@@ -8604,6 +8913,7 @@ mod tests {
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
+            app_id: AppState::next_app_id(),
         };
         let router =
             crate::router::build_router(vec![test_get_route("/dummy", "dummy")], &config, state);
@@ -8716,6 +9026,7 @@ mod tests {
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
+            app_id: AppState::next_app_id(),
         };
         let router = crate::router::build_router(post_routes, &config, state);
 
@@ -9068,6 +9379,7 @@ mod tests {
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
+            app_id: AppState::next_app_id(),
         };
         let router = crate::router::build_router_with_static(
             vec![test_get_route("/other", "other_page")],
@@ -9385,6 +9697,7 @@ mod tests {
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
+            app_id: AppState::next_app_id(),
         };
         crate::router::build_router(routes, config, state)
     }
@@ -9538,6 +9851,7 @@ mod tests {
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
+            app_id: AppState::next_app_id(),
         };
         let router = crate::router::build_router_with_static(
             vec![test_get_route("/test", "test")],
@@ -9589,6 +9903,7 @@ mod tests {
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
+            app_id: AppState::next_app_id(),
         };
         let router = crate::router::build_router_with_static(
             vec![test_get_route("/test", "test")],
@@ -9846,6 +10161,7 @@ mod tests {
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
+            app_id: AppState::next_app_id(),
             metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
             health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
         };
@@ -9921,6 +10237,7 @@ mod tests {
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
+            app_id: AppState::next_app_id(),
             metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
             health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
         };
@@ -10696,6 +11013,60 @@ mod tests {
                 .extension::<crate::http_client::SharedReqwestClient>()
                 .is_some(),
             "build_state must register a SharedReqwestClient for connection-pool sharing"
+        );
+    }
+
+    // AC5 plumbing (#1526): `with_story_gallery` stores the gallery on the
+    // builder, and `install_story_registry` — the single install step shared
+    // by both the run and build/SSG state-construction paths — publishes it
+    // as the StoryRegistry extension the `/_stories` handlers read.
+    #[cfg(feature = "maud")]
+    #[test]
+    fn with_story_gallery_installs_story_registry_extension() {
+        let builder = crate::app().with_story_gallery(crate::stories::StoryGallery::builtin());
+        let gallery = builder
+            .story_gallery
+            .expect("with_story_gallery must store the gallery on the builder");
+        let expected_count = gallery.stories().len();
+        assert!(expected_count > 0, "builtin gallery must not be empty");
+
+        let config = AutumnConfig::default();
+        let state = build_state(
+            &config,
+            #[cfg(feature = "db")]
+            None,
+            #[cfg(feature = "db")]
+            None,
+            #[cfg(feature = "ws")]
+            None,
+        );
+        install_story_registry(&state, Some(gallery));
+        let registry = state
+            .extension::<crate::stories::StoryRegistry>()
+            .expect("install_story_registry must publish the StoryRegistry extension");
+        assert_eq!(
+            registry.stories().len(),
+            expected_count,
+            "every registered story must reach the state extension"
+        );
+
+        // Without a registered gallery no extension is installed: the
+        // handlers fall back to the empty default and serve the empty state.
+        let bare_state = build_state(
+            &config,
+            #[cfg(feature = "db")]
+            None,
+            #[cfg(feature = "db")]
+            None,
+            #[cfg(feature = "ws")]
+            None,
+        );
+        install_story_registry(&bare_state, None);
+        assert!(
+            bare_state
+                .extension::<crate::stories::StoryRegistry>()
+                .is_none(),
+            "no gallery registered must mean no StoryRegistry extension"
         );
     }
 }

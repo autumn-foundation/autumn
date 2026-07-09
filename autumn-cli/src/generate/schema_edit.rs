@@ -10,7 +10,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
-use super::dsl::{Field, IdType};
+use sha2::{Digest, Sha256};
+
+use super::dsl::{Field, FieldKind, IdType};
 
 /// Append a `pub mod <name>;` line to a `mod.rs` file, returning the new
 /// contents. Idempotent: a second call with the same name is a no-op.
@@ -28,6 +30,23 @@ pub fn add_mod_declaration(existing: &str, name: &str) -> String {
     }
     let trimmed = existing.trim_end();
     format!("{trimmed}\n{line}\n")
+}
+
+/// Inverse of [`add_mod_declaration`] (`autumn destroy`, issue #1048).
+///
+/// Removes the exact `pub mod <name>;` line [`add_mod_declaration`] would
+/// have inserted. A no-op (returns `existing` unchanged) if that line isn't
+/// present — either because it was already destroyed, or because the module
+/// pre-existed as a bare `mod <name>;` that `add_mod_declaration` itself
+/// never touches (and destroy must not touch either).
+#[must_use]
+pub fn remove_mod_declaration(existing: &str, name: &str) -> String {
+    let line = format!("pub mod {name};");
+    let lines: Vec<&str> = existing.lines().collect();
+    let Some(idx) = lines.iter().position(|l| l.trim() == line) else {
+        return existing.to_owned();
+    };
+    remove_single_line(&lines, idx, existing.ends_with('\n'))
 }
 
 /// Build a new `diesel::table!` block for the given table, emitting the `id`
@@ -82,6 +101,76 @@ fn has_table(existing: &str, table: &str) -> bool {
     existing.lines().any(|l| l.trim().starts_with(&needle))
 }
 
+/// Inverse of [`append_schema_table_with_id`]/[`append_schema_table`]
+/// (`autumn destroy`, issue #1048).
+///
+/// Removes the whole `diesel::table! { <table> (...) { ... } }` block for
+/// `table`, plus the single blank separator line
+/// [`append_schema_table_with_id`] inserts before it when appending to a
+/// non-empty file — so removing the last table restores the file byte-for-
+/// byte to whatever preceded it (including becoming empty, in which case the
+/// caller deletes the file rather than leaving a blank `src/schema.rs`).
+///
+/// A no-op (returns `existing` unchanged) if `table` isn't declared, if the
+/// block's shape doesn't match what `append_schema_table_with_id` would have
+/// produced (hand-edited/malformed), or if the block's content isn't
+/// byte-identical to `expected_block` (the literal text this generator
+/// invocation would append for `table`) — the last check protects a
+/// same-named table that pre-existed with different columns from ever being
+/// destroyed (issue #1048 PR review): destroy never corrupts, nor deletes, a
+/// table it didn't itself produce.
+#[must_use]
+pub fn remove_schema_table(existing: &str, table: &str, expected_block: &str) -> String {
+    if !has_table(existing, table) {
+        return existing.to_owned();
+    }
+    let lines: Vec<&str> = existing.lines().collect();
+    let needle = format!("{table} (");
+    let Some(table_line_idx) = lines.iter().position(|l| l.trim().starts_with(&needle)) else {
+        return existing.to_owned();
+    };
+    if table_line_idx == 0 || lines[table_line_idx - 1].trim() != "diesel::table! {" {
+        return existing.to_owned();
+    }
+    let open_idx = table_line_idx - 1;
+    let Some(inner_close_offset) = lines[table_line_idx + 1..]
+        .iter()
+        .position(|l| l.trim() == "}")
+    else {
+        return existing.to_owned();
+    };
+    let inner_close_idx = table_line_idx + 1 + inner_close_offset;
+    let Some(outer_close_line) = lines.get(inner_close_idx + 1) else {
+        return existing.to_owned();
+    };
+    if outer_close_line.trim() != "}" {
+        return existing.to_owned();
+    }
+    let outer_close_idx = inner_close_idx + 1;
+
+    let found_block = format!("{}\n", lines[open_idx..=outer_close_idx].join("\n"));
+    if found_block != expected_block {
+        return existing.to_owned();
+    }
+
+    // Also consume one preceding blank separator line, if present.
+    let mut start = open_idx;
+    if start > 0 && lines[start - 1].trim().is_empty() {
+        start -= 1;
+    }
+
+    let mut new_lines: Vec<&str> = Vec::with_capacity(lines.len());
+    new_lines.extend_from_slice(&lines[..start]);
+    if outer_close_idx + 1 < lines.len() {
+        new_lines.extend_from_slice(&lines[outer_close_idx + 1..]);
+    }
+    let mut out = new_lines.join("\n");
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out
+}
+
 /// Public predicate: whether `schema` already declares a `<table>` block.
 ///
 /// Generators use this to detect a collision before emitting a migration that
@@ -91,8 +180,41 @@ pub fn schema_has_table(schema: &str, table: &str) -> bool {
     has_table(schema, table)
 }
 
+/// The column names already declared for `table` in `schema` (`src/schema.rs`
+/// as [`append_schema_table`] shapes it), or an empty `Vec` if `table` isn't
+/// declared there at all.
+///
+/// Used by [`add_columns_up_sql`]/[`remove_columns_down_sql`] (issue #1032
+/// review follow-up) to extend their unique-index collision check beyond the
+/// columns being added/removed in the current `AddXToY`/`RemoveXFromY`
+/// migration: a plain index on some *other*, already-existing column named
+/// `<field>_unique` would otherwise collide with a newly-added `unique`
+/// field's own index name with no way for `unique_index_name` to see it,
+/// since it only ever receives the fields touched by one `generate`
+/// invocation. This generator has no DB introspection, so `schema.rs` (which
+/// every model/scaffold generator keeps in sync with the migrations it
+/// writes) is the closest thing to a durable record of a table's existing
+/// columns across separate `generate` invocations — only as reliable as
+/// `schema.rs` staying in sync with the real database, the same assumption
+/// every other generator here already makes of it.
+fn existing_schema_columns(schema: &str, table: &str) -> Vec<String> {
+    let needle = format!("{table} (");
+    let Some(start) = schema.lines().position(|l| l.trim().starts_with(&needle)) else {
+        return Vec::new();
+    };
+    schema
+        .lines()
+        .skip(start + 1)
+        .take_while(|l| !l.trim().starts_with('}'))
+        .filter_map(|l| l.trim().trim_end_matches(',').split_once(" -> "))
+        .map(|(name, _)| name.to_owned())
+        .collect()
+}
+
 /// Build the full SQL for `up.sql` of a `CREATE TABLE` migration with optional
-/// defaults and non-unique indexes, honouring the caller-supplied `id_type`.
+/// defaults, plain (non-unique) `--index` columns, and `unique`-marked
+/// columns (their own `CREATE UNIQUE INDEX`, see [`unique_index_sql`]),
+/// honouring the caller-supplied `id_type`.
 /// For `Uuid`, prepends a comment documenting the index-locality trade-off and
 /// the `UUIDv7` upgrade path.
 #[must_use]
@@ -116,19 +238,50 @@ pub fn create_table_sql_with_metadata_and_id(
             sql,
             "    {} {} {}",
             f.name,
-            f.sql_type(),
+            f.sql_column_type(),
             f.sql_nullability()
         );
+        if let Some(target) = f.reference_table() {
+            let _ = write!(sql, " REFERENCES {target}(id)");
+        }
         if let Some(default) = defaults.get(&f.name) {
             let _ = write!(sql, " DEFAULT {default}");
         }
+        if let Some(check) = enum_check_suffix(f) {
+            let _ = write!(sql, " {check}");
+        }
     }
     sql.push_str(",\n    created_at TIMESTAMP NOT NULL DEFAULT NOW()\n);\n");
-    for field_name in indexes {
+    // Every `references` field gets an index automatically (Rails' `add_reference`
+    // behaviour), in addition to any explicit `--index` fields. Merging into the
+    // same sorted set keeps `CREATE INDEX` output deterministic and de-duplicates
+    // a reference field that was *also* passed via `--index`.
+    let unique_fields: BTreeSet<&str> = fields
+        .iter()
+        .filter(|f| f.unique)
+        .map(|f| f.name.as_str())
+        .collect();
+    let mut index_fields = indexes.clone();
+    for f in fields {
+        if f.kind.is_reference() {
+            index_fields.insert(f.name.clone());
+        }
+    }
+    // A `unique` field's own `CREATE UNIQUE INDEX` (emitted below) already
+    // covers lookups on that column, so an explicit `--index` on the same
+    // field (or an auto-added `references` index, though `unique` +
+    // `references` together is an unusual combination) must not also emit a
+    // redundant plain index (issue #1032).
+    index_fields.retain(|name| !unique_fields.contains(name.as_str()));
+    for field_name in &index_fields {
         let _ = writeln!(
             sql,
             "CREATE INDEX idx_{table}_{field_name} ON {table} ({field_name});"
         );
+    }
+    // `unique` fields get their own named `CREATE UNIQUE INDEX`.
+    for field_name in &unique_fields {
+        sql.push_str(&unique_index_sql(table, field_name, fields));
     }
     sql
 }
@@ -137,6 +290,97 @@ pub fn create_table_sql_with_metadata_and_id(
 #[must_use]
 pub fn drop_table_sql(table: &str) -> String {
     format!("DROP TABLE {table};\n")
+}
+
+/// `PostgreSQL` silently truncates identifiers past `NAMEDATALEN - 1` bytes
+/// (63 in a stock build) rather than erroring, so an unbounded
+/// `idx_<table>_<field>_unique` can name-collide with what Postgres
+/// actually stores once `table`/`field` are long enough. This is the one
+/// place that name is computed — [`unique_index_sql`] and every generated
+/// caller that needs to match a real constraint name at runtime
+/// ([`super::scaffold`]'s `UNIQUE_CONSTRAINTS` const and its duplicate-
+/// violation smoke test) all call through here so they stay byte-for-byte
+/// in agreement with what Postgres will actually name the index.
+const POSTGRES_MAX_IDENTIFIER_LEN: usize = 63;
+
+/// The `CREATE UNIQUE INDEX` name for `table`/`field` (issue #1032),
+/// distinct from the plain, non-unique `--index`/`references`-auto-index
+/// output (`idx_<table>_<field>`, no `_unique` suffix) so a field that is
+/// both `--index`ed and `unique` doesn't collide on the index name.
+///
+/// `fields` is the full field list `field` belongs to (not just the unique
+/// ones) — passed so this can also detect the *coincidental-naming* case: a
+/// plain index always names itself after its own column
+/// (`idx_<table>_<other_field>`), so if some *other* field in the same
+/// table happens to be named `<field>_unique`, its plain index would
+/// collide with this one's unique index even though neither field's
+/// `unique`-ness is otherwise related to the other. Every caller that
+/// computes this name — the migration SQL and every generated caller that
+/// needs to match a real constraint name at runtime ([`super::scaffold`]'s
+/// `UNIQUE_CONSTRAINTS` const and its duplicate-violation smoke test) —
+/// passes the same field list so they agree byte-for-byte on the same
+/// (possibly disambiguated) name Postgres will actually store.
+///
+/// When `idx_<table>_<field>_unique` neither exceeds Postgres's identifier
+/// limit nor collides with another field's plain-index name, it's used
+/// verbatim. Otherwise, a `_`-prefixed 8-hex-char digest of the full
+/// (untruncated) name is appended — truncating first if it's also too long
+/// — so two names that would otherwise collide (on truncation or on a
+/// coincidental match) don't collide with each other either.
+///
+/// Known limitation: the coincidental-naming check above compares literal
+/// field names, not what Postgres actually ends up storing. A plain index's
+/// own name (`idx_<table>_<other_field>`) is never truncated or
+/// disambiguated by this generator the way a unique index's is — so a
+/// sufficiently long *other* field's plain index can itself be silently
+/// truncated by Postgres to 63 bytes and collide with this field's unique
+/// index even when their un-truncated names don't literally match (e.g. a
+/// unique field whose name makes `idx_<table>_<field>_unique` exactly 63
+/// bytes, plus an indexed field literally named `<field>_unique_extra`,
+/// whose own plain index Postgres truncates down to the same 63 bytes).
+/// Closing this fully would mean giving *every* plain index name the same
+/// truncate-on-63-bytes treatment this function already gives unique index
+/// names — a broader, pre-existing gap in plain-index naming generally
+/// (two long plain-indexed fields can already collide with *each other* the
+/// same way, with no `unique` field involved at all), out of scope here.
+#[must_use]
+pub fn unique_index_name(table: &str, field: &str, fields: &[Field]) -> String {
+    let full = format!("idx_{table}_{field}_unique");
+    let collides_with_plain_index = fields.iter().any(|f| f.name == format!("{field}_unique"));
+    if full.len() <= POSTGRES_MAX_IDENTIFIER_LEN && !collides_with_plain_index {
+        return full;
+    }
+    let digest = hex::encode(Sha256::digest(full.as_bytes()));
+    let suffix = format!("_{}", &digest[..8]);
+    let prefix_len = (POSTGRES_MAX_IDENTIFIER_LEN.saturating_sub(suffix.len())).min(full.len());
+    format!("{}{suffix}", &full[..prefix_len])
+}
+
+/// A `CREATE UNIQUE INDEX` statement enforcing single-column uniqueness on
+/// `field` (issue #1032). See [`unique_index_name`] for the name it uses.
+#[must_use]
+pub fn unique_index_sql(table: &str, field: &str, fields: &[Field]) -> String {
+    let name = unique_index_name(table, field, fields);
+    format!("CREATE UNIQUE INDEX {name} ON {table} ({field});\n")
+}
+
+/// For an `enum{…}` field, the trailing ` CHECK (col IN ('a', 'b', …))`
+/// clause that enforces the closed set at the database layer. `None` for
+/// every other field kind.
+///
+/// Variants are validated `snake_case` identifiers (see
+/// [`super::dsl::parse_field`]), so no SQL-escaping is needed here.
+fn enum_check_suffix(field: &Field) -> Option<String> {
+    if !field.kind.is_enum() {
+        return None;
+    }
+    let quoted = field
+        .variants
+        .iter()
+        .map(|v| format!("'{v}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!("CHECK ({} IN ({quoted}))", field.name))
 }
 
 /// Result of inferring a migration shape from its name.
@@ -248,13 +492,45 @@ fn split_on_keyword(s: &str, keyword: &str) -> Option<(String, String)> {
     None
 }
 
+/// `fields`, extended with a placeholder [`Field`] per column `table`
+/// already declares in `existing_schema` (see [`existing_schema_columns`])
+/// that isn't already in `fields`. Only `name` is meaningful on the
+/// placeholders — [`unique_index_name`]'s collision check is the only thing
+/// that consumes this combined list, and it only ever looks at `.name`.
+fn fields_with_existing_schema_columns(
+    fields: &[Field],
+    existing_schema: &str,
+    table: &str,
+) -> Vec<Field> {
+    let mut combined = fields.to_vec();
+    for name in existing_schema_columns(existing_schema, table) {
+        if !combined.iter().any(|f| f.name == name) {
+            combined.push(Field {
+                name,
+                kind: FieldKind::String,
+                nullable: false,
+                variants: Vec::new(),
+                unique: false,
+            });
+        }
+    }
+    combined
+}
+
 /// SQL for adding columns to a table.
 ///
 /// Prepends an `autumn-safety` comment for `NOT NULL` columns that have no
 /// `DEFAULT` — those require a backfill or a default before the constraint can
 /// be added safely on a live table.
+///
+/// `existing_schema` is `src/schema.rs`'s current content (or `""` if
+/// unavailable) — passed through to [`fields_with_existing_schema_columns`]
+/// so a `unique` field's index name can't collide with a plain index on some
+/// other, already-existing column from an earlier migration (issue #1032
+/// review follow-up).
 #[must_use]
-pub fn add_columns_up_sql(table: &str, fields: &[Field]) -> String {
+pub fn add_columns_up_sql(table: &str, fields: &[Field], existing_schema: &str) -> String {
+    let collision_fields = fields_with_existing_schema_columns(fields, existing_schema, table);
     let mut out = String::new();
     for f in fields {
         if !f.nullable {
@@ -264,13 +540,41 @@ pub fn add_columns_up_sql(table: &str, fields: &[Field]) -> String {
                  -- add a DEFAULT or backfill existing rows before enforcing NOT NULL"
             );
         }
-        let _ = writeln!(
+        let _ = write!(
             out,
-            "ALTER TABLE {table} ADD COLUMN {} {} {};",
+            "ALTER TABLE {table} ADD COLUMN {} {} {}",
             f.name,
-            f.sql_type(),
+            f.sql_column_type(),
             f.sql_nullability()
         );
+        if let Some(target) = f.reference_table() {
+            let _ = write!(out, " REFERENCES {target}(id)");
+        }
+        if let Some(check) = enum_check_suffix(f) {
+            let _ = write!(out, " {check}");
+        }
+        out.push_str(";\n");
+        // A `unique` field's own `CREATE UNIQUE INDEX` (emitted below)
+        // already covers lookups on that column, so a `references` field
+        // that is *also* `unique` must not get the plain auto-index too —
+        // same dedup `create_table_sql_with_metadata_and_id` already applies
+        // (issue #1032 review follow-up: this path emitted both, building
+        // and maintaining a redundant second btree index).
+        if f.kind.is_reference() && !f.unique {
+            // Postgres auto-drops this index (and the FK constraint above) when
+            // the column is dropped, so `add_columns_down_sql` needs no change.
+            let _ = writeln!(
+                out,
+                "CREATE INDEX idx_{table}_{} ON {table} ({});",
+                f.name, f.name
+            );
+        }
+        if f.unique {
+            // Postgres auto-drops this index when the column is dropped,
+            // same as the `references` auto-index above, so
+            // `add_columns_down_sql` needs no change.
+            out.push_str(&unique_index_sql(table, &f.name, &collision_fields));
+        }
     }
     out
 }
@@ -461,18 +765,50 @@ pub fn remove_columns_up_sql(table: &str, fields: &[Field]) -> String {
     out
 }
 
-/// `down.sql` companion to [`remove_columns_up_sql`].
+/// `down.sql` companion to [`remove_columns_up_sql`]. Restores a `references`
+/// field's `REFERENCES <table>(id)` constraint and automatic index (see
+/// [`create_table_sql_with_metadata_and_id`]/[`add_columns_up_sql`]) — a
+/// bare re-added column would silently drop the foreign-key relationship and
+/// its lookup index on rollback (issue #1026). Likewise restores an `enum{…}`
+/// field's `CHECK` constraint (issue #1030), and a `unique` field's `CREATE
+/// UNIQUE INDEX` (issue #1032) — otherwise the closed set / uniqueness
+/// constraint would silently stop being enforced after a rollback.
+///
+/// `existing_schema` is `src/schema.rs`'s current content (or `""` if
+/// unavailable) — see [`add_columns_up_sql`]'s matching doc comment for why.
 #[must_use]
-pub fn remove_columns_down_sql(table: &str, fields: &[Field]) -> String {
+pub fn remove_columns_down_sql(table: &str, fields: &[Field], existing_schema: &str) -> String {
+    let collision_fields = fields_with_existing_schema_columns(fields, existing_schema, table);
     let mut out = String::new();
     for f in fields.iter().rev() {
-        let _ = writeln!(
+        let _ = write!(
             out,
-            "ALTER TABLE {table} ADD COLUMN {} {} {};",
+            "ALTER TABLE {table} ADD COLUMN {} {} {}",
             f.name,
-            f.sql_type(),
+            f.sql_column_type(),
             f.sql_nullability()
         );
+        if let Some(target) = f.reference_table() {
+            let _ = write!(out, " REFERENCES {target}(id)");
+        }
+        if let Some(check) = enum_check_suffix(f) {
+            let _ = write!(out, " {check}");
+        }
+        out.push_str(";\n");
+        // See `add_columns_up_sql`'s matching comment: a `unique` field's
+        // own `CREATE UNIQUE INDEX` already covers lookups, so a
+        // `references` field that is also `unique` must not get the plain
+        // auto-index restored too.
+        if f.kind.is_reference() && !f.unique {
+            let _ = writeln!(
+                out,
+                "CREATE INDEX idx_{table}_{} ON {table} ({});",
+                f.name, f.name
+            );
+        }
+        if f.unique {
+            out.push_str(&unique_index_sql(table, &f.name, &collision_fields));
+        }
     }
     out
 }
@@ -561,11 +897,92 @@ fn has_mod_declaration(existing: &str, name: &str) -> bool {
         .any(|line| needles.iter().any(|n| line == n))
 }
 
-/// Insert each entry into the body of the *first* `routes![ ... ]` macro
-/// invocation. Skips entries already present.
-fn ensure_routes_entries(existing: &str, entries: &[String]) -> String {
-    let Some(start) = existing.find("routes![") else {
+/// Inverse of [`ensure_mods`] (`autumn destroy`, issue #1048).
+///
+/// Removes each `mod <name>;` line (the bare, private form `ensure_mods`
+/// inserts) for a name in `names`, then collapses any run of blank lines the
+/// removal leaves behind down to at most one, and drops a leading blank line
+/// at the very start of the file — restoring the file exactly as it was
+/// before any of those declarations were added.
+///
+/// Unlike [`remove_mod_declaration`] (a resource's own `pub mod` entry in
+/// `src/models/mod.rs`), this targets `src/main.rs`'s shared infrastructure
+/// module names (`models`, `schema`, `repositories`, `routes`, …). The
+/// caller is responsible for only passing names whose backing module no
+/// longer exists on disk — these declarations are shared by every
+/// generated resource, not owned by one.
+#[must_use]
+pub fn remove_main_mod_declarations(existing: &str, names: &[&str]) -> String {
+    let lines: Vec<&str> = existing.lines().collect();
+    let patterns: Vec<String> = names.iter().map(|n| format!("mod {n};")).collect();
+    let matches_any = |line: &str| patterns.iter().any(|p| line.trim() == p);
+    if !lines.iter().any(|l| matches_any(l)) {
         return existing.to_owned();
+    }
+    let kept: Vec<&str> = lines.into_iter().filter(|l| !matches_any(l)).collect();
+
+    let mut collapsed: Vec<&str> = Vec::with_capacity(kept.len());
+    for line in kept {
+        if line.trim().is_empty() && collapsed.last().is_some_and(|l: &&str| l.trim().is_empty()) {
+            continue;
+        }
+        collapsed.push(line);
+    }
+    while collapsed.first().is_some_and(|l| l.trim().is_empty()) {
+        collapsed.remove(0);
+    }
+
+    let mut out = collapsed.join("\n");
+    if existing.ends_with('\n') && !out.is_empty() {
+        out.push('\n');
+    }
+    out
+}
+
+/// Whether the byte offset `pos` in `text` sits after a `//` on its own line —
+/// i.e. the match at `pos` lives inside a line comment (`//`, `///`, or `//!`).
+/// Used to skip `routes![` occurrences that appear in comments (e.g. a doc
+/// comment explaining the macro) rather than in real code.
+///
+/// A `//` inside a double-quoted string literal is content, not a comment
+/// marker — e.g. the URL in
+/// `let url = "https://example.com"; app.routes(routes![index])` must not
+/// make the line look commented out. This stays a line-local heuristic: it
+/// tracks `"…"` state with `\`-escape handling but does not understand raw
+/// strings (`r#"…"#`), char literals containing `"`, or block comments.
+fn is_on_comment_line(text: &str, pos: usize) -> bool {
+    let line_start = text[..pos].rfind('\n').map_or(0, |nl| nl + 1);
+    let mut in_string = false;
+    let mut chars = text[line_start..pos].chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' if in_string => {
+                // Skip the escaped character so `\"` doesn't end the string.
+                chars.next();
+            }
+            '"' => in_string = !in_string,
+            '/' if !in_string && chars.peek() == Some(&'/') => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Locate the body span (byte offsets, exclusive of the enclosing
+/// `routes![`/`]`) of the *first* `routes![ ... ]` macro invocation in
+/// `existing`, skipping occurrences on comment lines (a doc comment such as
+/// `//! routes![...]` must not be edited — injecting entries there breaks
+/// compilation). Returns `None` if there is no non-comment `routes![` or its
+/// brackets are unmatched. Shared by every function that reads or rewrites the
+/// `routes![...]` body so the bracket-scan logic lives in exactly one place.
+fn find_routes_body_range(existing: &str) -> Option<(usize, usize)> {
+    let mut search_from = 0;
+    let start = loop {
+        let pos = search_from + existing[search_from..].find("routes![")?;
+        if !is_on_comment_line(existing, pos) {
+            break pos;
+        }
+        search_from = pos + "routes![".len();
     };
     let body_start = start + "routes![".len();
     // Find the matching closing bracket. The macro body cannot contain a
@@ -587,16 +1004,180 @@ fn ensure_routes_entries(existing: &str, entries: &[String]) -> String {
         i += 1;
     }
     if depth != 0 {
-        // Unmatched bracket — leave the file untouched.
-        return existing.to_owned();
+        // Unmatched bracket.
+        return None;
     }
-    let body = &existing[body_start..i];
+    Some((body_start, i))
+}
+
+/// Insert each entry into the body of the *first* `routes![ ... ]` macro
+/// invocation. Skips entries already present.
+fn ensure_routes_entries(existing: &str, entries: &[String]) -> String {
+    let Some((body_start, body_end)) = find_routes_body_range(existing) else {
+        return existing.to_owned();
+    };
+    let body = &existing[body_start..body_end];
     let new_body = augment_routes_body(body, entries);
     let mut out = String::with_capacity(existing.len() + new_body.len());
     out.push_str(&existing[..body_start]);
     out.push_str(&new_body);
-    out.push_str(&existing[i..]);
+    out.push_str(&existing[body_end..]);
     out
+}
+
+/// Remove every entry in the *first* `routes![ ... ]` macro invocation whose
+/// identifier starts with `prefix`. A no-op (returns `existing` unchanged)
+/// if there is no `routes![...]` or no entry matches.
+///
+/// Used by generators that regenerate a resource whose route set can change
+/// between runs (e.g. `autumn generate channel <Name> --force` switching
+/// from the SSE transport's routes to the WS transport's) — call this
+/// before [`update_main_rs`] so stale entries referencing functions the
+/// regenerated file no longer defines are not left dangling in `main.rs`.
+#[must_use]
+pub fn remove_routes_entries_with_prefix(existing: &str, prefix: &str) -> String {
+    let Some((body_start, body_end)) = find_routes_body_range(existing) else {
+        return existing.to_owned();
+    };
+    let body = &existing[body_start..body_end];
+    let original_entries: Vec<&str> = body
+        .split([',', '\n'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    let kept: Vec<&str> = original_entries
+        .iter()
+        .copied()
+        .filter(|s| !s.starts_with(prefix))
+        .collect();
+    if kept.len() == original_entries.len() {
+        return existing.to_owned();
+    }
+    let indent = leading_indent(body);
+    let mut new_body = String::with_capacity(body.len());
+    for entry in &kept {
+        new_body.push_str(&indent);
+        new_body.push_str(entry);
+        new_body.push_str(",\n");
+    }
+    let mut out = String::with_capacity(existing.len());
+    out.push_str(&existing[..body_start]);
+    out.push_str(&new_body);
+    out.push_str(&existing[body_end..]);
+    out
+}
+
+/// Inverse of [`augment_routes_body`] (`autumn destroy`, issue #1048).
+///
+/// Removes exactly `entries` from the first `routes![ ... ]` invocation and
+/// restores the pre-existing entries' original layout — byte-identically
+/// when they were on one line (the common case: a fresh `autumn new`
+/// project's `routes![index, hello, hello_name]`), since `augment_routes_body`
+/// only ever *appends* after existing content and never reformats it, so the
+/// text preceding the first entry being removed is exactly what preceded
+/// this generate call.
+///
+/// A no-op (returns `existing` unchanged) if there's no `routes![...]`, or if
+/// NONE of `entries` is present any more (already destroyed). Removes
+/// whichever of `entries` ARE currently present when only some are — e.g.
+/// the user hand-removed one of this resource's routes before running
+/// `destroy` — rather than abandoning the whole cleanup and leaving the
+/// rest dangling (issue #1048 PR review): a route this resource's own file
+/// deletion is about to orphan must not survive just because a sibling
+/// entry from the same call was already gone.
+#[must_use]
+pub fn remove_routes_entries(existing: &str, entries: &[String]) -> String {
+    if entries.is_empty() {
+        return existing.to_owned();
+    }
+    let Some((body_start, body_end)) = find_routes_body_range(existing) else {
+        return existing.to_owned();
+    };
+    let body = &existing[body_start..body_end];
+    let present_entries: Vec<String> = body
+        .split([',', '\n'])
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if !entries.iter().any(|e| present_entries.contains(e)) {
+        return existing.to_owned();
+    }
+    let kept: Vec<&String> = present_entries
+        .iter()
+        .filter(|e| !entries.contains(e))
+        .collect();
+
+    // The pre-existing entries' original formatting survives untouched in
+    // the current body, up to the point where this call's first removed
+    // entry begins. Strip the separator (`,`/whitespace/newline) forward
+    // added right after the original content to see whether that ORIGINAL
+    // content itself spanned multiple lines.
+    //
+    // Locate that point via each entry's actual token span (from the same
+    // comma/newline split `present_entries` was built from), not a raw
+    // substring search — `body.find(e)` would also match `e` occurring
+    // inside a *different*, kept entry that has it as a textual prefix
+    // (e.g. removing `routes::posts::index` while `routes::posts::index_all`
+    // is kept), misdetecting where the original layout ends.
+    let spans = entry_spans(body);
+    let first_removed_at = entries
+        .iter()
+        .filter_map(|e| {
+            spans
+                .iter()
+                .find(|(_, _, text)| text == e)
+                .map(|(start, ..)| *start)
+        })
+        .min()
+        .unwrap_or(body.len());
+    let original_segment = &body[..first_removed_at];
+    let original_core = original_segment.trim_end_matches([' ', '\t', '\n', ',']);
+    let multiline = original_core.contains('\n');
+
+    let new_body = if multiline {
+        let indent = leading_indent(body);
+        let mut out = String::with_capacity(body.len());
+        for entry in &kept {
+            out.push_str(&indent);
+            out.push_str(entry);
+            out.push_str(",\n");
+        }
+        out
+    } else {
+        kept.iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    let mut out = String::with_capacity(existing.len());
+    out.push_str(&existing[..body_start]);
+    out.push_str(&new_body);
+    out.push_str(&existing[body_end..]);
+    out
+}
+
+/// Parse `body` into `(start, end, trimmed_text)` byte spans of each
+/// comma/newline-delimited entry, so callers can locate an entry's actual
+/// token occurrence rather than a raw substring search (which can match
+/// inside a different, unrelated entry that has it as a textual prefix).
+fn entry_spans(body: &str) -> Vec<(usize, usize, &str)> {
+    let mut spans = Vec::new();
+    let mut offset = 0usize;
+    for piece in body.split_inclusive([',', '\n']) {
+        let piece_start = offset;
+        offset += piece.len();
+        let trimmed = piece.trim_matches([',', '\n', ' ', '\t', '\r']);
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Some(inner_offset) = piece.find(trimmed) else {
+            continue;
+        };
+        let start = piece_start + inner_offset;
+        spans.push((start, start + trimmed.len(), trimmed));
+    }
+    spans
 }
 
 fn augment_routes_body(body: &str, entries: &[String]) -> String {
@@ -681,21 +1262,27 @@ pub fn add_mail_preview_to_app(existing: &str, mailer_type: &str) -> String {
     )
 }
 
-/// Append `mailer_type` inside an already-present `mail_previews![...]`.
-fn augment_mail_previews_list(existing: &str, body_start: usize, mailer_type: &str) -> String {
+/// Splice `entry` into the body of a `macro![...]` call starting at `body_start`.
+///
+/// Idempotent: returns `existing` unchanged if `entry` is already present.
+/// Returns `existing` unchanged if no closing `]` is found.
+fn splice_into_macro_body(existing: &str, body_start: usize, entry: &str) -> String {
     let rest = &existing[body_start..];
     let Some(end_offset) = rest.find(']') else {
         return existing.to_owned();
     };
     let body = &rest[..end_offset];
 
-    // Idempotency: skip if type is already registered.
-    if body.split(',').map(str::trim).any(|t| t == mailer_type) {
+    // Idempotency: skip if entry is already registered.
+    if body.split(',').map(str::trim).any(|t| t == entry) {
         return existing.to_owned();
     }
 
-    let separator = if body.trim().is_empty() { "" } else { ", " };
-    let new_body = format!("{}{}{}", body.trim_end(), separator, mailer_type);
+    // Trim whitespace and any trailing comma so `cargo fmt`-formatted multi-line
+    // macro bodies (which may end with a trailing comma) don't produce `entry1,, entry2`.
+    let trimmed_body = body.trim().trim_end_matches(',');
+    let separator = if trimmed_body.is_empty() { "" } else { ", " };
+    let new_body = format!("{trimmed_body}{separator}{entry}");
     [
         &existing[..body_start],
         &new_body,
@@ -704,35 +1291,283 @@ fn augment_mail_previews_list(existing: &str, body_start: usize, mailer_type: &s
     .concat()
 }
 
-/// Insert `.mail_previews(mail_previews![mailer_type])` before `.run()`.
-fn insert_mail_previews_call(existing: &str, mailer_type: &str) -> String {
-    let mut out = String::with_capacity(existing.len() + 80);
+/// Append `mailer_type` inside an already-present `mail_previews![...]`.
+fn augment_mail_previews_list(existing: &str, body_start: usize, mailer_type: &str) -> String {
+    splice_into_macro_body(existing, body_start, mailer_type)
+}
+
+/// Insert `line_to_insert` (without trailing newline) before the first `.run()`
+/// line in an `AppBuilder` chain, preserving the same indentation.
+///
+/// Returns `existing` unchanged when no `.run()` line can be found.
+fn insert_before_run_call(existing: &str, line_to_insert: &str) -> String {
+    let mut out = String::with_capacity(existing.len() + line_to_insert.len() + 4);
     let mut inserted = false;
-    for line in existing.split('\n') {
+    for line in existing.lines() {
         let trimmed = line.trim_start();
         if !inserted && trimmed.starts_with(".run()") {
             let indent_len = line.len() - trimmed.len();
             let indent = &line[..indent_len];
             out.push_str(indent);
-            out.push_str(".mail_previews(mail_previews![");
-            out.push_str(mailer_type);
-            out.push_str("])\n");
+            out.push_str(line_to_insert);
+            out.push('\n');
             inserted = true;
         }
         out.push_str(line);
         out.push('\n');
     }
-    // split('\n') always produces a trailing empty slice for strings ending
-    // with '\n', so we have one extra '\n'. Trim it if the original didn't
-    // end with a newline.
+    // lines() doesn't yield the trailing empty segment that split('\n') would,
+    // so remove the surplus '\n' only when the original had no trailing newline.
     if !existing.ends_with('\n') && out.ends_with('\n') {
         out.pop();
     }
-    // Remove the extra trailing newline produced by the final empty segment.
-    if existing.ends_with('\n') && out.ends_with("\n\n") {
-        out.pop();
+    out
+}
+
+/// Insert `.mail_previews(mail_previews![mailer_type])` before `.run()`.
+fn insert_mail_previews_call(existing: &str, mailer_type: &str) -> String {
+    insert_before_run_call(
+        existing,
+        &format!(".mail_previews(mail_previews![{mailer_type}])"),
+    )
+}
+
+/// Inverse of [`add_mail_preview_to_app`] (`autumn destroy`, issue #1048).
+///
+/// Removes `mailer_type` from the `mail_previews![...]` list. If it was the
+/// only entry, the whole freshly-inserted
+/// `.mail_previews(mail_previews![...])` line is removed too, rather than
+/// leaving an empty `mail_previews![]` call behind.
+///
+/// A no-op if there's no `mail_previews![...]`, or `mailer_type` isn't
+/// currently listed.
+///
+/// Locates the whole `.mail_previews(mail_previews![...])` call by balanced-
+/// paren scan (rather than assuming it stays on one line) when the list
+/// empties out, so a project that ran the call through `rustfmt` — which
+/// commonly wraps it across several lines once it has more than a couple of
+/// mailer names — doesn't end up with a dangling, now-meaningless remnant
+/// (issue #1048 PR review).
+#[must_use]
+pub fn remove_mail_preview_from_app(existing: &str, mailer_type: &str) -> String {
+    const PREVIEW_MACRO: &str = "mail_previews![";
+    const CALL_PREFIX: &str = ".mail_previews(";
+    let Some((spliced, now_empty)) =
+        remove_entry_from_bracketed_list(existing, PREVIEW_MACRO, mailer_type)
+    else {
+        return existing.to_owned();
+    };
+    if !now_empty {
+        return spliced;
+    }
+    // Only entry -- remove the whole freshly-inserted call, whichever lines
+    // it spans.
+    let Some(call_pos) = existing.find(CALL_PREFIX) else {
+        return existing.to_owned();
+    };
+    let Some(call_end) = find_balanced_close_paren(existing, call_pos + CALL_PREFIX.len()) else {
+        return existing.to_owned();
+    };
+    let start_line = existing[..call_pos].rfind('\n').map_or(0, |i| i + 1);
+    let end_line = existing[call_end..]
+        .find('\n')
+        .map_or(existing.len(), |i| call_end + i + 1);
+    let mut out = String::with_capacity(existing.len());
+    out.push_str(&existing[..start_line]);
+    out.push_str(&existing[end_line..]);
+    out
+}
+
+/// Scan forward from `start` (the byte position just after an already-open
+/// `(`, i.e. depth 1) for the matching closing paren, returning the index
+/// just past it. `None` if the parens never balance (malformed/truncated
+/// input — destroy never guesses).
+fn find_balanced_close_paren(src: &str, start: usize) -> Option<usize> {
+    let bytes = src.as_bytes();
+    let mut depth = 1usize;
+    let mut i = start;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Shared bracket-list-entry removal behind [`remove_job_entry`] and
+/// [`remove_mail_preview_from_app`]: locate `macro_literal` (e.g.
+/// `"jobs!["`), remove `entry` from its comma-separated body, and rejoin.
+///
+/// Returns `None` if the macro isn't present or `entry` isn't currently
+/// listed (destroy never guesses at a partial match). Otherwise returns
+/// `Some((new_content, list_is_now_empty))` — callers that need to collapse
+/// or remove a now-meaningless surrounding call/function when the list
+/// empties out (which one text becomes home to.. differs — `jobs![]`
+/// removes a whole `fn`, `mail_previews![]` removes a call line) check the
+/// `bool` and discard `new_content` in that case, matching
+/// [`remove_dep_feature_in_section`]'s `collapse_to_bare` pattern for the
+/// analogous Cargo-feature-list case.
+fn remove_entry_from_bracketed_list(
+    existing: &str,
+    macro_literal: &str,
+    entry: &str,
+) -> Option<(String, bool)> {
+    let macro_start = existing.find(macro_literal)?;
+    let body_start = macro_start + macro_literal.len();
+    let rest = &existing[body_start..];
+    let end_offset = rest.find(']')?;
+    let body = &rest[..end_offset];
+    let items: Vec<&str> = body
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if !items.contains(&entry) {
+        return None;
+    }
+    let remaining: Vec<&str> = items.into_iter().filter(|s| s != &entry).collect();
+    let now_empty = remaining.is_empty();
+    let new_body = remaining.join(", ");
+    let mut out = String::with_capacity(existing.len());
+    out.push_str(&existing[..body_start]);
+    out.push_str(&new_body);
+    out.push_str(&existing[body_start + end_offset..]);
+    Some((out, now_empty))
+}
+
+// ── Job registration helpers ──────────────────────────────────────────────
+
+/// Inject `.jobs(jobs::registered_jobs())` into the `AppBuilder` chain in
+/// `src/main.rs`, immediately before the `.run()` line.
+///
+/// Idempotent: if `.jobs(jobs::registered_jobs())` is already present the
+/// function returns `existing` unchanged.  Returns `existing` unchanged when
+/// no `.run()` line can be found.
+#[must_use]
+pub fn add_jobs_registration_to_app(existing: &str) -> String {
+    const JOBS_CALL: &str = ".jobs(jobs::registered_jobs())";
+    if existing.contains(JOBS_CALL) {
+        return existing.to_owned();
+    }
+    insert_jobs_call(existing)
+}
+
+/// Insert `.jobs(jobs::registered_jobs())` before the first `.run()` line.
+fn insert_jobs_call(existing: &str) -> String {
+    insert_before_run_call(existing, ".jobs(jobs::registered_jobs())")
+}
+
+/// Idempotently add `entry` (e.g. `"send_welcome_email::send_welcome_email"`)
+/// to the `jobs![...]` macro invocation inside `src/jobs/mod.rs`.
+///
+/// If no `jobs![` call exists yet, the full `registered_jobs()` function is
+/// appended.  If it already exists, only the new entry is spliced in (using
+/// the same bracket-scan logic as `augment_routes_body` / `augment_mail_previews_list`).
+/// Idempotent: a second call with the same entry is a no-op.
+#[must_use]
+pub fn augment_registered_jobs(existing: &str, entry: &str) -> String {
+    const JOBS_MACRO: &str = "jobs![";
+    existing.find(JOBS_MACRO).map_or_else(
+        || {
+            // Append a fresh registered_jobs() fn.
+            let trimmed = existing.trim_end();
+            let sep = if trimmed.is_empty() { "" } else { "\n\n" };
+            format!(
+                "{trimmed}{sep}#[must_use]\npub fn registered_jobs() -> Vec<autumn_web::job::JobInfo> {{\n    autumn_web::jobs![{entry}]\n}}\n"
+            )
+        },
+        |macro_start| {
+            let body_start = macro_start + JOBS_MACRO.len();
+            splice_jobs_list(existing, body_start, entry)
+        },
+    )
+}
+
+/// Splice `entry` into an already-present `jobs![...]` body.
+fn splice_jobs_list(existing: &str, body_start: usize, entry: &str) -> String {
+    splice_into_macro_body(existing, body_start, entry)
+}
+
+/// Inverse of [`augment_registered_jobs`] (`autumn destroy`, issue #1048).
+///
+/// Removes `entry` from the `jobs![...]` list. If it was the only entry, the
+/// whole freshly-generated `registered_jobs()` function (plus its
+/// `#[must_use]` attribute and the blank separator line before it) is
+/// removed too, rather than leaving an empty `jobs![]` behind.
+///
+/// A no-op if there's no `jobs![...]`, or `entry` isn't currently listed.
+#[must_use]
+pub fn remove_job_entry(existing: &str, entry: &str) -> String {
+    const JOBS_MACRO: &str = "jobs![";
+    let Some((spliced, now_empty)) = remove_entry_from_bracketed_list(existing, JOBS_MACRO, entry)
+    else {
+        return existing.to_owned();
+    };
+    if now_empty {
+        remove_registered_jobs_fn(existing)
+    } else {
+        spliced
+    }
+}
+
+/// Remove the whole `registered_jobs()` function [`augment_registered_jobs`]
+/// generates when it creates one from scratch, plus its `#[must_use]`
+/// attribute and one preceding blank separator line.
+fn remove_registered_jobs_fn(existing: &str) -> String {
+    let lines: Vec<&str> = existing.lines().collect();
+    let Some(fn_line_idx) = lines
+        .iter()
+        .position(|l| l.trim_start().starts_with("pub fn registered_jobs("))
+    else {
+        return existing.to_owned();
+    };
+    let start = if fn_line_idx > 0 && lines[fn_line_idx - 1].trim() == "#[must_use]" {
+        fn_line_idx - 1
+    } else {
+        fn_line_idx
+    };
+    let Some(close_offset) = lines[fn_line_idx..].iter().position(|l| l.trim() == "}") else {
+        return existing.to_owned();
+    };
+    let end = fn_line_idx + close_offset;
+
+    let mut effective_start = start;
+    if effective_start > 0 && lines[effective_start - 1].trim().is_empty() {
+        effective_start -= 1;
+    }
+
+    let mut new_lines: Vec<&str> = Vec::with_capacity(lines.len());
+    new_lines.extend_from_slice(&lines[..effective_start]);
+    if end + 1 < lines.len() {
+        new_lines.extend_from_slice(&lines[end + 1..]);
+    }
+    let mut out = new_lines.join("\n");
+    if !out.is_empty() {
+        out.push('\n');
     }
     out
+}
+
+/// Inverse of [`add_jobs_registration_to_app`] (`autumn destroy`, issue #1048).
+///
+/// Removes the `.jobs(jobs::registered_jobs())` line from the `AppBuilder`
+/// chain. A no-op if it isn't present.
+#[must_use]
+pub fn remove_jobs_registration_from_app(existing: &str) -> String {
+    const JOBS_CALL: &str = ".jobs(jobs::registered_jobs())";
+    let lines: Vec<&str> = existing.lines().collect();
+    let Some(idx) = lines.iter().position(|l| l.trim() == JOBS_CALL) else {
+        return existing.to_owned();
+    };
+    remove_single_line(&lines, idx, existing.ends_with('\n'))
 }
 
 // ── Cargo.toml: feature injection ────────────────────────────────────────
@@ -901,31 +1736,44 @@ fn add_feature_to_multiline_inline_table(
     Some(out)
 }
 
-/// Handle the dotted key form `autumn-web.* = ...` inside a `[dependencies]` section.
+/// Handle the dotted key form `<dep_name>.* = ...` inside a dependency
+/// section (`[dependencies]` or `[dev-dependencies]`, per `section`).
 ///
-/// Looks for an existing `autumn-web.features` key in the section to splice into;
-/// if none is found, inserts one immediately after `dep_line_idx`.
+/// Looks for an existing `<dep_name>.features` key in the section to splice
+/// into; if none is found, inserts one immediately after `dep_line_idx`.
 fn patch_dotted_dep(
     lines: &[&str],
     dep_line_idx: usize,
     existing: &str,
+    dep_name: &str,
     feature: &str,
     feature_quoted: &str,
+    section: &str,
 ) -> String {
     let section_end = lines[dep_line_idx + 1..]
         .iter()
-        .position(|l| is_toml_table_header(l.trim()))
+        .position(|l| is_section_boundary(l.trim(), section))
         .map_or(lines.len(), |p| dep_line_idx + 1 + p);
 
     if lines[dep_line_idx..section_end].iter().any(|l| {
         let line_code = l.split_once('#').map_or(*l, |(before, _)| before);
-        line_code.trim_start().starts_with("autumn-web") && line_code.contains(feature_quoted)
+        // Require an exact dotted match (`<dep_name>.` ...) rather than a
+        // bare prefix, so an unrelated dependency sharing the prefix (e.g.
+        // `tokio-util = { features = ["rt"] }` when `dep_name` is "tokio")
+        // can't be mistaken for evidence that `<dep_name>` already has the
+        // feature -- that would skip actually adding it to the real dep.
+        line_code
+            .trim_start()
+            .strip_prefix(dep_name)
+            .is_some_and(|rest| rest.starts_with('.'))
+            && line_code.contains(feature_quoted)
     }) {
         return existing.to_owned();
     }
 
+    let features_key = format!("{dep_name}.features");
     for (j, &sec_line) in lines[dep_line_idx..section_end].iter().enumerate() {
-        if sec_line.trim_start().starts_with("autumn-web.features") {
+        if sec_line.trim_start().starts_with(&features_key) {
             let new_line = rewrite_features_line(sec_line, feature);
             let mut out = String::with_capacity(existing.len() + 32);
             for (k, &l) in lines.iter().enumerate() {
@@ -939,7 +1787,7 @@ fn patch_dotted_dep(
         }
     }
 
-    let new_feat = format!("autumn-web.features = [{feature_quoted}]");
+    let new_feat = format!("{features_key} = [{feature_quoted}]");
     let mut out = String::with_capacity(existing.len() + new_feat.len() + 2);
     for (k, &l) in lines.iter().enumerate() {
         out.push_str(l);
@@ -971,6 +1819,465 @@ pub fn ensure_autumn_web_feature(existing: &str, feature: &str) -> String {
     ensure_autumn_web_feature_status(existing, feature).0
 }
 
+/// Inverse of [`ensure_autumn_web_feature`] (`autumn destroy`, issue #1048),
+/// scoped to `[dependencies]`.
+///
+/// Removes `feature` from `autumn-web`'s `features = [...]` list, in
+/// whichever of the four shapes [`ensure_autumn_web_feature`] can add it to:
+/// single-line inline table, dotted key (`autumn-web.features = [...]`),
+/// multiline inline table, or a `[dependencies.autumn-web]` subtable. Only
+/// the single-line inline-table case can collapse: when removing `feature`
+/// empties the list and `version` is the only other key, the whole entry
+/// collapses back to a bare string, restoring the pre-generate declaration
+/// byte-for-byte — the other three shapes only ever lose the one list entry
+/// (or the now-empty `features` line/key), since their surrounding
+/// structure may predate `generate` entirely and destroy never restructures
+/// content it didn't itself add.
+///
+/// A no-op for an entry `feature` doesn't currently list — destroy only
+/// reverses what `generate` itself would have written. A renamed/aliased
+/// `autumn-web` dependency (`autumn_web = { package = "autumn-web", ... }` or
+/// `[dependencies.autumn_web]`) is resolved to its actual key first (issue
+/// #1048 PR review) — [`ensure_autumn_web_feature_status_in_section`] adds
+/// features there too, so destroy must look under the same key it did.
+#[must_use]
+pub fn remove_autumn_web_feature(existing: &str, feature: &str) -> String {
+    let dep_key = resolve_autumn_web_dep_key(existing, "dependencies");
+    remove_dep_feature_in_section(existing, dep_key, feature, "dependencies", true)
+}
+
+/// Inverse of [`ensure_dev_dependency_test_support`] (`autumn destroy`,
+/// issue #1048), scoped to `[dev-dependencies]`.
+///
+/// Unlike [`remove_autumn_web_feature`], a fresh project's
+/// `[dev-dependencies]` never has a prior `autumn-web` entry —
+/// [`ensure_dev_dependency_test_support`] always *inserts* a brand-new line.
+/// So when removing `feature` empties its features list, the whole line is
+/// deleted outright rather than collapsed to a bare string.
+///
+/// A no-op for any other declaration shape, mirroring
+/// [`remove_autumn_web_feature`].
+#[must_use]
+pub fn remove_autumn_web_dev_dependency_feature(existing: &str, feature: &str) -> String {
+    let dep_key = resolve_autumn_web_dep_key(existing, "dev-dependencies");
+    remove_dep_feature_in_section(existing, dep_key, feature, "dev-dependencies", false)
+}
+
+/// Which literal identifier `autumn-web`'s dependency entry uses in
+/// `section` — either the plain crate name, or an importable alias declared
+/// with an explicit `package = "autumn-web"` (mirrors the alias detection in
+/// [`ensure_autumn_web_feature_status_in_section`], whose Pass 1 "else"
+/// branch and Pass 2b add features under exactly these two alias shapes:
+/// `autumn_web = { package = "autumn-web", ... }` and
+/// `[<section>.autumn_web]` with `package = "autumn-web"` inside).
+///
+/// [`remove_dep_feature_in_section`] previously always searched for the
+/// literal `"autumn-web"` key, so a project using either alias shape kept
+/// its generator-added feature forever — `destroy` located no matching line
+/// and silently made no edit (issue #1048 PR review).
+///
+/// Falls back to the literal key when no dependency entry is found at all —
+/// `remove_dep_feature_in_section` is already a no-op in that case.
+fn resolve_autumn_web_dep_key(existing: &str, section: &str) -> &'static str {
+    let lines: Vec<&str> = existing.lines().collect();
+    let mut in_section = false;
+    for &line in &lines {
+        let trimmed = line.trim();
+        if is_section_header(trimmed, section) {
+            in_section = true;
+            continue;
+        }
+        if in_section && is_section_boundary(trimmed, section) {
+            in_section = false;
+            continue;
+        }
+        if !in_section || trimmed.starts_with('#') {
+            continue;
+        }
+        let after_ws = line.trim_start();
+        if let Some(rest) = after_ws.strip_prefix("autumn-web") {
+            if rest.starts_with('.') || rest.trim_start().starts_with('=') {
+                return "autumn-web";
+            }
+            continue;
+        }
+        let Some((key, val)) = after_ws.split_once('=') else {
+            continue;
+        };
+        let key_trimmed = key.trim();
+        let alias = key_trimmed
+            .split_once('.')
+            .map_or(key_trimmed, |(base, _)| base);
+        if alias.replace('-', "_") == "autumn_web" && declares_package(val, "autumn-web") {
+            return "autumn_web";
+        }
+    }
+
+    let literal_subtable_key = format!("[{section}.autumn-web]");
+    if lines
+        .iter()
+        .any(|l| l.trim().split('#').next().unwrap_or("").trim() == literal_subtable_key)
+    {
+        return "autumn-web";
+    }
+    let renamed_subtable_key = format!("[{section}.autumn_web]");
+    if find_section_start_with_autumn_web_package(&lines, &renamed_subtable_key).is_some() {
+        return "autumn_web";
+    }
+
+    "autumn-web"
+}
+
+/// How a single-line dependency declaration should be rewritten once a
+/// feature has been removed from its `features = [...]` array.
+enum FeatureRemovalEdit {
+    /// Keep the line, with this new full text.
+    Replace(String),
+    /// Delete the line entirely.
+    Delete,
+    /// Leave the file completely unchanged — either `feature` wasn't found,
+    /// or the shape doesn't confidently invert.
+    Unchanged,
+}
+
+/// Shared implementation behind [`remove_autumn_web_feature`] and
+/// [`remove_autumn_web_dev_dependency_feature`]. See their docs for the two
+/// `collapse_to_bare` behaviours.
+///
+/// Beyond the single-line inline-table shape [`parse_feature_removal`]
+/// handles, this also inverts the dotted-key (`<dep_name>.features =
+/// [...]`), multiline inline-table, and `[<section>.<dep_name>]` subtable
+/// forms [`ensure_autumn_web_feature_status_in_section`] can add a feature
+/// to (issue #1048 PR review) — `generate mailer`/`channel --ws` otherwise
+/// left the feature behind forever in a hand-maintained `Cargo.toml` using
+/// one of those shapes. Each of those three only ever edits the `features`
+/// line itself, never collapsing or restructuring the surrounding
+/// declaration — unlike the single-line case, that structure may predate
+/// `generate` entirely, so only what `generate` itself would have inserted
+/// (an entry in the list) is reverted.
+fn remove_dep_feature_in_section(
+    existing: &str,
+    dep_name: &str,
+    feature: &str,
+    section: &str,
+    collapse_to_bare: bool,
+) -> String {
+    let feature_quoted = format!("\"{feature}\"");
+    let lines: Vec<&str> = existing.lines().collect();
+    let dotted_features_key = format!("{dep_name}.features");
+    let mut in_section = false;
+    for (i, &line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if is_section_header(trimmed, section) {
+            in_section = true;
+            continue;
+        }
+        if in_section && is_section_boundary(trimmed, section) {
+            in_section = false;
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+
+        if line.trim_start().starts_with(&dotted_features_key)
+            && let Some((new_line, now_empty)) =
+                remove_feature_from_features_line(line, &feature_quoted)
+        {
+            return if now_empty {
+                remove_single_line(&lines, i, existing.ends_with('\n'))
+            } else {
+                splice_single_line(&lines, i, &new_line, existing.ends_with('\n'))
+            };
+        }
+
+        let edit = parse_feature_removal(line, dep_name, &feature_quoted, collapse_to_bare);
+        match edit {
+            FeatureRemovalEdit::Replace(new_line) => {
+                return splice_single_line(&lines, i, &new_line, existing.ends_with('\n'));
+            }
+            FeatureRemovalEdit::Delete => {
+                return remove_single_line(&lines, i, existing.ends_with('\n'));
+            }
+            FeatureRemovalEdit::Unchanged => {
+                if let Some(result) = remove_feature_from_open_multiline_inline_table(
+                    &lines,
+                    i,
+                    existing,
+                    dep_name,
+                    &feature_quoted,
+                ) {
+                    return result;
+                }
+            }
+        }
+    }
+
+    // Pass 2: multiline subtable form `[<section>.<dep_name>]`.
+    let subtable_key = format!("[{section}.{dep_name}]");
+    for (i, &line) in lines.iter().enumerate() {
+        let key_part = line.trim().split('#').next().unwrap_or("").trim();
+        if key_part != subtable_key {
+            continue;
+        }
+        let section_start = i + 1;
+        let section_end = lines[section_start..]
+            .iter()
+            .position(|l| {
+                let t = l.trim();
+                t.starts_with('[') && !t.is_empty()
+            })
+            .map_or(lines.len(), |p| section_start + p);
+        if let Some(result) = remove_feature_from_deps_section(
+            &lines,
+            section_start,
+            section_end,
+            existing,
+            &feature_quoted,
+        ) {
+            return result;
+        }
+    }
+
+    existing.to_owned()
+}
+
+/// Remove `feature_quoted` from a standalone `key = [...]` TOML line
+/// (inverse of [`rewrite_features_line`]). `None` if the line has no
+/// bracketed array, or it doesn't list `feature_quoted`. Otherwise returns
+/// the rewritten line and whether the array is now empty.
+fn remove_feature_from_features_line(line: &str, feature_quoted: &str) -> Option<(String, bool)> {
+    let open = line.find('[')?;
+    let close_rel = line[open..].find(']')?;
+    let abs_end = open + close_rel;
+    let body = &line[open + 1..abs_end];
+    let items: Vec<&str> = body
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if !items.contains(&feature_quoted) {
+        return None;
+    }
+    let remaining: Vec<&str> = items
+        .into_iter()
+        .filter(|it| *it != feature_quoted)
+        .collect();
+    let now_empty = remaining.is_empty();
+    let new_line = format!(
+        "{}{}{}",
+        &line[..=open],
+        remaining.join(", "),
+        &line[abs_end..]
+    );
+    Some((new_line, now_empty))
+}
+
+/// If `lines[open_idx]` opens a multiline inline-table declaration for
+/// `dep_name` (`<dep_name> = {` with no closing `}` on the same line),
+/// removes `feature_quoted` from its `features = [...]` entry — inverse of
+/// [`add_feature_to_multiline_inline_table`]. Only edits the `features`
+/// line; never collapses the surrounding table, since it may predate
+/// `generate` entirely. `None` if `lines[open_idx]` isn't that opening
+/// shape, no closing `}` is found, no `features` line exists inside the
+/// block, or that line doesn't list `feature_quoted`.
+fn remove_feature_from_open_multiline_inline_table(
+    lines: &[&str],
+    open_idx: usize,
+    existing: &str,
+    dep_name: &str,
+    feature_quoted: &str,
+) -> Option<String> {
+    let after_ws = lines[open_idx].trim_start();
+    let rest = after_ws.strip_prefix(dep_name)?;
+    let rest = rest.trim_start().strip_prefix('=')?;
+    let rest = rest.trim_start().strip_prefix('{')?;
+    if rest.contains('}') {
+        return None; // closes on the same line -- not the multiline form.
+    }
+    let close_idx = lines[open_idx + 1..]
+        .iter()
+        .position(|l| l.trim_start().starts_with('}'))
+        .map(|p| open_idx + 1 + p)?;
+    remove_feature_from_deps_section(lines, open_idx + 1, close_idx, existing, feature_quoted)
+}
+
+/// Remove `feature_quoted` from a `features = [...]` line found inside
+/// `lines[section_start..section_end)` (a multiline inline-table body or a
+/// `[<section>.<dep_name>]` subtable body). Only that one line is ever
+/// changed — every other key in the span is left untouched. `None` if no
+/// `features` line is found there, or it doesn't list `feature_quoted`.
+fn remove_feature_from_deps_section(
+    lines: &[&str],
+    section_start: usize,
+    section_end: usize,
+    existing: &str,
+    feature_quoted: &str,
+) -> Option<String> {
+    for (j, &sect_line) in lines[section_start..section_end].iter().enumerate() {
+        if !sect_line.trim_start().starts_with("features") {
+            continue;
+        }
+        let idx = section_start + j;
+        let (new_line, now_empty) = remove_feature_from_features_line(sect_line, feature_quoted)?;
+        return Some(if now_empty {
+            remove_single_line(lines, idx, existing.ends_with('\n'))
+        } else {
+            splice_single_line(lines, idx, &new_line, existing.ends_with('\n'))
+        });
+    }
+    None
+}
+
+/// Find the `features` key inside an inline-table `body` (e.g.
+/// `version = "1", default-features = false, features = ["mail"]`), as a
+/// whole key — not a substring match that a plain `body.find("features")`
+/// would also hit inside `default-features` when that key comes first
+/// (issue #1048 PR review: `default-features = false, features = ["mail"]`
+/// would otherwise truncate `before_features` mid-word at `default-` and
+/// rewrite the dependency into invalid TOML). Requires the match to be
+/// preceded by the body start or a non-identifier character, and followed
+/// by optional whitespace then `=`.
+fn find_features_key(body: &str) -> Option<usize> {
+    let mut search_from = 0;
+    while let Some(rel) = body[search_from..].find("features") {
+        let idx = search_from + rel;
+        let is_key_start = idx == 0
+            || !matches!(body.as_bytes()[idx - 1], b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'-');
+        let is_key_end = body[idx + "features".len()..].trim_start().starts_with('=');
+        if is_key_start && is_key_end {
+            return Some(idx);
+        }
+        search_from = idx + "features".len();
+    }
+    None
+}
+
+/// Parse `line` as `{indent}{dep_name} = { ...features = [...] ... }` and
+/// decide how to rewrite it once `feature_quoted` is removed from the
+/// features array. Returns [`FeatureRemovalEdit::Unchanged`] whenever the
+/// line doesn't match that exact single-line inline-table shape, or doesn't
+/// currently list the feature.
+fn parse_feature_removal(
+    line: &str,
+    dep_name: &str,
+    feature_quoted: &str,
+    collapse_to_bare: bool,
+) -> FeatureRemovalEdit {
+    let after_ws = line.trim_start();
+    let indent = &line[..line.len() - after_ws.len()];
+    let Some(rest) = after_ws.strip_prefix(dep_name) else {
+        return FeatureRemovalEdit::Unchanged;
+    };
+    let Some(rest) = rest.trim_start().strip_prefix('=') else {
+        return FeatureRemovalEdit::Unchanged;
+    };
+    let Some(rest) = rest.trim_start().strip_prefix('{') else {
+        return FeatureRemovalEdit::Unchanged;
+    };
+    let Some(body_end) = rest.rfind('}') else {
+        return FeatureRemovalEdit::Unchanged;
+    };
+    let body = rest[..body_end].trim();
+    let Some(features_kw) = find_features_key(body) else {
+        return FeatureRemovalEdit::Unchanged;
+    };
+    let before_features = body[..features_kw].trim().trim_end_matches(',').trim();
+    let after_kw = &body[features_kw + "features".len()..];
+    let Some(bracket_open) = after_kw.find('[') else {
+        return FeatureRemovalEdit::Unchanged;
+    };
+    let Some(bracket_close) = after_kw.find(']') else {
+        return FeatureRemovalEdit::Unchanged;
+    };
+    if bracket_close < bracket_open {
+        return FeatureRemovalEdit::Unchanged;
+    }
+    let list_body = &after_kw[bracket_open + 1..bracket_close];
+    let after_list = after_kw[bracket_close + 1..]
+        .trim()
+        .trim_start_matches(',')
+        .trim();
+    let items: Vec<&str> = list_body
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if !items.contains(&feature_quoted) {
+        return FeatureRemovalEdit::Unchanged;
+    }
+    let remaining: Vec<&str> = items.into_iter().filter(|s| *s != feature_quoted).collect();
+
+    if !remaining.is_empty() {
+        let sep = if before_features.is_empty() { "" } else { ", " };
+        let after_sep = if after_list.is_empty() { "" } else { ", " };
+        return FeatureRemovalEdit::Replace(format!(
+            "{indent}{dep_name} = {{ {before_features}{sep}features = [{}]{after_sep}{after_list} }}",
+            remaining.join(", "),
+        ));
+    }
+
+    if collapse_to_bare {
+        if !after_list.is_empty() {
+            return FeatureRemovalEdit::Unchanged;
+        }
+        if let Some(v) = before_features
+            .strip_prefix("version")
+            .map(str::trim_start)
+            .and_then(|r| r.strip_prefix('='))
+        {
+            return FeatureRemovalEdit::Replace(format!("{indent}{dep_name} = {}", v.trim()));
+        }
+        // Some other key remains besides the now-empty `features` array —
+        // e.g. a renamed dep's `package = "autumn-web"` (issue #1048 PR
+        // review), or `default-features = false`. Collapsing to a bare
+        // string would silently drop that key, so just remove the
+        // `features` key and keep the rest of the inline table intact.
+        if before_features.is_empty() {
+            return FeatureRemovalEdit::Unchanged;
+        }
+        return FeatureRemovalEdit::Replace(format!(
+            "{indent}{dep_name} = {{ {before_features} }}"
+        ));
+    }
+
+    FeatureRemovalEdit::Delete
+}
+
+/// Replace line `idx` with `new_line`, preserving the file's trailing-newline status.
+pub(super) fn splice_single_line(
+    lines: &[&str],
+    idx: usize,
+    new_line: &str,
+    ends_with_newline: bool,
+) -> String {
+    let mut out = String::with_capacity(lines.len() * 24 + new_line.len());
+    for (i, &l) in lines.iter().enumerate() {
+        out.push_str(if i == idx { new_line } else { l });
+        out.push('\n');
+    }
+    if !ends_with_newline {
+        out.pop();
+    }
+    out
+}
+
+/// Remove line `idx` entirely, preserving the file's trailing-newline status.
+pub(super) fn remove_single_line(lines: &[&str], idx: usize, ends_with_newline: bool) -> String {
+    let mut out = String::with_capacity(lines.len() * 24);
+    for (i, &l) in lines.iter().enumerate() {
+        if i == idx {
+            continue;
+        }
+        out.push_str(l);
+        out.push('\n');
+    }
+    if !ends_with_newline && out.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
 /// Like [`ensure_autumn_web_feature`], but also reports whether the `autumn-web`
 /// dependency ends up carrying `feature`. The `bool` is `false` only when no
 /// `autumn-web` dependency could be located (so the caller can warn that the
@@ -978,22 +2285,36 @@ pub fn ensure_autumn_web_feature(existing: &str, feature: &str) -> String {
 /// was already present.
 #[must_use]
 pub fn ensure_autumn_web_feature_status(existing: &str, feature: &str) -> (String, bool) {
+    ensure_autumn_web_feature_status_in_section(existing, feature, "dependencies")
+}
+
+/// Like [`ensure_autumn_web_feature_status`], but targets an arbitrary
+/// dependency section (`"dependencies"` or `"dev-dependencies"`) instead of
+/// always assuming `[dependencies]`. Shared by [`ensure_autumn_web_feature_status`]
+/// and [`ensure_dev_dependency_test_support`] so both sections get the same
+/// handling of every `autumn-web` declaration shape (inline, dotted-key,
+/// multiline subtable, renamed/aliased dep).
+fn ensure_autumn_web_feature_status_in_section(
+    existing: &str,
+    feature: &str,
+    section: &str,
+) -> (String, bool) {
     let feature_quoted = format!("\"{feature}\"");
     let lines: Vec<&str> = existing.lines().collect();
-    let mut in_deps = false;
+    let mut in_section = false;
 
-    // Pass 1: inline form under [dependencies].
+    // Pass 1: inline form under the section header.
     for (i, &line) in lines.iter().enumerate() {
         let trimmed = line.trim();
-        if is_dependencies_header(trimmed) {
-            in_deps = true;
+        if is_section_header(trimmed, section) {
+            in_section = true;
             continue;
         }
-        if in_deps && is_toml_table_header(trimmed) {
-            in_deps = false;
+        if in_section && is_section_boundary(trimmed, section) {
+            in_section = false;
             continue;
         }
-        if !in_deps {
+        if !in_section {
             continue;
         }
         // Skip commented-out lines so that a commented dep like
@@ -1004,23 +2325,30 @@ pub fn ensure_autumn_web_feature_status(existing: &str, feature: &str) -> (Strin
         }
         // Match either the exact `autumn-web` key or a renamed dep with `package = "autumn-web"`.
         let after_ws = line.trim_start();
-        if let Some(rest) = after_ws.strip_prefix("autumn-web") {
+        let dep_prefix = if let Some(rest) = after_ws.strip_prefix("autumn-web") {
             if rest.starts_with('.') {
                 // Dotted key form: autumn-web.workspace = true, autumn-web.features = [...], etc.
                 return (
-                    patch_dotted_dep(&lines, i, existing, feature, &feature_quoted),
+                    patch_dotted_dep(
+                        &lines,
+                        i,
+                        existing,
+                        "autumn-web",
+                        feature,
+                        &feature_quoted,
+                        section,
+                    ),
                     true,
                 );
             }
             if rest.starts_with(|c: char| c != '=' && !c.is_whitespace()) {
                 continue;
             }
+            "autumn-web"
         } else {
             // Check for a renamed dep: `aw = { package = "autumn-web", ... }`.
             let val = after_ws.split_once('=').map_or("", |x| x.1);
-            if !val.contains(r#"package = "autumn-web""#)
-                && !val.contains(r#"package="autumn-web""#)
-            {
+            if !declares_package(val, "autumn-web") {
                 continue;
             }
             // The alias must be importable as `autumn_web`; an alias such as
@@ -1030,7 +2358,8 @@ pub fn ensure_autumn_web_feature_status(existing: &str, feature: &str) -> (Strin
             if alias.replace('-', "_") != "autumn_web" {
                 continue;
             }
-        }
+            alias
+        };
         // Idempotency check: strip any trailing TOML comment so that a line such as
         //   autumn-web = { version = "0.6" } # add "inbound-mailgun" later
         // does not falsely appear to already have the feature enabled.
@@ -1038,7 +2367,7 @@ pub fn ensure_autumn_web_feature_status(existing: &str, feature: &str) -> (Strin
         if line_code.contains(&feature_quoted) {
             return (existing.to_owned(), true);
         }
-        let new_line = rewrite_dep_with_feature(line, feature);
+        let new_line = rewrite_dep_with_feature(line, dep_prefix, feature);
         if new_line == line {
             // Multiline inline table — delegate to helper.
             match add_feature_to_multiline_inline_table(
@@ -1063,11 +2392,12 @@ pub fn ensure_autumn_web_feature_status(existing: &str, feature: &str) -> (Strin
         return (out, true);
     }
 
-    // Pass 2: multiline section form `[dependencies.autumn-web]`.
+    // Pass 2: multiline section form `[<section>.autumn-web]`.
+    let subtable_key = format!("[{section}.autumn-web]");
     for (i, &line) in lines.iter().enumerate() {
         // Strip trailing TOML line-comment before comparing the section header.
         let key_part = line.trim().split('#').next().unwrap_or("").trim();
-        if key_part != "[dependencies.autumn-web]" {
+        if key_part != subtable_key {
             continue;
         }
         return (
@@ -1076,11 +2406,10 @@ pub fn ensure_autumn_web_feature_status(existing: &str, feature: &str) -> (Strin
         );
     }
 
-    // Pass 2b: `[dependencies.autumn_web]` table section whose body declares
+    // Pass 2b: `[<section>.autumn_web]` table section whose body declares
     // `package = "autumn-web"` — Cargo's table-key form of a renamed dep.
-    if let Some(start) =
-        find_section_start_with_autumn_web_package(&lines, "[dependencies.autumn_web]")
-    {
+    let renamed_subtable_key = format!("[{section}.autumn_web]");
+    if let Some(start) = find_section_start_with_autumn_web_package(&lines, &renamed_subtable_key) {
         return (
             add_feature_to_deps_section(&lines, start, existing, feature, &feature_quoted),
             true,
@@ -1088,6 +2417,579 @@ pub fn ensure_autumn_web_feature_status(existing: &str, feature: &str) -> (Strin
     }
 
     (existing.to_owned(), false)
+}
+
+/// Like [`ensure_autumn_web_feature_status_in_section`], but for an
+/// arbitrary dependency name instead of always `autumn-web`.
+///
+/// Handles the literal-key inline form, the dotted-key form, and the
+/// multiline `[<section>.<dep_name>]` subtable form -- but *not* a
+/// renamed/aliased dependency (`x = { package = "<dep_name>", ... }`).
+/// `autumn-web` is the one dependency projects realistically rename (to
+/// dodge the hyphen); nothing else in a generated project's `Cargo.toml`
+/// needs that, so the extra alias-detection complexity stays specific to
+/// [`ensure_autumn_web_feature_status_in_section`] instead of being carried
+/// here for every caller.
+fn ensure_dep_feature_status_in_section(
+    existing: &str,
+    dep_name: &str,
+    feature: &str,
+    section: &str,
+) -> (String, bool) {
+    let feature_quoted = format!("\"{feature}\"");
+    let lines: Vec<&str> = existing.lines().collect();
+    let mut in_section = false;
+
+    // Pass 1: literal-key inline or dotted-key form.
+    for (i, &line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if is_section_header(trimmed, section) {
+            in_section = true;
+            continue;
+        }
+        if in_section && is_section_boundary(trimmed, section) {
+            in_section = false;
+            continue;
+        }
+        if !in_section || trimmed.starts_with('#') {
+            continue;
+        }
+        let after_ws = line.trim_start();
+        let Some(rest) = after_ws.strip_prefix(dep_name) else {
+            continue;
+        };
+        if rest.starts_with('.') {
+            return (
+                patch_dotted_dep(
+                    &lines,
+                    i,
+                    existing,
+                    dep_name,
+                    feature,
+                    &feature_quoted,
+                    section,
+                ),
+                true,
+            );
+        }
+        if rest.starts_with(|c: char| c != '=' && !c.is_whitespace()) {
+            // A different dependency sharing this prefix -- keep scanning.
+            continue;
+        }
+        let line_code = line.split_once('#').map_or(line, |(before, _)| before);
+        if line_code.contains(&feature_quoted) {
+            return (existing.to_owned(), true);
+        }
+        let new_line = rewrite_dep_with_feature(line, dep_name, feature);
+        if new_line == line {
+            match add_feature_to_multiline_inline_table(
+                &lines,
+                i,
+                existing,
+                feature,
+                &feature_quoted,
+            ) {
+                None => continue,
+                Some(result) => return (result, true),
+            }
+        }
+        let mut out = String::with_capacity(existing.len() + 32);
+        for (j, &l) in lines.iter().enumerate() {
+            out.push_str(if j == i { &new_line } else { l });
+            out.push('\n');
+        }
+        if !existing.ends_with('\n') {
+            out.pop();
+        }
+        return (out, true);
+    }
+
+    // Pass 2: multiline `[<section>.<dep_name>]` subtable form.
+    let subtable_key = format!("[{section}.{dep_name}]");
+    for (i, &line) in lines.iter().enumerate() {
+        let key_part = line.trim().split('#').next().unwrap_or("").trim();
+        if key_part != subtable_key {
+            continue;
+        }
+        return (
+            add_feature_to_deps_section(&lines, i + 1, existing, feature, &feature_quoted),
+            true,
+        );
+    }
+
+    (existing.to_owned(), false)
+}
+
+/// Ensure `[dev-dependencies]` carries a `tokio` entry with the `rt` and
+/// `macros` features that a generated `#[tokio::test]` smoke test needs to
+/// compile.
+///
+/// Every `autumn new` project template already declares this (see
+/// `templates/Cargo.toml.tmpl`), but a hand-rolled project -- or one where
+/// the entry was edited down -- might not. `cargo test --tests` still
+/// compiles `#[ignore]`d tests, so a missing (or feature-incomplete) `tokio`
+/// dev-dependency leaves an otherwise-valid project unable to compile its
+/// test targets at all.
+///
+/// If there's no existing `tokio` dev-dependency, the new entry mirrors
+/// whatever `[dependencies]` declares for `tokio` (crates.io version,
+/// `workspace = true`, `path`, `git`, etc.) via [`detect_dependencies_source`],
+/// for the same reason [`ensure_dev_dependency_test_support`] mirrors
+/// `autumn-web`'s source: Cargo requires every declaration of a dependency
+/// to unify to one source across build targets, so defaulting to a
+/// crates.io version unconditionally would break `cargo` entirely for any
+/// project that sources `tokio` from the workspace or a local path/git
+/// checkout in `[dependencies]`.
+///
+/// Idempotent: a second call is a no-op once both features are present.
+#[must_use]
+pub fn ensure_dev_dependency_tokio_test_features(existing: &str) -> String {
+    let (updated, found_rt) =
+        ensure_dep_feature_status_in_section(existing, "tokio", "rt", "dev-dependencies");
+    let (updated, found_macros) =
+        ensure_dep_feature_status_in_section(&updated, "tokio", "macros", "dev-dependencies");
+    if found_rt && found_macros {
+        return updated;
+    }
+
+    // No existing `tokio` dev-dependency at all -- insert one with both
+    // features. (If it existed but was missing one of the features, the two
+    // ensure_dep_feature_status_in_section calls above already added it.)
+    let lines: Vec<&str> = existing.lines().collect();
+    let source = detect_dependencies_source(existing, "tokio")
+        .unwrap_or_else(|| "version = \"1\"".to_string());
+    let new_dep_line = format!("tokio = {{ {source}, features = [\"rt\", \"macros\"] }}");
+
+    let Some(header_idx) = lines
+        .iter()
+        .position(|l| is_section_header(l.trim(), "dev-dependencies"))
+    else {
+        let mut out = existing.to_owned();
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        if !out.is_empty() && !out.ends_with("\n\n") {
+            out.push('\n');
+        }
+        out.push_str("[dev-dependencies]\n");
+        let _ = writeln!(out, "{new_dep_line}");
+        return out;
+    };
+
+    let mut out = String::with_capacity(existing.len() + 96);
+    for (j, &l) in lines.iter().enumerate() {
+        out.push_str(l);
+        out.push('\n');
+        if j == header_idx {
+            let _ = writeln!(out, "{new_dep_line}");
+        }
+    }
+    if !existing.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
+/// Ensure `[dev-dependencies]` carries an `autumn-web` entry with the
+/// `test-support` feature, which enables `TestDb` (the shared Postgres
+/// testcontainer that generated `TestApp`-based integration tests use).
+///
+/// `autumn-web` is intentionally left out of `test-support` in
+/// `[dependencies]` — production builds must not pull in the
+/// `testcontainers`/`testcontainers-modules` dependency tree that the feature
+/// enables. Cargo unifies features across every declaration of the same
+/// dependency in the build graph, so a *dev*-only entry is enough to light up
+/// `TestDb` for `cargo test` while release builds stay lean.
+///
+/// Reuses [`ensure_autumn_web_feature_status_in_section`] for the "there's
+/// already an `autumn-web` entry in `[dev-dependencies]`" case, so every
+/// declaration shape that function understands for `[dependencies]` (inline,
+/// dotted-key `autumn-web.workspace = true`, multiline `[dev-dependencies.autumn-web]`
+/// subtable, renamed/aliased dep) is handled here too, instead of a
+/// less-capable reimplementation. Only the "no `autumn-web` entry yet" case is
+/// bespoke: unlike `[dependencies]` (which every `autumn new` project already
+/// declares `autumn-web` in), a fresh project's `[dev-dependencies]` has no
+/// `autumn-web` line at all, so this inserts one. Its source mirrors whatever
+/// `[dependencies]` uses (crates.io version, `workspace = true`, `path`, or
+/// `git`) via [`detect_dependencies_autumn_web_source`] -- Cargo requires
+/// every declaration of a dependency to unify to one source across build
+/// targets, so defaulting to a crates.io version unconditionally would break
+/// `cargo` entirely for any project that inherits `autumn-web` from the
+/// workspace or a local path/git checkout.
+///
+/// Idempotent: a second call is a no-op once the feature is present.
+#[must_use]
+pub fn ensure_dev_dependency_test_support(existing: &str, autumn_version: &str) -> String {
+    let (updated, found) =
+        ensure_autumn_web_feature_status_in_section(existing, "test-support", "dev-dependencies");
+    if found {
+        return updated;
+    }
+
+    let feature_quoted = "\"test-support\"";
+    let source = detect_dependencies_autumn_web_source(existing)
+        .unwrap_or_else(|| format!("version = \"{autumn_version}\""));
+    let new_dep_line = format!("autumn-web = {{ {source}, features = [{feature_quoted}] }}");
+    let lines: Vec<&str> = existing.lines().collect();
+
+    let Some(header_idx) = lines
+        .iter()
+        .position(|l| is_section_header(l.trim(), "dev-dependencies"))
+    else {
+        // No [dev-dependencies] section yet -- append one. (Every project
+        // scaffolded by `autumn new` already has one for the `tokio` test
+        // dep, so this branch only guards hand-edited Cargo.toml files.)
+        let mut out = existing.to_owned();
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        if !out.is_empty() && !out.ends_with("\n\n") {
+            out.push('\n');
+        }
+        out.push_str("[dev-dependencies]\n");
+        let _ = writeln!(out, "{new_dep_line}");
+        return out;
+    };
+
+    // Section exists but has no `autumn-web` line yet -- insert one right
+    // after the section header.
+    let mut out = String::with_capacity(existing.len() + 96);
+    for (j, &l) in lines.iter().enumerate() {
+        out.push_str(l);
+        out.push('\n');
+        if j == header_idx {
+            let _ = writeln!(out, "{new_dep_line}");
+        }
+    }
+    if !existing.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
+/// TOML keys that determine *where* a dependency resolves from. Cargo
+/// unifies every declaration of a given dependency name to a single source
+/// across build targets, so if `[dependencies]` and `[dev-dependencies]`
+/// disagree on any of these, `cargo` refuses to build at all ("Dependency
+/// 'autumn-web' has different source paths depending on the build target").
+const SOURCE_KEYS: &[&str] = &[
+    "workspace",
+    "path",
+    "git",
+    "branch",
+    "tag",
+    "rev",
+    "registry",
+];
+
+fn is_source_key(key: &str) -> bool {
+    SOURCE_KEYS.contains(&key)
+}
+
+/// Split `s` on top-level commas, ignoring commas nested inside a quoted
+/// string or a `[...]`/`{...}` value (e.g. a `features = [...]` list).
+fn split_top_level_commas(s: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut depth = 0i32;
+    let mut in_str = false;
+    for (i, c) in s.char_indices() {
+        match c {
+            '"' => in_str = !in_str,
+            '[' | '{' if !in_str => depth += 1,
+            ']' | '}' if !in_str => depth -= 1,
+            ',' if !in_str && depth == 0 => {
+                parts.push(&s[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&s[start..]);
+    parts
+}
+
+/// True iff `text` declares `package = "<target>"` -- either as one field
+/// of a `{ ... }` inline table (e.g. `aw = { package = "autumn-web", ... }`)
+/// or as a bare `key = value` line (the multiline subtable form, e.g. a
+/// `[dependencies.aw]` body's `package = "autumn-web"` line).
+///
+/// Tolerant of any amount of TOML whitespace around `=` on either side --
+/// TOML permits none, one, or many spaces there, so a literal substring
+/// check for one specific spacing (`package = "..."` or `package="..."`)
+/// silently misses forms like `package= "..."` or `package ="..."`. Also
+/// tolerant of TOML's single-quoted literal-string form (`package =
+/// 'autumn-web'`), which Cargo accepts identically to a double-quoted one.
+fn declares_package(text: &str, target: &str) -> bool {
+    let body = match (text.find('{'), text.rfind('}')) {
+        (Some(open), Some(close)) if close > open => &text[open + 1..close],
+        _ => text,
+    };
+    split_top_level_commas(body).into_iter().any(|part| {
+        part.split_once('=').is_some_and(|(k, v)| {
+            k.trim() == "package" && v.trim().trim_matches(['"', '\'']) == target
+        })
+    })
+}
+
+/// Pull the source-defining keys (see [`SOURCE_KEYS`]) out of a run of
+/// `key = value` pairs, joined back into a single `key = value, ...`
+/// fragment. Returns `None` only when `pairs` has no `version` and no
+/// source key at all (i.e. the dependency can't be found).
+///
+/// `registry` is special-cased: unlike `workspace`/`path`/`git`, a registry
+/// alone doesn't pin a resolvable dependency -- Cargo still requires an
+/// explicit `version` alongside it (confirmed via `cargo metadata --offline`:
+/// dropping `version` from a registry dep reports "was specified without
+/// a path, git repository, version, or workspace dependency"), so `version`
+/// is mirrored too whenever `registry` is present.
+///
+/// When there's no source key at all (a plain `{ version = "...", features
+/// = [...] }` table), the existing `version` requirement is mirrored on its
+/// own rather than returning `None` -- a caller that fell back to its own
+/// version instead would produce two different requirements for the same
+/// crate (e.g. an existing `autumn-web = "0.5"` pin vs. the CLI's current
+/// `0.6`), which Cargo's resolver rejects outright when the ranges don't
+/// overlap (confirmed via `cargo metadata`: "failed to select a version").
+fn extract_source_keys<'a>(pairs: impl Iterator<Item = &'a str>) -> Option<String> {
+    let items: Vec<(&str, &str)> = pairs
+        .filter_map(|part| {
+            let (key, value) = part.split_once('=')?;
+            Some((key.trim(), value.trim()))
+        })
+        .collect();
+
+    let mut found: Vec<String> = items
+        .iter()
+        .filter(|(key, _)| is_source_key(key))
+        .map(|(key, value)| format!("{key} = {value}"))
+        .collect();
+
+    let version = items.iter().find(|(key, _)| *key == "version");
+
+    if found.iter().any(|f| f.starts_with("registry"))
+        && let Some((_, value)) = version
+    {
+        found.insert(0, format!("version = {value}"));
+    }
+
+    if found.is_empty() {
+        return version.map(|(_, value)| format!("version = {value}"));
+    }
+    Some(found.join(", "))
+}
+
+/// Extract the source keys from an inline-table `autumn-web = { ... }` line.
+fn extract_source_from_inline_table(line: &str) -> Option<String> {
+    let open = line.find('{')?;
+    let close = line.rfind('}')?;
+    if close <= open {
+        return None;
+    }
+    extract_source_keys(split_top_level_commas(&line[open + 1..close]).into_iter())
+}
+
+/// Extract the source keys from the body lines of a `[dependencies.autumn-web]`
+/// multiline subtable.
+fn extract_source_from_subtable_lines(lines: &[&str]) -> Option<String> {
+    extract_source_keys(
+        lines
+            .iter()
+            .map(|l| l.split_once('#').map_or(*l, |(code, _)| code).trim())
+            .filter(|l| !l.is_empty()),
+    )
+}
+
+/// Extract the version literal from a plain-string `<dep_name> = "x.y.z"`
+/// declaration (no inline table), so it can be mirrored the same way an
+/// explicit `version = "..."` key is. Recognizes both of TOML's string
+/// forms -- double-quoted (`"x.y.z"`) and single-quoted literal
+/// (`'x.y.z'`) -- since Cargo accepts either.
+fn extract_plain_string_version(line: &str, dep_name: &str) -> Option<String> {
+    let rest = line.trim().strip_prefix(dep_name)?.trim_start();
+    let rest = rest.strip_prefix('=')?.trim_start();
+    let rest = rest.split('#').next().unwrap_or(rest).trim();
+    let is_quoted = rest.len() >= 2
+        && ((rest.starts_with('"') && rest.ends_with('"'))
+            || (rest.starts_with('\'') && rest.ends_with('\'')));
+    is_quoted.then(|| format!("version = {rest}"))
+}
+
+/// Like [`detect_dependencies_autumn_web_source`], but for an arbitrary
+/// dependency name instead of always `autumn-web`. Doesn't handle a
+/// renamed/aliased dependency -- see [`ensure_dep_feature_status_in_section`]
+/// for why that stays specific to `autumn-web`.
+///
+/// Returns `None` when `[dependencies]` has no `<dep_name>` entry at all, or
+/// declares it as a plain crates.io dependency with no other source keys and
+/// no explicit `version` either (i.e. nothing at all to mirror).
+fn detect_dependencies_source(existing: &str, dep_name: &str) -> Option<String> {
+    let lines: Vec<&str> = existing.lines().collect();
+    let mut in_section = false;
+    // Every `<dep_name>.<key> = <value>` dotted line, collected across the
+    // whole section before filtering -- a dep can spread `version` and
+    // `registry` (or any other source key) across separate dotted lines in
+    // any order, and extract_source_keys needs to see all of them at once to
+    // apply the "registry needs version too" rule.
+    let mut dotted_pairs: Vec<String> = Vec::new();
+
+    // Pass 1: inline or dotted-key form directly under `[dependencies]`.
+    for &line in &lines {
+        let trimmed = line.trim();
+        if is_section_header(trimmed, "dependencies") {
+            in_section = true;
+            continue;
+        }
+        if in_section && is_section_boundary(trimmed, "dependencies") {
+            in_section = false;
+            continue;
+        }
+        if !in_section || trimmed.starts_with('#') {
+            continue;
+        }
+        let after_ws = line.trim_start();
+        let Some(rest) = after_ws.strip_prefix(dep_name) else {
+            continue;
+        };
+        if let Some(dotted) = rest.strip_prefix('.') {
+            // <dep_name>.workspace = true / <dep_name>.path = "..." / etc.
+            let code = dotted.split_once('#').map_or(dotted, |(before, _)| before);
+            if let Some((key, value)) = code.split_once('=') {
+                dotted_pairs.push(format!("{} = {}", key.trim(), value.trim()));
+            }
+            continue;
+        }
+        if rest.starts_with(|c: char| c != '=' && !c.is_whitespace()) {
+            // A different dependency sharing this prefix -- keep scanning.
+            continue;
+        }
+        // The single `<dep_name> = ...` declaration for this section: a
+        // plain string version, or an inline table that may carry
+        // `workspace`/`path`/`git`/`version`.
+        if let Some(version) = extract_plain_string_version(line, dep_name) {
+            return Some(version);
+        }
+        return extract_source_from_inline_table(line);
+    }
+
+    if !dotted_pairs.is_empty() {
+        return extract_source_keys(dotted_pairs.iter().map(String::as_str));
+    }
+
+    // Pass 2: multiline `[dependencies.<dep_name>]` subtable form.
+    let subtable_key = format!("[dependencies.{dep_name}]");
+    let section_start = lines
+        .iter()
+        .position(|l| l.trim().split('#').next().unwrap_or("").trim() == subtable_key)
+        .map(|p| p + 1)?;
+    let section_end = lines[section_start..]
+        .iter()
+        .position(|l| {
+            let t = l.trim();
+            t.starts_with('[') && !t.is_empty()
+        })
+        .map_or(lines.len(), |p| section_start + p);
+    extract_source_from_subtable_lines(&lines[section_start..section_end])
+}
+
+/// Detect the source (`workspace = true`, `path = "..."`, `git = "..."`,
+/// `version = "..."`, etc.) that `[dependencies]` declares for `autumn-web`,
+/// so a freshly inserted `[dev-dependencies]` entry can mirror it instead of
+/// defaulting to the CLI's own `version = ...`. See [`SOURCE_KEYS`] for why
+/// mismatched sources break the build, and [`extract_source_keys`] for why
+/// even a plain crates.io version needs mirroring (not just workspace/path/
+/// git/registry): a stale or pinned `[dependencies]` requirement that
+/// doesn't overlap the CLI's version makes Cargo's resolver fail too.
+///
+/// Returns `None` only when `[dependencies]` has no `autumn-web` entry at
+/// all, in which case the caller should fall back to an explicit
+/// `version = ...`.
+fn detect_dependencies_autumn_web_source(existing: &str) -> Option<String> {
+    if let Some(source) = detect_dependencies_source(existing, "autumn-web") {
+        return Some(source);
+    }
+
+    // Not found under the literal key -- check for a renamed dep, e.g.
+    // `aw = { package = "autumn-web", path = "../autumn" }` or its
+    // dotted-key equivalent `aw.package = "autumn-web"` / `aw.path =
+    // "../autumn"`. `ensure_autumn_web_feature_status_in_section` already
+    // mirrors both shapes for `[dependencies]`; the source-detection path
+    // needs the same coverage, else it silently drops the alias's
+    // path/git/workspace source and falls back to a mismatched crates.io
+    // version.
+    let lines: Vec<&str> = existing.lines().collect();
+    let mut in_section = false;
+    // Every `autumn_web.<key> = <value>` dotted line, collected across the
+    // whole section -- only trusted as the autumn-web alias once a sibling
+    // `.package = "autumn-web"` line confirms it (an alias importable as
+    // `autumn_web` could coincidentally exist for an unrelated crate
+    // otherwise).
+    let mut alias_dotted_pairs: Vec<String> = Vec::new();
+    let mut alias_confirmed = false;
+
+    for &line in &lines {
+        let trimmed = line.trim();
+        if is_section_header(trimmed, "dependencies") {
+            in_section = true;
+            continue;
+        }
+        if in_section && is_section_boundary(trimmed, "dependencies") {
+            in_section = false;
+            continue;
+        }
+        if !in_section || trimmed.starts_with('#') {
+            continue;
+        }
+        let after_ws = line.trim_start();
+        if after_ws.strip_prefix("autumn-web").is_some() {
+            // The literal key -- already covered by detect_dependencies_source above.
+            continue;
+        }
+        let Some((key, val)) = after_ws.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        let (alias, dotted_sub) = key
+            .split_once('.')
+            .map_or((key, None), |(b, r)| (b, Some(r)));
+        if alias.replace('-', "_") != "autumn_web" {
+            continue;
+        }
+        let val_code = val.split('#').next().unwrap_or(val).trim();
+        let Some(sub) = dotted_sub else {
+            // Inline form: autumn_web = { package = "autumn-web", ... }.
+            if declares_package(val_code, "autumn-web") {
+                return extract_source_from_inline_table(line);
+            }
+            continue;
+        };
+        // Dotted form: autumn_web.package = "autumn-web" /
+        // autumn_web.path = "../autumn" / etc. Trim both TOML quote forms
+        // -- Cargo accepts `package = 'autumn-web'` identically to a
+        // double-quoted value.
+        if sub == "package" && val_code.trim_matches(['"', '\'']) == "autumn-web" {
+            alias_confirmed = true;
+        }
+        alias_dotted_pairs.push(format!("{sub} = {val_code}"));
+    }
+
+    if alias_confirmed {
+        return extract_source_keys(alias_dotted_pairs.iter().map(String::as_str));
+    }
+
+    // `[dependencies.autumn_web]` subtable whose body declares `package =
+    // "autumn-web"` -- the table-key form of a renamed dep (mirrors
+    // `ensure_autumn_web_feature_status_in_section`'s Pass 2b).
+    let section_start =
+        find_section_start_with_autumn_web_package(&lines, "[dependencies.autumn_web]")?;
+    let section_end = lines[section_start..]
+        .iter()
+        .position(|l| {
+            let t = l.trim();
+            t.starts_with('[') && !t.is_empty()
+        })
+        .map_or(lines.len(), |p| section_start + p);
+    extract_source_from_subtable_lines(&lines[section_start..section_end])
 }
 
 /// Scan `lines` for a section header matching `key` (after stripping inline TOML comments)
@@ -1109,7 +3011,7 @@ fn find_section_start_with_autumn_web_package(lines: &[&str], key: &str) -> Opti
             .map_or(lines.len(), |p| section_start + p);
         let has_pkg = lines[section_start..section_end].iter().any(|l| {
             let code = l.split_once('#').map_or(*l, |(b, _)| b);
-            code.contains(r#"package = "autumn-web""#) || code.contains(r#"package="autumn-web""#)
+            declares_package(code, "autumn-web")
         });
         if has_pkg {
             return Some(section_start);
@@ -1202,37 +3104,53 @@ fn rewrite_features_line(line: &str, feature: &str) -> String {
 }
 
 /// Rewrite a single `autumn-web = …` TOML line to include `feature`.
-fn rewrite_dep_with_feature(line: &str, feature: &str) -> String {
+fn rewrite_dep_with_feature(line: &str, dep_name: &str, feature: &str) -> String {
     let feature_quoted = format!("\"{feature}\"");
     let trimmed = line.trim();
 
-    // Form 1: autumn-web = "x.y.z"  (optional trailing TOML comment)
-    if let Some(rest) = trimmed.strip_prefix("autumn-web") {
+    // Form 1: <dep_name> = "x.y.z"  (optional trailing TOML comment).
+    // Recognizes both of TOML's string forms -- double-quoted and
+    // single-quoted literal (`<dep_name> = 'x.y.z'`) -- since Cargo accepts
+    // either; a version-only check here for `"` alone left a single-quoted
+    // dep unrecognized, so the caller treated it as absent and inserted a
+    // duplicate key.
+    if let Some(rest) = trimmed.strip_prefix(dep_name) {
         let rest = rest.trim_start_matches([' ', '=', '\t']);
-        if rest.starts_with('"') {
+        if let Some(quote) = rest.chars().next().filter(|&c| c == '"' || c == '\'') {
             // Strip any trailing `# comment` before matching the closing quote.
             let value_str = rest.split('#').next().unwrap_or(rest).trim_end();
             if let Some(version) = value_str
-                .strip_prefix('"')
-                .and_then(|r| r.strip_suffix('"'))
+                .strip_prefix(quote)
+                .and_then(|r| r.strip_suffix(quote))
             {
                 let indent_len = line.len() - line.trim_start().len();
                 let indent = &line[..indent_len];
                 return format!(
-                    "{indent}autumn-web = {{ version = \"{version}\", features = [{feature_quoted}] }}"
+                    "{indent}{dep_name} = {{ version = {quote}{version}{quote}, features = [{feature_quoted}] }}"
                 );
             }
         }
     }
 
-    // Form 2/3: autumn-web = { ... features = [...] ... }
-    if let Some(open) = line.find("features")
-        && let Some(bracket_start) = line[open..].find('[')
+    // Everything below only considers the code portion of the line -- a
+    // trailing `# comment` containing TOML-looking text (e.g. an example
+    // `# features = []`) must never be mistaken for a real key. Otherwise
+    // the feature gets spliced into the comment while the actual
+    // dependency value is untouched, and the caller reports success even
+    // though nothing real changed (confirmed: `tokio = { version = "1" } #
+    // features = []` would otherwise "succeed" without adding the feature).
+    let (code, comment) = line
+        .split_once('#')
+        .map_or((line, String::new()), |(c, rest)| (c, format!("#{rest}")));
+
+    // Form 2/3: <dep_name> = { ... features = [...] ... }
+    if let Some(open) = code.find("features")
+        && let Some(bracket_start) = code[open..].find('[')
     {
         let abs_start = open + bracket_start;
-        if let Some(bracket_end_rel) = line[abs_start..].find(']') {
+        if let Some(bracket_end_rel) = code[abs_start..].find(']') {
             let abs_end = abs_start + bracket_end_rel;
-            let body = &line[abs_start + 1..abs_end];
+            let body = &code[abs_start + 1..abs_end];
             let body_trimmed = body.trim();
             let separator = if body_trimmed.is_empty() {
                 ""
@@ -1242,33 +3160,40 @@ fn rewrite_dep_with_feature(line: &str, feature: &str) -> String {
                 ", "
             };
             return format!(
-                "{}{}{}{}",
-                &line[..abs_end],
+                "{}{}{}{}{}",
+                &code[..abs_end],
                 separator,
                 feature_quoted,
-                &line[abs_end..]
+                &code[abs_end..],
+                comment
             );
         }
     }
 
-    // Form 2b: autumn-web = { version = "x.y.z" } — no features key yet.
+    // Form 2b: <dep_name> = { version = "x.y.z" } — no features key yet.
     // Insert features before the closing `}`.
-    if let Some(close) = line.rfind('}') {
-        let before = line[..close].trim_end();
-        let after = &line[close..];
-        return format!("{before}, features = [{feature_quoted}]{after}");
+    if let Some(close) = code.rfind('}') {
+        let before = code[..close].trim_end();
+        let after = &code[close..];
+        return format!("{before}, features = [{feature_quoted}]{after}{comment}");
     }
 
     line.to_owned()
 }
 
-fn is_dependencies_header(trimmed: &str) -> bool {
-    trimmed == "[dependencies]"
-        || trimmed.starts_with("[dependencies]") && trimmed[13..].trim_start().starts_with('#')
+/// True iff `trimmed` is the TOML section header `[section]`, with or without
+/// a trailing inline comment (e.g. `[dependencies] # shared deps`).
+fn is_section_header(trimmed: &str, section: &str) -> bool {
+    let header = format!("[{section}]");
+    trimmed == header
+        || (trimmed.starts_with(&header) && trimmed[header.len()..].trim_start().starts_with('#'))
 }
 
-fn is_toml_table_header(trimmed: &str) -> bool {
-    trimmed.starts_with('[') && !trimmed.starts_with("[dependencies.")
+/// True iff `trimmed` is a TOML table header that ends a scan of `section`'s
+/// body -- i.e. a `[...]` header other than a `[<section>.subtable]`, which is
+/// still part of the parent section rather than a new sibling table.
+fn is_section_boundary(trimmed: &str, section: &str) -> bool {
+    trimmed.starts_with('[') && !trimmed.starts_with(&format!("[{section}."))
 }
 
 /// SQL for adding a stored generated `search_vector` column and GIN index.
@@ -2357,6 +4282,423 @@ mod tests {
         assert_eq!(drop_table_sql("posts"), "DROP TABLE posts;\n");
     }
 
+    // ── references field: FK column + constraint + index (issue #1026) ─────
+
+    #[test]
+    fn create_table_sql_emits_fk_column_with_constraint() {
+        let sql = create_table_sql_with_metadata_and_id(
+            "comments",
+            &fields(&["body:Text", "post:references"]),
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            IdType::BigSerial,
+        );
+        assert!(
+            sql.contains("post_id BIGINT NOT NULL REFERENCES posts(id)"),
+            "expected FK column with constraint; got:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn create_table_sql_emits_fk_index_automatically() {
+        let sql = create_table_sql_with_metadata_and_id(
+            "comments",
+            &fields(&["post:references"]),
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            IdType::BigSerial,
+        );
+        assert!(
+            sql.contains("CREATE INDEX idx_comments_post_id ON comments (post_id);"),
+            "expected an automatic FK index; got:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn create_table_sql_nullable_reference_has_no_not_null_but_keeps_constraint_and_index() {
+        let sql = create_table_sql_with_metadata_and_id(
+            "comments",
+            &fields(&["post:references?"]),
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            IdType::BigSerial,
+        );
+        assert!(
+            sql.contains("post_id BIGINT NULL REFERENCES posts(id)"),
+            "nullable FK column must omit NOT NULL but keep the constraint; got:\n{sql}"
+        );
+        assert!(sql.contains("CREATE INDEX idx_comments_post_id ON comments (post_id);"));
+    }
+
+    #[test]
+    fn create_table_sql_fk_index_not_duplicated_when_also_passed_via_index_flag() {
+        let mut explicit_indexes = BTreeSet::new();
+        explicit_indexes.insert("post_id".to_owned());
+        let sql = create_table_sql_with_metadata_and_id(
+            "comments",
+            &fields(&["post:references"]),
+            &explicit_indexes,
+            &BTreeMap::new(),
+            IdType::BigSerial,
+        );
+        assert_eq!(
+            sql.matches("CREATE INDEX idx_comments_post_id").count(),
+            1,
+            "the FK index and an explicit --index on the same field must not \
+             produce two CREATE INDEX statements:\n{sql}"
+        );
+    }
+
+    // ── unique field marker: CREATE UNIQUE INDEX (issue #1032) ──────────────
+
+    #[test]
+    fn create_table_sql_emits_unique_index_for_dsl_marker() {
+        let sql = create_table_sql_with_metadata_and_id(
+            "users",
+            &fields(&["email:String:unique"]),
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            IdType::BigSerial,
+        );
+        assert!(
+            sql.contains("CREATE UNIQUE INDEX idx_users_email_unique ON users (email);"),
+            "expected a unique index for the `:unique`-marked field; got:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn create_table_sql_unique_index_is_distinct_from_plain_index() {
+        // A `--index`-flagged field emits `idx_<table>_<field>` (no `_unique`
+        // suffix); a `unique`-marked field must use a distinct name so the
+        // two kinds of index never collide even on the same column.
+        let sql = create_table_sql_with_metadata_and_id(
+            "users",
+            &fields(&["email:String:unique"]),
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            IdType::BigSerial,
+        );
+        assert!(
+            !sql.contains("CREATE INDEX idx_users_email ON users (email);"),
+            "a unique field must not also emit a plain, non-unique index; got:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn create_table_sql_unique_field_not_duplicated_when_also_passed_via_index_flag() {
+        let mut explicit_indexes = BTreeSet::new();
+        explicit_indexes.insert("email".to_owned());
+        let sql = create_table_sql_with_metadata_and_id(
+            "users",
+            &fields(&["email:String:unique"]),
+            &explicit_indexes,
+            &BTreeMap::new(),
+            IdType::BigSerial,
+        );
+        assert_eq!(
+            sql.matches("CREATE UNIQUE INDEX idx_users_email_unique")
+                .count(),
+            1,
+            "got:\n{sql}"
+        );
+        assert!(
+            !sql.contains("CREATE INDEX idx_users_email ON"),
+            "the unique index already covers lookups; a redundant plain index \
+             must not also be emitted:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn create_table_sql_unique_nullable_field_keeps_null_and_unique_index() {
+        let sql = create_table_sql_with_metadata_and_id(
+            "users",
+            &fields(&["nickname:Option<String>:unique"]),
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            IdType::BigSerial,
+        );
+        assert!(sql.contains("nickname TEXT NULL"), "got:\n{sql}");
+        assert!(
+            sql.contains("CREATE UNIQUE INDEX idx_users_nickname_unique ON users (nickname);"),
+            "got:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn add_columns_up_sql_emits_unique_index() {
+        let sql = add_columns_up_sql("users", &fields(&["email:String:unique"]), "");
+        assert!(
+            sql.contains("ALTER TABLE users ADD COLUMN email TEXT NOT NULL;"),
+            "got:\n{sql}"
+        );
+        assert!(
+            sql.contains("CREATE UNIQUE INDEX idx_users_email_unique ON users (email);"),
+            "got:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn remove_columns_down_sql_restores_unique_index_for_unique_field() {
+        let sql = remove_columns_down_sql("users", &fields(&["email:String:unique"]), "");
+        assert!(
+            sql.contains("ALTER TABLE users ADD COLUMN email TEXT NOT NULL"),
+            "got:\n{sql}"
+        );
+        assert!(
+            sql.contains("CREATE UNIQUE INDEX idx_users_email_unique ON users (email);"),
+            "rollback of RemoveXFromY must restore the UNIQUE index, not just the \
+             bare column; got:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn add_columns_up_sql_unique_reference_skips_redundant_plain_index() {
+        // Regression guard (issue #1032 review follow-up): a `references`
+        // field's own auto-index and a `unique` field's `CREATE UNIQUE
+        // INDEX` were emitted unconditionally and independently here, so a
+        // field that is both (`author:references:unique`) got two
+        // overlapping btree indexes on the same column — the plain one is
+        // fully redundant since the unique index already covers the same
+        // lookup. `create_table_sql_with_metadata_and_id` already dedupes
+        // this for `CREATE TABLE`; `AddXToY` must match.
+        let sql = add_columns_up_sql("posts", &fields(&["author:references:unique"]), "");
+        assert!(
+            sql.contains("CREATE UNIQUE INDEX idx_posts_author_id_unique ON posts (author_id);"),
+            "got:\n{sql}"
+        );
+        assert!(
+            !sql.contains("CREATE INDEX idx_posts_author_id ON posts (author_id);"),
+            "a references field that is also unique must not get a redundant \
+             plain index alongside its unique index; got:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn remove_columns_down_sql_unique_reference_skips_redundant_plain_index() {
+        // `RemoveXFromY`'s rollback must restore the same shape `AddXToY`
+        // would have created, not the redundant pre-fix pair.
+        let sql = remove_columns_down_sql("posts", &fields(&["author:references:unique"]), "");
+        assert!(
+            sql.contains("CREATE UNIQUE INDEX idx_posts_author_id_unique ON posts (author_id);"),
+            "got:\n{sql}"
+        );
+        assert!(
+            !sql.contains("CREATE INDEX idx_posts_author_id ON posts (author_id);"),
+            "got:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn unique_index_sql_names_index_with_unique_suffix() {
+        assert_eq!(
+            unique_index_sql("users", "email", &[]),
+            "CREATE UNIQUE INDEX idx_users_email_unique ON users (email);\n"
+        );
+    }
+
+    #[test]
+    fn unique_index_name_short_names_pass_through_unchanged() {
+        assert_eq!(
+            unique_index_name("users", "email", &[]),
+            "idx_users_email_unique"
+        );
+    }
+
+    #[test]
+    fn unique_index_name_truncates_long_names_to_fit_postgres_limit() {
+        let table = "a_very_long_table_name_that_pushes_the_identifier_over_the_limit";
+        let field = "an_equally_long_field_name_for_good_measure";
+        let name = unique_index_name(table, field, &[]);
+        assert!(
+            name.len() <= 63,
+            "index name must fit Postgres's identifier limit, got {} bytes: {name}",
+            name.len()
+        );
+        assert!(
+            name.starts_with("idx_a_very_long_table_name"),
+            "got: {name}"
+        );
+    }
+
+    #[test]
+    fn unique_index_name_disambiguates_distinct_long_names_that_share_a_prefix() {
+        // Two different (table, field) pairs that truncate to the same
+        // prefix must still produce distinct index names (issue #1032 review
+        // follow-up) -- otherwise the runtime `unique_violation_field` match
+        // would misclassify a violation on one field as the other.
+        let table = "a_very_long_table_name_that_pushes_the_identifier_over_the_limit";
+        let name_a = unique_index_name(table, "an_equally_long_field_name_alpha_variant", &[]);
+        let name_b = unique_index_name(table, "an_equally_long_field_name_bravo_variant", &[]);
+        assert_ne!(name_a, name_b);
+    }
+
+    #[test]
+    fn unique_index_name_is_deterministic() {
+        let table = "a_very_long_table_name_that_pushes_the_identifier_over_the_limit";
+        let field = "an_equally_long_field_name_for_good_measure";
+        assert_eq!(
+            unique_index_name(table, field, &[]),
+            unique_index_name(table, field, &[])
+        );
+    }
+
+    #[test]
+    fn unique_index_sql_uses_truncated_name_for_long_identifiers() {
+        let table = "a_very_long_table_name_that_pushes_the_identifier_over_the_limit";
+        let field = "an_equally_long_field_name_for_good_measure";
+        let sql = unique_index_sql(table, field, &[]);
+        let expected_name = unique_index_name(table, field, &[]);
+        assert!(
+            sql.contains(&format!(
+                "CREATE UNIQUE INDEX {expected_name} ON {table} ({field});"
+            )),
+            "got:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn unique_index_name_disambiguates_coincidental_collision_with_plain_index() {
+        // Regression guard (issue #1032 review follow-up): a plain index
+        // always names itself after its own column (`idx_<table>_<name>`),
+        // with no `_unique` suffix. If some *other* field in the same table
+        // happens to be literally named `<field>_unique`, that field's own
+        // plain index collides with `field`'s unique index name even though
+        // the two fields are otherwise unrelated (`email:unique` +
+        // `email_unique:String --index email_unique` both want
+        // `idx_users_email_unique`) -- the generated migration would fail
+        // with "relation already exists" before the table was ever usable.
+        let colliding_field = fields(&["email_unique:String"]);
+        let name = unique_index_name("users", "email", &colliding_field);
+        assert_ne!(
+            name, "idx_users_email_unique",
+            "must disambiguate away from the name a same-named plain index \
+             would already claim"
+        );
+        assert!(name.len() <= 63, "got {} bytes: {name}", name.len());
+    }
+
+    #[test]
+    fn unique_index_name_no_collision_stays_the_plain_name() {
+        // The disambiguation in the test above must not fire when there's
+        // nothing to collide with.
+        let unrelated_fields = fields(&["age:i32"]);
+        assert_eq!(
+            unique_index_name("users", "email", &unrelated_fields),
+            "idx_users_email_unique"
+        );
+    }
+
+    #[test]
+    fn create_table_sql_unique_field_avoids_name_collision_with_plain_index() {
+        let fields = fields(&["email:String:unique", "email_unique:String"]);
+        let indexes: BTreeSet<String> = std::iter::once("email_unique".to_owned()).collect();
+        let sql = create_table_sql_with_metadata_and_id(
+            "users",
+            &fields,
+            &indexes,
+            &BTreeMap::new(),
+            IdType::BigSerial,
+        );
+        assert!(
+            sql.contains("CREATE INDEX idx_users_email_unique ON users (email_unique);"),
+            "got:\n{sql}"
+        );
+        // The unique index must have been disambiguated away from the
+        // plain index's name above, not emitted as a second, colliding
+        // `CREATE UNIQUE INDEX idx_users_email_unique` (checked with the
+        // exact trailing ` ON users (email);` so the plain index's own
+        // line, which shares the same name as a prefix, doesn't also match).
+        assert!(
+            !sql.contains("CREATE UNIQUE INDEX idx_users_email_unique ON users (email);"),
+            "the unique index must not collide with the plain index's exact \
+             name; got:\n{sql}"
+        );
+        assert!(
+            sql.contains("CREATE UNIQUE INDEX idx_users_email_unique_")
+                && sql.contains(" ON users (email);"),
+            "the unique index must still exist, under a disambiguated name; \
+             got:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn existing_schema_columns_parses_declared_column_names() {
+        let schema = append_schema_table("", "users", &fields(&["email_unique:String"]));
+        let columns = existing_schema_columns(&schema, "users");
+        assert!(
+            columns.contains(&"email_unique".to_owned()),
+            "got: {columns:?}"
+        );
+        assert!(columns.contains(&"id".to_owned()), "got: {columns:?}");
+        assert!(
+            columns.contains(&"created_at".to_owned()),
+            "got: {columns:?}"
+        );
+    }
+
+    #[test]
+    fn existing_schema_columns_empty_for_unknown_table() {
+        let schema = append_schema_table("", "users", &fields(&["email:String"]));
+        assert!(existing_schema_columns(&schema, "posts").is_empty());
+    }
+
+    #[test]
+    fn add_columns_up_sql_avoids_name_collision_with_earlier_migrations_columns() {
+        // Regression guard (issue #1032 review follow-up): `add_columns_up_sql`
+        // only ever sees the columns being added in *this* `AddXToY`
+        // migration -- not a table's other, already-existing columns from an
+        // earlier, separately-run migration. A field named `email_unique`
+        // added back when the table was first created would otherwise still
+        // collide with a `unique` field named `email` added later, with no
+        // way for this call alone to know `email_unique` already exists.
+        // `src/schema.rs` (kept in sync by every model/scaffold generator) is
+        // what lets this call see across that gap.
+        let existing_schema = append_schema_table("", "users", &fields(&["email_unique:String"]));
+        let sql = add_columns_up_sql("users", &fields(&["email:String:unique"]), &existing_schema);
+        assert!(
+            !sql.contains("CREATE UNIQUE INDEX idx_users_email_unique ON users (email);"),
+            "must not collide with the pre-existing email_unique column's \
+             plain index name; got:\n{sql}"
+        );
+        assert!(
+            sql.contains("CREATE UNIQUE INDEX idx_users_email_unique_"),
+            "the unique index must still exist, under a disambiguated name; \
+             got:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn remove_columns_down_sql_avoids_name_collision_with_earlier_migrations_columns() {
+        // `RemoveXFromY`'s rollback must avoid the same coincidental
+        // collision `add_columns_up_sql` avoids above.
+        let existing_schema = append_schema_table("", "users", &fields(&["email_unique:String"]));
+        let sql =
+            remove_columns_down_sql("users", &fields(&["email:String:unique"]), &existing_schema);
+        assert!(
+            !sql.contains("CREATE UNIQUE INDEX idx_users_email_unique ON users (email);"),
+            "got:\n{sql}"
+        );
+        assert!(
+            sql.contains("CREATE UNIQUE INDEX idx_users_email_unique_"),
+            "got:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn add_columns_up_sql_emits_fk_constraint_and_index() {
+        let sql = add_columns_up_sql("comments", &fields(&["post:references"]), "");
+        assert!(
+            sql.contains(
+                "ALTER TABLE comments ADD COLUMN post_id BIGINT NOT NULL REFERENCES posts(id);"
+            ),
+            "got:\n{sql}"
+        );
+        assert!(
+            sql.contains("CREATE INDEX idx_comments_post_id ON comments (post_id);"),
+            "got:\n{sql}"
+        );
+    }
+
     #[test]
     fn detect_add_migration() {
         match detect_migration_shape("AddTitleToPosts") {
@@ -2430,7 +4772,7 @@ mod tests {
     #[test]
     fn add_columns_up_sql_emits_alter_per_field() {
         let f = fields(&["title:String", "count:i32"]);
-        let sql = add_columns_up_sql("posts", &f);
+        let sql = add_columns_up_sql("posts", &f, "");
         assert!(sql.contains("ALTER TABLE posts ADD COLUMN title TEXT NOT NULL;"));
         assert!(sql.contains("ALTER TABLE posts ADD COLUMN count INTEGER NOT NULL;"));
     }
@@ -2438,7 +4780,7 @@ mod tests {
     #[test]
     fn add_columns_up_sql_includes_safety_comment_for_not_null() {
         let f = fields(&["title:String"]);
-        let sql = add_columns_up_sql("posts", &f);
+        let sql = add_columns_up_sql("posts", &f, "");
         assert!(
             sql.contains("autumn-safety: potentially-blocking"),
             "NOT NULL column must carry a safety comment; got:\n{sql}"
@@ -2448,7 +4790,7 @@ mod tests {
     #[test]
     fn add_columns_up_sql_no_safety_comment_for_nullable() {
         let f = fields(&["subtitle:Option<String>"]);
-        let sql = add_columns_up_sql("posts", &f);
+        let sql = add_columns_up_sql("posts", &f, "");
         assert!(
             !sql.contains("autumn-safety"),
             "nullable column must NOT carry a safety comment; got:\n{sql}"
@@ -2467,12 +4809,132 @@ mod tests {
     }
 
     #[test]
+    fn remove_columns_down_sql_restores_fk_constraint_and_index_for_references_field() {
+        // Rolling back `RemovePostFromComments post:references` must restore
+        // the FK constraint and its index, not just a bare BIGINT column —
+        // otherwise the relationship and its lookup index silently vanish
+        // on rollback (issue #1026).
+        let f = fields(&["post:references"]);
+        let sql = remove_columns_down_sql("comments", &f, "");
+        assert!(
+            sql.contains(
+                "ALTER TABLE comments ADD COLUMN post_id BIGINT NOT NULL REFERENCES posts(id);"
+            ),
+            "got:\n{sql}"
+        );
+        assert!(
+            sql.contains("CREATE INDEX idx_comments_post_id ON comments (post_id);"),
+            "got:\n{sql}"
+        );
+    }
+
+    #[test]
     fn add_columns_down_sql_drops_in_reverse() {
         let f = fields(&["title:String", "count:i32"]);
         let sql = add_columns_down_sql("posts", &f);
         let title_pos = sql.find("DROP COLUMN title").unwrap();
         let count_pos = sql.find("DROP COLUMN count").unwrap();
         assert!(count_pos < title_pos);
+    }
+
+    // ── enum field: CHECK constraint (issue #1030) ──────────────────────────
+
+    #[test]
+    fn create_table_emits_check_constraint_for_enum() {
+        let sql = create_table_sql_with_metadata_and_id(
+            "posts",
+            &fields(&["status:enum{draft,published,archived}"]),
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            IdType::BigSerial,
+        );
+        assert!(
+            sql.contains(
+                "status TEXT NOT NULL CHECK (status IN ('draft', 'published', 'archived'))"
+            ),
+            "got:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn create_table_check_comes_after_default() {
+        let mut defaults = BTreeMap::new();
+        defaults.insert("status".to_owned(), "'draft'".to_owned());
+        let sql = create_table_sql_with_metadata_and_id(
+            "posts",
+            &fields(&["status:enum{draft,published}"]),
+            &BTreeSet::new(),
+            &defaults,
+            IdType::BigSerial,
+        );
+        assert!(
+            sql.contains(
+                "status TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft', 'published'))"
+            ),
+            "got:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn create_table_nullable_enum_check_allows_null() {
+        let sql = create_table_sql_with_metadata_and_id(
+            "posts",
+            &fields(&["status:Option<enum{draft,published}>"]),
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            IdType::BigSerial,
+        );
+        assert!(
+            sql.contains("status TEXT NULL CHECK (status IN ('draft', 'published'))"),
+            "got:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn add_columns_emits_check_constraint_for_enum() {
+        let f = fields(&["status:enum{draft,published,archived}"]);
+        let sql = add_columns_up_sql("posts", &f, "");
+        assert!(
+            sql.contains(
+                "ALTER TABLE posts ADD COLUMN status TEXT NOT NULL CHECK (status IN ('draft', 'published', 'archived'));"
+            ),
+            "got:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn add_columns_down_drops_enum_column_plainly() {
+        let f = fields(&["status:enum{draft,published}"]);
+        let sql = add_columns_down_sql("posts", &f);
+        assert_eq!(sql, "ALTER TABLE posts DROP COLUMN status;\n");
+    }
+
+    #[test]
+    fn non_enum_column_has_no_check_constraint() {
+        let sql = create_table_sql_with_metadata_and_id(
+            "posts",
+            &fields(&["title:String"]),
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            IdType::BigSerial,
+        );
+        assert!(!sql.contains("CHECK"), "got:\n{sql}");
+    }
+
+    #[test]
+    fn remove_columns_down_sql_restores_check_constraint_for_enum_field() {
+        // Symmetric with the FK-restoration precedent above: rolling back a
+        // `RemoveStatusFromPosts` migration must restore the CHECK constraint,
+        // not just a bare TEXT column — otherwise the closed set silently
+        // stops being enforced after a rollback.
+        let f = fields(&["status:enum{draft,published,archived}"]);
+        let sql = remove_columns_down_sql("posts", &f, "");
+        assert!(
+            sql.contains(
+                "ALTER TABLE posts ADD COLUMN status TEXT NOT NULL CHECK (status IN ('draft', 'published', 'archived'));"
+            ),
+            "got:\n{sql}"
+        );
     }
 
     #[test]
@@ -2581,6 +5043,171 @@ async fn main() {\n\
         assert!(updated.contains("foo"));
     }
 
+    #[test]
+    fn ensure_routes_entries_skips_routes_macro_in_comments() {
+        // A doc comment mentioning `routes![]` must not receive the injected
+        // entries — that used to break compilation by editing the comment.
+        let original = "\
+//! Register handlers with `.routes(routes![])` in main.
+// e.g. routes![index]
+fn main() {
+    routes![]
+}
+";
+        let updated = ensure_routes_entries(original, &["foo".into()]);
+        assert!(
+            updated.contains("//! Register handlers with `.routes(routes![])` in main."),
+            "doc comment must be untouched: {updated}"
+        );
+        assert!(
+            updated.contains("// e.g. routes![index]"),
+            "line comment must be untouched: {updated}"
+        );
+        assert!(
+            updated.contains("foo,"),
+            "entry must land in the real macro: {updated}"
+        );
+        assert!(
+            updated.rfind("foo,").unwrap() > updated.find("fn main()").unwrap(),
+            "entry must be inside the macro in fn main, not in the comments: {updated}"
+        );
+    }
+
+    #[test]
+    fn ensure_routes_entries_only_comment_matches_is_noop() {
+        let original = "//! Add handlers via routes![].\nfn main() {}\n";
+        let updated = ensure_routes_entries(original, &["foo".into()]);
+        assert_eq!(updated, original);
+    }
+
+    #[test]
+    fn ensure_routes_entries_url_in_string_before_macro_is_code() {
+        // The `//` in the URL string literal is content, not a comment
+        // marker — the `routes![` on the same line is real code and must
+        // receive the injected entry.
+        let original =
+            "fn main() {\n    let url = \"https://example.com\"; app.routes(routes![index]);\n}\n";
+        let updated = ensure_routes_entries(original, &["foo".into()]);
+        assert!(
+            updated.contains("foo"),
+            "routes![ after a URL string must be edited as code: {updated}"
+        );
+        assert!(
+            updated.contains("\"https://example.com\""),
+            "the string literal must be untouched: {updated}"
+        );
+    }
+
+    #[test]
+    fn ensure_routes_entries_genuinely_commented_macro_still_skipped() {
+        // A real line comment before `routes![` must still be skipped, even
+        // when the comment itself contains quotes.
+        let original = "\
+// see \"docs\": routes![index]
+fn main() {
+    routes![]
+}
+";
+        let updated = ensure_routes_entries(original, &["foo".into()]);
+        assert!(
+            updated.contains("// see \"docs\": routes![index]"),
+            "comment must be untouched: {updated}"
+        );
+        assert!(
+            updated.rfind("foo").unwrap() > updated.find("fn main()").unwrap(),
+            "entry must land in the real macro, not the comment: {updated}"
+        );
+    }
+
+    #[test]
+    fn ensure_routes_entries_slashes_in_string_with_macro_on_line() {
+        // A string literal containing `//` followed by a real macro use on
+        // the same line: the escaped quote must not flip the string state.
+        let original = "fn main() {\n    let s = \"say \\\"// not a comment\\\"\"; app.routes(routes![index]);\n}\n";
+        let updated = ensure_routes_entries(original, &["foo".into()]);
+        assert!(
+            updated.contains("foo"),
+            "escaped quotes in a string must not hide the real macro: {updated}"
+        );
+    }
+
+    #[test]
+    fn remove_routes_entries_with_prefix_skips_commented_macro() {
+        let original = "\
+// routes![channels::chat::chat_page]
+fn main() {
+    routes![
+        channels::chat::chat_page,
+        index,
+    ]
+}
+";
+        let updated = remove_routes_entries_with_prefix(original, "channels::chat::");
+        assert!(
+            updated.contains("// routes![channels::chat::chat_page]"),
+            "comment must be untouched: {updated}"
+        );
+        assert!(updated.contains("index,"));
+        assert!(
+            !updated.contains("routes![\n        channels::chat::chat_page"),
+            "real entry must be removed: {updated}"
+        );
+    }
+
+    // ── remove_routes_entries_with_prefix ──────────────────────────────────
+
+    #[test]
+    fn remove_routes_entries_with_prefix_drops_matching_entries() {
+        let original = "fn main() {\n    routes![\n        index,\n        channels::chat::chat_page,\n        channels::chat::chat_events,\n        channels::chat::chat_publish,\n    ]\n}\n";
+        let updated = remove_routes_entries_with_prefix(original, "channels::chat::");
+        assert!(updated.contains("index,"));
+        assert!(!updated.contains("channels::chat::chat_page"));
+        assert!(!updated.contains("channels::chat::chat_events"));
+        assert!(!updated.contains("channels::chat::chat_publish"));
+    }
+
+    #[test]
+    fn remove_routes_entries_with_prefix_leaves_other_prefixes_untouched() {
+        let original = "fn main() {\n    routes![\n        channels::chat::chat_page,\n        channels::notifications::notifications_page,\n    ]\n}\n";
+        let updated = remove_routes_entries_with_prefix(original, "channels::chat::");
+        assert!(!updated.contains("channels::chat::chat_page"));
+        assert!(updated.contains("channels::notifications::notifications_page"));
+    }
+
+    #[test]
+    fn remove_routes_entries_with_prefix_is_noop_when_nothing_matches() {
+        let original = "fn main() {\n    routes![index, hello]\n}\n";
+        let updated = remove_routes_entries_with_prefix(original, "channels::chat::");
+        assert_eq!(updated, original);
+    }
+
+    #[test]
+    fn remove_routes_entries_with_prefix_no_routes_macro_leaves_file_alone() {
+        let original = "fn main() {}\n";
+        let updated = remove_routes_entries_with_prefix(original, "channels::chat::");
+        assert_eq!(updated, original);
+    }
+
+    #[test]
+    fn remove_then_ensure_routes_entries_composes_for_transport_switch() {
+        // Regression test for the `--force` transport-switch scenario: a
+        // channel generated with SSE routes, then regenerated with the WS
+        // route set, must not leave the stale SSE entries behind.
+        let original = "fn main() {\n    routes![\n        channels::chat::chat_page,\n        channels::chat::chat_events,\n        channels::chat::chat_publish,\n    ]\n}\n";
+        let stripped = remove_routes_entries_with_prefix(original, "channels::chat::");
+        let updated = ensure_routes_entries(
+            &stripped,
+            &[
+                "channels::chat::chat_ws".to_owned(),
+                "channels::chat::chat_publish".to_owned(),
+            ],
+        );
+        assert!(!updated.contains("chat_page"));
+        assert!(!updated.contains("chat_events"));
+        assert!(updated.contains("channels::chat::chat_ws"));
+        assert!(updated.contains("channels::chat::chat_publish"));
+    }
+
     // ── add_mail_preview_to_app ───────────────────────────────────────────
 
     fn app_main() -> &'static str {
@@ -2635,6 +5262,220 @@ async fn main() {\n\
         let updated = add_mail_preview_to_app(app_main(), "mailers::welcome::WelcomeMailer");
         assert!(updated.contains(".run()"), ".run() must still be present");
         assert!(updated.contains(".await;"), ".await must still be present");
+    }
+
+    // ── add_jobs_registration_to_app ─────────────────────────────────────
+
+    #[test]
+    fn add_jobs_registration_inserts_before_run() {
+        let updated = add_jobs_registration_to_app(app_main());
+        assert!(
+            updated.contains(".jobs(jobs::registered_jobs())"),
+            "must insert .jobs call: {updated}"
+        );
+        let jobs_pos = updated.find(".jobs(").unwrap();
+        let run_pos = updated.find(".run()").unwrap();
+        assert!(
+            jobs_pos < run_pos,
+            ".jobs() must appear before .run(): {updated}"
+        );
+    }
+
+    #[test]
+    fn add_jobs_registration_idempotent() {
+        let first = add_jobs_registration_to_app(app_main());
+        let second = add_jobs_registration_to_app(&first);
+        assert_eq!(first, second, "second call must be a no-op");
+    }
+
+    #[test]
+    fn add_jobs_registration_preserves_run_await() {
+        let updated = add_jobs_registration_to_app(app_main());
+        assert!(updated.contains(".run()"), ".run() must still be present");
+        assert!(updated.contains(".await;"), ".await must still be present");
+    }
+
+    #[test]
+    fn add_jobs_registration_single_call_even_with_two_jobs() {
+        let after_first = add_jobs_registration_to_app(app_main());
+        // Simulates running generate job a second time — .jobs(...) is already there.
+        let after_second = add_jobs_registration_to_app(&after_first);
+        assert_eq!(
+            after_second
+                .matches(".jobs(jobs::registered_jobs())")
+                .count(),
+            1,
+            "must not duplicate the .jobs() call"
+        );
+    }
+
+    // ── augment_registered_jobs ───────────────────────────────────────────
+
+    #[test]
+    fn augment_registered_jobs_creates_fn_when_absent() {
+        let mod_rs = "pub mod send_welcome_email;\n";
+        let updated = augment_registered_jobs(mod_rs, "send_welcome_email::send_welcome_email");
+        assert!(
+            updated.contains("pub fn registered_jobs()"),
+            "must create registered_jobs fn: {updated}"
+        );
+        assert!(
+            updated.contains("jobs![send_welcome_email::send_welcome_email]"),
+            "must include the new entry: {updated}"
+        );
+    }
+
+    #[test]
+    fn augment_registered_jobs_splices_into_existing() {
+        let mod_rs = "pub mod send_welcome_email;\n\n\
+            #[must_use]\n\
+            pub fn registered_jobs() -> Vec<autumn_web::job::JobInfo> {\n    \
+                autumn_web::jobs![send_welcome_email::send_welcome_email]\n}\n";
+        let updated = augment_registered_jobs(mod_rs, "post_notification::post_notification");
+        assert!(
+            updated.contains("send_welcome_email::send_welcome_email"),
+            "must preserve existing entry"
+        );
+        assert!(
+            updated.contains("post_notification::post_notification"),
+            "must include new entry"
+        );
+        assert_eq!(
+            updated.matches("jobs![").count(),
+            1,
+            "must not duplicate jobs![]: {updated}"
+        );
+    }
+
+    #[test]
+    fn augment_registered_jobs_idempotent() {
+        let mod_rs = "pub mod send_welcome_email;\n\n\
+            #[must_use]\n\
+            pub fn registered_jobs() -> Vec<autumn_web::job::JobInfo> {\n    \
+                autumn_web::jobs![send_welcome_email::send_welcome_email]\n}\n";
+        let second = augment_registered_jobs(mod_rs, "send_welcome_email::send_welcome_email");
+        assert_eq!(mod_rs, second, "duplicate entry must be a no-op");
+    }
+
+    #[test]
+    fn augment_registered_jobs_no_double_comma_with_trailing_comma() {
+        // cargo fmt may produce trailing commas inside multi-line macro bodies.
+        let mod_rs = "pub fn registered_jobs() -> Vec<autumn_web::job::JobInfo> {\n    \
+            autumn_web::jobs![\n        send_welcome_email::send_welcome_email,\n    ]\n}\n";
+        let updated = augment_registered_jobs(mod_rs, "post_notification::post_notification");
+        assert!(
+            !updated.contains(",,"),
+            "must not produce double comma: {updated}"
+        );
+        assert!(
+            updated.contains("post_notification::post_notification"),
+            "must include new entry"
+        );
+    }
+
+    #[test]
+    fn augment_registered_jobs_empty_mod_rs_creates_full_fn() {
+        let updated = augment_registered_jobs("", "foo::foo");
+        assert!(updated.contains("pub fn registered_jobs()"));
+        assert!(updated.contains("jobs![foo::foo]"));
+    }
+
+    // ── remove_job_entry / remove_jobs_registration_from_app (destroy, #1048) ──
+
+    #[test]
+    fn remove_job_entry_restores_original_when_it_was_the_only_one() {
+        let base = "pub mod send_welcome_email;\n";
+        let after_add = augment_registered_jobs(base, "send_welcome_email::send_welcome_email");
+        assert_ne!(after_add, base);
+        assert_eq!(
+            remove_job_entry(&after_add, "send_welcome_email::send_welcome_email"),
+            base
+        );
+    }
+
+    #[test]
+    fn remove_job_entry_keeps_other_entries() {
+        let base = "pub mod send_welcome_email;\n";
+        let with_one = augment_registered_jobs(base, "send_welcome_email::send_welcome_email");
+        let with_both = augment_registered_jobs(&with_one, "post_notification::post_notification");
+        let reverted = remove_job_entry(&with_both, "post_notification::post_notification");
+        assert!(reverted.contains("send_welcome_email::send_welcome_email"));
+        assert!(!reverted.contains("post_notification::post_notification"));
+    }
+
+    #[test]
+    fn remove_job_entry_is_idempotent_when_absent() {
+        let base = "pub mod send_welcome_email;\n";
+        assert_eq!(remove_job_entry(base, "nonexistent::nonexistent"), base);
+    }
+
+    #[test]
+    fn remove_jobs_registration_from_app_restores_original() {
+        let base = "fn main() {\n    App::new()\n        .run()\n}\n";
+        let after_add = add_jobs_registration_to_app(base);
+        assert_ne!(after_add, base);
+        assert_eq!(remove_jobs_registration_from_app(&after_add), base);
+    }
+
+    #[test]
+    fn remove_jobs_registration_from_app_is_idempotent_when_absent() {
+        let base = "fn main() {\n    App::new()\n        .run()\n}\n";
+        assert_eq!(remove_jobs_registration_from_app(base), base);
+    }
+
+    #[test]
+    fn remove_mail_preview_from_app_restores_original_when_only_entry() {
+        let base = "fn main() {\n    App::new()\n        .run()\n}\n";
+        let after_add = add_mail_preview_to_app(base, "WelcomeMailer");
+        assert_ne!(after_add, base);
+        assert_eq!(
+            remove_mail_preview_from_app(&after_add, "WelcomeMailer"),
+            base
+        );
+    }
+
+    #[test]
+    fn remove_mail_preview_from_app_keeps_other_entries() {
+        let base = "fn main() {\n    App::new()\n        .run()\n}\n";
+        let with_one = add_mail_preview_to_app(base, "WelcomeMailer");
+        let with_both = add_mail_preview_to_app(&with_one, "ReceiptMailer");
+        let reverted = remove_mail_preview_from_app(&with_both, "ReceiptMailer");
+        assert!(reverted.contains("WelcomeMailer"));
+        assert!(!reverted.contains("ReceiptMailer"));
+    }
+
+    #[test]
+    fn remove_mail_preview_from_app_removes_a_rustfmt_wrapped_call() {
+        // rustfmt commonly wraps `.mail_previews(mail_previews![...])`
+        // across several lines once it has a couple of mailer names. Naive
+        // line-start matching would strip only the opening line and leave
+        // the rest (`WelcomeMailer,` / `])`) dangling — issue #1048 PR
+        // review.
+        let src = "fn main() {\n    App::new()\n        .mail_previews(mail_previews![\n            WelcomeMailer,\n        ])\n        .run()\n}\n";
+        let updated = remove_mail_preview_from_app(src, "WelcomeMailer");
+        assert!(
+            !updated.contains("mail_previews"),
+            "the whole call must be removed once its only entry is gone, got:\n{updated}"
+        );
+        assert_eq!(updated, "fn main() {\n    App::new()\n        .run()\n}\n");
+    }
+
+    #[test]
+    fn remove_mail_preview_from_app_keeps_other_entry_in_a_rustfmt_wrapped_call() {
+        let src = "fn main() {\n    App::new()\n        .mail_previews(mail_previews![\n            WelcomeMailer,\n            ReceiptMailer,\n        ])\n        .run()\n}\n";
+        let updated = remove_mail_preview_from_app(src, "WelcomeMailer");
+        assert!(
+            updated.contains("mail_previews"),
+            "the call must survive while another entry remains, got:\n{updated}"
+        );
+        assert!(updated.contains("ReceiptMailer"));
+        assert!(!updated.contains("WelcomeMailer"));
+    }
+
+    #[test]
+    fn remove_mail_preview_from_app_is_idempotent_when_absent() {
+        let base = "fn main() {\n    App::new()\n        .run()\n}\n";
+        assert_eq!(remove_mail_preview_from_app(base, "WelcomeMailer"), base);
     }
 
     // ── ensure_autumn_web_feature ─────────────────────────────────────────
@@ -3695,6 +6536,608 @@ pub struct Comment {
         );
     }
 
+    // ── ensure_dev_dependency_test_support (issue #1023) ───────────────────
+
+    #[test]
+    fn dev_dependency_test_support_inserts_into_existing_section() {
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = \"0.6\"\n\n[dev-dependencies]\ntokio = { version = \"1\", features = [\"rt\", \"macros\"] }\n";
+        let updated = ensure_dev_dependency_test_support(cargo, "0.6");
+        assert!(
+            updated.contains("autumn-web = { version = \"0.6\", features = [\"test-support\"] }"),
+            "must add a dev-dependency autumn-web entry with test-support: {updated}"
+        );
+        // The original tokio dev-dependency must survive untouched.
+        assert!(updated.contains("tokio = { version = \"1\""));
+        // The production dependency must be untouched (no test-support there).
+        let deps_section = updated.split("[dev-dependencies]").next().unwrap();
+        assert!(!deps_section.contains("test-support"));
+    }
+
+    #[test]
+    fn dev_dependency_test_support_is_idempotent() {
+        let cargo = "[package]\nname=\"x\"\n\n[dev-dependencies]\ntokio = \"1\"\n";
+        let once = ensure_dev_dependency_test_support(cargo, "0.6");
+        let twice = ensure_dev_dependency_test_support(&once, "0.6");
+        assert_eq!(once, twice, "a second call must be a no-op");
+    }
+
+    #[test]
+    fn dev_dependency_test_support_adds_feature_to_existing_dev_entry() {
+        let cargo =
+            "[package]\nname=\"x\"\n\n[dev-dependencies]\nautumn-web = { version = \"0.6\" }\n";
+        let updated = ensure_dev_dependency_test_support(cargo, "0.6");
+        assert!(
+            updated.contains("\"test-support\""),
+            "must add test-support to the existing dev-dependency entry: {updated}"
+        );
+        // Must not duplicate the autumn-web line.
+        assert_eq!(
+            updated.matches("autumn-web").count(),
+            1,
+            "must not duplicate the autumn-web dev-dependency: {updated}"
+        );
+    }
+
+    #[test]
+    fn dev_dependency_test_support_rewrites_single_quoted_plain_version() {
+        // Regression test (Codex review, issue #1023): same gap as the
+        // tokio case -- rewrite_dep_with_feature's Form 1 only recognized
+        // double-quoted plain-string versions, so a valid single-quoted
+        // existing `autumn-web = '0.6'` dev-dependency was treated as
+        // absent and duplicated instead of getting test-support added.
+        let cargo = "[package]\nname=\"x\"\n\n[dev-dependencies]\nautumn-web = '0.6'\n";
+        let updated = ensure_dev_dependency_test_support(cargo, "0.6");
+        assert_eq!(
+            updated.matches("autumn-web").count(),
+            1,
+            "must rewrite the existing single-quoted autumn-web dep in place, not duplicate it: {updated}"
+        );
+        assert!(
+            updated.contains("\"test-support\""),
+            "must add test-support to the single-quoted dev entry: {updated}"
+        );
+    }
+
+    #[test]
+    fn dev_dependency_test_support_creates_section_when_absent() {
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = \"0.6\"\n";
+        let updated = ensure_dev_dependency_test_support(cargo, "0.6");
+        assert!(updated.contains("[dev-dependencies]"));
+        assert!(updated.contains("\"test-support\""));
+    }
+
+    #[test]
+    fn dev_dependency_test_support_handles_dotted_key_form() {
+        // Regression test (code review, issue #1023): `autumn-web.workspace = true`
+        // must not be silently ignored -- that used to leave the Cargo.toml
+        // unmodified with no error, so the generated smoke test failed to
+        // compile with no hint why. Matches `patch_dotted_dep`'s established
+        // shape (see ensure_feature_dotted_workspace_inserts_features_line):
+        // a separate `autumn-web.features = [...]` dotted-key line, not a
+        // rewrite of the `.workspace = true` line itself.
+        let cargo = "[package]\nname=\"x\"\n\n[dev-dependencies]\nautumn-web.workspace = true\n";
+        let updated = ensure_dev_dependency_test_support(cargo, "0.6");
+        assert!(
+            updated.contains("\"test-support\""),
+            "must add test-support to a dotted-key autumn-web entry: {updated}"
+        );
+        assert!(
+            updated.contains("autumn-web.features"),
+            "must use the dotted key form: {updated}"
+        );
+        assert!(updated.contains("autumn-web.workspace = true"));
+    }
+
+    #[test]
+    fn dev_dependency_test_support_handles_subtable_form() {
+        // Regression test (code review, issue #1023): a `[dev-dependencies.autumn-web]`
+        // subtable used to go unrecognized, causing a second, conflicting
+        // `autumn-web = {...}` line to be inserted (a duplicate-key Cargo.toml).
+        let cargo = "[package]\nname=\"x\"\n\n[dev-dependencies.autumn-web]\nversion = \"0.6\"\n";
+        let updated = ensure_dev_dependency_test_support(cargo, "0.6");
+        assert!(
+            updated.contains("test-support"),
+            "must add test-support to a subtable autumn-web entry: {updated}"
+        );
+        assert_eq!(
+            updated.matches("autumn-web").count(),
+            1,
+            "must not insert a duplicate autumn-web entry: {updated}"
+        );
+    }
+
+    #[test]
+    fn dev_dependency_test_support_reuses_shared_feature_logic() {
+        // The dev-dependencies path must go through the same
+        // ensure_autumn_web_feature_status_in_section as [dependencies] does,
+        // so it inherits every declaration shape that function already
+        // understands instead of a smaller reimplementation.
+        let (via_shared, found) = ensure_autumn_web_feature_status_in_section(
+            "[package]\nname=\"x\"\n\n[dev-dependencies]\nautumn-web = \"0.6\"\n",
+            "test-support",
+            "dev-dependencies",
+        );
+        assert!(found);
+        let via_public = ensure_dev_dependency_test_support(
+            "[package]\nname=\"x\"\n\n[dev-dependencies]\nautumn-web = \"0.6\"\n",
+            "0.6",
+        );
+        assert_eq!(via_shared, via_public);
+    }
+
+    #[test]
+    fn dev_dependency_test_support_mirrors_workspace_source() {
+        // Regression test (Codex review, issue #1023): when `[dependencies]`
+        // inherits `autumn-web` from the workspace and there's no existing
+        // `[dev-dependencies]` entry, inserting a crates.io `version = ...`
+        // entry makes Cargo refuse to build at all -- confirmed via a
+        // hand-built `cargo metadata` reproduction ("Dependency 'autumn-web'
+        // has different source paths depending on the build target"). The
+        // new dev-dependency entry must mirror `workspace = true` instead.
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web.workspace = true\n\n[dev-dependencies]\ntokio = { version = \"1\" }\n";
+        let updated = ensure_dev_dependency_test_support(cargo, "0.6");
+        assert!(
+            updated.contains("autumn-web = { workspace = true, features = [\"test-support\"] }"),
+            "must mirror the workspace source instead of defaulting to a crates.io version: {updated}"
+        );
+        assert!(!updated.contains("version = \"0.6\""));
+    }
+
+    #[test]
+    fn dev_dependency_test_support_mirrors_path_source() {
+        // Same failure mode as the workspace case, but for a direct `path`
+        // source (the pattern this monorepo's own `examples/*` projects use).
+        let cargo =
+            "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = { path = \"../autumn\" }\n";
+        let updated = ensure_dev_dependency_test_support(cargo, "0.6");
+        assert!(
+            updated
+                .contains("autumn-web = { path = \"../autumn\", features = [\"test-support\"] }"),
+            "must mirror the path source instead of defaulting to a crates.io version: {updated}"
+        );
+        assert!(!updated.contains("version = \"0.6\""));
+    }
+
+    #[test]
+    fn dev_dependency_test_support_mirrors_subtable_path_source() {
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies.autumn-web]\npath = \"../autumn\"\n";
+        let updated = ensure_dev_dependency_test_support(cargo, "0.6");
+        assert!(
+            updated
+                .contains("autumn-web = { path = \"../autumn\", features = [\"test-support\"] }"),
+            "must mirror a subtable-declared path source: {updated}"
+        );
+        assert!(!updated.contains("version = \"0.6\""));
+    }
+
+    #[test]
+    fn dev_dependency_test_support_falls_back_to_version_for_plain_crates_io_dep() {
+        // Baseline: a plain crates.io version in `[dependencies]` must still
+        // produce the pre-existing `version = ...` fallback.
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = \"0.6\"\n";
+        let updated = ensure_dev_dependency_test_support(cargo, "0.6");
+        assert!(
+            updated.contains("autumn-web = { version = \"0.6\", features = [\"test-support\"] }"),
+            "must fall back to an explicit version when [dependencies] has no source keys: {updated}"
+        );
+    }
+
+    #[test]
+    fn dev_dependency_test_support_mirrors_registry_with_version() {
+        // Regression test (Codex review, issue #1023): `registry = "..."`
+        // alone doesn't pin a resolvable dependency the way `workspace`/
+        // `path`/`git` do -- Cargo still requires an explicit `version`
+        // alongside it (confirmed via `cargo metadata --offline`: a dep with
+        // neither path/git/version/workspace fails with "specified without
+        // providing a local path, Git repository, version, or workspace
+        // dependency to use"). Dropping `version` when mirroring `registry`
+        // would produce the same failure.
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = { version = \"0.6\", registry = \"private\" }\n";
+        let updated = ensure_dev_dependency_test_support(cargo, "0.6");
+        assert!(
+            updated.contains(
+                "autumn-web = { version = \"0.6\", registry = \"private\", features = [\"test-support\"] }"
+            ),
+            "must mirror both version and registry together: {updated}"
+        );
+    }
+
+    #[test]
+    fn dev_dependency_test_support_mirrors_dotted_registry_with_version() {
+        // Regression test (Codex review, issue #1023): the dotted-key form
+        // can spread `version` and `registry` across separate
+        // `autumn-web.<key> = <value>` lines. The scan used to return as
+        // soon as it saw the first source key (`registry`), dropping the
+        // sibling `autumn-web.version` line entirely -- same underlying bug
+        // as the inline-table case, just in the dotted-key branch.
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web.version = \"0.6\"\nautumn-web.registry = \"private\"\n";
+        let updated = ensure_dev_dependency_test_support(cargo, "0.6");
+        let dep_line = updated
+            .lines()
+            .find(|l| l.starts_with("autumn-web =") && l.contains("test-support"))
+            .unwrap_or_else(|| panic!("no dev-dependency autumn-web line in: {updated}"));
+        assert!(
+            dep_line.contains("version = \"0.6\"") && dep_line.contains("registry = \"private\""),
+            "must mirror both dotted version and registry together: {dep_line}"
+        );
+    }
+
+    #[test]
+    fn dev_dependency_test_support_mirrors_aliased_path_source() {
+        // Regression test (Codex review, issue #1023): a renamed dep, e.g.
+        // `autumn_web = { package = "autumn-web", path = "../autumn" }`,
+        // wasn't recognized at all -- the detector only matched the literal
+        // `autumn-web` key, so it fell back to a mismatched crates.io
+        // version. Confirmed via `cargo metadata --offline` that Cargo
+        // unifies dependency sources by *package name* (here "autumn-web"),
+        // not by the local alias key, so an unaliased `autumn-web = { path
+        // = "../autumn", ... }` dev-dependency (mirroring just the source,
+        // not the alias) resolves to the identical node as the aliased
+        // `[dependencies]` entry.
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nautumn_web = { package = \"autumn-web\", path = \"../autumn\" }\n";
+        let updated = ensure_dev_dependency_test_support(cargo, "0.6");
+        assert!(
+            updated
+                .contains("autumn-web = { path = \"../autumn\", features = [\"test-support\"] }"),
+            "must mirror the aliased dep's path source: {updated}"
+        );
+        assert!(!updated.contains("version = \"0.6\""));
+    }
+
+    #[test]
+    fn dev_dependency_test_support_mirrors_aliased_path_source_odd_spacing() {
+        // Regression test (Codex review, issue #1023): the alias detector
+        // matched `package = "autumn-web"` or `package="autumn-web"` as
+        // literal substrings, missing other TOML-legal spacings like
+        // `package= "autumn-web"` (space after `=` only) -- confirmed valid
+        // via `cargo metadata --offline --no-deps`. That silently dropped
+        // the alias's path/workspace/git source and fell back to a
+        // mismatched crates.io version.
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nautumn_web = { package= \"autumn-web\", path = \"../autumn\" }\n";
+        let updated = ensure_dev_dependency_test_support(cargo, "0.6");
+        assert!(
+            updated
+                .contains("autumn-web = { path = \"../autumn\", features = [\"test-support\"] }"),
+            "must mirror the aliased dep's path source despite odd spacing around package=: {updated}"
+        );
+        assert!(!updated.contains("version = \"0.6\""));
+    }
+
+    #[test]
+    fn dev_dependency_test_support_mirrors_aliased_path_source_single_quoted() {
+        // Regression test (Codex review, issue #1023): TOML's single-quoted
+        // literal-string form (`package = 'autumn-web'`) is accepted by
+        // Cargo identically to a double-quoted one (confirmed via `cargo
+        // metadata --offline --no-deps`), but the alias detector only
+        // stripped double quotes from the package value, so it missed this
+        // form and fell back to a mismatched crates.io version.
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nautumn_web = { package = 'autumn-web', path = '../autumn' }\n";
+        let updated = ensure_dev_dependency_test_support(cargo, "0.6");
+        assert!(
+            updated.contains("autumn-web = { path = '../autumn', features = [\"test-support\"] }"),
+            "must mirror the aliased dep's single-quoted path source: {updated}"
+        );
+        assert!(!updated.contains("version = \"0.6\""));
+    }
+
+    #[test]
+    fn dev_dependency_test_support_mirrors_single_quoted_version() {
+        // Regression test (Codex review, issue #1023): a plain single-quoted
+        // version (`autumn-web = '0.5'`) is valid Cargo.toml (confirmed via
+        // `cargo metadata --offline --no-deps`), but extract_plain_string_version
+        // only recognized double-quoted strings, so it fell back to the
+        // CLI's own version instead of mirroring the project's pin --
+        // exactly the same failure mode the double-quoted version-mirroring
+        // fix addressed.
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = '0.5'\n";
+        let updated = ensure_dev_dependency_test_support(cargo, "0.6");
+        assert!(
+            updated.contains("autumn-web = { version = '0.5', features = [\"test-support\"] }"),
+            "must mirror the existing single-quoted pinned version, not the CLI's: {updated}"
+        );
+        assert!(!updated.contains("version = \"0.6\""));
+    }
+
+    #[test]
+    fn dev_dependency_test_support_mirrors_existing_pinned_version_not_cli_version() {
+        // Regression test (Codex review, issue #1023): the fallback used to
+        // insert `version = "<CLI's own CARGO_PKG_VERSION>"` unconditionally,
+        // ignoring whatever `[dependencies]` actually pins. When the two
+        // differ (e.g. a project pinned to an older `autumn-web = "0.5"`
+        // while the CLI itself is `0.6`), Cargo's resolver can reject the
+        // manifest outright if the two version requirements don't overlap
+        // (confirmed via `cargo metadata`: "failed to select a version").
+        // The dev-dependency entry must mirror the *existing* requirement,
+        // not the CLI's.
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = \"0.5\"\n";
+        let updated = ensure_dev_dependency_test_support(cargo, "0.6");
+        assert!(
+            updated.contains("autumn-web = { version = \"0.5\", features = [\"test-support\"] }"),
+            "must mirror the existing pinned version, not the CLI's: {updated}"
+        );
+        assert!(!updated.contains("version = \"0.6\""));
+    }
+
+    #[test]
+    fn dev_dependency_test_support_mirrors_version_from_inline_table() {
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = { version = \"0.5\" }\n";
+        let updated = ensure_dev_dependency_test_support(cargo, "0.6");
+        assert!(
+            updated.contains("autumn-web = { version = \"0.5\", features = [\"test-support\"] }"),
+            "must mirror the existing pinned version from an inline table: {updated}"
+        );
+    }
+
+    #[test]
+    fn dev_dependency_test_support_mirrors_aliased_subtable_path_source() {
+        // Regression test (Codex review, issue #1023): the renamed-dep fix
+        // only covered the inline-table alias form (`autumn_web = {
+        // package = "autumn-web", ... }`); the multiline subtable form
+        // (`[dependencies.autumn_web]` with a `package = "autumn-web"`
+        // body) went undetected the same way the unaliased subtable case
+        // did before that fix, silently falling back to a crates.io
+        // version that conflicts with the aliased dep's real path/git/
+        // workspace source.
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies.autumn_web]\npackage = \"autumn-web\"\npath = \"../autumn\"\n";
+        let updated = ensure_dev_dependency_test_support(cargo, "0.6");
+        assert!(
+            updated
+                .contains("autumn-web = { path = \"../autumn\", features = [\"test-support\"] }"),
+            "must mirror the aliased subtable's path source: {updated}"
+        );
+        assert!(!updated.contains("version = \"0.6\""));
+    }
+
+    #[test]
+    fn dev_dependency_test_support_mirrors_dotted_aliased_path_source() {
+        // Regression test (Codex review, issue #1023): the renamed-dep fixes
+        // covered the inline-table (`autumn_web = { package = "autumn-web",
+        // ... }`) and subtable (`[dependencies.autumn_web]`) alias shapes,
+        // but not Cargo's dotted renamed-dependency form
+        // (`autumn_web.package = "autumn-web"` plus `autumn_web.path =
+        // "../autumn"` on separate lines). The alias-detection branch split
+        // on the key's dot and compared the whole `autumn_web.package`
+        // string against `autumn_web`, so it never matched and fell through
+        // to a mismatched crates.io version. Confirmed via `cargo metadata
+        // --offline` that two different paths for the same package name
+        // conflict, same as the other alias forms.
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nautumn_web.package = \"autumn-web\"\nautumn_web.path = \"../autumn\"\n";
+        let updated = ensure_dev_dependency_test_support(cargo, "0.6");
+        assert!(
+            updated
+                .contains("autumn-web = { path = \"../autumn\", features = [\"test-support\"] }"),
+            "must mirror the dotted-aliased dep's path source: {updated}"
+        );
+        assert!(!updated.contains("version = \"0.6\""));
+    }
+
+    #[test]
+    fn dev_dependency_test_support_mirrors_dotted_aliased_path_source_single_quoted() {
+        // Regression test (Codex review, issue #1023): the dotted-alias
+        // confirmation check (`sub == "package" && val_code.trim_matches...`)
+        // still trimmed only double quotes even after the inline-table and
+        // subtable single-quote fixes, so `autumn_web.package =
+        // 'autumn-web'` (valid Cargo.toml, same as the double-quoted form)
+        // never confirmed the alias and fell through to a mismatched
+        // crates.io version.
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nautumn_web.package = 'autumn-web'\nautumn_web.path = '../autumn'\n";
+        let updated = ensure_dev_dependency_test_support(cargo, "0.6");
+        assert!(
+            updated.contains("autumn-web = { path = '../autumn', features = [\"test-support\"] }"),
+            "must mirror the single-quoted dotted-aliased dep's path source: {updated}"
+        );
+        assert!(!updated.contains("version = \"0.6\""));
+    }
+
+    // ── ensure_dev_dependency_tokio_test_features (issue #1023) ────────────
+
+    #[test]
+    fn tokio_test_features_inserts_when_dev_dependencies_absent() {
+        // Regression test (Codex review, issue #1023): a project not
+        // created from `autumn new` (or one where the tokio dev-dependency
+        // was removed) has no `tokio` entry to add `rt`/`macros` to, so the
+        // generated `#[tokio::test]` smoke test fails to compile. `cargo
+        // test --tests` still compiles `#[ignore]`d tests, so this broke an
+        // otherwise-valid project's test build entirely.
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = \"0.6\"\n";
+        let updated = ensure_dev_dependency_tokio_test_features(cargo);
+        assert!(
+            updated.contains("tokio = { version = \"1\", features = [\"rt\", \"macros\"] }"),
+            "must insert a tokio dev-dependency with rt and macros: {updated}"
+        );
+    }
+
+    #[test]
+    fn tokio_test_features_inserts_when_dev_dependencies_section_exists_without_tokio() {
+        let cargo =
+            "[package]\nname=\"x\"\n\n[dev-dependencies]\nautumn-web = { version = \"0.6\" }\n";
+        let updated = ensure_dev_dependency_tokio_test_features(cargo);
+        assert!(
+            updated.contains("tokio = { version = \"1\", features = [\"rt\", \"macros\"] }"),
+            "must insert tokio into the existing dev-dependencies section: {updated}"
+        );
+        assert!(updated.contains("autumn-web"));
+    }
+
+    #[test]
+    fn tokio_test_features_adds_missing_features_to_existing_tokio() {
+        let cargo = "[package]\nname=\"x\"\n\n[dev-dependencies]\ntokio = { version = \"1\" }\n";
+        let updated = ensure_dev_dependency_tokio_test_features(cargo);
+        let dep_line = updated
+            .lines()
+            .find(|l| l.trim_start().starts_with("tokio"))
+            .unwrap_or_else(|| panic!("no tokio line in: {updated}"));
+        assert!(
+            dep_line.contains("\"rt\"") && dep_line.contains("\"macros\""),
+            "must add both missing features to the existing tokio entry: {dep_line}"
+        );
+        assert_eq!(
+            updated.matches("tokio").count(),
+            1,
+            "must not duplicate the tokio dev-dependency: {updated}"
+        );
+    }
+
+    #[test]
+    fn tokio_test_features_adds_only_the_missing_feature() {
+        let cargo = "[package]\nname=\"x\"\n\n[dev-dependencies]\ntokio = { version = \"1\", features = [\"macros\"] }\n";
+        let updated = ensure_dev_dependency_tokio_test_features(cargo);
+        let dep_line = updated
+            .lines()
+            .find(|l| l.trim_start().starts_with("tokio"))
+            .unwrap_or_else(|| panic!("no tokio line in: {updated}"));
+        assert!(dep_line.contains("\"rt\"") && dep_line.contains("\"macros\""));
+        assert_eq!(
+            dep_line.matches("\"macros\"").count(),
+            1,
+            "must not duplicate an already-present feature: {dep_line}"
+        );
+    }
+
+    #[test]
+    fn tokio_test_features_is_idempotent() {
+        let cargo = "[package]\nname=\"x\"\n\n[dev-dependencies]\ntokio = { version = \"1\", features = [\"rt\", \"macros\"] }\n";
+        let once = ensure_dev_dependency_tokio_test_features(cargo);
+        let twice = ensure_dev_dependency_tokio_test_features(&once);
+        assert_eq!(once, twice, "a second call must be a no-op");
+    }
+
+    #[test]
+    fn tokio_test_features_handles_dotted_key_form() {
+        let cargo = "[package]\nname=\"x\"\n\n[dev-dependencies]\ntokio.version = \"1\"\n";
+        let updated = ensure_dev_dependency_tokio_test_features(cargo);
+        let features_line = updated
+            .lines()
+            .find(|l| l.trim_start().starts_with("tokio.features"))
+            .unwrap_or_else(|| panic!("no tokio.features line in: {updated}"));
+        assert!(features_line.contains("\"rt\"") && features_line.contains("\"macros\""));
+    }
+
+    #[test]
+    fn tokio_test_features_dotted_form_not_shadowed_by_prefixed_dep() {
+        // Regression test (Codex review, issue #1023): patch_dotted_dep's
+        // idempotency check used a bare `starts_with(dep_name)`, so a later
+        // unrelated dependency sharing the prefix (e.g. `tokio-util`, a real
+        // crate that can plausibly coexist with `tokio` in the same
+        // project) whose value happened to contain `"rt"` was mistaken for
+        // proof that the real `tokio` dotted dep already had the feature --
+        // skipping the actual `tokio.features` splice and leaving the
+        // generated `#[tokio::test]` smoke test unable to compile.
+        let cargo = "[package]\nname=\"x\"\n\n[dev-dependencies]\ntokio.version = \"1\"\ntokio-util = { features = [\"rt\"] }\n";
+        let updated = ensure_dev_dependency_tokio_test_features(cargo);
+        let features_line = updated
+            .lines()
+            .find(|l| l.trim_start().starts_with("tokio.features"))
+            .unwrap_or_else(|| panic!("no tokio.features line in: {updated}"));
+        assert!(
+            features_line.contains("\"rt\"") && features_line.contains("\"macros\""),
+            "the real tokio dep must get both features despite the tokio-util decoy: {features_line}"
+        );
+    }
+
+    #[test]
+    fn tokio_test_features_not_spliced_into_trailing_comment() {
+        // Regression test (Codex review, issue #1023): rewrite_dep_with_feature
+        // searched for "features"/"[...]" in the raw line, including any
+        // trailing `# comment`. A comment that happens to contain
+        // TOML-looking text (e.g. a `# features = []` example) got the
+        // feature spliced into the comment instead of the real dependency
+        // value, while the caller still reported success -- leaving the
+        // generated `#[tokio::test]` smoke test unable to compile because
+        // the actual tokio entry never gained rt/macros.
+        let cargo = "[package]\nname=\"x\"\n\n[dev-dependencies]\ntokio = { version = \"1\" } # features = []\n";
+        let updated = ensure_dev_dependency_tokio_test_features(cargo);
+        let tokio_line = updated
+            .lines()
+            .find(|l| l.trim_start().starts_with("tokio"))
+            .unwrap_or_else(|| panic!("no tokio line in: {updated}"));
+        let code = tokio_line.split_once('#').map_or(tokio_line, |(c, _)| c);
+        assert!(
+            code.contains("\"rt\"") && code.contains("\"macros\""),
+            "features must be added to the real dependency value, not the trailing comment: {tokio_line}"
+        );
+    }
+
+    #[test]
+    fn tokio_test_features_rewrites_single_quoted_plain_version() {
+        // Regression test (Codex review, issue #1023): rewrite_dep_with_feature's
+        // Form 1 only recognized a double-quoted plain-string version
+        // (`tokio = "1"`). A valid single-quoted one (`tokio = '1'`,
+        // confirmed accepted by `cargo metadata --offline --no-deps`) fell
+        // through unrecognized, so the caller treated the dependency as
+        // absent and inserted a *second*, duplicate `tokio` key -- which
+        // Cargo rejects outright, making the manifest unusable.
+        let cargo = "[package]\nname=\"x\"\n\n[dev-dependencies]\ntokio = '1'\n";
+        let updated = ensure_dev_dependency_tokio_test_features(cargo);
+        assert_eq!(
+            updated.matches("tokio").count(),
+            1,
+            "must rewrite the existing single-quoted tokio dep in place, not duplicate it: {updated}"
+        );
+        let tokio_line = updated
+            .lines()
+            .find(|l| l.trim_start().starts_with("tokio"))
+            .unwrap_or_else(|| panic!("no tokio line in: {updated}"));
+        assert!(
+            tokio_line.contains("\"rt\"") && tokio_line.contains("\"macros\""),
+            "must add both features to the single-quoted tokio dep: {tokio_line}"
+        );
+    }
+
+    #[test]
+    fn tokio_test_features_handles_subtable_form() {
+        let cargo = "[package]\nname=\"x\"\n\n[dev-dependencies.tokio]\nversion = \"1\"\n";
+        let updated = ensure_dev_dependency_tokio_test_features(cargo);
+        assert!(
+            updated.contains("\"rt\"") && updated.contains("\"macros\""),
+            "must add both features to a subtable tokio entry: {updated}"
+        );
+        assert_eq!(
+            updated.matches("tokio").count(),
+            1,
+            "must not insert a duplicate tokio entry: {updated}"
+        );
+    }
+
+    #[test]
+    fn tokio_test_features_mirrors_path_source() {
+        // Regression test (Codex review, issue #1023): the same
+        // source-mismatch bug that motivated the whole autumn-web
+        // source-mirroring saga also applies to tokio -- if [dependencies]
+        // sources tokio from a path/workspace/git override (e.g. an
+        // internal fork), inserting a crates.io `version = "1"` dev entry
+        // makes Cargo reject the manifest ("Dependency 'tokio' has
+        // different source paths depending on the build target"; confirmed
+        // via a hand-built `cargo metadata --offline` reproduction). The
+        // new entry must mirror the existing path source instead.
+        let cargo =
+            "[package]\nname=\"x\"\n\n[dependencies]\ntokio = { path = \"../fake-tokio\" }\n";
+        let updated = ensure_dev_dependency_tokio_test_features(cargo);
+        let tokio_dev_line = updated
+            .lines()
+            .find(|l| l.trim_start().starts_with("tokio") && l.contains("rt"))
+            .unwrap_or_else(|| panic!("no tokio dev-dependency line in: {updated}"));
+        assert!(
+            tokio_dev_line.contains("path = \"../fake-tokio\""),
+            "must mirror the path source instead of defaulting to a crates.io version: {tokio_dev_line}"
+        );
+        assert!(!tokio_dev_line.contains("version"));
+    }
+
+    #[test]
+    fn tokio_test_features_falls_back_to_version_for_plain_crates_io_dep() {
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\ntokio = \"1\"\n";
+        let updated = ensure_dev_dependency_tokio_test_features(cargo);
+        let tokio_dev_line = updated
+            .lines()
+            .find(|l| l.trim_start().starts_with("tokio") && l.contains("rt"))
+            .unwrap_or_else(|| panic!("no tokio dev-dependency line in: {updated}"));
+        assert!(
+            tokio_dev_line.contains("version = \"1\""),
+            "must fall back to an explicit version when [dependencies] has no source keys: {tokio_dev_line}"
+        );
+    }
+
     // ── IdType-aware variants (issue #1400) ────────────────────────────────
 
     #[test]
@@ -3801,5 +7244,352 @@ pub struct Comment {
         let fs = fields(&["title:String"]);
         let schema = append_schema_table_with_id("", "posts", &fs, IdType::Uuid);
         assert!(schema.contains("id -> Uuid,"));
+    }
+
+    // ── `autumn destroy` inverse helpers (issue #1048) ─────────────────────
+    //
+    // Each inverse is tested for byte-identical round-tripping:
+    // `inverse(forward(base)) == base`.
+
+    #[test]
+    fn remove_mod_declaration_restores_empty_file() {
+        let after_add = add_mod_declaration("", "post");
+        assert_eq!(remove_mod_declaration(&after_add, "post"), "");
+    }
+
+    #[test]
+    fn remove_mod_declaration_restores_original_with_other_mods() {
+        let base = "pub mod user;\n";
+        let after_add = add_mod_declaration(base, "post");
+        assert_eq!(remove_mod_declaration(&after_add, "post"), base);
+    }
+
+    #[test]
+    fn remove_mod_declaration_is_idempotent_when_absent() {
+        let base = "pub mod user;\n";
+        assert_eq!(remove_mod_declaration(base, "post"), base);
+    }
+
+    #[test]
+    fn remove_mod_declaration_leaves_private_mod_untouched() {
+        // `add_mod_declaration` treats a bare `mod post;` as already-present and
+        // never writes `pub mod post;` in that case — so destroy must not
+        // remove a private `mod post;` it didn't add.
+        let base = "mod post;\n";
+        assert_eq!(remove_mod_declaration(base, "post"), base);
+    }
+
+    #[test]
+    fn remove_schema_table_restores_empty_file() {
+        let f = fields(&["title:String"]);
+        let block = append_schema_table("", "posts", &f);
+        let after_add = block.clone();
+        assert_eq!(remove_schema_table(&after_add, "posts", &block), "");
+    }
+
+    #[test]
+    fn remove_schema_table_restores_original_with_other_tables() {
+        let f1 = fields(&["title:String"]);
+        let f2 = fields(&["name:String"]);
+        let base = append_schema_table("", "users", &f2);
+        let block = append_schema_table("", "posts", &f1);
+        let after_add = append_schema_table(&base, "posts", &f1);
+        assert_eq!(remove_schema_table(&after_add, "posts", &block), base);
+    }
+
+    #[test]
+    fn remove_schema_table_is_idempotent_when_absent() {
+        let f = fields(&["name:String"]);
+        let base = append_schema_table("", "users", &f);
+        let block = append_schema_table("", "posts", &f);
+        assert_eq!(remove_schema_table(&base, "posts", &block), base);
+    }
+
+    #[test]
+    fn remove_schema_table_never_removes_a_pre_existing_table_with_different_columns() {
+        // A hand-rolled `posts` table with different columns than this
+        // generator invocation would produce must survive `destroy` — it
+        // wasn't generate's own output, even though the name matches
+        // (issue #1048 PR review).
+        let hand_written = "diesel::table! {\n    posts (id) {\n        id -> BigInt,\n        \
+                             body -> Text,\n    }\n}\n";
+        let generated_block = append_schema_table("", "posts", &fields(&["title:String"]));
+        assert_eq!(
+            remove_schema_table(hand_written, "posts", &generated_block),
+            hand_written,
+            "pre-existing table with different columns must not be removed"
+        );
+    }
+
+    #[test]
+    fn remove_routes_entries_restores_single_line_template_body() {
+        // Mirrors the `autumn new` template's `.routes(routes![index, hello, hello_name])`.
+        let base = "fn main() {\n    App::new()\n        .routes(routes![index, hello, hello_name])\n        .run()\n}\n";
+        let appended = vec![
+            "routes::posts::index".to_owned(),
+            "routes::posts::show".to_owned(),
+        ];
+        let after_add = ensure_routes_entries(base, &appended);
+        assert_ne!(
+            after_add, base,
+            "test setup: append must actually change the body"
+        );
+        let reverted = remove_routes_entries(&after_add, &appended);
+        assert_eq!(reverted, base);
+    }
+
+    #[test]
+    fn remove_routes_entries_is_idempotent_when_absent() {
+        let base =
+            "fn main() {\n    App::new()\n        .routes(routes![index])\n        .run()\n}\n";
+        let appended = vec!["routes::posts::index".to_owned()];
+        assert_eq!(remove_routes_entries(base, &appended), base);
+    }
+
+    #[test]
+    fn remove_routes_entries_removes_present_entries_even_when_one_is_already_gone() {
+        // issue #1048 PR review: a user may have hand-removed one of a
+        // resource's own route entries before running destroy. The rest of
+        // that resource's routes are still present and about to be
+        // orphaned (the underlying handler file is deleted regardless) —
+        // abandoning the whole cleanup because ONE entry is already absent
+        // would leave `main.rs` referencing a missing function/module.
+        let appended = vec![
+            "routes::posts::index".to_owned(),
+            "routes::posts::show".to_owned(),
+        ];
+        // Simulate the user having already removed `show` by hand.
+        let hand_edited = "fn main() {\n    App::new()\n        .routes(routes![index, routes::posts::index])\n        .run()\n}\n";
+        let reverted = remove_routes_entries(hand_edited, &appended);
+        assert_eq!(
+            reverted,
+            "fn main() {\n    App::new()\n        .routes(routes![index])\n        .run()\n}\n",
+            "the still-present `index` entry must be removed even though `show` was \
+             already gone: {reverted}"
+        );
+    }
+
+    #[test]
+    fn remove_routes_entries_preserves_other_resources_multiline() {
+        let base =
+            "fn main() {\n    App::new()\n        .routes(routes![index])\n        .run()\n}\n";
+        let comments_entries = vec![
+            "routes::comments::index".to_owned(),
+            "routes::comments::show".to_owned(),
+        ];
+        let after_comments = ensure_routes_entries(base, &comments_entries);
+        let posts_entries = vec![
+            "routes::posts::index".to_owned(),
+            "routes::posts::show".to_owned(),
+        ];
+        let after_posts = ensure_routes_entries(&after_comments, &posts_entries);
+        let reverted = remove_routes_entries(&after_posts, &posts_entries);
+        // Comments entries must survive destroying posts.
+        assert!(reverted.contains("routes::comments::index"));
+        assert!(reverted.contains("routes::comments::show"));
+        assert!(!reverted.contains("routes::posts::index"));
+        assert!(!reverted.contains("routes::posts::show"));
+    }
+
+    #[test]
+    fn remove_routes_entries_not_confused_by_kept_entry_sharing_a_prefix() {
+        // `routes::posts::index` is a textual PREFIX of the kept
+        // `routes::posts::index_all` entry that appears earlier in the body.
+        // A raw substring search for the removed entry would match inside
+        // the kept one and misdetect the original single-line layout as
+        // multi-line.
+        let base = "fn main() {\n    App::new()\n        .routes(routes![index, routes::posts::index_all, routes::posts::index])\n        .run()\n}\n";
+        let removed = vec!["routes::posts::index".to_owned()];
+        let reverted = remove_routes_entries(base, &removed);
+        assert_eq!(
+            reverted,
+            "fn main() {\n    App::new()\n        .routes(routes![index, routes::posts::index_all])\n        .run()\n}\n",
+            "must restore the original single-line layout byte-identically, not collapse/reformat it"
+        );
+    }
+
+    #[test]
+    fn remove_autumn_web_feature_collapses_to_bare_string() {
+        let base = "[dependencies]\nautumn-web = \"0.6.0\"\n";
+        let after_add = ensure_autumn_web_feature(base, "maud");
+        assert_ne!(after_add, base);
+        assert_eq!(remove_autumn_web_feature(&after_add, "maud"), base);
+    }
+
+    #[test]
+    fn remove_autumn_web_feature_keeps_other_features() {
+        let base = "[dependencies]\nautumn-web = \"0.6.0\"\n";
+        let with_maud = ensure_autumn_web_feature(base, "maud");
+        let with_both = ensure_autumn_web_feature(&with_maud, "htmx");
+        let reverted = remove_autumn_web_feature(&with_both, "htmx");
+        assert_eq!(reverted, with_maud);
+    }
+
+    #[test]
+    fn remove_autumn_web_feature_preserves_keys_after_the_features_array() {
+        // A hand-edited (or otherwise pre-existing) dependency line can carry
+        // keys after `features = [...]`, e.g. `default-features = false`.
+        // Removing one feature while others remain must not silently drop
+        // those trailing keys.
+        let base = "[dependencies]\nautumn-web = { version = \"0.6.0\", features = [\"maud\", \"htmx\"], default-features = false }\n";
+        let reverted = remove_autumn_web_feature(base, "htmx");
+        assert_eq!(
+            reverted,
+            "[dependencies]\nautumn-web = { version = \"0.6.0\", features = [\"maud\"], default-features = false }\n",
+            "trailing keys after the features array must survive: {reverted}"
+        );
+    }
+
+    #[test]
+    fn remove_autumn_web_feature_handles_default_features_key_before_features() {
+        // issue #1048 PR review: a plain `body.find("features")` matches
+        // inside `default-features` when that key comes first, truncating
+        // `before_features` mid-word and corrupting the rewritten line.
+        let base = "[dependencies]\nautumn-web = { version = \"0.6.0\", default-features = false, features = [\"maud\", \"htmx\"] }\n";
+        let reverted = remove_autumn_web_feature(base, "htmx");
+        assert_eq!(
+            reverted,
+            "[dependencies]\nautumn-web = { version = \"0.6.0\", default-features = false, features = [\"maud\"] }\n",
+            "must remove only the target feature, keeping default-features intact: {reverted}"
+        );
+    }
+
+    #[test]
+    fn remove_autumn_web_feature_is_idempotent_when_absent() {
+        let base = "[dependencies]\nautumn-web = \"0.6.0\"\n";
+        assert_eq!(remove_autumn_web_feature(base, "maud"), base);
+    }
+
+    #[test]
+    fn remove_autumn_web_feature_reverts_dotted_key_form() {
+        // issue #1048 PR review: `ensure_autumn_web_feature` can add a
+        // feature to a pre-existing dotted-key declaration; destroy must be
+        // able to remove it again, not leave it behind forever.
+        let base =
+            "[dependencies]\nautumn-web.version = \"0.6.0\"\nautumn-web.features = [\"db\"]\n";
+        let with_mail = ensure_autumn_web_feature(base, "mail");
+        assert_ne!(with_mail, base);
+        assert_eq!(remove_autumn_web_feature(&with_mail, "mail"), base);
+    }
+
+    #[test]
+    fn remove_autumn_web_feature_deletes_dotted_features_key_when_emptied() {
+        let base =
+            "[dependencies]\nautumn-web.version = \"0.6.0\"\nautumn-web.features = [\"mail\"]\n";
+        let reverted = remove_autumn_web_feature(base, "mail");
+        assert_eq!(
+            reverted, "[dependencies]\nautumn-web.version = \"0.6.0\"\n",
+            "an emptied dotted features key must be removed outright: {reverted}"
+        );
+    }
+
+    #[test]
+    fn remove_autumn_web_feature_reverts_multiline_inline_table_form() {
+        let base = "[dependencies]\nautumn-web = {\n    version = \"0.6.0\",\n    features = [\"db\"],\n}\n";
+        let with_mail = ensure_autumn_web_feature(base, "mail");
+        assert_ne!(with_mail, base);
+        assert!(with_mail.contains("\"mail\""));
+        let reverted = remove_autumn_web_feature(&with_mail, "mail");
+        assert_eq!(
+            reverted, base,
+            "must remove only the added feature from the features line, restoring the \
+             original multiline table: {reverted}"
+        );
+    }
+
+    #[test]
+    fn remove_autumn_web_feature_reverts_subtable_form() {
+        // issue #1048 PR review: `[dependencies.autumn-web]` with a
+        // separate `features` key is a shape `ensure_autumn_web_feature`
+        // supports adding to, but the old remover only handled single-line
+        // inline tables.
+        let base = "[dependencies.autumn-web]\nversion = \"0.6.0\"\nfeatures = [\"db\"]\n\n[dev-dependencies]\n";
+        let with_mail = ensure_autumn_web_feature(base, "mail");
+        assert_ne!(with_mail, base);
+        assert_eq!(remove_autumn_web_feature(&with_mail, "mail"), base);
+    }
+
+    #[test]
+    fn remove_autumn_web_feature_deletes_subtable_features_key_when_emptied() {
+        let base = "[dependencies.autumn-web]\nversion = \"0.6.0\"\nfeatures = [\"mail\"]\n";
+        let reverted = remove_autumn_web_feature(base, "mail");
+        assert_eq!(
+            reverted, "[dependencies.autumn-web]\nversion = \"0.6.0\"\n",
+            "an emptied subtable features key must be removed outright, leaving \
+             `version` and the header untouched: {reverted}"
+        );
+    }
+
+    #[test]
+    fn remove_autumn_web_feature_reverts_renamed_inline_alias() {
+        // issue #1048 PR review: `ensure_autumn_web_feature_status_in_section`
+        // adds features to an importable rename like
+        // `autumn_web = { package = "autumn-web", ... }` too, but the old
+        // remover always searched for the literal `"autumn-web"` key and
+        // silently left the feature behind on this shape.
+        let base =
+            "[dependencies]\nautumn_web = { package = \"autumn-web\", version = \"0.6.0\" }\n";
+        let with_mail = ensure_autumn_web_feature(base, "mail");
+        assert_ne!(with_mail, base);
+        assert!(with_mail.contains("autumn_web"));
+        assert_eq!(remove_autumn_web_feature(&with_mail, "mail"), base);
+    }
+
+    #[test]
+    fn remove_autumn_web_feature_reverts_renamed_subtable_alias() {
+        let base = "[dependencies.autumn_web]\npackage = \"autumn-web\"\nversion = \"0.6.0\"\nfeatures = [\"db\"]\n\n[dev-dependencies]\n";
+        let with_mail = ensure_autumn_web_feature(base, "mail");
+        assert_ne!(with_mail, base);
+        assert_eq!(remove_autumn_web_feature(&with_mail, "mail"), base);
+    }
+
+    #[test]
+    fn remove_autumn_web_dev_dependency_feature_deletes_freshly_inserted_line() {
+        let base =
+            "[dev-dependencies]\ntokio = { version = \"1\", features = [\"rt\", \"macros\"] }\n";
+        let after_add = ensure_dev_dependency_test_support(base, "0.6.0");
+        assert_ne!(after_add, base);
+        assert_eq!(
+            remove_autumn_web_dev_dependency_feature(&after_add, "test-support"),
+            base
+        );
+    }
+
+    #[test]
+    fn remove_autumn_web_dev_dependency_feature_is_idempotent_when_absent() {
+        let base = "[dev-dependencies]\ntokio = { version = \"1\" }\n";
+        assert_eq!(
+            remove_autumn_web_dev_dependency_feature(base, "test-support"),
+            base
+        );
+    }
+
+    #[test]
+    fn remove_main_mod_declarations_restores_original_with_no_leading_attributes() {
+        // Mirrors `autumn new`'s template main.rs, which has no leading
+        // `//!`/`#![` lines at all.
+        let base = "use autumn_web::prelude::*;\n\nfn main() {}\n";
+        let after_add = ensure_mods(base, &["models", "repositories", "routes", "schema"]);
+        assert_ne!(after_add, base);
+        let reverted = remove_main_mod_declarations(
+            &after_add,
+            &["models", "repositories", "routes", "schema"],
+        );
+        assert_eq!(reverted, base);
+    }
+
+    #[test]
+    fn remove_main_mod_declarations_leaves_other_shared_mods_when_only_some_missing() {
+        let base = "fn main() {}\n";
+        let after_add = ensure_mods(base, &["models", "jobs"]);
+        let reverted = remove_main_mod_declarations(&after_add, &["jobs"]);
+        assert!(reverted.contains("mod models;"));
+        assert!(!reverted.contains("mod jobs;"));
+    }
+
+    #[test]
+    fn remove_main_mod_declarations_is_idempotent_when_absent() {
+        let base = "fn main() {}\n";
+        assert_eq!(remove_main_mod_declarations(base, &["models"]), base);
     }
 }

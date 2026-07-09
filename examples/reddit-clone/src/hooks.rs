@@ -19,10 +19,11 @@ impl MutationHooks for PostHooks {
         _ctx: &mut MutationContext,
         new: &mut NewPost,
     ) -> AutumnResult<()> {
-        // Auto-generate slug from title
-        new.slug = slugify(&new.title);
-
-        tracing::debug!(slug = %new.slug, "Generated post slug from title");
+        // Auto-generate slug from title if not already populated
+        if new.slug.is_empty() {
+            new.slug = slugify(&new.title);
+            tracing::debug!(slug = %new.slug, "Generated post slug from title");
+        }
         Ok(())
     }
 
@@ -31,8 +32,8 @@ impl MutationHooks for PostHooks {
         _ctx: &mut MutationContext,
         draft: &mut UpdateDraft<Post>,
     ) -> AutumnResult<()> {
-        // Re-slug if title changed
-        if draft.after.title != draft.before.title {
+        // Re-slug if title changed and slug was not manually set in the changes
+        if draft.after.title != draft.before.title && draft.after.slug == draft.before.slug {
             draft.after.slug = slugify(&draft.after.title);
             tracing::debug!(
                 old_slug = %draft.before.slug,

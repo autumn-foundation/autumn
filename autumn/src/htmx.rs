@@ -63,6 +63,22 @@ pub const AUTUMN_WIDGETS_JS_PATH: &str = "/static/js/autumn-widgets.js";
 /// `data-header="..."` on the meta tag when using a custom CSRF header name.
 pub const HTMX_CSRF_JS_PATH: &str = "/static/js/autumn-htmx-csrf.js";
 
+/// Idiomorph DOM-morphing library, embedded at compile time.
+///
+/// Serves at [`IDIOMORPH_JS_PATH`] with immutable caching headers.
+/// Enables `hx-swap="morph"` on htmx requests for smooth DOM updates.
+///
+/// Reference in your layout:
+/// ```html
+/// <script src="/static/js/idiomorph.min.js"></script>
+/// ```
+#[cfg(feature = "htmx")]
+pub const IDIOMORPH_JS: &[u8] = include_bytes!("../vendor/idiomorph.min.js");
+
+/// Same-origin path where Autumn serves the idiomorph library.
+#[cfg(feature = "htmx")]
+pub const IDIOMORPH_JS_PATH: &str = "/static/js/idiomorph.min.js";
+
 /// CSP-compatible htmx CSRF helper JavaScript.
 ///
 /// Served as an external same-origin script so applications do not need inline
@@ -648,6 +664,50 @@ mod tests {
         assert!(HTMX_CSRF_JS.contains("X-CSRF-Token"));
         assert!(HTMX_CSRF_JS.contains("csrf-token"));
         assert!(!HTMX_CSRF_JS.contains("<script"));
+    }
+
+    #[test]
+    fn widgets_js_wires_nav_bar() {
+        let js = std::str::from_utf8(AUTUMN_WIDGETS_JS)
+            .expect("autumn-widgets.js should be valid UTF-8");
+        assert!(js.contains("data-autumn-nav"), "{js}");
+        assert!(js.contains("data-nav-toggle"), "{js}");
+        assert!(js.contains("data-nav-menu-toggle"), "{js}");
+        assert!(js.contains("aria-expanded"), "{js}");
+        assert!(js.contains("Escape"), "{js}");
+    }
+
+    #[test]
+    fn widgets_js_wires_modal() {
+        let js = std::str::from_utf8(AUTUMN_WIDGETS_JS)
+            .expect("autumn-widgets.js should be valid UTF-8");
+        // Fallback open/close wiring for browsers without the Invoker
+        // Commands API (command/commandfor), used by autumn_web::widgets::modal
+        // and confirm_action (issue #1233).
+        assert!(js.contains("data-modal-open"), "{js}");
+        assert!(js.contains("data-modal-close"), "{js}");
+        assert!(js.contains("showModal"), "{js}");
+        assert!(
+            js.contains("'command' in HTMLButtonElement.prototype"),
+            "{js}"
+        );
+        // The whole point of this widget is to replace the native
+        // window.confirm() dialog with a server-rendered, testable one.
+        assert!(!js.contains("window.confirm"), "{js}");
+    }
+
+    #[test]
+    fn widgets_js_polyfills_light_dismiss_backdrop_click() {
+        // PR review (chatgpt-codex-connector): closedby="any" (see
+        // ModalConfig::light_dismiss) has limited browser support, so
+        // backdrop clicks must be polyfilled for browsers that don't honor
+        // it natively yet — mirroring the command/commandfor fallback above.
+        let js = std::str::from_utf8(AUTUMN_WIDGETS_JS)
+            .expect("autumn-widgets.js should be valid UTF-8");
+        assert!(
+            js.contains(r#"dialog[closedby="any"][open]"#),
+            "must polyfill backdrop-click dismissal for closedby=\"any\" dialogs: {js}"
+        );
     }
 
     #[tokio::test]

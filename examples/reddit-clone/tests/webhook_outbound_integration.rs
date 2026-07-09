@@ -89,6 +89,7 @@ async fn test_reddit_registration_triggers_outbound_webhook() {
         name: "autumn_webhook_delivery".to_owned(),
         max_attempts: 1,
         initial_backoff_ms: 1,
+        queue: "default".to_string(),
         uniqueness: None,
         concurrency: None,
         handler: autumn_web::webhook_outbound::deliver_webhook_job,

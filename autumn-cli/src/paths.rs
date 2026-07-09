@@ -11,6 +11,8 @@
 //! the `AUTUMN_RUNTIME_DIR` override used by integration tests.
 //! [`RuntimePaths::from_base`] is the pure, fs-free seam the unit tests drive.
 
+#![allow(dead_code, clippy::missing_const_for_fn)]
+
 use std::path::{Path, PathBuf};
 
 /// Environment variable that overrides the runtime base directory. When set,

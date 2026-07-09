@@ -9,6 +9,7 @@ use autumn_web::prelude::*;
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 
+use crate::models::Post;
 use crate::schema::{posts, votes};
 
 use super::layout::vote_controls;
@@ -19,8 +20,9 @@ pub async fn upvote(
     Path(post_id): Path<i64>,
     session: Session,
     mut db: Db,
+    State(state): State<AppState>,
 ) -> AutumnResult<Markup> {
-    cast_vote(post_id, 1, &session, &mut db).await
+    cast_vote(post_id, 1, &session, &mut db, &state).await
 }
 
 /// Downvote a post (-1). Returns updated vote controls HTML via htmx.
@@ -29,20 +31,18 @@ pub async fn downvote(
     Path(post_id): Path<i64>,
     session: Session,
     mut db: Db,
+    State(state): State<AppState>,
 ) -> AutumnResult<Markup> {
-    cast_vote(post_id, -1, &session, &mut db).await
+    cast_vote(post_id, -1, &session, &mut db, &state).await
 }
 
 /// Cast a vote on a post. Handles insert-or-update and score recalculation.
-///
-/// Uses `ON CONFLICT DO UPDATE` so that concurrent/rapid requests always
-/// persist the latest intended value. Score is recomputed in a single
-/// `UPDATE ... SET score = (subquery)` so no read-then-write race exists.
 async fn cast_vote(
     post_id: i64,
     value: i16,
     session: &Session,
     db: &mut Db,
+    state: &AppState,
 ) -> AutumnResult<Markup> {
     let user_id: i64 = session
         .get("user_id")
@@ -60,8 +60,6 @@ async fn cast_vote(
     }
 
     // Check if user already voted on this post
-    // All mutations filter by (user_id, post_id) — never by vote_id —
-    // so concurrent toggle/flip requests cannot target a deleted row.
     let existing_value: Option<i16> = votes::table
         .filter(votes::user_id.eq(user_id))
         .filter(votes::post_id.eq(post_id))
@@ -93,8 +91,7 @@ async fn cast_vote(
             .await?;
         }
         None => {
-            // New vote — ON CONFLICT DO UPDATE so rapid clicks always
-            // persist the latest intended value instead of dropping one.
+            // New vote
             diesel::insert_into(votes::table)
                 .values((
                     votes::user_id.eq(user_id),
@@ -110,7 +107,6 @@ async fn cast_vote(
     }
 
     // Recompute score atomically in a single statement — no read-then-write race.
-    // Uses raw SQL because Diesel doesn't support SET col = (subquery) directly.
     diesel::sql_query(
         "UPDATE posts SET score = COALESCE((SELECT SUM(value::bigint) FROM votes WHERE post_id = $1), 0) WHERE id = $1"
     )
@@ -118,13 +114,50 @@ async fn cast_vote(
     .execute(&mut **db)
     .await?;
 
-    let score: i64 = posts::table
-        .find(post_id)
-        .select(posts::score)
+    // Load the updated post to broadcast it
+    let post: Post = posts::table.find(post_id).first(&mut **db).await?;
+    let new_score = post.score;
+
+    // Load the subreddit to get its slug
+    let sub: crate::models::Subreddit = crate::schema::subreddits::table
+        .find(post.subreddit_id)
         .first(&mut **db)
         .await?;
 
-    Ok(vote_controls(post_id, score))
+    // Load the author to get their username
+    let author: crate::models::User = crate::schema::users::table
+        .find(post.author_id)
+        .first(&mut **db)
+        .await?;
+
+    let lookup = crate::repositories::PostRelationsLookup {
+        author_name: author.username,
+        sub_name: sub.name,
+        sub_slug: sub.slug.clone(),
+    };
+
+    let sse_state = state.clone();
+    let sse_post = post.clone();
+    let sse_sub_slug = sub.slug.clone();
+    crate::repositories::CURRENT_POST_RELATIONS
+        .scope(lookup, async move {
+            let _ = sse_state.broadcast().publish_oob(
+                "posts",
+                &sse_post.dom_id(),
+                &autumn_web::htmx::OobSwap::OuterHTML,
+                &sse_post.render_fragment(),
+            );
+
+            let _ = sse_state.broadcast().publish_oob(
+                &format!("posts:r/{}", sse_sub_slug),
+                &sse_post.dom_id(),
+                &autumn_web::htmx::OobSwap::OuterHTML,
+                &sse_post.render_fragment(),
+            );
+        })
+        .await;
+
+    Ok(vote_controls(post_id, new_score))
 }
 
 autumn_web::paths![upvote, downvote];

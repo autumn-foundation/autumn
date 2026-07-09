@@ -11,10 +11,15 @@ use autumn_web::job::{
 use autumn_web::pagination::Page;
 use autumn_web::runtime_config::{ConfigChangeRecord, ConfigEntry};
 use autumn_web::ui::pagination::{PagerOptions, pagination_nav};
+use autumn_web::widgets::{
+    CardConfig, ConfirmActionConfig, ModalConfig, NavBarConfig, NavBarLayout, NavItem, card,
+    confirm_action, modal, modal_close_button, nav_bar, stat_card,
+};
+use http::Method;
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 use serde_json::Value;
 
-use crate::registry::AdminRegistry;
+use crate::registry::{AdminRegistry, JOBS_NAV_SLUG, RUNTIME_CONFIG_NAV_SLUG};
 use crate::routes::ADMIN_JS_PATH;
 use crate::traits::{
     AdminAction, AdminField, AdminFieldKind, AdminHistoryPage, AdminImportReport, CsvImportMode,
@@ -24,8 +29,6 @@ use crate::traits::{
 const HTMX_JS_PATH: &str = "/static/js/htmx.min.js";
 const HTMX_CSRF_JS_PATH: &str = "/static/js/autumn-htmx-csrf.js";
 const TOKENS_CSS: &str = include_str!("tokens.css");
-const JOBS_NAV_SLUG: &str = "__admin_jobs";
-const RUNTIME_CONFIG_NAV_SLUG: &str = "__admin_config";
 const FLASH_CSS: &str = "\
 .flash {
     padding: 0.75rem 1rem;
@@ -91,7 +94,8 @@ const ADMIN_CSS: &str = "
         padding: 2rem;
         min-width: 0;
     }
-    .admin-logo {
+    .admin-sidebar .autumn-nav__brand {
+        display: block;
         font-size: 1.125rem;
         font-weight: 700;
         padding: 0 1.5rem 1rem;
@@ -99,8 +103,8 @@ const ADMIN_CSS: &str = "
         margin-bottom: 1rem;
         color: var(--text);
     }
-    .admin-nav { list-style: none; }
-    .admin-nav li a {
+    .admin-sidebar .autumn-nav__items { list-style: none; }
+    .admin-sidebar .autumn-nav__item a {
         display: block;
         padding: 0.5rem 1.5rem;
         color: var(--text-muted);
@@ -109,17 +113,17 @@ const ADMIN_CSS: &str = "
         border-left: 3px solid transparent;
         transition: all 0.15s;
     }
-    .admin-nav li a:hover {
+    .admin-sidebar .autumn-nav__item a:hover {
         background: var(--bg);
         color: var(--text);
         text-decoration: none;
     }
-    .admin-nav li a.active {
+    .admin-sidebar .autumn-nav__item a.active {
         background: var(--primary-light);
         color: var(--primary);
         border-left-color: var(--primary);
     }
-    .admin-nav-section {
+    .admin-sidebar .autumn-nav__section {
         font-size: 0.7rem;
         text-transform: uppercase;
         letter-spacing: 0.05em;
@@ -127,26 +131,35 @@ const ADMIN_CSS: &str = "
         padding: 1rem 1.5rem 0.375rem;
         font-weight: 600;
     }
+    /* The sidebar hides itself entirely below 768px (see the .admin-sidebar
+       rule in the Responsive section) instead of collapsing behind nav_bar's
+       own hamburger toggle, so the toggle stays hidden at every width. */
+    .admin-sidebar .autumn-nav__toggle {
+        display: none;
+    }
 
     /* Cards */
     .card {
         background: var(--surface);
         border-radius: var(--radius);
         box-shadow: var(--shadow);
-        padding: 1.5rem;
         margin-bottom: 1.5rem;
     }
     .card-header {
         display: flex;
         justify-content: space-between;
         align-items: center;
-        margin-bottom: 1rem;
-        padding-bottom: 0.75rem;
+        padding: 1rem 1.5rem 0.75rem;
         border-bottom: 1px solid var(--border);
     }
+    .header-actions form { display: inline; }
     .card-title {
         font-size: 1.125rem;
         font-weight: 600;
+        margin: 0;
+    }
+    .card-body {
+        padding: 1.5rem;
     }
 
     /* Buttons */
@@ -411,6 +424,43 @@ pub fn admin_layout(
     show_config: bool,
     content: &Markup,
 ) -> Markup {
+    // Each nav item's href is computed once here and reused both to
+    // synthesize current_path (so nav_link's own path-comparison logic
+    // decides which sidebar item is active) and as the anchor's href below —
+    // so the "/jobs" and "/config" route suffixes each appear as a literal
+    // exactly once.
+    let jobs_href = format!("{prefix}/jobs");
+    let config_href = format!("{prefix}/config");
+    let current_path = match active_slug {
+        None => prefix.to_owned(),
+        Some(JOBS_NAV_SLUG) => jobs_href.clone(),
+        Some(RUNTIME_CONFIG_NAV_SLUG) => config_href.clone(),
+        Some(slug) => format!("{prefix}/{slug}"),
+    };
+
+    let mut nav_items = vec![NavItem::link(prefix, "Dashboard")];
+    if registry.model_count() > 0 {
+        nav_items.push(NavItem::section("Models"));
+        nav_items.extend(registry.iter().map(|(slug, model)| {
+            NavItem::link(format!("{prefix}/{slug}"), model.display_name_plural())
+        }));
+    }
+    nav_items.push(NavItem::section("System"));
+    nav_items.push(NavItem::link(jobs_href, "Jobs"));
+    if show_config {
+        nav_items.push(NavItem::link(config_href, "Runtime Config"));
+    }
+    nav_items.push(NavItem::plain_link(
+        format!("{actuator_prefix}/ui"),
+        "Actuator",
+    ));
+    let sidebar_nav = NavBarConfig::new()
+        .brand_html(html! { "🍂 Autumn Admin" }, None)
+        .items(nav_items)
+        .aria_label("Admin navigation")
+        .layout(NavBarLayout::Sidebar)
+        .class("admin-sidebar");
+
     html! {
         (DOCTYPE)
         html lang="en" {
@@ -426,6 +476,11 @@ pub fn admin_layout(
                 title { (title) " — Autumn Admin" }
                 script src=(HTMX_JS_PATH) {}
                 script src=(HTMX_CSRF_JS_PATH) {}
+                // Reveals/wires up nav_bar's hamburger toggle and any future
+                // dropdown menu; the sidebar itself stays fully visible/hidden
+                // via the .admin-sidebar media-query rule below, not the
+                // toggle, so its own toggle button is kept CSS-hidden always.
+                script src=(autumn_web::htmx::AUTUMN_WIDGETS_JS_PATH) defer {}
                 // External so it runs under the default CSP `script-src 'self'`.
                 script src={ (prefix) (&**ADMIN_JS_PATH) } {}
                 style {
@@ -440,43 +495,7 @@ pub fn admin_layout(
                 div class="admin-layout" {
                     // Sidebar navigation landmark
                     header role="banner" {
-                        nav class="admin-sidebar" aria-label="Admin navigation" {
-                            div class="admin-logo" { "🍂 Autumn Admin" }
-                            ul class="admin-nav" {
-                                li {
-                                    a href=(prefix) class=[active_slug.is_none().then_some("active")] {
-                                        "Dashboard"
-                                    }
-                                }
-                                @if registry.model_count() > 0 {
-                                    li { div class="admin-nav-section" { "Models" } }
-                                    @for (slug, model) in registry.iter() {
-                                        li {
-                                            a href={ (prefix) "/" (slug) }
-                                              class=[(active_slug == Some(slug)).then_some("active")] {
-                                                (model.display_name_plural())
-                                            }
-                                        }
-                                    }
-                                }
-                                li { div class="admin-nav-section" { "System" } }
-                                li {
-                                    a href={ (prefix) "/jobs" }
-                                      class=[(active_slug == Some(JOBS_NAV_SLUG)).then_some("active")] {
-                                        "Jobs"
-                                    }
-                                }
-                                @if show_config {
-                                    li {
-                                        a href={ (prefix) "/config" }
-                                          class=[(active_slug == Some(RUNTIME_CONFIG_NAV_SLUG)).then_some("active")] {
-                                            "Runtime Config"
-                                        }
-                                    }
-                                }
-                                li { a href={ (actuator_prefix) "/ui" } { "Actuator" } }
-                            }
-                        }
+                        (nav_bar(&current_path, &sidebar_nav))
                     }
                     // Main content landmark
                     main id="admin-main" class="admin-main" {
@@ -625,51 +644,55 @@ fn job_list_card(
     csrf_form_field: &str,
     prefix: &str,
 ) -> Markup {
-    html! {
-        div class="card" {
-            div class="card-header" {
-                div {
-                    span class="card-title" { (title) }
-                    div style="font-size: 0.8125rem; color: var(--text-muted); margin-top: 0.25rem;" {
-                        (description)
+    let header_action = html! {
+        span style="font-size: 0.875rem; color: var(--text-muted);" {
+            (page.total) " total"
+        }
+    };
+    let title_markup = html! {
+        (title)
+        span style="display: block; font-size: 0.8125rem; color: var(--text-muted); margin-top: 0.25rem; font-weight: 400;" {
+            (description)
+        }
+    };
+    let body = html! {
+        div class="table-wrap" {
+            table {
+                thead {
+                    tr {
+                        th { "Job" }
+                        th { "Enqueued At" }
+                        th { "Started At" }
+                        th { "Finished At" }
+                        th { "Attempts" }
+                        th { "Principal" }
+                        th { "Correlation" }
+                        th { "Last Error" }
+                        th { "Actions" }
                     }
                 }
-                span style="font-size: 0.875rem; color: var(--text-muted);" {
-                    (page.total) " total"
-                }
-            }
-            div class="table-wrap" {
-                table {
-                    thead {
+                tbody {
+                    @if page.records.is_empty() {
                         tr {
-                            th { "Job" }
-                            th { "Enqueued At" }
-                            th { "Started At" }
-                            th { "Finished At" }
-                            th { "Attempts" }
-                            th { "Principal" }
-                            th { "Correlation" }
-                            th { "Last Error" }
-                            th { "Actions" }
-                        }
-                    }
-                    tbody {
-                        @if page.records.is_empty() {
-                            tr {
-                                td colspan="9" style="text-align: center; padding: 1.5rem; color: var(--text-muted);" {
-                                    "No jobs."
-                                }
+                            td colspan="9" style="text-align: center; padding: 1.5rem; color: var(--text-muted);" {
+                                "No jobs."
                             }
                         }
-                        @for record in &page.records {
-                            (job_row(record, csrf_token, csrf_form_field, prefix))
-                        }
+                    }
+                    @for record in &page.records {
+                        (job_row(record, csrf_token, csrf_form_field, prefix))
                     }
                 }
             }
-            (jobs_pagination(page, page_param, prefix))
         }
-    }
+        (jobs_pagination(page, page_param, prefix))
+    };
+    card(
+        &body,
+        &CardConfig::new()
+            .title_html(title_markup)
+            .header_action(header_action),
+    )
 }
 
 fn job_row(
@@ -683,7 +706,7 @@ fn job_row(
             td {
                 strong { (record.name) }
                 div style="font-size: 0.75rem; color: var(--text-muted);" {
-                    (record.status.label()) " · " (record.id)
+                    (record.status.label()) " · queue " (record.queue) " · " (record.id)
                     @if let Some(due) = record.scheduled_for.as_deref() {
                         " · due " (due)
                     }
@@ -774,42 +797,38 @@ fn jobs_pagination(page: &JobAdminPage, page_param: &str, prefix: &str) -> Marku
 }
 
 fn job_schedules_card(schedules: &[JobScheduleSummary]) -> Markup {
-    html! {
-        div class="card" {
-            div class="card-header" {
-                span class="card-title" { "Recurring Schedules" }
-            }
-            div class="table-wrap" {
-                table {
-                    thead {
+    let body = html! {
+        div class="table-wrap" {
+            table {
+                thead {
+                    tr {
+                        th { "Name" }
+                        th { "Schedule" }
+                        th { "Next Run At" }
+                        th { "Last Run Status" }
+                    }
+                }
+                tbody {
+                    @if schedules.is_empty() {
                         tr {
-                            th { "Name" }
-                            th { "Schedule" }
-                            th { "Next Run At" }
-                            th { "Last Run Status" }
+                            td colspan="4" style="text-align: center; padding: 1.5rem; color: var(--text-muted);" {
+                                "No scheduled tasks registered."
+                            }
                         }
                     }
-                    tbody {
-                        @if schedules.is_empty() {
-                            tr {
-                                td colspan="4" style="text-align: center; padding: 1.5rem; color: var(--text-muted);" {
-                                    "No scheduled tasks registered."
-                                }
-                            }
-                        }
-                        @for schedule in schedules {
-                            tr {
-                                td { (schedule.name) }
-                                td { (schedule.schedule) }
-                                td { (optional_text(schedule.next_run_at.as_deref())) }
-                                td { (optional_text(schedule.last_run_status.as_deref())) }
-                            }
+                    @for schedule in schedules {
+                        tr {
+                            td { (schedule.name) }
+                            td { (schedule.schedule) }
+                            td { (optional_text(schedule.next_run_at.as_deref())) }
+                            td { (optional_text(schedule.last_run_status.as_deref())) }
                         }
                     }
                 }
             }
         }
-    }
+    };
+    card(&body, &CardConfig::new().title("Recurring Schedules"))
 }
 
 fn optional_text(value: Option<&str>) -> Markup {
@@ -840,26 +859,22 @@ pub fn dashboard_page(
 
         div class="stats-grid" {
             @for (slug, name, count) in model_counts {
-                div class="stat-card" {
-                    div class="stat-label" { (name) }
-                    div class="stat-value" { (count) }
-                    div class="stat-link" {
-                        a href={ (prefix) "/" (slug) } { "View all →" }
-                    }
-                }
+                (stat_card(name, &count.to_string(), Some((&format!("{prefix}/{slug}"), "View all →"))))
             }
         }
 
         // Actuator summary (loaded via HTMX)
-        div class="card" {
-            div class="card-header" {
-                span class="card-title" { "System Health" }
+        ({
+            let action = html! {
                 a href={ (actuator_prefix) "/ui" } class="btn btn-sm" { "Full Dashboard →" }
-            }
-            div hx-get={ (actuator_prefix) "/ui/metrics" } hx-trigger="load, every 5s" {
-                "Loading metrics…"
-            }
-        }
+            };
+            let body = html! {
+                div hx-get={ (actuator_prefix) "/ui/metrics" } hx-trigger="load, every 5s" {
+                    "Loading metrics…"
+                }
+            };
+            card(&body, &CardConfig::new().title("System Health").header_action(action))
+        })
     };
     admin_layout(
         registry,
@@ -946,14 +961,14 @@ pub fn model_list_page(
             span { (model_name_plural) }
         }
 
-        div class="card" {
-            div class="card-header" {
-                span class="card-title" {
-                    (model_name_plural)
-                    span style="font-weight: 400; color: var(--text-muted); margin-left: 0.5rem;" {
-                        "(" (result.total) ")"
-                    }
+        ({
+            let title = html! {
+                (model_name_plural)
+                span style="font-weight: 400; color: var(--text-muted); margin-left: 0.5rem;" {
+                    "(" (result.total) ")"
                 }
+            };
+            let header_action = html! {
                 div style="display: flex; gap: 0.5rem; align-items: center;" {
                     @if supports_csv_export {
                         a href=(export_csv_url) class="btn btn-sm"
@@ -971,101 +986,102 @@ pub fn model_list_page(
                         "+ Add " (model_slug.trim_end_matches('s'))
                     }
                 }
-            }
-
-            // Search. Hidden inputs preserve any active filters so both
-            // full-form GET submits AND live-search HTMX requests carry
-            // the filter set forward (htmx only includes the triggering
-            // element by default — `hx-include="closest form"` pulls in
-            // every input in the form, including the filter hiddens).
-            form class="search-bar" method="get" {
-                input type="search" name="q" placeholder="Search…"
-                    value=(search_query)
-                    hx-get={ (prefix) "/" (model_slug) }
-                    hx-trigger="input changed delay:300ms"
-                    hx-include="closest form"
-                    hx-target="closest .card"
-                    hx-select=".card > *"
-                    hx-push-url="true" {}
-                @for (k, v) in filters {
-                    input type="hidden" name={ "filter." (k) } value=(v);
-                }
-            }
-
-            // Bulk-action form wraps the table so the row checkboxes
-            // submit alongside the action selector.
-            form method="post" action={ (prefix) "/" (model_slug) "/actions" } {
-                (csrf_hidden_input(csrf_token, csrf_form_field))
-
-            // Table
-            div class="table-wrap" {
-                table {
-                    thead {
-                        tr {
-                            th class="checkbox-cell" {
-                                // Wired up by admin.js via event delegation on #select-all.
-                                input type="checkbox" id="select-all";
-                            }
-                            @for field in &list_fields {
-                                @let is_sorted = sort_by == Some(field.name);
-                                @let next_dir = if is_sorted { sort_dir.flipped() } else { SortDirection::Asc };
-                                th {
-                                    @if field.sortable {
-                                        a href={ (prefix) "/" (model_slug) "?sort=" (field.name) "&dir=" (next_dir.as_str())
-                                            @if !search_enc.is_empty() { "&q=" (search_enc) }
-                                            (filters_enc)
-                                        }
-                                        style="color: inherit; text-decoration: none;" {
-                                            (field.label)
-                                            @if is_sorted {
-                                                span class="sort-icon" {
-                                                    @if matches!(sort_dir, SortDirection::Asc) { "▲" } @else { "▼" }
-                                                }
-                                            }
-                                        }
-                                    } @else {
-                                        (field.label)
-                                    }
-                                }
-                            }
-                            th { "Actions" }
-                        }
+            };
+            let body = html! {
+                // Search. Hidden inputs preserve any active filters so both
+                // full-form GET submits AND live-search HTMX requests carry
+                // the filter set forward (htmx only includes the triggering
+                // element by default — `hx-include="closest form"` pulls in
+                // every input in the form, including the filter hiddens).
+                form class="search-bar" method="get" {
+                    input type="search" name="q" placeholder="Search…"
+                        value=(search_query)
+                        hx-get={ (prefix) "/" (model_slug) }
+                        hx-trigger="input changed delay:300ms"
+                        hx-include="closest form"
+                        hx-target="closest .card"
+                        hx-select=".card > *"
+                        hx-push-url="true" {}
+                    @for (k, v) in filters {
+                        input type="hidden" name={ "filter." (k) } value=(v);
                     }
-                    tbody {
-                        @if result.records.is_empty() {
+                }
+
+                // Bulk-action form wraps the table so the row checkboxes
+                // submit alongside the action selector.
+                form method="post" action={ (prefix) "/" (model_slug) "/actions" } {
+                    (csrf_hidden_input(csrf_token, csrf_form_field))
+
+                // Table
+                div class="table-wrap" {
+                    table {
+                        thead {
                             tr {
-                                td colspan=(list_fields.len() + 2)
-                                    style="text-align: center; padding: 2rem; color: var(--text-muted);" {
-                                    "No records found."
-                                }
-                            }
-                        }
-                        @for record in &result.records {
-                            @let row_id = record_id(record);
-                            tr {
-                                td class="checkbox-cell" {
-                                    // Only emit a bulk-action checkbox for rows with a
-                                    // routable id — otherwise the form would post id="" or
-                                    // the wrong record.
-                                    @if let Some(id) = row_id {
-                                        input type="checkbox" class="row-check"
-                                            name="ids" value=(id);
-                                    }
+                                th class="checkbox-cell" {
+                                    // Wired up by admin.js via event delegation on #select-all.
+                                    input type="checkbox" id="select-all";
                                 }
                                 @for field in &list_fields {
-                                    td { (render_cell_value(record, field)) }
+                                    @let is_sorted = sort_by == Some(field.name);
+                                    @let next_dir = if is_sorted { sort_dir.flipped() } else { SortDirection::Asc };
+                                    th {
+                                        @if field.sortable {
+                                            a href={ (prefix) "/" (model_slug) "?sort=" (field.name) "&dir=" (next_dir.as_str())
+                                                @if !search_enc.is_empty() { "&q=" (search_enc) }
+                                                (filters_enc)
+                                            }
+                                            style="color: inherit; text-decoration: none;" {
+                                                (field.label)
+                                                @if is_sorted {
+                                                    span class="sort-icon" {
+                                                        @if matches!(sort_dir, SortDirection::Asc) { "▲" } @else { "▼" }
+                                                    }
+                                                }
+                                            }
+                                        } @else {
+                                            (field.label)
+                                        }
+                                    }
                                 }
-                                td {
-                                    @if let Some(id) = row_id {
-                                        a href={ (prefix) "/" (model_slug) "/" (id) }
-                                            class="btn btn-sm" { "View" }
-                                        " "
-                                        a href={ (prefix) "/" (model_slug) "/" (id) "/edit" }
-                                            class="btn btn-sm" { "Edit" }
-                                    } @else {
-                                        // Surface the issue rather than rendering links to /0.
-                                        span style="color: var(--text-muted); font-size: 0.75rem;" {
-                                            "no id"
+                                th { "Actions" }
+                            }
+                        }
+                        tbody {
+                            @if result.records.is_empty() {
+                                tr {
+                                    td colspan=(list_fields.len() + 2)
+                                        style="text-align: center; padding: 2rem; color: var(--text-muted);" {
+                                        "No records found."
+                                    }
+                                }
+                            }
+                            @for record in &result.records {
+                                @let row_id = record_id(record);
+                                tr {
+                                    td class="checkbox-cell" {
+                                        // Only emit a bulk-action checkbox for rows with a
+                                        // routable id — otherwise the form would post id="" or
+                                        // the wrong record.
+                                        @if let Some(id) = row_id {
+                                            input type="checkbox" class="row-check"
+                                                name="ids" value=(id);
+                                        }
+                                    }
+                                    @for field in &list_fields {
+                                        td { (render_cell_value(record, field)) }
+                                    }
+                                    td {
+                                        @if let Some(id) = row_id {
+                                            a href={ (prefix) "/" (model_slug) "/" (id) }
+                                                class="btn btn-sm" { "View" }
+                                            " "
+                                            a href={ (prefix) "/" (model_slug) "/" (id) "/edit" }
+                                                class="btn btn-sm" { "Edit" }
+                                        } @else {
+                                            // Surface the issue rather than rendering links to /0.
+                                            span style="color: var(--text-muted); font-size: 0.75rem;" {
+                                                "no id"
+                                            }
                                         }
                                     }
                                 }
@@ -1073,35 +1089,57 @@ pub fn model_list_page(
                         }
                     }
                 }
-            }
 
-                // Bulk-action bar — only rendered when the model declares
-                // at least one action. Sits below the table inside the
-                // wrapping form.
-                @if !actions.is_empty() {
-                    div class="action-bar" {
-                        label for="bulk-action" { "With selected:" }
-                        select name="action" id="bulk-action" class="form-input"
-                            style="width: auto; display: inline-block;" {
-                            @for a in actions {
-                                option value=(a.name) data-confirm=[a.confirm.then_some("1")] {
-                                    (a.label)
+                    // Bulk-action bar — only rendered when the model declares
+                    // at least one action. Sits below the table inside the
+                    // wrapping form.
+                    @if !actions.is_empty() {
+                        div class="action-bar" {
+                            label for="bulk-action" { "With selected:" }
+                            select name="action" id="bulk-action" class="form-input"
+                                style="width: auto; display: inline-block;" {
+                                @for a in actions {
+                                    option value=(a.name) data-confirm=[a.confirm.then_some("1")] {
+                                        (a.label)
+                                    }
                                 }
                             }
-                        }
-                        button type="submit" class="btn" data-bulk-submit="1" {
-                            "Apply"
+                            button type="submit" class="btn" data-bulk-submit="1" {
+                                "Apply"
+                            }
                         }
                     }
+
+                } // /form
+
+                // Shared confirm dialog for destructive bulk actions — rendered
+                // once per page when at least one declared action requires
+                // confirmation. admin.js intercepts the bulk form's submit,
+                // shows this dialog instead of window.confirm(), and fills in
+                // [data-bulk-confirm-detail] with the action/count description.
+                @if actions.iter().any(|a| a.confirm) {
+                    (modal(
+                        "admin-bulk-confirm",
+                        "Confirm bulk action",
+                        &html! { p data-bulk-confirm-detail {} },
+                        &ModalConfig::new().footer(html! {
+                            (modal_close_button("Cancel", "admin-bulk-confirm", Some("btn")))
+                            button type="button" class="btn btn-danger"
+                                command="close" commandfor="admin-bulk-confirm"
+                                data-modal-close="admin-bulk-confirm" data-bulk-confirm {
+                                "Confirm"
+                            }
+                        }),
+                    ))
                 }
 
-            } // /form
-
-            // Pagination
-            @if result.total_pages() > 1 {
-                (render_pagination(result, model_slug, &search_enc, sort_by, sort_dir, &filters_enc, prefix))
-            }
-        }
+                // Pagination
+                @if result.total_pages() > 1 {
+                    (render_pagination(result, model_slug, &search_enc, sort_by, sort_dir, &filters_enc, prefix))
+                }
+            };
+            card(&body, &CardConfig::new().title_html(title).header_action(header_action))
+        })
     };
     admin_layout(
         registry,
@@ -1142,12 +1180,9 @@ pub fn model_import_form_page(
             span { "Import CSV" }
         }
 
-        div class="card" {
-            div class="card-header" {
-                span class="card-title" { "Import " (model_name_plural) " from CSV" }
-            }
-
-            div style="padding: 1.5rem;" {
+        ({
+            let title = html! { "Import " (model_name_plural) " from CSV" };
+            let body = html! {
                 p style="color: var(--text-muted); margin-bottom: 1rem;" {
                     "Upload a CSV file with a header row. Column names must match the model's field names."
                 }
@@ -1200,8 +1235,9 @@ pub fn model_import_form_page(
                         }
                     }
                 }
-            }
-        }
+            };
+            card(&body, &CardConfig::new().title_html(title))
+        })
     };
 
     admin_layout(
@@ -1248,12 +1284,9 @@ pub fn model_import_result_page(
             span { "Import Result" }
         }
 
-        div class="card" {
-            div class="card-header" {
-                span class="card-title" { "Import Report — " (mode_label) }
-            }
-
-            div style="padding: 1.5rem;" {
+        ({
+            let title = html! { "Import Report — " (mode_label) };
+            let body = html! {
                 div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 1rem; margin-bottom: 1.5rem;" {
                     div style="text-align: center; padding: 1rem; background: var(--success-light); border-radius: 0.375rem;" {
                         div style="font-size: 1.5rem; font-weight: 700; color: var(--success);" { (report.inserted) }
@@ -1316,8 +1349,9 @@ pub fn model_import_result_page(
                     a href={ (prefix) "/" (model_slug) } class="btn btn-primary" { "Back to list" }
                     a href={ (prefix) "/" (model_slug) "/import" } class="btn" { "Import another file" }
                 }
-            }
-        }
+            };
+            card(&body, &CardConfig::new().title_html(title))
+        })
     };
 
     admin_layout(
@@ -1352,6 +1386,7 @@ pub fn model_detail_page(
     id: i64,
     messages: &[FlashMessage],
     csrf_token: &str,
+    csrf_form_field: &str,
     csrf_token_header: &str,
     prefix: &str,
     actuator_prefix: &str,
@@ -1367,10 +1402,12 @@ pub fn model_detail_page(
             span { (record_display) }
         }
 
-        div class="card" {
-            div class="card-header" {
-                span class="card-title" { (record_display) }
-                div {
+        ({
+            let delete_url = format!("{prefix}/{model_slug}/{id}");
+            let delete_dialog_id = format!("delete-confirm-{id}");
+            let delete_title = format!("Delete this {model_name}?");
+            let header_action = html! {
+                div class="header-actions" {
                     @if has_history {
                         a href={ (prefix) "/" (model_slug) "/" (id) "/history" }
                             class="btn btn-secondary" { "History" }
@@ -1379,24 +1416,33 @@ pub fn model_detail_page(
                     a href={ (prefix) "/" (model_slug) "/" (id) "/edit" }
                         class="btn btn-primary" { "Edit" }
                     " "
-                    button class="btn btn-danger"
-                        hx-delete={ (prefix) "/" (model_slug) "/" (id) }
-                        hx-confirm={ "Are you sure you want to delete this " (model_name) "?" }
-                        hx-target="body" {
-                        "Delete"
+                    (confirm_action(
+                        &delete_dialog_id,
+                        "Delete",
+                        &delete_url,
+                        Method::DELETE,
+                        csrf_token,
+                        &ConfirmActionConfig::new()
+                            .title(&delete_title)
+                            .message(html! { p { "This action cannot be undone." } })
+                            .trigger_class("btn btn-danger")
+                            .confirm_class("btn btn-danger")
+                            .csrf_field(csrf_form_field),
+                    ))
+                }
+            };
+            let body = html! {
+                div class="detail-grid" {
+                    @for field in fields {
+                        div class="detail-label" { (field.label) }
+                        div class="detail-value" {
+                            (render_detail_value(record, field))
+                        }
                     }
                 }
-            }
-
-            div class="detail-grid" {
-                @for field in fields {
-                    div class="detail-label" { (field.label) }
-                    div class="detail-value" {
-                        (render_detail_value(record, field))
-                    }
-                }
-            }
-        }
+            };
+            card(&body, &CardConfig::new().title(record_display).header_action(header_action))
+        })
     };
     admin_layout(
         registry,
@@ -1452,43 +1498,48 @@ pub fn model_form_page(
             span { (title) }
         }
 
-        div class="card" {
-            div class="card-header" {
-                span class="card-title" { (title) }
-            }
+        ({
+            let body = html! {
+                form method="post"
+                    action={
+                        @if let Some(id) = id {
+                            (prefix) "/" (model_slug) "/" (id)
+                        } @else {
+                            (prefix) "/" (model_slug)
+                        }
+                    } {
+                    (csrf_hidden_input(csrf_token, csrf_form_field))
 
-            form method="post"
-                action={
-                    @if let Some(id) = id {
-                        (prefix) "/" (model_slug) "/" (id)
-                    } @else {
-                        (prefix) "/" (model_slug)
-                    }
-                } {
-                (csrf_hidden_input(csrf_token, csrf_form_field))
-
-                @for field in &editable_fields {
-                    div class="form-group" {
-                        label class="form-label" for=(field.name) {
-                            (field.label)
-                            @if field.required {
-                                span class="required" { "*" }
+                    @for field in &editable_fields {
+                        div class="form-group" {
+                            label class="form-label" for=(field.name) {
+                                (field.label)
+                                @if field.required && !(is_edit && field.create_only) {
+                                    span class="required" { "*" }
+                                }
+                            }
+                            @if is_edit && field.create_only {
+                                // Immutable-after-create: show current value as read-only text
+                                // so the admin can see it but cannot change it.
+                                (render_readonly_display(field, record))
+                            } @else {
+                                (render_form_widget(field, record))
                             }
                         }
-                        (render_form_widget(field, record))
                     }
-                }
 
-                div style="display: flex; gap: 0.75rem; margin-top: 1.5rem;" {
-                    button type="submit" class="btn btn-primary" {
-                        @if is_edit { "Save Changes" } @else { "Create" }
-                    }
-                    a href={ (prefix) "/" (model_slug) } class="btn" {
-                        "Cancel"
+                    div style="display: flex; gap: 0.75rem; margin-top: 1.5rem;" {
+                        button type="submit" class="btn btn-primary" {
+                            @if is_edit { "Save Changes" } @else { "Create" }
+                        }
+                        a href={ (prefix) "/" (model_slug) } class="btn" {
+                            "Cancel"
+                        }
                     }
                 }
-            }
-        }
+            };
+            card(&body, &CardConfig::new().title(&title))
+        })
     };
     admin_layout(
         registry,
@@ -1533,7 +1584,7 @@ pub fn config_page(
         }
 
         @if entries.is_empty() {
-            div class="card" {
+            (card(&html! {
                 p style="color: var(--text-muted); padding: 1rem;" {
                     "No config keys have been registered. Declare keys with "
                     code { "ConfigRegistry::define" }
@@ -1541,9 +1592,9 @@ pub fn config_page(
                     code { "AdminPlugin::with_runtime_config" }
                     "."
                 }
-            }
+            }, &CardConfig::new()))
         } @else {
-            div class="card" {
+            (card(&html! {
                 table class="table" {
                     thead {
                         tr {
@@ -1611,7 +1662,7 @@ pub fn config_page(
                         }
                     }
                 }
-            }
+            }, &CardConfig::new()))
         }
     };
     admin_layout(
@@ -1654,7 +1705,7 @@ pub fn config_history_page(
             "History: " (key)
         }
 
-        div class="card" {
+        (card(&html! {
             @if history.is_empty() {
                 p style="color: var(--text-muted); padding: 1rem;" {
                     "No changes recorded for this key yet."
@@ -1705,7 +1756,7 @@ pub fn config_history_page(
                     }
                 }
             }
-        }
+        }, &CardConfig::new()))
 
         a href={ (prefix) "/config" } class="btn" style="margin-top: 1rem;" {
             "← Back to Runtime Config"
@@ -1909,6 +1960,28 @@ fn render_detail_value(record: &Value, field: &AdminField) -> Markup {
                 (serde_json::to_string_pretty(v).unwrap_or_default())
             }
         },
+    }
+}
+
+/// Render a read-only display for a create-only field on the edit form.
+///
+/// Shows the current value as static text with no form control so the admin
+/// can see it but cannot alter it (and it is never submitted to the server).
+fn render_readonly_display(field: &AdminField, record: Option<&Value>) -> Markup {
+    let value = record
+        .and_then(|r| r.get(field.name))
+        .map(|v| match v {
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
+        })
+        .unwrap_or_default();
+    html! {
+        p class="form-static-value" style="margin: 0; padding: 0.375rem 0; color: #555;" {
+            (value)
+        }
+        small class="form-help" style="color: #888;" {
+            "This field cannot be changed after creation."
+        }
     }
 }
 
@@ -2134,69 +2207,67 @@ pub fn model_history_page(
             span { "History" }
         }
 
-        div class="card" {
-            div class="card-header" {
-                span class="card-title" { "Version History" }
-                small { " " (history.total) " entries" }
-            }
-
-            @if history.entries.is_empty() {
-                p class="text-muted" style="padding:1rem" { "No history entries yet." }
-            } @else {
-                table class="admin-table" {
-                    thead {
-                        tr {
-                            th { "#" }
-                            th { "Operation" }
-                            th { "Actor" }
-                            th { "Request ID" }
-                            th { "Changes" }
-                            th { "Recorded At" }
-                        }
-                    }
-                    tbody {
-                        @for entry in &history.entries {
+        ({
+            let header_action = html! { small { " " (history.total) " entries" } };
+            let body = html! {
+                @if history.entries.is_empty() {
+                    p class="text-muted" style="padding:1rem" { "No history entries yet." }
+                } @else {
+                    table class="admin-table" {
+                        thead {
                             tr {
-                                td { (entry.id) }
-                                td {
-                                    span class={ "badge badge-" (entry.op) } { (entry.op) }
-                                }
-                                td { code { (entry.actor) } }
-                                td {
-                                    @if let Some(ref req_id) = entry.request_id {
-                                        code class="text-muted" { (req_id) }
-                                    } @else {
-                                        span class="text-muted" { "—" }
+                                th { "#" }
+                                th { "Operation" }
+                                th { "Actor" }
+                                th { "Request ID" }
+                                th { "Changes" }
+                                th { "Recorded At" }
+                            }
+                        }
+                        tbody {
+                            @for entry in &history.entries {
+                                tr {
+                                    td { (entry.id) }
+                                    td {
+                                        span class={ "badge badge-" (entry.op) } { (entry.op) }
                                     }
-                                }
-                                td {
-                                    @if entry.changes.is_empty() {
-                                        span class="text-muted" { "no changes" }
-                                    } @else {
-                                        details {
-                                            summary { (entry.changes.len()) " column(s)" }
-                                            ul class="change-list" {
-                                                @for change in &entry.changes {
-                                                    li {
-                                                        @if let Some(col) = change.get("column").and_then(Value::as_str) {
-                                                            code { (col) }
-                                                        }
-                                                        @if change.get("sensitive").and_then(Value::as_bool).unwrap_or(false) {
-                                                            span class="badge-sensitive" { " [sensitive]" }
-                                                        } @else {
-                                                            " "
-                                                            span class="text-muted" { "before: " }
-                                                            @if let Some(before) = change.get("before") {
-                                                                code { (before) }
-                                                            } @else {
-                                                                em { "null" }
+                                    td { code { (entry.actor) } }
+                                    td {
+                                        @if let Some(ref req_id) = entry.request_id {
+                                            code class="text-muted" { (req_id) }
+                                        } @else {
+                                            span class="text-muted" { "—" }
+                                        }
+                                    }
+                                    td {
+                                        @if entry.changes.is_empty() {
+                                            span class="text-muted" { "no changes" }
+                                        } @else {
+                                            details {
+                                                summary { (entry.changes.len()) " column(s)" }
+                                                ul class="change-list" {
+                                                    @for change in &entry.changes {
+                                                        li {
+                                                            @if let Some(col) = change.get("column").and_then(Value::as_str) {
+                                                                code { (col) }
                                                             }
-                                                            " → "
-                                                            span class="text-muted" { "after: " }
-                                                            @if let Some(after) = change.get("after") {
-                                                                code { (after) }
+                                                            @if change.get("sensitive").and_then(Value::as_bool).unwrap_or(false) {
+                                                                span class="badge-sensitive" { " [sensitive]" }
                                                             } @else {
-                                                                em { "null" }
+                                                                " "
+                                                                span class="text-muted" { "before: " }
+                                                                @if let Some(before) = change.get("before") {
+                                                                    code { (before) }
+                                                                } @else {
+                                                                    em { "null" }
+                                                                }
+                                                                " → "
+                                                                span class="text-muted" { "after: " }
+                                                                @if let Some(after) = change.get("after") {
+                                                                    code { (after) }
+                                                                } @else {
+                                                                    em { "null" }
+                                                                }
                                                             }
                                                         }
                                                     }
@@ -2204,32 +2275,33 @@ pub fn model_history_page(
                                             }
                                         }
                                     }
-                                }
-                                td {
-                                    time datetime=(entry.recorded_at.to_rfc3339()) {
-                                        (entry.recorded_at.format("%Y-%m-%d %H:%M:%S UTC"))
+                                    td {
+                                        time datetime=(entry.recorded_at.to_rfc3339()) {
+                                            (entry.recorded_at.format("%Y-%m-%d %H:%M:%S UTC"))
+                                        }
                                     }
                                 }
                             }
                         }
                     }
-                }
 
-                @if history.total_pages() > 1 {
-                    div class="pagination" {
-                        @if history.page > 1 {
-                            a href=(history_page_href(history.page - 1))
-                                class="btn btn-secondary btn-sm" { "← Prev" }
-                        }
-                        span { " Page " (history.page) " of " (history.total_pages()) " " }
-                        @if history.has_next_page() {
-                            a href=(history_page_href(history.page + 1))
-                                class="btn btn-secondary btn-sm" { "Next →" }
+                    @if history.total_pages() > 1 {
+                        div class="pagination" {
+                            @if history.page > 1 {
+                                a href=(history_page_href(history.page - 1))
+                                    class="btn btn-secondary btn-sm" { "← Prev" }
+                            }
+                            span { " Page " (history.page) " of " (history.total_pages()) " " }
+                            @if history.has_next_page() {
+                                a href=(history_page_href(history.page + 1))
+                                    class="btn btn-secondary btn-sm" { "Next →" }
+                            }
                         }
                     }
                 }
-            }
-        }
+            };
+            card(&body, &CardConfig::new().title("Version History").header_action(header_action))
+        })
     };
     admin_layout(
         registry,
@@ -2598,6 +2670,7 @@ mod tests {
                 vec![JobAdminRecord {
                     id: "job-enqueued".to_owned(),
                     name: "send_email".to_owned(),
+                    queue: "default".to_owned(),
                     status: JobAdminStatus::Enqueued,
                     enqueued_at: Some("2026-05-07T10:00:00Z".to_owned()),
                     scheduled_for: None,
@@ -2617,6 +2690,7 @@ mod tests {
                 vec![JobAdminRecord {
                     id: "job-scheduled".to_owned(),
                     name: "reminder".to_owned(),
+                    queue: "default".to_owned(),
                     status: JobAdminStatus::Scheduled,
                     enqueued_at: Some("2026-05-07T10:00:00Z".to_owned()),
                     scheduled_for: Some("2026-05-08T10:00:00Z".to_owned()),
@@ -2636,6 +2710,7 @@ mod tests {
                 vec![JobAdminRecord {
                     id: "job-running".to_owned(),
                     name: "reindex".to_owned(),
+                    queue: "default".to_owned(),
                     status: JobAdminStatus::Running,
                     enqueued_at: Some("2026-05-07T10:01:00Z".to_owned()),
                     scheduled_for: None,
@@ -2655,6 +2730,7 @@ mod tests {
                 vec![JobAdminRecord {
                     id: "job-complete".to_owned(),
                     name: "digest".to_owned(),
+                    queue: "default".to_owned(),
                     status: JobAdminStatus::Completed,
                     enqueued_at: Some("2026-05-07T09:00:00Z".to_owned()),
                     scheduled_for: None,
@@ -2674,6 +2750,7 @@ mod tests {
                 vec![JobAdminRecord {
                     id: "job-failed".to_owned(),
                     name: "send_email".to_owned(),
+                    queue: "default".to_owned(),
                     status: JobAdminStatus::Failed,
                     enqueued_at: Some("2026-05-07T08:00:00Z".to_owned()),
                     scheduled_for: None,
@@ -2854,6 +2931,7 @@ mod tests {
             42,
             &[],
             "t",
+            "_csrf",
             "X-CSRF-Token",
             "/admin",
             "/actuator",
@@ -2866,12 +2944,101 @@ mod tests {
             "Edit link must use path id 42: {html}"
         );
         assert!(
-            html.contains(r#"hx-delete="/admin/widgets/42""#),
-            "Delete must target path id 42: {html}"
+            html.contains(r#"<form action="/admin/widgets/42" method="post""#),
+            "Delete confirm form must target path id 42: {html}"
         );
         assert!(
             !html.contains("widgets/99"),
             "payload id 99 must not route mutations: {html}"
+        );
+        // The delete button is now rendered via confirm_action (a server-rendered
+        // <dialog>), so a no-JS form submission also works: POST + _method=DELETE + CSRF.
+        assert!(
+            html.contains(r#"name="_method" value="DELETE""#),
+            "Delete form must carry a _method override: {html}"
+        );
+        assert!(
+            html.contains(r#"name="_csrf" value="t""#),
+            "Delete form must carry the CSRF token: {html}"
+        );
+    }
+
+    #[test]
+    fn detail_page_delete_uses_confirm_dialog_not_hx_confirm() {
+        // Issue #1233: the admin delete confirmation must be a server-rendered,
+        // testable <dialog> (autumn_web::widgets::confirm_action), not the
+        // native window.confirm() reached via hx-confirm.
+        let r = dummy_registry();
+        let fields = vec![AdminField::new("name", AdminFieldKind::Text)];
+        let record = serde_json::json!({"id": 42, "name": "x"});
+        let html = model_detail_page(
+            &r,
+            "widgets",
+            "Widget",
+            "Widgets",
+            &fields,
+            &record,
+            "#42",
+            42,
+            &[],
+            "t",
+            "_csrf",
+            "X-CSRF-Token",
+            "/admin",
+            "/actuator",
+            false,
+            false,
+        )
+        .into_string();
+        assert!(!html.contains("hx-confirm"), "{html}");
+        assert!(!html.contains("hx-delete"), "{html}");
+        assert!(html.contains("<dialog"), "{html}");
+        assert!(html.contains(r#"aria-modal="true""#), "{html}");
+        assert!(
+            html.contains("Widget"),
+            "confirm dialog title should mention the model name: {html}"
+        );
+        // The trigger button opens the dialog via the native invoker
+        // commands (with a JS-fallback data attribute) rather than hx-delete.
+        assert!(html.contains(r#"command="show-modal""#), "{html}");
+        assert!(html.contains("data-modal-open"), "{html}");
+    }
+
+    #[test]
+    fn detail_page_delete_button_honors_custom_csrf_form_field() {
+        // Regression: the delete button must emit the CSRF hidden input
+        // under the app's configured field name, not a hardcoded "_csrf" —
+        // otherwise a no-JS form submission fails CSRF validation whenever
+        // security.csrf.form_field is customized.
+        let r = dummy_registry();
+        let fields = vec![AdminField::new("name", AdminFieldKind::Text)];
+        let record = serde_json::json!({"id": 42, "name": "x"});
+        let html = model_detail_page(
+            &r,
+            "widgets",
+            "Widget",
+            "Widgets",
+            &fields,
+            &record,
+            "#42",
+            42,
+            &[],
+            "t",
+            "authenticity_token",
+            "X-CSRF-Token",
+            "/admin",
+            "/actuator",
+            false,
+            false,
+        )
+        .into_string();
+        assert!(
+            html.contains(r#"name="authenticity_token" value="t""#),
+            "Delete form must use the configured CSRF field name: {html}"
+        );
+        assert!(
+            !html.contains(r#"name="_csrf""#),
+            "Delete form must not fall back to the default CSRF field name: {html}"
         );
     }
 
@@ -2896,6 +3063,7 @@ mod tests {
             1,
             &[],
             "t",
+            "_csrf",
             "X-CSRF-Token",
             "/admin",
             "/actuator",
@@ -3341,6 +3509,71 @@ mod tests {
             html.contains(r#"data-confirm="1""#),
             "destructive action should set data-confirm: {html}"
         );
+        // Issue #1233: a shared confirm <dialog> is rendered because at
+        // least one action (delete) requires confirmation. admin.js
+        // intercepts the bulk submit and shows this dialog instead of
+        // calling window.confirm().
+        assert!(
+            html.contains(r#"<dialog id="admin-bulk-confirm""#),
+            "list view with a confirm-requiring action must render the bulk confirm dialog: {html}"
+        );
+        assert!(html.contains("data-bulk-confirm-detail"), "{html}");
+        // Regression: "data-bulk-confirm" is a substring of
+        // "data-bulk-confirm-detail", so a plain `.contains("data-bulk-confirm")`
+        // would pass even if the Confirm button's own attribute were removed.
+        // Require an occurrence NOT immediately followed by `-` (i.e. not part
+        // of `-detail`) so this actually verifies the button's bare attribute.
+        assert!(
+            html.match_indices("data-bulk-confirm")
+                .any(|(i, m)| html.as_bytes().get(i + m.len()) != Some(&b'-')),
+            "confirm button must carry a standalone data-bulk-confirm attribute: {html}"
+        );
+        assert!(!html.contains("window.confirm"), "{html}");
+    }
+
+    #[test]
+    fn list_page_skips_bulk_confirm_dialog_when_no_action_requires_confirm() {
+        use crate::traits::{ActionStyle, ListResult};
+        let r = dummy_registry();
+        let fields = vec![AdminField::new("name", AdminFieldKind::Text)];
+        let actions = vec![AdminAction {
+            name: "archive",
+            label: "Archive".to_owned(),
+            style: ActionStyle::Default,
+            confirm: false,
+        }];
+        let result = ListResult {
+            records: vec![serde_json::json!({"id": 1, "name": "x"})],
+            total: 1,
+            page: 1,
+            per_page: 25,
+        };
+        let html = model_list_page(
+            &r,
+            "widgets",
+            "Widgets",
+            &fields,
+            &actions,
+            &result,
+            "",
+            None,
+            SortDirection::Asc,
+            &[],
+            &[],
+            "tok",
+            "admin_csrf",
+            "X-CSRF-Token",
+            "/admin",
+            "/actuator",
+            false,
+            false,
+            false,
+        )
+        .into_string();
+        assert!(
+            !html.contains("admin-bulk-confirm"),
+            "no action requires confirmation, so no dialog should render: {html}"
+        );
     }
 
     #[test]
@@ -3567,7 +3800,7 @@ mod tests {
 
     #[test]
     fn admin_js_does_not_contain_inline_event_handlers() {
-        // Sanity-check the shipped JS: has the two behaviours we expect.
+        // Sanity-check the shipped JS: has the behaviours we expect.
         let js = include_str!("admin.js");
         assert!(
             js.contains("select-all"),
@@ -3576,6 +3809,142 @@ mod tests {
         assert!(
             js.contains("removeAttribute(\"name\")"),
             "admin.js should strip blank password input names"
+        );
+    }
+
+    #[test]
+    fn admin_js_uses_confirm_dialog_as_primary_path() {
+        // Issue #1233: the bulk-action confirm's primary path is the
+        // server-rendered #admin-bulk-confirm <dialog>
+        // (autumn_web::widgets::modal), not the native window.confirm().
+        let js = include_str!("admin.js");
+        assert!(js.contains("data-bulk-confirm"), "{js}");
+        assert!(js.contains("showModal"), "{js}");
+    }
+
+    #[test]
+    fn admin_js_window_confirm_only_reached_as_showmodal_fallback() {
+        // Code-review fix: window.confirm() must not be the primary confirm
+        // mechanism, but it IS kept as a fallback for browsers without
+        // <dialog>.showModal support — otherwise a destructive bulk action
+        // would submit with zero confirmation on those browsers (fail-open).
+        // Verify it's only reachable after the showModal support guard, not
+        // called unconditionally earlier in the file.
+        let js = include_str!("admin.js");
+        let guard_idx = js
+            .find("!dialog.showModal")
+            .unwrap_or_else(|| panic!("must feature-detect <dialog>.showModal support: {js}"));
+        // Search for the actual call site (not just the substring
+        // "window.confirm", which also appears in an explanatory comment
+        // earlier in the file).
+        let confirm_idx = js
+            .find("window.confirm(message)")
+            .unwrap_or_else(|| panic!("must keep a window.confirm() fallback: {js}"));
+        assert!(
+            confirm_idx > guard_idx,
+            "window.confirm() must only be reached after the showModal support guard: {js}"
+        );
+    }
+
+    #[test]
+    fn admin_js_defers_showmodal_fallback_resubmit() {
+        // Regression (caught by a real-browser Playwright check, not by any
+        // string-matching test): calling form.requestSubmit() synchronously
+        // from within that same form's still-dispatching `submit` event
+        // handler is a no-op per the HTML spec's reentrancy guard ("if
+        // form's firing submit event is true, then return"). The
+        // window.confirm() fallback branch runs inside that handler, so its
+        // resubmit must be deferred (e.g. via setTimeout) past the current
+        // dispatch — otherwise the confirmed action silently never submits.
+        let js = include_str!("admin.js");
+        let confirm_idx = js
+            .find("window.confirm(message)")
+            .unwrap_or_else(|| panic!("must keep a window.confirm() fallback: {js}"));
+        let defer_idx = js
+            .find("setTimeout")
+            .unwrap_or_else(|| panic!("fallback resubmit must be deferred: {js}"));
+        assert!(
+            defer_idx > confirm_idx,
+            "the deferred resubmit must be inside the window.confirm() fallback branch: {js}"
+        );
+    }
+
+    #[test]
+    fn admin_js_requestsubmit_has_form_submit_fallback() {
+        // PR review (gemini-code-assist): form.requestSubmit() shipped later
+        // than <dialog> support in some browsers (e.g. Safari 15.4-15.6 has
+        // <dialog> but not requestSubmit, which arrived in Safari 16) and
+        // may be absent in older headless test runners — calling it
+        // unguarded throws a TypeError. Both call sites must go through a
+        // feature-detected fallback to form.submit() instead of calling
+        // requestSubmit directly.
+        let js = include_str!("admin.js");
+        assert!(
+            js.contains(r#"typeof form.requestSubmit === "function""#),
+            "must feature-detect requestSubmit before calling it: {js}"
+        );
+        assert!(
+            js.contains("form.submit();"),
+            "must fall back to form.submit() when requestSubmit is unavailable: {js}"
+        );
+        // The only *call statement* invoking requestSubmit() should be
+        // inside the feature-detected submitForm() helper itself (matched
+        // with a trailing `;` so an explanatory comment mentioning the same
+        // method name doesn't also count) — every other resubmit call site
+        // routes through submitForm(form) instead.
+        assert_eq!(
+            js.matches("form.requestSubmit();").count(),
+            1,
+            "form.requestSubmit() should only be called from inside the \
+             feature-detected submitForm() helper, not unguarded elsewhere: {js}"
+        );
+        assert_eq!(
+            js.matches("submitForm(form);").count(),
+            2,
+            "both bulk-action resubmit call sites must route through submitForm(): {js}"
+        );
+    }
+
+    #[test]
+    fn admin_js_clears_bulk_confirmed_before_fallback_submit() {
+        // PR review (chatgpt-codex-connector): form.submit() (the
+        // requestSubmit-unavailable fallback) bypasses the 'submit' event
+        // entirely, so the top-level submit handler's `bulkConfirmed`
+        // cleanup never runs for that path. Without an explicit clear here,
+        // a bfcache-restored page after that fallback submit would carry a
+        // stale "confirmed" flag into the next, unrelated bulk-action
+        // attempt and skip its confirmation dialog. The clear must happen
+        // in the same branch as (and before) the form.submit() fallback
+        // call, not just "somewhere in the file".
+        let js = include_str!("admin.js");
+        let fallback_idx = js
+            .find("form.submit();")
+            .unwrap_or_else(|| panic!("must keep a form.submit() fallback: {js}"));
+        // `find` (first occurrence), not `rfind`: the top-level submit-event
+        // handler has its own, unrelated "delete ...;" later in the file
+        // (its normal one-shot-flag consumption on a genuine event) — this
+        // must find the one inside submitForm() itself, which comes first.
+        let clear_idx = js
+            .find("delete form.dataset.bulkConfirmed;")
+            .unwrap_or_else(|| {
+                panic!("must clear bulkConfirmed before the form.submit() fallback: {js}")
+            });
+        assert!(
+            clear_idx < fallback_idx,
+            "bulkConfirmed must be cleared BEFORE the form.submit() fallback call \
+             (form.submit() bypasses the submit event, so clearing it after — or \
+             relying on the submit-event listener to clear it — never happens): {js}"
+        );
+        // Clearing must live inside submitForm() itself, not just at one of
+        // its call sites, so it applies regardless of which call site
+        // triggers the fallback path.
+        let submit_form_idx = js
+            .find("function submitForm(form)")
+            .unwrap_or_else(|| panic!("submitForm() helper must exist: {js}"));
+        assert!(
+            submit_form_idx < clear_idx && clear_idx < fallback_idx,
+            "the bulkConfirmed clear must be inside submitForm(), immediately \
+             guarding its form.submit() fallback: {js}"
         );
     }
 
@@ -3875,5 +4244,171 @@ mod tests {
         // 2023-11-14 22:13:20 UTC
         let s = format_timestamp(1_700_000_000);
         assert!(s.contains("2023"), "expected 2023 in formatted output: {s}");
+    }
+
+    // ── admin_layout nav (#1134) ─────────────────────────────────────────
+
+    fn render_layout(active_slug: Option<&str>) -> String {
+        let registry = AdminRegistry::new();
+        admin_layout(
+            &registry,
+            active_slug,
+            "Title",
+            "/admin",
+            "/actuator",
+            "tok",
+            "X-CSRF-Token",
+            &[],
+            true,
+            &html! {},
+        )
+        .into_string()
+    }
+
+    #[test]
+    fn admin_layout_dashboard_active_has_aria_current() {
+        let html = render_layout(None);
+        assert_eq!(html.matches(r#"aria-current="page""#).count(), 1, "{html}");
+        assert!(
+            html.contains(r#"href="/admin" class="active" aria-current="page""#),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn admin_layout_jobs_active_has_aria_current() {
+        let html = render_layout(Some(JOBS_NAV_SLUG));
+        assert_eq!(html.matches(r#"aria-current="page""#).count(), 1, "{html}");
+        assert!(
+            html.contains(r#"href="/admin/jobs" class="active" aria-current="page""#),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn admin_layout_runtime_config_active_has_aria_current() {
+        let html = render_layout(Some(RUNTIME_CONFIG_NAV_SLUG));
+        assert_eq!(html.matches(r#"aria-current="page""#).count(), 1, "{html}");
+        assert!(
+            html.contains(r#"href="/admin/config" class="active" aria-current="page""#),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn admin_layout_no_active_slug_has_no_dashboard_aria_current() {
+        // active_slug = Some(...) for an unrelated slug: Dashboard must not
+        // claim the active state, and nothing else should either since the
+        // registry is empty (no model nav items).
+        let html = render_layout(Some(JOBS_NAV_SLUG));
+        assert!(
+            !html.contains(r#"href="/admin" class="active""#),
+            "dashboard must not be active: {html}"
+        );
+    }
+
+    // ── admin_layout nav_bar (#1137) ──────────────────────────────────────
+
+    use crate::registry::tests::DummyModel;
+
+    fn render_layout_with_registry(registry: &AdminRegistry, active_slug: Option<&str>) -> String {
+        admin_layout(
+            registry,
+            active_slug,
+            "Title",
+            "/admin",
+            "/actuator",
+            "tok",
+            "X-CSRF-Token",
+            &[],
+            true,
+            &html! {},
+        )
+        .into_string()
+    }
+
+    #[test]
+    fn admin_layout_renders_nav_bar_sidebar() {
+        let html = render_layout(None);
+        assert!(html.contains("autumn-nav--sidebar"), "{html}");
+        assert!(
+            html.contains(r#"class="autumn-nav autumn-nav--sidebar admin-sidebar""#),
+            "{html}"
+        );
+        assert!(html.contains(r#"aria-label="Admin navigation""#), "{html}");
+    }
+
+    #[test]
+    fn admin_layout_brand_uses_nav_brand_class() {
+        let html = render_layout(None);
+        assert!(html.contains("autumn-nav__brand"), "{html}");
+        assert!(html.contains("🍂 Autumn Admin"), "{html}");
+        assert!(!html.contains(r#"class="admin-logo""#), "{html}");
+    }
+
+    #[test]
+    fn admin_layout_sections_render_as_nav_sections_without_models() {
+        let html = render_layout(None);
+        assert!(
+            html.contains(r#"<li class="autumn-nav__section">System</li>"#),
+            "{html}"
+        );
+        assert!(!html.contains("Models"), "{html}");
+    }
+
+    #[test]
+    fn admin_layout_sections_render_as_nav_sections_with_models() {
+        let mut registry = AdminRegistry::new();
+        registry.register(DummyModel {
+            slug: "projects",
+            name: "Projects",
+        });
+        let html = render_layout_with_registry(&registry, None);
+        assert!(
+            html.contains(r#"<li class="autumn-nav__section">Models</li>"#),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"<li class="autumn-nav__section">System</li>"#),
+            "{html}"
+        );
+        assert!(html.contains(r#"href="/admin/projects""#), "{html}");
+    }
+
+    #[test]
+    fn admin_layout_actuator_link_is_plain() {
+        let html = render_layout(None);
+        assert!(html.contains(r#"href="/actuator/ui""#), "{html}");
+        // Only one aria-current in the whole page: Dashboard's. The Actuator
+        // link must never claim active state even though it's the last item.
+        assert_eq!(html.matches(r#"aria-current="page""#).count(), 1, "{html}");
+    }
+
+    #[test]
+    fn admin_layout_has_no_hand_rolled_nav_markup() {
+        let html = render_layout(None);
+        assert!(!html.contains(r#"class="admin-nav""#), "{html}");
+        assert!(!html.contains("admin-logo"), "{html}");
+    }
+
+    #[test]
+    fn admin_layout_loads_nav_bar_widget_runtime() {
+        // nav_bar's hamburger toggle and any future dropdown depend on
+        // autumn-widgets.js to reveal/wire them up; without it the toggle
+        // stays permanently hidden and dead.
+        let html = render_layout(None);
+        assert!(
+            html.contains(autumn_web::htmx::AUTUMN_WIDGETS_JS_PATH),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn admin_sidebar_toggle_stays_hidden() {
+        // The admin sidebar hides itself entirely below 768px (see the
+        // .admin-sidebar { display: none } media rule) rather than using
+        // nav_bar's own collapse-behind-a-hamburger UX, so the toggle must
+        // never become visible even once autumn-widgets.js unhides it.
+        assert!(ADMIN_CSS.contains(".autumn-nav__toggle"), "{ADMIN_CSS}");
     }
 }

@@ -243,6 +243,16 @@ pub(crate) fn append_framework_routes(
         });
         infos.push(RouteInfo {
             method: "GET".to_owned(),
+            path: crate::htmx::IDIOMORPH_JS_PATH.to_owned(),
+            handler: "idiomorph".to_owned(),
+            source: RouteSource::Framework,
+            middleware: Vec::new(),
+            api_version: None,
+            status: None,
+            sunset_opt_out: None,
+        });
+        infos.push(RouteInfo {
+            method: "GET".to_owned(),
             path: crate::htmx::HTMX_SSE_JS_PATH.to_owned(),
             handler: "htmx_sse".to_owned(),
             source: RouteSource::Framework,
@@ -268,6 +278,27 @@ pub(crate) fn append_framework_routes(
                 "/_autumn/mail/previews/{mailer}/{method}",
                 "mail_preview_template",
             ),
+        ] {
+            infos.push(RouteInfo {
+                method: "GET".to_owned(),
+                path: path.to_owned(),
+                handler: handler.to_owned(),
+                source: RouteSource::Framework,
+                middleware: Vec::new(),
+                api_version: None,
+                status: None,
+                sunset_opt_out: None,
+            });
+        }
+    }
+
+    // Widget story gallery routes (#1526), listed iff the resolved config
+    // enables them (same gating condition as the router mount).
+    #[cfg(feature = "maud")]
+    if config.stories.enabled {
+        for (path, handler) in [
+            (crate::stories::STORIES_PATH, "story_gallery_index"),
+            ("/_stories/{slug}", "story_gallery_story"),
         ] {
             infos.push(RouteInfo {
                 method: "GET".to_owned(),
@@ -724,6 +755,39 @@ mod tests {
         assert!(
             paths.contains(&"/ping"),
             "custom health path missing: {paths:?}"
+        );
+    }
+
+    /// T18 (AC5, issue #1526): `autumn routes` introspection lists the story
+    /// gallery endpoints exactly when the resolved config enables them.
+    #[cfg(feature = "maud")]
+    #[test]
+    fn framework_routes_include_stories_when_enabled() {
+        let mut config = AutumnConfig::default();
+        config.stories.enabled = true;
+        let mut infos = Vec::new();
+        append_framework_routes(&mut infos, &config);
+        let paths: Vec<&str> = infos.iter().map(|i| i.path.as_str()).collect();
+        assert!(
+            paths.contains(&crate::stories::STORIES_PATH),
+            "enabled stories must list the index route: {paths:?}"
+        );
+        assert!(
+            paths.contains(&"/_stories/{slug}"),
+            "enabled stories must list the detail route: {paths:?}"
+        );
+
+        let default_config = AutumnConfig::default();
+        let mut infos = Vec::new();
+        append_framework_routes(&mut infos, &default_config);
+        let paths: Vec<&str> = infos.iter().map(|i| i.path.as_str()).collect();
+        assert!(
+            !paths.contains(&"/_stories"),
+            "disabled stories must not be listed: {paths:?}"
+        );
+        assert!(
+            !paths.contains(&"/_stories/{slug}"),
+            "disabled stories must not list the detail route: {paths:?}"
         );
     }
 

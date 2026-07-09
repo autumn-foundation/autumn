@@ -7,6 +7,10 @@ backend = "postgres"
 workers = 2
 max_attempts = 5
 initial_backoff_ms = 500
+# Named queues drained in strict priority order (highest first). Jobs tagged
+# with `#[job(queue = "...")]` route here; untagged jobs use "default".
+# For weighted/fair draining instead, use a table: [jobs.queues] critical = 4 ...
+queues = ["critical", "default", "low"]
 
 [log]
 level = "info"
@@ -18,6 +22,9 @@ path = "/health"
 [security.csrf]
 enabled = true
 
+[security.webhooks.replay]
+allow_memory_in_production = true
+
 # Signed inbound webhook intake — verifies Stripe-Signature before handler runs.
 # Each endpoint maps a route path to a provider preset + signing secret.
 # In production: use `secret_env = "STRIPE_WEBHOOK_SECRET"` (never commit real secrets).
@@ -25,7 +32,7 @@ enabled = true
 name                    = "stripe"
 path                    = "/webhooks/stripe"
 provider                = "stripe"
-secret                  = "dev-only-override-in-prod"
+secret                  = "dev-only-override-in-prod-32-chars-long"
 timestamp_tolerance_secs = 300
 replay_window_secs       = 86400
 

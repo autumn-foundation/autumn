@@ -35,7 +35,7 @@
 
 use proc_macro2::{Span, TokenStream};
 use quote::quote;
-use syn::parse::{Parse, ParseStream, Parser as _};
+use syn::parse::{Parse, ParseStream};
 use syn::{Attribute, Expr, ExprLit, Ident, Lit, LitBool, LitStr, Token};
 
 /// Parsed `#[api_doc(...)]` attribute arguments.
@@ -596,7 +596,7 @@ pub fn has_policy_check_in_stmts(stmts: &[syn::Stmt]) -> bool {
     false
 }
 
-pub fn extract_secured_info(input_fn: &syn::ItemFn) -> (bool, TokenStream) {
+pub fn extract_secured_info(input_fn: &syn::ItemFn) -> (bool, TokenStream, TokenStream) {
     // Case 1 — #[secured] or #[autumn_web::secured] visible as a remaining attribute.
     for attr in &input_fn.attrs {
         if attr.path().is_ident("secured")
@@ -607,8 +607,12 @@ pub fn extract_secured_info(input_fn: &syn::ItemFn) -> (bool, TokenStream) {
                 .is_some_and(|s| s.ident == "secured")
         {
             let roles = extract_secured_roles(attr);
-            let roles_tokens = emit_static_str_slice(&roles);
-            return (true, roles_tokens);
+            let scopes = extract_secured_scopes(attr);
+            return (
+                true,
+                emit_static_str_slice(&roles),
+                emit_static_str_slice(&scopes),
+            );
         }
     }
 
@@ -621,21 +625,25 @@ pub fn extract_secured_info(input_fn: &syn::ItemFn) -> (bool, TokenStream) {
                 .last()
                 .is_some_and(|s| s.ident == "authorize")
         {
-            return (true, quote! { &[] });
+            return (true, quote! { &[] }, quote! { &[] });
         }
     }
 
     // Case 2 — #[secured] was above the route macro and already expanded;
-    // read the marker emitted into the guarded function body.
+    // read the markers emitted into the guarded function body.
     if let Some(roles) = extract_secured_roles_marker(input_fn) {
-        let roles_tokens = emit_static_str_slice(&roles);
-        return (true, roles_tokens);
+        let scopes = extract_secured_scopes_marker(input_fn).unwrap_or_default();
+        return (
+            true,
+            emit_static_str_slice(&roles),
+            emit_static_str_slice(&scopes),
+        );
     }
 
     // Case 2b — #[authorize] was above the route macro and already expanded;
     // check if a policy check statement is present.
     if has_policy_check_in_stmts(&input_fn.block.stmts) {
-        return (true, quote! { &[] });
+        return (true, quote! { &[] }, quote! { &[] });
     }
 
     // Case 3 — compatibility fallback for expansions produced before the
@@ -649,10 +657,10 @@ pub fn extract_secured_info(input_fn: &syn::ItemFn) -> (bool, TokenStream) {
         false
     });
     if has_session {
-        return (true, quote! { &[] });
+        return (true, quote! { &[] }, quote! { &[] });
     }
 
-    (false, quote! { &[] })
+    (false, quote! { &[] }, quote! { &[] })
 }
 
 fn extract_secured_roles_marker(input_fn: &syn::ItemFn) -> Option<Vec<String>> {
@@ -712,15 +720,102 @@ fn extract_roles_from_marker_expr(expr: &syn::Expr) -> Option<Vec<String>> {
 }
 
 fn extract_secured_roles(attr: &syn::Attribute) -> Vec<String> {
+    use proc_macro2::TokenTree;
+
     let syn::Meta::List(list) = &attr.meta else {
         return Vec::new();
     };
-    let roles: syn::Result<syn::punctuated::Punctuated<syn::LitStr, syn::Token![,]>> =
-        syn::punctuated::Punctuated::<syn::LitStr, syn::Token![,]>::parse_terminated
-            .parse2(list.tokens.clone());
-    match roles {
-        Ok(r) => r.iter().map(syn::LitStr::value).collect(),
-        Err(_) => Vec::new(),
+    // Roles are the leading bare string literals; a trailing `scopes = [...]`
+    // (token abilities) may follow and is not a role, so peel literals
+    // directly rather than parsing the whole list as `LitStr`s.
+    let mut roles = Vec::new();
+    let mut iter = list.tokens.clone().into_iter().peekable();
+    while let Some(TokenTree::Literal(lit)) = iter.peek() {
+        match syn::parse2::<syn::LitStr>(quote! { #lit }) {
+            Ok(s) => roles.push(s.value()),
+            Err(_) => break,
+        }
+        iter.next();
+        if let Some(TokenTree::Punct(p)) = iter.peek()
+            && p.as_char() == ','
+        {
+            iter.next();
+        } else {
+            break;
+        }
+    }
+    roles
+}
+
+fn extract_secured_scopes(attr: &syn::Attribute) -> Vec<String> {
+    use proc_macro2::TokenTree;
+
+    let syn::Meta::List(list) = &attr.meta else {
+        return Vec::new();
+    };
+    // Scopes appear as `scopes = ["scope1", "scope2"]` after any role literals.
+    let mut iter = list.tokens.clone().into_iter();
+    while let Some(tt) = iter.next() {
+        let TokenTree::Ident(ident) = tt else {
+            continue;
+        };
+        if ident != "scopes" {
+            continue;
+        }
+        let Some(TokenTree::Punct(p)) = iter.next() else {
+            continue;
+        };
+        if p.as_char() != '=' {
+            continue;
+        }
+        let Some(TokenTree::Group(group)) = iter.next() else {
+            continue;
+        };
+        let mut scopes = Vec::new();
+        for inner_tt in group.stream() {
+            if let TokenTree::Literal(lit) = inner_tt
+                && let Ok(s) = syn::parse2::<syn::LitStr>(quote! { #lit })
+            {
+                scopes.push(s.value());
+            }
+        }
+        return scopes;
+    }
+    Vec::new()
+}
+
+fn extract_secured_scopes_marker(input_fn: &syn::ItemFn) -> Option<Vec<String>> {
+    extract_secured_scopes_marker_from_stmts(&input_fn.block.stmts)
+}
+
+fn extract_secured_scopes_marker_from_stmts(stmts: &[syn::Stmt]) -> Option<Vec<String>> {
+    stmts
+        .iter()
+        .find_map(extract_secured_scopes_marker_from_stmt)
+}
+
+fn extract_secured_scopes_marker_from_stmt(stmt: &syn::Stmt) -> Option<Vec<String>> {
+    match stmt {
+        syn::Stmt::Item(syn::Item::Const(item_const))
+            if item_const.ident == "__AUTUMN_SECURED_SCOPES" =>
+        {
+            extract_roles_from_marker_expr(&item_const.expr)
+        }
+        syn::Stmt::Expr(expr, _) => extract_secured_scopes_marker_from_expr(expr),
+        syn::Stmt::Local(local) => local
+            .init
+            .as_ref()
+            .and_then(|init| extract_secured_scopes_marker_from_expr(&init.expr)),
+        _ => None,
+    }
+}
+
+fn extract_secured_scopes_marker_from_expr(expr: &syn::Expr) -> Option<Vec<String>> {
+    match expr {
+        syn::Expr::Block(block) => extract_secured_scopes_marker_from_stmts(&block.block.stmts),
+        syn::Expr::Async(block) => extract_secured_scopes_marker_from_stmts(&block.block.stmts),
+        syn::Expr::Unsafe(block) => extract_secured_scopes_marker_from_stmts(&block.block.stmts),
+        _ => None,
     }
 }
 
@@ -838,5 +933,86 @@ mod tests {
             extract_secured_roles_marker(&input_fn),
             Some(vec!["admin".to_owned()])
         );
+    }
+
+    // ── Scopes extraction (#1158) ────────────────────────────────────────────
+
+    #[test]
+    fn extract_secured_scopes_from_attribute_scopes_only() {
+        let input_fn: syn::ItemFn = syn::parse_quote! {
+            #[secured(scopes = ["posts:read", "posts:write"])]
+            async fn handler() {}
+        };
+        let attr = input_fn
+            .attrs
+            .iter()
+            .find(|a| a.path().is_ident("secured"))
+            .unwrap();
+        assert_eq!(
+            extract_secured_scopes(attr),
+            vec!["posts:read".to_owned(), "posts:write".to_owned()]
+        );
+    }
+
+    #[test]
+    fn extract_secured_scopes_from_attribute_roles_and_scopes() {
+        let input_fn: syn::ItemFn = syn::parse_quote! {
+            #[secured("admin", scopes = ["posts:write"])]
+            async fn handler() {}
+        };
+        let attr = input_fn
+            .attrs
+            .iter()
+            .find(|a| a.path().is_ident("secured"))
+            .unwrap();
+        assert_eq!(extract_secured_scopes(attr), vec!["posts:write".to_owned()]);
+    }
+
+    #[test]
+    fn extract_secured_scopes_returns_empty_for_roles_only() {
+        let input_fn: syn::ItemFn = syn::parse_quote! {
+            #[secured("admin")]
+            async fn handler() {}
+        };
+        let attr = input_fn
+            .attrs
+            .iter()
+            .find(|a| a.path().is_ident("secured"))
+            .unwrap();
+        assert!(extract_secured_scopes(attr).is_empty());
+    }
+
+    #[test]
+    fn scopes_marker_extracted_from_handler_body() {
+        let input_fn: syn::ItemFn = syn::parse_quote! {
+            async fn handler() {
+                const __AUTUMN_SECURED_SCOPES: &[&str] = &["posts:write", "posts:delete"];
+            }
+        };
+        assert_eq!(
+            extract_secured_scopes_marker(&input_fn),
+            Some(vec!["posts:write".to_owned(), "posts:delete".to_owned()])
+        );
+    }
+
+    #[test]
+    fn scopes_marker_empty_array_returns_some_empty_vec() {
+        let input_fn: syn::ItemFn = syn::parse_quote! {
+            async fn handler() {
+                const __AUTUMN_SECURED_SCOPES: &[&str] = &[];
+            }
+        };
+        assert_eq!(
+            extract_secured_scopes_marker(&input_fn),
+            Some(Vec::<String>::new())
+        );
+    }
+
+    #[test]
+    fn scopes_marker_absent_returns_none() {
+        let input_fn: syn::ItemFn = syn::parse_quote! {
+            async fn handler() {}
+        };
+        assert_eq!(extract_secured_scopes_marker(&input_fn), None);
     }
 }

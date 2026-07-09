@@ -72,6 +72,8 @@ pub mod assets;
 pub mod audit;
 pub mod auth;
 pub mod authorization;
+pub mod batches;
+pub mod build_info;
 pub mod cache;
 #[cfg(feature = "ws")]
 pub mod channels;
@@ -86,17 +88,26 @@ pub mod config;
 pub mod credentials;
 #[cfg(feature = "db")]
 pub mod db;
+pub mod dotenv;
+pub mod download;
 pub mod encryption;
 pub mod error;
 #[cfg(feature = "maud")]
 pub mod error_pages;
 pub mod extract;
+pub mod feed;
+/// View-layer value formatting helpers (currency, delimited numbers,
+/// pluralize, truncate, relative/absolute dates) for Maud templates.
+///
+/// See [`mod@format`] for the full API.
+pub mod format;
 pub mod health;
 #[cfg(feature = "db")]
 pub mod hooks;
 #[cfg(feature = "i18n")]
 pub mod i18n;
 pub mod idempotency;
+pub mod range;
 pub mod seo;
 /// Translation lookup macro with compile-time key validation.
 ///
@@ -115,6 +126,7 @@ pub mod maintenance;
 pub mod managed_pg;
 #[cfg(feature = "db")]
 pub mod migrate;
+pub(crate) mod pg_conn_str;
 pub mod plugin;
 pub mod plugin_conformance;
 pub mod probe;
@@ -200,6 +212,23 @@ pub(crate) mod repository_commit_hooks;
 #[cfg(feature = "db")]
 pub use repository::RepositoryError;
 
+/// Read-your-own-writes routing support.
+///
+/// When `database.read_your_writes` is `request` or `session`, generated
+/// repository read methods consult the per-request task-local at acquire time
+/// and redirect replica-eligible reads to the primary when a write has
+/// occurred in the same request (or within the session cookie window).
+#[cfg(feature = "db")]
+pub mod read_your_writes;
+
+/// Offline-first local SQLite store and background sync engine for
+/// occasionally-connected apps (e.g. Tauri mobile).
+///
+/// See the [`sync`] module documentation for the architecture (change
+/// tracking, tombstoning, conflict resolution) and wiring examples.
+#[cfg(feature = "offline-sync")]
+pub mod sync;
+
 /// Automatic record version history for `#[repository]` writes.
 ///
 /// See [`version_history`] module documentation for the full API.
@@ -233,6 +262,14 @@ pub use http_client as http;
 pub mod flash;
 #[cfg(feature = "htmx")]
 pub mod htmx;
+/// Declarative live-broadcast trait for `#[repository(Model, broadcasts = "topic")]`.
+///
+/// Implement [`live::LiveFragment`] on a model to enable automatic `hx-swap-oob`
+/// broadcasts after each `save`/`update`/`delete_by_id` call. Requires the
+/// `ws`, `maud`, and `htmx` features.
+#[cfg(all(feature = "htmx", feature = "maud"))]
+pub mod live;
+pub mod lock;
 pub mod log;
 pub(crate) mod logging;
 /// Project typed JSON endpoints as Model Context Protocol (MCP) tools so AI
@@ -254,6 +291,15 @@ pub mod prelude;
 pub use paths::PathExt;
 #[cfg(feature = "presence")]
 pub mod presence;
+#[cfg(all(feature = "presence", feature = "maud"))]
+pub use presence::presence_badge;
+#[cfg(all(
+    feature = "presence",
+    feature = "ws",
+    feature = "maud",
+    feature = "htmx"
+))]
+pub use presence::presence_stream;
 #[cfg(feature = "presence")]
 pub use presence::{Presence, PresenceEntry, PresenceEvent, PresenceHandle};
 pub(crate) mod route;
@@ -291,16 +337,27 @@ pub mod feature_flags;
 pub mod form;
 pub mod gdpr;
 pub mod job;
+pub mod job_tracking;
+/// Safe, method-aware link helpers: [`links::link_to`] anchors and
+/// [`links::button_to`] CSRF-protected action buttons.
+pub mod links;
 pub mod runtime_config;
 #[cfg(feature = "seed")]
 pub mod seed;
+/// Widget story gallery (issue #1526).
+///
+/// Browsable `/_stories` UI plus a CI anti-rot registry of zero-arg widget
+/// render examples.
+#[cfg(feature = "maud")]
+pub mod stories;
 pub mod task;
 pub mod telemetry;
 pub mod ui;
 /// Active search and autocomplete form primitives with htmx integration.
 ///
 /// See [`widgets`] for the full API including [`widgets::active_search`],
-/// [`widgets::autocomplete_input`], and their configuration types.
+/// [`widgets::autocomplete_input`], [`widgets::data_table`],
+/// [`widgets::property_list`], and their configuration types.
 pub mod widgets;
 /// First-class multi-step form wizards with session-backed state and per-step validation.
 ///
@@ -314,6 +371,7 @@ pub use form::ChangesetForm;
 /// Trait implemented for all `validator::Validate` types to produce a [`Changeset`].
 pub use form::IntoChangeset;
 pub mod data;
+pub mod normalize;
 pub mod validation;
 pub mod webhook;
 #[cfg(feature = "http-client")]
@@ -327,6 +385,10 @@ pub mod ws;
 #[doc(hidden)]
 pub mod __private {
     #[cfg(feature = "db")]
+    pub use crate::db::scoped_transaction;
+    #[cfg(all(feature = "db", feature = "ws"))]
+    pub use crate::repository_commit_hooks::CURRENT_CHANNELS;
+    #[cfg(feature = "db")]
     pub use crate::repository_commit_hooks::{
         RepositoryCommitHookDescriptor, catch_repository_after_hook_unwind,
         discard_repository_commit_hook_pending, enqueue_repository_commit_hook_on_conn,
@@ -339,7 +401,9 @@ pub mod __private {
         start_repository_commit_hook_worker,
     };
     #[cfg(feature = "db")]
-    pub use crate::repository_commit_hooks::{get_global_channels, set_global_channels};
+    pub use crate::repository_commit_hooks::{
+        clear_global_channels, get_global_channels, set_global_channels,
+    };
     #[cfg(feature = "db")]
     pub use crate::version_history::VersionedRepositoryDescriptor;
 
@@ -386,6 +450,11 @@ pub use app::{ApiVersion, RegisteredApiVersions};
 /// connection. See [`db::Db`] for full documentation and examples.
 #[cfg(feature = "db")]
 pub use db::Db;
+
+/// Transaction options (isolation level + retry policy) and the savepoint
+/// helper for [`Db::tx_with`]. See [`db::TxOptions`].
+#[cfg(feature = "db")]
+pub use db::{IsolationLevel, TxOptions, savepoint};
 
 /// Framework error type and result alias.
 ///
@@ -441,14 +510,20 @@ pub use validation::Validated;
 #[cfg(feature = "htmx")]
 pub use htmx::{
     AUTUMN_WIDGETS_JS_PATH, HTMX_CSRF_JS_PATH, HTMX_JS, HTMX_JS_PATH, HTMX_SSE_JS,
-    HTMX_SSE_JS_PATH, HTMX_VERSION,
+    HTMX_SSE_JS_PATH, HTMX_VERSION, IDIOMORPH_JS, IDIOMORPH_JS_PATH,
 };
 #[cfg(all(feature = "htmx", feature = "maud"))]
 pub use htmx::{HtmxFragments, OobSwap};
+/// Trait for rendering a model instance as an htmx `hx-swap-oob` fragment.
+///
+/// Implement this on your model and declare `broadcasts = "topic"` on the
+/// `#[repository]` attribute to enable automatic live broadcasts.
+#[cfg(all(feature = "htmx", feature = "maud"))]
+pub use live::LiveFragment;
 #[cfg(feature = "mail")]
 pub use mail::{
-    Mail, MailConfig, MailDeliveryQueue, MailDeliveryQueueHandle, MailError, MailTransport, Mailer,
-    SmtpConfig, TlsMode, Transport,
+    Mail, MailAttachment, MailConfig, MailDeliveryQueue, MailDeliveryQueueHandle, MailError,
+    MailTransport, Mailer, SmtpConfig, TlsMode, Transport,
 };
 /// Extension trait adding `.validate()` to all `validator::Validate` types.
 pub use validation::ValidateExt;
@@ -546,6 +621,12 @@ pub use autumn_macros::mailer_preview;
 /// }
 /// ```
 pub use autumn_macros::main;
+/// Author a widget story for the `/_stories` gallery:
+/// `story!{ "Group", "Name", { ... } }`.
+///
+/// Also available as [`stories::story`], the macro's module home.
+#[cfg(feature = "maud")]
+pub use autumn_macros::story;
 
 /// Derive Diesel and Serde traits for a database model struct.
 ///
@@ -795,8 +876,15 @@ pub use auth::ApiToken;
 /// Tower layer that validates `Authorization: Bearer <token>` on API routes.
 ///
 /// Verifies tokens against any [`auth::ApiTokenStore`] implementation.
-/// Returns `401 Unauthorized` for missing, unknown, or revoked tokens.
+/// Returns `401 Unauthorized` for missing, unknown, revoked, or expired tokens.
 pub use auth::RequireApiToken;
+
+/// Scoped service-token types and helpers: mint named, scoped, optionally
+/// expiring tokens whose granted scopes flow into the policy layer.
+pub use auth::{
+    ApiTokenScopes, IssueTokenSpec, TokenMetadata, VerifiedToken, issue_scoped_api_token,
+    list_api_tokens, rotate_api_token,
+};
 
 /// Postgres-backed API token store (requires `db` feature).
 ///
@@ -889,6 +977,35 @@ pub use autumn_macros::secured;
 /// }
 /// ```
 pub use autumn_macros::step_up;
+
+/// Apply a per-route rate limit that composes with the global limiter.
+///
+/// # Forms
+///
+/// - `#[throttle(limit = 5, per = "1m")]` — inline limit; keying strategy
+///   matches the global limiter (`[security.rate_limit]`).
+/// - `#[throttle(limit = 5, per = "1m", key = "ip" | "principal" | "token")]`
+///   — inline limit with an explicit key strategy.
+/// - `#[throttle("login")]` — reference a named limiter defined in
+///   `[security.rate_limit.named.login]`.
+///
+/// Requests denied by the per-route bucket receive `429 Too Many Requests`
+/// with a `Retry-After` header and the standard `x-ratelimit-*` headers.
+/// [`RateLimitExempt`](crate::security::RateLimitExempt) still bypasses the
+/// per-route throttle.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use autumn_web::prelude::*;
+///
+/// #[post("/login")]
+/// #[throttle(limit = 5, per = "1m", key = "ip")]
+/// async fn login() -> AutumnResult<&'static str> {
+///     Ok("welcome back")
+/// }
+/// ```
+pub use autumn_macros::throttle;
 
 /// Gate a route handler on a named feature flag. If the flag is disabled for
 /// the current actor the handler responds with `404 Not Found` (default) or
@@ -1117,6 +1234,7 @@ pub mod reexports {
     pub use inventory;
     #[cfg(feature = "mail")]
     pub use lettre;
+    pub use rust_decimal;
     #[cfg(feature = "db")]
     pub use scoped_futures;
     pub use serde;

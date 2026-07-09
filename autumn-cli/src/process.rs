@@ -6,6 +6,8 @@
 //! liveness probing, atomic lock acquisition with stale-PID reclamation, and
 //! bounded waits for a process to exit.
 
+#![allow(dead_code, clippy::missing_const_for_fn)]
+
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::process::Child;

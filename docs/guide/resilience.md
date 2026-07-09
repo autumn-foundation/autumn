@@ -114,3 +114,48 @@ Example transition log:
 ```
 INFO circuit_breaker: Transitioned to OPEN circuit.name="api.stripe.com" circuit.state="OPEN" circuit.failure_ratio=0.6
 ```
+
+---
+
+## Overload Protection & Load Shedding
+
+Circuit breakers protect against a *downstream* dependency failing. Rate
+limiting protects against a *greedy client*. Neither protects against the
+*process itself* running out of capacity — a traffic spike, a slow query, or
+a GC stall that causes admitted requests to pile up faster than they
+complete. Left unbounded, that pile-up climbs RSS until the process is
+OOM-killed: a full blackout that drops every in-flight request at once.
+
+Autumn's answer is admission control: a single config knob caps concurrent
+in-flight requests, and the excess is shed immediately with a `503 Service
+Unavailable` + `Retry-After` — a brownout instead of a blackout.
+
+```toml
+# autumn.toml
+[server]
+max_concurrent_requests = 256   # unset by default (unlimited)
+```
+
+Override at runtime with `AUTUMN_SERVER__MAX_CONCURRENT_REQUESTS`. A
+reasonable starting point is the number of worker threads times a small
+multiple (2-4x); tune based on the observed `autumn_requests_shed_total`
+counter (exposed at `/actuator/prometheus`) and per-route latency.
+
+Key properties:
+
+- **Disabled by default.** `None`/`0` preserves today's unlimited behavior —
+  no existing application silently changes throughput.
+- **Before the handler runs.** A shed request never reaches your handler or
+  has its body read; the `503` is returned immediately.
+- **Probes are never shed.** `/health`, `/live`, `/ready`, `/startup`, and
+  the whole actuator prefix always pass through, so a merely-busy replica is
+  never killed by its orchestrator.
+- **Composes with graceful shutdown.** The admission counter is independent
+  of the shutdown-drain accounting, so shedding never double-counts,
+  deadlocks, or extends the drain budget.
+- **Observable.** Every shed request increments `autumn_requests_shed_total`
+  and is access-logged with `status = 503` like any other response.
+
+See [ADR 0009](../adr/0009-adopt-overload-protection-load-shedding.md) for
+the full design rationale and how this differs from rate limiting and
+per-request timeouts.

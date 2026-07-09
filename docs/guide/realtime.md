@@ -80,6 +80,87 @@ async fn private_events(
 }
 ```
 
+## Resumable SSE with `Last-Event-ID` (unreleased — trunk-dev, issue #1356)
+
+`sse::stream_resumable` is a drop-in upgrade to `sse::stream` that survives a
+brief client disconnect. Every event carries an automatic epoch-tagged per-topic
+`id` of the form `epoch.seq` (opaque to clients — the browser just stores it and
+echoes it back), and Autumn keeps a bounded per-topic replay ring buffer. When
+the browser reconnects it echoes back the last id it saw in the `Last-Event-ID`
+header (the SSE spec does this automatically); Autumn replays the events that
+arrived while the client was gone, then continues live — with no duplicated or
+skipped events at the seam.
+
+The `epoch` half of the id is a per-topic tag assigned when the topic's
+in-memory state is created; the `seq` half is a dense counter that restarts at
+`1` within each epoch. The epoch changes whenever the topic is
+garbage-collected/recreated or the process restarts, which lets Autumn tell a
+stale id from a previous epoch apart from a current-epoch id (see Limitations).
+
+```rust,no_run
+use autumn_web::prelude::*;
+use autumn_web::sse::LastEventId;
+
+#[get("/events")]
+async fn events(State(state): State<AppState>, LastEventId(last): LastEventId) -> impl IntoResponse {
+    autumn_web::sse::stream_resumable(&state, "tasks", last)
+}
+```
+
+- A first connection (no `Last-Event-ID`) behaves exactly like `sse::stream`:
+  no replay, just live events.
+- If the requested id has aged out of the retained window (the buffer
+  overflowed while the client was away), the stream emits a single `gap`
+  sentinel event (`event: gap`, `data: {"gap":true}`, no `id`) before the
+  partial replay so the client can recover — for example by refetching the full
+  list — instead of silently missing events.
+- The existing id-less helpers (`sse::stream`, `sse::stream_authorized`,
+  `sse::from_subscriber`) are unchanged; `stream_resumable` is additive.
+
+Retention is configured with `channels.replay_buffer` (number of most-recent
+events kept per topic; default `256`, env `AUTUMN_CHANNELS__REPLAY_BUFFER`).
+Memory is `O(N)` per topic regardless of publish throughput. Only the in-process
+backend retains a replay buffer; the Redis fan-out backend degrades gracefully
+to live-only.
+
+If you need the raw pieces (for a custom transport), `Channels::resume(topic,
+last_event_id)` returns a `ResumeHandle { subscriber, replay, gap, next_live_id,
+resumable }`.
+
+### Limitations
+
+The replay buffer is an in-process, best-effort convenience (the in-process
+scope of issue #1356, matching its "Out of Scope") — not a durable event log:
+
+- The buffer lives in the topic's in-memory state and is dropped when the topic
+  is garbage-collected. A topic is kept only while it has a live receiver or an
+  outstanding `Sender`, so a topic with only transient SSE subscribers can lose
+  its buffer during the disconnect window. Because the recreated topic gets a
+  new `epoch`, a client reconnecting across the gap is **not** silently fed a
+  corrupted partial: the epoch mismatch is detected, so the stream emits a `gap`
+  sentinel and then replays the full retained *current* epoch. The old epoch's
+  events themselves are gone (still best-effort), but the client is told to
+  resynchronise rather than receiving a hole.
+- On process restart (or any topic GC/recreation) the per-topic `seq` counter
+  resets to `1` under a fresh `epoch`. Before epoch tagging this was a real hole:
+  a client reconnecting with a stale `Last-Event-ID` whose `seq` the new epoch
+  had already passed (e.g. old `4`, new epoch already at `10`) received the new
+  epoch's later events while its earlier ones were silently dropped, because an
+  old id `4` was indistinguishable from a new id `4`. Now the epoch tag makes the
+  two id spaces distinct: a cross-epoch reconnect always yields a `gap` sentinel
+  followed by a full replay of the current epoch — never a silent partial. The
+  buffered history from before the restart is still gone (persist events
+  yourself for durability), but the client is never corrupted.
+- Publishing via `channels.publish()` / `broadcast().publish()` /
+  `channels.sender().send()` is safe on resumable topics: all three route
+  through the backend's `publish`, assigning ids and appending to the replay
+  buffer. Only calling `.send()` directly on the raw `broadcast::Sender`
+  (obtained from `channels.sender().keepalive` or the `ensure_topic` trait
+  method) bypasses id assignment and the replay buffer, breaking resumability.
+
+For durability across restarts or replicas, persist events yourself (a database
+table or a Redis stream) rather than relying on this buffer.
+
 ## Direct Channels
 
 `AppState::channels()` remains the low-level primitive for WebSocket loops and
@@ -146,6 +227,227 @@ selection, matching the session-store escape hatch.
 app.with_channels_backend(LocalChannelsBackend::new(64))
 # }
 ```
+
+## Auto-broadcast with `LiveFragment`
+
+Autumn can broadcast OOB (out-of-band) htmx fragments automatically whenever
+a repository mutates a record. Opt in by implementing `LiveFragment` on your
+model and adding `broadcasts = true` to `#[repository]`.
+
+Requires the `ws`, `maud`, and `htmx` Cargo features.
+
+### 1. Implement `LiveFragment`
+
+```rust
+use autumn_web::prelude::*;
+use maud::{Markup, html};
+
+pub struct Post { pub id: i64, pub title: String }
+
+impl LiveFragment for Post {
+    fn dom_id_for(id: i64) -> String {
+        format!("post-{id}")
+    }
+
+    fn dom_id(&self) -> String {
+        Self::dom_id_for(self.id)
+    }
+
+    fn render_fragment(&self) -> Markup {
+        html! {
+            li id=(self.dom_id()) { (self.title) }
+        }
+    }
+
+    // Override for inserts: append to a list container instead of
+    // trying to replace an element that doesn't exist yet on the client.
+    fn insert_swap() -> OobSwap {
+        OobSwap::Target(OobMethod::BeforeEnd, "#posts-list".to_string())
+    }
+}
+```
+
+### 2. Declare `broadcasts = true` on the repository
+
+```rust
+#[repository(Post, broadcasts = true)]
+pub trait PostRepository {}
+```
+
+Use `topic = "custom-name"` to override the default topic (which is the
+table name, e.g. `"posts"`). Broadcasts fire synchronously after each
+`save`, `update`, or `delete_by_id` call.
+
+### 3. Wire the SSE list container in your template
+
+```html
+<ul id="posts-list"
+    hx-ext="sse"
+    sse-connect="/posts/stream"
+    sse-swap="message"
+    hx-swap="none">
+  <!-- rows rendered server-side on initial load -->
+</ul>
+```
+
+`hx-swap="none"` is required — it disables htmx's default in-band
+`innerHTML` swap so that incoming SSE messages are processed only as OOB
+swaps (instead of clearing the list first).
+
+### 4. Add the SSE stream route
+
+```rust
+#[get("/posts/stream")]
+async fn stream(State(state): State<AppState>) -> impl IntoResponse {
+    autumn_web::sse::stream(&state, "posts")
+}
+```
+
+### OOB swap strategies
+
+| Mutation | Default strategy |
+|----------|-----------------|
+| `save`   | `LiveFragment::insert_swap()` — defaults to `OobSwap::True` (replace by id); override with `OobSwap::Target` to append to a container |
+| `update` | `OobSwap::OuterHTML` (replace element by matching id) |
+| `delete` | `OobSwap::Delete` (remove element from DOM) |
+
+When both `broadcasts = true` and `commit_hooks = true` are declared,
+broadcasts fire in the durable commit-hook worker (after DB commit). Without
+commit hooks, they fire inline after the mutation in the same async task.
+
+---
+
+## Live scaffold — the closest thing to Phoenix LiveView
+
+`autumn generate scaffold` with `--live` and `--live-validation` gives you
+the same two headline features that make Phoenix LiveView compelling:
+real-time DOM updates pushed from the server, and inline field validation
+without a page reload — all without a persistent socket or a client-side
+state machine.
+
+### The one-liner
+
+```sh
+autumn generate scaffold Post title:String body:String \
+    --live \
+    --live-validation \
+    --validate title=length:min=1,max=200 \
+    --validate body=length:min=1
+```
+
+Open two browser tabs on the index. Create, edit, or delete a post in one
+tab — the other tab updates itself via SSE without polling or a full reload.
+Type in the create/edit form — error messages appear inline, per field, on
+`change`, driven by the same server-side rules that guard the actual save.
+
+### What `--live` generates
+
+- A `LiveFragment` impl on the model (see above).
+- `#[repository(Post, broadcasts = true)]` on the repository — save, update,
+  and delete automatically publish OOB htmx fragments to connected clients.
+- A `/posts/events` SSE route.
+- The idiomorph `<script>` in the layout (`IDIOMORPH_JS_PATH`) and
+  `hx-ext="morph"` on `<body>` for smooth morphing navigations.
+- An index list container wired to the SSE stream:
+
+```html
+<ul id="posts-list"
+    hx-ext="sse"
+    sse-connect="/posts/events"
+    sse-swap="message"
+    hx-swap="none">
+```
+
+`hx-swap="none"` is intentional — it prevents htmx from running an
+in-band innerHTML swap (which would clear the list) when an SSE message
+arrives. The OOB attributes on each fragment handle their own targeted
+patch.
+
+### What `--live-validation` adds
+
+This is the key feature. For every field named in `--validate`, the
+scaffold generates three things working together:
+
+**1. `hx-*` attributes on each form input** (both create and edit forms):
+
+```html
+<input name="title" type="text" value=""
+       hx-post="/posts/validate/title"
+       hx-trigger="change"
+       hx-target="#title-error"
+       hx-swap="outerHTML">
+```
+
+On every `change` event the browser POSTs the current field value to a
+dedicated validation endpoint. No JavaScript required.
+
+**2. An error span slot** adjacent to each input:
+
+```html
+<span id="title-error"></span>
+```
+
+htmx's `hx-swap="outerHTML"` replaces this span with whatever the server
+returns — either a populated error span or an empty one on success.
+
+**3. A validation handler** per field that runs the actual declared rules:
+
+```rust
+#[post("/posts/validate/title")]
+pub async fn validate_title(body: Bytes) -> Markup {
+    let value = /* parse form body */;
+    let error: Option<&str> = if value.is_empty() {
+        Some("required")
+    } else if value.chars().count() > 200 {
+        Some("must be at most 200 characters")
+    } else {
+        None
+    };
+    html! {
+        span id="title-error" {
+            @if let Some(msg) = error {
+                span style="color:red" { (msg) }
+            }
+        }
+    }
+}
+```
+
+The rules are the same ones the model's `#[validate]` attributes enforce on
+save — they live in one place (the `--validate` flags) and the scaffold
+emits them consistently in both the model and the runtime handler. Users see
+feedback at `change` time; the server rejects invalid saves anyway; no
+duplication of logic.
+
+### Supported validation rules
+
+| Rule | Flag syntax | Behaviour |
+|------|-------------|-----------|
+| Required (non-nullable) | automatic | Empty string → `"required"` |
+| Min/max length | `length(min=1,max=200)` | Character count check |
+| Valid URL | `url` | `url::Url::parse` |
+| Valid email | `email` | `@` + domain dot check |
+
+### Comparison with Phoenix LiveView
+
+Phoenix LiveView achieves inline validation through a persistent WebSocket
+and a stateful server-side process that re-renders the form on each event.
+Autumn's approach is intentionally stateless — each validation POST is a
+standalone HTTP request that returns a single fragment. There is no
+per-connection server process to crash, hibernate, or scale; the tradeoff
+is that multi-field cross-validation (e.g. "password matches confirm")
+requires a small custom handler rather than a single `handle_event`.
+
+---
+
+## Presence helpers
+
+See the [Presence guide](presence.md) for `presence_stream` (an SSE stream
+of join/leave events with OOB count badges) and `presence_badge` (a
+re-usable viewer-count fragment). Both integrate with the same channels
+infrastructure described here.
+
+---
 
 ## Actuator Metrics
 

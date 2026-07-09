@@ -16,6 +16,11 @@ use serde_json::Value;
 
 use crate::{AppState, AutumnError, AutumnResult};
 
+pub use crate::job_tracking::{
+    JobContext, JobTrackingStore, JobTrackingStoreEntry, TrackedJobHandle, TrackedJobOwner,
+    TrackedJobRecord, TrackedJobStatus, enqueue_tracked, enqueue_tracked_for,
+};
+
 /// The asynchronous function signature for a background job.
 ///
 /// Handlers receive the full `AppState` and a JSON `Value` representing the job's payload.
@@ -80,6 +85,9 @@ pub struct JobInfo {
     pub max_attempts: u32,
     /// Base delay in milliseconds before the first retry (scales exponentially).
     pub initial_backoff_ms: u64,
+    /// Named queue this job is routed to. Workers drain queues in the priority
+    /// order configured under `[jobs] queues`. Defaults to `"default"`.
+    pub queue: String,
     /// Uniqueness (dedup) configuration; `None` means no dedup.
     pub uniqueness: Option<JobUniqueness>,
     /// In-flight concurrency cap; `None` means unbounded per-type concurrency.
@@ -101,10 +109,140 @@ impl JobInfo {
             name: name.into(),
             max_attempts,
             initial_backoff_ms,
+            queue: "default".to_string(),
             uniqueness: None,
             concurrency: None,
             handler,
         }
+    }
+}
+
+/// The queue every job lands on when none is declared.
+pub(crate) const DEFAULT_QUEUE: &str = "default";
+
+/// Normalize a declared queue name, mapping empty/whitespace to `"default"`.
+pub(crate) fn normalize_queue_name(name: &str) -> String {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        DEFAULT_QUEUE.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// The worker's queue drain plan: an ordered/weighted set of queues plus the
+/// strict-vs-weighted strategy. Backend-agnostic and shared by all three
+/// backends so priority logic lives in one place.
+#[derive(Debug, Clone)]
+pub(crate) struct QueueSchedule {
+    /// `(name, weight)` pairs, highest priority first.
+    queues: Vec<(String, u32)>,
+    strict: bool,
+}
+
+impl QueueSchedule {
+    /// Build a schedule from parsed `[jobs] queues` config.
+    pub(crate) fn from_config(cfg: &crate::config::JobQueuesConfig) -> Self {
+        let queues: Vec<(String, u32)> = cfg
+            .queues
+            .iter()
+            .map(|q| (normalize_queue_name(&q.name), q.weight.max(1)))
+            .collect();
+        let queues = if queues.is_empty() {
+            vec![(DEFAULT_QUEUE.to_string(), 1)]
+        } else {
+            queues
+        };
+        Self {
+            queues,
+            strict: cfg.strict,
+        }
+    }
+
+    /// Build the effective schedule, appending any queue that a registered job
+    /// declares but the operator did not configure — at lowest priority, so the
+    /// job still drains instead of silently stalling. Returns the names of those
+    /// unconfigured queues so the caller can log a loud warning.
+    pub(crate) fn effective(
+        cfg: &crate::config::JobQueuesConfig,
+        declared: &[String],
+    ) -> (Self, Vec<String>) {
+        let mut schedule = Self::from_config(cfg);
+        let mut warnings = Vec::new();
+        for declared_queue in declared {
+            let name = normalize_queue_name(declared_queue);
+            if !schedule.queues.iter().any(|(n, _)| *n == name) {
+                schedule.queues.push((name.clone(), 1));
+                warnings.push(name);
+            }
+        }
+        (schedule, warnings)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) const fn is_strict(&self) -> bool {
+        self.strict
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn contains(&self, name: &str) -> bool {
+        self.queues.iter().any(|(n, _)| n == name)
+    }
+
+    /// Queue names highest priority first.
+    #[cfg_attr(not(any(test, feature = "redis")), allow(dead_code))]
+    pub(crate) fn names(&self) -> Vec<String> {
+        self.queues.iter().map(|(n, _)| n.clone()).collect()
+    }
+
+    /// A per-worker cursor producing each claim iteration's attempt order.
+    pub(crate) fn cursor(&self) -> QueueCursor {
+        QueueCursor {
+            names: Arc::new(self.queues.iter().map(|(n, _)| n.clone()).collect()),
+            weights: self.queues.iter().map(|(_, w)| *w).collect(),
+            current: vec![0_i64; self.queues.len()],
+            strict: self.strict,
+        }
+    }
+}
+
+/// Per-worker draining cursor. For strict schedules it always yields the
+/// configured order; for weighted schedules it uses smooth weighted round-robin
+/// so each queue is served in proportion to its weight and none is ever starved.
+#[derive(Debug, Clone)]
+pub(crate) struct QueueCursor {
+    names: Arc<Vec<String>>,
+    weights: Vec<u32>,
+    current: Vec<i64>,
+    strict: bool,
+}
+
+impl QueueCursor {
+    /// Ordered queue names to attempt for this claim iteration. The first entry
+    /// is the queue to serve now; the rest follow (so a worker never idles while
+    /// any queue has work).
+    pub(crate) fn next_order(&mut self) -> Arc<Vec<String>> {
+        if self.strict || self.names.len() <= 1 {
+            return Arc::clone(&self.names);
+        }
+        // Smooth weighted round-robin (nginx-style): every queue is the first
+        // choice exactly `weight` times per cycle of length `sum(weights)`.
+        let total: i64 = self.weights.iter().map(|w| i64::from(*w)).sum();
+        let mut best = 0_usize;
+        for i in 0..self.names.len() {
+            self.current[i] += i64::from(self.weights[i]);
+            if self.current[i] > self.current[best] {
+                best = i;
+            }
+        }
+        self.current[best] -= total;
+        // Chosen queue first, then the rest by descending remaining credit.
+        let mut rest: Vec<usize> = (0..self.names.len()).filter(|&i| i != best).collect();
+        rest.sort_by(|&a, &b| self.current[b].cmp(&self.current[a]));
+        let mut order = Vec::with_capacity(self.names.len());
+        order.push(self.names[best].clone());
+        order.extend(rest.into_iter().map(|i| self.names[i].clone()));
+        Arc::new(order)
     }
 }
 
@@ -133,6 +271,8 @@ pub struct JobClient {
 struct JobRuntimeSettings {
     max_attempts: u32,
     initial_backoff_ms: u64,
+    /// Named queue the job is routed to (defaults to `"default"`).
+    queue: String,
     uniqueness: Option<JobUniqueness>,
     concurrency: Option<JobConcurrency>,
 }
@@ -180,11 +320,17 @@ impl ResolvedJobConstraints {
     }
 }
 
-/// Whether an enqueue stored a new job or coalesced into an existing one.
+/// Whether an enqueue stored a new job, coalesced into an existing one, or
+/// was never delivered at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EnqueueOutcome {
     Queued,
     Deduplicated,
+    /// A `JobInterceptor::intercept_enqueue` completed without ever awaiting
+    /// the `next` future it was handed, so the job was never actually
+    /// delivered to any backend — distinct from `Queued` (which callers must
+    /// not treat as a successful delivery).
+    Skipped,
 }
 
 /// Specifies the due instant for an after-commit enqueue.
@@ -203,6 +349,8 @@ enum AfterCommitDue {
 struct QueuedJob {
     id: String,
     name: String,
+    /// Named queue this job is routed to (defaults to `"default"`).
+    queue: String,
     payload: Value,
     attempt: u32,
     max_attempts: u32,
@@ -287,6 +435,8 @@ pub struct JobAdminRecord {
     pub id: String,
     /// Job kind/name from `#[job(name = "...")]`.
     pub name: String,
+    /// Named queue the job is routed to (from `#[job(queue = "...")]`).
+    pub queue: String,
     /// Current lifecycle status.
     pub status: JobAdminStatus,
     /// Time the job entered the queue.
@@ -457,6 +607,7 @@ pub fn job_admin_backend(state: &AppState) -> Option<Arc<dyn JobAdminBackend>> {
 struct JobAdminStoredRecord {
     id: String,
     name: String,
+    queue: String,
     payload: Value,
     status: JobAdminStatus,
     enqueued_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -482,6 +633,7 @@ impl JobAdminStoredRecord {
         JobAdminRecord {
             id: self.id.clone(),
             name: self.name.clone(),
+            queue: self.queue.clone(),
             status: self.status,
             enqueued_at: self.enqueued_at.map(format_job_admin_time),
             scheduled_for: self.scheduled_for.map(format_job_admin_time),
@@ -542,6 +694,7 @@ impl JobAdminMemoryBackend {
         &self,
         id: String,
         name: &str,
+        queue: &str,
         payload: Value,
         attempt: u32,
         max_attempts: u32,
@@ -562,6 +715,7 @@ impl JobAdminMemoryBackend {
                 JobAdminStoredRecord {
                     id,
                     name: name.to_owned(),
+                    queue: normalize_queue_name(queue),
                     payload,
                     status,
                     enqueued_at: Some(now),
@@ -869,6 +1023,7 @@ impl JobAdminMemoryBackend {
         self.record_enqueue_due(
             id.clone(),
             name,
+            DEFAULT_QUEUE,
             payload,
             attempt,
             max_attempts,
@@ -913,8 +1068,23 @@ impl JobAdminBackend for JobAdminMemoryBackend {
                 AutumnError::service_unavailable_msg("job runtime is not initialized")
             })?;
             let (name, payload) = self.retry_payload(&id)?;
+            let payload_for_reset = payload.clone();
+            // Snapshot the tracking record's owner/updated_at *before*
+            // re-enqueueing makes the retry visible to workers, so the
+            // reset below can detect (and skip) a retry that completes
+            // faster than this function returns.
+            let retry_snapshot =
+                crate::job_tracking::capture_retry_snapshot(&payload_for_reset).await;
             match client.enqueue_with_outcome(&name, payload).await {
-                Ok(EnqueueOutcome::Queued) => Ok(()),
+                Ok(EnqueueOutcome::Queued) => {
+                    // The record was `Failed` (terminal) from the original
+                    // run; reset it to `Pending` so the retried attempt's
+                    // mark_running/set_progress calls (which otherwise
+                    // no-op against a terminal record) surface.
+                    crate::job_tracking::apply_retry_reset(&payload_for_reset, retry_snapshot)
+                        .await;
+                    Ok(())
+                }
                 Ok(EnqueueOutcome::Deduplicated) => {
                     // No retry was actually queued: an equivalent unique job
                     // already holds the key. Restore the failed record and
@@ -923,6 +1093,15 @@ impl JobAdminBackend for JobAdminMemoryBackend {
                     Err(AutumnError::bad_request_msg(
                         "an equivalent unique job is already pending or running; \
                          retry after it settles",
+                    ))
+                }
+                Ok(EnqueueOutcome::Skipped) => {
+                    // A JobInterceptor declined to deliver the retry — the
+                    // record must not be left in a "retrying" state for a
+                    // job that will never actually run.
+                    self.restore_failed_retry(&id);
+                    Err(AutumnError::bad_request_msg(
+                        "the retry was intercepted and not delivered to the queue",
                     ))
                 }
                 Err(error) => {
@@ -1061,12 +1240,24 @@ fn fnv1a_64(input: &str) -> u64 {
     hash
 }
 
+/// Whether `attempt` is a job's last allowed attempt.
+///
+/// The single comparison every backend's retry-vs-terminal decision is built
+/// on: shared so the `final_attempt` flag computed before execution (which
+/// decides whether a tracked job's status settles to `failed` or stays
+/// `running`) can never silently drift from that same backend's own
+/// post-execution retry/dead-letter decision.
+fn is_final_attempt<T: PartialOrd>(attempt: &T, max_attempts: &T) -> bool {
+    attempt >= max_attempts
+}
+
 /// Derive the uniqueness key for a job payload.
 ///
 /// With `unique_by` fields configured the key concatenates the canonical JSON
 /// of each selected field (missing fields read as `null`); otherwise it is a
 /// stable hash of the full canonicalized payload.
 fn job_unique_key(uniqueness: &JobUniqueness, payload: &Value) -> String {
+    let (_, payload) = crate::job_tracking::split_tracked_payload(payload);
     if uniqueness.by.is_empty() {
         let mut canonical = String::new();
         write_canonical_json(payload, &mut canonical);
@@ -1091,6 +1282,7 @@ fn job_unique_key(uniqueness: &JobUniqueness, payload: &Value) -> String {
 /// type). A configured-but-missing field reads as canonical `null` so all
 /// payloads lacking the field share one scope.
 fn job_concurrency_scope(concurrency: &JobConcurrency, payload: &Value) -> Option<String> {
+    let (_, payload) = crate::job_tracking::split_tracked_payload(payload);
     concurrency.key.as_ref().map(|field| {
         let mut scope = String::new();
         write_canonical_json(payload.get(field).unwrap_or(&Value::Null), &mut scope);
@@ -1099,6 +1291,7 @@ fn job_concurrency_scope(concurrency: &JobConcurrency, payload: &Value) -> Optio
 }
 
 fn job_payload_identity(payload: &Value) -> (Option<String>, Option<String>) {
+    let (_, payload) = crate::job_tracking::split_tracked_payload(payload);
     let principal = first_payload_string(payload, &["principal_id", "principal", "user_id"]);
     let correlation = first_payload_string(payload, &["correlation_id", "request_id"]);
     (principal, correlation)
@@ -1130,10 +1323,19 @@ fn default_job_admin_backend_for_state(state: &AppState) -> JobAdminMemoryBacken
 }
 
 #[cfg(feature = "redis")]
+fn default_redis_queue() -> String {
+    DEFAULT_QUEUE.to_string()
+}
+
+#[cfg(feature = "redis")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RedisJobRecord {
     id: String,
     name: String,
+    /// Named queue (defaults to `"default"`; `serde(default)` keeps records
+    /// written before queues existed readable after an upgrade).
+    #[serde(default = "default_redis_queue")]
+    queue: String,
     payload: Value,
     attempt: u32,
     max_attempts: u32,
@@ -1337,7 +1539,14 @@ fn redis_worker_idle_sleep(retry_promotion_interval: std::time::Duration) -> std
 #[cfg(feature = "redis")]
 #[derive(Clone)]
 struct RedisWorkerConfig {
+    /// Default-queue list key (`{prefix}:queue`); retained for the test suite
+    /// and as the promotion fallback target.
+    #[cfg_attr(not(test), allow(dead_code))]
     queue_key: String,
+    /// Base key prefix used to derive per-queue list keys.
+    key_prefix: String,
+    /// Priority drain schedule across named queues.
+    schedule: QueueSchedule,
     processing_key: String,
     delayed_key: String,
     dead_key: String,
@@ -1352,6 +1561,17 @@ struct RedisWorkerConfig {
     default_attempts: u32,
     default_backoff: u64,
     retry_promotion_interval: std::time::Duration,
+}
+
+#[cfg(feature = "redis")]
+impl RedisWorkerConfig {
+    /// Ordered queue list keys to attempt for one claim iteration.
+    fn queue_keys_for(&self, order: &[String]) -> Vec<String> {
+        order
+            .iter()
+            .map(|queue| redis_queue_key(&self.key_prefix, queue))
+            .collect()
+    }
 }
 
 #[cfg(feature = "redis")]
@@ -1460,7 +1680,26 @@ async fn run_job_handler(
     handler: JobHandler,
     state: AppState,
     payload: Value,
+    final_attempt: bool,
 ) -> JobExecutionOutcome {
+    // Tracked jobs carry their args wrapped in an envelope keyed by a hash of
+    // the polling token (never the raw token). Strip it here — the single
+    // choke point all three backends run handlers through — so the handler
+    // itself only ever sees the caller's original args, and make a
+    // `JobContext` ambient for the duration of execution so `ctx.set_progress`
+    // works from anywhere inside the handler.
+    let (tracked_key, payload) = crate::job_tracking::take_tracked_payload(payload);
+    let ctx = match &tracked_key {
+        Some(key) => match crate::job_tracking::tracking_store_from_state(&state) {
+            Some(store) => {
+                let _ = store.mark_running(key).await;
+                crate::job_tracking::JobContext::tracked(key.clone(), store)
+            }
+            None => crate::job_tracking::JobContext::none(),
+        },
+        None => crate::job_tracking::JobContext::none(),
+    };
+
     // Make this job's app the ambient event context so a job (or durable event
     // listener) that calls the free `events::publish` dispatches against its own
     // app rather than the process-global bus.
@@ -1494,17 +1733,45 @@ async fn run_job_handler(
         }
     }));
 
-    let future = match interceptor_res {
-        Ok(future) => future,
-        Err(panic) => return JobExecutionOutcome::Panicked(format_job_panic(panic.as_ref())),
+    let outcome = match interceptor_res {
+        Ok(future) => {
+            let execution = std::panic::AssertUnwindSafe(future).catch_unwind();
+            match crate::job_tracking::scope(
+                ctx.clone(),
+                crate::events::scope_event_app(event_app, execution),
+            )
+            .await
+            {
+                Ok(Ok(())) => JobExecutionOutcome::Succeeded,
+                Ok(Err(error)) => JobExecutionOutcome::Failed(error.to_string()),
+                Err(panic) => JobExecutionOutcome::Panicked(format_job_panic(panic.as_ref())),
+            }
+        }
+        Err(panic) => JobExecutionOutcome::Panicked(format_job_panic(panic.as_ref())),
     };
 
-    let execution = std::panic::AssertUnwindSafe(future).catch_unwind();
-    match crate::events::scope_event_app(event_app, execution).await {
-        Ok(Ok(())) => JobExecutionOutcome::Succeeded,
-        Ok(Err(error)) => JobExecutionOutcome::Failed(error.to_string()),
-        Err(panic) => JobExecutionOutcome::Panicked(format_job_panic(panic.as_ref())),
+    if tracked_key.is_some() {
+        match &outcome {
+            JobExecutionOutcome::Succeeded => ctx.settle_success().await,
+            // Panics always dead-letter regardless of remaining attempts
+            // (matching every backend's worker loop), so they are always
+            // terminal for tracking purposes too.
+            JobExecutionOutcome::Panicked(_) => {
+                ctx.settle_failure(crate::job_tracking::GENERIC_FAILURE_MESSAGE)
+                    .await;
+            }
+            JobExecutionOutcome::Failed(_) if final_attempt => {
+                ctx.settle_failure(crate::job_tracking::GENERIC_FAILURE_MESSAGE)
+                    .await;
+            }
+            JobExecutionOutcome::Failed(_) => {
+                // A retry is pending; leave the record running so progress
+                // persists across attempts.
+            }
+        }
     }
+
+    outcome
 }
 
 fn format_job_panic(panic: &(dyn std::any::Any + Send)) -> String {
@@ -1566,26 +1833,30 @@ pub fn global_job_client() -> Option<Arc<JobClient>> {
 pub(crate) fn install_job_client(state: &AppState, client: JobClient) {
     state.insert_extension(client.clone());
     init_global_job_client(client);
+    // `enqueue_tracked` needs a tracking store the moment a job runtime is
+    // live, even for backends/tests that build a `JobClient` directly rather
+    // than going through `start_runtime` (which installs a config-driven
+    // store before the backend starter runs and gets here).
+    crate::job_tracking::ensure_tracking_store_installed(state);
 }
 
 pub(crate) fn init_global_job_client(client: JobClient) {
-    if let Some(lock) = GLOBAL_JOB_CLIENT.get() {
-        if let Ok(mut guard) = lock.write() {
-            *guard = Some(Arc::new(client));
-        }
-        return;
-    }
-    let _ = GLOBAL_JOB_CLIENT.set(RwLock::new(Some(Arc::new(client))));
+    let lock = GLOBAL_JOB_CLIENT.get_or_init(|| RwLock::new(None));
+    let mut guard = lock
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *guard = Some(Arc::new(client));
 }
 
 pub fn clear_global_job_client() {
-    if let Some(lock) = GLOBAL_JOB_CLIENT.get() {
-        if let Ok(mut guard) = lock.write() {
-            *guard = None;
-        }
-    } else {
-        let _ = GLOBAL_JOB_CLIENT.set(RwLock::new(None));
+    let lock = GLOBAL_JOB_CLIENT.get_or_init(|| RwLock::new(None));
+    {
+        let mut guard = lock
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = None;
     }
+    crate::job_tracking::clear_global_tracking_store();
 }
 
 /// Enqueue a job payload on the configured runtime backend.
@@ -1901,6 +2172,7 @@ impl JobClient {
     /// or enqueueing fails in the active backend.
     #[allow(clippy::too_many_lines)]
     pub async fn enqueue(&self, name: &str, payload: Value) -> AutumnResult<()> {
+        crate::job_tracking::reject_reserved_envelope_marker(&payload)?;
         self.enqueue_with_outcome(name, payload).await.map(|_| ())
     }
 
@@ -1917,6 +2189,7 @@ impl JobClient {
         payload: Value,
         due_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> AutumnResult<()> {
+        crate::job_tracking::reject_reserved_envelope_marker(&payload)?;
         self.enqueue_with_outcome_due(name, payload, due_at)
             .await
             .map(|_| ())
@@ -1963,12 +2236,14 @@ impl JobClient {
         } else {
             self.default_initial_backoff_ms
         };
+        let job_queue = normalize_queue_name(&settings.queue);
         let constraints = ResolvedJobConstraints::for_payload(settings, &payload);
         let id = uuid::Uuid::new_v4().to_string();
         self.registry.record_enqueue(name);
         self.job_admin.record_enqueue_due(
             id.clone(),
             name,
+            &job_queue,
             payload.clone(),
             1,
             job_max_attempts,
@@ -2001,6 +2276,7 @@ impl JobClient {
                 let queued = QueuedJob {
                     id: id_for_enqueue.clone(),
                     name: name.to_string(),
+                    queue: job_queue.clone(),
                     payload: payload_clone.clone(),
                     attempt: 1,
                     max_attempts: job_max_attempts,
@@ -2091,6 +2367,7 @@ impl JobClient {
                 self.enqueue_durable(
                     id_for_enqueue.clone(),
                     name,
+                    &job_queue,
                     payload_clone.clone(),
                     job_max_attempts,
                     job_backoff_ms,
@@ -2100,7 +2377,11 @@ impl JobClient {
                 .await
             };
             let result = match outcome {
-                Ok(EnqueueOutcome::Queued) => Ok(()),
+                // `Skipped` can never actually be produced here — it's a
+                // synthetic outcome the outer wrapper derives from whether
+                // this closure ran at all — but it's part of the enum, so
+                // the match must stay exhaustive.
+                Ok(EnqueueOutcome::Queued | EnqueueOutcome::Skipped) => Ok(()),
                 Ok(EnqueueOutcome::Deduplicated) => {
                     self.record_deduplicated_enqueue(name, &id_for_enqueue);
                     deduplicated_clone.store(true, ::std::sync::atomic::Ordering::SeqCst);
@@ -2117,18 +2398,35 @@ impl JobClient {
 
         let res = if let Some(interceptor) = &self.interceptor {
             let interceptor = (*interceptor).clone();
-            run_enqueue_interceptor(interceptor, name, &payload, Box::pin(actual_enqueue)).await
+            // `payload` is the tracked-envelope-wrapped value for a tracked
+            // job (see `enqueue_tracked_for`); app-registered interceptors
+            // must see the real args, matching what `intercept_execute` sees
+            // at run time, not the internal envelope.
+            let (_, interceptor_payload) = crate::job_tracking::split_tracked_payload(&payload);
+            run_enqueue_interceptor(
+                interceptor,
+                name,
+                interceptor_payload,
+                Box::pin(actual_enqueue),
+            )
+            .await
         } else {
             actual_enqueue.await
         };
 
-        if !started.load(::std::sync::atomic::Ordering::SeqCst) {
+        let started = started.load(::std::sync::atomic::Ordering::SeqCst);
+        if !started {
             self.registry.record_cancel(name);
             self.job_admin.record_cancelled(&id);
         }
         res.map(|()| {
             if deduplicated.load(::std::sync::atomic::Ordering::SeqCst) {
                 EnqueueOutcome::Deduplicated
+            } else if !started {
+                // The interceptor completed without ever awaiting `next`, so
+                // `actual_enqueue` (and thus the real backend write) never
+                // ran — this must not be reported as Queued.
+                EnqueueOutcome::Skipped
             } else {
                 EnqueueOutcome::Queued
             }
@@ -2239,6 +2537,11 @@ impl JobClient {
                 "enqueue_after_commit: failed to serialize payload for job '{name}': {e}"
             )))
         })?;
+        // Also validate eagerly: the deferred callback below calls
+        // enqueue_due (which re-checks this), but that runs after the
+        // transaction has already committed — by then it's too late for the
+        // caller to roll back on a rejected payload.
+        crate::job_tracking::reject_reserved_envelope_marker(&payload)?;
         let client = self.clone();
         // Keep a copy for the debug log in the eager path (name is moved into f_opt).
         let name_for_log = name.clone();
@@ -2295,6 +2598,7 @@ impl JobClient {
         &self,
         id: String,
         name: &str,
+        queue: &str,
         payload: Value,
         max_attempts: u32,
         backoff_ms: u64,
@@ -2327,6 +2631,7 @@ impl JobClient {
             .enqueue_durable_inner(
                 id,
                 name,
+                queue,
                 payload,
                 max_attempts,
                 backoff_ms,
@@ -2347,6 +2652,7 @@ impl JobClient {
         &self,
         id: String,
         name: &str,
+        queue: &str,
         payload: Value,
         max_attempts: u32,
         backoff_ms: u64,
@@ -2360,6 +2666,7 @@ impl JobClient {
                 .enqueue(
                     id,
                     name,
+                    queue,
                     payload,
                     max_attempts,
                     backoff_ms,
@@ -2374,6 +2681,7 @@ impl JobClient {
                 pool,
                 id,
                 name,
+                queue,
                 payload,
                 max_attempts,
                 backoff_ms,
@@ -2385,6 +2693,7 @@ impl JobClient {
         let _ = (
             id,
             name,
+            queue,
             payload,
             max_attempts,
             backoff_ms,
@@ -2436,6 +2745,7 @@ impl JobClient {
         conn: &mut diesel_async::AsyncPgConnection,
         due_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> AutumnResult<()> {
+        crate::job_tracking::reject_reserved_envelope_marker(&payload)?;
         let due_at = due_at.filter(|due| *due > chrono::Utc::now());
         let Some(settings) = self.per_job_settings.get(name) else {
             return Err(AutumnError::internal_server_error(std::io::Error::other(
@@ -2452,6 +2762,7 @@ impl JobClient {
         } else {
             self.default_initial_backoff_ms
         };
+        let job_queue = normalize_queue_name(&settings.queue);
         let constraints = ResolvedJobConstraints::for_payload(settings, &payload);
         let id = uuid::Uuid::new_v4().to_string();
 
@@ -2489,6 +2800,7 @@ impl JobClient {
                     conn,
                     id_for_enqueue.clone(),
                     name,
+                    &job_queue,
                     payload_for_enqueue,
                     job_max_attempts,
                     job_backoff_ms,
@@ -2554,6 +2866,8 @@ pub fn start_runtime(
         )))
     })?;
 
+    crate::job_tracking::ensure_tracking_store_installed_from_config(state, config);
+
     match config.backend.as_str() {
         "local" => {
             start_local_runtime(
@@ -2563,6 +2877,7 @@ pub fn start_runtime(
                 config.workers,
                 config.max_attempts,
                 config.initial_backoff_ms,
+                &config.queues,
             );
             Ok(())
         }
@@ -2604,6 +2919,7 @@ pub fn start_runtime(
                 config.workers,
                 config.max_attempts,
                 config.initial_backoff_ms,
+                &config.queues,
             );
             Ok(())
         }
@@ -2747,6 +3063,7 @@ pub(crate) fn start_local_runtime(
     workers: usize,
     default_max_attempts: u32,
     default_initial_backoff_ms: u64,
+    queues_config: &crate::config::JobQueuesConfig,
 ) {
     let job_admin = default_job_admin_backend_for_state(state);
     let per_job_settings = build_per_job_settings(&jobs);
@@ -2762,9 +3079,22 @@ pub(crate) fn start_local_runtime(
     }
 
     let worker_count = workers.max(1);
-    let (tx, rx) = tokio::sync::mpsc::channel::<QueuedJob>(1024);
-    let shared_rx = Arc::new(tokio::sync::Mutex::new(rx));
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<QueuedJob>(1024);
     let coordination = Arc::new(LocalJobCoordination::default());
+
+    // Build the priority drain schedule from `[jobs] queues`, appending any
+    // queue declared on a job but missing from config at lowest priority so it
+    // still drains. Warn loudly about those so the operator can fix the config.
+    let declared_queues = collect_declared_queues(&jobs_by_name);
+    let (schedule, unconfigured) = QueueSchedule::effective(queues_config, &declared_queues);
+    for queue in &unconfigured {
+        tracing::warn!(
+            queue = %queue,
+            "job declares queue '{queue}' which is not in [jobs] queues; draining it at \
+             lowest priority. Add it to the configured queue list to control its priority.",
+        );
+    }
+    let buffer = Arc::new(LocalQueueBuffer::new());
 
     let client = JobClient {
         local_sender: Some(tx.clone()),
@@ -2787,29 +3117,126 @@ pub(crate) fn start_local_runtime(
     };
     install_job_client(state, client);
 
+    // Ingress task: own the channel receiver and route each job into its named
+    // queue in the shared priority buffer. Retries and concurrency-unparked jobs
+    // re-enter here too, preserving their queue.
+    {
+        let buffer = Arc::clone(&buffer);
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    () = shutdown.cancelled() => break,
+                    maybe = rx.recv() => {
+                        match maybe {
+                            Some(job) => buffer.push(job),
+                            None => break,
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     for _ in 0..worker_count {
         let state = state.clone();
         let tx = tx.clone();
         let job_admin = job_admin.clone();
         let jobs_by_name = Arc::clone(&jobs_by_name);
-        let shared_rx = Arc::clone(&shared_rx);
+        let buffer = Arc::clone(&buffer);
         let shutdown = shutdown.clone();
         let coordination = Arc::clone(&coordination);
+        let mut cursor = schedule.cursor();
 
         tokio::spawn(async move {
             loop {
+                // Register interest before checking so an enqueue that lands
+                // between the pop attempt and the await is never lost.
+                let notified = buffer.notify.notified();
+                if let Some(job) = buffer.try_pop(&cursor.next_order()) {
+                    execute_local_job(job, &jobs_by_name, &tx, &state, &job_admin, &coordination)
+                        .await;
+                    continue;
+                }
                 tokio::select! {
                     () = shutdown.cancelled() => break,
-                    maybe = async {
-                        let mut guard = shared_rx.lock().await;
-                        guard.recv().await
-                    } => {
-                        let Some(job) = maybe else { break; };
-                        execute_local_job(job, &jobs_by_name, &tx, &state, &job_admin, &coordination).await;
-                    }
+                    () = notified => {}
                 }
             }
         });
+    }
+}
+
+/// Distinct queue names declared by the registered jobs.
+fn collect_declared_queues(jobs_by_name: &Arc<RwLock<HashMap<String, JobInfo>>>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut queues = Vec::new();
+    {
+        let guard = jobs_by_name.read().expect("job registry lock poisoned");
+        for job in guard.values() {
+            let name = normalize_queue_name(&job.queue);
+            if seen.insert(name.clone()) {
+                queues.push(name);
+            }
+        }
+    }
+    queues
+}
+
+const LOCAL_QUEUE_WARN_THRESHOLD: usize = 10_000;
+
+/// Shared, priority-ordered job buffer for the in-process backend.
+///
+/// Jobs are bucketed per named queue; workers pop the highest-priority
+/// non-empty queue according to their [`QueueCursor`]. A fallback sweep ensures
+/// a job whose queue is somehow outside the drain order is never stranded.
+struct LocalQueueBuffer {
+    inner: std::sync::Mutex<HashMap<String, VecDeque<QueuedJob>>>,
+    notify: tokio::sync::Notify,
+}
+
+impl LocalQueueBuffer {
+    fn new() -> Self {
+        Self {
+            inner: std::sync::Mutex::new(HashMap::new()),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    #[allow(clippy::significant_drop_tightening)]
+    fn push(&self, job: QueuedJob) {
+        {
+            let mut map = self.inner.lock().expect("local job buffer lock poisoned");
+            let bucket = map.entry(normalize_queue_name(&job.queue)).or_default();
+            if bucket.len() == LOCAL_QUEUE_WARN_THRESHOLD {
+                tracing::warn!(
+                    queue = %job.queue,
+                    threshold = LOCAL_QUEUE_WARN_THRESHOLD,
+                    "local job queue has grown past the warning threshold; \
+                     memory use is unbounded — consider reducing enqueue rate or \
+                     switching to the Redis or Postgres backend"
+                );
+            }
+            bucket.push_back(job);
+        }
+        self.notify.notify_one();
+    }
+
+    #[allow(clippy::significant_drop_tightening)]
+    fn try_pop(&self, order: &[String]) -> Option<QueuedJob> {
+        let mut map = self.inner.lock().expect("local job buffer lock poisoned");
+        for name in order {
+            if let Some(job) = map.get_mut(name).and_then(VecDeque::pop_front) {
+                return Some(job);
+            }
+        }
+        // Never strand work: drain any queue outside the configured order.
+        for queue in map.values_mut() {
+            if let Some(job) = queue.pop_front() {
+                return Some(job);
+            }
+        }
+        None
     }
 }
 
@@ -2840,6 +3267,12 @@ async fn execute_local_job(
         if job_admin.try_record_start(&job.id, job.attempt) == JobAdminStartDecision::Canceled {
             state.job_registry.record_cancel(&job.name);
             job_admin.record_cancelled(&job.id);
+            crate::job_tracking::settle_tracked_payload_as_failed(
+                state,
+                &job.payload,
+                "This job was canceled.",
+            )
+            .await;
             return;
         }
         state.job_registry.record_start(&job.name);
@@ -2847,6 +3280,12 @@ async fn execute_local_job(
             .job_registry
             .record_failure(&job.name, format!("unknown job '{}'", job.name), true);
         job_admin.record_failure(&job.id, format!("unknown job '{}'", job.name));
+        crate::job_tracking::settle_tracked_payload_as_failed(
+            state,
+            &job.payload,
+            crate::job_tracking::GENERIC_FAILURE_MESSAGE,
+        )
+        .await;
         return;
     };
 
@@ -2883,6 +3322,12 @@ async fn execute_local_job(
             &job.id,
         );
         finish_local_slot(coordination, concurrency_group.as_ref(), tx, state);
+        crate::job_tracking::settle_tracked_payload_as_failed(
+            state,
+            &job.payload,
+            "This job was canceled.",
+        )
+        .await;
         return;
     }
     state.job_registry.record_start(&job.name);
@@ -2918,7 +3363,14 @@ async fn execute_local_job(
         use tracing_opentelemetry::OpenTelemetrySpanExt as _;
         let _ = job_span.set_parent(cx);
     }
-    let f = run_job_handler(&job.name, handler, state.clone(), job.payload.clone());
+    let final_attempt = is_final_attempt(&job.attempt, &max_attempts);
+    let f = run_job_handler(
+        &job.name,
+        handler,
+        state.clone(),
+        job.payload.clone(),
+        final_attempt,
+    );
     let outcome = tracing::Instrument::instrument(f, job_span).await;
     match outcome {
         JobExecutionOutcome::Succeeded => {
@@ -2933,7 +3385,8 @@ async fn execute_local_job(
             );
         }
         JobExecutionOutcome::Failed(error) => {
-            if job.attempt < max_attempts {
+            #[allow(clippy::if_not_else)]
+            if !is_final_attempt(&job.attempt, &max_attempts) {
                 // Running-window keys stay held across retries (the job is
                 // still in flight until it settles). A pending-window key was
                 // released when execution started, so re-acquire it now to
@@ -2949,6 +3402,16 @@ async fn execute_local_job(
                     if !coordination.try_acquire_unique(&job.name, &key, &job.id, unique.window) {
                         state.job_registry.record_deduplicated(&job.name);
                         job_admin.record_deduplicated(&job.id);
+                        // This job will never run again — it was coalesced
+                        // into the duplicate that now owns the unique lock —
+                        // so its tracked record (if any) must settle now
+                        // rather than being left non-terminal until TTL.
+                        crate::job_tracking::settle_tracked_payload_as_failed(
+                            state,
+                            &job.payload,
+                            "An equivalent job is already in progress.",
+                        )
+                        .await;
                         finish_local_slot(coordination, concurrency_group.as_ref(), tx, state);
                         return;
                     }
@@ -2962,6 +3425,7 @@ async fn execute_local_job(
                 let job_admin = job_admin.clone();
                 let id = job.id.clone();
                 let name = job.name.clone();
+                let queue = job.queue.clone();
                 let payload = job.payload;
                 #[cfg(feature = "telemetry-otlp")]
                 let traceparent = job.traceparent;
@@ -2976,6 +3440,7 @@ async fn execute_local_job(
                         .send(QueuedJob {
                             id,
                             name,
+                            queue,
                             payload,
                             attempt: job.attempt + 1,
                             max_attempts,
@@ -3060,9 +3525,10 @@ fn finish_local_slot(
 #[derive(Clone)]
 struct RedisClient {
     connection: redis::aio::ConnectionManager,
-    queue_key: String,
+    /// Base key prefix (e.g. `autumn:jobs`) used to derive per-queue list keys.
+    key_prefix: String,
     /// ZSET keyed by due-time-ms used for delayed enqueues and retries. A
-    /// future-dated job is `ZADD`-ed here instead of pushed to `queue_key`, and
+    /// future-dated job is `ZADD`-ed here instead of pushed to its queue key, and
     /// the worker's promotion loop moves it onto the queue once due.
     delayed_key: String,
     record_prefix: String,
@@ -3081,6 +3547,19 @@ fn now_unix_ms() -> u64 {
 #[cfg(feature = "redis")]
 fn redis_record_key(record_prefix: &str, id: &str) -> String {
     format!("{record_prefix}{id}")
+}
+
+/// List key for a named queue. The `default` queue keeps the legacy
+/// `{prefix}:queue` key so an upgrade that doesn't opt into priority queues
+/// keeps draining its existing backlog unchanged.
+#[cfg(feature = "redis")]
+fn redis_queue_key(key_prefix: &str, queue: &str) -> String {
+    let queue = normalize_queue_name(queue);
+    if queue == DEFAULT_QUEUE {
+        format!("{key_prefix}:queue")
+    } else {
+        format!("{key_prefix}:queue:{queue}")
+    }
 }
 
 #[cfg(feature = "redis")]
@@ -3119,15 +3598,15 @@ fn prepare_redis_failure_action(
     record.last_error = Some(error);
     record.finished_at_ms = Some(now_ms);
 
-    if record.attempt < record.max_attempts {
+    if is_final_attempt(&record.attempt, &record.max_attempts) {
+        RedisFailureAction::DeadLetter(record)
+    } else {
         let due_at_ms = now_ms.saturating_add(redis_retry_delay_ms(
             record.initial_backoff_ms,
             record.attempt,
         ));
         record.attempt = record.attempt.saturating_add(1);
         RedisFailureAction::Retry(RedisRetrySchedule { record, due_at_ms })
-    } else {
-        RedisFailureAction::DeadLetter(record)
     }
 }
 
@@ -3164,11 +3643,11 @@ fn recover_stale_redis_record(
     record.finished_at_ms = Some(now_ms);
     clear_redis_claim(&mut record);
 
-    if record.attempt < record.max_attempts {
+    if is_final_attempt(&record.attempt, &record.max_attempts) {
+        Some(RedisStaleRecovery::DeadLetter(record))
+    } else {
         record.attempt = record.attempt.saturating_add(1);
         Some(RedisStaleRecovery::Requeue(record))
-    } else {
-        Some(RedisStaleRecovery::DeadLetter(record))
     }
 }
 
@@ -3207,6 +3686,7 @@ impl RedisClient {
         &self,
         id: String,
         name: &str,
+        queue: &str,
         payload: Value,
         default_max_attempts: u32,
         default_initial_backoff_ms: u64,
@@ -3216,9 +3696,12 @@ impl RedisClient {
         #[cfg(feature = "telemetry-otlp")]
         let (traceparent, tracestate) = capture_job_trace_context();
         let mut connection = self.connection.clone();
+        let queue = normalize_queue_name(queue);
+        let queue_key = redis_queue_key(&self.key_prefix, &queue);
         let msg = RedisJobRecord {
             id: id.clone(),
             name: name.to_string(),
+            queue,
             payload,
             attempt: 1,
             max_attempts: default_max_attempts,
@@ -3282,7 +3765,7 @@ impl RedisClient {
             .arg(REDIS_ENQUEUE_SCRIPT)
             .arg(4)
             .arg(record_key)
-            .arg(&self.queue_key)
+            .arg(&queue_key)
             .arg(unique_lock_key)
             .arg(&self.delayed_key)
             .arg(encoded)
@@ -3309,7 +3792,11 @@ impl RedisClient {
 #[derive(Clone)]
 struct RedisJobAdminBackend {
     connection: redis::aio::ConnectionManager,
-    queue_key: String,
+    /// Per-queue list keys (priority order) the dashboard reads enqueued jobs
+    /// from. A single-queue app has just `{prefix}:queue`.
+    queue_keys: Vec<String>,
+    /// Base key prefix, used to route admin retry/cancel to a job's own queue.
+    key_prefix: String,
     delayed_key: String,
     processing_key: String,
     dead_key: String,
@@ -3327,7 +3814,8 @@ impl RedisJobAdminBackend {
     #[allow(clippy::too_many_arguments)]
     fn new(
         connection: redis::aio::ConnectionManager,
-        queue_key: String,
+        queue_keys: Vec<String>,
+        key_prefix: String,
         delayed_key: String,
         processing_key: String,
         dead_key: String,
@@ -3341,7 +3829,8 @@ impl RedisJobAdminBackend {
     ) -> Self {
         Self {
             connection,
-            queue_key,
+            queue_keys,
+            key_prefix,
             delayed_key,
             processing_key,
             dead_key,
@@ -3364,7 +3853,7 @@ impl RedisJobAdminBackend {
 
         let enqueued = redis_admin_active_list_page(
             &mut connection,
-            &self.queue_key,
+            &self.queue_keys,
             &self.record_prefix,
             JobAdminStatus::Enqueued,
             query.enqueued_page,
@@ -3423,6 +3912,26 @@ impl RedisJobAdminBackend {
         let mut connection = self.connection.clone();
         let new_id = uuid::Uuid::new_v4().to_string();
         let dead_record_key = format!("{}{id}", self.dead_record_prefix);
+        // Fetch the record's payload first (for a tracked-status reset on
+        // success below) — the script below moves this same dead record.
+        let raw_record: Option<String> = redis::cmd("GET")
+            .arg(&dead_record_key)
+            .query_async(&mut connection)
+            .await
+            .ok()
+            .flatten();
+        let tracked_payload = raw_record
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<RedisJobRecord>(s).ok())
+            .map(|r| r.payload);
+        // Snapshot the tracking record's owner/updated_at *before* the EVAL
+        // script below makes the retry visible to workers, so the reset can
+        // detect (and skip) a retry that completes faster than this
+        // function returns.
+        let retry_snapshot = match &tracked_payload {
+            Some(payload) => crate::job_tracking::capture_retry_snapshot(payload).await,
+            None => None,
+        };
         // The unique lock was released when the job dead-lettered, so a
         // retried unique job must take it again under its new id — and the
         // retry must be refused when an equivalent job is already holding it,
@@ -3463,7 +3972,17 @@ record['claimed_at_ms'] = nil
 record['last_error'] = nil
 local active = cjson.encode(record)
 redis.call('SET', KEYS[3] .. ARGV[1], active)
-redis.call('LPUSH', KEYS[4], ARGV[1])
+local queue = 'default'
+if record['queue'] and record['queue'] ~= cjson.null then
+  queue = record['queue']
+end
+local qkey
+if queue == 'default' then
+  qkey = KEYS[4] .. ':queue'
+else
+  qkey = KEYS[4] .. ':queue:' .. queue
+end
+redis.call('LPUSH', qkey, ARGV[1])
 return 1
 ",
             )
@@ -3471,7 +3990,7 @@ return 1
             .arg(dead_record_key)
             .arg(&self.dead_key)
             .arg(&self.record_prefix)
-            .arg(&self.queue_key)
+            .arg(&self.key_prefix)
             .arg(&self.unique_prefix)
             .arg(new_id)
             .arg(now_unix_ms())
@@ -3479,6 +3998,11 @@ return 1
             .query_async(&mut connection)
             .await
             .map_err(|error| redis_admin_error("retry failed job", &error))?;
+        if result == 1
+            && let Some(payload) = tracked_payload
+        {
+            crate::job_tracking::apply_retry_reset(&payload, retry_snapshot).await;
+        }
         redis_admin_operation_result(result, id, "retry failed job")
     }
 
@@ -3518,10 +4042,15 @@ return 1
             .await
             .ok()
             .flatten();
-        let job_name: Option<String> = raw_record
+        let parsed_record = raw_record
             .as_deref()
-            .and_then(|s| serde_json::from_str::<RedisJobRecord>(s).ok())
-            .map(|r| r.name);
+            .and_then(|s| serde_json::from_str::<RedisJobRecord>(s).ok());
+        let job_name: Option<String> = parsed_record.as_ref().map(|r| r.name.clone());
+        // Remove the job from its own queue list, not just the default one.
+        let queue_key = parsed_record.as_ref().map_or_else(
+            || redis_queue_key(&self.key_prefix, DEFAULT_QUEUE),
+            |r| redis_queue_key(&self.key_prefix, &r.queue),
+        );
         // A concurrency-parked job lives in the blocked zset rather than the
         // queue list, and a canceled unique job must hand its lock back so
         // future enqueues are not coalesced against work that will never run.
@@ -3556,7 +4085,7 @@ return 1
             )
             .arg(5)
             .arg(&active_record_key)
-            .arg(&self.queue_key)
+            .arg(&queue_key)
             .arg(&self.blocked_key)
             .arg(&self.unique_prefix)
             .arg(&self.delayed_key)
@@ -3564,10 +4093,21 @@ return 1
             .query_async(&mut connection)
             .await
             .map_err(|error| redis_admin_error("cancel enqueued job", &error))?;
-        if result == 1
-            && let Some(name) = job_name
-        {
-            self.registry.record_cancel(&name);
+        if result == 1 {
+            if let Some(name) = job_name {
+                self.registry.record_cancel(&name);
+            }
+            // An operator can cancel a job before any worker ever claims it,
+            // which never reaches run_job_handler — settle the tracked
+            // record here too, or it stays pending until TTL expiry even
+            // though the durable job will never run.
+            if let Some(record) = &parsed_record {
+                crate::job_tracking::settle_tracked_payload_as_failed_globally(
+                    &record.payload,
+                    "This job was canceled.",
+                )
+                .await;
+            }
         }
         redis_admin_operation_result(result, id, "cancel enqueued job")
     }
@@ -3644,6 +4184,7 @@ fn redis_record_to_admin_record(record: &RedisJobRecord, status: JobAdminStatus)
     JobAdminRecord {
         id: record.id.clone(),
         name: record.name.clone(),
+        queue: normalize_queue_name(&record.queue),
         status,
         enqueued_at: redis_admin_time(record.enqueued_at_ms),
         scheduled_for: None,
@@ -3681,7 +4222,7 @@ async fn redis_records_for_ids(
 #[cfg(feature = "redis")]
 async fn redis_admin_active_list_page(
     connection: &mut redis::aio::ConnectionManager,
-    queue_key: &str,
+    queue_keys: &[String],
     record_prefix: &str,
     status: JobAdminStatus,
     page: u64,
@@ -3689,17 +4230,46 @@ async fn redis_admin_active_list_page(
 ) -> AutumnResult<JobAdminPage> {
     let page = page.max(1);
     let start = page.saturating_sub(1).saturating_mul(per_page);
-    let stop = start.saturating_add(per_page).saturating_sub(1);
-    let (ids, total): (Vec<String>, u64) = redis::pipe()
-        .cmd("LRANGE")
-        .arg(queue_key)
-        .arg(start)
-        .arg(stop)
-        .cmd("LLEN")
-        .arg(queue_key)
-        .query_async(connection)
-        .await
-        .map_err(|error| redis_admin_error("read enqueued page", &error))?;
+
+    // Per-queue lengths so we can paginate across the priority-ordered queues as
+    // one logical list (highest-priority queue first).
+    let mut lens = Vec::with_capacity(queue_keys.len());
+    let mut total = 0_u64;
+    for queue_key in queue_keys {
+        let len: u64 = redis::cmd("LLEN")
+            .arg(queue_key)
+            .query_async(connection)
+            .await
+            .map_err(|error| redis_admin_error("read enqueued length", &error))?;
+        lens.push(len);
+        total = total.saturating_add(len);
+    }
+
+    let mut ids: Vec<String> = Vec::new();
+    let mut global_offset = 0_u64;
+    for (queue_key, len) in queue_keys.iter().zip(lens) {
+        if u64::try_from(ids.len()).unwrap_or(u64::MAX) >= per_page {
+            break;
+        }
+        // Global indices covered by this queue: [global_offset, global_offset+len).
+        if start >= global_offset.saturating_add(len) {
+            global_offset = global_offset.saturating_add(len);
+            continue;
+        }
+        let local_start = start.saturating_sub(global_offset);
+        let remaining = per_page.saturating_sub(u64::try_from(ids.len()).unwrap_or(u64::MAX));
+        let local_stop = local_start.saturating_add(remaining).saturating_sub(1);
+        let chunk: Vec<String> = redis::cmd("LRANGE")
+            .arg(queue_key)
+            .arg(local_start)
+            .arg(local_stop)
+            .query_async(connection)
+            .await
+            .map_err(|error| redis_admin_error("read enqueued page", &error))?;
+        ids.extend(chunk);
+        global_offset = global_offset.saturating_add(len);
+    }
+
     let records = redis_records_for_ids(connection, record_prefix, &ids)
         .await
         .map_err(|error| redis_admin_error("read enqueued records", &error))?
@@ -3858,16 +4428,19 @@ async fn push_json_list_item<T: ?Sized + Serialize + Sync>(
 }
 
 #[cfg(feature = "redis")]
+#[allow(clippy::too_many_lines)]
 async fn claim_next_redis_job(
     connection: &mut redis::aio::ConnectionManager,
     worker_config: &RedisWorkerConfig,
+    queue_keys: &[String],
 ) -> Result<Option<RedisJobRecord>, redis::RedisError> {
-    // Pops queue entries until one is claimable. Jobs whose concurrency group
-    // is saturated are parked into the blocked zset (KEYS[4]) with a short
-    // due time and retried via promotion; the scan bound keeps one call from
-    // walking an arbitrarily long queue. The concurrency counter INCR is
-    // atomic with the claim itself, so two workers can never both observe a
-    // free slot for the last opening in a group.
+    // Walks the priority-ordered queue list keys (ARGV[9..]) highest first,
+    // popping entries until one is claimable. Jobs whose concurrency group is
+    // saturated are parked into the blocked zset (KEYS[3]) with a short due time
+    // and retried via promotion; the scan bound keeps one call from walking an
+    // arbitrarily long queue. The concurrency counter INCR is atomic with the
+    // claim itself, so two workers can never both observe a free slot for the
+    // last opening in a group.
     const CLAIM_SCRIPT: &str = r"
 local function scope_string(value)
   if value == nil or value == cjson.null then
@@ -3875,49 +4448,53 @@ local function scope_string(value)
   end
   return tostring(value)
 end
-for attempt = 1, tonumber(ARGV[6]) do
-  local id = redis.call('RPOP', KEYS[1])
-  if not id then
-    return nil
-  end
-  local key = KEYS[3] .. id
-  local body = redis.call('GET', key)
-  if body then
-    local ok, record = pcall(cjson.decode, body)
-    if not ok then
-      redis.call('ZADD', KEYS[2], ARGV[3], id)
-      return { id, body }
+local queue_count = tonumber(ARGV[9])
+for qi = 1, queue_count do
+  local queue_key = ARGV[9 + qi]
+  for attempt = 1, tonumber(ARGV[6]) do
+    local id = redis.call('RPOP', queue_key)
+    if not id then
+      break
     end
-    local blocked = false
-    if record['concurrency_limit'] and record['concurrency_limit'] ~= cjson.null then
-      local counter = ARGV[4] .. record['name'] .. ':' .. scope_string(record['concurrency_key'])
-      local current = tonumber(redis.call('GET', counter) or '0')
-      if current >= tonumber(record['concurrency_limit']) then
-        redis.call('ZADD', KEYS[4], ARGV[5], id)
-        blocked = true
-      else
-        redis.call('INCR', counter)
+    local key = KEYS[2] .. id
+    local body = redis.call('GET', key)
+    if body then
+      local ok, record = pcall(cjson.decode, body)
+      if not ok then
+        redis.call('ZADD', KEYS[1], ARGV[3], id)
+        return { id, body }
       end
-    end
-    if not blocked then
-      if record['unique_key'] and record['unique_key'] ~= cjson.null then
-        local lock = ARGV[7] .. record['name'] .. ':' .. record['unique_key']
-        if record['unique_window'] == 'pending' then
-          if redis.call('GET', lock) == record['id'] then
-            redis.call('DEL', lock)
-          end
-        elseif record['unique_window'] == 'running' then
-          redis.call('PEXPIRE', lock, tonumber(ARGV[8]))
+      local blocked = false
+      if record['concurrency_limit'] and record['concurrency_limit'] ~= cjson.null then
+        local counter = ARGV[4] .. record['name'] .. ':' .. scope_string(record['concurrency_key'])
+        local current = tonumber(redis.call('GET', counter) or '0')
+        if current >= tonumber(record['concurrency_limit']) then
+          redis.call('ZADD', KEYS[3], ARGV[5], id)
+          blocked = true
+        else
+          redis.call('INCR', counter)
         end
       end
-      record['claimed_by'] = ARGV[1]
-      record['claimed_at_ms'] = tonumber(ARGV[2])
-      record['started_at_ms'] = tonumber(ARGV[2])
-      record['finished_at_ms'] = nil
-      local updated = cjson.encode(record)
-      redis.call('SET', key, updated)
-      redis.call('ZADD', KEYS[2], ARGV[3], id)
-      return { id, updated }
+      if not blocked then
+        if record['unique_key'] and record['unique_key'] ~= cjson.null then
+          local lock = ARGV[7] .. record['name'] .. ':' .. record['unique_key']
+          if record['unique_window'] == 'pending' then
+            if redis.call('GET', lock) == record['id'] then
+              redis.call('DEL', lock)
+            end
+          elseif record['unique_window'] == 'running' then
+            redis.call('PEXPIRE', lock, tonumber(ARGV[8]))
+          end
+        end
+        record['claimed_by'] = ARGV[1]
+        record['claimed_at_ms'] = tonumber(ARGV[2])
+        record['started_at_ms'] = tonumber(ARGV[2])
+        record['finished_at_ms'] = nil
+        local updated = cjson.encode(record)
+        redis.call('SET', key, updated)
+        redis.call('ZADD', KEYS[1], ARGV[3], id)
+        return { id, updated }
+      end
     end
   end
 end
@@ -3927,10 +4504,9 @@ return nil
     let now_ms = now_unix_ms();
     let deadline_ms = now_ms.saturating_add(worker_config.visibility_timeout_ms);
     let blocked_due_ms = now_ms.saturating_add(REDIS_CONCURRENCY_REQUEUE_DELAY_MS);
-    let response: Option<(String, String)> = redis::cmd("EVAL")
-        .arg(CLAIM_SCRIPT)
-        .arg(4)
-        .arg(&worker_config.queue_key)
+    let mut cmd = redis::cmd("EVAL");
+    cmd.arg(CLAIM_SCRIPT)
+        .arg(3)
         .arg(&worker_config.processing_key)
         .arg(&worker_config.record_prefix)
         .arg(&worker_config.blocked_key)
@@ -3942,8 +4518,11 @@ return nil
         .arg(REDIS_CLAIM_SCAN_LIMIT)
         .arg(&worker_config.unique_prefix)
         .arg(REDIS_UNIQUE_LOCK_TTL_BACKSTOP_MS)
-        .query_async(connection)
-        .await?;
+        .arg(queue_keys.len());
+    for queue_key in queue_keys {
+        cmd.arg(queue_key);
+    }
+    let response: Option<(String, String)> = cmd.query_async(connection).await?;
 
     let Some((id, body)) = response else {
         return Ok(None);
@@ -4088,12 +4667,30 @@ async fn promote_due_redis_retries(
     state: &AppState,
     job_admin: &JobAdminMemoryBackend,
 ) -> Result<(), redis::RedisError> {
+    // Route each promoted job back onto its own named queue list. `ARGV[3]` is
+    // the base key prefix and `KEYS[2]` the record-key prefix; the queue is read
+    // from the stored record (defaulting to `default`).
     const PROMOTE_SCRIPT: &str = r"
 local ids = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, ARGV[2])
 local promoted = {}
+local key_prefix = ARGV[3]
 for _, id in ipairs(ids) do
   if redis.call('ZREM', KEYS[1], id) == 1 then
-    redis.call('LPUSH', KEYS[2], id)
+    local queue = 'default'
+    local body = redis.call('GET', KEYS[2] .. id)
+    if body then
+      local ok, record = pcall(cjson.decode, body)
+      if ok and record['queue'] and record['queue'] ~= cjson.null then
+        queue = record['queue']
+      end
+    end
+    local qkey
+    if queue == 'default' then
+      qkey = key_prefix .. ':queue'
+    else
+      qkey = key_prefix .. ':queue:' .. queue
+    end
+    redis.call('LPUSH', qkey, id)
     table.insert(promoted, id)
   end
 end
@@ -4104,9 +4701,10 @@ return promoted
         .arg(PROMOTE_SCRIPT)
         .arg(2)
         .arg(&worker_config.delayed_key)
-        .arg(&worker_config.queue_key)
+        .arg(&worker_config.record_prefix)
         .arg(now_unix_ms())
         .arg(64_usize)
+        .arg(&worker_config.key_prefix)
         .query_async(connection)
         .await?;
 
@@ -4124,9 +4722,24 @@ async fn promote_due_blocked_redis_jobs(
 ) -> Result<(), redis::RedisError> {
     const PROMOTE_BLOCKED_SCRIPT: &str = r"
 local ids = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, ARGV[2])
+local key_prefix = ARGV[3]
 for _, id in ipairs(ids) do
   if redis.call('ZREM', KEYS[1], id) == 1 then
-    redis.call('LPUSH', KEYS[2], id)
+    local queue = 'default'
+    local body = redis.call('GET', KEYS[2] .. id)
+    if body then
+      local ok, record = pcall(cjson.decode, body)
+      if ok and record['queue'] and record['queue'] ~= cjson.null then
+        queue = record['queue']
+      end
+    end
+    local qkey
+    if queue == 'default' then
+      qkey = key_prefix .. ':queue'
+    else
+      qkey = key_prefix .. ':queue:' .. queue
+    end
+    redis.call('LPUSH', qkey, id)
   end
 end
 return #ids
@@ -4135,9 +4748,10 @@ return #ids
         .arg(PROMOTE_BLOCKED_SCRIPT)
         .arg(2)
         .arg(&worker_config.blocked_key)
-        .arg(&worker_config.queue_key)
+        .arg(&worker_config.record_prefix)
         .arg(now_unix_ms())
         .arg(64_usize)
+        .arg(&worker_config.key_prefix)
         .query_async(connection)
         .await?;
     Ok(())
@@ -4226,7 +4840,7 @@ elseif ARGV[4] == 'retry' then
   if ARGV[10] == 'pending' then
     if not redis.call('SET', KEYS[7], ARGV[1], 'NX', 'PX', tonumber(ARGV[11])) then
       redis.call('DEL', key)
-      return 1
+      return 2
     end
   end
   redis.call('SET', key, ARGV[5])
@@ -4253,9 +4867,9 @@ async fn apply_claimed_redis_transition(
     mode: &str,
     encoded_record: Option<String>,
     due_at_ms: Option<u64>,
-) -> Result<bool, redis::RedisError> {
+) -> Result<i64, redis::RedisError> {
     let Some((claimed_by, claimed_at_ms)) = expected_claim_args(expected) else {
-        return Ok(false);
+        return Ok(0);
     };
 
     // The concurrency slot frees on every settle (success, retry backoff,
@@ -4271,7 +4885,7 @@ async fn apply_claimed_redis_transition(
     } else {
         "0"
     };
-    let applied: usize = redis::cmd("EVAL")
+    let applied: i64 = redis::cmd("EVAL")
         .arg(CLAIMED_REDIS_TRANSITION_SCRIPT)
         .arg(8)
         .arg(&worker_config.processing_key)
@@ -4300,7 +4914,7 @@ async fn apply_claimed_redis_transition(
         .query_async(connection)
         .await?;
 
-    Ok(applied == 1)
+    Ok(applied)
 }
 
 #[cfg(feature = "redis")]
@@ -4317,7 +4931,7 @@ async fn ack_redis_success(
         tracing::warn!(job_id = %record.id, "failed to serialize redis completed record");
         return Ok(false);
     };
-    apply_claimed_redis_transition(
+    let applied = apply_claimed_redis_transition(
         connection,
         worker_config,
         record,
@@ -4325,7 +4939,26 @@ async fn ack_redis_success(
         Some(encoded),
         None,
     )
-    .await
+    .await?;
+    Ok(applied == 1)
+}
+
+/// Outcome of [`schedule_redis_retry`], distinguishing an ordinary applied
+/// retry from a pending-window unique job whose retry was silently dropped
+/// because an equivalent job already claimed the unique slot while this one
+/// ran — the two collapse to the same Lua return code as a plain "claim
+/// changed" no-op would otherwise, but the caller needs to tell them apart:
+/// a dropped retry settles a tracked record; a claim-changed no-op doesn't.
+#[cfg(feature = "redis")]
+enum RedisRetryOutcome {
+    /// The retry record was written normally.
+    Applied,
+    /// A duplicate already held the pending-window unique lock, so the
+    /// record was deleted instead of retried (coalesced into the duplicate).
+    DroppedByDuplicate,
+    /// The claim no longer matched (another worker already settled this
+    /// job), so nothing was changed.
+    ClaimChanged,
 }
 
 #[cfg(feature = "redis")]
@@ -4334,12 +4967,12 @@ async fn schedule_redis_retry(
     worker_config: &RedisWorkerConfig,
     expected: &RedisJobRecord,
     schedule: &RedisRetrySchedule,
-) -> Result<bool, redis::RedisError> {
+) -> Result<RedisRetryOutcome, redis::RedisError> {
     let Ok(encoded) = encode_redis_record(&schedule.record) else {
         tracing::warn!(job_id = %schedule.record.id, "failed to serialize redis retry record");
-        return Ok(false);
+        return Ok(RedisRetryOutcome::ClaimChanged);
     };
-    apply_claimed_redis_transition(
+    let applied = apply_claimed_redis_transition(
         connection,
         worker_config,
         expected,
@@ -4347,7 +4980,12 @@ async fn schedule_redis_retry(
         Some(encoded),
         Some(schedule.due_at_ms),
     )
-    .await
+    .await?;
+    Ok(match applied {
+        1 => RedisRetryOutcome::Applied,
+        2 => RedisRetryOutcome::DroppedByDuplicate,
+        _ => RedisRetryOutcome::ClaimChanged,
+    })
 }
 
 #[cfg(feature = "redis")]
@@ -4361,7 +4999,7 @@ async fn dead_letter_redis_job(
         tracing::warn!(job_id = %record.id, "failed to serialize redis dead-letter record");
         return Ok(false);
     };
-    apply_claimed_redis_transition(
+    let applied = apply_claimed_redis_transition(
         connection,
         worker_config,
         expected,
@@ -4369,7 +5007,8 @@ async fn dead_letter_redis_job(
         Some(encoded),
         None,
     )
-    .await
+    .await?;
+    Ok(applied == 1)
 }
 
 #[cfg(feature = "redis")]
@@ -4468,12 +5107,14 @@ async fn apply_stale_redis_recovery(
     } else {
         "0"
     };
+    // A requeued stale job returns to its own named queue, not the default one.
+    let requeue_key = redis_queue_key(&worker_config.key_prefix, &record.queue);
     let applied: usize = redis::cmd("EVAL")
         .arg(STALE_REDIS_RECOVERY_SCRIPT)
         .arg(7)
         .arg(&worker_config.processing_key)
         .arg(&worker_config.record_prefix)
-        .arg(&worker_config.queue_key)
+        .arg(&requeue_key)
         .arg(&worker_config.dead_key)
         .arg(&worker_config.dead_record_prefix)
         .arg(worker_config.unique_lock_key_for(expected))
@@ -4574,6 +5215,16 @@ async fn recover_stale_redis_jobs(
                         .job_registry
                         .record_failure(&dead.name, error.clone(), true);
                     job_admin.record_failure(&dead.id, error);
+                    // The worker that held this claim is gone and the job is
+                    // now terminally dead-lettered — settle the tracked
+                    // record too, or it stays pending/running until TTL
+                    // expiry even though the job will never run again.
+                    crate::job_tracking::settle_tracked_payload_as_failed(
+                        state,
+                        &dead.payload,
+                        crate::job_tracking::GENERIC_FAILURE_MESSAGE,
+                    )
+                    .await;
                 }
             }
         }
@@ -4608,6 +5259,7 @@ fn spawn_redis_worker(
             REDIS_BLOCKED_PROMOTION_INTERVAL,
         );
         let idle_sleep = redis_worker_idle_sleep(worker_config.retry_promotion_interval);
+        let mut queue_cursor = worker_config.schedule.cursor();
 
         loop {
             if shutdown.is_cancelled() {
@@ -4648,14 +5300,17 @@ fn spawn_redis_worker(
                 tracing::warn!(error = %error, "redis blocked job promotion failed");
             }
 
-            let Some(record) = (match claim_next_redis_job(&mut connection, &worker_config).await {
-                Ok(record) => record,
-                Err(error) => {
-                    tracing::warn!(error = %error, "redis job worker claim failed");
-                    tokio::time::sleep(idle_sleep).await;
-                    continue;
-                }
-            }) else {
+            let queue_keys = worker_config.queue_keys_for(&queue_cursor.next_order());
+            let claimed =
+                match claim_next_redis_job(&mut connection, &worker_config, &queue_keys).await {
+                    Ok(record) => record,
+                    Err(error) => {
+                        tracing::warn!(error = %error, "redis job worker claim failed");
+                        tokio::time::sleep(idle_sleep).await;
+                        continue;
+                    }
+                };
+            let Some(record) = claimed else {
                 tokio::time::sleep(idle_sleep).await;
                 continue;
             };
@@ -4690,13 +5345,30 @@ async fn settle_failed_redis_job(
     match action {
         RedisFailureAction::Retry(schedule) => {
             match schedule_redis_retry(connection, worker_config, record, &schedule).await {
-                Ok(true) => {
+                Ok(RedisRetryOutcome::Applied) => {
                     state
                         .job_registry
                         .record_retry(&schedule.record.name, &error, record.attempt);
                     job_admin.record_retrying(&schedule.record.id, &error);
                 }
-                Ok(false) => tracing::warn!(
+                Ok(RedisRetryOutcome::DroppedByDuplicate) => {
+                    // A duplicate already claimed the pending-window unique
+                    // lock while this job ran, so the retry was coalesced
+                    // into it (deleted, not requeued) — this job will never
+                    // run again, so its tracked record (if any) must settle
+                    // now rather than being left non-terminal until TTL.
+                    state
+                        .job_registry
+                        .record_deduplicated(&schedule.record.name);
+                    job_admin.record_deduplicated(&schedule.record.id);
+                    crate::job_tracking::settle_tracked_payload_as_failed(
+                        state,
+                        &record.payload,
+                        "An equivalent job is already in progress.",
+                    )
+                    .await;
+                }
+                Ok(RedisRetryOutcome::ClaimChanged) => tracing::warn!(
                     job = %record.name,
                     job_id = %record.id,
                     outcome = %outcome,
@@ -4785,6 +5457,12 @@ async fn dead_letter_invalid_redis_job(
     clear_redis_claim(&mut dead);
     dead.last_error = Some(error.to_owned());
     let _ = dead_letter_redis_job(connection, worker_config, record, &dead).await;
+    crate::job_tracking::settle_tracked_payload_as_failed(
+        state,
+        &record.payload,
+        crate::job_tracking::GENERIC_FAILURE_MESSAGE,
+    )
+    .await;
 }
 
 #[cfg(feature = "redis")]
@@ -4801,6 +5479,12 @@ async fn process_redis_job_record(
         state.job_registry.record_cancel(&record.name);
         job_admin.record_cancelled(&record.id);
         let _ = ack_redis_success(connection, worker_config, &record).await;
+        crate::job_tracking::settle_tracked_payload_as_failed(
+            state,
+            &record.payload,
+            "This job was canceled.",
+        )
+        .await;
         return;
     }
     state.job_registry.record_start(&record.name);
@@ -4862,7 +5546,14 @@ async fn process_redis_job_record(
         use tracing_opentelemetry::OpenTelemetrySpanExt as _;
         let _ = job_span.set_parent(cx);
     }
-    let f = run_job_handler(&record.name, handler, state.clone(), record.payload.clone());
+    let final_attempt = is_final_attempt(&record.attempt, &record.max_attempts);
+    let f = run_job_handler(
+        &record.name,
+        handler,
+        state.clone(),
+        record.payload.clone(),
+        final_attempt,
+    );
     match tracing::Instrument::instrument(f, job_span).await {
         JobExecutionOutcome::Succeeded => {
             match ack_redis_success(connection, worker_config, &record).await {
@@ -4951,10 +5642,38 @@ fn start_redis_runtime(
     let unique_prefix = format!("{}:unique:", config.redis.key_prefix);
     let concurrency_prefix = format!("{}:concurrency:", config.redis.key_prefix);
 
+    // Build the priority drain schedule; declared-but-unconfigured queues are
+    // appended at lowest priority (warned about) so jobs never silently stall.
+    let declared_queues = {
+        let mut seen = std::collections::HashSet::new();
+        let mut queues = Vec::new();
+        for job in &jobs {
+            let name = normalize_queue_name(&job.queue);
+            if seen.insert(name.clone()) {
+                queues.push(name);
+            }
+        }
+        queues
+    };
+    let (schedule, unconfigured) = QueueSchedule::effective(&config.queues, &declared_queues);
+    for queue in &unconfigured {
+        tracing::warn!(
+            queue = %queue,
+            "job declares queue '{queue}' which is not in [jobs] queues; draining it at \
+             lowest priority. Add it to the configured queue list to control its priority.",
+        );
+    }
+    let admin_queue_keys: Vec<String> = schedule
+        .names()
+        .iter()
+        .map(|queue| redis_queue_key(&config.redis.key_prefix, queue))
+        .collect();
+
     if job_admin_backend(state).is_none() {
         state.insert_extension(JobAdminBackendEntry(Arc::new(RedisJobAdminBackend::new(
             admin_connection,
-            queue_key.clone(),
+            admin_queue_keys,
+            config.redis.key_prefix.clone(),
             delayed_key.clone(),
             processing_key.clone(),
             dead_key.clone(),
@@ -4990,7 +5709,7 @@ fn start_redis_runtime(
             local_coordination: None,
             redis: Some(RedisClient {
                 connection: producer_connection,
-                queue_key: queue_key.clone(),
+                key_prefix: config.redis.key_prefix.clone(),
                 delayed_key: delayed_key.clone(),
                 record_prefix: record_prefix.clone(),
                 unique_prefix: unique_prefix.clone(),
@@ -5021,6 +5740,8 @@ fn start_redis_runtime(
             shutdown.clone(),
             RedisWorkerConfig {
                 queue_key: queue_key.clone(),
+                key_prefix: config.redis.key_prefix.clone(),
+                schedule: schedule.clone(),
                 processing_key: processing_key.clone(),
                 delayed_key: delayed_key.clone(),
                 dead_key: dead_key.clone(),
@@ -5225,10 +5946,18 @@ fn record_pg_row_cancel_after_ack(
 const PG_WORKER_IDLE_SLEEP: std::time::Duration = std::time::Duration::from_millis(200);
 #[cfg(feature = "db")]
 const PG_MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+/// How often to sweep expired rows out of `autumn_job_tracking`. Much
+/// slower than [`PG_MAINTENANCE_INTERVAL`] (which recovers stale claims —
+/// a latency-sensitive concern) since tracking-row expiry has no such
+/// urgency: the row is already invisible to reads/writes the moment it
+/// expires (`PgJobTrackingStore` filters on `expires_at` lazily), so this
+/// sweep exists only to bound table growth over time, not correctness.
+#[cfg(feature = "db")]
+const PG_TRACKING_CLEANUP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Columns returned by every SELECT from `autumn_jobs` when OTLP is disabled.
 #[cfg(all(feature = "db", not(feature = "telemetry-otlp")))]
-const PG_JOB_SELECT_COLS: &str = "id, name, payload::TEXT AS payload, status, attempt, \
+const PG_JOB_SELECT_COLS: &str = "id, name, queue, payload::TEXT AS payload, status, attempt, \
     max_attempts, initial_backoff_ms, enqueued_at, run_at, started_at, finished_at, \
     claimed_by, claimed_at, last_error";
 
@@ -5236,7 +5965,7 @@ const PG_JOB_SELECT_COLS: &str = "id, name, payload::TEXT AS payload, status, at
 /// Includes the nullable `traceparent` and `tracestate` columns added by the
 /// `add_trace_context_to_jobs` migration.
 #[cfg(all(feature = "db", feature = "telemetry-otlp"))]
-const PG_JOB_SELECT_COLS: &str = "id, name, payload::TEXT AS payload, status, attempt, \
+const PG_JOB_SELECT_COLS: &str = "id, name, queue, payload::TEXT AS payload, status, attempt, \
     max_attempts, initial_backoff_ms, enqueued_at, run_at, started_at, finished_at, \
     claimed_by, claimed_at, last_error, traceparent, tracestate";
 
@@ -5249,6 +5978,8 @@ struct PgJobRow {
     id: String,
     #[diesel(sql_type = diesel::sql_types::Text)]
     name: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    queue: String,
     #[diesel(sql_type = diesel::sql_types::Text)]
     payload: String,
     #[diesel(sql_type = diesel::sql_types::Text)]
@@ -5291,6 +6022,7 @@ impl PgJobRow {
         JobAdminRecord {
             id: self.id.clone(),
             name: self.name.clone(),
+            queue: normalize_queue_name(&self.queue),
             status,
             enqueued_at: self.enqueued_at.map(format_job_admin_time),
             scheduled_for: if status == JobAdminStatus::Scheduled {
@@ -5333,6 +6065,29 @@ fn pg_retry_delay_ms(initial_backoff_ms: i64, attempt: i32) -> i64 {
     initial_backoff_ms.saturating_mul(2_i64.saturating_pow(exp))
 }
 
+#[cfg(feature = "db")]
+async fn pg_evict_expired_unique_key(
+    conn: &mut diesel_async::AsyncPgConnection,
+    name: &str,
+    key: &str,
+    ttl_ms: i64,
+) {
+    use diesel_async::RunQueryDsl as _;
+    let _ = diesel::sql_query(
+        "UPDATE autumn_jobs \
+         SET unique_key = NULL \
+         WHERE name = $1 AND unique_key = $2 \
+           AND unique_window = 'ttl' \
+           AND enqueued_at <= NOW() - ($3::BIGINT * INTERVAL '1 millisecond') \
+           AND status IN ('enqueued', 'running')",
+    )
+    .bind::<diesel::sql_types::Text, _>(name)
+    .bind::<diesel::sql_types::Text, _>(key)
+    .bind::<diesel::sql_types::BigInt, _>(ttl_ms)
+    .execute(conn)
+    .await;
+}
+
 /// Shared INSERT for new job rows, with uniqueness dedup applied in SQL.
 ///
 /// The `WHERE ... NOT EXISTS` guard handles the common dedup paths (an
@@ -5342,11 +6097,12 @@ fn pg_retry_delay_ms(initial_backoff_ms: i64, attempt: i32) -> i64 {
 /// pass the guard simultaneously. Zero rows inserted for a unique job means
 /// the enqueue was coalesced.
 #[cfg(feature = "db")]
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn pg_insert_job(
     conn: &mut diesel_async::AsyncPgConnection,
     id: String,
     name: &str,
+    queue: &str,
     payload: Value,
     max_attempts: u32,
     initial_backoff_ms: u64,
@@ -5369,6 +6125,7 @@ async fn pg_insert_job(
     const UNIQUE_CONFLICT: &str = "ON CONFLICT (name, unique_key) \
          WHERE unique_key IS NOT NULL AND status IN ('enqueued', 'running') DO NOTHING";
 
+    let queue = normalize_queue_name(queue);
     #[cfg(feature = "telemetry-otlp")]
     let (traceparent, tracestate) = capture_job_trace_context();
     let payload_str = serde_json::to_string(&payload).map_err(|e| {
@@ -5395,27 +6152,15 @@ async fn pg_insert_job(
     // the partial unique index (idx_autumn_jobs_unique_inflight) and cause the
     // ON CONFLICT DO NOTHING to silently drop a legitimate replacement enqueue.
     if let (Some(ttl), Some(key)) = (unique_ttl_ms, &constraints.unique_key) {
-        let _ = diesel::sql_query(
-            "UPDATE autumn_jobs \
-             SET unique_key = NULL \
-             WHERE name = $1 AND unique_key = $2 \
-               AND unique_window = 'ttl' \
-               AND enqueued_at <= NOW() - ($3::BIGINT * INTERVAL '1 millisecond') \
-               AND status IN ('enqueued', 'running')",
-        )
-        .bind::<diesel::sql_types::Text, _>(name)
-        .bind::<diesel::sql_types::Text, _>(key.as_str())
-        .bind::<diesel::sql_types::BigInt, _>(ttl)
-        .execute(conn)
-        .await;
+        pg_evict_expired_unique_key(conn, name, key.as_str(), ttl).await;
     }
 
     #[cfg(not(feature = "telemetry-otlp"))]
     let query = diesel::sql_query(format!(
         "INSERT INTO autumn_jobs \
-         (id, name, payload, status, attempt, max_attempts, initial_backoff_ms, \
+         (id, name, queue, payload, status, attempt, max_attempts, initial_backoff_ms, \
           enqueued_at, run_at, unique_key, unique_window, concurrency_key, concurrency_limit) \
-         SELECT $1, $2, $3::JSONB, 'enqueued', 1, $4, $5, NOW(), COALESCE($11, NOW()), $6, $7, $9, $10 \
+         SELECT $1, $2, $12, $3::JSONB, 'enqueued', 1, $4, $5, NOW(), COALESCE($11, NOW()), $6, $7, $9, $10 \
          WHERE {DEDUP_GUARD} \
          {UNIQUE_CONFLICT}"
     ))
@@ -5431,14 +6176,15 @@ async fn pg_insert_job(
     .bind::<diesel::sql_types::Nullable<diesel::sql_types::BigInt>, _>(unique_ttl_ms)
     .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(concurrency_key)
     .bind::<diesel::sql_types::Nullable<diesel::sql_types::Integer>, _>(concurrency_limit)
-    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(run_at);
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(run_at)
+    .bind::<diesel::sql_types::Text, _>(queue.clone());
     #[cfg(feature = "telemetry-otlp")]
     let query = diesel::sql_query(format!(
         "INSERT INTO autumn_jobs \
-         (id, name, payload, status, attempt, max_attempts, initial_backoff_ms, \
+         (id, name, queue, payload, status, attempt, max_attempts, initial_backoff_ms, \
           enqueued_at, run_at, unique_key, unique_window, concurrency_key, concurrency_limit, \
           traceparent, tracestate) \
-         SELECT $1, $2, $3::JSONB, 'enqueued', 1, $4, $5, NOW(), COALESCE($13, NOW()), $6, $7, $9, $10, $11, $12 \
+         SELECT $1, $2, $14, $3::JSONB, 'enqueued', 1, $4, $5, NOW(), COALESCE($13, NOW()), $6, $7, $9, $10, $11, $12 \
          WHERE {DEDUP_GUARD} \
          {UNIQUE_CONFLICT}"
     ))
@@ -5456,7 +6202,8 @@ async fn pg_insert_job(
     .bind::<diesel::sql_types::Nullable<diesel::sql_types::Integer>, _>(concurrency_limit)
     .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(traceparent)
     .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(tracestate)
-    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(run_at);
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(run_at)
+    .bind::<diesel::sql_types::Text, _>(queue.clone());
 
     let inserted = query.execute(conn).await.map_err(|e| {
         AutumnError::internal_server_error_msg(format!("pg job enqueue failed: {e}"))
@@ -5472,10 +6219,12 @@ async fn pg_insert_job(
 /// Thin wrapper over [`pg_enqueue_job_at`] with no delay; retained for the
 /// Postgres backend's test suite, which exercises the immediate path directly.
 #[cfg(all(feature = "db", test))]
+#[allow(clippy::too_many_arguments)]
 async fn pg_enqueue_job(
     pool: &PgPool,
     id: String,
     name: &str,
+    queue: &str,
     payload: Value,
     max_attempts: u32,
     initial_backoff_ms: u64,
@@ -5485,6 +6234,7 @@ async fn pg_enqueue_job(
         pool,
         id,
         name,
+        queue,
         payload,
         max_attempts,
         initial_backoff_ms,
@@ -5504,6 +6254,7 @@ async fn pg_enqueue_job_at(
     pool: &PgPool,
     id: String,
     name: &str,
+    queue: &str,
     payload: Value,
     max_attempts: u32,
     initial_backoff_ms: u64,
@@ -5518,6 +6269,7 @@ async fn pg_enqueue_job_at(
         &mut conn,
         id,
         name,
+        queue,
         payload,
         max_attempts,
         initial_backoff_ms,
@@ -5541,6 +6293,7 @@ async fn pg_enqueue_on_conn_at(
     conn: &mut diesel_async::AsyncPgConnection,
     id: String,
     name: &str,
+    queue: &str,
     payload: Value,
     max_attempts: u32,
     initial_backoff_ms: u64,
@@ -5551,6 +6304,7 @@ async fn pg_enqueue_on_conn_at(
         conn,
         id,
         name,
+        queue,
         payload,
         max_attempts,
         initial_backoff_ms,
@@ -5576,6 +6330,10 @@ const PG_CLAIM_ADVISORY_LOCK_KEY: i64 = 0x6175_7475_6d6e_6a62; // "autumnjb"
 
 #[cfg(feature = "db")]
 fn pg_claim_sql() -> String {
+    // `$2` is the worker's ordered queue list for this claim. Restricting to it
+    // and ordering by `array_position` drains higher-priority queues first;
+    // passing a per-iteration rotation of the list yields weighted draining.
+    // A single-queue (`['default']`) app orders only by `run_at` — today's behavior.
     format!(
         "UPDATE autumn_jobs \
          SET status = 'running', started_at = NOW(), claimed_by = $1, claimed_at = NOW(), \
@@ -5584,13 +6342,14 @@ fn pg_claim_sql() -> String {
          WHERE id = ( \
            SELECT candidate.id FROM autumn_jobs candidate \
            WHERE candidate.status = 'enqueued' AND candidate.run_at <= NOW() \
+             AND candidate.queue = ANY($2) \
              AND (candidate.concurrency_limit IS NULL OR ( \
                SELECT COUNT(*) FROM autumn_jobs running \
                WHERE running.status = 'running' \
                  AND running.name = candidate.name \
                  AND running.concurrency_key IS NOT DISTINCT FROM candidate.concurrency_key \
              ) < candidate.concurrency_limit) \
-           ORDER BY candidate.run_at ASC \
+           ORDER BY array_position($2::text[], candidate.queue), candidate.run_at ASC \
            LIMIT 1 \
            FOR UPDATE SKIP LOCKED \
          ) \
@@ -5603,33 +6362,33 @@ async fn pg_claim_next_job(
     pool: &PgPool,
     worker_id: &str,
     serialize_claims: bool,
+    queue_order: &[String],
 ) -> Option<PgJobRow> {
     use diesel::OptionalExtension as _;
     use diesel_async::{AsyncConnection as _, RunQueryDsl as _};
-    use scoped_futures::ScopedFutureExt as _;
 
     let mut conn = pool.get().await.ok()?;
     let sql = pg_claim_sql();
+    let queue_order = queue_order.to_vec();
     let claimed = if serialize_claims {
         let worker_id = worker_id.to_owned();
-        conn.transaction::<Option<PgJobRow>, diesel::result::Error, _>(move |conn| {
-            async move {
-                diesel::sql_query("SELECT pg_advisory_xact_lock($1)")
-                    .bind::<diesel::sql_types::BigInt, _>(PG_CLAIM_ADVISORY_LOCK_KEY)
-                    .execute(conn)
-                    .await?;
-                diesel::sql_query(sql)
-                    .bind::<diesel::sql_types::Text, _>(worker_id)
-                    .get_result::<PgJobRow>(conn)
-                    .await
-                    .optional()
-            }
-            .scope_boxed()
+        conn.transaction::<Option<PgJobRow>, diesel::result::Error, _>(async move |conn| {
+            diesel::sql_query("SELECT pg_advisory_xact_lock($1)")
+                .bind::<diesel::sql_types::BigInt, _>(PG_CLAIM_ADVISORY_LOCK_KEY)
+                .execute(conn)
+                .await?;
+            diesel::sql_query(sql)
+                .bind::<diesel::sql_types::Text, _>(worker_id)
+                .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queue_order)
+                .get_result::<PgJobRow>(conn)
+                .await
+                .optional()
         })
         .await
     } else {
         diesel::sql_query(sql)
             .bind::<diesel::sql_types::Text, _>(worker_id)
+            .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queue_order)
             .get_result::<PgJobRow>(&mut *conn)
             .await
             .optional()
@@ -5714,6 +6473,7 @@ async fn pg_ack_success(pool: &PgPool, job_id: &str, worker_id: &str) -> AutumnR
 
 /// Handle a job failure: schedule a retry with exponential backoff or dead-letter.
 #[cfg(feature = "db")]
+#[allow(clippy::if_not_else)]
 async fn pg_nack_failure(
     pool: &PgPool,
     job_id: &str,
@@ -5729,7 +6489,7 @@ async fn pg_nack_failure(
         .await
         .map_err(|e| AutumnError::internal_server_error_msg(format!("pg pool error: {e}")))?;
 
-    if row.attempt < row.max_attempts {
+    if !is_final_attempt(&row.attempt, &row.max_attempts) {
         let delay_ms = pg_retry_delay_ms(row.initial_backoff_ms, row.attempt);
         // Re-enqueue and restore the pending-window unique key atomically in one
         // UPDATE to eliminate the window where status='enqueued' and
@@ -5829,13 +6589,22 @@ async fn pg_ack_dead_letter(
     .map_err(|e| AutumnError::internal_server_error_msg(format!("pg job dead-letter failed: {e}")))
 }
 
+#[cfg(feature = "db")]
+#[derive(diesel::QueryableByName)]
+struct PgStaleRecoveryRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    payload: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    status: String,
+}
+
 /// Recover jobs whose visibility timeout has expired.
 ///
 /// Uses a single `UPDATE … WHERE id IN (SELECT … FOR UPDATE SKIP LOCKED)` so
 /// concurrent maintenance tasks from multiple replicas each recover disjoint
 /// sets of stale jobs.
 #[cfg(feature = "db")]
-async fn pg_recover_stale_claims(pool: &PgPool, visibility_timeout_ms: u64) {
+async fn pg_recover_stale_claims(pool: &PgPool, visibility_timeout_ms: u64, state: &AppState) {
     use diesel_async::RunQueryDsl as _;
 
     let Ok(mut conn) = pool.get().await else {
@@ -5846,7 +6615,7 @@ async fn pg_recover_stale_claims(pool: &PgPool, visibility_timeout_ms: u64) {
     // there is no window where status='enqueued' and unique_key=NULL co-exist.
     // The CASE subquery checks for already-committed duplicates; if one exists
     // the key stays NULL (best-effort, same behaviour as pg_nack_failure).
-    let _ = diesel::sql_query(
+    let rows = diesel::sql_query(
         "UPDATE autumn_jobs \
          SET \
            status = CASE \
@@ -5893,12 +6662,32 @@ async fn pg_recover_stale_claims(pool: &PgPool, visibility_timeout_ms: u64) {
              AND claimed_at < NOW() - ($1::BIGINT * INTERVAL '1 millisecond') \
            FOR UPDATE SKIP LOCKED \
            LIMIT 100 \
-         )",
+         ) \
+         RETURNING payload::TEXT AS payload, status",
     )
     .bind::<diesel::sql_types::BigInt, _>(i64::try_from(visibility_timeout_ms).unwrap_or(i64::MAX))
-    .execute(&mut *conn)
-    .await
-    .map_err(|e| tracing::warn!(error = %e, "postgres stale claim recovery failed"));
+    .get_results::<PgStaleRecoveryRow>(&mut *conn)
+    .await;
+
+    // Rows this UPDATE flipped straight to 'failed' (the job's final
+    // attempt) are terminally dead-lettered with no further code path
+    // touching them — settle their tracked status too, or a tracked job
+    // whose worker crashed on its last attempt stays "running" until TTL
+    // expiry even though it will never run again.
+    match rows {
+        Ok(rows) => {
+            for row in rows.into_iter().filter(|row| row.status == "failed") {
+                let payload = serde_json::from_str::<Value>(&row.payload).unwrap_or(Value::Null);
+                crate::job_tracking::settle_tracked_payload_as_failed(
+                    state,
+                    &payload,
+                    crate::job_tracking::GENERIC_FAILURE_MESSAGE,
+                )
+                .await;
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "postgres stale claim recovery failed"),
+    }
 }
 
 /// Execute one claimed job and ack/nack based on the outcome.
@@ -5918,6 +6707,19 @@ async fn pg_execute_job(
         let ack =
             pg_nack_failure(pool, &row.id, worker_id, "canceled by operator", &row, None).await;
         record_pg_row_cancel_after_ack(ack, &row, state);
+        // `pg_nack_failure` reuses the ordinary retry-vs-dead-letter decision
+        // even for a cancellation, so only settle the tracked record here
+        // when this really was the terminal attempt; otherwise the job is
+        // about to be retried and `run_job_handler` will settle it later.
+        if is_final_attempt(&attempt, &max_attempts) {
+            let payload = serde_json::from_str::<Value>(&row.payload).unwrap_or(Value::Null);
+            crate::job_tracking::settle_tracked_payload_as_failed(
+                state,
+                &payload,
+                "This job was canceled.",
+            )
+            .await;
+        }
         return;
     }
     state.job_registry.record_start(&row.name);
@@ -5943,6 +6745,12 @@ async fn pg_execute_job(
         let ack = pg_ack_dead_letter(pool, &row.id, worker_id, &error).await;
         let lifecycle = PgLifecycleRecord::Failure { error: &error };
         record_pg_row_lifecycle_ack_result(ack, &row, "unknown-type", lifecycle, state, job_admin);
+        crate::job_tracking::settle_tracked_payload_as_failed(
+            state,
+            &payload,
+            crate::job_tracking::GENERIC_FAILURE_MESSAGE,
+        )
+        .await;
         return;
     };
 
@@ -5954,7 +6762,8 @@ async fn pg_execute_job(
         use tracing_opentelemetry::OpenTelemetrySpanExt as _;
         let _ = job_span.set_parent(cx);
     }
-    let f = run_job_handler(&row.name, handler, state.clone(), payload);
+    let final_attempt = is_final_attempt(&attempt, &max_attempts);
+    let f = run_job_handler(&row.name, handler, state.clone(), payload, final_attempt);
     match tracing::Instrument::instrument(f, job_span).await {
         JobExecutionOutcome::Succeeded => {
             let ack = pg_ack_success(pool, &row.id, worker_id).await;
@@ -5968,13 +6777,13 @@ async fn pg_execute_job(
             );
         }
         JobExecutionOutcome::Failed(error) => {
-            let lifecycle = if attempt < max_attempts {
+            let lifecycle = if is_final_attempt(&attempt, &max_attempts) {
+                PgLifecycleRecord::Failure { error: &error }
+            } else {
                 PgLifecycleRecord::Retry {
                     error: &error,
                     attempt,
                 }
-            } else {
-                PgLifecycleRecord::Failure { error: &error }
             };
             let ack = pg_nack_failure(
                 pool,
@@ -6012,20 +6821,49 @@ async fn pg_maintenance_loop(
 ) {
     let mut interval = tokio::time::interval(PG_MAINTENANCE_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut tracking_cleanup_interval = tokio::time::interval(PG_TRACKING_CLEANUP_INTERVAL);
+    tracking_cleanup_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                pg_recover_stale_claims(&pool, visibility_timeout_ms).await;
+                pg_recover_stale_claims(&pool, visibility_timeout_ms, &state).await;
                 if survey_blocked {
                     pg_update_concurrency_blocked_gauges(&pool, &state).await;
                 }
+            }
+            _ = tracking_cleanup_interval.tick() => {
+                pg_cleanup_expired_tracking_rows(&pool).await;
             }
             () = shutdown.cancelled() => break,
         }
     }
 }
 
+/// Delete `autumn_job_tracking` rows past their `expires_at`.
+///
+/// Expired rows are already invisible to `PgJobTrackingStore` reads/writes
+/// (it filters on `expires_at` lazily), so this exists only to bound the
+/// table's growth for high-volume tracked-job usage — every enqueue writes
+/// a row here, and without a sweep those rows would otherwise accumulate
+/// forever.
 #[cfg(feature = "db")]
+async fn pg_cleanup_expired_tracking_rows(pool: &PgPool) {
+    use diesel_async::RunQueryDsl as _;
+
+    let Ok(mut conn) = pool.get().await else {
+        tracing::warn!("job tracking cleanup could not acquire connection");
+        return;
+    };
+    if let Err(e) = diesel::sql_query("DELETE FROM autumn_job_tracking WHERE expires_at <= NOW()")
+        .execute(&mut *conn)
+        .await
+    {
+        tracing::warn!(error = %e, "job tracking cleanup failed");
+    }
+}
+
+#[cfg(feature = "db")]
+#[allow(clippy::too_many_arguments)]
 async fn pg_worker_loop(
     pool: PgPool,
     worker_id: String,
@@ -6033,10 +6871,13 @@ async fn pg_worker_loop(
     state: AppState,
     job_admin: JobAdminMemoryBackend,
     serialize_claims: bool,
+    schedule: QueueSchedule,
     shutdown: tokio_util::sync::CancellationToken,
 ) {
+    let mut cursor = schedule.cursor();
     loop {
-        match pg_claim_next_job(&pool, &worker_id, serialize_claims).await {
+        let queue_order = cursor.next_order();
+        match pg_claim_next_job(&pool, &worker_id, serialize_claims, &queue_order).await {
             Some(row) => {
                 pg_execute_job(row, &jobs_by_name, &pool, &worker_id, &state, &job_admin).await;
                 if shutdown.is_cancelled() {
@@ -6058,6 +6899,13 @@ async fn pg_worker_loop(
 #[derive(Clone)]
 struct PgJobAdminBackend {
     pool: PgPool,
+}
+
+#[cfg(feature = "db")]
+#[derive(diesel::QueryableByName)]
+struct PgPayloadRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    payload: String,
 }
 
 #[cfg(feature = "db")]
@@ -6116,21 +6964,45 @@ impl PgJobAdminBackend {
     }
 
     async fn pg_retry_failed(&self, id: &str) -> AutumnResult<()> {
+        use diesel::OptionalExtension as _;
         use diesel_async::RunQueryDsl as _;
 
         let mut conn = self.pool.get().await.map_err(|e| {
             AutumnError::internal_server_error_msg(format!("pg admin pool error: {e}"))
         })?;
+        // Snapshot the tracking record's owner/updated_at *before* the
+        // UPDATE below makes the retry visible to workers, so the reset can
+        // detect (and skip) a retry that completes faster than this
+        // function returns.
+        let pre_retry_row = diesel::sql_query(
+            "SELECT payload::TEXT AS payload FROM autumn_jobs WHERE id = $1 AND status = 'failed'",
+        )
+        .bind::<diesel::sql_types::Text, _>(id)
+        .get_result::<PgPayloadRow>(&mut *conn)
+        .await
+        .optional()
+        .map_err(|e| {
+            AutumnError::internal_server_error_msg(format!("pg admin retry failed: {e}"))
+        })?;
+        let retry_snapshot = match &pre_retry_row {
+            Some(row) => {
+                let payload = serde_json::from_str::<Value>(&row.payload).unwrap_or(Value::Null);
+                crate::job_tracking::capture_retry_snapshot(&payload).await
+            }
+            None => None,
+        };
         let updated = diesel::sql_query(
             "UPDATE autumn_jobs \
              SET status = 'enqueued', attempt = 1, run_at = NOW(), enqueued_at = NOW(), \
                  started_at = NULL, finished_at = NULL, \
                  claimed_by = NULL, claimed_at = NULL, last_error = NULL \
-             WHERE id = $1 AND status = 'failed'",
+             WHERE id = $1 AND status = 'failed' \
+             RETURNING payload::TEXT AS payload",
         )
         .bind::<diesel::sql_types::Text, _>(id)
-        .execute(&mut *conn)
+        .get_result::<PgPayloadRow>(&mut *conn)
         .await
+        .optional()
         .map_err(|e| {
             // The retried row keeps its unique_key, so re-enqueueing while an
             // equivalent job is already in flight trips the partial unique
@@ -6145,11 +7017,17 @@ impl PgJobAdminBackend {
                 AutumnError::internal_server_error_msg(format!("pg admin retry failed: {e}"))
             }
         })?;
-        if updated == 0 {
+        let Some(row) = updated else {
             return Err(AutumnError::not_found_msg(format!(
                 "job '{id}' not found or not in failed state"
             )));
-        }
+        };
+        // The record is currently `Failed` (terminal) from the original run;
+        // reset it to `Pending` so the retried attempt's
+        // mark_running/set_progress calls (which otherwise no-op against a
+        // terminal record) surface.
+        let payload = serde_json::from_str::<Value>(&row.payload).unwrap_or(Value::Null);
+        crate::job_tracking::apply_retry_reset(&payload, retry_snapshot).await;
         Ok(())
     }
 
@@ -6179,6 +7057,7 @@ impl PgJobAdminBackend {
     }
 
     async fn pg_cancel_enqueued(&self, id: &str) -> AutumnResult<()> {
+        use diesel::OptionalExtension as _;
         use diesel_async::RunQueryDsl as _;
 
         let mut conn = self.pool.get().await.map_err(|e| {
@@ -6187,19 +7066,31 @@ impl PgJobAdminBackend {
         let updated = diesel::sql_query(
             "UPDATE autumn_jobs \
              SET status = 'discarded', finished_at = NOW() \
-             WHERE id = $1 AND status = 'enqueued'",
+             WHERE id = $1 AND status = 'enqueued' \
+             RETURNING payload::TEXT AS payload",
         )
         .bind::<diesel::sql_types::Text, _>(id)
-        .execute(&mut *conn)
+        .get_result::<PgPayloadRow>(&mut *conn)
         .await
+        .optional()
         .map_err(|e| {
             AutumnError::internal_server_error_msg(format!("pg admin cancel failed: {e}"))
         })?;
-        if updated == 0 {
+        let Some(row) = updated else {
             return Err(AutumnError::not_found_msg(format!(
                 "job '{id}' not found or not in enqueued state"
             )));
-        }
+        };
+        // An operator can cancel a job before any worker ever claims it,
+        // which never reaches run_job_handler — settle the tracked record
+        // here too, or it stays pending until TTL expiry even though the
+        // durable job will never run.
+        let payload = serde_json::from_str::<Value>(&row.payload).unwrap_or(Value::Null);
+        crate::job_tracking::settle_tracked_payload_as_failed_globally(
+            &payload,
+            "This job was canceled.",
+        )
+        .await;
         Ok(())
     }
 }
@@ -6434,6 +7325,16 @@ fn start_postgres_runtime(
         })));
     }
 
+    let (schedule, unconfigured) =
+        QueueSchedule::effective(&config.queues, &collect_declared_queues(&jobs_by_name));
+    for queue in &unconfigured {
+        tracing::warn!(
+            queue = %queue,
+            "job declares queue '{queue}' which is not in [jobs] queues; draining it at \
+             lowest priority. Add it to the configured queue list to control its priority.",
+        );
+    }
+
     install_job_client(
         state,
         JobClient {
@@ -6482,6 +7383,7 @@ fn start_postgres_runtime(
         let state = state.clone();
         let job_admin = job_admin.clone();
         let shutdown = shutdown.clone();
+        let schedule = schedule.clone();
         tokio::spawn(async move {
             let worker_id = format!("{}:{}", std::process::id(), uuid::Uuid::new_v4());
             pg_worker_loop(
@@ -6491,6 +7393,7 @@ fn start_postgres_runtime(
                 state,
                 job_admin,
                 serialize_claims,
+                schedule,
                 shutdown,
             )
             .await;
@@ -6508,6 +7411,7 @@ fn build_per_job_settings(jobs: &[JobInfo]) -> HashMap<String, JobRuntimeSetting
                 JobRuntimeSettings {
                     max_attempts: job.max_attempts,
                     initial_backoff_ms: job.initial_backoff_ms,
+                    queue: normalize_queue_name(&job.queue),
                     uniqueness: job.uniqueness.clone(),
                     concurrency: job.concurrency.clone(),
                 },
@@ -6552,6 +7456,18 @@ mod tests {
                 "forced failure",
             )))
         })
+    }
+
+    #[test]
+    fn is_final_attempt_matches_attempt_greater_or_equal_max_attempts() {
+        assert!(!is_final_attempt(&1_u32, &3));
+        assert!(!is_final_attempt(&2_u32, &3));
+        assert!(is_final_attempt(&3_u32, &3));
+        assert!(is_final_attempt(&4_u32, &3));
+        // Every backend's retry-vs-terminal branches are written as `attempt
+        // < max_attempts`, i.e. exactly `!is_final_attempt(..)`.
+        assert_eq!(is_final_attempt(&1_i32, &3), 1_i32 >= 3);
+        assert_eq!(is_final_attempt(&3_i32, &3), 3_i32 >= 3);
     }
 
     #[cfg(feature = "redis")]
@@ -6669,6 +7585,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn global_job_client_survives_concurrent_init_and_clear() {
+        fn make_client() -> JobClient {
+            JobClient {
+                local_sender: None,
+                local_coordination: None,
+                #[cfg(feature = "redis")]
+                redis: None,
+                #[cfg(feature = "db")]
+                pg_pool: None,
+                registry: crate::actuator::JobRegistry::new(),
+                job_admin: JobAdminMemoryBackend::new_for_test(32),
+                default_max_attempts: 3,
+                default_initial_backoff_ms: 250,
+                per_job_settings: HashMap::new(),
+                interceptor: None,
+                resilience_config: None,
+            }
+        }
+
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+
+        // Hammer the global slot from several std threads at once: installs,
+        // reads, and clears must never panic or poison the lock, no matter
+        // how they interleave.
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let client = make_client();
+            handles.push(std::thread::spawn(move || init_global_job_client(client)));
+            handles.push(std::thread::spawn(|| {
+                let _ = global_job_client();
+            }));
+            handles.push(std::thread::spawn(clear_global_job_client));
+        }
+        for handle in handles {
+            handle.join().expect("concurrent global client op panicked");
+        }
+
+        // Whatever the interleaving above, an install performed after every
+        // concurrent operation has finished must always be observable. The
+        // old get-then-set code could silently drop a client whose losing
+        // `OnceLock::set` raced a concurrent first-time init/clear.
+        init_global_job_client(make_client());
+        assert!(
+            global_job_client().is_some(),
+            "install after concurrent init/clear must win"
+        );
+
+        clear_global_job_client();
+        assert!(global_job_client().is_none());
+    }
+
+    #[tokio::test]
     async fn job_admin_retry_reenqueues_failed_payload() {
         let _guard = global_job_runtime_test_lock().lock().await;
         clear_global_job_client();
@@ -6727,6 +7696,76 @@ mod tests {
             .expect("snapshot after retry");
         assert!(snapshot.failed.records.is_empty());
         assert_eq!(snapshot.enqueued.total, 1);
+
+        clear_global_job_client();
+    }
+
+    #[tokio::test]
+    async fn local_admin_retry_resets_tracked_record_off_its_stale_terminal_status() {
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+
+        let store: Arc<dyn crate::job_tracking::JobTrackingStore> =
+            Arc::new(crate::job_tracking::InMemoryJobTrackingStore::new(60));
+        let state = AppState::for_test().with_profile("dev");
+        crate::job_tracking::install_tracking_store(&state, store.clone());
+
+        let key = "retry-reset-key";
+        store
+            .create(key, crate::job_tracking::TrackedJobOwner::Anonymous)
+            .await
+            .unwrap();
+        // The original attempt ran to completion and settled the record
+        // terminally, exactly as `run_job_handler` would on a final-attempt
+        // failure.
+        store
+            .fail(key, "smtp refused recipient".to_string())
+            .await
+            .unwrap();
+        let payload = crate::job_tracking::wrap_tracked_payload(key, &serde_json::json!({}));
+
+        let backend = JobAdminMemoryBackend::new_for_test(32);
+        let (tx, mut rx) = mpsc::channel(1);
+        init_global_job_client(JobClient {
+            local_sender: Some(tx),
+            local_coordination: None,
+            #[cfg(feature = "redis")]
+            redis: None,
+            #[cfg(feature = "db")]
+            pg_pool: None,
+            registry: crate::actuator::JobRegistry::new(),
+            job_admin: backend.clone(),
+            default_max_attempts: 5,
+            default_initial_backoff_ms: 250,
+            per_job_settings: HashMap::from([(
+                "send_email".to_string(),
+                JobRuntimeSettings::basic(5, 250),
+            )]),
+            interceptor: None,
+            resilience_config: None,
+        });
+
+        let failed_id = backend.record_enqueue_for_test("send_email", payload, 2, 5);
+        backend.record_start_for_test(&failed_id, 2);
+        backend.record_failure_for_test(&failed_id, "smtp refused recipient");
+
+        backend
+            .retry(&failed_id)
+            .await
+            .expect("failed job should be retried");
+        let _ = timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("retry should enqueue promptly")
+            .expect("retry should enqueue a job");
+
+        let record = store.get(key).await.unwrap().expect("record");
+        assert_eq!(
+            record.status,
+            crate::job_tracking::TrackedJobStatus::Pending,
+            "an operator retry must reset the tracked record off its stale terminal status so \
+             the retried attempt's mark_running/set_progress calls surface instead of no-op'ing \
+             against a still-Failed record"
+        );
 
         clear_global_job_client();
     }
@@ -6868,6 +7907,7 @@ mod tests {
             instantly_panicking_handler,
             state,
             serde_json::json!({}),
+            true,
         )
         .await;
         assert_eq!(
@@ -6919,8 +7959,14 @@ mod tests {
             Arc::new(PanickingJobInterceptor) as Arc<dyn crate::interceptor::JobInterceptor>
         );
 
-        let outcome =
-            run_job_handler("test_job", success_handler, state, serde_json::json!({})).await;
+        let outcome = run_job_handler(
+            "test_job",
+            success_handler,
+            state,
+            serde_json::json!({}),
+            true,
+        )
+        .await;
 
         assert_eq!(
             outcome,
@@ -6987,6 +8033,7 @@ mod tests {
             side_effect_handler,
             state,
             serde_json::json!({}),
+            true,
         )
         .await;
 
@@ -7130,6 +8177,7 @@ mod tests {
                 name: "noop".to_string(),
                 max_attempts: 3,
                 initial_backoff_ms: 10,
+                queue: "default".to_string(),
                 uniqueness: None,
                 concurrency: None,
                 handler: |_state, _payload| Box::pin(async move { Ok(()) }),
@@ -7139,6 +8187,7 @@ mod tests {
             1,
             5,
             250,
+            &crate::config::JobQueuesConfig::default(),
         );
 
         let mut samples = Vec::new();
@@ -7170,6 +8219,7 @@ mod tests {
                 name: "delayed".to_string(),
                 max_attempts: 3,
                 initial_backoff_ms: 10,
+                queue: "default".to_string(),
                 uniqueness: None,
                 concurrency: None,
                 handler: |_state, _payload| Box::pin(async move { Ok(()) }),
@@ -7179,6 +8229,7 @@ mod tests {
             1,
             5,
             250,
+            &crate::config::JobQueuesConfig::default(),
         );
 
         enqueue_in("delayed", serde_json::json!({}), Duration::from_millis(400))
@@ -7225,6 +8276,7 @@ mod tests {
                 name: "past".to_string(),
                 max_attempts: 3,
                 initial_backoff_ms: 10,
+                queue: "default".to_string(),
                 uniqueness: None,
                 concurrency: None,
                 handler: |_state, _payload| Box::pin(async move { Ok(()) }),
@@ -7234,6 +8286,7 @@ mod tests {
             1,
             5,
             250,
+            &crate::config::JobQueuesConfig::default(),
         );
 
         let when = chrono::Utc::now() - chrono::TimeDelta::seconds(60);
@@ -7266,6 +8319,7 @@ mod tests {
                 name: "cancelable".to_string(),
                 max_attempts: 3,
                 initial_backoff_ms: 10,
+                queue: "default".to_string(),
                 uniqueness: None,
                 concurrency: None,
                 handler: |_state, _payload| Box::pin(async move { Ok(()) }),
@@ -7275,6 +8329,7 @@ mod tests {
             1,
             5,
             250,
+            &crate::config::JobQueuesConfig::default(),
         );
 
         enqueue_in(
@@ -7301,6 +8356,92 @@ mod tests {
             snap.scheduled.total, 0,
             "canceled scheduled job should leave the scheduled list"
         );
+
+        shutdown.cancel();
+        clear_global_job_client();
+    }
+
+    #[tokio::test]
+    async fn intercept_enqueue_sees_unwrapped_args_for_a_tracked_job() {
+        static CAPTURED: std::sync::OnceLock<std::sync::Mutex<Option<Value>>> =
+            std::sync::OnceLock::new();
+        fn captured() -> &'static std::sync::Mutex<Option<Value>> {
+            CAPTURED.get_or_init(|| std::sync::Mutex::new(None))
+        }
+
+        struct CapturingInterceptor;
+        impl crate::interceptor::JobInterceptor for CapturingInterceptor {
+            fn intercept_enqueue<'a>(
+                &'a self,
+                _name: &'a str,
+                payload: &'a serde_json::Value,
+                next: std::pin::Pin<
+                    Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send + 'a>,
+                >,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send + 'a>,
+            > {
+                *captured().lock().unwrap() = Some(payload.clone());
+                next
+            }
+
+            fn intercept_execute<'a>(
+                &'a self,
+                _name: &'a str,
+                _payload: &'a serde_json::Value,
+                next: std::pin::Pin<
+                    Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send + 'a>,
+                >,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send + 'a>,
+            > {
+                next
+            }
+        }
+
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+        *captured().lock().unwrap() = None;
+
+        let state = AppState::for_test().with_profile("dev");
+        state.insert_extension(
+            Arc::new(CapturingInterceptor) as Arc<dyn crate::interceptor::JobInterceptor>
+        );
+
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        start_local_runtime(
+            vec![JobInfo::new(
+                "intercepted_tracked",
+                1,
+                10,
+                |_state, _payload| Box::pin(async move { Ok(()) }),
+            )],
+            &state,
+            &shutdown,
+            1,
+            5,
+            250,
+            &crate::config::JobQueuesConfig::default(),
+        );
+
+        crate::job_tracking::enqueue_tracked(
+            "intercepted_tracked",
+            serde_json::json!({"account_id": 9}),
+        )
+        .await
+        .unwrap();
+
+        let seen = captured()
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("intercept_enqueue should have been called");
+        assert_eq!(
+            seen,
+            serde_json::json!({"account_id": 9}),
+            "intercept_enqueue must see the real args, not the tracked envelope: {seen}"
+        );
+        assert!(seen.get("__autumn_tracked").is_none(), "{seen}");
 
         shutdown.cancel();
         clear_global_job_client();
@@ -7355,6 +8496,7 @@ mod tests {
                 name: "noop".to_string(),
                 max_attempts: 3,
                 initial_backoff_ms: 10,
+                queue: "default".to_string(),
                 uniqueness: None,
                 concurrency: None,
                 handler: |_state, _payload| Box::pin(async move { Ok(()) }),
@@ -7364,6 +8506,7 @@ mod tests {
             1,
             5,
             250,
+            &crate::config::JobQueuesConfig::default(),
         );
 
         let res = enqueue("noop", serde_json::json!({})).await;
@@ -7395,6 +8538,7 @@ mod tests {
                 name: "panic".to_string(),
                 max_attempts: 3,
                 initial_backoff_ms: 1,
+                queue: "default".to_string(),
                 uniqueness: None,
                 concurrency: None,
                 handler: panicking_handler,
@@ -7409,6 +8553,7 @@ mod tests {
             QueuedJob {
                 id: job_id,
                 name: "panic".to_string(),
+                queue: "default".to_string(),
                 payload: serde_json::json!({}),
                 attempt: 1,
                 max_attempts: 3,
@@ -7453,6 +8598,7 @@ mod tests {
                 name: "flaky".to_string(),
                 max_attempts: 2,
                 initial_backoff_ms: 1,
+                queue: "default".to_string(),
                 uniqueness: None,
                 concurrency: None,
                 handler: always_fail_handler,
@@ -7467,6 +8613,7 @@ mod tests {
             QueuedJob {
                 id: job_id.clone(),
                 name: "flaky".to_string(),
+                queue: "default".to_string(),
                 payload: serde_json::json!({}),
                 attempt: 1,
                 max_attempts: 2,
@@ -7513,6 +8660,7 @@ mod tests {
                 name: "flaky".to_string(),
                 max_attempts: 1,
                 initial_backoff_ms: 1,
+                queue: "default".to_string(),
                 uniqueness: None,
                 concurrency: None,
                 handler: always_fail_handler,
@@ -7527,6 +8675,7 @@ mod tests {
             QueuedJob {
                 id: job_id,
                 name: "flaky".to_string(),
+                queue: "default".to_string(),
                 payload: serde_json::json!({}),
                 attempt: 1,
                 max_attempts: 1,
@@ -7568,6 +8717,7 @@ mod tests {
                 name: "flaky".to_string(),
                 max_attempts: 2,
                 initial_backoff_ms: 60_000,
+                queue: "default".to_string(),
                 uniqueness: None,
                 concurrency: None,
                 handler: always_fail_handler,
@@ -7582,6 +8732,7 @@ mod tests {
             QueuedJob {
                 id: job_id.clone(),
                 name: "flaky".to_string(),
+                queue: "default".to_string(),
                 payload: serde_json::json!({}),
                 attempt: 1,
                 max_attempts: 2,
@@ -7625,6 +8776,7 @@ mod tests {
         RedisJobRecord {
             id: "job-1".to_string(),
             name: "send_email".to_string(),
+            queue: "default".to_string(),
             payload: serde_json::json!({ "user_id": 42 }),
             attempt,
             max_attempts,
@@ -7676,6 +8828,7 @@ mod tests {
                 name: "slow".to_string(),
                 max_attempts: 3,
                 initial_backoff_ms: 250,
+                queue: "default".to_string(),
                 uniqueness: None,
                 concurrency: None,
                 handler: redis_counting_success_handler,
@@ -7684,6 +8837,7 @@ mod tests {
                 name: "fast".to_string(),
                 max_attempts: 3,
                 initial_backoff_ms: 25,
+                queue: "default".to_string(),
                 uniqueness: None,
                 concurrency: None,
                 handler: redis_counting_success_handler,
@@ -7698,6 +8852,7 @@ mod tests {
             name: "very_slow".to_string(),
             max_attempts: 3,
             initial_backoff_ms: 60_000,
+            queue: "default".to_string(),
             uniqueness: None,
             concurrency: None,
             handler: redis_counting_success_handler,
@@ -7867,6 +9022,8 @@ mod tests {
     ) -> RedisWorkerConfig {
         RedisWorkerConfig {
             queue_key: format!("{prefix}:queue"),
+            key_prefix: prefix.to_string(),
+            schedule: QueueSchedule::from_config(&crate::config::JobQueuesConfig::single_default()),
             processing_key: format!("{prefix}:processing"),
             delayed_key: format!("{prefix}:delayed"),
             dead_key: format!("{prefix}:dead"),
@@ -7909,6 +9066,7 @@ mod tests {
                 name: "send_email".to_string(),
                 max_attempts,
                 initial_backoff_ms: 1,
+                queue: "default".to_string(),
                 uniqueness: None,
                 concurrency: None,
                 handler,
@@ -7925,7 +9083,7 @@ mod tests {
         let connection = new_redis_connection_manager(client, "test redis producer").unwrap();
         let producer = RedisClient {
             connection,
-            queue_key: worker_config.queue_key.clone(),
+            key_prefix: worker_config.key_prefix.clone(),
             delayed_key: worker_config.delayed_key.clone(),
             record_prefix: worker_config.record_prefix.clone(),
             unique_prefix: worker_config.unique_prefix.clone(),
@@ -7934,6 +9092,7 @@ mod tests {
             .enqueue(
                 uuid::Uuid::new_v4().to_string(),
                 "send_email",
+                "default",
                 serde_json::json!({ "user_id": 42 }),
                 max_attempts,
                 1,
@@ -7961,7 +9120,8 @@ mod tests {
         let admin_connection = new_redis_connection_manager(client, "test redis admin").unwrap();
         RedisJobAdminBackend::new(
             admin_connection,
-            worker_config.queue_key.clone(),
+            vec![worker_config.queue_key.clone()],
+            worker_config.key_prefix.clone(),
             worker_config.delayed_key.clone(),
             worker_config.processing_key.clone(),
             worker_config.dead_key.clone(),
@@ -7982,6 +9142,7 @@ mod tests {
             enqueued: RedisJobRecord {
                 id: "job-enqueued".to_string(),
                 name: "send_email".to_string(),
+                queue: "default".to_string(),
                 payload: serde_json::json!({"user_id": 42, "correlation_id": "req-redis"}),
                 attempt: 1,
                 max_attempts: 5,
@@ -8004,6 +9165,7 @@ mod tests {
             running: RedisJobRecord {
                 id: "job-running".to_string(),
                 name: "reindex".to_string(),
+                queue: "default".to_string(),
                 payload: serde_json::json!({}),
                 attempt: 1,
                 max_attempts: 3,
@@ -8026,6 +9188,7 @@ mod tests {
             completed: RedisJobRecord {
                 id: "job-completed".to_string(),
                 name: "digest".to_string(),
+                queue: "default".to_string(),
                 payload: serde_json::json!({}),
                 attempt: 1,
                 max_attempts: 3,
@@ -8048,6 +9211,7 @@ mod tests {
             failed_retry: RedisJobRecord {
                 id: "job-failed-retry".to_string(),
                 name: "send_email".to_string(),
+                queue: "default".to_string(),
                 payload: serde_json::json!({ "user_id": 7 }),
                 attempt: 5,
                 max_attempts: 5,
@@ -8070,6 +9234,7 @@ mod tests {
             failed_discard: RedisJobRecord {
                 id: "job-failed-discard".to_string(),
                 name: "webhook".to_string(),
+                queue: "default".to_string(),
                 payload: serde_json::json!({}),
                 attempt: 2,
                 max_attempts: 2,
@@ -8231,6 +9396,70 @@ mod tests {
     #[cfg(feature = "redis")]
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires Docker (testcontainers)"]
+    async fn redis_claim_drains_higher_priority_queue_first() {
+        let (_container, client) = redis_test_client().await;
+        let prefix = "autumn:test:prio";
+        let worker_config = redis_test_worker_config(prefix, "worker-prio", 30_000);
+        let mut connection = new_redis_connection_manager(&client, "test prio").unwrap();
+        let producer = RedisClient {
+            connection: connection.clone(),
+            key_prefix: prefix.to_string(),
+            delayed_key: worker_config.delayed_key.clone(),
+            record_prefix: worker_config.record_prefix.clone(),
+            unique_prefix: worker_config.unique_prefix.clone(),
+        };
+
+        // Low enqueued first, then critical.
+        producer
+            .enqueue(
+                "low-1".to_string(),
+                "bulk",
+                "low",
+                serde_json::json!({}),
+                5,
+                1,
+                None,
+                &ResolvedJobConstraints::default(),
+            )
+            .await
+            .expect("enqueue low");
+        producer
+            .enqueue(
+                "crit-1".to_string(),
+                "urgent",
+                "critical",
+                serde_json::json!({}),
+                5,
+                1,
+                None,
+                &ResolvedJobConstraints::default(),
+            )
+            .await
+            .expect("enqueue critical");
+
+        // Strict priority: critical's queue key is attempted first.
+        let order_keys = vec![
+            redis_queue_key(prefix, "critical"),
+            redis_queue_key(prefix, "default"),
+            redis_queue_key(prefix, "low"),
+        ];
+        let first = claim_next_redis_job(&mut connection, &worker_config, &order_keys)
+            .await
+            .unwrap()
+            .expect("first claim");
+        assert_eq!(first.id, "crit-1");
+        assert_eq!(first.queue, "critical");
+        let second = claim_next_redis_job(&mut connection, &worker_config, &order_keys)
+            .await
+            .unwrap()
+            .expect("second claim");
+        assert_eq!(second.id, "low-1");
+        assert_eq!(second.queue, "low");
+    }
+
+    #[cfg(feature = "redis")]
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires Docker (testcontainers)"]
     async fn redis_claim_ack_deletes_record_only_after_success() {
         use redis::AsyncCommands as _;
 
@@ -8240,10 +9469,14 @@ mod tests {
         redis_enqueue_test_job(&client, &worker_config, 2).await;
 
         let mut connection = new_redis_connection_manager(&client, "test redis worker").unwrap();
-        let record = claim_next_redis_job(&mut connection, &worker_config)
-            .await
-            .unwrap()
-            .expect("job should be claimed");
+        let record = claim_next_redis_job(
+            &mut connection,
+            &worker_config,
+            std::slice::from_ref(&worker_config.queue_key),
+        )
+        .await
+        .unwrap()
+        .expect("job should be claimed");
         let record_key = redis_record_key(&worker_config.record_prefix, &record.id);
         let processing_count: usize = connection
             .zcard(&worker_config.processing_key)
@@ -8299,10 +9532,14 @@ mod tests {
         state.job_registry().record_enqueue("send_email");
         let jobs = redis_jobs_by_name(redis_counting_failure_handler, 2);
 
-        let first = claim_next_redis_job(&mut connection, &worker_config)
-            .await
-            .unwrap()
-            .expect("first attempt should be claimed");
+        let first = claim_next_redis_job(
+            &mut connection,
+            &worker_config,
+            std::slice::from_ref(&worker_config.queue_key),
+        )
+        .await
+        .unwrap()
+        .expect("first attempt should be claimed");
         process_redis_job_record(
             &mut connection,
             first,
@@ -8327,10 +9564,14 @@ mod tests {
         let queued_count: usize = connection.llen(&worker_config.queue_key).await.unwrap();
         assert_eq!(queued_count, 1);
 
-        let second = claim_next_redis_job(&mut connection, &worker_config)
-            .await
-            .unwrap()
-            .expect("retry attempt should be claimed");
+        let second = claim_next_redis_job(
+            &mut connection,
+            &worker_config,
+            std::slice::from_ref(&worker_config.queue_key),
+        )
+        .await
+        .unwrap()
+        .expect("retry attempt should be claimed");
         assert_eq!(second.attempt, 2);
         process_redis_job_record(
             &mut connection,
@@ -8369,10 +9610,14 @@ mod tests {
         state.job_registry().register("send_email");
         state.job_registry().record_enqueue("send_email");
 
-        let record = claim_next_redis_job(&mut connection, &worker_config)
-            .await
-            .unwrap()
-            .expect("panicking job should be claimed");
+        let record = claim_next_redis_job(
+            &mut connection,
+            &worker_config,
+            std::slice::from_ref(&worker_config.queue_key),
+        )
+        .await
+        .unwrap()
+        .expect("panicking job should be claimed");
         process_redis_job_record(
             &mut connection,
             record,
@@ -8413,10 +9658,14 @@ mod tests {
         redis_enqueue_test_job(&client, &worker_a, 3).await;
 
         let mut connection = new_redis_connection_manager(&client, "test redis worker").unwrap();
-        let claimed = claim_next_redis_job(&mut connection, &worker_a)
-            .await
-            .unwrap()
-            .expect("first worker should claim the job");
+        let claimed = claim_next_redis_job(
+            &mut connection,
+            &worker_a,
+            std::slice::from_ref(&worker_a.queue_key),
+        )
+        .await
+        .unwrap()
+        .expect("first worker should claim the job");
         assert_eq!(claimed.claimed_by.as_deref(), Some("worker-a"));
         assert_eq!(claimed.attempt, 1);
 
@@ -8430,10 +9679,14 @@ mod tests {
 
         let queued_count: usize = connection.llen(&worker_b.queue_key).await.unwrap();
         assert_eq!(queued_count, 1);
-        let reclaimed = claim_next_redis_job(&mut connection, &worker_b)
-            .await
-            .unwrap()
-            .expect("second worker should reclaim stale job");
+        let reclaimed = claim_next_redis_job(
+            &mut connection,
+            &worker_b,
+            std::slice::from_ref(&worker_b.queue_key),
+        )
+        .await
+        .unwrap()
+        .expect("second worker should reclaim stale job");
         assert_eq!(reclaimed.claimed_by.as_deref(), Some("worker-b"));
         assert_eq!(reclaimed.attempt, 2);
         assert!(
@@ -8456,10 +9709,14 @@ mod tests {
         redis_enqueue_test_job(&client, &worker_a, 1).await;
 
         let mut connection = new_redis_connection_manager(&client, "test redis worker").unwrap();
-        let claimed = claim_next_redis_job(&mut connection, &worker_a)
-            .await
-            .unwrap()
-            .expect("first worker should claim the final attempt");
+        let claimed = claim_next_redis_job(
+            &mut connection,
+            &worker_a,
+            std::slice::from_ref(&worker_a.queue_key),
+        )
+        .await
+        .unwrap()
+        .expect("first worker should claim the final attempt");
         assert_eq!(claimed.claimed_by.as_deref(), Some("worker-a"));
         assert_eq!(claimed.attempt, 1);
         let failed_id = claimed.id.clone();
@@ -8689,9 +9946,13 @@ mod tests {
         }
         // Claim k2 out of the way first, then claim b1 so b2 parks.
         let mut parked_target = None;
-        while let Some(record) = claim_next_redis_job(&mut connection, &worker_config)
-            .await
-            .unwrap()
+        while let Some(record) = claim_next_redis_job(
+            &mut connection,
+            &worker_config,
+            std::slice::from_ref(&worker_config.queue_key),
+        )
+        .await
+        .unwrap()
         {
             if record.name == "recalculate" {
                 parked_target = Some(record);
@@ -8718,6 +9979,263 @@ mod tests {
     }
 
     #[cfg(feature = "redis")]
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn redis_admin_cancel_enqueued_settles_the_tracked_record() {
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+
+        let (_container, client) = redis_test_client().await;
+        let worker_config = redis_test_worker_config("cancel-tracked", "worker-1", 30_000);
+        let admin = redis_admin_test_backend(&client, &worker_config);
+
+        let state = AppState::for_test().with_profile("dev");
+        let store: Arc<dyn crate::job_tracking::JobTrackingStore> =
+            Arc::new(crate::job_tracking::InMemoryJobTrackingStore::new(60));
+        crate::job_tracking::install_tracking_store(&state, store.clone());
+        let key = "cancel-tracked-key";
+        store
+            .create(key, crate::job_tracking::TrackedJobOwner::Anonymous)
+            .await
+            .unwrap();
+        let payload = crate::job_tracking::wrap_tracked_payload(key, &serde_json::json!({}));
+
+        let connection = new_redis_connection_manager(&client, "test redis producer").unwrap();
+        let producer = RedisClient {
+            connection,
+            key_prefix: worker_config.key_prefix.clone(),
+            delayed_key: worker_config.delayed_key.clone(),
+            record_prefix: worker_config.record_prefix.clone(),
+            unique_prefix: worker_config.unique_prefix.clone(),
+        };
+        let constraints = ResolvedJobConstraints {
+            unique_key: None,
+            unique_window: None,
+            concurrency_limit: None,
+            concurrency_scope: None,
+        };
+        assert_eq!(
+            producer
+                .enqueue(
+                    "k-tracked".to_string(),
+                    "cancel_tracked",
+                    "default",
+                    payload,
+                    3,
+                    1,
+                    None,
+                    &constraints,
+                )
+                .await
+                .unwrap(),
+            EnqueueOutcome::Queued
+        );
+
+        // Cancelling an enqueued-but-not-yet-claimed job never reaches
+        // run_job_handler.
+        admin.cancel_enqueued_redis("k-tracked").await.unwrap();
+
+        let record = store.get(key).await.unwrap().expect("record");
+        assert_eq!(
+            record.status,
+            crate::job_tracking::TrackedJobStatus::Failed,
+            "an operator-cancelled enqueued tracked job must settle its status record instead \
+             of staying pending until TTL expiry"
+        );
+
+        clear_global_job_client();
+    }
+
+    #[cfg(feature = "redis")]
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn redis_admin_retry_resets_tracked_record_off_its_stale_terminal_status() {
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+
+        let (_container, client) = redis_test_client().await;
+        let worker_config = redis_test_worker_config("retry-tracked", "worker-1", 30_000);
+        let admin = redis_admin_test_backend(&client, &worker_config);
+        let mut connection = new_redis_connection_manager(&client, "test redis setup").unwrap();
+
+        let state = AppState::for_test().with_profile("dev");
+        let store: Arc<dyn crate::job_tracking::JobTrackingStore> =
+            Arc::new(crate::job_tracking::InMemoryJobTrackingStore::new(60));
+        crate::job_tracking::install_tracking_store(&state, store.clone());
+        let key = "retry-tracked-key";
+        store
+            .create(key, crate::job_tracking::TrackedJobOwner::Anonymous)
+            .await
+            .unwrap();
+        // The original attempt ran to completion and settled the record
+        // terminally, exactly as `run_job_handler` would on a final-attempt
+        // failure.
+        store
+            .fail(key, "smtp refused recipient".to_string())
+            .await
+            .unwrap();
+        let payload = crate::job_tracking::wrap_tracked_payload(key, &serde_json::json!({}));
+
+        let now = now_unix_ms();
+        let record = RedisJobRecord {
+            id: "job-failed-tracked".to_string(),
+            name: "send_email".to_string(),
+            queue: "default".to_string(),
+            payload,
+            attempt: 1,
+            max_attempts: 1,
+            initial_backoff_ms: 250,
+            enqueued_at_ms: Some(now),
+            started_at_ms: Some(now),
+            finished_at_ms: Some(now),
+            claimed_by: Some("worker-1".to_string()),
+            claimed_at_ms: Some(now),
+            last_error: Some("smtp refused recipient".to_string()),
+            unique_key: None,
+            unique_window: None,
+            concurrency_key: None,
+            concurrency_limit: None,
+            #[cfg(feature = "telemetry-otlp")]
+            traceparent: None,
+            #[cfg(feature = "telemetry-otlp")]
+            tracestate: None,
+        };
+        redis_store_history_admin_record(&mut connection, &worker_config, &record, true).await;
+
+        admin
+            .retry(&record.id)
+            .await
+            .expect("failed redis job should be retryable");
+
+        let tracked = store.get(key).await.unwrap().expect("record");
+        assert_eq!(
+            tracked.status,
+            crate::job_tracking::TrackedJobStatus::Pending,
+            "an operator retry must reset the tracked record off its stale terminal status so \
+             the retried attempt's mark_running/set_progress calls surface instead of no-op'ing \
+             against a still-Failed record"
+        );
+
+        clear_global_job_client();
+    }
+
+    #[cfg(feature = "redis")]
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn redis_dropped_pending_window_retry_settles_the_tracked_record_instead_of_leaving_it_stuck()
+     {
+        REDIS_HANDLER_CALLS.store(0, Ordering::SeqCst);
+        let (_container, client) = redis_test_client().await;
+        let worker_config = redis_test_worker_config("dropped-pending", "worker-a", 30_000);
+        let mut connection = new_redis_connection_manager(&client, "test redis worker").unwrap();
+
+        let state = AppState::for_test().with_profile("dev");
+        let store: Arc<dyn crate::job_tracking::JobTrackingStore> =
+            Arc::new(crate::job_tracking::InMemoryJobTrackingStore::new(60));
+        crate::job_tracking::install_tracking_store(&state, store.clone());
+        let key = "dropped-pending-key";
+        store
+            .create(key, crate::job_tracking::TrackedJobOwner::Anonymous)
+            .await
+            .unwrap();
+        let payload = crate::job_tracking::wrap_tracked_payload(key, &serde_json::json!({}));
+
+        let job_admin = JobAdminMemoryBackend::new_for_test(32);
+        state.job_registry().register("send_email");
+        state.job_registry().record_enqueue("send_email");
+
+        let producer = RedisClient {
+            connection: new_redis_connection_manager(&client, "test redis producer").unwrap(),
+            key_prefix: worker_config.key_prefix.clone(),
+            delayed_key: worker_config.delayed_key.clone(),
+            record_prefix: worker_config.record_prefix.clone(),
+            unique_prefix: worker_config.unique_prefix.clone(),
+        };
+        let constraints = ResolvedJobConstraints {
+            unique_key: Some("dropped-pending-lock".to_string()),
+            unique_window: Some(JobUniquenessWindow::Pending),
+            concurrency_limit: None,
+            concurrency_scope: None,
+        };
+        assert_eq!(
+            producer
+                .enqueue(
+                    "job-original".to_string(),
+                    "send_email",
+                    "default",
+                    payload,
+                    2,
+                    1,
+                    None,
+                    &constraints,
+                )
+                .await
+                .unwrap(),
+            EnqueueOutcome::Queued
+        );
+
+        let jobs = redis_jobs_by_name(redis_counting_failure_handler, 2);
+        let claimed = claim_next_redis_job(
+            &mut connection,
+            &worker_config,
+            std::slice::from_ref(&worker_config.queue_key),
+        )
+        .await
+        .unwrap()
+        .expect("original job should be claimed");
+
+        // Claiming released the pending-window unique lock (see
+        // claim_next_redis_job); a duplicate now takes it over before the
+        // original's retry gets a chance to re-acquire it.
+        assert_eq!(
+            producer
+                .enqueue(
+                    "job-duplicate".to_string(),
+                    "send_email",
+                    "default",
+                    serde_json::json!({}),
+                    2,
+                    1,
+                    None,
+                    &constraints,
+                )
+                .await
+                .unwrap(),
+            EnqueueOutcome::Queued,
+            "the lock must be free for the duplicate to acquire it"
+        );
+
+        process_redis_job_record(
+            &mut connection,
+            claimed,
+            &jobs,
+            &state,
+            &job_admin,
+            &worker_config,
+        )
+        .await;
+
+        let tracked = store.get(key).await.unwrap().expect("record");
+        assert_eq!(
+            tracked.status,
+            crate::job_tracking::TrackedJobStatus::Failed,
+            "a tracked job whose retry was dropped because a duplicate already claimed the \
+             pending-window unique lock must settle its status record instead of staying \
+             pending/running until TTL expiry"
+        );
+        assert_eq!(
+            tracked.error.as_deref(),
+            Some("An equivalent job is already in progress.")
+        );
+
+        let status = state.job_registry().snapshot()["send_email"].clone();
+        assert_eq!(
+            status.total_deduplicated, 1,
+            "the dropped retry must be recorded as deduplicated, not as a normal retry"
+        );
+    }
+
+    #[cfg(feature = "redis")]
     async fn redis_enqueue_with_constraints(
         client: &redis::Client,
         worker_config: &RedisWorkerConfig,
@@ -8728,7 +10246,7 @@ mod tests {
         let connection = new_redis_connection_manager(client, "test redis producer").unwrap();
         let producer = RedisClient {
             connection,
-            queue_key: worker_config.queue_key.clone(),
+            key_prefix: worker_config.key_prefix.clone(),
             delayed_key: worker_config.delayed_key.clone(),
             record_prefix: worker_config.record_prefix.clone(),
             unique_prefix: worker_config.unique_prefix.clone(),
@@ -8737,6 +10255,7 @@ mod tests {
             .enqueue(
                 id.to_string(),
                 name,
+                "default",
                 serde_json::json!({ "marker": id }),
                 3,
                 1,
@@ -8791,10 +10310,14 @@ mod tests {
         assert_eq!(queued, 1, "exactly one queue entry for the burst");
 
         // While in flight, the key is still held.
-        let record = claim_next_redis_job(&mut connection, &worker_config)
-            .await
-            .unwrap()
-            .expect("claim the single job");
+        let record = claim_next_redis_job(
+            &mut connection,
+            &worker_config,
+            std::slice::from_ref(&worker_config.queue_key),
+        )
+        .await
+        .unwrap()
+        .expect("claim the single job");
         let inflight = redis_enqueue_with_constraints(
             &client,
             &worker_config,
@@ -8850,15 +10373,23 @@ mod tests {
             );
         }
 
-        let first = claim_next_redis_job(&mut connection, &worker_config)
+        let first = claim_next_redis_job(
+            &mut connection,
+            &worker_config,
+            std::slice::from_ref(&worker_config.queue_key),
+        )
+        .await
+        .unwrap()
+        .expect("first claim");
+        assert!(
+            claim_next_redis_job(
+                &mut connection,
+                &worker_config,
+                std::slice::from_ref(&worker_config.queue_key)
+            )
             .await
             .unwrap()
-            .expect("first claim");
-        assert!(
-            claim_next_redis_job(&mut connection, &worker_config)
-                .await
-                .unwrap()
-                .is_none(),
+            .is_none(),
             "second claim must park behind the concurrency limit"
         );
         let parked: i64 = redis::cmd("ZCARD")
@@ -8881,10 +10412,14 @@ mod tests {
         promote_due_blocked_redis_jobs(&mut connection, &worker_config)
             .await
             .unwrap();
-        let second = claim_next_redis_job(&mut connection, &worker_config)
-            .await
-            .unwrap()
-            .expect("slot freed after settle");
+        let second = claim_next_redis_job(
+            &mut connection,
+            &worker_config,
+            std::slice::from_ref(&worker_config.queue_key),
+        )
+        .await
+        .unwrap()
+        .expect("slot freed after settle");
         assert_ne!(second.id, first.id);
     }
 
@@ -8910,7 +10445,7 @@ mod tests {
             new_redis_connection_manager(&client, "test redis producer").unwrap();
         let producer = RedisClient {
             connection: connection_producer,
-            queue_key: worker_config.queue_key.clone(),
+            key_prefix: worker_config.key_prefix.clone(),
             delayed_key: worker_config.delayed_key.clone(),
             record_prefix: worker_config.record_prefix.clone(),
             unique_prefix: worker_config.unique_prefix.clone(),
@@ -8921,6 +10456,7 @@ mod tests {
                 .enqueue(
                     "x1".to_string(),
                     "crashy",
+                    "default",
                     serde_json::json!({}),
                     1,
                     1,
@@ -8933,10 +10469,14 @@ mod tests {
         );
 
         // Simulate a crashed worker: claim, never settle.
-        let _claimed = claim_next_redis_job(&mut connection, &worker_config)
-            .await
-            .unwrap()
-            .expect("claim");
+        let _claimed = claim_next_redis_job(
+            &mut connection,
+            &worker_config,
+            std::slice::from_ref(&worker_config.queue_key),
+        )
+        .await
+        .unwrap()
+        .expect("claim");
         tokio::time::sleep(Duration::from_millis(30)).await;
         recover_stale_redis_jobs(&mut connection, &worker_config, &state, &job_admin)
             .await
@@ -8958,6 +10498,7 @@ mod tests {
                 .enqueue(
                     "x2".to_string(),
                     "crashy",
+                    "default",
                     serde_json::json!({}),
                     1,
                     1,
@@ -8968,6 +10509,84 @@ mod tests {
                 .unwrap(),
             EnqueueOutcome::Queued,
             "a dead worker must not deadlock the unique key"
+        );
+    }
+
+    #[cfg(feature = "redis")]
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn redis_stale_recovery_dead_letter_settles_the_tracked_record() {
+        let (_container, client) = redis_test_client().await;
+        // 10ms visibility timeout: an unsettled claim is immediately stale.
+        let worker_config = redis_test_worker_config("crash-tracked", "dead-worker", 10);
+        let mut connection = new_redis_connection_manager(&client, "test redis worker").unwrap();
+        let state = AppState::for_test().with_profile("dev");
+        state.job_registry().register("crashy_tracked");
+        let job_admin = JobAdminMemoryBackend::new_for_test(32);
+
+        let store: Arc<dyn crate::job_tracking::JobTrackingStore> =
+            Arc::new(crate::job_tracking::InMemoryJobTrackingStore::new(60));
+        crate::job_tracking::install_tracking_store(&state, store.clone());
+        let key = "crash-tracking-key";
+        store
+            .create(key, crate::job_tracking::TrackedJobOwner::Anonymous)
+            .await
+            .unwrap();
+        let payload = crate::job_tracking::wrap_tracked_payload(key, &serde_json::json!({}));
+
+        let connection_producer =
+            new_redis_connection_manager(&client, "test redis producer").unwrap();
+        let producer = RedisClient {
+            connection: connection_producer,
+            key_prefix: worker_config.key_prefix.clone(),
+            delayed_key: worker_config.delayed_key.clone(),
+            record_prefix: worker_config.record_prefix.clone(),
+            unique_prefix: worker_config.unique_prefix.clone(),
+        };
+        let constraints = ResolvedJobConstraints {
+            unique_key: None,
+            unique_window: None,
+            concurrency_limit: None,
+            concurrency_scope: None,
+        };
+        // max_attempts = 1 so stale recovery dead-letters instead of requeueing.
+        assert_eq!(
+            producer
+                .enqueue(
+                    "x1".to_string(),
+                    "crashy_tracked",
+                    "default",
+                    payload,
+                    1,
+                    1,
+                    None,
+                    &constraints,
+                )
+                .await
+                .unwrap(),
+            EnqueueOutcome::Queued
+        );
+
+        // Simulate a crashed worker: claim, never settle.
+        let _claimed = claim_next_redis_job(
+            &mut connection,
+            &worker_config,
+            std::slice::from_ref(&worker_config.queue_key),
+        )
+        .await
+        .unwrap()
+        .expect("claim");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        recover_stale_redis_jobs(&mut connection, &worker_config, &state, &job_admin)
+            .await
+            .unwrap();
+
+        let record = store.get(key).await.unwrap().expect("record");
+        assert_eq!(
+            record.status,
+            crate::job_tracking::TrackedJobStatus::Failed,
+            "a stale-recovered, terminally dead-lettered tracked job must settle its status \
+             record instead of leaving it pending/running until TTL expiry"
         );
     }
 
@@ -8990,7 +10609,7 @@ mod tests {
 
         let producer = RedisClient {
             connection: new_redis_connection_manager(&client, "test redis producer").unwrap(),
-            queue_key: worker_config.queue_key.clone(),
+            key_prefix: worker_config.key_prefix.clone(),
             delayed_key: worker_config.delayed_key.clone(),
             record_prefix: worker_config.record_prefix.clone(),
             unique_prefix: worker_config.unique_prefix.clone(),
@@ -9003,6 +10622,7 @@ mod tests {
                 .enqueue(
                     "d1".to_string(),
                     "send_email",
+                    "default",
                     serde_json::json!({ "user_id": 7 }),
                     3,
                     1,
@@ -9028,10 +10648,14 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            claim_next_redis_job(&mut connection, &worker_config)
-                .await
-                .unwrap()
-                .is_none(),
+            claim_next_redis_job(
+                &mut connection,
+                &worker_config,
+                std::slice::from_ref(&worker_config.queue_key)
+            )
+            .await
+            .unwrap()
+            .is_none(),
             "delayed job must not be claimable before its due time"
         );
 
@@ -9044,17 +10668,25 @@ mod tests {
         promote_due_redis_retries(&mut connection, &worker_config, &state, &job_admin)
             .await
             .unwrap();
-        let claimed = claim_next_redis_job(&mut connection, &worker_config)
-            .await
-            .unwrap()
-            .expect("due job should be claimable after its due time");
+        let claimed = claim_next_redis_job(
+            &mut connection,
+            &worker_config,
+            std::slice::from_ref(&worker_config.queue_key),
+        )
+        .await
+        .unwrap()
+        .expect("due job should be claimable after its due time");
         assert_eq!(claimed.id, "d1");
         assert_eq!(claimed.attempt, 1);
         assert!(
-            claim_next_redis_job(&mut connection, &worker_config)
-                .await
-                .unwrap()
-                .is_none(),
+            claim_next_redis_job(
+                &mut connection,
+                &worker_config,
+                std::slice::from_ref(&worker_config.queue_key)
+            )
+            .await
+            .unwrap()
+            .is_none(),
             "a due job must be delivered to exactly one worker"
         );
     }
@@ -9071,6 +10703,7 @@ mod tests {
                 name: "known".to_string(),
                 max_attempts: 3,
                 initial_backoff_ms: 10,
+                queue: "default".to_string(),
                 uniqueness: None,
                 concurrency: None,
                 handler: |_state, _payload| Box::pin(async move { Ok(()) }),
@@ -9080,6 +10713,7 @@ mod tests {
             1,
             5,
             250,
+            &crate::config::JobQueuesConfig::default(),
         );
 
         let error = enqueue("typoed-job", serde_json::json!({}))
@@ -9120,6 +10754,7 @@ mod tests {
                     name: "dupe".to_string(),
                     max_attempts: 1,
                     initial_backoff_ms: 1,
+                    queue: "default".to_string(),
                     uniqueness: None,
                     concurrency: None,
                     handler: |_state, _payload| Box::pin(async move { Ok(()) }),
@@ -9128,6 +10763,7 @@ mod tests {
                     name: "dupe".to_string(),
                     max_attempts: 1,
                     initial_backoff_ms: 1,
+                    queue: "default".to_string(),
                     uniqueness: None,
                     concurrency: None,
                     handler: |_state, _payload| Box::pin(async move { Ok(()) }),
@@ -9166,6 +10802,7 @@ mod tests {
                 name: "known".to_string(),
                 max_attempts: 1,
                 initial_backoff_ms: 1,
+                queue: "default".to_string(),
                 uniqueness: None,
                 concurrency: None,
                 handler: |_state, _payload| Box::pin(async move { Ok(()) }),
@@ -9207,6 +10844,7 @@ mod tests {
                 name: "known".to_string(),
                 max_attempts: 1,
                 initial_backoff_ms: 1,
+                queue: "default".to_string(),
                 uniqueness: None,
                 concurrency: None,
                 handler: |_state, _payload| Box::pin(async move { Ok(()) }),
@@ -9553,12 +11191,503 @@ mod tests {
     #[tokio::test]
     async fn run_job_handler_reports_async_panics() {
         let state = AppState::for_test().with_profile("dev");
-        let outcome =
-            run_job_handler("test_job", panicking_handler, state, serde_json::json!({})).await;
+        let outcome = run_job_handler(
+            "test_job",
+            panicking_handler,
+            state,
+            serde_json::json!({}),
+            true,
+        )
+        .await;
         assert_eq!(
             outcome,
             JobExecutionOutcome::Panicked("job handler panicked: forced panic".to_string())
         );
+    }
+
+    // ── Tracked-job choke-point behavior (#1373) ──────────────────────────────
+    //
+    // run_job_handler is the single point all three backends run handlers
+    // through; these tests drive it via the real local backend + the free
+    // enqueue_tracked function rather than calling it directly, so they also
+    // exercise enqueue_tracked's envelope-wrapping and the local backend's
+    // retry/dead-letter decisions end to end.
+
+    #[tokio::test]
+    async fn enqueue_tracked_token_is_a_64_char_hex_capability_distinct_from_job_ids() {
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+
+        let state = AppState::for_test().with_profile("dev");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        start_local_runtime(
+            vec![JobInfo::new("tracked_noop", 1, 10, |_state, _payload| {
+                Box::pin(async move { Ok(()) })
+            })],
+            &state,
+            &shutdown,
+            1,
+            5,
+            250,
+            &crate::config::JobQueuesConfig::default(),
+        );
+
+        let handle = crate::job_tracking::enqueue_tracked("tracked_noop", serde_json::json!({}))
+            .await
+            .unwrap();
+
+        // Internal job ids are UUIDs (36 chars, hyphenated); the tracked
+        // token is a distinct 256-bit hex capability with no hyphens.
+        assert_eq!(handle.token.len(), 64, "token: {}", handle.token);
+        assert!(
+            handle.token.chars().all(|c| c.is_ascii_hexdigit()),
+            "token: {}",
+            handle.token
+        );
+        assert!(!handle.token.contains('-'), "token: {}", handle.token);
+
+        shutdown.cancel();
+        clear_global_job_client();
+    }
+
+    #[tokio::test]
+    async fn tracked_envelope_is_stripped_before_handler_sees_args() {
+        static CAPTURED: std::sync::OnceLock<std::sync::Mutex<Option<Value>>> =
+            std::sync::OnceLock::new();
+        fn captured() -> &'static std::sync::Mutex<Option<Value>> {
+            CAPTURED.get_or_init(|| std::sync::Mutex::new(None))
+        }
+        fn capturing_handler(
+            _state: AppState,
+            payload: Value,
+        ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'static>> {
+            Box::pin(async move {
+                *captured().lock().unwrap() = Some(payload);
+                Ok(())
+            })
+        }
+
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+        *captured().lock().unwrap() = None;
+
+        let state = AppState::for_test().with_profile("dev");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        start_local_runtime(
+            vec![JobInfo::new("capture_args", 1, 10, capturing_handler)],
+            &state,
+            &shutdown,
+            1,
+            5,
+            250,
+            &crate::config::JobQueuesConfig::default(),
+        );
+
+        crate::job_tracking::enqueue_tracked("capture_args", serde_json::json!({"account_id": 7}))
+            .await
+            .unwrap();
+
+        let payload = timeout(Duration::from_secs(1), async {
+            loop {
+                let seen = captured().lock().unwrap().clone();
+                if let Some(payload) = seen {
+                    return payload;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("handler should have run within 1s");
+
+        assert_eq!(payload, serde_json::json!({"account_id": 7}));
+        assert!(payload.get("__autumn_tracked").is_none(), "{payload}");
+        assert!(payload.get("args").is_none(), "{payload}");
+
+        shutdown.cancel();
+        clear_global_job_client();
+    }
+
+    #[tokio::test]
+    async fn enqueue_rejects_a_payload_that_collides_with_the_tracked_envelope_shape() {
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+
+        let state = AppState::for_test().with_profile("dev");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        start_local_runtime(
+            vec![JobInfo::new(
+                "colliding_payload_job",
+                1,
+                10,
+                |_state, _payload| Box::pin(async move { Ok(()) }),
+            )],
+            &state,
+            &shutdown,
+            1,
+            5,
+            250,
+            &crate::config::JobQueuesConfig::default(),
+        );
+
+        // A plain (untracked) enqueue whose Args struct happens to shadow the
+        // reserved envelope marker must be rejected outright rather than
+        // silently reaching the handler with the wrong args.
+        let colliding = serde_json::json!({"__autumn_tracked": {"k": "abc"}, "other": 1});
+        let err = enqueue("colliding_payload_job", colliding)
+            .await
+            .expect_err("a colliding payload must be rejected");
+        assert!(
+            err.to_string().contains("__autumn_tracked"),
+            "unexpected error: {err}"
+        );
+
+        // enqueue_in/enqueue_at share the same guard via enqueue_due.
+        let err = enqueue_in(
+            "colliding_payload_job",
+            serde_json::json!({"__autumn_tracked": {"k": "abc"}}),
+            Duration::from_millis(1),
+        )
+        .await
+        .expect_err("a colliding payload must be rejected");
+        assert!(
+            err.to_string().contains("__autumn_tracked"),
+            "unexpected error: {err}"
+        );
+
+        shutdown.cancel();
+        clear_global_job_client();
+    }
+
+    #[tokio::test]
+    async fn admin_cancel_before_local_execution_settles_the_tracked_record_instead_of_leaving_it_stuck()
+     {
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+
+        let store: Arc<dyn crate::job_tracking::JobTrackingStore> =
+            Arc::new(crate::job_tracking::InMemoryJobTrackingStore::new(60));
+        let state = AppState::for_test().with_profile("dev");
+        crate::job_tracking::install_tracking_store(&state, store.clone());
+
+        let key = "cancel-test-key";
+        store
+            .create(key, crate::job_tracking::TrackedJobOwner::Anonymous)
+            .await
+            .unwrap();
+        let payload = crate::job_tracking::wrap_tracked_payload(key, &serde_json::json!({}));
+
+        let job_admin = JobAdminMemoryBackend::new_for_test(32);
+        let id = job_admin.record_enqueue_for_test("canceled_tracked", payload.clone(), 1, 3);
+        job_admin
+            .cancel_enqueued(&id)
+            .expect("enqueued job should be cancelable");
+
+        let jobs_by_name: Arc<RwLock<HashMap<String, JobInfo>>> =
+            Arc::new(RwLock::new(HashMap::from([(
+                "canceled_tracked".to_string(),
+                JobInfo::new("canceled_tracked", 3, 10, |_state, _payload| {
+                    Box::pin(async move { Ok(()) })
+                }),
+            )])));
+        let (tx, _rx) = tokio::sync::mpsc::channel::<QueuedJob>(1);
+        let coordination = Arc::new(LocalJobCoordination::default());
+
+        let job = QueuedJob {
+            id: id.clone(),
+            name: "canceled_tracked".to_string(),
+            queue: "default".to_string(),
+            payload,
+            attempt: 1,
+            max_attempts: 3,
+            initial_backoff_ms: 10,
+            #[cfg(feature = "telemetry-otlp")]
+            traceparent: None,
+            #[cfg(feature = "telemetry-otlp")]
+            tracestate: None,
+        };
+
+        // The admin already flagged this job Canceled before it ever reached
+        // a worker, so `execute_local_job` short-circuits before
+        // `run_job_handler` — the tracking record must still settle to
+        // Failed rather than being left at Pending until TTL expiry.
+        execute_local_job(job, &jobs_by_name, &tx, &state, &job_admin, &coordination).await;
+
+        let record = store.get(key).await.unwrap().expect("record");
+        assert_eq!(record.status, crate::job_tracking::TrackedJobStatus::Failed);
+
+        clear_global_job_client();
+    }
+
+    #[tokio::test]
+    async fn unregistered_job_name_at_local_dispatch_settles_the_tracked_record_instead_of_leaving_it_stuck()
+     {
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+
+        let store: Arc<dyn crate::job_tracking::JobTrackingStore> =
+            Arc::new(crate::job_tracking::InMemoryJobTrackingStore::new(60));
+        let state = AppState::for_test().with_profile("dev");
+        crate::job_tracking::install_tracking_store(&state, store.clone());
+
+        let key = "unregistered-test-key";
+        store
+            .create(key, crate::job_tracking::TrackedJobOwner::Anonymous)
+            .await
+            .unwrap();
+        let payload = crate::job_tracking::wrap_tracked_payload(key, &serde_json::json!({}));
+
+        let job_admin = JobAdminMemoryBackend::new_for_test(32);
+        // Never inserted into `jobs_by_name`, so the dispatcher cannot find a
+        // handler even though the tracking record was created for it.
+        let id = job_admin.record_enqueue_for_test("no_such_job", payload.clone(), 1, 3);
+
+        let jobs_by_name: Arc<RwLock<HashMap<String, JobInfo>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let (tx, _rx) = tokio::sync::mpsc::channel::<QueuedJob>(1);
+        let coordination = Arc::new(LocalJobCoordination::default());
+
+        let job = QueuedJob {
+            id,
+            name: "no_such_job".to_string(),
+            queue: "default".to_string(),
+            payload,
+            attempt: 1,
+            max_attempts: 3,
+            initial_backoff_ms: 10,
+            #[cfg(feature = "telemetry-otlp")]
+            traceparent: None,
+            #[cfg(feature = "telemetry-otlp")]
+            tracestate: None,
+        };
+
+        execute_local_job(job, &jobs_by_name, &tx, &state, &job_admin, &coordination).await;
+
+        let record = store.get(key).await.unwrap().expect("record");
+        assert_eq!(record.status, crate::job_tracking::TrackedJobStatus::Failed);
+
+        clear_global_job_client();
+    }
+
+    #[test]
+    fn job_unique_key_and_identity_use_inner_args_for_tracked_payloads() {
+        let inner = serde_json::json!({"account_id": 42, "principal_id": "user:7"});
+        let wrapped = crate::job_tracking::wrap_tracked_payload("somehash", &inner);
+
+        let uniqueness = JobUniqueness {
+            by: vec!["account_id".to_string()],
+            window: JobUniquenessWindow::Running,
+        };
+        assert_eq!(
+            job_unique_key(&uniqueness, &wrapped),
+            job_unique_key(&uniqueness, &inner),
+            "the tracked envelope must not change the derived unique key"
+        );
+
+        let concurrency = JobConcurrency {
+            limit: 1,
+            key: Some("account_id".to_string()),
+        };
+        assert_eq!(
+            job_concurrency_scope(&concurrency, &wrapped),
+            job_concurrency_scope(&concurrency, &inner)
+        );
+
+        let (principal, _) = job_payload_identity(&wrapped);
+        assert_eq!(principal.as_deref(), Some("user:7"));
+    }
+
+    #[tokio::test]
+    async fn deduplicated_tracked_enqueue_fails_new_token_with_duplicate_message() {
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+
+        let state = AppState::for_test().with_profile("dev");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let mut info = JobInfo::new("dedup_tracked", 1, 10, |_state, _payload| {
+            Box::pin(async move { Ok(()) })
+        });
+        info.uniqueness = Some(JobUniqueness {
+            by: Vec::new(),
+            window: JobUniquenessWindow::Running,
+        });
+        start_local_runtime(
+            vec![info],
+            &state,
+            &shutdown,
+            1,
+            5,
+            250,
+            &crate::config::JobQueuesConfig::default(),
+        );
+
+        let first =
+            crate::job_tracking::enqueue_tracked("dedup_tracked", serde_json::json!({"x": 1}))
+                .await
+                .unwrap();
+        let second =
+            crate::job_tracking::enqueue_tracked("dedup_tracked", serde_json::json!({"x": 1}))
+                .await
+                .unwrap();
+        assert_ne!(first.token, second.token);
+
+        let store =
+            crate::job_tracking::tracking_store_from_state(&state).expect("store installed");
+        let key = crate::auth::hash_api_token(&second.token);
+        let record = store.get(&key).await.unwrap().expect("record");
+        assert_eq!(record.status, crate::job_tracking::TrackedJobStatus::Failed);
+        assert_eq!(
+            record.error.as_deref(),
+            Some("An equivalent job is already in progress.")
+        );
+
+        shutdown.cancel();
+        clear_global_job_client();
+    }
+
+    #[tokio::test]
+    async fn retryable_failure_leaves_tracked_record_running_final_attempt_settles_it() {
+        static ATTEMPTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        fn flaky_handler(
+            _state: AppState,
+            _payload: Value,
+        ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'static>> {
+            Box::pin(async move {
+                let attempt = ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                let ctx = crate::job_tracking::JobContext::current();
+                let _ = ctx.set_progress(10, None).await;
+                if attempt < 2 {
+                    Err(AutumnError::internal_server_error(std::io::Error::other(
+                        "transient",
+                    )))
+                } else {
+                    Ok(())
+                }
+            })
+        }
+
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+        ATTEMPTS.store(0, std::sync::atomic::Ordering::SeqCst);
+
+        let state = AppState::for_test().with_profile("dev");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        start_local_runtime(
+            vec![JobInfo::new("flaky_tracked", 2, 10, flaky_handler)],
+            &state,
+            &shutdown,
+            1,
+            5,
+            250,
+            &crate::config::JobQueuesConfig::default(),
+        );
+
+        let handle = crate::job_tracking::enqueue_tracked("flaky_tracked", serde_json::json!({}))
+            .await
+            .unwrap();
+        let store = crate::job_tracking::tracking_store_from_state(&state).unwrap();
+        let key = crate::auth::hash_api_token(&handle.token);
+
+        // Wait for attempt 1 to fail and its settle logic to run.
+        timeout(Duration::from_secs(2), async {
+            while ATTEMPTS.load(std::sync::atomic::Ordering::SeqCst) < 1 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("attempt 1 should run within 2s");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let record = store.get(&key).await.unwrap().expect("record");
+        assert_ne!(
+            record.status,
+            crate::job_tracking::TrackedJobStatus::Failed,
+            "a retryable failure with attempts remaining must not settle the record"
+        );
+
+        // Wait for the retry (attempt 2) to succeed and settle the record.
+        let record = timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(record) = store.get(&key).await.unwrap()
+                    && record.status == crate::job_tracking::TrackedJobStatus::Succeeded
+                {
+                    return record;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("retry should succeed within 2s");
+        assert_eq!(
+            record.status,
+            crate::job_tracking::TrackedJobStatus::Succeeded
+        );
+
+        shutdown.cancel();
+        clear_global_job_client();
+    }
+
+    #[tokio::test]
+    async fn panic_marks_tracked_record_failed_with_generic_message_not_panic_detail() {
+        fn panicking_handler(
+            _state: AppState,
+            _payload: Value,
+        ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'static>> {
+            Box::pin(async move { panic!("sensitive internal detail") })
+        }
+
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+
+        let state = AppState::for_test().with_profile("dev");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        start_local_runtime(
+            // max_attempts = 3: proves a panic dead-letters immediately
+            // regardless of remaining attempts, not just when it's the last one.
+            vec![JobInfo::new("panicking_tracked", 3, 10, panicking_handler)],
+            &state,
+            &shutdown,
+            1,
+            5,
+            250,
+            &crate::config::JobQueuesConfig::default(),
+        );
+
+        let handle =
+            crate::job_tracking::enqueue_tracked("panicking_tracked", serde_json::json!({}))
+                .await
+                .unwrap();
+        let store = crate::job_tracking::tracking_store_from_state(&state).unwrap();
+        let key = crate::auth::hash_api_token(&handle.token);
+
+        let record = timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(record) = store.get(&key).await.unwrap()
+                    && record.status == crate::job_tracking::TrackedJobStatus::Failed
+                {
+                    return record;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("a panic should settle the record to failed within 2s");
+
+        assert_eq!(
+            record.error.as_deref(),
+            Some(crate::job_tracking::GENERIC_FAILURE_MESSAGE)
+        );
+        assert!(
+            !record
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("sensitive internal detail"),
+            "the raw panic message must never reach the tracked record: {:?}",
+            record.error
+        );
+
+        shutdown.cancel();
+        clear_global_job_client();
     }
 
     #[tokio::test]
@@ -9574,6 +11703,7 @@ mod tests {
             QueuedJob {
                 id: job_id.clone(),
                 name: "ghost".to_string(),
+                queue: "default".to_string(),
                 payload: serde_json::json!({}),
                 attempt: 1,
                 max_attempts: 1,
@@ -9633,6 +11763,7 @@ mod tests {
             PgJobRow {
                 id: id.to_owned(),
                 name: name.to_owned(),
+                queue: "default".to_owned(),
                 payload: "{}".to_owned(),
                 status: PG_STATUS_RUNNING.to_owned(),
                 attempt,
@@ -10049,6 +12180,7 @@ mod tests {
                     name: "test_job".to_string(),
                     max_attempts: 1,
                     initial_backoff_ms: 1,
+                    queue: "default".to_string(),
                     uniqueness: None,
                     concurrency: None,
                     handler: |_state, _payload| Box::pin(async move { Ok(()) }),
@@ -10097,6 +12229,14 @@ mod tests {
                     diesel::sql_query(stmt).execute(&mut *conn).await.unwrap();
                 }
             }
+
+            let sql3 = include_str!("../migrations/20260628000000_add_queue_to_jobs/up.sql");
+            for stmt in sql3.split(';') {
+                let stmt = stmt.trim();
+                if !stmt.is_empty() {
+                    diesel::sql_query(stmt).execute(&mut *conn).await.unwrap();
+                }
+            }
         }
 
         fn unique_constraints(key: &str, window: JobUniquenessWindow) -> ResolvedJobConstraints {
@@ -10138,6 +12278,7 @@ mod tests {
                 &pool,
                 job_id.clone(),
                 "send_email",
+                "default",
                 serde_json::json!({ "user_id": 42 }),
                 5,
                 250,
@@ -10146,7 +12287,7 @@ mod tests {
             .await
             .expect("enqueue should succeed");
 
-            let claimed = pg_claim_next_job(&pool, "test-worker", false)
+            let claimed = pg_claim_next_job(&pool, "test-worker", false, &["default".to_string()])
                 .await
                 .expect("claim should return a job");
 
@@ -10193,6 +12334,7 @@ mod tests {
                 &pool,
                 job_id.clone(),
                 "send_email",
+                "default",
                 serde_json::json!({ "user_id": 7 }),
                 5,
                 250,
@@ -10204,7 +12346,9 @@ mod tests {
 
             // Before the due time: not claimable.
             assert!(
-                pg_claim_next_job(&pool, "worker-1", false).await.is_none(),
+                pg_claim_next_job(&pool, "worker-1", false, &["default".to_string()])
+                    .await
+                    .is_none(),
                 "delayed job must not be claimable before its due time"
             );
 
@@ -10213,19 +12357,23 @@ mod tests {
             drop(pool);
             let pool = pg_test_pool(&url);
             assert!(
-                pg_claim_next_job(&pool, "worker-2", false).await.is_none(),
+                pg_claim_next_job(&pool, "worker-2", false, &["default".to_string()])
+                    .await
+                    .is_none(),
                 "delayed job must still be invisible right after a restart"
             );
 
             // After the due time: claimable exactly once, then runs the normal path.
             tokio::time::sleep(Duration::from_millis(2_500)).await;
-            let claimed = pg_claim_next_job(&pool, "worker-2", false)
+            let claimed = pg_claim_next_job(&pool, "worker-2", false, &["default".to_string()])
                 .await
                 .expect("delayed job should be claimable once due");
             assert_eq!(claimed.id, job_id);
             assert_eq!(claimed.attempt, 1);
             assert!(
-                pg_claim_next_job(&pool, "worker-2", false).await.is_none(),
+                pg_claim_next_job(&pool, "worker-2", false, &["default".to_string()])
+                    .await
+                    .is_none(),
                 "a due job must be delivered to exactly one worker"
             );
 
@@ -10234,6 +12382,63 @@ mod tests {
                 .expect("ack should succeed");
             let finished = pg_fetch_by_id(&pool, &job_id).await.expect("row exists");
             assert_eq!(finished.status, PG_STATUS_COMPLETED);
+        }
+
+        #[tokio::test]
+        #[ignore = "requires Docker (testcontainers)"]
+        async fn pg_claim_drains_higher_priority_queue_first() {
+            use testcontainers::runners::AsyncRunner as _;
+            use testcontainers_modules::postgres::Postgres;
+
+            let container = Postgres::default().start().await.unwrap();
+            let port = container.get_host_port_ipv4(5432).await.unwrap();
+            let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+            let pool = pg_test_pool(&url);
+            pg_run_migration(&pool).await;
+
+            // Low-priority work enqueued first, the critical job after it.
+            pg_enqueue_job(
+                &pool,
+                "low-1".to_string(),
+                "bulk",
+                "low",
+                serde_json::json!({}),
+                5,
+                250,
+                &ResolvedJobConstraints::default(),
+            )
+            .await
+            .expect("enqueue low");
+            pg_enqueue_job(
+                &pool,
+                "crit-1".to_string(),
+                "urgent",
+                "critical",
+                serde_json::json!({}),
+                5,
+                250,
+                &ResolvedJobConstraints::default(),
+            )
+            .await
+            .expect("enqueue critical");
+
+            // Strict priority: critical drains before low despite enqueue order,
+            // and each row carries (round-trips) its queue.
+            let order = [
+                "critical".to_string(),
+                "default".to_string(),
+                "low".to_string(),
+            ];
+            let first = pg_claim_next_job(&pool, "w1", false, &order)
+                .await
+                .expect("first claim");
+            assert_eq!(first.id, "crit-1");
+            assert_eq!(first.queue, "critical");
+            let second = pg_claim_next_job(&pool, "w1", false, &order)
+                .await
+                .expect("second claim");
+            assert_eq!(second.id, "low-1");
+            assert_eq!(second.queue, "low");
         }
 
         #[tokio::test]
@@ -10352,6 +12557,7 @@ mod tests {
                 &pool,
                 uuid::Uuid::new_v4().to_string(),
                 "send_email",
+                "default",
                 serde_json::json!({}),
                 5,
                 250,
@@ -10360,9 +12566,10 @@ mod tests {
             .await
             .unwrap();
 
+            let order = ["default".to_string()];
             let (claim_a, claim_b) = tokio::join!(
-                pg_claim_next_job(&pool, "worker-a", false),
-                pg_claim_next_job(&pool, "worker-b", false)
+                pg_claim_next_job(&pool, "worker-a", false, &order),
+                pg_claim_next_job(&pool, "worker-b", false, &order)
             );
 
             let both = claim_a.is_some() && claim_b.is_some();
@@ -10389,6 +12596,7 @@ mod tests {
                 &pool,
                 job_id.clone(),
                 "flaky",
+                "default",
                 serde_json::json!({}),
                 2,
                 1,
@@ -10398,7 +12606,7 @@ mod tests {
             .unwrap();
 
             // Attempt 1: claim and fail
-            let job = pg_claim_next_job(&pool, "worker-1", false)
+            let job = pg_claim_next_job(&pool, "worker-1", false, &["default".to_string()])
                 .await
                 .expect("first claim should succeed");
             assert_eq!(job.attempt, 1);
@@ -10418,7 +12626,7 @@ mod tests {
             .await;
 
             // Attempt 2: claim and fail again (max_attempts = 2 → dead-letter)
-            let job2 = pg_claim_next_job(&pool, "worker-1", false)
+            let job2 = pg_claim_next_job(&pool, "worker-1", false, &["default".to_string()])
                 .await
                 .expect("second claim should succeed");
             assert_eq!(job2.attempt, 2);
@@ -10449,6 +12657,7 @@ mod tests {
                 &pool,
                 job_id.clone(),
                 "crashy",
+                "default",
                 serde_json::json!({}),
                 3,
                 1,
@@ -10457,7 +12666,7 @@ mod tests {
             .await
             .unwrap();
 
-            let _ = pg_claim_next_job(&pool, "crashed-worker", false)
+            let _ = pg_claim_next_job(&pool, "crashed-worker", false, &["default".to_string()])
                 .await
                 .unwrap();
 
@@ -10467,7 +12676,7 @@ mod tests {
             )).await;
 
             // Recover stale claims with a 1-second timeout
-            pg_recover_stale_claims(&pool, 1_000).await;
+            pg_recover_stale_claims(&pool, 1_000, &AppState::for_test()).await;
 
             let row = pg_fetch_by_id(&pool, &job_id).await.unwrap();
             assert_eq!(
@@ -10500,6 +12709,7 @@ mod tests {
                 &pool,
                 "enq-1".to_string(),
                 "digest",
+                "default",
                 serde_json::json!({}),
                 5,
                 250,
@@ -10513,6 +12723,7 @@ mod tests {
                 &pool,
                 "run-1".to_string(),
                 "reindex",
+                "default",
                 serde_json::json!({}),
                 5,
                 250,
@@ -10520,13 +12731,14 @@ mod tests {
             )
             .await
             .unwrap();
-            let _ = pg_claim_next_job(&pool, "w1", false).await;
+            let _ = pg_claim_next_job(&pool, "w1", false, &["default".to_string()]).await;
 
             // Completed
             pg_enqueue_job(
                 &pool,
                 "cmp-1".to_string(),
                 "send_email",
+                "default",
                 serde_json::json!({}),
                 5,
                 250,
@@ -10541,7 +12753,7 @@ mod tests {
                 "UPDATE autumn_jobs SET run_at = NOW() - INTERVAL '1 second' WHERE id = 'cmp-1'",
             )
             .await;
-            let job_c = pg_claim_next_job(&pool, "w1", false)
+            let job_c = pg_claim_next_job(&pool, "w1", false, &["default".to_string()])
                 .await
                 .expect("completed job to claim");
             pg_ack_success(&pool, &job_c.id, "w1").await.unwrap();
@@ -10551,6 +12763,7 @@ mod tests {
                 &pool,
                 "fail-1".to_string(),
                 "webhook",
+                "default",
                 serde_json::json!({}),
                 1,
                 1,
@@ -10563,7 +12776,7 @@ mod tests {
                 "UPDATE autumn_jobs SET run_at = NOW() - INTERVAL '1 second' WHERE id = 'fail-1'",
             )
             .await;
-            let job_f = pg_claim_next_job(&pool, "w1", false)
+            let job_f = pg_claim_next_job(&pool, "w1", false, &["default".to_string()])
                 .await
                 .expect("failed job to claim");
             pg_nack_failure(&pool, &job_f.id, "w1", "server down", &job_f, None)
@@ -10604,6 +12817,7 @@ mod tests {
                 &pool,
                 "fail-r".to_string(),
                 "job",
+                "default",
                 serde_json::json!({}),
                 1,
                 1,
@@ -10611,7 +12825,9 @@ mod tests {
             )
             .await
             .unwrap();
-            let jf = pg_claim_next_job(&pool, "w", false).await.unwrap();
+            let jf = pg_claim_next_job(&pool, "w", false, &["default".to_string()])
+                .await
+                .unwrap();
             pg_nack_failure(&pool, &jf.id, "w", "boom", &jf, None)
                 .await
                 .unwrap();
@@ -10626,6 +12842,7 @@ mod tests {
                 &pool,
                 "fail-d".to_string(),
                 "job",
+                "default",
                 serde_json::json!({}),
                 1,
                 1,
@@ -10638,7 +12855,9 @@ mod tests {
                 "UPDATE autumn_jobs SET run_at = NOW() - INTERVAL '1 second' WHERE id = 'fail-d'",
             )
             .await;
-            let jd = pg_claim_next_job(&pool, "w", false).await.unwrap();
+            let jd = pg_claim_next_job(&pool, "w", false, &["default".to_string()])
+                .await
+                .unwrap();
             pg_nack_failure(&pool, &jd.id, "w", "boom", &jd, None)
                 .await
                 .unwrap();
@@ -10655,6 +12874,7 @@ mod tests {
                 &pool,
                 "cancel-c".to_string(),
                 "job",
+                "default",
                 serde_json::json!({}),
                 5,
                 1,
@@ -10668,6 +12888,185 @@ mod tests {
                 .expect("cancel should succeed");
             let row = pg_fetch_by_id(&pool, "cancel-c").await.unwrap();
             assert_eq!(row.status, "discarded");
+        }
+
+        #[tokio::test]
+        #[ignore = "requires Docker (testcontainers)"]
+        async fn pg_admin_cancel_enqueued_settles_the_tracked_record() {
+            use testcontainers::runners::AsyncRunner as _;
+            use testcontainers_modules::postgres::Postgres;
+
+            let container = Postgres::default().start().await.unwrap();
+            let port = container.get_host_port_ipv4(5432).await.unwrap();
+            let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+            let pool = pg_test_pool(&url);
+            pg_run_migration(&pool).await;
+            let backend = PgJobAdminBackend { pool: pool.clone() };
+
+            let _guard = global_job_runtime_test_lock().lock().await;
+            clear_global_job_client();
+            let store: Arc<dyn crate::job_tracking::JobTrackingStore> =
+                Arc::new(crate::job_tracking::InMemoryJobTrackingStore::new(60));
+            crate::job_tracking::install_tracking_store(&AppState::for_test(), store.clone());
+            let key = "pg-cancel-tracked-key";
+            store
+                .create(key, crate::job_tracking::TrackedJobOwner::Anonymous)
+                .await
+                .unwrap();
+            let payload = crate::job_tracking::wrap_tracked_payload(key, &serde_json::json!({}));
+
+            pg_enqueue_job(
+                &pool,
+                "pg-cancel-tracked".to_string(),
+                "job",
+                "default",
+                payload,
+                5,
+                1,
+                &ResolvedJobConstraints::default(),
+            )
+            .await
+            .unwrap();
+
+            // Cancelling an enqueued-but-not-yet-claimed job never reaches
+            // run_job_handler.
+            backend
+                .cancel("pg-cancel-tracked")
+                .await
+                .expect("cancel should succeed");
+
+            let record = store.get(key).await.unwrap().expect("record");
+            assert_eq!(
+                record.status,
+                crate::job_tracking::TrackedJobStatus::Failed,
+                "an operator-cancelled enqueued tracked job must settle its status record \
+                 instead of staying pending until TTL expiry"
+            );
+
+            clear_global_job_client();
+        }
+
+        #[tokio::test]
+        #[ignore = "requires Docker (testcontainers)"]
+        async fn pg_admin_retry_resets_tracked_record_off_its_stale_terminal_status() {
+            use testcontainers::runners::AsyncRunner as _;
+            use testcontainers_modules::postgres::Postgres;
+
+            let container = Postgres::default().start().await.unwrap();
+            let port = container.get_host_port_ipv4(5432).await.unwrap();
+            let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+            let pool = pg_test_pool(&url);
+            pg_run_migration(&pool).await;
+            let backend = PgJobAdminBackend { pool: pool.clone() };
+
+            let _guard = global_job_runtime_test_lock().lock().await;
+            clear_global_job_client();
+            let store: Arc<dyn crate::job_tracking::JobTrackingStore> =
+                Arc::new(crate::job_tracking::InMemoryJobTrackingStore::new(60));
+            crate::job_tracking::install_tracking_store(&AppState::for_test(), store.clone());
+            let key = "pg-retry-tracked-key";
+            store
+                .create(key, crate::job_tracking::TrackedJobOwner::Anonymous)
+                .await
+                .unwrap();
+            // The original attempt ran to completion and settled the record
+            // terminally, exactly as `run_job_handler` would on a
+            // final-attempt failure.
+            store.fail(key, "boom".to_string()).await.unwrap();
+            let payload = crate::job_tracking::wrap_tracked_payload(key, &serde_json::json!({}));
+
+            pg_enqueue_job(
+                &pool,
+                "pg-retry-tracked".to_string(),
+                "job",
+                "default",
+                payload,
+                1,
+                1,
+                &ResolvedJobConstraints::default(),
+            )
+            .await
+            .unwrap();
+            let claimed = pg_claim_next_job(&pool, "w", false, &["default".to_string()])
+                .await
+                .unwrap();
+            pg_nack_failure(&pool, &claimed.id, "w", "boom", &claimed, None)
+                .await
+                .unwrap();
+
+            backend
+                .retry("pg-retry-tracked")
+                .await
+                .expect("retry should succeed");
+
+            let tracked = store.get(key).await.unwrap().expect("record");
+            assert_eq!(
+                tracked.status,
+                crate::job_tracking::TrackedJobStatus::Pending,
+                "an operator retry must reset the tracked record off its stale terminal status \
+                 so the retried attempt's mark_running/set_progress calls surface instead of \
+                 no-op'ing against a still-Failed record"
+            );
+
+            clear_global_job_client();
+        }
+
+        #[tokio::test]
+        #[ignore = "requires Docker (testcontainers)"]
+        async fn pg_tracking_cleanup_deletes_expired_rows_and_keeps_live_ones() {
+            use testcontainers::runners::AsyncRunner as _;
+            use testcontainers_modules::postgres::Postgres;
+
+            let container = Postgres::default().start().await.unwrap();
+            let port = container.get_host_port_ipv4(5432).await.unwrap();
+            let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+            let pool = pg_test_pool(&url);
+
+            let mut conn = pool.get().await.unwrap();
+            let tracking_sql =
+                include_str!("../migrations/20260702000000_create_job_tracking/up.sql");
+            for stmt in tracking_sql.split(';') {
+                let stmt = stmt.trim();
+                if !stmt.is_empty() {
+                    diesel::sql_query(stmt).execute(&mut *conn).await.unwrap();
+                }
+            }
+            drop(conn);
+
+            // A record whose TTL puts `expires_at` far in the past — the
+            // clock only controls what timestamp gets written, not any
+            // filtering here, since `pg_cleanup_expired_tracking_rows`
+            // compares against Postgres's real `NOW()`.
+            let long_ago = chrono::DateTime::parse_from_rfc3339("2000-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc);
+            let expired_store = crate::job_tracking::PgJobTrackingStore::new(pool.clone(), 60)
+                .with_clock(std::sync::Arc::new(crate::time::FixedClock::at(long_ago)));
+            expired_store
+                .create(
+                    "expired-key",
+                    crate::job_tracking::TrackedJobOwner::Anonymous,
+                )
+                .await
+                .unwrap();
+
+            let live_store = crate::job_tracking::PgJobTrackingStore::new(pool.clone(), 86_400);
+            live_store
+                .create("live-key", crate::job_tracking::TrackedJobOwner::Anonymous)
+                .await
+                .unwrap();
+
+            pg_cleanup_expired_tracking_rows(&pool).await;
+
+            let verify_store = crate::job_tracking::PgJobTrackingStore::new(pool.clone(), 86_400);
+            assert!(
+                verify_store.get("expired-key").await.unwrap().is_none(),
+                "an expired tracking row must be swept instead of accumulating forever"
+            );
+            assert!(
+                verify_store.get("live-key").await.unwrap().is_some(),
+                "the cleanup sweep must not touch rows that haven't expired yet"
+            );
         }
 
         /// Helper: fetch a single job row by id for test assertions.
@@ -10688,6 +13087,7 @@ mod tests {
                 &pool,
                 "uniq-1".to_string(),
                 "send_invoice",
+                "default",
                 serde_json::json!({"invoice": 7}),
                 3,
                 10,
@@ -10699,6 +13099,7 @@ mod tests {
                 &pool,
                 "uniq-2".to_string(),
                 "send_invoice",
+                "default",
                 serde_json::json!({"invoice": 7}),
                 3,
                 10,
@@ -10714,16 +13115,21 @@ mod tests {
             );
 
             // Exactly one row exists and exactly one execution happens.
-            let row = pg_claim_next_job(&pool, "w1", false)
+            let row = pg_claim_next_job(&pool, "w1", false, &["default".to_string()])
                 .await
                 .expect("one job");
-            assert!(pg_claim_next_job(&pool, "w1", false).await.is_none());
+            assert!(
+                pg_claim_next_job(&pool, "w1", false, &["default".to_string()])
+                    .await
+                    .is_none()
+            );
 
             // While running, the key is still held.
             let blocked = pg_enqueue_job(
                 &pool,
                 "uniq-3".to_string(),
                 "send_invoice",
+                "default",
                 serde_json::json!({"invoice": 7}),
                 3,
                 10,
@@ -10739,6 +13145,7 @@ mod tests {
                 &pool,
                 "uniq-4".to_string(),
                 "send_invoice",
+                "default",
                 serde_json::json!({"invoice": 7}),
                 3,
                 10,
@@ -10766,6 +13173,7 @@ mod tests {
                 &pool,
                 "pend-1".to_string(),
                 "sync_account",
+                "default",
                 serde_json::json!({}),
                 3,
                 10,
@@ -10779,6 +13187,7 @@ mod tests {
                 &pool,
                 "pend-2".to_string(),
                 "sync_account",
+                "default",
                 serde_json::json!({}),
                 3,
                 10,
@@ -10790,12 +13199,15 @@ mod tests {
 
             // Claiming clears the key, so a new enqueue is accepted while the
             // original is still running.
-            let claimed = pg_claim_next_job(&pool, "w1", false).await.expect("claim");
+            let claimed = pg_claim_next_job(&pool, "w1", false, &["default".to_string()])
+                .await
+                .expect("claim");
             assert_eq!(claimed.id, "pend-1");
             let while_running = pg_enqueue_job(
                 &pool,
                 "pend-3".to_string(),
                 "sync_account",
+                "default",
                 serde_json::json!({}),
                 3,
                 10,
@@ -10823,6 +13235,7 @@ mod tests {
                 &pool,
                 "ttl-1".to_string(),
                 "rebuild_index",
+                "default",
                 serde_json::json!({}),
                 3,
                 10,
@@ -10830,7 +13243,9 @@ mod tests {
             )
             .await
             .unwrap();
-            let row = pg_claim_next_job(&pool, "w1", false).await.expect("claim");
+            let row = pg_claim_next_job(&pool, "w1", false, &["default".to_string()])
+                .await
+                .expect("claim");
             assert!(pg_ack_success(&pool, &row.id, "w1").await.unwrap());
 
             // Completed, but still inside the TTL window: coalesced.
@@ -10838,6 +13253,7 @@ mod tests {
                 &pool,
                 "ttl-2".to_string(),
                 "rebuild_index",
+                "default",
                 serde_json::json!({}),
                 3,
                 10,
@@ -10852,6 +13268,7 @@ mod tests {
                 &pool,
                 "ttl-3".to_string(),
                 "rebuild_index",
+                "default",
                 serde_json::json!({}),
                 3,
                 10,
@@ -10880,6 +13297,7 @@ mod tests {
                     &pool,
                     id.to_string(),
                     "recalculate",
+                    "default",
                     serde_json::json!({}),
                     3,
                     10,
@@ -10890,21 +13308,27 @@ mod tests {
             }
 
             // Limit 1: only one claim succeeds even with serialized claims on.
-            let first = pg_claim_next_job(&pool, "w1", true)
+            let first = pg_claim_next_job(&pool, "w1", true, &["default".to_string()])
                 .await
                 .expect("claim one");
             assert!(
-                pg_claim_next_job(&pool, "w2", true).await.is_none(),
+                pg_claim_next_job(&pool, "w2", true, &["default".to_string()])
+                    .await
+                    .is_none(),
                 "second claim must wait for the concurrency slot"
             );
 
             // Settling the running job frees the slot for the next claim.
             assert!(pg_ack_success(&pool, &first.id, "w1").await.unwrap());
-            let second = pg_claim_next_job(&pool, "w2", true)
+            let second = pg_claim_next_job(&pool, "w2", true, &["default".to_string()])
                 .await
                 .expect("next claim");
             assert_ne!(second.id, first.id);
-            assert!(pg_claim_next_job(&pool, "w3", true).await.is_none());
+            assert!(
+                pg_claim_next_job(&pool, "w3", true, &["default".to_string()])
+                    .await
+                    .is_none()
+            );
 
             // A different scope is not blocked by this group.
             let other_scope = limited_constraints(1, Some("acct-10"));
@@ -10912,6 +13336,7 @@ mod tests {
                 &pool,
                 "cap-other".to_string(),
                 "recalculate",
+                "default",
                 serde_json::json!({}),
                 3,
                 10,
@@ -10919,7 +13344,7 @@ mod tests {
             )
             .await
             .unwrap();
-            let other = pg_claim_next_job(&pool, "w3", true)
+            let other = pg_claim_next_job(&pool, "w3", true, &["default".to_string()])
                 .await
                 .expect("other scope");
             assert_eq!(other.id, "cap-other");
@@ -10947,6 +13372,7 @@ mod tests {
                 &pool,
                 "crash-1".to_string(),
                 "crashy",
+                "default",
                 serde_json::json!({}),
                 1,
                 10,
@@ -10956,7 +13382,7 @@ mod tests {
             .unwrap();
 
             // Simulate a worker crash: claim and never settle.
-            let row = pg_claim_next_job(&pool, "dead-worker", true)
+            let row = pg_claim_next_job(&pool, "dead-worker", true, &["default".to_string()])
                 .await
                 .expect("claim");
             assert_eq!(row.id, "crash-1");
@@ -10964,7 +13390,7 @@ mod tests {
 
             // Stale recovery dead-letters the final attempt, which must free
             // both the unique key and the concurrency slot.
-            pg_recover_stale_claims(&pool, 10).await;
+            pg_recover_stale_claims(&pool, 10, &AppState::for_test()).await;
             let recovered = pg_fetch_by_id(&pool, "crash-1").await.unwrap();
             assert_eq!(recovered.status, "failed");
 
@@ -10978,6 +13404,7 @@ mod tests {
                 &pool,
                 "crash-2".to_string(),
                 "crashy",
+                "default",
                 serde_json::json!({}),
                 1,
                 10,
@@ -10991,8 +13418,72 @@ mod tests {
                 "a dead worker must not deadlock the unique key"
             );
             assert!(
-                pg_claim_next_job(&pool, "w2", true).await.is_some(),
+                pg_claim_next_job(&pool, "w2", true, &["default".to_string()])
+                    .await
+                    .is_some(),
                 "the concurrency slot must be free after stale recovery"
+            );
+        }
+
+        #[tokio::test]
+        #[ignore = "requires Docker (testcontainers)"]
+        async fn pg_stale_claim_recovery_dead_letter_settles_the_tracked_record() {
+            use testcontainers::runners::AsyncRunner as _;
+            use testcontainers_modules::postgres::Postgres;
+
+            let container = Postgres::default().start().await.unwrap();
+            let port = container.get_host_port_ipv4(5432).await.unwrap();
+            let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+            let pool = pg_test_pool(&url);
+            pg_run_migration(&pool).await;
+
+            let state = AppState::for_test().with_profile("dev");
+            let store: Arc<dyn crate::job_tracking::JobTrackingStore> =
+                Arc::new(crate::job_tracking::InMemoryJobTrackingStore::new(60));
+            crate::job_tracking::install_tracking_store(&state, store.clone());
+            let key = "pg-crash-tracking-key";
+            store
+                .create(key, crate::job_tracking::TrackedJobOwner::Anonymous)
+                .await
+                .unwrap();
+            let payload = crate::job_tracking::wrap_tracked_payload(key, &serde_json::json!({}));
+
+            // max_attempts = 1 so stale recovery dead-letters instead of requeueing.
+            pg_enqueue_job(
+                &pool,
+                "pg-crash-1".to_string(),
+                "crashy_tracked",
+                "default",
+                payload,
+                1,
+                10,
+                &ResolvedJobConstraints {
+                    unique_key: None,
+                    unique_window: None,
+                    concurrency_limit: None,
+                    concurrency_scope: None,
+                },
+            )
+            .await
+            .unwrap();
+
+            // Simulate a crashed worker: claim, never settle.
+            let row = pg_claim_next_job(&pool, "dead-worker", false, &["default".to_string()])
+                .await
+                .expect("claim");
+            assert_eq!(row.id, "pg-crash-1");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            pg_recover_stale_claims(&pool, 10, &state).await;
+            let recovered = pg_fetch_by_id(&pool, "pg-crash-1").await.unwrap();
+            assert_eq!(recovered.status, "failed");
+
+            let record = store.get(key).await.unwrap().expect("record");
+            assert_eq!(
+                record.status,
+                crate::job_tracking::TrackedJobStatus::Failed,
+                "a stale-recovered, terminally dead-lettered tracked job must settle its \
+                 status record instead of leaving it running until TTL expiry"
             );
         }
 
@@ -11014,6 +13505,7 @@ mod tests {
                 &pool,
                 "fail-uq".to_string(),
                 "send_invoice",
+                "default",
                 serde_json::json!({}),
                 1,
                 10,
@@ -11022,7 +13514,9 @@ mod tests {
             .await
             .unwrap();
             // Dead-letter it: claim, then terminal nack (attempt == max).
-            let row = pg_claim_next_job(&pool, "w1", false).await.expect("claim");
+            let row = pg_claim_next_job(&pool, "w1", false, &["default".to_string()])
+                .await
+                .expect("claim");
             assert!(
                 pg_nack_failure(&pool, &row.id, "w1", "boom", &row, None)
                     .await
@@ -11035,6 +13529,7 @@ mod tests {
                     &pool,
                     "twin".to_string(),
                     "send_invoice",
+                    "default",
                     serde_json::json!({}),
                     1,
                     10,
@@ -11057,7 +13552,7 @@ mod tests {
 
             // Once the twin settles, the retry goes through and the retried
             // row still carries its unique key.
-            let twin = pg_claim_next_job(&pool, "w1", false)
+            let twin = pg_claim_next_job(&pool, "w1", false, &["default".to_string()])
                 .await
                 .expect("claim twin");
             assert!(pg_ack_success(&pool, &twin.id, "w1").await.unwrap());
@@ -11070,6 +13565,7 @@ mod tests {
                     &pool,
                     "dup".to_string(),
                     "send_invoice",
+                    "default",
                     serde_json::json!({}),
                     1,
                     10,
@@ -11203,6 +13699,7 @@ mod tests {
             let _job = QueuedJob {
                 id: "t".to_string(),
                 name: "t".to_string(),
+                queue: "default".to_string(),
                 payload: serde_json::json!({}),
                 attempt: 1,
                 max_attempts: 1,
@@ -11262,6 +13759,7 @@ mod tests {
             let _record = RedisJobRecord {
                 id: "r".to_string(),
                 name: "j".to_string(),
+                queue: "default".to_string(),
                 payload: serde_json::json!({}),
                 attempt: 1,
                 max_attempts: 1,
@@ -11342,6 +13840,7 @@ mod tests {
                     name: "noop".to_string(),
                     max_attempts: 1,
                     initial_backoff_ms: 0,
+                    queue: "default".to_string(),
                     uniqueness: None,
                     concurrency: None,
                     handler: |_state, _payload| Box::pin(async { Ok(()) }),
@@ -11356,6 +13855,7 @@ mod tests {
                 QueuedJob {
                     id: job_id,
                     name: "noop".to_string(),
+                    queue: "default".to_string(),
                     payload: serde_json::json!({}),
                     attempt: 1,
                     max_attempts: 1,
@@ -11391,6 +13891,7 @@ mod tests {
             let original = RedisJobRecord {
                 id: "r".to_string(),
                 name: "j".to_string(),
+                queue: "default".to_string(),
                 payload: serde_json::json!({}),
                 attempt: 1,
                 max_attempts: 1,
@@ -11556,6 +14057,7 @@ mod tests {
                 .enqueue_durable(
                     "job_id".to_string(),
                     "job_name",
+                    "default",
                     serde_json::Value::Null,
                     1,
                     1000,
@@ -11573,6 +14075,7 @@ mod tests {
             .enqueue_durable(
                 "job_id".to_string(),
                 "job_name",
+                "default",
                 serde_json::Value::Null,
                 1,
                 1000,
@@ -11636,6 +14139,7 @@ mod tests {
         backend.record_enqueue_due(
             id.clone(),
             "myjob",
+            DEFAULT_QUEUE,
             serde_json::json!({}),
             1,
             3,
@@ -11778,6 +14282,7 @@ mod tests {
         backend.record_enqueue_due(
             id.clone(),
             "myjob",
+            DEFAULT_QUEUE,
             serde_json::json!({}),
             1,
             3,
@@ -11817,6 +14322,7 @@ mod tests {
         backend.record_enqueue_due(
             sched_id.clone(),
             "delayed_job",
+            DEFAULT_QUEUE,
             serde_json::json!({}),
             1,
             3,
@@ -11860,6 +14366,7 @@ mod tests {
         backend.record_enqueue_due(
             id.clone(),
             "myjob",
+            DEFAULT_QUEUE,
             serde_json::json!({}),
             1,
             3,
@@ -11899,6 +14406,7 @@ mod tests {
         backend.record_enqueue_due(
             id.clone(),
             "myjob",
+            DEFAULT_QUEUE,
             serde_json::json!({}),
             1,
             3,
@@ -12001,6 +14509,7 @@ mod tests {
                 name: "unique_cancelable".to_string(),
                 max_attempts: 1,
                 initial_backoff_ms: 10,
+                queue: "default".to_string(),
                 uniqueness: Some(JobUniqueness {
                     by: vec![],
                     window: JobUniquenessWindow::Running,
@@ -12013,6 +14522,7 @@ mod tests {
             1,
             5,
             250,
+            &crate::config::JobQueuesConfig::default(),
         );
 
         // Enqueue the first job with a long delay — it holds the unique lock.
@@ -12066,6 +14576,7 @@ mod tests {
         backend.record_enqueue_due(
             id,
             "myjob",
+            DEFAULT_QUEUE,
             serde_json::json!({}),
             1,
             3,
@@ -12091,6 +14602,7 @@ mod tests {
         backend.record_enqueue_due(
             id,
             "myjob",
+            DEFAULT_QUEUE,
             serde_json::json!({}),
             1,
             3,
@@ -12315,6 +14827,166 @@ mod tests {
 
         clear_global_job_client();
     }
+
+    struct SilentlySkippingInterceptor;
+    impl crate::interceptor::JobInterceptor for SilentlySkippingInterceptor {
+        fn intercept_enqueue<'a>(
+            &'a self,
+            _name: &'a str,
+            _payload: &'a serde_json::Value,
+            _next: std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send + 'a>,
+            >,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send + 'a>>
+        {
+            // Deliberately never awaits `next` — simulates an interceptor
+            // that silently decides not to deliver the job (e.g. a feature
+            // flag or rate limiter) without erroring.
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn intercept_execute<'a>(
+            &'a self,
+            _name: &'a str,
+            _payload: &'a serde_json::Value,
+            next: std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send + 'a>,
+            >,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send + 'a>>
+        {
+            next
+        }
+    }
+
+    #[tokio::test]
+    async fn enqueue_tracked_settles_failed_when_an_interceptor_skips_delivery() {
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+
+        let state = AppState::for_test().with_profile("dev");
+        state
+            .insert_extension(Arc::new(SilentlySkippingInterceptor)
+                as Arc<dyn crate::interceptor::JobInterceptor>);
+
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        start_local_runtime(
+            vec![JobInfo::new(
+                "skipped_tracked",
+                1,
+                10,
+                |_state, _payload| Box::pin(async move { Ok(()) }),
+            )],
+            &state,
+            &shutdown,
+            1,
+            5,
+            250,
+            &crate::config::JobQueuesConfig::default(),
+        );
+
+        let handle = crate::job_tracking::enqueue_tracked("skipped_tracked", serde_json::json!({}))
+            .await
+            .expect("enqueue_tracked itself should still succeed and return a handle");
+
+        let store =
+            crate::job_tracking::tracking_store_from_state(&state).expect("store installed");
+        let key = crate::auth::hash_api_token(&handle.token);
+        let record = store.get(&key).await.unwrap().expect("record");
+        assert_eq!(
+            record.status,
+            crate::job_tracking::TrackedJobStatus::Failed,
+            "a job an interceptor silently skipped must settle its tracked status instead of \
+             staying pending forever"
+        );
+
+        shutdown.cancel();
+        clear_global_job_client();
+    }
+
+    #[tokio::test]
+    async fn plain_enqueue_still_succeeds_when_an_interceptor_skips_delivery() {
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+
+        let state = AppState::for_test().with_profile("dev");
+        state
+            .insert_extension(Arc::new(SilentlySkippingInterceptor)
+                as Arc<dyn crate::interceptor::JobInterceptor>);
+
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        start_local_runtime(
+            vec![JobInfo::new("skipped_plain", 1, 10, |_state, _payload| {
+                Box::pin(async move { Ok(()) })
+            })],
+            &state,
+            &shutdown,
+            1,
+            5,
+            250,
+            &crate::config::JobQueuesConfig::default(),
+        );
+
+        // Untracked enqueue's observable Ok(()) behavior is unchanged: the
+        // new EnqueueOutcome::Skipped variant only changes behavior for
+        // enqueue_tracked, which needs to distinguish it to settle status.
+        enqueue("skipped_plain", serde_json::json!({}))
+            .await
+            .expect("plain enqueue must still return Ok even when an interceptor skips delivery");
+
+        shutdown.cancel();
+        clear_global_job_client();
+    }
+
+    #[tokio::test]
+    async fn enqueue_after_commit_rejects_a_colliding_payload_eagerly_not_in_the_deferred_callback()
+    {
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+
+        let (tx, mut rx) = mpsc::channel(16);
+        init_global_job_client(JobClient {
+            local_sender: Some(tx),
+            local_coordination: None,
+            #[cfg(feature = "redis")]
+            redis: None,
+            #[cfg(feature = "db")]
+            pg_pool: None,
+            registry: crate::actuator::JobRegistry::new(),
+            job_admin: JobAdminMemoryBackend::new_for_test(32),
+            default_max_attempts: 3,
+            default_initial_backoff_ms: 100,
+            per_job_settings: HashMap::from([(
+                "test_job".to_string(),
+                JobRuntimeSettings::basic(3, 100),
+            )]),
+            interceptor: None,
+            resilience_config: None,
+        });
+
+        // Called outside a db.tx, so without the eager check this would
+        // enqueue immediately (see the test above) before ever reaching
+        // enqueue_due's own check — which is exactly what would let a
+        // colliding payload slip through a committed transaction when
+        // called from inside one.
+        let err = enqueue_after_commit(
+            "test_job",
+            serde_json::json!({"__autumn_tracked": {"k": "abc"}}),
+        )
+        .await
+        .expect_err("a colliding payload must be rejected before any commit/delivery");
+        assert!(
+            err.to_string().contains("__autumn_tracked"),
+            "unexpected error: {err}"
+        );
+
+        let received = tokio::time::timeout(Duration::from_millis(50), rx.recv()).await;
+        assert!(
+            received.is_err(),
+            "a rejected payload must never reach the queue"
+        );
+
+        clear_global_job_client();
+    }
 }
 
 #[cfg(test)]
@@ -12340,6 +15012,7 @@ mod uniqueness_concurrency_tests {
             name: name.to_string(),
             max_attempts: 1,
             initial_backoff_ms: 1,
+            queue: "default".to_string(),
             uniqueness: Some(JobUniqueness {
                 by: Vec::new(),
                 window,
@@ -12489,6 +15162,7 @@ mod uniqueness_concurrency_tests {
             2,
             5,
             250,
+            &crate::config::JobQueuesConfig::default(),
         );
 
         let payload = serde_json::json!({"invoice_id": 42});
@@ -12544,6 +15218,7 @@ mod uniqueness_concurrency_tests {
             1,
             5,
             250,
+            &crate::config::JobQueuesConfig::default(),
         );
 
         let payload = serde_json::json!({"invoice_id": 1});
@@ -12594,6 +15269,7 @@ mod uniqueness_concurrency_tests {
             1,
             5,
             250,
+            &crate::config::JobQueuesConfig::default(),
         );
 
         let failures = |state: &AppState| {
@@ -12650,6 +15326,7 @@ mod uniqueness_concurrency_tests {
             2,
             5,
             250,
+            &crate::config::JobQueuesConfig::default(),
         );
 
         let payload = serde_json::json!({"invoice_id": 3});
@@ -12703,6 +15380,7 @@ mod uniqueness_concurrency_tests {
             1,
             5,
             250,
+            &crate::config::JobQueuesConfig::default(),
         );
 
         let payload = serde_json::json!({"invoice_id": 4});
@@ -12748,6 +15426,7 @@ mod uniqueness_concurrency_tests {
                 name: "unique_by_field".to_string(),
                 max_attempts: 1,
                 initial_backoff_ms: 1,
+                queue: "default".to_string(),
                 uniqueness: Some(JobUniqueness {
                     by: vec!["account_id".to_string()],
                     window: JobUniquenessWindow::Running,
@@ -12760,6 +15439,7 @@ mod uniqueness_concurrency_tests {
             2,
             5,
             250,
+            &crate::config::JobQueuesConfig::default(),
         );
 
         enqueue(
@@ -12826,6 +15506,7 @@ mod uniqueness_concurrency_tests {
                 name: "recalculate".to_string(),
                 max_attempts: 1,
                 initial_backoff_ms: 1,
+                queue: "default".to_string(),
                 uniqueness: None,
                 concurrency: Some(JobConcurrency {
                     limit: 2,
@@ -12838,6 +15519,7 @@ mod uniqueness_concurrency_tests {
             4,
             5,
             250,
+            &crate::config::JobQueuesConfig::default(),
         );
 
         for marker in 0..6 {
@@ -12908,6 +15590,7 @@ mod uniqueness_concurrency_tests {
                 name: "per_account".to_string(),
                 max_attempts: 1,
                 initial_backoff_ms: 1,
+                queue: "default".to_string(),
                 uniqueness: None,
                 concurrency: Some(JobConcurrency {
                     limit: 1,
@@ -12920,6 +15603,7 @@ mod uniqueness_concurrency_tests {
             4,
             5,
             250,
+            &crate::config::JobQueuesConfig::default(),
         );
 
         for marker in 0..2 {
@@ -12976,6 +15660,7 @@ mod uniqueness_concurrency_tests {
                 name: "retry_conflict".to_string(),
                 max_attempts: 1,
                 initial_backoff_ms: 1,
+                queue: "default".to_string(),
                 uniqueness: Some(JobUniqueness {
                     by: vec!["k".to_string()],
                     window: JobUniquenessWindow::Running,
@@ -12988,6 +15673,7 @@ mod uniqueness_concurrency_tests {
             2,
             5,
             250,
+            &crate::config::JobQueuesConfig::default(),
         );
 
         // First instance fails terminally, releasing the key.
@@ -13071,6 +15757,7 @@ mod uniqueness_concurrency_tests {
                 name: "pending_retry".to_string(),
                 max_attempts: 2,
                 initial_backoff_ms: 400,
+                queue: "default".to_string(),
                 uniqueness: Some(JobUniqueness {
                     by: Vec::new(),
                     window: JobUniquenessWindow::Pending,
@@ -13083,6 +15770,7 @@ mod uniqueness_concurrency_tests {
             2,
             5,
             250,
+            &crate::config::JobQueuesConfig::default(),
         );
 
         let payload = serde_json::json!({"invoice_id": 11});
@@ -13118,6 +15806,117 @@ mod uniqueness_concurrency_tests {
         clear_global_job_client();
     }
 
+    static DROPPED_RETRY_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static DROPPED_RETRY_STARTED: OnceLock<tokio::sync::Notify> = OnceLock::new();
+    static DROPPED_RETRY_RELEASE: OnceLock<tokio::sync::Notify> = OnceLock::new();
+    fn dropped_pending_retry_handler(
+        _state: AppState,
+        _payload: Value,
+    ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'static>> {
+        Box::pin(async move {
+            if DROPPED_RETRY_CALLS.fetch_add(1, Ordering::SeqCst) == 0 {
+                // First call: signal that execution has started (the
+                // pending-window key is now released) and hold until the
+                // test lets a duplicate enqueue grab it first.
+                DROPPED_RETRY_STARTED
+                    .get_or_init(tokio::sync::Notify::new)
+                    .notify_one();
+                DROPPED_RETRY_RELEASE
+                    .get_or_init(tokio::sync::Notify::new)
+                    .notified()
+                    .await;
+                Err(AutumnError::internal_server_error(std::io::Error::other(
+                    "forced failure",
+                )))
+            } else {
+                // The duplicate's own (independent) execution.
+                Ok(())
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn local_dropped_pending_window_retry_settles_the_tracked_record_instead_of_leaving_it_stuck()
+     {
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+        DROPPED_RETRY_CALLS.store(0, Ordering::SeqCst);
+
+        let store: Arc<dyn crate::job_tracking::JobTrackingStore> =
+            Arc::new(crate::job_tracking::InMemoryJobTrackingStore::new(60));
+        let state = AppState::for_test().with_profile("dev");
+        crate::job_tracking::install_tracking_store(&state, store.clone());
+
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        start_local_runtime(
+            vec![JobInfo {
+                name: "dropped_pending_retry".to_string(),
+                max_attempts: 2,
+                initial_backoff_ms: 1,
+                queue: "default".to_string(),
+                uniqueness: Some(JobUniqueness {
+                    by: Vec::new(),
+                    window: JobUniquenessWindow::Pending,
+                }),
+                concurrency: None,
+                handler: dropped_pending_retry_handler,
+            }],
+            &state,
+            &shutdown,
+            2,
+            5,
+            250,
+            &crate::config::JobQueuesConfig::default(),
+        );
+
+        let payload = serde_json::json!({"invoice_id": 22});
+        let handle = enqueue_tracked("dropped_pending_retry", payload.clone())
+            .await
+            .unwrap();
+        let key = crate::auth::hash_api_token(&handle.token);
+
+        // Wait for the first attempt to start executing — the pending-window
+        // key is released at that point (see execute_queued_job).
+        DROPPED_RETRY_STARTED
+            .get_or_init(tokio::sync::Notify::new)
+            .notified()
+            .await;
+
+        // A duplicate lands while the key is free and takes it over.
+        enqueue("dropped_pending_retry", payload).await.unwrap();
+
+        // Let the original attempt fail; its retry can no longer re-acquire
+        // the pending key (the duplicate holds it), so the retry is dropped
+        // and coalesced into the duplicate instead.
+        DROPPED_RETRY_RELEASE
+            .get_or_init(tokio::sync::Notify::new)
+            .notify_one();
+
+        assert!(
+            wait_for(2_000, || deduplicated(&state, "dropped_pending_retry") == 1).await,
+            "the dropped retry must be recorded as deduplicated"
+        );
+
+        let record = store.get(&key).await.unwrap().expect("record");
+        assert_eq!(
+            record.status,
+            TrackedJobStatus::Failed,
+            "a tracked job whose retry was dropped because a duplicate already claimed the \
+             pending-window unique lock must settle its status record instead of staying \
+             pending/running until TTL expiry"
+        );
+        assert_eq!(
+            record.error.as_deref(),
+            Some("An equivalent job is already in progress.")
+        );
+
+        // The duplicate itself still runs independently.
+        assert!(wait_for(2_000, || successes(&state, "dropped_pending_retry") == 1).await);
+
+        shutdown.cancel();
+        clear_global_job_client();
+    }
+
     static SLOT_RELEASE_CALLS: AtomicUsize = AtomicUsize::new(0);
     fn slot_release_failing_handler(
         _state: AppState,
@@ -13144,6 +15943,7 @@ mod uniqueness_concurrency_tests {
                 name: "limited_failing".to_string(),
                 max_attempts: 1,
                 initial_backoff_ms: 1,
+                queue: "default".to_string(),
                 uniqueness: None,
                 concurrency: Some(JobConcurrency {
                     limit: 1,
@@ -13156,6 +15956,7 @@ mod uniqueness_concurrency_tests {
             2,
             5,
             250,
+            &crate::config::JobQueuesConfig::default(),
         );
 
         enqueue("limited_failing", serde_json::json!({"marker": 1}))
@@ -13173,5 +15974,193 @@ mod uniqueness_concurrency_tests {
 
         shutdown.cancel();
         clear_global_job_client();
+    }
+
+    static PRIO_URGENT_STARTED: AtomicUsize = AtomicUsize::new(0);
+    static PRIO_LOW_BEFORE_URGENT: AtomicUsize = AtomicUsize::new(0);
+    static PRIO_URGENT_DONE: AtomicUsize = AtomicUsize::new(0);
+
+    fn priority_low_handler(
+        _state: AppState,
+        _payload: Value,
+    ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'static>> {
+        Box::pin(async move {
+            if PRIO_URGENT_STARTED.load(Ordering::SeqCst) == 0 {
+                PRIO_LOW_BEFORE_URGENT.fetch_add(1, Ordering::SeqCst);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            Ok(())
+        })
+    }
+
+    fn priority_urgent_handler(
+        _state: AppState,
+        _payload: Value,
+    ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'static>> {
+        Box::pin(async move {
+            PRIO_URGENT_STARTED.store(1, Ordering::SeqCst);
+            PRIO_URGENT_DONE.store(1, Ordering::SeqCst);
+            Ok(())
+        })
+    }
+
+    #[tokio::test]
+    async fn local_strict_priority_runs_critical_before_backlog_of_low() {
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+        PRIO_URGENT_STARTED.store(0, Ordering::SeqCst);
+        PRIO_LOW_BEFORE_URGENT.store(0, Ordering::SeqCst);
+        PRIO_URGENT_DONE.store(0, Ordering::SeqCst);
+
+        let state = AppState::for_test().with_profile("dev");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        start_local_runtime(
+            vec![
+                JobInfo {
+                    name: "bulk".to_string(),
+                    max_attempts: 1,
+                    initial_backoff_ms: 1,
+                    queue: "low".to_string(),
+                    uniqueness: None,
+                    concurrency: None,
+                    handler: priority_low_handler,
+                },
+                JobInfo {
+                    name: "urgent".to_string(),
+                    max_attempts: 1,
+                    initial_backoff_ms: 1,
+                    queue: "critical".to_string(),
+                    uniqueness: None,
+                    concurrency: None,
+                    handler: priority_urgent_handler,
+                },
+            ],
+            &state,
+            &shutdown,
+            1,
+            5,
+            250,
+            &crate::config::JobQueuesConfig::strict_list(["critical", "default", "low"]),
+        );
+
+        // A flood of low-priority work, then a single critical job behind it.
+        for marker in 0..200 {
+            enqueue("bulk", serde_json::json!({ "marker": marker }))
+                .await
+                .unwrap();
+        }
+        enqueue("urgent", serde_json::json!({})).await.unwrap();
+
+        assert!(
+            wait_for(5_000, || PRIO_URGENT_DONE.load(Ordering::SeqCst) == 1).await,
+            "critical job must run while low backlog remains"
+        );
+        // Under strict priority a single worker runs at most the one in-flight
+        // low job before the critical one — never the whole backlog (FIFO ≈ 200).
+        let low_before = PRIO_LOW_BEFORE_URGENT.load(Ordering::SeqCst);
+        assert!(
+            low_before <= 5,
+            "critical job should jump the low backlog; {low_before} low jobs ran first"
+        );
+
+        // The admin view surfaces which queue each job is on.
+        let admin = job_admin_backend(&state).unwrap();
+        let snap = admin.snapshot(JobAdminQuery::default()).await.unwrap();
+        let urgent_record = snap
+            .completed
+            .records
+            .iter()
+            .find(|r| r.name == "urgent")
+            .expect("urgent job present in admin snapshot");
+        assert_eq!(urgent_record.queue, "critical");
+
+        shutdown.cancel();
+        clear_global_job_client();
+    }
+}
+
+#[cfg(test)]
+mod queue_schedule_tests {
+    use super::*;
+    use crate::config::JobQueuesConfig;
+
+    #[test]
+    fn strict_schedule_drains_high_priority_first_every_iteration() {
+        let cfg = JobQueuesConfig::strict_list(["critical", "default", "low"]);
+        let schedule = QueueSchedule::from_config(&cfg);
+        assert!(schedule.is_strict());
+        let mut cursor = schedule.cursor();
+        for _ in 0..10 {
+            assert_eq!(
+                cursor.next_order().as_slice(),
+                [
+                    "critical".to_string(),
+                    "default".to_string(),
+                    "low".to_string()
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn weighted_schedule_picks_each_queue_proportional_to_weight() {
+        // Smooth weighted round-robin: over one full cycle (sum of weights = 7),
+        // each queue is the *first* choice exactly `weight` times.
+        let cfg = JobQueuesConfig::weighted([("critical", 4), ("default", 2), ("low", 1)]);
+        let schedule = QueueSchedule::from_config(&cfg);
+        assert!(!schedule.is_strict());
+        let mut cursor = schedule.cursor();
+        let mut firsts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        for _ in 0..7 {
+            let order = cursor.next_order();
+            // Every iteration still lists *all* queues so a worker never idles
+            // while another queue has work.
+            assert_eq!(order.len(), 3, "order must include all queues: {order:?}");
+            *firsts.entry(order[0].clone()).or_default() += 1;
+        }
+        assert_eq!(firsts.get("critical").copied(), Some(4));
+        assert_eq!(firsts.get("default").copied(), Some(2));
+        assert_eq!(firsts.get("low").copied(), Some(1));
+    }
+
+    #[test]
+    fn weighted_schedule_does_not_starve_low_queue() {
+        // No queue may wait indefinitely: each is chosen-first within one cycle.
+        let cfg = JobQueuesConfig::weighted([("critical", 100), ("low", 1)]);
+        let schedule = QueueSchedule::from_config(&cfg);
+        let mut cursor = schedule.cursor();
+        let mut saw_low_first = false;
+        for _ in 0..101 {
+            if cursor.next_order()[0] == "low" {
+                saw_low_first = true;
+                break;
+            }
+        }
+        assert!(
+            saw_low_first,
+            "low queue must be served within one weight cycle"
+        );
+    }
+
+    #[test]
+    fn effective_appends_unconfigured_declared_queue_at_lowest_priority() {
+        let cfg = JobQueuesConfig::strict_list(["critical", "default"]);
+        let declared = vec![
+            "critical".to_string(),
+            "default".to_string(),
+            "ghost".to_string(),
+        ];
+        let (schedule, warnings) = QueueSchedule::effective(&cfg, &declared);
+        assert_eq!(schedule.names(), vec!["critical", "default", "ghost"]);
+        assert!(schedule.contains("ghost"));
+        assert_eq!(warnings, vec!["ghost".to_string()]);
+    }
+
+    #[test]
+    fn effective_has_no_warnings_when_all_declared_queues_configured() {
+        let cfg = JobQueuesConfig::strict_list(["critical", "default"]);
+        let declared = vec!["default".to_string(), "critical".to_string()];
+        let (_schedule, warnings) = QueueSchedule::effective(&cfg, &declared);
+        assert!(warnings.is_empty());
     }
 }

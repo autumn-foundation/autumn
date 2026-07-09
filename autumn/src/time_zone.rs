@@ -430,38 +430,12 @@ pub fn local_date(dt: DateTime<Utc>, tz: Tz) -> maud::Markup {
 #[cfg(feature = "maud")]
 #[must_use]
 pub fn time_ago(dt: DateTime<Utc>, now: DateTime<Utc>, tz: Tz) -> maud::Markup {
-    let diff = now.signed_duration_since(dt);
-    let relative = format_relative(diff);
+    let relative = crate::format::relative_time_words(dt, now);
     let rfc = dt.to_rfc3339();
     let local = tz.from_utc_datetime(&dt.naive_utc());
     let display = local.format("%Y-%m-%d %H:%M %Z").to_string();
     maud::html! {
         time datetime=(rfc) title=(display) { (relative) }
-    }
-}
-
-fn format_relative(diff: chrono::Duration) -> String {
-    let secs = diff.num_seconds();
-    if secs < 0 {
-        let future = secs.unsigned_abs();
-        return if future < 60 {
-            format!("in {future} seconds")
-        } else if future < 3600 {
-            format!("in {} minutes", future / 60)
-        } else if future < 86400 {
-            format!("in {} hours", future / 3600)
-        } else {
-            format!("in {} days", future / 86400)
-        };
-    }
-    if secs < 60 {
-        format!("{secs} seconds ago")
-    } else if secs < 3600 {
-        format!("{} minutes ago", secs / 60)
-    } else if secs < 86400 {
-        format!("{} hours ago", secs / 3600)
-    } else {
-        format!("{} days ago", secs / 86400)
     }
 }
 
