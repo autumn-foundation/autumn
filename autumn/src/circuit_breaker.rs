@@ -1,3 +1,52 @@
+//! Circuit Breaker implementation for preventing cascading failures in distributed systems.
+//!
+//! A [Circuit Breaker](https://martinfowler.com/bliki/CircuitBreaker.html) protects your system from
+//! repeated failures when calling external services or unreliable dependencies. Instead of
+//! continuously attempting operations that are likely to fail (and potentially exacerbating an
+//! ongoing outage by adding load to a struggling service), the circuit breaker monitors failure
+//! rates and temporarily halts traffic ("opens") when a threshold is exceeded.
+//!
+//! # Core Concepts
+//!
+//! - **Closed:** Normal operation. The breaker allows traffic through. If the failure rate over a
+//!   given `sample_window` exceeds the `failure_ratio_threshold` (and there are at least
+//!   `minimum_sample_count` attempts), the breaker transitions to the Open state.
+//! - **Open:** Protective state. The breaker immediately rejects all requests, returning an error
+//!   fast (usually [`CircuitBreakerError::Open`]), rather than executing the underlying operation.
+//!   It remains in this state for a defined `open_duration`.
+//! - **Half-Open:** Trial state. After the `open_duration` elapses, the breaker allows a limited
+//!   number of test requests (`half_open_trial_count`) through. If these succeed, the breaker
+//!   assumes the downstream service has recovered and transitions back to Closed. If they fail, it
+//!   immediately reverts to Open.
+//!
+//! # Usage Patterns
+//!
+//! You can use the circuit breaker manually via [`CircuitBreaker::run`], or automatically
+//! wrap `tower::Service`s using [`CircuitBreakerLayer`].
+//!
+//! For global, named circuit breakers, use the [`global_registry()`] to ensure
+//! you reuse the same breaker state across different parts of your application.
+//!
+//! # Examples
+//!
+//! Manual usage:
+//!
+//! ```rust
+//! use autumn_web::circuit_breaker::{CircuitBreaker, CircuitBreakerPolicy, CircuitBreakerError};
+//!
+//! # tokio_test::block_on(async {
+//! let policy = CircuitBreakerPolicy::default();
+//! let breaker = CircuitBreaker::new("example_service", policy);
+//!
+//! let result: Result<&str, CircuitBreakerError<&'static str>> = breaker.run(async {
+//!     // Simulate a successful API call
+//!     Ok("data")
+//! }).await;
+//!
+//! assert_eq!(result.unwrap(), "data");
+//! # })
+//! ```
+
 #![allow(
     clippy::missing_panics_doc,
     clippy::missing_errors_doc,
@@ -15,6 +64,10 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
+/// Represents the current operational state of a [`CircuitBreaker`].
+///
+/// The state machine determines whether traffic is allowed through to the underlying
+/// operation or immediately rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum CircuitState {
@@ -33,6 +86,10 @@ impl CircuitState {
     }
 }
 
+/// Configuration parameters governing a [`CircuitBreaker`]'s behavior and state transitions.
+///
+/// This defines the thresholds for failure, how long to wait before attempting recovery,
+/// and how many requests are used to evaluate health.
 #[derive(Debug, Clone)]
 pub struct CircuitBreakerPolicy {
     pub failure_ratio_threshold: f64,
@@ -95,6 +152,7 @@ impl CircuitBreakerPolicy {
     }
 }
 
+/// Errors returned when executing an operation through a [`CircuitBreaker`].
 #[derive(Debug, Error)]
 pub enum CircuitBreakerError<E> {
     #[error("circuit breaker is open")]
@@ -103,6 +161,26 @@ pub enum CircuitBreakerError<E> {
     Execution(E),
 }
 
+/// An execution wrapper that protects a system from repeated downstream failures.
+///
+/// A `CircuitBreaker` monitors the success/failure rate of operations. If failures
+/// exceed a configured threshold, the breaker "opens", instantly failing subsequent
+/// requests to give the downstream system time to recover without added load.
+///
+/// # Examples
+///
+/// ```rust
+/// use autumn_web::circuit_breaker::{CircuitBreaker, CircuitBreakerPolicy, CircuitBreakerError};
+///
+/// # tokio_test::block_on(async {
+/// let breaker = CircuitBreaker::new("my_db", CircuitBreakerPolicy::default());
+///
+/// let result: Result<(), CircuitBreakerError<&'static str>> = breaker.run(async {
+///     // Your external call here
+///     Ok(())
+/// }).await;
+/// # })
+/// ```
 #[derive(Clone)]
 pub struct CircuitBreaker {
     name: String,
@@ -328,6 +406,10 @@ impl CircuitBreaker {
     }
 }
 
+/// A RAII guard for manual circuit breaker state management.
+///
+/// When dropped without calling `success()` or `failure()`, it automatically
+/// records a failure (useful for panics or early returns).
 pub struct CircuitBreakerGuard {
     breaker: CircuitBreaker,
     completed: bool,
@@ -365,6 +447,10 @@ impl Drop for CircuitBreakerGuard {
     }
 }
 
+/// A thread-safe registry for managing and reusing global named [`CircuitBreaker`]s.
+///
+/// Use this to ensure all parts of your application share the same breaker instance
+/// for a given downstream dependency.
 pub struct CircuitBreakerRegistry {
     breakers: Mutex<HashMap<String, CircuitBreaker>>,
 }
@@ -424,12 +510,26 @@ impl CircuitBreakerRegistry {
 
 static REGISTRY: std::sync::OnceLock<CircuitBreakerRegistry> = std::sync::OnceLock::new();
 
+/// Returns a reference to the global static [`CircuitBreakerRegistry`].
+///
+/// # Examples
+///
+/// ```rust
+/// use autumn_web::circuit_breaker::{global_registry, CircuitBreakerPolicy};
+///
+/// let registry = global_registry();
+/// let breaker = registry.get_or_create("payment_gateway", CircuitBreakerPolicy::default());
+/// ```
 pub fn global_registry() -> &'static CircuitBreakerRegistry {
     REGISTRY.get_or_init(CircuitBreakerRegistry::new)
 }
 
 pub static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// A `tower::Layer` that wraps services with a [`CircuitBreaker`].
+///
+/// This allows you to apply circuit breaker semantics transparently to any
+/// `tower::Service`, such as HTTP clients or routing layers.
 #[derive(Clone)]
 pub struct CircuitBreakerLayer {
     breaker: CircuitBreaker,
@@ -453,6 +553,9 @@ impl<S> tower::Layer<S> for CircuitBreakerLayer {
     }
 }
 
+/// A `tower::Service` wrapper that executes requests through a [`CircuitBreaker`].
+///
+/// Created by applying a [`CircuitBreakerLayer`] to an underlying service.
 #[derive(Clone)]
 pub struct CircuitBreakerService<S> {
     inner: S,
