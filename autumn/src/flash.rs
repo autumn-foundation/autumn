@@ -348,8 +348,14 @@ pub fn flash_messages_with(
                     role=(role) aria-live=(live) {
                     span class="autumn-flash__body" { (msg.message) }
                     @if config.dismissible {
-                        label class="autumn-flash__dismiss" aria-label="Dismiss this message" {
-                            input type="checkbox" class="autumn-flash__dismiss-toggle" hidden;
+                        // The checkbox stays in tab order (visually hidden but
+                        // focusable via `.autumn-flash__dismiss-toggle`, never
+                        // `hidden`/`display:none`) so keyboard and screen-reader
+                        // users can dismiss; the accessible name is on the
+                        // control itself.
+                        label class="autumn-flash__dismiss" {
+                            input type="checkbox" class="autumn-flash__dismiss-toggle"
+                                aria-label="Dismiss this message";
                             span aria-hidden="true" { "×" }
                         }
                     }
@@ -387,6 +393,8 @@ pub const FLASH_CSS: &str = "\
 .autumn-flash--warning{background:var(--flash-warning-bg,#fffbeb);color:var(--flash-warning-fg,#92400e);border-color:var(--flash-warning-border,#fcd34d)}\
 .autumn-flash--error{background:var(--flash-error-bg,#fef2f2);color:var(--flash-error-fg,#991b1b);border-color:var(--flash-error-border,#fca5a5)}\
 .autumn-flash__dismiss{flex:0 0 auto;cursor:pointer;line-height:1;font-size:1.25rem;color:inherit;background:none;border:0;padding:0 .25rem}\
+.autumn-flash__dismiss-toggle{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip-path:inset(50%);white-space:nowrap;border:0}\
+.autumn-flash__dismiss:has(.autumn-flash__dismiss-toggle:focus-visible){outline:2px solid var(--primary,#7c3aed);outline-offset:2px}\
 .autumn-flash:has(.autumn-flash__dismiss-toggle:checked){display:none}\
 ";
 
@@ -659,6 +667,21 @@ mod tests {
         assert!(dismissible.contains(r#"type="checkbox""#), "{dismissible}");
         assert!(!dismissible.contains("onclick"), "{dismissible}");
         assert!(!dismissible.contains("<script"), "{dismissible}");
+        // WCAG 2.1.1: the toggle must NOT be `hidden` (that removes it from tab
+        // order) — it stays focusable via the sr-only toggle class, with the
+        // accessible name on the control itself.
+        assert!(
+            !dismissible.contains(r#"autumn-flash__dismiss-toggle" hidden"#),
+            "toggle must not be `hidden`: {dismissible}"
+        );
+        assert!(
+            dismissible.contains("autumn-flash__dismiss-toggle"),
+            "sr-only focusable toggle class present: {dismissible}"
+        );
+        assert!(
+            dismissible.contains(r#"aria-label="Dismiss this message""#),
+            "{dismissible}"
+        );
     }
 
     #[test]
@@ -671,9 +694,19 @@ mod tests {
             ".autumn-flash--warning",
             ".autumn-flash--error",
             ".autumn-flash__dismiss",
+            ".autumn-flash__dismiss-toggle",
         ] {
             assert!(FLASH_CSS.contains(selector), "FLASH_CSS missing {selector}");
         }
+        // WCAG 2.1.1: sr-only-but-focusable toggle + a visible focus indicator.
+        assert!(
+            FLASH_CSS.contains("clip-path:inset(50%)"),
+            "FLASH_CSS must ship the sr-only (focusable) toggle rule"
+        );
+        assert!(
+            FLASH_CSS.contains(":focus-visible"),
+            "FLASH_CSS must ship a focus indicator"
+        );
     }
 
     #[tokio::test]

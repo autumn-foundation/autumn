@@ -93,6 +93,31 @@ fn dismiss_control_is_opt_in_and_js_free() {
     assert!(dismissible.contains(r#"type="checkbox""#), "{dismissible}");
     assert!(!dismissible.contains("<script"), "zero JS: {dismissible}");
     assert!(!dismissible.contains("onclick"), "zero JS: {dismissible}");
+    // WCAG 2.1.1: the toggle must NOT be `hidden` (that removes it from tab
+    // order) — it stays focusable via the sr-only `alert__dismiss-toggle` class.
+    assert!(
+        !dismissible.contains(r#"alert__dismiss-toggle" hidden"#),
+        "toggle must not be `hidden`: {dismissible}"
+    );
+    assert!(
+        dismissible.contains("alert__dismiss-toggle"),
+        "sr-only focusable toggle class present: {dismissible}"
+    );
+    // The accessible name is on the focusable control itself.
+    assert!(
+        dismissible.contains(r#"aria-label="Dismiss this message""#),
+        "{dismissible}"
+    );
+    // The sr-only rule is shipped (visually hidden but focusable, not display:none).
+    assert!(
+        autumn_web::ui::WIDGETS_COMPONENT_CSS.contains(".alert__dismiss-toggle")
+            && autumn_web::ui::WIDGETS_COMPONENT_CSS.contains("clip-path: inset(50%)"),
+        "sr-only CSS for the toggle must ship"
+    );
+    assert!(
+        autumn_web::ui::WIDGETS_COMPONENT_CSS.contains(":focus-visible"),
+        "a visible focus indicator must ship"
+    );
 }
 
 // ── escaping ─────────────────────────────────────────────────────────────────

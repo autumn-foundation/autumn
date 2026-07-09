@@ -3347,8 +3347,13 @@ pub fn alert_with(
                 div class="alert__body" { (body) }
             }
             @if config.dismissible {
-                label class="alert__dismiss" aria-label="Dismiss this message" {
-                    input type="checkbox" class="alert__dismiss-toggle" hidden;
+                // The checkbox stays in tab order (visually hidden but focusable
+                // via `.alert__dismiss-toggle`, never `hidden`/`display:none`) so
+                // keyboard and screen-reader users can dismiss; the accessible
+                // name is on the control itself.
+                label class="alert__dismiss" {
+                    input type="checkbox" class="alert__dismiss-toggle"
+                        aria-label="Dismiss this message";
                     span aria-hidden="true" { "×" }
                 }
             }

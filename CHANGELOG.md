@@ -48,7 +48,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   renders an `Error` alert listing every field error as a `<ul>` (stable order)
   or `None` when valid, for the form re-render path. All caller markup is
   escaped by Maud; no inline styles.
-
 - **ci:** README-quickstart gate against the published crates (issue #1586) —
   `.github/workflows/quickstart-gate.yml` + `scripts/check-quickstart.sh`
   install the README-pinned `autumn-cli` from crates.io (never the local
