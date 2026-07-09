@@ -214,6 +214,29 @@ pub trait BlobStore: Send + Sync + 'static {
     /// Read the bytes for `key` into memory.
     fn get<'a>(&'a self, key: &'a str) -> BlobFuture<'a, Bytes>;
 
+    /// Stream an object's bytes without buffering the whole object in memory.
+    ///
+    /// Use this for serving large objects (see
+    /// [`Download::from_blob`](crate::download::Download::from_blob)) so a
+    /// 100 MB file does not materialize entirely in RAM.
+    ///
+    /// The default implementation buffers via [`get`](BlobStore::get) and
+    /// yields a single chunk; backends that can truly stream (like the
+    /// [`LocalBlobStore`]) override this to read the object incrementally.
+    /// The returned stream is `'static` so callers can detach it from the
+    /// store's borrow and hand it to a response body.
+    ///
+    /// The S3 backend (`autumn-storage-s3`, a separate crate) uses the
+    /// buffering default; overriding it there is tracked separately.
+    fn get_stream<'a>(&'a self, key: &'a str) -> BlobFuture<'a, ByteStream<'static>> {
+        Box::pin(async move {
+            let bytes = self.get(key).await?;
+            let stream: ByteStream<'static> =
+                Box::pin(futures::stream::once(async move { Ok(bytes) }));
+            Ok(stream)
+        })
+    }
+
     /// Delete the blob at `key`. No-op when the key does not exist.
     fn delete<'a>(&'a self, key: &'a str) -> BlobFuture<'a, ()>;
 

@@ -121,6 +121,75 @@ async fn migrate_down_steps_1_reverts_most_recent_user_migration() {
 
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers); run with -- --ignored"]
+async fn migrate_down_clears_checksum_so_edited_up_sql_reapplies_cleanly() {
+    // PR review P2 (issue #1203): after `migrate down`, the reverted version's
+    // recorded checksum must be gone so an edited `up.sql` can be re-applied and
+    // its NEW content recorded — instead of leaving the stale hash from the
+    // previous application, which would later trip the drift guard.
+    use testcontainers::runners::AsyncRunner as _;
+    use testcontainers_modules::postgres::Postgres;
+
+    let container = Postgres::default()
+        .start()
+        .await
+        .expect("failed to start Postgres testcontainer — is Docker running?");
+
+    let host = container.get_host().await.unwrap();
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    let db_url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+
+    let tmp = tempfile::tempdir().unwrap();
+    let migrations_dir = tmp.path().join("migrations");
+    std::fs::create_dir_all(&migrations_dir).unwrap();
+
+    write_migration(
+        &migrations_dir,
+        "20260101000000_create_posts",
+        "CREATE TABLE posts (id BIGSERIAL PRIMARY KEY);",
+        "DROP TABLE posts;",
+    );
+
+    let envs = [("AUTUMN_DATABASE__URL", db_url.as_str())];
+    let dir = tmp.path();
+
+    // Apply, then roll back — the rollback must delete the recorded checksum.
+    run_autumn_ok(dir, &["migrate"], &envs);
+    let (_, stderr) = run_autumn_ok(dir, &["migrate", "down"], &envs);
+    assert!(
+        stderr.contains("Rolled back"),
+        "down should report rollback: {stderr}"
+    );
+
+    // Now that the migration is reverted, editing its up.sql is legitimate
+    // (this is exactly the down + edit + re-apply flow the fix supports).
+    write_migration(
+        &migrations_dir,
+        "20260101000000_create_posts",
+        "CREATE TABLE posts (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL);",
+        "DROP TABLE posts;",
+    );
+
+    // Re-apply the edited migration. With the stale checksum cleared on
+    // rollback, this records the NEW content's hash.
+    run_autumn_ok(dir, &["migrate"], &envs);
+
+    // A follow-up run validates already-applied checksums against on-disk
+    // content. If the rollback had left the stale hash, this would fail with a
+    // "checksum mismatch" for the version; with the fix it is clean.
+    let (_, stderr) = run_autumn_ok(dir, &["migrate"], &envs);
+    assert!(
+        !stderr.contains("checksum mismatch"),
+        "re-applied edited migration must not report stale-checksum drift: {stderr}"
+    );
+    let (_, stderr) = run_autumn_ok(dir, &["migrate", "status"], &envs);
+    assert!(
+        !stderr.contains("checksum mismatch") && !stderr.contains("drifted"),
+        "status must report no drift after rollback + edited re-apply: {stderr}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers); run with -- --ignored"]
 async fn migrate_down_refuses_when_down_sql_is_empty() {
     use testcontainers::runners::AsyncRunner as _;
     use testcontainers_modules::postgres::Postgres;

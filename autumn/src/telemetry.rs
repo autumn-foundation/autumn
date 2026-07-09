@@ -14,6 +14,10 @@ use opentelemetry::{KeyValue, trace::TracerProvider as _};
 #[cfg(feature = "telemetry-otlp")]
 use opentelemetry_otlp::WithExportConfig as _;
 #[cfg(feature = "telemetry-otlp")]
+use opentelemetry_otlp::WithTonicConfig as _;
+#[cfg(feature = "telemetry-otlp")]
+use opentelemetry_otlp::tonic_types::transport::ClientTlsConfig;
+#[cfg(feature = "telemetry-otlp")]
 use opentelemetry_sdk::{Resource, propagation::TraceContextPropagator, trace::SdkTracerProvider};
 
 /// Concrete log formatting chosen for the running process.
@@ -297,6 +301,16 @@ fn is_production_env() -> bool {
     std::env::var("AUTUMN_ENV").is_ok_and(|value| value.eq_ignore_ascii_case("production"))
 }
 
+/// Returns `true` when the OTLP endpoint uses the `https` scheme.
+#[cfg(feature = "telemetry-otlp")]
+fn is_https_endpoint(endpoint: &str) -> bool {
+    endpoint
+        .parse::<Uri>()
+        .ok()
+        .and_then(|uri| uri.scheme_str().map(|scheme| scheme == "https"))
+        .unwrap_or(false)
+}
+
 fn validate_otlp_endpoint(endpoint: &str) -> Result<(), TelemetryInitError> {
     let uri: Uri = endpoint.parse().map_err(|error: http::uri::InvalidUri| {
         TelemetryInitError::InvalidEndpoint {
@@ -453,10 +467,24 @@ fn build_tracer_provider(otlp: &OtlpTraceRuntime) -> Result<SdkTracerProvider, T
         .build();
 
     let exporter = match otlp.protocol {
-        TelemetryProtocol::Grpc => opentelemetry_otlp::SpanExporter::builder()
-            .with_tonic()
-            .with_endpoint(otlp.endpoint.clone())
-            .build(),
+        TelemetryProtocol::Grpc => {
+            let builder = opentelemetry_otlp::SpanExporter::builder()
+                .with_tonic()
+                .with_endpoint(otlp.endpoint.clone());
+            // For `https` endpoints opentelemetry-otlp installs a default
+            // `ClientTlsConfig::new()`, which carries an *empty* trust-root
+            // store: the roots supplied by tonic's `tls-native-roots`
+            // feature (via the `tls-roots` otlp feature) are only loaded
+            // when `with_enabled_roots()` is called. Without this, every
+            // TLS handshake to a publicly-trusted collector fails with an
+            // unknown-issuer error.
+            let builder = if is_https_endpoint(&otlp.endpoint) {
+                builder.with_tls_config(ClientTlsConfig::new().with_enabled_roots())
+            } else {
+                builder
+            };
+            builder.build()
+        }
         TelemetryProtocol::HttpProtobuf => opentelemetry_otlp::SpanExporter::builder()
             .with_http()
             .with_endpoint(otlp.endpoint.clone())
@@ -603,6 +631,15 @@ mod tests {
         // Sanity: the disabled guard must be droppable without panic.
         drop(guard);
     }
+    #[cfg(feature = "telemetry-otlp")]
+    #[test]
+    fn is_https_endpoint_detects_scheme() {
+        assert!(is_https_endpoint("https://collector.example.com:4317"));
+        assert!(!is_https_endpoint("http://localhost:4317"));
+        assert!(!is_https_endpoint("localhost:4317"));
+        assert!(!is_https_endpoint("not a uri"));
+    }
+
     #[test]
     fn build_capture_layer_returns_none_when_disabled() {
         let log = LogConfig::default(); // capture.enabled = false
