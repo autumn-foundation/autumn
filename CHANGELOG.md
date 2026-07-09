@@ -21,6 +21,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `BlobStore::get_stream` without buffering the whole object in memory, so it
   serves large private files behind a `#[secured]` handler with no public
   presigned URL (#1141).
+- **security:** per-route `#[throttle]` route attribute (issue #1350) —
+  drop-in stricter rate limit for abuse-prone endpoints (login, search,
+  export). `#[throttle(limit = 5, per = "1m")]` bounds requests to that
+  handler on top of the global limiter, `#[throttle(limit = N, per = "…",
+  key = "ip" | "principal" | "token")]` selects the keying strategy, and
+  `#[throttle("login")]` references a named limiter defined in
+  `[security.rate_limit.named.login]`. Reuses the shipped token-bucket
+  backend (memory + Redis), the shipped principal/IP/token keying (#794),
+  and the existing 429 `Retry-After` + `x-ratelimit-*` response shape.
+  `RateLimitExempt` still bypasses per-route throttles, and backend errors
+  honor `on_backend_failure` fail-open/fail-closed. See
+  `docs/guide/rate-limiting.md`.
 - **ci:** README-quickstart gate against the published crates (issue #1586) —
   `.github/workflows/quickstart-gate.yml` + `scripts/check-quickstart.sh`
   install the README-pinned `autumn-cli` from crates.io (never the local

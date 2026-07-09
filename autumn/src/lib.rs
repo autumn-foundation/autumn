@@ -972,6 +972,35 @@ pub use autumn_macros::secured;
 /// ```
 pub use autumn_macros::step_up;
 
+/// Apply a per-route rate limit that composes with the global limiter.
+///
+/// # Forms
+///
+/// - `#[throttle(limit = 5, per = "1m")]` — inline limit; keying strategy
+///   matches the global limiter (`[security.rate_limit]`).
+/// - `#[throttle(limit = 5, per = "1m", key = "ip" | "principal" | "token")]`
+///   — inline limit with an explicit key strategy.
+/// - `#[throttle("login")]` — reference a named limiter defined in
+///   `[security.rate_limit.named.login]`.
+///
+/// Requests denied by the per-route bucket receive `429 Too Many Requests`
+/// with a `Retry-After` header and the standard `x-ratelimit-*` headers.
+/// [`RateLimitExempt`](crate::security::RateLimitExempt) still bypasses the
+/// per-route throttle.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use autumn_web::prelude::*;
+///
+/// #[post("/login")]
+/// #[throttle(limit = 5, per = "1m", key = "ip")]
+/// async fn login() -> AutumnResult<&'static str> {
+///     Ok("welcome back")
+/// }
+/// ```
+pub use autumn_macros::throttle;
+
 /// Gate a route handler on a named feature flag. If the flag is disabled for
 /// the current actor the handler responds with `404 Not Found` (default) or
 /// delegates to a custom fallback specified with `fallback = my_fn`.

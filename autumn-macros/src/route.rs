@@ -135,7 +135,8 @@ pub fn route_macro(
     let body_guarded_replay = secured
         || has_authorize_guard(&input_fn)
         || has_feature_flag
-        || has_step_up_guard(&input_fn);
+        || has_step_up_guard(&input_fn)
+        || has_throttle_guard(&input_fn);
     let intercepted_route = !interceptors.is_empty();
     let handler_expr = build_handler_expr(
         &routing_fn,
@@ -261,6 +262,15 @@ fn has_step_up_guard(input_fn: &syn::ItemFn) -> bool {
             .segments
             .last()
             .is_some_and(|segment| segment.ident == "step_up")
+    })
+}
+
+fn has_throttle_guard(input_fn: &syn::ItemFn) -> bool {
+    input_fn.attrs.iter().any(|attr| {
+        attr.path()
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == "throttle")
     })
 }
 

@@ -81,6 +81,7 @@ together (`0.5.0` published; `0.6.0` on trunk-dev, unpublished).
 | `#[feature_flag]` | Feature-flag definition |
 | `#[inbound_mail]` | Inbound mail handler |
 | `#[step_up]` | Step-up authentication guard |
+| `#[throttle]` | Per-route rate limit — inline (`limit`/`per`/`key`) or named (`#[throttle("login")]`) (**unreleased**) |
 | `#[event]`, `#[listener]`, `listeners![...]` | Typed domain event bus (**unreleased**) — publish via the `Events` extractor, register with `.listeners(...)` |
 
 `#[model]` also recognizes `#[belongs_to]` / `#[has_many]` / `#[has_one]`

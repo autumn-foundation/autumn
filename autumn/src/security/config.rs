@@ -804,6 +804,32 @@ pub struct RateLimitTierConfig {
     pub burst: u32,
 }
 
+/// Named per-route rate limit referenced from `#[throttle("name")]`.
+///
+/// Declare one entry per named limiter under `[security.rate_limit.named.<name>]`
+/// and reference it from a handler via `#[throttle("name")]` so the throttling
+/// policy lives in config, not code.
+///
+/// ```toml
+/// [security.rate_limit.named.login]
+/// limit = 5
+/// per = "1m"
+/// key = "ip"
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct RateLimitNamedConfig {
+    /// Maximum number of requests allowed in each `per` window. Also serves as
+    /// the token-bucket burst capacity.
+    pub limit: u32,
+    /// Window duration parsed by [`crate::task::parse_duration`] (e.g. `"1m"`,
+    /// `"30s"`, `"1h"`). The steady-state refill rate is `limit / per`.
+    pub per: String,
+    /// Optional keying strategy override. When `None`, the named limiter uses
+    /// the same key strategy as the global limiter (`security.rate_limit.key_strategy`).
+    #[serde(default)]
+    pub key: Option<KeyStrategy>,
+}
+
 /// Rate limiting configuration.
 ///
 /// Applies a token bucket to every request, keyed by client IP (default)
@@ -940,6 +966,22 @@ pub struct RateLimitConfig {
     #[serde(default)]
     pub tiers: HashMap<String, RateLimitTierConfig>,
 
+    /// Named per-route limiters referenced from `#[throttle("name")]`.
+    ///
+    /// Each entry defines a `limit` (tokens per window) and `per` (window
+    /// duration) so ops can tune per-route thresholds without a recompile.
+    /// An optional `key` overrides the default keying strategy for that
+    /// named limiter.
+    ///
+    /// ```toml
+    /// [security.rate_limit.named.login]
+    /// limit = 5
+    /// per = "1m"
+    /// key = "ip"
+    /// ```
+    #[serde(default)]
+    pub named: HashMap<String, RateLimitNamedConfig>,
+
     /// Bucket store backend. Default: `"memory"` (in-process, single-replica).
     ///
     /// Set to `"redis"` in multi-replica deployments so the configured
@@ -977,6 +1019,7 @@ impl Default for RateLimitConfig {
             trusted_proxies: Vec::new(),
             key_strategy: KeyStrategy::default(),
             tiers: HashMap::new(),
+            named: HashMap::new(),
             backend: RateLimitBackend::default(),
             #[cfg(feature = "redis")]
             redis: RateLimitRedisConfig::default(),

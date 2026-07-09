@@ -979,6 +979,263 @@ where
     }
 }
 
+// ── Per-route throttle (#[throttle] attribute macro backend) ─────────────────
+
+/// Attribute-supplied throttle policy applied to a single handler.
+///
+/// Emitted by the `#[throttle(...)]` proc macro; instances are `const`-embedded
+/// in the generated handler body and passed to [`__check_throttle`] on each
+/// request. Users do not construct these directly.
+#[derive(Debug, Clone)]
+pub enum ThrottleSpec {
+    /// Inline `#[throttle(limit = N, per = "…", key = "…")]`.
+    Inline {
+        /// Requests allowed per `per_secs` window.
+        limit: u32,
+        /// Window length in seconds.
+        per_secs: u64,
+        /// Optional keying strategy; `None` means "match the global limiter".
+        key: Option<KeyStrategy>,
+    },
+    /// Named `#[throttle("name")]` referencing a `[security.rate_limit.named.<name>]`
+    /// entry.
+    Named(&'static str),
+}
+
+/// Per-route limiter registry shared across a process.
+///
+/// Keyed by `route_id` for inline `#[throttle(...)]` forms and by `"named:{name}"`
+/// for `#[throttle("name")]` forms, so distinct routes pointing at the same
+/// named limiter share a single token bucket while inline throttles get an
+/// isolated bucket per handler.
+#[allow(clippy::type_complexity)]
+static THROTTLE_REGISTRY: std::sync::OnceLock<
+    Mutex<std::collections::HashMap<String, Arc<Limiter>>>,
+> = std::sync::OnceLock::new();
+
+fn throttle_registry() -> &'static Mutex<std::collections::HashMap<String, Arc<Limiter>>> {
+    THROTTLE_REGISTRY.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Clear the process-wide `#[throttle]` limiter registry.
+///
+/// Only intended for tests; each integration test that uses `#[throttle]`
+/// should call this at the top of the test to avoid cross-test bucket bleed
+/// through the shared registry.
+#[doc(hidden)]
+pub fn __throttle_registry_reset() {
+    if let Some(reg) = THROTTLE_REGISTRY.get()
+        && let Ok(mut guard) = reg.lock()
+    {
+        guard.clear();
+    }
+}
+
+fn build_throttle_limiter(
+    global: &RateLimitConfig,
+    limit: u32,
+    per_secs: u64,
+    key: KeyStrategy,
+) -> Arc<Limiter> {
+    // Rebuild a fresh RateLimitConfig with the same backend/failure/redis
+    // settings as the global limiter, then override the rate and burst.
+    let cfg = RateLimitConfig {
+        enabled: true,
+        requests_per_second: throttle_rps(limit, per_secs),
+        burst: limit,
+        trust_forwarded_headers: global.trust_forwarded_headers,
+        trusted_proxies: global.trusted_proxies.clone(),
+        key_strategy: key,
+        tiers: std::collections::HashMap::new(),
+        named: std::collections::HashMap::new(),
+        backend: global.backend,
+        #[cfg(feature = "redis")]
+        redis: global.redis.clone(),
+        #[cfg(feature = "redis")]
+        on_backend_failure: global.on_backend_failure,
+    };
+    Arc::new(Limiter::from_config(&cfg))
+}
+
+/// Steady-state refill rate for a throttle limiter: `limit` tokens per
+/// `per_secs` seconds. `limit` and `per_secs` come from a route attribute or a
+/// small config value, so the `f64` casts never lose meaningful precision.
+#[allow(clippy::cast_precision_loss)]
+fn throttle_rps(limit: u32, per_secs: u64) -> f64 {
+    f64::from(limit) / (per_secs as f64).max(1.0)
+}
+
+/// Resolve the effective inline parameters for a spec, given the global config.
+///
+/// Returns `Some((limit, per_secs, key, registry_key))` when a limiter should
+/// be applied, or `None` when the named entry is missing (fail-open with warn).
+fn resolve_throttle_params(
+    route_id: &'static str,
+    spec: &ThrottleSpec,
+    config: &RateLimitConfig,
+) -> Option<(u32, u64, KeyStrategy, String)> {
+    match spec {
+        ThrottleSpec::Inline {
+            limit,
+            per_secs,
+            key,
+        } => {
+            let key = key.unwrap_or(config.key_strategy);
+            Some((*limit, *per_secs, key, format!("route:{route_id}")))
+        }
+        ThrottleSpec::Named(name) => {
+            let Some(entry) = config.named.get(*name) else {
+                tracing::warn!(
+                    name = %name,
+                    "#[throttle(\"{name}\")] references \
+                     [security.rate_limit.named.{name}] but no such entry exists in \
+                     config; failing open"
+                );
+                return None;
+            };
+            let Some(duration) = crate::task::parse_duration(&entry.per) else {
+                tracing::warn!(
+                    name = %name,
+                    per = %entry.per,
+                    "[security.rate_limit.named.{name}] has invalid `per`; failing open"
+                );
+                return None;
+            };
+            let per_secs = duration.as_secs().max(1);
+            let key = entry.key.unwrap_or(config.key_strategy);
+            Some((entry.limit, per_secs, key, format!("named:{name}")))
+        }
+    }
+}
+
+/// Extract a bucket key for a throttle check by reconstructing a minimal
+/// request from the parts an axum extractor already broke out, then reusing
+/// the shipped [`Limiter::extract_key`] so IP-via-proxy-resolver, bearer-token,
+/// and authenticated-principal keying all behave exactly as the global limiter
+/// (satisfying "no new keying scheme").
+fn extract_throttle_key(
+    limiter: &Limiter,
+    headers: &axum::http::HeaderMap,
+    peer: Option<std::net::SocketAddr>,
+    principal: Option<&RateLimitPrincipal>,
+) -> Option<String> {
+    let mut req: Request<()> = Request::new(());
+    *req.headers_mut() = headers.clone();
+    if let Some(addr) = peer {
+        req.extensions_mut()
+            .insert(axum::extract::ConnectInfo(addr));
+    }
+    if let Some(p) = principal {
+        req.extensions_mut().insert(p.clone());
+    }
+    limiter.extract_key(&req)
+}
+
+/// Build the shared 429 problem-details response used by both the global tower
+/// layer and the `#[throttle]` per-route guard.
+fn build_rate_limited_response(
+    key_class: &str,
+    retry_after_secs: u64,
+    limit: u32,
+    reset_at_unix: u64,
+) -> axum::response::Response {
+    use axum::body::Body;
+
+    let body_json = rate_limit_problem_json(key_class);
+    let mut response = Response::new(Body::from(body_json));
+    *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+    let hdrs = response.headers_mut();
+    hdrs.insert(RETRY_AFTER, HeaderValue::from(retry_after_secs));
+    hdrs.insert(X_RATELIMIT_LIMIT, HeaderValue::from(limit));
+    hdrs.insert(X_RATELIMIT_REMAINING, HeaderValue::from_static("0"));
+    hdrs.insert(X_RATELIMIT_RESET, HeaderValue::from(reset_at_unix));
+    hdrs.insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("application/problem+json"),
+    );
+    response
+}
+
+/// Runtime hook invoked by handlers annotated with `#[throttle(...)]`.
+///
+/// Consults the per-route limiter (lazily initialized on first call) and
+/// returns:
+///
+/// - `Ok(())` when the request is allowed to proceed, when the request carries
+///   the [`RateLimitExempt`] marker, or when a named-limiter lookup fails
+///   (fail-open) / a backend error is configured as `fail_open`.
+/// - `Err(Response)` when the token bucket denies the request or a backend
+///   error is configured as `fail_closed`. The response is a `429 Too Many
+///   Requests` with `Retry-After` and the standard `x-ratelimit-*` headers.
+///
+/// This function is `#[doc(hidden)]`-style: it is only meant to be called by
+/// the code generated by the `#[throttle]` macro. External callers should
+/// build their own `RateLimitLayer` instead.
+#[doc(hidden)]
+pub async fn __check_throttle(
+    state: &crate::AppState,
+    route_id: &'static str,
+    spec: ThrottleSpec,
+    headers: &axum::http::HeaderMap,
+    peer: Option<std::net::SocketAddr>,
+    principal: Option<&RateLimitPrincipal>,
+    exempt: bool,
+) -> Result<(), axum::response::Response> {
+    // `RateLimitExempt` bypasses per-route throttles the same way it bypasses
+    // the framework's global limiter, so an MCP `tools/call` counted once at
+    // the `/mcp` envelope is not re-charged on dispatch replay.
+    if exempt {
+        return Ok(());
+    }
+
+    let config = state.config();
+    let rl_config = &config.security.rate_limit;
+
+    let Some((limit, per_secs, key_strategy, registry_key)) =
+        resolve_throttle_params(route_id, &spec, rl_config)
+    else {
+        // Fail-open: named entry missing or unparseable (already logged).
+        return Ok(());
+    };
+
+    let limiter =
+        {
+            let mut reg = throttle_registry()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            Arc::clone(reg.entry(registry_key).or_insert_with(|| {
+                build_throttle_limiter(rl_config, limit, per_secs, key_strategy)
+            }))
+        };
+
+    let Some(bucket_key) = extract_throttle_key(&limiter, headers, peer, principal) else {
+        // In-process caller with no identifiable peer (SSG, tests without
+        // ConnectInfo). Bypass — matches how the tower layer handles this.
+        return Ok(());
+    };
+
+    let burst = f64::from(limit.max(1));
+    let rps = throttle_rps(limit.max(1), per_secs);
+
+    match limiter.decide(&bucket_key, burst, rps).await {
+        Some(Decision::Denied {
+            retry_after_secs,
+            reset_at_unix,
+        }) => {
+            let key_class = key_class_label(&bucket_key);
+            Err(build_rate_limited_response(
+                key_class,
+                retry_after_secs,
+                limit,
+                reset_at_unix,
+            ))
+        }
+        Some(Decision::Allowed { .. }) | None => Ok(()),
+    }
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2054,5 +2311,193 @@ mod tests {
         assert_eq!(r.status(), StatusCode::OK);
         let r = app.clone().oneshot(make_req("regular_user")).await.unwrap();
         assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    // ── #[throttle] unit tests ────────────────────────────────────────────
+
+    #[test]
+    fn resolve_throttle_params_inline_uses_defaults_from_global_key_strategy() {
+        let global = RateLimitConfig {
+            key_strategy: KeyStrategy::AuthenticatedPrincipal,
+            ..Default::default()
+        };
+        let spec = ThrottleSpec::Inline {
+            limit: 5,
+            per_secs: 60,
+            key: None,
+        };
+        let (limit, per, key, reg_key) =
+            resolve_throttle_params("m::h", &spec, &global).expect("params");
+        assert_eq!(limit, 5);
+        assert_eq!(per, 60);
+        assert_eq!(key, KeyStrategy::AuthenticatedPrincipal);
+        assert_eq!(reg_key, "route:m::h");
+    }
+
+    #[test]
+    fn resolve_throttle_params_named_missing_entry_fails_open() {
+        let global = RateLimitConfig::default();
+        let spec = ThrottleSpec::Named("nonexistent");
+        assert!(resolve_throttle_params("m::h", &spec, &global).is_none());
+    }
+
+    #[test]
+    fn resolve_throttle_params_named_uses_config_key_when_present() {
+        use super::super::config::RateLimitNamedConfig;
+        let mut named = std::collections::HashMap::new();
+        named.insert(
+            "login".to_owned(),
+            RateLimitNamedConfig {
+                limit: 3,
+                per: "30s".to_owned(),
+                key: Some(KeyStrategy::ApiToken),
+            },
+        );
+        let global = RateLimitConfig {
+            named,
+            ..Default::default()
+        };
+        let spec = ThrottleSpec::Named("login");
+        let (limit, per, key, reg_key) =
+            resolve_throttle_params("m::h", &spec, &global).expect("params");
+        assert_eq!(limit, 3);
+        assert_eq!(per, 30);
+        assert_eq!(key, KeyStrategy::ApiToken);
+        assert_eq!(reg_key, "named:login");
+    }
+
+    #[tokio::test]
+    async fn check_throttle_named_missing_entry_returns_ok_fail_open() {
+        // Fail-open path when a named limiter is referenced but not configured.
+        // Uses AppState::default() (no config installed) so lookup misses.
+        __throttle_registry_reset();
+        let state = crate::AppState::for_test();
+        let headers = axum::http::HeaderMap::new();
+        let result = __check_throttle(
+            &state,
+            "test::route",
+            ThrottleSpec::Named("does_not_exist"),
+            &headers,
+            Some("127.0.0.1:1234".parse().unwrap()),
+            None,
+            false,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "missing named limiter must fail-open, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn check_throttle_exempt_bypasses_limiter() {
+        __throttle_registry_reset();
+        let state = crate::AppState::for_test();
+        let headers = axum::http::HeaderMap::new();
+        // Even with an extremely tight limiter, `exempt = true` returns Ok.
+        let result = __check_throttle(
+            &state,
+            "test::exempt",
+            ThrottleSpec::Inline {
+                limit: 1,
+                per_secs: 3600,
+                key: Some(KeyStrategy::Ip),
+            },
+            &headers,
+            Some("127.0.0.1:1234".parse().unwrap()),
+            None,
+            true,
+        )
+        .await;
+        assert!(result.is_ok(), "exempt request must bypass throttle");
+    }
+
+    #[tokio::test]
+    async fn check_throttle_inline_denies_after_burst_and_response_carries_headers() {
+        __throttle_registry_reset();
+        let state = crate::AppState::for_test();
+        let headers = axum::http::HeaderMap::new();
+        let peer: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        let spec = ThrottleSpec::Inline {
+            limit: 1,
+            per_secs: 60,
+            key: Some(KeyStrategy::Ip),
+        };
+
+        // First call consumes the only token.
+        let r1 = __check_throttle(
+            &state,
+            "test::inline_denies",
+            spec.clone(),
+            &headers,
+            Some(peer),
+            None,
+            false,
+        )
+        .await;
+        assert!(r1.is_ok(), "first request must succeed");
+
+        // Second call denies.
+        let r2 = __check_throttle(
+            &state,
+            "test::inline_denies",
+            spec,
+            &headers,
+            Some(peer),
+            None,
+            false,
+        )
+        .await;
+        let denied = r2.expect_err("second request must be denied");
+        assert_eq!(denied.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            denied.headers().get(RETRY_AFTER).is_some(),
+            "denied response must include Retry-After"
+        );
+        assert!(
+            denied.headers().get(X_RATELIMIT_LIMIT).is_some(),
+            "denied response must include x-ratelimit-limit"
+        );
+        assert_eq!(
+            denied
+                .headers()
+                .get(X_RATELIMIT_REMAINING)
+                .and_then(|v| v.to_str().ok()),
+            Some("0"),
+        );
+        assert!(
+            denied.headers().get(X_RATELIMIT_RESET).is_some(),
+            "denied response must include x-ratelimit-reset"
+        );
+        assert_eq!(
+            denied
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/problem+json"),
+        );
+    }
+
+    #[tokio::test]
+    async fn check_throttle_no_identifiable_peer_bypasses_limiter() {
+        // In-process caller without ConnectInfo (SSG, some tests): bypass.
+        __throttle_registry_reset();
+        let state = crate::AppState::for_test();
+        let headers = axum::http::HeaderMap::new();
+        let result = __check_throttle(
+            &state,
+            "test::no_peer",
+            ThrottleSpec::Inline {
+                limit: 1,
+                per_secs: 60,
+                key: Some(KeyStrategy::Ip),
+            },
+            &headers,
+            None,
+            None,
+            false,
+        )
+        .await;
+        assert!(result.is_ok());
     }
 }

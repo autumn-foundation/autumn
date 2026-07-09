@@ -47,6 +47,7 @@ mod static_routes_macro;
 mod step_up;
 mod story_macro;
 mod tasks_macro;
+mod throttle;
 mod ws;
 
 use proc_macro::TokenStream;
@@ -674,6 +675,39 @@ pub fn secured(attr: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn step_up(attr: TokenStream, item: TokenStream) -> TokenStream {
     step_up::step_up_macro(attr.into(), item.into()).into()
+}
+
+/// Apply a per-route rate limit to a handler.
+///
+/// The handler is guarded by an additional rate limiter that composes with
+/// (and, for the annotated route, is stricter than) the global limiter
+/// configured under `[security.rate_limit]`. Requests denied by either
+/// limiter respond with `429 Too Many Requests` including a `Retry-After`
+/// header and the standard `x-ratelimit-*` headers.
+///
+/// # Forms
+///
+/// - `#[throttle(limit = 5, per = "1m")]` — inline limit; keying strategy
+///   matches the global limiter.
+/// - `#[throttle(limit = 5, per = "1m", key = "ip" | "principal" | "token")]`
+///   — inline limit with an explicit key strategy override.
+/// - `#[throttle("login")]` — reference a named limiter defined in
+///   `[security.rate_limit.named.login]`.
+///
+/// # Example
+///
+/// ```ignore
+/// use autumn_web::prelude::*;
+///
+/// #[post("/login")]
+/// #[throttle(limit = 5, per = "1m", key = "ip")]
+/// async fn login() -> AutumnResult<&'static str> {
+///     Ok("welcome back")
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn throttle(attr: TokenStream, item: TokenStream) -> TokenStream {
+    throttle::throttle_macro(attr.into(), item.into()).into()
 }
 
 /// Gate a route handler on a named feature flag.
