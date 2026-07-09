@@ -544,6 +544,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   previously gitignored) so builds are reproducible and dependency updates
   are reviewable.
 
+### Security
+
+- **auth:** OIDC `id_token` verification no longer trusts the token header's
+  `alg` to select the verification algorithm (JWT algorithm-confusion
+  defense). The accepted algorithm set is now pinned from the matched JWKS
+  key — its declared `alg` when present, otherwise the asymmetric signature
+  algorithms compatible with its key type (`kty`) — and tokens whose header
+  algorithm is not in that set are rejected before signature verification.
+  In particular, symmetric (HS256/HS384/HS512) headers are rejected when
+  verifying against asymmetric JWKS keys, closing the forgery vector where an
+  attacker HMAC-signs a token using the provider's public key material, and
+  `alg: none` tokens remain rejected at header parsing.
+
 ## [0.6.0] - 2026-06-30
 
 ### Added
