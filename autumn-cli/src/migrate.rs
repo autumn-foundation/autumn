@@ -998,9 +998,18 @@ fn deep_merge_toml(base: &mut toml::Table, overlay: toml::Table) {
 /// Returns `None` when no URL can be resolved, leaving the caller to decide how
 /// to report the failure (the `autumn db` commands surface their own message).
 pub fn resolve_primary_url(profile: Option<&str>) -> Option<String> {
+    use autumn_web::config::Env as _;
+
     let effective = effective_profile(profile);
     let config_table = read_autumn_toml_table_with_profile(Some(&effective));
-    resolve_primary_database_url_from_sources(|key| std::env::var(key), config_table.as_ref())
+    // Overlay a project-root `.env` UNDER the real environment so a
+    // `.env`-provided AUTUMN_DATABASE__* / DATABASE_URL is honored for the
+    // `autumn db` lifecycle commands (create/drop/reset) and `db pull`, exactly
+    // as `autumn migrate` resolves its target URLs via `resolve_targets`. A real
+    // env var of the same key still wins; a malformed `.env` fails loudly here
+    // (with a `path:line` location), where a DB URL is actually needed.
+    let env = os_env_with_dotenv_or_exit();
+    resolve_primary_database_url_from_sources(|key| env.var(key), config_table.as_ref())
 }
 
 pub fn resolve_primary_database_url_from_sources<F>(

@@ -2498,7 +2498,7 @@ pub fn run(opts: DoctorOptions) {
     let auth_extractor_mounted = resolve_auth_extractor_mounted();
     let compression_enabled = resolve_compression_enabled();
     let proxy_conflict_data = resolve_proxy_conflict_data();
-    let (dotenv_has_example, dotenv_has_env, dotenv_gitignored) = resolve_dotenv_state();
+    let (dotenv_has_example, dotenv_has_env, dotenv_uncovered) = resolve_dotenv_state();
 
     // ── Phase 2: build tasks in display order ────────────────────────────────
     let mut tasks: Vec<Task> = Vec::new();
@@ -2699,7 +2699,7 @@ pub fn run(opts: DoctorOptions) {
     // 12b. Local-dev `.env` handling (warn on `.env.example` without `.env`,
     //      or a present-but-ungitignored `.env`).
     tasks.push(Box::new(move || {
-        check_dotenv_impl(dotenv_has_example, dotenv_has_env, dotenv_gitignored)
+        check_dotenv_impl(dotenv_has_example, dotenv_has_env, &dotenv_uncovered)
     }));
 
     // 13. System-test browser (warn if missing; not all projects use system tests)
@@ -2799,43 +2799,140 @@ pub fn check_compression_impl(compression_enabled: bool, is_production: bool) ->
 
 /// Resolve `.env` filesystem state for [`check_dotenv_impl`].
 ///
-/// Returns `(has_env_example, has_env, env_gitignored)`. A `.env` is treated as
-/// gitignored when any trimmed `.gitignore` line equals `.env` or is a glob
-/// that covers it (`.env*` / `*.env`). Note that `.env.*` does NOT cover the
-/// root `.env` (it only matches `.env.local` etc.), so it is not counted.
-fn resolve_dotenv_state() -> (bool, bool, bool) {
+/// Returns `(has_env_example, has_env, uncovered_secret_files)`, where the last
+/// element lists every always-secret dotenv file present in the project root
+/// (`.env`, `.env.local`, and any `.env.<profile>.local`) that the project's
+/// `.gitignore` does NOT cover. Committable `.env.<profile>` (non-local) files
+/// are intentionally excluded from the secret set — they follow the Vite/Next
+/// convention of being safe to commit — so doctor never flags them.
+fn resolve_dotenv_state() -> (bool, bool, Vec<String>) {
     let has_env_example = std::path::Path::new(".env.example").exists();
     let has_env = std::path::Path::new(".env").exists();
-    let env_gitignored = std::fs::read_to_string(".gitignore")
-        .map(|contents| gitignore_covers_dotenv(&contents))
-        .unwrap_or(false);
-    (has_env_example, has_env, env_gitignored)
+    let gitignore = std::fs::read_to_string(".gitignore").unwrap_or_default();
+    let uncovered = present_secret_dotenv_files(std::path::Path::new("."))
+        .into_iter()
+        .filter(|name| !gitignore_covers(&gitignore, name))
+        .collect();
+    (has_env_example, has_env, uncovered)
 }
 
-/// Whether a `.gitignore` body ignores a root `.env` file.
-fn gitignore_covers_dotenv(contents: &str) -> bool {
+/// Enumerate the always-secret dotenv files present in `dir`: the root `.env`,
+/// `.env.local`, and any `.env.<profile>.local`. Returned sorted for stable
+/// output. Committable `.env.<profile>` (non-local) files are excluded — see
+/// [`is_secret_dotenv_filename`].
+fn present_secret_dotenv_files(dir: &std::path::Path) -> Vec<String> {
+    let mut files = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.filter_map(Result::ok) {
+            if !entry.path().is_file() {
+                continue;
+            }
+            if let Some(name) = entry.file_name().to_str()
+                && is_secret_dotenv_filename(name)
+            {
+                files.push(name.to_owned());
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
+/// Whether `name` is an always-secret dotenv file the loader can auto-load:
+/// `.env`, `.env.local`, or a `.env.<profile>.local` variant.
+///
+/// A non-local `.env.<profile>` (e.g. `.env.dev`) is committable by convention
+/// and returns `false`, as does the `.env.example` template.
+fn is_secret_dotenv_filename(name: &str) -> bool {
+    // Everything after the mandatory `.env` prefix.
+    let Some(rest) = name.strip_prefix(".env") else {
+        return false;
+    };
+    match rest {
+        // Bare `.env` and the root `.env.local` are always secret.
+        "" | ".local" => true,
+        // `.env.<profile>.local` — a per-profile local override. `rest` here is
+        // `.<profile>.local`; require a leading `.`, a `local` final segment,
+        // and at least two `.` separators so `<profile>` is a real segment
+        // (excludes committable non-local `.env.<profile>` files).
+        _ => {
+            rest.starts_with('.')
+                && rest.rsplit('.').next() == Some("local")
+                && rest.matches('.').count() >= 2
+        }
+    }
+}
+
+/// Whether a `.gitignore` body ignores a project-root file named `filename`.
+///
+/// Git-ignore semantics, restricted to the cases needed for root-level dotenv
+/// files: comment (`#…`), blank, and negation (`!…`) lines are skipped; every
+/// other line is treated as a glob matched against the file's basename, where
+/// `*` matches any run of non-`/` characters (including empty). An optional
+/// leading `**/` (match in any directory) then an optional leading `/` (anchor
+/// to the repository root) are accepted and stripped before matching. A pattern
+/// that still contains a `/` after stripping those prefixes — or ends in `/`
+/// (directory-only) — is a path/dir pattern that cannot match a bare root-level
+/// file and never counts as coverage.
+fn gitignore_covers(contents: &str, filename: &str) -> bool {
     contents.lines().any(|line| {
         let entry = line.trim();
-        if entry.starts_with('#') || entry.is_empty() {
+        if entry.is_empty() || entry.starts_with('#') || entry.starts_with('!') {
             return false;
         }
-        matches!(entry, ".env" | ".env*" | "/.env" | "*.env")
-            || entry.ends_with("/.env")
-            || entry.ends_with("/.env*")
-            || entry.ends_with("/*.env")
+        let pattern = entry.strip_prefix("**/").unwrap_or(entry);
+        let pattern = pattern.strip_prefix('/').unwrap_or(pattern);
+        if pattern.ends_with('/') || pattern.contains('/') {
+            return false;
+        }
+        glob_matches_basename(pattern, filename)
     })
+}
+
+/// Match a basename glob against `text`, anchored at both ends. The only special
+/// character is `*`, which matches any run of characters (including empty).
+fn glob_matches_basename(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    // Iterative wildcard match with backtracking on the most recent `*`.
+    let (mut pi, mut ti) = (0_usize, 0_usize);
+    let mut star: Option<usize> = None;
+    let mut star_ti = 0_usize;
+    while ti < t.len() {
+        if pi < p.len() && p[pi] == t[ti] {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some(pi);
+            star_ti = ti;
+            pi += 1;
+        } else if let Some(s) = star {
+            pi = s + 1;
+            star_ti += 1;
+            ti = star_ti;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
 }
 
 /// Check that project-root `.env` handling is set up safely.
 ///
 /// - `.env.example` present but no `.env` → Warn (developer likely needs to
 ///   copy the template).
-/// - `.env` present but not gitignored → Warn (risk of committing secrets).
+/// - Any always-secret dotenv file (`.env`, `.env.local`, `.env.<profile>.local`)
+///   present but NOT gitignore-covered → Warn, naming the offending file(s).
 /// - otherwise → Pass.
+///
+/// Warn-only by design (never Fail), consistent with the skill doc.
 pub fn check_dotenv_impl(
     has_env_example: bool,
     has_env: bool,
-    env_gitignored: bool,
+    uncovered_secret_files: &[String],
 ) -> CheckResult {
     if has_env_example && !has_env {
         return CheckResult {
@@ -2845,14 +2942,17 @@ pub fn check_dotenv_impl(
             hint: Some("Copy `.env.example` to `.env` and fill in local values"),
         };
     }
-    if has_env && !env_gitignored {
+    if !uncovered_secret_files.is_empty() {
         return CheckResult {
             name: "dotenv",
             status: CheckStatus::Warn,
-            detail: Some(
-                "`.env` is present but not gitignored — you risk committing secrets".into(),
+            detail: Some(format!(
+                "{} present but not gitignored — you risk committing secrets",
+                uncovered_secret_files.join(", ")
+            )),
+            hint: Some(
+                "Add your local .env files to .gitignore (e.g. `.env`, `.env.local`, `.env.*.local`)",
             ),
-            hint: Some("Add `.env` to .gitignore"),
         };
     }
     CheckResult {
@@ -4986,7 +5086,7 @@ redirect_uri = "http://localhost/callback"
 
     #[test]
     fn dotenv_warns_when_example_present_without_env() {
-        let result = check_dotenv_impl(true, false, false);
+        let result = check_dotenv_impl(true, false, &[]);
         assert_eq!(result.name, "dotenv");
         assert!(
             matches!(result.status, CheckStatus::Warn),
@@ -4998,7 +5098,23 @@ redirect_uri = "http://localhost/callback"
 
     #[test]
     fn dotenv_warns_when_env_present_but_not_gitignored() {
-        let result = check_dotenv_impl(true, true, false);
+        let result = check_dotenv_impl(true, true, &[".env".to_owned()]);
+        assert_eq!(result.name, "dotenv");
+        assert!(
+            matches!(result.status, CheckStatus::Warn),
+            "expected Warn, got {:?}",
+            result.status
+        );
+        let detail = result.detail.as_deref().unwrap();
+        assert!(detail.contains("not gitignored"), "got: {detail:?}");
+        assert!(detail.contains(".env"), "got: {detail:?}");
+    }
+
+    #[test]
+    fn dotenv_warns_when_env_local_present_but_not_gitignored() {
+        // A `.env.local` with no root `.env` must still warn: the loader reads
+        // it and it is always secret.
+        let result = check_dotenv_impl(false, false, &[".env.local".to_owned()]);
         assert_eq!(result.name, "dotenv");
         assert!(
             matches!(result.status, CheckStatus::Warn),
@@ -5006,15 +5122,31 @@ redirect_uri = "http://localhost/callback"
             result.status
         );
         assert!(
-            result.detail.as_deref().unwrap().contains("not gitignored"),
+            result.detail.as_deref().unwrap().contains(".env.local"),
+            "detail should name the offending file: {:?}",
+            result.detail
+        );
+    }
+
+    #[test]
+    fn dotenv_warns_when_profile_local_present_but_not_gitignored() {
+        let result = check_dotenv_impl(false, false, &[".env.dev.local".to_owned()]);
+        assert!(
+            matches!(result.status, CheckStatus::Warn),
+            "expected Warn, got {:?}",
+            result.status
+        );
+        assert!(
+            result.detail.as_deref().unwrap().contains(".env.dev.local"),
             "got: {:?}",
             result.detail
         );
     }
 
     #[test]
-    fn dotenv_passes_when_env_present_and_gitignored() {
-        let result = check_dotenv_impl(true, true, true);
+    fn dotenv_passes_when_all_present_secret_files_gitignored() {
+        // No uncovered secret files → Pass, even with a root `.env` present.
+        let result = check_dotenv_impl(true, true, &[]);
         assert_eq!(result.name, "dotenv");
         assert!(
             matches!(result.status, CheckStatus::Pass),
@@ -5025,7 +5157,7 @@ redirect_uri = "http://localhost/callback"
 
     #[test]
     fn dotenv_passes_when_nothing_configured() {
-        let result = check_dotenv_impl(false, false, false);
+        let result = check_dotenv_impl(false, false, &[]);
         assert_eq!(result.name, "dotenv");
         assert!(
             matches!(result.status, CheckStatus::Pass),
@@ -5035,23 +5167,49 @@ redirect_uri = "http://localhost/callback"
     }
 
     #[test]
-    fn gitignore_covers_dotenv_matches_common_globs() {
-        assert!(gitignore_covers_dotenv("/target\n.env\n"));
-        assert!(gitignore_covers_dotenv(".env*\n"));
-        assert!(gitignore_covers_dotenv("*.env\n"));
-        assert!(gitignore_covers_dotenv("/.env\n"));
-        // `.env.*` matches `.env.local` etc. but NOT the root `.env`, so a
-        // gitignore that only lists `.env.*` must count as NOT covering `.env`.
-        assert!(!gitignore_covers_dotenv("  .env.*  \n"));
-        assert!(!gitignore_covers_dotenv("/target\n.env.example\n"));
-        assert!(!gitignore_covers_dotenv(""));
-        // Recursive-glob style entries must also count as coverage.
-        assert!(gitignore_covers_dotenv("**/.env\n"));
-        assert!(gitignore_covers_dotenv("**/.env*\n"));
-        // A bare `.env.example` line still does not cover `.env`.
-        assert!(!gitignore_covers_dotenv(".env.example\n"));
-        // Comment and blank lines are ignored.
-        assert!(!gitignore_covers_dotenv("# .env\n\n"));
+    fn is_secret_dotenv_filename_classifies_local_vs_committable() {
+        assert!(is_secret_dotenv_filename(".env"));
+        assert!(is_secret_dotenv_filename(".env.local"));
+        assert!(is_secret_dotenv_filename(".env.dev.local"));
+        assert!(is_secret_dotenv_filename(".env.production.local"));
+        // Committable per-profile (non-local) files are NOT secret.
+        assert!(!is_secret_dotenv_filename(".env.dev"));
+        assert!(!is_secret_dotenv_filename(".env.production"));
+        // The template is not itself a secret.
+        assert!(!is_secret_dotenv_filename(".env.example"));
+        assert!(!is_secret_dotenv_filename("env.local"));
+    }
+
+    #[test]
+    fn gitignore_covers_truth_table() {
+        // `.env` covers `.env` but NOT `.env.local`.
+        assert!(gitignore_covers(".env\n", ".env"));
+        assert!(!gitignore_covers(".env\n", ".env.local"));
+        // `.env.*` covers `.env.local` but NOT `.env`.
+        assert!(gitignore_covers(".env.*\n", ".env.local"));
+        assert!(!gitignore_covers(".env.*\n", ".env"));
+        // `.env*` covers both.
+        assert!(gitignore_covers(".env*\n", ".env"));
+        assert!(gitignore_covers(".env*\n", ".env.local"));
+        // `*.local` and `.env.*.local` cover `.env.dev.local`.
+        assert!(gitignore_covers("*.local\n", ".env.dev.local"));
+        assert!(gitignore_covers(".env.*.local\n", ".env.dev.local"));
+        // `.env.example` covers neither `.env` nor `.env.local`.
+        assert!(!gitignore_covers(".env.example\n", ".env"));
+        assert!(!gitignore_covers(".env.example\n", ".env.local"));
+        // `**/.env` covers `.env`.
+        assert!(gitignore_covers("**/.env\n", ".env"));
+        // Leading `/` anchor and surrounding whitespace.
+        assert!(gitignore_covers("/target\n.env\n", ".env"));
+        assert!(gitignore_covers("  .env  \n", ".env"));
+        // Comment, blank, and negation lines never count as coverage.
+        assert!(!gitignore_covers("# .env\n\n", ".env"));
+        assert!(!gitignore_covers("!.env\n", ".env"));
+        assert!(!gitignore_covers("", ".env"));
+        // A path pattern in a subdirectory does not cover a root-level file.
+        assert!(!gitignore_covers("config/.env\n", ".env"));
+        // A directory-only pattern does not cover a regular file.
+        assert!(!gitignore_covers(".env/\n", ".env"));
     }
 
     #[test]
