@@ -93,6 +93,52 @@ fn escapes_special_characters_no_injection() {
     assert!(xml.contains("&quot;quotes&quot;"));
 }
 
+#[test]
+fn drops_xml_illegal_control_characters() {
+    let feed = Feed::atom(
+        "Title",
+        "https://example.com/",
+        "https://example.com/feed.xml",
+    )
+    .entry(
+        FeedEntry::new(
+            "https://example.com/x",
+            "Bell\u{7}Boundary\u{1f}End",
+            "https://example.com/x",
+        )
+        .summary("body\u{0}with\u{8}controls")
+        .published(Utc.with_ymd_and_hms(2026, 5, 1, 12, 0, 0).unwrap()),
+    );
+    let xml = feed.render();
+    // Illegal controls are gone...
+    assert!(!xml.contains('\u{7}'));
+    assert!(!xml.contains('\u{1f}'));
+    assert!(!xml.contains('\u{0}'));
+    assert!(!xml.contains('\u{8}'));
+    // ...but the surrounding legal text survives, and legal whitespace is kept.
+    assert!(xml.contains("BellBoundaryEnd"));
+    assert!(xml.contains("bodywithcontrols"));
+}
+
+#[test]
+fn keeps_legal_whitespace_in_text() {
+    let feed = Feed::atom(
+        "Title",
+        "https://example.com/",
+        "https://example.com/feed.xml",
+    )
+    .entry(
+        FeedEntry::new(
+            "https://example.com/x",
+            "Line\tone\nLine two",
+            "https://example.com/x",
+        )
+        .published(Utc.with_ymd_and_hms(2026, 5, 1, 12, 0, 0).unwrap()),
+    );
+    let xml = feed.render();
+    assert!(xml.contains("Line\tone\nLine two"));
+}
+
 #[tokio::test]
 async fn atom_into_response_sets_content_type() {
     let resp = sample_feed(FeedFormat::Atom).into_response();

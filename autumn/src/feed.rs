@@ -400,12 +400,17 @@ fn rfc2822(dt: DateTime<Utc>) -> String {
     dt.to_rfc2822()
 }
 
-/// XML-escape a text value: `&`, `<`, `>`, `"`, `'`. Escaping `>` also
-/// neutralises any `]]>` sequence so untrusted titles/bodies cannot break out
-/// of the document.
+/// XML-escape a text value: `&`, `<`, `>`, `"`, `'`. Characters outside the
+/// XML 1.0 `Char` set (control characters below space other than tab, newline,
+/// and carriage return) are dropped, since they cannot appear in a well-formed
+/// XML document even when escaped. Escaping `>` also neutralises any `]]>`
+/// sequence so untrusted titles/bodies cannot break out of the document.
 fn escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
+        if !is_xml_char(c) {
+            continue;
+        }
         match c {
             '&' => out.push_str("&amp;"),
             '<' => out.push_str("&lt;"),
@@ -416,4 +421,17 @@ fn escape(s: &str) -> String {
         }
     }
     out
+}
+
+/// Whether `c` is a valid XML 1.0 character (XML 1.0 §2.2 `Char` production).
+/// Rust `char` already excludes surrogates, so only the low control range and
+/// the two non-characters `U+FFFE`/`U+FFFF` need filtering here.
+const fn is_xml_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{9}' | '\u{A}' | '\u{D}'
+            | '\u{20}'..='\u{D7FF}'
+            | '\u{E000}'..='\u{FFFD}'
+            | '\u{10000}'..='\u{10FFFF}'
+    )
 }
