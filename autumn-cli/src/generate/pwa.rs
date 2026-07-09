@@ -594,8 +594,11 @@ fn inject_pwa_handlers(source: &str) -> String {
         return source.to_owned();
     }
 
-    // Insert before `#[autumn_web::main]`, or append at end as fallback.
-    source.find("#[autumn_web::main]").map_or_else(
+    // Insert before the line that is exactly `#[autumn_web::main]` — a naive
+    // substring search would also match the text inside a comment that merely
+    // mentions the macro (e.g. `// routes are wired under #[autumn_web::main]`)
+    // and slice the file mid-comment. Appends at end as fallback.
+    find_main_attr_line_start(source).map_or_else(
         || {
             let mut result = source.to_owned();
             if !result.ends_with('\n') {
@@ -613,6 +616,21 @@ fn inject_pwa_handlers(source: &str) -> String {
             result
         },
     )
+}
+
+/// Byte offset of the start of the first line whose entire content (modulo
+/// surrounding whitespace) is `#[autumn_web::main]`, or `None` when no such
+/// line exists. Line-exact matching prevents false positives on comments
+/// that mention the attribute.
+fn find_main_attr_line_start(source: &str) -> Option<usize> {
+    let mut offset = 0;
+    for line in source.split_inclusive('\n') {
+        if line.trim() == "#[autumn_web::main]" {
+            return Some(offset);
+        }
+        offset += line.len();
+    }
+    None
 }
 
 fn indent_count(line: &str) -> usize {
@@ -1153,6 +1171,53 @@ async fn main() {
         assert!(
             handler_pos < main_pos,
             "PWA handlers must appear before #[autumn_web::main]"
+        );
+    }
+
+    #[test]
+    fn inject_handlers_ignores_main_attr_mentioned_in_comment() {
+        // A comment that merely mentions `#[autumn_web::main]` must not be
+        // treated as the insertion point — the naive substring search used to
+        // slice the file mid-comment, leaving the handlers inside the comment
+        // text and the file uncompilable.
+        let source = "\
+use autumn_web::prelude::*;
+
+// Route handlers are registered under #[autumn_web::main] via routes![].
+fn helper() {}
+
+#[autumn_web::main]
+async fn main() {
+    autumn_web::app().routes(routes![]).run().await;
+}
+";
+        let updated = inject_pwa_handlers(source);
+        assert!(
+            updated.contains(
+                "// Route handlers are registered under #[autumn_web::main] via routes![]."
+            ),
+            "comment must be untouched: {updated}"
+        );
+        let handler_pos = updated.find("async fn pwa_manifest()").unwrap();
+        let helper_pos = updated.find("fn helper()").unwrap();
+        let real_main_pos = updated.find("\n#[autumn_web::main]\n").unwrap();
+        assert!(
+            helper_pos < handler_pos && handler_pos < real_main_pos,
+            "handlers must be inserted immediately before the real attribute line: {updated}"
+        );
+    }
+
+    #[test]
+    fn inject_handlers_appends_when_only_comment_mentions_main_attr() {
+        let source = "// see #[autumn_web::main]\nfn main() {}\n";
+        let updated = inject_pwa_handlers(source);
+        assert!(
+            updated.starts_with("// see #[autumn_web::main]\nfn main() {}\n"),
+            "original source must be untouched: {updated}"
+        );
+        assert!(
+            updated.ends_with(PWA_HANDLERS_BLOCK),
+            "handlers must be appended at end as fallback: {updated}"
         );
     }
 
