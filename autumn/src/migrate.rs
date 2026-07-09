@@ -586,10 +586,13 @@ fn normalise_up_sql(up_sql: &str) -> String {
 /// CLI's `status` printer. `Ok` is the normal happy path; `Unrecorded`
 /// covers legacy migrations applied before the framework tracked
 /// checksums (baseline them with `autumn migrate baseline`); `Changed`
-/// is the failure mode — an applied migration whose on-disk `up.sql`
-/// no longer matches the checksum recorded when it was applied, which
-/// means the schema in production silently differs from what a fresh
-/// build would produce.
+/// and `Missing` are the failure modes. `Changed` is an applied migration
+/// whose on-disk `up.sql` no longer matches the checksum recorded when it
+/// was applied; `Missing` is an applied migration that *had* a recorded
+/// checksum (so it was once part of this source tree) but whose `up.sql`
+/// is now gone — deleted or renamed after being applied. Both mean the
+/// schema in production silently differs from what a fresh build would
+/// produce.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChecksumState {
     /// The recorded checksum matches the current on-disk content — safe.
@@ -602,10 +605,23 @@ pub enum ChecksumState {
         /// Hex-encoded SHA-256 of the current on-disk `up.sql`.
         actual: String,
     },
+    /// A recorded checksum exists but the on-disk `up.sql` is gone — the
+    /// migration was deleted or renamed after being applied. Because a
+    /// checksum is only ever recorded for a migration whose `up.sql` was
+    /// present in *this* migrations dir at record time (see
+    /// [`record_checksums`]), a recorded-but-now-absent file is genuine
+    /// drift: a fresh DB built from the current source tree would no longer
+    /// run this migration. Embedded/framework migrations never receive a
+    /// recorded checksum against the user dir, so they can never land here.
+    Missing {
+        /// Hex-encoded SHA-256 of the `up.sql` at the time it was applied.
+        recorded: String,
+    },
     /// The migration has no recorded checksum — either applied before
     /// this feature existed, or its `up.sql` could not be resolved to
-    /// hash. Never itself an error; `autumn migrate baseline` records
-    /// pending on-disk hashes so future edits are caught.
+    /// hash and it was never recorded. Never itself an error;
+    /// `autumn migrate baseline` records pending on-disk hashes so future
+    /// edits are caught.
     Unrecorded,
 }
 
@@ -614,7 +630,9 @@ pub enum ChecksumState {
 /// * `applied` — applied migration versions from `__diesel_schema_migrations`.
 /// * `up_sql_by_version` — the current on-disk `up.sql` text for each version
 ///   the caller could resolve (may be missing entries for versions that were
-///   removed locally; those are reported as [`ChecksumState::Unrecorded`]).
+///   removed locally; a version whose `up.sql` is absent is reported as
+///   [`ChecksumState::Missing`] when it has a recorded checksum — genuine
+///   drift — and [`ChecksumState::Unrecorded`] when it has none).
 /// * `recorded` — the (version → hex checksum) map from
 ///   `autumn_migration_checksums`.
 ///
@@ -645,28 +663,51 @@ where
                         }
                     }
                 }
-                // No recorded checksum, or on-disk up.sql unresolvable.
-                _ => ChecksumState::Unrecorded,
+                // Recorded as applied but the on-disk up.sql is gone: the
+                // migration was deleted or renamed after being applied. The
+                // recorded checksum proves it once belonged to THIS dir (a
+                // checksum is only recorded for a file present at record
+                // time), so this is genuine drift — not the legacy case.
+                // Framework/embedded migrations never get a recorded checksum
+                // against the user dir, so they can never reach this arm.
+                (None, Some(recorded_hash)) => ChecksumState::Missing {
+                    recorded: recorded_hash.clone(),
+                },
+                // No recorded checksum (with or without on-disk up.sql):
+                // legacy migration applied before checksum tracking, or an
+                // unresolvable up.sql that was never recorded. Never an error.
+                (Some(_) | None, None) => ChecksumState::Unrecorded,
             };
             (version.clone(), state)
         })
         .collect()
 }
 
-/// Fail fast on the first mismatched migration checksum.
+/// Fail fast on the first drifted migration checksum.
 ///
-/// A migration edited after being applied is a silent schema fork between
-/// environments; this guard exists to catch it. `Unrecorded` entries never
-/// fail — they are the legacy state before this feature existed, and
-/// `autumn migrate baseline` records their current hash so future edits are
-/// caught.
+/// Two failure modes are caught, both of which silently fork the schema
+/// between environments:
+///
+///   * [`ChecksumState::Changed`] — a migration was edited after being applied.
+///   * [`ChecksumState::Missing`] — a migration was deleted or renamed after
+///     being applied (its `up.sql` is gone but it still has a recorded
+///     checksum, so a fresh DB from the current source tree would no longer
+///     run it).
+///
+/// `Unrecorded` entries never fail — they are the legacy state before this
+/// feature existed, and `autumn migrate baseline` records their current hash
+/// so future edits are caught. Because `Missing` requires a recorded checksum,
+/// and a checksum is only recorded for a file that was present in this dir at
+/// record time, embedded/framework migrations (never recorded against the user
+/// dir) cannot trigger a false-positive `Missing`.
 ///
 /// # Errors
 ///
-/// Returns [`MigrationError::Migration`] with a message that includes the
-/// version, the recorded hex, the actual hex, and the recommended remedy
+/// Returns [`MigrationError::Migration`] with a message that names the version.
+/// For `Changed` it includes the recorded hex, the actual hex, and the remedy
 /// (never edit an applied migration — add a new one; the re-baseline command
-/// is the deliberate escape hatch).
+/// is the deliberate escape hatch). For `Missing` it explains that a migration
+/// must never be deleted or renamed after being applied.
 pub fn validate_checksums<S1, S2>(
     applied: &[String],
     up_sql_by_version: &HashMap<String, String, S1>,
@@ -677,13 +718,23 @@ where
     S2: std::hash::BuildHasher,
 {
     for (version, state) in classify(applied, up_sql_by_version, recorded) {
-        if let ChecksumState::Changed { recorded, actual } = state {
-            return Err(MigrationError::Migration(format!(
-                "migration {version} checksum mismatch: recorded {recorded} but on-disk \
-                 content hashes to {actual}. Migrations must never be edited after being \
-                 applied \u{2014} add a new migration instead, or run the documented \
-                 re-baseline command if this change was deliberate."
-            )));
+        match state {
+            ChecksumState::Changed { recorded, actual } => {
+                return Err(MigrationError::Migration(format!(
+                    "migration {version} checksum mismatch: recorded {recorded} but on-disk \
+                     content hashes to {actual}. Migrations must never be edited after being \
+                     applied \u{2014} add a new migration instead, or run the documented \
+                     re-baseline command if this change was deliberate."
+                )));
+            }
+            ChecksumState::Missing { recorded } => {
+                return Err(MigrationError::Migration(format!(
+                    "migration {version} is recorded as applied (checksum {recorded}) but its \
+                     up.sql is missing from the source tree \u{2014} a migration must never be \
+                     deleted or renamed after being applied; add a new migration instead."
+                )));
+            }
+            ChecksumState::Ok | ChecksumState::Unrecorded => {}
         }
     }
     Ok(())
@@ -1776,8 +1827,18 @@ pub(crate) fn auto_migrate(
         if migrations_dir.is_dir() {
             match validate_recorded_checksums_against_dir(database_url, migrations_dir) {
                 Ok(()) => {}
-                Err(MigrationError::Migration(msg)) if msg.contains("checksum mismatch") => {
-                    tracing::error!(error = %msg, target = %target, "Applied migration content has changed since it was applied");
+                // Hard-fail on genuine drift: an applied migration was either
+                // edited ("checksum mismatch") or deleted/renamed ("up.sql is
+                // missing from the source tree") after being applied. Both mean
+                // the deployed schema silently forks from a fresh build. Any
+                // other error (dir unreadable, transient DB failure) stays
+                // best-effort so a prod binary without the source tree still
+                // boots.
+                Err(MigrationError::Migration(msg))
+                    if msg.contains("checksum mismatch")
+                        || msg.contains("up.sql is missing from the source tree") =>
+                {
+                    tracing::error!(error = %msg, target = %target, "Applied migration has drifted from the source tree since it was applied");
                     #[cfg(feature = "managed-pg")]
                     crate::managed_pg::emergency_stop();
                     std::process::exit(1);
@@ -2924,5 +2985,89 @@ mod tests {
         let up_map = checksum_map(&[("20260101000000", up)]);
         let recorded = std::collections::HashMap::new();
         assert!(validate_checksums(&applied, &up_map, &recorded).is_ok());
+    }
+
+    #[test]
+    fn classify_marks_missing_when_recorded_but_up_sql_gone() {
+        // A migration that WAS recorded (so it once belonged to this dir) but
+        // whose on-disk up.sql is now gone (deleted or renamed) must classify
+        // as Missing — genuine drift, NOT the tolerated Unrecorded legacy case.
+        let original = "SELECT 1;\n";
+        let applied = vec!["20260101000000".to_string()];
+        let up_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let recorded = checksum_map(&[("20260101000000", &migration_checksum(original))]);
+
+        let result = classify(&applied, &up_map, &recorded);
+        assert_eq!(result.len(), 1);
+        match &result[0].1 {
+            ChecksumState::Missing { recorded } => {
+                assert_eq!(recorded, &migration_checksum(original));
+            }
+            other => panic!("expected Missing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_checksums_fails_on_missing() {
+        // The Missing state must hard-fail validation (drift), with a message
+        // that names the version, the recorded hex, and the remedy.
+        let original = "SELECT 1;\n";
+        let version = "20260101000000";
+        let applied = vec![version.to_string()];
+        let up_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let recorded = checksum_map(&[(version, &migration_checksum(original))]);
+
+        let err = validate_checksums(&applied, &up_map, &recorded)
+            .expect_err("a recorded migration whose up.sql is gone must fail validation");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(version),
+            "message must name the version: {msg}"
+        );
+        assert!(
+            msg.contains(&migration_checksum(original)),
+            "message must include the recorded hex: {msg}"
+        );
+        assert!(
+            msg.contains("up.sql is missing from the source tree"),
+            "message must name the failure mode: {msg}"
+        );
+        // The auto_migrate startup guard matches on this exact substring to
+        // decide to hard-exit; keep them in lockstep.
+        assert!(
+            msg.contains("must never be deleted or renamed"),
+            "message must state the remedy: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_checksums_tolerates_absent_up_sql_without_recorded_checksum() {
+        // NEGATIVE / no-false-positive test: a version that is applied but has
+        // NO recorded checksum and NO on-disk up.sql — e.g. an embedded or
+        // framework migration whose SQL never lived in the validated dir, or a
+        // truly legacy migration — must classify Unrecorded and NOT hard-fail,
+        // even alongside a normal recorded+present migration. This proves the
+        // `recorded.is_some()` scoping keeps `Missing` from firing on
+        // migrations that never belonged to this dir.
+        let ok_up = "SELECT 1;\n";
+        let framework_version = "00000000000000".to_string();
+        let user_version = "20260101000000".to_string();
+        let applied = vec![framework_version.clone(), user_version];
+        // Only the user migration is present on disk / recorded; the framework
+        // version is applied but has neither a file nor a recorded checksum.
+        let up_map = checksum_map(&[("20260101000000", ok_up)]);
+        let recorded = checksum_map(&[("20260101000000", &migration_checksum(ok_up))]);
+
+        let states = classify(&applied, &up_map, &recorded);
+        assert_eq!(
+            states
+                .iter()
+                .find(|(v, _)| v == &framework_version)
+                .map(|(_, s)| s),
+            Some(&ChecksumState::Unrecorded),
+            "an applied version with no recorded checksum and no file must be Unrecorded"
+        );
+        validate_checksums(&applied, &up_map, &recorded)
+            .expect("an unrecorded absent migration must not hard-fail validation");
     }
 }

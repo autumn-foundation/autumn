@@ -1664,6 +1664,9 @@ fn show_status(database_url: &str, migrations_dir: &str) {
 /// * `ok` — the on-disk `up.sql` still hashes to the recorded value.
 /// * `changed` — an applied migration's content was edited after being applied;
 ///   running `autumn migrate` would refuse to continue with the same message.
+/// * `missing` — an applied migration that had a recorded checksum but whose
+///   `up.sql` is now gone (deleted or renamed after being applied); this is
+///   drift and `autumn migrate` would refuse to continue.
 /// * `unrecorded` — legacy applied migration with no recorded checksum; run
 ///   `autumn migrate baseline` to record the current hash.
 fn show_checksum_status(database_url: &str, migrations_dir: &Path) {
@@ -1674,6 +1677,7 @@ fn show_checksum_status(database_url: &str, migrations_dir: &Path) {
         }
         Ok(entries) => {
             let mut changed = 0;
+            let mut missing = 0;
             let mut unrecorded = 0;
             for (version, state) in &entries {
                 match state {
@@ -1685,6 +1689,13 @@ fn show_checksum_status(database_url: &str, migrations_dir: &Path) {
                         eprintln!(
                             "  \u{2717} {version}  [changed]  recorded={recorded} \
                              actual={actual}"
+                        );
+                    }
+                    autumn_web::migrate::ChecksumState::Missing { recorded } => {
+                        missing += 1;
+                        eprintln!(
+                            "  \u{2717} {version}  [missing]  recorded={recorded} \
+                             (recorded as applied but up.sql is gone \u{2014} possible drift)"
                         );
                     }
                     autumn_web::migrate::ChecksumState::Unrecorded => {
@@ -1699,6 +1710,14 @@ fn show_checksum_status(database_url: &str, migrations_dir: &Path) {
                      `autumn migrate` will refuse to run until this is resolved. Never edit \
                      an applied migration \u{2014} add a new one, or re-baseline deliberately \
                      with `autumn migrate baseline --force <version>`."
+                );
+            }
+            if missing > 0 {
+                eprintln!(
+                    "\n  \u{2717} {missing} migration(s) are recorded as applied but their \
+                     up.sql is missing from the source tree (deleted or renamed after being \
+                     applied). `autumn migrate` will refuse to run until this is resolved. \
+                     Never delete or rename an applied migration \u{2014} add a new one instead."
                 );
             }
             if unrecorded > 0 {

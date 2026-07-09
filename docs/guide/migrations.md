@@ -158,6 +158,12 @@ The rule is simple: **never edit an applied migration.** Add a new migration
 that expresses the change instead — that keeps every environment reproducible
 from the same source tree.
 
+The same guard also catches a migration that was **deleted or renamed after
+being applied**: if a version has a recorded checksum but its `up.sql` is gone
+from the source tree, a fresh database would no longer run it, so `autumn
+migrate` refuses to continue (`missing` in `status`). The remedy is the same —
+never delete or rename an applied migration; add a new migration instead.
+
 > **Note:** startup auto-migrate validation is **best-effort** and requires the
 > `migrations/` directory to be present on disk at runtime (production binaries
 > often ship without the source tree, in which case startup validation is
@@ -208,6 +214,9 @@ signal that you understand the consequences.
 * `changed` — the migration was edited after being applied; `autumn migrate`
   will refuse to run until this is resolved (add a new migration or
   re-baseline).
+* `missing` — the migration is recorded as applied but its `up.sql` is gone
+  (deleted or renamed after being applied); `autumn migrate` will refuse to
+  run until this is resolved — add a new migration instead.
 * `unrecorded` — legacy migration with no stored hash; run
   `autumn migrate baseline`.
 
