@@ -975,6 +975,33 @@ enum MigrateCommands {
         #[arg(long)]
         yes_i_mean_prod: bool,
     },
+    /// Record content hashes for applied migrations (issue #1203).
+    ///
+    /// Content hashes (SHA-256 of each migration's `up.sql`) live in the
+    /// `autumn_migration_checksums` table and are validated before every
+    /// `autumn migrate` run so a migration that was edited after being
+    /// applied fails loudly instead of silently forking the schema.
+    ///
+    /// # Examples
+    ///
+    ///   # Backfill hashes for legacy migrations applied before the checksum
+    ///   # table existed. Idempotent — safe to re-run.
+    ///   autumn migrate baseline
+    ///
+    ///   # Escape hatch: overwrite one version's stored hash with the current
+    ///   # on-disk hash. Use ONLY when you deliberately edited an applied
+    ///   # migration and accept that other environments running the previous
+    ///   # content will now report a mismatch.
+    ///   autumn migrate baseline --force 20260101000000
+    #[command(verbatim_doc_comment)]
+    Baseline {
+        /// Re-baseline the checksum for a single applied version, overwriting
+        /// whatever hash is currently recorded. The escape hatch for a
+        /// deliberate edit. Without this flag, `baseline` only records
+        /// hashes for applied migrations that don't already have one.
+        #[arg(long = "force", value_name = "VERSION")]
+        force: Option<String>,
+    },
 }
 
 /// Subcommands for `autumn shard`.
@@ -1906,6 +1933,41 @@ enum GenerateCommands {
         #[arg(long)]
         force: bool,
     },
+    /// Generate a handler-only, non-CRUD route module (no model, migration, or
+    /// database).
+    ///
+    /// Each action maps to `/<controller>/<action>`, except an action literally
+    /// named `index`, which maps to `/<controller>`. Under `--api` the prefix is
+    /// `/api/<controller>[/<action>]`.
+    ///
+    /// Actions default to GET; request another method with `action:method`
+    /// (method ∈ get, post, put, patch, delete), e.g. `submit:post`.
+    ///
+    /// HTML mode (default) emits Maud stub views returning HTTP 200; `--api`
+    /// emits JSON actions with no view stubs. Re-running against an existing
+    /// controller fails without `--force`.
+    ///
+    /// Example:
+    ///
+    ///   autumn generate controller pages home about contact
+    #[command(verbatim_doc_comment)]
+    Controller {
+        /// Controller name (`snake_case` or `PascalCase`, e.g. `pages`).
+        name: String,
+        /// Action names, each optionally suffixed with `:method`
+        /// (e.g. `home`, `submit:post`, `index`).
+        #[arg(required = true)]
+        actions: Vec<String>,
+        /// Emit JSON actions (no HTML/Maud views).
+        #[arg(long)]
+        api: bool,
+        /// Print the file plan and exit without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Overwrite existing files instead of erroring on collision.
+        #[arg(long)]
+        force: bool,
+    },
     /// Generate model, migration, repository, HTML routes, smoke test, and
     /// register the new routes in `src/main.rs`.
     ///
@@ -2087,6 +2149,11 @@ fn run_command(command: Commands) {
                     to,
                     yes_i_mean_prod,
                 }),
+                Some(MigrateCommands::Baseline { force }) => {
+                    migrate::MigrateAction::Baseline(migrate::BaselineArgs {
+                        force_version: force,
+                    })
+                }
                 None => migrate::MigrateAction::Run,
             };
             let target = match (shard, control_only) {
@@ -3113,6 +3180,16 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
             force,
         } => {
             let plan = generate::wizard::plan_wizard(&resolve_cwd(), &name, &steps);
+            apply_plan(plan, generate::Flags { dry_run, force }, mode);
+        }
+        GenerateCommands::Controller {
+            name,
+            actions,
+            api,
+            dry_run,
+            force,
+        } => {
+            let plan = generate::controller::plan_controller(&resolve_cwd(), &name, &actions, api);
             apply_plan(plan, generate::Flags { dry_run, force }, mode);
         }
         GenerateCommands::Scaffold {

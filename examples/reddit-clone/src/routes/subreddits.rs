@@ -10,7 +10,7 @@ use diesel_async::RunQueryDsl;
 
 use crate::models::NewSubreddit;
 use crate::repositories::{PgSubredditRepository, SubredditRepository};
-use crate::schema::{subreddits, users};
+use crate::schema::users;
 use crate::slugify::slugify;
 
 use super::layout::{layout, time_ago};
@@ -128,7 +128,7 @@ pub struct CreateSubredditForm {
 #[post("/r/create")]
 pub async fn create(
     session: Session,
-    mut db: Db,
+    repo: PgSubredditRepository,
     form: Form<CreateSubredditForm>,
 ) -> AutumnResult<Redirect> {
     let user_id: i64 = session
@@ -158,13 +158,22 @@ pub async fn create(
         creator_id: user_id,
     };
 
-    diesel::insert_into(subreddits::table)
-        .values(&new_sub)
-        .execute(&mut *db)
-        .await
-        .map_err(|_| AutumnError::unprocessable_msg("Community name already taken"))?;
+    // Race-safe get-or-insert on the unique `slug` column (#1382): replaces the
+    // old raw `insert_into(...).map_err("already taken")`. If two requests race
+    // to create the same community, `ON CONFLICT DO NOTHING` lets exactly one
+    // win the insert while the loser reads the winner's row back — neither sees
+    // a unique-violation, and both land on the same community.
+    let (subreddit, created) = repo.find_or_create_by_slug(slug.clone(), &new_sub).await?;
+    if !created {
+        // The slug is already owned by an existing community; preserve the prior
+        // UX of rejecting the duplicate rather than redirecting into someone
+        // else's community as if the create had succeeded.
+        return Err(AutumnError::unprocessable_msg(
+            "Community name already taken",
+        ));
+    }
 
-    Ok(Redirect::to(&paths::show(slug)))
+    Ok(Redirect::to(&paths::show(&subreddit.slug)))
 }
 
 // ── Show subreddit with posts ──────────────────────────────────

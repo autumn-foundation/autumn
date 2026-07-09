@@ -45,6 +45,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   limits — the key-expression shapes treated as *dynamic — not checked* rather
   than validated — are documented under "Known heuristic limits" in the command
   module rustdoc and the plugin skill doc. See `autumn-cli/src/i18n.rs`.
+- **generator:** `autumn generate controller <name> <action>...` scaffolds a handler-only module (named actions, wired routes, Maud stub views) for non-CRUD pages/endpoints — no model, migration, or DB; `--api` emits JSON actions. (issue #1050)
 - **download:** typed `Download` `IntoResponse` (`autumn_web::download::Download`)
   for serving files from a handler without hand-rolling headers. Construct it
   from owned bytes, an async byte stream, an `AsyncRead`, or a stored blob
@@ -57,6 +58,114 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `BlobStore::get_stream` without buffering the whole object in memory, so it
   serves large private files behind a `#[secured]` handler with no public
   presigned URL (#1141).
+- **migrations:** content checksums for applied migrations (issue #1203) —
+  the framework now records a SHA-256 of every migration's `up.sql` in a
+  new `autumn_migration_checksums` table (created by the framework
+  migration `20260709000000_create_migration_checksums`) when it is
+  applied via `autumn migrate run` or backfilled by `autumn migrate
+  baseline`. Startup auto-migrate **validates** but does not record: it
+  applies the embedded SQL compiled into the binary (which may differ
+  from the on-disk files), so recording those disk bytes could store a
+  hash for content that was never applied — recording is deferred to the
+  CLI/baseline paths where applied bytes == on-disk bytes. Before every
+  subsequent `autumn migrate` run and before startup auto-migrate, each
+  applied migration's on-disk `up.sql` is re-hashed and compared against
+  the recorded value; a
+  mismatch fails fast with a message that names the version and both
+  hashes: `migration <version> checksum mismatch: recorded <hex-a> but
+  on-disk content hashes to <hex-b>. Migrations must never be edited
+  after being applied — add a new migration instead, or run the
+  documented re-baseline command if this change was deliberate.` Hashing
+  normalises line endings (`\r\n`/`\r` → `\n`) and trims trailing
+  whitespace so a Windows checkout and a Linux one produce identical
+  checksums. `autumn migrate status` reports each applied migration's
+  state (`ok`/`changed`/`unrecorded`), excluding framework-owned migrations
+  (the same set rollback excludes) so operators are never prompted to
+  `baseline` framework versions whose `up.sql` does not live in the user dir;
+  `autumn migrate baseline` records
+  hashes for legacy applied migrations that pre-date the checksum table
+  (idempotent, additive); `autumn migrate baseline --force <version>`
+  overwrites one version's stored hash — the deliberate escape hatch,
+  WARN-logged. Both baseline paths run their applied-versions read and
+  checksum write under the same advisory migration lock as `run`/`down`, so a
+  concurrent rollback cannot revert a version between baseline's read and its
+  write. Rolling a migration back (`autumn migrate down`) now clears its
+  recorded checksum, so a reverted migration can be re-applied cleanly —
+  including with changed contents — instead of leaving a stale hash that would
+  trip the drift guard on a later run. `autumn migrate status` and the pre-apply
+  validation are read-only — they never create the checksum table, so displaying
+  or checking state needs no DDL privileges — and freshly-applied user
+  migrations are recorded immediately after they apply (before the framework
+  migration step), so a later framework failure can no longer leave them
+  unrecorded and mask a subsequent edit. See `docs/guide/migrations.md`.
+- **repository:** race-safe get-or-insert (#1382) — declaring
+  `fn find_or_create_by_<field>[_and_<field>...](...)` in a `#[repository]`
+  trait generates an inherent
+  `find_or_create_by_<field>(&self, <field>: <Ty>, ..., new: &NewModel) ->
+  AutumnResult<(Model, bool)>` that returns the model plus a `created` flag. It
+  looks the row up on the read path first (replica-eligible, honoring tenant
+  scoping and soft-delete); if absent it inserts on the primary with
+  `ON CONFLICT DO NOTHING`, so under concurrent callers exactly one row is
+  created, exactly one caller observes `created == true`, and no
+  unique-violation (`23505`) is ever surfaced — a concurrent loser re-reads its
+  own write on the primary and returns `(row, false)`. `before_create` /
+  `after_create` and the durable commit-hook queue fire only on the created
+  path, and — unlike `upsert_many` — the method is generated even on hooked
+  repositories. Race-safety requires a unique constraint covering the lookup
+  column(s); `_or_` is rejected because it would span constraints. On a
+  sharded, tenant-scoped repository the generated method is wrapped in the same
+  cross-shard write guard as `save`/`update`/`delete`, so a get-or-insert issued
+  through `across_tenants()` is rejected rather than silently writing to a single
+  shard while matching rows on other shards go unseen. See the
+  "Race-safe get-or-insert" section of the repositories guide.
+- **widgets:** `flash_messages(&[FlashMessage])` (issue #1240) — an accessible
+  renderer for consumed flash messages. Each banner is its own live region
+  whose `role`/`aria-live` is chosen by severity (`Error`/`Warning` announce
+  assertively, `Success`/`Info` politely), carries semantic
+  `autumn-flash`/`autumn-flash--<level>` classes backed by `FLASH_CSS`, and
+  escapes its text. An empty slice renders nothing; `flash_messages_with` adds
+  an opt-in, no-JavaScript dismiss control. The `flash` module doc now points
+  at the helper instead of the hand-rolled `div class=(level)` snippet.
+- **widgets:** `badge`/`status_tag` (issue #1259) — semantic status pills.
+  `badge(label, BadgeVariant)` emits a stable `badge badge--<variant>` class
+  (`Neutral`/`Info`/`Success`/`Warning`/`Danger`), `BadgeVariant::for_label`
+  maps an arbitrary status string to a deterministic color, `status_tag` is the
+  neutral one-liner, and `badge_with`/`BadgeConfig` set a `title`/`aria-label`.
+  Text is always present (color is never the sole signal); no inline styles.
+- **widgets:** `avatar(name, &AvatarConfig)` (issue #1263) — renders an `<img>`
+  (lazy-loaded, square `width`/`height`, name-derived `alt`) when an image URL
+  is present, or a deterministic colored-initials badge when it isn't (1–2
+  Unicode-safe uppercase initials, per-name background via a stable
+  `autumn-avatar--cN` palette class — no inline `style`, so it survives a
+  nonce-based CSP). Never a broken-image request; three named sizes
+  (`Small`/`Medium`/`Large`); the display name is HTML-escaped.
+- **widgets:** `alert`/`alert_with` + `error_summary` (issue #1314) — inline
+  block-level callouts with an `AlertVariant` (`Info`/`Success`/`Warning`/
+  `Error`, `role` chosen per variant), optional title, per-variant inline-SVG
+  icon, and an opt-in no-JavaScript dismiss control. `error_summary(&Changeset)`
+  renders an `Error` alert listing every field error as a `<ul>` (stable order)
+  or `None` when valid, for the form re-render path. All caller markup is
+  escaped by Maud; no inline styles.
+- **model:** `#[private]` field attribute (issue #1374) hides a `#[model]`
+  column from JSON — it is excluded from the model's `Serialize` impl so it
+  never appears in `Json` output, the auto-generated `--api` list/show
+  endpoints, or any `serde_json::to_value(&model)`, while staying a normal,
+  queryable column whose write path (`NewX`/`UpdateX`/`Changeset`) still binds
+  it (set a password, never read the hash back). `#[encrypted]` columns are now
+  `#[private]` in JSON by default (opt back in via `#[encrypted(admin_visible)]`);
+  `#[private]` still appears in `FormModel::form_fields()` (the write side). New
+  `autumn doctor` check `model_private_columns` warns when a sensitively-named
+  column (`password`/`token`/`secret`/`*_hash`) is not marked `#[private]`.
+- **model:** `#[normalize(trim, downcase, upcase, squish, with = path)]` field
+  attribute (issue #1379) canonicalizes a `String` column, composing
+  normalizers left-to-right. Runs on the write path (`save`/`save_many` insert
+  and `update` via `UpdateDraft::from_patch`) before the `before_create`/
+  `before_update` hooks and the DB write, and on derived `#[repository]`
+  `find_by_`/`count_by_` lookups (so `find_by_email("  FOO@X.com ")` matches the
+  stored `foo@x.com` row). Built-ins are idempotent, so `#[normalize(downcase)]`
+  plus a `unique` column gives case-insensitive uniqueness; non-`String` fields
+  are a compile error. Built-ins and the `Normalize` / `NormalizedModel` traits
+  live in the new `autumn_web::normalize` module.
 - **ci:** README-quickstart gate against the published crates (issue #1586) —
   `.github/workflows/quickstart-gate.yml` + `scripts/check-quickstart.sh`
   install the README-pinned `autumn-cli` from crates.io (never the local
