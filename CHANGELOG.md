@@ -547,6 +547,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **generator:** scaffolded `create`/`update`/`destroy` handlers now redirect
+  with `autumn_web::Redirect::to(...)` — a real **303 See Other** with a
+  `Location` header — instead of the hand-rolled 200 meta-refresh HTML page,
+  matching the `Redirect` primitive `docs/guide/path-helpers.md` already
+  recommends (and which the new #1127 write-path test asserts). `create` and
+  `destroy` redirect to the index route; `update` redirects to the show route.
 - **deps:** bumped `diesel-async` from 0.8 to 0.9 (resolving 0.9.2, with
   `diesel` at 2.3.10) and `libsqlite3-sys` from 0.36 to 0.37 — 0.37 is the
   newest release line diesel 2.3 accepts (`<0.38`). diesel-async 0.9 changed

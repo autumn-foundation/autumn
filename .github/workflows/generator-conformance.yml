@@ -69,6 +69,7 @@ jobs:
   #   generated_project_compiles_runs_and_serves  (e2e.rs)
   #   generated_scaffold_cargo_checks             (generate.rs)
   #   generated_scaffold_config_cargo_checks      (generate.rs)
+  #   generated_validated_scaffold_round_trip_test_passes (generate.rs)
   #   generated_auth_totp_cargo_checks            (generate.rs)
   #   generated_job_cargo_checks                  (generate.rs)
   #   generated_channel_cargo_checks              (generate.rs)
@@ -115,6 +116,15 @@ jobs:
         run: |
           cargo test -p autumn-cli --test generate \
             generated_scaffold_config_cargo_checks -- --ignored --exact
+
+      - name: generated_validated_scaffold_round_trip_test_passes
+        # Compiles a fresh scaffold and RUNS its generated test suite (not just
+        # `cargo check`): the changeset round-trip test plus the write-path CRUD
+        # test (create/update/delete + validation re-render, issue #1127). Both
+        # are DB-free, so they run to completion here without Postgres.
+        run: |
+          cargo test -p autumn-cli --test generate \
+            generated_validated_scaffold_round_trip_test_passes -- --ignored --exact
 
       - name: Pre-fetch TOTP deps (absent from workspace Cargo.lock)
         # totp-rs is not a workspace dep, so it is absent from the workspace

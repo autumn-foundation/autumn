@@ -1466,7 +1466,7 @@ fn render_routes_file(
         format!(
             "{create_stmt}\n    \
              flash.success(\"{pascal_name} created\").await;\n    \
-             Ok(redirect_to(\"/{plural}\").into_response())"
+             Ok(Redirect::to(\"/{plural}\").into_response())"
         )
     } else {
         format!(
@@ -1484,7 +1484,7 @@ fn render_routes_file(
              return Err(err);\n    \
              }}\n    \
              flash.success(\"{pascal_name} created\").await;\n    \
-             Ok(redirect_to(\"/{plural}\").into_response())"
+             Ok(Redirect::to(\"/{plural}\").into_response())"
         )
     };
     let create_fn = format!(
@@ -1513,7 +1513,7 @@ fn render_routes_file(
              )));\n    \
              }}\n    \
              flash.success(\"{pascal_name} updated\").await;\n    \
-             Ok(redirect_to(&format!(\"/{plural}/{{}}\", *id)).into_response())"
+             Ok(Redirect::to(&format!(\"/{plural}/{{}}\", *id)).into_response())"
         )
     } else {
         format!(
@@ -1539,7 +1539,7 @@ fn render_routes_file(
              )));\n    \
              }}\n    \
              flash.success(\"{pascal_name} updated\").await;\n    \
-             Ok(redirect_to(&format!(\"/{plural}/{{}}\", *id)).into_response())"
+             Ok(Redirect::to(&format!(\"/{plural}/{{}}\", *id)).into_response())"
         )
     };
     let update_fn = format!(
@@ -1829,6 +1829,7 @@ pub async fn index(
 //! HTML route handlers for the resource. Edit freely — once generated,
 //! these are ordinary user code.
 {attachment_note}
+use autumn_web::Redirect;
 use autumn_web::extract::Path;
 use autumn_web::pagination::{{Page, PageRequest}};
 use autumn_web::reexports::axum::body::Bytes;
@@ -1983,7 +1984,7 @@ pub async fn destroy(
     id: Path<{id_rust}>,
     {destroy_signature_arg},
     flash: Flash,
-) -> AutumnResult<Markup> {{
+) -> AutumnResult<Redirect> {{
     {destroy_stmt}
     if deleted == 0 {{
         return Err(AutumnError::not_found_msg(format!(
@@ -1991,7 +1992,7 @@ pub async fn destroy(
         )));
     }}
     flash.success("{pascal_name} deleted").await;
-    Ok(redirect_to("/{plural}"))
+    Ok(Redirect::to("/{plural}"))
 }}
 
 {form_struct}
@@ -2018,15 +2019,6 @@ pub async fn destroy(
 
 fn is_nullable_form_field(name: &str) -> bool {{
     {nullable_field_match}
-}}
-
-fn redirect_to(url: &str) -> Markup {{
-    html! {{
-        (autumn_web::PreEscaped("<!DOCTYPE html>"))
-        html {{ head {{
-            meta http-equiv="refresh" content=(format!("0;url={{url}}"));
-        }} body {{ p {{ "Redirecting to " a href=(url) {{ (url) }} "…" }} }} }}
-    }}
 }}
 "#
         )
@@ -3147,14 +3139,18 @@ fn render_validation_rejection_smoke_test(
 /// mechanism* on the real, shipped primitives the generated handlers are built
 /// on — the `ChangesetForm`/`Changeset` round-trip (issue #1124), the typed
 /// `text_input` renderer, and `Redirect` — independent of the specific model's
-/// columns (already exercised by the other generated smoke tests):
+/// columns (already exercised by the other generated smoke tests). Its redirect
+/// contract mirrors the generated handlers exactly: those now redirect with
+/// `Redirect::to(...)` (a real 303 See Other with a `Location` header), the same
+/// primitive `docs/guide/path-helpers.md` recommends over a meta-refresh page —
+/// create/delete to the index route, update to the show route:
 ///
 /// * a valid `POST` redirects (303 See Other) to the index route and the row is
 ///   observable on a follow-up read (create);
-/// * a `POST` to the `/{id}/update` route redirects and the change is observable
-///   (update);
+/// * a `POST` to the `/{id}/update` route redirects (303) to the show route and
+///   the change is observable on a follow-up read (update);
 /// * a `POST` to the generated `/{id}/delete` HTML action (issue #1021)
-///   redirects and the row is gone on the next read (delete);
+///   redirects (303) and the row is gone on the next read (delete);
 /// * an invalid `POST` re-renders the form at 422 with the submitted input
 ///   preserved and an inline `role="alert"` error — it does NOT redirect and
 ///   does NOT persist (validation failure, issue #1124).
@@ -3200,7 +3196,7 @@ async fn __PLURAL___write_path_crud() {
         let store = STORE.lock().unwrap();
         let count = store.len() as i64;
         html! {
-            h1 { "__PASCAL__s" }
+            h1 { "__PLURAL__" }
             p { (count) " row(s)" }
             ul { @for (_, name) in store.iter() { li { (name.as_str()) } } }
         }
@@ -3238,7 +3234,8 @@ async fn __PLURAL___write_path_crud() {
                 row.1 = valid.name;
             }
         }
-        Redirect::to("/__PLURAL__").into_response()
+        // Mirror the generated handler: update redirects to the show route.
+        Redirect::to(&format!("/__PLURAL__/{}", *id)).into_response()
     }
 
     #[post("/__PLURAL__/{id}/delete")]
@@ -3285,16 +3282,16 @@ async fn __PLURAL___write_path_crud() {
         .await
         .assert_body_contains("1 row(s)");
 
-    // Update (happy path): a POST of changed fields redirects and the change is
-    // observable on a subsequent read. The row count is unchanged, so the value
-    // was replaced in place, not appended.
+    // Update (happy path): a POST of changed fields redirects (303) to the show
+    // route and the change is observable on a subsequent read. The row count is
+    // unchanged, so the value was replaced in place, not appended.
     client
         .post("/__PLURAL__/1/update")
         .form("name=second-record&witness=w")
         .send()
         .await
         .assert_status(303)
-        .assert_header("location", "/__PLURAL__");
+        .assert_header("location", "/__PLURAL__/1");
     client
         .get("/__PLURAL__")
         .send()
@@ -5028,10 +5025,17 @@ async fn main() {
     }
 
     #[test]
-    fn write_path_smoke_test_has_real_failure_power() {
-        // Red-phase spike: the emitted handlers must actually redirect, persist,
-        // and re-render — so a broken handler (200 instead of a redirect, a
-        // no-op delete, or a create that skips validation) turns the test red.
+    fn write_path_smoke_test_emits_redirect_persist_and_validation_shapes() {
+        // String-shape check (this test does not itself run the emitted test):
+        // assert the emitted handlers carry the constructs that give the
+        // generated test its failure power — a real redirect (not a 200
+        // meta-refresh), a cross-request store the create/update/delete mutate,
+        // a validation gate, and row-count reads. A broken generated handler
+        // (200 instead of a redirect, a no-op delete, a create that skips
+        // validation) would then turn the generated test red at runtime; that
+        // runtime red-spike is exercised by
+        // `generated_validated_scaffold_round_trip_test_passes` in
+        // `tests/generate.rs`.
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold(tmp.path(), "Post", &[], "20260427000000").unwrap();
         plan.execute(Flags::default()).unwrap();
@@ -5068,7 +5072,7 @@ async fn main() {
     }
 
     #[test]
-    fn write_path_smoke_test_documents_csrf_posture() {
+    fn write_path_smoke_test_emits_csrf_posture_note() {
         // Issue #1127: the write-path tests must account for CSRF. `TestApp`
         // disables CSRF by default (mirroring the real form_for-injected token
         // that the in-process harness does not require), and the emitted test
