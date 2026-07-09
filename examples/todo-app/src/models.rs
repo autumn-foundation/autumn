@@ -55,6 +55,21 @@ impl Todo {
     }
 }
 
+impl autumn_web::data::csv::CsvSchema for Todo {
+    fn csv_columns() -> &'static [&'static str] {
+        &["id", "title", "completed", "created_at"]
+    }
+
+    fn to_csv_record(&self) -> Vec<String> {
+        vec![
+            self.id.to_string(),
+            self.title.clone(),
+            self.completed.to_string(),
+            self.created_at.to_string(),
+        ]
+    }
+}
+
 /// Data needed to insert a new todo.
 ///
 /// Derives [`Validate`] so it can be used directly with

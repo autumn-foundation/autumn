@@ -80,6 +80,87 @@ async fn private_events(
 }
 ```
 
+## Resumable SSE with `Last-Event-ID` (unreleased — trunk-dev, issue #1356)
+
+`sse::stream_resumable` is a drop-in upgrade to `sse::stream` that survives a
+brief client disconnect. Every event carries an automatic epoch-tagged per-topic
+`id` of the form `epoch.seq` (opaque to clients — the browser just stores it and
+echoes it back), and Autumn keeps a bounded per-topic replay ring buffer. When
+the browser reconnects it echoes back the last id it saw in the `Last-Event-ID`
+header (the SSE spec does this automatically); Autumn replays the events that
+arrived while the client was gone, then continues live — with no duplicated or
+skipped events at the seam.
+
+The `epoch` half of the id is a per-topic tag assigned when the topic's
+in-memory state is created; the `seq` half is a dense counter that restarts at
+`1` within each epoch. The epoch changes whenever the topic is
+garbage-collected/recreated or the process restarts, which lets Autumn tell a
+stale id from a previous epoch apart from a current-epoch id (see Limitations).
+
+```rust,no_run
+use autumn_web::prelude::*;
+use autumn_web::sse::LastEventId;
+
+#[get("/events")]
+async fn events(State(state): State<AppState>, LastEventId(last): LastEventId) -> impl IntoResponse {
+    autumn_web::sse::stream_resumable(&state, "tasks", last)
+}
+```
+
+- A first connection (no `Last-Event-ID`) behaves exactly like `sse::stream`:
+  no replay, just live events.
+- If the requested id has aged out of the retained window (the buffer
+  overflowed while the client was away), the stream emits a single `gap`
+  sentinel event (`event: gap`, `data: {"gap":true}`, no `id`) before the
+  partial replay so the client can recover — for example by refetching the full
+  list — instead of silently missing events.
+- The existing id-less helpers (`sse::stream`, `sse::stream_authorized`,
+  `sse::from_subscriber`) are unchanged; `stream_resumable` is additive.
+
+Retention is configured with `channels.replay_buffer` (number of most-recent
+events kept per topic; default `256`, env `AUTUMN_CHANNELS__REPLAY_BUFFER`).
+Memory is `O(N)` per topic regardless of publish throughput. Only the in-process
+backend retains a replay buffer; the Redis fan-out backend degrades gracefully
+to live-only.
+
+If you need the raw pieces (for a custom transport), `Channels::resume(topic,
+last_event_id)` returns a `ResumeHandle { subscriber, replay, gap, next_live_id,
+resumable }`.
+
+### Limitations
+
+The replay buffer is an in-process, best-effort convenience (the in-process
+scope of issue #1356, matching its "Out of Scope") — not a durable event log:
+
+- The buffer lives in the topic's in-memory state and is dropped when the topic
+  is garbage-collected. A topic is kept only while it has a live receiver or an
+  outstanding `Sender`, so a topic with only transient SSE subscribers can lose
+  its buffer during the disconnect window. Because the recreated topic gets a
+  new `epoch`, a client reconnecting across the gap is **not** silently fed a
+  corrupted partial: the epoch mismatch is detected, so the stream emits a `gap`
+  sentinel and then replays the full retained *current* epoch. The old epoch's
+  events themselves are gone (still best-effort), but the client is told to
+  resynchronise rather than receiving a hole.
+- On process restart (or any topic GC/recreation) the per-topic `seq` counter
+  resets to `1` under a fresh `epoch`. Before epoch tagging this was a real hole:
+  a client reconnecting with a stale `Last-Event-ID` whose `seq` the new epoch
+  had already passed (e.g. old `4`, new epoch already at `10`) received the new
+  epoch's later events while its earlier ones were silently dropped, because an
+  old id `4` was indistinguishable from a new id `4`. Now the epoch tag makes the
+  two id spaces distinct: a cross-epoch reconnect always yields a `gap` sentinel
+  followed by a full replay of the current epoch — never a silent partial. The
+  buffered history from before the restart is still gone (persist events
+  yourself for durability), but the client is never corrupted.
+- Publishing via `channels.publish()` / `broadcast().publish()` /
+  `channels.sender().send()` is safe on resumable topics: all three route
+  through the backend's `publish`, assigning ids and appending to the replay
+  buffer. Only calling `.send()` directly on the raw `broadcast::Sender`
+  (obtained from `channels.sender().keepalive` or the `ensure_topic` trait
+  method) bypasses id assignment and the replay buffer, breaking resumability.
+
+For durability across restarts or replicas, persist events yourself (a database
+table or a Redis stream) rather than relying on this buffer.
+
 ## Direct Channels
 
 `AppState::channels()` remains the low-level primitive for WebSocket loops and

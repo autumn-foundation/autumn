@@ -448,6 +448,56 @@ The distributed bookmarks example uses this shape explicitly with a primary,
 streaming replica, one migration job, two web replicas, and a readiness gate
 that fails while the replica has not replayed the latest Diesel migration.
 
+## Replication lag and read-your-own-writes
+
+> **Warning — the classic anomaly.** Replication is asynchronous. A read
+> immediately after a write can land on a lagging replica and return stale data
+> — the user submits a form, is redirected, reloads the page, and the change
+> appears gone. DDIA §5 calls this the *read-your-own-writes* anomaly.
+
+Autumn's default behavior routes all replica-eligible reads to the replica
+regardless of whether the same request performed a write. Add
+`read_your_writes` in `[database]` to pin post-write reads to the primary:
+
+```toml
+[database]
+primary_url   = "postgres://user:pass@primary:5432/app"
+replica_url   = "postgres://user:pass@replica:5432/app"
+
+# Option A — intra-request pin only (Laravel "sticky")
+read_your_writes = "request"
+
+# Option B — cross-request pin via signed cookie (Rails automatic role switching)
+read_your_writes = "session"
+pin_after_write_secs = 5          # how long the cookie pins reads; default 5 s
+```
+
+### Modes
+
+| Mode | What happens | Tradeoff |
+|------|-------------|----------|
+| `off` (default) | No pinning. Replica reads always use the replica. | Zero overhead; stale reads possible after writes. |
+| `request` | Once the current request checks out a **primary** connection (via `Db` or a generated mutating method), all subsequent replica-eligible reads in that request route to the primary. | Eliminates intra-request anomalies at negligible overhead. A read-only handler that still injects `Db` will pin its reads unnecessarily — document this in your team's conventions. |
+| `session` | Like `request`, plus a signed `autumn.ryw` cookie pins the same client's reads to the primary for `pin_after_write_secs` seconds after a write. | Eliminates post-redirect anomalies. Adds a small cookie round-trip and increases primary read load during the pin window. |
+
+### Composing with `replica_fallback`
+
+`read_your_writes` and `replica_fallback` are independent: you can have
+`read_your_writes = "request"` and `replica_fallback = "primary"` simultaneously.
+When the replica is unready and fallback is `primary`, all reads already go to
+the primary regardless of the pin. When fallback is `fail_readiness`, a
+`ReadRoute::Unavailable` repo returns an error on reads even while pinned — the
+pin does not bypass the health gate.
+
+### Observability
+
+Every pin-redirected read (a replica-eligible read sent to the primary because
+the pin is active) increments `autumn_read_your_writes_pins_total` in
+`/actuator/metrics` and emits a `DEBUG` event to the `autumn::db` tracing
+target. A spike in this counter after a deployment indicates more reads than
+expected are being pinned — tune `pin_after_write_secs` or audit which handlers
+are injecting `Db` unnecessarily.
+
 ## Shared Cache
 
 In-process Moka caches are the zero-config default and are perfect for
@@ -494,6 +544,11 @@ with the default per-function Moka caches.
 
 The `memory` default produces a startup warning in the `prod` profile — the
 same pattern as sessions and file storage.
+
+For read-through fills that coalesce concurrent misses into a single
+recompute (in-process single-flight, plus an opt-in distributed fill lock and
+stale-while-revalidate on the Redis backend), see [Cache Stampede
+Protection](cache-stampede.md).
 
 ## Concurrent Writes
 

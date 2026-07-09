@@ -61,7 +61,13 @@ migration_guide="docs/migrations/${workspace_version}.md"
 # cargo-semver-checks 0.48 requires rustc >= 1.91.0, while rustc 1.96.0 has
 # ICE'd in the rustdoc JSON path for the Diesel/diesel-async graph. Keep this
 # pinned to a known-good toolchain instead of following latest stable.
-semver_toolchain="${AUTUMN_SEMVER_RUST_VERSION:-1.92.0}"
+# Floor raised from 1.92.0 to 1.94.1: the aws-smithy-* releases of 2026-07-07
+# (e.g. aws-smithy-async 1.3.0) declare rust-version 1.94.1, and
+# cargo-semver-checks builds the autumn-storage-s3 crates.io baseline with a
+# fresh lockfile, so any toolchain below that MSRV fails the baseline build.
+# Keep in sync with the dtolnay/rust-toolchain pin in the semver job of
+# .github/workflows/publish-gate.yml.
+semver_toolchain="${AUTUMN_SEMVER_RUST_VERSION:-1.94.1}"
 
 command -v rustup &>/dev/null || die "rustup is required to run SemVer checks with Rust $semver_toolchain"
 if ! rustup toolchain list | grep -Fq "${semver_toolchain}-"; then

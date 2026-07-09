@@ -7,14 +7,16 @@
 //! # Known limitations
 //!
 //! - Statement splitting uses `;` as the delimiter with awareness of
-//!   `PostgreSQL` dollar-quoted blocks (`$$…$$` and `$tag$…$tag$`) and
-//!   `--` line comments. Semicolons inside a dollar-quoted function body or
-//!   inside a `--` comment are kept intact so they do not produce spurious
-//!   statement fragments. Semicolons inside single-quoted string literals are
-//!   not handled; that pattern is essentially absent from real migration files.
-//! - Line comment stripping matches `--` by position on each line. A `--`
-//!   sequence inside a string literal would be incorrectly treated as a comment
-//!   start. Again, this pattern is essentially absent from real migration files.
+//!   `PostgreSQL` dollar-quoted blocks (`$$…$$` and `$tag$…$tag$`), `--` line
+//!   comments, and single-quoted string literals (including the standard
+//!   `''`-doubled escaped quote). Semicolons inside any of these are kept
+//!   intact so they do not produce spurious statement fragments -- e.g. a
+//!   `DEFAULT 'hello; world'` clause splits as one statement, not two.
+//! - Line comment stripping matches `--` by position on each line, checked
+//!   only *outside* single-quoted literals and dollar-quoted blocks (both
+//!   handled above). A `--` or `;` sequence inside a double-quoted identifier
+//!   (e.g. a quoted column name) is not handled; this pattern is essentially
+//!   absent from real migration files.
 //! - Block comment stripping (`/* … */`) similarly does not handle `/*` or `*/`
 //!   tokens that appear inside string literals.
 
@@ -166,11 +168,12 @@ fn extract_index_table_name(normalized: &str) -> Option<&str> {
     if name.is_empty() { None } else { Some(name) }
 }
 
-/// Split `sql` into individual statements, using `;` as the delimiter.
+/// Split `sql` into individual statements, using `;` as the delimiter. Each
+/// returned statement has its terminating `;` stripped.
 ///
 /// Dollar-quoted blocks (`$$…$$`, `$tag$…$tag$`) are kept intact so that
 /// semicolons inside a function body do not produce spurious fragments.
-fn split_statements(sql: &str) -> Vec<String> {
+pub fn split_statements(sql: &str) -> Vec<String> {
     let mut statements = Vec::new();
     let mut current = String::new();
     let mut i = 0;
@@ -199,6 +202,32 @@ fn split_statements(sql: &str) -> Vec<String> {
                 }
                 continue;
             }
+        }
+
+        // Single-quoted string literal: consume to the closing quote, treating
+        // a doubled `''` as an escaped quote (the standard SQL convention --
+        // matches how `sql_default_literal` escapes user-supplied defaults) so
+        // a semicolon inside a literal (e.g. a `DEFAULT 'hello; world'`) is
+        // never treated as a statement separator.
+        if rest.starts_with('\'') {
+            let mut j = 1;
+            loop {
+                if let Some(rel) = rest[j..].find('\'') {
+                    let abs = j + rel;
+                    if rest[abs + 1..].starts_with('\'') {
+                        j = abs + 2; // escaped '' -- keep scanning
+                    } else {
+                        j = abs + 1; // closing quote
+                        break;
+                    }
+                } else {
+                    j = rest.len(); // unclosed literal: consume to end of input
+                    break;
+                }
+            }
+            current.push_str(&rest[..j]);
+            i += j;
+            continue;
         }
 
         // Line comment: consume to end-of-line without treating the semicolons
@@ -1658,6 +1687,42 @@ mod tests {
             1,
             "tagged dollar-quote body with semicolons must not split: {findings:?}"
         );
+    }
+
+    #[test]
+    fn split_statements_keeps_semicolon_in_string_literal_intact() {
+        // Regression test (PR review, issue #1023): a `DEFAULT 'hello; world'`
+        // clause -- exactly what `sql_default_literal` produces for a
+        // `--default` value containing a semicolon -- must not be split at
+        // the semicolon inside the quotes.
+        let sql = "CREATE TABLE posts (\n    \
+             id BIGSERIAL PRIMARY KEY,\n    \
+             title TEXT NOT NULL DEFAULT 'hello; world',\n    \
+             created_at TIMESTAMP NOT NULL DEFAULT NOW()\n\
+             );";
+        let statements = split_statements(sql);
+        assert_eq!(
+            statements.len(),
+            1,
+            "a semicolon inside a single-quoted literal must not split the statement: {statements:?}"
+        );
+        assert!(statements[0].contains("'hello; world'"));
+    }
+
+    #[test]
+    fn split_statements_handles_doubled_escaped_quote_in_literal() {
+        // `''` is the standard SQL-escaped single quote; a semicolon after one
+        // must still be treated as inside the (still-open) literal.
+        let sql = "INSERT INTO posts (title) VALUES ('it''s; still one literal');";
+        let statements = split_statements(sql);
+        assert_eq!(statements.len(), 1, "got: {statements:?}");
+    }
+
+    #[test]
+    fn split_statements_multiple_string_literals_with_semicolons() {
+        let sql = "CREATE TABLE posts (a TEXT DEFAULT 'x;y', b TEXT DEFAULT 'p;q');";
+        let statements = split_statements(sql);
+        assert_eq!(statements.len(), 1, "got: {statements:?}");
     }
 
     // ── DROP INDEX ────────────────────────────────────────────────────────────

@@ -430,6 +430,91 @@ the decision in `RELEASE_NOTES.md`.
 
 ---
 
+## Overload / Load-Shedding Benchmark (issue #1006)
+
+`autumn dev-loop-bench --overload` measures the Success Metric declared by
+the overload-protection feature (`server.max_concurrent_requests`, see
+[ADR 0009](../adr/0009-adopt-overload-protection-load-shedding.md)): under a
+synthetic overload, admitted-request tail latency must stay stable and RSS
+must stay bounded, while excess requests are shed near-instantly.
+
+### Budget
+
+| Dimension | Budget |
+|---|---|
+| Admitted-request p99 latency | ≤ 120% of the unloaded baseline p99 |
+| Shed (`503`) response latency | ≤ 5 ms |
+| RSS during the overload phase | must not grow unboundedly |
+
+All three must pass for the run to be reported `PASS`.
+
+### Methodology
+
+`autumn dev-loop-bench --overload` measures a genuine live run, not a
+synthetic estimate:
+
+1. Scaffolds a minimal throwaway app (a single `/block` handler that sleeps
+   `--block-ms`) and compiles it against the workspace's local `autumn-web`
+   source via the same `[patch.crates-io]` trick the cold-start and scaling
+   benchmarks use.
+2. Boots it with `AUTUMN_SERVER__MAX_CONCURRENT_REQUESTS=<--ceiling>` and
+   waits for the built-in `/live` probe to report ready.
+3. **Baseline**: fires `--ceiling` concurrent requests (offered load == the
+   ceiling, no shedding expected) and records admitted-request latency.
+4. **Overload**: fires `--ceiling × --load-multiplier` concurrent requests
+   simultaneously, classifies each response as admitted (2xx) or shed
+   (`503`), and samples the child process's RSS every 30ms throughout
+   (Linux only; the RSS check is skipped, not failed, elsewhere).
+5. Repeats steps 3-4 `--runs` times against the same running server,
+   accumulating samples, then checks the accumulated stats against the
+   budget above.
+
+### Measurement caveat: client-side overhead on constrained hardware
+
+The shed/admitted latency samples are measured **client-side**, timed from
+just before each request is sent to just after its response is received —
+this necessarily includes thread-scheduling and TCP-connection overhead on
+the machine running the benchmark, not just the server's processing time.
+On a CPU-constrained or heavily virtualized runner, firing `ceiling ×
+load_multiplier` concurrent OS threads can itself become the bottleneck,
+inflating *all* measured latencies (including shed responses, which the
+framework rejects in well under a millisecond server-side — verified
+directly, with no network stack involved, by the `autumn/tests/integration/
+load_shed.rs` and `autumn/src/middleware/load_shed.rs` test suites). If
+`--overload` reports shed latency far above the 5ms budget on a busy or
+small runner, prefer those in-process tests as the authoritative check of
+the framework's admission-control contract, and treat the live benchmark's
+absolute numbers as most meaningful on dedicated, lightly-loaded hardware —
+the same caveat the warm dev-loop and cold-start benchmarks carry for CI
+runner variance (see [Regression allowance](#regression-allowance)).
+
+### Running the overload benchmark
+
+```bash
+# Print the budget table (no build, no server):
+autumn dev-loop-bench --overload --dry-run
+
+# Measure with the default ceiling (64), block time (200ms), and load (2x):
+autumn dev-loop-bench --overload
+
+# Tune the synthetic load:
+autumn dev-loop-bench --overload --ceiling 32 --block-ms 150 --load-multiplier 3 --runs 3
+
+# Fail CI on regression, writing a JSON report:
+autumn dev-loop-bench --overload --fail-on-regression --output overload-report.json
+```
+
+### Report format
+
+The JSON report carries the same environment metadata as the other
+benchmark modes (`timestamp_utc`, `runner_os`, `rust_version`,
+`autumn_version`) plus the run parameters (`ceiling`, `block_ms`,
+`load_multiplier`) and a `result` object with each dimension's measured
+value and pass/fail flag — suitable for archiving as release evidence
+alongside the warm/cold-start/scaling reports.
+
+---
+
 ## CI Gate
 
 ### Scheduled job (`.github/workflows/dev-loop-latency.yml`)

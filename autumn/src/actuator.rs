@@ -382,18 +382,125 @@ struct LogLevelsInner {
     current_level: String,
     /// Per-logger level overrides applied at runtime.
     logger_overrides: HashMap<String, String>,
+    /// Handle for pushing level changes to the live `tracing` subscriber.
+    ///
+    /// `Some` once `AppBuilder` wires in the reload handle from the telemetry
+    /// guard; `None` in bare `LogLevels` (e.g. unit tests) where no
+    /// reload-capable subscriber is installed. When `None`, a level change is
+    /// recorded but cannot affect emission — the endpoint reports this honestly
+    /// rather than returning a false-positive `ok` (issue #1044).
+    reload_handle: Option<crate::telemetry::FilterReloadHandle>,
+}
+
+impl LogLevelsInner {
+    /// Build a combined `EnvFilter` directive from the global level plus every
+    /// per-target override, e.g. `"info,my_app::module=trace"`. Targets are
+    /// sorted for deterministic output.
+    fn build_directive(&self) -> String {
+        let mut parts = Vec::new();
+        if !self.current_level.is_empty() {
+            parts.push(self.current_level.clone());
+        }
+        let mut targets: Vec<String> = self
+            .logger_overrides
+            .iter()
+            .filter(|(name, _)| name.as_str() != "root" && !name.is_empty())
+            .map(|(name, level)| format!("{name}={level}"))
+            .collect();
+        targets.sort();
+        parts.extend(targets);
+        parts.join(",")
+    }
+}
+
+/// Split a startup `log.level` value — which may be a full `EnvFilter`
+/// directive such as `"info,tower_http=warn,my_app=debug"` — into a bare
+/// global level plus per-target overrides.
+///
+/// Seeding the overrides map at construction ensures that a later
+/// `PUT /actuator/loggers/root` (which replaces only the global level) does
+/// not silently drop the module-specific directives configured at startup.
+///
+/// Classification follows `EnvFilter` semantics:
+/// - A segment containing `=` is a per-target override (keyed on the part
+///   before the final `=`, so span-field directives round-trip). `root=<level>`
+///   and `=<level>` fold into the global level.
+/// - A bare segment that IS a tracing level (`trace|debug|info|warn|error|off`,
+///   case-insensitive) updates the global level, last one winning to match
+///   `EnvFilter` precedence.
+/// - A bare segment that is NOT a level is a *target directive at trace* (e.g.
+///   `my_app` means "enable target `my_app` at trace"), so it is stored as a
+///   per-target override with the implicit level `trace`.
+fn parse_initial_directive(directive: &str) -> (String, HashMap<String, String>) {
+    let mut global = String::new();
+    let mut overrides = HashMap::new();
+    for segment in directive.split(',') {
+        let segment = segment.trim();
+        if segment.is_empty() {
+            continue;
+        }
+        if let Some((target, level)) = segment.rsplit_once('=') {
+            let target = target.trim();
+            let level = level.trim();
+            // `root=<level>` / `=<level>` are just the global level in disguise.
+            if target.is_empty() || target == "root" {
+                global = level.to_string();
+            } else {
+                overrides.insert(target.to_string(), level.to_string());
+            }
+        } else if is_tracing_level(segment) {
+            // A bare level sets the global level (last-level-wins).
+            global = segment.to_string();
+        } else {
+            // A bare non-level segment is a target enabled at trace.
+            overrides.insert(segment.to_string(), "trace".to_string());
+        }
+    }
+    (global, overrides)
+}
+
+/// Returns `true` when `segment` is a bare `tracing` level keyword
+/// (case-insensitive), i.e. a global-level directive rather than a target.
+fn is_tracing_level(segment: &str) -> bool {
+    matches!(
+        segment.to_ascii_lowercase().as_str(),
+        "trace" | "debug" | "info" | "warn" | "error" | "off"
+    )
 }
 
 impl LogLevels {
     /// Create a new `LogLevels` with the given initial level.
     #[must_use]
     pub fn new(initial_level: &str) -> Self {
+        let (current_level, logger_overrides) = parse_initial_directive(initial_level);
         Self {
             inner: Arc::new(RwLock::new(LogLevelsInner {
-                current_level: initial_level.to_string(),
-                logger_overrides: HashMap::new(),
+                current_level,
+                logger_overrides,
+                reload_handle: None,
             })),
         }
+    }
+
+    /// Attach the live-subscriber reload handle produced by telemetry init.
+    ///
+    /// Called once by `AppBuilder` after the tracing subscriber is installed so
+    /// subsequent [`Self::set_logger_level`] calls take effect on the running
+    /// process (issue #1044).
+    pub fn attach_reload_handle(&self, handle: crate::telemetry::FilterReloadHandle) {
+        if let Ok(mut guard) = self.inner.write() {
+            guard.reload_handle = Some(handle);
+        }
+    }
+
+    /// Returns `true` when a reload-capable subscriber is installed, i.e. level
+    /// changes made via [`Self::set_logger_level`] actually reach the live
+    /// `tracing` subscriber.
+    #[must_use]
+    pub fn reload_available(&self) -> bool {
+        self.inner
+            .read()
+            .is_ok_and(|guard| guard.reload_handle.is_some())
     }
 
     /// Get the current global log level.
@@ -413,28 +520,126 @@ impl LogLevels {
             .unwrap_or_default()
     }
 
-    /// Set the level for a specific logger. Returns the previous level if any.
-    #[must_use]
-    pub fn set_logger_level(&self, name: &str, level: &str) -> Option<String> {
+    /// The combined `EnvFilter` directive currently pushed to the live
+    /// subscriber (global level plus per-target overrides). Test-only.
+    #[cfg(test)]
+    fn rebuilt_directive_for_test(&self) -> String {
+        self.inner
+            .read()
+            .map(|guard| guard.build_directive())
+            .unwrap_or_default()
+    }
+
+    /// Set the level for a specific logger.
+    ///
+    /// When a reload-capable subscriber is installed (see
+    /// [`Self::attach_reload_handle`]), the rebuilt filter directive is pushed
+    /// to the live `tracing` subscriber so the change takes effect immediately
+    /// on the next event (issue #1044). Overrides remain ephemeral — they live
+    /// only in this in-memory state and reset on process restart.
+    ///
+    /// The returned [`LogLevelChange`] reflects the **actual** outcome, not
+    /// merely handle presence:
+    /// - [`LogLevelChange::Applied`] — pushed to a live subscriber.
+    /// - [`LogLevelChange::Recorded`] — stored, but no reload-capable subscriber
+    ///   is installed (bare state / tests).
+    /// - [`LogLevelChange::Rejected`] — the map is at capacity, or the directive
+    ///   failed to apply and the override was **rolled back** so the map never
+    ///   claims a live override that isn't (issue #1044).
+    ///
+    /// The directive is applied while the write lock is held so that concurrent
+    /// callers apply directives in the same order they mutate the map — the live
+    /// subscriber can never disagree with `GET /loggers` (issue #1044 AC4).
+    /// `reload`/`apply` never re-enters `LogLevels`, so this is deadlock-free.
+    pub fn set_logger_level(&self, name: &str, level: &str) -> LogLevelChange {
         let Ok(mut guard) = self.inner.write() else {
-            return None;
+            return LogLevelChange::Rejected {
+                reason: "log level state lock poisoned".to_string(),
+            };
         };
         // Prevent unbounded memory growth from arbitrary logger names
         if guard.logger_overrides.len() >= 1000 && !guard.logger_overrides.contains_key(name) {
-            return None;
+            return LogLevelChange::Rejected {
+                reason: "too many logger overrides".to_string(),
+            };
         }
 
-        let previous = guard.logger_overrides.get(name).cloned();
+        let is_root = name == "root" || name.is_empty();
+        let previous_override = guard.logger_overrides.get(name).cloned();
+        let previous_current = guard.current_level.clone();
+
         guard
             .logger_overrides
             .insert(name.to_string(), level.to_string());
-        // If setting the root level, update current_level too
-        if name == "root" || name.is_empty() {
-            let prev = Some(guard.current_level.clone());
+        // If setting the root level, update current_level too.
+        let returned = if is_root {
             guard.current_level = level.to_string();
-            return prev;
+            Some(previous_current.clone())
+        } else {
+            previous_override.clone()
+        };
+
+        let directive = guard.build_directive();
+        // Clone the handle out so the rollback path below can mutate `guard`
+        // without holding a borrow of `guard.reload_handle`.
+        let Some(handle) = guard.reload_handle.clone() else {
+            return LogLevelChange::Recorded { previous: returned };
+        };
+
+        match handle.apply_directive(&directive) {
+            Ok(()) => LogLevelChange::Applied { previous: returned },
+            Err(error) => {
+                // Roll back so `GET /loggers` never advertises an override that
+                // failed to reach the live subscriber.
+                match previous_override {
+                    Some(prev) => {
+                        guard.logger_overrides.insert(name.to_string(), prev);
+                    }
+                    None => {
+                        guard.logger_overrides.remove(name);
+                    }
+                }
+                if is_root {
+                    guard.current_level = previous_current;
+                }
+                LogLevelChange::Rejected { reason: error }
+            }
         }
-        previous
+    }
+}
+
+/// Outcome of [`LogLevels::set_logger_level`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
+pub enum LogLevelChange {
+    /// The change was pushed to a live, reload-capable subscriber. Carries the
+    /// previous level for that target, if any.
+    Applied {
+        /// Previous level for the target, if it had one.
+        previous: Option<String>,
+    },
+    /// The change was stored in the in-memory map, but no reload-capable
+    /// subscriber is installed, so it does not affect emission.
+    Recorded {
+        /// Previous level for the target, if it had one.
+        previous: Option<String>,
+    },
+    /// The change was not stored: the map was at capacity, or applying the
+    /// directive to the live subscriber failed and the override was rolled back.
+    Rejected {
+        /// Human-readable reason.
+        reason: String,
+    },
+}
+
+impl LogLevelChange {
+    /// The previous level for the target, if the change was stored.
+    #[must_use]
+    pub fn previous(&self) -> Option<&str> {
+        match self {
+            Self::Applied { previous } | Self::Recorded { previous } => previous.as_deref(),
+            Self::Rejected { .. } => None,
+        }
     }
 }
 
@@ -1609,6 +1814,12 @@ struct ActuatorHealth {
     uptime: String,
     #[cfg(feature = "db")]
     autumn_after_commit_failures_total: u64,
+    /// Total transaction retries triggered by a `40001`/`40P01` (issue #1202).
+    #[cfg(feature = "db")]
+    autumn_tx_retries_total: u64,
+    /// Total transactions that exhausted their retry budget (issue #1202).
+    #[cfg(feature = "db")]
+    autumn_tx_retry_exhausted_total: u64,
     /// Per-component health, keyed by indicator name.
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     components: HashMap<String, ComponentHealth>,
@@ -1763,6 +1974,12 @@ pub async fn health<S: ProvideActuatorState + Send + Sync + 'static>(
         #[cfg(feature = "db")]
         autumn_after_commit_failures_total: crate::db::AFTER_COMMIT_FAILURES_TOTAL
             .load(std::sync::atomic::Ordering::Relaxed),
+        #[cfg(feature = "db")]
+        autumn_tx_retries_total: crate::db::TX_RETRIES_TOTAL
+            .load(std::sync::atomic::Ordering::Relaxed),
+        #[cfg(feature = "db")]
+        autumn_tx_retry_exhausted_total: crate::db::TX_RETRY_EXHAUSTED_TOTAL
+            .load(std::sync::atomic::Ordering::Relaxed),
         components,
         checks,
     };
@@ -1783,6 +2000,8 @@ pub(crate) struct ActuatorInfo {
     app: AppInfo,
     autumn: FrameworkInfo,
     runtime: RuntimeInfo,
+    /// Build + git provenance baked into the running binary (issue #1242).
+    build: crate::build_info::BuildProvenance,
 }
 
 #[derive(Serialize)]
@@ -1808,8 +2027,11 @@ pub(crate) async fn info<S: ProvideActuatorState + Send + Sync + 'static>(
 ) -> Json<ActuatorInfo> {
     Json(ActuatorInfo {
         app: AppInfo {
-            name: std::env::var("CARGO_PKG_NAME").unwrap_or_else(|_| "unknown".into()),
-            version: std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "unknown".into()),
+            // Read the consuming app's compile-time name/version (baked in by
+            // `#[autumn_web::main]`), not a runtime `std::env::var` lookup that
+            // always failed in a released binary (issue #1242).
+            name: crate::build_info::app_name(),
+            version: crate::build_info::app_version(),
         },
         autumn: FrameworkInfo {
             version: env!("CARGO_PKG_VERSION"),
@@ -1818,6 +2040,7 @@ pub(crate) async fn info<S: ProvideActuatorState + Send + Sync + 'static>(
         runtime: RuntimeInfo {
             uptime: state.uptime_display(),
         },
+        build: crate::build_info::build_provenance(),
     })
 }
 
@@ -1871,6 +2094,16 @@ pub(crate) async fn metrics_endpoint<S: ProvideActuatorState + Send + Sync + 'st
 ) -> Json<serde_json::Value> {
     let snapshot = state.metrics().snapshot();
     let mut result = serde_json::to_value(&snapshot).unwrap_or_default();
+
+    // Include read-through cache stampede-protection counters (always
+    // present; the read-through API works standalone without app state).
+    if let serde_json::Value::Object(ref mut map) = result {
+        map.insert(
+            "cache".to_string(),
+            serde_json::to_value(crate::cache::read_through_metrics().snapshot())
+                .unwrap_or_default(),
+        );
+    }
 
     // Include DB pool stats if available
     #[cfg(feature = "db")]
@@ -2269,6 +2502,30 @@ fn write_builtin_http_metrics(
         snapshot.http.request_timeouts_total
     );
 
+    // autumn_read_your_writes_pins_total
+    out.push_str(
+        "# HELP autumn_read_your_writes_pins_total \
+         Replica reads redirected to the primary by the read-your-own-writes pin\n",
+    );
+    out.push_str("# TYPE autumn_read_your_writes_pins_total counter\n");
+    let _ = writeln!(
+        out,
+        "autumn_read_your_writes_pins_total{{version=\"{version}\"}} {}",
+        snapshot.read_your_writes_pins_total
+    );
+
+    // autumn_requests_shed_total
+    out.push_str(
+        "# HELP autumn_requests_shed_total \
+         HTTP requests rejected by admission control because server.max_concurrent_requests was at its ceiling\n",
+    );
+    out.push_str("# TYPE autumn_requests_shed_total counter\n");
+    let _ = writeln!(
+        out,
+        "autumn_requests_shed_total{{version=\"{version}\"}} {}",
+        snapshot.http.requests_shed_total
+    );
+
     // by_route
     if !snapshot.http.by_route.is_empty() {
         out.push_str("# HELP autumn_http_route_requests_total HTTP requests by route and method\n");
@@ -2289,6 +2546,67 @@ fn write_builtin_http_metrics(
     }
 }
 
+/// Render the built-in `autumn_cache_*` read-through stampede-protection
+/// counters into `out`, tagged with the replica's deploy `version` label.
+/// These counters are process-wide (the read-through API works standalone
+/// without app state), unlike the HTTP metrics which come from per-app state.
+fn write_builtin_cache_metrics(
+    out: &mut String,
+    version: &str,
+    snapshot: &crate::cache::ReadThroughMetricsSnapshot,
+) {
+    use std::fmt::Write;
+
+    for (name, help, value) in [
+        (
+            "autumn_cache_read_through_hits_total",
+            "Read-through cache reads served from a fresh cached value",
+            snapshot.hits,
+        ),
+        (
+            "autumn_cache_read_through_misses_total",
+            "Read-through cache reads that found no fresh cached value",
+            snapshot.misses,
+        ),
+        (
+            "autumn_cache_read_through_coalesced_waits_total",
+            "Read-through callers that awaited a concurrent in-process fill instead of \
+             computing their own (single-flight coalescing)",
+            snapshot.coalesced_waits,
+        ),
+        (
+            "autumn_cache_read_through_fills_total",
+            "Read-through fill closures that completed successfully",
+            snapshot.fills,
+        ),
+        (
+            "autumn_cache_read_through_fill_failures_total",
+            "Read-through fill closures that returned an error",
+            snapshot.fill_failures,
+        ),
+        (
+            "autumn_cache_read_through_stale_serves_total",
+            "Stale-while-revalidate reads that served a stale value while a background \
+             refresh ran",
+            snapshot.stale_serves,
+        ),
+        (
+            "autumn_cache_fill_lock_acquires_total",
+            "Distributed cache fill locks acquired by this process",
+            snapshot.fill_lock_acquires,
+        ),
+        (
+            "autumn_cache_fill_lock_contended_total",
+            "Distributed cache fill lock attempts that found the lock held by another replica",
+            snapshot.fill_lock_contended,
+        ),
+    ] {
+        let _ = writeln!(out, "# HELP {name} {help}");
+        let _ = writeln!(out, "# TYPE {name} counter");
+        let _ = writeln!(out, "{name}{{version=\"{version}\"}} {value}");
+    }
+}
+
 /// `GET <actuator-prefix>/prometheus` -- export metrics in Prometheus format.
 pub(crate) async fn prometheus_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
     State(state): State<S>,
@@ -2301,6 +2619,11 @@ pub(crate) async fn prometheus_endpoint<S: ProvideActuatorState + Send + Sync + 
     let mut out = String::with_capacity(2048);
 
     write_builtin_http_metrics(&mut out, &version, &snapshot);
+    write_builtin_cache_metrics(
+        &mut out,
+        &version,
+        &crate::cache::read_through_metrics().snapshot(),
+    );
 
     // Plugin-contributed metric families — seed with built-in names so
     // plugins cannot shadow or duplicate them.
@@ -2312,8 +2635,18 @@ pub(crate) async fn prometheus_endpoint<S: ProvideActuatorState + Send + Sync + 
             "autumn_http_request_duration_seconds",
             "autumn_shutdown_aborted_requests_total",
             "autumn_request_timeouts_total",
+            "autumn_read_your_writes_pins_total",
+            "autumn_requests_shed_total",
             "autumn_http_route_requests_total",
             "autumn_metrics_source_errors_total",
+            "autumn_cache_read_through_hits_total",
+            "autumn_cache_read_through_misses_total",
+            "autumn_cache_read_through_coalesced_waits_total",
+            "autumn_cache_read_through_fills_total",
+            "autumn_cache_read_through_fill_failures_total",
+            "autumn_cache_read_through_stale_serves_total",
+            "autumn_cache_fill_lock_acquires_total",
+            "autumn_cache_fill_lock_contended_total",
         ]
         .iter()
         .map(|s| (*s).to_string())
@@ -2374,6 +2707,24 @@ pub(crate) struct SetLoggerRequest {
     level: String,
 }
 
+/// Whether `name` is a valid `tracing` directive target.
+///
+/// A directive target is a module path: ASCII alphanumerics plus `_`, `:`, `.`
+/// and `-` (e.g. `my_app::module`, `tower-http`, `my.custom.target`). `root`
+/// (and the empty string, treated as root) are special-cased. `.` and `-` are
+/// valid inside a `tracing` target and are *not* `EnvFilter` directive
+/// metacharacters. Anything carrying an `EnvFilter` metacharacter — `=`, `,`,
+/// whitespace, `[`, `]`, `{`, `}` — is rejected so a malformed target never
+/// reaches the subscriber and the endpoint cannot lie about applying it
+/// (issue #1044).
+fn is_valid_logger_name(name: &str) -> bool {
+    if name.is_empty() || name == "root" {
+        return true;
+    }
+    name.chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == ':' || ch == '.' || ch == '-')
+}
+
 /// `PUT <actuator-prefix>/loggers/{name}` -- change a logger's level at runtime.
 pub(crate) async fn loggers_put<S: ProvideActuatorState + Send + Sync + 'static>(
     State(state): State<S>,
@@ -2397,16 +2748,54 @@ pub(crate) async fn loggers_put<S: ProvideActuatorState + Send + Sync + 'static>
         );
     }
 
-    let previous = state.log_levels().set_logger_level(&name, &level);
+    // Validate the target name the same way, so a name carrying an `EnvFilter`
+    // metacharacter is rejected before it can reach the subscriber (issue #1044).
+    if !is_valid_logger_name(&name) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "status": "error",
+                "message": format!(
+                    "Invalid logger name '{name}'. Names may contain only \
+                     alphanumerics, '_', ':', '.' and '-' (or 'root')."
+                ),
+            })),
+        );
+    }
 
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "status": "ok",
-            "message": format!("Logger '{}' set to '{}'", name, level),
-            "previous": previous,
-        })),
-    )
+    // Base the response on the *actual* apply outcome, never on handle presence:
+    // a change that failed to reach the live subscriber must not report `ok`
+    // (issue #1044).
+    match state.log_levels().set_logger_level(&name, &level) {
+        LogLevelChange::Applied { previous } => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "ok",
+                "message": format!("Logger '{name}' set to '{level}'"),
+                "previous": previous,
+                "applied": true,
+            })),
+        ),
+        LogLevelChange::Recorded { previous } => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "recorded",
+                "message": format!(
+                    "Logger '{name}' recorded as '{level}' but not applied: no reload-capable subscriber is installed"
+                ),
+                "previous": previous,
+                "applied": false,
+            })),
+        ),
+        LogLevelChange::Rejected { reason } => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "status": "error",
+                "message": format!("Logger '{name}' could not be set to '{level}': {reason}"),
+                "applied": false,
+            })),
+        ),
+    }
 }
 
 // ── Logfile (sensitive) ────────────────────────────────────────
@@ -3828,6 +4217,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn actuator_info_reports_build_and_git_provenance() {
+        // This is the only test in the lib test binary that touches the
+        // process-global build context (`__set_build_context` is first-wins),
+        // so the injected values below are guaranteed to be the ones rendered.
+        fn leak(value: String) -> &'static str {
+            Box::leak(value.into_boxed_str())
+        }
+
+        // Use the repo's real HEAD so this exercises AC #2's contract: the
+        // reported commit equals `git rev-parse HEAD` of the source tree.
+        let head = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .and_then(|out| String::from_utf8(out.stdout).ok())
+            .map(|out| out.trim().to_owned())
+            .expect("git rev-parse HEAD should succeed in the repo");
+        let short: String = head.chars().take(7).collect();
+
+        crate::build_info::__set_build_context(
+            "provenance_probe_app",
+            "9.9.9",
+            Some(leak(head.clone())),
+            Some(leak(short.clone())),
+            Some("provenance-branch"),
+            Some("false"),
+            Some("2026-07-09T00:00:00Z"),
+        );
+
+        let app = actuator_router(true).with_state(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/info")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // AC #3: app.name/version reflect the consuming app's compile-time
+        // values, not "unknown".
+        assert_eq!(json["app"]["name"], "provenance_probe_app");
+        assert_eq!(json["app"]["version"], "9.9.9");
+        assert_ne!(json["app"]["version"], "unknown");
+
+        // AC #1/#2: build object carries full + short SHA, branch, dirty bool,
+        // and an ISO-8601 UTC build timestamp; commit equals real HEAD.
+        assert_eq!(json["build"]["git"]["commit"], head);
+        assert_eq!(json["build"]["git"]["commit_short"], short);
+        assert_eq!(json["build"]["git"]["branch"], "provenance-branch");
+        assert_eq!(json["build"]["git"]["dirty"], false);
+        assert_eq!(json["build"]["timestamp"], "2026-07-09T00:00:00Z");
+        assert_eq!(json["build"]["version"], "9.9.9");
+    }
+
+    #[tokio::test]
     async fn actuator_env_available_in_sensitive_mode() {
         let config = AutumnConfig {
             profile: Some("prod".into()),
@@ -4158,8 +4610,13 @@ mod tests {
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["status"], "ok");
-        assert_eq!(json["message"], "Logger 'autumn_web' set to 'debug'");
+        // `test_state()` has no reload-capable subscriber wired in, so the
+        // endpoint honestly reports the change was recorded but not applied
+        // rather than a false-positive `ok` (issue #1044). A live-subscriber
+        // integration test (`actuator_loggers_live_reload`) covers the `ok`
+        // path with a real reloadable subscriber.
+        assert_eq!(json["status"], "recorded");
+        assert_eq!(json["applied"], false);
 
         let overrides = state.log_levels().logger_overrides();
         assert_eq!(
@@ -4192,6 +4649,167 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn actuator_loggers_put_rejects_invalid_name() {
+        // A logger name carrying an `EnvFilter` metacharacter (`=`) must be
+        // rejected up front (400) — never applied, never recorded — so the
+        // endpoint cannot claim success for a directive the subscriber would
+        // reject (issue #1044). Other metacharacters (`,`, whitespace) too.
+        // `has%20space` is percent-encoded whitespace: axum's `Path` extractor
+        // decodes it back to a space, which the validator must still reject.
+        let state = test_state();
+        for bogus in ["a=b", "a,b", "has%20space", "a::b=trace"] {
+            let app = actuator_router(true).with_state(state.clone());
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri(format!("/actuator/loggers/{bogus}"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(r#"{"level": "debug"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "logger name {bogus:?} should be rejected"
+            );
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["status"], "error");
+        }
+
+        // And GET /loggers must NOT then list any of the bogus overrides.
+        let app = actuator_router(true).with_state(state.clone());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/loggers")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let loggers = json["loggers"].as_object().unwrap();
+        assert!(
+            loggers.is_empty(),
+            "no bogus override should be recorded, got {loggers:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn actuator_loggers_put_accepts_dotted_and_hyphenated_names() {
+        // Real-world `tracing` targets from third-party crates and custom
+        // targets carry `.` and `-` (e.g. `tower-http`, `my.custom.target`,
+        // `h2::proto`). These are valid inside a target and are *not*
+        // `EnvFilter` directive metacharacters, so a PUT to such a name must
+        // NOT be rejected as invalid (400) — it reaches the normal
+        // apply/record path (200) and is recorded as an override.
+        let state = test_state();
+        for name in ["tower-http", "my.custom.target", "h2::proto"] {
+            let app = actuator_router(true).with_state(state.clone());
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri(format!("/actuator/loggers/{name}"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(r#"{"level": "debug"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "logger name {name:?} should be accepted, not rejected as invalid"
+            );
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            // No live subscriber is attached in `test_state()`, so a valid name
+            // takes the "recorded" path — the point is it is not the invalid
+            // "error" path.
+            assert_ne!(
+                json["status"], "error",
+                "valid name {name:?} must not hit the invalid-name error path"
+            );
+        }
+
+        // GET /loggers must now list the accepted overrides.
+        let app = actuator_router(true).with_state(state.clone());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/loggers")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let loggers = json["loggers"].as_object().unwrap();
+        for name in ["tower-http", "my.custom.target", "h2::proto"] {
+            assert!(
+                loggers.contains_key(name),
+                "accepted override {name:?} should be recorded, got {loggers:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn actuator_loggers_put_applied_ok_with_live_subscriber() {
+        // Positive path: with a reload-capable subscriber installed, a valid
+        // change reports `{"status":"ok","applied":true}` end-to-end (issue
+        // #1044 AC7). Uses a no-op reload handle that accepts any valid
+        // directive, standing in for a live subscriber.
+        let state = test_state();
+        state
+            .log_levels()
+            .attach_reload_handle(crate::telemetry::FilterReloadHandle::accept_all_for_test());
+
+        let app = actuator_router(true).with_state(state.clone());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/actuator/loggers/autumn_web")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"level": "debug"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "ok");
+        assert_eq!(json["applied"], true);
+
+        let overrides = state.log_levels().logger_overrides();
+        assert_eq!(
+            overrides.get("autumn_web").map(String::as_str),
+            Some("debug")
+        );
+    }
+
+    #[tokio::test]
     async fn actuator_loggers_hidden_in_nonsensitive_mode() {
         let app = actuator_router(false).with_state(test_state());
         let resp = app
@@ -4219,9 +4837,113 @@ mod tests {
     #[test]
     fn log_levels_root_updates_current() {
         let levels = LogLevels::new("info");
-        let prev = levels.set_logger_level("root", "trace");
-        assert_eq!(prev, Some("info".to_string()));
+        let change = levels.set_logger_level("root", "trace");
+        assert_eq!(change.previous(), Some("info"));
         assert_eq!(levels.current_level(), "trace");
+    }
+
+    #[test]
+    fn root_level_change_preserves_startup_per_target_directives() {
+        // Regression: an app configured with a full `EnvFilter` directive at
+        // startup must not lose its per-target directives when
+        // `PUT /actuator/loggers/root` replaces only the global level.
+        let levels = LogLevels::new("info,tower_http=warn,my_app=debug");
+        levels.attach_reload_handle(crate::telemetry::FilterReloadHandle::accept_all_for_test());
+
+        // The startup per-target directives are seeded as overrides, leaving
+        // only the bare global level in `current_level`.
+        let seeded = levels.logger_overrides();
+        assert_eq!(seeded.get("tower_http").map(String::as_str), Some("warn"));
+        assert_eq!(seeded.get("my_app").map(String::as_str), Some("debug"));
+        assert_eq!(levels.current_level(), "info");
+
+        // Raising the root level must NOT wipe the module-specific directives.
+        let change = levels.set_logger_level("root", "warn");
+        assert!(matches!(change, LogLevelChange::Applied { .. }));
+        assert_eq!(levels.current_level(), "warn");
+
+        let overrides = levels.logger_overrides();
+        assert_eq!(
+            overrides.get("tower_http").map(String::as_str),
+            Some("warn"),
+            "tower_http directive must survive a root-level change"
+        );
+        assert_eq!(
+            overrides.get("my_app").map(String::as_str),
+            Some("debug"),
+            "my_app directive must survive a root-level change"
+        );
+
+        // The rebuilt live directive still carries both per-target directives.
+        let directive = levels.rebuilt_directive_for_test();
+        assert!(
+            directive.contains("tower_http=warn"),
+            "rebuilt directive dropped tower_http: {directive}"
+        );
+        assert!(
+            directive.contains("my_app=debug"),
+            "rebuilt directive dropped my_app: {directive}"
+        );
+    }
+
+    #[test]
+    fn bare_non_level_segment_is_a_trace_target_not_the_global_level() {
+        // `EnvFilter` semantics: in `info,my_app`, `info` is the global level
+        // and the bare `my_app` is a *target directive at trace*, NOT the global
+        // level. The old code took the last bare segment as the global level,
+        // which both lost `info` and set an invalid global of `my_app`.
+        let levels = LogLevels::new("info,my_app");
+        assert_eq!(levels.current_level(), "info");
+        let overrides = levels.logger_overrides();
+        assert_eq!(
+            overrides.get("my_app").map(String::as_str),
+            Some("trace"),
+            "bare non-level segment must become a trace target"
+        );
+
+        // The rebuilt directive is equivalent to `info,my_app=trace`.
+        assert_eq!(levels.rebuilt_directive_for_test(), "info,my_app=trace");
+
+        // A subsequent root PUT to `warn` keeps `my_app` as a target.
+        levels.attach_reload_handle(crate::telemetry::FilterReloadHandle::accept_all_for_test());
+        let change = levels.set_logger_level("root", "warn");
+        assert!(matches!(change, LogLevelChange::Applied { .. }));
+        assert_eq!(levels.current_level(), "warn");
+        assert_eq!(
+            levels.logger_overrides().get("my_app").map(String::as_str),
+            Some("trace"),
+            "my_app target must survive a root-level change"
+        );
+    }
+
+    #[test]
+    fn mixed_bare_level_explicit_target_and_bare_target() {
+        // `debug,tower_http=warn,my_app`: global=debug, explicit tower_http=warn,
+        // and the bare `my_app` becomes a trace target.
+        let levels = LogLevels::new("debug,tower_http=warn,my_app");
+        assert_eq!(levels.current_level(), "debug");
+        let overrides = levels.logger_overrides();
+        assert_eq!(
+            overrides.get("tower_http").map(String::as_str),
+            Some("warn")
+        );
+        assert_eq!(overrides.get("my_app").map(String::as_str), Some("trace"));
+
+        // Targets are emitted sorted after the global level.
+        assert_eq!(
+            levels.rebuilt_directive_for_test(),
+            "debug,my_app=trace,tower_http=warn"
+        );
+    }
+
+    #[test]
+    fn purely_bare_level_config_has_no_target_overrides() {
+        // Regression guard: a plain level stays the global level with no
+        // spurious target overrides.
+        let levels = LogLevels::new("info");
+        assert_eq!(levels.current_level(), "info");
+        assert!(levels.logger_overrides().is_empty());
+        assert_eq!(levels.rebuilt_directive_for_test(), "info");
     }
 
     // ── Prometheus endpoint tests ──────────────────────────────
@@ -4278,6 +5000,113 @@ mod tests {
         assert!(text.contains("# HELP autumn_request_timeouts_total"));
         assert!(text.contains("# TYPE autumn_request_timeouts_total counter"));
         assert!(text.contains("autumn_request_timeouts_total{version=\"stable\"} 0"));
+
+        assert!(text.contains("# HELP autumn_read_your_writes_pins_total"));
+        assert!(text.contains("# TYPE autumn_read_your_writes_pins_total counter"));
+        assert!(text.contains("autumn_read_your_writes_pins_total{version=\"stable\"} 0"));
+
+        assert!(text.contains("# HELP autumn_requests_shed_total"));
+        assert!(text.contains("# TYPE autumn_requests_shed_total counter"));
+        assert!(text.contains("autumn_requests_shed_total{version=\"stable\"} 0"));
+    }
+
+    #[cfg(feature = "cache-moka")]
+    #[tokio::test]
+    async fn prometheus_includes_cache_read_through_counters() {
+        // read_through_metrics() is a process-wide singleton shared with other
+        // tests in this crate; assert presence and a monotonic delta rather
+        // than an absolute value.
+        let before = crate::cache::read_through_metrics().snapshot();
+        let cache: std::sync::Arc<dyn crate::cache::Cache> =
+            std::sync::Arc::new(crate::cache::MokaCache::new(10, None));
+        let key = format!("actuator-prometheus-cache-test-{before:?}");
+        let _: i32 =
+            crate::cache::get_or_compute(
+                &cache,
+                &key,
+                None,
+                || async move { Ok::<i32, String>(1) },
+            )
+            .await
+            .unwrap();
+        let after = crate::cache::read_through_metrics().snapshot();
+        assert!(after.fills > before.fills, "fills counter must increase");
+
+        let state = test_state();
+        let app = actuator_router(true).with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/prometheus")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+
+        for name in [
+            "autumn_cache_read_through_hits_total",
+            "autumn_cache_read_through_misses_total",
+            "autumn_cache_read_through_coalesced_waits_total",
+            "autumn_cache_read_through_fills_total",
+            "autumn_cache_read_through_fill_failures_total",
+            "autumn_cache_read_through_stale_serves_total",
+            "autumn_cache_fill_lock_acquires_total",
+            "autumn_cache_fill_lock_contended_total",
+        ] {
+            assert!(
+                text.contains(&format!("# TYPE {name} counter")),
+                "missing TYPE line for {name} in:\n{text}"
+            );
+            assert!(
+                text.contains(&format!("{name}{{version=\"stable\"}}")),
+                "missing value line for {name} in:\n{text}"
+            );
+        }
+    }
+
+    #[cfg(feature = "cache-moka")]
+    #[tokio::test]
+    async fn metrics_json_includes_cache_section() {
+        let cache: std::sync::Arc<dyn crate::cache::Cache> =
+            std::sync::Arc::new(crate::cache::MokaCache::new(10, None));
+        let key = "actuator-metrics-json-cache-test";
+        let _: i32 =
+            crate::cache::get_or_compute(&cache, key, None, || async move { Ok::<i32, String>(1) })
+                .await
+                .unwrap();
+
+        let state = test_state();
+        let app = actuator_router(true).with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["cache"]["fills"].as_u64().unwrap() >= 1);
+        assert!(json["cache"]["hits"].is_u64());
+        assert!(json["cache"]["misses"].is_u64());
+        assert!(json["cache"]["coalesced_waits"].is_u64());
+        assert!(json["cache"]["fill_failures"].is_u64());
+        assert!(json["cache"]["stale_serves"].is_u64());
+        assert!(json["cache"]["fill_lock_acquires"].is_u64());
+        assert!(json["cache"]["fill_lock_contended"].is_u64());
     }
 
     #[tokio::test]
@@ -4585,7 +5414,7 @@ mod tests {
 
         // Try to add a new key, should be rejected
         let result = levels.set_logger_level("logger_1000", "warn");
-        assert_eq!(result, None);
+        assert!(matches!(result, LogLevelChange::Rejected { .. }));
         assert_eq!(levels.logger_overrides().len(), 1000);
         assert_eq!(levels.logger_overrides().get("logger_1000"), None);
     }
@@ -4599,8 +5428,8 @@ mod tests {
         }
 
         // Try to update an existing key, should succeed
-        let prev = levels.set_logger_level("logger_999", "warn");
-        assert_eq!(prev.as_deref(), Some("debug"));
+        let change = levels.set_logger_level("logger_999", "warn");
+        assert_eq!(change.previous(), Some("debug"));
         assert_eq!(levels.logger_overrides().len(), 1000);
         assert_eq!(
             levels

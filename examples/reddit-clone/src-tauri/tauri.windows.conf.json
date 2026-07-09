@@ -1,0 +1,6 @@
+{
+  "build": {
+    "beforeBuildCommand": "powershell -ExecutionPolicy Bypass -File src-tauri\\stage-sidecar.ps1",
+    "beforeDevCommand": { "script": "powershell -ExecutionPolicy Bypass -File src-tauri\\stage-sidecar.ps1", "wait": true }
+  }
+}

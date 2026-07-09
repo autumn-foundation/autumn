@@ -1,0 +1,1185 @@
+/*
+ * Autumn — framework-owned widget component CSS (issue #1215)
+ *
+ * Backs every `autumn-*` (and `wizard-*`) class emitted by
+ * `autumn_web::{form, widgets, wizard, ui::pagination, storage::form_helper,
+ * job_tracking}`. Plain CSS — no `@import`/`@apply` — so it works standalone,
+ * without a Tailwind build. Colors, borders, and radius reference the shared
+ * design tokens (`ui/tokens.css`); re-theme by overriding the token
+ * `:root` variables, not by forking these rules.
+ *
+ * Not included here: `autumn-dev-*` (dev-error badge ships its own inline
+ * `<style>`) and `.flash`/`.flash-*` (served separately as `FLASH_CSS`).
+ */
+
+/* ── Wizard progress stepper ──────────────────────────────────────────────── */
+
+.wizard-progress {
+    display: flex;
+    align-items: flex-start;
+    list-style: none;
+    padding: 0;
+    margin: 0 0 1.5rem 0;
+}
+
+.wizard-step {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    flex-shrink: 0;
+}
+
+.wizard-step + .wizard-step {
+    flex: 1;
+}
+
+.wizard-step + .wizard-step::before {
+    content: '';
+    flex: 1;
+    height: 2px;
+    background-color: var(--border);
+}
+
+.wizard-step--completed + .wizard-step::before {
+    background-color: var(--primary);
+}
+
+.wizard-step__number {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 2rem;
+    height: 2rem;
+    border-radius: 9999px;
+    font-size: 0.8125rem;
+    font-weight: 600;
+    flex-shrink: 0;
+    background-color: var(--border);
+    color: var(--text-muted);
+}
+
+.wizard-step__label {
+    font-size: 0.875rem;
+    color: var(--text-muted);
+    text-transform: capitalize;
+    white-space: nowrap;
+}
+
+.wizard-step--completed .wizard-step__number {
+    background-color: var(--primary);
+    color: #fff;
+}
+
+.wizard-step--completed .wizard-step__label {
+    color: var(--primary);
+}
+
+.wizard-step--current .wizard-step__number {
+    background-color: var(--primary);
+    color: #fff;
+    box-shadow: 0 0 0 3px var(--primary-light);
+}
+
+.wizard-step--current .wizard-step__label {
+    color: var(--text);
+    font-weight: 600;
+}
+
+/* Same as the unmodified .wizard-step__number/__label defaults — stated
+   explicitly so every state the widget emits has a rule, per the coverage
+   test in tests/integration/widget_css_coverage.rs. */
+.wizard-step--upcoming .wizard-step__number {
+    background-color: var(--border);
+    color: var(--text-muted);
+}
+
+.wizard-step--upcoming .wizard-step__label {
+    color: var(--text-muted);
+}
+
+.wizard-progress__summary {
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    margin-top: 0.5rem;
+}
+
+/* ── Form fields (autumn-field) ───────────────────────────────────────────── */
+
+.autumn-field {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    margin-bottom: 1rem;
+}
+
+.autumn-field__label {
+    font-size: 0.875rem;
+    font-weight: 500;
+    color: var(--text);
+}
+
+.autumn-field__input {
+    width: 100%;
+    padding: 0.5rem 0.75rem;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    font-size: 0.875rem;
+    line-height: 1.5;
+    color: var(--text);
+    background-color: var(--surface);
+    outline: none;
+    transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.autumn-field__input:focus {
+    border-color: var(--primary);
+    box-shadow: 0 0 0 3px var(--primary-light);
+}
+
+.autumn-field__input--invalid {
+    border-color: var(--danger);
+}
+
+.autumn-field__input--invalid:focus {
+    border-color: var(--danger);
+    box-shadow: 0 0 0 3px var(--danger-light);
+}
+
+.autumn-field__errors {
+    display: flex;
+    flex-direction: column;
+    gap: 0.125rem;
+}
+
+.autumn-field__error {
+    font-size: 0.8125rem;
+    color: var(--danger);
+    margin: 0;
+}
+
+/* ── Submit button (autumn-submit) ────────────────────────────────────────── */
+
+.autumn-submit {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0.5rem 1.25rem;
+    background-color: var(--primary);
+    color: #fff;
+    border: none;
+    border-radius: var(--radius);
+    font-size: 0.875rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background-color 0.15s ease;
+}
+
+.autumn-submit:hover {
+    background-color: var(--primary-hover);
+}
+
+.autumn-submit:focus {
+    outline: none;
+    box-shadow: 0 0 0 3px var(--primary-light);
+}
+
+.autumn-submit:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+/* ── Active search input (autumn-search) ──────────────────────────────────── */
+
+.autumn-search {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    margin-bottom: 1rem;
+}
+
+.autumn-search__label {
+    font-size: 0.875rem;
+    font-weight: 500;
+    color: var(--text);
+}
+
+.autumn-search__input {
+    width: 100%;
+    padding: 0.5rem 0.75rem 0.5rem 2.25rem;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    font-size: 0.875rem;
+    color: var(--text);
+    background-color: var(--surface);
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%239ca3af' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='11' cy='11' r='8'/%3E%3Cline x1='21' y1='21' x2='16.65' y2='16.65'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: 0.625rem center;
+    background-size: 1rem 1rem;
+    outline: none;
+    transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.autumn-search__input:focus {
+    border-color: var(--primary);
+    box-shadow: 0 0 0 3px var(--primary-light);
+}
+
+/* ── Autocomplete (autumn-autocomplete) ───────────────────────────────────── */
+
+.autumn-autocomplete {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    margin-bottom: 1rem;
+}
+
+.autumn-autocomplete__label {
+    font-size: 0.875rem;
+    font-weight: 500;
+    color: var(--text);
+}
+
+.autumn-autocomplete__input {
+    width: 100%;
+    padding: 0.5rem 0.75rem;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    font-size: 0.875rem;
+    color: var(--text);
+    background-color: var(--surface);
+    outline: none;
+    transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.autumn-autocomplete__input:focus {
+    border-color: var(--primary);
+    box-shadow: 0 0 0 3px var(--primary-light);
+}
+
+.autumn-autocomplete__options {
+    position: absolute;
+    top: 100%;
+    left: 0;
+    right: 0;
+    z-index: 50;
+    background-color: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    max-height: 15rem;
+    overflow-y: auto;
+    list-style: none;
+    margin: 0.25rem 0 0 0;
+    padding: 0.25rem 0;
+}
+
+.autumn-autocomplete__option {
+    padding: 0.5rem 0.75rem;
+    font-size: 0.875rem;
+    color: var(--text);
+    cursor: pointer;
+}
+
+.autumn-autocomplete__option:hover,
+.autumn-autocomplete__option[aria-selected="true"] {
+    background-color: var(--primary-light);
+    color: var(--primary);
+}
+
+/* ── Nav bar (autumn-nav) ──────────────────────────────────────────────────── */
+
+.autumn-nav {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    padding: 0.75rem 1rem;
+}
+
+.autumn-nav--sidebar {
+    flex-direction: column;
+    align-items: stretch;
+}
+
+.autumn-nav__brand {
+    font-weight: 600;
+    color: var(--text);
+    text-decoration: none;
+}
+
+.autumn-nav__toggle {
+    display: none;
+}
+
+/* Wraps the primary and trailing item lists; must be a flex row itself (and
+   grow to fill space the brand/toggle don't use) or the two lists just stack
+   as ordinary block children instead of sitting side by side — which would
+   leave .autumn-nav__items--trailing's margin-left:auto below with nothing
+   to push against. */
+.autumn-nav__collapse {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    flex: 1;
+}
+
+.autumn-nav__items {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    list-style: none;
+    margin: 0;
+    padding: 0;
+}
+
+.autumn-nav__items--trailing {
+    margin-left: auto;
+}
+
+.autumn-nav__item {
+    display: flex;
+    align-items: center;
+}
+
+.autumn-nav__item a {
+    color: var(--text);
+    text-decoration: none;
+}
+
+.autumn-nav__item a:hover {
+    color: var(--primary);
+}
+
+.autumn-nav__item--menu {
+    position: relative;
+}
+
+.autumn-nav__section {
+    font-size: 0.75rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    color: var(--text-muted);
+}
+
+.autumn-nav__menu-toggle {
+    background: none;
+    border: none;
+    color: inherit;
+    font: inherit;
+    cursor: pointer;
+}
+
+.autumn-nav__menu {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+}
+
+.autumn-nav__menu[hidden] {
+    display: none;
+}
+
+@media (max-width: 768px) {
+    /* .autumn-nav is a nowrap flex row; .autumn-nav__collapse's basis-full
+       below only starts a new row (dropping the menu under the brand/toggle
+       instead of squeezing onto the same row) once the row itself can wrap. */
+    .autumn-nav--enhanced {
+        flex-wrap: wrap;
+    }
+    .autumn-nav--enhanced .autumn-nav__toggle {
+        display: flex;
+    }
+    .autumn-nav--enhanced .autumn-nav__collapse {
+        display: none;
+        width: 100%;
+        flex-basis: 100%;
+        flex-direction: column;
+        align-items: flex-start;
+    }
+    .autumn-nav--enhanced .autumn-nav__collapse--open {
+        display: flex;
+    }
+    .autumn-nav--enhanced .autumn-nav__items {
+        flex-direction: column;
+        align-items: flex-start;
+    }
+}
+
+/* ── Breadcrumb (autumn-breadcrumb) ───────────────────────────────────────── */
+
+.autumn-breadcrumb {
+    font-size: 0.875rem;
+    margin-bottom: 1rem;
+}
+
+.autumn-breadcrumb__list {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.375rem;
+    list-style: none;
+    margin: 0;
+    padding: 0;
+}
+
+.autumn-breadcrumb__item {
+    display: flex;
+    align-items: center;
+    gap: 0.375rem;
+}
+
+.autumn-breadcrumb__separator {
+    color: var(--text-muted);
+}
+
+.autumn-breadcrumb__link {
+    color: var(--text-muted);
+    text-decoration: none;
+}
+
+.autumn-breadcrumb__link:hover {
+    color: var(--primary);
+    text-decoration: underline;
+}
+
+.autumn-breadcrumb__current {
+    color: var(--text);
+    font-weight: 500;
+}
+
+.autumn-breadcrumb__text {
+    color: var(--text-muted);
+}
+
+/* ── Hero (autumn-hero) ────────────────────────────────────────────────────── */
+
+.autumn-hero {
+    padding: 3rem 1.5rem;
+    text-align: center;
+}
+
+.autumn-hero__title {
+    margin: 0;
+    font-size: 2rem;
+    font-weight: 700;
+    color: var(--text);
+}
+
+.autumn-hero__subtitle {
+    margin: 0.75rem 0 0 0;
+    font-size: 1.125rem;
+    color: var(--text-muted);
+}
+
+.autumn-hero__actions {
+    display: flex;
+    justify-content: center;
+    gap: 0.75rem;
+    margin-top: 1.5rem;
+}
+
+.autumn-hero__cta {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0.625rem 1.5rem;
+    border-radius: var(--radius);
+    font-size: 0.9375rem;
+    font-weight: 500;
+    text-decoration: none;
+    transition: background-color 0.15s ease, border-color 0.15s ease;
+}
+
+.autumn-hero__cta--primary {
+    background-color: var(--primary);
+    color: #fff;
+    border: 1px solid var(--primary);
+}
+
+.autumn-hero__cta--primary:hover {
+    background-color: var(--primary-hover);
+    border-color: var(--primary-hover);
+}
+
+.autumn-hero__cta--secondary {
+    background-color: var(--surface);
+    color: var(--text);
+    border: 1px solid var(--border);
+}
+
+.autumn-hero__cta--secondary:hover {
+    background-color: var(--bg);
+}
+
+/* ── Property list (autumn-property-list) ─────────────────────────────────── */
+
+.autumn-property-list {
+    display: grid;
+    grid-template-columns: minmax(8rem, max-content) 1fr;
+    gap: 0.5rem 1rem;
+    margin: 0;
+}
+
+.autumn-property-list dt {
+    font-weight: 500;
+    color: var(--text-muted);
+}
+
+.autumn-property-list dd {
+    margin: 0;
+    color: var(--text);
+}
+
+/* ── Modal / confirm dialog (autumn-modal, autumn-confirm) ────────────────── */
+
+.autumn-confirm {
+    display: inline-block;
+}
+
+.autumn-modal {
+    padding: 0;
+    border: none;
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    max-width: 28rem;
+    width: calc(100% - 2rem);
+}
+
+.autumn-modal::backdrop {
+    background-color: rgba(17, 24, 39, 0.5);
+}
+
+.autumn-modal__content {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+    padding: 1.5rem;
+}
+
+.autumn-modal__title {
+    margin: 0;
+    font-size: 1.125rem;
+    font-weight: 600;
+    color: var(--text);
+}
+
+.autumn-modal__body {
+    color: var(--text);
+    font-size: 0.9375rem;
+}
+
+.autumn-modal__footer {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.5rem;
+    margin-top: 0.25rem;
+}
+
+.autumn-modal__confirm-form {
+    display: inline;
+}
+
+.autumn-modal__cancel {
+    padding: 0.5rem 1.25rem;
+    background-color: var(--surface);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    font-size: 0.875rem;
+    font-weight: 500;
+    cursor: pointer;
+}
+
+.autumn-modal__cancel:hover {
+    background-color: var(--bg);
+}
+
+.autumn-modal__confirm {
+    padding: 0.5rem 1.25rem;
+    background-color: var(--primary);
+    color: #fff;
+    border: 1px solid var(--primary);
+    border-radius: var(--radius);
+    font-size: 0.875rem;
+    font-weight: 500;
+    cursor: pointer;
+}
+
+.autumn-modal__confirm:hover {
+    background-color: var(--primary-hover);
+}
+
+.autumn-modal__confirm--danger {
+    background-color: var(--danger);
+    border-color: var(--danger);
+    color: #fff;
+}
+
+.autumn-modal__confirm--danger:hover {
+    background-color: var(--danger-hover);
+    border-color: var(--danger-hover);
+}
+
+/* ── Tabs (autumn-tabs) ────────────────────────────────────────────────────── */
+
+.autumn-tabs__list {
+    display: flex;
+    gap: 0.25rem;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 1rem;
+}
+
+.autumn-tabs__tab {
+    padding: 0.5rem 1rem;
+    margin-bottom: -1px;
+    color: var(--text-muted);
+    font-weight: 500;
+    font-size: 0.9375rem;
+    text-decoration: none;
+    border-bottom: 2px solid transparent;
+}
+
+.autumn-tabs__tab:hover {
+    color: var(--text);
+}
+
+.autumn-tabs__tab--active {
+    color: var(--text);
+    border-bottom-color: var(--primary);
+}
+
+.autumn-tabs__panel {
+    display: none;
+}
+
+/* No-JS switching: a panel becomes visible when its id is the URL's
+   fragment (`:target`), OR when it contains — at any depth — a currently
+   `:target`-ed element. The second half reveals the whole ancestor chain
+   down to a panel deep-linked inside a *nested* `tabs()` widget (one
+   `tabs()` call rendered inside another's panel body): without it, the
+   ancestor panel that merely contains the nested widget would stay
+   `display: none` and hide the correctly-targeted inner panel along with
+   it, even though the inner panel's own `:target` rule matched. This half
+   is deliberately unscoped (no `>`) since the target may be arbitrarily
+   deep. */
+.autumn-tabs__panel:is(:target, :has(:target)) {
+    display: block;
+}
+
+/* Fallback: show the first panel only when NOTHING inside this widget is
+   currently targeted — checked as bare `:target` (any element at all, not
+   just `.autumn-tabs__panel`), since the fragment can target an arbitrary
+   element inside a panel's body (a heading, an anchor) and not just a
+   panel or a nested tabs() widget's panel; any such target means some
+   panel of ours is already shown by the rule above, so the default must
+   be suppressed. (An earlier version checked only
+   `.autumn-tabs__panel:target`, which missed body-anchor targets: the
+   panel containing the anchor would correctly show via `:has(:target)`
+   above, but this fallback wouldn't detect anything was targeted and
+   would show the default panel *too* — two panels visible for one
+   deep link.) The `:has()` argument here is intentionally UNSCOPED (no
+   `>`, checked at any depth): CSS forbids nesting `:has()` inside another
+   `:has()`, so the `:has(:target)` half of the rule above can't be tested
+   from inside this `:has()` directly — but any `:target` anywhere in the
+   subtree, direct or nested, is exactly the signal that some panel is
+   already shown by one half of the rule above or the other, so testing
+   for plain `:target` gives the same answer without needing to nest. The
+   *consequent* (`> .autumn-tabs__panel--active`) IS scoped to direct
+   children, so this rule only ever reveals THIS widget's own default
+   panel, never a nested widget's. */
+.autumn-tabs:not(:has(:target)) > .autumn-tabs__panel--active {
+    display: block;
+}
+
+/* Graceful degradation for browsers that support `:target` (universal)
+   but not `:has()` (narrower support): the `:not(:has(...))` fallback
+   above never applies, so without this rule every panel would stay
+   `display: none` on first load. Unconditionally showing the first panel
+   here is a strictly better failure mode than a blank widget — in these
+   browsers, navigating to a different panel's fragment may show that
+   panel alongside the first rather than replacing it. */
+@supports not selector(:has(a)) {
+    .autumn-tabs > .autumn-tabs__panel--active {
+        display: block;
+    }
+}
+
+/* Sync the active-tab highlight with whichever panel is actually shown.
+   Panel/tab ids are arbitrary caller strings, so a shared stylesheet can't
+   match them by value — match by position instead, for the first 6 tabs.
+   Widgets with more tabs keep switching panels correctly; only the
+   active-tab highlight past the 6th degrades to showing no tab as active.
+   The suppression rule below checks bare `:target` (any element, matching
+   the panel-fallback reasoning above — the fragment can target an
+   arbitrary element inside a panel body, not just a panel), with the same
+   unscoped-argument / scoped-consequent pattern as the panel fallback,
+   for the same :has()-can't-nest-in-:has() reason. The per-tab rules that
+   follow can only match a panel that is ITSELF the direct `:target` — a
+   panel shown only because it *contains* a target (nested widget or plain
+   body anchor) can't be attributed to a specific tab position without
+   nesting `:has()` inside `:has()`, which CSS disallows, so in that case
+   no tab gets highlighted (a graceful degrade: no tab looks active,
+   rather than the wrong one). */
+.autumn-tabs:has(:target) > .autumn-tabs__list > .autumn-tabs__tab--active {
+    color: var(--text-muted);
+    border-bottom-color: transparent;
+}
+
+.autumn-tabs:has(> .autumn-tabs__panel:nth-of-type(1):target) > .autumn-tabs__list > .autumn-tabs__tab:nth-child(1),
+.autumn-tabs:has(> .autumn-tabs__panel:nth-of-type(2):target) > .autumn-tabs__list > .autumn-tabs__tab:nth-child(2),
+.autumn-tabs:has(> .autumn-tabs__panel:nth-of-type(3):target) > .autumn-tabs__list > .autumn-tabs__tab:nth-child(3),
+.autumn-tabs:has(> .autumn-tabs__panel:nth-of-type(4):target) > .autumn-tabs__list > .autumn-tabs__tab:nth-child(4),
+.autumn-tabs:has(> .autumn-tabs__panel:nth-of-type(5):target) > .autumn-tabs__list > .autumn-tabs__tab:nth-child(5),
+.autumn-tabs:has(> .autumn-tabs__panel:nth-of-type(6):target) > .autumn-tabs__list > .autumn-tabs__tab:nth-child(6) {
+    color: var(--text);
+    border-bottom-color: var(--primary);
+}
+
+/* ── Pagination (autumn-pager) ─────────────────────────────────────────────── */
+
+.autumn-pager,
+.autumn-pager--cursor {
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+}
+
+.autumn-pager__link,
+.autumn-pager__current,
+.autumn-pager__ellipsis {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 2rem;
+    padding: 0.375rem 0.75rem;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    font-size: 0.875rem;
+    color: var(--text);
+    text-decoration: none;
+}
+
+.autumn-pager__link:hover {
+    background-color: var(--bg);
+}
+
+/* `__prev`/`__next` are always combined with `.autumn-pager__link` (enabled)
+   or `.autumn-pager__disabled` (disabled) on the same element — no unique
+   styling needed beyond that combination; kept as flex-shrink-0 hooks for
+   app overrides that want to target direction specifically. */
+.autumn-pager__prev,
+.autumn-pager__next {
+    flex-shrink: 0;
+}
+
+.autumn-pager__current {
+    background-color: var(--primary);
+    border-color: var(--primary);
+    color: #fff;
+}
+
+.autumn-pager__ellipsis {
+    border: none;
+    color: var(--text-muted);
+}
+
+.autumn-pager__disabled {
+    color: var(--text-muted);
+    opacity: 0.5;
+}
+
+/* ── Direct-to-storage upload (autumn-direct-upload) ──────────────────────── */
+
+.autumn-direct-upload {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+}
+
+.autumn-upload-progress {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+}
+
+.autumn-upload-bar {
+    height: 0.375rem;
+    border-radius: 9999px;
+    background-color: var(--border);
+    overflow: hidden;
+}
+
+.autumn-upload-bar::before {
+    content: '';
+    display: block;
+    height: 100%;
+    width: var(--autumn-upload-percent, 0%);
+    background-color: var(--primary);
+    transition: width 0.15s ease;
+}
+
+.autumn-upload-noscript {
+    font-size: 0.8125rem;
+    color: var(--text-muted);
+}
+
+/* ── Job status (autumn-job-status) ───────────────────────────────────────── */
+
+.autumn-job-status {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+}
+
+.autumn-job-status__bar {
+    width: 100%;
+    height: 0.5rem;
+    border-radius: 9999px;
+    accent-color: var(--primary);
+}
+
+.autumn-job-status__message {
+    font-size: 0.875rem;
+    color: var(--text-muted);
+}
+
+.autumn-job-status__success {
+    font-size: 0.875rem;
+    color: var(--success);
+}
+
+.autumn-job-status__error {
+    font-size: 0.875rem;
+    color: var(--danger);
+}
+
+/* ── Badge / status pill (#1259) ──────────────────────────────────────────── */
+
+.badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.25rem;
+    padding: 0.125rem 0.5rem;
+    font-size: 0.75rem;
+    font-weight: 600;
+    line-height: 1.25;
+    border-radius: var(--radius);
+    border: 1px solid transparent;
+    white-space: nowrap;
+}
+
+.badge--neutral {
+    background: var(--surface-muted, #f1f5f9);
+    color: var(--text-muted);
+    border-color: var(--border);
+}
+
+.badge--info {
+    background: var(--info-light, #eff6ff);
+    color: var(--info, #1e3a8a);
+    border-color: var(--info, #93c5fd);
+}
+
+.badge--success {
+    background: var(--success-light, #ecfdf5);
+    color: var(--success);
+    border-color: var(--success);
+}
+
+.badge--warning {
+    background: var(--warning-light, #fffbeb);
+    color: var(--warning, #92400e);
+    border-color: var(--warning, #fcd34d);
+}
+
+.badge--danger {
+    background: var(--danger-light, #fef2f2);
+    color: var(--danger);
+    border-color: var(--danger);
+}
+
+/* ── Avatar (#1263) ───────────────────────────────────────────────────────── */
+
+.autumn-avatar {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex: 0 0 auto;
+    border-radius: 9999px;
+    overflow: hidden;
+    vertical-align: middle;
+    border: 1px solid var(--border);
+}
+
+.autumn-avatar--image {
+    object-fit: cover;
+}
+
+.autumn-avatar--initials {
+    color: #fff;
+    font-weight: 600;
+    text-transform: uppercase;
+    /* Fallback; the deterministic per-name color is one of the
+       .autumn-avatar--cN palette classes below (defined after this rule so it
+       wins at equal specificity). Class-based — not an inline style — so it
+       survives a nonce CSP that forbids inline `style` attributes. */
+    background: var(--primary);
+}
+
+/* Deterministic per-name background palette (selected by avatar_palette_class).
+   Class-based so no inline `style` attribute is emitted. */
+.autumn-avatar--c0 { background: hsl(0, 60%, 42%); }
+.autumn-avatar--c1 { background: hsl(30, 60%, 40%); }
+.autumn-avatar--c2 { background: hsl(60, 55%, 36%); }
+.autumn-avatar--c3 { background: hsl(90, 55%, 34%); }
+.autumn-avatar--c4 { background: hsl(120, 50%, 34%); }
+.autumn-avatar--c5 { background: hsl(150, 55%, 34%); }
+.autumn-avatar--c6 { background: hsl(180, 55%, 32%); }
+.autumn-avatar--c7 { background: hsl(210, 60%, 42%); }
+.autumn-avatar--c8 { background: hsl(240, 55%, 50%); }
+.autumn-avatar--c9 { background: hsl(270, 55%, 48%); }
+.autumn-avatar--c10 { background: hsl(300, 55%, 42%); }
+.autumn-avatar--c11 { background: hsl(330, 60%, 44%); }
+
+.autumn-avatar--sm {
+    width: 24px;
+    height: 24px;
+    font-size: 0.625rem;
+}
+
+.autumn-avatar--md {
+    width: 40px;
+    height: 40px;
+    font-size: 0.875rem;
+}
+
+.autumn-avatar--lg {
+    width: 64px;
+    height: 64px;
+    font-size: 1.375rem;
+}
+
+.autumn-avatar__initials {
+    line-height: 1;
+    user-select: none;
+}
+
+/* ── Alert / callout (#1314) ──────────────────────────────────────────────── */
+
+.alert {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.625rem;
+    padding: 0.75rem 1rem;
+    border-radius: var(--radius);
+    border: 1px solid var(--border);
+    margin-bottom: 1rem;
+}
+
+.alert__icon {
+    flex: 0 0 auto;
+    display: inline-flex;
+    line-height: 1;
+}
+
+.alert__content {
+    flex: 1 1 auto;
+    min-width: 0;
+}
+
+.alert__title {
+    margin: 0 0 0.25rem;
+    font-size: 0.9375rem;
+    font-weight: 700;
+}
+
+.alert__body {
+    font-size: 0.875rem;
+}
+
+.alert__errors {
+    margin: 0;
+    padding-left: 1.25rem;
+}
+
+.alert__dismiss {
+    flex: 0 0 auto;
+    cursor: pointer;
+    line-height: 1;
+    font-size: 1.25rem;
+    color: inherit;
+    padding: 0 0.25rem;
+    background: none;
+    border: 0;
+}
+
+/* Visually hidden but kept in tab order / focusable (WCAG 2.1.1) — never
+   `display:none`/`hidden`, which would remove it from the keyboard path. */
+.alert__dismiss-toggle {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+    border: 0;
+}
+
+.alert__dismiss:has(.alert__dismiss-toggle:focus-visible) {
+    outline: 2px solid var(--primary);
+    outline-offset: 2px;
+}
+
+.alert:has(.alert__dismiss-toggle:checked) {
+    display: none;
+}
+
+.alert-info {
+    background: var(--info-light, #eff6ff);
+    color: var(--info, #1e3a8a);
+    border-color: var(--info, #93c5fd);
+}
+
+.alert-success {
+    background: var(--success-light, #ecfdf5);
+    color: var(--success);
+    border-color: var(--success);
+}
+
+.alert-warning {
+    background: var(--warning-light, #fffbeb);
+    color: var(--warning, #92400e);
+    border-color: var(--warning, #fcd34d);
+}
+
+.alert-error {
+    background: var(--danger-light, #fef2f2);
+    color: var(--danger);
+    border-color: var(--danger);
+}
+
+/* ── Toast (autumn-toast) ──────────────────────────────────────────────────── */
+
+/* Fixed stacking context dropped once in the layout; `pointer-events: none`
+   so the empty region never blocks clicks, re-enabled on each toast below. */
+.autumn-toast-region {
+    position: fixed;
+    bottom: 1rem;
+    right: 1rem;
+    z-index: 1000;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    max-width: min(24rem, calc(100vw - 2rem));
+    pointer-events: none;
+}
+
+/* Auto-dismiss is CSS-only: a slide/fade in, then a fade+collapse out after a
+   visible dwell — no JavaScript. The element stays in the DOM (CSS cannot
+   remove nodes) but ends `visibility: hidden` with zero height, so it neither
+   shows nor occupies space. */
+.autumn-toast {
+    pointer-events: auto;
+    padding: 0.75rem 1rem;
+    border: 1px solid var(--border);
+    border-left-width: 4px;
+    border-radius: var(--radius);
+    background: var(--surface, #fff);
+    color: var(--text);
+    box-shadow: 0 4px 12px rgb(0 0 0 / 12%);
+    font-size: 0.9375rem;
+    /* Explicit starting max-height so the dismiss animation's height collapse
+       (to `max-height: 0`) transitions smoothly instead of jumping — larger
+       than any realistic single toast. */
+    max-height: 200px;
+    animation:
+        autumn-toast-in 200ms ease-out,
+        autumn-toast-out 400ms ease-in 5s forwards;
+}
+
+.autumn-toast__message {
+    display: block;
+}
+
+.autumn-toast--success {
+    border-left-color: var(--success);
+}
+
+.autumn-toast--info {
+    border-left-color: var(--info, #3b82f6);
+}
+
+.autumn-toast--warning {
+    border-left-color: var(--warning, #d97706);
+}
+
+.autumn-toast--error {
+    border-left-color: var(--danger);
+}
+
+@keyframes autumn-toast-in {
+    from {
+        opacity: 0;
+        transform: translateY(0.5rem);
+    }
+
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+@keyframes autumn-toast-out {
+    to {
+        opacity: 0;
+        visibility: hidden;
+        max-height: 0;
+        margin-top: -0.5rem;
+        padding-top: 0;
+        padding-bottom: 0;
+    }
+}
+
+/* Respect reduced-motion: skip the entrance/exit transforms but still
+   auto-hide after the dwell so toasts don't pile up. */
+@media (prefers-reduced-motion: reduce) {
+    .autumn-toast {
+        animation: autumn-toast-out 0s linear 5s forwards;
+    }
+}
+
+/* ── Infinite feed (autumn-feed) ───────────────────────────────────────────── */
+
+.autumn-feed {
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+}
+
+.autumn-feed__sentinel {
+    display: flex;
+    justify-content: center;
+    padding: 1rem 0;
+}
+
+.autumn-feed__more {
+    display: inline-block;
+    padding: 0.5rem 1.25rem;
+    color: var(--primary);
+    font-weight: 500;
+    font-size: 0.9375rem;
+    text-decoration: none;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+}
+
+.autumn-feed__more:hover {
+    border-color: var(--primary);
+}
+
+.autumn-feed__more:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: 2px;
+}

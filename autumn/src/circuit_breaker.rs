@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
@@ -133,6 +133,15 @@ impl CircuitBreakerInner {
         failures as f64 / self.history.len() as f64
     }
 
+    /// Records a state transition and logs it.
+    ///
+    /// Must be the *last* mutation of every transition: callers set all
+    /// associated fields (`open_until`, half-open counters, history) before
+    /// calling this. The `tracing` call below can panic in a user-provided
+    /// subscriber, and because [`CircuitBreaker::lock_inner`] recovers
+    /// poisoned state, a mid-transition panic must still leave the breaker
+    /// fully consistent (the state write below precedes the log, so the new
+    /// state is complete by the time anything can panic).
     fn transition_to(&mut self, name: &str, new_state: CircuitState, failure_ratio: f64) {
         let old_state = self.state;
         self.state = new_state;
@@ -168,17 +177,27 @@ impl CircuitBreaker {
         &self.name
     }
 
+    /// Locks the inner state, recovering from a poisoned mutex.
+    ///
+    /// Circuit breaker state is simple and self-correcting (a sliding sample
+    /// window plus counters), so the data behind a poisoned lock is still
+    /// safe to use. Recovering here keeps a single panicking lock holder from
+    /// permanently poisoning the breaker and panicking every subsequent call.
+    fn lock_inner(&self) -> MutexGuard<'_, CircuitBreakerInner> {
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     pub fn state(&self) -> CircuitState {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.lock_inner();
         let now = Instant::now();
         if inner.state == CircuitState::Open {
             if let Some(until) = inner.open_until {
                 if now >= until {
-                    inner.transition_to(&self.name, CircuitState::HalfOpen, 1.0);
                     inner.half_open_successes = 0;
                     inner.half_open_failures = 0;
                     inner.half_open_in_flight = 0;
                     inner.open_until = None;
+                    inner.transition_to(&self.name, CircuitState::HalfOpen, 1.0);
                 }
             }
         }
@@ -186,18 +205,18 @@ impl CircuitBreaker {
     }
 
     pub fn config(&self) -> CircuitBreakerPolicy {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.lock_inner();
         inner.config.clone()
     }
 
     pub fn update_config(&self, mut config: CircuitBreakerPolicy) {
         config.failure_ratio_threshold = config.failure_ratio_threshold.clamp(0.000_1, 1.0);
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.lock_inner();
         inner.config = config;
     }
 
     pub fn failure_ratio(&self) -> f64 {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.lock_inner();
         let window = inner.config.sample_window;
         inner.clean_history(window, Instant::now());
         inner.failure_ratio()
@@ -205,17 +224,17 @@ impl CircuitBreaker {
 
     #[allow(clippy::significant_drop_tightening)]
     pub(crate) fn before_call(&self) -> Result<(), CircuitBreakerError<()>> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.lock_inner();
         let now = Instant::now();
 
         if inner.state == CircuitState::Open {
             if let Some(until) = inner.open_until {
                 if now >= until {
-                    inner.transition_to(&self.name, CircuitState::HalfOpen, 1.0);
                     inner.half_open_successes = 0;
                     inner.half_open_failures = 0;
                     inner.half_open_in_flight = 0;
                     inner.open_until = None;
+                    inner.transition_to(&self.name, CircuitState::HalfOpen, 1.0);
                 }
             }
         }
@@ -236,7 +255,7 @@ impl CircuitBreaker {
     }
 
     pub(crate) fn after_call(&self, success: bool) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.lock_inner();
         let now = Instant::now();
         let window = inner.config.sample_window;
         inner.clean_history(window, now);
@@ -253,8 +272,8 @@ impl CircuitBreaker {
                 if inner.history.len() as u64 >= min_sample {
                     let ratio = inner.failure_ratio();
                     if ratio >= failure_ratio_threshold {
-                        inner.transition_to(&self.name, CircuitState::Open, ratio);
                         inner.open_until = Some(now + open_duration);
+                        inner.transition_to(&self.name, CircuitState::Open, ratio);
                     }
                 }
             }
@@ -267,13 +286,13 @@ impl CircuitBreaker {
                 if success {
                     inner.half_open_successes += 1;
                     if inner.half_open_successes >= trial_count {
-                        inner.transition_to(&self.name, CircuitState::Closed, 0.0);
                         inner.history.clear();
+                        inner.transition_to(&self.name, CircuitState::Closed, 0.0);
                     }
                 } else {
                     inner.half_open_failures += 1;
-                    inner.transition_to(&self.name, CircuitState::Open, 1.0);
                     inner.open_until = Some(now + open_duration);
+                    inner.transition_to(&self.name, CircuitState::Open, 1.0);
                 }
             }
             CircuitState::Open => {}
@@ -336,7 +355,7 @@ impl CircuitBreakerGuard {
 impl Drop for CircuitBreakerGuard {
     fn drop(&mut self) {
         if !self.completed {
-            let mut inner = self.breaker.inner.lock().unwrap();
+            let mut inner = self.breaker.lock_inner();
             if inner.state == CircuitState::HalfOpen {
                 if inner.half_open_in_flight > 0 {
                     inner.half_open_in_flight -= 1;
@@ -357,8 +376,17 @@ impl CircuitBreakerRegistry {
         }
     }
 
+    /// Locks the registry map, recovering from a poisoned mutex.
+    ///
+    /// See [`CircuitBreaker::lock_inner`] for the rationale: the map is
+    /// always left in a consistent state, so a panicking lock holder must
+    /// not permanently break every subsequent registry call.
+    fn lock_breakers(&self) -> MutexGuard<'_, HashMap<String, CircuitBreaker>> {
+        self.breakers.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     pub fn get_or_create(&self, name: &str, config: CircuitBreakerPolicy) -> CircuitBreaker {
-        let mut breakers = self.breakers.lock().unwrap();
+        let mut breakers = self.lock_breakers();
         breakers
             .entry(name.to_owned())
             .or_insert_with(|| CircuitBreaker::new(name, config))
@@ -370,7 +398,7 @@ impl CircuitBreakerRegistry {
         name: &str,
         config: CircuitBreakerPolicy,
     ) -> CircuitBreaker {
-        let mut breakers = self.breakers.lock().unwrap();
+        let mut breakers = self.lock_breakers();
         if let Some(breaker) = breakers.get(name) {
             breaker.update_config(config);
             breaker.clone()
@@ -382,22 +410,14 @@ impl CircuitBreakerRegistry {
     }
 
     /// Returns a list of all currently registered circuit breakers.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal registry lock is poisoned.
     pub fn all_breakers(&self) -> Vec<CircuitBreaker> {
-        let breakers = self.breakers.lock().unwrap();
+        let breakers = self.lock_breakers();
         breakers.values().cloned().collect()
     }
 
     /// Clears all registered circuit breakers from the registry.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal registry lock is poisoned.
     pub fn clear(&self) {
-        let mut breakers = self.breakers.lock().unwrap();
+        let mut breakers = self.lock_breakers();
         breakers.clear();
     }
 }
@@ -753,5 +773,95 @@ mod tests {
             )
             .await;
         assert_eq!(fallback_result_open, Ok("fallback_from_open"));
+    }
+
+    #[test]
+    fn test_circuit_breaker_recovers_from_poisoned_mutex() {
+        let breaker = CircuitBreaker::new("poison_test", CircuitBreakerPolicy::default());
+
+        // Poison the inner mutex by panicking while holding the lock.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = breaker.inner.lock().unwrap();
+            panic!("poison the circuit breaker mutex");
+        }));
+        assert!(result.is_err());
+        assert!(breaker.inner.is_poisoned());
+
+        // Every breaker method must keep working instead of panicking.
+        assert_eq!(breaker.state(), CircuitState::Closed);
+        assert!(breaker.before_call().is_ok());
+        breaker.after_call(true);
+        assert!(breaker.failure_ratio() < f64::EPSILON);
+        let config = breaker.config();
+        breaker.update_config(config);
+
+        // The guard's Drop path (cancellation) must not panic either.
+        drop(CircuitBreakerGuard::new(breaker.clone()));
+
+        // Registry locks recover from poisoning too.
+        let registry = CircuitBreakerRegistry::new();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = registry.breakers.lock().unwrap();
+            panic!("poison the registry mutex");
+        }));
+        assert!(result.is_err());
+        assert!(registry.breakers.is_poisoned());
+
+        let b = registry.get_or_create("poison_reg", CircuitBreakerPolicy::default());
+        let b2 = registry.get_or_create_with_config("poison_reg", CircuitBreakerPolicy::default());
+        assert_eq!(b.name(), b2.name());
+        assert_eq!(registry.all_breakers().len(), 1);
+        registry.clear();
+        assert!(registry.all_breakers().is_empty());
+    }
+
+    #[test]
+    fn test_circuit_breaker_survives_panic_during_state_transition() {
+        // A tracing subscriber that panics on every event, simulating a
+        // user-provided subscriber panicking inside `transition_to`'s log.
+        struct PanickingSubscriber;
+        impl tracing::Subscriber for PanickingSubscriber {
+            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, _: &tracing::Event<'_>) {
+                panic!("subscriber panic during circuit breaker transition");
+            }
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+
+        let policy = CircuitBreakerPolicy {
+            failure_ratio_threshold: 0.5,
+            sample_window: Duration::from_secs(10),
+            minimum_sample_count: 1,
+            open_duration: Duration::ZERO,
+            half_open_trial_count: 1,
+        };
+        let breaker = CircuitBreaker::new("transition_panic_test", policy);
+
+        // Panic mid-transition (Closed -> Open) while holding the lock; this
+        // both poisons the mutex and interrupts `transition_to`.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            tracing::subscriber::with_default(PanickingSubscriber, || {
+                breaker.after_call(false);
+            });
+        }));
+        assert!(result.is_err());
+        assert!(breaker.inner.is_poisoned());
+
+        // The interrupted transition must still be complete: `open_until` was
+        // set before `transition_to`, so the breaker recovers to HalfOpen
+        // (instantly, since open_duration is zero) instead of being stuck
+        // permanently Open with `open_until == None`.
+        assert_eq!(breaker.state(), CircuitState::HalfOpen);
+        assert!(breaker.before_call().is_ok());
+        breaker.after_call(true);
+        assert_eq!(breaker.state(), CircuitState::Closed);
     }
 }
