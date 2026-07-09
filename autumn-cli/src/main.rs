@@ -952,6 +952,33 @@ enum MigrateCommands {
         #[arg(long)]
         yes_i_mean_prod: bool,
     },
+    /// Record content hashes for applied migrations (issue #1203).
+    ///
+    /// Content hashes (SHA-256 of each migration's `up.sql`) live in the
+    /// `autumn_migration_checksums` table and are validated before every
+    /// `autumn migrate` run so a migration that was edited after being
+    /// applied fails loudly instead of silently forking the schema.
+    ///
+    /// # Examples
+    ///
+    ///   # Backfill hashes for legacy migrations applied before the checksum
+    ///   # table existed. Idempotent — safe to re-run.
+    ///   autumn migrate baseline
+    ///
+    ///   # Escape hatch: overwrite one version's stored hash with the current
+    ///   # on-disk hash. Use ONLY when you deliberately edited an applied
+    ///   # migration and accept that other environments running the previous
+    ///   # content will now report a mismatch.
+    ///   autumn migrate baseline --force 20260101000000
+    #[command(verbatim_doc_comment)]
+    Baseline {
+        /// Re-baseline the checksum for a single applied version, overwriting
+        /// whatever hash is currently recorded. The escape hatch for a
+        /// deliberate edit. Without this flag, `baseline` only records
+        /// hashes for applied migrations that don't already have one.
+        #[arg(long = "force", value_name = "VERSION")]
+        force: Option<String>,
+    },
 }
 
 /// Subcommands for `autumn shard`.
@@ -2099,6 +2126,11 @@ fn run_command(command: Commands) {
                     to,
                     yes_i_mean_prod,
                 }),
+                Some(MigrateCommands::Baseline { force }) => {
+                    migrate::MigrateAction::Baseline(migrate::BaselineArgs {
+                        force_version: force,
+                    })
+                }
                 None => migrate::MigrateAction::Run,
             };
             let target = match (shard, control_only) {
