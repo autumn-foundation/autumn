@@ -1237,6 +1237,67 @@ fn extract_subject(
     Err(crate::AutumnError::bad_request_msg("missing sub claim"))
 }
 
+/// Returns the set of signature algorithms a given JWKS key is allowed to
+/// verify. The set is derived from trusted key material only (the JWK's
+/// declared `alg`, or failing that its key type), never from the untrusted
+/// token header. Symmetric algorithms are always rejected: OIDC `id_token`s are
+/// verified against public JWKS keys, and accepting HS* here would enable
+/// algorithm-confusion forgeries.
+#[cfg(feature = "oauth2")]
+fn jwk_allowed_algorithms(
+    jwk: &jsonwebtoken::jwk::Jwk,
+) -> crate::AutumnResult<Vec<jsonwebtoken::Algorithm>> {
+    use jsonwebtoken::Algorithm;
+    use jsonwebtoken::jwk::{AlgorithmParameters, EllipticCurve, KeyAlgorithm};
+
+    // If the JWKS entry declares an algorithm, it is the only one accepted.
+    if let Some(key_alg) = jwk.common.key_algorithm {
+        let alg = match key_alg {
+            KeyAlgorithm::RS256 => Algorithm::RS256,
+            KeyAlgorithm::RS384 => Algorithm::RS384,
+            KeyAlgorithm::RS512 => Algorithm::RS512,
+            KeyAlgorithm::PS256 => Algorithm::PS256,
+            KeyAlgorithm::PS384 => Algorithm::PS384,
+            KeyAlgorithm::PS512 => Algorithm::PS512,
+            KeyAlgorithm::ES256 => Algorithm::ES256,
+            KeyAlgorithm::ES384 => Algorithm::ES384,
+            KeyAlgorithm::EdDSA => Algorithm::EdDSA,
+            // Symmetric (HS*) and encryption algorithms are never valid for
+            // verifying an id_token signature against a JWKS document.
+            other => {
+                return Err(crate::AutumnError::unauthorized_msg(format!(
+                    "jwk algorithm {other} not allowed for id_token verification"
+                )));
+            }
+        };
+        return Ok(vec![alg]);
+    }
+
+    // Otherwise derive the allowed set from the key type. Only asymmetric
+    // signature algorithms compatible with the key are permitted.
+    match &jwk.algorithm {
+        AlgorithmParameters::RSA(_) => Ok(vec![
+            Algorithm::RS256,
+            Algorithm::RS384,
+            Algorithm::RS512,
+            Algorithm::PS256,
+            Algorithm::PS384,
+            Algorithm::PS512,
+        ]),
+        AlgorithmParameters::EllipticCurve(params) => match params.curve {
+            EllipticCurve::P256 => Ok(vec![Algorithm::ES256]),
+            EllipticCurve::P384 => Ok(vec![Algorithm::ES384]),
+            ref other => Err(crate::AutumnError::unauthorized_msg(format!(
+                "unsupported jwk curve {other:?} for id_token verification"
+            ))),
+        },
+        AlgorithmParameters::OctetKeyPair(_) => Ok(vec![Algorithm::EdDSA]),
+        AlgorithmParameters::OctetKey(_) => Err(crate::AutumnError::unauthorized_msg(
+            "symmetric jwk not allowed for id_token verification",
+        )),
+    }
+}
+
 #[cfg(feature = "oauth2")]
 async fn validate_and_decode_id_token(
     token: &str,
@@ -1280,7 +1341,19 @@ async fn validate_and_decode_id_token(
     let decoding_key = jsonwebtoken::DecodingKey::from_jwk(jwk)
         .map_err(|e| crate::AutumnError::unauthorized_msg(format!("invalid jwk key: {e}")))?;
 
+    // Never trust the token header's `alg` to select the verification
+    // algorithm (algorithm-confusion defense). Pin the accepted set from the
+    // matched JWK and reject tokens whose header alg is not in it — in
+    // particular symmetric (HS*) algorithms, which would otherwise let an
+    // attacker forge tokens HMAC-signed with the public JWKS material.
+    let allowed_algs = jwk_allowed_algorithms(jwk)?;
+    if !allowed_algs.contains(&alg) {
+        return Err(crate::AutumnError::unauthorized_msg(format!(
+            "id_token alg {alg:?} not permitted by matching jwk"
+        )));
+    }
     let mut validation = jsonwebtoken::Validation::new(alg);
+    validation.algorithms = allowed_algs;
     let mut issuers = vec![issuer.to_owned()];
     let is_multi_tenant = issuer.contains("/common/")
         || issuer.contains("/organizations/")
@@ -2830,6 +2903,186 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.to_string(), "provider.issuer required for oidc");
+    }
+
+    /// RFC 7515 appendix A.2 example RSA public key as a JWK, optionally with
+    /// a declared `alg`.
+    #[cfg(feature = "oauth2")]
+    fn rsa_test_jwk_json(key_algorithm: Option<&str>) -> serde_json::Value {
+        let mut jwk = serde_json::json!({
+            "kty": "RSA",
+            "kid": "test-kid",
+            "n": "ofgWCuLjybRlzo0tZWJjNiuSfb4p4fAkd_wWJcyQoTbji9k0l8W26mPddxHmfHQp\
+                  -Vaw-4qPCJrcS2mJPMEzP1Pt0Bm4d4QlL-yRT-SFd2lZS-pCgNMsD1W_YpRPEwOW\
+                  vG6b32690r2jZ47soMZo9wGzjb_7OMg0LOL-bSf63kpaSHSXndS5z5rexMdbBYUs\
+                  LA9e-KXBdQOS-UTo7WTBEMa2R2CapHg665xsmtdVMTBQY4uDZlxvb3qCo5ZwKh9k\
+                  G4LT6_I5IhlJH7aGhyxXFvUK-DWNmoudF8NAco9_h9iaGNj8q2ethFkMLs91kzk2\
+                  PAcDTW9gb54h4FRWyuXpoQ",
+            "e": "AQAB"
+        });
+        if let Some(alg) = key_algorithm {
+            jwk["alg"] = serde_json::json!(alg);
+        }
+        jwk
+    }
+
+    #[cfg(feature = "oauth2")]
+    fn rsa_test_jwk(key_algorithm: Option<&str>) -> jsonwebtoken::jwk::Jwk {
+        serde_json::from_value(rsa_test_jwk_json(key_algorithm)).unwrap()
+    }
+
+    #[cfg(feature = "oauth2")]
+    #[test]
+    fn jwk_allowed_algorithms_pins_declared_algorithm() {
+        let algs = jwk_allowed_algorithms(&rsa_test_jwk(Some("RS256"))).unwrap();
+        assert_eq!(algs, vec![jsonwebtoken::Algorithm::RS256]);
+    }
+
+    #[cfg(feature = "oauth2")]
+    #[test]
+    fn jwk_allowed_algorithms_rejects_symmetric_declared_algorithm() {
+        let err = jwk_allowed_algorithms(&rsa_test_jwk(Some("HS256"))).unwrap_err();
+        assert!(
+            err.to_string().contains("not allowed"),
+            "expected symmetric alg rejection, got: {err}"
+        );
+    }
+
+    #[cfg(feature = "oauth2")]
+    #[test]
+    fn jwk_allowed_algorithms_derives_asymmetric_set_from_key_type() {
+        let algs = jwk_allowed_algorithms(&rsa_test_jwk(None)).unwrap();
+        assert!(algs.contains(&jsonwebtoken::Algorithm::RS256));
+        assert!(algs.contains(&jsonwebtoken::Algorithm::PS256));
+        assert!(!algs.contains(&jsonwebtoken::Algorithm::HS256));
+        assert!(!algs.contains(&jsonwebtoken::Algorithm::HS384));
+        assert!(!algs.contains(&jsonwebtoken::Algorithm::HS512));
+    }
+
+    #[cfg(feature = "oauth2")]
+    #[test]
+    fn jwk_allowed_algorithms_rejects_symmetric_octet_key() {
+        let jwk: jsonwebtoken::jwk::Jwk = serde_json::from_value(serde_json::json!({
+            "kty": "oct",
+            "kid": "sym-kid",
+            "k": "c2VjcmV0"
+        }))
+        .unwrap();
+        let err = jwk_allowed_algorithms(&jwk).unwrap_err();
+        assert!(
+            err.to_string().contains("symmetric jwk not allowed"),
+            "expected symmetric jwk rejection, got: {err}"
+        );
+    }
+
+    /// Serves a fixed JSON body over plain HTTP/1.1 on a random localhost
+    /// port; returns the URL to fetch it from.
+    #[cfg(feature = "oauth2")]
+    async fn spawn_jwks_stub(body: String) -> String {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        format!("http://{addr}/jwks")
+    }
+
+    #[cfg(feature = "oauth2")]
+    fn oidc_test_provider(jwks_url: String) -> OAuth2ProviderConfig {
+        OAuth2ProviderConfig {
+            client_id: "cid".into(),
+            client_secret: "secret".into(),
+            authorize_url: "https://idp.example/authorize".into(),
+            token_url: "https://idp.example/token".into(),
+            userinfo_url: None,
+            redirect_uri: "http://localhost:3000/callback".into(),
+            scope: "openid".into(),
+            issuer: Some("https://idp.example".into()),
+            jwks_url: Some(jwks_url),
+            discovery_url: None,
+        }
+    }
+
+    #[cfg(feature = "oauth2")]
+    fn unix_now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    /// Algorithm-confusion attack: the JWKS serves an RSA public key, and the
+    /// attacker forges an HS256 token (HMAC keyed with material derivable
+    /// from the public key). The token must be rejected because its header
+    /// alg is not in the set pinned from the JWK — before any signature
+    /// check is even attempted.
+    #[cfg(feature = "oauth2")]
+    #[tokio::test]
+    async fn validate_id_token_rejects_hs256_against_rsa_jwks_key() {
+        let jwks_body = serde_json::json!({ "keys": [rsa_test_jwk_json(None)] }).to_string();
+        let provider = oidc_test_provider(spawn_jwks_stub(jwks_body).await);
+
+        let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
+        header.kid = Some("test-kid".into());
+        let claims = serde_json::json!({
+            "sub": "attacker-controlled",
+            "iss": "https://idp.example",
+            "aud": "cid",
+            "exp": unix_now_secs() + 3600,
+        });
+        let token = jsonwebtoken::encode(
+            &header,
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(b"guessed-public-key-material"),
+        )
+        .unwrap();
+
+        let err = validate_and_decode_id_token(&token, &provider)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("not permitted by matching jwk"),
+            "expected algorithm pinning rejection, got: {err}"
+        );
+    }
+
+    /// A token whose header declares `alg: none` must be rejected outright.
+    #[cfg(feature = "oauth2")]
+    #[tokio::test]
+    async fn validate_id_token_rejects_alg_none() {
+        use base64::Engine as _;
+        let b64 = |v: &serde_json::Value| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v.to_string())
+        };
+        let header = b64(&serde_json::json!({"alg": "none", "kid": "test-kid", "typ": "JWT"}));
+        let payload = b64(&serde_json::json!({
+            "sub": "attacker-controlled",
+            "iss": "https://idp.example",
+            "aud": "cid",
+            "exp": unix_now_secs() + 3600,
+        }));
+        let token = format!("{header}.{payload}.");
+
+        // Unreachable jwks_url: the token must be rejected before any fetch.
+        let provider = oidc_test_provider("http://127.0.0.1:9/jwks".into());
+        let err = validate_and_decode_id_token(&token, &provider)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("invalid id_token header"),
+            "expected header rejection for alg=none, got: {err}"
+        );
     }
 
     #[cfg(feature = "oauth2")]

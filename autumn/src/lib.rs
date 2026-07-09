@@ -216,6 +216,14 @@ pub use repository::RepositoryError;
 #[cfg(feature = "db")]
 pub mod read_your_writes;
 
+/// Offline-first local SQLite store and background sync engine for
+/// occasionally-connected apps (e.g. Tauri mobile).
+///
+/// See the [`sync`] module documentation for the architecture (change
+/// tracking, tombstoning, conflict resolution) and wiring examples.
+#[cfg(feature = "offline-sync")]
+pub mod sync;
+
 /// Automatic record version history for `#[repository]` writes.
 ///
 /// See [`version_history`] module documentation for the full API.
