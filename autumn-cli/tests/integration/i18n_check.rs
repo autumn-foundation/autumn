@@ -341,6 +341,51 @@ dir = \"i18n\"
 }
 
 #[test]
+fn override_file_alias_precedence_matches_runtime_first_existing_wins() {
+    // Runtime config loading merges only the FIRST existing profile override
+    // file (`autumn-prod.toml` before `autumn-production.toml` under
+    // `AUTUMN_ENV=prod`; see `profile_override_file_lookup_names` + the `break`
+    // in `autumn/src/config.rs`). Here `autumn-prod.toml` — the one the runtime
+    // would actually load — has NO `[i18n]`, while the never-loaded
+    // `autumn-production.toml` DOES. With no `i18n/` directory, the project has
+    // no active i18n config in scope, so the check must take the no-op skip
+    // (exit 0) rather than consulting the unloaded alias and failing.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    // Base config declares no i18n.
+    write(root, "autumn.toml", "[server]\n");
+    write(root, "src/main.rs", "fn main() {}\n");
+    // The override file the runtime actually loads (first existing) — no i18n.
+    write(root, "autumn-prod.toml", "[log]\nlevel = \"info\"\n");
+    // A later alias that is never loaded, but DOES configure i18n. The check
+    // must not consult it.
+    write(
+        root,
+        "autumn-production.toml",
+        "\
+[i18n]
+default_locale = \"en\"
+supported_locales = [\"en\"]
+dir = \"i18n\"
+",
+    );
+    // No `i18n/` directory exists.
+
+    let output = run_check_with_env(root, "prod", &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "only the first-existing override file (autumn-prod.toml, no i18n) is \
+         loaded → no active i18n config → no-op skip (exit 0)\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("nothing to check"),
+        "should report the no-op skip, not consult the unloaded autumn-production.toml\nstdout:\n{stdout}"
+    );
+}
+
+#[test]
 fn profile_overlay_with_missing_directory_fails_under_autumn_env() {
     // No base `[i18n]`, so under dev the project is a genuine no-op (PASS). A
     // `[profile.prod.i18n]` overlay points at a directory that does not exist,

@@ -37,10 +37,7 @@ use std::str::FromStr as _;
 use autumn_web::config::{AutumnConfig, Env, OsEnv};
 use autumn_web::i18n::{Bundle, I18nConfig};
 use proc_macro2::{Delimiter, TokenStream, TokenTree};
-use quote::ToTokens as _;
 use serde::Serialize;
-use syn::parse::Parser as _;
-use syn::spanned::Spanned as _;
 
 /// Output format for `autumn i18n check`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -253,60 +250,79 @@ fn scan_stream(stream: &TokenStream, file: &str, result: &mut ScanResult) {
     }
 }
 
-/// Parse a call/macro argument list and classify the argument at `index` as the
-/// translation key.
+/// Split a call/macro argument [`TokenStream`] on its **top-level** commas.
+///
+/// Nested commas (inside `(...)`, `[...]`, `{...}`) live within a single
+/// [`TokenTree::Group`] and so are never seen here — each returned segment is
+/// exactly one argument. Working on the raw token list rather than parsing the
+/// whole list as [`syn::Expr`] means a `$metavariable` (or any other
+/// non-`Expr` token) in *another* argument position cannot discard a literal
+/// key — e.g. `t!($locale, "nav.home")` or `.t_with("nav.home", &[("n", $n)])`
+/// written inside a `macro_rules!` transcriber still records `nav.home`.
+fn split_top_level_args(args: &TokenStream) -> Vec<TokenStream> {
+    let mut segments = Vec::new();
+    let mut current: Vec<TokenTree> = Vec::new();
+    for tt in args.clone() {
+        if matches!(&tt, TokenTree::Punct(p) if p.as_char() == ',') {
+            segments.push(std::mem::take(&mut current).into_iter().collect());
+        } else {
+            current.push(tt);
+        }
+    }
+    if !current.is_empty() {
+        segments.push(current.into_iter().collect());
+    }
+    segments
+}
+
+/// Extract the argument at `index` from a call/macro argument list and classify
+/// just that key slot. Tokens in the remaining positions are never inspected,
+/// so metavariables elsewhere do not discard a literal key.
 fn record_key_at(args: &TokenStream, index: usize, file: &str, result: &mut ScanResult) {
-    let parser = syn::punctuated::Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated;
-    let Ok(parsed) = parser.parse2(args.clone()) else {
-        return;
-    };
-    if let Some(expr) = parsed.iter().nth(index) {
-        record_key(expr, file, result);
+    if let Some(segment) = split_top_level_args(args).get(index) {
+        record_key_segment(segment, file, result);
     }
 }
 
-/// Parse a call argument list and treat the first string-literal argument as
-/// the key; if there is none, record the call as a dynamic site.
+/// Treat the first string-literal argument as the key; if there is none, record
+/// the first argument as a dynamic site.
 fn record_first_literal_key(args: &TokenStream, file: &str, result: &mut ScanResult) {
-    let parser = syn::punctuated::Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated;
-    let Ok(parsed) = parser.parse2(args.clone()) else {
-        return;
-    };
-    if let Some(expr) = parsed.iter().find(|e| as_str_lit(e).is_some()) {
-        record_key(expr, file, result);
-    } else if let Some(first) = parsed.iter().next() {
-        record_dynamic(first, file, result);
+    let segments = split_top_level_args(args);
+    if let Some(segment) = segments.iter().find(|s| segment_str_lit(s).is_some()) {
+        record_key_segment(segment, file, result);
+    } else if let Some(first) = segments.first() {
+        record_dynamic_segment(first, file, result);
     }
 }
 
-/// Return the value of `expr` if it is a string literal.
-fn as_str_lit(expr: &syn::Expr) -> Option<String> {
-    if let syn::Expr::Lit(syn::ExprLit {
-        lit: syn::Lit::Str(s),
-        ..
-    }) = expr
-    {
-        Some(s.value())
-    } else {
-        None
-    }
+/// Return the value of `segment` if it is a single string-literal token.
+fn segment_str_lit(segment: &TokenStream) -> Option<String> {
+    syn::parse2::<syn::LitStr>(segment.clone())
+        .ok()
+        .map(|s| s.value())
 }
 
-/// Classify a key expression: a string literal is a referenced key; anything
-/// else is a dynamic (unanalyzable) call site.
-fn record_key(expr: &syn::Expr, file: &str, result: &mut ScanResult) {
-    if let Some(key) = as_str_lit(expr) {
+/// Classify a key segment: a lone string literal is a referenced key; anything
+/// else (a metavariable, a `format!(...)`, a borrow, …) is a dynamic
+/// (unanalyzable) call site.
+fn record_key_segment(segment: &TokenStream, file: &str, result: &mut ScanResult) {
+    if let Some(key) = segment_str_lit(segment) {
         result.referenced.insert(key);
     } else {
-        record_dynamic(expr, file, result);
+        record_dynamic_segment(segment, file, result);
     }
 }
 
-fn record_dynamic(expr: &syn::Expr, file: &str, result: &mut ScanResult) {
+fn record_dynamic_segment(segment: &TokenStream, file: &str, result: &mut ScanResult) {
+    let line = segment
+        .clone()
+        .into_iter()
+        .next()
+        .map_or(0, |tt| tt.span().start().line);
     result.dynamic.push(DynamicSite {
         file: file.to_owned(),
-        line: expr.span().start().line,
-        snippet: expr.to_token_stream().to_string(),
+        line,
+        snippet: segment.to_string(),
     });
 }
 
@@ -517,7 +533,7 @@ fn load_i18n_config(root: &Path, env: &dyn Env) -> (I18nConfig, Option<String>) 
 /// would hit via `.i18n_auto()` → [`Bundle::load_from_dir`] →
 /// `MissingDefaultLocale` at startup). In the latter case the check must *not*
 /// skip: it lets the bundle loader surface the same startup error.
-fn i18n_is_configured(root: &Path, profile: Option<&str>) -> bool {
+fn i18n_is_configured(root: &Path, profile: Option<&str>, selected_input: &str) -> bool {
     // Base `autumn.toml`: a top-level `[i18n]` table, or a
     // `[profile.<env>.i18n]` inline overlay for the active profile.
     if let Some(base) = read_config_table(&root.join("autumn.toml")) {
@@ -539,13 +555,17 @@ fn i18n_is_configured(root: &Path, profile: Option<&str>) -> bool {
         }
     }
 
-    // `autumn-<env>.toml` overlay: a top-level `[i18n]` table.
+    // `autumn-<env>.toml` overlay. The runtime loads only the FIRST existing
+    // override file in `profile_override_file_lookup_names` order and `break`s
+    // (see `AutumnConfig::load_with_env` in `autumn/src/config.rs`), so only
+    // that file's `[i18n]` table participates. Consulting later aliases here
+    // would let an *unloaded* file's `[i18n]` falsely report i18n as configured
+    // (e.g. `autumn-production.toml` when `autumn-prod.toml` already won).
     if let Some(profile) = profile {
-        for name in profile_lookup_names(profile) {
-            if read_config_table(&root.join(format!("autumn-{name}.toml")))
-                .is_some_and(|t| t.contains_key("i18n"))
-            {
-                return true;
+        for name in profile_override_file_lookup_names(profile, selected_input) {
+            let path = root.join(format!("autumn-{name}.toml"));
+            if path.exists() {
+                return read_config_table(&path).is_some_and(|t| t.contains_key("i18n"));
             }
         }
     }
@@ -569,6 +589,44 @@ fn profile_lookup_names(profile: &str) -> Vec<&str> {
         "dev" => vec!["development", "dev"],
         other => vec![other],
     }
+}
+
+/// Ordered `autumn-<name>.toml` override-file lookup names, mirroring the
+/// runtime `profile_override_file_lookup_names` in `autumn/src/config.rs`
+/// exactly. The runtime loads only the FIRST existing file in this order (then
+/// `break`s), and the order prefers the explicitly-selected spelling — so under
+/// `AUTUMN_ENV=prod` an `autumn-prod.toml` wins over `autumn-production.toml`,
+/// but `AUTUMN_ENV=production` reverses that preference. `selected_input` is the
+/// raw profile spelling from the environment (see [`selected_profile_input`]).
+fn profile_override_file_lookup_names(profile: &str, selected_input: &str) -> Vec<String> {
+    match profile {
+        "prod" if selected_input.eq_ignore_ascii_case("production") => {
+            vec!["production".to_owned(), "prod".to_owned()]
+        }
+        "prod" => vec!["prod".to_owned(), "production".to_owned()],
+        "dev" if selected_input.eq_ignore_ascii_case("development") => {
+            vec!["development".to_owned(), "dev".to_owned()]
+        }
+        "dev" => vec!["dev".to_owned(), "development".to_owned()],
+        other => vec![other.to_owned()],
+    }
+}
+
+/// The raw profile spelling the runtime would resolve from the environment,
+/// mirroring the `AUTUMN_ENV` → `AUTUMN_PROFILE` precedence of the runtime's
+/// `resolve_profile_input`. Only these env-var sources are relevant to profile
+/// override-file precedence, which is the sole use of this value: picking the
+/// winning `autumn-<env>.toml` alias when both spellings exist on disk.
+fn selected_profile_input(env: &dyn Env) -> String {
+    for key in ["AUTUMN_ENV", "AUTUMN_PROFILE"] {
+        if let Ok(val) = env.var(key) {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_owned();
+            }
+        }
+    }
+    String::new()
 }
 
 /// Read only the base `[i18n]` section from `autumn.toml` in `root`, falling
@@ -606,7 +664,8 @@ pub fn run_in(root: &Path, env: &dyn Env, opts: I18nCheckOptions) -> i32 {
     // through to `Bundle::load_from_dir` so the missing directory surfaces the
     // same `MissingDefaultLocale` error the app would fail with at startup —
     // rather than a false CI pass.
-    if !dir.exists() && !i18n_is_configured(root, profile.as_deref()) {
+    if !dir.exists() && !i18n_is_configured(root, profile.as_deref(), &selected_profile_input(env))
+    {
         if opts.format == OutputFormat::Json {
             println!(
                 "{{\"status\":\"skipped\",\"reason\":\"no i18n directory\",\"dir\":{}}}",
@@ -773,6 +832,52 @@ mod tests {
         assert_eq!(result.dynamic.len(), 1);
         assert_eq!(result.dynamic[0].file, "view.rs");
         assert!(result.dynamic[0].snippet.contains("format"));
+    }
+
+    #[test]
+    fn macro_metavariables_do_not_discard_literal_key() {
+        // A translation call written inside a `macro_rules!` transcriber carries
+        // `$metavariable` tokens in non-key argument positions. Parsing the whole
+        // argument list as `syn::Expr` would reject the `$...` tokens and drop the
+        // call — but the key slot is still a plain string literal and must be
+        // recorded as referenced.
+        let src = r#"
+            macro_rules! nav {
+                ($locale:expr, $n:expr) => {{
+                    let _ = t!($locale, "nav.home");
+                    let _ = $locale.t_with("nav.count", &[("n", $n)]);
+                }};
+            }
+        "#;
+        let mut result = ScanResult::default();
+        scan_source(src, "macros.rs", &mut result);
+        assert_eq!(result.referenced, keys(&["nav.count", "nav.home"]));
+        assert!(
+            result.dynamic.is_empty(),
+            "metavariables in non-key positions must not create dynamic sites: {:?}",
+            result.dynamic
+        );
+    }
+
+    #[test]
+    fn metavariable_in_key_slot_is_dynamic_not_referenced() {
+        // When the key slot ITSELF is a metavariable (genuinely non-literal), it
+        // is correctly classified as dynamic — not recorded as a referenced key.
+        let src = r"
+            macro_rules! tr {
+                ($locale:expr, $key:expr) => {
+                    let _ = t!($locale, $key);
+                };
+            }
+        ";
+        let mut result = ScanResult::default();
+        scan_source(src, "tr.rs", &mut result);
+        assert!(
+            result.referenced.is_empty(),
+            "a metavariable key must not be a referenced key: {:?}",
+            result.referenced
+        );
+        assert_eq!(result.dynamic.len(), 1);
     }
 
     #[test]
