@@ -462,3 +462,5 @@ perfectly good desktop app layout). Two practical notes:
 `autumn generate tauri-mobile` (this page), and `autumn generate pwa` are
 independent and composable: one server-rendered codebase can ship as a
 desktop installer, a mobile app, and an installable PWA.
+
+For offline-capable mobile apps — local SQLite storage plus background sync to the remote Postgres — see [tauri-mobile-offline-sync.md](tauri-mobile-offline-sync.md) (`autumn generate tauri-mobile --offline-sync`).

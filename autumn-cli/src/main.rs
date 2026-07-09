@@ -1840,9 +1840,20 @@ enum GenerateCommands {
     /// Example:
     ///
     ///   autumn generate tauri-mobile
+    ///   autumn generate tauri-mobile --offline-sync
     ///   autumn generate tauri-mobile --dry-run
     #[command(verbatim_doc_comment)]
     TauriMobile {
+        /// Wire offline-first local storage + background sync (issue #1508):
+        /// app data lives in a `SyncStore`-backed `SQLite` file inside the app
+        /// sandbox and a background `SyncEngine` syncs it with the remote
+        /// deployment's `/sync` endpoints whenever the network allows. Adds
+        /// the `offline-sync` feature (on `autumn-web`) to the app crate and
+        /// mounts the server-side sync router in the extracted `serve()`.
+        /// See docs/guide/tauri-mobile-offline-sync.md. Pass the same flag to
+        /// `autumn destroy tauri-mobile` so the recomputed plan matches.
+        #[arg(long)]
+        offline_sync: bool,
         /// Print the file plan and exit without writing anything.
         #[arg(long)]
         dry_run: bool,
@@ -2951,8 +2962,13 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
                 }
             }
         }
-        GenerateCommands::TauriMobile { dry_run, force } => {
+        GenerateCommands::TauriMobile {
+            offline_sync,
+            dry_run,
+            force,
+        } => {
             let flags = generate::Flags { dry_run, force };
+            let opts = generate::tauri_mobile::TauriMobileOptions { offline_sync };
             let project_root = resolve_cwd();
             // Mixed-mode guard (mirrors the `tauri` arm above): generating
             // the mobile in-process shell over a desktop-sidecar or
@@ -2967,7 +2983,7 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
                 Ok(())
             };
             let plan =
-                guard.and_then(|()| generate::tauri_mobile::plan_tauri_mobile(&project_root));
+                guard.and_then(|()| generate::tauri_mobile::plan_tauri_mobile(&project_root, opts));
             let result = plan.and_then(|p| match mode {
                 ApplyMode::Generate => p.execute(flags),
                 ApplyMode::Destroy => p.revert(flags),
@@ -2977,7 +2993,7 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
                     if mode == ApplyMode::Generate && !dry_run {
                         println!(
                             "\n{}",
-                            generate::tauri_mobile::render_mobile_prerequisites()
+                            generate::tauri_mobile::render_mobile_prerequisites(opts)
                         );
                     }
                 }
@@ -6167,6 +6183,7 @@ mod tests {
         assert!(matches!(
             cli.command,
             Commands::Generate(GenerateCommands::TauriMobile {
+                offline_sync: false,
                 dry_run: false,
                 force: false
             })
@@ -6176,10 +6193,15 @@ mod tests {
     #[test]
     fn parse_generate_tauri_mobile_dry_run() {
         let cli = Cli::try_parse_from(["autumn", "generate", "tauri-mobile", "--dry-run"]).unwrap();
-        let Commands::Generate(GenerateCommands::TauriMobile { dry_run, force }) = cli.command
+        let Commands::Generate(GenerateCommands::TauriMobile {
+            offline_sync,
+            dry_run,
+            force,
+        }) = cli.command
         else {
             panic!("expected TauriMobile variant");
         };
+        assert!(!offline_sync);
         assert!(dry_run);
         assert!(!force);
     }
@@ -6187,11 +6209,57 @@ mod tests {
     #[test]
     fn parse_generate_tauri_mobile_force() {
         let cli = Cli::try_parse_from(["autumn", "generate", "tauri-mobile", "--force"]).unwrap();
-        let Commands::Generate(GenerateCommands::TauriMobile { dry_run, force }) = cli.command
+        let Commands::Generate(GenerateCommands::TauriMobile {
+            offline_sync,
+            dry_run,
+            force,
+        }) = cli.command
         else {
             panic!("expected TauriMobile variant");
         };
+        assert!(!offline_sync);
         assert!(!dry_run);
+        assert!(force);
+    }
+
+    #[test]
+    fn parse_generate_tauri_mobile_offline_sync() {
+        let cli =
+            Cli::try_parse_from(["autumn", "generate", "tauri-mobile", "--offline-sync"]).unwrap();
+        let Commands::Generate(GenerateCommands::TauriMobile {
+            offline_sync,
+            dry_run,
+            force,
+        }) = cli.command
+        else {
+            panic!("expected TauriMobile variant");
+        };
+        assert!(offline_sync);
+        assert!(!dry_run);
+        assert!(!force);
+    }
+
+    #[test]
+    fn parse_generate_tauri_mobile_offline_sync_composes_with_flags() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "generate",
+            "tauri-mobile",
+            "--offline-sync",
+            "--dry-run",
+            "--force",
+        ])
+        .unwrap();
+        let Commands::Generate(GenerateCommands::TauriMobile {
+            offline_sync,
+            dry_run,
+            force,
+        }) = cli.command
+        else {
+            panic!("expected TauriMobile variant");
+        };
+        assert!(offline_sync);
+        assert!(dry_run);
         assert!(force);
     }
 
