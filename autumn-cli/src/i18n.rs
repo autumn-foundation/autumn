@@ -416,6 +416,13 @@ fn dynamic_key_prefix(segment: &TokenStream) -> String {
 /// a later position (a `format!`'s own arg list, a method-call's args, the right
 /// operand of a `+`) is left intact, so a `format!` buried after real tokens is
 /// never misattributed as the key's prefix.
+///
+/// "Wraps the whole expression" is exact: after peeling leading `&`/`*`, the
+/// remaining trees must be *exactly one* group (and nothing after it) for the
+/// descent to happen. A leading group followed by further tokens — a method
+/// call `(…).trim()`, an operator `(…) + x`, an index `(…)[i]` — is NOT
+/// unwrapped, so the trailing tokens are never dropped and the expression stays
+/// dynamic instead of being misread as the group's inner literal.
 fn normalize_key_segment(trees: &[TokenTree]) -> Vec<TokenTree> {
     let Some(start) = trees
         .iter()
@@ -424,7 +431,18 @@ fn normalize_key_segment(trees: &[TokenTree]) -> Vec<TokenTree> {
         return Vec::new();
     };
     let rest = &trees[start..];
-    if let TokenTree::Group(g) = &rest[0]
+    // Only unwrap a leading group when it spans the WHOLE remaining segment —
+    // i.e. after peeling leading `&`/`*` the remaining trees are exactly a
+    // single group and nothing else. A group followed by further tokens (a
+    // method call `.trim()`, an operator `+ x`, an index `[..]`, …) is part of a
+    // larger derived expression; descending into it would silently drop those
+    // trailing tokens and misread e.g. `(" nav.home ").trim()` as the literal
+    // key `" nav.home "` (which the runtime actually looks up post-`trim` as
+    // `nav.home`). Leaving such a segment intact keeps it correctly classified
+    // as a dynamic site and prevents a bogus literal prefix being lifted out of
+    // the wrapped group.
+    if rest.len() == 1
+        && let TokenTree::Group(g) = &rest[0]
         && matches!(g.delimiter(), Delimiter::Parenthesis | Delimiter::None)
     {
         let inner: Vec<TokenTree> = g.stream().into_iter().collect();
@@ -1126,6 +1144,78 @@ mod tests {
             result.dynamic
         );
         assert!(result.dynamic[0].snippet.contains("format"));
+    }
+
+    #[test]
+    fn group_followed_by_trailing_tokens_is_dynamic_not_referenced() {
+        // A leading parenthesized literal that continues AFTER the group —
+        // `t((" nav.home ").trim())` — is a DERIVED expression, not a literal
+        // key. The runtime looks up the post-`trim` value (`nav.home`), so the
+        // check must NOT record the raw wrapped literal `" nav.home "` (spaces
+        // included) — nor the trimmed `nav.home` — as a referenced key. Only a
+        // group that spans the WHOLE segment unwraps; this one is followed by
+        // `.trim()`, so the site is treated as dynamic. An unrelated real key on
+        // the same file is still recorded normally.
+        let src = r#"
+            fn view(locale: &Locale) {
+                let _ = locale.t((" nav.home ").trim());
+                let _ = locale.t("nav.about");
+            }
+        "#;
+        let mut result = ScanResult::default();
+        scan_source(src, "view.rs", &mut result);
+        assert!(
+            !result.referenced.contains(" nav.home "),
+            "the raw wrapped literal must not be a referenced key: {:?}",
+            result.referenced
+        );
+        assert!(
+            !result.referenced.contains("nav.home"),
+            "the trimmed literal must not be a referenced key either: {:?}",
+            result.referenced
+        );
+        assert_eq!(
+            result.referenced,
+            keys(&["nav.about"]),
+            "only the genuine literal key is referenced: {:?}",
+            result.referenced
+        );
+        assert_eq!(
+            result.dynamic.len(),
+            1,
+            "the `(...).trim()` site is dynamic: {:?}",
+            result.dynamic
+        );
+        assert!(result.dynamic[0].snippet.contains("trim"));
+        assert_eq!(
+            result.dynamic[0].key_prefix, "",
+            "no bogus literal prefix is lifted from inside the wrapped group: {:?}",
+            result.dynamic[0]
+        );
+    }
+
+    #[test]
+    fn format_group_followed_by_trailing_tokens_has_no_prefix() {
+        // A leading `format!` group followed by further tokens —
+        // `t((format!("status.{state}")).to_uppercase())` — is also a derived
+        // expression: the group does not span the whole segment (it is followed
+        // by `.to_uppercase()`), so it is NOT unwrapped. No prefix is recovered;
+        // the site is fully dynamic (empty prefix). This documents the
+        // whole-segment rule for the `format!` prefix path.
+        let src = r#"
+            fn view(locale: &Locale, state: &str) {
+                let _ = locale.t((format!("status.{state}")).to_uppercase());
+            }
+        "#;
+        let mut result = ScanResult::default();
+        scan_source(src, "view.rs", &mut result);
+        assert_eq!(result.dynamic.len(), 1);
+        assert_eq!(
+            result.dynamic[0].key_prefix, "",
+            "a format! group with trailing tokens must not yield a prefix: {:?}",
+            result.dynamic[0]
+        );
+        assert!(result.referenced.is_empty());
     }
 
     #[test]

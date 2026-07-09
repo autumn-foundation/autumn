@@ -306,6 +306,56 @@ fn view(locale: &Locale) -> String {
 }
 
 #[test]
+fn wrapped_literal_with_trailing_tokens_is_dynamic_not_a_false_missing() {
+    // A parenthesized literal that CONTINUES after the group —
+    // `locale.t((" nav.home ").trim())` — is a derived expression, not a literal
+    // key. The runtime looks up the post-`trim` value (`nav.home`). The scanner
+    // must NOT record the raw wrapped literal `" nav.home "` (spaces included) as
+    // a referenced key: doing so would flag a false Missing (`" nav.home "` is
+    // absent from the `.ftl`) paired with a false Unused (`nav.home` looks
+    // unreferenced) even though the translations are correct. Instead the site is
+    // treated as dynamic and the check passes.
+    let dir = clean_project();
+    write(
+        dir.path(),
+        "src/main.rs",
+        r#"
+fn view(locale: &Locale) -> String {
+    locale.t((" nav.home ").trim()).into()
+}
+"#,
+    );
+    // `nav.home` IS defined in every locale — the correct key the runtime uses.
+    write(dir.path(), "i18n/en.ftl", "nav.home = Home\n");
+    write(dir.path(), "i18n/es.ftl", "nav.home = Inicio\n");
+
+    // Even under --strict the check must pass: no false Missing, and the
+    // fully-dynamic site suppresses Unused reporting.
+    let output = run_check(dir.path(), &["--strict"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "a `(...).trim()` site must be dynamic, not a false Missing/Unused pair\nstdout:\n{stdout}"
+    );
+    // No Missing key was recorded (the `✗` marker never appears): the raw
+    // wrapped literal `" nav.home "` was NOT lifted into the referenced set. Its
+    // only appearance in the output is the dynamic call-site snippet.
+    assert!(
+        !stdout.contains('✗'),
+        "no Missing key must be reported for the `(...).trim()` site\n{stdout}"
+    );
+    assert!(
+        stdout.contains("0 referenced key(s)"),
+        "the `(...).trim()` site must not contribute a referenced key\n{stdout}"
+    );
+    assert!(
+        stdout.contains("dynamic (not checked): 1"),
+        "the `(...).trim()` site must be reported as dynamic\n{stdout}"
+    );
+    assert!(stdout.contains("PASS"), "stdout:\n{stdout}");
+}
+
+#[test]
 fn path_qualified_format_prefix_is_recovered_not_treated_as_fully_dynamic() {
     // A path-qualified format macro — `locale.t(&std::format!("status.{state}"))`
     // — must be recognized as `format!` and record prefix `status.`, NOT leave
