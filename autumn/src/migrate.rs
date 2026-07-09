@@ -1291,11 +1291,44 @@ pub fn checksum_status(
     migrations_dir: &Path,
 ) -> Result<Vec<(String, ChecksumState)>, MigrationError> {
     let up_by_version = read_up_sql_by_version(migrations_dir)?;
+    let framework = framework_migration_versions()?;
     with_migration_connection!(database_url, |conn| {
         let recorded = recorded_checksums(conn)?;
         let applied = load_applied_versions_lenient(conn)?;
-        Ok(classify(&applied, &up_by_version, &recorded))
+        // Framework-owned versions never record a checksum against the user dir
+        // and their up.sql is not in `migrations_dir`, so classifying them would
+        // report `Unrecorded` and prompt `baseline` — which cannot record them.
+        // Exclude them exactly as rollback does before classifying the rest.
+        let user_applied = user_applied_versions(&applied, &up_by_version, &framework);
+        Ok(classify(&user_applied, &up_by_version, &recorded))
     })
+}
+
+/// Filter framework-owned versions out of the applied set before checksum
+/// classification, using the SAME definition rollback uses
+/// ([`framework_migration_versions`]): a version is excluded only when it is
+/// framework-owned **and** absent from the local dir. Local presence wins, so a
+/// user migration colliding with a framework shim version is still classified,
+/// and an applied user version absent from disk (a genuine `Missing`/
+/// `Unrecorded` problem) still surfaces — the filter keys on framework-set
+/// membership, never on "absent from the user dir".
+///
+/// This mirrors the rollback filter in [`classify_applied_user_migrations`]
+/// (`by_version.contains_key(v) || !framework.contains(v)`) so status and
+/// rollback share one definition of "framework-owned".
+fn user_applied_versions<S>(
+    applied: &[String],
+    up_sql_by_version: &HashMap<String, String, S>,
+    framework: &std::collections::BTreeSet<String>,
+) -> Vec<String>
+where
+    S: std::hash::BuildHasher,
+{
+    applied
+        .iter()
+        .filter(|v| up_sql_by_version.contains_key(*v) || !framework.contains(*v))
+        .cloned()
+        .collect()
 }
 
 /// Classify the database's applied migrations into user migrations (ascending
@@ -3559,5 +3592,88 @@ mod tests {
         );
         validate_checksums(&applied, &up_map, &recorded)
             .expect("an unrecorded absent migration must not hard-fail validation");
+    }
+
+    #[test]
+    fn checksum_status_excludes_framework_but_keeps_user_unrecorded() {
+        // Reproduces the status bug: an applied FRAMEWORK version (no local
+        // up.sql, no recorded checksum) must NOT be classified Unrecorded and
+        // prompt `baseline` (which cannot record it — its up.sql isn't in the
+        // user dir). A genuinely user-owned applied-but-unrecorded version must
+        // STILL classify Unrecorded. The status path filters framework versions
+        // via `user_applied_versions` BEFORE `classify`, so exercise that first.
+        let framework_version = "00000000000000".to_string();
+        let user_recorded_version = "20260101000000".to_string();
+        let user_unrecorded_version = "20260102000000".to_string();
+
+        let applied = vec![
+            framework_version.clone(),
+            user_recorded_version.clone(),
+            user_unrecorded_version.clone(),
+        ];
+
+        let ok_up = "SELECT 1;\n";
+        let pending_up = "SELECT 2;\n";
+        // The framework version has no on-disk up.sql; both user versions do.
+        let up_map = checksum_map(&[("20260101000000", ok_up), ("20260102000000", pending_up)]);
+        // Only the first user migration has a recorded checksum. The framework
+        // version is (correctly) never recorded against the user dir.
+        let recorded = checksum_map(&[("20260101000000", &migration_checksum(ok_up))]);
+        let framework = version_set(&["00000000000000"]);
+
+        let user_applied = user_applied_versions(&applied, &up_map, &framework);
+        // The framework version is filtered out entirely before classification.
+        assert!(
+            !user_applied.contains(&framework_version),
+            "applied framework version must be excluded from checksum status"
+        );
+
+        let states = classify(&user_applied, &up_map, &recorded);
+        // The framework version produces no status entry, so it can never
+        // recommend `baseline`.
+        assert!(
+            states.iter().all(|(v, _)| v != &framework_version),
+            "framework version must not appear in checksum status output"
+        );
+        // The recorded user migration is Ok.
+        assert_eq!(
+            states
+                .iter()
+                .find(|(v, _)| v == &user_recorded_version)
+                .map(|(_, s)| s),
+            Some(&ChecksumState::Ok),
+        );
+        // The user-owned applied-but-unrecorded migration STILL surfaces as
+        // Unrecorded — the filter must not over-reach.
+        assert_eq!(
+            states
+                .iter()
+                .find(|(v, _)| v == &user_unrecorded_version)
+                .map(|(_, s)| s),
+            Some(&ChecksumState::Unrecorded),
+            "a user-owned unrecorded migration must still classify Unrecorded"
+        );
+    }
+
+    #[test]
+    fn user_applied_versions_keeps_disk_missing_user_migration() {
+        // A user-owned applied version absent from disk AND not framework-owned
+        // must still be kept (it is a real problem to surface), while a
+        // framework version absent from disk is dropped. The filter keys on
+        // framework-set membership, never on "absent from the user dir".
+        let framework_version = "00000000000000".to_string();
+        let missing_user_version = "20260101000000".to_string();
+        let applied = vec![framework_version.clone(), missing_user_version.clone()];
+        // Neither version is present on disk.
+        let up_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let framework = version_set(&["00000000000000"]);
+
+        let user_applied = user_applied_versions(&applied, &up_map, &framework);
+
+        assert_eq!(user_applied, vec![missing_user_version]);
+        assert!(
+            !user_applied.contains(&framework_version),
+            "framework version absent from disk must be dropped"
+        );
     }
 }

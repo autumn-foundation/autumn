@@ -42,7 +42,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   normalises line endings (`\r\n`/`\r` → `\n`) and trims trailing
   whitespace so a Windows checkout and a Linux one produce identical
   checksums. `autumn migrate status` reports each applied migration's
-  state (`ok`/`changed`/`unrecorded`); `autumn migrate baseline` records
+  state (`ok`/`changed`/`unrecorded`), excluding framework-owned migrations
+  (the same set rollback excludes) so operators are never prompted to
+  `baseline` framework versions whose `up.sql` does not live in the user dir;
+  `autumn migrate baseline` records
   hashes for legacy applied migrations that pre-date the checksum table
   (idempotent, additive); `autumn migrate baseline --force <version>`
   overwrites one version's stored hash — the deliberate escape hatch,
