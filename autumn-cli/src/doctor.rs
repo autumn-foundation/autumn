@@ -2815,7 +2815,14 @@ fn resolve_dotenv_state() -> (bool, bool, bool) {
 fn gitignore_covers_dotenv(contents: &str) -> bool {
     contents.lines().any(|line| {
         let entry = line.trim();
+        if entry.starts_with('#') || entry.is_empty() {
+            return false;
+        }
         matches!(entry, ".env" | ".env*" | ".env.*" | "/.env" | "*.env")
+            || entry.ends_with("/.env")
+            || entry.ends_with("/.env*")
+            || entry.ends_with("/.env.*")
+            || entry.ends_with("/*.env")
     })
 }
 
@@ -5034,6 +5041,14 @@ redirect_uri = "http://localhost/callback"
         assert!(gitignore_covers_dotenv("  .env.*  \n"));
         assert!(!gitignore_covers_dotenv("/target\n.env.example\n"));
         assert!(!gitignore_covers_dotenv(""));
+        // Recursive-glob style entries must also count as coverage.
+        assert!(gitignore_covers_dotenv("**/.env\n"));
+        assert!(gitignore_covers_dotenv("**/.env*\n"));
+        assert!(gitignore_covers_dotenv("**/.env.*\n"));
+        // A bare `.env.example` line still does not cover `.env`.
+        assert!(!gitignore_covers_dotenv(".env.example\n"));
+        // Comment and blank lines are ignored.
+        assert!(!gitignore_covers_dotenv("# .env\n\n"));
     }
 
     #[test]

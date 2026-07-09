@@ -79,9 +79,10 @@ fn should_load(profile: &str, env: &dyn Env) -> bool {
 /// Parse the contents of a single `.env` file into ordered key/value pairs.
 ///
 /// Blank lines and `#` comments are skipped. A leading `export ` prefix is
-/// stripped. Keys must match `[A-Za-z_][A-Za-z0-9_]*`. Values are taken
-/// verbatim after the first `=`, trimmed, with matching surrounding single or
-/// double quotes stripped. There is no `${VAR}` interpolation.
+/// stripped. Keys must match `[A-Za-z_][A-Za-z0-9_]*`. Values are taken after
+/// the first `=`, trimmed, with matching surrounding single or double quotes
+/// stripped and any inline comment ignored (see [`parse_value`]). There is no
+/// `${VAR}` interpolation.
 ///
 /// # Errors
 /// Returns a [`DotenvError`] (with the correct 1-based line number) for a line
@@ -118,7 +119,7 @@ fn parse_dotenv(path: &Path, contents: &str) -> Result<Vec<(String, String)>, Do
         }
 
         let value_raw = body[eq + 1..].trim();
-        let value = strip_quotes(value_raw);
+        let value = parse_value(value_raw);
         out.push((key.to_owned(), value));
     }
     Ok(out)
@@ -135,18 +136,43 @@ fn is_valid_key(key: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// Strip a single matching pair of surrounding single or double quotes, if
-/// present. The content is otherwise returned verbatim (no interpolation).
-fn strip_quotes(value: &str) -> String {
-    let bytes = value.as_bytes();
-    if bytes.len() >= 2 {
-        let first = bytes[0];
-        let last = bytes[bytes.len() - 1];
-        if (first == b'"' || first == b'\'') && first == last {
-            return value[1..value.len() - 1].to_owned();
+/// Parse a value, stripping surrounding quotes if present and ignoring inline
+/// comments. The caller passes an already-trimmed value.
+///
+/// If the value starts with `"` or `'`, the inner content up to the matching
+/// closing quote is returned (respecting `\`-escapes while scanning) and
+/// anything after the closing quote — such as a trailing inline comment — is
+/// ignored; a `#` inside the quotes is preserved literally. Otherwise the value
+/// is unquoted: the first `#` that is at the start or preceded by ASCII
+/// whitespace begins an inline comment and the part before it (trimmed) is
+/// returned, while a `#` not preceded by whitespace (e.g. inside
+/// `postgres://u:p#ss@h`) is preserved. There is no `${VAR}` interpolation.
+fn parse_value(raw: &str) -> String {
+    if raw.is_empty() {
+        return String::new();
+    }
+    let bytes = raw.as_bytes();
+    let quote = bytes[0];
+    if quote == b'"' || quote == b'\'' {
+        let mut escaped = false;
+        let mut end_idx = None;
+        for (i, &b) in bytes.iter().enumerate().skip(1) {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == quote {
+                end_idx = Some(i);
+                break;
+            }
+        }
+        if let Some(end) = end_idx {
+            return raw[1..end].to_owned();
         }
     }
-    value.to_owned()
+    let comment_start = (0..bytes.len())
+        .find(|&i| bytes[i] == b'#' && (i == 0 || bytes[i - 1].is_ascii_whitespace()));
+    comment_start.map_or_else(|| raw.to_owned(), |idx| raw[..idx].trim().to_owned())
 }
 
 /// Resolve the merged `.env` variable set for a directory and profile.
@@ -319,6 +345,45 @@ mod tests {
     fn no_interpolation_of_dollar_vars() {
         let out = parse_dotenv(&p(), "A=${FOO}/literal\n").unwrap();
         assert_eq!(out[0], ("A".to_owned(), "${FOO}/literal".to_owned()));
+    }
+
+    #[test]
+    fn strips_unquoted_inline_comment() {
+        let out = parse_dotenv(&p(), "KEY=val # c\n").unwrap();
+        assert_eq!(out[0], ("KEY".to_owned(), "val".to_owned()));
+    }
+
+    #[test]
+    fn strips_trailing_comment_after_quoted_value() {
+        let out = parse_dotenv(&p(), "KEY=\"a b\" # c\n").unwrap();
+        assert_eq!(out[0], ("KEY".to_owned(), "a b".to_owned()));
+    }
+
+    #[test]
+    fn hash_inside_quotes_is_preserved() {
+        let out = parse_dotenv(&p(), "KEY=\"a#b\"\n").unwrap();
+        assert_eq!(out[0], ("KEY".to_owned(), "a#b".to_owned()));
+    }
+
+    #[test]
+    fn hash_not_preceded_by_whitespace_is_not_a_comment() {
+        let out = parse_dotenv(&p(), "KEY=a#b\n").unwrap();
+        assert_eq!(out[0], ("KEY".to_owned(), "a#b".to_owned()));
+    }
+
+    #[test]
+    fn hash_in_unquoted_connection_string_is_preserved() {
+        let out = parse_dotenv(&p(), "KEY=postgres://u:p#w@h/db\n").unwrap();
+        assert_eq!(
+            out[0],
+            ("KEY".to_owned(), "postgres://u:p#w@h/db".to_owned())
+        );
+    }
+
+    #[test]
+    fn empty_value_is_empty_string() {
+        let out = parse_dotenv(&p(), "KEY=\n").unwrap();
+        assert_eq!(out[0], ("KEY".to_owned(), String::new()));
     }
 
     #[test]
