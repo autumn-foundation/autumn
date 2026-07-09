@@ -571,27 +571,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **cli:** the generators' `main.rs` editing no longer matches inside
-  comments (supersedes #1516): route-registration edits skip `routes![`
-  occurrences on `//`/`///`/`//!` comment lines (a `//` inside a string
-  literal on the line — e.g. a `https://` URL — is code, not a comment
-  marker) instead of injecting route entries into the comment text, and
-  the PWA generator inserts its handlers
-  before the line that is exactly `#[autumn_web::main]` rather than before
-  any comment that merely mentions the macro — both used to produce
-  uncompilable `main.rs` output when such comments were present.
-### Security
-
-- **auth:** OIDC `id_token` verification no longer trusts the token header's
-  `alg` to select the verification algorithm (JWT algorithm-confusion
-  defense). The accepted algorithm set is now pinned from the matched JWKS
-  key — its declared `alg` when present, otherwise the asymmetric signature
-  algorithms compatible with its key type (`kty`) — and tokens whose header
-  algorithm is not in that set are rejected before signature verification.
-  In particular, symmetric (HS256/HS384/HS512) headers are rejected when
-  verifying against asymmetric JWKS keys, closing the forgery vector where an
-  attacker HMAC-signs a token using the provider's public key material, and
-  `alg: none` tokens remain rejected at header parsing.
+- **jobs:** fixed a first-initialization race in the process-global job
+  client (supersedes #1491): `init_global_job_client` /
+  `clear_global_job_client` used a get-then-set pattern on the backing
+  `OnceLock`, so two threads racing the very first install/clear could have
+  one side's `OnceLock::set` lose and be silently dropped — leaving a job
+  runtime that had just installed its client invisible to `global_job_client()`
+  (free-function `enqueue` and `#[job]` handlers would see no runtime). Both
+  functions now use `OnceLock::get_or_init` so the slot is created exactly
+  once and every install/clear lands through the `RwLock`. Both functions now
+  also recover from a poisoned lock (`PoisonError::into_inner`) instead of
+  silently skipping the write, and a loom model-check
+  (`chaos_job_client_loom`) exercises the first-init race across all
+  interleavings.
 
 ## [0.6.0] - 2026-06-30
 
