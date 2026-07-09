@@ -40,7 +40,7 @@ use std::str::FromStr as _;
 
 use autumn_web::config::{AutumnConfig, Env, OsEnv};
 use autumn_web::i18n::{Bundle, I18nConfig};
-use proc_macro2::{Delimiter, TokenStream, TokenTree};
+use proc_macro2::{Delimiter, Group, TokenStream, TokenTree};
 use serde::Serialize;
 
 /// Output format for `autumn i18n check`.
@@ -363,6 +363,7 @@ fn record_dynamic_segment(segment: &TokenStream, file: &str, result: &mut ScanRe
 ///
 /// - `format!("status.{state}")` → `"status."`
 /// - `&format!("nav.{}", x)`     → `"nav."`
+/// - `&(format!("status.{s}"))`  → `"status."`
 /// - `"status.".to_owned() + s`  → `"status."`
 /// - a bare variable / `&key` / `format!("{x}")` (no leading literal) → `""`
 ///
@@ -370,48 +371,82 @@ fn record_dynamic_segment(segment: &TokenStream, file: &str, result: &mut ScanRe
 /// treat the entire `Unused` set as untrustworthy.
 fn dynamic_key_prefix(segment: &TokenStream) -> String {
     let trees: Vec<TokenTree> = segment.clone().into_iter().collect();
+    // Peel leading borrows/derefs and unwrap any group that merely *wraps* the
+    // whole key expression — e.g. `&(format!("status.{s}"))`, `&(&format!(...))`,
+    // `((format!(...)))` — so the leading `format!`/literal is exposed. Without
+    // this, a wrapped `format!` is invisible to the detection below and the site
+    // is misread as fully dynamic (empty prefix), which suppresses every Unused
+    // warning project-wide.
+    let normalized = normalize_key_segment(&trees);
 
-    // Case 1: a `format!(...)` invocation anywhere in the expression (e.g. the
-    // `format!` in `&format!("nav.{}", x)`). Its first argument's format string
-    // supplies the static prefix — the text before the first `{` interpolation.
-    for i in 0..trees.len() {
-        if let TokenTree::Ident(id) = &trees[i]
-            && *id == "format"
-            && matches!(trees.get(i + 1), Some(TokenTree::Punct(p)) if p.as_char() == '!')
-            && let Some(TokenTree::Group(group)) = trees.get(i + 2)
-        {
-            return split_top_level_args(&group.stream())
-                .first()
-                .and_then(segment_str_lit)
-                .map_or_else(String::new, |fmt| format_static_prefix(&fmt));
-        }
+    // Case 1: a leading `format!(...)` invocation (e.g. the `format!` in
+    // `&format!("nav.{}", x)`, now exposed at the front by normalization). Its
+    // first argument's format string supplies the static prefix — the text
+    // before the first `{` interpolation.
+    if let Some(group) = leading_format_group(&normalized) {
+        return split_top_level_args(&group.stream())
+            .first()
+            .and_then(segment_str_lit)
+            .map_or_else(String::new, |fmt| format_static_prefix(&fmt));
     }
 
-    // Case 2: a leading string literal (e.g. `"status." + s`, or the borrowed /
-    // parenthesized `&("footer.".to_owned() + s)`). A plain literal has no
-    // interpolation, so its whole value is static leading text. Only the
+    // Case 2: a leading string literal (e.g. `"status." + s`). A plain literal
+    // has no interpolation, so its whole value is static leading text. Only the
     // *leading* literal counts; one in a later position must not masquerade as
     // the key's prefix.
-    leading_str_literal(&trees).unwrap_or_default()
+    leading_str_literal(&normalized)
 }
 
-/// The value of the leading string literal of an expression, stepping over
-/// leading borrow/deref puncts (`&`/`*`) and descending into a single leading
-/// parenthesized/implicit group. `None` when the expression does not begin with
-/// a string literal (a bare variable, a metavariable, a method-call receiver…).
-fn leading_str_literal(trees: &[TokenTree]) -> Option<String> {
-    let first = trees
+/// Peel leading borrow/deref puncts (`&`, `*`) and unwrap a single leading
+/// parenthesized or implicit (`Delimiter::None`) group that wraps the whole key
+/// expression, returning the exposed top-level token list. Recurses so nested
+/// wrappers such as `&(&format!(...))` and `((format!(...)))` fully unwrap.
+///
+/// Only *leading* wrappers around the entire expression are peeled — a group in
+/// a later position (a `format!`'s own arg list, a method-call's args, the right
+/// operand of a `+`) is left intact, so a `format!` buried after real tokens is
+/// never misattributed as the key's prefix.
+fn normalize_key_segment(trees: &[TokenTree]) -> Vec<TokenTree> {
+    let Some(start) = trees
         .iter()
-        .find(|tt| !matches!(tt, TokenTree::Punct(p) if matches!(p.as_char(), '&' | '*')))?;
-    match first {
-        TokenTree::Literal(_) => segment_str_lit(&TokenStream::from(first.clone())),
-        TokenTree::Group(g)
-            if matches!(g.delimiter(), Delimiter::Parenthesis | Delimiter::None) =>
-        {
-            let inner: Vec<TokenTree> = g.stream().into_iter().collect();
-            leading_str_literal(&inner)
+        .position(|tt| !matches!(tt, TokenTree::Punct(p) if matches!(p.as_char(), '&' | '*')))
+    else {
+        return Vec::new();
+    };
+    let rest = &trees[start..];
+    if let TokenTree::Group(g) = &rest[0]
+        && matches!(g.delimiter(), Delimiter::Parenthesis | Delimiter::None)
+    {
+        let inner: Vec<TokenTree> = g.stream().into_iter().collect();
+        return normalize_key_segment(&inner);
+    }
+    rest.to_vec()
+}
+
+/// If `trees` begins with a `format!(...)` / `format!{...}` / `format![...]`
+/// invocation, return its argument group. Expects a [`normalize_key_segment`]-
+/// normalized stream, so the `format` ident is the leading meaningful token.
+fn leading_format_group(trees: &[TokenTree]) -> Option<&Group> {
+    if let Some(TokenTree::Ident(id)) = trees.first()
+        && *id == "format"
+        && matches!(trees.get(1), Some(TokenTree::Punct(p)) if p.as_char() == '!')
+        && let Some(TokenTree::Group(group)) = trees.get(2)
+    {
+        return Some(group);
+    }
+    None
+}
+
+/// The value of the leading string literal of a
+/// [`normalize_key_segment`]-normalized expression. `None` when the expression
+/// does not begin with a string literal (a bare variable, a metavariable, a
+/// `format!`, a method-call receiver…), yielding an empty prefix.
+fn leading_str_literal(trees: &[TokenTree]) -> String {
+    match trees.first() {
+        Some(tt @ TokenTree::Literal(_)) => {
+            segment_str_lit(&TokenStream::from(tt.clone())).unwrap_or_default()
         }
-        _ => None,
+        _ => String::new(),
     }
 }
 
@@ -1090,6 +1125,67 @@ mod tests {
             .map(|d| d.key_prefix.as_str())
             .collect();
         assert_eq!(prefixes, vec!["status.", "nav.", "", "footer.", ""]);
+    }
+
+    #[test]
+    fn dynamic_prefix_descends_through_wrapping_groups() {
+        // A `format!` wrapped in an extra group behind borrows — `&(format!(…))`,
+        // `&(&format!(…))`, `(format!(…))` — must still expose the leading
+        // `format!` so its static prefix is recovered, rather than being misread
+        // as a fully-dynamic (empty-prefix) site that suppresses all Unused
+        // checking. A bare variable still yields an empty prefix.
+        let src = r#"
+            fn view(locale: &Locale, state: &str, x: &str, y: &str, key: &str) {
+                let _ = locale.t(&(format!("status.{state}")));
+                let _ = locale.t(&(&format!("nav.{x}")));
+                let _ = locale.t((format!("footer.{y}")));
+                let _ = locale.t(&(key));
+            }
+        "#;
+        let mut result = ScanResult::default();
+        scan_source(src, "view.rs", &mut result);
+        let prefixes: Vec<&str> = result
+            .dynamic
+            .iter()
+            .map(|d| d.key_prefix.as_str())
+            .collect();
+        assert_eq!(prefixes, vec!["status.", "nav.", "footer.", ""]);
+    }
+
+    #[test]
+    fn wrapped_dynamic_prefix_suppresses_only_matching_unused_keys() {
+        // A `format!` wrapped in an extra group — `t(&(format!("status.{s}")))` —
+        // records prefix `status.` (NOT empty), so `unused_suppressed_by_dynamic`
+        // stays false: `status.*` is suppressed from Unused, but an unrelated
+        // stale `footer.legacy` still fails `--strict`.
+        let src = r#"
+            fn view(locale: &Locale, state: &str) {
+                let _ = locale.t("nav.home");
+                let _ = locale.t(&(format!("status.{state}")));
+            }
+        "#;
+        let mut scan = ScanResult::default();
+        scan_source(src, "view.rs", &mut scan);
+        assert_eq!(scan.dynamic.len(), 1);
+        assert_eq!(scan.dynamic[0].key_prefix, "status.");
+
+        let mut per_locale = BTreeMap::new();
+        per_locale.insert(
+            "en".to_owned(),
+            keys(&["nav.home", "status.open", "status.closed", "footer.legacy"]),
+        );
+        let report = build_report(&scan, &cfg("en", &[]), &per_locale);
+
+        assert!(!report.unused_suppressed_by_dynamic);
+        let en = &report.locales[0];
+        assert_eq!(
+            en.unused,
+            vec!["footer.legacy".to_owned()],
+            "wrapped prefix `status.` must suppress status.* but keep footer.legacy"
+        );
+        assert!(report.has_warnings());
+        assert_eq!(report.exit_code(false), 0);
+        assert_eq!(report.exit_code(true), 1);
     }
 
     #[test]

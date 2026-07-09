@@ -265,6 +265,58 @@ fn view(locale: &Locale, state: &str) -> String {
 }
 
 #[test]
+fn wrapped_dynamic_prefix_is_recovered_not_treated_as_fully_dynamic() {
+    // A dynamic key wrapped in an extra group behind a borrow —
+    // `locale.t(&(format!("status.{state}")))` — must still expose the leading
+    // `format!` and record prefix `status.`, NOT be misread as a fully-dynamic
+    // (empty-prefix) site that suppresses every Unused warning project-wide.
+    // So `status.*` is covered, but an unrelated stale `footer.legacy` still
+    // fails `--strict`.
+    let dir = clean_project();
+    write(
+        dir.path(),
+        "src/main.rs",
+        r#"
+fn view(locale: &Locale, state: &str) -> String {
+    let a = t!(locale, "nav.home");
+    let b = locale.t("nav.about");
+    let c = locale.t(&(format!("status.{state}")));
+    format!("{a}{b}{c}")
+}
+"#,
+    );
+    write(
+        dir.path(),
+        "i18n/en.ftl",
+        "nav.home = Home\nnav.about = About\nstatus.open = Open\nstatus.closed = Closed\nfooter.legacy = Old\n",
+    );
+    write(
+        dir.path(),
+        "i18n/es.ftl",
+        "nav.home = Inicio\nnav.about = Acerca\nstatus.open = Abierto\nstatus.closed = Cerrado\nfooter.legacy = Viejo\n",
+    );
+
+    let strict = run_check(dir.path(), &["--strict"]);
+    let strict_stdout = String::from_utf8_lossy(&strict.stdout);
+    assert!(
+        !strict.status.success(),
+        "footer.legacy matches no prefix, so --strict must fail (wrapped format! must not suppress all Unused)\nstdout:\n{strict_stdout}"
+    );
+    assert!(
+        !strict_stdout.contains("Unused checking suppressed"),
+        "a wrapped format! has a static prefix and must NOT suppress Unused wholesale\n{strict_stdout}"
+    );
+    assert!(
+        strict_stdout.contains("footer.legacy"),
+        "should list the genuinely-unused key\n{strict_stdout}"
+    );
+    assert!(
+        !strict_stdout.contains("status.open") && !strict_stdout.contains("status.closed"),
+        "status.* keys must be suppressed by the wrapped `status.` dynamic prefix\n{strict_stdout}"
+    );
+}
+
+#[test]
 fn associated_dynamic_prefix_records_key_arg_not_receiver() {
     // The associated call form `Locale::t(&locale, &format!("status.{state}"))`
     // puts the receiver at argument 0 and the KEY at argument 1. The scanner
