@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **config:** Autumn now auto-loads a project-root `.env` file, feeding its
+  values into the highest (`AUTUMN_*` environment-variable) configuration layer.
+  It is not a new precedence tier: a real shell environment variable of the same
+  name always wins, so `.env` only fills keys that are still unset. Files load in
+  order `.env` → `.env.local` → `.env.{profile}` → `.env.{profile}.local`, and
+  earlier files (and real env vars) win. Auto-loading runs in the `dev` and
+  `test` profiles and is skipped in `prod` unless `AUTUMN_DOTENV=1` (conversely
+  `AUTUMN_DOTENV=0` disables it anywhere). A malformed `.env` fails loudly at
+  startup rather than being silently ignored. `autumn new` now scaffolds a
+  documented `.env.example` and gitignores `.env`, `.env.local`, and
+  `.env.*.local` (while keeping `.env.example` and committable `.env.{profile}`
+  files tracked). `autumn doctor` gained a `dotenv` check that warns when
+  `.env.example` is present without a `.env`, or when a `.env` exists but is not
+  gitignored (issue #1051).
 - **generator:** `autumn new` now generates a `README.md` at the project root
   (listed in the "Created …" output) with explicit prerequisites and a
   golden-path quickstart — configure the `[database]` block in `autumn.toml`

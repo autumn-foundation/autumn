@@ -2498,6 +2498,7 @@ pub fn run(opts: DoctorOptions) {
     let auth_extractor_mounted = resolve_auth_extractor_mounted();
     let compression_enabled = resolve_compression_enabled();
     let proxy_conflict_data = resolve_proxy_conflict_data();
+    let (dotenv_has_example, dotenv_has_env, dotenv_gitignored) = resolve_dotenv_state();
 
     // ── Phase 2: build tasks in display order ────────────────────────────────
     let mut tasks: Vec<Task> = Vec::new();
@@ -2695,6 +2696,12 @@ pub fn run(opts: DoctorOptions) {
         check_compression_impl(compression_enabled, is_production)
     }));
 
+    // 12b. Local-dev `.env` handling (warn on `.env.example` without `.env`,
+    //      or a present-but-ungitignored `.env`).
+    tasks.push(Box::new(move || {
+        check_dotenv_impl(dotenv_has_example, dotenv_has_env, dotenv_gitignored)
+    }));
+
     // 13. System-test browser (warn if missing; not all projects use system tests)
     tasks.push(Box::new(check_system_test_browser));
 
@@ -2785,6 +2792,69 @@ pub fn check_compression_impl(compression_enabled: bool, is_production: bool) ->
             "response compression is enabled".into()
         } else {
             "response compression is disabled (off by default; use CDN or enable explicitly)".into()
+        }),
+        hint: None,
+    }
+}
+
+/// Resolve `.env` filesystem state for [`check_dotenv_impl`].
+///
+/// Returns `(has_env_example, has_env, env_gitignored)`. A `.env` is treated as
+/// gitignored when any trimmed `.gitignore` line equals `.env` or is a glob
+/// that covers it (`.env*` / `.env.*`).
+fn resolve_dotenv_state() -> (bool, bool, bool) {
+    let has_env_example = std::path::Path::new(".env.example").exists();
+    let has_env = std::path::Path::new(".env").exists();
+    let env_gitignored = std::fs::read_to_string(".gitignore")
+        .map(|contents| gitignore_covers_dotenv(&contents))
+        .unwrap_or(false);
+    (has_env_example, has_env, env_gitignored)
+}
+
+/// Whether a `.gitignore` body ignores a root `.env` file.
+fn gitignore_covers_dotenv(contents: &str) -> bool {
+    contents.lines().any(|line| {
+        let entry = line.trim();
+        matches!(entry, ".env" | ".env*" | ".env.*" | "/.env" | "*.env")
+    })
+}
+
+/// Check that project-root `.env` handling is set up safely.
+///
+/// - `.env.example` present but no `.env` → Warn (developer likely needs to
+///   copy the template).
+/// - `.env` present but not gitignored → Warn (risk of committing secrets).
+/// - otherwise → Pass.
+pub fn check_dotenv_impl(
+    has_env_example: bool,
+    has_env: bool,
+    env_gitignored: bool,
+) -> CheckResult {
+    if has_env_example && !has_env {
+        return CheckResult {
+            name: "dotenv",
+            status: CheckStatus::Warn,
+            detail: Some("`.env.example` is present but no `.env` exists".into()),
+            hint: Some("Copy `.env.example` to `.env` and fill in local values"),
+        };
+    }
+    if has_env && !env_gitignored {
+        return CheckResult {
+            name: "dotenv",
+            status: CheckStatus::Warn,
+            detail: Some(
+                "`.env` is present but not gitignored — you risk committing secrets".into(),
+            ),
+            hint: Some("Add `.env` to .gitignore"),
+        };
+    }
+    CheckResult {
+        name: "dotenv",
+        status: CheckStatus::Pass,
+        detail: Some(if has_env {
+            "`.env` handling looks correct".into()
+        } else {
+            ".env not configured".into()
         }),
         hint: None,
     }
@@ -4903,6 +4973,67 @@ redirect_uri = "http://localhost/callback"
             "expected Pass in dev profile, got {:?}",
             result.status
         );
+    }
+
+    // ── check_dotenv ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn dotenv_warns_when_example_present_without_env() {
+        let result = check_dotenv_impl(true, false, false);
+        assert_eq!(result.name, "dotenv");
+        assert!(
+            matches!(result.status, CheckStatus::Warn),
+            "expected Warn, got {:?}",
+            result.status
+        );
+        assert!(result.detail.as_deref().unwrap().contains(".env.example"));
+    }
+
+    #[test]
+    fn dotenv_warns_when_env_present_but_not_gitignored() {
+        let result = check_dotenv_impl(true, true, false);
+        assert_eq!(result.name, "dotenv");
+        assert!(
+            matches!(result.status, CheckStatus::Warn),
+            "expected Warn, got {:?}",
+            result.status
+        );
+        assert!(
+            result.detail.as_deref().unwrap().contains("not gitignored"),
+            "got: {:?}",
+            result.detail
+        );
+    }
+
+    #[test]
+    fn dotenv_passes_when_env_present_and_gitignored() {
+        let result = check_dotenv_impl(true, true, true);
+        assert_eq!(result.name, "dotenv");
+        assert!(
+            matches!(result.status, CheckStatus::Pass),
+            "expected Pass, got {:?}",
+            result.status
+        );
+    }
+
+    #[test]
+    fn dotenv_passes_when_nothing_configured() {
+        let result = check_dotenv_impl(false, false, false);
+        assert_eq!(result.name, "dotenv");
+        assert!(
+            matches!(result.status, CheckStatus::Pass),
+            "expected Pass, got {:?}",
+            result.status
+        );
+    }
+
+    #[test]
+    fn gitignore_covers_dotenv_matches_common_globs() {
+        assert!(gitignore_covers_dotenv("/target\n.env\n"));
+        assert!(gitignore_covers_dotenv(".env*\n"));
+        assert!(gitignore_covers_dotenv("  .env.*  \n"));
+        assert!(!gitignore_covers_dotenv("/target\n.env.example\n"));
+        assert!(!gitignore_covers_dotenv(""));
     }
 
     #[test]

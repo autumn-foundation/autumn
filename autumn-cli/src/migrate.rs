@@ -118,6 +118,17 @@ pub fn run(
 ) {
     eprintln!("\u{1F342} autumn migrate\n");
 
+    // Overlay a project-root `.env` UNDER the real environment for DB-URL
+    // resolution, without mutating the process environment. A real env var of
+    // the same key always wins; a malformed `.env` fails loudly here.
+    let env = match autumn_web::dotenv::os_env_with_dotenv() {
+        Ok(env) => env,
+        Err(e) => {
+            eprintln!("  \u{274C} .env: {e}");
+            std::process::exit(1);
+        }
+    };
+
     match action {
         MigrateAction::Check => {
             let migrations_dir = resolve_migrations_dir();
@@ -125,11 +136,11 @@ pub fn run(
             return;
         }
         MigrateAction::Down(args) => {
-            run_down(args, with_maintenance, target, profile);
+            run_down(args, with_maintenance, target, profile, &env);
             return;
         }
         MigrateAction::Baseline(args) => {
-            run_baseline(args, target, profile);
+            run_baseline(args, target, profile, &env);
             return;
         }
         _ => {}
@@ -138,7 +149,7 @@ pub fn run(
     // 1. Resolve migration target databases from autumn.toml (+ profile
     //    overlay) + env.  The merged config table is returned so that
     //    resolve_startup_wait can reuse it without a second filesystem read.
-    let (targets, config_table) = resolve_targets(target, profile);
+    let (targets, config_table) = resolve_targets(target, profile, &env);
 
     // 2. Resolve migrations directory
     let migrations_dir = resolve_migrations_dir();
@@ -183,6 +194,7 @@ pub fn run(
 fn resolve_targets(
     target: &MigrateTarget,
     profile: Option<&str>,
+    env: &dyn autumn_web::config::Env,
 ) -> (Vec<(String, String)>, Option<toml::Table>) {
     // Read autumn.toml once, deep-merging the `autumn-<profile>.toml` overlay
     // when a profile is selected, so control and shard URLs both resolve from
@@ -192,12 +204,15 @@ fn resolve_targets(
     // When no profile is given explicitly (via `--profile` / `AUTUMN_PROFILE`),
     // fall back to `AUTUMN_ENV` — the framework's preferred profile selector —
     // so `autumn migrate` resolves the same overlay the app itself would use.
+    //
+    // `env` overlays a project-root `.env` under the real environment, so a
+    // `.env`-provided DB URL is honored while a real env var still wins.
     let effective = effective_profile(profile);
     let config_table = read_autumn_toml_table_with_profile(Some(&effective));
     let control =
-        resolve_primary_database_url_from_sources(|key| std::env::var(key), config_table.as_ref());
+        resolve_primary_database_url_from_sources(|key| env.var(key), config_table.as_ref());
     let shards =
-        resolve_shard_database_urls_from_sources(|key| std::env::var(key), config_table.as_ref());
+        resolve_shard_database_urls_from_sources(|key| env.var(key), config_table.as_ref());
     match build_targets(control, shards, target) {
         Ok(targets) => (targets, config_table),
         Err(message) => {
@@ -535,8 +550,13 @@ fn record_checksums_after_apply(database_url: &str, migrations_dir: &std::path::
 /// advisory migration lock that `run`/`down` use (via the `*_locked` helpers),
 /// so a concurrent `autumn migrate down` cannot revert a version between the
 /// read and the write (issue #1203 review).
-fn run_baseline(args: &BaselineArgs, target: &MigrateTarget, profile: Option<&str>) {
-    let (targets, _) = resolve_targets(target, profile);
+fn run_baseline(
+    args: &BaselineArgs,
+    target: &MigrateTarget,
+    profile: Option<&str>,
+    env: &dyn autumn_web::config::Env,
+) {
+    let (targets, _) = resolve_targets(target, profile, env);
     let migrations_dir = resolve_migrations_dir();
     let dir = std::path::Path::new(&migrations_dir);
 
@@ -1337,6 +1357,7 @@ fn run_down(
     with_maintenance: bool,
     target: &MigrateTarget,
     profile: Option<&str>,
+    env: &dyn autumn_web::config::Env,
 ) {
     // 1. Production guard. Derive prod-ness from the SAME effective profile the
     //    rollback will target (env precedence + build-mode + explicit flag), so
@@ -1354,7 +1375,7 @@ fn run_down(
     // 2. Resolve target databases (control + shards / a single shard /
     //    control-only) and the migrations dir. `down` honors --shard /
     //    --control-only exactly like `migrate run`.
-    let (targets, _) = resolve_targets(target, profile);
+    let (targets, _) = resolve_targets(target, profile, env);
     let migrations_dir = resolve_migrations_dir();
     let dir = Path::new(&migrations_dir);
 

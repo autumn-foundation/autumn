@@ -558,6 +558,15 @@ Profile selection precedence:
 3. `--profile <name>`
 4. `AUTUMN_IS_DEBUG` auto-detection from the macro
 
+`.env` auto-loading (unreleased — trunk-dev): a project-root `.env` file is a
+local-dev feeder for the env-var layer (6), not a new precedence tier. On
+startup Autumn injects `.env` values into the process environment only for keys
+that are still unset, so a real environment variable of the same name always
+wins. Files load in order `.env` → `.env.local` → `.env.{profile}` →
+`.env.{profile}.local`, and earlier files (and real env vars) win. Auto-loaded
+in `dev`/`test`; skipped in `prod` unless `AUTUMN_DOTENV=1` (set `AUTUMN_DOTENV=0`
+to disable it anywhere). A malformed `.env` fails loudly at startup.
+
 Frequently used env keys:
 
 | Env | Config field |

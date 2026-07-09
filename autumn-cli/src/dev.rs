@@ -571,7 +571,24 @@ fn start_server(
     show_config: bool,
 ) -> Option<Child> {
     eprintln!("  Starting server...\n");
+
+    // Resolve `.env` fresh right before each spawn so a hot-reload restart
+    // picks up an edited `.env`. Values are injected explicitly into the child
+    // process (rather than mutating this process's environment); the child also
+    // self-loads via the config overlay, so this is belt-and-suspenders and
+    // makes a bare `DATABASE_URL` visible to the child. A malformed `.env`
+    // fails loudly. Applied BEFORE the explicit `.env(...)` calls below so those
+    // win on any key overlap.
+    let dotenv_vars = match autumn_web::dotenv::resolve_dotenv_for_cwd() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("  \u{274C} .env: {e}");
+            std::process::exit(1);
+        }
+    };
+
     let mut command = Command::new(binary);
+    command.envs(dotenv_vars);
     // Inherit stdio so tracing output (including --show-config) is visible.
     // Previously used Stdio::null(), but server logs are valuable during dev.
     command.stdout(Stdio::inherit()).stderr(Stdio::inherit());

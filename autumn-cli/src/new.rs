@@ -19,6 +19,7 @@ mod templates {
     pub const INPUT_CSS: &str = include_str!("templates/input.css.tmpl");
     pub const TAILWIND_CONFIG: &str = include_str!("templates/tailwind.config.js.tmpl");
     pub const GITIGNORE: &str = include_str!("templates/gitignore.tmpl");
+    pub const ENV_EXAMPLE: &str = include_str!("templates/env.example.tmpl");
     pub const SEED_RS: &str = include_str!("templates/seed.rs.tmpl");
     pub const SEED_CARGO_TOML: &str = include_str!("templates/seed_Cargo.toml.tmpl");
     pub const INTEGRATION_TEST: &str = include_str!("templates/tests/integration_test.rs.tmpl");
@@ -281,6 +282,10 @@ fn generate_inner(
         render(templates::TAILWIND_CONFIG),
     )?;
     fs::write(project_dir.join(".gitignore"), render(templates::GITIGNORE))?;
+    fs::write(
+        project_dir.join(".env.example"),
+        render(templates::ENV_EXAMPLE),
+    )?;
     fs::write(project_dir.join("migrations/.gitkeep"), "")?;
 
     scaffold_vendor_assets(&project_dir)?;
@@ -407,6 +412,7 @@ fn print_scaffold_summary(name: &str, opts: GenerateOptions) {
     println!("  Created {name}/static/css/input.css");
     println!("  Created {name}/tailwind.config.js");
     println!("  Created {name}/.gitignore");
+    println!("  Created {name}/.env.example");
     println!("  Created {name}/rust-toolchain.toml");
     println!("  Created {name}/rustfmt.toml");
     println!("  Created {name}/clippy.toml");
@@ -936,6 +942,7 @@ mod tests {
         );
         assert!(p.join("build.rs").is_file());
         assert!(p.join(".gitignore").is_file());
+        assert!(p.join(".env.example").is_file());
         assert!(p.join("static/css/input.css").is_file());
         assert!(p.join("tailwind.config.js").is_file());
         assert!(p.join("migrations/.gitkeep").is_file());
@@ -1146,6 +1153,32 @@ mod tests {
         assert!(content.contains("/target"));
         assert!(content.contains("static/css/autumn.css"));
         assert!(!content.contains("static/autumn/"));
+        // `.env` (and local variants) are gitignored, but the committable
+        // `.env.example` template is not.
+        assert!(content.lines().any(|l| l.trim() == ".env"));
+        assert!(!content.lines().any(|l| l.trim() == ".env.example"));
+    }
+
+    #[test]
+    fn scaffolds_env_example_and_gitignores_env() {
+        let tmp = TempDir::new().unwrap();
+        generate("dotenv-check", tmp.path()).unwrap();
+        let p = tmp.path().join("dotenv-check");
+
+        // `.env.example` is scaffolded and documents the DB URL env key.
+        let example = fs::read_to_string(p.join(".env.example")).unwrap();
+        assert!(
+            example.contains("AUTUMN_DATABASE__URL"),
+            ".env.example must document AUTUMN_DATABASE__URL:\n{example}"
+        );
+        // crate_name token is substituted into the example URL.
+        assert!(example.contains("dotenv_check"), "got:\n{example}");
+
+        // `.gitignore` ignores `.env` but the committable `.env.example` remains
+        // in the project (and is not ignored).
+        let gitignore = fs::read_to_string(p.join(".gitignore")).unwrap();
+        assert!(gitignore.lines().any(|l| l.trim() == ".env"));
+        assert!(p.join(".env.example").is_file());
     }
 
     #[test]
