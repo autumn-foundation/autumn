@@ -592,6 +592,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **circuit_breaker:** the breaker and its registry now recover from a
+  poisoned mutex (`lock().unwrap_or_else(PoisonError::into_inner)`) instead
+  of panicking on every subsequent call once a single lock holder has
+  panicked; breaker state is a self-correcting sliding window, so the
+  recovered data is safe to keep using. Supersedes #1207. [no-plugin]
 - **docs:** repaired the broken intra-doc links in the `reporting` module
   overview (`ErrorEvent`, `ErrorReporter`, `LogReporter`, `ReportingLayer`
   rendered as dead links on docs.rs because shorthand references don't resolve
