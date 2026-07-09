@@ -78,6 +78,7 @@ enum DownloadBody {
 /// [`inline`](Download::inline)) and return it from a handler.
 ///
 /// See the [module docs](crate::download) for a worked example.
+#[must_use = "a Download does nothing unless returned from a handler or converted with `into_response`"]
 pub struct Download {
     body: DownloadBody,
     filename: Option<String>,
@@ -162,6 +163,13 @@ impl Download {
     /// bytes flowing through your own authorized handler — no public presigned
     /// URL is issued.
     ///
+    /// The `Content-Length` is taken from the [`head`](crate::storage::BlobStore::head)
+    /// metadata read before the body stream is opened. There is a small
+    /// time-of-check/time-of-use window: if the blob is overwritten with a
+    /// different size between the `head` and the `get_stream` (a local-backend
+    /// edge case; overwrites are otherwise atomic), the advertised length may
+    /// disagree with the streamed bytes.
+    ///
     /// # Errors
     ///
     /// Returns a [`BlobStoreError`](crate::storage::BlobStoreError) if the blob
@@ -198,7 +206,7 @@ impl Download {
     /// The name is sanitized: control characters (including CR/LF) are
     /// stripped and the value is quoted, so a caller-supplied name cannot
     /// inject extra header directives.
-    #[must_use]
+    #[must_use = "builder setters return a new Download; use the returned value"]
     pub fn filename(mut self, filename: impl Into<String>) -> Self {
         self.filename = Some(filename.into());
         self
@@ -206,7 +214,7 @@ impl Download {
 
     /// Set the `Content-Type` explicitly, overriding any type inferred from the
     /// filename extension or blob metadata.
-    #[must_use]
+    #[must_use = "builder setters return a new Download; use the returned value"]
     pub fn content_type(mut self, content_type: impl Into<String>) -> Self {
         self.content_type = Some(content_type.into());
         self
@@ -214,7 +222,7 @@ impl Download {
 
     /// Serve the file inline (`Content-Disposition: inline`) instead of forcing
     /// a save dialog.
-    #[must_use]
+    #[must_use = "builder setters return a new Download; use the returned value"]
     pub const fn inline(mut self) -> Self {
         self.disposition = Disposition::Inline;
         self
@@ -302,8 +310,10 @@ fn quote_header_value(value: &str) -> String {
 /// Build the `Content-Disposition` header value.
 ///
 /// Always ASCII and CR/LF-free by construction: control characters are
-/// stripped, the ASCII form is quoted, and non-ASCII filenames are RFC 5987
-/// percent-encoded (`filename*=UTF-8''…`) alongside an ASCII fallback.
+/// stripped, the value is reduced to its basename (so a path-like name cannot
+/// leak directory components), the ASCII form is quoted, and non-ASCII
+/// filenames are RFC 5987 percent-encoded (`filename*=UTF-8''…`) alongside an
+/// ASCII fallback.
 fn build_content_disposition(disposition: Disposition, filename: Option<&str>) -> String {
     let kind = match disposition {
         Disposition::Attachment => "attachment",
@@ -316,6 +326,10 @@ fn build_content_disposition(disposition: Disposition, filename: Option<&str>) -
 
     let clean = strip_header_controls(raw);
     let clean = clean.trim();
+    // Defense-in-depth: reduce a caller-supplied path to its basename so
+    // `.filename("../../etc/passwd")` emits `filename="passwd"` rather than
+    // leaking directory components into the header.
+    let clean = clean.rsplit(['/', '\\']).next().unwrap_or(clean).trim();
     if clean.is_empty() {
         return kind.to_owned();
     }
@@ -391,8 +405,23 @@ mod tests {
     #[test]
     fn non_ascii_filename_gets_extended_param() {
         let disp = build_content_disposition(Disposition::Attachment, Some("naïve.txt"));
-        assert!(disp.contains("filename*=UTF-8''"));
+        // Exact encoding: ASCII fallback with non-ASCII replaced by `_`, plus
+        // the RFC 5987 extended value (ï → %C3%AF).
+        assert_eq!(
+            disp,
+            "attachment; filename=\"na_ve.txt\"; filename*=UTF-8''na%C3%AFve.txt"
+        );
         assert!(disp.is_ascii());
+    }
+
+    #[test]
+    fn path_like_filename_is_reduced_to_basename() {
+        let disp = build_content_disposition(Disposition::Attachment, Some("../../etc/passwd"));
+        assert_eq!(disp, "attachment; filename=\"passwd\"");
+
+        // Windows-style separators too.
+        let disp = build_content_disposition(Disposition::Attachment, Some("a\\b\\report.pdf"));
+        assert_eq!(disp, "attachment; filename=\"report.pdf\"");
     }
 
     #[test]

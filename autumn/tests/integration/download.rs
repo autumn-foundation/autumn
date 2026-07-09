@@ -69,13 +69,13 @@ async fn non_ascii_filename_uses_rfc5987_extended_form() {
         .unwrap()
         .to_str()
         .unwrap();
-    assert!(
-        disp.contains("filename*=UTF-8''"),
-        "non-ASCII names emit the RFC 5987 extended form (AC #2): {disp}"
-    );
-    assert!(
-        disp.starts_with("attachment;"),
-        "still an attachment disposition: {disp}"
+    // Exact extended value: ï → %C3%AF, space → %20, 文 → %E6%96%87,
+    // 件 → %E4%BB%B6; `.` stays literal. Locks the RFC 5987 encoding down.
+    assert_eq!(
+        disp,
+        "attachment; filename=\"na_ve __.txt\"; \
+         filename*=UTF-8''na%C3%AFve%20%E6%96%87%E4%BB%B6.txt",
+        "non-ASCII names emit the exact RFC 5987 extended form (AC #2): {disp}"
     );
     // The extended value must be percent-encoded (no raw non-ASCII bytes).
     assert!(disp.is_ascii(), "header value must be pure ASCII: {disp}");
