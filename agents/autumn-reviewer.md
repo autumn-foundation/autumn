@@ -113,9 +113,41 @@ Check every file you review against these items. Report only items that fail.
 ### Database (MEDIUM)
 
 - **N+1 queries**: Loading a collection and then querying per item in a loop.
-  Flag it — suggest eager loading or a JOIN.
-- **Missing index on FK column**: Any `references:Model` or BIGINT FK column
-  used in a WHERE clause should have an index.
+  Flag it — suggest `#[belongs_to]`/`#[has_many]` associations with
+  `repo.preload(...)` (unreleased — trunk-dev only), or a JOIN.
+- **Missing index on FK column**: Any BIGINT FK column used in a WHERE clause
+  should have an index (the trunk-dev `field:references` DSL adds one
+  automatically; hand-added FK columns need one in the migration).
+
+### Framework idioms (MEDIUM)
+
+Autumn allows raw Axum/Diesel, but hand-rolling what the framework generates
+is a defect. Flag these and name the framework replacement:
+
+- **Hand-rolled status-transition validation**: a `match`/`if` block over
+  old/new status values in `before_create`/`before_update` hooks or handlers.
+  Fix: `#[state_machine(transitions(...))]` on the model field + the
+  generated `transition_{field}_to` (see `docs/guide/state-machines.md`).
+- **Raw Diesel for generated repository operations**: hand-written
+  `LIMIT/OFFSET` pagination, per-row insert loops, or CRUD queries when the
+  model has a `#[repository]`. Fix: `page`/`cursor_page`, bulk
+  `save_many`/`update_many`/`delete_many`/`upsert_many`, generated CRUD.
+- **Hand-rolled find-then-create / insert-or-catch-23505** (a `find_by_x` +
+  branch-then-`insert`, or `insert_into(...).on_conflict...`/error-mapping a
+  unique violation) when the model has a `#[repository]` and a unique
+  constraint on the lookup column. Fix: declare
+  `fn find_or_create_by_<field>(...)` and call the generated race-safe
+  `find_or_create_by_<field>(field, &new) -> (Model, bool)` **(unreleased)** —
+  the manual read-then-insert is a TOCTOU race that can surface a `23505`.
+- **Raw `axum::Router` handlers for app routes**: `.route("/x", get(...))`
+  instead of `#[get]`/`#[post]` + `routes![...]`. `.merge()`/`.nest()` is
+  acceptable only for third-party routers.
+- **Ad-hoc `tokio::spawn` for deferred/background work**: fix with `#[job]`
+  (retries, backends) or `#[scheduled]`.
+- **Hand-rolled session/token parsing in handler bodies** when `#[secured]`,
+  `#[authorize]`, or repository policies express the same check.
+- Only flag when the framework feature actually covers the case; dropping to
+  raw Axum/Diesel for something the framework does not provide is fine.
 
 ## Output format
 

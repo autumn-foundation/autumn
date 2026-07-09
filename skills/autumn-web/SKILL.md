@@ -12,8 +12,16 @@ description: >
 
 **Repository**: https://github.com/madmax983/autumn
 **Branch**: `trunk-dev`
-**Current release**: 0.5.0 (2026-06-04) | **Edition**: 2024 | **MSRV**: 1.88.0
+**Latest published release**: 0.5.0 on crates.io | **Edition**: 2024 | **MSRV**: 1.88.0
 **Author**: madmax983
+
+**Version identity trip wire**: the workspace on `trunk-dev` is versioned
+0.6.0, but 0.6.0 is **not published** — crates.io still serves 0.5.0. Apps
+depending on the published crates (`autumn-web = "0.5"`, `cargo install
+autumn-cli --version 0.5.0`) do not have trunk-dev-only features. Anything
+below marked **(unreleased)** is merged on `trunk-dev` but absent from the
+published 0.5.0 crates — do not use it in an app built against 0.5.0.
+Unmarked features are in the published release.
 
 autumn-web is a Spring Boot-style web framework for Rust, built on Axum. It
 assembles Axum, Diesel, Maud, htmx, Tailwind, Tokio, tracing, and production
@@ -29,6 +37,39 @@ when their details matter:
 - `references/examples.md` - official 0.5.0 example patterns for minimal apps,
   CRUD, production-ish jobs, Redis channels, S3 storage plugins, and signed
   webhooks. Use this before generating full app code.
+
+## Prefer framework idioms over raw Diesel/Axum
+
+Autumn deliberately lets you drop to raw Axum routers and raw Diesel queries.
+That is a **last resort**, not a starting point. Before hand-rolling any of
+the patterns below, check this table and the matching `docs/guide/*.md` page —
+the framework almost certainly already generates or ships it:
+
+| Temptation (do NOT hand-roll) | Autumn-native answer |
+|---|---|
+| Status-transition validation written by hand in `before_create`/`before_update` hooks or handlers (`if old == "draft" && new == "published"` match blocks) | `#[state_machine(transitions(...))]` on the model field — generated `can_transition_{field}_to` / `transition_{field}_to` enforce the graph. See "Model state machines" below and `docs/guide/state-machines.md` |
+| Raw `axum::Router` routes and handlers, manual `.route("/x", get(...))` | `#[get]`/`#[post]`/`#[put]`/`#[patch]`/`#[delete]` + `routes![...]`, `.scoped(prefix, layer, routes)` for groups. `.merge()`/`.nest()` exist for the rare escape hatch only |
+| Raw Diesel queries for CRUD, lookups, pagination, or bulk writes | `#[repository]`-generated methods: `find_by_id`, `find_all`, `save`, `update`, `delete_by_id`, derived `find_by_*`, `page(&PageRequest)`, `cursor_page(&CursorRequest)`, bulk `save_many`/`update_many`/`delete_many`/`upsert_many`. See `docs/guide/repositories.md`, `docs/guide/pagination.md` |
+| Manual per-item queries in a loop (N+1) or hand-written JOINs to fetch associations | `#[belongs_to]`/`#[has_many]`/`#[has_one]` + `repo.preload(records, Model::preload()...)` (unreleased) |
+| Hand-rolled auth, session, or token checks in handler bodies | `#[secured]` / `#[secured("role")]`, `#[authorize]`, repository `policy =`/`scope =`; `#[secured(scopes = [...])]` for service tokens (unreleased) |
+| A punishingly low global rate limit to protect one abuse-prone endpoint (login, search, export) | `#[throttle(limit = 5, per = "1m", key = "ip")]` sits alongside `#[get]`/`#[post]`; `#[throttle("login")]` reads `[security.rate_limit.named.login]` from config (unreleased — issue #1350, see `docs/guide/rate-limiting.md`) |
+| Hand-assembled `<form>` markup with manual value re-fill and error display | `autumn_web::form::form_for(&changeset, action, method)` + the `#[model]`-derived `FormModel` (unreleased — trunk-dev, not in published 0.5.0) renders the whole form — CSRF, `_method` override, one pre-filled control per column, inline errors, submit — in one call; see "Whole-form rendering" below. Compose the per-field helpers only when its escape hatches don't fit: `form_tag`, `method_input`, `text_input` (published); `number_input`, `datetime_input`, `date_input`, `checkbox_input`, `select_input` + `Changeset` 422 re-render (unreleased) |
+| `find_all()` + a loop (or raw Diesel `LIMIT`/`OFFSET` paging) to sweep a whole table in a task/job/backfill | `repo.find_in_batches(n)` / `repo.find_each(n)` (unreleased — trunk-dev) — bounded-memory primary-key keyset iteration. See "Generated repository surface" below and `docs/guide/pagination.md` |
+| Ad-hoc `tokio::spawn` / background threads for deferred work | `#[job]` (+ retries, backends, uniqueness/concurrency caps), `#[scheduled]` for recurring, `#[task]` for operator CLI work |
+| Hand-written memoization or cache-aside code | `#[cached]` on functions; `cache::get_or_compute` / `get_or_compute_with` for stampede-safe read-through fills (unreleased) |
+| Hand-written transaction retry loops for serialization failures | `Db::tx(...)`; `Db::tx_with(TxOptions::serializable(), ...)` auto-retries 40001 (unreleased) |
+| Hand-rolled HMAC verification for Stripe/GitHub/Slack callbacks | `SignedWebhook` extractor + `[webhooks.<name>]` config |
+| Hand-rolled pager markup (page-number windows, prev/next links) | `pagination_nav(&page, &PagerOptions::new("/posts"))` / `cursor_pagination_nav` (unreleased) |
+| Hand-rolled cross-module notifications (calling every reaction inline) | `#[event]` + `#[listener]` typed event bus, `.listeners(listeners![...])` (unreleased) |
+| Hand-rolled cards, tabs, modals, delete-confirm dialogs, method-override links | `autumn_web::widgets`: `card`/`stat_card`, `tabs`, `modal`/`confirm_action`, `link_to`/`button_to` + `ui::WIDGETS_CSS_PATH` stylesheet (unreleased) |
+| Hand-built file-download responses (manual `Content-Disposition`/`Content-Type`/`Content-Length` headers, byte-buffered blob reads) | `autumn_web::download::Download` — `from_bytes` / `from_stream` / `from_async_read` / `from_blob(&store, key).await?` + `.filename(...)` / `.content_type(...)` / `.inline()`; RFC 5987 filenames, injection-safe, streams blobs without buffering (unreleased) |
+| Hand-parsed `Range` headers / manual `206 Partial Content` / `Content-Range` / `416` for seekable media or resumable downloads | `autumn_web::range` (`resolve` + `partial_bytes_response`) and `Download::into_response_ranged(&headers).await` — RFC 7233 single-range parsing, multi-range single-range collapse, `If-Range` via `.etag(..)`/`.last_modified(..)`, blob slices via `BlobStore::get_range` (no whole-object buffering) (unreleased) |
+| Hand-written RSS/Atom XML strings for a `/feed.xml` or podcast/blog feed | `feed::Feed::atom(..)` / `feed::Feed::rss(..)` + `feed::FeedEntry` — builds the XML, implements `IntoResponse` with the right `application/atom+xml`/`application/rss+xml` type, XML-escapes text, and `Feed::conditional(&headers)` reuses the `etag` layer for `304`s (unreleased). See `docs/guide/conditional-get.md` |
+| Hand-assembled `Cache-Control` header strings on a handler | `etag::cache_for(Duration)` → `CacheControl`; attach as a tuple `(cache_for(dur).public(), html!{…})` or `.wrap(resp)`. Chain `public`/`private`, `max_age`, `s_maxage`, `stale_while_revalidate`, `no_store`, `no_cache`, `must_revalidate`, `immutable`; `header_value()` renders a deterministic value. Defaults to `private` (a secured page can't be silently made public); composes with `fresh_when` — the directives ride the `200` and the preserved `304` (unreleased — issue #1344). See `docs/guide/conditional-get.md` |
+
+When none of these fit, dropping to raw Axum (`.merge()`/`.nest()`/`.layer()`)
+or raw Diesel (`&mut *db` with `diesel_async`) is supported and fine — but only
+after checking this table and `docs/guide/`.
 
 ## Crate naming trip wires
 
@@ -180,7 +221,11 @@ Use `.one_off_tasks(one_off_tasks![...])` for `#[task]` handlers invoked by
 | `.with_blob_store(store)` | Install a file storage backend |
 | `.with_cache_backend(cache)` | Install a cache backend |
 | `.with_mail_delivery_queue(queue)` | Install durable deferred mail |
+| `.with_mail_suppression_store(store)` | Install a durable bounce/complaint suppression backend (unreleased; in-memory default auto-wired otherwise) |
 | `.with_audit_sink(sink)` | Install structured audit sink |
+| `.listeners(listeners![...])` | Register `#[listener]` event listeners (unreleased) |
+| `.static_gate(layer)` | Middleware that also guards `#[static_get]` pre-render (unreleased; `has_static_gate::<L>()`, `get_static_gate_types()`, `TestApp::static_gate` mirror it) |
+| `.with_shard_router(router)` | Install a shard router for `[[database.shards]]` (unreleased) |
 | `.run()` | Launch the server |
 
 ## Route macros
@@ -224,6 +269,17 @@ async fn ws() -> impl autumn_web::ws::WsHandler {
 Route functions are collected with `routes![...]`. Static routes also need
 `static_routes![...]` so `autumn build` can pre-render them.
 
+**Duplicate-route preflight (issue #1012, unreleased — trunk-dev):** two
+handlers that resolve to the same `(method, path)` after `.scoped(...)` prefix
+resolution — including `#[repository]`-generated API routes — fail app build
+with `RouterBuildError::DuplicateUserRoute { method, path, existing, incoming }`
+BEFORE any router mounts, instead of the previous `axum::MethodRouter::merge`
+startup panic. Distinct methods on the same path (`GET /admin` + `POST /admin`)
+still merge cleanly. Opaque `.merge(...)`/`.nest(...)` routers can't be
+introspected — a non-empty opaque table emits a `tracing::warn!`
+("check skipped") rather than a false pass. See
+`docs/guide/getting-started.md` "Route collision diagnostics".
+
 ## Models and repositories
 
 Autumn uses Diesel + diesel-async for Postgres. Primary keys are `i64` /
@@ -255,7 +311,7 @@ pub trait PostRepository {}
 allow_unauthorized_repository_api = true # only when intentional
 ```
 
-### Associations and preloading
+### Associations and preloading (unreleased — trunk-dev, not in published 0.5.0)
 
 Declare `#[belongs_to]` / `#[has_many]` / `#[has_one]` on a `#[model]` for
 batched eager loading — no N+1, no lazy loading (un-preloaded access returns
@@ -300,6 +356,109 @@ See `examples/reddit-clone` (`Post` ↔ `Tag` via `post_tags`) for a full
 worked example, and `docs/adr/0008-associations-and-eager-loading.md` for
 the design.
 
+### Model state machines — `#[state_machine]`
+
+**Never hand-roll status-transition validation.** Declare valid transitions on
+the model field; the macro generates the transition table and enforcement:
+
+```rust
+#[autumn_web::model]
+pub struct Order {
+    #[id]
+    pub id: i64,
+    pub amount: i64,
+    #[state_machine(transitions(
+        pending -> processing,
+        processing -> shipped: "can_ship",   // quoted guard method name
+        processing -> cancelled,
+        shipped -> delivered,
+    ))]
+    pub status: String,
+}
+
+impl Order {
+    fn can_ship(&self) -> bool { self.amount > 0 }  // guard: &self -> bool
+}
+```
+
+For a field named `status` this generates on the struct:
+
+| Item | Signature |
+|---|---|
+| `can_transition_status_to` | `(&self, target: &str) -> bool` — edge exists and guards pass |
+| `transition_status_to` | `(&self, target: &str) -> AutumnResult<String>` — `Ok(target)` or a 400 `bad_request` error |
+| `__AUTUMN_SM_STATUS_TRANSITIONS` | `&'static [(&'static str, &'static str, Option<&'static str>)]` — `(from, to, guard)` edge list for UI/API metadata |
+
+Rules: `String` fields only; state and guard names are plain identifiers
+(`in_progress`, not `in-progress`); guards are quoted names of `&self -> bool`
+methods on the model; multiple `#[state_machine]` fields per model are fine
+(each gets its own `{field}`-named methods).
+
+The idiomatic enforcement point is a repository `before_update` hook — this
+replaces any hand-written status `match` block:
+
+```rust
+async fn before_update(
+    &self,
+    _ctx: &mut MutationContext,
+    draft: &mut UpdateDraft<Order>,
+) -> AutumnResult<()> {
+    if draft.after.status != draft.before.status {
+        // Guards must see the proposed content, but the edge lookup needs
+        // the *current* status — clone after, restore the before-status:
+        let mut proposed = draft.after.clone();
+        proposed.status = draft.before.status.clone();
+        proposed.transition_status_to(&draft.after.status)?;
+    }
+    Ok(())
+}
+```
+
+See `docs/guide/state-machines.md` and `examples/wiki` (`Page` model,
+`draft → published → archived`).
+
+### Generated repository surface
+
+`#[repository]` generates far more than CRUD — reach for these before writing
+raw Diesel:
+
+| Method / attr key | Purpose |
+|---|---|
+| `find_by_id`, `find_all`, `count`, `exists_by_id`, `save`, `update`, `delete_by_id` | Core CRUD |
+| `page(&PageRequest)` | Offset pagination (`?page=N&size=M`, clamped, never 400) |
+| `cursor_page(&CursorRequest)` + `cursor_key = field` (opt. `cursor_key_type =`) | Keyset pagination for feeds/large tables; `cursor_key` must be non-nullable |
+| `save_many`, `save_many_skip_invalid`, `update_many`, `delete_many`, `upsert_many` | Bulk ops, hook-aware, auto-chunked under the 65,535-param ceiling; `upsert_many` is a compile error on hooked repositories |
+| `with_lock` | `SELECT ... FOR UPDATE` row locking in a transaction |
+| `primary_reads` (attr) / `on_primary()` | Pin reads to primary; read-your-writes after a save |
+| `soft_delete`, `tenant_scoped` (attrs), `across_tenants()` | Soft deletion and tenant scoping |
+| `hooks = MyHooks` (attr) | `before_/after_create/update/delete` + `after_*_commit` lifecycle hooks with `MutationContext` |
+| `from_shard(&ShardedDb)`, `with_pool_untracked(pool)` | **(unreleased)** shard-scoped construction; `with_pool_untracked` is new on trunk-dev — published 0.5.0 repositories have **no** pool constructor at all |
+| `find_in_batches(batch_size)`, `find_each(batch_size)` | **(unreleased)** Bounded-memory whole-table iteration via a primary-key keyset cursor (`WHERE id > last ORDER BY id ASC LIMIT batch_size` — never `LIMIT`/`OFFSET`), generated on every repository. `find_in_batches` returns a `FindInBatches` handle — drive with `while let Some(chunk) = b.next_batch().await?`; `find_each` returns `FindEach` yielding one model per `next().await?`. Inherits soft-delete filtering, tenant scoping, and read routing like `find_all`; errors are retryable (cursor advances only on success; `Ok(None)` always means completion); `batch_size == 0` errors instead of spinning; `batch_size` is **not** clamped to `MAX_PAGE_SIZE`; sharded repos reject cross-shard `across_tenants()` iteration (iterate per shard via `from_shard`). Handle types: `autumn_web::batches::{FindInBatches, FindEach, BatchSource}` (not in the prelude). See "Batched iteration" in `docs/guide/pagination.md` |
+| `find_or_create_by_<field>[_and_<field>...](<field>, &new)` | **(unreleased)** Race-safe get-or-insert; declare `fn find_or_create_by_slug(slug: String);` (lookup fields only) to generate an inherent `find_or_create_by_slug(&self, slug: String, new: &NewModel) -> AutumnResult<(Model, bool)>`. Reads on the read path first (tenant/soft-delete aware), else inserts on the primary with `ON CONFLICT DO NOTHING` — under concurrency exactly one row is created, exactly one caller sees `created == true`, and no `23505` escapes. `before_/after_create` + commit hooks fire only on the created path; works on hooked repos (unlike `upsert_many`). **Requires a unique constraint on the lookup column(s)** (`_or_` is rejected). See "Race-safe get-or-insert" in `docs/guide/repositories.md` |
+
+Read routing: with `database.replica_url` set, all generated reads use the
+replica automatically; writes always hit the primary. See
+`docs/guide/repositories.md` and `docs/guide/pagination.md`.
+
+### Transactions
+
+`Db::tx(f)` runs a READ COMMITTED transaction. On trunk-dev
+**(unreleased)**, `Db::tx_with(opts, f)` adds isolation levels and automatic
+retry of serialization failures (SQLSTATE 40001) with capped exponential
+backoff:
+
+```rust
+use autumn_web::db::{TxOptions, IsolationLevel};
+
+let opts = TxOptions::serializable()      // or ::repeatable_read(), ::read_committed()
+    .read_only()
+    .max_attempts(8);                     // serializable()/repeatable_read() default to 5
+db.tx_with(opts, |conn| async move { /* &mut AsyncPgConnection */ }.scope_boxed()).await?;
+```
+
+`TxOptions::default()` is identical to `Db::tx`. See
+`docs/guide/transactions.md` and `docs/guide/hooks-and-transactions.md`.
+
 ## Security and auth
 
 ```rust
@@ -334,6 +493,22 @@ async fn update_post(Path(id): Path<i64>, mut db: Db, session: Session) -> Autum
     Ok(html! { "updated" })
 }
 ```
+
+**(unreleased)** Scoped service tokens (trunk-dev only): mint named,
+optionally-expiring API tokens carrying flat scopes via `IssueTokenSpec` +
+`issue_scoped_api_token`; gate handlers with
+`#[secured(scopes = ["posts:write"])]` (no session required — default-deny,
+403 when missing) or `#[secured("admin", scopes = [...])]` for both; check in
+policies with `PolicyContext::has_scope/has_any_scope/has_all_scopes`; manage
+with `autumn token issue <principal> --name ... --scope ...` / `list` /
+`rotate`. The
+published 0.5.0 `autumn token` has only `issue <principal>` / `revoke`.
+
+Active session management ships with `autumn generate auth` (published 0.5.0):
+a `{user}_sessions` row per login, generated `sessions()`,
+`revoke_session(id)`, `revoke_other_sessions(...)`, `revoke_all_sessions()`
+methods, an `/account/sessions` Maud + htmx page, and `[auth.sessions]`
+config (incl. `revoke_on_credential_change`, default on).
 
 In `prod` / `production`, configure a stable signing secret or startup fails:
 
@@ -400,6 +575,92 @@ key_prefix = "myapp:webhooks:replay"
 
 Read `docs/guide/signed-webhooks.md` and `examples/signed-webhooks/`.
 
+## Mail suppression — stop emailing bounced addresses (unreleased — trunk-dev)
+
+Autumn *detects* delivery failure (inbound bounce/complaint webhooks) **and**
+acts on it: `Mailer::send()` consults a bounce/complaint suppression list
+**before** transport and skips addresses that hard-bounced or complained. This
+protects sender reputation (re-sending to a hard bounce is what gets a domain
+throttled by Gmail/Microsoft/SES). Distinct from recipient-initiated
+List-Unsubscribe (`#[mailer(list_unsubscribe)]`): that is a user opt-out;
+this is *provider-reported* failure.
+
+- **Zero-config:** an in-memory `SuppressionStore` is auto-wired; the loop works
+  out of the box on a single instance. For multi-instance deploys register the
+  durable Postgres backend (shared across replicas):
+
+  ```rust
+  use autumn_web::mail::suppression::PgSuppressionStore;
+  App::builder().with_mail_suppression_store(PgSuppressionStore::new(pool))
+  ```
+
+  > **You must create the `mail_suppressions` table yourself** —
+  > `PgSuppressionStore` ships no migration (same convention as the
+  > List-Unsubscribe `mail_unsubscribes` store, whose table is written by
+  > `autumn generate mailer --list-unsubscribe`). Add a migration with:
+  > ```sql
+  > CREATE TABLE mail_suppressions (
+  >     address       TEXT PRIMARY KEY,
+  >     reason        TEXT NOT NULL,
+  >     suppressed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  > );
+  > ```
+  > Without it, every send errors on the suppression lookup.
+
+- **Close the loop** — receive provider bounce webhook → suppress → later send
+  is skipped. The inbound handler and the `Mailer` must consult the **same**
+  store. `with_mail_suppression_store` takes a store *by value* and wraps it in
+  a fresh handle internally, so build **one** `InMemorySuppressionStore` and
+  hand out `.clone()`s of it — the clone shares the same `Arc<Mutex<…>>` state
+  (inbound handlers are plain `fn` pointers, so stash a handle in a `OnceLock`):
+
+  ```rust
+  use std::sync::OnceLock;
+  use autumn_web::mail::suppression::{
+      record_inbound, InMemorySuppressionStore, SuppressionStoreHandle,
+  };
+
+  static SUPPRESSION: OnceLock<SuppressionStoreHandle> = OnceLock::new();
+
+  // ONE store; clones share the same underlying state.
+  let store = InMemorySuppressionStore::new();
+  SUPPRESSION
+      .set(SuppressionStoreHandle::new(store.clone())) // inbound side
+      .ok();
+  let app = App::builder().with_mail_suppression_store(store); // Mailer side — same state
+
+  // Inbound router: the provided handler records the bounce.
+  InboundMailRouter::new()
+      .endpoint(InboundMailEndpointConfig::mailgun("/mail/inbound", signing_key))
+      .on_bounce(|email| Box::pin(async move {
+          record_inbound(SUPPRESSION.get().unwrap().inner().as_ref(), &email).await?;
+          Ok(())
+      }));
+  ```
+
+  A bounce suppresses the provider-reported `email.bounced_address`
+  (`SuppressionReason::HardBounce`). Afterwards `mailer.send(mail_to("a@x.com"))`
+  returns `Err(MailError::AllRecipientsSuppressed)` (zero transport calls) while
+  `b@x.com` still delivers.
+
+  > **`on_spam` is an inbound spam *verdict*, not an outbound complaint.**
+  > autumn's `on_spam` fires on a provider-side inbound spam flag
+  > (`X-Mailgun-Sflag: Yes`) — it carries no outbound complainant address, and
+  > `email.to` there is *your app's own inbound address*. So `record_inbound`
+  > deliberately suppresses **nothing** for a bare spam verdict (it logs
+  > instead), and never suppresses `email.to`. Only a genuine FBL complaint
+  > that populates `InboundEmail::complained_address` suppresses that
+  > complainant (`SuppressionReason::Complaint`). Wire a real feedback-loop
+  > source to that field before routing complaints here.
+
+- **Observability:** every skip logs `outcome = "skipped_suppressed"` and bumps
+  `suppression::suppressed_skips()` — a suppressed drop is never silent.
+- **Critical mail bypass:** `Mail::builder().….ignore_suppression()` delivers
+  even to a suppressed address (password resets, MFA codes, security alerts).
+- **Escape hatch:** `store.unsuppress(addr)` removes an address (e.g. the
+  recipient fixed their mailbox); `store.suppress(addr, SuppressionReason::Manual)`
+  adds one by hand.
+
 ## Background work
 
 Use built-in jobs and tasks before reaching for a workflow engine:
@@ -414,6 +675,65 @@ Use built-in jobs and tasks before reaching for a workflow engine:
 `autumn-admin-plugin` includes `/admin/jobs` for inspecting, retrying,
 discarding, and canceling framework jobs. `GET /actuator/jobs` exposes
 lower-level counters.
+
+Job attributes beyond `name`/`max_attempts`/`backoff_ms` (published 0.5.0):
+`#[job(unique)]` dedupes on an args hash, `unique_by = "field"`,
+`unique_window = "running"|"pending"`, `unique_for_ms = N` (debounce),
+`concurrency = N` + `concurrency_key = "field"` caps simultaneous runs. A
+coalesced enqueue is a no-op `Ok(())`.
+
+**(unreleased)** trunk-dev jobs additions:
+
+- **Named queues**: `#[job(queue = "critical")]`; drain order via
+  `[jobs] queues = ["critical", "default", "low"]` (strict priority) or a
+  `[jobs.queues]` weight table (weighted, starvation-free). No `queue` →
+  `"default"`. See `docs/guide/jobs.md`.
+- **Tracked jobs**: `job::enqueue_tracked` / `enqueue_tracked_for` (and
+  generated `{Job}::enqueue_tracked` companions) return a `TrackedJobHandle`
+  with a public token; `#[job]` accepts an optional third `JobContext` arg
+  (`async fn(AppState, Args, JobContext)`) with `set_progress(pct, msg)` /
+  `set_result(json)` / `set_user_error(msg)`; poll `GET /_autumn/jobs/{token}`
+  (JSON or self-polling htmx fragment). Config: `jobs.tracking.ttl_secs`
+  (default 24h), `jobs.tracking.route_enabled`.
+
+**(unreleased)** Events & listeners — a typed domain event bus so one action
+can fan out without inline coupling: `#[event]` on a struct, publish via the
+`Events` extractor (`events.publish(UserSignedUp { .. }).await?`), react with
+`#[listener(UserSignedUp)]` (sync, in-request) or
+`#[listener(UserSignedUp, durable, max_attempts = 5)]` (jobs-backed), and
+register with `.listeners(listeners![...])`. Do not also list durable
+listeners in `jobs![...]`. See `docs/guide/events.md`.
+
+## Distributed locks (unreleased — trunk-dev)
+
+For "run this exactly once across replicas right now" work (nightly cleanup,
+cache warming, one-shot backfills, "send the daily digest once"), use
+`autumn_web::lock::Lock` (re-exported from the prelude) instead of hand-rolling
+`pg_try_advisory_lock` raw SQL. It is the same Postgres advisory-lock machinery
+that already gates migrations, `#[scheduled]` leader election, and ISR.
+
+- Build: `Lock::from_state(&state, "name")?` (primary pool) or
+  `Lock::new(pool, "name")`. Names hash to a stable, namespaced 64-bit key via
+  `distributed_lock_key` (a `"autumn:lock:v1"` domain prefix keeps app keys out
+  of the scheduler/migration/ISR/repository keyspaces).
+- Acquire: `try_lock()` → `Option<LockGuard>` (non-blocking, `None` when held
+  elsewhere); `lock()` blocks; `lock_timeout(dur)` blocks with a typed
+  `LockError::Timeout`.
+- Run-and-release closures: for **run-once-across-replicas** work (must not run
+  twice) use `try_with(f)` → `Option<T>` — the winner runs the closure, every
+  other replica gets `None` and skips (check `ran.is_none()`). The blocking
+  `with(f)` / `with_timeout(dur, f)` instead *serialize* a mutually-exclusive
+  section: they block until the holder releases and then run the closure, so
+  every waiter eventually runs — they are **not** a run-once primitive. The lock
+  auto-releases when the section ends — normal return, early `?`, or panic — and
+  the lock-bearing connection is never recycled to the pool while held, so it
+  cannot leak.
+- Non-goals: not fair (no FIFO), not a lease (no heartbeat — use the scheduler
+  for long-lived leader election), not row-level (use `with_lock`), Postgres
+  only.
+
+See `docs/guide/distributed-locks.md` and
+`docs/adr/0010-app-facing-distributed-lock.md`.
 
 ## File storage and cache plugins
 
@@ -445,6 +765,163 @@ autumn_web::app()
     .await;
 ```
 
+**(unreleased)** Cache stampede protection — do not hand-roll cache-aside
+fills: `cache::get_or_compute(cache, key, Some(ttl), fill)` runs `fill` once
+per process for concurrent callers; `get_or_compute_with` +
+`GetOrComputeOptions::new().distributed_fill_lock(true)` (Redis lock) and
+`.stale_while_revalidate(grace)` add cross-replica single-fill and
+serve-stale; `cache::jittered_ttl(base, fraction)` de-synchronizes mass
+expiry. A failed fill never poisons the key. See
+`docs/guide/cache-stampede.md`.
+
+## View helpers and widgets (unreleased — trunk-dev, not in published 0.5.0)
+
+Trunk-dev ships framework view widgets — prefer these over hand-rolled Maud
+for the common cases:
+
+| Helper | Purpose |
+|---|---|
+| `link_to(label, href)` / `link_to_with(..., &LinkToOptions)` | Escaped GET anchors; auto `rel="noopener"` on `target="_blank"` |
+| `button_to(label, href, Method, csrf_token)` / `button_to_with` | Single-button form for state-changing actions; CSRF is a required arg; non-GET emits hidden `_method` override |
+| `card(&body, &CardConfig::new().title("..."))` / `stat_card(label, value, link)` | Titled panels and metric tiles (`autumn_web::widgets`, prelude re-export) |
+| `tabs(id, &[(id, label, markup)])` | No-JS CSS-only tab switcher (`docs/guide/tabs.md`) |
+| `modal(id, title, &body, &ModalConfig)` / `confirm_action(...)` | Native `<dialog>` confirm for destructive actions — replaces `hx-confirm`/`window.confirm()` |
+| `badge(label, BadgeVariant::for_label(status))` / `status_tag(label)` | Semantic status pill; `BadgeVariant` = `Neutral`/`Info`/`Success`/`Warning`/`Danger`, `for_label` picks a deterministic color; `badge_with`/`BadgeConfig` set `title`/`aria-label`. Composes inside a `data_table` cell |
+| `avatar(name, &AvatarConfig::new().image(url).size(AvatarSize::Small))` | Person chip: `<img>` (lazy, square, name `alt`) or a deterministic colored-initials fallback — never a broken image, no JS, no external call |
+| `alert(AlertVariant::Info, body)` / `alert_with(..., &AlertConfig::new().title("...").icon(true).dismissible(true))` | Inline callout / empty-state / error box; `role` per variant, optional title + inline-SVG icon + no-JS dismiss. `error_summary(&changeset)` renders an `Error` alert of all field errors (or `None` when valid) |
+| `flash_messages(&flash.consume().await)` (`autumn_web::flash`) | Accessible flash banners: per-severity `role`/`aria-live`, `autumn-flash--<level>` classes, empty slice renders nothing; `flash_messages_with` adds a no-JS dismiss |
+| `pagination_nav(&page, &PagerOptions::new("/posts"))` / `cursor_pagination_nav` | Accessible, filter-preserving, htmx-opt-in pager from a `Page`/`CursorPage` (prelude re-export) |
+| `toast(message, variant)` / `toast_region(DEFAULT_TOAST_REGION_ID)` / `toast_in(region_id, ...)` | Transient htmx action feedback: drop `toast_region` once in the layout, then return `toast(...)` next to your swapped fragment — it appends into the region OOB (`hx-swap-oob="beforeend:#toast-region"`). CSS-only auto-dismiss (no `<script>`); `variant` reuses `AlertVariant`. `toast_region` is a persistent `aria-live="polite"` region — non-error toasts inherit its politeness (no own `role`/`aria-live`); `Error` announces assertively via its own `role="alert"` |
+| `infinite_feed(items, next_cursor, &FeedConfig)` / `feed_page(items, next_cursor, &FeedConfig)` | htmx infinite-scroll / "Load more" feed from a `CursorPage`: single `hx-get` sentinel carries the cursor and appends the next page in place (no reload, no duplicate rows). `FeedMode::{Reveal,Button}`; progressive `<a href>` fallback. `feed_page` is the append fragment a handler returns for each page (`page.next_cursor.as_deref()`) |
+| `autumn_web::ui::WIDGETS_CSS` / `WIDGETS_CSS_PATH` | One shipped stylesheet backing every `autumn-*` widget class — link `href=(WIDGETS_CSS_PATH)` instead of copying widget CSS into `input.css`. Accent now follows `var(--primary)` (violet), not the old hardcoded indigo (`docs/guide/widget-styling.md`) |
+
+### Whole-form rendering — `form_for` (unreleased — trunk-dev, not in published 0.5.0)
+
+`#[model]` derives `autumn_web::form::FormModel` (one `FormField` per
+`NewX`-editable column: humanized label, type-appropriate `FieldControl`,
+`required` = non-`Option`), and `form_for` renders the entire `<form>` from a
+`Changeset` in one call — opening tag with CSRF and hidden `_method` override
+(same audited path as `form_tag`), pre-filled controls with inline per-field
+errors, and a submit button. Import from `autumn_web::form` (not in the
+prelude):
+
+```rust
+use autumn_web::form::{form_for, FieldControl};
+
+// changeset: Changeset<Post> — blank for `new`, error-carrying on 422 re-render
+let markup = form_for(&changeset, "/posts", "post") // non-GET/POST method emits hidden _method
+    .csrf(&csrf_token)                              // .csrf_field_name(...) overrides "_csrf"
+    .exclude("internal_notes")
+    .override_field("status", FieldControl::Select {
+        options: vec![("draft".into(), "Draft".into()), ("published".into(), "Published".into())],
+    })                                              // last call wins per field
+    .override_label("body", "Content")
+    .submit_label("Publish")                        // default "Save"
+    .render();
+```
+
+Derived control mapping: strings/`Uuid`/unknown types → `Text` (promote enums
+via `.override_field`), integers → `Number` (step 1), floats/`Decimal` →
+`Number` (step any), `bool` → `Checkbox` (nullable `bool` → tri-state
+`Select`), `NaiveDate` → `Date`, `NaiveDateTime`/`DateTime<Utc>`/
+`DateTime<Local>` → `DateTime`, any other `DateTime` zone → `Text` (an
+offsetless `datetime-local` value is ambiguous there). Any
+`FieldControl::File` field (or `.multipart()`) makes `render()` emit
+`enctype="multipart/form-data"`.
+
+Round-trip contracts are handled by the `#[model]`-generated `NewX`: unchecked
+checkboxes decode as `false` (`#[serde(default)]` — `checkbox_input` emits no
+hidden false fallback), and `datetime-local` submissions decode via the
+`deserialize_datetime_local_utc[_option]` /
+`deserialize_datetime_local_local[_option]` /
+`deserialize_naive_datetime_local[_option]` helpers (which also still accept
+RFC 3339 JSON bodies). Serde-renamed columns pre-fill correctly via
+`FormField::value_name` (set automatically by the derive; hand-written
+`FormModel` impls use `FormField::new(...).with_value_name(...)`). Trunk-dev
+`autumn generate scaffold` views render through a single shared
+`{snake}_form_for` helper built on this (except `--live-validation`, which
+keeps per-field htmx emission).
+
+## Resumable SSE streams (unreleased — trunk-dev, issue #1356)
+
+Don't hand-roll `Last-Event-ID` bookkeeping or a manual replay buffer for
+server-sent events. On trunk-dev the `ws`-gated channels backend keeps a
+**bounded per-topic replay ring buffer** and assigns every event an
+**epoch-tagged per-topic `id` automatically** (wire format `epoch.seq`, opaque
+to clients) — no manual `.id(...)` in handler code.
+
+- `autumn_web::sse::stream_resumable(&state, topic, last_event_id)` is the route
+  primitive. It reads the client's `Last-Event-ID`, replays the buffered events
+  the client missed in order, then continues live — no duplicated or skipped
+  events at the seam (publish assigns seqs and broadcasts under one lock; resume
+  subscribes under that same lock and snapshots the buffer). Within one epoch it
+  replays entries with `seq > last_event_id.seq`; across an epoch boundary it
+  gaps and replays the full retained current epoch (see Limitations).
+- Read the inbound header with `autumn_web::sse::last_event_id(&headers)` →
+  `Option<EventId>` (`EventId { epoch: u64, seq: u64 }`, exported as
+  `autumn_web::sse::EventId` and re-exported `autumn_web::channels::EventId`), or
+  the `autumn_web::sse::LastEventId(pub Option<EventId>)` extractor (never fails;
+  absent/malformed/legacy-bare-integer → `None` → treated as a cold connection).
+- **Cold connection** (`None`) behaves exactly like `sse::stream`: no replay,
+  just live events, dense seqs preserved.
+- **Gap sentinel:** when the requested id has aged out of the retained window
+  (the buffer overflowed) **or belongs to a different epoch**, the stream emits
+  one `gap` event (`event: gap`, `data: {"gap":true}`, no `id`) *before* the
+  replay so clients can detect missed events rather than silently receiving a
+  hole. A live broadcast lag surfaces the same `gap` sentinel and advances the
+  seq counter.
+- The existing non-resumable helpers — `sse::stream`, `sse::stream_authorized`,
+  `sse::from_subscriber`, `Channels::sse_stream` — are **unchanged and remain
+  id-less**; `stream_resumable` is purely additive.
+- Only the in-process local backend retains a replay buffer; the Redis fan-out
+  backend degrades gracefully to a live-only `ResumeHandle`
+  (`Channels::resume(topic, last_event_id) -> ResumeHandle` is available on any
+  backend).
+
+```rust
+use autumn_web::prelude::*;
+use autumn_web::sse::LastEventId;
+
+#[get("/events")]
+async fn events(State(state): State<AppState>, LastEventId(last): LastEventId) -> impl IntoResponse {
+    autumn_web::sse::stream_resumable(&state, "feed", last)
+}
+```
+
+Retention is configurable via `channels.replay_buffer` (`N`, default `256`;
+env `AUTUMN_CHANNELS__REPLAY_BUFFER`). Memory is `O(N)` per topic regardless of
+throughput. This is distinct from `channels.capacity`, which sizes the live
+broadcast fan-out ring.
+
+**Limitations** (in-process best-effort scope, per issue #1356's "Out of
+Scope") — the replay buffer is a same-process convenience, not a durable log:
+
+- The replay buffer lives in the topic's in-memory state, which is dropped when
+  the topic is garbage-collected (a topic is retained only while it has a live
+  receiver or an outstanding `Sender`). A topic with only transient SSE
+  subscribers can lose its buffer during the disconnect window. The recreated
+  topic gets a **new epoch**, so a reconnect across the gap is not silently
+  corrupted: the epoch mismatch is signalled as a `gap` sentinel plus a full
+  replay of the current epoch (the old epoch's events themselves are gone).
+- On process restart (or any topic GC/recreation) the per-topic `seq` counter
+  resets to `1` under a fresh `epoch`. The epoch tag means a stale `Last-Event-ID`
+  from a previous epoch — even one whose `seq` the new epoch has already passed —
+  is always distinguishable from a current-epoch id, so the reconnect yields a
+  `gap` sentinel followed by a full replay of the current epoch rather than
+  silently dropping the new epoch's early events (the pre-epoch-tag hole, issue
+  #1356). The buffered history from before the restart is still gone (persist it
+  yourself for durability), but the client is never fed a corrupted partial.
+- Publishing through `channels.publish()` / `broadcast().publish()` /
+  `channels.sender().send()` is safe on resumable topics: all three route
+  through the backend's `publish`, assigning a seq and appending to the replay
+  buffer. Only calling `.send()` directly on the raw `broadcast::Sender`
+  (obtained from `channels.sender().keepalive` or the `ensure_topic` trait
+  method) broadcasts without assigning an id or appending to the replay buffer,
+  which breaks resumability for that topic.
+
+For cross-restart / multi-replica durability, back the stream with a durable log
+(e.g. a database table or a Redis stream) instead of the in-process buffer.
+
 ## Configuration
 
 Config layering, lowest to highest:
@@ -467,6 +944,128 @@ Use `AUTUMN_SECTION__FIELD` for env overrides, for example
 `AUTUMN_DATABASE__PRIMARY_URL`, `AUTUMN_JOBS__BACKEND`,
 `AUTUMN_SECURITY__SIGNING_SECRET`, and
 `AUTUMN_SECURITY__WEBHOOKS__REPLAY__BACKEND`.
+
+## Observability defaults
+
+Published 0.5.0 behavior:
+
+- Structured per-request access log is **on by default**; disable with
+  `log.access_log = false`, tune exclusions with `log.access_log_exclude`
+  (probes/static excluded out of the box).
+- Request-scoped log context auto-tags every log line in a request; add
+  custom fields with `autumn_web::log::context::with_log_field("order_id", id)`
+  (prelude re-export).
+- `actuator.prometheus` exposes the Prometheus scrape endpoint independently
+  of sensitive actuator mode.
+
+### Runtime log levels (unreleased — trunk-dev)
+
+`PUT /actuator/loggers/{name}` now changes the **live** `tracing` subscriber,
+not just an in-memory map — raise/lower verbosity in production without a
+redeploy. The default telemetry init installs a `tracing_subscriber` reload
+layer and hands the handle to `LogLevels`, so a level change rebuilds the
+combined `EnvFilter` directive (global level + per-target overrides) and pushes
+it to the running subscriber on the next event. Examples (sensitive actuator
+mode required):
+
+```bash
+curl -X PUT .../actuator/loggers/root -d '{"level":"debug"}'          # global
+curl -X PUT .../actuator/loggers/my_app::orders -d '{"level":"trace"}' # per-target
+curl -X PUT .../actuator/loggers/root -d '{"level":"info"}'            # revert
+```
+
+The response now carries `"applied": true` and `"status":"ok"` only when the
+change actually reached a reload-capable subscriber; otherwise it reports
+`"status":"recorded"` / `"applied": false` rather than a false-positive `ok`.
+Overrides stay ephemeral — a restart resets to the configured `log.level`.
+Invalid levels still return `400`. `GET /actuator/loggers` keeps reporting
+`current_level` + overrides, now matching real emission.
+
+### Build & git provenance on `/actuator/info` (unreleased — trunk-dev)
+
+`GET /actuator/info` now reports which commit/build is running, for
+deploy/rollback verification. Apps scaffolded by `autumn new` get this with
+**zero action**: the generated `build.rs` bakes `AUTUMN_BUILD_*` values and
+`#[autumn_web::main]` reads them (plus the app's own `CARGO_PKG_NAME` /
+`CARGO_PKG_VERSION`) at the app's compile time. That also fixes the old
+`app.version = "unknown"` regression — the value is now baked in, correct even
+in a `--release` binary with the cargo env unset at runtime. Sample payload:
+
+```json
+{
+  "app":     { "name": "my_app", "version": "1.4.2" },
+  "autumn":  { "version": "0.6.0", "profile": "prod" },
+  "runtime": { "uptime": "3h 12m" },
+  "build": {
+    "version": "1.4.2",
+    "timestamp": "2026-07-09T12:34:56Z",
+    "git": {
+      "commit": "9f3c1a7e…",
+      "commit_short": "9f3c1a7",
+      "branch": "main",
+      "dirty": false
+    }
+  }
+}
+```
+
+Outside a git checkout (tarball / CI cache) the `git.*` fields degrade to
+`null` while `build.timestamp` + `version` stay present. The block exposes only
+commit / branch / time / version / dirty — never remote URLs or an env dump.
+Hand-rolled apps opt in by adding the generated `build.rs` provenance stanza
+and using `#[autumn_web::main]`.
+
+**Known limitation:** apps built from the scaffolded Dockerfile currently report
+null git provenance because the Docker build context excludes `.git` (tracked in
+#1676).
+Unreleased (trunk-dev) — `Server-Timing` response header:
+
+- Opt-in via `[observability] server_timing = true` (or
+  `AUTUMN_OBSERVABILITY__SERVER_TIMING=true`). Defaults **on in `dev` /
+  `development`** profiles, **off everywhere else** — so prod never leaks
+  timings to anonymous clients without explicit opt-in.
+- Emits `total;dur=…` (whole-request wall time, same clock as access-log
+  `duration_ms`) and, when at least one instrumented query ran,
+  `db;dur=…;desc="N queries"` for N+1 visibility.
+- SSE responses (`text/event-stream`) get `total`-only; header is
+  best-effort — never turns absent timing data into an error.
+- The `db` metric installs autumn's own Diesel connection instrumentation on
+  measured checkouts only (nothing is installed when `server_timing` is off, so
+  an app's `diesel::connection::set_default_instrumentation` is untouched).
+  While enabled, autumn's timer replaces an app-provided default rather than
+  composing with it — documented limitation; keep `server_timing` off where you
+  rely on your own instrumentation.
+- Doc + browser DevTools walk-through:
+  `docs/guide/observability/server-timing.md`.
+
+## Resilience: load shedding (unreleased — trunk-dev)
+
+Admission control caps concurrent in-flight requests; excess is shed
+immediately with `503` + `Retry-After` before the handler runs. Disabled by
+default:
+
+```toml
+[server]
+max_concurrent_requests = 256   # unset/0 = unlimited
+```
+
+Probes (`/health`, `/live`, `/ready`, `/startup`, actuator) are never shed;
+sheds increment `autumn_requests_shed_total`. See `docs/guide/resilience.md`
+and `docs/adr/0009-adopt-overload-protection-load-shedding.md`.
+
+## Sharding (unreleased — trunk-dev, not in published 0.5.0)
+
+Framework-native horizontal sharding: declare `[[database.shards]]` (each a
+full primary/replica topology), route by key → logical slot → shard. Prelude
+extractors: `ShardedDb` (auto-routed handle — resolves the routing key from
+the request, checks out the owning shard's primary, derefs to the connection
+like `Db`) and `Shards` (explicit routing: `db_for`/`read_for`/`db_on`, plus
+bounded `each_shard` fan-out); install custom routing with
+`AppBuilder::with_shard_router`; build repositories per shard with
+`from_shard(&ShardedDb)`. `autumn migrate` gains `--shard <name>` /
+`--control-only`; a boot-time shard-map guard fails fast on config drift.
+There are no cross-shard queries or transactions by design. See
+`docs/guide/sharding.md` and `examples/bookmarks-sharded`.
 
 ## Error handling
 
@@ -563,6 +1162,84 @@ autumn dev-loop-bench --dry-run
 autumn plugin-check --plugin-name autumn-admin-plugin --prefix /admin
 ```
 
+**(unreleased)** trunk-dev-only CLI additions — NOT in the published 0.5.0
+`autumn-cli`; do not suggest them to users on the published release:
+
+```bash
+autumn serve --daemon            # non-watch local daemon; also: serve stop|status|restart
+autumn serve --bundled-pg        # managed local Postgres (managed-pg-bundled feature)
+autumn destroy scaffold Post title:String   # cleanly reverses generate; --dry-run supported
+autumn generate scaffold Post title:String 'status:enum{draft,published}' 'price:decimal{10,2}' author:references email:String:unique
+autumn generate scaffold Post title:String --live --live-validation
+autumn generate tauri            # desktop sidecar project (cargo tauri build)
+autumn generate plugin my-plugin # installable/conformant plugin crate
+autumn token issue service:ci --name ci --scope posts:write   # scoped tokens; also list, rotate
+autumn i18n check                # compare t!/t(...) keys vs i18n/*.ftl; --strict, --format json
+```
+
+`autumn i18n check` scans `**/*.rs` for string-literal keys passed to
+`t!(...)`, `.t(...)`, and `.t_with(...)`, loads every `i18n/<locale>.ftl` via
+the runtime `Bundle` loader, and reports per locale: **Missing** (referenced in
+code but absent from that locale's resolved fallback chain — the correctness
+failure, non-zero exit), **Untranslated** (present in the default locale but
+not a non-default one), and **Unused** (defined in a `.ftl` with no call site).
+Untranslated/Unused are warnings unless `--strict`. `--format json` feeds CI.
+Runtime-built keys like `t(&format!(...))` are listed as "dynamic — not
+checked" rather than flagged.
+
+**Known heuristic limits.** The scanner is a best-effort token/grammar
+heuristic over source text, not a type-resolved AST. Any key it cannot
+statically resolve to a string literal is treated as *dynamic — not checked*,
+so unsupported shapes are never falsely flagged as Missing/Unused and cannot
+break CI:
+
+- Only whole-key string literals (optionally in leading borrows/parens spanning
+  the entire key argument) are checked precisely. A literal transformed by a
+  chained method or operator (`t(" nav.home ".trim())`, `t("a" + b)`) is treated
+  as dynamic, not as the literal.
+- Dynamic keys are reported as "dynamic — not checked". A whole-key
+  `format!("status.{state}")` contributes its static `"status."` prefix so
+  matching `.ftl` keys aren't marked Unused; a fully-dynamic key (bare variable,
+  `format!("{x}")`) suppresses Unused reporting entirely.
+- Keys built through concatenation, helper functions, non-`format!` macros, or
+  deeper transformations are treated as dynamic and not validated — such `.ftl`
+  entries aren't checked for Missing/Unused.
+- No type resolution: it can't distinguish an unrelated local helper named
+  `t`/`t_with` from the real translation API beyond its syntactic
+  `t!(...)` / `receiver.t(...)` / `Type::t(...)` (real `::` path) checks; a bare
+  free-function `t("...")` is left alone.
+autumn migrate baseline          # record content hashes for legacy applied migrations (issue #1203)
+autumn migrate baseline --force <version>  # escape hatch: overwrite one version's stored hash (WARN-logged)
+```
+
+### Migration content checksums (issue #1203)
+
+The framework hashes every migration's `up.sql` (SHA-256, with `\r\n`/`\r`
+→ `\n` normalisation and `trim_end()`) into `autumn_migration_checksums`
+the first time it's applied, and re-validates the hash before every
+subsequent `autumn migrate` run and startup auto-migrate. Editing an
+already-applied migration flips its state to `changed` and the next
+`autumn migrate` refuses to run:
+
+```
+migration <version> checksum mismatch: recorded <hex-a> but on-disk
+content hashes to <hex-b>. Migrations must never be edited after being
+applied — add a new migration instead, or run the documented re-baseline
+command if this change was deliberate.
+```
+
+Rule of thumb: **never edit an applied migration.** Add a new one. If the
+user asks you to edit an applied migration, push back with this rule and
+propose a follow-up migration. `autumn migrate status` reports each
+applied migration's state as `ok`, `changed`, or `unrecorded`. Use
+`autumn migrate baseline` (additive, idempotent) to record hashes for
+legacy migrations applied before the checksum feature existed; use
+`autumn migrate baseline --force <version>` only when a deliberate edit
+is intended and the fork risk is accepted.
+
+`autumn destroy` mirrors `autumn generate` argument-for-argument and never
+touches a database — it only reverses generated files/migrations.
+
 `autumn doctor --strict` is the deployment sanity check. It reports unsafe
 production defaults, missing primaries, stale replica migrations, missing
 signing secrets, and other config problems without printing credentials.
@@ -612,8 +1289,19 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo test -p autumn-web --doc --all-features
-cargo test -p autumn-cli --test repo_hygiene
+cargo test -p autumn-cli --test cli_tests
 ```
+
+There is no separate `repo_hygiene` test target anymore — it is consolidated
+into `cli_tests` (`autumn-cli/tests/integration/repo_hygiene.rs`). Integration
+tests live in consolidated binaries (`autumn` → `integration_tests`,
+`autumn-cli` → `cli_tests`); new tests go in `tests/integration/<name>.rs` +
+a `mod` line in `tests/integration/mod.rs`, not new `[[test]]` targets.
+
+CI also runs a feature-combination compile gate (35 `autumn-web` feature
+combos via `cargo hack`), a generator-conformance gate, and a plugin
+freshness gate (`scripts/check-plugin-freshness.sh` — user-facing changelog
+entries must ship matching Claude-plugin updates).
 
 For docs or generated-app changes, also run the docs smoke procedure in
 `docs/guide/docs-smoke.md`. For public API changes, run doctests for the
@@ -650,6 +1338,19 @@ touched crate so examples compile from an external-consumer perspective.
 - `docs/guide/signed-webhooks.md`
 - `docs/guide/storage.md`
 - `docs/guide/jobs.md`
+- `docs/guide/state-machines.md`
+- `docs/guide/repositories.md`
+- `docs/guide/pagination.md`
+- `docs/guide/transactions.md`
+- `docs/guide/hooks-and-transactions.md`
+- `docs/guide/events.md`
+- `docs/guide/cache-stampede.md`
+- `docs/guide/sharding.md`
+- `docs/guide/daemon.md`
+- `docs/guide/resilience.md`
+- `docs/guide/generators.md`
+- `docs/guide/widget-styling.md`
+- `docs/guide/tabs.md`
 - `docs/guide/maintenance-mode.md`
 - `docs/guide/dev-loop-latency.md`
 - `docs/guide/system-tests.md`

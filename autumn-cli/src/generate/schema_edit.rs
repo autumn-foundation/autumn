@@ -32,6 +32,23 @@ pub fn add_mod_declaration(existing: &str, name: &str) -> String {
     format!("{trimmed}\n{line}\n")
 }
 
+/// Inverse of [`add_mod_declaration`] (`autumn destroy`, issue #1048).
+///
+/// Removes the exact `pub mod <name>;` line [`add_mod_declaration`] would
+/// have inserted. A no-op (returns `existing` unchanged) if that line isn't
+/// present — either because it was already destroyed, or because the module
+/// pre-existed as a bare `mod <name>;` that `add_mod_declaration` itself
+/// never touches (and destroy must not touch either).
+#[must_use]
+pub fn remove_mod_declaration(existing: &str, name: &str) -> String {
+    let line = format!("pub mod {name};");
+    let lines: Vec<&str> = existing.lines().collect();
+    let Some(idx) = lines.iter().position(|l| l.trim() == line) else {
+        return existing.to_owned();
+    };
+    remove_single_line(&lines, idx, existing.ends_with('\n'))
+}
+
 /// Build a new `diesel::table!` block for the given table, emitting the `id`
 /// column with the caller-supplied `id_type`.
 #[must_use]
@@ -82,6 +99,76 @@ pub fn append_schema_table_with_id(
 fn has_table(existing: &str, table: &str) -> bool {
     let needle = format!("{table} (");
     existing.lines().any(|l| l.trim().starts_with(&needle))
+}
+
+/// Inverse of [`append_schema_table_with_id`]/[`append_schema_table`]
+/// (`autumn destroy`, issue #1048).
+///
+/// Removes the whole `diesel::table! { <table> (...) { ... } }` block for
+/// `table`, plus the single blank separator line
+/// [`append_schema_table_with_id`] inserts before it when appending to a
+/// non-empty file — so removing the last table restores the file byte-for-
+/// byte to whatever preceded it (including becoming empty, in which case the
+/// caller deletes the file rather than leaving a blank `src/schema.rs`).
+///
+/// A no-op (returns `existing` unchanged) if `table` isn't declared, if the
+/// block's shape doesn't match what `append_schema_table_with_id` would have
+/// produced (hand-edited/malformed), or if the block's content isn't
+/// byte-identical to `expected_block` (the literal text this generator
+/// invocation would append for `table`) — the last check protects a
+/// same-named table that pre-existed with different columns from ever being
+/// destroyed (issue #1048 PR review): destroy never corrupts, nor deletes, a
+/// table it didn't itself produce.
+#[must_use]
+pub fn remove_schema_table(existing: &str, table: &str, expected_block: &str) -> String {
+    if !has_table(existing, table) {
+        return existing.to_owned();
+    }
+    let lines: Vec<&str> = existing.lines().collect();
+    let needle = format!("{table} (");
+    let Some(table_line_idx) = lines.iter().position(|l| l.trim().starts_with(&needle)) else {
+        return existing.to_owned();
+    };
+    if table_line_idx == 0 || lines[table_line_idx - 1].trim() != "diesel::table! {" {
+        return existing.to_owned();
+    }
+    let open_idx = table_line_idx - 1;
+    let Some(inner_close_offset) = lines[table_line_idx + 1..]
+        .iter()
+        .position(|l| l.trim() == "}")
+    else {
+        return existing.to_owned();
+    };
+    let inner_close_idx = table_line_idx + 1 + inner_close_offset;
+    let Some(outer_close_line) = lines.get(inner_close_idx + 1) else {
+        return existing.to_owned();
+    };
+    if outer_close_line.trim() != "}" {
+        return existing.to_owned();
+    }
+    let outer_close_idx = inner_close_idx + 1;
+
+    let found_block = format!("{}\n", lines[open_idx..=outer_close_idx].join("\n"));
+    if found_block != expected_block {
+        return existing.to_owned();
+    }
+
+    // Also consume one preceding blank separator line, if present.
+    let mut start = open_idx;
+    if start > 0 && lines[start - 1].trim().is_empty() {
+        start -= 1;
+    }
+
+    let mut new_lines: Vec<&str> = Vec::with_capacity(lines.len());
+    new_lines.extend_from_slice(&lines[..start]);
+    if outer_close_idx + 1 < lines.len() {
+        new_lines.extend_from_slice(&lines[outer_close_idx + 1..]);
+    }
+    let mut out = new_lines.join("\n");
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out
 }
 
 /// Public predicate: whether `schema` already declares a `<table>` block.
@@ -151,7 +238,7 @@ pub fn create_table_sql_with_metadata_and_id(
             sql,
             "    {} {} {}",
             f.name,
-            f.sql_type(),
+            f.sql_column_type(),
             f.sql_nullability()
         );
         if let Some(target) = f.reference_table() {
@@ -457,7 +544,7 @@ pub fn add_columns_up_sql(table: &str, fields: &[Field], existing_schema: &str) 
             out,
             "ALTER TABLE {table} ADD COLUMN {} {} {}",
             f.name,
-            f.sql_type(),
+            f.sql_column_type(),
             f.sql_nullability()
         );
         if let Some(target) = f.reference_table() {
@@ -698,7 +785,7 @@ pub fn remove_columns_down_sql(table: &str, fields: &[Field], existing_schema: &
             out,
             "ALTER TABLE {table} ADD COLUMN {} {} {}",
             f.name,
-            f.sql_type(),
+            f.sql_column_type(),
             f.sql_nullability()
         );
         if let Some(target) = f.reference_table() {
@@ -810,13 +897,93 @@ fn has_mod_declaration(existing: &str, name: &str) -> bool {
         .any(|line| needles.iter().any(|n| line == n))
 }
 
+/// Inverse of [`ensure_mods`] (`autumn destroy`, issue #1048).
+///
+/// Removes each `mod <name>;` line (the bare, private form `ensure_mods`
+/// inserts) for a name in `names`, then collapses any run of blank lines the
+/// removal leaves behind down to at most one, and drops a leading blank line
+/// at the very start of the file — restoring the file exactly as it was
+/// before any of those declarations were added.
+///
+/// Unlike [`remove_mod_declaration`] (a resource's own `pub mod` entry in
+/// `src/models/mod.rs`), this targets `src/main.rs`'s shared infrastructure
+/// module names (`models`, `schema`, `repositories`, `routes`, …). The
+/// caller is responsible for only passing names whose backing module no
+/// longer exists on disk — these declarations are shared by every
+/// generated resource, not owned by one.
+#[must_use]
+pub fn remove_main_mod_declarations(existing: &str, names: &[&str]) -> String {
+    let lines: Vec<&str> = existing.lines().collect();
+    let patterns: Vec<String> = names.iter().map(|n| format!("mod {n};")).collect();
+    let matches_any = |line: &str| patterns.iter().any(|p| line.trim() == p);
+    if !lines.iter().any(|l| matches_any(l)) {
+        return existing.to_owned();
+    }
+    let kept: Vec<&str> = lines.into_iter().filter(|l| !matches_any(l)).collect();
+
+    let mut collapsed: Vec<&str> = Vec::with_capacity(kept.len());
+    for line in kept {
+        if line.trim().is_empty() && collapsed.last().is_some_and(|l: &&str| l.trim().is_empty()) {
+            continue;
+        }
+        collapsed.push(line);
+    }
+    while collapsed.first().is_some_and(|l| l.trim().is_empty()) {
+        collapsed.remove(0);
+    }
+
+    let mut out = collapsed.join("\n");
+    if existing.ends_with('\n') && !out.is_empty() {
+        out.push('\n');
+    }
+    out
+}
+
+/// Whether the byte offset `pos` in `text` sits after a `//` on its own line —
+/// i.e. the match at `pos` lives inside a line comment (`//`, `///`, or `//!`).
+/// Used to skip `routes![` occurrences that appear in comments (e.g. a doc
+/// comment explaining the macro) rather than in real code.
+///
+/// A `//` inside a double-quoted string literal is content, not a comment
+/// marker — e.g. the URL in
+/// `let url = "https://example.com"; app.routes(routes![index])` must not
+/// make the line look commented out. This stays a line-local heuristic: it
+/// tracks `"…"` state with `\`-escape handling but does not understand raw
+/// strings (`r#"…"#`), char literals containing `"`, or block comments.
+fn is_on_comment_line(text: &str, pos: usize) -> bool {
+    let line_start = text[..pos].rfind('\n').map_or(0, |nl| nl + 1);
+    let mut in_string = false;
+    let mut chars = text[line_start..pos].chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' if in_string => {
+                // Skip the escaped character so `\"` doesn't end the string.
+                chars.next();
+            }
+            '"' => in_string = !in_string,
+            '/' if !in_string && chars.peek() == Some(&'/') => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
 /// Locate the body span (byte offsets, exclusive of the enclosing
 /// `routes![`/`]`) of the *first* `routes![ ... ]` macro invocation in
-/// `existing`. Returns `None` if there is no `routes![` or its brackets are
-/// unmatched. Shared by every function that reads or rewrites the
+/// `existing`, skipping occurrences on comment lines (a doc comment such as
+/// `//! routes![...]` must not be edited — injecting entries there breaks
+/// compilation). Returns `None` if there is no non-comment `routes![` or its
+/// brackets are unmatched. Shared by every function that reads or rewrites the
 /// `routes![...]` body so the bracket-scan logic lives in exactly one place.
 fn find_routes_body_range(existing: &str) -> Option<(usize, usize)> {
-    let start = existing.find("routes![")?;
+    let mut search_from = 0;
+    let start = loop {
+        let pos = search_from + existing[search_from..].find("routes![")?;
+        if !is_on_comment_line(existing, pos) {
+            break pos;
+        }
+        search_from = pos + "routes![".len();
+    };
     let body_start = start + "routes![".len();
     // Find the matching closing bracket. The macro body cannot contain a
     // raw `]` outside of nested `[ ... ]`, so we just track depth.
@@ -898,6 +1065,119 @@ pub fn remove_routes_entries_with_prefix(existing: &str, prefix: &str) -> String
     out.push_str(&new_body);
     out.push_str(&existing[body_end..]);
     out
+}
+
+/// Inverse of [`augment_routes_body`] (`autumn destroy`, issue #1048).
+///
+/// Removes exactly `entries` from the first `routes![ ... ]` invocation and
+/// restores the pre-existing entries' original layout — byte-identically
+/// when they were on one line (the common case: a fresh `autumn new`
+/// project's `routes![index, hello, hello_name]`), since `augment_routes_body`
+/// only ever *appends* after existing content and never reformats it, so the
+/// text preceding the first entry being removed is exactly what preceded
+/// this generate call.
+///
+/// A no-op (returns `existing` unchanged) if there's no `routes![...]`, or if
+/// NONE of `entries` is present any more (already destroyed). Removes
+/// whichever of `entries` ARE currently present when only some are — e.g.
+/// the user hand-removed one of this resource's routes before running
+/// `destroy` — rather than abandoning the whole cleanup and leaving the
+/// rest dangling (issue #1048 PR review): a route this resource's own file
+/// deletion is about to orphan must not survive just because a sibling
+/// entry from the same call was already gone.
+#[must_use]
+pub fn remove_routes_entries(existing: &str, entries: &[String]) -> String {
+    if entries.is_empty() {
+        return existing.to_owned();
+    }
+    let Some((body_start, body_end)) = find_routes_body_range(existing) else {
+        return existing.to_owned();
+    };
+    let body = &existing[body_start..body_end];
+    let present_entries: Vec<String> = body
+        .split([',', '\n'])
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if !entries.iter().any(|e| present_entries.contains(e)) {
+        return existing.to_owned();
+    }
+    let kept: Vec<&String> = present_entries
+        .iter()
+        .filter(|e| !entries.contains(e))
+        .collect();
+
+    // The pre-existing entries' original formatting survives untouched in
+    // the current body, up to the point where this call's first removed
+    // entry begins. Strip the separator (`,`/whitespace/newline) forward
+    // added right after the original content to see whether that ORIGINAL
+    // content itself spanned multiple lines.
+    //
+    // Locate that point via each entry's actual token span (from the same
+    // comma/newline split `present_entries` was built from), not a raw
+    // substring search — `body.find(e)` would also match `e` occurring
+    // inside a *different*, kept entry that has it as a textual prefix
+    // (e.g. removing `routes::posts::index` while `routes::posts::index_all`
+    // is kept), misdetecting where the original layout ends.
+    let spans = entry_spans(body);
+    let first_removed_at = entries
+        .iter()
+        .filter_map(|e| {
+            spans
+                .iter()
+                .find(|(_, _, text)| text == e)
+                .map(|(start, ..)| *start)
+        })
+        .min()
+        .unwrap_or(body.len());
+    let original_segment = &body[..first_removed_at];
+    let original_core = original_segment.trim_end_matches([' ', '\t', '\n', ',']);
+    let multiline = original_core.contains('\n');
+
+    let new_body = if multiline {
+        let indent = leading_indent(body);
+        let mut out = String::with_capacity(body.len());
+        for entry in &kept {
+            out.push_str(&indent);
+            out.push_str(entry);
+            out.push_str(",\n");
+        }
+        out
+    } else {
+        kept.iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    let mut out = String::with_capacity(existing.len());
+    out.push_str(&existing[..body_start]);
+    out.push_str(&new_body);
+    out.push_str(&existing[body_end..]);
+    out
+}
+
+/// Parse `body` into `(start, end, trimmed_text)` byte spans of each
+/// comma/newline-delimited entry, so callers can locate an entry's actual
+/// token occurrence rather than a raw substring search (which can match
+/// inside a different, unrelated entry that has it as a textual prefix).
+fn entry_spans(body: &str) -> Vec<(usize, usize, &str)> {
+    let mut spans = Vec::new();
+    let mut offset = 0usize;
+    for piece in body.split_inclusive([',', '\n']) {
+        let piece_start = offset;
+        offset += piece.len();
+        let trimmed = piece.trim_matches([',', '\n', ' ', '\t', '\r']);
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Some(inner_offset) = piece.find(trimmed) else {
+            continue;
+        };
+        let start = piece_start + inner_offset;
+        spans.push((start, start + trimmed.len(), trimmed));
+    }
+    spans
 }
 
 fn augment_routes_body(body: &str, entries: &[String]) -> String {
@@ -1052,6 +1332,117 @@ fn insert_mail_previews_call(existing: &str, mailer_type: &str) -> String {
     )
 }
 
+/// Inverse of [`add_mail_preview_to_app`] (`autumn destroy`, issue #1048).
+///
+/// Removes `mailer_type` from the `mail_previews![...]` list. If it was the
+/// only entry, the whole freshly-inserted
+/// `.mail_previews(mail_previews![...])` line is removed too, rather than
+/// leaving an empty `mail_previews![]` call behind.
+///
+/// A no-op if there's no `mail_previews![...]`, or `mailer_type` isn't
+/// currently listed.
+///
+/// Locates the whole `.mail_previews(mail_previews![...])` call by balanced-
+/// paren scan (rather than assuming it stays on one line) when the list
+/// empties out, so a project that ran the call through `rustfmt` — which
+/// commonly wraps it across several lines once it has more than a couple of
+/// mailer names — doesn't end up with a dangling, now-meaningless remnant
+/// (issue #1048 PR review).
+#[must_use]
+pub fn remove_mail_preview_from_app(existing: &str, mailer_type: &str) -> String {
+    const PREVIEW_MACRO: &str = "mail_previews![";
+    const CALL_PREFIX: &str = ".mail_previews(";
+    let Some((spliced, now_empty)) =
+        remove_entry_from_bracketed_list(existing, PREVIEW_MACRO, mailer_type)
+    else {
+        return existing.to_owned();
+    };
+    if !now_empty {
+        return spliced;
+    }
+    // Only entry -- remove the whole freshly-inserted call, whichever lines
+    // it spans.
+    let Some(call_pos) = existing.find(CALL_PREFIX) else {
+        return existing.to_owned();
+    };
+    let Some(call_end) = find_balanced_close_paren(existing, call_pos + CALL_PREFIX.len()) else {
+        return existing.to_owned();
+    };
+    let start_line = existing[..call_pos].rfind('\n').map_or(0, |i| i + 1);
+    let end_line = existing[call_end..]
+        .find('\n')
+        .map_or(existing.len(), |i| call_end + i + 1);
+    let mut out = String::with_capacity(existing.len());
+    out.push_str(&existing[..start_line]);
+    out.push_str(&existing[end_line..]);
+    out
+}
+
+/// Scan forward from `start` (the byte position just after an already-open
+/// `(`, i.e. depth 1) for the matching closing paren, returning the index
+/// just past it. `None` if the parens never balance (malformed/truncated
+/// input — destroy never guesses).
+fn find_balanced_close_paren(src: &str, start: usize) -> Option<usize> {
+    let bytes = src.as_bytes();
+    let mut depth = 1usize;
+    let mut i = start;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Shared bracket-list-entry removal behind [`remove_job_entry`] and
+/// [`remove_mail_preview_from_app`]: locate `macro_literal` (e.g.
+/// `"jobs!["`), remove `entry` from its comma-separated body, and rejoin.
+///
+/// Returns `None` if the macro isn't present or `entry` isn't currently
+/// listed (destroy never guesses at a partial match). Otherwise returns
+/// `Some((new_content, list_is_now_empty))` — callers that need to collapse
+/// or remove a now-meaningless surrounding call/function when the list
+/// empties out (which one text becomes home to.. differs — `jobs![]`
+/// removes a whole `fn`, `mail_previews![]` removes a call line) check the
+/// `bool` and discard `new_content` in that case, matching
+/// [`remove_dep_feature_in_section`]'s `collapse_to_bare` pattern for the
+/// analogous Cargo-feature-list case.
+fn remove_entry_from_bracketed_list(
+    existing: &str,
+    macro_literal: &str,
+    entry: &str,
+) -> Option<(String, bool)> {
+    let macro_start = existing.find(macro_literal)?;
+    let body_start = macro_start + macro_literal.len();
+    let rest = &existing[body_start..];
+    let end_offset = rest.find(']')?;
+    let body = &rest[..end_offset];
+    let items: Vec<&str> = body
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if !items.contains(&entry) {
+        return None;
+    }
+    let remaining: Vec<&str> = items.into_iter().filter(|s| s != &entry).collect();
+    let now_empty = remaining.is_empty();
+    let new_body = remaining.join(", ");
+    let mut out = String::with_capacity(existing.len());
+    out.push_str(&existing[..body_start]);
+    out.push_str(&new_body);
+    out.push_str(&existing[body_start + end_offset..]);
+    Some((out, now_empty))
+}
+
 // ── Job registration helpers ──────────────────────────────────────────────
 
 /// Inject `.jobs(jobs::registered_jobs())` into the `AppBuilder` chain in
@@ -1103,6 +1494,80 @@ pub fn augment_registered_jobs(existing: &str, entry: &str) -> String {
 /// Splice `entry` into an already-present `jobs![...]` body.
 fn splice_jobs_list(existing: &str, body_start: usize, entry: &str) -> String {
     splice_into_macro_body(existing, body_start, entry)
+}
+
+/// Inverse of [`augment_registered_jobs`] (`autumn destroy`, issue #1048).
+///
+/// Removes `entry` from the `jobs![...]` list. If it was the only entry, the
+/// whole freshly-generated `registered_jobs()` function (plus its
+/// `#[must_use]` attribute and the blank separator line before it) is
+/// removed too, rather than leaving an empty `jobs![]` behind.
+///
+/// A no-op if there's no `jobs![...]`, or `entry` isn't currently listed.
+#[must_use]
+pub fn remove_job_entry(existing: &str, entry: &str) -> String {
+    const JOBS_MACRO: &str = "jobs![";
+    let Some((spliced, now_empty)) = remove_entry_from_bracketed_list(existing, JOBS_MACRO, entry)
+    else {
+        return existing.to_owned();
+    };
+    if now_empty {
+        remove_registered_jobs_fn(existing)
+    } else {
+        spliced
+    }
+}
+
+/// Remove the whole `registered_jobs()` function [`augment_registered_jobs`]
+/// generates when it creates one from scratch, plus its `#[must_use]`
+/// attribute and one preceding blank separator line.
+fn remove_registered_jobs_fn(existing: &str) -> String {
+    let lines: Vec<&str> = existing.lines().collect();
+    let Some(fn_line_idx) = lines
+        .iter()
+        .position(|l| l.trim_start().starts_with("pub fn registered_jobs("))
+    else {
+        return existing.to_owned();
+    };
+    let start = if fn_line_idx > 0 && lines[fn_line_idx - 1].trim() == "#[must_use]" {
+        fn_line_idx - 1
+    } else {
+        fn_line_idx
+    };
+    let Some(close_offset) = lines[fn_line_idx..].iter().position(|l| l.trim() == "}") else {
+        return existing.to_owned();
+    };
+    let end = fn_line_idx + close_offset;
+
+    let mut effective_start = start;
+    if effective_start > 0 && lines[effective_start - 1].trim().is_empty() {
+        effective_start -= 1;
+    }
+
+    let mut new_lines: Vec<&str> = Vec::with_capacity(lines.len());
+    new_lines.extend_from_slice(&lines[..effective_start]);
+    if end + 1 < lines.len() {
+        new_lines.extend_from_slice(&lines[end + 1..]);
+    }
+    let mut out = new_lines.join("\n");
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out
+}
+
+/// Inverse of [`add_jobs_registration_to_app`] (`autumn destroy`, issue #1048).
+///
+/// Removes the `.jobs(jobs::registered_jobs())` line from the `AppBuilder`
+/// chain. A no-op if it isn't present.
+#[must_use]
+pub fn remove_jobs_registration_from_app(existing: &str) -> String {
+    const JOBS_CALL: &str = ".jobs(jobs::registered_jobs())";
+    let lines: Vec<&str> = existing.lines().collect();
+    let Some(idx) = lines.iter().position(|l| l.trim() == JOBS_CALL) else {
+        return existing.to_owned();
+    };
+    remove_single_line(&lines, idx, existing.ends_with('\n'))
 }
 
 // ── Cargo.toml: feature injection ────────────────────────────────────────
@@ -1352,6 +1817,465 @@ fn patch_dotted_dep(
 #[must_use]
 pub fn ensure_autumn_web_feature(existing: &str, feature: &str) -> String {
     ensure_autumn_web_feature_status(existing, feature).0
+}
+
+/// Inverse of [`ensure_autumn_web_feature`] (`autumn destroy`, issue #1048),
+/// scoped to `[dependencies]`.
+///
+/// Removes `feature` from `autumn-web`'s `features = [...]` list, in
+/// whichever of the four shapes [`ensure_autumn_web_feature`] can add it to:
+/// single-line inline table, dotted key (`autumn-web.features = [...]`),
+/// multiline inline table, or a `[dependencies.autumn-web]` subtable. Only
+/// the single-line inline-table case can collapse: when removing `feature`
+/// empties the list and `version` is the only other key, the whole entry
+/// collapses back to a bare string, restoring the pre-generate declaration
+/// byte-for-byte — the other three shapes only ever lose the one list entry
+/// (or the now-empty `features` line/key), since their surrounding
+/// structure may predate `generate` entirely and destroy never restructures
+/// content it didn't itself add.
+///
+/// A no-op for an entry `feature` doesn't currently list — destroy only
+/// reverses what `generate` itself would have written. A renamed/aliased
+/// `autumn-web` dependency (`autumn_web = { package = "autumn-web", ... }` or
+/// `[dependencies.autumn_web]`) is resolved to its actual key first (issue
+/// #1048 PR review) — [`ensure_autumn_web_feature_status_in_section`] adds
+/// features there too, so destroy must look under the same key it did.
+#[must_use]
+pub fn remove_autumn_web_feature(existing: &str, feature: &str) -> String {
+    let dep_key = resolve_autumn_web_dep_key(existing, "dependencies");
+    remove_dep_feature_in_section(existing, dep_key, feature, "dependencies", true)
+}
+
+/// Inverse of [`ensure_dev_dependency_test_support`] (`autumn destroy`,
+/// issue #1048), scoped to `[dev-dependencies]`.
+///
+/// Unlike [`remove_autumn_web_feature`], a fresh project's
+/// `[dev-dependencies]` never has a prior `autumn-web` entry —
+/// [`ensure_dev_dependency_test_support`] always *inserts* a brand-new line.
+/// So when removing `feature` empties its features list, the whole line is
+/// deleted outright rather than collapsed to a bare string.
+///
+/// A no-op for any other declaration shape, mirroring
+/// [`remove_autumn_web_feature`].
+#[must_use]
+pub fn remove_autumn_web_dev_dependency_feature(existing: &str, feature: &str) -> String {
+    let dep_key = resolve_autumn_web_dep_key(existing, "dev-dependencies");
+    remove_dep_feature_in_section(existing, dep_key, feature, "dev-dependencies", false)
+}
+
+/// Which literal identifier `autumn-web`'s dependency entry uses in
+/// `section` — either the plain crate name, or an importable alias declared
+/// with an explicit `package = "autumn-web"` (mirrors the alias detection in
+/// [`ensure_autumn_web_feature_status_in_section`], whose Pass 1 "else"
+/// branch and Pass 2b add features under exactly these two alias shapes:
+/// `autumn_web = { package = "autumn-web", ... }` and
+/// `[<section>.autumn_web]` with `package = "autumn-web"` inside).
+///
+/// [`remove_dep_feature_in_section`] previously always searched for the
+/// literal `"autumn-web"` key, so a project using either alias shape kept
+/// its generator-added feature forever — `destroy` located no matching line
+/// and silently made no edit (issue #1048 PR review).
+///
+/// Falls back to the literal key when no dependency entry is found at all —
+/// `remove_dep_feature_in_section` is already a no-op in that case.
+fn resolve_autumn_web_dep_key(existing: &str, section: &str) -> &'static str {
+    let lines: Vec<&str> = existing.lines().collect();
+    let mut in_section = false;
+    for &line in &lines {
+        let trimmed = line.trim();
+        if is_section_header(trimmed, section) {
+            in_section = true;
+            continue;
+        }
+        if in_section && is_section_boundary(trimmed, section) {
+            in_section = false;
+            continue;
+        }
+        if !in_section || trimmed.starts_with('#') {
+            continue;
+        }
+        let after_ws = line.trim_start();
+        if let Some(rest) = after_ws.strip_prefix("autumn-web") {
+            if rest.starts_with('.') || rest.trim_start().starts_with('=') {
+                return "autumn-web";
+            }
+            continue;
+        }
+        let Some((key, val)) = after_ws.split_once('=') else {
+            continue;
+        };
+        let key_trimmed = key.trim();
+        let alias = key_trimmed
+            .split_once('.')
+            .map_or(key_trimmed, |(base, _)| base);
+        if alias.replace('-', "_") == "autumn_web" && declares_package(val, "autumn-web") {
+            return "autumn_web";
+        }
+    }
+
+    let literal_subtable_key = format!("[{section}.autumn-web]");
+    if lines
+        .iter()
+        .any(|l| l.trim().split('#').next().unwrap_or("").trim() == literal_subtable_key)
+    {
+        return "autumn-web";
+    }
+    let renamed_subtable_key = format!("[{section}.autumn_web]");
+    if find_section_start_with_autumn_web_package(&lines, &renamed_subtable_key).is_some() {
+        return "autumn_web";
+    }
+
+    "autumn-web"
+}
+
+/// How a single-line dependency declaration should be rewritten once a
+/// feature has been removed from its `features = [...]` array.
+enum FeatureRemovalEdit {
+    /// Keep the line, with this new full text.
+    Replace(String),
+    /// Delete the line entirely.
+    Delete,
+    /// Leave the file completely unchanged — either `feature` wasn't found,
+    /// or the shape doesn't confidently invert.
+    Unchanged,
+}
+
+/// Shared implementation behind [`remove_autumn_web_feature`] and
+/// [`remove_autumn_web_dev_dependency_feature`]. See their docs for the two
+/// `collapse_to_bare` behaviours.
+///
+/// Beyond the single-line inline-table shape [`parse_feature_removal`]
+/// handles, this also inverts the dotted-key (`<dep_name>.features =
+/// [...]`), multiline inline-table, and `[<section>.<dep_name>]` subtable
+/// forms [`ensure_autumn_web_feature_status_in_section`] can add a feature
+/// to (issue #1048 PR review) — `generate mailer`/`channel --ws` otherwise
+/// left the feature behind forever in a hand-maintained `Cargo.toml` using
+/// one of those shapes. Each of those three only ever edits the `features`
+/// line itself, never collapsing or restructuring the surrounding
+/// declaration — unlike the single-line case, that structure may predate
+/// `generate` entirely, so only what `generate` itself would have inserted
+/// (an entry in the list) is reverted.
+fn remove_dep_feature_in_section(
+    existing: &str,
+    dep_name: &str,
+    feature: &str,
+    section: &str,
+    collapse_to_bare: bool,
+) -> String {
+    let feature_quoted = format!("\"{feature}\"");
+    let lines: Vec<&str> = existing.lines().collect();
+    let dotted_features_key = format!("{dep_name}.features");
+    let mut in_section = false;
+    for (i, &line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if is_section_header(trimmed, section) {
+            in_section = true;
+            continue;
+        }
+        if in_section && is_section_boundary(trimmed, section) {
+            in_section = false;
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+
+        if line.trim_start().starts_with(&dotted_features_key)
+            && let Some((new_line, now_empty)) =
+                remove_feature_from_features_line(line, &feature_quoted)
+        {
+            return if now_empty {
+                remove_single_line(&lines, i, existing.ends_with('\n'))
+            } else {
+                splice_single_line(&lines, i, &new_line, existing.ends_with('\n'))
+            };
+        }
+
+        let edit = parse_feature_removal(line, dep_name, &feature_quoted, collapse_to_bare);
+        match edit {
+            FeatureRemovalEdit::Replace(new_line) => {
+                return splice_single_line(&lines, i, &new_line, existing.ends_with('\n'));
+            }
+            FeatureRemovalEdit::Delete => {
+                return remove_single_line(&lines, i, existing.ends_with('\n'));
+            }
+            FeatureRemovalEdit::Unchanged => {
+                if let Some(result) = remove_feature_from_open_multiline_inline_table(
+                    &lines,
+                    i,
+                    existing,
+                    dep_name,
+                    &feature_quoted,
+                ) {
+                    return result;
+                }
+            }
+        }
+    }
+
+    // Pass 2: multiline subtable form `[<section>.<dep_name>]`.
+    let subtable_key = format!("[{section}.{dep_name}]");
+    for (i, &line) in lines.iter().enumerate() {
+        let key_part = line.trim().split('#').next().unwrap_or("").trim();
+        if key_part != subtable_key {
+            continue;
+        }
+        let section_start = i + 1;
+        let section_end = lines[section_start..]
+            .iter()
+            .position(|l| {
+                let t = l.trim();
+                t.starts_with('[') && !t.is_empty()
+            })
+            .map_or(lines.len(), |p| section_start + p);
+        if let Some(result) = remove_feature_from_deps_section(
+            &lines,
+            section_start,
+            section_end,
+            existing,
+            &feature_quoted,
+        ) {
+            return result;
+        }
+    }
+
+    existing.to_owned()
+}
+
+/// Remove `feature_quoted` from a standalone `key = [...]` TOML line
+/// (inverse of [`rewrite_features_line`]). `None` if the line has no
+/// bracketed array, or it doesn't list `feature_quoted`. Otherwise returns
+/// the rewritten line and whether the array is now empty.
+fn remove_feature_from_features_line(line: &str, feature_quoted: &str) -> Option<(String, bool)> {
+    let open = line.find('[')?;
+    let close_rel = line[open..].find(']')?;
+    let abs_end = open + close_rel;
+    let body = &line[open + 1..abs_end];
+    let items: Vec<&str> = body
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if !items.contains(&feature_quoted) {
+        return None;
+    }
+    let remaining: Vec<&str> = items
+        .into_iter()
+        .filter(|it| *it != feature_quoted)
+        .collect();
+    let now_empty = remaining.is_empty();
+    let new_line = format!(
+        "{}{}{}",
+        &line[..=open],
+        remaining.join(", "),
+        &line[abs_end..]
+    );
+    Some((new_line, now_empty))
+}
+
+/// If `lines[open_idx]` opens a multiline inline-table declaration for
+/// `dep_name` (`<dep_name> = {` with no closing `}` on the same line),
+/// removes `feature_quoted` from its `features = [...]` entry — inverse of
+/// [`add_feature_to_multiline_inline_table`]. Only edits the `features`
+/// line; never collapses the surrounding table, since it may predate
+/// `generate` entirely. `None` if `lines[open_idx]` isn't that opening
+/// shape, no closing `}` is found, no `features` line exists inside the
+/// block, or that line doesn't list `feature_quoted`.
+fn remove_feature_from_open_multiline_inline_table(
+    lines: &[&str],
+    open_idx: usize,
+    existing: &str,
+    dep_name: &str,
+    feature_quoted: &str,
+) -> Option<String> {
+    let after_ws = lines[open_idx].trim_start();
+    let rest = after_ws.strip_prefix(dep_name)?;
+    let rest = rest.trim_start().strip_prefix('=')?;
+    let rest = rest.trim_start().strip_prefix('{')?;
+    if rest.contains('}') {
+        return None; // closes on the same line -- not the multiline form.
+    }
+    let close_idx = lines[open_idx + 1..]
+        .iter()
+        .position(|l| l.trim_start().starts_with('}'))
+        .map(|p| open_idx + 1 + p)?;
+    remove_feature_from_deps_section(lines, open_idx + 1, close_idx, existing, feature_quoted)
+}
+
+/// Remove `feature_quoted` from a `features = [...]` line found inside
+/// `lines[section_start..section_end)` (a multiline inline-table body or a
+/// `[<section>.<dep_name>]` subtable body). Only that one line is ever
+/// changed — every other key in the span is left untouched. `None` if no
+/// `features` line is found there, or it doesn't list `feature_quoted`.
+fn remove_feature_from_deps_section(
+    lines: &[&str],
+    section_start: usize,
+    section_end: usize,
+    existing: &str,
+    feature_quoted: &str,
+) -> Option<String> {
+    for (j, &sect_line) in lines[section_start..section_end].iter().enumerate() {
+        if !sect_line.trim_start().starts_with("features") {
+            continue;
+        }
+        let idx = section_start + j;
+        let (new_line, now_empty) = remove_feature_from_features_line(sect_line, feature_quoted)?;
+        return Some(if now_empty {
+            remove_single_line(lines, idx, existing.ends_with('\n'))
+        } else {
+            splice_single_line(lines, idx, &new_line, existing.ends_with('\n'))
+        });
+    }
+    None
+}
+
+/// Find the `features` key inside an inline-table `body` (e.g.
+/// `version = "1", default-features = false, features = ["mail"]`), as a
+/// whole key — not a substring match that a plain `body.find("features")`
+/// would also hit inside `default-features` when that key comes first
+/// (issue #1048 PR review: `default-features = false, features = ["mail"]`
+/// would otherwise truncate `before_features` mid-word at `default-` and
+/// rewrite the dependency into invalid TOML). Requires the match to be
+/// preceded by the body start or a non-identifier character, and followed
+/// by optional whitespace then `=`.
+fn find_features_key(body: &str) -> Option<usize> {
+    let mut search_from = 0;
+    while let Some(rel) = body[search_from..].find("features") {
+        let idx = search_from + rel;
+        let is_key_start = idx == 0
+            || !matches!(body.as_bytes()[idx - 1], b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'-');
+        let is_key_end = body[idx + "features".len()..].trim_start().starts_with('=');
+        if is_key_start && is_key_end {
+            return Some(idx);
+        }
+        search_from = idx + "features".len();
+    }
+    None
+}
+
+/// Parse `line` as `{indent}{dep_name} = { ...features = [...] ... }` and
+/// decide how to rewrite it once `feature_quoted` is removed from the
+/// features array. Returns [`FeatureRemovalEdit::Unchanged`] whenever the
+/// line doesn't match that exact single-line inline-table shape, or doesn't
+/// currently list the feature.
+fn parse_feature_removal(
+    line: &str,
+    dep_name: &str,
+    feature_quoted: &str,
+    collapse_to_bare: bool,
+) -> FeatureRemovalEdit {
+    let after_ws = line.trim_start();
+    let indent = &line[..line.len() - after_ws.len()];
+    let Some(rest) = after_ws.strip_prefix(dep_name) else {
+        return FeatureRemovalEdit::Unchanged;
+    };
+    let Some(rest) = rest.trim_start().strip_prefix('=') else {
+        return FeatureRemovalEdit::Unchanged;
+    };
+    let Some(rest) = rest.trim_start().strip_prefix('{') else {
+        return FeatureRemovalEdit::Unchanged;
+    };
+    let Some(body_end) = rest.rfind('}') else {
+        return FeatureRemovalEdit::Unchanged;
+    };
+    let body = rest[..body_end].trim();
+    let Some(features_kw) = find_features_key(body) else {
+        return FeatureRemovalEdit::Unchanged;
+    };
+    let before_features = body[..features_kw].trim().trim_end_matches(',').trim();
+    let after_kw = &body[features_kw + "features".len()..];
+    let Some(bracket_open) = after_kw.find('[') else {
+        return FeatureRemovalEdit::Unchanged;
+    };
+    let Some(bracket_close) = after_kw.find(']') else {
+        return FeatureRemovalEdit::Unchanged;
+    };
+    if bracket_close < bracket_open {
+        return FeatureRemovalEdit::Unchanged;
+    }
+    let list_body = &after_kw[bracket_open + 1..bracket_close];
+    let after_list = after_kw[bracket_close + 1..]
+        .trim()
+        .trim_start_matches(',')
+        .trim();
+    let items: Vec<&str> = list_body
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if !items.contains(&feature_quoted) {
+        return FeatureRemovalEdit::Unchanged;
+    }
+    let remaining: Vec<&str> = items.into_iter().filter(|s| *s != feature_quoted).collect();
+
+    if !remaining.is_empty() {
+        let sep = if before_features.is_empty() { "" } else { ", " };
+        let after_sep = if after_list.is_empty() { "" } else { ", " };
+        return FeatureRemovalEdit::Replace(format!(
+            "{indent}{dep_name} = {{ {before_features}{sep}features = [{}]{after_sep}{after_list} }}",
+            remaining.join(", "),
+        ));
+    }
+
+    if collapse_to_bare {
+        if !after_list.is_empty() {
+            return FeatureRemovalEdit::Unchanged;
+        }
+        if let Some(v) = before_features
+            .strip_prefix("version")
+            .map(str::trim_start)
+            .and_then(|r| r.strip_prefix('='))
+        {
+            return FeatureRemovalEdit::Replace(format!("{indent}{dep_name} = {}", v.trim()));
+        }
+        // Some other key remains besides the now-empty `features` array —
+        // e.g. a renamed dep's `package = "autumn-web"` (issue #1048 PR
+        // review), or `default-features = false`. Collapsing to a bare
+        // string would silently drop that key, so just remove the
+        // `features` key and keep the rest of the inline table intact.
+        if before_features.is_empty() {
+            return FeatureRemovalEdit::Unchanged;
+        }
+        return FeatureRemovalEdit::Replace(format!(
+            "{indent}{dep_name} = {{ {before_features} }}"
+        ));
+    }
+
+    FeatureRemovalEdit::Delete
+}
+
+/// Replace line `idx` with `new_line`, preserving the file's trailing-newline status.
+pub(super) fn splice_single_line(
+    lines: &[&str],
+    idx: usize,
+    new_line: &str,
+    ends_with_newline: bool,
+) -> String {
+    let mut out = String::with_capacity(lines.len() * 24 + new_line.len());
+    for (i, &l) in lines.iter().enumerate() {
+        out.push_str(if i == idx { new_line } else { l });
+        out.push('\n');
+    }
+    if !ends_with_newline {
+        out.pop();
+    }
+    out
+}
+
+/// Remove line `idx` entirely, preserving the file's trailing-newline status.
+pub(super) fn remove_single_line(lines: &[&str], idx: usize, ends_with_newline: bool) -> String {
+    let mut out = String::with_capacity(lines.len() * 24);
+    for (i, &l) in lines.iter().enumerate() {
+        if i == idx {
+            continue;
+        }
+        out.push_str(l);
+        out.push('\n');
+    }
+    if !ends_with_newline && out.ends_with('\n') {
+        out.pop();
+    }
+    out
 }
 
 /// Like [`ensure_autumn_web_feature`], but also reports whether the `autumn-web`
@@ -4119,6 +5043,117 @@ async fn main() {\n\
         assert!(updated.contains("foo"));
     }
 
+    #[test]
+    fn ensure_routes_entries_skips_routes_macro_in_comments() {
+        // A doc comment mentioning `routes![]` must not receive the injected
+        // entries — that used to break compilation by editing the comment.
+        let original = "\
+//! Register handlers with `.routes(routes![])` in main.
+// e.g. routes![index]
+fn main() {
+    routes![]
+}
+";
+        let updated = ensure_routes_entries(original, &["foo".into()]);
+        assert!(
+            updated.contains("//! Register handlers with `.routes(routes![])` in main."),
+            "doc comment must be untouched: {updated}"
+        );
+        assert!(
+            updated.contains("// e.g. routes![index]"),
+            "line comment must be untouched: {updated}"
+        );
+        assert!(
+            updated.contains("foo,"),
+            "entry must land in the real macro: {updated}"
+        );
+        assert!(
+            updated.rfind("foo,").unwrap() > updated.find("fn main()").unwrap(),
+            "entry must be inside the macro in fn main, not in the comments: {updated}"
+        );
+    }
+
+    #[test]
+    fn ensure_routes_entries_only_comment_matches_is_noop() {
+        let original = "//! Add handlers via routes![].\nfn main() {}\n";
+        let updated = ensure_routes_entries(original, &["foo".into()]);
+        assert_eq!(updated, original);
+    }
+
+    #[test]
+    fn ensure_routes_entries_url_in_string_before_macro_is_code() {
+        // The `//` in the URL string literal is content, not a comment
+        // marker — the `routes![` on the same line is real code and must
+        // receive the injected entry.
+        let original =
+            "fn main() {\n    let url = \"https://example.com\"; app.routes(routes![index]);\n}\n";
+        let updated = ensure_routes_entries(original, &["foo".into()]);
+        assert!(
+            updated.contains("foo"),
+            "routes![ after a URL string must be edited as code: {updated}"
+        );
+        assert!(
+            updated.contains("\"https://example.com\""),
+            "the string literal must be untouched: {updated}"
+        );
+    }
+
+    #[test]
+    fn ensure_routes_entries_genuinely_commented_macro_still_skipped() {
+        // A real line comment before `routes![` must still be skipped, even
+        // when the comment itself contains quotes.
+        let original = "\
+// see \"docs\": routes![index]
+fn main() {
+    routes![]
+}
+";
+        let updated = ensure_routes_entries(original, &["foo".into()]);
+        assert!(
+            updated.contains("// see \"docs\": routes![index]"),
+            "comment must be untouched: {updated}"
+        );
+        assert!(
+            updated.rfind("foo").unwrap() > updated.find("fn main()").unwrap(),
+            "entry must land in the real macro, not the comment: {updated}"
+        );
+    }
+
+    #[test]
+    fn ensure_routes_entries_slashes_in_string_with_macro_on_line() {
+        // A string literal containing `//` followed by a real macro use on
+        // the same line: the escaped quote must not flip the string state.
+        let original = "fn main() {\n    let s = \"say \\\"// not a comment\\\"\"; app.routes(routes![index]);\n}\n";
+        let updated = ensure_routes_entries(original, &["foo".into()]);
+        assert!(
+            updated.contains("foo"),
+            "escaped quotes in a string must not hide the real macro: {updated}"
+        );
+    }
+
+    #[test]
+    fn remove_routes_entries_with_prefix_skips_commented_macro() {
+        let original = "\
+// routes![channels::chat::chat_page]
+fn main() {
+    routes![
+        channels::chat::chat_page,
+        index,
+    ]
+}
+";
+        let updated = remove_routes_entries_with_prefix(original, "channels::chat::");
+        assert!(
+            updated.contains("// routes![channels::chat::chat_page]"),
+            "comment must be untouched: {updated}"
+        );
+        assert!(updated.contains("index,"));
+        assert!(
+            !updated.contains("routes![\n        channels::chat::chat_page"),
+            "real entry must be removed: {updated}"
+        );
+    }
+
     // ── remove_routes_entries_with_prefix ──────────────────────────────────
 
     #[test]
@@ -4343,6 +5378,104 @@ async fn main() {\n\
         let updated = augment_registered_jobs("", "foo::foo");
         assert!(updated.contains("pub fn registered_jobs()"));
         assert!(updated.contains("jobs![foo::foo]"));
+    }
+
+    // ── remove_job_entry / remove_jobs_registration_from_app (destroy, #1048) ──
+
+    #[test]
+    fn remove_job_entry_restores_original_when_it_was_the_only_one() {
+        let base = "pub mod send_welcome_email;\n";
+        let after_add = augment_registered_jobs(base, "send_welcome_email::send_welcome_email");
+        assert_ne!(after_add, base);
+        assert_eq!(
+            remove_job_entry(&after_add, "send_welcome_email::send_welcome_email"),
+            base
+        );
+    }
+
+    #[test]
+    fn remove_job_entry_keeps_other_entries() {
+        let base = "pub mod send_welcome_email;\n";
+        let with_one = augment_registered_jobs(base, "send_welcome_email::send_welcome_email");
+        let with_both = augment_registered_jobs(&with_one, "post_notification::post_notification");
+        let reverted = remove_job_entry(&with_both, "post_notification::post_notification");
+        assert!(reverted.contains("send_welcome_email::send_welcome_email"));
+        assert!(!reverted.contains("post_notification::post_notification"));
+    }
+
+    #[test]
+    fn remove_job_entry_is_idempotent_when_absent() {
+        let base = "pub mod send_welcome_email;\n";
+        assert_eq!(remove_job_entry(base, "nonexistent::nonexistent"), base);
+    }
+
+    #[test]
+    fn remove_jobs_registration_from_app_restores_original() {
+        let base = "fn main() {\n    App::new()\n        .run()\n}\n";
+        let after_add = add_jobs_registration_to_app(base);
+        assert_ne!(after_add, base);
+        assert_eq!(remove_jobs_registration_from_app(&after_add), base);
+    }
+
+    #[test]
+    fn remove_jobs_registration_from_app_is_idempotent_when_absent() {
+        let base = "fn main() {\n    App::new()\n        .run()\n}\n";
+        assert_eq!(remove_jobs_registration_from_app(base), base);
+    }
+
+    #[test]
+    fn remove_mail_preview_from_app_restores_original_when_only_entry() {
+        let base = "fn main() {\n    App::new()\n        .run()\n}\n";
+        let after_add = add_mail_preview_to_app(base, "WelcomeMailer");
+        assert_ne!(after_add, base);
+        assert_eq!(
+            remove_mail_preview_from_app(&after_add, "WelcomeMailer"),
+            base
+        );
+    }
+
+    #[test]
+    fn remove_mail_preview_from_app_keeps_other_entries() {
+        let base = "fn main() {\n    App::new()\n        .run()\n}\n";
+        let with_one = add_mail_preview_to_app(base, "WelcomeMailer");
+        let with_both = add_mail_preview_to_app(&with_one, "ReceiptMailer");
+        let reverted = remove_mail_preview_from_app(&with_both, "ReceiptMailer");
+        assert!(reverted.contains("WelcomeMailer"));
+        assert!(!reverted.contains("ReceiptMailer"));
+    }
+
+    #[test]
+    fn remove_mail_preview_from_app_removes_a_rustfmt_wrapped_call() {
+        // rustfmt commonly wraps `.mail_previews(mail_previews![...])`
+        // across several lines once it has a couple of mailer names. Naive
+        // line-start matching would strip only the opening line and leave
+        // the rest (`WelcomeMailer,` / `])`) dangling — issue #1048 PR
+        // review.
+        let src = "fn main() {\n    App::new()\n        .mail_previews(mail_previews![\n            WelcomeMailer,\n        ])\n        .run()\n}\n";
+        let updated = remove_mail_preview_from_app(src, "WelcomeMailer");
+        assert!(
+            !updated.contains("mail_previews"),
+            "the whole call must be removed once its only entry is gone, got:\n{updated}"
+        );
+        assert_eq!(updated, "fn main() {\n    App::new()\n        .run()\n}\n");
+    }
+
+    #[test]
+    fn remove_mail_preview_from_app_keeps_other_entry_in_a_rustfmt_wrapped_call() {
+        let src = "fn main() {\n    App::new()\n        .mail_previews(mail_previews![\n            WelcomeMailer,\n            ReceiptMailer,\n        ])\n        .run()\n}\n";
+        let updated = remove_mail_preview_from_app(src, "WelcomeMailer");
+        assert!(
+            updated.contains("mail_previews"),
+            "the call must survive while another entry remains, got:\n{updated}"
+        );
+        assert!(updated.contains("ReceiptMailer"));
+        assert!(!updated.contains("WelcomeMailer"));
+    }
+
+    #[test]
+    fn remove_mail_preview_from_app_is_idempotent_when_absent() {
+        let base = "fn main() {\n    App::new()\n        .run()\n}\n";
+        assert_eq!(remove_mail_preview_from_app(base, "WelcomeMailer"), base);
     }
 
     // ── ensure_autumn_web_feature ─────────────────────────────────────────
@@ -6111,5 +7244,352 @@ pub struct Comment {
         let fs = fields(&["title:String"]);
         let schema = append_schema_table_with_id("", "posts", &fs, IdType::Uuid);
         assert!(schema.contains("id -> Uuid,"));
+    }
+
+    // ── `autumn destroy` inverse helpers (issue #1048) ─────────────────────
+    //
+    // Each inverse is tested for byte-identical round-tripping:
+    // `inverse(forward(base)) == base`.
+
+    #[test]
+    fn remove_mod_declaration_restores_empty_file() {
+        let after_add = add_mod_declaration("", "post");
+        assert_eq!(remove_mod_declaration(&after_add, "post"), "");
+    }
+
+    #[test]
+    fn remove_mod_declaration_restores_original_with_other_mods() {
+        let base = "pub mod user;\n";
+        let after_add = add_mod_declaration(base, "post");
+        assert_eq!(remove_mod_declaration(&after_add, "post"), base);
+    }
+
+    #[test]
+    fn remove_mod_declaration_is_idempotent_when_absent() {
+        let base = "pub mod user;\n";
+        assert_eq!(remove_mod_declaration(base, "post"), base);
+    }
+
+    #[test]
+    fn remove_mod_declaration_leaves_private_mod_untouched() {
+        // `add_mod_declaration` treats a bare `mod post;` as already-present and
+        // never writes `pub mod post;` in that case — so destroy must not
+        // remove a private `mod post;` it didn't add.
+        let base = "mod post;\n";
+        assert_eq!(remove_mod_declaration(base, "post"), base);
+    }
+
+    #[test]
+    fn remove_schema_table_restores_empty_file() {
+        let f = fields(&["title:String"]);
+        let block = append_schema_table("", "posts", &f);
+        let after_add = block.clone();
+        assert_eq!(remove_schema_table(&after_add, "posts", &block), "");
+    }
+
+    #[test]
+    fn remove_schema_table_restores_original_with_other_tables() {
+        let f1 = fields(&["title:String"]);
+        let f2 = fields(&["name:String"]);
+        let base = append_schema_table("", "users", &f2);
+        let block = append_schema_table("", "posts", &f1);
+        let after_add = append_schema_table(&base, "posts", &f1);
+        assert_eq!(remove_schema_table(&after_add, "posts", &block), base);
+    }
+
+    #[test]
+    fn remove_schema_table_is_idempotent_when_absent() {
+        let f = fields(&["name:String"]);
+        let base = append_schema_table("", "users", &f);
+        let block = append_schema_table("", "posts", &f);
+        assert_eq!(remove_schema_table(&base, "posts", &block), base);
+    }
+
+    #[test]
+    fn remove_schema_table_never_removes_a_pre_existing_table_with_different_columns() {
+        // A hand-rolled `posts` table with different columns than this
+        // generator invocation would produce must survive `destroy` — it
+        // wasn't generate's own output, even though the name matches
+        // (issue #1048 PR review).
+        let hand_written = "diesel::table! {\n    posts (id) {\n        id -> BigInt,\n        \
+                             body -> Text,\n    }\n}\n";
+        let generated_block = append_schema_table("", "posts", &fields(&["title:String"]));
+        assert_eq!(
+            remove_schema_table(hand_written, "posts", &generated_block),
+            hand_written,
+            "pre-existing table with different columns must not be removed"
+        );
+    }
+
+    #[test]
+    fn remove_routes_entries_restores_single_line_template_body() {
+        // Mirrors the `autumn new` template's `.routes(routes![index, hello, hello_name])`.
+        let base = "fn main() {\n    App::new()\n        .routes(routes![index, hello, hello_name])\n        .run()\n}\n";
+        let appended = vec![
+            "routes::posts::index".to_owned(),
+            "routes::posts::show".to_owned(),
+        ];
+        let after_add = ensure_routes_entries(base, &appended);
+        assert_ne!(
+            after_add, base,
+            "test setup: append must actually change the body"
+        );
+        let reverted = remove_routes_entries(&after_add, &appended);
+        assert_eq!(reverted, base);
+    }
+
+    #[test]
+    fn remove_routes_entries_is_idempotent_when_absent() {
+        let base =
+            "fn main() {\n    App::new()\n        .routes(routes![index])\n        .run()\n}\n";
+        let appended = vec!["routes::posts::index".to_owned()];
+        assert_eq!(remove_routes_entries(base, &appended), base);
+    }
+
+    #[test]
+    fn remove_routes_entries_removes_present_entries_even_when_one_is_already_gone() {
+        // issue #1048 PR review: a user may have hand-removed one of a
+        // resource's own route entries before running destroy. The rest of
+        // that resource's routes are still present and about to be
+        // orphaned (the underlying handler file is deleted regardless) —
+        // abandoning the whole cleanup because ONE entry is already absent
+        // would leave `main.rs` referencing a missing function/module.
+        let appended = vec![
+            "routes::posts::index".to_owned(),
+            "routes::posts::show".to_owned(),
+        ];
+        // Simulate the user having already removed `show` by hand.
+        let hand_edited = "fn main() {\n    App::new()\n        .routes(routes![index, routes::posts::index])\n        .run()\n}\n";
+        let reverted = remove_routes_entries(hand_edited, &appended);
+        assert_eq!(
+            reverted,
+            "fn main() {\n    App::new()\n        .routes(routes![index])\n        .run()\n}\n",
+            "the still-present `index` entry must be removed even though `show` was \
+             already gone: {reverted}"
+        );
+    }
+
+    #[test]
+    fn remove_routes_entries_preserves_other_resources_multiline() {
+        let base =
+            "fn main() {\n    App::new()\n        .routes(routes![index])\n        .run()\n}\n";
+        let comments_entries = vec![
+            "routes::comments::index".to_owned(),
+            "routes::comments::show".to_owned(),
+        ];
+        let after_comments = ensure_routes_entries(base, &comments_entries);
+        let posts_entries = vec![
+            "routes::posts::index".to_owned(),
+            "routes::posts::show".to_owned(),
+        ];
+        let after_posts = ensure_routes_entries(&after_comments, &posts_entries);
+        let reverted = remove_routes_entries(&after_posts, &posts_entries);
+        // Comments entries must survive destroying posts.
+        assert!(reverted.contains("routes::comments::index"));
+        assert!(reverted.contains("routes::comments::show"));
+        assert!(!reverted.contains("routes::posts::index"));
+        assert!(!reverted.contains("routes::posts::show"));
+    }
+
+    #[test]
+    fn remove_routes_entries_not_confused_by_kept_entry_sharing_a_prefix() {
+        // `routes::posts::index` is a textual PREFIX of the kept
+        // `routes::posts::index_all` entry that appears earlier in the body.
+        // A raw substring search for the removed entry would match inside
+        // the kept one and misdetect the original single-line layout as
+        // multi-line.
+        let base = "fn main() {\n    App::new()\n        .routes(routes![index, routes::posts::index_all, routes::posts::index])\n        .run()\n}\n";
+        let removed = vec!["routes::posts::index".to_owned()];
+        let reverted = remove_routes_entries(base, &removed);
+        assert_eq!(
+            reverted,
+            "fn main() {\n    App::new()\n        .routes(routes![index, routes::posts::index_all])\n        .run()\n}\n",
+            "must restore the original single-line layout byte-identically, not collapse/reformat it"
+        );
+    }
+
+    #[test]
+    fn remove_autumn_web_feature_collapses_to_bare_string() {
+        let base = "[dependencies]\nautumn-web = \"0.6.0\"\n";
+        let after_add = ensure_autumn_web_feature(base, "maud");
+        assert_ne!(after_add, base);
+        assert_eq!(remove_autumn_web_feature(&after_add, "maud"), base);
+    }
+
+    #[test]
+    fn remove_autumn_web_feature_keeps_other_features() {
+        let base = "[dependencies]\nautumn-web = \"0.6.0\"\n";
+        let with_maud = ensure_autumn_web_feature(base, "maud");
+        let with_both = ensure_autumn_web_feature(&with_maud, "htmx");
+        let reverted = remove_autumn_web_feature(&with_both, "htmx");
+        assert_eq!(reverted, with_maud);
+    }
+
+    #[test]
+    fn remove_autumn_web_feature_preserves_keys_after_the_features_array() {
+        // A hand-edited (or otherwise pre-existing) dependency line can carry
+        // keys after `features = [...]`, e.g. `default-features = false`.
+        // Removing one feature while others remain must not silently drop
+        // those trailing keys.
+        let base = "[dependencies]\nautumn-web = { version = \"0.6.0\", features = [\"maud\", \"htmx\"], default-features = false }\n";
+        let reverted = remove_autumn_web_feature(base, "htmx");
+        assert_eq!(
+            reverted,
+            "[dependencies]\nautumn-web = { version = \"0.6.0\", features = [\"maud\"], default-features = false }\n",
+            "trailing keys after the features array must survive: {reverted}"
+        );
+    }
+
+    #[test]
+    fn remove_autumn_web_feature_handles_default_features_key_before_features() {
+        // issue #1048 PR review: a plain `body.find("features")` matches
+        // inside `default-features` when that key comes first, truncating
+        // `before_features` mid-word and corrupting the rewritten line.
+        let base = "[dependencies]\nautumn-web = { version = \"0.6.0\", default-features = false, features = [\"maud\", \"htmx\"] }\n";
+        let reverted = remove_autumn_web_feature(base, "htmx");
+        assert_eq!(
+            reverted,
+            "[dependencies]\nautumn-web = { version = \"0.6.0\", default-features = false, features = [\"maud\"] }\n",
+            "must remove only the target feature, keeping default-features intact: {reverted}"
+        );
+    }
+
+    #[test]
+    fn remove_autumn_web_feature_is_idempotent_when_absent() {
+        let base = "[dependencies]\nautumn-web = \"0.6.0\"\n";
+        assert_eq!(remove_autumn_web_feature(base, "maud"), base);
+    }
+
+    #[test]
+    fn remove_autumn_web_feature_reverts_dotted_key_form() {
+        // issue #1048 PR review: `ensure_autumn_web_feature` can add a
+        // feature to a pre-existing dotted-key declaration; destroy must be
+        // able to remove it again, not leave it behind forever.
+        let base =
+            "[dependencies]\nautumn-web.version = \"0.6.0\"\nautumn-web.features = [\"db\"]\n";
+        let with_mail = ensure_autumn_web_feature(base, "mail");
+        assert_ne!(with_mail, base);
+        assert_eq!(remove_autumn_web_feature(&with_mail, "mail"), base);
+    }
+
+    #[test]
+    fn remove_autumn_web_feature_deletes_dotted_features_key_when_emptied() {
+        let base =
+            "[dependencies]\nautumn-web.version = \"0.6.0\"\nautumn-web.features = [\"mail\"]\n";
+        let reverted = remove_autumn_web_feature(base, "mail");
+        assert_eq!(
+            reverted, "[dependencies]\nautumn-web.version = \"0.6.0\"\n",
+            "an emptied dotted features key must be removed outright: {reverted}"
+        );
+    }
+
+    #[test]
+    fn remove_autumn_web_feature_reverts_multiline_inline_table_form() {
+        let base = "[dependencies]\nautumn-web = {\n    version = \"0.6.0\",\n    features = [\"db\"],\n}\n";
+        let with_mail = ensure_autumn_web_feature(base, "mail");
+        assert_ne!(with_mail, base);
+        assert!(with_mail.contains("\"mail\""));
+        let reverted = remove_autumn_web_feature(&with_mail, "mail");
+        assert_eq!(
+            reverted, base,
+            "must remove only the added feature from the features line, restoring the \
+             original multiline table: {reverted}"
+        );
+    }
+
+    #[test]
+    fn remove_autumn_web_feature_reverts_subtable_form() {
+        // issue #1048 PR review: `[dependencies.autumn-web]` with a
+        // separate `features` key is a shape `ensure_autumn_web_feature`
+        // supports adding to, but the old remover only handled single-line
+        // inline tables.
+        let base = "[dependencies.autumn-web]\nversion = \"0.6.0\"\nfeatures = [\"db\"]\n\n[dev-dependencies]\n";
+        let with_mail = ensure_autumn_web_feature(base, "mail");
+        assert_ne!(with_mail, base);
+        assert_eq!(remove_autumn_web_feature(&with_mail, "mail"), base);
+    }
+
+    #[test]
+    fn remove_autumn_web_feature_deletes_subtable_features_key_when_emptied() {
+        let base = "[dependencies.autumn-web]\nversion = \"0.6.0\"\nfeatures = [\"mail\"]\n";
+        let reverted = remove_autumn_web_feature(base, "mail");
+        assert_eq!(
+            reverted, "[dependencies.autumn-web]\nversion = \"0.6.0\"\n",
+            "an emptied subtable features key must be removed outright, leaving \
+             `version` and the header untouched: {reverted}"
+        );
+    }
+
+    #[test]
+    fn remove_autumn_web_feature_reverts_renamed_inline_alias() {
+        // issue #1048 PR review: `ensure_autumn_web_feature_status_in_section`
+        // adds features to an importable rename like
+        // `autumn_web = { package = "autumn-web", ... }` too, but the old
+        // remover always searched for the literal `"autumn-web"` key and
+        // silently left the feature behind on this shape.
+        let base =
+            "[dependencies]\nautumn_web = { package = \"autumn-web\", version = \"0.6.0\" }\n";
+        let with_mail = ensure_autumn_web_feature(base, "mail");
+        assert_ne!(with_mail, base);
+        assert!(with_mail.contains("autumn_web"));
+        assert_eq!(remove_autumn_web_feature(&with_mail, "mail"), base);
+    }
+
+    #[test]
+    fn remove_autumn_web_feature_reverts_renamed_subtable_alias() {
+        let base = "[dependencies.autumn_web]\npackage = \"autumn-web\"\nversion = \"0.6.0\"\nfeatures = [\"db\"]\n\n[dev-dependencies]\n";
+        let with_mail = ensure_autumn_web_feature(base, "mail");
+        assert_ne!(with_mail, base);
+        assert_eq!(remove_autumn_web_feature(&with_mail, "mail"), base);
+    }
+
+    #[test]
+    fn remove_autumn_web_dev_dependency_feature_deletes_freshly_inserted_line() {
+        let base =
+            "[dev-dependencies]\ntokio = { version = \"1\", features = [\"rt\", \"macros\"] }\n";
+        let after_add = ensure_dev_dependency_test_support(base, "0.6.0");
+        assert_ne!(after_add, base);
+        assert_eq!(
+            remove_autumn_web_dev_dependency_feature(&after_add, "test-support"),
+            base
+        );
+    }
+
+    #[test]
+    fn remove_autumn_web_dev_dependency_feature_is_idempotent_when_absent() {
+        let base = "[dev-dependencies]\ntokio = { version = \"1\" }\n";
+        assert_eq!(
+            remove_autumn_web_dev_dependency_feature(base, "test-support"),
+            base
+        );
+    }
+
+    #[test]
+    fn remove_main_mod_declarations_restores_original_with_no_leading_attributes() {
+        // Mirrors `autumn new`'s template main.rs, which has no leading
+        // `//!`/`#![` lines at all.
+        let base = "use autumn_web::prelude::*;\n\nfn main() {}\n";
+        let after_add = ensure_mods(base, &["models", "repositories", "routes", "schema"]);
+        assert_ne!(after_add, base);
+        let reverted = remove_main_mod_declarations(
+            &after_add,
+            &["models", "repositories", "routes", "schema"],
+        );
+        assert_eq!(reverted, base);
+    }
+
+    #[test]
+    fn remove_main_mod_declarations_leaves_other_shared_mods_when_only_some_missing() {
+        let base = "fn main() {}\n";
+        let after_add = ensure_mods(base, &["models", "jobs"]);
+        let reverted = remove_main_mod_declarations(&after_add, &["jobs"]);
+        assert!(reverted.contains("mod models;"));
+        assert!(!reverted.contains("mod jobs;"));
+    }
+
+    #[test]
+    fn remove_main_mod_declarations_is_idempotent_when_absent() {
+        let base = "fn main() {}\n";
+        assert_eq!(remove_main_mod_declarations(base, &["models"]), base);
     }
 }

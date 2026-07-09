@@ -259,7 +259,7 @@ fn generate_model_force_overwrites() {
 fn generate_model_invalid_field_lists_supported_set() {
     let (_tmp, project) = fresh_project("badtype-app");
     let (_, stderr, code) =
-        run_autumn_failing(&project, &["generate", "model", "Post", "price:Decimal"]);
+        run_autumn_failing(&project, &["generate", "model", "Post", "price:Money"]);
     assert_eq!(code, Some(1));
     assert!(stderr.contains("unsupported type"));
     assert!(stderr.contains("Supported:"));
@@ -829,6 +829,282 @@ fn generate_scaffold_full_e2e_post() {
     }
 }
 
+// ── `autumn destroy` (issue #1048) ─────────────────────────────────────────
+
+/// Spawn the system `git` binary in `dir` (NOT the `autumn` binary — see
+/// [`run_autumn`]), asserting success, and return its stdout.
+fn run_git(dir: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("failed to run git");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        output.status.success(),
+        "git {args:?} failed (exit={:?})\nstdout: {stdout}\nstderr: {stderr}",
+        output.status.code(),
+    );
+    stdout
+}
+
+/// Recursively collect every file under `root` as `(relative_path, contents)`,
+/// sorted for deterministic comparison. Used to assert a project's working
+/// tree is byte-for-byte identical before/after a `generate`+`destroy`
+/// round-trip — a filesystem-level equivalent of `git status` being clean
+/// that doesn't require a `git` binary in the test sandbox.
+fn snapshot_tree(root: &Path) -> Vec<(String, Vec<u8>)> {
+    fn walk(dir: &Path, root: &Path, out: &mut Vec<(String, Vec<u8>)>) {
+        for entry in fs::read_dir(dir).expect("read_dir").filter_map(Result::ok) {
+            let path = entry.path();
+            if path.file_name().is_some_and(|n| n == ".git") {
+                // Never compare git's own internals — its background
+                // maintenance can create/remove transient files (e.g.
+                // `.git/objects/maintenance.lock`) between snapshots,
+                // producing spurious diffs unrelated to anything
+                // generate/destroy touched.
+                continue;
+            }
+            if path.is_dir() {
+                walk(&path, root, out);
+            } else {
+                let rel = path
+                    .strip_prefix(root)
+                    .unwrap()
+                    .display()
+                    .to_string()
+                    .replace('\\', "/");
+                let contents = fs::read(&path).expect("read file");
+                out.push((rel, contents));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// The headline acceptance test (issue #1048's success metric): `autumn
+/// generate scaffold Post title:String` immediately followed by `autumn
+/// destroy scaffold Post title:String` returns the project's working tree
+/// byte-for-byte identical to its pre-generate state — both via a
+/// filesystem snapshot comparison and via `git status --porcelain` being
+/// empty against a real commit, exactly the round-trip the issue describes.
+#[test]
+fn generate_then_destroy_scaffold_round_trips_git_clean() {
+    let (_tmp, project) = fresh_project("destroy-scaffold-app");
+
+    run_git(&project, &["init"]);
+    run_git(&project, &["add", "-A"]);
+    run_git(
+        &project,
+        &[
+            "-c",
+            "user.email=t@t.com",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-m",
+            "base",
+        ],
+    );
+
+    let before = snapshot_tree(&project);
+
+    run_autumn(&project, &["generate", "scaffold", "Post", "title:String"]);
+    assert!(project.join("src/models/post.rs").is_file());
+    assert!(project.join("src/routes/posts.rs").is_file());
+    assert!(project.join("src/repositories/post.rs").is_file());
+
+    run_autumn(&project, &["destroy", "scaffold", "Post", "title:String"]);
+
+    let after = snapshot_tree(&project);
+    assert_eq!(
+        before, after,
+        "working tree must be byte-identical after generate+destroy"
+    );
+
+    let status_stdout = run_git(&project, &["status", "--porcelain"]);
+    assert!(
+        status_stdout.trim().is_empty(),
+        "git status must be clean after generate+destroy, got:\n{status_stdout}"
+    );
+}
+
+#[test]
+fn generate_then_destroy_model_round_trips_git_clean() {
+    let (_tmp, project) = fresh_project("destroy-model-app");
+    run_git(&project, &["init"]);
+    run_git(&project, &["add", "-A"]);
+    run_git(
+        &project,
+        &[
+            "-c",
+            "user.email=t@t.com",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-m",
+            "base",
+        ],
+    );
+
+    let before = snapshot_tree(&project);
+    run_autumn(&project, &["generate", "model", "Post", "title:String"]);
+    run_autumn(&project, &["destroy", "model", "Post", "title:String"]);
+    let after = snapshot_tree(&project);
+    assert_eq!(before, after);
+
+    let status_stdout = run_git(&project, &["status", "--porcelain"]);
+    assert!(status_stdout.trim().is_empty());
+}
+
+#[test]
+fn generate_then_destroy_migration_round_trips_git_clean() {
+    let (_tmp, project) = fresh_project("destroy-migration-app");
+    run_autumn(&project, &["generate", "model", "Post", "title:String"]);
+    run_git(&project, &["init"]);
+    run_git(&project, &["add", "-A"]);
+    run_git(
+        &project,
+        &[
+            "-c",
+            "user.email=t@t.com",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-m",
+            "base",
+        ],
+    );
+
+    let before = snapshot_tree(&project);
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "migration",
+            "AddSubtitleToPosts",
+            "subtitle:String",
+        ],
+    );
+    run_autumn(
+        &project,
+        &[
+            "destroy",
+            "migration",
+            "AddSubtitleToPosts",
+            "subtitle:String",
+        ],
+    );
+    let after = snapshot_tree(&project);
+    assert_eq!(before, after);
+
+    let status_stdout = run_git(&project, &["status", "--porcelain"]);
+    assert!(status_stdout.trim().is_empty());
+}
+
+#[test]
+fn generate_then_destroy_plugin_round_trips_git_clean() {
+    // Regression test (issue #1048 PR review): `plan_plugin` refuses a
+    // non-empty target directory unless `--force` — a generate-time
+    // collision guard. Without special-casing destroy mode, `autumn destroy
+    // plugin Foo` would always hit that same guard (the plugin directory
+    // legitimately exists, holding the files this destroy is about to
+    // remove) and fail before ever reaching `Plan::revert`, even with no
+    // `--force` flag and no actual divergence.
+    let (_tmp, project) = fresh_project("destroy-plugin-app");
+
+    run_git(&project, &["init"]);
+    run_git(&project, &["add", "-A"]);
+    run_git(
+        &project,
+        &[
+            "-c",
+            "user.email=t@t.com",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-m",
+            "base",
+        ],
+    );
+
+    let before = snapshot_tree(&project);
+
+    run_autumn(&project, &["generate", "plugin", "Foo"]);
+    assert!(project.join("autumn-foo-plugin/Cargo.toml").is_file());
+
+    run_autumn(&project, &["destroy", "plugin", "Foo"]);
+    assert!(!project.join("autumn-foo-plugin").exists());
+
+    let after = snapshot_tree(&project);
+    assert_eq!(
+        before, after,
+        "working tree must be byte-identical after generate+destroy"
+    );
+
+    let status_stdout = run_git(&project, &["status", "--porcelain"]);
+    assert!(
+        status_stdout.trim().is_empty(),
+        "git status must be clean after generate+destroy, got:\n{status_stdout}"
+    );
+}
+
+/// AC5: `destroy --dry-run` prints a plan and exits 0 without touching disk.
+#[test]
+fn destroy_dry_run_writes_nothing() {
+    let (_tmp, project) = fresh_project("destroy-dry-run-app");
+    run_autumn(&project, &["generate", "scaffold", "Post", "title:String"]);
+    let before = snapshot_tree(&project);
+
+    let (stdout, _) = run_autumn(
+        &project,
+        &["destroy", "scaffold", "Post", "title:String", "--dry-run"],
+    );
+    assert!(stdout.contains("Dry run"));
+    assert!(stdout.contains("Would remove") || stdout.contains("Would revert"));
+
+    let after = snapshot_tree(&project);
+    assert_eq!(before, after, "--dry-run must not touch disk");
+}
+
+/// AC7: destroy refuses on diverged content unless `--force`, and never
+/// deletes the hand-edited file in that case.
+#[test]
+fn destroy_refuses_on_diverged_file_without_force() {
+    let (_tmp, project) = fresh_project("destroy-diverged-app");
+    run_autumn(&project, &["generate", "scaffold", "Post", "title:String"]);
+
+    let model_path = project.join("src/models/post.rs");
+    let mut content = fs::read_to_string(&model_path).unwrap();
+    content.push_str("\n// hand-edited by the user\n");
+    fs::write(&model_path, &content).unwrap();
+
+    let (_, stderr, code) =
+        run_autumn_failing(&project, &["destroy", "scaffold", "Post", "title:String"]);
+    assert_eq!(code, Some(1));
+    assert!(
+        stderr.contains("diverged") || stderr.contains("Diverged"),
+        "expected a divergence error, got stderr: {stderr}"
+    );
+    assert!(model_path.is_file(), "diverged file must not be deleted");
+    assert!(
+        fs::read_to_string(&model_path)
+            .unwrap()
+            .contains("hand-edited")
+    );
+
+    // --force overrides the guard and proceeds with the destroy.
+    run_autumn(
+        &project,
+        &["destroy", "scaffold", "Post", "title:String", "--force"],
+    );
+    assert!(!model_path.exists());
+}
+
 #[test]
 fn generate_scaffold_api_only() {
     let (_tmp, project) = fresh_project("scaffold-api-app");
@@ -946,13 +1222,19 @@ fn generate_scaffold_accepts_metadata_flags() {
     assert!(repo.contains("fn find_by_alive(alive: bool) -> Vec<Bookmark>;"));
 
     let routes = fs::read_to_string(project.join("src/routes/bookmarks.rs")).unwrap();
-    assert!(routes.contains("name=\"url\""));
-    assert!(routes.contains("name=\"title\""));
-    assert!(routes.contains("name=\"tag\""));
-    assert!(!routes.contains("name=\"alive\""));
-    assert!(routes.contains("bookmarks::tag.eq(form.tag.clone())"));
-    assert!(!routes.contains("bookmarks::alive.eq(form.alive.clone())"));
-    assert!(!routes.contains("form.alive"));
+    // The views render through one `form_for` call (issue #1135): the
+    // per-field controls (including the required signal for the three
+    // non-nullable strings) come from the `#[model]`-derived `FormModel`
+    // descriptors, delegated to from the generated form struct.
+    assert!(routes.contains("impl autumn_web::form::FormModel for BookmarkForm"));
+    assert!(routes.contains("<Bookmark as autumn_web::form::FormModel>::form_fields()"));
+    assert!(routes.contains("autumn_web::form::form_for(changeset, action, \"post\")"));
+    assert!(!routes.contains("autumn_web::form::required_text_input(&changeset"));
+    // `alive` is defaulted → excluded from the form entirely.
+    assert!(!routes.contains("\"alive\""));
+    assert!(routes.contains("bookmarks::tag.eq(new.tag.clone())"));
+    assert!(!routes.contains("bookmarks::alive.eq("));
+    assert!(!routes.contains("new.alive"));
 
     let migration = fs::read_dir(project.join("migrations"))
         .unwrap()
@@ -1040,6 +1322,39 @@ fn generate_scaffold_rejects_i32_default_outside_sql_integer_range() {
         stderr.contains("count=9223372036854775807")
             && stderr.contains("i32 defaults must fit the SQL INTEGER range"),
         "expected i32 default range validation error; got stderr: {stderr}"
+    );
+}
+
+/// Issue #1048's success metric, verified end-to-end: `autumn generate
+/// scaffold Post title:String` immediately followed by `autumn destroy
+/// scaffold Post title:String` leaves `cargo check` green on the
+/// round-tripped project — not just a clean working tree (already covered by
+/// [`generate_then_destroy_scaffold_round_trips_git_clean`]), but a project
+/// that still *compiles*, proving destroy never leaves a dangling `mod`
+/// declaration, `routes![]` entry, or Cargo.toml dependency behind.
+///
+/// Ignored by default; slow (compiles the full `autumn-web` dependency
+/// tree) and requires network access to fetch crates. Run with:
+/// `cargo test -p autumn-cli --test generate destroy_scaffold_round_trip_leaves_cargo_check_green -- --ignored --exact`
+#[test]
+#[ignore = "slow: compiles the generated project with cargo check"]
+fn destroy_scaffold_round_trip_leaves_cargo_check_green() {
+    let (_tmp, project) = fresh_project("destroy-scaffold-check-app");
+    patch_generated_cargo_toml(&project);
+
+    run_autumn(&project, &["generate", "scaffold", "Post", "title:String"]);
+    run_autumn(&project, &["destroy", "scaffold", "Post", "title:String"]);
+
+    let check = Command::new("cargo")
+        .args(["check", "--all-targets"])
+        .current_dir(&project)
+        .output()
+        .expect("failed to run cargo check");
+    assert!(
+        check.status.success(),
+        "cargo check failed on the round-tripped project:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr),
     );
 }
 
@@ -1161,6 +1476,22 @@ fn generate_help_documents_field_dsl() {
 }
 
 #[test]
+fn generate_help_documents_decimal_field_type() {
+    // AC4 (issue #1038): `decimal` must be discoverable from `--help`, not
+    // just accepted silently by the parser.
+    let tmp = tempfile::tempdir().unwrap();
+    let autumn_bin = env!("CARGO_BIN_EXE_autumn");
+    let output = Command::new(autumn_bin)
+        .args(["generate", "--help"])
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("decimal"), "got: {stdout}");
+    assert!(stdout.contains("NUMERIC"), "got: {stdout}");
+}
+
+#[test]
 fn generate_model_help_shows_example() {
     let tmp = tempfile::tempdir().unwrap();
     let autumn_bin = env!("CARGO_BIN_EXE_autumn");
@@ -1213,7 +1544,43 @@ fn generated_scaffold_cargo_checks() {
             "token:Option<Uuid>",
             "status:enum{draft,published,archived}",
             "mood:Option<enum{happy,sad}>",
+            "price:decimal{10,2}",
+            "balance:Option<decimal>",
+            "payload:Bytea",
+            "nickname:Option<Bytea>",
+            "--validate",
+            "title=length:min=1,max=200",
+            "--live-validation",
         ],
+    );
+
+    // A `Bytea` field's `{Pascal}Form` representation must actually round-trip:
+    // `Vec<u8>` cannot deserialize from a single url-encoded value at all
+    // (issue #1124 review), so both nullable and non-nullable Bytea fields
+    // are represented as `String`/`Option<String>` on the form.
+    let routes_bytea = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
+    assert!(
+        routes_bytea.contains("pub payload: String,"),
+        "{routes_bytea}"
+    );
+    assert!(
+        routes_bytea.contains("pub nickname: Option<String>,"),
+        "{routes_bytea}"
+    );
+
+    // The `--live-validation` inline-validation handler must compile against
+    // the real framework too (issue #1124 follow-up: it now decodes the full
+    // form via `decode_form` and renders through `text_input_htmx`, rather
+    // than a hand-rolled per-rule check returning a bare error span). `title`
+    // is non-nullable, so it keeps the `required` htmx variant.
+    let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
+    assert!(
+        routes.contains("pub async fn validate_title("),
+        "expected a validate_title handler:\n{routes}"
+    );
+    assert!(
+        routes.contains("autumn_web::form::required_text_input_htmx(&changeset, \"title\""),
+        "validate_title must return the full required_text_input_htmx wrapper:\n{routes}"
     );
 
     // The generator must have added every dep its emitted code needs.
@@ -1227,6 +1594,7 @@ fn generated_scaffold_cargo_checks() {
         "serde_json",
         "serde_urlencoded",
         "url",
+        "rust_decimal",
     ] {
         assert!(
             cargo_toml_after.contains(&format!("{dep} =")),
@@ -1244,6 +1612,86 @@ fn generated_scaffold_cargo_checks() {
         "cargo check on generated scaffold failed:\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&check.stdout),
         String::from_utf8_lossy(&check.stderr),
+    );
+}
+
+/// Slow end-to-end check (issue #1124): scaffold a model with a `--validate`
+/// rule and prove the generated changeset round-trip actually compiles *and*
+/// runs — a rejected submission gets 422 with the other field preserved and
+/// an inline error, a valid one still succeeds (AC1-AC5, AC7). Runs the
+/// generated `tests/<snake>.rs` changeset smoke test directly (it needs no
+/// Docker/Postgres — see `render_validation_rejection_smoke_test`), not just
+/// `cargo check`.
+///
+/// Ignored by default; run with `cargo test -p autumn-cli -- --ignored`.
+#[test]
+#[ignore = "slow: cargo-builds and runs a fresh project's test suite — run with `cargo test -p autumn-cli -- --ignored`"]
+fn generated_validated_scaffold_round_trip_test_passes() {
+    let (_tmp, project) = fresh_project("scaffold-validation-build");
+    patch_generated_cargo_toml(&project);
+
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Post",
+            "title:String",
+            "body:String",
+            "--validate",
+            "title=length:min=1,max=200",
+        ],
+    );
+
+    let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
+    assert!(routes.contains("pub struct PostForm"));
+    assert!(routes.contains("into_changeset()"));
+    assert!(routes.contains("StatusCode::UNPROCESSABLE_ENTITY"));
+
+    let test_file = fs::read_to_string(project.join("tests/post.rs")).unwrap();
+    assert!(test_file.contains("posts_rejects_invalid_title_and_preserves_input"));
+
+    let output = Command::new("cargo")
+        .args([
+            "test",
+            "--test",
+            "post",
+            "posts_rejects_invalid_title_and_preserves_input",
+        ])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "the generated changeset round-trip test failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("test result: ok"),
+        "expected the generated test to pass:\n{stdout}"
+    );
+
+    // Issue #1127: the same generated binary also carries the in-process
+    // write-path suite (create/update/delete + the validation-failure
+    // re-render). Run it by name and prove it compiles and passes — no Docker,
+    // no external services.
+    let write_path = Command::new("cargo")
+        .args(["test", "--test", "post", "posts_write_path_crud"])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        write_path.status.success(),
+        "the generated write-path CRUD test failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&write_path.stdout),
+        String::from_utf8_lossy(&write_path.stderr),
+    );
+    assert!(
+        String::from_utf8_lossy(&write_path.stdout).contains("test result: ok"),
+        "expected the generated write-path test to pass:\n{}",
+        String::from_utf8_lossy(&write_path.stdout)
     );
 }
 
@@ -1266,14 +1714,22 @@ fn generated_job_cargo_checks() {
             "SendWelcomeEmail",
             "user_id:i64",
             "email:String",
+            "amount:decimal",
         ],
     );
 
-    // The generated Cargo.toml must include serde.
+    // The generated Cargo.toml must include serde and — since a `decimal`
+    // field is present — rust_decimal (issue #1038 PR review: job_deps
+    // previously omitted it, so the generated args struct referenced
+    // rust_decimal::Decimal without the crate ever being declared).
     let cargo_toml = fs::read_to_string(project.join("Cargo.toml")).unwrap();
     assert!(
         cargo_toml.contains("serde"),
         "Cargo.toml must include serde after generate job"
+    );
+    assert!(
+        cargo_toml.contains("rust_decimal"),
+        "Cargo.toml must include rust_decimal after generate job with a decimal field"
     );
 
     // The generator must have created the expected files.
@@ -1598,24 +2054,25 @@ fn generate_scaffold_unique_field_create_violation_form_preserves_submitted_valu
         "the blank new_form must not reference `new`; got:\n{new_form_body}"
     );
 
-    // The violation-branch re-render (spliced into `create`) must restore
-    // every submitted value from `new`.
+    // The violation-branch re-render (spliced into `create`) rebuilds the
+    // changeset with the duplicate error via `Changeset::from_errors` and
+    // re-renders through the same changeset-aware helpers, so every submitted
+    // value is preserved (issue #1124 unifies the unique path with validation).
     let create_body = &routes[create_start..];
     assert!(
-        create_body.contains("value=(new.age.to_string())"),
+        create_body.contains("Changeset::from_errors(changeset.into_inner(), errors)"),
+        "got:\n{create_body}"
+    );
+    // The re-render goes through the same shared `form_for` helper as the GET
+    // views (issue #1135) — every submitted value is preserved because the
+    // controls all read from the rebuilt changeset.
+    assert!(
+        create_body.contains("user_form_for(&changeset"),
         "got:\n{create_body}"
     );
     assert!(
-        create_body.contains("checked[new.active]"),
-        "got:\n{create_body}"
-    );
-    assert!(
-        create_body.contains("selected[new.status == Status::Draft]"),
-        "got:\n{create_body}"
-    );
-    assert!(
-        create_body.contains("selected[new.status == Status::Published]"),
-        "got:\n{create_body}"
+        routes.contains(".override_field(\"status\", autumn_web::form::FieldControl::Select"),
+        "got:\n{routes}"
     );
 }
 
@@ -1644,40 +2101,34 @@ fn generate_scaffold_unique_field_update_violation_form_preserves_submitted_valu
     );
 
     let routes = fs::read_to_string(project.join("src/routes/users.rs")).unwrap();
-    // The plain `edit_form` (shows the persisted row, no prior rejected
-    // submission) must stay untouched — every value still comes from `row`.
+    // The plain `edit_form` seeds its changeset from the persisted row.
     let edit_form_start = routes
         .find("pub async fn edit_form")
         .expect("edit_form handler");
     let update_start = routes.find("pub async fn update(").expect("update handler");
     let edit_form_body = &routes[edit_form_start..update_start];
     assert!(
-        !edit_form_body.contains("form."),
-        "the plain edit_form must not reference `form`; got:\n{edit_form_body}"
-    );
-    assert!(
-        edit_form_body.contains("value=(row.age.to_string())"),
-        "got:\n{edit_form_body}"
+        edit_form_body.contains("Changeset::new(UserForm::from(&row))"),
+        "the edit_form seeds a changeset from the loaded row; got:\n{edit_form_body}"
     );
 
-    // The violation-branch re-render (spliced into `update`) must restore
-    // every submitted value from `form`, not the stale `row`.
+    // The violation-branch re-render (spliced into `update`) preserves the
+    // *submitted* edits by rebuilding the changeset from the decoded form via
+    // `Changeset::from_errors` — no stale `row` refetch (issue #1124).
     let update_body = &routes[update_start..];
     assert!(
-        update_body.contains("value=(form.age.to_string())"),
+        update_body.contains("Changeset::from_errors(changeset.into_inner(), errors)"),
+        "got:\n{update_body}"
+    );
+    // Same shared `form_for` helper as the GET views (issue #1135): the
+    // rebuilt changeset carries the submitted values into every control.
+    assert!(
+        update_body.contains("user_form_for(&changeset"),
         "got:\n{update_body}"
     );
     assert!(
-        update_body.contains("checked[form.active]"),
-        "got:\n{update_body}"
-    );
-    assert!(
-        update_body.contains("selected[form.status == Status::Draft]"),
-        "got:\n{update_body}"
-    );
-    assert!(
-        update_body.contains("selected[form.status == Status::Published]"),
-        "got:\n{update_body}"
+        !update_body.contains(".first(&mut *db)"),
+        "the update violation path must not re-fetch the row; got:\n{update_body}"
     );
 }
 
@@ -2119,10 +2570,10 @@ fn generate_scaffold_unique_attachment_field_is_skipped_in_smoke_test() {
 }
 
 #[test]
-fn generate_scaffold_without_unique_field_keeps_plain_create_signature() {
-    // Regression guard: a scaffold with NO unique fields must emit
-    // byte-identical output to before this feature existed — no
-    // UNIQUE_CONSTRAINTS const, no Response-returning create/update.
+fn generate_scaffold_without_unique_field_omits_unique_constraints() {
+    // A scaffold with NO unique fields emits no UNIQUE_CONSTRAINTS const, but
+    // (issue #1124) every scaffold now uses the changeset round-trip: create
+    // returns a Response and carries the CSRF params for the 422 re-render.
     let (_tmp, project) = fresh_project("no-unique-scaffold-routes-app");
     run_autumn(&project, &["generate", "scaffold", "Post", "title:String"]);
 
@@ -2130,10 +2581,11 @@ fn generate_scaffold_without_unique_field_keeps_plain_create_signature() {
     assert!(!routes.contains("UNIQUE_CONSTRAINTS"), "got:\n{routes}");
     assert!(
         routes.contains(
-            "pub async fn create(flash: Flash, mut db: Db, body: Bytes) -> AutumnResult<Markup>"
+            "pub async fn create(flash: Flash, csrf: Option<CsrfToken>, csrf_field: Option<CsrfFormField>, mut db: Db, body: Bytes) -> AutumnResult<autumn_web::reexports::axum::response::Response>"
         ),
         "got:\n{routes}"
     );
+    assert!(routes.contains("form.into_changeset()"), "got:\n{routes}");
 }
 
 #[test]
@@ -2291,12 +2743,11 @@ fn generate_scaffold_unique_live_field_wires_repository_save_and_db_refetch() {
         "got:\n{routes}"
     );
     // Regression guard (issue #1032 review follow-up): `update`'s signature
-    // must NOT carry a second `Db` extractor alongside `repo` — `Db` checks
-    // out and holds a pool connection for the whole handler scope, and
-    // `repo.update` (the live write path) checks out its own connection from
-    // the same pool, so holding both at once self-deadlocks/times out a pool
-    // sized for one connection per request. The unique-violation re-fetch
-    // must go through `repo.find_by_id` instead of a direct `db` query.
+    // must NOT carry a second `Db` extractor alongside `repo` — holding both a
+    // `Db` and `repo`'s own checkout at once self-deadlocks a pool sized for
+    // one connection per request. Issue #1124 drops the unique-violation
+    // row-refetch entirely (the 422 re-renders the submitted changeset), so the
+    // live update path no longer needs any refetch connection at all.
     let update_start = routes.find("pub async fn update(").expect("update handler");
     let update_body = &routes[update_start..];
     assert!(
@@ -2305,8 +2756,8 @@ fn generate_scaffold_unique_live_field_wires_repository_save_and_db_refetch() {
          got:\n{update_body}"
     );
     assert!(
-        update_body.contains("repo.find_by_id(*id).await?"),
-        "got:\n{update_body}"
+        update_body.contains("Changeset::from_errors(changeset.into_inner(), errors)"),
+        "the update violation path re-renders the submitted changeset; got:\n{update_body}"
     );
     assert!(routes.contains("repo: PgUserRepository"), "got:\n{routes}");
     assert!(
@@ -4286,38 +4737,34 @@ fn live_validation_emits_hx_post_and_error_slot() {
 
     let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
 
-    // hx-post attr on the title input in the create form
+    // A validated text field on `--live-validation` renders via the
+    // changeset-aware `text_input_htmx` helper (issue #1124), which wires up
+    // its own hx-post/hx-trigger/hx-target/hx-swap and inline error block —
+    // the generator no longer hand-rolls these attributes. `title` is
+    // non-nullable, so it keeps `required`/`aria-required` via the
+    // `required_text_input_htmx` variant.
     assert!(
-        routes.contains("hx-post=\"/posts/validate/title\""),
-        "create form must have hx-post on validated title input:\n{routes}"
+        routes.contains(
+            "autumn_web::form::required_text_input_htmx(&changeset, \"title\", \"Title\", \"/posts/validate/title\")"
+        ),
+        "create form must render the validated title input via required_text_input_htmx:\n{routes}"
     );
-    // hx-trigger, hx-target, hx-swap attrs
+    // body field (not validated, but required) must use required_text_input.
     assert!(
-        routes.contains("hx-trigger=\"change\""),
-        "create form must have hx-trigger=\"change\":\n{routes}"
+        routes.contains("autumn_web::form::required_text_input(&changeset, \"body\", \"Body\")"),
+        "unvalidated required body input must use required_text_input:\n{routes}"
     );
     assert!(
-        routes.contains("hx-target=\"#title-error\""),
-        "create form must have hx-target pointing at the error slot:\n{routes}"
-    );
-    assert!(
-        routes.contains("hx-swap=\"outerHTML\""),
-        "create form must have hx-swap=\"outerHTML\":\n{routes}"
-    );
-    // error span emitted after the input
-    assert!(
-        routes.contains("span id=\"title-error\""),
-        "create form must have a companion error span:\n{routes}"
-    );
-    // body field (not validated) must NOT have hx-post
-    assert!(
-        !routes.contains("hx-post=\"/posts/validate/body\""),
-        "unvalidated body input must not have hx-post:\n{routes}"
+        !routes.contains("autumn_web::form::text_input_htmx(&changeset, \"body\""),
+        "unvalidated body input must not use text_input_htmx:\n{routes}"
     );
 }
 
-/// `--live-validation` emits a `validate_{field}` route handler that actually
-/// checks the declared rule (length, url, email) — not just the empty check.
+/// `--live-validation` emits a `validate_{field}` route handler that decodes
+/// the full form, validates through the same `{Pascal}Form`/`Changeset`
+/// machinery as `create`/`update` (issue #1124 follow-up), and returns
+/// `text_input_htmx`'s full field wrapper — never a bare error span, which
+/// would delete the input on htmx's `hx-swap="outerHTML"`.
 #[test]
 fn live_validation_emits_validate_handler_with_real_rules() {
     let (_tmp, project) = fresh_project("lv-validate-handler");
@@ -4342,98 +4789,35 @@ fn live_validation_emits_validate_handler_with_real_rules() {
 
     let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
 
-    // length-validated field checks the length bounds
-    assert!(
-        routes.contains("validate_title"),
-        "routes must contain validate_title handler:\n{routes}"
+    for field in ["title", "site", "email"] {
+        assert!(
+            routes.contains(&format!("pub async fn validate_{field}(")),
+            "routes must contain a validate_{field} handler:\n{routes}"
+        );
+        // All three fields are non-nullable, so the required htmx variant
+        // keeps the `required`/`aria-required` signal through the swap too.
+        assert!(
+            routes.contains(&format!(
+                "autumn_web::form::required_text_input_htmx(&changeset, \"{field}\""
+            )),
+            "validate_{field} must return the full required_text_input_htmx wrapper, \
+             not a bare error span:\n{routes}"
+        );
+    }
+    // Each handler decodes the whole form (htmx posts the entire form via
+    // `hx-include="closest form"`) and validates through the derived
+    // `#[validate(...)]` rules on `PostForm` — one rule implementation, not a
+    // hand-rolled duplicate per field.
+    assert_eq!(
+        routes
+            .matches("let Ok(form) = decode_form(body) else")
+            .count(),
+        3,
+        "every validate_{{field}} handler must decode via the shared decode_form:\n{routes}"
     );
     assert!(
-        routes.contains("value.chars().count() < 1 || value.chars().count() > 200"),
-        "validate_title must check length bounds:\n{routes}"
-    );
-
-    // url-validated field checks with url::Url::parse
-    assert!(
-        routes.contains("validate_site"),
-        "routes must contain validate_site handler:\n{routes}"
-    );
-    assert!(
-        routes.contains("url::Url::parse(&value).is_err()"),
-        "validate_site must check with url::Url::parse:\n{routes}"
-    );
-
-    // email-validated field checks for @ and domain dot
-    assert!(
-        routes.contains("validate_email"),
-        "routes must contain validate_email handler:\n{routes}"
-    );
-    assert!(
-        routes.contains("!value.contains('@')"),
-        "validate_email must check for @ character:\n{routes}"
-    );
-}
-
-/// `--validate field=length:min=N` (no max) generates the min-only length check.
-#[test]
-fn live_validation_length_min_only() {
-    let (_tmp, project) = fresh_project("lv-min-only");
-    run_autumn(
-        &project,
-        &[
-            "generate",
-            "scaffold",
-            "Post",
-            "title:String",
-            "--validate",
-            "title=length:min=3",
-            "--live-validation",
-        ],
-    );
-
-    let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
-    assert!(
-        routes.contains("value.chars().count() < 3"),
-        "min-only length check must guard count < min:\n{routes}"
-    );
-    assert!(
-        routes.contains("must be at least 3 characters"),
-        "min-only error message must say 'at least':\n{routes}"
-    );
-    assert!(
-        !routes.contains("value.chars().count() >"),
-        "min-only rule must not emit an upper-bound check:\n{routes}"
-    );
-}
-
-/// `--validate field=length:max=N` (no min) generates the max-only length check.
-#[test]
-fn live_validation_length_max_only() {
-    let (_tmp, project) = fresh_project("lv-max-only");
-    run_autumn(
-        &project,
-        &[
-            "generate",
-            "scaffold",
-            "Post",
-            "title:String",
-            "--validate",
-            "title=length:max=50",
-            "--live-validation",
-        ],
-    );
-
-    let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
-    assert!(
-        routes.contains("value.chars().count() > 50"),
-        "max-only length check must guard count > max:\n{routes}"
-    );
-    assert!(
-        routes.contains("must be at most 50 characters"),
-        "max-only error message must say 'at most':\n{routes}"
-    );
-    assert!(
-        !routes.contains("value.chars().count() <"),
-        "max-only rule must not emit a lower-bound check:\n{routes}"
+        routes.contains("#[validate(length(min = 1, max = 200))]\n    pub title: String"),
+        "PostForm must carry the length rule for validator::Validate to enforce:\n{routes}"
     );
 }
 
@@ -6050,4 +6434,158 @@ fn generate_tauri_reuses_pwa_icon() {
         project.join("static/icons/icon.svg").is_file(),
         "PWA icon must still exist"
     );
+}
+
+// ── generate controller (issue #1050) ──────────────────────────────────────
+
+/// Re-running `generate controller` against an existing controller must fail
+/// (non-zero exit) and leave the first file byte-for-byte intact. Fast — no
+/// compile needed.
+#[test]
+fn controller_rerun_without_force_fails() {
+    let (_tmp, project) = fresh_project("controller-rerun-app");
+    run_autumn(
+        &project,
+        &["generate", "controller", "pages", "home", "about"],
+    );
+    let original = fs::read_to_string(project.join("src/routes/pages.rs")).unwrap();
+
+    let (_out, _err, code) = run_autumn_failing(
+        &project,
+        &["generate", "controller", "pages", "home", "contact"],
+    );
+    assert_eq!(code, Some(1), "second run must exit non-zero");
+    let after = fs::read_to_string(project.join("src/routes/pages.rs")).unwrap();
+    assert_eq!(
+        original, after,
+        "existing controller file must be untouched"
+    );
+}
+
+/// Slow end-to-end check: a fresh project + `generate controller` (HTML) must
+/// compile with zero edits, and `autumn routes` must list every generated
+/// route.
+///
+/// Ignored by default; run with `cargo test -p autumn-cli -- --ignored`.
+#[test]
+#[ignore = "slow: cargo-builds a fresh project — run with `cargo test -p autumn-cli -- --ignored`"]
+fn controller_generates_compiles_and_lists_routes() {
+    let (_tmp, project) = fresh_project("controller-html-build");
+    patch_generated_cargo_toml(&project);
+
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "controller",
+            "pages",
+            "home",
+            "about",
+            "contact",
+        ],
+    );
+
+    let build = Command::new("cargo")
+        .args(["build"])
+        .current_dir(&project)
+        .output()
+        .expect("failed to run cargo build");
+    assert!(
+        build.status.success(),
+        "cargo build failed on generated controller:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr),
+    );
+
+    let (stdout, _stderr) = run_autumn(&project, &["routes"]);
+    for path in ["/pages/home", "/pages/about", "/pages/contact"] {
+        assert!(
+            stdout.contains(path),
+            "autumn routes must list {path}:\n{stdout}"
+        );
+    }
+
+    // --force regeneration with a CHANGED action set must prune the stale
+    // route entries (`about`) from main.rs, not just append the new one
+    // (`services`) — otherwise `routes::pages::about` would reference a
+    // handler the overwritten file no longer defines and break the build.
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "controller",
+            "pages",
+            "home",
+            "contact",
+            "services",
+            "--force",
+        ],
+    );
+
+    let rebuild = Command::new("cargo")
+        .args(["build"])
+        .current_dir(&project)
+        .output()
+        .expect("failed to run cargo build after --force regen");
+    assert!(
+        rebuild.status.success(),
+        "cargo build failed after --force regen (stale route entry not pruned?):\n\
+         stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&rebuild.stdout),
+        String::from_utf8_lossy(&rebuild.stderr),
+    );
+
+    let (stdout2, _stderr2) = run_autumn(&project, &["routes"]);
+    for path in ["/pages/home", "/pages/contact", "/pages/services"] {
+        assert!(
+            stdout2.contains(path),
+            "autumn routes must list {path} after regen:\n{stdout2}"
+        );
+    }
+    assert!(
+        !stdout2.contains("/pages/about"),
+        "the dropped action /pages/about must no longer be listed:\n{stdout2}"
+    );
+}
+
+/// Slow end-to-end check: `generate controller --api` must compile and list its
+/// JSON routes under `/api/<controller>`.
+///
+/// Ignored by default; run with `cargo test -p autumn-cli -- --ignored`.
+#[test]
+#[ignore = "slow: cargo-builds a fresh project — run with `cargo test -p autumn-cli -- --ignored`"]
+fn controller_api_generates_json() {
+    let (_tmp, project) = fresh_project("controller-api-build");
+    patch_generated_cargo_toml(&project);
+
+    run_autumn(
+        &project,
+        &["generate", "controller", "pages", "index", "stats", "--api"],
+    );
+
+    let file = fs::read_to_string(project.join("src/routes/pages.rs")).unwrap();
+    assert!(
+        file.contains("AutumnResult<Json<serde_json::Value>>"),
+        "--api controller must return JSON:\n{file}"
+    );
+
+    let build = Command::new("cargo")
+        .args(["build"])
+        .current_dir(&project)
+        .output()
+        .expect("failed to run cargo build");
+    assert!(
+        build.status.success(),
+        "cargo build failed on generated --api controller:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr),
+    );
+
+    let (stdout, _stderr) = run_autumn(&project, &["routes"]);
+    for path in ["/api/pages", "/api/pages/stats"] {
+        assert!(
+            stdout.contains(path),
+            "autumn routes must list {path}:\n{stdout}"
+        );
+    }
 }

@@ -102,6 +102,7 @@ pub fn layout(
                     meta name="csrf-token" content=(token);
                 }
                 link rel="stylesheet" href=(autumn_web::flash::FLASH_CSS_PATH);
+                link rel="stylesheet" href=(autumn_web::ui::WIDGETS_CSS_PATH);
                 link rel="stylesheet" href="/static/css/autumn.css";
                 style {
                     " #posts-list.posts-feed-compact .posts-feed-card-version { display: none !important; } "

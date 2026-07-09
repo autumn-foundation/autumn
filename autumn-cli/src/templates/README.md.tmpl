@@ -1,0 +1,128 @@
+# {{project_name}}
+
+An [Autumn](https://crates.io/crates/autumn-web) web application.
+
+## Quickstart
+
+Run these steps top-to-bottom on a clean checkout to get a route serving.
+
+### 1. Prerequisites
+
+- **Rust {{rust_version}}+** (edition 2024) — https://rustup.rs
+- **The `autumn` CLI:**
+  ```sh
+  cargo install autumn-cli --version {{autumn_version}}
+  ```
+- **The Tailwind binary** (downloaded by `autumn setup`):
+  ```sh
+  autumn setup
+  ```
+- **A reachable Postgres** for database features. Don't have one? The golden
+  path in step 2 below ("Configure the database") includes a one-line Docker
+  option that matches the connection `url` you set there — no need to start a
+  container here; just follow that step in order. To generate a full
+  deployment/compose stack instead, see
+  `autumn release init --target docker-compose` in the CLI reference below.
+- **The PostgreSQL client library (`libpq`).** The default scaffold keeps the
+  `db` feature, so the base app links `libpq` at build time — it must be
+  installed for `cargo build` / `autumn dev` to succeed, even before you have a
+  running database configured. It is also required by the Diesel CLI's
+  `postgres` feature installed below. Install it with your package manager (e.g.
+  `libpq-dev` on Debian/Ubuntu, `libpq` via Homebrew on macOS).
+- **Diesel CLI** for the database path (its `postgres` feature needs the
+  `libpq` client library above):
+  ```sh
+  cargo install diesel_cli --no-default-features --features postgres
+  ```
+
+### 2. Configure the database
+
+The base scaffold ships with the `[database]` block in `autumn.toml` **commented
+out**. `autumn migrate` needs a resolved connection URL, so enable the database
+before running it — open `autumn.toml`, uncomment the `[database]` block, and set
+`url` to a reachable Postgres:
+
+```toml
+[database]
+url = "postgres://postgres:postgres@localhost:5432/{{crate_name}}"
+```
+
+> Prefer environment variables? Instead of editing `autumn.toml`, copy
+> `.env.example` to `.env` (gitignored) and set `AUTUMN_DATABASE__URL` there.
+> `autumn dev` auto-loads `.env` in the dev/test profiles; real shell
+> environment variables always win over `.env` values.
+
+Don't have a Postgres to point at? Start a throwaway local instance with Docker.
+This matches the `url` above (user and password `postgres`, database
+`{{crate_name}}`), so the two line up with no extra edits. The `-d` flag runs it
+in the background so your terminal stays free for the next steps; stop it later
+with `docker stop {{crate_name}}-pg`:
+
+```sh
+docker run -d --rm --name {{crate_name}}-pg -e POSTGRES_PASSWORD=postgres \
+  -e POSTGRES_DB={{crate_name}} -p 5432:5432 postgres:16
+
+# Wait until Postgres is ready to accept connections
+until docker exec {{crate_name}}-pg pg_isready -U postgres >/dev/null 2>&1; do sleep 1; done
+```
+
+The container reports "started" the instant it launches, but first-time Postgres
+initialization takes a few seconds before it accepts connections. `autumn db
+create` connects immediately and does not retry, so wait for the readiness loop
+above to finish before running it.
+
+Then create the database on its server (idempotent — safe to re-run; harmless if
+the container above already created it):
+
+```sh
+autumn db create
+```
+
+> Need containerized **deployment** assets (a production Dockerfile plus a
+> `docker-compose.yml` wiring app + Postgres + a one-shot migration)? Run
+> `autumn release init --target docker-compose`. That is a separate,
+> production-oriented stack — it overwrites the scaffold's `Dockerfile` and
+> `.dockerignore` (pass `--force`, since `autumn new` already wrote them), so
+> reach for it when you're packaging for deploy, not for the quick local DB above.
+
+### 3. Apply migrations
+
+```sh
+autumn migrate
+```
+
+Applies every pending migration to the database you configured above. This
+requires a resolved database URL — run step 2 first, or `autumn migrate` exits
+with `✗ No database URL found.`
+
+### 4. Run the dev server
+
+```sh
+autumn dev
+```
+
+Then visit **http://localhost:3000** — you should get a `200` with
+"Welcome to {{project_name}}!". Health endpoints are auto-mounted at
+`/health` and `/actuator/health`.
+
+## CLI reference
+
+The most useful `autumn` verbs for day-to-day work:
+
+| Command | What it does |
+|---|---|
+| `autumn dev` | Run the dev server with file watching + live reload. |
+| `autumn migrate` | Apply pending database migrations. |
+| `autumn doctor` | Preflight your environment / diagnose setup problems. |
+| `autumn routes` | List all mounted routes. |
+| `autumn generate scaffold <Name> field:Type …` | Scaffold a CRUD resource — model, migration, routes, and views. |
+| `autumn release init --target docker-compose` | Generate deployment assets (e.g. a docker-compose with Postgres). |
+
+## Project layout
+
+| Path | Purpose |
+|---|---|
+| `autumn.toml` | Base config (server, database, session, security, logging). |
+| `src/main.rs` | AppBuilder setup — register routes, tasks, jobs, migrations here. |
+| `migrations/` | Diesel migrations — one directory per migration. |
+| `static/` | Static assets served under `/static/`. |
