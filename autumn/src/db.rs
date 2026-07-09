@@ -120,13 +120,22 @@ pub(crate) fn record_request_db_query(elapsed: Duration) {
 /// request has scoped the task-local (background jobs, or the middleware being
 /// disabled) — so it never panics off-request.
 ///
-/// Only actual statement executions are timed. Connection-establish, prepared
-/// statement cache, and transaction (`BEGIN`/`COMMIT`/`ROLLBACK`) events are
-/// ignored: a transaction's inner statements each fire their own
-/// `StartQuery`/`FinishQuery` pair, so counting the transaction control
-/// statements too would double-count. Queries on a single connection are
-/// strictly sequential (`&mut conn`), so a single `Option<Instant>` slot is
-/// sufficient — there is no overlap between a start and its finish.
+/// Only genuine application statements are timed. The dedicated
+/// connection-establish, prepared-statement-cache, and
+/// `BeginTransaction`/`CommitTransaction`/`RollbackTransaction` events are
+/// ignored outright. Crucially, diesel-async runs the transaction-control SQL
+/// itself (`BEGIN`, `COMMIT`, `ROLLBACK`, and the `SAVEPOINT`/`RELEASE`
+/// variants for nested transactions) through `batch_execute`, which emits a
+/// `StartQuery`/`FinishQuery` pair with that SQL — exactly like a real query.
+/// Left unfiltered, a transaction wrapping a single `SELECT` would report
+/// `desc="3 queries"` (BEGIN + SELECT + COMMIT) and fold begin/commit latency
+/// into `db;dur`. So at `StartQuery` we inspect the statement text and skip
+/// timing when it is a transaction-control command (see
+/// [`RequestQueryTimer::is_transaction_control`]). Queries on a single
+/// connection are strictly sequential (`&mut conn`), so a single
+/// `Option<Instant>` slot is sufficient — there is no overlap between a start
+/// and its finish, and skipping a start leaves the slot empty so the matching
+/// finish is a no-op.
 #[cfg(feature = "db")]
 #[derive(Default, Debug)]
 pub(crate) struct RequestQueryTimer {
@@ -136,11 +145,39 @@ pub(crate) struct RequestQueryTimer {
 
 #[cfg(feature = "db")]
 impl RequestQueryTimer {
-    /// Record the start of a statement. Extracted from the event handler so
-    /// the start/finish accounting is unit-testable without constructing a
-    /// (non-exhaustive, unstable-to-build) `InstrumentationEvent`.
-    const fn on_start(&mut self, now: std::time::Instant) {
-        self.started_at = Some(now);
+    /// Whether `sql` is a transaction-control command that diesel-async runs
+    /// via `batch_execute` (which emits a `StartQuery`/`FinishQuery` pair just
+    /// like a real query). Matches a case-insensitive leading token in
+    /// `{BEGIN, COMMIT, ROLLBACK, SAVEPOINT, RELEASE}`, plus the two-word
+    /// `START TRANSACTION` / `SET TRANSACTION` forms. Such statements must not
+    /// be counted as application queries — see the type-level docs.
+    fn is_transaction_control(sql: &str) -> bool {
+        let mut tokens = sql.split_whitespace();
+        let Some(first) = tokens.next() else {
+            return false;
+        };
+        match first.to_ascii_uppercase().as_str() {
+            "BEGIN" | "COMMIT" | "ROLLBACK" | "SAVEPOINT" | "RELEASE" => true,
+            "START" | "SET" => tokens
+                .next()
+                .is_some_and(|second| second.eq_ignore_ascii_case("TRANSACTION")),
+            _ => false,
+        }
+    }
+
+    /// Record the start of a statement, unless `sql` is a transaction-control
+    /// command (`BEGIN`/`COMMIT`/…), in which case the timer is deliberately
+    /// not started so the statement is excluded from the per-request
+    /// accumulator. Clearing the slot keeps the matching `FinishQuery` a no-op.
+    /// Extracted from the event handler so the start/finish accounting is
+    /// unit-testable without constructing a (non-exhaustive, unstable-to-build)
+    /// `InstrumentationEvent`.
+    fn on_start(&mut self, now: std::time::Instant, sql: &str) {
+        self.started_at = if Self::is_transaction_control(sql) {
+            None
+        } else {
+            Some(now)
+        };
     }
 
     /// Record the completion of the in-flight statement, accumulating its
@@ -158,10 +195,16 @@ impl diesel::connection::Instrumentation for RequestQueryTimer {
     fn on_connection_event(&mut self, event: diesel::connection::InstrumentationEvent<'_>) {
         use diesel::connection::InstrumentationEvent;
         match event {
-            InstrumentationEvent::StartQuery { .. } => self.on_start(std::time::Instant::now()),
+            InstrumentationEvent::StartQuery { query, .. } => {
+                // `query` is an opaque `&dyn DebugQuery`; its `Display` impl
+                // renders the SQL text, which we inspect to skip
+                // transaction-control statements (see the type-level docs).
+                self.on_start(std::time::Instant::now(), &query.to_string());
+            }
             InstrumentationEvent::FinishQuery { .. } => self.on_finish(std::time::Instant::now()),
-            // Ignore connection-establish, prepared-statement cache, and
-            // transaction control events — see the type-level docs.
+            // Ignore connection-establish, prepared-statement cache, and the
+            // dedicated Begin/Commit/RollbackTransaction events — see the
+            // type-level docs.
             _ => {}
         }
     }
@@ -2130,12 +2173,12 @@ mod tests {
 
                 // Query 1: 1200µs.
                 let t0 = std::time::Instant::now();
-                timer.on_start(t0);
+                timer.on_start(t0, "SELECT 1");
                 timer.on_finish(t0 + Duration::from_micros(1_200));
 
                 // Query 2: 800µs.
                 let t1 = std::time::Instant::now();
-                timer.on_start(t1);
+                timer.on_start(t1, "UPDATE users SET name = $1");
                 timer.on_finish(t1 + Duration::from_micros(800));
 
                 // A stray FinishQuery with no matching StartQuery is ignored.
@@ -2162,9 +2205,91 @@ mod tests {
     async fn request_query_timer_is_noop_off_request() {
         let mut timer = RequestQueryTimer::default();
         let t0 = std::time::Instant::now();
-        timer.on_start(t0);
+        timer.on_start(t0, "SELECT 1");
         // Must not panic even though no task-local accumulator is scoped.
         timer.on_finish(t0 + Duration::from_micros(500));
+    }
+
+    /// A transaction wraps its inner statements in `BEGIN`/`COMMIT`, which
+    /// diesel-async runs through `batch_execute` — emitting a
+    /// `StartQuery`/`FinishQuery` pair with that transaction-control SQL, just
+    /// like a real query. The timer must skip those so a transaction with one
+    /// real `SELECT` reports `desc="1 query"`, not `"3 queries"`, and excludes
+    /// begin/commit latency from `db;dur`.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn request_query_timer_excludes_transaction_control_statements() {
+        let timings = Arc::new(RequestDbTimings::default());
+        REQUEST_DB_TIMINGS
+            .scope(Arc::clone(&timings), async {
+                let mut timer = RequestQueryTimer::default();
+
+                // BEGIN — must not be counted (10_000µs, would dominate if it
+                // leaked into the total).
+                let t0 = std::time::Instant::now();
+                timer.on_start(t0, "BEGIN");
+                timer.on_finish(t0 + Duration::from_micros(10_000));
+
+                // The single real query: 700µs.
+                let t1 = std::time::Instant::now();
+                timer.on_start(t1, "SELECT * FROM users");
+                timer.on_finish(t1 + Duration::from_micros(700));
+
+                // COMMIT — must not be counted.
+                let t2 = std::time::Instant::now();
+                timer.on_start(t2, "COMMIT");
+                timer.on_finish(t2 + Duration::from_micros(10_000));
+            })
+            .await;
+
+        assert_eq!(
+            timings.query_count.load(Ordering::Relaxed),
+            1,
+            "only the real SELECT is counted; BEGIN/COMMIT are excluded"
+        );
+        assert_eq!(
+            timings.total_us.load(Ordering::Relaxed),
+            700,
+            "only the SELECT's 700µs accumulates; begin/commit latency is excluded"
+        );
+    }
+
+    /// Unit coverage for the transaction-control classifier used by the timer:
+    /// leading-token match is case-insensitive and covers savepoint/release and
+    /// the two-word `START`/`SET TRANSACTION` forms, while real queries and a
+    /// bare `SET` (e.g. `SET statement_timeout`) are treated as countable.
+    #[cfg(feature = "db")]
+    #[test]
+    fn is_transaction_control_classifies_statements() {
+        for sql in [
+            "BEGIN",
+            "begin",
+            "  COMMIT",
+            "ROLLBACK",
+            "ROLLBACK TO SAVEPOINT diesel_savepoint_0",
+            "SAVEPOINT diesel_savepoint_1",
+            "RELEASE SAVEPOINT diesel_savepoint_0",
+            "start transaction",
+            "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+        ] {
+            assert!(
+                RequestQueryTimer::is_transaction_control(sql),
+                "{sql:?} should be treated as transaction control"
+            );
+        }
+
+        for sql in [
+            "SELECT 1",
+            "UPDATE users SET name = $1",
+            "INSERT INTO t VALUES (1)",
+            "SET statement_timeout = 5000",
+            "",
+        ] {
+            assert!(
+                !RequestQueryTimer::is_transaction_control(sql),
+                "{sql:?} should be treated as a countable query"
+            );
+        }
     }
 
     // ── after_commit tests ───────────────────────────────────────
