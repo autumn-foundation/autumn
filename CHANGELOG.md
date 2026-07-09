@@ -982,6 +982,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **idempotency:** the in-memory idempotency store no longer panics on extreme
+  TTL values. `Instant::now() + ttl` panics when the sum is not representable by
+  the platform clock, so a pathological configured or attacker-influenced TTL
+  (e.g. `Duration::MAX` / `Duration::from_secs(u64::MAX)`) could crash the
+  process; deadlines are now computed with a saturating helper that clamps to a
+  far-but-representable future.
 - **observability:** `Server-Timing` no longer miscounts pooled-connection reuse
   in the `db` metric. Connections are pooled and diesel-async's deadpool manager
   never resets a connection's instrumentation on recycle, so a connection that
