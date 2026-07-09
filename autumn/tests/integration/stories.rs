@@ -221,7 +221,10 @@ fn builtin_slugs_unique_groups_and_names_nonempty() {
 /// direction.
 const EXPECTED_STORY_SLUGS: &[&str] = &[
     "active-search",
+    "alert",
     "autocomplete",
+    "avatar",
+    "badge",
     "breadcrumb",
     "card",
     "confirm-action",

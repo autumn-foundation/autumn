@@ -1841,11 +1841,8 @@ impl SmtpTransport {
                     "mail.smtp.password_env is required when mail.smtp.username is set".to_owned(),
                 )
             })?;
-            let password = std::env::var(&password_env).map_err(|error| {
-                MailError::InvalidMessage(format!(
-                    "mail.smtp.password_env={password_env:?} could not be resolved: {error}"
-                ))
-            })?;
+            let password = std::env::var(&password_env)
+                .map_err(|error| smtp_password_env_error(&password_env, &error))?;
             builder = builder.credentials(Credentials::new(username, password));
         }
         Ok(Self {
@@ -1853,6 +1850,22 @@ impl SmtpTransport {
             resilience_config,
         })
     }
+}
+
+/// Builds the startup error for a failed SMTP password lookup without ever
+/// embedding the environment variable's *value*: [`std::env::VarError`]'s
+/// `NotUnicode` variant carries the raw contents of the variable — the SMTP
+/// password itself — in both its `Display` and `Debug` output, so the error
+/// kind is mapped to a static description instead of being formatted. The
+/// variable *name* is ordinary configuration and is kept for diagnostics.
+fn smtp_password_env_error(password_env: &str, error: &std::env::VarError) -> MailError {
+    let reason = match error {
+        std::env::VarError::NotPresent => "environment variable is not set",
+        std::env::VarError::NotUnicode(_) => "environment variable contains non-unicode data",
+    };
+    MailError::InvalidMessage(format!(
+        "mail.smtp.password_env={password_env:?} could not be resolved: {reason}"
+    ))
 }
 
 impl MailTransport for SmtpTransport {
@@ -4830,7 +4843,49 @@ mod tests {
             panic!("missing password env should fail at startup");
         };
 
-        assert!(error.to_string().contains(&missing_key));
+        let displayed = error.to_string();
+        assert!(displayed.contains(&missing_key));
+        assert!(displayed.contains("environment variable is not set"));
+    }
+
+    #[test]
+    fn smtp_password_env_error_never_embeds_the_secret_value() {
+        // `std::env::VarError::NotUnicode` carries the raw contents of the
+        // environment variable — i.e. the SMTP password itself. Formatting
+        // that error directly (`{error}` or `{error:?}`) would leak the
+        // secret into startup logs, so the redacting helper must map it to a
+        // static reason instead.
+        let secret = "hunter2-super-secret-password";
+        let error = std::env::VarError::NotUnicode(std::ffi::OsString::from(secret));
+        // Sanity check: the raw VarError does expose the value, which is
+        // exactly why it must never be formatted into a MailError.
+        assert!(error.to_string().contains(secret));
+        assert!(format!("{error:?}").contains(secret));
+
+        let mail_error = smtp_password_env_error("APP_SMTP_PASSWORD", &error);
+        let displayed = mail_error.to_string();
+        let debugged = format!("{mail_error:?}");
+        assert!(
+            !displayed.contains(secret),
+            "Display output leaked the SMTP password: {displayed}"
+        );
+        assert!(
+            !debugged.contains(secret),
+            "Debug output leaked the SMTP password: {debugged}"
+        );
+        // The env var *name* is ordinary configuration and stays in the
+        // message so operators can tell which variable is misconfigured.
+        assert!(displayed.contains("APP_SMTP_PASSWORD"));
+        assert!(displayed.contains("environment variable contains non-unicode data"));
+    }
+
+    #[test]
+    fn smtp_password_env_error_redacts_missing_variable_details() {
+        let error = std::env::VarError::NotPresent;
+        let mail_error = smtp_password_env_error("APP_SMTP_PASSWORD", &error);
+        let displayed = mail_error.to_string();
+        assert!(displayed.contains("APP_SMTP_PASSWORD"));
+        assert!(displayed.contains("environment variable is not set"));
     }
 
     #[test]

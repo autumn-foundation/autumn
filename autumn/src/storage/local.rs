@@ -384,6 +384,26 @@ impl BlobStore for LocalBlobStore {
         })
     }
 
+    fn get_stream<'a>(&'a self, key: &'a str) -> BlobFuture<'a, ByteStream<'static>> {
+        Box::pin(async move {
+            let path = self.safe_path_for_key(key).await?;
+            let file = match tokio::fs::File::open(&path).await {
+                Ok(file) => file,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(BlobStoreError::NotFound(key.to_owned()));
+                }
+                Err(err) => return Err(BlobStoreError::io(err)),
+            };
+            // `ReaderStream` owns the open file handle, so the resulting
+            // stream is `'static` (it does not borrow `self`) and reads the
+            // object incrementally rather than buffering it all in memory.
+            let stream = tokio_util::io::ReaderStream::new(file)
+                .map(|chunk| chunk.map_err(BlobStoreError::io));
+            let boxed: ByteStream<'static> = Box::pin(stream);
+            Ok(boxed)
+        })
+    }
+
     fn delete<'a>(&'a self, key: &'a str) -> BlobFuture<'a, ()> {
         Box::pin(async move {
             let path = self.safe_path_for_key(key).await?;
