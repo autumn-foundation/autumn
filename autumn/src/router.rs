@@ -3547,23 +3547,60 @@ pub async fn autumn_widgets_handler() -> axum::response::Response {
         .into_response()
 }
 
+/// Weak `ETag` for the vendored idiomorph script, derived once from the
+/// embedded bytes.
+///
+/// The idiomorph URL is **not** content-fingerprinted, so it cannot safely use
+/// an `immutable` cache. Instead the handler emits this content-derived `ETag`
+/// alongside a revalidating `Cache-Control`, letting caches confirm freshness
+/// (and pick up new bytes) whenever the vendored script changes.
+///
+/// The validator is **weak**: when compression is enabled,
+/// `apply_compression_middleware` gzips/brotli-encodes this
+/// `application/javascript` response after the handler attaches the `ETag`, so
+/// the identity, gzip, and br variants share one tag despite differing byte
+/// streams. A strong `ETag` asserts byte-for-byte equivalence and would be
+/// invalid across those encodings (matching the sibling CSS asset handler).
+#[cfg(feature = "htmx")]
+static IDIOMORPH_ETAG: std::sync::LazyLock<crate::etag::ETag> = std::sync::LazyLock::new(|| {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+
+    let digest = Sha256::digest(crate::htmx::IDIOMORPH_JS);
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    crate::etag::ETag::weak(format!("idiomorph-{hex}"))
+});
+
 /// Serves the vendored idiomorph DOM-morphing library at [`crate::htmx::IDIOMORPH_JS_PATH`].
 ///
 /// Idiomorph enables smooth DOM morphing via `hx-swap="morph"` in htmx.
+///
+/// Because the serving URL is not content-fingerprinted, the response uses a
+/// revalidating cache policy (`must-revalidate` plus a weak content-derived
+/// `ETag`) rather than a year-long `immutable` cache. This ensures clients that
+/// cached an earlier version of the script pick up new bytes instead of running
+/// a stale copy for up to a year.
 #[cfg(feature = "htmx")]
 pub async fn idiomorph_handler() -> axum::response::Response {
     use axum::response::IntoResponse;
-    (
+    let mut response = (
         [
             (http::header::CONTENT_TYPE, "application/javascript"),
             (
                 http::header::CACHE_CONTROL,
-                "public, max-age=31536000, immutable",
+                "public, max-age=0, must-revalidate",
             ),
         ],
         crate::htmx::IDIOMORPH_JS,
     )
-        .into_response()
+        .into_response();
+    response
+        .headers_mut()
+        .insert(http::header::ETAG, IDIOMORPH_ETAG.header_value());
+    response
 }
 
 /// Serves the vendored htmx SSE extension at [`crate::htmx::HTMX_SSE_JS_PATH`].
@@ -7491,9 +7528,32 @@ mod idiomorph_tests {
             .get(http::header::CACHE_CONTROL)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
+        // The idiomorph URL is not content-fingerprinted, so the response must
+        // revalidate rather than advertise a year-long `immutable` cache. This
+        // guards against returning clients running a stale copy after the
+        // vendored bytes change.
         assert!(
-            cc.contains("immutable"),
-            "expected immutable cache-control, got: {cc}"
+            cc.contains("must-revalidate"),
+            "expected revalidating cache-control, got: {cc}"
+        );
+        assert!(
+            !cc.contains("immutable"),
+            "cache-control must not be immutable for a non-fingerprinted URL, got: {cc}"
+        );
+
+        // A weak, content-derived ETag lets caches revalidate (and pick up new
+        // bytes when the script changes). It is weak rather than strong because
+        // compression middleware may re-encode this response after the handler
+        // attaches the validator, so the identity/gzip/br variants share a tag
+        // despite differing byte streams.
+        let etag = response
+            .headers()
+            .get(http::header::ETAG)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            etag.starts_with("W/\"idiomorph-") && etag.ends_with('"'),
+            "expected a weak quoted idiomorph ETag, got: {etag}"
         );
 
         let body = response.into_body().collect().await.unwrap().to_bytes();

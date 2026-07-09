@@ -527,6 +527,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Accept-Encoding` accepts them, instead of relying solely on the
   general-purpose compression middleware to redo that work on every request.
 
+### Fixed
+
+- **views:** vendored the full Idiomorph 0.3.0 morphing script (replacing a
+  minimal stub) so live `hx-ext="morph"` updates actually DOM-morph, and
+  patched its htmx extension so non-morph out-of-band swaps (e.g.
+  `beforeend`/`delete`) no longer throw a caught console error. Served the
+  idiomorph script with a revalidating cache policy (a weak content-derived
+  `ETag` plus `Cache-Control: public, max-age=0, must-revalidate`) instead of a
+  year-long `immutable` cache, so clients that had cached the old stub pick up
+  the real script on their next revalidation rather than running stale code for
+  up to a year. (The idiomorph URL is not content-fingerprinted; adding
+  fingerprinted asset URLs so it can safely go back to `immutable` caching is a
+  possible future follow-up.)
+
 ### Changed
 
 - **deps(security):** dependency-vulnerability upgrades (supersedes PR #1557;
