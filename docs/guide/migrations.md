@@ -228,6 +228,14 @@ drift guard on a stale one.
 * `unrecorded` — legacy migration with no stored hash; run
   `autumn migrate baseline`.
 
+`autumn migrate status` is **read-only**: it never creates the checksum table
+and needs no write or DDL privileges, so it is safe to run against a database
+with a read-only role. On a database where the checksum table does not yet
+exist, every applied migration simply reports `unrecorded`. The table is created
+by the framework migration (or lazily on the first `autumn migrate` /
+`autumn migrate baseline` that records a hash), all of which do require
+write + DDL privileges.
+
 ---
 
 ## Log output

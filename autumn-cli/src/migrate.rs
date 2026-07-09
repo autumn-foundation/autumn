@@ -453,6 +453,20 @@ fn run_single_target(
         }
     }
 
+    // Record the USER-migration checksums NOW — immediately after the user
+    // `diesel migration run` succeeded and BEFORE the framework / shard
+    // framework migrations run (issue #1203 review, P2-B). Those later steps
+    // can fail and early-return; if we deferred recording until after them, the
+    // just-applied user versions would be left with no stored hash. On the next
+    // retry they would classify as `Unrecorded`, so an edit to a user `up.sql`
+    // made while fixing the framework failure would be silently accepted as the
+    // baseline instead of tripping the drift guard. `record_checksums_from_dir`
+    // resolves against the user `dir`, so it only ever records user versions
+    // (framework versions live in the embedded set and are recorded by
+    // `run_pending`); it is idempotent (ON CONFLICT DO NOTHING), so recording
+    // again after the framework step below is harmless.
+    record_checksums_after_apply(database_url, dir);
+
     let framework_ok = if is_shard {
         run_shard_framework_migrations(database_url)
     } else {
@@ -462,9 +476,6 @@ fn run_single_target(
         return false;
     }
 
-    // Post-apply: record checksums for newly-applied migrations so any
-    // future edit trips the guard on the next run.
-    record_checksums_after_apply(database_url, dir);
     true
 }
 

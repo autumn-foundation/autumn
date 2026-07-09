@@ -43,7 +43,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   WARN-logged. Rolling a migration back (`autumn migrate down`) now clears its
   recorded checksum, so a reverted migration can be re-applied cleanly —
   including with changed contents — instead of leaving a stale hash that would
-  trip the drift guard on a later run. See `docs/guide/migrations.md`.
+  trip the drift guard on a later run. `autumn migrate status` and the pre-apply
+  validation are read-only — they never create the checksum table, so displaying
+  or checking state needs no DDL privileges — and freshly-applied user
+  migrations are recorded immediately after they apply (before the framework
+  migration step), so a later framework failure can no longer leave them
+  unrecorded and mask a subsequent edit. See `docs/guide/migrations.md`.
 - **ci:** README-quickstart gate against the published crates (issue #1586) —
   `.github/workflows/quickstart-gate.yml` + `scripts/check-quickstart.sh`
   install the README-pinned `autumn-cli` from crates.io (never the local

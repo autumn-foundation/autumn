@@ -799,21 +799,41 @@ where
 
 /// Load the full `(version, checksum)` map from `autumn_migration_checksums`.
 ///
-/// [`ensure_checksum_table`] runs first, so on a fresh database the table is
-/// auto-created and this returns an empty map (never an error for a missing
-/// table). This lets the caller sequence "validate → apply → record" without a
-/// chicken-and-egg bootstrap problem on the startup auto-migrate and shard
-/// paths, which never apply [`FRAMEWORK_MIGRATIONS`].
+/// **Read-only.** This never creates the table: on a fresh database (before any
+/// apply/record path has created it) it probes for the relation with
+/// `to_regclass` and returns an empty map when absent. This keeps read paths —
+/// `autumn migrate status` and the pre-apply validation — from requiring DDL
+/// privileges or mutating the database just to display / check state (issue
+/// #1203 review, P2-A).
+///
+/// The table is created lazily by the *write* helpers ([`record_checksum`],
+/// [`record_checksums`], [`rebaseline_checksum`], [`delete_checksum`],
+/// [`delete_checksums`]), each of which calls [`ensure_checksum_table`] before
+/// writing. So the "validate → apply → record" sequence on the startup
+/// auto-migrate and shard paths still works: the pre-apply validate reads an
+/// empty map (nothing to fork from yet, no error), and the subsequent
+/// `record_checksums` creates the table and records the freshly-applied hashes.
+///
+/// `to_regclass` returns NULL for an unknown relation — an existence test that
+/// never errors and never depends on localized "does not exist" error text
+/// (which breaks under a non-English `lc_messages`).
 ///
 /// # Errors
 ///
-/// Returns [`MigrationError::Migration`] for any database error (including a
-/// failure to create the table on a read-only connection).
+/// Returns [`MigrationError::Migration`] for any database error.
 pub fn recorded_checksums<C>(conn: &mut C) -> Result<HashMap<String, String>, MigrationError>
 where
     C: diesel::connection::LoadConnection<Backend = Pg>,
 {
-    ensure_checksum_table(conn)?;
+    let present = diesel::sql_query(
+        "SELECT to_regclass('autumn_migration_checksums') IS NOT NULL AS present",
+    )
+    .get_result::<TableExistsRow>(conn)
+    .map_err(|e| MigrationError::Migration(e.to_string()))?
+    .present;
+    if !present {
+        return Ok(HashMap::new());
+    }
     let rows: Vec<RecordedChecksumRow> =
         diesel::sql_query("SELECT version, checksum FROM autumn_migration_checksums")
             .load(conn)
@@ -1030,10 +1050,11 @@ pub fn read_up_sql_by_version(
 /// Validate recorded checksums for every applied migration.
 ///
 /// Compares each applied migration's recorded checksum with the current
-/// on-disk `up.sql` in `migrations_dir`. On a fresh DB the checksum table is
-/// auto-created (via [`recorded_checksums`]) and there are no recorded hashes
-/// yet, so every applied migration classifies as `Unrecorded` and validation
-/// passes without error — the correct "nothing to fork from yet" outcome.
+/// on-disk `up.sql` in `migrations_dir`. This is a read-only check: on a fresh
+/// DB the checksum table may not exist yet, in which case [`recorded_checksums`]
+/// returns an empty map (without creating the table), so every applied migration
+/// classifies as `Unrecorded` and validation passes without error — the correct
+/// "nothing to fork from yet" outcome.
 ///
 /// Intended to be called immediately **before** applying pending
 /// migrations — the fail-fast guard that catches "an already-applied
@@ -2229,8 +2250,8 @@ mod tests {
 
     /// End-to-end proof of the migration-checksum loop (issue #1203) against a
     /// live Postgres container. Exercises, in order: the fresh-DB behaviour of
-    /// [`recorded_checksums`] (table auto-created via `ensure_checksum_table` →
-    /// empty map, connection not poisoned, table now exists),
+    /// [`recorded_checksums`] (read-only — empty map, connection not poisoned,
+    /// table still absent afterward — then created by the framework migration),
     /// recording a freshly-applied migration's checksum, re-validating the same
     /// content (Ok), detecting edited content (Err naming the version and both
     /// hashes), the legacy/`Unrecorded` path (present in
@@ -2288,26 +2309,28 @@ mod tests {
         let mut conn =
             diesel::PgConnection::establish(url).expect("failed to connect to Postgres container");
 
-        // ── Step 7: fresh-DB behaviour ──────────────────────────────────────
+        // ── Step 7: fresh-DB behaviour (read-only contract) ─────────────────
         // Before any framework migration runs, `autumn_migration_checksums`
-        // does not exist. `recorded_checksums` must auto-create it (via
-        // `ensure_checksum_table`) and return an empty map — never an error —
-        // WITHOUT poisoning the session.
+        // does not exist. `recorded_checksums` is READ-ONLY: it must return an
+        // empty map — never an error — WITHOUT creating the table and WITHOUT
+        // poisoning the session (issue #1203 review, P2-A). Read paths
+        // (`autumn migrate status`, pre-apply validation) must not require DDL
+        // privileges or mutate the DB just to display / check state.
         assert!(
             !checksum_table_exists(&mut conn),
             "checksum table must be absent before the first checksum call"
         );
         let empty = recorded_checksums(&mut conn)
-            .expect("recorded_checksums must not error on a fresh DB (table auto-created)");
+            .expect("recorded_checksums must not error on a fresh DB (read-only, empty map)");
         assert!(
             empty.is_empty(),
             "fresh DB must report no recorded checksums"
         );
-        // The table must now exist — `recorded_checksums` created it rather than
-        // depending on a framework migration having run.
+        // The table must STILL be absent — `recorded_checksums` is read-only and
+        // must NOT create it (that is the write helpers' job on apply/record).
         assert!(
-            checksum_table_exists(&mut conn),
-            "recorded_checksums must auto-create the checksum table on a fresh DB"
+            !checksum_table_exists(&mut conn),
+            "recorded_checksums must NOT create the checksum table (read-only)"
         );
         // The connection must remain usable after the fresh-DB path — this is
         // the highest-risk untested path.
@@ -2316,8 +2339,16 @@ mod tests {
             .expect("connection must remain usable after the fresh-DB path");
         assert_eq!(row.one, 1, "post-fresh-DB query must succeed");
 
-        // ── Step 1: run framework migrations (idempotent — table exists) ────
+        // ── Step 1: run framework migrations, which create the checksum table ─
+        // The table is still absent (read-only reads above never created it);
+        // the framework migration set includes the managed
+        // `create_migration_checksums` DDL, so after applying it the table
+        // exists and starts empty.
         run_pending(url, FRAMEWORK_MIGRATIONS).expect("framework migrations must apply");
+        assert!(
+            checksum_table_exists(&mut conn),
+            "framework migrations must create the checksum table"
+        );
         assert!(
             recorded_checksums(&mut conn)
                 .expect("table exists")
