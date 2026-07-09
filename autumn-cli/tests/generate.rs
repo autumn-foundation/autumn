@@ -1672,6 +1672,27 @@ fn generated_validated_scaffold_round_trip_test_passes() {
         stdout.contains("test result: ok"),
         "expected the generated test to pass:\n{stdout}"
     );
+
+    // Issue #1127: the same generated binary also carries the in-process
+    // write-path suite (create/update/delete + the validation-failure
+    // re-render). Run it by name and prove it compiles and passes — no Docker,
+    // no external services.
+    let write_path = Command::new("cargo")
+        .args(["test", "--test", "post", "posts_write_path_crud"])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        write_path.status.success(),
+        "the generated write-path CRUD test failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&write_path.stdout),
+        String::from_utf8_lossy(&write_path.stderr),
+    );
+    assert!(
+        String::from_utf8_lossy(&write_path.stdout).contains("test result: ok"),
+        "expected the generated write-path test to pass:\n{}",
+        String::from_utf8_lossy(&write_path.stdout)
+    );
 }
 
 /// Slow end-to-end check: scaffold a fresh project, run `autumn generate job`,

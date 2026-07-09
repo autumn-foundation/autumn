@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **generator:** `autumn generate scaffold` now emits **write-path CRUD tests**,
+  not just a read smoke test (issue #1127). Alongside the in-process index/read
+  test, the generated `tests/<snake>.rs` gains a `<plural>_write_path_crud`
+  `#[tokio::test]` that drives create / update / delete **and** the
+  validation-failure re-render through `autumn_web::test::{TestApp, TestClient}`:
+  a valid `POST` redirects (303 See Other) and the row is observable on a
+  follow-up read, an invalid `POST` re-renders the form at 422 with the
+  submitted input preserved and an inline `role="alert"` error (and does not
+  persist), an update is observable on re-read, and a delete removes the row.
+  It runs fully in-process on the shipped `ChangesetForm`/`Changeset`
+  round-trip (issue #1124), the typed `text_input` renderer, and `Redirect`
+  against a process-local in-memory store — no database, no running server, no
+  external services, so it is a visible green (never `#[ignore]`d) with real
+  failure power (row-count assertions on each read turn a broken handler red).
+  `TestApp` disables CSRF, so the same-origin form `POST`s carry no `_csrf`
+  token — the real `form_for`-rendered forms (PR #1587) inject one for the
+  browser, which the in-process harness does not require. Emitted for HTML
+  scaffolds only (the `--api` JSON path is out of scope).
 - **ci:** README-quickstart gate against the published crates (issue #1586) —
   `.github/workflows/quickstart-gate.yml` + `scripts/check-quickstart.sh`
   install the README-pinned `autumn-cli` from crates.io (never the local

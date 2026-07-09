@@ -2909,10 +2909,22 @@ fn render_smoke_test(
     // rejected submission gets 422 with the other field preserved and an
     // inline error, not a 400 dead-end. HTML scaffolds only; the `--api` JSON
     // path is out of scope (Problem Details already covers it, issue #598).
-    if !api && !validations.is_empty() {
+    let base = if !api && !validations.is_empty() {
         base + &render_validation_rejection_smoke_test(plural, validations)
     } else {
         base
+    };
+
+    // Issue #1127: exercise the full write path (create / update / delete +
+    // validation-failure re-render) in-process. HTML scaffolds only — the
+    // `--api` JSON resource tests are out of scope (folded into issue #1028).
+    // Always emitted for HTML scaffolds (even without declared `--validate`
+    // rules): the stand-in carries its own validated field, so a bare
+    // `generate scaffold Post` still gets create/update/delete coverage.
+    if api {
+        base
+    } else {
+        base + &render_write_path_smoke_test(pascal_name, plural)
     }
 }
 
@@ -3121,6 +3133,193 @@ fn render_validation_rejection_smoke_test(
          \x20\x20\x20\x20\x20\x20\x20\x20.assert_status(200);\n\
          }}\n"
     )
+}
+
+/// Render the write-path portion of `tests/<snake>.rs` (issue #1127): one
+/// in-process `#[tokio::test]` that exercises the full mutating surface —
+/// create (happy path), update, delete, AND the validation-failure re-render —
+/// through `autumn_web::test::{TestApp, TestClient}`.
+///
+/// Like the read index smoke test, this redeclares a *stand-in* CRUD resource
+/// rather than importing the project's own handlers (a `tests/*.rs` integration
+/// binary can't import a binary crate's modules — see
+/// `docs/guide/tutorial/11-testing.md`). It proves the write-path *request
+/// mechanism* on the real, shipped primitives the generated handlers are built
+/// on — the `ChangesetForm`/`Changeset` round-trip (issue #1124), the typed
+/// `text_input` renderer, and `Redirect` — independent of the specific model's
+/// columns (already exercised by the other generated smoke tests):
+///
+/// * a valid `POST` redirects (303 See Other) to the index route and the row is
+///   observable on a follow-up read (create);
+/// * a `POST` to the `/{id}/update` route redirects and the change is observable
+///   (update);
+/// * a `POST` to the generated `/{id}/delete` HTML action (issue #1021)
+///   redirects and the row is gone on the next read (delete);
+/// * an invalid `POST` re-renders the form at 422 with the submitted input
+///   preserved and an inline `role="alert"` error — it does NOT redirect and
+///   does NOT persist (validation failure, issue #1124).
+///
+/// It needs no database: a process-local in-memory store stands in for the
+/// persistence layer, so the whole write-path suite runs in-process with zero
+/// external services and is a visible green (never `#[ignore]`d) — the row-count
+/// assertions on each read give it real failure power, so a broken handler (a
+/// 200 instead of a redirect, a no-op delete, a create that skips validation)
+/// turns it red.
+///
+/// CSRF: `TestApp::new()` disables CSRF (like Spring Security's test support),
+/// so these same-origin form `POST`s carry no `_csrf` token. The real,
+/// `form_for`-rendered forms (PR #1587) auto-inject a hidden CSRF field for the
+/// browser; the in-process harness does not require it, and this comment
+/// records that so the absent token reads as intentional, not a gap.
+#[allow(clippy::too_many_lines)] // the emitted test body is one raw-string template
+fn render_write_path_smoke_test(pascal_name: &str, plural: &str) -> String {
+    const TEMPLATE: &str = r#"
+// ── write-path CRUD (issue #1127) ─────────────────────────────────────────
+//
+// Exercises create / update / delete and the validation-failure re-render in
+// one in-process test against a stand-in resource. `TestApp::new()` disables
+// CSRF, so these same-origin form POSTs need no `_csrf` token (the real
+// form_for-rendered forms inject one for the browser; PR #1587).
+#[tokio::test]
+async fn __PLURAL___write_path_crud() {
+    use autumn_web::test::{TestApp, TestClient};
+
+    // A process-local, in-memory stand-in for the persistence layer: `(id, name)`
+    // rows shared across requests within this test. No database required.
+    static STORE: std::sync::Mutex<Vec<(i64, String)>> = std::sync::Mutex::new(Vec::new());
+
+    #[derive(serde::Deserialize, serde::Serialize, Default, validator::Validate, Clone)]
+    struct Form {
+        #[validate(length(min = 1, message = "must not be blank"))]
+        name: String,
+        witness: String,
+    }
+
+    #[get("/__PLURAL__")]
+    async fn index() -> Markup {
+        let store = STORE.lock().unwrap();
+        let count = store.len() as i64;
+        html! {
+            h1 { "__PASCAL__s" }
+            p { (count) " row(s)" }
+            ul { @for (_, name) in store.iter() { li { (name.as_str()) } } }
+        }
+    }
+
+    #[post("/__PLURAL__")]
+    async fn create(form: ChangesetForm<Form>) -> impl IntoResponse {
+        match form.into_valid() {
+            Ok(valid) => {
+                let mut store = STORE.lock().unwrap();
+                let id = store.iter().map(|(i, _)| *i).max().unwrap_or(0) + 1;
+                store.push((id, valid.name));
+                Redirect::to("/__PLURAL__").into_response()
+            }
+            Err(form) => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                html! {
+                    (autumn_web::form::text_input(&form.changeset, "name", "name"))
+                    (autumn_web::form::text_input(&form.changeset, "witness", "witness"))
+                },
+            )
+                .into_response(),
+        }
+    }
+
+    #[post("/__PLURAL__/{id}/update")]
+    async fn update(id: Path<i64>, form: ChangesetForm<Form>) -> impl IntoResponse {
+        let valid = match form.into_valid() {
+            Ok(valid) => valid,
+            Err(_) => return StatusCode::UNPROCESSABLE_ENTITY.into_response(),
+        };
+        {
+            let mut store = STORE.lock().unwrap();
+            if let Some(row) = store.iter_mut().find(|(i, _)| *i == *id) {
+                row.1 = valid.name;
+            }
+        }
+        Redirect::to("/__PLURAL__").into_response()
+    }
+
+    #[post("/__PLURAL__/{id}/delete")]
+    async fn destroy(id: Path<i64>) -> impl IntoResponse {
+        STORE.lock().unwrap().retain(|(i, _)| *i != *id);
+        Redirect::to("/__PLURAL__")
+    }
+
+    let client: TestClient = TestApp::new()
+        .routes(routes![index, create, update, destroy])
+        .build();
+
+    // Create (happy path): a valid POST redirects (303 See Other) to the index
+    // route and the row is persisted — a follow-up read shows it.
+    client
+        .post("/__PLURAL__")
+        .form("name=first-record&witness=w")
+        .send()
+        .await
+        .assert_status(303)
+        .assert_header("location", "/__PLURAL__");
+    client
+        .get("/__PLURAL__")
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("first-record")
+        .assert_body_contains("1 row(s)");
+
+    // Validation failure: an invalid create re-renders the form at 422 with the
+    // submitted input preserved and an inline error — it does NOT redirect and
+    // does NOT persist (the row count stays at 1).
+    client
+        .post("/__PLURAL__")
+        .form("name=&witness=kept-on-error")
+        .send()
+        .await
+        .assert_status(422)
+        .assert_body_contains("kept-on-error")
+        .assert_body_contains("role=\"alert\"");
+    client
+        .get("/__PLURAL__")
+        .send()
+        .await
+        .assert_body_contains("1 row(s)");
+
+    // Update (happy path): a POST of changed fields redirects and the change is
+    // observable on a subsequent read. The row count is unchanged, so the value
+    // was replaced in place, not appended.
+    client
+        .post("/__PLURAL__/1/update")
+        .form("name=second-record&witness=w")
+        .send()
+        .await
+        .assert_status(303)
+        .assert_header("location", "/__PLURAL__");
+    client
+        .get("/__PLURAL__")
+        .send()
+        .await
+        .assert_body_contains("second-record")
+        .assert_body_contains("1 row(s)");
+
+    // Delete: the generated HTML delete action removes the row — a POST to the
+    // `/delete` route redirects and the row is gone on the next index read.
+    client
+        .post("/__PLURAL__/1/delete")
+        .send()
+        .await
+        .assert_status(303)
+        .assert_header("location", "/__PLURAL__");
+    client
+        .get("/__PLURAL__")
+        .send()
+        .await
+        .assert_body_contains("0 row(s)");
+}
+"#;
+    TEMPLATE
+        .replace("__PASCAL__", pascal_name)
+        .replace("__PLURAL__", plural)
 }
 
 /// A representative non-`NULL` literal for a `FieldKind`, used to fill in the
@@ -4771,6 +4970,119 @@ async fn main() {
         assert!(test.contains("/posts"));
     }
 
+    // ── write-path CRUD smoke tests (issue #1127) ─────────────────────────
+
+    #[test]
+    fn smoke_test_emits_write_path_crud_and_validation_rerender() {
+        // Issue #1127: the generated suite must exercise create/update/delete
+        // AND the validation-failure re-render, not just the read index — even
+        // for a resource that declares no `--validate` rules of its own (the
+        // write-path stand-in carries its own validated field).
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(tmp.path(), "Post", &[], "20260427000000").unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let test = fs::read_to_string(tmp.path().join("tests/post.rs")).unwrap();
+
+        // The write-path test function is present.
+        assert!(
+            test.contains("async fn posts_write_path_crud()"),
+            "write-path CRUD test must be emitted: {test}"
+        );
+
+        // Create (happy path): POST that redirects (303) to the index route.
+        assert!(
+            test.contains(".post(\"/posts\")"),
+            "must POST to the create route: {test}"
+        );
+        assert!(
+            test.contains(".assert_status(303)"),
+            "create/update/delete must assert a 302/303 redirect: {test}"
+        );
+        assert!(
+            test.contains(".assert_header(\"location\", \"/posts\")"),
+            "redirects must be asserted to target the index route: {test}"
+        );
+
+        // Update (happy path): POST to the `/update` route.
+        assert!(
+            test.contains(".post(\"/posts/1/update\")"),
+            "must POST to the update route: {test}"
+        );
+
+        // Delete: POST to the generated HTML `/delete` action (#1021).
+        assert!(
+            test.contains(".post(\"/posts/1/delete\")"),
+            "must POST to the HTML delete action: {test}"
+        );
+
+        // Validation failure: an invalid create re-renders at 422 with an inline
+        // error and the preserved input, and does NOT redirect.
+        assert!(
+            test.contains(".assert_status(422)"),
+            "invalid create must re-render at 422: {test}"
+        );
+        assert!(
+            test.contains("role=\\\"alert\\\""),
+            "invalid create must assert an inline (role=\"alert\") error: {test}"
+        );
+    }
+
+    #[test]
+    fn write_path_smoke_test_has_real_failure_power() {
+        // Red-phase spike: the emitted handlers must actually redirect, persist,
+        // and re-render — so a broken handler (200 instead of a redirect, a
+        // no-op delete, or a create that skips validation) turns the test red.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(tmp.path(), "Post", &[], "20260427000000").unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let test = fs::read_to_string(tmp.path().join("tests/post.rs")).unwrap();
+
+        // A real redirect response (303 See Other via `Redirect::to`), not a
+        // 200 meta-refresh page — so `assert_status(303)` has teeth.
+        assert!(
+            test.contains("Redirect::to(\"/posts\")"),
+            "create/update/delete stand-ins must issue a real redirect: {test}"
+        );
+        // A real, cross-request store so persistence is observable on re-read —
+        // the create pushes, update mutates, delete removes.
+        assert!(
+            test.contains("STORE.lock().unwrap()"),
+            "handlers must read/write the shared store so persistence is observable: {test}"
+        );
+        assert!(
+            test.contains("store.push(") && test.contains(".retain("),
+            "create must persist and delete must remove from the store: {test}"
+        );
+        // The create actually gates on validation (the 422 branch is reachable).
+        assert!(
+            test.contains("form.into_valid()"),
+            "create must validate the submission through the real changeset round-trip: {test}"
+        );
+        // The follow-up read proves the row count changed (persist / delete),
+        // not just that a status code came back.
+        assert!(
+            test.contains(".assert_body_contains(\"1 row(s)\")")
+                && test.contains(".assert_body_contains(\"0 row(s)\")"),
+            "reads must assert the row count so persistence/removal is observable: {test}"
+        );
+    }
+
+    #[test]
+    fn write_path_smoke_test_documents_csrf_posture() {
+        // Issue #1127: the write-path tests must account for CSRF. `TestApp`
+        // disables CSRF by default (mirroring the real form_for-injected token
+        // that the in-process harness does not require), and the emitted test
+        // documents that so the missing `_csrf` field is intentional, not a bug.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(tmp.path(), "Post", &[], "20260427000000").unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let test = fs::read_to_string(tmp.path().join("tests/post.rs")).unwrap();
+        assert!(
+            test.contains("CSRF"),
+            "the write-path test must document its CSRF posture: {test}"
+        );
+    }
+
     // ── in-process TestApp/TestClient smoke test (issue #1023) ────────────
 
     #[test]
@@ -4937,13 +5249,14 @@ async fn main() {
     }
 
     #[test]
-    fn smoke_test_no_longer_includes_write_path_round_trip() {
+    fn smoke_test_write_path_stays_in_process_never_over_a_socket() {
         // The old create/delete round-trip test hit a *running server* over a
         // raw TcpStream, gated on `AUTUMN_TEST_BASE_URL` -- the very
-        // false-positive-green pattern issue #1023 fixes. Write-path coverage
-        // (create -> redirect, update, delete) is deferred as a follow-up (see
-        // that issue's "Out of Scope"); the generator now emits exactly one
-        // real, in-process, DB-backed index/read smoke test.
+        // false-positive-green pattern issue #1023 fixed. Issue #1127 restores
+        // write-path coverage (create -> redirect, update, delete, plus the
+        // validation-failure re-render) but it must stay in-process via the
+        // `TestApp`/`TestClient` harness -- never the old socket-based,
+        // env-gated, silently-skipping shape.
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold(
             tmp.path(),
@@ -4954,20 +5267,24 @@ async fn main() {
         .unwrap();
         plan.execute(Flags::default()).unwrap();
         let test = fs::read_to_string(tmp.path().join("tests/post.rs")).unwrap();
+        // None of the old false-positive-green machinery may come back.
         assert!(
-            !test.contains("delete_round_trip"),
-            "write-path round-trip coverage is deferred, not converted: {test}"
+            !test.contains("TcpStream"),
+            "write-path tests must not hand-roll a raw TCP request: {test}"
         );
-        // Positive check alongside the negative one above: exactly one test
-        // function is generated (the index/read smoke test), so a future
-        // change can't quietly reintroduce write-path coverage under a
-        // different name without this test catching the count changing.
+        assert!(
+            !test.contains("AUTUMN_TEST_BASE_URL"),
+            "write-path tests must not gate on a running server's base URL: {test}"
+        );
+        // The write-path suite is present and in-process alongside the read one:
+        // the index/read test plus the write-path CRUD test.
         assert_eq!(
             test.matches("#[tokio::test]").count(),
-            1,
-            "expected exactly one generated test function: {test}"
+            2,
+            "expected the read smoke test plus the write-path CRUD test: {test}"
         );
         assert!(test.contains("posts_index_renders_scaffolded_rows"));
+        assert!(test.contains("posts_write_path_crud"));
     }
 
     #[test]
