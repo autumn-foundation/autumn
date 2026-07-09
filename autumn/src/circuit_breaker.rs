@@ -758,8 +758,12 @@ mod tests {
         assert_eq!(fallback_result, Ok("fallback_success"));
 
         // Force open by exceeding threshold
-        let _ = breaker.run(async { Err::<(), &'static str>("fail1") }).await;
-        let _ = breaker.run(async { Err::<(), &'static str>("fail2") }).await;
+        let _ = breaker
+            .run(async { Err::<(), &'static str>("fail1") })
+            .await;
+        let _ = breaker
+            .run(async { Err::<(), &'static str>("fail2") })
+            .await;
         assert_eq!(breaker.state(), CircuitState::Open);
 
         // Test fallback on Open state
