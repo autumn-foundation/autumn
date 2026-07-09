@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **generator:** `autumn generate scaffold` now emits **write-path CRUD tests**,
+  not just a read smoke test (issue #1127). Alongside the in-process index/read
+  test, the generated `tests/<snake>.rs` gains a `<plural>_write_path_crud`
+  `#[tokio::test]` that drives create / update / delete **and** the
+  validation-failure re-render through `autumn_web::test::{TestApp, TestClient}`:
+  a valid `POST` redirects (303 See Other) and the row is observable on a
+  follow-up read, an invalid `POST` re-renders the form at 422 with the
+  submitted input preserved and an inline `role="alert"` error (and does not
+  persist), an update is observable on re-read, and a delete removes the row.
+  It runs fully in-process on the shipped `ChangesetForm`/`Changeset`
+  round-trip (issue #1124), the typed `text_input` renderer, and `Redirect`
+  against a process-local in-memory store — no database, no running server, no
+  external services, so it is a visible green (never `#[ignore]`d) with real
+  failure power (row-count assertions on each read turn a broken handler red).
+  `TestApp` disables CSRF, so the same-origin form `POST`s carry no `_csrf`
+  token — the real `form_for`-rendered forms (PR #1587) inject one for the
+  browser, which the in-process harness does not require. Emitted for HTML
+  scaffolds only (the `--api` JSON path is out of scope).
 - **cli:** `autumn i18n check` (issue #1252) — a read-only diagnostic that
   compares the translation keys referenced in code (string literals passed to
   `t!(...)`, `.t(...)`, and `.t_with(...)`) against the keys defined in each
@@ -734,6 +752,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **generator:** scaffolded `create`/`update`/`destroy` handlers now redirect
+  with `autumn_web::Redirect::to(...)` — a real **303 See Other** with a
+  `Location` header — instead of the hand-rolled 200 meta-refresh HTML page,
+  matching the `Redirect` primitive `docs/guide/path-helpers.md` already
+  recommends (and which the new #1127 write-path test asserts). `create` and
+  `destroy` redirect to the index route; `update` redirects to the show route.
 - **security:** `TenancyConfig::jwt_secret` is now stored as a
   `secrecy::SecretString` instead of a plain `String`, so the JWT signing
   secret is redacted from `Debug` output (and any logs that format the
