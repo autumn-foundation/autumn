@@ -111,6 +111,17 @@ fn cursor_with_reserved_chars_is_percent_encoded() {
 }
 
 #[test]
+fn semicolon_and_backslash_in_cursor_are_percent_encoded() {
+    let config = FeedConfig::new("/feed");
+    // `;` is a legacy query-param separator and `\` is unsafe; both must encode.
+    let out = feed_page(items(&["a"]), Some(";\\"), &config).into_string();
+    assert!(out.contains("cursor=%3B%5C"), "{out}");
+    // The raw chars must not survive in the query.
+    assert!(!out.contains("cursor=;"), "{out}");
+    assert!(!out.contains('\\'), "{out}");
+}
+
+#[test]
 fn custom_param_name_is_also_percent_encoded() {
     let config = FeedConfig::new("/feed").cursor_param("a b");
     let out = feed_page(items(&["a"]), Some("cur1"), &config).into_string();

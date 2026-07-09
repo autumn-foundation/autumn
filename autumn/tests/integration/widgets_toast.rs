@@ -47,6 +47,22 @@ fn toast_in_targets_custom_region_with_beforeend() {
 }
 
 #[test]
+fn toast_in_normalizes_a_leading_hash_in_region_id() {
+    // A caller passing a `#selector` (natural slip) must not produce an invalid
+    // `beforeend:##…`; exactly one leading `#` is stripped.
+    let out = toast_in("#region", "hi", AlertVariant::Info).into_string();
+    assert!(out.contains(r#"hx-swap-oob="beforeend:#region""#), "{out}");
+    assert!(!out.contains("beforeend:##"), "{out}");
+}
+
+#[test]
+fn toast_region_normalizes_a_leading_hash_in_id() {
+    let out = toast_region("#region").into_string();
+    assert!(out.contains(r#"id="region""#), "{out}");
+    assert!(!out.contains(r##"id="#region""##), "{out}");
+}
+
+#[test]
 fn oob_swap_is_on_a_discardable_template_carrier_not_the_toast() {
     // For a positional (`beforeend:#…`) OOB swap htmx inserts the carrier's
     // CHILDREN and discards the carrier itself. The carrier must therefore be a

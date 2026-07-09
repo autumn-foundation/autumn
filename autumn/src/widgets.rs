@@ -3490,6 +3490,10 @@ pub const DEFAULT_TOAST_REGION_ID: &str = "toast-region";
 #[cfg(feature = "maud")]
 #[must_use]
 pub fn toast_region(id: &str) -> maud::Markup {
+    // Accept either a bare id or a `#selector` (a natural caller slip); strip a
+    // leading `#` so the element id is always bare, matching the id that
+    // `toast_in`'s `beforeend:#…` OOB target points at.
+    let id = selector_to_id(id);
     maud::html! {
         div id=(id) class="autumn-toast-region" {}
     }
@@ -3571,6 +3575,9 @@ pub fn toast_in(region_id: &str, message: &str, variant: AlertVariant) -> maud::
         AlertVariant::Info | AlertVariant::Success | AlertVariant::Warning => ("status", "polite"),
     };
     let class = format!("autumn-toast autumn-toast--{}", variant.as_str());
+    // Accept a bare id or a `#selector`; strip one leading `#` so a caller
+    // passing `"#toast-region"` doesn't produce an invalid `beforeend:##…`.
+    let region_id = selector_to_id(region_id);
     let oob = format!("beforeend:#{region_id}");
     // For a POSITIONAL OOB swap (`beforeend:#…`) htmx inserts the carrier's
     // *children* and discards the carrier itself. On an HTTP response the swap
@@ -3699,10 +3706,12 @@ fn encode_query_component(value: &str) -> String {
         .add(b'&')
         .add(b'+')
         .add(b'/')
+        .add(b';')
         .add(b'=')
         .add(b'?')
         .add(b'@')
         .add(b'[')
+        .add(b'\\')
         .add(b']')
         .add(b'^')
         .add(b'`')

@@ -1090,6 +1090,10 @@
     color: var(--text);
     box-shadow: 0 4px 12px rgb(0 0 0 / 12%);
     font-size: 0.9375rem;
+    /* Explicit starting max-height so the dismiss animation's height collapse
+       (to `max-height: 0`) transitions smoothly instead of jumping — larger
+       than any realistic single toast. */
+    max-height: 200px;
     animation:
         autumn-toast-in 200ms ease-out,
         autumn-toast-out 400ms ease-in 5s forwards;
