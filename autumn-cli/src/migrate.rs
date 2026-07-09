@@ -530,6 +530,11 @@ fn record_checksums_after_apply(database_url: &str, migrations_dir: &std::path::
 ///   deliberate re-baseline (an operator edited an applied migration, accepts
 ///   the fork risk, and wants future runs to compare against the new bytes).
 ///   Emits a WARN log.
+///
+/// Both paths run their applied-versions read and checksum write under the same
+/// advisory migration lock that `run`/`down` use (via the `*_locked` helpers),
+/// so a concurrent `autumn migrate down` cannot revert a version between the
+/// read and the write (issue #1203 review).
 fn run_baseline(args: &BaselineArgs, target: &MigrateTarget, profile: Option<&str>) {
     let (targets, _) = resolve_targets(target, profile);
     let migrations_dir = resolve_migrations_dir();
@@ -543,7 +548,8 @@ fn run_baseline(args: &BaselineArgs, target: &MigrateTarget, profile: Option<&st
                  hash will replace the previously recorded one. Other environments running the \
                  previous content will now report a mismatch."
             );
-            match autumn_web::migrate::rebaseline_checksum_from_dir(url, dir, version) {
+            match autumn_web::migrate::rebaseline_checksum_from_dir_locked(url, dir, version, None)
+            {
                 Ok(()) => eprintln!("  \u{2713} Re-baselined {version}."),
                 Err(e) => {
                     eprintln!("\u{274C} Re-baseline failed for {label}: {e}");
@@ -551,7 +557,7 @@ fn run_baseline(args: &BaselineArgs, target: &MigrateTarget, profile: Option<&st
                 }
             }
         } else {
-            match autumn_web::migrate::record_checksums_from_dir(url, dir) {
+            match autumn_web::migrate::record_checksums_from_dir_locked(url, dir, None) {
                 Ok(0) => eprintln!("  All applied migrations already have recorded checksums."),
                 Ok(n) => eprintln!("  \u{2713} Recorded checksum(s) for {n} migration(s)."),
                 Err(e) => {

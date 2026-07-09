@@ -46,7 +46,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hashes for legacy applied migrations that pre-date the checksum table
   (idempotent, additive); `autumn migrate baseline --force <version>`
   overwrites one version's stored hash — the deliberate escape hatch,
-  WARN-logged. Rolling a migration back (`autumn migrate down`) now clears its
+  WARN-logged. Both baseline paths run their applied-versions read and
+  checksum write under the same advisory migration lock as `run`/`down`, so a
+  concurrent rollback cannot revert a version between baseline's read and its
+  write. Rolling a migration back (`autumn migrate down`) now clears its
   recorded checksum, so a reverted migration can be re-applied cleanly —
   including with changed contents — instead of leaving a stale hash that would
   trip the drift guard on a later run. `autumn migrate status` and the pre-apply

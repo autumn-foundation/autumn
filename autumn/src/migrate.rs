@@ -1172,6 +1172,111 @@ pub fn rebaseline_checksum_from_dir(
     })
 }
 
+/// [`record_checksums_from_dir`], serialized under the migration advisory lock.
+///
+/// This is the primitive `autumn migrate baseline` uses: unlike the bare
+/// [`record_checksums_from_dir`] (which is called by `autumn migrate run`
+/// *while it already holds* [`hold_migration_lock`] on a separate session, so
+/// re-locking there would self-deadlock), baseline runs standalone and must
+/// take the lock itself. It mirrors [`revert_user_migrations_locked`] exactly:
+/// acquire the lock, then read the applied set **and** record checksums on the
+/// *same* session inside the critical section, then release. Holding the lock
+/// across the read+write is what prevents a concurrent `autumn migrate down`
+/// from reverting a version between baseline's applied-versions read and its
+/// checksum write, which would otherwise let baseline re-insert a checksum row
+/// for a version that is no longer applied (issue #1203 review).
+///
+/// Pass `wait_timeout = None` to use [`DEFAULT_LOCK_WAIT_TIMEOUT`] (60 s).
+///
+/// # Errors
+///
+/// * [`MigrationError::Connection`] — the database is unreachable.
+/// * [`MigrationError::LockTimeout`] — the advisory lock cannot be acquired
+///   within `wait_timeout`.
+/// * [`MigrationError::Migration`] — the migrations dir cannot be read or a
+///   database error occurred.
+pub fn record_checksums_from_dir_locked(
+    database_url: &str,
+    migrations_dir: &Path,
+    wait_timeout: Option<std::time::Duration>,
+) -> Result<usize, MigrationError> {
+    let up_by_version = read_up_sql_by_version(migrations_dir)?;
+    let timeout = wait_timeout.unwrap_or(DEFAULT_LOCK_WAIT_TIMEOUT);
+    with_migration_connection!(database_url, |conn| {
+        acquire_migration_lock_on(conn, timeout)?;
+
+        // The applied-versions READ and the checksum WRITE both run here, under
+        // the advisory lock on THIS session, so a concurrent `down` cannot
+        // revert a version between them. Always release the lock afterwards.
+        let result: Result<usize, MigrationError> = (|| {
+            let applied = load_applied_versions_lenient(conn)?;
+            record_checksums(conn, &applied, &up_by_version)
+        })();
+
+        release_migration_lock_on(conn);
+        result
+    })
+}
+
+/// [`rebaseline_checksum_from_dir`], serialized under the migration advisory
+/// lock — the primitive behind `autumn migrate baseline --force <version>`.
+///
+/// See [`record_checksums_from_dir_locked`] for why baseline must take the lock
+/// itself. The applied-check for `version` and the overwrite both run on the
+/// *same* locked session so a concurrent `autumn migrate down` cannot revert
+/// `version` between the "is it applied?" probe and the write.
+///
+/// Pass `wait_timeout = None` to use [`DEFAULT_LOCK_WAIT_TIMEOUT`] (60 s).
+///
+/// # Errors
+///
+/// * [`MigrationError::Connection`] — the database is unreachable.
+/// * [`MigrationError::LockTimeout`] — the advisory lock cannot be acquired
+///   within `wait_timeout`.
+/// * [`MigrationError::Migration`] — the version isn't currently applied, its
+///   on-disk `up.sql` is unreadable, or a database error occurred.
+pub fn rebaseline_checksum_from_dir_locked(
+    database_url: &str,
+    migrations_dir: &Path,
+    version: &str,
+    wait_timeout: Option<std::time::Duration>,
+) -> Result<(), MigrationError> {
+    let up_by_version = read_up_sql_by_version(migrations_dir)?;
+    let Some(up_sql) = up_by_version.get(version) else {
+        return Err(MigrationError::Migration(format!(
+            "cannot re-baseline {version}: its up.sql was not found in {}",
+            migrations_dir.display()
+        )));
+    };
+    let new_checksum = migration_checksum(up_sql);
+    let timeout = wait_timeout.unwrap_or(DEFAULT_LOCK_WAIT_TIMEOUT);
+    with_migration_connection!(database_url, |conn| {
+        acquire_migration_lock_on(conn, timeout)?;
+
+        // The "is `version` currently applied?" READ and the overwrite WRITE
+        // both run here, under the advisory lock on THIS session. Always
+        // release the lock afterwards.
+        let result: Result<(), MigrationError> = (|| {
+            let is_applied = !diesel::sql_query(
+                "SELECT version FROM __diesel_schema_migrations WHERE version = $1",
+            )
+            .bind::<diesel::sql_types::Text, _>(version)
+            .load::<AppliedMigrationVersion>(conn)
+            .map_err(|e| MigrationError::Migration(e.to_string()))?
+            .is_empty();
+            if !is_applied {
+                return Err(MigrationError::Migration(format!(
+                    "cannot re-baseline {version}: it is not a currently applied migration"
+                )));
+            }
+            rebaseline_checksum(conn, version, &new_checksum)
+        })();
+
+        release_migration_lock_on(conn);
+        result
+    })
+}
+
 /// The recorded-vs-actual state of every applied migration, for status
 /// display. Returns `(version, state)` pairs in the same order as
 /// `__diesel_schema_migrations` (ascending by version).
@@ -2651,6 +2756,61 @@ mod tests {
         assert!(
             !planned,
             "plan closure must not run when the connection fails"
+        );
+    }
+
+    #[test]
+    fn record_checksums_from_dir_locked_fails_with_connection_error_on_bad_url() {
+        // `autumn migrate baseline` primitive: it reads the migrations dir first,
+        // then establishes a connection to take the advisory lock before the
+        // read+write. An unreachable host must surface as a Connection error
+        // (never a panic or a silently-held lock).
+        let dir = std::path::Path::new("../examples/todo-app/migrations");
+        let result = record_checksums_from_dir_locked(
+            "postgres://invalid:invalid@0.0.0.0:1/invalid_db",
+            dir,
+            None,
+        );
+        assert!(
+            matches!(result.unwrap_err(), MigrationError::Connection(_)),
+            "unreachable host must produce Connection error"
+        );
+    }
+
+    #[test]
+    fn rebaseline_checksum_from_dir_locked_fails_with_connection_error_on_bad_url() {
+        // `autumn migrate baseline --force <version>` primitive. `00000000000000`
+        // exists on disk, so the up.sql lookup succeeds and the code proceeds to
+        // connect for the advisory lock — an unreachable host must produce a
+        // Connection error.
+        let dir = std::path::Path::new("../examples/todo-app/migrations");
+        let result = rebaseline_checksum_from_dir_locked(
+            "postgres://invalid:invalid@0.0.0.0:1/invalid_db",
+            dir,
+            "00000000000000",
+            None,
+        );
+        assert!(
+            matches!(result.unwrap_err(), MigrationError::Connection(_)),
+            "unreachable host must produce Connection error"
+        );
+    }
+
+    #[test]
+    fn rebaseline_checksum_from_dir_locked_errors_before_connecting_on_unknown_version() {
+        // The up.sql lookup is a pure disk read that runs BEFORE any connection
+        // or lock acquisition, so an unknown version fails fast with a Migration
+        // error and never opens a session (nothing to serialize).
+        let dir = std::path::Path::new("../examples/todo-app/migrations");
+        let result = rebaseline_checksum_from_dir_locked(
+            "postgres://invalid:invalid@0.0.0.0:1/invalid_db",
+            dir,
+            "99999999999999",
+            None,
+        );
+        assert!(
+            matches!(result.unwrap_err(), MigrationError::Migration(m) if m.contains("99999999999999")),
+            "an unknown version must fail fast with a Migration error naming it"
         );
     }
 
