@@ -699,10 +699,19 @@ impl LocalChannelsBackend {
                         message: message.clone(),
                     })
                     .collect();
-                // Gap when the requested resume point precedes the oldest
-                // retained id: the client's next-expected id (`last + 1`) aged
-                // out of the window, so the replay would be partial.
-                let gap = oldest.is_some_and(|oldest| oldest > last.saturating_add(1));
+                // Gap in two cases:
+                //  1. The requested resume point precedes the oldest retained
+                //     id: the client's next-expected id (`last + 1`) aged out of
+                //     the window, so the replay would be partial.
+                //  2. The client's `last` id is in the future relative to the
+                //     current server state (`last > start_id`): after a process
+                //     restart or topic GC the monotonic counter resets to `1`,
+                //     so a client reconnecting with a stale-large
+                //     `Last-Event-ID` would otherwise get an empty replay and no
+                //     signal that its history is unrecoverable. Flag the epoch
+                //     reset so the client can resynchronise.
+                let gap =
+                    oldest.is_some_and(|oldest| oldest > last.saturating_add(1)) || last > start_id;
                 (replay, gap)
             },
         );
@@ -730,10 +739,12 @@ impl ChannelsBackend for LocalChannelsBackend {
     }
 
     fn ensure_topic(&self, topic: &str) -> Arc<broadcast::Sender<ChannelMessage>> {
-        // NOTE: sending directly on the returned `Sender` bypasses replay-id
-        // assignment and the replay buffer — publish via `Channels::publish` /
-        // `Broadcast` to keep resumable topics resumable (see the resumable-SSE
-        // limitations in docs/guide/realtime.md, issue #1356).
+        // NOTE: this returns the RAW `broadcast::Sender`; sending directly on it
+        // bypasses replay-id assignment and the replay buffer. Publish via
+        // `Channels::publish` / `Broadcast::publish` / `Channels::sender().send()`
+        // (all of which route through `publish` and stay id-assigned) to keep
+        // resumable topics resumable (see the resumable-SSE limitations in
+        // docs/guide/realtime.md, issue #1356).
         self.inner.metrics.ensure_topic(topic);
         self.get_or_create_sender(topic)
     }

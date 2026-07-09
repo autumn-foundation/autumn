@@ -892,12 +892,17 @@ Scope") — the replay buffer is a same-process convenience, not a durable log:
   subscribers can lose its buffer during the disconnect window, so a reconnect
   may find nothing to replay.
 - On process restart the per-topic id counter resets to `1`, so a client
-  reconnecting with a stale-large `Last-Event-ID` gets an empty replay and no
-  gap sentinel.
-- Publish through `channels.publish()` / `broadcast().publish()` on resumable
-  topics. Calling `.send()` directly on a `Sender` obtained from
-  `channels.sender()` broadcasts without assigning an id or appending to the
-  replay buffer, which breaks resumability for that topic.
+  reconnecting with a stale-large `Last-Event-ID` gets an empty replay. This is
+  detected and reported as a gap sentinel (the resume point is in the future
+  relative to the current server state), but the buffered history from before
+  the restart is gone.
+- Publishing through `channels.publish()` / `broadcast().publish()` /
+  `channels.sender().send()` is safe on resumable topics: all three route
+  through the backend's `publish`, assigning an id and appending to the replay
+  buffer. Only calling `.send()` directly on the raw `broadcast::Sender`
+  (obtained from `channels.sender().keepalive` or the `ensure_topic` trait
+  method) broadcasts without assigning an id or appending to the replay buffer,
+  which breaks resumability for that topic.
 
 For cross-restart / multi-replica durability, back the stream with a durable log
 (e.g. a database table or a Redis stream) instead of the in-process buffer.

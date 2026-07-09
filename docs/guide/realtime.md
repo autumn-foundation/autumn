@@ -131,11 +131,16 @@ scope of issue #1356, matching its "Out of Scope") — not a durable event log:
   its buffer during the disconnect window and have nothing to replay on
   reconnect.
 - On process restart the per-topic id counter resets to `1`, so a client
-  reconnecting with a stale-large `Last-Event-ID` gets an empty replay and no
-  gap sentinel.
-- Publish via `channels.publish()` / `broadcast().publish()` on resumable
-  topics. Calling `.send()` directly on a `Sender` from `channels.sender()`
-  bypasses id assignment and the replay buffer, breaking resumability.
+  reconnecting with a stale-large `Last-Event-ID` gets an empty replay. This is
+  detected and reported as a gap sentinel (the resume point is in the future
+  relative to the current server state), but the buffered history from before
+  the restart is gone.
+- Publishing via `channels.publish()` / `broadcast().publish()` /
+  `channels.sender().send()` is safe on resumable topics: all three route
+  through the backend's `publish`, assigning ids and appending to the replay
+  buffer. Only calling `.send()` directly on the raw `broadcast::Sender`
+  (obtained from `channels.sender().keepalive` or the `ensure_topic` trait
+  method) bypasses id assignment and the replay buffer, breaking resumability.
 
 For durability across restarts or replicas, persist events yourself (a database
 table or a Redis stream) rather than relying on this buffer.

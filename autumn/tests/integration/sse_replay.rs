@@ -26,7 +26,8 @@ struct SseFrame {
 /// Parse a raw `text/event-stream` byte buffer into its events, ignoring
 /// keep-alive comment lines (`: ...`).
 fn parse_sse(raw: &[u8]) -> Vec<SseFrame> {
-    let text = String::from_utf8_lossy(raw);
+    // Normalize CRLF so block/line splitting works regardless of line endings.
+    let text = String::from_utf8_lossy(raw).replace("\r\n", "\n");
     let mut frames = Vec::new();
     for block in text.split("\n\n") {
         if block.trim().is_empty() {
@@ -389,6 +390,59 @@ async fn stream_resumable_emits_gap_event_frame_on_overflow() {
         .filter(|f| f.event.as_deref() != Some("gap"))
         .count();
     assert_eq!(replay_count, 256, "replay retains exactly the capacity");
+}
+
+// ── Epoch reset: stale-large Last-Event-ID after a restart signals a gap ───────
+
+#[tokio::test]
+async fn resume_after_epoch_reset_signals_gap() {
+    // Fresh channels model a process that just restarted: the per-topic id
+    // counter starts at 1, so `start_id` is small.
+    let channels = Channels::new(64);
+    let topic = "epoch";
+    publish(&channels, topic, "e1");
+    publish(&channels, topic, "e2");
+    // start_id is now 2.
+
+    // A client reconnects with a Last-Event-ID from a *previous* epoch that is
+    // far larger than the current server id. There is nothing to replay, and the
+    // client must be told its history is unrecoverable.
+    let handle = channels.resume(topic, Some(500));
+    assert!(
+        handle.gap,
+        "a Last-Event-ID beyond the current server id must raise a gap"
+    );
+    assert!(
+        handle.replay.is_empty(),
+        "no retained id exceeds the stale-large resume point, so nothing replays"
+    );
+    assert_eq!(handle.next_live_id, 3);
+}
+
+#[tokio::test]
+async fn stream_resumable_emits_gap_event_frame_on_epoch_reset() {
+    let state = autumn_web::AppState::for_test();
+    let channels = state.channels().clone();
+    let topic = "sse-epoch";
+    publish(&channels, topic, "e1");
+    publish(&channels, topic, "e2");
+
+    // Resume with a future id (as if from a pre-restart epoch): the stream must
+    // lead with a gap sentinel and replay nothing.
+    let sse = autumn_web::sse::stream_resumable(&state, topic, Some(500));
+    let frames = collect_sse(sse.into_response().into_body(), Duration::from_millis(300)).await;
+
+    assert_eq!(
+        frames.first().and_then(|f| f.event.clone()).as_deref(),
+        Some("gap"),
+        "the gap sentinel must lead the frame sequence after an epoch reset"
+    );
+    assert_eq!(frames[0].data, "{\"gap\":true}");
+    let replay_count = frames
+        .iter()
+        .filter(|f| f.event.as_deref() != Some("gap"))
+        .count();
+    assert_eq!(replay_count, 0, "nothing to replay after an epoch reset");
 }
 
 // ── AC#5: cold connection behaves like today ──────────────────────────────────
