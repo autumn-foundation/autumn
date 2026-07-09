@@ -979,6 +979,12 @@ mod tests {
         // lives in the common dir.
         assert!(content.contains("--git-dir"));
         assert!(content.contains("--git-common-dir"));
+        // Linked worktrees: `--amend`/`reset` rewrites the per-worktree reflog
+        // (`<git-dir>/logs/HEAD`) but not the shared common-dir reflog, so the
+        // generated build.rs must watch the per-worktree reflog too — otherwise
+        // Cargo never re-runs after an amend in a worktree and `/actuator/info`
+        // reports a stale SHA.
+        assert!(content.contains("git_dir.join(\"logs/HEAD\")"));
         // Reproducible builds: honor and watch SOURCE_DATE_EPOCH.
         assert!(content.contains("SOURCE_DATE_EPOCH"));
         assert!(content.contains("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH"));
