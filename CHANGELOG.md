@@ -569,6 +569,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   feature the daemon scaffold disables, so following it would leave the app
   non-compiling. `--bundled-pg` keeps the `db` feature and retains
   `generate scaffold` (issue #1052).
+- **generator:** the `--daemon` and `--bundled-pg` READMEs now document
+  `autumn dev` as the browser-reachable local run (it binds TCP on
+  `127.0.0.1:3000`), matching the default README. The background daemon start
+  (`autumn serve --daemon` / `autumn serve --bundled-pg`) is reframed as the
+  production mode that binds a private Unix domain socket — not reachable at
+  `http://localhost:3000` — with a pointer to `autumn serve status` for the
+  socket address and `docs/guide/daemon.md` for details, so following the README
+  no longer leaves the route unreachable in a browser (issue #1052).
 - **views:** vendored the full Idiomorph 0.3.0 morphing script (replacing a
   minimal stub) so live `hx-ext="morph"` updates actually DOM-morph, and
   patched its htmx extension so non-morph out-of-band swaps (e.g.

@@ -188,7 +188,22 @@ fn cloud_native_scaffold_daemon_readme_is_db_free() {
         !readme.contains("libpq"),
         "daemon README must not tell users to install libpq (the db feature is off), got:\n{readme}"
     );
-    // The real run path must be documented.
+    // The browser-reachable local-run command must be `autumn dev` (which binds
+    // TCP on 127.0.0.1:3000), matching the default README — not a socket-bound
+    // daemon start. Following it must land the user on http://localhost:3000.
+    assert!(
+        readme.contains("autumn dev"),
+        "daemon README must document `autumn dev` as the browser-reachable local run, \
+         got:\n{readme}"
+    );
+    assert!(
+        readme.contains("http://localhost:3000"),
+        "daemon README must point the browser at http://localhost:3000, got:\n{readme}"
+    );
+    // The background daemon start must still be documented, but as the
+    // production/background mode that binds a private Unix socket — never paired
+    // with a bare localhost:3000 claim. It must point at `autumn serve status`
+    // for the reachable socket address.
     assert!(
         readme.contains("autumn serve"),
         "daemon README must document `autumn serve`, got:\n{readme}"
@@ -196,6 +211,11 @@ fn cloud_native_scaffold_daemon_readme_is_db_free() {
     assert!(
         readme.contains("--daemon"),
         "daemon README must mention the `--daemon` shape it was generated with, got:\n{readme}"
+    );
+    assert!(
+        readme.contains("Unix domain socket") && readme.contains("autumn serve status"),
+        "daemon README must document that the background daemon binds a Unix socket and is \
+         reached via `autumn serve status`, not a bare localhost:3000, got:\n{readme}"
     );
     // Project name substituted; no leftover template tokens.
     assert!(
@@ -226,9 +246,28 @@ fn cloud_native_scaffold_bundled_pg_readme_auto_provisions_db() {
         !readme.contains("Configure the database"),
         "bundled-pg README must not have a `Configure the database` step, got:\n{readme}"
     );
+    // The browser-reachable local-run command must be `autumn dev` (which binds
+    // TCP on 127.0.0.1:3000 and provisions the bundled cluster). `autumn serve
+    // --bundled-pg` implies `--daemon`, so it binds a private Unix socket and is
+    // NOT reachable at http://localhost:3000 — the README must not pair it with a
+    // bare browser claim.
+    assert!(
+        readme.contains("autumn dev"),
+        "bundled-pg README must document `autumn dev` as the browser-reachable local run, \
+         got:\n{readme}"
+    );
+    assert!(
+        readme.contains("http://localhost:3000"),
+        "bundled-pg README must point the browser at http://localhost:3000, got:\n{readme}"
+    );
     assert!(
         readme.contains("autumn serve --bundled-pg"),
         "bundled-pg README must document `autumn serve --bundled-pg`, got:\n{readme}"
+    );
+    assert!(
+        readme.contains("Unix domain socket") && readme.contains("autumn serve status"),
+        "bundled-pg README must document that the background daemon binds a Unix socket and \
+         is reached via `autumn serve status`, not a bare localhost:3000, got:\n{readme}"
     );
     // Finding 2 (guard against over-stripping): bundled-pg keeps the `db`
     // feature and auto-applies migrations, so `generate scaffold` is still valid

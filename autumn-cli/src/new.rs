@@ -651,19 +651,22 @@ fn daemon_readme_body(vars: &TemplateVars<'_>) -> String {
          This project was generated with `--daemon`: it builds with **no** database — the\n\
          `db` feature is off and there are no migrations — so there is no Postgres to\n\
          install, no database client library to link, and nothing in `autumn.toml` to\n\
-         configure. Just build and run it:\n\
+         configure. Run it locally with:\n\
          \n\
          ```sh\n\
-         autumn serve\n\
+         autumn dev\n\
          ```\n\
          \n\
          Then visit **http://localhost:3000** — you should get a `200` with\n\
          \"Welcome to {project}!\". Health endpoints are auto-mounted at `/health`\n\
          and `/actuator/health`.\n\
          \n\
-         Run it in the background as a managed daemon with `autumn serve --daemon`\n\
-         (`autumn serve status`, `autumn serve stop`, and `autumn serve restart` manage\n\
-         the background process).\n\
+         For production, `autumn serve --daemon` supervises it in the background as a\n\
+         managed daemon (`autumn serve status`, `autumn serve stop`, and `autumn serve\n\
+         restart` manage the process). Unlike `autumn dev`, the daemon binds a private\n\
+         **Unix domain socket**, not a TCP port — so it is *not* reachable at\n\
+         `http://localhost:3000`. Run `autumn serve status` to print its socket address;\n\
+         see `docs/guide/daemon.md` for the socket transport and lifecycle details.\n\
          \n\
          Need a database later? Re-enable `autumn-web`'s default features (turn the\n\
          `db` feature back on) in `Cargo.toml` to unlock the database-backed\n\
@@ -690,19 +693,25 @@ fn bundled_pg_readme_body(vars: &TemplateVars<'_>) -> String {
          \n\
          This project was generated with `--bundled-pg`: it embeds and manages its own\n\
          Postgres. You do **not** install a server, edit the `[database]` block, or run\n\
-         migrations by hand — the daemon provisions the cluster on startup and applies the\n\
+         migrations by hand — the app provisions the cluster on startup and applies the\n\
          embedded migrations automatically (see the `[database]` note in `autumn.toml`).\n\
-         Build and run it:\n\
+         Run it locally with:\n\
          \n\
          ```sh\n\
-         autumn serve --bundled-pg\n\
+         autumn dev\n\
          ```\n\
          \n\
          Then visit **http://localhost:3000** — you should get a `200` with\n\
          \"Welcome to {project}!\". Health endpoints are auto-mounted at `/health`\n\
          and `/actuator/health`.\n\
          \n\
-         Run it in the background with `autumn serve --bundled-pg --daemon`.\n\
+         For production, `autumn serve --bundled-pg` supervises the app and its managed\n\
+         Postgres in the background as a daemon (`autumn serve status`, `autumn serve stop`,\n\
+         and `autumn serve restart` manage the process). Unlike `autumn dev`, the daemon\n\
+         binds a private **Unix domain socket**, not a TCP port — so it is *not* reachable\n\
+         at `http://localhost:3000`. Run `autumn serve status` to print its socket address;\n\
+         see `docs/guide/daemon.md` for the socket transport, lifecycle, and bundled-Postgres\n\
+         details.\n\
          \n\
          ",
         project = vars.project_name,
