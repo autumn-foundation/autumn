@@ -121,6 +121,24 @@ receiving its `429`. For hard pre-body protection (rejecting the request before
 its body is read), pair the throttle with the global limiter layer, which runs
 as an outer tower layer ahead of body extraction.
 
+### Attribute ordering
+
+Place the route method attribute (`#[get]` / `#[post]` / …) *above*
+`#[throttle]` — method attribute outermost:
+
+```rust
+#[post("/login")]           // method attribute outermost
+#[throttle(limit = 5, per = "1m", key = "ip")]
+async fn login() -> Json<Session> { /* … */ }
+```
+
+Both orders enforce throttling correctly (including idempotency-replay
+accounting). Only the method-attribute-outermost order, however, lets the route
+macro see the handler's real return type for OpenAPI response-schema generation.
+When `#[throttle]` expands first it rewrites the return type to `Response` (like
+the sibling `#[secured]` / `#[step_up]` / `#[authorize]` guards), so a `Json<T>`
+response schema would be dropped from the generated OpenAPI document.
+
 ## Response shape
 
 Blocked requests receive:
