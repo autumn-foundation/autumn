@@ -8403,6 +8403,13 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 ) -> ::autumn_web::AutumnResult<(#model_name, bool)> {
                     use ::autumn_web::reexports::diesel::prelude::*;
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                    // Cross-shard write guard: reject a get-or-insert issued via
+                    // across_tenants() on a sharded, tenant-scoped repository. The
+                    // lookup+insert cannot be fanned out safely across shards, so we
+                    // reject rather than silently write to a single shard while
+                    // matching rows on other shards go unseen. Same guard used by
+                    // save/update/delete; a no-op token on non-sharded repos.
+                    #cross_shard_write_guard
                     #(#encode_lets)*
                     // Step 1: preliminary lookup on the read path (replica-eligible).
                     {

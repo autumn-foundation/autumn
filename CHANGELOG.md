@@ -35,7 +35,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `after_create` and the durable commit-hook queue fire only on the created
   path, and — unlike `upsert_many` — the method is generated even on hooked
   repositories. Race-safety requires a unique constraint covering the lookup
-  column(s); `_or_` is rejected because it would span constraints. See the
+  column(s); `_or_` is rejected because it would span constraints. On a
+  sharded, tenant-scoped repository the generated method is wrapped in the same
+  cross-shard write guard as `save`/`update`/`delete`, so a get-or-insert issued
+  through `across_tenants()` is rejected rather than silently writing to a single
+  shard while matching rows on other shards go unseen. See the
   "Race-safe get-or-insert" section of the repositories guide.
 - **ci:** README-quickstart gate against the published crates (issue #1586) —
   `.github/workflows/quickstart-gate.yml` + `scripts/check-quickstart.sh`

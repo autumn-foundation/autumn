@@ -6,9 +6,10 @@
 //! surface exists without a live database.
 //!
 //! Fixtures deliberately span every generated branch — plain, composite,
-//! tenant-scoped, hooked (`before`/`after_create`), commit-hooks, versioned and
-//! soft-delete — so `cargo test -p autumn --no-run --features db` type-checks
-//! all of them even though the ignored tests can't run here.
+//! tenant-scoped, sharded + tenant-scoped (cross-shard write guard),
+//! hooked (`before`/`after_create`), commit-hooks, versioned and soft-delete —
+//! so `cargo test -p autumn --no-run --features db` type-checks all of them even
+//! though the ignored tests can't run here.
 
 #![cfg(feature = "db")]
 #![allow(clippy::must_use_candidate, clippy::missing_const_for_fn)]
@@ -102,6 +103,43 @@ pub struct FocTenantRecord {
 
 #[autumn_web::repository(FocTenantRecord, table = "test_foc_tenant_records", tenant_scoped)]
 pub trait FocTenantRecordRepository {
+    fn find_or_create_by_slug(slug: String);
+}
+
+// ── Sharded + tenant-scoped model — compile-only ──────────────────────────────
+//
+// Exercises the cross-shard write guard on the generated `find_or_create_by_*`
+// method (Codex review on #1664): a sharded, tenant-scoped repository used via
+// `across_tenants()` must reject the get-or-insert rather than silently writing
+// to a single shard while matching rows on other shards go unseen. Compiling
+// this fixture monomorphizes the guarded branch of the codegen.
+
+diesel::table! {
+    test_foc_sharded_tenant_records (id) {
+        id -> Int8,
+        slug -> Text,
+        name -> Text,
+        tenant_id -> Text,
+    }
+}
+
+#[autumn_web::model(table = "test_foc_sharded_tenant_records")]
+pub struct FocShardedTenantRecord {
+    #[id]
+    pub id: i64,
+    pub slug: String,
+    pub name: String,
+    #[default]
+    pub tenant_id: String,
+}
+
+#[autumn_web::repository(
+    FocShardedTenantRecord,
+    table = "test_foc_sharded_tenant_records",
+    tenant_scoped,
+    sharded
+)]
+pub trait FocShardedTenantRecordRepository {
     fn find_or_create_by_slug(slug: String);
 }
 
@@ -331,6 +369,9 @@ fn find_or_create_by_methods_are_generated() {
     assert_is_fn(PgFocRecordRepository::find_or_create_by_slug);
     assert_is_fn(PgFocCompositeRepository::find_or_create_by_a_and_b);
     assert_is_fn(PgFocTenantRecordRepository::find_or_create_by_slug);
+    // Sharded + tenant-scoped: proves the cross-shard write guard branch of the
+    // find_or_create_by codegen monomorphizes (Codex review on #1664).
+    assert_is_fn(PgFocShardedTenantRecordRepository::find_or_create_by_slug);
     assert_is_fn(PgFocHookedRecordRepository::find_or_create_by_slug);
     assert_is_fn(PgFocCommitRecordRepository::find_or_create_by_slug);
     assert_is_fn(PgFocVersionedRecordRepository::find_or_create_by_slug);
