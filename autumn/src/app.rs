@@ -128,6 +128,8 @@ pub fn app() -> AppBuilder {
         #[cfg(feature = "mail")]
         suppression_store: None,
         #[cfg(feature = "mail")]
+        mail_suppression_store: None,
+        #[cfg(feature = "mail")]
         mount_unsubscribe_endpoint: false,
         #[cfg(feature = "mail")]
         mail_previews: Vec::new(),
@@ -383,6 +385,8 @@ pub struct AppBuilder {
     mail_delivery_queue_factory: Option<MailDeliveryQueueFactory>,
     #[cfg(feature = "mail")]
     pub(crate) suppression_store: Option<crate::mail::SuppressionStoreHandle>,
+    #[cfg(feature = "mail")]
+    pub(crate) mail_suppression_store: Option<crate::mail::suppression::SuppressionStoreHandle>,
     #[cfg(feature = "mail")]
     pub(crate) mount_unsubscribe_endpoint: bool,
     /// Mail template previews registered for the dev preview UI.
@@ -2092,6 +2096,27 @@ impl AppBuilder {
         self
     }
 
+    /// Register a bounce/complaint
+    /// [`SuppressionStore`](crate::mail::suppression::SuppressionStore) so
+    /// [`Mailer::send`](crate::mail::Mailer::send) skips addresses that have
+    /// hard-bounced or complained (issue #1247).
+    ///
+    /// Zero-config apps need not call this: the framework wires an in-memory
+    /// default store automatically. Use this to plug the durable
+    /// [`PgSuppressionStore`](crate::mail::suppression::PgSuppressionStore) (or
+    /// a custom backend) for multi-instance deploys that must share suppression
+    /// across replicas. Mirrors [`Self::with_suppression_store`].
+    #[cfg(feature = "mail")]
+    #[must_use]
+    pub fn with_mail_suppression_store(
+        mut self,
+        store: impl crate::mail::suppression::SuppressionStore + 'static,
+    ) -> Self {
+        self.mail_suppression_store =
+            Some(crate::mail::suppression::SuppressionStoreHandle::new(store));
+        self
+    }
+
     /// Mount the framework's default RFC 8058 one-click unsubscribe endpoint at
     /// `/_autumn/unsubscribe` (`GET` confirmation page + `POST` one-click).
     ///
@@ -2595,6 +2620,8 @@ impl AppBuilder {
             #[cfg(feature = "mail")]
             suppression_store,
             #[cfg(feature = "mail")]
+            mail_suppression_store,
+            #[cfg(feature = "mail")]
             mount_unsubscribe_endpoint,
             #[cfg(feature = "mail")]
             mail_previews,
@@ -2963,6 +2990,10 @@ impl AppBuilder {
         validate_repository_policies_registered(&all_routes, &scoped_groups, &state, &config);
         #[cfg(feature = "mail")]
         if let Some(handle) = suppression_store {
+            state.insert_extension(handle);
+        }
+        #[cfg(feature = "mail")]
+        if let Some(handle) = mail_suppression_store {
             state.insert_extension(handle);
         }
         #[cfg(feature = "mail")]
@@ -3670,6 +3701,8 @@ impl AppBuilder {
             #[cfg(feature = "mail")]
             suppression_store,
             #[cfg(feature = "mail")]
+            mail_suppression_store,
+            #[cfg(feature = "mail")]
             mount_unsubscribe_endpoint,
             #[cfg(feature = "mail")]
             mail_previews,
@@ -3895,6 +3928,10 @@ impl AppBuilder {
         // routes that extract `Mailer` for immediate `send` calls resolve.
         #[cfg(feature = "mail")]
         if let Some(handle) = suppression_store {
+            state.insert_extension(handle);
+        }
+        #[cfg(feature = "mail")]
+        if let Some(handle) = mail_suppression_store {
             state.insert_extension(handle);
         }
         #[cfg(feature = "mail")]
@@ -4251,6 +4288,8 @@ impl AppBuilder {
             #[cfg(feature = "mail")]
             suppression_store,
             #[cfg(feature = "mail")]
+            mail_suppression_store,
+            #[cfg(feature = "mail")]
                 mount_unsubscribe_endpoint: _,
             #[cfg(feature = "mail")]
             mail_interceptor,
@@ -4405,6 +4444,10 @@ impl AppBuilder {
 
         #[cfg(feature = "mail")]
         if let Some(handle) = suppression_store {
+            state.insert_extension(handle);
+        }
+        #[cfg(feature = "mail")]
+        if let Some(handle) = mail_suppression_store {
             state.insert_extension(handle);
         }
         #[cfg(feature = "mail")]
