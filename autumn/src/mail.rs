@@ -450,6 +450,12 @@ fn inline_css_html(html: &str) -> Result<String, MailError> {
         .load_remote_stylesheets(false)
         .build()
         .inline(html)
+        // Defensive / effectively unreachable: with remote-stylesheet loading
+        // disabled above and no file loader configured, `css-inline` only errors
+        // on IO/network — both compiled out here. It is fully lenient toward
+        // malformed CSS/HTML (garbage `<style>` bodies inline to an unchanged
+        // fragment, never an error). We still surface the typed error rather than
+        // `expect`ing, to keep the API stable if those loaders are ever enabled.
         .map_err(|error| MailError::CssInline(error.to_string()))
 }
 
@@ -914,9 +920,12 @@ pub enum MailError {
     /// [`MailBuilder::ignore_suppression`] for critical mail.
     #[error("all recipients are on the mail suppression list; nothing was sent")]
     AllRecipientsSuppressed,
-    /// CSS inlining of the HTML body failed (issue #1254). The original body is
-    /// preserved (never delivered corrupted) and this typed error is surfaced
-    /// so the caller can decide, rather than silently sending malformed HTML.
+    /// CSS inlining of the HTML body failed (issue #1254). `send` fails loudly
+    /// with this typed error instead of delivering a corrupted body — the
+    /// message is not sent, so callers can decide how to recover. Defensive:
+    /// with remote and file loaders disabled, `css-inline` is fully lenient and
+    /// this path is effectively unreachable, but the variant keeps the API
+    /// stable if those loaders are ever enabled.
     #[error("failed to inline CSS into HTML mail body: {0}")]
     CssInline(String),
 }
@@ -1597,9 +1606,9 @@ impl Mailer {
     ///
     /// Precedence: a per-message [`Mail::inline_css`] override wins; otherwise
     /// the [`Mailer`]'s configured [`MailConfig::inline_css`] default applies.
-    /// On inliner failure the original body is left untouched and a typed
-    /// [`MailError::CssInline`] is surfaced (rather than delivering a corrupted
-    /// body). Text bodies are never touched.
+    /// On inliner failure `send` fails loudly: a typed [`MailError::CssInline`]
+    /// is returned and the message is not delivered, rather than shipping a
+    /// corrupted body. Text bodies are never touched.
     fn apply_css_inlining(&self, mail: &mut Mail) -> Result<(), MailError> {
         let enabled = mail.inline_css.unwrap_or(self.inline_css_default);
         if !enabled {
@@ -4112,13 +4121,25 @@ mod tests {
         // inline `style="…"` on the anchor.
         let html = r#"<style>.btn{color:#fff;background:#06c}</style><a class="btn">Go</a>"#;
         let out = inline_css_html(html).expect("inlining succeeds");
+        // Inspect the `<a …>` opening tag specifically so every assertion is
+        // discriminating: `#fff`/`#06c` also appear in the retained `<style>`
+        // block, so a no-op would pass a bare `out.contains(...)`.
+        let anchor = out
+            .split("<a")
+            .nth(1)
+            .expect("an <a> tag is present in the output");
+        let anchor_open = &anchor[..anchor.find('>').expect("anchor tag closes")];
         assert!(
-            out.contains("<a") && out.contains("style=") && out.contains("#fff"),
-            "anchor must gain an inline style carrying the class rule; got: {out}"
+            anchor_open.contains("style="),
+            "anchor must gain an inline style attribute; got tag: {anchor_open}"
         );
         assert!(
-            out.contains("#06c") || out.contains("background"),
-            "background rule must be inlined too; got: {out}"
+            anchor_open.contains("#fff"),
+            "anchor's inline style must carry the color rule; got tag: {anchor_open}"
+        );
+        assert!(
+            anchor_open.contains("#06c") || anchor_open.contains("background"),
+            "anchor's inline style must carry the background rule; got tag: {anchor_open}"
         );
     }
 

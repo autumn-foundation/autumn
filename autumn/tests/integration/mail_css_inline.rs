@@ -231,6 +231,47 @@ async fn per_message_opt_in_overrides_config_default_off() {
     assert_inlined(&read_only_eml(dir.path()));
 }
 
+// ── AC4: malformed / non-document bodies are handled gracefully ───────────────
+
+/// With inlining forced ON, a garbage `<style>` body and a non-document HTML
+/// fragment must not error or panic: `send` returns `Ok` and a non-empty body
+/// is delivered. `css-inline` with remote and file loaders disabled is fully
+/// lenient, so malformed CSS/HTML never surfaces `MailError::CssInline`.
+#[tokio::test]
+async fn malformed_body_with_inlining_on_is_delivered_gracefully() {
+    // A `<style>` block full of nonsense CSS, followed by a bare text fragment
+    // (not a well-formed document).
+    let garbage = "<style>@@@!!!{{{color:::}}}</style>plain fragment";
+    // A `<style>` tag that is never closed.
+    let unclosed = r#"<style>.x{color:#123 <a class="x">dangling"#;
+
+    for body in [garbage, unclosed] {
+        let transport = CapturingTransport::default();
+        let mailer = Mailer::with_transport(transport.clone());
+
+        let mail = Mail::builder()
+            .from("app@example.com")
+            .to("user@example.com")
+            .subject("Hi")
+            .html(body)
+            .inline_css(true)
+            .build()
+            .expect("valid mail");
+
+        // Must not panic and must not error — inlining is lenient on bad input.
+        mailer
+            .send(mail)
+            .await
+            .expect("send succeeds on a malformed body");
+
+        let delivered = transport.last_html();
+        assert!(
+            !delivered.is_empty(),
+            "a non-empty body must still be delivered for input: {body:?}"
+        );
+    }
+}
+
 /// Read the single `.eml` file the file transport wrote into `dir`.
 fn read_only_eml(dir: &std::path::Path) -> String {
     let entry = std::fs::read_dir(dir)

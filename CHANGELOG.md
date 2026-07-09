@@ -113,8 +113,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its network/file stylesheet fetchers disabled — only embedded `<style>` CSS is
   inlined). `autumn generate mailer` now scaffolds a `<style>`-block template and
   a mailer that calls `.inline_css(true)`, demonstrating the happy path end to
-  end. On inliner failure a typed `MailError::CssInline` is surfaced and the
-  original body is preserved rather than delivered corrupted.
+  end. On inliner failure `send` fails loudly, returning a typed
+  `MailError::CssInline` instead of delivering a corrupted body — the message is
+  not sent, so the body is never silently corrupted.
 - **generator:** `autumn new` now generates a `README.md` at the project root
   (listed in the "Created …" output) with explicit prerequisites and a
   golden-path quickstart — configure the `[database]` block in `autumn.toml`
