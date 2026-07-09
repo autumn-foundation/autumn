@@ -53,7 +53,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use axum::body::{Body, Bytes};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use futures::{Stream, StreamExt as _};
 use serde_json::{Value, json};
@@ -926,10 +926,21 @@ async fn serve_mcp_get() -> Response {
 /// dispatch sees the same client identity a direct HTTP request would: the
 /// caller's headers, the proxy-resolved client identity, and the connection
 /// peer address (for the IP-keyed rate limiter).
+/// Header name for the `Server-Timing` response header (#1348), forwarded from
+/// the dispatch clone onto the rebuilt JSON-RPC response.
+static SERVER_TIMING: HeaderName = HeaderName::from_static("server-timing");
+
 struct ReplayContext<'a> {
     headers: &'a HeaderMap,
     identity: Option<&'a crate::security::ResolvedClientIdentity>,
     peer: Option<std::net::SocketAddr>,
+    /// The outer `/mcp` request's [`ServerTimingEmitted`] sentinel, planted by
+    /// the fallback `ServerTimingLayer` when `server_timing` is enabled. Used
+    /// by [`serve_tools_call`] to suppress the fallback's duplicate `total`
+    /// once it forwards the dispatch clone's `Server-Timing` header.
+    ///
+    /// [`ServerTimingEmitted`]: crate::middleware::ServerTimingEmitted
+    server_timing_sentinel: Option<&'a crate::middleware::ServerTimingEmitted>,
 }
 
 /// Reject an untrusted `Host`/`:authority` or a disallowed browser `Origin`
@@ -1008,10 +1019,17 @@ async fn serve_mcp(
     connect_info: Option<
         axum::extract::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>,
     >,
+    // The fallback `ServerTimingLayer` (applied in `apply_startup_barrier`)
+    // plants this sentinel in the request extensions when `server_timing` is
+    // enabled; absent otherwise. Threaded into `serve_tools_call` so it can
+    // suppress the fallback's duplicate `total` after forwarding the dispatch
+    // clone's `Server-Timing` header.
+    server_timing: Option<axum::extract::Extension<crate::middleware::ServerTimingEmitted>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     let identity = identity.as_ref().map(|ext| &ext.0);
+    let server_timing_sentinel = server_timing.as_ref().map(|ext| &ext.0);
 
     // Capture the request `Origin` (if any) so the actual JSON-RPC response can
     // carry the matching CORS grant, mirroring the `OPTIONS` preflight.
@@ -1041,6 +1059,7 @@ async fn serve_mcp(
         headers: &headers,
         identity,
         peer: connect_info.map(|ext| (ext.0).0),
+        server_timing_sentinel,
     };
 
     let mut response = match parsed {
@@ -1353,6 +1372,18 @@ async fn serve_tools_call(
         return stream_tool_result(id, &params, response, cookies);
     }
 
+    // Forward the dispatch clone's `Server-Timing` header (#1348) onto the
+    // rebuilt response. The clone runs the primary `ServerTimingLayer`, which
+    // builds the full metric set — including `db;dur;desc="N queries"` for a
+    // DB-backed tool — but that inner response is discarded when the JSON-RPC
+    // envelope is rebuilt below. Without this, a DB-backed `tools/call` would
+    // expose only the outer fallback's total-only header, losing the query
+    // count. Captured before the body is consumed, like `Set-Cookie` above.
+    let mut server_timings: Vec<HeaderValue> = Vec::new();
+    for value in response.headers().get_all(&SERVER_TIMING) {
+        server_timings.push(value.clone());
+    }
+
     // Unlike a normal HTTP response (streamed straight to the socket), the MCP
     // path buffers the whole body to repackage it as a tool result. Cap that
     // buffer so a runaway handler can't OOM the process; report an overflow as
@@ -1379,6 +1410,19 @@ async fn serve_tools_call(
     let mut resp = json_response(&value);
     for cookie in cookies {
         resp.headers_mut().append(header::SET_COOKIE, cookie);
+    }
+    if !server_timings.is_empty() {
+        for timing in server_timings {
+            resp.headers_mut().append(SERVER_TIMING.clone(), timing);
+        }
+        // Now that the inner `Server-Timing` is on the response, flip the outer
+        // sentinel so the fallback `ServerTimingLayer` does not append its own
+        // total-only header — a duplicate `total`. The dispatch replay ran on a
+        // fresh request that never carried this sentinel, so the primary inside
+        // it could not flip it; do it here explicitly.
+        if let Some(sentinel) = ctx.server_timing_sentinel {
+            sentinel.mark();
+        }
     }
     resp
 }

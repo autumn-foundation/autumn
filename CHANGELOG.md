@@ -30,7 +30,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `dev`/`development`, off everywhere else so prod never leaks timings to
   anonymous clients without explicit opt-in. `total` uses the identical
   clock formula as the access-log `duration_ms`; SSE
-  (`text/event-stream`) responses receive `total`-only. See
+  (`text/event-stream`) responses receive `total`-only. MCP `tools/call`
+  responses forward the dispatched handler's `Server-Timing` (including
+  `db;dur`) onto the `/mcp` response instead of exposing only the fallback's
+  `total`, so DB-backed tool calls surface their query count too. See
   `docs/guide/observability/server-timing.md`.
 - **ci:** README-quickstart gate against the published crates (issue #1586) —
   `.github/workflows/quickstart-gate.yml` + `scripts/check-quickstart.sh`

@@ -139,7 +139,15 @@ static SERVER_TIMING: HeaderName = HeaderName::from_static("server-timing");
 pub struct ServerTimingEmitted(Arc<AtomicBool>);
 
 impl ServerTimingEmitted {
-    fn mark(&self) {
+    /// Flip the sentinel so the outermost fallback layer stays silent.
+    ///
+    /// The primary layer calls this when it appends its header. The MCP
+    /// endpoint (`crate::mcp`) also calls it after forwarding the dispatch
+    /// clone's `Server-Timing` header onto the rebuilt JSON-RPC response, so
+    /// the fallback does not append a duplicate `total` — the inner dispatch
+    /// runs on a fresh request that never carried this outer sentinel, so the
+    /// primary inside it could not flip it.
+    pub(crate) fn mark(&self) {
         self.0.store(true, Ordering::Release);
     }
 
