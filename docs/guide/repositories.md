@@ -336,6 +336,10 @@ all-`NULL` group simply yields `(key, None)`.
   `.filter_eq(bucket_start)` would match only rows on the exact bucket boundary.
 - `.bucket(DateBucket::{Day, Week, Month})` — group by
   `date_trunc('<unit>', <col>)`, producing a time series keyed by bucket start.
+  This method is **only available when the group column is a timestamp type**
+  (`NaiveDateTime` or `DateTime<Utc>`); non-temporal group keys (e.g. an `i64`
+  `post_id`) have no `.bucket()` method, so an invalid `date_trunc` over a
+  non-timestamp column is a compile error rather than a runtime failure.
 
 ### Scoping comes for free
 

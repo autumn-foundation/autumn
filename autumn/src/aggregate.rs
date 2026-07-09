@@ -206,7 +206,7 @@ impl<'a, K, V> GroupedAggregate<'a, K, V> {
     /// Keep only rows whose group column equals `value`, applied **before**
     /// grouping (AC4). Bound as a query parameter.
     ///
-    /// The predicate is on the **raw** group column, even when [`bucket`](Self::bucket)
+    /// The predicate is on the **raw** group column, even when [`bucket`](GroupedAggregate::bucket)
     /// is set. Under a bucket, `filter_eq(bucket_start)` therefore matches only
     /// rows whose raw timestamp is *exactly* the bucket boundary, not the whole
     /// bucket — to window a bucketed time series you almost always want
@@ -222,21 +222,13 @@ impl<'a, K, V> GroupedAggregate<'a, K, V> {
     /// ranges too. Both bounds are bound as query parameters.
     ///
     /// Like [`filter_eq`](Self::filter_eq), the predicate is on the **raw** group
-    /// column even when [`bucket`](Self::bucket) is set. This is what you want
+    /// column even when [`bucket`](GroupedAggregate::bucket) is set. This is what you want
     /// for a bucketed time series: pass the raw timestamp window (e.g.
     /// `filter_range(window_start, window_end)`) to bound which rows feed the
     /// `date_trunc` buckets.
     #[must_use]
     pub fn filter_range(mut self, low: K, high: K) -> Self {
         self.opts.range = Some((low, high));
-        self
-    }
-
-    /// Group by `date_trunc('<unit>', <group_col>)` instead of the raw column,
-    /// producing a time series keyed by bucket start (AC5).
-    #[must_use]
-    pub const fn bucket(mut self, bucket: DateBucket) -> Self {
-        self.opts.bucket = Some(bucket);
         self
     }
 
@@ -257,5 +249,47 @@ impl<'a, K, V> GroupedAggregate<'a, K, V> {
     /// unsupported cross-shard aggregate merge.
     pub async fn load(self) -> AutumnResult<Vec<(K, V)>> {
         (self.exec)(self.opts).await
+    }
+}
+
+/// `.bucket()` is a compile-time-gated setter: it exists **only** when the group
+/// key `K` is a timestamp type, because it swaps the raw group column for
+/// `date_trunc('<unit>', <group_col>)`, whose result is always a `timestamp`.
+///
+/// Defining it on these key-specific impls (rather than the blanket
+/// `impl<'a, K, V>`) means a non-temporal key — e.g. an `i64` `post_id` from
+/// `count_grouped_by_post_id()` — has no `.bucket()` method at all, so an invalid
+/// `date_trunc(unit, bigint)` query is rejected by the type system instead of
+/// failing at runtime.
+///
+/// Only `NaiveDateTime` (`timestamp`) and `DateTime<Utc>` (`timestamptz`) are
+/// bucketable. `NaiveDate` (`date`) is intentionally excluded: Postgres
+/// `date_trunc(unit, date)` returns a `timestamp`, which would not match a
+/// `NaiveDate` result row.
+impl<V> GroupedAggregate<'_, ::chrono::NaiveDateTime, V> {
+    /// Group by `date_trunc('<unit>', <group_col>)` instead of the raw column,
+    /// producing a time series keyed by bucket start (AC5).
+    ///
+    /// Available **only** when the group column is a timestamp type
+    /// (`NaiveDateTime` / `DateTime<Utc>`); non-temporal group keys have no
+    /// `.bucket()` method.
+    #[must_use]
+    pub const fn bucket(mut self, bucket: DateBucket) -> Self {
+        self.opts.bucket = Some(bucket);
+        self
+    }
+}
+
+impl<V> GroupedAggregate<'_, ::chrono::DateTime<::chrono::Utc>, V> {
+    /// Group by `date_trunc('<unit>', <group_col>)` instead of the raw column,
+    /// producing a time series keyed by bucket start (AC5).
+    ///
+    /// Available **only** when the group column is a timestamp type
+    /// (`NaiveDateTime` / `DateTime<Utc>`); non-temporal group keys have no
+    /// `.bucket()` method.
+    #[must_use]
+    pub const fn bucket(mut self, bucket: DateBucket) -> Self {
+        self.opts.bucket = Some(bucket);
+        self
     }
 }
