@@ -67,16 +67,16 @@ tokio::task_local! {
 /// Per-request accumulator for database query timing, used by the
 /// `Server-Timing` middleware to surface `db;dur=…;desc="N queries"`.
 ///
-/// Populated by the [`RequestQueryTimer`] connection instrumentation
-/// installed at [`Db::checkout`], which fires on every diesel-async
-/// query (including the raw `.load()`/`.execute()` calls generated
-/// repositories run), whenever the task-local [`REQUEST_DB_TIMINGS`] is
-/// set (i.e. when the `ServerTimingLayer` has scoped the request). The
-/// connection instrumentation is the sole writer during a request — helpers
-/// like [`run_instrumented`] deliberately do *not* record here, to avoid
-/// double-counting the same statement. Absent otherwise — every write site
-/// uses `try_with`, so DB code paths are unaffected when the middleware is
-/// disabled.
+/// Populated by the [`RequestQueryTimer`] connection instrumentation, which
+/// [`Db::checkout`] installs on a checked-out connection only when this
+/// task-local is already scoped (i.e. when the `ServerTimingLayer` has scoped
+/// the request — see [`request_db_timing_active`]). Once installed it fires on
+/// every diesel-async query (including the raw `.load()`/`.execute()` calls
+/// generated repositories run). The connection instrumentation is the sole
+/// writer during a request — helpers like [`run_instrumented`] deliberately do
+/// *not* record here, to avoid double-counting the same statement. Absent
+/// otherwise — and when the middleware is disabled the timer is never installed
+/// in the first place, so opted-out requests carry zero per-query overhead.
 #[derive(Default, Debug)]
 pub(crate) struct RequestDbTimings {
     /// Total elapsed time across all DB queries for this request, in
@@ -107,11 +107,29 @@ pub(crate) fn record_request_db_query(elapsed: Duration) {
     });
 }
 
+/// Whether the current task is inside a [`REQUEST_DB_TIMINGS`] scope — i.e.
+/// whether the `ServerTimingLayer` (only active when `[observability]
+/// server_timing` is enabled) has wrapped this request's handler future.
+///
+/// Cheap: probes the task-local without cloning the `Arc`, allocating, or
+/// formatting anything. Used by [`Db::checkout`] to decide whether to install
+/// the [`RequestQueryTimer`] instrumentation at all — when no scope is active
+/// (the production default, `server_timing` unset), the timer is not installed,
+/// so opted-out requests pay zero per-query instrumentation overhead (no
+/// `DebugQuery` formatting on every statement).
+#[cfg(feature = "db")]
+pub(crate) fn request_db_timing_active() -> bool {
+    REQUEST_DB_TIMINGS.try_with(|_| ()).is_ok()
+}
+
 /// diesel-async [`Instrumentation`](diesel::connection::Instrumentation)
 /// that feeds every executed statement into the per-request
 /// [`REQUEST_DB_TIMINGS`] accumulator for the `Server-Timing` `db` metric.
 ///
-/// Installed on each pooled connection at [`Db::checkout`]. Because generated
+/// Installed on a pooled connection at [`Db::checkout`] only when a
+/// [`REQUEST_DB_TIMINGS`] scope is active (see [`request_db_timing_active`]),
+/// i.e. only for requests the `ServerTimingLayer` is measuring — so opted-out
+/// requests never install it and pay no per-query overhead. Because generated
 /// repositories run raw `diesel-async` `.load()`/`.execute()` (they do not go
 /// through [`run_instrumented`]), the connection-level instrumentation is the
 /// only thing that observes those queries. It brackets each statement between
@@ -1856,17 +1874,28 @@ impl Db {
                 AutumnError::service_unavailable_msg(format!("Database initialization error: {e}"))
             })?;
 
-        // Install the per-request query timer. Done AFTER the framework's own
-        // `SET statement_timeout` above so that housekeeping statement is not
-        // counted as an application query in the `Server-Timing` `db` metric.
-        // Records into the request-scoped accumulator via a task-local, so it
-        // is a no-op unless the `ServerTimingLayer` scoped this request.
-        // Replaces any prior instrumentation on the pooled connection (the
-        // framework installs none of its own elsewhere).
+        // Install the per-request query timer, but ONLY when this request is
+        // inside a `REQUEST_DB_TIMINGS` scope — i.e. when the `ServerTimingLayer`
+        // is active (`[observability] server_timing` enabled). `Db::checkout`
+        // runs inside the handler future the layer wraps, so the scope is
+        // present here exactly when the header will be emitted.
+        //
+        // When `server_timing` is disabled (the production default) the scope is
+        // absent, so we install nothing: connections then run with zero added
+        // per-query overhead. This avoids paying the instrumentation's
+        // `DebugQuery` formatting/allocation on every statement for a header that
+        // would never be emitted.
+        //
+        // Done AFTER the framework's own `SET statement_timeout` above so that
+        // housekeeping statement is not counted as an application query in the
+        // `Server-Timing` `db` metric. Replaces any prior instrumentation on the
+        // pooled connection (the framework installs none of its own elsewhere).
         #[cfg(feature = "db")]
         {
             use diesel_async::AsyncConnection as _;
-            conn.set_instrumentation(RequestQueryTimer::default());
+            if request_db_timing_active() {
+                conn.set_instrumentation(RequestQueryTimer::default());
+            }
         }
 
         let start_time = std::time::Instant::now();
@@ -2208,6 +2237,46 @@ mod tests {
         timer.on_start(t0, "SELECT 1");
         // Must not panic even though no task-local accumulator is scoped.
         timer.on_finish(t0 + Duration::from_micros(500));
+    }
+
+    /// `request_db_timing_active` — the gate `Db::checkout` uses to decide
+    /// whether to install the `RequestQueryTimer` at all — must report `false`
+    /// outside a `REQUEST_DB_TIMINGS` scope (the production / `server_timing`
+    /// disabled default) and `true` inside one (the `ServerTimingLayer`-scoped
+    /// request). This is what keeps opted-out requests from paying the
+    /// per-query `DebugQuery` formatting overhead: with the gate `false`,
+    /// checkout installs no instrumentation.
+    ///
+    /// NOTE: the real `Db::checkout` path needs a live Postgres connection,
+    /// which the sandbox cannot provide, so this exercises the gating predicate
+    /// directly. The guard at the `set_instrumentation` call site is a plain
+    /// `if request_db_timing_active()`, so this fully covers the branch
+    /// decision.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn request_db_timing_active_reflects_scope() {
+        assert!(
+            !request_db_timing_active(),
+            "no REQUEST_DB_TIMINGS scope active outside the ServerTimingLayer: \
+             checkout must NOT install the timer"
+        );
+
+        let timings = Arc::new(RequestDbTimings::default());
+        REQUEST_DB_TIMINGS
+            .scope(Arc::clone(&timings), async {
+                assert!(
+                    request_db_timing_active(),
+                    "inside a REQUEST_DB_TIMINGS scope the gate is active: \
+                     checkout installs the timer"
+                );
+            })
+            .await;
+
+        // Scope has ended; the gate reads false again.
+        assert!(
+            !request_db_timing_active(),
+            "the gate is false again once the scope is dropped"
+        );
     }
 
     /// A transaction wraps its inner statements in `BEGIN`/`COMMIT`, which

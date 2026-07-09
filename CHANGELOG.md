@@ -552,6 +552,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **observability:** `Server-Timing` no longer installs the per-request DB
+  query timer on checked-out connections when `[observability] server_timing`
+  is disabled (the production default). Previously every checked-out connection
+  received the instrumentation unconditionally, so each query paid a full
+  `DebugQuery` SQL formatting/allocation on its `StartQuery` event before the
+  no-op accumulator write discovered no request scope was active. `Db::checkout`
+  now probes the request-scoped task-local (`request_db_timing_active`) and
+  installs the timer only when the `Server-Timing` layer has scoped the request,
+  so opted-out requests carry zero per-query instrumentation overhead. When
+  enabled, behaviour (`db;dur`/query count) is unchanged (issue #1348).
 - **views:** vendored the full Idiomorph 0.3.0 morphing script (replacing a
   minimal stub) so live `hx-ext="morph"` updates actually DOM-morph, and
   patched its htmx extension so non-morph out-of-band swaps (e.g.
