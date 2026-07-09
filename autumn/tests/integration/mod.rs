@@ -42,6 +42,8 @@ mod custom_layer;
 mod db_telemetry_tests;
 #[cfg(feature = "db")]
 mod directory_shard_router;
+#[cfg(feature = "db")]
+mod distributed_lock;
 mod download;
 mod duplicate_route_detection;
 #[cfg(all(feature = "embed-assets", feature = "i18n"))]
