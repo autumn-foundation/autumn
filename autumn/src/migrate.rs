@@ -896,6 +896,62 @@ where
     Ok(())
 }
 
+/// Delete the recorded checksum row for a single version — the inverse of
+/// [`record_checksum`].
+///
+/// Called after a migration is rolled back (`autumn migrate down`) so the
+/// invariant "a row exists in `autumn_migration_checksums` for a version
+/// \u{21D4} that version is currently applied, and its hash matches the
+/// currently-applied bytes" is restored. Without this, the row from the
+/// *previous* application survives the rollback, and a later re-apply of an
+/// edited `up.sql` records nothing new (the additive [`record_checksums`] path
+/// skips versions that already have a row), leaving a stale hash that only
+/// trips a validate on some *later* migrate run.
+///
+/// [`ensure_checksum_table`] runs first (consistent with the other helpers,
+/// and safe/idempotent under autocommit). Idempotent: deleting an absent row
+/// is a no-op.
+///
+/// # Errors
+///
+/// Returns [`MigrationError::Migration`] on any database error.
+pub fn delete_checksum<C>(conn: &mut C, version: &str) -> Result<(), MigrationError>
+where
+    C: diesel::connection::LoadConnection<Backend = Pg>,
+{
+    ensure_checksum_table(conn)?;
+    diesel::sql_query("DELETE FROM autumn_migration_checksums WHERE version = $1")
+        .bind::<diesel::sql_types::Text, _>(version)
+        .execute(conn)
+        .map_err(|e| MigrationError::Migration(e.to_string()))?;
+    Ok(())
+}
+
+/// Delete the recorded checksum rows for several versions at once (bulk form of
+/// [`delete_checksum`]). Returns the number of rows actually removed.
+///
+/// [`ensure_checksum_table`] runs first; an empty `versions` slice is a no-op
+/// that returns `0`. Idempotent — versions with no recorded row are simply not
+/// counted.
+///
+/// # Errors
+///
+/// Returns [`MigrationError::Migration`] on any database error.
+pub fn delete_checksums<C>(conn: &mut C, versions: &[String]) -> Result<usize, MigrationError>
+where
+    C: diesel::connection::LoadConnection<Backend = Pg>,
+{
+    ensure_checksum_table(conn)?;
+    let mut deleted = 0usize;
+    for version in versions {
+        deleted += diesel::sql_query("DELETE FROM autumn_migration_checksums WHERE version = $1")
+            .bind::<diesel::sql_types::Text, _>(version)
+            .execute(conn)
+            .map_err(|e| MigrationError::Migration(e.to_string()))?;
+    }
+    Ok(deleted)
+}
+
 /// Record checksums for every applied version that has a resolvable `up.sql`
 /// and no existing recorded checksum. Idempotent: existing rows are left
 /// untouched.
@@ -1306,6 +1362,26 @@ where
                 conn.revert_migration(migration.as_ref())
                     .map_err(|e| MigrationError::Migration(e.to_string()))?;
                 let duration = started.elapsed();
+
+                // This version is no longer applied, so its recorded checksum
+                // row must go: reverting exactly this migration removes it from
+                // `__diesel_schema_migrations`, and `version` is the same key
+                // the row was recorded under. Deleting it restores the "row
+                // exists \u{21D4} version applied with matching bytes" invariant
+                // so a later re-apply of an edited `up.sql` records the NEW hash
+                // instead of leaving the stale one behind (issue #1203 review).
+                // Best-effort: the schema revert has already committed, so a
+                // failure to delete only warns — a subsequent `autumn migrate
+                // baseline` or re-apply reconciles it.
+                if let Err(e) = delete_checksum(&mut *conn, version) {
+                    tracing::warn!(
+                        version = %version,
+                        error = %e,
+                        "Rolled back migration but could not clear its recorded content \
+                         checksum; a later migrate may report drift for this version until \
+                         it is re-applied or re-baselined"
+                    );
+                }
 
                 on_reverted(&RevertedMigration {
                     version: version.clone(),
@@ -2382,6 +2458,53 @@ mod tests {
             matches!(&drift, MigrationError::Migration(m) if m.contains("checksum mismatch") && m.contains(&version)),
             "run_pending_locked_inner must validate checksums inside the locked section: {drift:?}"
         );
+
+        // ── Step 9: rollback clears the checksum, re-apply records fresh ────
+        // Reproduces the PR review's P2: down + edit up.sql + re-apply must NOT
+        // leave a stale hash. Simulate `autumn migrate down` for `version` the
+        // same way the wired revert path does — remove it from
+        // `__diesel_schema_migrations` and call `delete_checksums` — then prove
+        // its checksum row is gone (so the version is neither applied nor
+        // recorded → no drift), that re-applying an EDITED up.sql records the
+        // NEW hash (not the stale one), and that a subsequent validate passes.
+        diesel::sql_query("DELETE FROM __diesel_schema_migrations WHERE version = $1")
+            .bind::<diesel::sql_types::Text, _>(&version)
+            .execute(&mut conn)
+            .expect("simulate down: remove applied version");
+        let deleted = delete_checksums(&mut conn, std::slice::from_ref(&version))
+            .expect("delete_checksums must succeed");
+        assert_eq!(
+            deleted, 1,
+            "the reverted version's checksum row must be deleted"
+        );
+        let recorded = recorded_checksums(&mut conn).expect("read recorded checksums");
+        assert!(
+            !recorded.contains_key(&version),
+            "after rollback the reverted version must have NO recorded checksum"
+        );
+
+        // Re-apply the EDITED up.sql: re-record the applied version and record
+        // checksums from the edited content. The additive `record_checksums`
+        // now writes a fresh row (the stale one was deleted on rollback) whose
+        // hash matches the edited bytes.
+        diesel::sql_query("INSERT INTO __diesel_schema_migrations (version) VALUES ($1)")
+            .bind::<diesel::sql_types::Text, _>(&version)
+            .execute(&mut conn)
+            .expect("re-apply: re-record applied version");
+        let newly = record_checksums(&mut conn, &applied, &edited_by_version)
+            .expect("record_checksums after re-apply");
+        assert_eq!(
+            newly, 1,
+            "re-apply after rollback must record a fresh checksum for the reverted version"
+        );
+        let recorded = recorded_checksums(&mut conn).expect("read recorded checksums");
+        assert_eq!(
+            recorded.get(&version).map(String::as_str),
+            Some(actual_hash.as_str()),
+            "re-apply must record the EDITED content's hash, not the stale original"
+        );
+        validate_checksums(&applied, &edited_by_version, &recorded)
+            .expect("edited content validates Ok after rollback + fresh re-apply");
     }
 
     // ── Existing tests ─────────────────────────────────────────────────────

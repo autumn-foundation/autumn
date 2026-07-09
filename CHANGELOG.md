@@ -40,7 +40,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hashes for legacy applied migrations that pre-date the checksum table
   (idempotent, additive); `autumn migrate baseline --force <version>`
   overwrites one version's stored hash — the deliberate escape hatch,
-  WARN-logged. See `docs/guide/migrations.md`.
+  WARN-logged. Rolling a migration back (`autumn migrate down`) now clears its
+  recorded checksum, so a reverted migration can be re-applied cleanly —
+  including with changed contents — instead of leaving a stale hash that would
+  trip the drift guard on a later run. See `docs/guide/migrations.md`.
 - **ci:** README-quickstart gate against the published crates (issue #1586) —
   `.github/workflows/quickstart-gate.yml` + `scripts/check-quickstart.sh`
   install the README-pinned `autumn-cli` from crates.io (never the local

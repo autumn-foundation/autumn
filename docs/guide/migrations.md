@@ -206,6 +206,14 @@ on-disk hash. It is logged at `WARN` so the change is unambiguous in deploy
 logs. Never the default — the `--force <version>` flag is the deliberate
 signal that you understand the consequences.
 
+### Rolling a migration back clears its checksum
+
+Rolling a migration back (`autumn migrate down`) clears its recorded checksum,
+so it can be re-applied cleanly — including with changed contents. Because the
+version is no longer applied, editing its `up.sql` and re-running `autumn
+migrate` records the new content's hash from scratch rather than tripping the
+drift guard on a stale one.
+
 ### Checking status
 
 `autumn migrate status` reports each applied migration's checksum state:
