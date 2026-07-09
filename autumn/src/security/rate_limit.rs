@@ -1033,10 +1033,32 @@ pub fn __throttle_registry_reset() {
 
 fn build_throttle_limiter(
     global: &RateLimitConfig,
+    trusted_proxies: &TrustedProxiesConfig,
+    registry_key: &str,
     limit: u32,
     per_secs: u64,
     key: KeyStrategy,
 ) -> Arc<Limiter> {
+    // On the Redis backend every per-route limiter shares one connection and,
+    // by default, the single `redis.key_prefix`; the bucket key handed to
+    // `decide()` is only the client-derived value (ip/token/principal). Without
+    // namespacing, inline throttles, named throttles, and the global limiter for
+    // the same client all collide on one Redis bucket, breaking per-route
+    // isolation across replicas. Fold the `registry_key` (route:<id> or
+    // named:<name>) into the prefix so each route/name — and the global limiter,
+    // which keeps the bare prefix — lands in its own keyspace. The in-memory
+    // backend already isolates by allocating a fresh `MemoryStore` per `Limiter`,
+    // so `registry_key` is only consumed on the Redis path (memory keys never
+    // include the prefix).
+    #[cfg(not(feature = "redis"))]
+    let _ = registry_key;
+    #[cfg(feature = "redis")]
+    let redis = {
+        let mut redis = global.redis.clone();
+        redis.key_prefix = format!("{}:{}", redis.key_prefix, registry_key);
+        redis
+    };
+
     // Rebuild a fresh RateLimitConfig with the same backend/failure/redis
     // settings as the global limiter, then override the rate and burst.
     let cfg = RateLimitConfig {
@@ -1050,11 +1072,29 @@ fn build_throttle_limiter(
         named: std::collections::HashMap::new(),
         backend: global.backend,
         #[cfg(feature = "redis")]
-        redis: global.redis.clone(),
+        redis,
         #[cfg(feature = "redis")]
         on_backend_failure: global.on_backend_failure,
     };
-    Arc::new(Limiter::from_config(&cfg))
+
+    // Match the client-IP resolution the global tower layer uses (see
+    // `apply_rate_limit_middleware` in router.rs): prefer the shared top-level
+    // `[security.trusted_proxies]` resolver, but only when the legacy
+    // `security.rate_limit.*` proxy fields aren't set, so an operator's explicit
+    // legacy config still wins. Without this, `#[throttle(key = "ip")]` behind an
+    // ALB/CDN would key on the proxy peer instead of the real client.
+    let has_top_level_proxy_config = trusted_proxies.trust_forwarded_headers
+        || !trusted_proxies.ranges.is_empty()
+        || trusted_proxies.trusted_hops.is_some();
+    let has_rate_limit_proxy_config =
+        global.trust_forwarded_headers || !global.trusted_proxies.is_empty();
+    let top_level_resolver = if has_top_level_proxy_config && !has_rate_limit_proxy_config {
+        Some(ProxyResolver::from_config(trusted_proxies))
+    } else {
+        None
+    };
+
+    Arc::new(Limiter::from_config_with_resolver(&cfg, top_level_resolver))
 }
 
 /// Steady-state refill rate for a throttle limiter: `limit` tokens per
@@ -1221,6 +1261,7 @@ pub async fn __check_throttle(
 
     let config = state.config();
     let rl_config = &config.security.rate_limit;
+    let trusted_proxies = &config.security.trusted_proxies;
 
     let Some((limit, per_secs, key_strategy, registry_key)) =
         resolve_throttle_params(route_id, &spec, rl_config)
@@ -1229,15 +1270,21 @@ pub async fn __check_throttle(
         return Ok(());
     };
 
-    let limiter =
-        {
-            let mut reg = throttle_registry()
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            Arc::clone(reg.entry(registry_key).or_insert_with(|| {
-                build_throttle_limiter(rl_config, limit, per_secs, key_strategy)
-            }))
-        };
+    let limiter = {
+        let mut reg = throttle_registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Arc::clone(reg.entry(registry_key.clone()).or_insert_with(|| {
+            build_throttle_limiter(
+                rl_config,
+                trusted_proxies,
+                &registry_key,
+                limit,
+                per_secs,
+                key_strategy,
+            )
+        }))
+    };
 
     let Some(bucket_key) = extract_throttle_key(&limiter, headers, peer, principal) else {
         // In-process caller with no identifiable peer (SSG, tests without
@@ -2119,6 +2166,116 @@ mod tests {
         };
         let limiter = Limiter::from_config(&config);
         assert!(matches!(limiter.backend, BucketBackend::Memory(_)));
+    }
+
+    // ── #[throttle] per-route limiter construction (bugs #1350) ────────────────
+
+    /// Bug 1: on the shared Redis backend the per-route bucket must be namespaced
+    /// by route/name so distinct routes — and the global limiter — never collide.
+    #[cfg(feature = "redis")]
+    #[tokio::test]
+    async fn throttle_limiter_namespaces_redis_key_prefix_by_route() {
+        // Building a lazy Redis `ConnectionManager` requires a Tokio reactor, so
+        // this runs on `#[tokio::test]` even though no request is issued — the
+        // assertions only inspect the composed `key_prefix`.
+        use super::super::config::{
+            RateLimitBackend, RateLimitBackendFailure, RateLimitRedisConfig,
+        };
+
+        fn redis_prefix(limiter: &Limiter) -> String {
+            match &limiter.backend {
+                BucketBackend::Redis(store) => store.key_prefix.clone(),
+                BucketBackend::Memory(_) => panic!("expected Redis backend"),
+            }
+        }
+
+        let global = RateLimitConfig {
+            enabled: true,
+            requests_per_second: 100.0,
+            burst: 100,
+            backend: RateLimitBackend::Redis,
+            redis: RateLimitRedisConfig {
+                // A valid URL builds a *lazy* connection manager without dialing,
+                // so we get a real RedisStore whose key_prefix we can inspect.
+                url: Some("redis://127.0.0.1/".to_owned()),
+                key_prefix: "app:rl".to_owned(),
+            },
+            on_backend_failure: RateLimitBackendFailure::FailOpen,
+            ..Default::default()
+        };
+        let tp = TrustedProxiesConfig::default();
+
+        let route_a = build_throttle_limiter(&global, &tp, "route:a", 5, 60, KeyStrategy::Ip);
+        let route_b = build_throttle_limiter(&global, &tp, "route:b", 5, 60, KeyStrategy::Ip);
+        let named = build_throttle_limiter(&global, &tp, "named:login", 5, 60, KeyStrategy::Ip);
+        let global_limiter = Limiter::from_config(&global);
+
+        // (i) two different routes for the same client → different Redis keyspace.
+        assert_ne!(redis_prefix(&route_a), redis_prefix(&route_b));
+        // (ii) a throttled route and the global limiter → different Redis keyspace.
+        assert_ne!(redis_prefix(&route_a), redis_prefix(&global_limiter));
+        assert_ne!(redis_prefix(&named), redis_prefix(&global_limiter));
+        // The route namespace is folded under the shared global prefix.
+        assert_eq!(redis_prefix(&route_a), "app:rl:route:a");
+        assert_eq!(redis_prefix(&route_b), "app:rl:route:b");
+        assert_eq!(redis_prefix(&named), "app:rl:named:login");
+        // The global limiter keeps the bare prefix.
+        assert_eq!(redis_prefix(&global_limiter), "app:rl");
+    }
+
+    /// Bug 2: when the app configures the recommended top-level
+    /// `[security.trusted_proxies]` (and no legacy `security.rate_limit.*` proxy
+    /// fields), `#[throttle(key = "ip")]` must resolve the real forwarded client
+    /// IP — the same resolver the global tower layer uses — not the proxy peer.
+    #[test]
+    fn throttle_limiter_uses_top_level_trusted_proxies_resolver() {
+        let global = RateLimitConfig {
+            enabled: true,
+            requests_per_second: 10.0,
+            burst: 5,
+            // Legacy rate-limit proxy fields intentionally unset.
+            trust_forwarded_headers: false,
+            trusted_proxies: Vec::new(),
+            ..Default::default()
+        };
+        let tp = TrustedProxiesConfig {
+            ranges: Vec::new(),
+            trusted_hops: Some(1),
+            trust_forwarded_headers: true,
+        };
+        let limiter = build_throttle_limiter(&global, &tp, "route:x", 5, 60, KeyStrategy::Ip);
+
+        // XFF: real client, then one proxy hop; the TCP peer is the load balancer.
+        let req = req_with_connect_info("1.1.1.1, 2.2.2.2", "9.9.9.9:4000");
+        // trusted_hops = 1 peels the LB, leaving the real client. Under the bug
+        // (legacy-only resolver) this would key on the peer 9.9.9.9 instead.
+        assert_eq!(limiter.extract_key(&req).as_deref(), Some("1.1.1.1"));
+    }
+
+    /// Bug 2 precedence: an explicit legacy `security.rate_limit.*` proxy config
+    /// still wins over the top-level resolver, matching the global tower layer.
+    #[test]
+    fn throttle_limiter_prefers_legacy_rate_limit_proxy_config() {
+        let global = RateLimitConfig {
+            enabled: true,
+            requests_per_second: 10.0,
+            burst: 5,
+            // Legacy field set → legacy resolver takes precedence.
+            trust_forwarded_headers: true,
+            trusted_proxies: Vec::new(),
+            ..Default::default()
+        };
+        let tp = TrustedProxiesConfig {
+            ranges: Vec::new(),
+            trusted_hops: Some(1),
+            trust_forwarded_headers: true,
+        };
+        let limiter = build_throttle_limiter(&global, &tp, "route:y", 5, 60, KeyStrategy::Ip);
+
+        let req = req_with_connect_info("1.1.1.1, 2.2.2.2", "9.9.9.9:4000");
+        // Legacy resolver (trust_forwarded_headers = true, no hops/ranges) uses
+        // the rightmost forwarded entry, not the hop-peeled top-level result.
+        assert_eq!(limiter.extract_key(&req).as_deref(), Some("2.2.2.2"));
     }
 
     #[test]
