@@ -174,6 +174,68 @@ Autumn's `304` responses follow RFC 7232 §4.1:
 - **Headers preserved**: `ETag`, `Last-Modified`, `Cache-Control`, `Vary`, `Content-Location`.
 - **Headers stripped**: `Set-Cookie` (default, to avoid stale auth state on intermediaries).
 
+## `Cache-Control` freshness — `cache_for`
+
+`fresh_when` handles *revalidation* — deciding whether a cached copy is still valid. `Cache-Control` handles *freshness* — telling caches how long a copy may be reused **before** they bother to revalidate. `cache_for(duration)` builds the header declaratively:
+
+```rust
+use autumn_web::etag::cache_for;
+use autumn_web::prelude::*;
+use std::time::Duration;
+
+#[get("/pricing")]
+async fn pricing() -> impl IntoResponse {
+    // Tuple form: attaches "Cache-Control: public, max-age=300" to the body.
+    (cache_for(Duration::from_secs(300)).public(), html! { h1 { "Pricing" } })
+}
+```
+
+It composes as a tuple with any body (via `IntoResponseParts`), or call `.wrap(body)` for a single expression. Either way the header is **inserted** (never appended), so a response carries exactly one `Cache-Control` value.
+
+The builder covers the common directives:
+
+| Method | Directive | Meaning |
+|--------|-----------|---------|
+| `public()` | `public` | Any cache — browser **and** shared/CDN — may store it (explicit opt-in) |
+| `private()` | `private` | Browser cache only (the **default**) |
+| `max_age(d)` | `max-age=N` | Freshness lifetime for every cache, including the browser |
+| `s_maxage(d)` | `s-maxage=N` | Freshness lifetime for **shared** caches only; overrides `max-age` there |
+| `stale_while_revalidate(d)` | `stale-while-revalidate=N` | Serve stale for up to N s while revalidating in the background |
+| `no_store()` | `no-store` | Forbid storage entirely (overrides all freshness directives) |
+| `no_cache()` | `no-cache` | May store but must revalidate before reuse |
+| `must_revalidate()` | `must-revalidate` | Once stale, MUST revalidate; no serving stale on origin failure |
+| `immutable()` | `immutable` | Body won't change over its lifetime; skip revalidation on reload |
+
+### `max-age` vs `s-maxage`
+
+`max-age` is the lifetime for **every** cache, the end-user's browser included. `s-maxage` overrides it **only for shared caches** (CDNs, reverse proxies). Use both to let a CDN hold a page longer than the browser:
+
+```rust
+// Browser keeps it fresh 1 min; the CDN serves it for 10.
+cache_for(Duration::from_secs(60)).public().s_maxage(Duration::from_secs(600))
+// → "public, max-age=60, s-maxage=600"
+```
+
+### `Vary` and personalized responses
+
+A `public` response may be handed by a **shared** cache to *any* client. Never mark a page that embeds per-user state (a signed-in username, a cart, CSRF-bound markup) `public` without also setting a matching `Vary` header (e.g. `Vary: Cookie`) so the shared cache keys separate variants per user. When in doubt keep it `private` or `no_store` — a shared cache must never serve one user's page to another.
+
+### Default-private safety
+
+`cache_for(..)` defaults to `private`; `public` is an explicit opt-in. Dropping `cache_for(..)` onto a secured / authenticated handler can therefore never *silently* publish that page to a shared cache — you have to ask for `public` on purpose.
+
+### Composing with `fresh_when`
+
+`fresh_when` and `cache_for` are complementary and compose in one expression. The freshness directives ride along on both the `200` and the `304`:
+
+```rust
+Ok(fresh_when(&headers, post.etag())
+    .or(cache_for(Duration::from_secs(60)).public().wrap(html! { h1 { (post.title) } })))
+```
+
+- **Stale** → `200 OK` with the `ETag` **and** a single `Cache-Control: public, max-age=60`.
+- **Fresh** → `304 Not Modified` carrying the same single `Cache-Control` (preserved per RFC 7232 §4.1).
+
 ## Composing with `#[cached]`
 
 `fresh_when` and `#[cached]` compose cleanly — they target different layers:

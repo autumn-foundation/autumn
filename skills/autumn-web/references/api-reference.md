@@ -540,6 +540,39 @@ Endpoint builders:
   full `200` feed. See `docs/guide/conditional-get.md`. The `blog` example
   wires a `/feed.xml` route this way.
 
+## Cache-Control freshness (`etag::cache_for` / `CacheControl`)
+
+Declarative per-handler `Cache-Control` header (unreleased — issue #1344).
+While `fresh_when` handles *revalidation* (is a cached copy still valid?),
+`cache_for` handles *freshness* (how long may a copy be reused before
+revalidating?). Both are re-exported from the prelude.
+
+- `etag::cache_for(ttl: Duration) -> CacheControl` — starts a directive with
+  `max-age=ttl`, defaulting to `private`.
+- Attach it two ways: as a tuple with any body via `IntoResponseParts` —
+  `(cache_for(dur).public(), html!{ … })` — or `CacheControl::wrap(response)`
+  for a single expression. Either way the header is **inserted** (replacing any
+  prior value), so exactly one `Cache-Control` is emitted.
+- Chainable directives: `public()` / `private()`, `max_age(d)`, `s_maxage(d)`,
+  `stale_while_revalidate(d)`, `no_store()`, `no_cache()`, `must_revalidate()`,
+  `immutable()`. Durations render as whole seconds.
+- `CacheControl::header_value() -> String` renders the deterministic,
+  byte-for-byte value. Ordering: `no-store` alone if set, otherwise visibility,
+  `no-cache`, `max-age`, `s-maxage`, `stale-while-revalidate`,
+  `must-revalidate`, `immutable`.
+- **`max-age` vs `s-maxage`**: `max-age` applies to every cache (browser
+  included); `s-maxage` overrides it for **shared** caches (CDN/proxy) only.
+- **`Vary`**: only mark a personalized page `public` alongside a matching
+  `Vary` (e.g. `Vary: Cookie`) so a shared cache never serves one user's page
+  to another — otherwise keep it `private`/`no_store`.
+- **Default-private safety**: `public` is an explicit opt-in, so dropping
+  `cache_for(..)` onto a secured/authenticated handler can't silently publish
+  it to a shared cache.
+- Composes with `fresh_when`:
+  `fresh_when(&headers, etag).or(cache_for(dur).public().wrap(markup))` — the
+  freshness directives ride the `200` and the preserved `304`. See
+  `docs/guide/conditional-get.md`.
+
 ## Config layering and env keys
 
 Layering order, lowest to highest:
