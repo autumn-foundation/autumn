@@ -340,6 +340,13 @@ all-`NULL` group simply yields `(key, None)`.
   (`NaiveDateTime` or `DateTime<Utc>`); non-temporal group keys (e.g. an `i64`
   `post_id`) have no `.bucket()` method, so an invalid `date_trunc` over a
   non-timestamp column is a compile error rather than a runtime failure.
+  The truncation zone follows the key type: a `NaiveDateTime`
+  (`timestamp WITHOUT time zone`) bucket truncates on the **stored wall-clock**
+  value (a deterministic field truncation, independent of the session
+  `TimeZone`), while a `DateTime<Utc>` (`timestamptz`) bucket is computed **in
+  UTC** — the generated SQL uses `date_trunc('<unit>', <col>, 'UTC')` so bucket
+  boundaries stay stable across deployments regardless of the DB session zone,
+  consistent with the `DateTime<Utc>` key type.
 
 ### Scoping comes for free
 

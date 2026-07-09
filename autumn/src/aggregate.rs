@@ -273,6 +273,11 @@ impl<V> GroupedAggregate<'_, ::chrono::NaiveDateTime, V> {
     /// Available **only** when the group column is a timestamp type
     /// (`NaiveDateTime` / `DateTime<Utc>`); non-temporal group keys have no
     /// `.bucket()` method.
+    ///
+    /// For a `NaiveDateTime` (Postgres `timestamp WITHOUT time zone`) key the
+    /// bucket truncates on the **stored wall-clock** value: `date_trunc` on a
+    /// plain `timestamp` is a deterministic field truncation that ignores the
+    /// session `TimeZone`, so buckets are stable regardless of deployment.
     #[must_use]
     pub const fn bucket(mut self, bucket: DateBucket) -> Self {
         self.opts.bucket = Some(bucket);
@@ -287,6 +292,14 @@ impl<V> GroupedAggregate<'_, ::chrono::DateTime<::chrono::Utc>, V> {
     /// Available **only** when the group column is a timestamp type
     /// (`NaiveDateTime` / `DateTime<Utc>`); non-temporal group keys have no
     /// `.bucket()` method.
+    ///
+    /// For a `DateTime<Utc>` (Postgres `timestamptz`) key the bucket is
+    /// computed **in UTC** — the generated SQL uses the 3-arg
+    /// `date_trunc('<unit>', <col>, 'UTC')`, consistent with the `DateTime<Utc>`
+    /// key type. Truncating in an explicit zone keeps bucket boundaries stable
+    /// across deployments; the 2-arg form would truncate in the DB session
+    /// `TimeZone`, so a non-UTC session would shift UTC-midnight events into the
+    /// wrong local-date bucket (#1364).
     #[must_use]
     pub const fn bucket(mut self, bucket: DateBucket) -> Self {
         self.opts.bucket = Some(bucket);

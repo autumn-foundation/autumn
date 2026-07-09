@@ -534,6 +534,17 @@ fn type_is_option_of(ty: &syn::Type, inner_ident: &str) -> bool {
     option_inner_type(ty).is_some_and(|inner| type_is_bare_ident(inner, inner_ident))
 }
 
+/// True if `ty`'s final path segment identifier is `ident`, ignoring any
+/// generic arguments — so it matches both `DateTime` and `DateTime<Utc>`. Used
+/// to detect a `timestamptz` group key (`DateTime<Utc>`) so `.bucket()`
+/// truncation can be pinned to UTC (#1364).
+fn type_last_segment_is(ty: &syn::Type, ident: &str) -> bool {
+    let syn::Type::Path(p) = ty else {
+        return false;
+    };
+    p.path.segments.last().is_some_and(|s| s.ident == ident)
+}
+
 /// Map a supported Rust type to its diesel `sql_types` path token, threading
 /// `Option<T>` to `Nullable<…>`. Returns `None` for unsupported types.
 fn diesel_sql_type_for(ty: &syn::Type) -> Option<TokenStream> {
@@ -8483,6 +8494,15 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             let value_sql_type = &spec.value_sql_type;
             let agg_expr = &spec.agg_sql_expr;
             let group_col_q = format!("\"{}\"", spec.group_col);
+            // #1364 timezone correctness: only a `timestamptz` (`DateTime<Utc>`)
+            // bucket key gets the UTC-pinning 3-arg `date_trunc` zone argument.
+            // A `NaiveDateTime` (`timestamp`) key keeps the plain 2-arg form
+            // (deterministic field truncation, session-tz independent).
+            let bucket_zone_arg: &str = if type_last_segment_is(key_type, "DateTime") {
+                ", 'UTC'"
+            } else {
+                ""
+            };
             let doc = format!(
                 "Grouped aggregate `{fn_ident}` → lazy `GroupedAggregate<'_, K, V>` builder (issue #1364).\n\n\
                  Chain `.order_by_aggregate_desc()`/`.limit(n)` for top-N, \
@@ -8515,11 +8535,20 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 }
 
                                 // Group expression: bucketed (date_trunc) or the raw column.
+                                // For a `timestamptz` (`DateTime<Utc>`) key, `#bucket_zone_arg`
+                                // is `, 'UTC'` so the 3-arg `date_trunc('unit', col, 'UTC')`
+                                // (Postgres 12+) truncates in UTC — otherwise the 2-arg form
+                                // would truncate in the DB session `TimeZone`, drifting bucket
+                                // boundaries across deployments (#1364). For a `NaiveDateTime`
+                                // (`timestamp`) key it is empty, keeping the deterministic
+                                // 2-arg field truncation. SELECT and GROUP BY reuse this same
+                                // string, so the bucket expression always matches exactly.
                                 let __group_expr: ::std::string::String = match __opts.bucket {
                                     ::core::option::Option::Some(__b) => format!(
-                                        "date_trunc('{unit}', {col})",
+                                        "date_trunc('{unit}', {col}{zone})",
                                         unit = __b.as_trunc_unit(),
                                         col = #group_col_q,
+                                        zone = #bucket_zone_arg,
                                     ),
                                     ::core::option::Option::None => ::std::string::String::from(#group_col_q),
                                 };
@@ -12122,6 +12151,71 @@ mod tests {
             generated.matches("IS NOT NULL").count(),
             1,
             "grouped aggregate must emit exactly one `IS NOT NULL` group-key guard: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_grouped_bucket_timestamptz_key_truncates_in_utc() {
+        // §1364 timezone correctness: a `DateTime<Utc>` (Postgres `timestamptz`)
+        // bucket key must truncate in an explicit UTC zone via the 3-arg
+        // `date_trunc('unit', col, 'UTC')` form (Postgres 12+). The 2-arg form
+        // would truncate in the DB session `TimeZone`, drifting bucket
+        // boundaries across deployments even though the API exposes UTC.
+        let generated = repository_macro(
+            quote! { Event, table = "events" },
+            quote! {
+                pub trait EventRepository {
+                    fn count_grouped_by_created_at() -> Vec<(::chrono::DateTime<::chrono::Utc>, i64)>;
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("pub fn count_grouped_by_created_at"),
+            "grouped-aggregate method must be generated: {generated}"
+        );
+        // The emitted bucket expression pins truncation to UTC.
+        assert!(
+            generated.contains("date_trunc('{unit}', {col}{zone})"),
+            "bucket expression must be built from the parameterized template: {generated}"
+        );
+        assert!(
+            generated.contains("\", 'UTC'\""),
+            "timestamptz bucket key must supply the UTC zone argument so \
+             date_trunc truncates in UTC (#1364): {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_grouped_bucket_timestamp_key_has_no_zone() {
+        // A `NaiveDateTime` (Postgres `timestamp WITHOUT time zone`) bucket key
+        // is a deterministic field truncation, so it keeps the plain 2-arg
+        // `date_trunc('unit', col)` with an EMPTY zone argument — no `'UTC'`.
+        let generated = repository_macro(
+            quote! { Event, table = "events" },
+            quote! {
+                pub trait EventRepository {
+                    fn count_grouped_by_created_at() -> Vec<(::chrono::NaiveDateTime, i64)>;
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("pub fn count_grouped_by_created_at"),
+            "grouped-aggregate method must be generated: {generated}"
+        );
+        // Still built from the same parameterized bucket template …
+        assert!(
+            generated.contains("date_trunc('{unit}', {col}{zone})"),
+            "bucket expression must be built from the parameterized template: {generated}"
+        );
+        // … but with an empty zone argument, so no `'UTC'` is ever added.
+        assert!(
+            !generated.contains("'UTC'"),
+            "timestamp bucket key must NOT pin truncation to UTC — it is a \
+             deterministic field truncation (#1364): {generated}"
         );
     }
 
