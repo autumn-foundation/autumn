@@ -94,6 +94,9 @@ pub use crate::htmx::{HtmxFragments, OobSwap};
 /// Trait for live-broadcasting model fragments via `#[repository(Model, broadcasts = "topic")]`.
 #[cfg(all(feature = "htmx", feature = "maud"))]
 pub use crate::live::LiveFragment;
+/// Named, cluster-wide distributed lock for run-once-across-replicas work.
+#[cfg(feature = "db")]
+pub use crate::lock::{Lock, LockError, LockGuard};
 /// Transactional email types and extractor.
 #[cfg(feature = "mail")]
 pub use crate::mail::{

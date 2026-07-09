@@ -265,6 +265,7 @@ pub mod htmx;
 /// `ws`, `maud`, and `htmx` features.
 #[cfg(all(feature = "htmx", feature = "maud"))]
 pub mod live;
+pub mod lock;
 pub mod log;
 pub(crate) mod logging;
 /// Project typed JSON endpoints as Model Context Protocol (MCP) tools so AI

@@ -231,6 +231,21 @@ optional `.distributed_fill_lock(true)` / `.stale_while_revalidate(grace)`.
   `enqueue_tracked_for`, `TrackedJobHandle`, optional third `JobContext`
   handler arg, `GET /_autumn/jobs/{token}`, `jobs.tracking.*` config).
 
+## Distributed locks (unreleased — trunk-dev)
+
+- `autumn_web::lock::Lock` (prelude: `Lock`, `LockGuard`, `LockError`; `db`
+  feature). Named, cluster-wide Postgres advisory lock for
+  run-once-across-replicas work.
+- Build: `Lock::new(pool, "name")`, `Lock::from_state(&state, "name")` (primary
+  pool), `.with_poll_interval(dur)`. Key helper: `distributed_lock_key(name) ->
+  i64` (namespaced under `DISTRIBUTED_LOCK_DOMAIN = "autumn:lock:v1"`).
+- Acquire: `try_lock() -> Option<LockGuard>`, `lock()`, `lock_timeout(dur)`
+  (`LockError::Timeout`). Closures: `with(f)`, `with_timeout(dur, f)`,
+  `try_with(f) -> Option<T>`. Auto-releases on scope end / `?` / panic;
+  `LockGuard::release().await` releases explicitly. `LockError::PoolUnavailable`
+  / `Timeout` map to `503`.
+- Non-goals: not fair, not a lease, not row-level (`with_lock`), Postgres only.
+
 ## Auth additions
 
 - Published 0.5.0: `autumn generate auth` session management (`{user}_sessions`

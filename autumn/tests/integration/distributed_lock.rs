@@ -1,0 +1,240 @@
+//! Database-level integration tests for the app-facing distributed lock
+//! (`autumn_web::lock::Lock`, issue #1387).
+//!
+//! These tests exercise real `PostgreSQL` advisory-lock semantics and therefore
+//! **require Docker** (testcontainers); they are `#[ignore]`d by default, in the
+//! same style as `repository_find_in_batches.rs`. The success metric from the
+//! issue — "with N concurrent nodes contending on the same lock name the guarded
+//! section executes on exactly one node at a time (no overlap, no leaked lock
+//! after a panicking section)" — is covered by
+//! `exactly_one_node_holds_at_a_time` and `panicking_section_does_not_leak`.
+
+#![cfg(feature = "db")]
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+
+use autumn_web::lock::{Lock, LockError};
+use diesel_async::AsyncPgConnection;
+use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+use diesel_async::pooled_connection::deadpool::Pool;
+use testcontainers::runners::AsyncRunner;
+use testcontainers_modules::postgres::Postgres;
+
+async fn setup_pool() -> (
+    Pool<AsyncPgConnection>,
+    testcontainers::ContainerAsync<Postgres>,
+) {
+    let container = Postgres::default()
+        .start()
+        .await
+        .expect("failed to start postgres container");
+
+    let host = container.get_host().await.expect("host");
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+
+    // Enough connections for several concurrently-held locks plus contenders.
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(&url);
+    let pool = Pool::builder(manager).max_size(16).build().expect("pool");
+    (pool, container)
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn try_lock_is_exclusive_and_reacquirable() {
+    let (pool, _container) = setup_pool().await;
+    let lock = Lock::new(pool.clone(), "test-exclusive");
+
+    let guard = lock
+        .try_lock()
+        .await
+        .expect("first try_lock should not error")
+        .expect("first try_lock should acquire");
+
+    // A second, independent handle on the same name must not acquire.
+    let other = Lock::new(pool.clone(), "test-exclusive");
+    assert!(
+        other
+            .try_lock()
+            .await
+            .expect("second try_lock should not error")
+            .is_none(),
+        "the lock must stay exclusive while held"
+    );
+
+    guard.release().await.expect("release should succeed");
+
+    // After release the lock is available again.
+    let reacquired = other.try_lock().await.expect("reacquire should not error");
+    assert!(
+        reacquired.is_some(),
+        "the lock must be available again after release"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn distinct_names_do_not_contend() {
+    let (pool, _container) = setup_pool().await;
+    let a = Lock::new(pool.clone(), "test-name-a");
+    let b = Lock::new(pool.clone(), "test-name-b");
+
+    let ga = a.try_lock().await.expect("a").expect("a acquires");
+    let gb = b
+        .try_lock()
+        .await
+        .expect("b")
+        .expect("b acquires despite a");
+
+    ga.release().await.expect("release a");
+    gb.release().await.expect("release b");
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn with_auto_releases_after_section() {
+    let (pool, _container) = setup_pool().await;
+    let lock = Lock::new(pool.clone(), "test-with-release");
+
+    let out = lock
+        .with(|| async { 21 * 2 })
+        .await
+        .expect("with should acquire");
+    assert_eq!(out, 42);
+
+    // The lock must be free immediately after `with` returns.
+    let again = lock.try_lock().await.expect("post-with try_lock");
+    assert!(again.is_some(), "with must release the lock on return");
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn try_with_returns_none_when_held() {
+    let (pool, _container) = setup_pool().await;
+    let lock = Lock::new(pool.clone(), "test-try-with");
+
+    let held = lock.lock().await.expect("blocking acquire");
+
+    let ran = Arc::new(AtomicUsize::new(0));
+    let ran_clone = Arc::clone(&ran);
+    let result: Option<()> = lock
+        .try_with(|| async move {
+            ran_clone.fetch_add(1, Ordering::SeqCst);
+        })
+        .await
+        .expect("try_with should not error");
+    assert!(result.is_none(), "try_with must not run while lock is held");
+    assert_eq!(ran.load(Ordering::SeqCst), 0, "closure must not have run");
+
+    held.release().await.expect("release");
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn lock_timeout_expires_when_held() {
+    let (pool, _container) = setup_pool().await;
+    let lock =
+        Lock::new(pool.clone(), "test-timeout").with_poll_interval(Duration::from_millis(20));
+
+    let held = lock.lock().await.expect("first acquire");
+
+    let err = lock
+        .lock_timeout(Duration::from_millis(120))
+        .await
+        .expect_err("should time out while lock is held");
+    assert!(
+        matches!(err, LockError::Timeout { .. }),
+        "expected a Timeout error, got {err:?}"
+    );
+
+    held.release().await.expect("release");
+
+    // Once released, the timed acquire succeeds.
+    let g = lock
+        .lock_timeout(Duration::from_millis(500))
+        .await
+        .expect("acquire after release");
+    g.release().await.expect("cleanup release");
+}
+
+/// Success metric: N concurrent nodes contending on the same lock name execute
+/// the guarded section one at a time — the in-section counter is never > 1.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn exactly_one_node_holds_at_a_time() {
+    const NODES: usize = 8;
+
+    let (pool, _container) = setup_pool().await;
+
+    let in_section = Arc::new(AtomicUsize::new(0));
+    let max_seen = Arc::new(AtomicUsize::new(0));
+    let ran = Arc::new(AtomicUsize::new(0));
+
+    let mut handles = Vec::new();
+    for _ in 0..NODES {
+        let lock = Lock::new(pool.clone(), "test-mutual-exclusion");
+        let in_section = Arc::clone(&in_section);
+        let max_seen = Arc::clone(&max_seen);
+        let ran = Arc::clone(&ran);
+        handles.push(tokio::spawn(async move {
+            lock.with(|| async move {
+                let now = in_section.fetch_add(1, Ordering::SeqCst) + 1;
+                max_seen.fetch_max(now, Ordering::SeqCst);
+                // Hold the section briefly so overlap would be observable.
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                in_section.fetch_sub(1, Ordering::SeqCst);
+                ran.fetch_add(1, Ordering::SeqCst);
+            })
+            .await
+            .expect("each node should eventually acquire");
+        }));
+    }
+
+    for h in handles {
+        h.await.expect("node task should not panic");
+    }
+
+    assert_eq!(
+        ran.load(Ordering::SeqCst),
+        NODES,
+        "every node must run once"
+    );
+    assert_eq!(
+        max_seen.load(Ordering::SeqCst),
+        1,
+        "at most one node may be in the guarded section at a time"
+    );
+}
+
+/// A panicking guarded section must not leak the lock: the next contender can
+/// still acquire it.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn panicking_section_does_not_leak() {
+    let (pool, _container) = setup_pool().await;
+    let lock = Lock::new(pool.clone(), "test-panic-release");
+
+    let lock_for_panic = lock.clone();
+    let joined = tokio::spawn(async move {
+        lock_for_panic
+            .with(|| async {
+                panic!("boom inside the guarded section");
+            })
+            .await
+            .expect("acquire before panic")
+    })
+    .await;
+    assert!(joined.is_err(), "the guarded section should have panicked");
+
+    // Despite the panic, the lock must be free again.
+    let guard = lock
+        .try_lock()
+        .await
+        .expect("post-panic try_lock should not error");
+    assert!(
+        guard.is_some(),
+        "a panic in the guarded section must not leak the lock"
+    );
+}

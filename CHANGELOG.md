@@ -21,6 +21,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `BlobStore::get_stream` without buffering the whole object in memory, so it
   serves large private files behind a `#[secured]` handler with no public
   presigned URL (#1141).
+- **lock:** app-facing distributed lock for run-once-across-replicas work
+  (issue #1387) — `autumn_web::lock::Lock` promotes the Postgres advisory-lock
+  machinery that already gates migrations, `#[scheduled]` leader election, and
+  ISR revalidation into a small, safe public API. `Lock::new(pool, "name")`
+  (or `Lock::from_state(&state, "name")`) hashes the name to a stable,
+  collision-namespaced 64-bit key (kept out of the scheduler/migration/ISR/
+  repository keyspaces via a `"autumn:lock:v1"` domain prefix, see
+  `distributed_lock_key`) and offers both a blocking `lock` / `lock_timeout`
+  (typed `LockError::Timeout` on expiry) and a non-blocking `try_lock`
+  (returns `None` immediately when another node holds it), plus `with` /
+  `with_timeout` / `try_with` closure wrappers that auto-release the lock when
+  the guarded section ends — on normal return, an early `?`, or a panic. The
+  lock-bearing connection is detached from the pool while held and its session
+  is closed on release, so a recycled lock-bearing connection can never leak
+  the lock. The `bookmarks-distributed` link-checker was rewritten onto the
+  primitive, deleting its hand-rolled `pg_try_advisory_lock` /
+  `pg_advisory_unlock` raw SQL. `Lock`, `LockGuard`, and `LockError` are
+  re-exported from the prelude. See `docs/guide/distributed-locks.md` and
+  `docs/adr/0010-app-facing-distributed-lock.md`.
 - **ci:** README-quickstart gate against the published crates (issue #1586) —
   `.github/workflows/quickstart-gate.yml` + `scripts/check-quickstart.sh`
   install the README-pinned `autumn-cli` from crates.io (never the local

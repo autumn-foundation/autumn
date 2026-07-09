@@ -601,6 +601,32 @@ can fan out without inline coupling: `#[event]` on a struct, publish via the
 register with `.listeners(listeners![...])`. Do not also list durable
 listeners in `jobs![...]`. See `docs/guide/events.md`.
 
+## Distributed locks (unreleased — trunk-dev)
+
+For "run this exactly once across replicas right now" work (nightly cleanup,
+cache warming, one-shot backfills, "send the daily digest once"), use
+`autumn_web::lock::Lock` (re-exported from the prelude) instead of hand-rolling
+`pg_try_advisory_lock` raw SQL. It is the same Postgres advisory-lock machinery
+that already gates migrations, `#[scheduled]` leader election, and ISR.
+
+- Build: `Lock::from_state(&state, "name")?` (primary pool) or
+  `Lock::new(pool, "name")`. Names hash to a stable, namespaced 64-bit key via
+  `distributed_lock_key` (a `"autumn:lock:v1"` domain prefix keeps app keys out
+  of the scheduler/migration/ISR/repository keyspaces).
+- Acquire: `try_lock()` → `Option<LockGuard>` (non-blocking, `None` when held
+  elsewhere); `lock()` blocks; `lock_timeout(dur)` blocks with a typed
+  `LockError::Timeout`.
+- Run-and-release closures: `with(f)` / `with_timeout(dur, f)` (blocking) and
+  `try_with(f)` → `Option<T>` (skips when held). The lock auto-releases when the
+  section ends — normal return, early `?`, or panic — and the lock-bearing
+  connection is never recycled to the pool while held, so it cannot leak.
+- Non-goals: not fair (no FIFO), not a lease (no heartbeat — use the scheduler
+  for long-lived leader election), not row-level (use `with_lock`), Postgres
+  only.
+
+See `docs/guide/distributed-locks.md` and
+`docs/adr/0010-app-facing-distributed-lock.md`.
+
 ## File storage and cache plugins
 
 For local or pluggable file storage:
