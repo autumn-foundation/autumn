@@ -157,3 +157,188 @@ fn is_trusted_proxy(ip: IpAddr, trusted_proxies: &[TrustedProxy]) -> bool {
         .iter()
         .any(|trusted_proxy| trusted_proxy.contains(ip))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_trusted_proxy_valid_ipv4_no_prefix() {
+        let proxy = TrustedProxy::parse("192.168.1.1").unwrap();
+        assert_eq!(proxy.network, "192.168.1.1".parse::<IpAddr>().unwrap());
+        assert_eq!(proxy.prefix_len, 32);
+    }
+
+    #[test]
+    fn parse_trusted_proxy_valid_ipv6_no_prefix() {
+        let proxy = TrustedProxy::parse("2001:db8::1").unwrap();
+        assert_eq!(proxy.network, "2001:db8::1".parse::<IpAddr>().unwrap());
+        assert_eq!(proxy.prefix_len, 128);
+    }
+
+    #[test]
+    fn parse_trusted_proxy_valid_ipv4_with_prefix() {
+        let proxy = TrustedProxy::parse("10.0.0.0/8").unwrap();
+        assert_eq!(proxy.network, "10.0.0.0".parse::<IpAddr>().unwrap());
+        assert_eq!(proxy.prefix_len, 8);
+    }
+
+    #[test]
+    fn parse_trusted_proxy_valid_ipv6_with_prefix() {
+        let proxy = TrustedProxy::parse("2001:db8::/32").unwrap();
+        assert_eq!(proxy.network, "2001:db8::".parse::<IpAddr>().unwrap());
+        assert_eq!(proxy.prefix_len, 32);
+    }
+
+    #[test]
+    fn parse_trusted_proxy_invalid_ip() {
+        assert!(TrustedProxy::parse("not.an.ip").is_none());
+        assert!(TrustedProxy::parse("256.256.256.256").is_none());
+    }
+
+    #[test]
+    fn parse_trusted_proxy_invalid_prefix() {
+        assert!(TrustedProxy::parse("192.168.1.1/33").is_none());
+        assert!(TrustedProxy::parse("2001:db8::/129").is_none());
+        assert!(TrustedProxy::parse("192.168.1.1/abc").is_none());
+    }
+
+    #[test]
+    fn parse_trusted_proxy_empty_or_whitespace() {
+        assert!(TrustedProxy::parse("").is_none());
+        assert!(TrustedProxy::parse("   ").is_none());
+    }
+
+    #[test]
+    fn contains_ipv4_exact_match() {
+        let proxy = TrustedProxy::parse("192.168.1.1").unwrap();
+        assert!(proxy.contains("192.168.1.1".parse().unwrap()));
+        assert!(!proxy.contains("192.168.1.2".parse().unwrap()));
+    }
+
+    #[test]
+    fn contains_ipv6_exact_match() {
+        let proxy = TrustedProxy::parse("2001:db8::1").unwrap();
+        assert!(proxy.contains("2001:db8::1".parse().unwrap()));
+        assert!(!proxy.contains("2001:db8::2".parse().unwrap()));
+    }
+
+    #[test]
+    fn contains_ipv4_cidr() {
+        let proxy = TrustedProxy::parse("10.0.0.0/8").unwrap();
+        assert!(proxy.contains("10.1.2.3".parse().unwrap()));
+        assert!(proxy.contains("10.255.255.255".parse().unwrap()));
+        assert!(!proxy.contains("11.0.0.0".parse().unwrap()));
+    }
+
+    #[test]
+    fn contains_ipv6_cidr() {
+        let proxy = TrustedProxy::parse("2001:db8::/32").unwrap();
+        assert!(proxy.contains("2001:db8:1234::1".parse().unwrap()));
+        assert!(!proxy.contains("2001:db9::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn contains_zero_prefix() {
+        let proxy4 = TrustedProxy::parse("0.0.0.0/0").unwrap();
+        assert!(proxy4.contains("1.2.3.4".parse().unwrap()));
+        assert!(proxy4.contains("255.255.255.255".parse().unwrap()));
+        assert!(!proxy4.contains("2001:db8::1".parse().unwrap())); // Mismatched family
+
+        let proxy6 = TrustedProxy::parse("::/0").unwrap();
+        assert!(proxy6.contains("2001:db8::1".parse().unwrap()));
+        assert!(proxy6.contains("::1".parse().unwrap()));
+        assert!(!proxy6.contains("1.2.3.4".parse().unwrap())); // Mismatched family
+    }
+
+    #[test]
+    fn contains_mismatched_family() {
+        let proxy4 = TrustedProxy::parse("192.168.1.0/24").unwrap();
+        assert!(!proxy4.contains("2001:db8::1".parse().unwrap()));
+
+        let proxy6 = TrustedProxy::parse("2001:db8::/32").unwrap();
+        assert!(!proxy6.contains("192.168.1.1".parse().unwrap()));
+    }
+
+    fn make_req_with_peer(ip: &str) -> Request<()> {
+        let mut req = Request::new(());
+        let addr = format!("{ip}:12345").parse::<SocketAddr>().unwrap();
+        req.extensions_mut().insert(ConnectInfo(addr));
+        req
+    }
+
+    #[test]
+    fn extract_ip_no_forwarded_headers_trust_disabled() {
+        let req = make_req_with_peer("192.168.1.1");
+        let ip = extract_client_ip(&req, false, &[], false);
+        assert_eq!(ip, Some("192.168.1.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn extract_ip_no_forwarded_headers_trust_enabled() {
+        let req = make_req_with_peer("192.168.1.1");
+        let ip = extract_client_ip(&req, true, &[], false);
+        assert_eq!(ip, Some("192.168.1.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn extract_ip_xff_untrusted_proxy() {
+        let mut req = make_req_with_peer("192.168.1.1");
+        req.headers_mut()
+            .insert("x-forwarded-for", "1.2.3.4".parse().unwrap());
+
+        // proxy 192.168.1.1 is NOT in the trusted list, so XFF is ignored
+        let trusted = vec![TrustedProxy::parse("10.0.0.0/8").unwrap()];
+        let ip = extract_client_ip(&req, true, &trusted, true);
+        assert_eq!(ip, Some("192.168.1.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn extract_ip_xff_trusted_proxy() {
+        let mut req = make_req_with_peer("10.0.0.1");
+        req.headers_mut()
+            .insert("x-forwarded-for", "1.2.3.4".parse().unwrap());
+
+        // proxy 10.0.0.1 IS in the trusted list, so XFF is respected
+        let trusted = vec![TrustedProxy::parse("10.0.0.0/8").unwrap()];
+        let ip = extract_client_ip(&req, true, &trusted, true);
+        assert_eq!(ip, Some("1.2.3.4".parse().unwrap()));
+    }
+
+    #[test]
+    fn extract_ip_xff_chain_trust_configured() {
+        let mut req = make_req_with_peer("10.0.0.1");
+        req.headers_mut()
+            .insert("x-forwarded-for", "1.2.3.4, 10.0.0.2".parse().unwrap());
+
+        let trusted = vec![TrustedProxy::parse("10.0.0.0/8").unwrap()];
+        // Peer (10.0.0.1) is trusted.
+        // Last XFF (10.0.0.2) is trusted.
+        // Second to last XFF (1.2.3.4) is NOT trusted. It's the client.
+        let ip = extract_client_ip(&req, true, &trusted, true);
+        assert_eq!(ip, Some("1.2.3.4".parse().unwrap()));
+    }
+
+    #[test]
+    fn extract_ip_xff_chain_trust_not_configured() {
+        let mut req = make_req_with_peer("10.0.0.1");
+        req.headers_mut()
+            .insert("x-forwarded-for", "1.2.3.4, 10.0.0.1".parse().unwrap());
+
+        // If trusted proxies are not explicitly configured, we only trust the peer IP
+        // to have appended its own address, so we take the second to last.
+        let ip = extract_client_ip(&req, true, &[], false);
+        assert_eq!(ip, Some("1.2.3.4".parse().unwrap()));
+    }
+
+    #[test]
+    fn extract_ip_x_real_ip_trusted() {
+        let mut req = make_req_with_peer("10.0.0.1");
+        req.headers_mut()
+            .insert("x-real-ip", "1.2.3.4".parse().unwrap());
+
+        let trusted = vec![TrustedProxy::parse("10.0.0.0/8").unwrap()];
+        let ip = extract_client_ip(&req, true, &trusted, true);
+        assert_eq!(ip, Some("1.2.3.4".parse().unwrap()));
+    }
+}
