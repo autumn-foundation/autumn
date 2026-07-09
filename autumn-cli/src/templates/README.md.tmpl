@@ -47,6 +47,11 @@ before running it — open `autumn.toml`, uncomment the `[database]` block, and 
 url = "postgres://postgres:postgres@localhost:5432/{{crate_name}}"
 ```
 
+> Prefer environment variables? Instead of editing `autumn.toml`, copy
+> `.env.example` to `.env` (gitignored) and set `AUTUMN_DATABASE__URL` there.
+> `autumn dev` auto-loads `.env` in the dev/test profiles; real shell
+> environment variables always win over `.env` values.
+
 Don't have a Postgres to point at? Start a throwaway local instance with Docker.
 This matches the `url` above (user and password `postgres`, database
 `{{crate_name}}`), so the two line up with no extra edits. The `-d` flag runs it

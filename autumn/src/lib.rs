@@ -88,6 +88,7 @@ pub mod config;
 pub mod credentials;
 #[cfg(feature = "db")]
 pub mod db;
+pub mod dotenv;
 pub mod download;
 pub mod encryption;
 pub mod error;

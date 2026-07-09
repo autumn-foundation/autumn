@@ -120,6 +120,11 @@ pub fn run(
 
     match action {
         MigrateAction::Check => {
+            // `check` is an offline, SQL-only preflight that needs no database
+            // URL, so it must NOT parse `.env`. Resolving the overlay here would
+            // let a malformed/unreadable local `.env` abort the check (breaking
+            // offline / CI safety checks), so the `.env` overlay is built lazily
+            // only in the database-backed paths below.
             let migrations_dir = resolve_migrations_dir();
             run_safety_check(&migrations_dir);
             return;
@@ -135,10 +140,16 @@ pub fn run(
         _ => {}
     }
 
+    // Overlay a project-root `.env` UNDER the real environment for DB-URL
+    // resolution, without mutating the process environment. A real env var of
+    // the same key always wins; a malformed `.env` fails loudly here. Built only
+    // now — after the non-DB early returns — so `migrate check` never reads it.
+    let env = os_env_with_dotenv_or_exit();
+
     // 1. Resolve migration target databases from autumn.toml (+ profile
     //    overlay) + env.  The merged config table is returned so that
     //    resolve_startup_wait can reuse it without a second filesystem read.
-    let (targets, config_table) = resolve_targets(target, profile);
+    let (targets, config_table) = resolve_targets(target, profile, &env);
 
     // 2. Resolve migrations directory
     let migrations_dir = resolve_migrations_dir();
@@ -175,6 +186,23 @@ pub fn run(
     }
 }
 
+/// Build the real OS environment overlaid with a project-root `.env`, exiting
+/// loudly (`exit(1)`) if a `.env` file exists but is malformed or unreadable.
+///
+/// Called only from the database-backed migrate actions (the main `run` flow,
+/// `run_down`, and `run_baseline`), right before each `resolve_targets` — so a
+/// broken local `.env` fails only where a DB URL is actually resolved, never for
+/// the offline `migrate check` preflight.
+fn os_env_with_dotenv_or_exit() -> autumn_web::dotenv::DotenvOsEnv {
+    match autumn_web::dotenv::os_env_with_dotenv() {
+        Ok(env) => env,
+        Err(e) => {
+            eprintln!("  \u{274C} .env: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
 /// Resolve the `(label, database_url)` pairs the command operates on,
 /// in apply order (control first, then shards in declaration order).
 ///
@@ -183,6 +211,7 @@ pub fn run(
 fn resolve_targets(
     target: &MigrateTarget,
     profile: Option<&str>,
+    env: &dyn autumn_web::config::Env,
 ) -> (Vec<(String, String)>, Option<toml::Table>) {
     // Read autumn.toml once, deep-merging the `autumn-<profile>.toml` overlay
     // when a profile is selected, so control and shard URLs both resolve from
@@ -192,12 +221,15 @@ fn resolve_targets(
     // When no profile is given explicitly (via `--profile` / `AUTUMN_PROFILE`),
     // fall back to `AUTUMN_ENV` — the framework's preferred profile selector —
     // so `autumn migrate` resolves the same overlay the app itself would use.
+    //
+    // `env` overlays a project-root `.env` under the real environment, so a
+    // `.env`-provided DB URL is honored while a real env var still wins.
     let effective = effective_profile(profile);
     let config_table = read_autumn_toml_table_with_profile(Some(&effective));
     let control =
-        resolve_primary_database_url_from_sources(|key| std::env::var(key), config_table.as_ref());
+        resolve_primary_database_url_from_sources(|key| env.var(key), config_table.as_ref());
     let shards =
-        resolve_shard_database_urls_from_sources(|key| std::env::var(key), config_table.as_ref());
+        resolve_shard_database_urls_from_sources(|key| env.var(key), config_table.as_ref());
     match build_targets(control, shards, target) {
         Ok(targets) => (targets, config_table),
         Err(message) => {
@@ -536,7 +568,10 @@ fn record_checksums_after_apply(database_url: &str, migrations_dir: &std::path::
 /// so a concurrent `autumn migrate down` cannot revert a version between the
 /// read and the write (issue #1203 review).
 fn run_baseline(args: &BaselineArgs, target: &MigrateTarget, profile: Option<&str>) {
-    let (targets, _) = resolve_targets(target, profile);
+    // Overlay `.env` under the real environment only now that we are about to
+    // resolve a DB URL (a malformed `.env` fails loudly here).
+    let env = os_env_with_dotenv_or_exit();
+    let (targets, _) = resolve_targets(target, profile, &env);
     let migrations_dir = resolve_migrations_dir();
     let dir = std::path::Path::new(&migrations_dir);
 
@@ -963,9 +998,18 @@ fn deep_merge_toml(base: &mut toml::Table, overlay: toml::Table) {
 /// Returns `None` when no URL can be resolved, leaving the caller to decide how
 /// to report the failure (the `autumn db` commands surface their own message).
 pub fn resolve_primary_url(profile: Option<&str>) -> Option<String> {
+    use autumn_web::config::Env as _;
+
     let effective = effective_profile(profile);
     let config_table = read_autumn_toml_table_with_profile(Some(&effective));
-    resolve_primary_database_url_from_sources(|key| std::env::var(key), config_table.as_ref())
+    // Overlay a project-root `.env` UNDER the real environment so a
+    // `.env`-provided AUTUMN_DATABASE__* / DATABASE_URL is honored for the
+    // `autumn db` lifecycle commands (create/drop/reset) and `db pull`, exactly
+    // as `autumn migrate` resolves its target URLs via `resolve_targets`. A real
+    // env var of the same key still wins; a malformed `.env` fails loudly here
+    // (with a `path:line` location), where a DB URL is actually needed.
+    let env = os_env_with_dotenv_or_exit();
+    resolve_primary_database_url_from_sources(|key| env.var(key), config_table.as_ref())
 }
 
 pub fn resolve_primary_database_url_from_sources<F>(
@@ -1353,8 +1397,11 @@ fn run_down(
 
     // 2. Resolve target databases (control + shards / a single shard /
     //    control-only) and the migrations dir. `down` honors --shard /
-    //    --control-only exactly like `migrate run`.
-    let (targets, _) = resolve_targets(target, profile);
+    //    --control-only exactly like `migrate run`. Overlay `.env` under the
+    //    real environment only now that we are about to resolve a DB URL (a
+    //    malformed `.env` fails loudly here).
+    let env = os_env_with_dotenv_or_exit();
+    let (targets, _) = resolve_targets(target, profile, &env);
     let migrations_dir = resolve_migrations_dir();
     let dir = Path::new(&migrations_dir);
 

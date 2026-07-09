@@ -13,6 +13,17 @@
 //! An Autumn application runs with zero configuration -- every field
 //! has a sensible default value. Override only what you need.
 //!
+//! # Local-dev `.env` files
+//!
+//! A project-root `.env` file is a **local-dev feeder for the highest layer**
+//! (the `AUTUMN_*` env-var layer) -- it does *not* add a new precedence tier.
+//! Values parsed from `.env` populate env-layer keys that are still unset; a
+//! real environment variable of the same name always wins. Auto-loaded in the
+//! `dev` and `test` profiles and ignored in `prod` unless `AUTUMN_DOTENV=1`.
+//! Files load in order `.env` -> `.env.local` -> `.env.{profile}` ->
+//! `.env.{profile}.local`, and earlier files (and real env vars) win. See the
+//! [`dotenv`](crate::dotenv) module.
+//!
 //! # Profiles
 //!
 //! Profiles are resolved in precedence order:
@@ -286,6 +297,12 @@ pub(crate) fn resolve_profile(env: &dyn Env) -> String {
 }
 
 /// Resolve the raw profile selector value (before normalization).
+///
+/// The env-var keys consulted here (`AUTUMN_ENV`, `AUTUMN_PROFILE`,
+/// `AUTUMN_IS_DEBUG`) are the profile *selectors*; they are deliberately
+/// excluded from the `.env` overlay (see [`crate::dotenv`]'s
+/// `PROFILE_SELECTOR_KEYS`) so a `.env` file cannot switch the active profile.
+/// Keep the two lists in sync.
 fn resolve_profile_input(env: &dyn Env) -> String {
     // 1. Preferred env var
     if let Ok(profile) = env.var("AUTUMN_ENV") {
@@ -813,6 +830,10 @@ pub enum ConfigError {
     /// The credentials file exists but could not be decrypted.
     #[error("credentials error: {0}")]
     Credentials(String),
+
+    /// A project-root `.env` file exists but could not be read or parsed.
+    #[error("dotenv error: {0}")]
+    Dotenv(String),
 }
 
 /// Top-level framework configuration.
@@ -2274,7 +2295,23 @@ impl AutumnConfig {
     /// Panics if the internally-built TOML table fails to re-serialize
     /// (should never happen with well-formed profile defaults).
     pub fn load() -> Result<Self, ConfigError> {
-        Self::load_with_env(&OsEnv)
+        // Feed a project-root `.env` into the `AUTUMN_*` env layer before
+        // resolving config from the real environment. Rather than mutating the
+        // process environment, `.env` values are layered *under* the real
+        // environment via an overlay `Env`, so a real env var always wins. A
+        // malformed `.env` fails loudly here rather than silently skipping
+        // developer-provided values.
+        let base = OsEnv;
+        let profile = resolve_profile(&base);
+        // Resolve `.env` from the same base directory config uses for
+        // `autumn.toml` (AUTUMN_MANIFEST_DIR when set, else the process CWD),
+        // so a binary launched from outside its crate root reads the `.env`
+        // next to its config instead of the process working directory.
+        let dir = crate::dotenv::dotenv_base_dir(&base);
+        let vars = crate::dotenv::resolve_dotenv_vars(&dir, &profile, &base)
+            .map_err(|e| ConfigError::Dotenv(e.to_string()))?;
+        let env = crate::dotenv::DotenvEnv::new(&base, vars);
+        Self::load_with_env(&env)
     }
 
     /// Load configuration with profile-aware layering, using a provided
@@ -5268,7 +5305,24 @@ impl TomlEnvConfigLoader {
 
 impl ConfigLoader for TomlEnvConfigLoader {
     async fn load(&self) -> Result<AutumnConfig, ConfigError> {
-        AutumnConfig::load_with_env(&OsEnv)
+        // Feed a project-root `.env` into the `AUTUMN_*` env layer before
+        // resolving config from the real environment. Rather than mutating the
+        // process environment (unsound on a live multi-threaded runtime), `.env`
+        // values are layered *under* the real environment via an overlay `Env`,
+        // so a real env var always wins. The sync file IO in `resolve_dotenv_vars`
+        // is fine on the async path. A malformed `.env` fails loudly here rather
+        // than silently skipping developer-provided values.
+        let base = OsEnv;
+        let profile = resolve_profile(&base);
+        // Resolve `.env` from the same base directory config uses for
+        // `autumn.toml` (AUTUMN_MANIFEST_DIR when set, else the process CWD),
+        // so a binary launched from outside its crate root reads the `.env`
+        // next to its config instead of the process working directory.
+        let dir = crate::dotenv::dotenv_base_dir(&base);
+        let vars = crate::dotenv::resolve_dotenv_vars(&dir, &profile, &base)
+            .map_err(|e| ConfigError::Dotenv(e.to_string()))?;
+        let env = crate::dotenv::DotenvEnv::new(&base, vars);
+        AutumnConfig::load_with_env(&env)
     }
 }
 
