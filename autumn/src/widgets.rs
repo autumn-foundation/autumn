@@ -3086,12 +3086,37 @@ fn avatar_initials(name: &str) -> String {
     }
 }
 
-/// Deterministic background color for a name's initials badge, as an `hsl(...)`
-/// string. The same name always yields the same color across renders/machines.
+/// The deterministic avatar background-color palette. Each entry is a CSS class
+/// (backed by a rule in the widget stylesheet) rather than an inline color, so
+/// the per-name color survives a nonce-based Content-Security-Policy — which
+/// forbids inline `style` attributes (`style-src` gains a nonce and drops
+/// `'unsafe-inline'`; nonces cover `<style>` elements, not attribute styles).
 #[cfg(feature = "maud")]
-fn avatar_color(name: &str) -> String {
-    let hue = fnv1a_hash(name.trim()) % 360;
-    format!("hsl({hue}, 60%, 42%)")
+const AVATAR_PALETTE: [&str; 12] = [
+    "autumn-avatar--c0",
+    "autumn-avatar--c1",
+    "autumn-avatar--c2",
+    "autumn-avatar--c3",
+    "autumn-avatar--c4",
+    "autumn-avatar--c5",
+    "autumn-avatar--c6",
+    "autumn-avatar--c7",
+    "autumn-avatar--c8",
+    "autumn-avatar--c9",
+    "autumn-avatar--c10",
+    "autumn-avatar--c11",
+];
+
+/// Deterministic background-color class for a name's initials badge. The same
+/// name always yields the same class across renders/machines, and the color is
+/// applied via the stylesheet (no inline `style` attribute) so it is not
+/// stripped by a nonce-based CSP.
+#[cfg(feature = "maud")]
+fn avatar_palette_class(name: &str) -> &'static str {
+    // `% 12` (a literal) keeps the index in range without a truncating `usize`
+    // cast; the assertion keeps the literal in sync with the palette length.
+    const _: () = assert!(AVATAR_PALETTE.len() == 12);
+    AVATAR_PALETTE[(fnv1a_hash(name.trim()) % 12) as usize]
 }
 
 /// Render a person's avatar: an image when one is supplied, or a deterministic
@@ -3101,13 +3126,15 @@ fn avatar_color(name: &str) -> String {
 ///   from `name`, `loading="lazy"`, and square `width`/`height` for the chosen
 ///   size (no layout shift).
 /// * **Initials branch** — a square badge with 1–2 uppercase initials and a
-///   background color chosen deterministically from `name`, so the same person
-///   always gets the same color and there is never a broken-image request.
+///   background color chosen deterministically from `name` (via a stable
+///   `autumn-avatar--cN` palette class), so the same person always gets the
+///   same color and there is never a broken-image request.
 ///
 /// Both `name` and the image URL are HTML-escaped by Maud (no XSS via a crafted
 /// display name). All output carries `autumn-avatar*` classes backed by the
-/// framework stylesheet; the only inline style is the per-name background,
-/// exposed as the `--autumn-avatar-bg` custom property.
+/// framework stylesheet and emits **no inline `style` attribute** — the per-name
+/// color is a palette class, so it survives a nonce-based Content-Security-Policy
+/// that forbids inline styles.
 ///
 /// # Example
 ///
@@ -3153,13 +3180,13 @@ pub fn avatar(name: &str, config: &AvatarConfig<'_>) -> maud::Markup {
             }
         }
         _ => {
+            let palette = avatar_palette_class(name);
             let root = merge_class(
-                &format!("autumn-avatar autumn-avatar--initials {size_class}"),
+                &format!("autumn-avatar autumn-avatar--initials {size_class} {palette}"),
                 config.class,
             );
             maud::html! {
-                span class=(root) role="img" aria-label=(alt) title=(alt)
-                    style={ "--autumn-avatar-bg:" (avatar_color(name)) } {
+                span class=(root) role="img" aria-label=(alt) title=(alt) {
                     span class="autumn-avatar__initials" aria-hidden="true" { (avatar_initials(name)) }
                 }
             }

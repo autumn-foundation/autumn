@@ -82,37 +82,65 @@ fn empty_or_whitespace_name_uses_placeholder_glyph() {
 
 // ── determinism ──────────────────────────────────────────────────────────────
 
+/// Extract the deterministic `autumn-avatar--cN` palette class from the markup.
+fn palette_class(name: &str) -> String {
+    let s = avatar(name, &AvatarConfig::new()).into_string();
+    let start = s
+        .find("autumn-avatar--c")
+        .expect("initials avatar has a palette class");
+    let rest = &s[start..];
+    let end = rest.find([' ', '"']).unwrap_or(rest.len());
+    rest[..end].to_string()
+}
+
 #[test]
 fn same_name_yields_same_color_across_renders() {
     let a = avatar("Ada Lovelace", &AvatarConfig::new()).into_string();
     let b = avatar("Ada Lovelace", &AvatarConfig::new()).into_string();
     assert_eq!(a, b, "same name must render identically");
-    assert!(
-        a.contains("--autumn-avatar-bg:hsl("),
-        "inline custom property: {a}"
-    );
+    // The color is a stable palette class (not an inline style).
+    assert_eq!(palette_class("Ada Lovelace"), palette_class("Ada Lovelace"));
+    assert!(a.contains("autumn-avatar--c"), "palette class present: {a}");
 }
 
 #[test]
 fn different_names_get_distinct_colors() {
-    let bg = |name: &str| {
-        let s = avatar(name, &AvatarConfig::new()).into_string();
-        let start = s.find("--autumn-avatar-bg:").unwrap();
-        let rest = &s[start..];
-        let end = rest.find('"').unwrap();
-        rest[..end].to_string()
-    };
-    assert_ne!(bg("Ada Lovelace"), bg("Grace Hopper"));
+    // Names spread across the palette produce more than one distinct color
+    // class (color varies by name), while each name stays deterministic.
+    let names = [
+        "Ada Lovelace",
+        "Grace Hopper",
+        "Alan Turing",
+        "Katherine Johnson",
+        "Donald Knuth",
+        "Barbara Liskov",
+        "Edsger Dijkstra",
+        "Margaret Hamilton",
+    ];
+    let classes: std::collections::HashSet<String> =
+        names.iter().map(|n| palette_class(n)).collect();
+    assert!(
+        classes.len() > 1,
+        "color must vary by name; got only {classes:?}"
+    );
 }
 
-// ── styling contract ─────────────────────────────────────────────────────────
+// ── styling contract (CSP: no inline style attribute) ─────────────────────────
 
 #[test]
-fn initials_bg_is_the_only_inline_style() {
+fn initials_branch_emits_no_inline_style() {
+    // The per-name color is a palette class, NOT an inline `style=` attribute —
+    // so it survives a nonce-based CSP that forbids inline styles.
     let out = avatar("Ada", &AvatarConfig::new()).into_string();
-    // Exactly one style= attribute, and it is the per-name custom property.
-    assert_eq!(out.matches("style=").count(), 1, "{out}");
-    assert!(out.contains("--autumn-avatar-bg:"), "{out}");
+    assert!(
+        !out.contains("style="),
+        "avatar must emit no inline style attribute: {out}"
+    );
+    // The deterministic color is still applied, via the stylesheet palette class.
+    assert!(
+        out.contains("autumn-avatar--c"),
+        "palette class applied: {out}"
+    );
 }
 
 #[test]

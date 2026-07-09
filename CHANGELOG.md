@@ -38,9 +38,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **widgets:** `avatar(name, &AvatarConfig)` (issue #1263) — renders an `<img>`
   (lazy-loaded, square `width`/`height`, name-derived `alt`) when an image URL
   is present, or a deterministic colored-initials badge when it isn't (1–2
-  Unicode-safe uppercase initials, per-name background via the
-  `--autumn-avatar-bg` custom property). Never a broken-image request; three
-  named sizes (`Small`/`Medium`/`Large`); the display name is HTML-escaped.
+  Unicode-safe uppercase initials, per-name background via a stable
+  `autumn-avatar--cN` palette class — no inline `style`, so it survives a
+  nonce-based CSP). Never a broken-image request; three named sizes
+  (`Small`/`Medium`/`Large`); the display name is HTML-escaped.
 - **widgets:** `alert`/`alert_with` + `error_summary` (issue #1314) — inline
   block-level callouts with an `AlertVariant` (`Info`/`Success`/`Warning`/
   `Error`, `role` chosen per variant), optional title, per-variant inline-SVG

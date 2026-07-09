@@ -919,8 +919,27 @@
     color: #fff;
     font-weight: 600;
     text-transform: uppercase;
-    background: var(--autumn-avatar-bg, var(--primary));
+    /* Fallback; the deterministic per-name color is one of the
+       .autumn-avatar--cN palette classes below (defined after this rule so it
+       wins at equal specificity). Class-based — not an inline style — so it
+       survives a nonce CSP that forbids inline `style` attributes. */
+    background: var(--primary);
 }
+
+/* Deterministic per-name background palette (selected by avatar_palette_class).
+   Class-based so no inline `style` attribute is emitted. */
+.autumn-avatar--c0 { background: hsl(0, 60%, 42%); }
+.autumn-avatar--c1 { background: hsl(30, 60%, 40%); }
+.autumn-avatar--c2 { background: hsl(60, 55%, 36%); }
+.autumn-avatar--c3 { background: hsl(90, 55%, 34%); }
+.autumn-avatar--c4 { background: hsl(120, 50%, 34%); }
+.autumn-avatar--c5 { background: hsl(150, 55%, 34%); }
+.autumn-avatar--c6 { background: hsl(180, 55%, 32%); }
+.autumn-avatar--c7 { background: hsl(210, 60%, 42%); }
+.autumn-avatar--c8 { background: hsl(240, 55%, 50%); }
+.autumn-avatar--c9 { background: hsl(270, 55%, 48%); }
+.autumn-avatar--c10 { background: hsl(300, 55%, 42%); }
+.autumn-avatar--c11 { background: hsl(330, 60%, 44%); }
 
 .autumn-avatar--sm {
     width: 24px;
