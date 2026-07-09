@@ -22,6 +22,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `BlobStore::get_stream` without buffering the whole object in memory, so it
   serves large private files behind a `#[secured]` handler with no public
   presigned URL (#1141).
+- **model:** `#[private]` field attribute (issue #1374) hides a `#[model]`
+  column from JSON — it is excluded from the model's `Serialize` impl so it
+  never appears in `Json` output, the auto-generated `--api` list/show
+  endpoints, or any `serde_json::to_value(&model)`, while staying a normal,
+  queryable column whose write path (`NewX`/`UpdateX`/`Changeset`) still binds
+  it (set a password, never read the hash back). `#[encrypted]` columns are now
+  `#[private]` in JSON by default (opt back in via `#[encrypted(admin_visible)]`);
+  `#[private]` still appears in `FormModel::form_fields()` (the write side). New
+  `autumn doctor` check `model_private_columns` warns when a sensitively-named
+  column (`password`/`token`/`secret`/`*_hash`) is not marked `#[private]`.
+- **model:** `#[normalize(trim, downcase, upcase, squish, with = path)]` field
+  attribute (issue #1379) canonicalizes a `String` column, composing
+  normalizers left-to-right. Runs on the write path (`save`/`save_many` insert
+  and `update` via `UpdateDraft::from_patch`) before the `before_create`/
+  `before_update` hooks and the DB write, and on derived `#[repository]`
+  `find_by_`/`count_by_` lookups (so `find_by_email("  FOO@X.com ")` matches the
+  stored `foo@x.com` row). Built-ins are idempotent, so `#[normalize(downcase)]`
+  plus a `unique` column gives case-insensitive uniqueness; non-`String` fields
+  are a compile error. Built-ins and the `Normalize` / `NormalizedModel` traits
+  live in the new `autumn_web::normalize` module.
 - **ci:** README-quickstart gate against the published crates (issue #1586) —
   `.github/workflows/quickstart-gate.yml` + `scripts/check-quickstart.sh`
   install the README-pinned `autumn-cli` from crates.io (never the local
