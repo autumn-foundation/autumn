@@ -26,7 +26,8 @@ them; on 0.5.0 fall back to the documented manual alternative.
 
 | Subcommand | Example | What it creates |
 |---|---|---|
-| `scaffold` | `scaffold Post title:String body:Text` | Model + migration + routes (index/show/new/create/edit/update/delete) + views + smoke test. Also updates `src/main.rs`. |
+| `scaffold` | `scaffold Post title:String body:Text` | Model + migration + routes (index/show/new/create/edit/update/delete) + views + a test suite (in-process read test + write-path CRUD test). Also updates `src/main.rs`. |
+| `controller` **(trunk-dev)** | `controller pages home about contact` | Handler-only route module for non-CRUD pages/endpoints — one handler per named action, Maud stub views (HTTP 200), wired into `routes![...]` and `src/routes/mod.rs`. **No** model, migration, DB, schema, or `Cargo.toml` changes. `--api` emits JSON actions instead of views. |
 | `model` | `model Post title:String body:Text` | Model struct + migration |
 | `migration` | `migration add_slug_to_posts` | Empty timestamped migration file |
 | `mailer` | `mailer User` | Mailer struct + email templates (generator appends `Mailer` → produces `UserMailer`) |
@@ -95,6 +96,22 @@ exists in the project, attachment columns append a file input at the end of
 the form) — adding a column needs no view edits. `--live-validation` keeps the
 per-field htmx emission instead.
 
+**Scaffold test suite (trunk-dev)**: the generated `tests/<snake>.rs` exercises
+the whole CRUD surface in-process via `autumn_web::test::{TestApp, TestClient}`,
+not just the read path. Alongside the `<plural>_index_renders_scaffolded_rows`
+read test (DB-backed, `#[ignore]`d unless Docker is available), a
+`<plural>_write_path_crud` `#[tokio::test]` drives **create / update / delete
+and the validation-failure re-render**: a valid `POST` redirects (303 See Other)
+and the row is observable on a follow-up read, an invalid `POST` re-renders the
+form at 422 with the submitted input preserved and an inline `role="alert"`
+error (and does not persist), an update is observable on re-read, and a delete
+removes the row. It runs on a process-local in-memory store — no database, no
+running server — so it is a visible green (never `#[ignore]`d). `TestApp`
+disables CSRF, so the same-origin form `POST`s carry no `_csrf` token (the real
+`form_for`-rendered forms inject one for the browser; the in-process harness
+does not require it). Emitted for HTML scaffolds only — `--api` scaffolds get
+the JSON read test but no write-path suite.
+
 ## Execution flow
 
 1. Parse the subcommand and arguments from user input.
@@ -118,6 +135,34 @@ Next steps:
 1. Run: autumn migrate   (the generator already updated src/main.rs)
 2. Run: autumn dev
 3. Visit: http://localhost:3000/<plural>
+```
+
+### controller (trunk-dev)
+```
+Next steps:
+1. The generator already:
+   - Created src/routes/<controller>.rs (one handler per action)
+   - Added `pub mod <controller>;` to src/routes/mod.rs
+   - Wired each action into routes![...] and added `mod routes;` in src/main.rs
+   No model, migration, database, schema, or Cargo.toml changes are made.
+
+2. Path rule: each action maps to /<controller>/<action>, except an action
+   literally named `index`, which maps to /<controller>. Under `--api` the
+   prefix is /api/<controller>[/<action>].
+
+3. Method rule: actions default to GET. Request another method with
+   `action:method` (method ∈ get, post, put, patch, delete), e.g.
+   `autumn generate controller pages home submit:post`.
+
+4. HTML mode returns a Maud stub view (HTTP 200 placeholder) per action;
+   `--api` returns AutumnResult<Json<serde_json::Value>> with a JSON stub and
+   no view. Edit the generated handlers to add real content.
+
+5. Re-running against an existing controller fails (non-destructive); pass
+   `--force` to overwrite. `autumn destroy controller <name> <action>...`
+   reverts it.
+
+6. Run: cargo check   (then `autumn routes` lists every new route)
 ```
 
 ### model

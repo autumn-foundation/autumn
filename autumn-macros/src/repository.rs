@@ -417,6 +417,29 @@ fn parse_query_name(name: &str) -> Option<DerivedQuery> {
     })
 }
 
+/// A parsed `find_or_create_by_<field>[_and_<field>...]` declaration (#1382).
+///
+/// Unlike the [`DerivedQuery`] finders, this is emitted as an inherent async
+/// method on the `Pg*` struct (it returns `(Model, bool)` and takes an extra
+/// `new` insert value), so it lives in its own spec list rather than the trait
+/// method surface.
+struct FindOrCreateSpec {
+    /// The declared method identifier, e.g. `find_or_create_by_slug`.
+    fn_ident: Ident,
+    /// Lookup fields in declaration order, paired with the parameter type the
+    /// user declared for each field.
+    lookup_params: Vec<(Ident, syn::Type)>,
+    /// Subset of lookup fields whose parameter type is a string — routed
+    /// through the encrypted-column registry encoder at runtime, matching the
+    /// `find_by` derived-query surface (#805).
+    string_fields: std::collections::HashSet<String>,
+    /// When set, generation emits a `compile_error!` with this message instead
+    /// of a method (e.g. `_or_` was used, or a field lacks a matching
+    /// parameter). Race-safety requires a single unique constraint, so `_or_`
+    /// (which spans constraints) is rejected.
+    error: Option<String>,
+}
+
 #[allow(clippy::too_many_lines)]
 fn generate_derived_query_for_source(
     query: &DerivedQuery,
@@ -445,9 +468,26 @@ fn generate_derived_query_for_source(
             if string_fields.contains(&field.to_string()) {
                 let field_str = field.to_string();
                 let enc_ident = format_ident!("__autumn_q_{field}");
+                let norm_ident = format_ident!("__autumn_qn_{field}");
+                // #1379 AC3: canonicalize the lookup argument for `#[normalize]`
+                // columns so `find_by_email("  FOO@X.com ")` matches the stored
+                // `foo@x.com` row. Dispatches through the autoref-specialization
+                // probe, so it returns the raw value for non-normalized columns
+                // and for hand-written models that don't implement
+                // `NormalizedModel`. Runs *before* the encrypted-column encoder
+                // (a normalized + deterministic-encrypted column matches on the
+                // canonical form).
                 encode_lets.push(quote! {
+                    let #norm_ident = {
+                        #[allow(unused_imports)]
+                        use ::autumn_web::normalize::{SpezLookupNo as _, SpezLookupYes as _};
+                        ::autumn_web::normalize::SpezLookup::<#model_name>(
+                            ::core::marker::PhantomData, #field_str, &#param,
+                        )
+                        .spez_lookup()
+                    };
                     let #enc_ident = ::autumn_web::encryption::encode_derived_query_param(
-                        #table_name_str, #field_str, &#param,
+                        #table_name_str, #field_str, &#norm_ident,
                     )
                     .map_err(|__e| ::autumn_web::AutumnError::internal_server_error_msg(
                         __e.to_string(),
@@ -758,6 +798,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // Parse derived query methods from trait body
     let mut derived_trait_methods = Vec::new();
     let mut derived_impl_methods = Vec::new();
+    // §1382: race-safe `find_or_create_by_*` declarations. Collected here and
+    // codegen'd near the batch-feature bindings (once `tenant_query_filter`
+    // is in scope), then spliced into the inherent `impl Pg*` block.
+    let mut find_or_create_specs: Vec<FindOrCreateSpec> = Vec::new();
     // §1d: per-shard helpers for derived read methods that fan out under
     // across_tenants. Emitted into the inherent impl (a trait impl cannot hold
     // non-trait members), so kept in a separate list.
@@ -785,6 +829,88 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     for item in &trait_def.items {
         if let TraitItem::Fn(method) = item {
             let method_name = method.sig.ident.to_string();
+
+            // §1382: `find_or_create_by_<field>[_and_<field>...]`. Parsed and
+            // codegen'd separately from the `find_by`/`count`/… derived-query
+            // surface: it is an inherent method returning `(Model, bool)`, not
+            // a trait finder. `parse_query_name` never matches these names
+            // (`find_or_create_by_slug` → strip `find` → `_or_create_by_slug`,
+            // which is not `_by_`-prefixed), but we handle them first and
+            // `continue` to keep the two paths cleanly separated.
+            if let Some(rest) = method_name.strip_prefix("find_or_create_by_") {
+                let fn_ident = method.sig.ident.clone();
+
+                // Map each declared parameter name to its type.
+                let param_map: Vec<(String, syn::Type)> = method
+                    .sig
+                    .inputs
+                    .iter()
+                    .filter_map(|arg| {
+                        let syn::FnArg::Typed(pat_type) = arg else {
+                            return None;
+                        };
+                        let syn::Pat::Ident(pat_ident) = pat_type.pat.as_ref() else {
+                            return None;
+                        };
+                        Some((pat_ident.ident.to_string(), (*pat_type.ty).clone()))
+                    })
+                    .collect();
+
+                // Determine the lookup fields (and reject `_or_`, which would
+                // span multiple unique constraints and defeat race-safety).
+                let mut error: Option<String> = if rest.is_empty() {
+                    Some(format!(
+                        "`{method_name}` has no lookup field: name it \
+                         `find_or_create_by_<field>` (optionally `_and_<field>`)"
+                    ))
+                } else if rest.contains("_or_") {
+                    Some(format!(
+                        "`{method_name}`: find_or_create_by does not support `_or_`. \
+                         Race-safety requires a single unique constraint, so only a \
+                         single field or an `_and_`-composite (matching one composite \
+                         unique index) is allowed."
+                    ))
+                } else {
+                    None
+                };
+
+                let field_names: Vec<String> = if error.is_some() {
+                    Vec::new()
+                } else {
+                    rest.split("_and_").map(String::from).collect()
+                };
+
+                let mut lookup_params: Vec<(Ident, syn::Type)> = Vec::new();
+                if error.is_none() {
+                    for fname in &field_names {
+                        if let Some((_, ty)) = param_map.iter().find(|(n, _)| n == fname) {
+                            lookup_params.push((format_ident!("{fname}"), ty.clone()));
+                        } else {
+                            error = Some(format!(
+                                "`{method_name}`: no parameter named `{fname}` was \
+                                 declared. Declare each lookup field as a parameter, \
+                                 e.g. `fn {method_name}({fname}: String, new: {new_name});`"
+                            ));
+                            break;
+                        }
+                    }
+                }
+
+                let string_fields: std::collections::HashSet<String> = lookup_params
+                    .iter()
+                    .filter(|(_, ty)| is_string_param_type(ty))
+                    .map(|(ident, _)| ident.to_string())
+                    .collect();
+
+                find_or_create_specs.push(FindOrCreateSpec {
+                    fn_ident,
+                    lookup_params,
+                    string_fields,
+                    error,
+                });
+                continue;
+            }
+
             if let Some(query) = parse_query_name(&method_name) {
                 let fn_ident = &method.sig.ident;
 
@@ -7876,6 +8002,460 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
+    // ── Race-safe get-or-insert (find_or_create_by_*, issue #1382) ──────────
+    //
+    // Emitted as inherent async methods on the Pg* struct (parallel to
+    // find_in_batches) — they return `(Model, bool)` and take an extra `new`
+    // insert value, so they don't fit the trait finder surface. Recipe:
+    //   1. Preliminary lookup on the READ path (replica-eligible), honoring
+    //      tenant scoping + soft-delete. Found → `(row, false)`, no hooks.
+    //   2. Else INSERT on the PRIMARY with `ON CONFLICT DO NOTHING`, which
+    //      avoids the Postgres 23505 transaction abort entirely — no
+    //      unique-violation error ever escapes to a caller.
+    //        - Some(row) → a real insert happened → `(row, true)`; the same
+    //          before_create / after_create / commit-hook weaving as `save`
+    //          runs (only on this created path).
+    //        - None → a concurrent caller won the race → re-lookup on the
+    //          PRIMARY (read-your-writes) → `(row, false)`, no hooks.
+    // Unlike `upsert_many`, this is generated even on hooked repositories.
+    let foc_sd_boxed = if config.soft_delete {
+        quote! { query = query.filter(#table_ident::deleted_at.is_null()); }
+    } else {
+        quote! {}
+    };
+    let foc_tenant_id_let = if config.tenant_scoped {
+        quote! {
+            let tenant_id = if self.across_tenants {
+                ::autumn_web::tenancy::CURRENT_TENANT.try_with(|t| t.clone()).ok().flatten()
+            } else {
+                let t = ::autumn_web::tenancy::CURRENT_TENANT.try_with(|t| t.clone()).ok().flatten()
+                    .ok_or_else(|| ::autumn_web::AutumnError::internal_server_error_msg(
+                        "Query scoped to tenant, but no tenant context was established"
+                    ))?;
+                ::core::option::Option::Some(t)
+            };
+        }
+    } else {
+        quote! {}
+    };
+    // The `ON CONFLICT DO NOTHING` insert, returning `Option<Model>` (None on a
+    // conflict). `#values` is the insert value binding, `#conn` a `&mut`/owned
+    // connection expression matching the diesel-async surface at the call site.
+    let foc_insert_opt = |values: &TokenStream, conn: &TokenStream| -> TokenStream {
+        if config.tenant_scoped {
+            quote! {
+                if let ::core::option::Option::Some(ref __t) = tenant_id {
+                    ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                        .values(::autumn_web::tenancy::TenantInsertable::tenant_values(#values.clone(), __t))
+                        .on_conflict_do_nothing()
+                        .get_result::<#model_name>(#conn)
+                        .await
+                } else {
+                    ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                        .values(#values.clone())
+                        .on_conflict_do_nothing()
+                        .get_result::<#model_name>(#conn)
+                        .await
+                }
+                .optional()
+                .map_err(::autumn_web::AutumnError::from)?
+            }
+        } else {
+            quote! {
+                ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                    .values(#values.clone())
+                    .on_conflict_do_nothing()
+                    .get_result::<#model_name>(#conn)
+                    .await
+                    .optional()
+                    .map_err(::autumn_web::AutumnError::from)?
+            }
+        }
+    };
+    // Version-history INSERT snippets (empty unless `versioned`). `__record` is
+    // the freshly-inserted row; `conn` is the in-transaction connection.
+    let foc_vh_ctx = if config.versioned {
+        vh_insert_ts(
+            table_name,
+            "insert",
+            true,
+            &quote! { __record },
+            None,
+            &quote! { conn },
+            model_name,
+        )
+    } else {
+        quote! {}
+    };
+    let foc_vh_noctx = if config.versioned {
+        vh_insert_ts(
+            table_name,
+            "insert",
+            false,
+            &quote! { __record },
+            None,
+            &quote! { conn },
+            model_name,
+        )
+    } else {
+        quote! {}
+    };
+    // Post-commit hook machinery for the commit_hooks path (mirrors `save`):
+    // fires after_create, then finalizes the durable commit-hook row. Only
+    // reached on the created path. Ends by returning `(record, true)`.
+    let foc_commit_after_machinery = quote! {
+        let __autumn_pending_heartbeat =
+            ::autumn_web::__private::start_repository_commit_hook_pending_finalizer_heartbeat(
+                self.pool.clone(),
+                __autumn_commit_hook_id.clone(),
+                __autumn_commit_hook_owner.clone(),
+            );
+        let __autumn_after_create = ::autumn_web::__private::catch_repository_after_hook_unwind(
+            self.hooks.after_create(&mut ctx, &record)
+        )
+        .await;
+        match __autumn_after_create {
+            ::core::result::Result::Ok(::core::result::Result::Ok(())) => {}
+            ::core::result::Result::Ok(::core::result::Result::Err(__autumn_error)) => {
+                let __autumn_error_message = ::std::format!("{__autumn_error}");
+                ::autumn_web::__private::mark_repository_commit_hook_after_hook_failed(
+                    &self.pool,
+                    &__autumn_commit_hook_id,
+                    &__autumn_commit_hook_owner,
+                    __autumn_error_message,
+                )
+                .await;
+                __autumn_pending_heartbeat.cancel();
+                return ::core::result::Result::Err(
+                    ::autumn_web::idempotency::__cache_committed_error_response(__autumn_error)
+                );
+            }
+            ::core::result::Result::Err(__autumn_panic) => {
+                ::autumn_web::__private::mark_repository_commit_hook_after_hook_failed(
+                    &self.pool,
+                    &__autumn_commit_hook_id,
+                    &__autumn_commit_hook_owner,
+                    "after_create panicked",
+                )
+                .await;
+                __autumn_pending_heartbeat.cancel();
+                if self.idempotency.is_some() {
+                    return ::core::result::Result::Err(
+                        ::autumn_web::idempotency::__cache_committed_error_response(
+                            ::autumn_web::AutumnError::internal_server_error_msg("after_create panicked")
+                        )
+                    );
+                }
+                ::std::panic::resume_unwind(__autumn_panic);
+            }
+        }
+        let __autumn_finalize_result = ::autumn_web::__private::finalize_repository_commit_hook_after_hook(
+            &self.pool,
+            &__autumn_commit_hook_id,
+            &__autumn_commit_hook_owner,
+            &ctx,
+            &__autumn_commit_hook_record,
+        )
+        .await;
+        __autumn_pending_heartbeat.cancel();
+        match __autumn_finalize_result {
+            ::core::result::Result::Ok(()) => {
+                ::autumn_web::__private::kick_repository_commit_hook_dispatcher(&self.pool);
+            }
+            ::core::result::Result::Err(__autumn_error) => {
+                ::autumn_web::reexports::tracing::warn!(
+                    hook_id = %__autumn_commit_hook_id,
+                    error = %__autumn_error,
+                    "failed to finalize repository create commit hook after mutation commit; failing request closed"
+                );
+                return ::core::result::Result::Err(
+                    ::autumn_web::idempotency::__cache_committed_error_response(__autumn_error)
+                );
+            }
+        }
+        ::core::result::Result::Ok((record, true))
+    };
+
+    let find_or_create_by_methods = {
+        let mut __methods: Vec<TokenStream> = Vec::new();
+        for spec in &find_or_create_specs {
+            let fn_ident = &spec.fn_ident;
+            if let Some(msg) = &spec.error {
+                __methods.push(quote! { ::core::compile_error!(#msg); });
+                continue;
+            }
+
+            let sig_params: Vec<TokenStream> = spec
+                .lookup_params
+                .iter()
+                .map(|(name, ty)| quote! { #name: #ty })
+                .collect();
+
+            // Encrypted-column encoding (string fields) + boxed-query filters,
+            // matching the `find_by` derived-query surface (#805).
+            let table_name_str = table_ident.to_string();
+            let mut encode_lets: Vec<TokenStream> = Vec::new();
+            let mut filter_assigns: Vec<TokenStream> = Vec::new();
+            for (name, _ty) in &spec.lookup_params {
+                let fname = name.to_string();
+                if spec.string_fields.contains(&fname) {
+                    let enc_ident = format_ident!("__autumn_foc_{name}");
+                    encode_lets.push(quote! {
+                        let #enc_ident = ::autumn_web::encryption::encode_derived_query_param(
+                            #table_name_str, #fname, &#name,
+                        )
+                        .map_err(|__e| ::autumn_web::AutumnError::internal_server_error_msg(
+                            __e.to_string(),
+                        ))?;
+                    });
+                    filter_assigns.push(quote! {
+                        query = query.filter(#table_ident::#name.eq(&#enc_ident));
+                    });
+                } else {
+                    filter_assigns.push(quote! {
+                        query = query.filter(#table_ident::#name.eq(&#name));
+                    });
+                }
+            }
+
+            // A boxed lookup honoring tenant scoping, the eq-filters and
+            // soft-delete, returning `Option<Model>`. `#conn` is a `&mut` conn.
+            let make_lookup = |conn: TokenStream| -> TokenStream {
+                let filter_assigns = &filter_assigns;
+                quote! {
+                    {
+                        let mut query = #table_ident::table.into_boxed();
+                        #tenant_query_filter
+                        #(#filter_assigns)*
+                        #foc_sd_boxed
+                        query
+                            .select(#model_name::as_select())
+                            .first::<#model_name>(#conn)
+                            .await
+                            .optional()
+                            .map_err(::autumn_web::AutumnError::from)?
+                    }
+                }
+            };
+
+            let step1_lookup = make_lookup(quote! { &mut __rconn });
+            let relookup = make_lookup(quote! { &mut conn });
+            let none_branch_msg = if config.soft_delete {
+                "find_or_create_by: the insert hit a unique conflict but no matching \
+                 row was found on re-lookup. Two causes are possible: (1) the lookup \
+                 columns are not the ones backed by the unique constraint that fired \
+                 — find_or_create_by is only race-safe when its lookup columns match \
+                 a unique constraint; or (2) this is a soft_delete repository and the \
+                 unique index is a plain (non-partial) index, so a soft-deleted row is \
+                 still occupying the unique slot: the insert conflicts with it while \
+                 the `deleted_at IS NULL` lookup cannot see it. For soft_delete \
+                 repositories the unique index must be partial \
+                 (`... WHERE deleted_at IS NULL`) so soft-deleted rows free the slot."
+            } else {
+                "find_or_create_by: the insert hit a unique conflict but no matching \
+                 row was found on re-lookup. The lookup columns are likely not the \
+                 ones backed by the unique constraint that fired — find_or_create_by \
+                 is only race-safe when its lookup columns match a unique constraint."
+            };
+            let none_branch = quote! {
+                let __row: ::core::option::Option<#model_name> = #relookup;
+                match __row {
+                    ::core::option::Option::Some(__r) => ::core::result::Result::Ok((__r, false)),
+                    ::core::option::Option::None => ::core::result::Result::Err(
+                        ::autumn_web::AutumnError::internal_server_error_msg(
+                            #none_branch_msg
+                        )
+                    ),
+                }
+            };
+
+            let insert_new_conn = foc_insert_opt(&quote! { new }, &quote! { &mut conn });
+            let insert_input_txconn = foc_insert_opt(&quote! { input }, &quote! { conn });
+            let insert_new_txconn = foc_insert_opt(&quote! { new }, &quote! { conn });
+
+            // Step 2 varies by hook configuration (mirrors `save`).
+            let step2 = if commit_hooks_enabled {
+                quote! {
+                    use ::autumn_web::reexports::diesel_async::AsyncConnection;
+                    use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
+                    use ::autumn_web::hooks::{MutationContext, MutationOp, MutationHooks};
+                    #foc_tenant_id_let
+                    Self::__autumn_register_repository_commit_hooks();
+                    let mut conn = self.__autumn_acquire_conn().await?;
+                    let __outcome: ::core::option::Option<(#model_name, MutationContext, ::std::string::String, ::std::string::String, ::autumn_web::reexports::serde_json::Value)> =
+                        ::autumn_web::__private::scoped_transaction::<::core::option::Option<(#model_name, MutationContext, ::std::string::String, ::std::string::String, ::autumn_web::reexports::serde_json::Value)>, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
+                            async move {
+                                let mut input = new.clone();
+                                let mut ctx = MutationContext::new(MutationOp::Create);
+                                let mut __autumn_commit_hook_discriminator: ::core::option::Option<::std::string::String> =
+                                    ::core::option::Option::None;
+                                if let ::core::option::Option::Some(__autumn_idempotency) = &self.idempotency {
+                                    ctx.set_idempotency_key(__autumn_idempotency.scoped_key());
+                                    __autumn_commit_hook_discriminator =
+                                        ::core::option::Option::Some(__autumn_idempotency.next_mutation_discriminator());
+                                }
+                                self.hooks.before_create(&mut ctx, &mut input).await?;
+                                let __rec_opt: ::core::option::Option<#model_name> = #insert_input_txconn;
+                                match __rec_opt {
+                                    ::core::option::Option::Some(__record) => {
+                                        #foc_vh_ctx
+                                        let __autumn_commit_hook_record = __record.__autumn_commit_hook_to_value()?;
+                                        let (__autumn_commit_hook_id, __autumn_commit_hook_owner) = ::autumn_web::__private::enqueue_repository_commit_hook_pending_on_conn(
+                                            conn,
+                                            Self::__autumn_repository_commit_hook_key(),
+                                            "create",
+                                            ctx.idempotency_key.as_deref(),
+                                            __autumn_commit_hook_discriminator.as_deref(),
+                                            &ctx,
+                                            &__autumn_commit_hook_record,
+                                        )
+                                        .await?;
+                                        ::core::result::Result::Ok(::core::option::Option::Some((
+                                            __record, ctx, __autumn_commit_hook_id, __autumn_commit_hook_owner, __autumn_commit_hook_record,
+                                        )))
+                                    }
+                                    ::core::option::Option::None => ::core::result::Result::Ok(::core::option::Option::None),
+                                }
+                            }
+                            .scope_boxed()
+                        })
+                        .await?;
+                    match __outcome {
+                        ::core::option::Option::Some((record, mut ctx, __autumn_commit_hook_id, __autumn_commit_hook_owner, __autumn_commit_hook_record)) => {
+                            ::core::mem::drop(conn);
+                            #foc_commit_after_machinery
+                        }
+                        ::core::option::Option::None => { #none_branch }
+                    }
+                }
+            } else if config.hooks_type.is_some() {
+                quote! {
+                    use ::autumn_web::reexports::diesel_async::AsyncConnection;
+                    use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
+                    use ::autumn_web::hooks::{MutationContext, MutationOp, MutationHooks};
+                    #foc_tenant_id_let
+                    let mut conn = self.__autumn_acquire_conn().await?;
+                    let __outcome: ::core::option::Option<(#model_name, MutationContext)> =
+                        ::autumn_web::__private::scoped_transaction::<::core::option::Option<(#model_name, MutationContext)>, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
+                            async move {
+                                let mut input = new.clone();
+                                let mut ctx = MutationContext::new(MutationOp::Create);
+                                self.hooks.before_create(&mut ctx, &mut input).await?;
+                                let __rec_opt: ::core::option::Option<#model_name> = #insert_input_txconn;
+                                match __rec_opt {
+                                    ::core::option::Option::Some(__record) => {
+                                        #foc_vh_ctx
+                                        ::core::result::Result::Ok(::core::option::Option::Some((__record, ctx)))
+                                    }
+                                    ::core::option::Option::None => ::core::result::Result::Ok(::core::option::Option::None),
+                                }
+                            }
+                            .scope_boxed()
+                        })
+                        .await?;
+                    match __outcome {
+                        ::core::option::Option::Some((__record, mut ctx)) => {
+                            ::core::mem::drop(conn);
+                            self.hooks.after_create(&mut ctx, &__record).await?;
+                            ::core::result::Result::Ok((__record, true))
+                        }
+                        ::core::option::Option::None => { #none_branch }
+                    }
+                }
+            } else if config.versioned {
+                quote! {
+                    use ::autumn_web::reexports::diesel_async::AsyncConnection;
+                    use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
+                    #foc_tenant_id_let
+                    let mut conn = self.__autumn_acquire_conn().await?;
+                    let __inserted: ::core::option::Option<#model_name> =
+                        ::autumn_web::__private::scoped_transaction::<::core::option::Option<#model_name>, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
+                            async move {
+                                let __rec_opt: ::core::option::Option<#model_name> = #insert_new_txconn;
+                                if let ::core::option::Option::Some(ref __record) = __rec_opt {
+                                    #foc_vh_noctx
+                                }
+                                ::core::result::Result::Ok(__rec_opt)
+                            }
+                            .scope_boxed()
+                        })
+                        .await?;
+                    match __inserted {
+                        ::core::option::Option::Some(__record) => ::core::result::Result::Ok((__record, true)),
+                        ::core::option::Option::None => { #none_branch }
+                    }
+                }
+            } else {
+                quote! {
+                    #foc_tenant_id_let
+                    let mut conn = self.__autumn_acquire_conn().await?;
+                    let __inserted: ::core::option::Option<#model_name> = #insert_new_conn;
+                    match __inserted {
+                        ::core::option::Option::Some(__record) => ::core::result::Result::Ok((__record, true)),
+                        ::core::option::Option::None => { #none_branch }
+                    }
+                }
+            };
+
+            __methods.push(quote! {
+                /// Race-safe get-or-insert keyed on the lookup column(s).
+                ///
+                /// Returns `(model, created)`: `created == true` only when this
+                /// call actually inserted the row. When a matching row already
+                /// exists (or a concurrent caller wins the insert race), the
+                /// existing row is returned with `created == false`.
+                ///
+                /// Only the `after_create` and `after_create_commit` (commit)
+                /// hooks are guaranteed to fire **exclusively** on the created
+                /// path — they run only when a row is actually inserted
+                /// (`created == true`). `before_create` is different: it runs
+                /// *before* the `ON CONFLICT DO NOTHING` insert, so when a
+                /// concurrent caller loses the insert race the method returns
+                /// `created == false` yet that caller's `before_create` has
+                /// already executed — and any side effects (including DB writes
+                /// made inside the transaction) still occur. Keep
+                /// `before_create` side effects idempotent, or move create-only
+                /// work into `after_create`; do not rely on the found-path
+                /// semantics to suppress `before_create`.
+                ///
+                /// Race-safety relies on a unique constraint covering the lookup
+                /// column(s): the insert uses `ON CONFLICT DO NOTHING`, so under
+                /// concurrent callers exactly one row is created, exactly one
+                /// caller observes `created == true`, and no unique-violation
+                /// error is surfaced. Without such a constraint the method is
+                /// NOT race-safe (concurrent callers may each insert a row).
+                #[allow(clippy::let_and_return, unused_variables, clippy::used_underscore_binding)]
+                pub async fn #fn_ident(
+                    &self,
+                    #(#sig_params,)*
+                    new: &#new_name,
+                ) -> ::autumn_web::AutumnResult<(#model_name, bool)> {
+                    use ::autumn_web::reexports::diesel::prelude::*;
+                    use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                    // Cross-shard write guard: reject a get-or-insert issued via
+                    // across_tenants() on a sharded, tenant-scoped repository. The
+                    // lookup+insert cannot be fanned out safely across shards, so we
+                    // reject rather than silently write to a single shard while
+                    // matching rows on other shards go unseen. Same guard used by
+                    // save/update/delete; a no-op token on non-sharded repos.
+                    #cross_shard_write_guard
+                    #(#encode_lets)*
+                    // Step 1: preliminary lookup on the read path (replica-eligible).
+                    {
+                        let mut __rconn = self.__autumn_acquire_read_conn().await?;
+                        let __found: ::core::option::Option<#model_name> = #step1_lookup;
+                        if let ::core::option::Option::Some(__row) = __found {
+                            return ::core::result::Result::Ok((__row, false));
+                        }
+                    }
+                    // Step 2: create on the primary with ON CONFLICT DO NOTHING.
+                    #step2
+                }
+            });
+        }
+        quote! { #(#__methods)* }
+    };
+
     let tenant_scoped_traits = if config.tenant_scoped {
         quote! {
             impl ::autumn_web::tenancy::HasTenantIdColumn for #table_ident::table {
@@ -10298,6 +10878,21 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
 
             async fn save(&self, new: &#new_name) -> ::autumn_web::AutumnResult<#model_name> {
+                // #1379: normalize `#[normalize]` columns on the insert path,
+                // before the `before_create` hook and the DB write, so
+                // validators and the database observe the canonical value.
+                // Dispatches through the autoref-specialization probe: the `Yes`
+                // arm clones and canonicalizes only for models whose `New*`
+                // implements `Normalize`; the `No` arm hands back the caller's
+                // borrow unchanged, so models with no `#[normalize]` columns (and
+                // hand-written `New*` types that don't implement `Normalize`) pay
+                // no clone. `Borrow` unifies the owned/borrowed arms to `&#new_name`.
+                #[allow(unused_imports)]
+                use ::autumn_web::normalize::{SpezNormalizeNo as _, SpezNormalizeYes as _};
+                #[allow(unused_imports)]
+                use ::std::borrow::Borrow as _;
+                let __autumn_normalized = ::autumn_web::normalize::SpezNormalize(new).spez_normalize();
+                let new: &#new_name = __autumn_normalized.borrow();
                 #save_body
             }
 
@@ -10329,6 +10924,17 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             #soft_delete_impl_methods
 
             async fn save_many(&self, new: &[#new_name]) -> ::autumn_web::AutumnResult<Vec<#model_name>> {
+                // #1379: normalize each `#[normalize]` column before the bulk
+                // insert path (mirrors `save`). The `Yes` arm clones+canonicalizes
+                // only for `Normalize` `New*` types; the `No` arm hands back the
+                // caller's slice unchanged (no clone) for everything else.
+                // `Borrow` unifies the owned `Vec`/borrowed slice arms.
+                #[allow(unused_imports)]
+                use ::autumn_web::normalize::{SpezNormalizeManyNo as _, SpezNormalizeManyYes as _};
+                #[allow(unused_imports)]
+                use ::std::borrow::Borrow as _;
+                let __autumn_normalized = ::autumn_web::normalize::SpezNormalize(new).spez_normalize_many();
+                let new: &[#new_name] = __autumn_normalized.borrow();
                 #save_many_body
             }
 
@@ -10384,6 +10990,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
 
             #find_in_batches_methods
+
+            // Race-safe get-or-insert (find_or_create_by_*, issue #1382).
+            #find_or_create_by_methods
 
             /// Eager-load associations for records returned by a finder.
             ///
@@ -11847,10 +12456,46 @@ mod tests {
         let impl_delete = generated
             .find("async fn delete_by_title")
             .expect("delete_by_title impl must be generated");
-        let section = &generated[impl_delete..impl_delete + 800];
+        let section = &generated[impl_delete..impl_delete + 1200];
         assert!(
             section.contains("deleted_at"),
             "derived delete_by_title must reference deleted_at in soft-delete mode: {section}"
+        );
+    }
+
+    // ── #1379: normalization wiring in the repository codegen ─────────────
+
+    #[test]
+    fn repository_macro_derived_finder_normalizes_string_lookup_arg() {
+        // AC3: a derived `find_by_email` must canonicalize its String argument
+        // through the model's `NormalizedModel` impl before filtering, so
+        // `find_by_email("FOO@X.COM")` matches the stored `foo@x.com` row.
+        let generated = repository_macro(
+            quote! { User },
+            quote! { pub trait UserRepository {
+                fn find_by_email(email: String) -> Vec<User>;
+            } },
+        )
+        .to_string();
+        assert!(
+            generated.contains("SpezLookup :: < User >"),
+            "derived finder must normalize its String lookup argument: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_save_normalizes_new_input() {
+        // AC2: the insert path (`save`/`save_many`) normalizes the `New*` input
+        // before the `before_create` hook and the DB write.
+        let generated =
+            repository_macro(quote! { User }, quote! { pub trait UserRepository {} }).to_string();
+        assert!(
+            generated.contains("SpezNormalize (new) . spez_normalize ()"),
+            "save must normalize the New input before persisting: {generated}"
+        );
+        assert!(
+            generated.contains("SpezNormalize (new) . spez_normalize_many ()"),
+            "save_many must normalize each New input before persisting: {generated}"
         );
     }
 

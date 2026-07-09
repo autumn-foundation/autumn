@@ -9,6 +9,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **test:** opt-in channel broadcast recorder for integration tests (issue
+  #1043) — `TestApp::record_broadcasts()` installs a recorder through the
+  existing `ChannelsInterceptor` seam (no hand-written spy or `Arc<Mutex>`).
+  After a request runs, read captured publications in order with
+  `TestClient::broadcasts()` / `broadcasts_on(topic)` (both raw `publish` text
+  and `publish_html` HTML/OOB payloads are captured), or assert on them with
+  `assert_broadcast(topic, predicate)`, `assert_broadcast_count(topic, n)`, and
+  `assert_no_broadcasts(topic)` — each failure self-diagnoses by listing what
+  *was* published to that topic and nearby topics. The recorder is in-memory,
+  ordered, thread-safe, and scoped to the `TestClient` (no global state, no
+  cross-test leak); nothing is installed and production `Channels` behavior is
+  untouched unless the builder is called.
+- **generator:** `autumn generate scaffold` now emits **write-path CRUD tests**,
+  not just a read smoke test (issue #1127). Alongside the in-process index/read
+  test, the generated `tests/<snake>.rs` gains a `<plural>_write_path_crud`
+  `#[tokio::test]` that drives create / update / delete **and** the
+  validation-failure re-render through `autumn_web::test::{TestApp, TestClient}`:
+  a valid `POST` redirects (303 See Other) and the row is observable on a
+  follow-up read, an invalid `POST` re-renders the form at 422 with the
+  submitted input preserved and an inline `role="alert"` error (and does not
+  persist), an update is observable on re-read, and a delete removes the row.
+  It runs fully in-process on the shipped `ChangesetForm`/`Changeset`
+  round-trip (issue #1124), the typed `text_input` renderer, and `Redirect`
+  against a process-local in-memory store — no database, no running server, no
+  external services, so it is a visible green (never `#[ignore]`d) with real
+  failure power (row-count assertions on each read turn a broken handler red).
+  `TestApp` disables CSRF, so the same-origin form `POST`s carry no `_csrf`
+  token — the real `form_for`-rendered forms (PR #1587) inject one for the
+  browser, which the in-process harness does not require. Emitted for HTML
+  scaffolds only (the `--api` JSON path is out of scope).
+- **cli:** `autumn i18n check` (issue #1252) — a read-only diagnostic that
+  compares the translation keys referenced in code (string literals passed to
+  `t!(...)`, `.t(...)`, and `.t_with(...)`) against the keys defined in each
+  `i18n/<locale>.ftl`, so a missing or untranslated string is caught in CI
+  instead of from a production `Bundle::miss_count()` warning. It loads the
+  bundle through the existing `Bundle::load_from_dir` loader and reports, per
+  locale, **Missing** keys (referenced in code but absent from that locale's
+  resolved fallback chain), **Untranslated** keys (defined in the default locale
+  but resolving all the way to it for this locale — neither the locale itself nor
+  any non-default locale in its fallback chain supplies them, so the user sees
+  default-language text; a key an intermediate parent locale like `pt` supplies
+  for `pt-BR` is not flagged), and **Unused** keys (defined in a `.ftl` with no call
+  site). Exit is non-zero when any locale has Missing keys; Untranslated/Unused
+  are warnings that become errors under `--strict`. `--format json` emits a
+  machine-readable report for `autumn check`/CI to consume. Dynamically-built
+  keys (e.g. `t(&format!(...))`) are listed as "dynamic — not checked" rather
+  than silently ignored or falsely flagged. The i18n config is resolved through
+  the same profile-aware loader the runtime uses (`AutumnConfig::load_with_env`),
+  so `AUTUMN_ENV` and `[profile.<env>.i18n]` / `autumn-<env>.toml` overlays are
+  honored — under `AUTUMN_ENV=prod` the check inspects the production locale
+  directory and `supported_locales` instead of the base defaults, so missing
+  production translations are no longer silently passed. A missing locale
+  directory only skips (exit 0) when the project has *no* i18n configuration at
+  all; when i18n *is* configured (a base `[i18n]` table or a
+  `[profile.<env>.i18n]` / `autumn-<env>.toml` overlay for the active profile)
+  but the resolved directory is absent, the check loads through
+  `Bundle::load_from_dir` and fails with the same `MissingDefaultLocale` error
+  the app would hit at startup, so CI no longer passes an app that cannot start.
+  A translation call nested in another call's arguments (e.g.
+  `t_with("message", &[("status", &locale.t("status.open"))])`) now has *both*
+  keys recorded — the scanner recurses into the outer call's argument group — so
+  removing the inner key from every `.ftl` is correctly reported as Missing
+  instead of slipping past with exit 0. The scanner's intentional heuristic
+  limits — the key-expression shapes treated as *dynamic — not checked* rather
+  than validated — are documented under "Known heuristic limits" in the command
+  module rustdoc and the plugin skill doc. See `autumn-cli/src/i18n.rs`.
+- **generator:** `autumn generate controller <name> <action>...` scaffolds a handler-only module (named actions, wired routes, Maud stub views) for non-CRUD pages/endpoints — no model, migration, or DB; `--api` emits JSON actions. (issue #1050)
 - **download:** typed `Download` `IntoResponse` (`autumn_web::download::Download`)
   for serving files from a handler without hand-rolling headers. Construct it
   from owned bytes, an async byte stream, an `AsyncRead`, or a stored blob
@@ -22,6 +89,148 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   serves large private files behind a `#[secured]` handler with no public
   presigned URL (#1141).
 - **Atom/RSS feed renderer** (`feed::Feed` / `feed::FeedEntry`): build an Atom 1.0 or RSS 2.0 feed from channel metadata plus an iterator of entries and return it directly from a `#[get]` handler — it implements `IntoResponse` with the correct `application/atom+xml`/`application/rss+xml` content type, XML-escapes every text field, and `Feed::conditional(&headers)` reuses the `etag` layer so feed pollers get a `304 Not Modified` on unchanged content. The `blog` example gains a `/feed.xml` route. (#1045)
+- **router:** duplicate-route preflight (issue #1012) — two user- or
+  plugin-registered handlers that resolve to the same `(method, path)` after
+  `.scoped(prefix, …)` prefix resolution now fail app build with a structured
+  `RouterBuildError::DuplicateUserRoute` **before any router is mounted**,
+  instead of an `axum::routing::MethodRouter::merge` panic at startup. The
+  error names BOTH handlers, the HTTP method, and the resolved path. The
+  synthetic `WS` method a `#[ws]` handler mounts as `GET` is normalized before
+  keying, so `#[get("/live")]` + `#[ws("/live")]` is caught too. Two routes
+  whose **different** templates resolve to overlapping path shapes are a matchit
+  route conflict *regardless of HTTP method* (so `GET /users/{id}` +
+  `POST /users/{slug}` clashes) and now fail with a dedicated
+  `RouterBuildError::ConflictingRouteShape` that names BOTH handlers and BOTH
+  original templates, instead of leaking an axum matchit panic. Path-shape
+  conflict detection is delegated to **matchit** — the exact engine axum 0.8
+  routes through — instead of a hand-rolled normalizer, so it mirrors axum's
+  accept/reject behavior precisely on every edge case: capture-name diffs
+  (`/users/{id}` vs `/users/{slug}`), catch-all vs sibling capture (`/u/{id}`
+  vs `/u/{*rest}`), catch-all vs dynamic *descendant* (`/cmd/{tool}/{sub}` vs
+  `/cmd/{*path}`, which the old normalizer missed), and mixed literal+capture
+  segments (`/file.{ext}` vs `/file.{kind}`). Because the check *is* matchit it
+  never over-flags what axum accepts: static-vs-capture (`/users/me` vs
+  `/users/{id}`), escaped literal braces (`/{{foo}}` vs `/{{bar}}`), and mixed
+  segments like `/file.{ext}` vs `/file.json` build cleanly. A permanent parity
+  test pins matchit's verdicts to axum 0.8.9's so a future axum bump cannot let
+  the oracle drift silently. Distinct methods on
+  the *same exact path* (`GET /admin` + `POST /admin`, `GET /users/{id}` +
+  `POST /users/{id}`) and genuinely different shapes (`/users/{id}` vs
+  `/users/{id}/posts`) are unaffected;
+  `#[repository]`-generated API routes are covered because they land in the
+  normal `Route` list. Opaque `AppBuilder::merge` and `AppBuilder::nest`
+  routers cannot be introspected — a non-empty opaque table emits a
+  `tracing::warn!` ("check skipped") mirroring the existing OpenAPI/MCP
+  merge-router warnings. See `docs/guide/getting-started.md`
+  ("Route collision diagnostics").
+- **migrations:** content checksums for applied migrations (issue #1203) —
+  the framework now records a SHA-256 of every migration's `up.sql` in a
+  new `autumn_migration_checksums` table (created by the framework
+  migration `20260709000000_create_migration_checksums`) when it is
+  applied via `autumn migrate run` or backfilled by `autumn migrate
+  baseline`. Startup auto-migrate **validates** but does not record: it
+  applies the embedded SQL compiled into the binary (which may differ
+  from the on-disk files), so recording those disk bytes could store a
+  hash for content that was never applied — recording is deferred to the
+  CLI/baseline paths where applied bytes == on-disk bytes. Before every
+  subsequent `autumn migrate` run and before startup auto-migrate, each
+  applied migration's on-disk `up.sql` is re-hashed and compared against
+  the recorded value; a
+  mismatch fails fast with a message that names the version and both
+  hashes: `migration <version> checksum mismatch: recorded <hex-a> but
+  on-disk content hashes to <hex-b>. Migrations must never be edited
+  after being applied — add a new migration instead, or run the
+  documented re-baseline command if this change was deliberate.` Hashing
+  normalises line endings (`\r\n`/`\r` → `\n`) and trims trailing
+  whitespace so a Windows checkout and a Linux one produce identical
+  checksums. `autumn migrate status` reports each applied migration's
+  state (`ok`/`changed`/`unrecorded`), excluding framework-owned migrations
+  (the same set rollback excludes) so operators are never prompted to
+  `baseline` framework versions whose `up.sql` does not live in the user dir;
+  `autumn migrate baseline` records
+  hashes for legacy applied migrations that pre-date the checksum table
+  (idempotent, additive); `autumn migrate baseline --force <version>`
+  overwrites one version's stored hash — the deliberate escape hatch,
+  WARN-logged. Both baseline paths run their applied-versions read and
+  checksum write under the same advisory migration lock as `run`/`down`, so a
+  concurrent rollback cannot revert a version between baseline's read and its
+  write. Rolling a migration back (`autumn migrate down`) now clears its
+  recorded checksum, so a reverted migration can be re-applied cleanly —
+  including with changed contents — instead of leaving a stale hash that would
+  trip the drift guard on a later run. `autumn migrate status` and the pre-apply
+  validation are read-only — they never create the checksum table, so displaying
+  or checking state needs no DDL privileges — and freshly-applied user
+  migrations are recorded immediately after they apply (before the framework
+  migration step), so a later framework failure can no longer leave them
+  unrecorded and mask a subsequent edit. See `docs/guide/migrations.md`.
+- **repository:** race-safe get-or-insert (#1382) — declaring
+  `fn find_or_create_by_<field>[_and_<field>...](...)` in a `#[repository]`
+  trait generates an inherent
+  `find_or_create_by_<field>(&self, <field>: <Ty>, ..., new: &NewModel) ->
+  AutumnResult<(Model, bool)>` that returns the model plus a `created` flag. It
+  looks the row up on the read path first (replica-eligible, honoring tenant
+  scoping and soft-delete); if absent it inserts on the primary with
+  `ON CONFLICT DO NOTHING`, so under concurrent callers exactly one row is
+  created, exactly one caller observes `created == true`, and no
+  unique-violation (`23505`) is ever surfaced — a concurrent loser re-reads its
+  own write on the primary and returns `(row, false)`. `before_create` /
+  `after_create` and the durable commit-hook queue fire only on the created
+  path, and — unlike `upsert_many` — the method is generated even on hooked
+  repositories. Race-safety requires a unique constraint covering the lookup
+  column(s); `_or_` is rejected because it would span constraints. On a
+  sharded, tenant-scoped repository the generated method is wrapped in the same
+  cross-shard write guard as `save`/`update`/`delete`, so a get-or-insert issued
+  through `across_tenants()` is rejected rather than silently writing to a single
+  shard while matching rows on other shards go unseen. See the
+  "Race-safe get-or-insert" section of the repositories guide.
+- **widgets:** `flash_messages(&[FlashMessage])` (issue #1240) — an accessible
+  renderer for consumed flash messages. Each banner is its own live region
+  whose `role`/`aria-live` is chosen by severity (`Error`/`Warning` announce
+  assertively, `Success`/`Info` politely), carries semantic
+  `autumn-flash`/`autumn-flash--<level>` classes backed by `FLASH_CSS`, and
+  escapes its text. An empty slice renders nothing; `flash_messages_with` adds
+  an opt-in, no-JavaScript dismiss control. The `flash` module doc now points
+  at the helper instead of the hand-rolled `div class=(level)` snippet.
+- **widgets:** `badge`/`status_tag` (issue #1259) — semantic status pills.
+  `badge(label, BadgeVariant)` emits a stable `badge badge--<variant>` class
+  (`Neutral`/`Info`/`Success`/`Warning`/`Danger`), `BadgeVariant::for_label`
+  maps an arbitrary status string to a deterministic color, `status_tag` is the
+  neutral one-liner, and `badge_with`/`BadgeConfig` set a `title`/`aria-label`.
+  Text is always present (color is never the sole signal); no inline styles.
+- **widgets:** `avatar(name, &AvatarConfig)` (issue #1263) — renders an `<img>`
+  (lazy-loaded, square `width`/`height`, name-derived `alt`) when an image URL
+  is present, or a deterministic colored-initials badge when it isn't (1–2
+  Unicode-safe uppercase initials, per-name background via a stable
+  `autumn-avatar--cN` palette class — no inline `style`, so it survives a
+  nonce-based CSP). Never a broken-image request; three named sizes
+  (`Small`/`Medium`/`Large`); the display name is HTML-escaped.
+- **widgets:** `alert`/`alert_with` + `error_summary` (issue #1314) — inline
+  block-level callouts with an `AlertVariant` (`Info`/`Success`/`Warning`/
+  `Error`, `role` chosen per variant), optional title, per-variant inline-SVG
+  icon, and an opt-in no-JavaScript dismiss control. `error_summary(&Changeset)`
+  renders an `Error` alert listing every field error as a `<ul>` (stable order)
+  or `None` when valid, for the form re-render path. All caller markup is
+  escaped by Maud; no inline styles.
+- **model:** `#[private]` field attribute (issue #1374) hides a `#[model]`
+  column from JSON — it is excluded from the model's `Serialize` impl so it
+  never appears in `Json` output, the auto-generated `--api` list/show
+  endpoints, or any `serde_json::to_value(&model)`, while staying a normal,
+  queryable column whose write path (`NewX`/`UpdateX`/`Changeset`) still binds
+  it (set a password, never read the hash back). `#[encrypted]` columns are now
+  `#[private]` in JSON by default (opt back in via `#[encrypted(admin_visible)]`);
+  `#[private]` still appears in `FormModel::form_fields()` (the write side). New
+  `autumn doctor` check `model_private_columns` warns when a sensitively-named
+  column (`password`/`token`/`secret`/`*_hash`) is not marked `#[private]`.
+- **model:** `#[normalize(trim, downcase, upcase, squish, with = path)]` field
+  attribute (issue #1379) canonicalizes a `String` column, composing
+  normalizers left-to-right. Runs on the write path (`save`/`save_many` insert
+  and `update` via `UpdateDraft::from_patch`) before the `before_create`/
+  `before_update` hooks and the DB write, and on derived `#[repository]`
+  `find_by_`/`count_by_` lookups (so `find_by_email("  FOO@X.com ")` matches the
+  stored `foo@x.com` row). Built-ins are idempotent, so `#[normalize(downcase)]`
+  plus a `unique` column gives case-insensitive uniqueness; non-`String` fields
+  are a compile error. Built-ins and the `Normalize` / `NormalizedModel` traits
+  live in the new `autumn_web::normalize` module.
 - **ci:** README-quickstart gate against the published crates (issue #1586) —
   `.github/workflows/quickstart-gate.yml` + `scripts/check-quickstart.sh`
   install the README-pinned `autumn-cli` from crates.io (never the local
@@ -556,6 +765,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **generator:** scaffolded `create`/`update`/`destroy` handlers now redirect
+  with `autumn_web::Redirect::to(...)` — a real **303 See Other** with a
+  `Location` header — instead of the hand-rolled 200 meta-refresh HTML page,
+  matching the `Redirect` primitive `docs/guide/path-helpers.md` already
+  recommends (and which the new #1127 write-path test asserts). `create` and
+  `destroy` redirect to the index route; `update` redirects to the show route.
 - **security:** `TenancyConfig::jwt_secret` is now stored as a
   `secrecy::SecretString` instead of a plain `String`, so the JWT signing
   secret is redacted from `Debug` output (and any logs that format the
