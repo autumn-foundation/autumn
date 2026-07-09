@@ -2682,12 +2682,16 @@ mod tests {
     async fn check_throttle_named_missing_entry_returns_ok_fail_open() {
         // Fail-open path when a named limiter is referenced but not configured.
         // Uses AppState::default() (no config installed) so lookup misses.
-        __throttle_registry_reset();
+        //
+        // Uses a route_id unique to this test so its registry bucket cannot
+        // collide with sibling tests running in parallel; see the module note
+        // on `__throttle_registry_reset` — clearing the shared registry mid-run
+        // races other tests, so we isolate by key instead of resetting.
         let state = crate::AppState::for_test();
         let headers = axum::http::HeaderMap::new();
         let result = __check_throttle(
             &state,
-            "test::route",
+            "test::check_throttle_named_missing_entry_returns_ok_fail_open",
             ThrottleSpec::Named("does_not_exist"),
             &headers,
             Some("127.0.0.1:1234".parse().unwrap()),
@@ -2704,13 +2708,14 @@ mod tests {
 
     #[tokio::test]
     async fn check_throttle_exempt_bypasses_limiter() {
-        __throttle_registry_reset();
+        // Unique route_id keeps this test's registry bucket isolated from
+        // siblings under parallel `cargo test`; no shared-registry reset.
         let state = crate::AppState::for_test();
         let headers = axum::http::HeaderMap::new();
         // Even with an extremely tight limiter, `exempt = true` returns Ok.
         let result = __check_throttle(
             &state,
-            "test::exempt",
+            "test::check_throttle_exempt_bypasses_limiter",
             ThrottleSpec::Inline {
                 limit: 1,
                 per_secs: 3600,
@@ -2728,7 +2733,11 @@ mod tests {
 
     #[tokio::test]
     async fn check_throttle_inline_denies_after_burst_and_response_carries_headers() {
-        __throttle_registry_reset();
+        // This test depends on registry state persisting between r1 and r2, so
+        // it MUST own a route_id no other test touches: a parallel test calling
+        // the shared-registry reset between the two calls would otherwise clear
+        // the bucket and let r2 succeed (the historical flake). Isolate by a
+        // unique key rather than resetting the shared registry.
         let state = crate::AppState::for_test();
         let headers = axum::http::HeaderMap::new();
         let peer: SocketAddr = "127.0.0.1:1234".parse().unwrap();
@@ -2741,7 +2750,7 @@ mod tests {
         // First call consumes the only token.
         let r1 = __check_throttle(
             &state,
-            "test::inline_denies",
+            "test::check_throttle_inline_denies_after_burst",
             spec.clone(),
             &headers,
             Some(peer),
@@ -2755,7 +2764,7 @@ mod tests {
         // Second call denies.
         let r2 = __check_throttle(
             &state,
-            "test::inline_denies",
+            "test::check_throttle_inline_denies_after_burst",
             spec,
             &headers,
             Some(peer),
@@ -2797,12 +2806,12 @@ mod tests {
     #[tokio::test]
     async fn check_throttle_no_identifiable_peer_bypasses_limiter() {
         // In-process caller without ConnectInfo (SSG, some tests): bypass.
-        __throttle_registry_reset();
+        // Unique route_id isolates this test from parallel siblings.
         let state = crate::AppState::for_test();
         let headers = axum::http::HeaderMap::new();
         let result = __check_throttle(
             &state,
-            "test::no_peer",
+            "test::check_throttle_no_identifiable_peer",
             ThrottleSpec::Inline {
                 limit: 1,
                 per_secs: 60,
