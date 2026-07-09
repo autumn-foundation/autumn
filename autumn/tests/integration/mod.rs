@@ -193,7 +193,11 @@ mod widgets_alert;
 mod widgets_avatar;
 #[cfg(feature = "maud")]
 mod widgets_badge;
+#[cfg(feature = "maud")]
+mod widgets_infinite_feed;
 mod widgets_modal;
 mod widgets_tabs;
+#[cfg(feature = "maud")]
+mod widgets_toast;
 #[cfg(feature = "ws")]
 mod ws_integration;

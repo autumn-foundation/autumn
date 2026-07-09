@@ -244,6 +244,17 @@ Free functions rendering changeset-aware, accessible inputs:
   colored-initials fallback); `alert(AlertVariant, body)` / `alert_with(...,
   &AlertConfig)` with `AlertVariant::{Info,Success,Warning,Error}` and
   `error_summary(&Changeset) -> Option<Markup>`. All prelude re-exported.
+- `autumn_web::widgets` feedback atoms: `toast(message, AlertVariant)` /
+  `toast_in(region_id, message, AlertVariant)` / `toast_region(id)` +
+  `DEFAULT_TOAST_REGION_ID` — transient htmx toast appended out-of-band
+  (`hx-swap-oob="beforeend:#<region-id>"`), CSS-only auto-dismiss (no JS),
+  `Error` → assertive `role="alert"`, others polite `role="status"` (reuses the
+  `AlertVariant` color lane). `infinite_feed(items, next_cursor, &FeedConfig)` /
+  `feed_page(items, next_cursor, &FeedConfig)` with `FeedMode::{Reveal,Button}`
+  — htmx infinite-scroll / "Load more" feed from a `CursorPage`: one cursored
+  `hx-get` sentinel appends the next page in place (no reload, no duplicate
+  rows), progressive `<a href>` fallback; `feed_page` is the per-page append
+  fragment. All prelude re-exported.
 - `autumn_web::flash::{flash_messages, flash_messages_with,
   FlashMessagesConfig}` — accessible flash-banner renderer (per-severity
   `role`/`aria-live`, `autumn-flash--<level>` classes, empty renders nothing,

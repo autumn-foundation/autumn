@@ -318,5 +318,48 @@ pub(super) fn builtin_stories() -> Vec<Story> {
                 }
             }
         },
+        story! {
+            "Feedback",
+            "Toast",
+            {
+                use autumn_web::widgets::{
+                    AlertVariant, DEFAULT_TOAST_REGION_ID, toast, toast_in, toast_region,
+                };
+
+                maud::html! {
+                    // Drop the region once in your base layout:
+                    (toast_region(DEFAULT_TOAST_REGION_ID))
+                    // Then return toasts from htmx handlers — appended OOB into
+                    // the region. `Error` announces assertively, others politely.
+                    (toast("Saved successfully", AlertVariant::Success))
+                    (toast("Could not save — please retry", AlertVariant::Error))
+                    // Target a differently-named region with `toast_in`:
+                    (toast_in(DEFAULT_TOAST_REGION_ID, "Heads up: trial ends soon", AlertVariant::Warning))
+                }
+            }
+        },
+        story! {
+            "Feedback",
+            "Infinite feed",
+            {
+                use autumn_web::widgets::{FeedConfig, FeedMode, feed_page, infinite_feed};
+
+                let items = maud::html! {
+                    article class="post" { h3 { "First post" } }
+                    article class="post" { h3 { "Second post" } }
+                };
+                let next = maud::html! {
+                    article class="post" { h3 { "Third post" } }
+                };
+                let config = FeedConfig::new("/posts/feed").mode(FeedMode::Reveal);
+                maud::html! {
+                    // Initial view: the feed container + an auto-loading sentinel.
+                    (infinite_feed(items, Some("eyJpZCI6Mn0"), &config))
+                    // The fragment a handler returns for each append (here the
+                    // last page, so no further sentinel is emitted):
+                    (feed_page(next, None, &FeedConfig::new("/posts/feed").button()))
+                }
+            }
+        },
     ]
 }

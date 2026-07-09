@@ -17,6 +17,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Download::into_response_ranged`; blob ranges fetch only the requested slice
   on the local store (S3/other backends fall back to a buffered slice) via the
   additive `BlobStore::get_range`.
+- **widgets:** three new server-rendered, accessible, zero-JavaScript view
+  helpers in `autumn_web::widgets` (all prelude re-exported, with `/_stories`
+  gallery entries). `toast(message, variant)` / `toast_region(id)` /
+  `toast_in(region_id, …)` render transient, CSS-auto-dismissing htmx action
+  feedback: the toast appends into a fixed region out-of-band via
+  `hx-swap-oob="beforeend:#<region-id>"`, reusing the shared `AlertVariant`
+  color lane (`Error` announces assertively via `role="alert"`/`aria-live`,
+  others politely) — no `<script>`, no new color vocabulary (issue #1320).
+  `infinite_feed(items, next_cursor, &FeedConfig)` + the companion
+  `feed_page(items, next_cursor, &FeedConfig)` render an htmx infinite-scroll /
+  "Load more" feed driven by a `CursorPage`: a single `hx-get` sentinel carries
+  the cursor and appends the next page in place (no reload, no duplicate rows),
+  in reveal (`hx-trigger="revealed"`) or explicit-button mode, with a
+  progressive `<a href>` fallback (issue #1372). `tabs(id, panels)` completes
+  the trio as the no-JS `tablist`/`tabpanel` switcher (issue #1316). Semantic
+  `.autumn-toast*` / `.autumn-feed*` classes backed by the shipped `WIDGETS_CSS`
+  stylesheet; all caller input HTML-escaped by Maud.
 - **generator:** `autumn new` now generates a `README.md` at the project root
   (listed in the "Created …" output) with explicit prerequisites and a
   golden-path quickstart — configure the `[database]` block in `autumn.toml`
