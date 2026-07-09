@@ -10,10 +10,13 @@ name: Fuzz (nightly long-run)
 # commit back into the repo corpus.
 #
 # Corpus retention is handled by actions/cache below: we RESTORE the previous
-# corpus before fuzzing and SAVE the (grown) corpus after. The cache key embeds
-# the ref so branches keep independent corpora, and restore-keys lets a fresh
-# key fall back to the most recent prior corpus for the same ref prefix — so a
-# key rotation never resets the accumulated corpus to empty.
+# corpus before fuzzing and SAVE the (grown) corpus after. The cache is scoped
+# per fuzz target (each matrix leg caches only fuzz/corpus/<target>) so the five
+# legs never clobber each other's discoveries under a shared key. The cache key
+# also embeds the ref so branches keep independent corpora, and restore-keys
+# lets a fresh key fall back to the most recent prior corpus for the same
+# target+ref prefix — so a key rotation never resets the accumulated corpus to
+# empty.
 
 on:
   schedule:
@@ -46,24 +49,25 @@ jobs:
       - uses: Swatinem/rust-cache@v2.7.8
         with:
           workspaces: fuzz
-      # Restore the accumulated corpus from the previous run. libFuzzer only
-      # appends coverage-increasing inputs, so this corpus grows monotonically;
-      # restore-keys falls back to the newest prior cache for this ref if the
-      # exact key misses, so the corpus is never silently reset to the committed
-      # seeds alone.
+      # Restore the accumulated corpus for THIS target from the previous run.
+      # libFuzzer only appends coverage-increasing inputs, so this corpus grows
+      # monotonically; the cache is keyed per target so each of the five matrix
+      # legs persists its own discoveries independently. restore-keys falls back
+      # to the newest prior cache for this target+ref if the exact key misses, so
+      # the corpus is never silently reset to the committed seeds alone.
       - name: Restore persisted corpus
-        uses: actions/cache@v4
+        uses: actions/cache@v7
         with:
-          path: fuzz/corpus
-          key: fuzz-corpus-${{ github.ref }}-${{ github.run_id }}
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.ref }}-${{ github.run_id }}
           restore-keys: |
-            fuzz-corpus-${{ github.ref }}-
-            fuzz-corpus-
+            fuzz-corpus-${{ matrix.target }}-${{ github.ref }}-
+            fuzz-corpus-${{ matrix.target }}-
       - name: Fuzz ${{ matrix.target }} (5 min, corpus persisted across runs)
         run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=300 -timeout=10
       - name: Upload crash reproducers
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fuzz-artifacts-${{ matrix.target }}
           path: fuzz/artifacts/**
