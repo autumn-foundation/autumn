@@ -12,6 +12,44 @@ use crate::{
     ListResult, SelectOption,
 };
 
+// ── Grouped-aggregate roll-up over the audit trail (#1364) ──────────────────
+//
+// A typed `#[repository]` over `autumn_experiment_changes` so the per-experiment
+// audit-trail size is computed with the grouped-aggregate API
+// (`count_grouped_by_experiment().filter_eq(name)`) instead of a hand-written
+// `SELECT COUNT(*) … WHERE experiment = $1`. The read is replica-routed by the
+// generated executor — a dashboard win the raw `diesel::sql_query` skipped.
+
+diesel::table! {
+    autumn_experiment_changes (id) {
+        id -> diesel::sql_types::Int8,
+        experiment -> diesel::sql_types::Text,
+        mutation -> diesel::sql_types::Text,
+        actor -> diesel::sql_types::Nullable<diesel::sql_types::Text>,
+        changed_at -> diesel::sql_types::Timestamptz,
+    }
+}
+
+#[autumn_web::model(table = "autumn_experiment_changes")]
+pub struct ExperimentChange {
+    #[id]
+    pub id: i64,
+    #[indexed]
+    pub experiment: String,
+    pub mutation: String,
+    pub actor: Option<String>,
+    #[default]
+    pub changed_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[autumn_web::repository(ExperimentChange, table = "autumn_experiment_changes")]
+pub trait ExperimentChangeRepository {
+    /// COUNT(*) GROUP BY experiment → one `(experiment, count)` pair per
+    /// experiment; `.filter_eq(name)` narrows it to a single experiment's
+    /// audit-trail size.
+    fn count_grouped_by_experiment() -> Vec<(String, i64)>;
+}
+
 /// Admin panel model for A/B experiments.
 ///
 /// Register this model with the admin plugin to get an experiment management UI
@@ -496,13 +534,19 @@ impl AdminModel for ExperimentAdminModel {
                 });
             };
 
-            let count: i64 = diesel::sql_query(
-                "SELECT COUNT(*) FROM autumn_experiment_changes WHERE experiment = $1",
-            )
-            .bind::<diesel::sql_types::Text, _>(&name)
-            .get_result::<CountRow>(&mut conn)
-            .await
-            .map_or(0, |r| r.count);
+            // Audit-trail size via the typed grouped-aggregate API (#1364):
+            // COUNT(*) GROUP BY experiment, scoped to this experiment. Grouping
+            // on the filtered column yields a single `(name, count)` row (or
+            // none when the experiment has no history). Errors degrade to 0,
+            // matching the previous raw-SQL `map_or(0, …)`.
+            let count: i64 = PgExperimentChangeRepository::with_pool_untracked(pool.clone())
+                .count_grouped_by_experiment()
+                .filter_eq(name.clone())
+                .load()
+                .await
+                .ok()
+                .and_then(|rows| rows.into_iter().next())
+                .map_or(0, |(_, c)| c);
 
             let offset = (page.saturating_sub(1)) * per_page;
             let entries: Vec<crate::AdminHistoryEntry> = diesel::sql_query(

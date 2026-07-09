@@ -117,25 +117,21 @@ pub struct Comment {
     pub created_at: chrono::NaiveDateTime,
 }
 
-// Manual model -- complex constraints.
-
-#[allow(dead_code)] // Used by generated API routes; not directly referenced in app code
-#[derive(Debug, Clone, diesel::Queryable, diesel::Selectable, serde::Serialize)]
-#[diesel(table_name = votes)]
+// `Vote` is an `#[autumn_web::model]` so `VoteRepository` (see
+// `crate::repositories`) can expose the typed grouped-aggregate roll-up
+// `sum_value_grouped_by_post_id` (#1364) used to recompute a post's score.
+// A vote references *either* a post or a comment, so both FKs are nullable.
+#[autumn_web::model(table = "votes")]
 pub struct Vote {
+    #[id]
     pub id: i64,
+    #[indexed]
     pub user_id: i64,
+    #[indexed]
     pub post_id: Option<i64>,
+    #[indexed]
     pub comment_id: Option<i64>,
     pub value: i16,
+    #[default]
     pub created_at: chrono::NaiveDateTime,
-}
-
-#[derive(Debug, diesel::Insertable)]
-#[diesel(table_name = votes)]
-pub struct NewVote {
-    pub user_id: i64,
-    pub post_id: Option<i64>,
-    pub comment_id: Option<i64>,
-    pub value: i16,
 }

@@ -179,6 +179,26 @@ Requires a unique constraint covering the lookup column(s); `_or_` is rejected
 (it would span constraints). See "Race-safe get-or-insert" in
 `docs/guide/repositories.md`.
 
+**(unreleased)** — typed grouped aggregate queries (#1364): declare
+`fn count_grouped_by_<col>() -> Vec<(K, i64)>` or
+`fn <sum|avg|min|max>_<num_col>_grouped_by_<col>() -> Vec<(K, Option<T>)>`
+(`avg` → `Option<f64>`) in the `#[repository]` trait — the pair return type is
+**required** (the macro reads the key/value SQL types from it). Each becomes an
+inherent method returning a lazy `GroupedAggregate<'_, K, V>` builder that
+yields one `(group, aggregate)` pair per group; nothing runs until the terminal
+`.load().await -> AutumnResult<Vec<(K, V)>>`. Chain
+`.order_by_aggregate_desc()` / `.order_by_aggregate_asc()` + `.limit(n)` for
+top-N, `.filter_eq(v)` / `.filter_range(lo, hi)` to scope the group column
+*before* aggregating (bound as params, inclusive range), or
+`.bucket(autumn_web::aggregate::DateBucket::{Day,Week,Month})` for a
+`date_trunc` time series keyed by bucket start. `sum`/`avg`/`min`/`max` are
+null-safe (all-`NULL` group → `None`, empty table → empty `Vec`). Inherits
+soft-delete + tenant scoping + read routing like `count`; a sharded,
+tenant-scoped repo used via `across_tenants()` rejects the aggregate rather than
+returning a per-shard-partial answer. `DateBucket` and the `GroupedAggregate`
+builder live in `autumn_web::aggregate`. See "Grouped aggregate queries" in
+`docs/guide/repositories.md`.
+
 ## Db transactions
 
 - `Db::tx(f)` — READ COMMITTED, one attempt (published 0.5.0).

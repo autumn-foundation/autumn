@@ -245,6 +245,100 @@ single-constraint guarantee.
 
 ---
 
+## 7. Grouped aggregate queries: `count_/sum_/avg_/min_/max_..._grouped_by_<col>` *(unreleased)*
+
+Dashboard roll-ups — a post's vote tally, an experiment's audit-trail size, a
+per-day event time series — are `GROUP BY` aggregates. Hand-writing them as raw
+`diesel::sql_query("SELECT … SUM(...) … GROUP BY …")` strings bypasses the
+repository's replica routing, tenant scoping, and soft-delete filters, and has
+to be re-typed for every widening cast. Declare them on the `#[repository]`
+trait instead (issue #1364):
+
+```rust
+#[autumn_web::repository(Vote, table = "votes")]
+pub trait VoteRepository {
+    /// COUNT(*)  GROUP BY post_id → Vec<(post_id, count)>.
+    fn count_grouped_by_post_id() -> Vec<(i64, i64)>;
+    /// SUM(value) GROUP BY post_id → Vec<(post_id, Option<sum>)>.
+    fn sum_value_grouped_by_post_id() -> Vec<(i64, Option<i64>)>;
+    /// AVG(value) GROUP BY post_id → Vec<(post_id, Option<f64>)>.
+    fn avg_value_grouped_by_post_id() -> Vec<(i64, Option<f64>)>;
+}
+```
+
+Each declared method becomes an **inherent** method on the generated `Pg*`
+struct that returns a lazy `GroupedAggregate<'_, K, V>` builder — nothing runs
+until the terminal `.load().await`:
+
+```rust
+// Top-5 posts by score, highest first.
+let top: Vec<(i64, Option<i64>)> = repo
+    .sum_value_grouped_by_post_id()
+    .order_by_aggregate_desc()
+    .limit(5)
+    .load()
+    .await?;
+
+// One post's tally: group by post_id, scope to it, take the single row.
+let score = repo
+    .sum_value_grouped_by_post_id()
+    .filter_eq(post_id)
+    .load()
+    .await?
+    .into_iter()
+    .next()
+    .and_then(|(_, sum)| sum)
+    .unwrap_or(0);
+
+// A day-bucketed time series over a bounded window.
+use autumn_web::aggregate::DateBucket;
+let per_day: Vec<(chrono::NaiveDateTime, i64)> = repo
+    .count_grouped_by_created_at()
+    .bucket(DateBucket::Day)
+    .filter_range(window_start, window_end)
+    .load()
+    .await?;
+```
+
+### Method-name shapes and the `Vec<(K, V)>` return
+
+The trait method **must** declare its pair return type; the macro reads `K` and
+`V` from it and bakes the matching Postgres bind/result SQL types.
+
+| method shape                              | `V`                                |
+|-------------------------------------------|------------------------------------|
+| `count_grouped_by_<col>`                  | `i64`                              |
+| `sum_<num_col>_grouped_by_<col>`          | `Option<T>` (`T` = column type)    |
+| `min_/max_<num_col>_grouped_by_<col>`     | `Option<T>`                        |
+| `avg_<num_col>_grouped_by_<col>`          | `Option<f64>`                      |
+
+`K` is the group column's Rust type (or, under `.bucket(..)`, the bucket-start
+timestamp's type). `sum`/`min`/`max`/`avg` are **null-safe**: a group whose
+values are all `NULL` yields `None`, and an empty result set is an empty `Vec`.
+
+### Builder chain
+
+- `.order_by_aggregate_desc()` / `.order_by_aggregate_asc()` — order by the
+  aggregated value; combine with `.limit(n)` for a top-N roll-up.
+- `.limit(n)` — cap the number of groups returned.
+- `.filter_eq(v)` / `.filter_range(lo, hi)` — scope rows **before** grouping;
+  both filter the *group column* and are bound as query parameters (never
+  interpolated). `filter_range` is inclusive and works for date/time windows.
+- `.bucket(DateBucket::{Day, Week, Month})` — group by
+  `date_trunc('<unit>', <col>)`, producing a time series keyed by bucket start.
+
+### Scoping comes for free
+
+The generated query composes the repository's soft-delete filter and tenant
+predicate exactly like `count`, and acquires its connection through the same
+read-route helper — so **replica routing and multi-tenancy work with no extra
+code**. Because `sum`/`avg`/`min`/`max` cannot be merged across shards, a
+sharded, tenant-scoped repository used via `across_tenants()` **rejects** a
+grouped aggregate rather than returning a per-shard-partial answer; run it per
+shard with `from_shard(..)` instead.
+
+---
+
 ## Read Replicas: Automatic Read Routing
 
 When `database.replica_url` is configured, every generated **read-only** method — `find_by_id`, `find_all`, `count`, `exists_by_id`, `paginate`, `cursor_page`, derived `find_by_*` / `count_by_*` / `exists_by_*` queries, and full-text `search` / `search_page` — automatically acquires its connection from the replica pool. Mutating methods (`save`, `update`, `delete_by_id`, the bulk operations, hook-driven writes, `with_lock`) always run on the primary. Provisioning a replica therefore offloads your primary with **zero application code changes**.

@@ -15,9 +15,10 @@
 
 use crate::hooks::PostHooks;
 use crate::models::{
-    NewPost, NewSubreddit, Post, PostDraftExt, Subreddit, UpdatePost, UpdateSubreddit,
+    NewPost, NewSubreddit, NewVote, Post, PostDraftExt, Subreddit, UpdatePost, UpdateSubreddit,
+    UpdateVote, Vote,
 };
-use crate::schema::{posts, subreddits};
+use crate::schema::{posts, subreddits, votes};
 
 #[autumn_web::repository(Subreddit, api = "/api/subreddits")]
 pub trait SubredditRepository {
@@ -54,6 +55,17 @@ pub trait PostRepository {
 
     /// SELECT * FROM posts WHERE author_id = $1
     fn find_by_author_id(author_id: i64) -> Vec<Post>;
+}
+
+// Typed grouped aggregate (#1364): `sum_value_grouped_by_post_id` rolls the
+// votes table up to `SUM(value) GROUP BY post_id`, returning one
+// `(post_id, Option<sum>)` pair per post. `cast_vote` scopes it to a single
+// post with `.filter_eq(post_id)` to recompute that post's score without a
+// hand-written `SUM` subquery -- the read is replica-routed automatically.
+#[autumn_web::repository(Vote, table = "votes")]
+pub trait VoteRepository {
+    /// SUM(value) GROUP BY post_id -> `Vec<(post_id, Option<sum>)>`.
+    fn sum_value_grouped_by_post_id() -> Vec<(i64, Option<i64>)>;
 }
 
 #[derive(Clone, Debug)]
