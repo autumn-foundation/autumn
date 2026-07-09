@@ -749,6 +749,12 @@ Unreleased (trunk-dev) — `Server-Timing` response header:
   `db;dur=…;desc="N queries"` for N+1 visibility.
 - SSE responses (`text/event-stream`) get `total`-only; header is
   best-effort — never turns absent timing data into an error.
+- The `db` metric installs autumn's own Diesel connection instrumentation on
+  measured checkouts only (nothing is installed when `server_timing` is off, so
+  an app's `diesel::connection::set_default_instrumentation` is untouched).
+  While enabled, autumn's timer replaces an app-provided default rather than
+  composing with it — documented limitation; keep `server_timing` off where you
+  rely on your own instrumentation.
 - Doc + browser DevTools walk-through:
   `docs/guide/observability/server-timing.md`.
 

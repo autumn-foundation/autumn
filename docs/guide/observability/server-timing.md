@@ -96,3 +96,26 @@ The header is a best-effort observability surface. If the assembled string
 somehow fails `HeaderValue::from_str`, the middleware silently drops the
 header rather than aborting the response. Absent timing data (e.g. no
 queries ran) never turns into an error path.
+
+## Interaction with app-provided Diesel instrumentation
+
+To measure per-query database time, autumn installs its own
+[Diesel connection instrumentation](https://docs.rs/diesel/latest/diesel/connection/trait.Instrumentation.html)
+on each connection it checks out **while a request is being measured**.
+Diesel's `set_instrumentation` *wholesale replaces* a connection's
+instrumentation, so this has an important consequence:
+
+- When `server_timing` is **disabled** (the production default), autumn
+  installs nothing. Any global instrumentation you registered with
+  [`diesel::connection::set_default_instrumentation`](https://docs.rs/diesel/latest/diesel/connection/fn.set_default_instrumentation.html)
+  — query logging, tracing, custom metrics — runs untouched.
+- When `server_timing` is **enabled**, autumn's timer replaces your
+  instrumentation for the duration of each measured checkout. Autumn does
+  **not** currently compose with (wrap or chain) an app-provided default
+  instrumentation, so your hook will not fire for queries that run while the
+  feature is active.
+
+This is a documented limitation, not a bug: `server_timing` is a
+development-oriented, off-by-default feature. If you rely on your own Diesel
+instrumentation in a given environment, keep `server_timing` disabled there
+(it already defaults off outside the `dev`/`development` profiles).

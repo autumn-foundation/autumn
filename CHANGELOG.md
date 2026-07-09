@@ -563,12 +563,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stale timer was active — adding a bogus `+1 query` (and its latency) to the
   next request before any application SQL — and a reused connection kept paying
   per-query `DebugQuery` formatting even on later opted-out requests. `Db::checkout`
-  now installs a fresh timer on every checkout (before the `SET`), the timer's
-  `on_start` probes the request scope before formatting or recording anything
-  (a cheap no-op when opted out, so always installing is free of per-query
-  overhead), and the checkout `SET statement_timeout` is classified as an
-  uncounted housekeeping statement alongside transaction-control SQL (issue
-  #1348).
+  now installs a fresh timer on every measured checkout (before the `SET`), the
+  timer's `on_start` probes the request scope before formatting or recording
+  anything (a cheap no-op for any stale timer left on a reused connection), and
+  the checkout `SET statement_timeout` is classified as an uncounted
+  housekeeping statement alongside transaction-control SQL (issue #1348).
+- **observability:** `Server-Timing` no longer clobbers an application's own
+  Diesel instrumentation. `Db::checkout` installs its `RequestQueryTimer` via
+  diesel-async's `set_instrumentation`, which *wholesale replaces* a
+  connection's instrumentation — so an unconditional install would overwrite
+  any global hook an app registered with
+  `diesel::connection::set_default_instrumentation` (query logging, tracing,
+  metrics) on the first checkout and never restore it, silently disabling it
+  even when `[observability] server_timing` is off. `Db::checkout` now installs
+  the timer only when a `Server-Timing` request scope is active
+  (`request_db_timing_active`), so an opted-out app keeps its own
+  instrumentation intact. Composing autumn's timer with an app-provided default
+  instrumentation is a documented limitation while `server_timing` is enabled —
+  see `docs/guide/observability/server-timing.md` (issue #1348).
 - **observability:** `Server-Timing` no longer installs the per-request DB
   query timer on checked-out connections when `[observability] server_timing`
   is disabled (the production default). Previously every checked-out connection
