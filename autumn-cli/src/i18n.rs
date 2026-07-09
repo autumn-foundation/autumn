@@ -337,8 +337,18 @@ fn segment_str_lit(segment: &TokenStream) -> Option<String> {
 /// Classify a key segment: a lone string literal is a referenced key; anything
 /// else (a metavariable, a `format!(...)`, a borrow, …) is a dynamic
 /// (unanalyzable) call site.
+///
+/// The literal is matched *after* [`normalize_key_segment`] peels leading
+/// borrows/derefs and unwraps a parenthesized/implicit group wrapping the whole
+/// key, so a literal passed through a wrapper — `t(("nav.home"))`,
+/// `t(&"nav.home")`, `t(&("nav.home"))` — is still recorded as a referenced key
+/// rather than being misread as a dynamic (unanalyzable) site. A genuinely
+/// dynamic key (`&format!(...)`, a bare variable, a metavariable) does not
+/// normalize to a lone literal and remains a dynamic site.
 fn record_key_segment(segment: &TokenStream, file: &str, result: &mut ScanResult) {
-    if let Some(key) = segment_str_lit(segment) {
+    let trees: Vec<TokenTree> = segment.clone().into_iter().collect();
+    let normalized: TokenStream = normalize_key_segment(&trees).into_iter().collect();
+    if let Some(key) = segment_str_lit(&normalized) {
         result.referenced.insert(key);
     } else {
         record_dynamic_segment(segment, file, result);
@@ -426,11 +436,39 @@ fn normalize_key_segment(trees: &[TokenTree]) -> Vec<TokenTree> {
 /// If `trees` begins with a `format!(...)` / `format!{...}` / `format![...]`
 /// invocation, return its argument group. Expects a [`normalize_key_segment`]-
 /// normalized stream, so the `format` ident is the leading meaningful token.
+///
+/// A path-qualified form is also accepted: an optional leading `::` and any
+/// number of `ident ::` path segments preceding the macro name, so
+/// `std::format!(...)`, `::std::format!(...)`, `alloc::format!(...)`, and
+/// `core::format!(...)` are recognized as well as plain `format!(...)`. The
+/// *final* path segment ident must be exactly `format`, so an unrelated
+/// path-qualified macro like `std::println!` / `std::concat!` (or a custom
+/// `myfmt!`) is not mistaken for a format invocation.
 fn leading_format_group(trees: &[TokenTree]) -> Option<&Group> {
-    if let Some(TokenTree::Ident(id)) = trees.first()
+    let mut i = 0;
+    // Optional leading `::` (absolute path). `::` tokenizes as two `:` puncts.
+    if matches!(trees.get(i), Some(TokenTree::Punct(p)) if p.as_char() == ':')
+        && matches!(trees.get(i + 1), Some(TokenTree::Punct(p)) if p.as_char() == ':')
+    {
+        i += 2;
+    }
+    // Walk `ident (:: ident)*`, tracking the final segment ident.
+    let mut last_ident: Option<&proc_macro2::Ident> = None;
+    while let Some(TokenTree::Ident(id)) = trees.get(i) {
+        last_ident = Some(id);
+        i += 1;
+        if matches!(trees.get(i), Some(TokenTree::Punct(p)) if p.as_char() == ':')
+            && matches!(trees.get(i + 1), Some(TokenTree::Punct(p)) if p.as_char() == ':')
+        {
+            i += 2;
+        } else {
+            break;
+        }
+    }
+    if let Some(id) = last_ident
         && *id == "format"
-        && matches!(trees.get(1), Some(TokenTree::Punct(p)) if p.as_char() == '!')
-        && let Some(TokenTree::Group(group)) = trees.get(2)
+        && matches!(trees.get(i), Some(TokenTree::Punct(p)) if p.as_char() == '!')
+        && let Some(TokenTree::Group(group)) = trees.get(i + 1)
     {
         return Some(group);
     }
@@ -1058,6 +1096,39 @@ mod tests {
     }
 
     #[test]
+    fn wrapped_literal_key_recorded_as_referenced() {
+        // A literal key passed through a borrow or a parenthesized group —
+        // `t(("nav.home"))`, `t(&"nav.home")`, `t(&("nav.home"))` — must still be
+        // recorded as a referenced key, not misclassified as a dynamic
+        // (unanalyzable) site. Otherwise deleting `nav.home` from the `.ftl`
+        // would exit 0 rather than reporting the runtime miss. A genuinely
+        // dynamic key stays dynamic.
+        let src = r#"
+            fn view(locale: &Locale, section: &str) {
+                let _ = locale.t(("nav.home"));
+                let _ = locale.t(&"nav.about");
+                let _ = locale.t(&("nav.contact"));
+                let _ = locale.t(&format!("nav.{section}"));
+            }
+        "#;
+        let mut result = ScanResult::default();
+        scan_source(src, "view.rs", &mut result);
+        assert_eq!(
+            result.referenced,
+            keys(&["nav.about", "nav.contact", "nav.home"]),
+            "wrapped literal keys must be recorded as referenced: {:?}",
+            result.referenced
+        );
+        assert_eq!(
+            result.dynamic.len(),
+            1,
+            "only the genuinely dynamic `format!` key is a dynamic site: {:?}",
+            result.dynamic
+        );
+        assert!(result.dynamic[0].snippet.contains("format"));
+    }
+
+    #[test]
     fn macro_metavariables_do_not_discard_literal_key() {
         // A translation call written inside a `macro_rules!` transcriber carries
         // `$metavariable` tokens in non-key argument positions. Parsing the whole
@@ -1150,6 +1221,69 @@ mod tests {
             .map(|d| d.key_prefix.as_str())
             .collect();
         assert_eq!(prefixes, vec!["status.", "nav.", "footer.", ""]);
+    }
+
+    #[test]
+    fn path_qualified_format_prefix_recognized() {
+        // A path-qualified `format!` — `std::format!(...)`, `::std::format!(...)`
+        // — must be recognized as a format macro so its leading static prefix is
+        // recovered, rather than leaving the stream starting with `std` and being
+        // misread as a fully-dynamic (empty-prefix) site. Plain `format!` still
+        // works; an unrelated path macro (`std::concat!`) or a bare variable
+        // yields an empty prefix.
+        let src = r#"
+            fn view(locale: &Locale, state: &str, x: &str, a: &str, b: &str, key: &str) {
+                let _ = locale.t(&std::format!("status.{state}"));
+                let _ = locale.t(&::std::format!("nav.{x}"));
+                let _ = locale.t(&format!("footer.{a}"));
+                let _ = locale.t(&std::concat!("misc.", b));
+                let _ = locale.t(key);
+            }
+        "#;
+        let mut result = ScanResult::default();
+        scan_source(src, "view.rs", &mut result);
+        let prefixes: Vec<&str> = result
+            .dynamic
+            .iter()
+            .map(|d| d.key_prefix.as_str())
+            .collect();
+        assert_eq!(prefixes, vec!["status.", "nav.", "footer.", "", ""]);
+    }
+
+    #[test]
+    fn path_qualified_format_suppresses_only_matching_unused_keys() {
+        // `t(&std::format!("status.{state}"))` records prefix `status.` (NOT
+        // empty), so `unused_suppressed_by_dynamic` stays false: `status.*` is
+        // suppressed from Unused, but an unrelated stale `footer.legacy` still
+        // fails `--strict`.
+        let src = r#"
+            fn view(locale: &Locale, state: &str) {
+                let _ = locale.t("nav.home");
+                let _ = locale.t(&std::format!("status.{state}"));
+            }
+        "#;
+        let mut scan = ScanResult::default();
+        scan_source(src, "view.rs", &mut scan);
+        assert_eq!(scan.dynamic.len(), 1);
+        assert_eq!(scan.dynamic[0].key_prefix, "status.");
+
+        let mut per_locale = BTreeMap::new();
+        per_locale.insert(
+            "en".to_owned(),
+            keys(&["nav.home", "status.open", "status.closed", "footer.legacy"]),
+        );
+        let report = build_report(&scan, &cfg("en", &[]), &per_locale);
+
+        assert!(!report.unused_suppressed_by_dynamic);
+        let en = &report.locales[0];
+        assert_eq!(
+            en.unused,
+            vec!["footer.legacy".to_owned()],
+            "path-qualified prefix `status.` must suppress status.* but keep footer.legacy"
+        );
+        assert!(report.has_warnings());
+        assert_eq!(report.exit_code(false), 0);
+        assert_eq!(report.exit_code(true), 1);
     }
 
     #[test]
