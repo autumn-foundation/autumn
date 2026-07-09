@@ -725,37 +725,46 @@ impl CacheControl {
         if self.no_store {
             return "no-store".to_string();
         }
-        let mut parts: Vec<String> = Vec::new();
+        // Pre-allocate a single buffer and append directives directly, only
+        // allocating for the dynamic `max-age`/`s-maxage`/`stale-while-revalidate`
+        // parts. The ", " separator is written before every directive but the first.
+        let mut out = String::with_capacity(64);
+        let mut push = |directive: &str| {
+            if !out.is_empty() {
+                out.push_str(", ");
+            }
+            out.push_str(directive);
+        };
         match self.visibility {
-            Some(Visibility::Public) => parts.push("public".to_string()),
-            Some(Visibility::Private) => parts.push("private".to_string()),
+            Some(Visibility::Public) => push("public"),
+            Some(Visibility::Private) => push("private"),
             None => {}
         }
         if self.no_cache {
-            parts.push("no-cache".to_string());
+            push("no-cache");
         }
         if let Some(d) = self.max_age {
-            parts.push(format!("max-age={}", d.as_secs()));
+            push(&format!("max-age={}", d.as_secs()));
         }
         if let Some(d) = self.s_maxage {
-            parts.push(format!("s-maxage={}", d.as_secs()));
+            push(&format!("s-maxage={}", d.as_secs()));
         }
         if let Some(d) = self.stale_while_revalidate {
-            parts.push(format!("stale-while-revalidate={}", d.as_secs()));
+            push(&format!("stale-while-revalidate={}", d.as_secs()));
         }
         if self.must_revalidate {
-            parts.push("must-revalidate".to_string());
+            push("must-revalidate");
         }
         if self.immutable {
-            parts.push("immutable".to_string());
+            push("immutable");
         }
-        parts.join(", ")
+        out
     }
 
     /// Insert the rendered `Cache-Control` header into `headers`, replacing any
     /// pre-existing value so exactly one `Cache-Control` remains.
     fn apply_to(&self, headers: &mut HeaderMap) {
-        if let Ok(v) = HeaderValue::from_str(&self.header_value()) {
+        if let Ok(v) = HeaderValue::try_from(self.header_value()) {
             headers.insert(CACHE_CONTROL, v);
         }
     }
