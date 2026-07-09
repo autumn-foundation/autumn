@@ -8386,8 +8386,20 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 /// Returns `(model, created)`: `created == true` only when this
                 /// call actually inserted the row. When a matching row already
                 /// exists (or a concurrent caller wins the insert race), the
-                /// existing row is returned with `created == false` and no
-                /// create/commit hooks fire.
+                /// existing row is returned with `created == false`.
+                ///
+                /// Only the `after_create` and `after_create_commit` (commit)
+                /// hooks are guaranteed to fire **exclusively** on the created
+                /// path — they run only when a row is actually inserted
+                /// (`created == true`). `before_create` is different: it runs
+                /// *before* the `ON CONFLICT DO NOTHING` insert, so when a
+                /// concurrent caller loses the insert race the method returns
+                /// `created == false` yet that caller's `before_create` has
+                /// already executed — and any side effects (including DB writes
+                /// made inside the transaction) still occur. Keep
+                /// `before_create` side effects idempotent, or move create-only
+                /// work into `after_create`; do not rely on the found-path
+                /// semantics to suppress `before_create`.
                 ///
                 /// Race-safety relies on a unique constraint covering the lookup
                 /// column(s): the insert uses `ON CONFLICT DO NOTHING`, so under
