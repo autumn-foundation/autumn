@@ -1,5 +1,10 @@
 [workspace]
 members = ["autumn", "autumn-macros", "autumn-cli", "autumn-admin-plugin", "autumn-storage-s3", "autumn-cache-redis", "examples/hello", "examples/todo-app", "examples/blog", "examples/bookmarks", "examples/bookmarks-distributed", "examples/bookmarks-sharded", "examples/wiki", "examples/reddit-clone", "examples/saas", "benchmarks/runtime/gate", "example-e2e"]
+# The cargo-fuzz crate builds only under nightly with sanitizers and pulls
+# `autumn` in as a path dependency. Excluding it keeps `cargo build/test
+# --workspace` (and the publish gate) untouched; `fuzz/Cargo.toml` is also its
+# own workspace root. It is intentionally NOT a member.
+exclude = ["fuzz"]
 resolver = "3"
 
 # `cargo test --workspace` builds every example, plugin, integration test, and
@@ -80,6 +85,11 @@ proc-macro2 = "1"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
+# `fuzzing` is set by cargo-fuzz/libFuzzer when building the `fuzz/` crate's
+# targets (which pull `autumn` in as a path dependency). Declaring it here keeps
+# the `#[cfg(fuzzing)]` seams in the source from tripping the `unexpected_cfgs`
+# lint under `-D warnings` in normal (non-fuzzing) workspace builds.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }

@@ -1,0 +1,69 @@
+[package]
+name = "autumn-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+rust-version = "1.88.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Detach the fuzz crate into its own workspace so cargo-fuzz's nightly/sanitizer
+# build never participates in `cargo build --workspace` for the main tree. The
+# root `Cargo.toml` also lists this directory under `[workspace] exclude`.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+# The framework crate is published as `autumn-web`; pull it in under the `autumn`
+# name via a path dependency so the fuzz targets `use autumn::__fuzz`. Only the
+# features needed to reach the fuzzed request-path surfaces are enabled.
+[dependencies.autumn]
+path = "../autumn"
+package = "autumn-web"
+# Keep the crate's default features (maud/htmx/db/… — the normal build posture
+# the parsing seams live in) and add the extra surfaces the fuzz targets reach:
+# inbound-mail MIME parsing, multipart form decoding, and `openapi` (which gates
+# `router::extract_path_params`, the path-parameter extraction seam).
+features = ["inbound-mail", "multipart", "openapi"]
+
+[profile.release]
+debug = 1
+
+# Keep fuzz-target builds from tripping the "unused `main`" style lints and to
+# match cargo-fuzz conventions.
+[[bin]]
+name = "idempotency"
+path = "fuzz_targets/idempotency.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "routing"
+path = "fuzz_targets/routing.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "headers"
+path = "fuzz_targets/headers.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "session"
+path = "fuzz_targets/session.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "body"
+path = "fuzz_targets/body.rs"
+test = false
+doc = false
+bench = false

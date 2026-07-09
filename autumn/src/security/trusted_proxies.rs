@@ -421,6 +421,61 @@ impl ProxyResolver {
     }
 }
 
+// ── Fuzzing seams ───────────────────────────────────────────────────────────
+// These `#[cfg(fuzzing)]` wrappers expose the private trusted-proxy parsing
+// surface (`TrustedProxy::parse`, `ProxyResolver::parse_forwarded_ip`, and the
+// full `X-Forwarded-*` resolver) to the `fuzz/` crate. They are compiled out of
+// every normal build (including `cargo package`), so the published crate is
+// byte-identical. See `fuzz/fuzz_targets/headers.rs`.
+
+/// Fuzzing seam: parse a single `[security.trusted_proxies]` range/IP entry.
+#[cfg(fuzzing)]
+pub fn __fuzz_parse_trusted_proxy(value: &str) -> bool {
+    TrustedProxy::parse(value).is_some()
+}
+
+/// Fuzzing seam: parse a single `X-Forwarded-For` entry into an IP.
+#[cfg(fuzzing)]
+#[must_use]
+pub fn __fuzz_parse_forwarded_ip(value: &str) -> Option<IpAddr> {
+    ProxyResolver::parse_forwarded_ip(value)
+}
+
+/// Fuzzing seam: run the full trusted-proxy resolver over arbitrary
+/// `X-Forwarded-*` / `X-Real-IP` / `Host` header values.
+#[cfg(fuzzing)]
+pub fn __fuzz_resolve_forwarded(
+    xff: &str,
+    x_real_ip: &str,
+    x_forwarded_proto: &str,
+    x_forwarded_host: &str,
+    host: &str,
+) {
+    use axum::http::HeaderValue;
+    let resolver = ProxyResolver::loopback_only();
+    let mut req = Request::new(());
+    // Give the request a loopback peer so the trusted path is exercised.
+    req.extensions_mut().insert(ConnectInfo(SocketAddr::from((
+        [127, 0, 0, 1],
+        8080,
+    ))));
+    let headers = req.headers_mut();
+    for (name, value) in [
+        ("x-forwarded-for", xff),
+        ("x-real-ip", x_real_ip),
+        ("x-forwarded-proto", x_forwarded_proto),
+        ("x-forwarded-host", x_forwarded_host),
+        ("host", host),
+    ] {
+        if let Ok(v) = HeaderValue::from_str(value) {
+            headers.insert(name, v);
+        }
+    }
+    let _ = resolver.resolve_client_addr(&req);
+    let _ = resolver.resolve_client_host(&req);
+    let _ = resolver.resolve_client_scheme(&req);
+}
+
 /// Resolved client identity, injected into request extensions by the
 /// framework's proxy-resolver middleware.  Extractors read from this.
 #[derive(Debug, Clone)]
