@@ -75,6 +75,7 @@ First-run checklist:
 
 | File | Purpose |
 |---|---|
+| `README.md` | Generated quickstart — prerequisites and the golden-path commands (configure the `[database]` block in `autumn.toml`, then `autumn migrate` → `autumn dev`) that take a clean checkout to a serving route, plus a CLI reference. Flag-aware: `--with-i18n` / `--with-seed` add sections for their extra steps. |
 | `autumn.toml` | Base config (server, database, session, security, logging) |
 | `autumn-dev.toml` | Dev profile overrides (auto-detected in debug builds) |
 | `src/main.rs` | AppBuilder setup — register routes, tasks, jobs, migrations here |

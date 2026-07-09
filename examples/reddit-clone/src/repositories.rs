@@ -26,6 +26,12 @@ pub trait SubredditRepository {
 
     /// SELECT * FROM subreddits WHERE creator_id = $1
     fn find_by_creator_id(creator_id: i64) -> Vec<Subreddit>;
+
+    /// Race-safe get-or-insert keyed on the unique `slug` column (#1382):
+    /// `find_or_create_by_slug(slug, &new) -> (Subreddit, created: bool)`.
+    /// Two people submitting "r/rustlang" at once both end up on the same
+    /// community with no unique-violation error — see `routes::subreddits::create`.
+    fn find_or_create_by_slug(slug: String);
 }
 
 // `broadcasts = true` wires every mutation that goes through PgPostRepository
