@@ -142,6 +142,37 @@ pub enum RouterBuildError {
         /// the collision.
         incoming: String,
     },
+    /// Two user- or plugin-registered routes normalize to the SAME Axum path
+    /// shape but use DIFFERENT exact path templates — e.g. their capture names
+    /// differ (`/users/{id}` vs `/users/{slug}`) or a normal capture meets a
+    /// catch-all at the same position (`/u/{id}` vs `/u/{*rest}`).
+    ///
+    /// axum's matchit router rejects the second template as a route conflict
+    /// *before* method-router merging, so — unlike an exact-duplicate path,
+    /// which axum happily merges across distinct HTTP methods
+    /// ([`DuplicateUserRoute`](Self::DuplicateUserRoute)) — these two templates
+    /// can never coexist REGARDLESS of method. Issue #1012 surfaces the clash
+    /// here (naming both handlers and both original templates) instead of
+    /// letting the matchit conflict panic inside `Router::route` at startup.
+    ///
+    /// Opaque `AppBuilder::merge` / `AppBuilder::nest` routers are exempt for
+    /// the same reason as [`DuplicateUserRoute`](Self::DuplicateUserRoute).
+    #[error(
+        "conflicting route shapes: {existing:?} ({existing_path:?}) and {incoming:?} ({incoming_path:?}) \
+         resolve to the same Axum path shape but use different path templates; axum's matchit router \
+         rejects this as a route conflict regardless of HTTP method — rename the captures so both use the \
+         same template, or make their static paths distinct"
+    )]
+    ConflictingRouteShape {
+        /// The `route.name` of the first (already-seen) handler.
+        existing: String,
+        /// The original path template registered by the first handler.
+        existing_path: String,
+        /// The `route.name` of the second handler that triggered the conflict.
+        incoming: String,
+        /// The original path template registered by the second handler.
+        incoming_path: String,
+    },
 }
 
 /// Build the fully-configured Axum router from routes, config, and state.
@@ -1404,19 +1435,64 @@ fn effective_mount_method(method: &http::Method) -> http::Method {
 /// * but a static segment stays distinct from a capture — `/u/{id}` does NOT
 ///   conflict with `/u/foo`, and `/u/{id}` does NOT conflict with `/u/{id}/x`.
 ///
-/// So every capture segment (normal `{name}` or catch-all `{*name}`) collapses to
-/// a single placeholder, and static segments are left untouched. Only the KEY is
-/// normalized; the error still reports the original template for readability.
+/// So every genuine capture run (normal `{name}` or catch-all `{*name}`)
+/// collapses to a single placeholder, and everything else — static text AND
+/// escaped literal braces — is preserved verbatim. Only the KEY is normalized;
+/// the error still reports the original template for readability.
+///
+/// # Escaped braces
+///
+/// axum/matchit treat `{{` and `}}` as ESCAPED literal braces, not captures —
+/// `/{{foo}}` is the static literal segment `{foo}`. Verified against axum
+/// 0.8.9 by building `axum::Router` directly: `/{{foo}}` and `/{{bar}}` build
+/// as two distinct static routes, and `/{{id}}` (literal `{id}`) does NOT
+/// conflict with the real capture `/{id}`. Collapsing every brace run — as a
+/// naive whole-segment or greedy scan would — falsely rejects those valid apps
+/// (a #1012 regression). So this scans char-by-char and only collapses
+/// UNESCAPED `{…}` capture runs, copying `{{` / `}}` through as literals. That
+/// also keeps mixed segments correct: `/file.{ext}` → `/file.{\0}` (literal
+/// prefix preserved, only the capture collapsed) and `/{{lit}}-{id}` →
+/// `/{{lit}}-{\0}`.
 fn normalize_route_shape(path: &str) -> String {
+    // Placeholder for a collapsed capture run: `{` + NUL + `}`. A NUL byte can
+    // never appear in a real path template, so a collapsed capture can never be
+    // confused with static text or an escaped literal brace.
+    const PLACEHOLDER: &str = "{\u{0}}";
     let mut out = String::with_capacity(path.len());
-    for (i, seg) in path.split('/').enumerate() {
-        if i > 0 {
-            out.push('/');
-        }
-        if seg.len() >= 2 && seg.starts_with('{') && seg.ends_with('}') {
-            out.push_str("{\u{0}}");
-        } else {
-            out.push_str(seg);
+    let bytes = path.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'{' if bytes.get(i + 1) == Some(&b'{') => {
+                // Escaped literal `{{` — preserve verbatim, skip both bytes.
+                out.push_str("{{");
+                i += 2;
+            }
+            b'}' if bytes.get(i + 1) == Some(&b'}') => {
+                // Escaped literal `}}` — preserve verbatim, skip both bytes.
+                out.push_str("}}");
+                i += 2;
+            }
+            b'{' => {
+                // Start of a genuine unescaped capture run. Capture names never
+                // contain braces, so it ends at the next `}`. Collapse the whole
+                // `{…}` run (normal or `{*catch-all}`) to a single placeholder.
+                out.push_str(PLACEHOLDER);
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'}' {
+                    i += 1;
+                }
+                if i < bytes.len() {
+                    // Skip the closing `}`.
+                    i += 1;
+                }
+            }
+            _ => {
+                // Copy one full UTF-8 char so multibyte static text survives.
+                let ch = path[i..].chars().next().unwrap();
+                out.push(ch);
+                i += ch.len_utf8();
+            }
         }
     }
     out
@@ -1454,22 +1530,56 @@ fn reject_duplicate_user_routes(
     merge_routers: &[axum::Router<AppState>],
     nest_routers: &[(String, axum::Router<AppState>)],
 ) -> Result<(), RouterBuildError> {
-    // Key on `(method, resolved_path)`; the value is the first-seen handler
-    // name so the error can point at BOTH sides of the collision (AC #2).
-    // Iterate in the same order the mount pass will: top-level routes first
-    // (`group_and_mount_routes`), then scoped groups (`mount_scoped_groups`).
+    // `claimed` keys on `(effective_method, exact_path)`; the value is the
+    // first-seen handler name so the error can point at BOTH sides of an
+    // EXACT-duplicate collision (AC #2). Iterate in the same order the mount
+    // pass will: top-level routes first (`group_and_mount_routes`), then scoped
+    // groups (`mount_scoped_groups`).
+    //
+    // NOTE: the key is the EXACT path string, not the normalized shape — axum
+    // merges the same exact path across distinct methods (AC #4: `GET /admin` +
+    // `POST /admin`, `GET /users/{id}` + `POST /users/{id}`), so a same-shape
+    // clash is NOT a duplicate unless the exact path AND effective method both
+    // match. The cross-method shape conflict is handled separately below.
     let mut claimed: std::collections::HashMap<(String, String), String> =
         std::collections::HashMap::new();
 
-    // Key on the EFFECTIVE mount method (`WS` → `GET`) and the normalized path
-    // SHAPE (capture names collapsed) so the preflight collides exactly when
-    // axum's `MethodRouter::merge` / `Router::route` would panic. The error
-    // still carries the effective method and the ORIGINAL path template so the
-    // diagnostic stays readable.
+    // `shapes` keys on the normalized path SHAPE (capture names collapsed,
+    // catch-all/normal captures unified) and records the FIRST exact path
+    // template + handler seen for that shape. axum's matchit router rejects two
+    // DIFFERENT exact templates that share a shape (`/users/{id}` vs
+    // `/users/{slug}`, `/u/{id}` vs `/u/{*rest}`) as a route conflict BEFORE any
+    // method merging — so that clash is illegal regardless of method and is
+    // surfaced as `ConflictingRouteShape`. Two registrations of the SAME exact
+    // template share both the shape and the exact string, so they fall through
+    // to the method-keyed `claimed` check (duplicate vs legal cross-method).
+    let mut shapes: std::collections::HashMap<String, (String, String)> =
+        std::collections::HashMap::new();
+
     let mut record =
         |method: &http::Method, path: String, name: &str| -> Result<(), RouterBuildError> {
             let effective_method = effective_mount_method(method).to_string();
-            let key = (effective_method.clone(), normalize_route_shape(&path));
+            let shape = normalize_route_shape(&path);
+
+            // Shape conflict (method-independent): a different exact template
+            // already claimed this shape → axum matchit would panic on mount.
+            if let Some((existing_path, existing_name)) = shapes.get(&shape) {
+                if existing_path != &path {
+                    return Err(RouterBuildError::ConflictingRouteShape {
+                        existing: existing_name.clone(),
+                        existing_path: existing_path.clone(),
+                        incoming: name.to_owned(),
+                        incoming_path: path,
+                    });
+                }
+            } else {
+                shapes.insert(shape, (path.clone(), name.to_owned()));
+            }
+
+            // Exact-duplicate check: same effective method AND same exact path
+            // → axum's `MethodRouter::merge` would panic. Distinct methods on
+            // the same exact path are legal (axum merges them) and fall through.
+            let key = (effective_method.clone(), path.clone());
             if let Some(existing) = claimed.get(&key) {
                 return Err(RouterBuildError::DuplicateUserRoute {
                     method: effective_method,
@@ -6199,9 +6309,10 @@ enabled = true
     /// Finding 1 (issue #1012 review): two handlers that differ ONLY by capture
     /// name — `/users/{id}` vs `/users/{slug}` — key by literal template so they
     /// look distinct to a naive preflight, but axum's matcher (verified against
-    /// axum 0.8: matchit reports a "conflict") rejects the second route shape at
-    /// mount. Normalizing capture names into a shared placeholder makes the
-    /// preflight catch the collision as `DuplicateUserRoute` instead.
+    /// axum 0.8.9: matchit reports a "conflict") rejects the second route shape
+    /// at mount. Because the two EXACT templates differ, this is a matchit route
+    /// conflict (illegal regardless of method), surfaced as
+    /// `ConflictingRouteShape` naming both handlers AND both original templates.
     #[tokio::test]
     async fn try_build_router_rejects_duplicate_capture_name_paths() {
         let config = AutumnConfig::default();
@@ -6211,21 +6322,24 @@ enabled = true
             super::try_build_router_inner(vec![a, b], &config, test_state(), duplicate_test_ctx())
                 .expect_err("capture-name-only difference must be rejected before mount");
         match err {
-            RouterBuildError::DuplicateUserRoute {
+            RouterBuildError::ConflictingRouteShape {
                 ref existing,
+                ref existing_path,
                 ref incoming,
-                ..
+                ref incoming_path,
             } => {
                 assert_eq!(existing, "by_id");
+                assert_eq!(existing_path, "/users/{id}");
                 assert_eq!(incoming, "by_slug");
+                assert_eq!(incoming_path, "/users/{slug}");
             }
-            other => panic!("expected DuplicateUserRoute, got {other:?}"),
+            other => panic!("expected ConflictingRouteShape, got {other:?}"),
         }
-        // The diagnostic must show an ORIGINAL template, not the normalized key.
+        // The diagnostic must name BOTH original templates, not the normalized key.
         let display = err.to_string();
         assert!(
-            display.contains("/users/{id}") || display.contains("/users/{slug}"),
-            "error must show an original path template; got: {display}"
+            display.contains("/users/{id}") && display.contains("/users/{slug}"),
+            "error must show both original path templates; got: {display}"
         );
     }
 
@@ -6251,10 +6365,14 @@ enabled = true
         assert!(
             matches!(
                 err,
-                RouterBuildError::DuplicateUserRoute { ref existing, ref incoming, .. }
+                RouterBuildError::ConflictingRouteShape {
+                    ref existing, ref incoming, ref existing_path, ref incoming_path
+                }
                     if existing == "top_by_id" && incoming == "scoped_by_slug"
+                        && existing_path == "/api/users/{id}"
+                        && incoming_path == "/api/users/{slug}"
             ),
-            "expected DuplicateUserRoute naming both handlers, got {err:?}"
+            "expected ConflictingRouteShape naming both handlers + both paths, got {err:?}"
         );
     }
 
@@ -6311,6 +6429,193 @@ enabled = true
             }
             other => panic!("expected DuplicateUserRoute, got {other:?}"),
         }
+    }
+
+    /// Finding A (round 2): different HTTP methods whose paths differ ONLY by
+    /// capture name (`GET /users/{id}` + `POST /users/{slug}`) key as distinct
+    /// `(method, shape)` pairs, so the method-independent shape check must catch
+    /// them. Verified against axum 0.8.9: `Router::route("/users/{id}", get)`
+    /// then `Router::route("/users/{slug}", post)` PANICS — matchit rejects the
+    /// second template as a route conflict BEFORE method merging. The preflight
+    /// surfaces it as `ConflictingRouteShape` naming both handlers + both
+    /// templates; no axum panic escapes.
+    #[tokio::test]
+    async fn try_build_router_rejects_cross_method_shape_conflict() {
+        let config = AutumnConfig::default();
+        let get = duplicate_test_route(http::Method::GET, "/users/{id}", "by_id");
+        let post = duplicate_test_route(http::Method::POST, "/users/{slug}", "by_slug");
+        let err = super::try_build_router_inner(
+            vec![get, post],
+            &config,
+            test_state(),
+            duplicate_test_ctx(),
+        )
+        .expect_err("cross-method capture-name-only conflict must be rejected before mount");
+        match err {
+            RouterBuildError::ConflictingRouteShape {
+                ref existing,
+                ref existing_path,
+                ref incoming,
+                ref incoming_path,
+            } => {
+                assert_eq!(existing, "by_id");
+                assert_eq!(existing_path, "/users/{id}");
+                assert_eq!(incoming, "by_slug");
+                assert_eq!(incoming_path, "/users/{slug}");
+            }
+            other => panic!("expected ConflictingRouteShape, got {other:?}"),
+        }
+        let display = err.to_string();
+        assert!(
+            display.contains("by_id") && display.contains("by_slug"),
+            "error must name both handlers; got: {display}"
+        );
+        assert!(
+            display.contains("/users/{id}") && display.contains("/users/{slug}"),
+            "error must name both original templates; got: {display}"
+        );
+    }
+
+    /// Finding A, scoped-group variant: the method-independent shape conflict
+    /// check must run AFTER `join_nested_path`, so a scoped `POST /users/{slug}`
+    /// under `/api` conflicts with a top-level `GET /api/users/{id}`.
+    #[tokio::test]
+    async fn try_build_router_rejects_cross_method_shape_conflict_across_scoped_group() {
+        let config = AutumnConfig::default();
+        let top = duplicate_test_route(http::Method::GET, "/api/users/{id}", "top_by_id");
+        let scoped_child =
+            duplicate_test_route(http::Method::POST, "/users/{slug}", "scoped_by_slug");
+        let group = crate::app::ScopedGroup {
+            prefix: "/api".to_owned(),
+            routes: vec![scoped_child],
+            source: crate::route_listing::RouteSource::User,
+            apply_layer: Box::new(|r| r),
+        };
+        let mut ctx = duplicate_test_ctx();
+        ctx.scoped_groups.push(group);
+        let err = super::try_build_router_inner(vec![top], &config, test_state(), ctx)
+            .expect_err("scoped cross-method shape conflict must be rejected before mount");
+        assert!(
+            matches!(
+                err,
+                RouterBuildError::ConflictingRouteShape {
+                    ref existing, ref incoming, ref existing_path, ref incoming_path
+                }
+                    if existing == "top_by_id" && incoming == "scoped_by_slug"
+                        && existing_path == "/api/users/{id}"
+                        && incoming_path == "/api/users/{slug}"
+            ),
+            "expected ConflictingRouteShape naming both handlers + both paths, got {err:?}"
+        );
+    }
+
+    /// AC #4 (round 2): the SAME exact capture template on distinct methods
+    /// (`GET /users/{id}` + `POST /users/{id}`) is LEGAL — axum merges the two
+    /// `MethodRouter`s. Verified against axum 0.8.9: this pair builds cleanly.
+    /// The shape check keys on the FIRST exact template per shape, so an
+    /// identical template never trips it — only a DIFFERENT template does.
+    #[tokio::test]
+    async fn try_build_router_allows_same_capture_template_distinct_methods() {
+        let config = AutumnConfig::default();
+        let get = duplicate_test_route(http::Method::GET, "/users/{id}", "show");
+        let post = duplicate_test_route(http::Method::POST, "/users/{id}", "update");
+        let _router = super::try_build_router_inner(
+            vec![get, post],
+            &config,
+            test_state(),
+            duplicate_test_ctx(),
+        )
+        .expect("same capture template on GET + POST must build cleanly");
+    }
+
+    /// Finding B (round 2): axum/matchit treat `{{`/`}}` as ESCAPED literal
+    /// braces, so `/{{foo}}` and `/{{bar}}` are two DISTINCT static routes.
+    /// Verified against axum 0.8.9: both build cleanly. `normalize_route_shape`
+    /// must preserve escaped braces as literals (not collapse them to the
+    /// capture placeholder) so this valid app is not falsely rejected.
+    #[tokio::test]
+    async fn try_build_router_allows_escaped_brace_literals() {
+        let config = AutumnConfig::default();
+        let a = duplicate_test_route(http::Method::GET, "/{{foo}}", "lit_foo");
+        let b = duplicate_test_route(http::Method::GET, "/{{bar}}", "lit_bar");
+        let _router =
+            super::try_build_router_inner(vec![a, b], &config, test_state(), duplicate_test_ctx())
+                .expect("distinct escaped-literal paths must not be flagged as duplicates");
+    }
+
+    /// Finding B guard: an escaped-literal prefix combined with a real capture
+    /// keeps the shapes distinct — `/{{x}}/{id}` and `/{{y}}/{id}` differ only in
+    /// their literal segment. Verified against axum 0.8.9: both build cleanly.
+    #[tokio::test]
+    async fn try_build_router_allows_escaped_literal_prefix_with_capture() {
+        let config = AutumnConfig::default();
+        let a = duplicate_test_route(http::Method::GET, "/{{x}}/{id}", "x_show");
+        let b = duplicate_test_route(http::Method::GET, "/{{y}}/{id}", "y_show");
+        let _router =
+            super::try_build_router_inner(vec![a, b], &config, test_state(), duplicate_test_ctx())
+                .expect("distinct escaped-literal prefixes with a shared capture must build");
+    }
+
+    /// Adversarial sweep: a mixed literal+capture segment must normalize at the
+    /// char level. `/file.{ext}` and `/file.{kind}` share the shape `/file.{…}`.
+    /// Verified against axum 0.8.9: this pair PANICS (matchit conflict), so the
+    /// preflight must flag it as `ConflictingRouteShape` naming both templates.
+    #[tokio::test]
+    async fn try_build_router_rejects_mixed_literal_capture_shape_conflict() {
+        let config = AutumnConfig::default();
+        let a = duplicate_test_route(http::Method::GET, "/file.{ext}", "by_ext");
+        let b = duplicate_test_route(http::Method::GET, "/file.{kind}", "by_kind");
+        let err =
+            super::try_build_router_inner(vec![a, b], &config, test_state(), duplicate_test_ctx())
+                .expect_err("mixed literal+capture shape conflict must be rejected before mount");
+        assert!(
+            matches!(
+                err,
+                RouterBuildError::ConflictingRouteShape {
+                    ref existing_path, ref incoming_path, ..
+                }
+                    if existing_path == "/file.{ext}" && incoming_path == "/file.{kind}"
+            ),
+            "expected ConflictingRouteShape naming both templates, got {err:?}"
+        );
+    }
+
+    /// Adversarial sweep NEGATIVE guard: a mixed literal+capture segment stays
+    /// distinct from a fully static segment. `/file.{ext}` and `/file.json` do
+    /// NOT share a shape. Verified against axum 0.8.9: this pair builds cleanly,
+    /// so the char-level normalization must not over-collapse the static one.
+    #[tokio::test]
+    async fn try_build_router_allows_mixed_capture_vs_static_segment() {
+        let config = AutumnConfig::default();
+        let a = duplicate_test_route(http::Method::GET, "/file.{ext}", "by_ext");
+        let b = duplicate_test_route(http::Method::GET, "/file.json", "static_json");
+        let _router =
+            super::try_build_router_inner(vec![a, b], &config, test_state(), duplicate_test_ctx())
+                .expect("a capture segment and a static segment must not be flagged as duplicates");
+    }
+
+    /// Adversarial sweep: a normal capture and a catch-all at the same terminal
+    /// position (`/u/{id}` vs `/u/{*rest}`) collapse to the same placeholder.
+    /// Verified against axum 0.8.9: this pair PANICS (matchit conflict), so the
+    /// preflight must flag it. Different exact templates → `ConflictingRouteShape`.
+    #[tokio::test]
+    async fn try_build_router_rejects_catch_all_vs_normal_capture() {
+        let config = AutumnConfig::default();
+        let a = duplicate_test_route(http::Method::GET, "/u/{id}", "one");
+        let b = duplicate_test_route(http::Method::GET, "/u/{*rest}", "rest");
+        let err =
+            super::try_build_router_inner(vec![a, b], &config, test_state(), duplicate_test_ctx())
+                .expect_err("catch-all vs normal capture must be rejected before mount");
+        assert!(
+            matches!(
+                err,
+                RouterBuildError::ConflictingRouteShape {
+                    ref existing_path, ref incoming_path, ..
+                }
+                    if existing_path == "/u/{id}" && incoming_path == "/u/{*rest}"
+            ),
+            "expected ConflictingRouteShape naming both templates, got {err:?}"
+        );
     }
 
     // --- Static file serving (SSG/ISG) tests ---

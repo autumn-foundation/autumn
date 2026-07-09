@@ -1075,8 +1075,29 @@ half-configured process crashing at startup:
   duplicate registration
   ```
 
-  Distinct methods on the same path (`GET /admin` + `POST /admin`) are NOT
-  flagged -- Axum merges them into a single `MethodRouter` cleanly.
+  Distinct methods on the *same exact path* (`GET /admin` + `POST /admin`, or
+  `GET /users/{id}` + `POST /users/{id}`) are NOT flagged -- Axum merges them
+  into a single `MethodRouter` cleanly.
+- **`ConflictingRouteShape`** (issue #1012) -- two routes whose path templates
+  normalize to the same Axum path *shape* but use **different** templates: their
+  capture names differ (`/users/{id}` vs `/users/{slug}`) or a normal capture
+  meets a catch-all at the same position (`/u/{id}` vs `/u/{*rest}`). Axum's
+  matchit router rejects the second template as a conflict *before* method
+  merging, so unlike an exact-duplicate path these can never coexist **regardless
+  of HTTP method** -- `GET /users/{id}` + `POST /users/{slug}` is still a
+  conflict. The error names **both** handlers and **both** original templates:
+
+  ```text
+  conflicting route shapes: "show_user" ("/users/{id}") and "create_user"
+  ("/users/{slug}") resolve to the same Axum path shape but use different path
+  templates; axum's matchit router rejects this as a route conflict regardless
+  of HTTP method — rename the captures so both use the same template, or make
+  their static paths distinct
+  ```
+
+  Escaped literal braces (`{{`/`}}`, e.g. the static path `/{{foo}}`) are *not*
+  captures, so `/{{foo}}` and `/{{bar}}` remain distinct static routes and build
+  cleanly -- the preflight only collapses genuine unescaped captures.
 
 Opaque routers registered via `.merge(router)` or `.nest(prefix, router)`
 cannot be introspected through Axum's public API, so a collision that lives

@@ -17,7 +17,7 @@
 //! preflight failure ourselves before axum ever sees the overlap.
 
 use autumn_web::test::TestApp;
-use autumn_web::{get, routes};
+use autumn_web::{get, post, routes};
 
 #[get("/")]
 async fn root_a() -> &'static str {
@@ -27,6 +27,16 @@ async fn root_a() -> &'static str {
 #[get("/")]
 async fn root_b() -> &'static str {
     "b"
+}
+
+#[get("/users/{id}")]
+async fn user_by_id() -> &'static str {
+    "id"
+}
+
+#[post("/users/{slug}")]
+async fn user_by_slug() -> &'static str {
+    "slug"
 }
 
 fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
@@ -80,5 +90,46 @@ async fn two_root_handlers_return_structured_error_without_axum_panic() {
     assert!(
         message.contains(r#"path: "/""#) || message.contains('/'),
         "error must include the offending path: {message}"
+    );
+}
+
+/// Finding A (issue #1012 review, round 2): two handlers on DIFFERENT methods
+/// whose paths differ only by capture name (`GET /users/{id}` +
+/// `POST /users/{slug}`) key as distinct `(method, shape)` pairs, so the
+/// original preflight passed them through — and axum's matchit rejected the
+/// second template as a route conflict at mount, leaking a panic. The
+/// method-independent shape check now converts this into a structured
+/// `ConflictingRouteShape` build error BEFORE axum ever sees the overlap. This
+/// asserts the panic payload is OUR preflight error (naming both handlers and
+/// both templates), NOT a raw matchit "Conflict"/"Insertion failed" panic.
+#[tokio::test]
+async fn cross_method_shape_conflict_returns_structured_error_without_axum_panic() {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = TestApp::new()
+            .routes(routes![user_by_id, user_by_slug])
+            .build();
+    }));
+
+    let payload = result.expect_err(
+        "cross-method capture-name-only conflict must fail the build; instead it succeeded",
+    );
+    let message = panic_message(payload.as_ref());
+
+    assert!(
+        message.contains("ConflictingRouteShape"),
+        "expected structured ConflictingRouteShape preflight error, got: {message}"
+    );
+    assert!(
+        message.contains("user_by_id") && message.contains("user_by_slug"),
+        "error must name both handlers: {message}"
+    );
+    assert!(
+        message.contains("/users/{id}") && message.contains("/users/{slug}"),
+        "error must name both original path templates: {message}"
+    );
+    // A leaked axum/matchit panic would carry these tokens instead.
+    assert!(
+        !message.contains("Insertion failed") && !message.contains("Overlapping method route"),
+        "no raw axum matchit panic should escape: {message}"
     );
 }

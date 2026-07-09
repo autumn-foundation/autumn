@@ -26,13 +26,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `.scoped(prefix, …)` prefix resolution now fail app build with a structured
   `RouterBuildError::DuplicateUserRoute` **before any router is mounted**,
   instead of an `axum::routing::MethodRouter::merge` panic at startup. The
-  error names BOTH handlers, the HTTP method, and the resolved path. The key is
-  normalized to the same shape axum's matcher conflicts on, so collisions that
-  differ only by capture NAME (`/users/{id}` vs `/users/{slug}`) or by the
-  synthetic `WS` method a `#[ws]` handler mounts as `GET` (`#[get("/live")]` +
-  `#[ws("/live")]`) are caught too, instead of slipping past to an axum panic.
-  Distinct methods on the same path (`GET /admin` + `POST /admin`) and genuinely
-  different shapes (`/users/{id}` vs `/users/{id}/posts`) are unaffected;
+  error names BOTH handlers, the HTTP method, and the resolved path. The
+  synthetic `WS` method a `#[ws]` handler mounts as `GET` is normalized before
+  keying, so `#[get("/live")]` + `#[ws("/live")]` is caught too. Two routes
+  whose templates normalize to the same axum path *shape* but use **different**
+  templates — capture names differ (`/users/{id}` vs `/users/{slug}`) or a
+  normal capture meets a catch-all (`/u/{id}` vs `/u/{*rest}`) — are a matchit
+  route conflict *regardless of HTTP method* (so `GET /users/{id}` +
+  `POST /users/{slug}` clashes) and now fail with a dedicated
+  `RouterBuildError::ConflictingRouteShape` that names BOTH handlers and BOTH
+  original templates, instead of leaking an axum matchit panic. Shape
+  normalization is char-level and honors escaped literal braces (`{{`/`}}`), so
+  static paths like `/{{foo}}` vs `/{{bar}}` and mixed segments like
+  `/file.{ext}` vs `/file.json` are NOT falsely rejected. Distinct methods on
+  the *same exact path* (`GET /admin` + `POST /admin`, `GET /users/{id}` +
+  `POST /users/{id}`) and genuinely different shapes (`/users/{id}` vs
+  `/users/{id}/posts`) are unaffected;
   `#[repository]`-generated API routes are covered because they land in the
   normal `Route` list. Opaque `AppBuilder::merge` and `AppBuilder::nest`
   routers cannot be introspected — a non-empty opaque table emits a
