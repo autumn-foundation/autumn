@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **cli:** `autumn i18n check` (issue #1252) — a read-only diagnostic that
+  compares the translation keys referenced in code (string literals passed to
+  `t!(...)`, `.t(...)`, and `.t_with(...)`) against the keys defined in each
+  `i18n/<locale>.ftl`, so a missing or untranslated string is caught in CI
+  instead of from a production `Bundle::miss_count()` warning. It loads the
+  bundle through the existing `Bundle::load_from_dir` loader and reports, per
+  locale, **Missing** keys (referenced in code but absent from that locale's
+  resolved fallback chain), **Untranslated** keys (in the default locale but
+  not a non-default one), and **Unused** keys (defined in a `.ftl` with no call
+  site). Exit is non-zero when any locale has Missing keys; Untranslated/Unused
+  are warnings that become errors under `--strict`. `--format json` emits a
+  machine-readable report for `autumn check`/CI to consume. Dynamically-built
+  keys (e.g. `t(&format!(...))`) are listed as "dynamic — not checked" rather
+  than silently ignored or falsely flagged. See `autumn-cli/src/i18n.rs`.
 - **download:** typed `Download` `IntoResponse` (`autumn_web::download::Download`)
   for serving files from a handler without hand-rolling headers. Construct it
   from owned bytes, an async byte stream, an `AsyncRead`, or a stored blob

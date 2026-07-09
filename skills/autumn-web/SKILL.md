@@ -874,7 +874,18 @@ autumn generate scaffold Post title:String --live --live-validation
 autumn generate tauri            # desktop sidecar project (cargo tauri build)
 autumn generate plugin my-plugin # installable/conformant plugin crate
 autumn token issue service:ci --name ci --scope posts:write   # scoped tokens; also list, rotate
+autumn i18n check                # compare t!/t(...) keys vs i18n/*.ftl; --strict, --format json
 ```
+
+`autumn i18n check` scans `**/*.rs` for string-literal keys passed to
+`t!(...)`, `.t(...)`, and `.t_with(...)`, loads every `i18n/<locale>.ftl` via
+the runtime `Bundle` loader, and reports per locale: **Missing** (referenced in
+code but absent from that locale's resolved fallback chain — the correctness
+failure, non-zero exit), **Untranslated** (present in the default locale but
+not a non-default one), and **Unused** (defined in a `.ftl` with no call site).
+Untranslated/Unused are warnings unless `--strict`. `--format json` feeds CI.
+Runtime-built keys like `t(&format!(...))` are listed as "dynamic — not
+checked" rather than flagged.
 
 `autumn destroy` mirrors `autumn generate` argument-for-argument and never
 touches a database — it only reverses generated files/migrations.
