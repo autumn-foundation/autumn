@@ -420,9 +420,17 @@ impl LogLevelsInner {
 /// Seeding the overrides map at construction ensures that a later
 /// `PUT /actuator/loggers/root` (which replaces only the global level) does
 /// not silently drop the module-specific directives configured at startup.
-/// Segments containing `=` become per-target overrides (keyed on the part
-/// before the final `=`, so span-field directives round-trip); a bare segment
-/// sets the global level, last one winning to match `EnvFilter` precedence.
+///
+/// Classification follows `EnvFilter` semantics:
+/// - A segment containing `=` is a per-target override (keyed on the part
+///   before the final `=`, so span-field directives round-trip). `root=<level>`
+///   and `=<level>` fold into the global level.
+/// - A bare segment that IS a tracing level (`trace|debug|info|warn|error|off`,
+///   case-insensitive) updates the global level, last one winning to match
+///   `EnvFilter` precedence.
+/// - A bare segment that is NOT a level is a *target directive at trace* (e.g.
+///   `my_app` means "enable target `my_app` at trace"), so it is stored as a
+///   per-target override with the implicit level `trace`.
 fn parse_initial_directive(directive: &str) -> (String, HashMap<String, String>) {
     let mut global = String::new();
     let mut overrides = HashMap::new();
@@ -440,11 +448,24 @@ fn parse_initial_directive(directive: &str) -> (String, HashMap<String, String>)
             } else {
                 overrides.insert(target.to_string(), level.to_string());
             }
-        } else {
+        } else if is_tracing_level(segment) {
+            // A bare level sets the global level (last-level-wins).
             global = segment.to_string();
+        } else {
+            // A bare non-level segment is a target enabled at trace.
+            overrides.insert(segment.to_string(), "trace".to_string());
         }
     }
     (global, overrides)
+}
+
+/// Returns `true` when `segment` is a bare `tracing` level keyword
+/// (case-insensitive), i.e. a global-level directive rather than a target.
+fn is_tracing_level(segment: &str) -> bool {
+    matches!(
+        segment.to_ascii_lowercase().as_str(),
+        "trace" | "debug" | "info" | "warn" | "error" | "off"
+    )
 }
 
 impl LogLevels {
@@ -4863,6 +4884,66 @@ mod tests {
             directive.contains("my_app=debug"),
             "rebuilt directive dropped my_app: {directive}"
         );
+    }
+
+    #[test]
+    fn bare_non_level_segment_is_a_trace_target_not_the_global_level() {
+        // `EnvFilter` semantics: in `info,my_app`, `info` is the global level
+        // and the bare `my_app` is a *target directive at trace*, NOT the global
+        // level. The old code took the last bare segment as the global level,
+        // which both lost `info` and set an invalid global of `my_app`.
+        let levels = LogLevels::new("info,my_app");
+        assert_eq!(levels.current_level(), "info");
+        let overrides = levels.logger_overrides();
+        assert_eq!(
+            overrides.get("my_app").map(String::as_str),
+            Some("trace"),
+            "bare non-level segment must become a trace target"
+        );
+
+        // The rebuilt directive is equivalent to `info,my_app=trace`.
+        assert_eq!(levels.rebuilt_directive_for_test(), "info,my_app=trace");
+
+        // A subsequent root PUT to `warn` keeps `my_app` as a target.
+        levels.attach_reload_handle(crate::telemetry::FilterReloadHandle::accept_all_for_test());
+        let change = levels.set_logger_level("root", "warn");
+        assert!(matches!(change, LogLevelChange::Applied { .. }));
+        assert_eq!(levels.current_level(), "warn");
+        assert_eq!(
+            levels.logger_overrides().get("my_app").map(String::as_str),
+            Some("trace"),
+            "my_app target must survive a root-level change"
+        );
+    }
+
+    #[test]
+    fn mixed_bare_level_explicit_target_and_bare_target() {
+        // `debug,tower_http=warn,my_app`: global=debug, explicit tower_http=warn,
+        // and the bare `my_app` becomes a trace target.
+        let levels = LogLevels::new("debug,tower_http=warn,my_app");
+        assert_eq!(levels.current_level(), "debug");
+        let overrides = levels.logger_overrides();
+        assert_eq!(
+            overrides.get("tower_http").map(String::as_str),
+            Some("warn")
+        );
+        assert_eq!(overrides.get("my_app").map(String::as_str), Some("trace"));
+
+        // Targets are emitted sorted after the global level.
+        assert_eq!(
+            levels.rebuilt_directive_for_test(),
+            "debug,my_app=trace,tower_http=warn"
+        );
+    }
+
+    #[test]
+    fn purely_bare_level_config_has_no_target_overrides() {
+        // Regression guard: a plain level stays the global level with no
+        // spurious target overrides.
+        let levels = LogLevels::new("info");
+        assert_eq!(levels.current_level(), "info");
+        assert!(levels.logger_overrides().is_empty());
+        assert_eq!(levels.rebuilt_directive_for_test(), "info");
     }
 
     // ── Prometheus endpoint tests ──────────────────────────────

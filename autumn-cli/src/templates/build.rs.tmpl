@@ -65,41 +65,64 @@ fn emit_build_provenance() {
 
     // Re-run when the ref is checked out (HEAD), the index changes (staging /
     // index), or HEAD *moves* — commit, `--amend`, `reset --soft` all rewrite
-    // `logs/HEAD` even when `HEAD` itself is untouched. Resolving the real
-    // gitdir first means this also works in git worktrees and submodules, where
-    // `.git` is a *file* pointing elsewhere rather than a directory.
-    if let Some(git_dir) = resolve_git_dir() {
-        for rel in ["HEAD", "index", "logs/HEAD"] {
-            let path = git_dir.join(rel);
-            if path.exists() {
-                println!("cargo:rerun-if-changed={}", path.display());
-            }
-        }
-    }
+    // `logs/HEAD` even when `HEAD` itself is untouched.
+    emit_git_rerun_triggers();
 
     // Reproducible builds: re-run if the source date is pinned or changed.
     println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
 }
 
-/// Resolve the real git directory. Normally `.git` is a directory; in a git
-/// worktree or submodule it is a *file* containing `gitdir: <path>`. Returns
-/// `None` when there is no `.git` at all (non-git build).
-fn resolve_git_dir() -> Option<std::path::PathBuf> {
-    let dot_git = std::path::Path::new(".git");
-    let meta = std::fs::metadata(dot_git).ok()?;
-    if meta.is_dir() {
-        return Some(dot_git.to_path_buf());
-    }
-    // `.git` is a file: "gitdir: <path>" (path may be relative to the package
-    // root, which is where this build script runs).
-    let contents = std::fs::read_to_string(dot_git).ok()?;
-    let target = contents.lines().find_map(|line| {
-        line.strip_prefix("gitdir:").map(|rest| rest.trim().to_string())
-    })?;
-    if target.is_empty() {
-        None
-    } else {
-        Some(std::path::PathBuf::from(target))
+/// Register `rerun-if-changed` triggers on the git ref state so a commit /
+/// amend / reset re-runs this script and re-bakes the SHA and dirty flag.
+///
+/// The gitdir is resolved by asking git itself (`git rev-parse --git-dir`)
+/// rather than looking for a `.git` entry in the package root. That matters for
+/// apps generated *inside* an existing repo/monorepo: the package root has no
+/// `.git`, but `git` still resolves the parent checkout — so we must register
+/// the parent's `HEAD`/`logs/HEAD`/`index`, or Cargo would never re-run after a
+/// commit and `/actuator/info` would report a stale SHA.
+///
+/// `--git-common-dir` covers linked worktrees, where per-worktree state lives
+/// in `--git-dir` but shared history (`logs/HEAD`) lives in the common dir.
+///
+/// Graceful degradation: if git is absent (tarball / CI cache), `git rev-parse`
+/// fails, we register no triggers, and the build still succeeds.
+fn emit_git_rerun_triggers() {
+    // git prints paths relative to the current dir; resolve them against the
+    // crate dir so they are valid regardless of Cargo's working directory.
+    let crate_dir = std::env::var_os("CARGO_MANIFEST_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default();
+    let resolve = |flag: &str| -> Option<std::path::PathBuf> {
+        let raw = git(&["rev-parse", flag])?;
+        let path = std::path::PathBuf::from(&raw);
+        Some(if path.is_absolute() {
+            path
+        } else {
+            crate_dir.join(path)
+        })
+    };
+
+    let Some(git_dir) = resolve("--git-dir") else {
+        return;
+    };
+    // Linked worktrees keep shared `logs/HEAD` in the common dir; when there is
+    // no separate common dir this is the same as `git_dir`.
+    let common_dir = resolve("--git-common-dir").unwrap_or_else(|| git_dir.clone());
+
+    let mut seen: Vec<std::path::PathBuf> = Vec::new();
+    for path in [
+        git_dir.join("HEAD"),
+        git_dir.join("index"),
+        common_dir.join("logs/HEAD"),
+    ] {
+        if seen.contains(&path) {
+            continue; // dedupe when git_dir == common_dir
+        }
+        if path.exists() {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
+        seen.push(path);
     }
 }
 

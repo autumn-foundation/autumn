@@ -973,9 +973,12 @@ mod tests {
         // Re-run when HEAD *moves* (commit/amend/reset all rewrite logs/HEAD),
         // not only when HEAD/index files change.
         assert!(content.contains("logs/HEAD"));
-        // Worktree / submodule support: `.git` may be a file pointing elsewhere.
-        assert!(content.contains("resolve_git_dir"));
-        assert!(content.contains("gitdir:"));
+        // Gitdir is resolved by asking git itself, so nested/monorepo apps whose
+        // package root has no `.git` still register the parent checkout's rerun
+        // triggers. `--git-common-dir` covers linked worktrees where `logs/HEAD`
+        // lives in the common dir.
+        assert!(content.contains("--git-dir"));
+        assert!(content.contains("--git-common-dir"));
         // Reproducible builds: honor and watch SOURCE_DATE_EPOCH.
         assert!(content.contains("SOURCE_DATE_EPOCH"));
         assert!(content.contains("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH"));
