@@ -688,9 +688,12 @@ fn autumn_web_patch_entry(dir: &Path) -> Option<(String, toml::Value)> {
 ///   no enclosing workspace exists (standalone),
 /// - the target of an explicit `package.workspace = "…"` pointer,
 /// - otherwise the nearest ancestor manifest declaring `[workspace]` —
-///   unless that ancestor's `workspace.exclude` names the app's directory
-///   (exact relative path; glob patterns are not expanded — the cheap
-///   rule), in which case the app is standalone.
+///   unless that ancestor's `workspace.exclude` covers the app's directory
+///   (exact relative path OR any ancestor directory of it, matched by
+///   whole path components — Cargo treats exclude entries as directory
+///   prefixes, so `exclude = ["examples"]` excludes `examples/mobile` but
+///   never `examples-extra/mobile`; glob patterns are not expanded — the
+///   cheap rule), in which case the app is standalone.
 ///
 /// Full `members` glob verification is deliberately skipped: a nearest
 /// ancestor root that does not include the member is a broken workspace
@@ -720,9 +723,19 @@ pub fn effective_workspace_root(project_root: &Path) -> std::path::PathBuf {
                 .get("exclude")
                 .and_then(toml::Value::as_array)
                 .is_some_and(|entries| {
+                    // Cargo treats exclude entries as DIRECTORY PREFIXES: a
+                    // package anywhere under an excluded dir is excluded
+                    // (root `exclude = ["examples"]` excludes
+                    // examples/mobile). `Path::starts_with` compares whole
+                    // components, so "examples" matches examples/mobile but
+                    // never examples-extra/mobile. Glob patterns are still
+                    // not expanded (the sanctioned cheap rule) — a literal
+                    // component comparison simply never matches them.
+                    let relative = lexical_relative(project_root, d);
                     entries.iter().filter_map(toml::Value::as_str).any(|entry| {
-                        lexical_relative(project_root, d)
-                            .is_some_and(|relative| relative == Path::new(entry))
+                        relative
+                            .as_deref()
+                            .is_some_and(|relative| relative.starts_with(Path::new(entry)))
                     })
                 });
             return if excluded {
@@ -3342,6 +3355,92 @@ mod tests {
             "got: {patch}"
         );
         assert!(plan.warnings.is_empty(), "got {:?}", plan.warnings);
+    }
+
+    #[test]
+    fn offline_exclude_entries_match_as_directory_prefixes() {
+        // Cargo treats `workspace.exclude` entries as DIRECTORY PREFIXES: a
+        // package anywhere under an excluded dir is excluded and becomes
+        // its own workspace. The common layout — root
+        // `exclude = ["examples"]` with the app at examples/mobile — must
+        // therefore use the APP's own manifest, not adopt the excluding
+        // ancestor and mirror its patches.
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[workspace]\nmembers = []\nexclude = [\"examples\"]\n\n\
+             [patch.crates-io]\nautumn-web = { path = \"/src/ancestor/autumn\" }\n",
+        )
+        .unwrap();
+        let app = tmp.path().join("examples").join("mobile");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(
+            app.join("Cargo.toml"),
+            "[package]\nname = \"my-app\"\nversion = \"0.2.3\"\n\n\
+             [dependencies]\nautumn-web = \"0.9.1\"\n\n\
+             [patch.crates-io]\nautumn-web = { path = \"/src/own/autumn\" }\n",
+        )
+        .unwrap();
+        let mut plan = Plan::new(&app);
+        let dep = shell_autumn_web_dep(&app, &mut plan);
+        let patch = dep
+            .patch_entry
+            .expect("the prefix-excluded (standalone) app's own patch must be mirrored");
+        assert!(
+            patch.contains(r#"autumn-web = { path = "/src/own/autumn" }"#),
+            "got: {patch}"
+        );
+        assert!(
+            !patch.contains("/src/ancestor/autumn"),
+            "the excluding ancestor's patch must not leak in: {patch}"
+        );
+        assert!(plan.warnings.is_empty(), "got {:?}", plan.warnings);
+    }
+
+    #[test]
+    fn offline_exclude_prefix_match_respects_component_boundaries() {
+        // `exclude = ["examples"]` must NOT exclude examples-extra/mobile —
+        // the comparison is whole path components, not a string prefix. The
+        // app IS a member of the ancestor workspace, so the ancestor's
+        // patch table governs and the member-local one is skipped with the
+        // established loud warning.
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"examples-extra/mobile\"]\nexclude = [\"examples\"]\n\n\
+             [patch.crates-io]\nautumn-web = { path = \"/src/ancestor/autumn\" }\n",
+        )
+        .unwrap();
+        let app = tmp.path().join("examples-extra").join("mobile");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(
+            app.join("Cargo.toml"),
+            "[package]\nname = \"my-app\"\nversion = \"0.2.3\"\n\n\
+             [dependencies]\nautumn-web = \"0.9.1\"\n\n\
+             [patch.crates-io]\nautumn-web = { path = \"/src/member-local/autumn\" }\n",
+        )
+        .unwrap();
+        let mut plan = Plan::new(&app);
+        let dep = shell_autumn_web_dep(&app, &mut plan);
+        let patch = dep
+            .patch_entry
+            .expect("the ancestor root's patch must be mirrored for a real member");
+        assert!(
+            patch.contains(r#"autumn-web = { path = "/src/ancestor/autumn" }"#),
+            "examples-extra must not be swallowed by the `examples` exclude \
+             entry, got: {patch}"
+        );
+        assert!(
+            !patch.contains("/src/member-local/autumn"),
+            "the ignored member-local patch must not leak in: {patch}"
+        );
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|w| w.contains("Cargo ignores [patch] tables outside the workspace root")),
+            "the member-local patch skip must warn, got {:?}",
+            plan.warnings
+        );
     }
 
     #[test]
