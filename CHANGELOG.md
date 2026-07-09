@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **web:** new public `ProvideAuthorizationState` trait (PR #1505) [no-plugin]
+  — the authorization layer (policy registry lookup, auth session key,
+  forbidden response, and the `db`-gated connection pool accessor) is now
+  driven through this trait instead of concrete `AppState`, decoupling
+  `authorization.rs` from `state.rs`. `AppState` implements it, so existing
+  apps are unaffected; custom state types can implement it to plug into
+  authorization.
 - **channels/sse:** Resumable SSE streams — automatic per-topic event ids, a bounded per-topic replay ring buffer, and `sse::stream_resumable` that replays events a client missed during a brief disconnect via `Last-Event-ID` (with a `gap` sentinel on buffer overflow) (issue #1356).
 
 - **test:** first-class auth helpers for the test harness (issue #1359).
