@@ -705,6 +705,15 @@ pub fn step_up(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///     Ok("welcome back")
 /// }
 /// ```
+///
+/// # Limitations
+///
+/// Like the sibling `#[secured]` / `#[step_up]` guards it mirrors, the throttle
+/// check runs inside the handler after `FromRequestParts` extractors, but body
+/// extractors (`Json` / `Form` / `Multipart`) are parsed by Axum *before* the
+/// throttle check, so an over-limit client can still incur request-body parsing
+/// before receiving its `429`. For hard pre-body protection, combine with the
+/// global limiter layer under `[security.rate_limit]`.
 #[proc_macro_attribute]
 pub fn throttle(attr: TokenStream, item: TokenStream) -> TokenStream {
     throttle::throttle_macro(attr.into(), item.into()).into()

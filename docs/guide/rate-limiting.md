@@ -111,6 +111,16 @@ traffic and the global limiter still applies.
   the request through, `fail_closed` returns `429` until the backend
   recovers.
 
+## Limitations
+
+`#[throttle]` — like the sibling `#[secured]` / `#[step_up]` guards it mirrors —
+runs inside the handler after `FromRequestParts` extractors, but body extractors
+(`Json` / `Form` / `Multipart`) are parsed by Axum *before* the throttle check.
+An over-limit client can therefore still incur request-body parsing before
+receiving its `429`. For hard pre-body protection (rejecting the request before
+its body is read), pair the throttle with the global limiter layer, which runs
+as an outer tower layer ahead of body extraction.
+
 ## Response shape
 
 Blocked requests receive:

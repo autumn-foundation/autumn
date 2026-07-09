@@ -70,6 +70,12 @@ async fn trusted_proxy_ip() -> &'static str {
     "trusted-proxy-ip-ok"
 }
 
+#[get("/global-plus-throttle")]
+#[throttle(limit = 1, per = "1s", key = "ip")]
+async fn global_plus_throttle() -> &'static str {
+    "global-plus-throttle-ok"
+}
+
 #[cfg(all(feature = "redis", feature = "test-support"))]
 #[get("/redis-route-a")]
 #[throttle(limit = 1, per = "60s", key = "ip")]
@@ -97,13 +103,12 @@ fn base_config() -> AutumnConfig {
     config
 }
 
-/// Config with the global limiter disabled so a `#[throttle]` denial's own
-/// `x-ratelimit-*` headers are asserted precisely. (When the global limiter is
-/// enabled and generous, it sees the request as allowed and stamps its own
-/// `x-ratelimit-limit`/`remaining`/`reset` onto the outgoing response — the
-/// throttle's `Retry-After` still survives, but its `remaining: 0` is
-/// overwritten by the global bucket's remaining count.) The per-route throttle
-/// applies regardless of the global limiter's `enabled` flag.
+/// Config with the global limiter disabled, isolating a `#[throttle]` denial's
+/// own `x-ratelimit-*` headers for a precise assertion. The per-route throttle
+/// applies regardless of the global limiter's `enabled` flag; the companion
+/// `throttle_429_headers_survive_enabled_global_limiter` test covers the case
+/// where the global limiter is *also* enabled and must not overwrite the
+/// throttle's `remaining: 0` / route limit.
 fn throttle_only_config() -> AutumnConfig {
     let mut config = AutumnConfig::default();
     config.security.rate_limit.enabled = false;
@@ -206,6 +211,57 @@ async fn throttled_429_carries_retry_after_and_ratelimit_headers() {
     assert!(
         denied.header("x-ratelimit-reset").is_some(),
         "x-ratelimit-reset header must be present"
+    );
+    denied.assert_header_contains("content-type", "application/problem+json");
+}
+
+/// Regression (Codex P2, PR #1662): when the GLOBAL limiter is enabled and a
+/// per-route `#[throttle]` denies a request, the throttle's own 429 (built
+/// inside the handler) bubbles UP through the global `RateLimitService`'s
+/// *allowed* path — the global limiter let the request through, so from its
+/// perspective the inner service simply returned a response. That path used to
+/// unconditionally overwrite `x-ratelimit-*` with the GLOBAL bucket's values,
+/// so a throttled 429 advertised the global (non-zero) remaining quota and the
+/// global limit instead of the route's `remaining: 0` / route limit.
+///
+/// This drives the route past its per-route limit while the global bucket still
+/// has ample quota, and asserts the 429 carries the ROUTE's headers.
+#[tokio::test]
+async fn throttle_429_headers_survive_enabled_global_limiter() {
+    // Generous global limiter (rps/burst = 1000) + a strict per-route throttle
+    // (limit = 1). The global bucket is nowhere near exhausted, so any 429 here
+    // is purely the per-route throttle's doing.
+    let client = TestApp::new()
+        .routes(routes![global_plus_throttle])
+        .config(base_config())
+        .build();
+
+    client
+        .get("/global-plus-throttle")
+        .header("X-Forwarded-For", "198.51.100.42")
+        .send()
+        .await
+        .assert_status(200);
+
+    let denied = client
+        .get("/global-plus-throttle")
+        .header("X-Forwarded-For", "198.51.100.42")
+        .send()
+        .await;
+    denied.assert_status(429);
+
+    // The 429 must advertise the ROUTE's exhausted bucket, not the global one.
+    // Route limit is 1 (global burst is 1000); route remaining is 0.
+    denied.assert_header("x-ratelimit-remaining", "0");
+    denied.assert_header("x-ratelimit-limit", "1");
+
+    // Retry-After from the per-route throttle must survive too.
+    let retry_after = denied
+        .header("retry-after")
+        .expect("Retry-After header must be present on the throttled 429");
+    assert!(
+        retry_after.parse::<u64>().is_ok(),
+        "Retry-After should be an integer number of seconds, got {retry_after:?}",
     );
     denied.assert_header_contains("content-type", "application/problem+json");
 }

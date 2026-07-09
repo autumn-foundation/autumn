@@ -967,10 +967,22 @@ where
                     reset_at_unix,
                 }) => {
                     let mut response = inner.call(req).await?;
-                    let headers = response.headers_mut();
-                    headers.insert(X_RATELIMIT_LIMIT, burst_for_header);
-                    headers.insert(X_RATELIMIT_REMAINING, HeaderValue::from(remaining));
-                    headers.insert(X_RATELIMIT_RESET, HeaderValue::from(reset_at_unix));
+                    // The global limiter allowed this request, but the inner
+                    // service may still have denied it downstream — most notably
+                    // a per-route `#[throttle]` guard, which returns its own 429
+                    // carrying route-specific `x-ratelimit-*`/`retry-after`
+                    // headers (remaining: 0, the route's limit). Overwriting
+                    // those with this global bucket's informational headers would
+                    // mislead clients into thinking quota remains. A 429 from the
+                    // inner service is only ever a per-route throttle denial, so
+                    // leave such responses' headers untouched; normal
+                    // 200/other responses still get the global headers.
+                    if response.status() != StatusCode::TOO_MANY_REQUESTS {
+                        let headers = response.headers_mut();
+                        headers.insert(X_RATELIMIT_LIMIT, burst_for_header);
+                        headers.insert(X_RATELIMIT_REMAINING, HeaderValue::from(remaining));
+                        headers.insert(X_RATELIMIT_RESET, HeaderValue::from(reset_at_unix));
+                    }
                     Ok(response)
                 }
                 None => inner.call(req).await,
