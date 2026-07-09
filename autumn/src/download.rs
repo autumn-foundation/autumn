@@ -8,7 +8,9 @@
 //!
 //! The blob-backed constructor streams bytes straight from the store without
 //! buffering the whole object in memory, so it works for large files behind
-//! authorization (no public presigned URL required).
+//! authorization (no public presigned URL required). The byte stream is opened
+//! lazily when the response is built, so a `Range` request fetches only the
+//! requested slice rather than reading the whole object.
 //!
 //! # Serving a private stored file behind auth
 //!
@@ -72,17 +74,17 @@ enum DownloadBody {
     /// **Not range-capable**: the source cannot be re-seeked, so it is always
     /// served in full and never advertises `Accept-Ranges`.
     Stream(BoxByteStream),
-    /// A stored blob, retaining enough state (store handle + key + size) to
-    /// re-fetch an arbitrary byte slice. **Range-capable**: a ranged request
-    /// asks the store for only the requested slice via
-    /// [`BlobStore::get_range`](crate::storage::BlobStore::get_range). The
-    /// pre-opened `full_stream` serves the non-ranged path without a second
-    /// round-trip.
+    /// A stored blob, retaining only the state needed to open the byte stream
+    /// lazily (store handle + key + size) — never a pre-opened stream.
+    /// **Range-capable**: the byte stream is opened only when the response is
+    /// built, and a ranged request asks the store for only the requested slice
+    /// via [`BlobStore::get_range`](crate::storage::BlobStore::get_range),
+    /// never buffering the whole object for a seek. The non-ranged path opens
+    /// the whole-object stream lazily via
+    /// [`BlobStore::get_stream`](crate::storage::BlobStore::get_stream).
     #[cfg(feature = "storage")]
     Blob {
-        /// Whole-object stream opened up-front for the non-ranged `200` path.
-        full_stream: BoxByteStream,
-        /// Store handle used to re-fetch a byte slice for a ranged request.
+        /// Store handle used to open the object stream or a byte slice.
         store: crate::storage::SharedBlobStore,
         /// Object key within the store.
         key: String,
@@ -208,44 +210,42 @@ impl Download {
     /// Build a download that streams a stored blob's bytes.
     ///
     /// Reads the blob's metadata ([`head`](crate::storage::BlobStore::head))
-    /// for the `Content-Length` and a default `Content-Type`, and opens a
-    /// streaming body ([`get_stream`](crate::storage::BlobStore::get_stream))
-    /// that does **not** buffer the whole object in memory. This keeps the
-    /// bytes flowing through your own authorized handler — no public presigned
-    /// URL is issued.
+    /// for the `Content-Length` and a default `Content-Type`, then retains the
+    /// store handle + key so the byte stream can be opened **lazily** when the
+    /// response is built. It does **not** open (or buffer) the object here, so
+    /// a later `Range` request fetches only the requested slice via
+    /// [`get_range`](crate::storage::BlobStore::get_range) rather than reading
+    /// the whole object. This keeps the bytes flowing through your own
+    /// authorized handler — no public presigned URL is issued.
     ///
     /// The `Content-Length` is taken from the [`head`](crate::storage::BlobStore::head)
-    /// metadata read before the body stream is opened. There is a small
-    /// time-of-check/time-of-use window: if the blob is overwritten with a
-    /// different size between the `head` and the `get_stream` (a local-backend
-    /// edge case; overwrites are otherwise atomic), the advertised length may
-    /// disagree with the streamed bytes.
+    /// metadata read here. There is a small time-of-check/time-of-use window:
+    /// if the blob is overwritten with a different size between this `head` and
+    /// the later stream open (a local-backend edge case; overwrites are
+    /// otherwise atomic), the advertised length may disagree with the streamed
+    /// bytes.
     ///
     /// # Errors
     ///
     /// Returns a [`BlobStoreError`](crate::storage::BlobStoreError) if the blob
-    /// does not exist or the store cannot be read.
+    /// does not exist or its metadata cannot be read.
     #[cfg(feature = "storage")]
     pub async fn from_blob(
         store: &crate::storage::SharedBlobStore,
         key: impl Into<String>,
     ) -> Result<Self, crate::storage::BlobStoreError> {
-        use futures::StreamExt as _;
-
         let key = key.into();
         let meta = store
             .head(&key)
             .await?
             .ok_or_else(|| crate::storage::BlobStoreError::NotFound(key.clone()))?;
-        // `get_stream` yields a `'static` stream, so the download detaches
-        // cleanly from the borrow of `store`. The stream serves the non-ranged
-        // `200` path; the retained store handle + key + size let
-        // `into_response_ranged` re-fetch an arbitrary byte slice.
-        let stream = store.get_stream(&key).await?;
-        let full_stream = stream.map(|chunk| chunk.map_err(std::io::Error::other));
+        // Only metadata is read here; the byte stream is opened lazily when the
+        // response is built. The retained store handle + key + size let the
+        // non-ranged path open the whole-object stream and a ranged request
+        // fetch only the requested slice — the full object is never buffered
+        // for a seek.
         Ok(Self {
             body: DownloadBody::Blob {
-                full_stream: Box::pin(full_stream),
                 store: std::sync::Arc::clone(store),
                 key,
                 size: meta.byte_size,
@@ -421,12 +421,9 @@ impl Download {
                 response
             }
             #[cfg(feature = "storage")]
-            DownloadBody::Blob {
-                full_stream,
-                store,
-                key,
-                size,
-            } => blob_ranged_response(&resolution, full_stream, &store, &key, size, &meta).await,
+            DownloadBody::Blob { store, key, size } => {
+                blob_ranged_response(&resolution, &store, &key, size, &meta).await
+            }
             // Not range-capable — handled by the early return above.
             DownloadBody::Stream(_) => unreachable!("opaque streams return early"),
         }
@@ -445,7 +442,6 @@ fn merge_headers(dst: &mut HeaderMap, src: &HeaderMap) {
 #[cfg(feature = "storage")]
 async fn blob_ranged_response(
     resolution: &range::RangeResolution,
-    full_stream: BoxByteStream,
     store: &crate::storage::SharedBlobStore,
     key: &str,
     size: u64,
@@ -455,7 +451,14 @@ async fn blob_ranged_response(
 
     match *resolution {
         range::RangeResolution::Full => {
-            let mut response = Body::from_stream(full_stream).into_response();
+            // Open the whole-object stream only now (never up-front), so a
+            // non-ranged request streams without buffering the object.
+            let stream = match store.get_stream(key).await {
+                Ok(stream) => stream,
+                Err(err) => return err.into_autumn_error().into_response(),
+            };
+            let stream = stream.map(|chunk| chunk.map_err(std::io::Error::other));
+            let mut response = Body::from_stream(stream).into_response();
             let headers = response.headers_mut();
             range::set_accept_ranges(headers);
             headers.insert(CONTENT_LENGTH, HeaderValue::from(size));
@@ -488,10 +491,28 @@ async fn blob_ranged_response(
     }
 }
 
+/// Build a whole-object stream for the plain [`IntoResponse`] path, which
+/// cannot `.await` the store up front. The store's byte stream is opened
+/// lazily on first poll (never buffering the object here); an open error
+/// surfaces as a stream error mid-body.
+#[cfg(feature = "storage")]
+fn lazy_blob_stream(store: crate::storage::SharedBlobStore, key: String) -> BoxByteStream {
+    use futures::TryStreamExt as _;
+
+    let opened = futures::stream::once(async move {
+        store
+            .get_stream(&key)
+            .await
+            .map(|stream| stream.map_err(std::io::Error::other))
+            .map_err(std::io::Error::other)
+    })
+    .try_flatten();
+    Box::pin(opened)
+}
+
 impl IntoResponse for Download {
     fn into_response(self) -> Response {
         let content_length = self.content_length;
-        let range_capable = self.body.is_range_capable();
 
         // Compute metadata before moving the body out of `self`.
         let mut header_scratch = HeaderMap::new();
@@ -501,7 +522,9 @@ impl IntoResponse for Download {
             DownloadBody::Bytes(bytes) => Body::from(bytes),
             DownloadBody::Stream(stream) => Body::from_stream(stream),
             #[cfg(feature = "storage")]
-            DownloadBody::Blob { full_stream, .. } => Body::from_stream(full_stream),
+            DownloadBody::Blob { store, key, .. } => {
+                Body::from_stream(lazy_blob_stream(store, key))
+            }
         };
 
         let mut response = body.into_response();
@@ -512,12 +535,10 @@ impl IntoResponse for Download {
         if let Some(len) = content_length {
             headers.insert(CONTENT_LENGTH, HeaderValue::from(len));
         }
-        // Advertise range support so clients learn they can issue `Range`
-        // requests (answered via `into_response_ranged`). Opaque streams are
-        // not seekable, so they never advertise it.
-        if range_capable {
-            range::set_accept_ranges(headers);
-        }
+        // This plain conversion cannot inspect the request's `Range` header and
+        // always returns the full body, so it deliberately does **not**
+        // advertise `Accept-Ranges` — that promise is honored only by
+        // `into_response_ranged`, which can actually answer with `206`/`416`.
         response
     }
 }

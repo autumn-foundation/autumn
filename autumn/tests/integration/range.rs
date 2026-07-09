@@ -74,13 +74,19 @@ async fn download_bytes_without_range_is_200_and_advertises_accept_ranges() {
     assert_eq!(&body[..], &payload[..]);
 }
 
-/// The plain `IntoResponse` conversion also advertises range support so a
-/// client learns it may issue `Range` requests.
+/// The plain `IntoResponse` conversion cannot inspect the request's `Range`
+/// header and always returns the full `200`, so it must **not** advertise
+/// `Accept-Ranges` — that would dishonestly promise range support only the
+/// request-aware `into_response_ranged` path can actually honor with a
+/// `206`/`416`.
 #[tokio::test]
-async fn download_bytes_plain_into_response_advertises_accept_ranges() {
+async fn download_bytes_plain_into_response_does_not_advertise_accept_ranges() {
     use axum::response::IntoResponse as _;
     let resp = Download::from_bytes(Bytes::from_static(b"abc")).into_response();
-    assert_eq!(resp.headers().get(ACCEPT_RANGES).unwrap(), "bytes");
+    assert!(
+        resp.headers().get(ACCEPT_RANGES).is_none(),
+        "plain IntoResponse must not advertise Accept-Ranges it cannot honor"
+    );
 }
 
 // ── AC #4: unsatisfiable range → 416 ────────────────────────────────────────
@@ -455,6 +461,164 @@ mod blob {
         );
         let body = body_bytes(resp).await;
         assert_eq!(&body[..], &payload[..]);
+    }
+
+    /// A `BlobStore` decorator that counts how often the whole-object stream
+    /// (`get_stream`) versus a sliced read (`get_range`) is opened, so a test
+    /// can prove a `Range` request never opens the full stream.
+    struct CountingStore {
+        inner: SharedBlobStore,
+        get_stream_calls: Arc<std::sync::atomic::AtomicUsize>,
+        get_range_calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl autumn_web::storage::BlobStore for CountingStore {
+        fn provider_id(&self) -> &str {
+            self.inner.provider_id()
+        }
+        fn put<'a>(
+            &'a self,
+            key: &'a str,
+            content_type: &'a str,
+            bytes: Bytes,
+        ) -> autumn_web::storage::BlobFuture<'a, autumn_web::storage::Blob> {
+            self.inner.put(key, content_type, bytes)
+        }
+        fn put_stream<'a>(
+            &'a self,
+            key: &'a str,
+            content_type: &'a str,
+            data: autumn_web::storage::ByteStream<'a>,
+        ) -> autumn_web::storage::BlobFuture<'a, autumn_web::storage::Blob> {
+            self.inner.put_stream(key, content_type, data)
+        }
+        fn get<'a>(&'a self, key: &'a str) -> autumn_web::storage::BlobFuture<'a, Bytes> {
+            self.inner.get(key)
+        }
+        fn get_stream<'a>(
+            &'a self,
+            key: &'a str,
+        ) -> autumn_web::storage::BlobFuture<'a, autumn_web::storage::ByteStream<'static>> {
+            self.get_stream_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.get_stream(key)
+        }
+        fn get_range<'a>(
+            &'a self,
+            key: &'a str,
+            start: u64,
+            end: u64,
+        ) -> autumn_web::storage::BlobFuture<'a, autumn_web::storage::ByteStream<'static>> {
+            self.get_range_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.get_range(key, start, end)
+        }
+        fn delete<'a>(&'a self, key: &'a str) -> autumn_web::storage::BlobFuture<'a, ()> {
+            self.inner.delete(key)
+        }
+        fn head<'a>(
+            &'a self,
+            key: &'a str,
+        ) -> autumn_web::storage::BlobFuture<'a, Option<autumn_web::storage::BlobMeta>> {
+            self.inner.head(key)
+        }
+        fn presigned_url<'a>(
+            &'a self,
+            key: &'a str,
+            expires_in: Duration,
+        ) -> autumn_web::storage::BlobFuture<'a, String> {
+            self.inner.presigned_url(key, expires_in)
+        }
+    }
+
+    /// AC #5 (Finding 1): a blob `Range` request must fetch **only** the
+    /// requested slice via `get_range` and must **never** open the whole-object
+    /// stream (`get_stream`) — otherwise a seek buffers the entire object.
+    #[tokio::test]
+    async fn blob_range_uses_get_range_and_never_opens_full_stream() {
+        let dir = tempfile::tempdir().unwrap();
+        let get_stream_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let get_range_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let store: SharedBlobStore = Arc::new(CountingStore {
+            inner: make_store(dir.path()),
+            get_stream_calls: Arc::clone(&get_stream_calls),
+            get_range_calls: Arc::clone(&get_range_calls),
+        });
+        store
+            .put(
+                "media/clip.bin",
+                "application/octet-stream",
+                Bytes::from_static(b"0123456789abcdef"),
+            )
+            .await
+            .unwrap();
+
+        let headers = range_headers("bytes=4-9");
+        let resp = Download::from_blob(&store, "media/clip.bin")
+            .await
+            .unwrap()
+            .into_response_ranged(&headers)
+            .await;
+
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        // Draining the body must not trigger a full-object open either.
+        let body = body_bytes(resp).await;
+        assert_eq!(&body[..], b"456789", "served exactly the requested slice");
+
+        assert_eq!(
+            get_range_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a Range request must fetch the slice via get_range"
+        );
+        assert_eq!(
+            get_stream_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a Range request must NOT open the whole-object stream"
+        );
+    }
+
+    /// The non-ranged path opens the whole-object stream lazily via
+    /// `get_stream` (and never `get_range`), and `from_blob` alone opens
+    /// neither — it only reads metadata.
+    #[tokio::test]
+    async fn blob_non_ranged_opens_full_stream_only_when_response_built() {
+        let dir = tempfile::tempdir().unwrap();
+        let get_stream_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let get_range_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let store: SharedBlobStore = Arc::new(CountingStore {
+            inner: make_store(dir.path()),
+            get_stream_calls: Arc::clone(&get_stream_calls),
+            get_range_calls: Arc::clone(&get_range_calls),
+        });
+        store
+            .put(
+                "media/clip.bin",
+                "application/octet-stream",
+                Bytes::from_static(b"0123456789abcdef"),
+            )
+            .await
+            .unwrap();
+
+        let download = Download::from_blob(&store, "media/clip.bin").await.unwrap();
+        assert_eq!(
+            get_stream_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "from_blob must not open the byte stream (metadata only)"
+        );
+
+        let resp = download.into_response_ranged(&http::HeaderMap::new()).await;
+        let body = body_bytes(resp).await;
+        assert_eq!(&body[..], b"0123456789abcdef");
+        assert_eq!(
+            get_stream_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the non-ranged path opens the whole-object stream once"
+        );
+        assert_eq!(
+            get_range_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the non-ranged path must not use get_range"
+        );
     }
 
     #[tokio::test]

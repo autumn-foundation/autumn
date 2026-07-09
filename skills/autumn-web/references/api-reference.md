@@ -305,11 +305,13 @@ building, wired into `Download` and the embedded static-asset path.
 - **`If-Range`** (strong `ETag` or `Last-Modified` HTTP-date) via `Validator`:
   a stale/absent validator falls back to the full `200`.
 - `Download::into_response_ranged(&headers).await` is the request-aware entry
-  point that returns `206`/`416` (the plain `IntoResponse` cannot see the
-  request, so it serves the full body but still advertises `Accept-Ranges:
-  bytes` for range-capable bodies). Add `.etag(..)` / `.last_modified(..)` to
-  supply the `If-Range` validator. Opaque `from_stream`/`from_async_read`
-  bodies are not seekable: always full `200`, no `Accept-Ranges`.
+  point that returns `206`/`416` and advertises `Accept-Ranges: bytes` on the
+  `200`/`206`/`416` for range-capable bodies. The plain `IntoResponse` cannot
+  see the request, always serves the full `200`, and therefore does **not**
+  advertise `Accept-Ranges` (only `into_response_ranged` can honor a `Range`).
+  Add `.etag(..)` / `.last_modified(..)` to supply the `If-Range` validator.
+  Opaque `from_stream`/`from_async_read` bodies are not seekable: always full
+  `200`, never `Accept-Ranges`.
 - Blob range path fetches only the requested slice via the additive
   `BlobStore::get_range(key, start, end) -> ByteStream<'static>`
   (`LocalBlobStore` seeks + takes off disk; other backends inherit a buffering
