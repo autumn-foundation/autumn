@@ -1294,6 +1294,7 @@ impl TestApp {
             clock: self
                 .clock
                 .unwrap_or_else(|| std::sync::Arc::new(crate::time::SystemClock)),
+            app_id: crate::state::AppState::next_app_id(),
         };
 
         for register in self.policy_registrations {

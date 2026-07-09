@@ -1414,14 +1414,25 @@ pub async fn __check_throttle(
         };
     let principal = principal.or(derived_principal.as_ref());
 
-    // Qualify the registry key with a fingerprint of every construction-affecting
-    // config input so a later `AppState` with a different config in the same
-    // process can never reuse an earlier app's limiter for the same route/name.
+    // Qualify the registry key with (1) the constructing app's process-unique
+    // id and (2) a fingerprint of every construction-affecting config input.
+    //
+    // The fingerprint alone stops a later `AppState` with a DIFFERENT config
+    // from reusing an earlier app's limiter for the same route/name. But two
+    // INDEPENDENTLY built apps with IDENTICAL rate-limit + trusted-proxy config
+    // (parallel `TestApp`s, or one process hosting two apps with the same
+    // handler) would still fingerprint-collide and share one process-global
+    // `Limiter`/`MemoryStore`, so traffic in one app would drain the other's
+    // per-route bucket. Prefixing the clone-stable `app_id` gives each app its
+    // own buckets, while a cloned `AppState` (what `State` hands the handler)
+    // keeps its origin's id and therefore its origin's bucket.
+    //
     // The bare `registry_key` (route:<id> / named:<name>) still drives the Redis
     // keyspace namespacing in `build_throttle_limiter`; only the in-memory cache
-    // lookup carries the fingerprint.
+    // lookup carries the app id + fingerprint.
+    let app_id = state.app_id();
     let fingerprint = throttle_config_fingerprint(rl_config, trusted_proxies, key_strategy);
-    let cache_key = format!("{registry_key}@{fingerprint:016x}");
+    let cache_key = format!("{app_id}:{registry_key}@{fingerprint:016x}");
     let limiter = {
         let mut reg = throttle_registry()
             .lock()
@@ -2545,10 +2556,13 @@ mod tests {
         };
         let tp = TrustedProxiesConfig::default();
 
-        // Mirror `__check_throttle`'s cache lookup against the shared registry.
+        // Mirror `__check_throttle`'s cache lookup against the shared registry,
+        // including the app-id prefix the real key carries (fixed here since this
+        // test drives the registry directly rather than through an `AppState`).
+        let app_id: u64 = 424_242;
         let get = |key_strategy: KeyStrategy| -> Arc<Limiter> {
             let fp = throttle_config_fingerprint(&global, &tp, key_strategy);
-            let cache_key = format!("{route}@{fp:016x}");
+            let cache_key = format!("{app_id}:{route}@{fp:016x}");
             let mut reg = throttle_registry()
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -3062,6 +3076,73 @@ mod tests {
                 .get(CONTENT_TYPE)
                 .and_then(|v| v.to_str().ok()),
             Some("application/problem+json"),
+        );
+    }
+
+    #[tokio::test]
+    async fn check_throttle_two_apps_same_route_get_independent_buckets() {
+        // Regression for the multi-app throttle bleed: two INDEPENDENTLY built
+        // `AppState`s with IDENTICAL config, hitting the SAME throttled route
+        // from the SAME client, must charge SEPARATE per-route buckets. Before
+        // scoping the registry key by the app's process-unique id, both apps
+        // fingerprint-collided onto one process-global limiter, so exhausting
+        // app A would also deny app B.
+        let app_a = crate::AppState::for_test();
+        let app_b = crate::AppState::for_test();
+        // Distinct construction => distinct clone-stable identities.
+        assert_ne!(
+            app_a.app_id(),
+            app_b.app_id(),
+            "independently built apps must have distinct ids"
+        );
+
+        let headers = axum::http::HeaderMap::new();
+        let peer: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        // Same route id + same single-token inline spec for both apps.
+        let route = "test::two_apps_same_route_independent_buckets";
+        let spec = ThrottleSpec::Inline {
+            limit: 1,
+            per_secs: 60,
+            key: Some(KeyStrategy::Ip),
+        };
+
+        // Exhaust app A: first request consumes its only token, second is denied.
+        let a1 = __check_throttle(
+            &app_a,
+            route,
+            spec.clone(),
+            &headers,
+            Some(peer),
+            None,
+            None,
+            false,
+        )
+        .await;
+        assert!(a1.is_ok(), "app A first request must succeed");
+        let a2 = __check_throttle(
+            &app_a,
+            route,
+            spec.clone(),
+            &headers,
+            Some(peer),
+            None,
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(
+            a2.expect_err("app A second request must be denied")
+                .status(),
+            StatusCode::TOO_MANY_REQUESTS,
+        );
+
+        // App B shares config + route + client, yet its own bucket is untouched:
+        // its first request must still succeed (proving buckets are independent).
+        let b1 =
+            __check_throttle(&app_b, route, spec, &headers, Some(peer), None, None, false).await;
+        assert!(
+            b1.is_ok(),
+            "app B must have an independent bucket and still succeed after app A is exhausted"
         );
     }
 
