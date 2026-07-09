@@ -5202,9 +5202,9 @@ enabled = true
     async fn custom_story_served_alongside_builtins() {
         let custom = crate::stories::story! {
             "App",
-            "Badge",
+            "Greeting",
             {
-                maud::html! { span class="app-badge" { "hi from the app" } }
+                maud::html! { span class="app-greeting" { "hi from the app" } }
             }
         };
         let state = test_state();
@@ -5216,7 +5216,7 @@ enabled = true
 
         let router = build_router(Vec::new(), &story_gallery_config(), state);
 
-        let detail = get_with_host(router.clone(), "/_stories/badge").await;
+        let detail = get_with_host(router.clone(), "/_stories/greeting").await;
         assert_eq!(detail.status(), StatusCode::OK);
         let body = response_text(detail).await;
         assert!(
@@ -5227,7 +5227,7 @@ enabled = true
         let index = get_with_host(router, "/_stories").await;
         let body = response_text(index).await;
         assert!(
-            body.contains("Badge"),
+            body.contains("Greeting"),
             "index must list the custom story: {body}"
         );
         assert!(

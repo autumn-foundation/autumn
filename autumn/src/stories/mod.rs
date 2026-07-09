@@ -662,7 +662,7 @@ mod tests {
 
         let custom = crate::stories::story! {
             "App",
-            "Badge",
+            "Greeting",
             {
                 maud::html! { span { "hi" } }
             }
@@ -670,7 +670,7 @@ mod tests {
         let registry = StoryGallery::builtin().extend([custom]).into_registry();
         assert_eq!(registry.stories().len(), builtin_count + 1);
         assert!(
-            registry.find("badge").is_some(),
+            registry.find("greeting").is_some(),
             "extended custom story must be findable by its slug"
         );
     }
