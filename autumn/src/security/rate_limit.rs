@@ -1059,6 +1059,11 @@ pub enum ThrottleSpec {
 /// for `#[throttle("name")]` forms, so distinct routes pointing at the same
 /// named limiter share a single token bucket while inline throttles get an
 /// isolated bucket per handler.
+///
+/// The route/name is further qualified by a
+/// [`throttle_config_fingerprint`] so that two `AppState`s with DIFFERENT
+/// rate-limit configs sharing one process don't hand each other a limiter built
+/// from the wrong app's key strategy, proxy resolver, backend, or Redis prefix.
 #[allow(clippy::type_complexity)]
 static THROTTLE_REGISTRY: std::sync::OnceLock<
     Mutex<std::collections::HashMap<String, Arc<Limiter>>>,
@@ -1146,6 +1151,68 @@ fn build_throttle_limiter(
     };
 
     Arc::new(Limiter::from_config_with_resolver(&cfg, top_level_resolver))
+}
+
+/// Stable fingerprint of every config input `build_throttle_limiter` bakes into
+/// a `Limiter` at construction time.
+///
+/// The throttle registry caches `Limiter`s process-wide keyed by route/name.
+/// When two `AppState`s with DIFFERENT rate-limit configs run in the same
+/// process (multiple `TestApp`s, or one embedded server hosting several apps),
+/// keying on route/name alone would hand the FIRST app's cached limiter to
+/// every later app for the same route. The `limit`/`rate` are re-supplied to
+/// `decide()` on each call and so stay correct, but the cached limiter still
+/// carries the first app's **key strategy, trusted-proxy resolver, backend
+/// (memory vs Redis), Redis key prefix, and backend-failure posture** — so a
+/// later app would silently key on the wrong client/principal or use in-memory
+/// storage instead of its configured Redis. Folding this fingerprint into the
+/// registry key gives each distinct config its own, correctly-built limiter.
+///
+/// This must capture EXACTLY the inputs `build_throttle_limiter` reads from
+/// config (see that function) so a cached limiter can never mismatch the
+/// current app's config; `limit`/`per_secs` are deliberately excluded because
+/// they only set construction-time defaults that `decide()` overrides per call.
+///
+/// Trade-off: two apps whose construction-affecting config is byte-identical
+/// still share one bucket. That is acceptable — they build identical limiters,
+/// so shared token accounting is behaviorally indistinguishable from per-app
+/// accounting. The bug this closes is a later app getting the WRONG config's
+/// limiter, not two identical apps sharing one.
+fn throttle_config_fingerprint(
+    global: &RateLimitConfig,
+    trusted_proxies: &TrustedProxiesConfig,
+    key: KeyStrategy,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+
+    // Key strategy baked into the limiter (`KeyStrategy` is a fieldless enum but
+    // isn't `Hash`, so hash its discriminant).
+    (key as u8).hash(&mut hasher);
+
+    // Legacy `security.rate_limit.*` proxy resolver inputs.
+    global.trust_forwarded_headers.hash(&mut hasher);
+    global.trusted_proxies.hash(&mut hasher);
+
+    // Top-level `[security.trusted_proxies]` resolver inputs (the resolver
+    // `build_throttle_limiter` derives from these when legacy fields are unset).
+    trusted_proxies.trust_forwarded_headers.hash(&mut hasher);
+    trusted_proxies.ranges.hash(&mut hasher);
+    trusted_proxies.trusted_hops.hash(&mut hasher);
+
+    // Backend selection (memory vs Redis); fieldless enum, hash its discriminant.
+    (global.backend as u8).hash(&mut hasher);
+
+    // Redis connection, key prefix, and failure posture only exist under the
+    // `redis` feature and only affect construction there.
+    #[cfg(feature = "redis")]
+    {
+        global.redis.url.hash(&mut hasher);
+        global.redis.key_prefix.hash(&mut hasher);
+        (global.on_backend_failure as u8).hash(&mut hasher);
+    }
+
+    hasher.finish()
 }
 
 /// Steady-state refill rate for a throttle limiter: `limit` tokens per
@@ -1347,11 +1414,19 @@ pub async fn __check_throttle(
         };
     let principal = principal.or(derived_principal.as_ref());
 
+    // Qualify the registry key with a fingerprint of every construction-affecting
+    // config input so a later `AppState` with a different config in the same
+    // process can never reuse an earlier app's limiter for the same route/name.
+    // The bare `registry_key` (route:<id> / named:<name>) still drives the Redis
+    // keyspace namespacing in `build_throttle_limiter`; only the in-memory cache
+    // lookup carries the fingerprint.
+    let fingerprint = throttle_config_fingerprint(rl_config, trusted_proxies, key_strategy);
+    let cache_key = format!("{registry_key}@{fingerprint:016x}");
     let limiter = {
         let mut reg = throttle_registry()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Arc::clone(reg.entry(registry_key.clone()).or_insert_with(|| {
+        Arc::clone(reg.entry(cache_key).or_insert_with(|| {
             build_throttle_limiter(
                 rl_config,
                 trusted_proxies,
@@ -2353,6 +2428,149 @@ mod tests {
         // Legacy resolver (trust_forwarded_headers = true, no hops/ranges) uses
         // the rightmost forwarded entry, not the hop-peeled top-level result.
         assert_eq!(limiter.extract_key(&req).as_deref(), Some("2.2.2.2"));
+    }
+
+    /// Bug (#1662 / Codex P2): the process-wide throttle registry was keyed by
+    /// route/name only. The fingerprint must differ whenever any input
+    /// `build_throttle_limiter` bakes into the `Limiter` differs, and match when
+    /// they are identical, so distinct-config apps get distinct limiters while
+    /// byte-identical configs still share one bucket.
+    #[test]
+    fn throttle_config_fingerprint_separates_distinct_configs() {
+        let base = RateLimitConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let tp = TrustedProxiesConfig::default();
+
+        // Identical config + key strategy → identical fingerprint (shared bucket).
+        assert_eq!(
+            throttle_config_fingerprint(&base, &tp, KeyStrategy::Ip),
+            throttle_config_fingerprint(&base, &tp, KeyStrategy::Ip),
+        );
+
+        // Key strategy differs → fingerprint differs.
+        assert_ne!(
+            throttle_config_fingerprint(&base, &tp, KeyStrategy::Ip),
+            throttle_config_fingerprint(&base, &tp, KeyStrategy::AuthenticatedPrincipal),
+        );
+
+        // Top-level trusted-proxy resolver inputs differ → fingerprint differs.
+        let tp2 = TrustedProxiesConfig {
+            ranges: Vec::new(),
+            trusted_hops: Some(2),
+            trust_forwarded_headers: true,
+        };
+        assert_ne!(
+            throttle_config_fingerprint(&base, &tp, KeyStrategy::Ip),
+            throttle_config_fingerprint(&base, &tp2, KeyStrategy::Ip),
+        );
+
+        // Legacy `security.rate_limit.*` proxy inputs differ → fingerprint differs.
+        let legacy = RateLimitConfig {
+            trust_forwarded_headers: true,
+            ..base.clone()
+        };
+        assert_ne!(
+            throttle_config_fingerprint(&base, &tp, KeyStrategy::Ip),
+            throttle_config_fingerprint(&legacy, &tp, KeyStrategy::Ip),
+        );
+    }
+
+    /// Bug (#1662 / Codex P2): under the redis feature, backend selection, Redis
+    /// key prefix, and backend-failure posture also bake into the limiter and so
+    /// must move the fingerprint.
+    #[cfg(feature = "redis")]
+    #[test]
+    fn throttle_config_fingerprint_separates_redis_config() {
+        use super::super::config::{
+            RateLimitBackend, RateLimitBackendFailure, RateLimitRedisConfig,
+        };
+
+        let memory = RateLimitConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let tp = TrustedProxiesConfig::default();
+        let redis = RateLimitConfig {
+            backend: RateLimitBackend::Redis,
+            redis: RateLimitRedisConfig {
+                url: Some("redis://127.0.0.1/".to_owned()),
+                key_prefix: "app:rl".to_owned(),
+            },
+            ..memory.clone()
+        };
+
+        // Memory vs Redis backend → fingerprint differs.
+        assert_ne!(
+            throttle_config_fingerprint(&memory, &tp, KeyStrategy::Ip),
+            throttle_config_fingerprint(&redis, &tp, KeyStrategy::Ip),
+        );
+
+        // Different Redis key prefix → fingerprint differs.
+        let redis_other_prefix = RateLimitConfig {
+            redis: RateLimitRedisConfig {
+                url: Some("redis://127.0.0.1/".to_owned()),
+                key_prefix: "other:rl".to_owned(),
+            },
+            ..redis.clone()
+        };
+        assert_ne!(
+            throttle_config_fingerprint(&redis, &tp, KeyStrategy::Ip),
+            throttle_config_fingerprint(&redis_other_prefix, &tp, KeyStrategy::Ip),
+        );
+
+        // Different backend-failure posture → fingerprint differs.
+        let redis_fail_closed = RateLimitConfig {
+            on_backend_failure: RateLimitBackendFailure::FailClosed,
+            ..redis.clone()
+        };
+        assert_ne!(
+            throttle_config_fingerprint(&redis, &tp, KeyStrategy::Ip),
+            throttle_config_fingerprint(&redis_fail_closed, &tp, KeyStrategy::Ip),
+        );
+    }
+
+    /// Bug (#1662 / Codex P2): two `AppState`s with DIFFERENT configs sharing one
+    /// process must NOT reuse each other's cached limiter for the same route id.
+    /// Exercises the real process-wide registry exactly as `__check_throttle`
+    /// does (fingerprint-qualified cache key), using a route id unique to this
+    /// test so no sibling test can clear or collide with its entries.
+    #[test]
+    fn throttle_registry_scopes_cached_limiter_by_config_fingerprint() {
+        let route = "route:m1662_multi_app";
+        let global = RateLimitConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let tp = TrustedProxiesConfig::default();
+
+        // Mirror `__check_throttle`'s cache lookup against the shared registry.
+        let get = |key_strategy: KeyStrategy| -> Arc<Limiter> {
+            let fp = throttle_config_fingerprint(&global, &tp, key_strategy);
+            let cache_key = format!("{route}@{fp:016x}");
+            let mut reg = throttle_registry()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            Arc::clone(reg.entry(cache_key).or_insert_with(|| {
+                build_throttle_limiter(&global, &tp, route, 5, 60, key_strategy)
+            }))
+        };
+
+        // App A keys by IP; App B keys by authenticated principal — same route id.
+        let app_a = get(KeyStrategy::Ip);
+        let app_b = get(KeyStrategy::AuthenticatedPrincipal);
+
+        // Distinct instances: App B did NOT inherit App A's cached limiter.
+        assert!(!Arc::ptr_eq(&app_a, &app_b));
+        // Each carries its OWN key strategy (the bug: B would key on IP like A).
+        assert_eq!(app_a.key_strategy, KeyStrategy::Ip);
+        assert_eq!(app_b.key_strategy, KeyStrategy::AuthenticatedPrincipal);
+
+        // Re-requesting App A's exact config returns the SAME cached Arc, so
+        // identical configs still share one bucket (registry can't grow unbounded).
+        let app_a_again = get(KeyStrategy::Ip);
+        assert!(Arc::ptr_eq(&app_a, &app_a_again));
     }
 
     #[test]
