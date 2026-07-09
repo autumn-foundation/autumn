@@ -33,7 +33,7 @@ pub use autumn_macros::ws;
 pub use autumn_macros::{
     api_doc, authorize, cached, delete, event, feature_flag, get, job, jobs, listener, listeners,
     main, oauth2_callback, one_off_tasks, patch, paths, post, put, routes, scheduled, secured,
-    service, static_get, static_routes, step_up, task, tasks,
+    service, static_get, static_routes, step_up, task, tasks, throttle,
 };
 #[cfg(feature = "mail")]
 pub use autumn_macros::{mail_previews, mailer, mailer_preview};
@@ -80,6 +80,9 @@ pub use crate::extract::Query;
 /// Flash message extractor.
 #[cfg(feature = "flash")]
 pub use crate::flash::{Flash, FlashLevel, FlashMessage};
+/// Accessible flash-banner renderer.
+#[cfg(all(feature = "flash", feature = "maud"))]
+pub use crate::flash::{FlashMessagesConfig, flash_messages, flash_messages_with};
 /// Extension trait for adding htmx response headers.
 #[cfg(feature = "htmx")]
 pub use crate::htmx::HxResponseExt;
@@ -183,13 +186,14 @@ pub use crate::form::{Changeset, ChangesetForm, IntoChangeset};
 /// See [`crate::widgets`] for the full API.
 #[cfg(feature = "maud")]
 pub use crate::widgets::{
-    ActiveSearchConfig, AutocompleteConfig, CardConfig, Column, ConfirmActionConfig, Crumb, Cta,
-    CtaStyle, DataTableConfig, HeadingLevel, HeroConfig, ModalConfig, NavBarConfig, NavBarLayout,
-    NavItem, NavLinkMatch, NavMenu, SearchMethod, SortDir, active_search,
-    active_search_empty_state, active_search_input, active_search_results,
-    autocomplete_empty_state, autocomplete_input, autocomplete_option, breadcrumb, card,
-    confirm_action, data_table, hero, modal, modal_close_button, modal_trigger, nav_bar, nav_link,
-    nav_link_matched, property_list, stat_card, tabs,
+    ActiveSearchConfig, AlertConfig, AlertVariant, AutocompleteConfig, AvatarConfig, AvatarSize,
+    BadgeConfig, BadgeVariant, CardConfig, Column, ConfirmActionConfig, Crumb, Cta, CtaStyle,
+    DataTableConfig, HeadingLevel, HeroConfig, ModalConfig, NavBarConfig, NavBarLayout, NavItem,
+    NavLinkMatch, NavMenu, SearchMethod, SortDir, active_search, active_search_empty_state,
+    active_search_input, active_search_results, alert, alert_with, autocomplete_empty_state,
+    autocomplete_input, autocomplete_option, avatar, badge, badge_with, breadcrumb, card,
+    confirm_action, data_table, error_summary, hero, modal, modal_close_button, modal_trigger,
+    nav_bar, nav_link, nav_link_matched, property_list, stat_card, status_tag, tabs,
 };
 
 // ── Widget stories ───────────────────────────────────────────────
@@ -409,6 +413,7 @@ mod tests {
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
+            app_id: AppState::next_app_id(),
         };
         #[cfg(not(feature = "db"))]
         let _state = AppState {
@@ -437,6 +442,7 @@ mod tests {
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
+            app_id: AppState::next_app_id(),
         };
         let _err: AutumnResult<()> = Ok(());
     }

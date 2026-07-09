@@ -2,11 +2,17 @@ use std::fs;
 use std::process::Command;
 
 fn scaffold(project_name: &str) -> tempfile::TempDir {
+    scaffold_with_flags(project_name, &[])
+}
+
+fn scaffold_with_flags(project_name: &str, flags: &[&str]) -> tempfile::TempDir {
     let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
     let autumn_bin = env!("CARGO_BIN_EXE_autumn");
 
+    let mut args = vec!["new", project_name];
+    args.extend_from_slice(flags);
     let output = Command::new(autumn_bin)
-        .args(["new", project_name])
+        .args(&args)
         .current_dir(temp_dir.path())
         .output()
         .expect("failed to run `autumn new`");
@@ -19,6 +25,286 @@ fn scaffold(project_name: &str) -> tempfile::TempDir {
     );
 
     temp_dir
+}
+
+#[test]
+fn cloud_native_scaffold_generates_readme_golden_path() {
+    let temp_dir = scaffold("readme-app");
+    let project_dir = temp_dir.path().join("readme-app");
+
+    let readme_path = project_dir.join("README.md");
+    assert!(
+        readme_path.is_file(),
+        "autumn new must write a README.md at the project root"
+    );
+
+    let readme = fs::read_to_string(&readme_path).unwrap();
+    // Golden-path commands (AC #6): the README must document the two commands
+    // that take a clean checkout to a serving route.
+    assert!(
+        readme.contains("autumn migrate"),
+        "README.md must document `autumn migrate`, got:\n{readme}"
+    );
+    assert!(
+        readme.contains("autumn dev"),
+        "README.md must document `autumn dev`, got:\n{readme}"
+    );
+    // The golden path must configure the database BEFORE `autumn migrate` —
+    // migrate needs a resolved URL and errors ("No database URL found") on the
+    // base scaffold, where the `[database]` block ships commented out. The
+    // README must tell the user to enable it. Assert on stable substrings so
+    // minor wording changes don't break the test.
+    assert!(
+        readme.contains("[database]"),
+        "README.md must tell the user to enable the `[database]` block before \
+         `autumn migrate`, got:\n{readme}"
+    );
+    assert!(
+        readme.contains("autumn.toml"),
+        "README.md must reference `autumn.toml` for enabling the database, got:\n{readme}"
+    );
+    // Finding 1: the DB-bootstrap step must NOT dead-end on a `release init`
+    // file-exists error. `autumn new` already wrote Dockerfile/.dockerignore, so
+    // `autumn release init --target docker-compose` aborts before emitting the
+    // compose file unless --force (which would clobber the scaffold's Dockerfile).
+    // The golden path bootstraps a throwaway local Postgres with `docker run`
+    // instead, matching the `url` in the `[database]` block.
+    assert!(
+        readme.contains("docker run") && readme.contains("postgres:16"),
+        "README.md DB-bootstrap must offer a working `docker run … postgres:16` one-liner \
+         (not dead-end on `release init`), got:\n{readme}"
+    );
+    // Codex P2: the runnable Postgres Docker helper must appear EXACTLY ONCE (in
+    // the step-2 "Configure the database" section). It previously also lived in
+    // the prerequisites block, so a user following the README top-to-bottom
+    // started the `{crate}-pg` container, then hit the identical command in step 2
+    // — which fails because the container name is already in use. The
+    // prerequisites now only cross-reference step 2 instead of repeating it.
+    assert_eq!(
+        readme.matches("docker run -d").count(),
+        1,
+        "README.md must contain the runnable `docker run -d …` Postgres helper exactly once \
+         (de-duplicated between prerequisites and step 2), got:\n{readme}"
+    );
+    // Codex P2: a freshly-started `postgres:16` container accepts connections
+    // only after first-time initialization finishes, but `autumn db create`
+    // connects immediately with no retry. The README must document an explicit
+    // readiness wait (e.g. `pg_isready`) AFTER starting the container and BEFORE
+    // `autumn db create`, so the golden path doesn't fail with a connection error.
+    let pg_isready_at = readme.find("pg_isready");
+    let db_create_at = readme.find("autumn db create");
+    assert!(
+        matches!((pg_isready_at, db_create_at), (Some(r), Some(c)) if r < c),
+        "README.md must wait for Postgres readiness (e.g. `pg_isready`) before \
+         `autumn db create`, got:\n{readme}"
+    );
+    // AC #3's pointer to `release init --target docker-compose` is still present
+    // (reframed as a deployment-asset generator, not the local DB path).
+    assert!(
+        readme.contains("autumn release init --target docker-compose"),
+        "README.md must still point at `autumn release init --target docker-compose` for \
+         deployment assets, got:\n{readme}"
+    );
+    // Finding 1: the `libpq` prerequisite must appear BEFORE the
+    // `cargo install diesel_cli … --features postgres` command, since that
+    // command's `postgres` feature (and the base `cargo build`, which links the
+    // `db` feature) needs the libpq client library.
+    let libpq_at = readme.find("libpq");
+    let diesel_at = readme.find("cargo install diesel_cli");
+    assert!(
+        matches!((libpq_at, diesel_at), (Some(l), Some(d)) if l < d),
+        "README.md must introduce the `libpq` prerequisite before the `cargo install \
+         diesel_cli … --features postgres` command that needs it, got:\n{readme}"
+    );
+    // The project name must be substituted everywhere (AC #5) — no leftover
+    // template tokens.
+    assert!(
+        readme.contains("readme-app"),
+        "README.md must substitute the project name, got:\n{readme}"
+    );
+    assert!(
+        !readme.contains("{{"),
+        "README.md must not contain unsubstituted template placeholders, got:\n{readme}"
+    );
+}
+
+#[test]
+fn cloud_native_scaffold_readme_is_flag_aware_for_i18n_and_seed() {
+    // AC #7: with `--with-i18n --with-seed`, the generated README must document
+    // the extra steps those flags introduce (a seed section and an i18n
+    // section) while still substituting every template token.
+    let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
+    let autumn_bin = env!("CARGO_BIN_EXE_autumn");
+
+    let output = Command::new(autumn_bin)
+        .args(["new", "flagged-app", "--with-i18n", "--with-seed"])
+        .current_dir(temp_dir.path())
+        .output()
+        .expect("failed to run `autumn new`");
+
+    assert!(
+        output.status.success(),
+        "autumn new failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let readme_path = temp_dir.path().join("flagged-app").join("README.md");
+    let readme = fs::read_to_string(&readme_path).unwrap();
+
+    // Seed section (`--with-seed`): must point at `autumn seed`.
+    assert!(
+        readme.contains("autumn seed"),
+        "flag-aware README must document `autumn seed`, got:\n{readme}"
+    );
+    // i18n section (`--with-i18n`): must reference the `t!(` macro and the
+    // scaffolded locale bundle.
+    assert!(
+        readme.contains("t!("),
+        "flag-aware README must reference the `t!(` macro, got:\n{readme}"
+    );
+    assert!(
+        readme.contains("i18n/en.ftl"),
+        "flag-aware README must reference the i18n/en.ftl bundle, got:\n{readme}"
+    );
+    // Appended flag sections must not reintroduce template tokens.
+    assert!(
+        !readme.contains("{{"),
+        "flag-aware README must not contain unsubstituted placeholders, got:\n{readme}"
+    );
+}
+
+#[test]
+fn cloud_native_scaffold_daemon_readme_is_db_free() {
+    // Finding 2: `--daemon` scaffolds a DB-free app (no `db` feature, no
+    // migrations) that runs via `autumn serve`. The README must reflect that
+    // shape — not the DB-first golden path (install libpq, configure Postgres,
+    // `autumn migrate`).
+    let temp_dir = scaffold_with_flags("daemon-readme-app", &["--daemon"]);
+    let readme_path = temp_dir.path().join("daemon-readme-app").join("README.md");
+    let readme = fs::read_to_string(&readme_path).unwrap();
+
+    // The DB-first steps must be gone.
+    assert!(
+        !readme.contains("autumn migrate"),
+        "daemon README must not tell users to run `autumn migrate` (no DB / no migrations), \
+         got:\n{readme}"
+    );
+    // Finding 2: `generate scaffold` emits Diesel code that needs the `db`
+    // feature the daemon scaffold disables, so following the daemon README must
+    // not advertise it (it would leave the app non-compiling).
+    assert!(
+        !readme.contains("autumn generate scaffold"),
+        "daemon README must not advertise `autumn generate scaffold` (its output needs the \
+         disabled `db` feature), got:\n{readme}"
+    );
+    // The `migrations/` layout row references a directory a DB-free daemon
+    // scaffold does not have.
+    assert!(
+        !readme.contains("| `migrations/`"),
+        "daemon README must not list a `migrations/` layout row (no migrations dir), got:\n{readme}"
+    );
+    assert!(
+        !readme.contains("Configure the database"),
+        "daemon README must not have a `Configure the database` step, got:\n{readme}"
+    );
+    assert!(
+        !readme.contains("libpq"),
+        "daemon README must not tell users to install libpq (the db feature is off), got:\n{readme}"
+    );
+    // The browser-reachable local-run command must be `autumn dev` (which binds
+    // TCP on 127.0.0.1:3000), matching the default README — not a socket-bound
+    // daemon start. Following it must land the user on http://localhost:3000.
+    assert!(
+        readme.contains("autumn dev"),
+        "daemon README must document `autumn dev` as the browser-reachable local run, \
+         got:\n{readme}"
+    );
+    assert!(
+        readme.contains("http://localhost:3000"),
+        "daemon README must point the browser at http://localhost:3000, got:\n{readme}"
+    );
+    // The background daemon start must still be documented, but as the
+    // production/background mode that binds a private Unix socket — never paired
+    // with a bare localhost:3000 claim. It must point at `autumn serve status`
+    // for the reachable socket address.
+    assert!(
+        readme.contains("autumn serve"),
+        "daemon README must document `autumn serve`, got:\n{readme}"
+    );
+    assert!(
+        readme.contains("--daemon"),
+        "daemon README must mention the `--daemon` shape it was generated with, got:\n{readme}"
+    );
+    assert!(
+        readme.contains("Unix domain socket") && readme.contains("autumn serve status"),
+        "daemon README must document that the background daemon binds a Unix socket and is \
+         reached via `autumn serve status`, not a bare localhost:3000, got:\n{readme}"
+    );
+    // Project name substituted; no leftover template tokens.
+    assert!(
+        readme.contains("daemon-readme-app"),
+        "daemon README must substitute the project name, got:\n{readme}"
+    );
+    assert!(
+        !readme.contains("{{"),
+        "daemon README must not contain unsubstituted template placeholders, got:\n{readme}"
+    );
+}
+
+#[test]
+fn cloud_native_scaffold_bundled_pg_readme_auto_provisions_db() {
+    // Finding 2: `--bundled-pg` embeds and manages its own Postgres, so the
+    // README must not tell users to configure an external `[database]` or run
+    // migrations by hand — it runs via `autumn serve --bundled-pg`.
+    let temp_dir = scaffold_with_flags("bundled-readme-app", &["--bundled-pg"]);
+    let readme_path = temp_dir.path().join("bundled-readme-app").join("README.md");
+    let readme = fs::read_to_string(&readme_path).unwrap();
+
+    assert!(
+        !readme.contains("autumn migrate"),
+        "bundled-pg README must not tell users to run `autumn migrate` (auto-applied), \
+         got:\n{readme}"
+    );
+    assert!(
+        !readme.contains("Configure the database"),
+        "bundled-pg README must not have a `Configure the database` step, got:\n{readme}"
+    );
+    // The browser-reachable local-run command must be `autumn dev` (which binds
+    // TCP on 127.0.0.1:3000 and provisions the bundled cluster). `autumn serve
+    // --bundled-pg` implies `--daemon`, so it binds a private Unix socket and is
+    // NOT reachable at http://localhost:3000 — the README must not pair it with a
+    // bare browser claim.
+    assert!(
+        readme.contains("autumn dev"),
+        "bundled-pg README must document `autumn dev` as the browser-reachable local run, \
+         got:\n{readme}"
+    );
+    assert!(
+        readme.contains("http://localhost:3000"),
+        "bundled-pg README must point the browser at http://localhost:3000, got:\n{readme}"
+    );
+    assert!(
+        readme.contains("autumn serve --bundled-pg"),
+        "bundled-pg README must document `autumn serve --bundled-pg`, got:\n{readme}"
+    );
+    assert!(
+        readme.contains("Unix domain socket") && readme.contains("autumn serve status"),
+        "bundled-pg README must document that the background daemon binds a Unix socket and \
+         is reached via `autumn serve status`, not a bare localhost:3000, got:\n{readme}"
+    );
+    // Finding 2 (guard against over-stripping): bundled-pg keeps the `db`
+    // feature and auto-applies migrations, so `generate scaffold` is still valid
+    // here and must remain in the CLI reference.
+    assert!(
+        readme.contains("autumn generate scaffold"),
+        "bundled-pg README must keep `autumn generate scaffold` (the `db` feature is on), \
+         got:\n{readme}"
+    );
+    assert!(
+        !readme.contains("{{"),
+        "bundled-pg README must not contain unsubstituted template placeholders, got:\n{readme}"
+    );
 }
 
 #[test]

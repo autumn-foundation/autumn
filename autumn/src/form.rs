@@ -187,6 +187,17 @@ impl<T> Changeset<T> {
         self.errors.get(field).map_or(&[], Vec::as_slice)
     }
 
+    /// Returns every field-level error keyed by field name.
+    ///
+    /// Iteration order is unspecified (it is a [`HashMap`]); callers that render
+    /// a stable list (e.g. [`crate::widgets::error_summary`]) should sort. Used
+    /// by the error-summary widget to enumerate all messages without the caller
+    /// needing to know the field set in advance.
+    #[must_use]
+    pub const fn all_errors(&self) -> &HashMap<String, Vec<String>> {
+        &self.errors
+    }
+
     /// Unwrap the inner data regardless of validity.
     pub fn into_inner(self) -> T {
         self.data

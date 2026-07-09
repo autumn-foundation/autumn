@@ -1051,6 +1051,68 @@ global middleware (including `X-Request-Id` response headers). Avoid defining
 the same method+path in both managed and raw routers -- Axum treats overlaps as
 an error during router construction.
 
+### Route collision diagnostics
+
+Autumn preflights route registration and refuses to start when it can already
+prove a collision. Instead of an Axum panic mid-mount, the framework returns a
+structured `RouterBuildError` **before any router is mounted**, so the failure
+mode is a clean error message that names the offending handlers rather than a
+half-configured process crashing at startup:
+
+- **`FrameworkRouteOverlap`** -- a user route lands on a path a framework route
+  already owns (probes, actuator, `X-Request-Id`, dev live-reload).
+- **`OpenApiPathCollision`** (feature `openapi`) -- an `openapi_json_path` or
+  `swagger_ui_path` collides with a `GET` route Autumn already owns; each side
+  is named so you can fix the config or the route.
+- **`DuplicateUserRoute`** (issue #1012) -- two user- or plugin-registered
+  routes resolve to the same `(method, path)` after `.scoped(prefix, …)` prefix
+  resolution (including `#[repository]`-generated API routes). The error names
+  **both** handlers, the HTTP method, and the path:
+
+  ```text
+  duplicate user route: "list_posts_v1" and "list_posts_v2" both resolve to
+  GET "/api/posts"; choose a different path for one of them or remove the
+  duplicate registration
+  ```
+
+  Distinct methods on the *same exact path* (`GET /admin` + `POST /admin`, or
+  `GET /users/{id}` + `POST /users/{id}`) are NOT flagged -- Axum merges them
+  into a single `MethodRouter` cleanly.
+- **`ConflictingRouteShape`** (issue #1012) -- two routes whose **different**
+  path templates resolve to overlapping shapes that Axum's matcher cannot tell
+  apart. Path-shape conflict detection is delegated to **matchit**, the exact
+  routing engine Axum 0.8 uses, so the preflight mirrors Axum's real accept/
+  reject behavior precisely -- including every edge case: capture-name
+  differences (`/users/{id}` vs `/users/{slug}`), a normal capture versus a
+  catch-all at the same position (`/u/{id}` vs `/u/{*rest}`), a catch-all
+  versus a dynamic *descendant* (`/cmd/{tool}/{sub}` vs `/cmd/{*path}`), and
+  mixed literal+capture segments (`/file.{ext}` vs `/file.{kind}`). Axum's
+  matchit router rejects the second template as a conflict *before* method
+  merging, so unlike an exact-duplicate path these can never coexist **regardless
+  of HTTP method** -- `GET /users/{id}` + `POST /users/{slug}` is still a
+  conflict. The error names **both** handlers and **both** original templates:
+
+  ```text
+  conflicting route shapes: "show_user" ("/users/{id}") and "create_user"
+  ("/users/{slug}") resolve to the same Axum path shape but use different path
+  templates; axum's matchit router rejects this as a route conflict regardless
+  of HTTP method — rename the captures so both use the same template, or make
+  their static paths distinct
+  ```
+
+  Because the check *is* matchit, it never over-flags what Axum would accept: a
+  static segment and a capture at the same position (`/users/me` +
+  `/users/{id}`) coexist, and escaped literal braces (`{{`/`}}`, e.g. the static
+  path `/{{foo}}`) are *not* captures, so `/{{foo}}` and `/{{bar}}` remain
+  distinct static routes and build cleanly.
+
+Opaque routers registered via `.merge(router)` or `.nest(prefix, router)`
+cannot be introspected through Axum's public API, so a collision that lives
+inside one of those routers still surfaces as an Axum startup panic. The
+duplicate-route preflight emits a `tracing::warn!` in that case ("check
+skipped") so operators know the check didn't cover that code path -- keep
+merged/nested raw routers on paths disjoint from your Autumn-managed routes.
+
 ---
 
 ## What's Next?

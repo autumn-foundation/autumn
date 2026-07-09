@@ -247,5 +247,76 @@ pub(super) fn builtin_stories() -> Vec<Story> {
                 )
             }
         },
+        story! {
+            "Display",
+            "Badge",
+            {
+                use autumn_web::widgets::{
+                    BadgeConfig, BadgeVariant, badge, badge_with, status_tag,
+                };
+
+                maud::html! {
+                    // Explicit variant, and a deterministic color from a label:
+                    (badge("Published", BadgeVariant::Success))
+                    (badge("Draft", BadgeVariant::for_label("draft")))
+                    // With a tooltip / accessible name for an abbreviated label:
+                    (badge_with(
+                        "WIP",
+                        BadgeVariant::Info,
+                        &BadgeConfig::new().title("Work in progress"),
+                    ))
+                    // Neutral one-liner:
+                    (status_tag("Archived"))
+                }
+            }
+        },
+        story! {
+            "Display",
+            "Avatar",
+            {
+                use autumn_web::widgets::{AvatarConfig, AvatarSize, avatar};
+
+                maud::html! {
+                    // With an image (the demo URL is synthetic — a served
+                    // gallery has nothing mounted there):
+                    (avatar("Ada Lovelace", &AvatarConfig::new()
+                        .image("/_stories/demo/ada.png")
+                        .size(AvatarSize::Large)))
+                    // Deterministic colored-initials fallback, no image:
+                    (avatar("Ada Lovelace", &AvatarConfig::new()))
+                    (avatar("Grace Hopper", &AvatarConfig::new().size(AvatarSize::Small)))
+                }
+            }
+        },
+        story! {
+            "Feedback",
+            "Alert",
+            {
+                use autumn_web::form::Changeset;
+                use autumn_web::widgets::{
+                    AlertConfig, AlertVariant, alert, alert_with, error_summary,
+                };
+
+                // A form error summary from an invalid changeset.
+                let mut errors = std::collections::HashMap::new();
+                errors.insert("email".to_string(), vec!["is invalid".to_string()]);
+                let changeset = Changeset::from_errors((), errors);
+
+                maud::html! {
+                    (alert(
+                        AlertVariant::Info,
+                        maud::html! { "No posts yet — create your first one." },
+                    ))
+                    (alert_with(
+                        AlertVariant::Warning,
+                        maud::html! { "Your trial ends in 3 days." },
+                        &AlertConfig::new().title("Heads up").icon(true).dismissible(true),
+                    ))
+                    @if let Some(summary) = error_summary(&changeset) {
+                        (summary)
+                    }
+                }
+            }
+        },
     ]
 }
