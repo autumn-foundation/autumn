@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- HTTP `Range`/`206 Partial Content` support for `Download` responses and
+  embedded static assets (seekable media, resumable downloads) via the new
+  `autumn_web::range` helper — RFC 7233 single-range parsing with a documented
+  multi-range single-range collapse, `Accept-Ranges`/`Content-Range`/`416`
+  handling, `If-Range` (strong `ETag` or `Last-Modified`), and
+  `Download::into_response_ranged`; blob ranges fetch only the requested slice
+  on the local store (S3/other backends fall back to a buffered slice) via the
+  additive `BlobStore::get_range`.
 - **generator:** `autumn new` now generates a `README.md` at the project root
   (listed in the "Created …" output) with explicit prerequisites and a
   golden-path quickstart — configure the `[database]` block in `autumn.toml`

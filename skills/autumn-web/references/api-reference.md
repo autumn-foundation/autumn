@@ -284,6 +284,39 @@ optional `.distributed_fill_lock(true)` / `.stale_while_revalidate(grace)`.
   object's bytes; `LocalBlobStore` overrides it to stream from disk, other
   backends inherit a buffering default.
 
+### Range / 206 Partial Content (unreleased)
+
+`autumn_web::range` — reusable HTTP `Range` (RFC 7233) parsing + response
+building, wired into `Download` and the embedded static-asset path.
+
+- `range::resolve(&HeaderMap, total, Option<Validator>) -> RangeResolution`
+  parses `Range: bytes=N-` / `N-M` / `-N` against a known `total`, returning
+  `RangeResolution::{Full, Partial{start,end,total}, Unsatisfiable{total}}`
+  (`start`/`end` inclusive). Invalid/unparseable ranges and non-`bytes` units
+  return `Full` (serve the whole representation with `200`).
+- `range::partial_bytes_response(&RangeResolution, Bytes)` builds the response:
+  `206` + `Content-Range: bytes start-end/total` + `Content-Length` for a
+  partial, `200` + `Accept-Ranges: bytes` for full, `416` +
+  `Content-Range: bytes */total` for unsatisfiable. Helpers:
+  `content_range_value`, `unsatisfied_content_range`, `set_accept_ranges`.
+- **Multi-range** (`bytes=0-50,100-150`) is collapsed deterministically to the
+  first satisfiable sub-range as a well-formed single-range `206` (no
+  `multipart/byteranges`).
+- **`If-Range`** (strong `ETag` or `Last-Modified` HTTP-date) via `Validator`:
+  a stale/absent validator falls back to the full `200`.
+- `Download::into_response_ranged(&headers).await` is the request-aware entry
+  point that returns `206`/`416` and advertises `Accept-Ranges: bytes` on the
+  `200`/`206`/`416` for range-capable bodies. The plain `IntoResponse` cannot
+  see the request, always serves the full `200`, and therefore does **not**
+  advertise `Accept-Ranges` (only `into_response_ranged` can honor a `Range`).
+  Add `.etag(..)` / `.last_modified(..)` to supply the `If-Range` validator.
+  Opaque `from_stream`/`from_async_read` bodies are not seekable: always full
+  `200`, never `Accept-Ranges`.
+- Blob range path fetches only the requested slice via the additive
+  `BlobStore::get_range(key, start, end) -> ByteStream<'static>`
+  (`LocalBlobStore` seeks + takes off disk; other backends inherit a buffering
+  default) — a seek in a large video never buffers the whole object.
+
 ## Jobs additions
 
 - Published 0.5.0 `#[job]` keys: `name`, `max_attempts`, `backoff_ms`,
