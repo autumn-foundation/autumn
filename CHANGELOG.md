@@ -585,6 +585,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **docs:** repaired the broken intra-doc links in the `reporting` module
+  overview (`ErrorEvent`, `ErrorReporter`, `LogReporter`, `ReportingLayer`
+  rendered as dead links on docs.rs because shorthand references don't resolve
+  when a module carries both outer and inner doc comments — they now use
+  explicit `crate::reporting::…` paths) and dropped a redundant explicit link
+  target in the `job_tracking` module docs. Supersedes the salvageable parts
+  of PR #1555.
 - **jobs:** fixed a first-initialization race in the process-global job
   client (supersedes #1491): `init_global_job_client` /
   `clear_global_job_client` used a get-then-set pattern on the backing
