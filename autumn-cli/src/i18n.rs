@@ -162,16 +162,25 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
         return;
     };
     for entry in entries.flatten() {
+        // Never follow symlinks: a symlinked directory cycle under the project
+        // would otherwise recurse forever and hang this CI tool. `file_type()`
+        // (unlike `Path::is_dir`) does not traverse the link.
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
         let path = entry.path();
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if path.is_dir() {
+        if file_type.is_dir() {
             // Skip build artifacts, VCS metadata, and hidden dirs.
             if name == "target" || name.starts_with('.') {
                 continue;
             }
             collect_rs_files(&path, out);
-        } else if path.extension().and_then(|s| s.to_str()) == Some("rs") {
+        } else if file_type.is_file() && path.extension().and_then(|s| s.to_str()) == Some("rs") {
             out.push(path);
         }
     }
@@ -311,7 +320,10 @@ pub fn parse_ftl_keys(src: &str) -> BTreeSet<String> {
     let mut keys = BTreeSet::new();
     for line in src.lines() {
         // Continuation of a multi-line value, a comment, or a blank line.
-        if line.starts_with(char::is_whitespace)
+        // Mirror the runtime `parse_ftl`, which treats only ' ' and '\t' as
+        // continuation indent.
+        if line.starts_with(' ')
+            || line.starts_with('\t')
             || line.trim_start().starts_with('#')
             || line.trim().is_empty()
         {
@@ -401,9 +413,13 @@ pub fn build_report(
                 default_keys.difference(keys).cloned().collect()
             };
 
+            // Fluent terms (`-brand = …`) are only referenced from within other
+            // messages via `{ -brand }`, never through `t!`, so they would
+            // always show up as Unused. Exclude them to avoid false-positive CI
+            // noise.
             let unused: Vec<String> = keys
                 .iter()
-                .filter(|k| !scan.referenced.contains(*k))
+                .filter(|k| !k.starts_with('-') && !scan.referenced.contains(*k))
                 .cloned()
                 .collect();
 
@@ -710,6 +726,52 @@ mod tests {
         assert_eq!(report.exit_code(true), 1, "unused fails under --strict");
         let en = &report.locales[0];
         assert_eq!(en.unused, vec!["footer.old".to_owned()]);
+    }
+
+    #[test]
+    fn fluent_terms_are_not_reported_unused() {
+        // A Fluent term (`-brand = …`) is referenced only from within other
+        // messages via `{ -brand }`, never through `t!`, so it must not be
+        // flagged Unused (that would be false-positive CI noise).
+        let src = "nav.home = Home\n-brand = Autumn\n";
+        assert_eq!(parse_ftl_keys(src), keys(&["-brand", "nav.home"]));
+
+        let scan = scan_with(&["nav.home"]);
+        let mut per_locale = BTreeMap::new();
+        per_locale.insert("en".to_owned(), keys(&["nav.home", "-brand"]));
+        let report = build_report(&scan, &cfg("en", &[]), &per_locale);
+
+        let en = &report.locales[0];
+        assert!(
+            en.unused.is_empty(),
+            "Fluent term should not be Unused: {:?}",
+            en.unused
+        );
+        assert!(!report.has_warnings());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collect_rs_files_does_not_follow_symlink_cycles() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // One real source file, to be collected exactly once.
+        std::fs::write(root.join("main.rs"), "fn main() {}").unwrap();
+        // A subdirectory holding a symlink back to the root, forming a cycle:
+        // root/sub/loop -> root. Following it would recurse forever.
+        let sub = root.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        symlink(root, sub.join("loop")).unwrap();
+
+        let mut files = Vec::new();
+        collect_rs_files(root, &mut files);
+
+        // Terminates (no infinite recursion / stack overflow) and does not
+        // double-count `main.rs` by traversing the symlinked cycle.
+        assert_eq!(files.len(), 1, "cycle must not be followed: {files:?}");
+        assert!(files[0].ends_with("main.rs"));
     }
 
     #[test]
