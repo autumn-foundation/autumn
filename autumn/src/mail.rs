@@ -156,6 +156,17 @@ pub struct MailConfig {
     /// [`AppBuilder::mount_unsubscribe_endpoint`](crate::app::AppBuilder::mount_unsubscribe_endpoint).
     #[serde(default)]
     pub mount_unsubscribe_endpoint: bool,
+    /// Default for CSS inlining of HTML mail bodies (issue #1254).
+    ///
+    /// When `true`, every HTML body sent through a [`Mailer`] built from this
+    /// config has its `<style>` rules inlined onto matching elements as
+    /// `style="…"` attributes at send time, so it renders styled in clients
+    /// that strip `<head>`/`<style>` (Gmail, Outlook). Off by default —
+    /// existing apps are unaffected until they opt in. A per-message
+    /// [`MailBuilder::inline_css`] call overrides this default in either
+    /// direction (explicit builder value wins).
+    #[serde(default)]
+    pub inline_css: bool,
     /// SMTP settings.
     #[serde(default)]
     pub smtp: SmtpConfig,
@@ -256,6 +267,7 @@ impl Default for MailConfig {
             unsubscribe_mailto: None,
             unsubscribe_token_ttl_days: default_unsubscribe_ttl_days(),
             mount_unsubscribe_endpoint: false,
+            inline_css: false,
             smtp: SmtpConfig::default(),
         }
     }
@@ -391,6 +403,56 @@ pub fn compose_layout(layout: &str, body: &str) -> String {
     }
 }
 
+/// Whether `html` contains a `<style` tag (case-insensitive), i.e. there is any
+/// embedded stylesheet worth inlining. Allocation-free ASCII scan — the fast
+/// path for the common case of plain-text or already-inlined bodies.
+fn html_contains_style_block(html: &str) -> bool {
+    html.as_bytes()
+        .windows(6)
+        .any(|window| window.eq_ignore_ascii_case(b"<style"))
+}
+
+/// Inline the `<style>` rules of an HTML mail body onto matching elements as
+/// `style="…"` attributes, so the message renders styled in clients that strip
+/// `<head>`/`<style>` (Gmail, Outlook). See issue #1254.
+///
+/// Behavior:
+/// - Bodies with no `<style>` block are returned unchanged (fast path), so
+///   plain-text and already-fully-inlined bodies pass through byte-for-byte.
+/// - `<style>` blocks are retained, but rules that were successfully inlined are
+///   stripped from them — so what remains is exactly the un-inlinable
+///   `@media`/pseudo-class rules, which still reach clients that honor them.
+///   Because the inlinable rules are removed from the retained block, running
+///   this again is a no-op: inlining is idempotent.
+/// - Remote/`<link>` stylesheets are never fetched (the `css-inline` network
+///   feature is not compiled in) — only embedded `<style>` CSS is inlined.
+///
+/// # Errors
+///
+/// Returns [`MailError::CssInline`] if the body cannot be parsed/inlined, rather
+/// than returning a silently corrupted body.
+fn inline_css_html(html: &str) -> Result<String, MailError> {
+    // Fast path: nothing to inline. Keeps text-like, fragment, and
+    // already-inlined bodies byte-identical and makes re-inlining idempotent.
+    if !html_contains_style_block(html) {
+        return Ok(html.to_owned());
+    }
+    css_inline::CSSInliner::options()
+        // Retain `<style>` so un-inlinable rules survive…
+        .keep_style_tags(true)
+        // …including `@media`/other at-rules (dropped by default), so responsive
+        // tweaks still work in clients that honor them.
+        .keep_at_rules(true)
+        // …but drop the rules we did inline, leaving only the un-inlinable ones
+        // in the retained block (also what makes a second pass a no-op).
+        .remove_inlined_selectors(true)
+        // Never reach out to the network for `<link>`ed stylesheets.
+        .load_remote_stylesheets(false)
+        .build()
+        .inline(html)
+        .map_err(|error| MailError::CssInline(error.to_string()))
+}
+
 /// A file attached to a [`Mail`] message.
 ///
 /// Built via [`MailBuilder::attach`]. Carries raw, undecoded bytes so it
@@ -451,6 +513,16 @@ pub struct Mail {
     /// recipient regardless of prior delivery failures. `false` by default.
     #[serde(default)]
     pub ignore_suppression: bool,
+    /// Per-message override for CSS inlining (issue #1254).
+    ///
+    /// `Some(true)`/`Some(false)` force inlining on/off for this message,
+    /// overriding the [`Mailer`]'s configured default; `None` (the default)
+    /// defers to [`MailConfig::inline_css`]. Set via
+    /// [`MailBuilder::inline_css`]. Carried through a durable
+    /// [`MailDeliveryQueue`] so deferred mail inlines consistently with
+    /// immediate sends.
+    #[serde(default)]
+    pub inline_css: Option<bool>,
 }
 
 /// Stable root path for the dev mail preview UI.
@@ -599,6 +671,7 @@ pub struct MailBuilder {
     extra_headers: Vec<(String, String)>,
     attachments: Vec<MailAttachment>,
     ignore_suppression: bool,
+    inline_css: Option<bool>,
 }
 
 impl MailBuilder {
@@ -666,6 +739,26 @@ impl MailBuilder {
     #[must_use]
     pub const fn ignore_suppression(mut self) -> Self {
         self.ignore_suppression = true;
+        self
+    }
+
+    /// Force CSS inlining on or off for this message, overriding the
+    /// [`Mailer`]'s configured [`MailConfig::inline_css`] default.
+    ///
+    /// When enabled, the HTML body's `<style>` rules are inlined onto matching
+    /// elements as `style="…"` attributes at send time so the message renders
+    /// styled in clients that strip `<head>`/`<style>` (Gmail, Outlook).
+    /// Un-inlinable `@media`/pseudo-class rules are preserved in a retained
+    /// `<style>` block. Text bodies and HTML with no `<style>` block are left
+    /// untouched.
+    ///
+    /// Precedence: an explicit call here always wins over the config default —
+    /// `inline_css(false)` opts a single message out even when the environment
+    /// defaults inlining on, and `inline_css(true)` opts a single message in
+    /// when the default is off.
+    #[must_use]
+    pub const fn inline_css(mut self, enabled: bool) -> Self {
+        self.inline_css = Some(enabled);
         self
     }
 
@@ -784,6 +877,7 @@ impl MailBuilder {
             extra_headers: self.extra_headers,
             attachments: self.attachments,
             ignore_suppression: self.ignore_suppression,
+            inline_css: self.inline_css,
         })
     }
 }
@@ -820,6 +914,11 @@ pub enum MailError {
     /// [`MailBuilder::ignore_suppression`] for critical mail.
     #[error("all recipients are on the mail suppression list; nothing was sent")]
     AllRecipientsSuppressed,
+    /// CSS inlining of the HTML body failed (issue #1254). The original body is
+    /// preserved (never delivered corrupted) and this typed error is surfaced
+    /// so the caller can decide, rather than silently sending malformed HTML.
+    #[error("failed to inline CSS into HTML mail body: {0}")]
+    CssInline(String),
 }
 
 /// Escape hatch for custom transports.
@@ -1319,6 +1418,9 @@ pub struct Mailer {
     /// [`suppression`]. `None` disables the check (suppression is opt-in on a
     /// hand-built [`Mailer`]; the framework wires a default in-memory store).
     suppression: Option<Arc<dyn suppression::SuppressionStore>>,
+    /// Default for CSS inlining of HTML bodies when a message does not set its
+    /// own [`Mail::inline_css`] override. Sourced from [`MailConfig::inline_css`].
+    inline_css_default: bool,
 }
 
 impl Mailer {
@@ -1343,6 +1445,7 @@ impl Mailer {
     ) -> Result<Self, MailError> {
         let mut builder = Self::builder()
             .transport(config.transport)
+            .inline_css(config.inline_css)
             .resilience_config(resilience);
         if let Some(from) = &config.from {
             builder = builder.from(from.clone());
@@ -1368,6 +1471,7 @@ impl Mailer {
             delivery_queue: None,
             unsubscribe: None,
             suppression: None,
+            inline_css_default: false,
         }
     }
 
@@ -1439,6 +1543,13 @@ impl Mailer {
     pub async fn send(&self, mail: Mail) -> Result<(), MailError> {
         let mut mail = mail.with_defaults(&self.defaults);
 
+        // Inline `<style>` CSS into element `style="…"` attributes before
+        // transport, so every transport (SMTP, file, log, preview) delivers the
+        // inlined body and it renders styled in clients that strip
+        // `<head>`/`<style>`. Doing it here — ahead of the list-mail branch that
+        // clones per recipient — inlines exactly once regardless of path.
+        self.apply_css_inlining(&mut mail)?;
+
         // Consult the bounce/complaint suppression list *before* transport.
         // Suppressed recipients are dropped from `to` (skipped, not an error)
         // unless the message opts out via `Mail::ignore_suppression`. When every
@@ -1479,6 +1590,40 @@ impl Mailer {
             );
         }
         self.transport.send(mail).await
+    }
+
+    /// Resolve the CSS-inlining decision for a message and, when enabled, inline
+    /// its HTML body in place (issue #1254).
+    ///
+    /// Precedence: a per-message [`Mail::inline_css`] override wins; otherwise
+    /// the [`Mailer`]'s configured [`MailConfig::inline_css`] default applies.
+    /// On inliner failure the original body is left untouched and a typed
+    /// [`MailError::CssInline`] is surfaced (rather than delivering a corrupted
+    /// body). Text bodies are never touched.
+    fn apply_css_inlining(&self, mail: &mut Mail) -> Result<(), MailError> {
+        let enabled = mail.inline_css.unwrap_or(self.inline_css_default);
+        if !enabled {
+            return Ok(());
+        }
+        let Some(html) = mail.html.as_deref() else {
+            return Ok(());
+        };
+        match inline_css_html(html) {
+            Ok(inlined) => {
+                mail.html = Some(inlined);
+                Ok(())
+            }
+            Err(error) => {
+                // Leave `mail.html` as the original body (not corrupted) and make
+                // the failure loud rather than silently shipping broken HTML.
+                tracing::warn!(
+                    target: "mail",
+                    error = %error,
+                    "CSS inlining failed; HTML body left un-inlined"
+                );
+                Err(error)
+            }
+        }
     }
 
     /// Deliver a list mail recipient-by-recipient, applying suppression and
@@ -1718,6 +1863,7 @@ pub struct MailerBuilder {
     smtp: Option<SmtpConfig>,
     delivery_queue: Option<Arc<dyn MailDeliveryQueue>>,
     resilience_config: Option<Arc<crate::config::ResilienceConfig>>,
+    inline_css: bool,
 }
 
 impl Default for MailerBuilder {
@@ -1730,6 +1876,7 @@ impl Default for MailerBuilder {
             smtp: None,
             delivery_queue: None,
             resilience_config: None,
+            inline_css: false,
         }
     }
 }
@@ -1791,6 +1938,15 @@ impl MailerBuilder {
         self
     }
 
+    /// Set the default for CSS inlining of HTML bodies (issue #1254). Applied to
+    /// every message that does not carry its own [`MailBuilder::inline_css`]
+    /// override. Mirrors [`MailConfig::inline_css`].
+    #[must_use]
+    pub const fn inline_css(mut self, enabled: bool) -> Self {
+        self.inline_css = enabled;
+        self
+    }
+
     /// Build the mailer.
     ///
     /// # Errors
@@ -1823,6 +1979,7 @@ impl MailerBuilder {
             delivery_queue: self.delivery_queue,
             unsubscribe: None,
             suppression: None,
+            inline_css_default: self.inline_css,
         })
     }
 }
@@ -3939,6 +4096,165 @@ pub mod db_suppression {
 mod tests {
     use super::*;
 
+    // ── CSS inlining (issue #1254) ────────────────────────────────────────
+
+    #[test]
+    fn html_contains_style_block_is_case_insensitive() {
+        assert!(html_contains_style_block("<STYLE>.a{}</STYLE>"));
+        assert!(html_contains_style_block("<p>x</p><style>.a{}</style>"));
+        assert!(!html_contains_style_block("<p style=\"color:red\">x</p>"));
+        assert!(!html_contains_style_block("just plain text, no tags"));
+    }
+
+    #[test]
+    fn inline_css_applies_class_style_to_anchor() {
+        // AC1: a `<style>` block + a class-styled `<a>` yields an equivalent
+        // inline `style="…"` on the anchor.
+        let html = r#"<style>.btn{color:#fff;background:#06c}</style><a class="btn">Go</a>"#;
+        let out = inline_css_html(html).expect("inlining succeeds");
+        assert!(
+            out.contains("<a") && out.contains("style=") && out.contains("#fff"),
+            "anchor must gain an inline style carrying the class rule; got: {out}"
+        );
+        assert!(
+            out.contains("#06c") || out.contains("background"),
+            "background rule must be inlined too; got: {out}"
+        );
+    }
+
+    #[test]
+    fn inline_css_applies_class_style_to_table() {
+        // AC7: a class-styled `<table>` gains the expected inline style.
+        let html = r#"<style>.wrap{width:600px;background:#eee}</style><table class="wrap"><tr><td>x</td></tr></table>"#;
+        let out = inline_css_html(html).expect("inlining succeeds");
+        let table = out
+            .split("<table")
+            .nth(1)
+            .expect("a <table> tag is present in the output");
+        let table_open = &table[..table.find('>').expect("table tag closes")];
+        assert!(
+            table_open.contains("style=") && table_open.contains("600px"),
+            "table must carry an inline style with the width rule; got tag: {table_open}"
+        );
+    }
+
+    #[test]
+    fn inline_css_passthrough_without_style_block_is_byte_identical() {
+        // AC3: bodies already fully inlined (no `<style>`) pass through unchanged.
+        let html = r#"<p style="color:red">Hello</p><a href="/x">link</a>"#;
+        let out = inline_css_html(html).expect("no-op inlining succeeds");
+        assert_eq!(out, html, "no-<style> body must be returned unchanged");
+    }
+
+    #[test]
+    #[allow(
+        clippy::literal_string_with_formatting_args,
+        reason = "CSS rule braces are literal HTML, not format placeholders"
+    )]
+    fn inline_css_is_idempotent() {
+        // AC3: inlining twice equals inlining once.
+        let html = r#"<style>.btn{color:#fff}p{margin:0}</style><a class="btn">Go</a><p>hi</p>"#;
+        let once = inline_css_html(html).expect("first pass");
+        let twice = inline_css_html(&once).expect("second pass");
+        assert_eq!(once, twice, "inlining must be idempotent");
+    }
+
+    #[test]
+    #[allow(
+        clippy::literal_string_with_formatting_args,
+        reason = "CSS rule braces are literal HTML, not format placeholders"
+    )]
+    fn inline_css_retains_uninlinable_media_queries() {
+        // AC5: `@media` rules that cannot be inlined survive in a retained
+        // `<style>` block rather than being dropped.
+        let html = r#"<style>.btn{color:#fff}@media (max-width:600px){.btn{color:#000}}</style><a class="btn">Go</a>"#;
+        let out = inline_css_html(html).expect("inlining succeeds");
+        assert!(
+            out.contains("@media") && out.contains("max-width"),
+            "the @media rule must be preserved in a retained <style> block; got: {out}"
+        );
+        // And the inlinable rule was still applied to the element.
+        assert!(
+            out.contains("<a") && out.contains("style="),
+            "the inlinable rule must still be inlined onto the anchor; got: {out}"
+        );
+    }
+
+    #[test]
+    fn inline_css_stripped_style_renders_same_computed_styling() {
+        // AC7: a `<style>`-stripped copy of the inlined output renders the same
+        // computed styling — i.e. the visual styling lives in the inline
+        // `style="…"` attribute, independent of any `<head>`/`<style>` the
+        // client might drop.
+        let html = r#"<style>.btn{color:#fff;padding:8px}</style><a class="btn">Go</a>"#;
+        let inlined = inline_css_html(html).expect("inlining succeeds");
+
+        // Strip every <style>…</style> block (what Gmail/Outlook effectively do).
+        let mut stripped = String::new();
+        let mut rest = inlined.as_str();
+        while let Some(start) = rest.to_ascii_lowercase().find("<style") {
+            stripped.push_str(&rest[..start]);
+            let after = &rest[start..];
+            let end = after
+                .to_ascii_lowercase()
+                .find("</style>")
+                .map_or(after.len(), |e| e + "</style>".len());
+            rest = &after[end..];
+        }
+        stripped.push_str(rest);
+
+        // The anchor's inline style survives the strip, so styling is unchanged.
+        let anchor = stripped
+            .split("<a")
+            .nth(1)
+            .expect("anchor present after stripping <style>");
+        let anchor_open = &anchor[..anchor.find('>').expect("anchor closes")];
+        assert!(
+            anchor_open.contains("style=") && anchor_open.contains("#fff"),
+            "computed styling must be carried inline so a style-stripped copy looks identical; got: {anchor_open}"
+        );
+    }
+
+    #[test]
+    fn mail_builder_inline_css_sets_per_message_override() {
+        let on = Mail::builder()
+            .to("a@example.com")
+            .subject("s")
+            .html("<p>x</p>")
+            .inline_css(true)
+            .build()
+            .expect("valid mail");
+        assert_eq!(on.inline_css, Some(true));
+
+        let off = Mail::builder()
+            .to("a@example.com")
+            .subject("s")
+            .html("<p>x</p>")
+            .inline_css(false)
+            .build()
+            .expect("valid mail");
+        assert_eq!(off.inline_css, Some(false));
+
+        let unset = Mail::builder()
+            .to("a@example.com")
+            .subject("s")
+            .html("<p>x</p>")
+            .build()
+            .expect("valid mail");
+        assert_eq!(
+            unset.inline_css, None,
+            "unset builder must defer to the mailer/config default"
+        );
+    }
+
+    #[test]
+    fn mail_config_inline_css_defaults_off() {
+        assert!(
+            !MailConfig::default().inline_css,
+            "inlining must default off so existing apps are unaffected"
+        );
+    }
+
     // ── Attachments (issue #1256): pinning tests ──────────────────────────
     //
     // These prove attachment support introduces zero byte-for-byte regression
@@ -4347,6 +4663,7 @@ mod tests {
                 bytes: b"x".to_vec(),
             }],
             ignore_suppression: false,
+            inline_css: None,
         };
         let eml = render_eml(&mail);
         assert!(
@@ -4376,6 +4693,7 @@ mod tests {
             )],
             attachments: Vec::new(),
             ignore_suppression: false,
+            inline_css: None,
         };
         let eml = render_eml(&mail);
         assert!(
@@ -4410,6 +4728,7 @@ mod tests {
                 bytes: b"x".to_vec(),
             }],
             ignore_suppression: false,
+            inline_css: None,
         };
         let eml = render_eml(&mail);
         assert!(eml.contains("Content-Type: application/octet-stream"));
@@ -4433,6 +4752,7 @@ mod tests {
                 bytes: b"x".to_vec(),
             }],
             ignore_suppression: false,
+            inline_css: None,
         };
         let eml = render_eml(&mail);
         assert!(eml.contains("filename*=UTF-8''"));
@@ -4581,6 +4901,7 @@ mod tests {
                     bytes: b"x".to_vec(),
                 }],
                 ignore_suppression: false,
+                inline_css: None,
             };
             let message = lettre_message(&mail).expect("lettre message should build");
             let formatted = String::from_utf8_lossy(&message.formatted()).into_owned();
@@ -4616,6 +4937,7 @@ mod tests {
                 bytes: b"x".to_vec(),
             }],
             ignore_suppression: false,
+            inline_css: None,
         };
         let err = lettre_message(&mail).expect_err("invalid content type should error");
         assert!(matches!(err, MailError::InvalidMessage(_)));

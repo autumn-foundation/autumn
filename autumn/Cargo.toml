@@ -90,7 +90,7 @@ variants = ["storage", "dep:image"]
 # `LogReporter` as the default. On by default; disable to drop the panic-catch
 # layer and the reporting machinery.
 reporting = []
-mail = ["dep:lettre", "maud"]
+mail = ["dep:lettre", "dep:css-inline", "maud"]
 # First-class inbound email handling with provider webhooks and routing DSL.
 # Adds `autumn_web::inbound_mail` with the generic RFC 5322 adapter.
 inbound-mail = []
@@ -224,6 +224,11 @@ hex = "0.4"
 include_dir = { version = "0.7", optional = true }
 csv = { workspace = true, optional = true }
 lettre = { version = "0.11.21", default-features = false, features = ["builder", "smtp-transport", "tokio1-rustls-tls"], optional = true }
+# CSS inliner for HTML email (issue #1254). `default-features = false` drops the
+# optional network (`http`/reqwest) and local-file stylesheet fetchers — Autumn
+# only inlines embedded `<style>` blocks, never remote CSS — keeping the added
+# graph to the html5ever/selectors parsing stack. Gated behind the `mail` feature.
+css-inline = { version = "0.21", default-features = false, optional = true }
 chromiumoxide = { workspace = true, optional = true }
 image = { workspace = true, optional = true }
 

@@ -87,6 +87,8 @@ mod load_shed;
 #[cfg(feature = "mail")]
 mod mail;
 #[cfg(feature = "mail")]
+mod mail_css_inline;
+#[cfg(feature = "mail")]
 mod mail_layout;
 #[cfg(feature = "mail")]
 mod mail_macro;

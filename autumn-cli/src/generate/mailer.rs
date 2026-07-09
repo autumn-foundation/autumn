@@ -304,6 +304,10 @@ impl {struct_name} {{
             .subject("{struct_name}")
             .html(include_str!("../../templates/mailers/{snake_name}.html"))
             .text(include_str!("../../templates/mailers/{snake_name}.txt")){layout_call}
+            // Rewrite the template's `<style>` rules onto elements as inline
+            // `style="…"` attributes at send time, so the mail renders styled in
+            // Gmail/Outlook (which strip `<head>`/`<style>`). See issue #1254.
+            .inline_css(true)
             .build()
             .expect("valid mail")
     }}
@@ -415,19 +419,41 @@ fn render_layout_txt() -> String {
 /// full document is emitted instead.
 fn render_html_template(struct_name: &str, no_layout: bool) -> String {
     if no_layout {
+        // Full self-contained document with a `<head>` `<style>` block. The
+        // generated mailer calls `.inline_css(true)`, so these class rules are
+        // rewritten onto the elements as inline `style="…"` at send time and
+        // render in Gmail/Outlook (which drop `<head>`/`<style>`). See #1254.
         format!(
             "<!DOCTYPE html>\n\
              <html>\n\
-             <head><meta charset=\"utf-8\"></head>\n\
+             <head>\n\
+               <meta charset=\"utf-8\">\n\
+               <style>\n\
+            \x20    .lead {{ font-size:16px; line-height:1.6; color:#333333; }}\n\
+               </style>\n\
+             </head>\n\
              <body>\n\
-               <p>Hello from {struct_name}!</p>\n\
+               <p class=\"lead\">Hello from {struct_name}!</p>\n\
              </body>\n\
              </html>\n"
         )
     } else {
+        // Authored with a `<style>` block + CSS classes — the ergonomic way to
+        // style email. The generated mailer calls `.inline_css(true)`, so at
+        // send time Autumn rewrites these rules onto the elements as
+        // `style="…"` attributes (issue #1254); that is what makes them render
+        // in Gmail/Outlook, which strip `<head>`/`<style>`. The `@media` rule is
+        // preserved in a retained `<style>` block for clients that honor it.
         format!(
-            "<h1 style=\"margin:0 0 16px;font-size:24px;color:#1a1a2e;\">Hello from {struct_name}!</h1>\n\
-             <p style=\"margin:0;font-size:16px;line-height:1.6;color:#333333;\">Your email body goes here.</p>\n"
+            "<style>\n\
+            \x20 .greeting {{ margin:0 0 16px; font-size:24px; color:#1a1a2e; }}\n\
+            \x20 .lead {{ margin:0 0 24px; font-size:16px; line-height:1.6; color:#333333; }}\n\
+            \x20 .btn {{ display:inline-block; padding:12px 20px; background:#1a1a2e; color:#ffffff; text-decoration:none; border-radius:4px; }}\n\
+            \x20 @media (max-width:600px) {{ .btn {{ display:block; text-align:center; }} }}\n\
+             </style>\n\
+             <h1 class=\"greeting\">Hello from {struct_name}!</h1>\n\
+             <p class=\"lead\">Your email body goes here.</p>\n\
+             <a class=\"btn\" href=\"https://example.com\">Call to action</a>\n"
         )
     }
 }
@@ -1020,6 +1046,59 @@ async fn main() {
         );
         // With layout, per-mailer template is body-only; full document is in _layout.html.
         assert!(!html.is_empty(), "html template must not be empty");
+    }
+
+    #[test]
+    fn html_template_shows_style_block_example_relying_on_inlining() {
+        // AC6 (issue #1254): the scaffolded per-mailer template demonstrates the
+        // `<style>`-block + CSS-class happy path that inlining resolves.
+        let tmp = project_with_main(default_main());
+        plan_mailer(tmp.path(), "Welcome", None, false)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+
+        let html = fs::read_to_string(tmp.path().join("templates/mailers/welcome.html")).unwrap();
+        assert!(
+            html.contains("<style>"),
+            "with-layout template must show a <style>-block example: {html}"
+        );
+        assert!(
+            html.contains("class=\"btn\""),
+            "template must reference a CSS class that inlining resolves: {html}"
+        );
+    }
+
+    #[test]
+    fn generated_mailer_enables_css_inlining() {
+        // AC6 (issue #1254): the generated mailer opts into inlining so the
+        // `<style>`-block template renders styled end to end.
+        let tmp = project_with_main(default_main());
+        plan_mailer(tmp.path(), "Welcome", None, false)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+
+        let mailer = fs::read_to_string(tmp.path().join("src/mailers/welcome.rs")).unwrap();
+        assert!(
+            mailer.contains(".inline_css(true)"),
+            "generated mailer must enable CSS inlining: {mailer}"
+        );
+    }
+
+    #[test]
+    fn no_layout_template_also_shows_style_block() {
+        let tmp = project_with_main(default_main());
+        plan_mailer(tmp.path(), "Welcome", None, true)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+
+        let html = fs::read_to_string(tmp.path().join("templates/mailers/welcome.html")).unwrap();
+        assert!(
+            html.contains("<style>"),
+            "--no-layout template must also show a <style>-block example: {html}"
+        );
     }
 
     #[test]

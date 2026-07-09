@@ -99,6 +99,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **testing:** property-based (proptest) invariant tests for the parser/codec
   surfaces, asserting round-trip and well-formedness invariants alongside the
   fuzz harness. Test-only, no public API change. [no-plugin]
+- **mail:** automatic CSS inlining for HTML email (issue #1254). HTML bodies
+  authored with a `<style>` block and CSS classes are transformed at send time
+  so matching elements carry equivalent `style="…"` attributes in the delivered
+  message — the fix for Gmail/Outlook stripping `<head>`/`<style>`. Opt in per
+  message with `MailBuilder::inline_css(true)` or default it per environment via
+  `mail.inline_css = true` (`MailConfig::inline_css` / `MailerBuilder::inline_css`);
+  an explicit builder call wins over the config default in either direction, and
+  the default is off so existing apps are unaffected. Un-inlinable `@media`/
+  pseudo-class rules are preserved in a retained `<style>` block, text parts and
+  bodies with no `<style>` pass through unchanged, and inlining is idempotent.
+  Backed by the mature `css-inline` crate (gated behind the `mail` feature, with
+  its network/file stylesheet fetchers disabled — only embedded `<style>` CSS is
+  inlined). `autumn generate mailer` now scaffolds a `<style>`-block template and
+  a mailer that calls `.inline_css(true)`, demonstrating the happy path end to
+  end. On inliner failure a typed `MailError::CssInline` is surfaced and the
+  original body is preserved rather than delivered corrupted.
 - **generator:** `autumn new` now generates a `README.md` at the project root
   (listed in the "Created …" output) with explicit prerequisites and a
   golden-path quickstart — configure the `[database]` block in `autumn.toml`

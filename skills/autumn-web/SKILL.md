@@ -575,6 +575,41 @@ key_prefix = "myapp:webhooks:replay"
 
 Read `docs/guide/signed-webhooks.md` and `examples/signed-webhooks/`.
 
+## Mail CSS inlining — render styled in Gmail/Outlook (unreleased — trunk-dev)
+
+Gmail strips `<style>` in many contexts and Outlook (Word engine) ignores
+`<head>`/`<style>` and most external CSS, so email authored with a stylesheet
+arrives **unstyled**. The decades-old fix is to inline CSS onto elements at send
+time. Autumn does this for you (issue #1254).
+
+- **Author with a `<style>` block + classes**, then opt in — either per message
+  or per environment:
+  ```rust
+  // Per message (wins over the config default in both directions):
+  Mail::builder()
+      .to(to).subject("Welcome")
+      .html(r#"<style>.btn{color:#fff;background:#06c}</style><a class="btn">Go</a>"#)
+      .inline_css(true)      // ← rewrites .btn onto the <a> as style="…" at send
+      .build()?
+  ```
+  ```toml
+  # Per environment — default it on for every mailer:
+  [mail]
+  inline_css = true
+  ```
+- **Precedence:** an explicit `MailBuilder::inline_css(true|false)` always beats
+  the `mail.inline_css` default (`inline_css(false)` opts one message out of an
+  environment that defaults on). Default is **off** — existing apps are
+  unaffected until they opt in.
+- **What's preserved:** un-inlinable `@media`/pseudo-class rules stay in a
+  retained `<style>` block; text parts and bodies with no `<style>` pass through
+  unchanged; inlining is idempotent (running it twice equals once).
+- **Failure is loud, not corrupting:** on an inliner error the original body is
+  kept and a typed `MailError::CssInline` is surfaced rather than delivering
+  malformed HTML.
+- `autumn generate mailer` scaffolds this end to end (a `<style>` template + a
+  mailer that calls `.inline_css(true)`).
+
 ## Mail suppression — stop emailing bounced addresses (unreleased — trunk-dev)
 
 Autumn *detects* delivery failure (inbound bounce/complaint webhooks) **and**
