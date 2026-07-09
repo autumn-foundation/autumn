@@ -1466,7 +1466,7 @@ fn render_routes_file(
         format!(
             "{create_stmt}\n    \
              flash.success(\"{pascal_name} created\").await;\n    \
-             Ok(Redirect::to(\"/{plural}\").into_response())"
+             Ok(autumn_web::Redirect::to(\"/{plural}\").into_response())"
         )
     } else {
         format!(
@@ -1484,7 +1484,7 @@ fn render_routes_file(
              return Err(err);\n    \
              }}\n    \
              flash.success(\"{pascal_name} created\").await;\n    \
-             Ok(Redirect::to(\"/{plural}\").into_response())"
+             Ok(autumn_web::Redirect::to(\"/{plural}\").into_response())"
         )
     };
     let create_fn = format!(
@@ -1513,7 +1513,7 @@ fn render_routes_file(
              )));\n    \
              }}\n    \
              flash.success(\"{pascal_name} updated\").await;\n    \
-             Ok(Redirect::to(&format!(\"/{plural}/{{}}\", *id)).into_response())"
+             Ok(autumn_web::Redirect::to(&format!(\"/{plural}/{{}}\", *id)).into_response())"
         )
     } else {
         format!(
@@ -1539,7 +1539,7 @@ fn render_routes_file(
              )));\n    \
              }}\n    \
              flash.success(\"{pascal_name} updated\").await;\n    \
-             Ok(Redirect::to(&format!(\"/{plural}/{{}}\", *id)).into_response())"
+             Ok(autumn_web::Redirect::to(&format!(\"/{plural}/{{}}\", *id)).into_response())"
         )
     };
     let update_fn = format!(
@@ -1829,7 +1829,6 @@ pub async fn index(
 //! HTML route handlers for the resource. Edit freely — once generated,
 //! these are ordinary user code.
 {attachment_note}
-use autumn_web::Redirect;
 use autumn_web::extract::Path;
 use autumn_web::pagination::{{Page, PageRequest}};
 use autumn_web::reexports::axum::body::Bytes;
@@ -1984,7 +1983,7 @@ pub async fn destroy(
     id: Path<{id_rust}>,
     {destroy_signature_arg},
     flash: Flash,
-) -> AutumnResult<Redirect> {{
+) -> AutumnResult<autumn_web::Redirect> {{
     {destroy_stmt}
     if deleted == 0 {{
         return Err(AutumnError::not_found_msg(format!(
@@ -1992,7 +1991,7 @@ pub async fn destroy(
         )));
     }}
     flash.success("{pascal_name} deleted").await;
-    Ok(Redirect::to("/{plural}"))
+    Ok(autumn_web::Redirect::to("/{plural}"))
 }}
 
 {form_struct}
@@ -4529,6 +4528,50 @@ async fn main() {
             },
         )
         .unwrap();
+    }
+
+    #[test]
+    fn scaffold_enum_field_named_redirect_is_accepted_and_routes_fully_qualify_redirect() {
+        // Regression (PR #1659): the routes file's write handlers issue real 303
+        // redirects. If the file imported the framework type via
+        // `use autumn_web::Redirect;`, a `redirect:enum{a,b}` field — which
+        // pascalizes to `Redirect` and is imported via
+        // `use crate::models::post::{…, Redirect}` — would produce two `Redirect`
+        // imports and fail with E0252. `Redirect` is deliberately NOT reserved
+        // (users may name a model/enum `Redirect`); instead the handlers
+        // fully-qualify the framework type as `autumn_web::Redirect`, so the enum
+        // field is accepted and both types coexist.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["redirect:enum{a,b}".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        // The model-side `Redirect` enum is imported — this is the type that
+        // would have collided with a framework `use autumn_web::Redirect;`.
+        assert!(
+            routes.contains("Redirect}"),
+            "expected the enum `Redirect` to be imported from crate::models: {routes}"
+        );
+        // The framework redirect is fully-qualified, never imported, so there is
+        // no duplicate import and no glob-shadowing.
+        assert!(
+            !routes.contains("use autumn_web::Redirect;"),
+            "routes must not import the framework Redirect (would collide): {routes}"
+        );
+        assert!(
+            routes.contains("autumn_web::Redirect::to("),
+            "redirect handlers must fully-qualify autumn_web::Redirect::to: {routes}"
+        );
+        assert!(
+            routes.contains("-> AutumnResult<autumn_web::Redirect>"),
+            "destroy handler must fully-qualify its return type: {routes}"
+        );
     }
 
     // ── enum field: nullable (issue #1030) ──────────────────────────────────
