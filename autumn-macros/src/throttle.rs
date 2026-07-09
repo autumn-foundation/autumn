@@ -212,6 +212,22 @@ fn inject_throttle_params(input_fn: &mut ItemFn) {
         };
         input_fn.sig.inputs.insert(0, p);
     }
+    if !has_input_named(input_fn, "__autumn_throttle_session") {
+        // Optional so throttled routes without session middleware (or a
+        // per-route throttle that doesn't key on the principal) still compile
+        // and run. `__check_throttle` only consults it for `key = "principal"`
+        // when no `RateLimitPrincipal` extension was installed, deriving the
+        // principal from the same verified session `populate_rate_limit_principal`
+        // reads.
+        let p: syn::FnArg = parse_quote! {
+            __autumn_throttle_session: ::core::option::Option<
+                ::autumn_web::reexports::axum::extract::Extension<
+                    ::autumn_web::session::Session
+                >
+            >
+        };
+        input_fn.sig.inputs.insert(0, p);
+    }
     if !has_input_named(input_fn, "__autumn_throttle_exempt") {
         let p: syn::FnArg = parse_quote! {
             __autumn_throttle_exempt: ::core::option::Option<
@@ -341,6 +357,7 @@ pub fn throttle_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     .as_ref()
                     .map(|ext| ext.0.0),
                 __autumn_throttle_principal.as_ref().map(|e| &e.0),
+                __autumn_throttle_session.as_ref().map(|e| &e.0),
                 __autumn_throttle_exempt.is_some(),
             ).await
         {

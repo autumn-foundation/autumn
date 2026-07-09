@@ -65,6 +65,37 @@ async fn principal_throttled() -> &'static str {
     "principal-ok"
 }
 
+#[get("/principal-session")]
+#[throttle(limit = 1, per = "1s", key = "principal")]
+async fn principal_session_throttled() -> &'static str {
+    "principal-session-ok"
+}
+
+// Login handlers that establish an authenticated session (auth key `user_id`)
+// the same way `#[secured]` reads it, so a later `#[throttle(key = "principal")]`
+// request under that session can derive its principal without the global
+// principal middleware being installed.
+#[get("/throttle-login-alice")]
+async fn throttle_login_alice(session: autumn_web::session::Session) -> &'static str {
+    session.insert("user_id", "alice").await;
+    "logged-in"
+}
+
+#[get("/throttle-login-bob")]
+async fn throttle_login_bob(session: autumn_web::session::Session) -> &'static str {
+    session.insert("user_id", "bob").await;
+    "logged-in"
+}
+
+// A plain user handler (no `#[throttle]`) that returns its OWN 429 carrying no
+// rate-limit headers — models a lockout/backpressure response from application
+// code. It consumed a global token, so the global limiter's informational
+// `x-ratelimit-*` headers must still be attached.
+#[get("/user-429")]
+async fn user_429() -> axum::http::StatusCode {
+    axum::http::StatusCode::TOO_MANY_REQUESTS
+}
+
 #[get("/login")]
 #[throttle("login")]
 async fn named_login() -> &'static str {
@@ -512,6 +543,126 @@ async fn principal_key_isolates_by_principal_extension() {
     // Different principal on the same peer: fresh bucket.
     let r3 = app.clone().oneshot(build_req("bob")).await.expect("ok");
     assert_eq!(r3.status(), StatusCode::OK);
+}
+
+/// Regression (Codex P2, PR #1662): a `#[throttle(key = "principal")]` route must
+/// key on the authenticated principal even when the GLOBAL limiter is left at its
+/// default IP strategy — the case where the router does NOT install
+/// `populate_rate_limit_principal`, so no `RateLimitPrincipal` extension is ever
+/// set. `__check_throttle` must derive the principal from the same verified
+/// session (`user_id`) `populate_rate_limit_principal` reads; otherwise every user
+/// behind one source IP would silently share the route bucket.
+///
+/// Two principals share one source IP: principal A is throttled after its own
+/// limit while principal B — with no `RateLimitPrincipal` extension either — still
+/// passes, proving keying is per-principal, not per-IP.
+#[tokio::test]
+async fn principal_key_derives_from_session_without_global_principal_middleware() {
+    // Global limiter enabled but at its DEFAULT (IP) strategy — so the router
+    // does NOT install populate_rate_limit_principal and no RateLimitPrincipal
+    // extension is ever set. The global IP bucket is generous (burst = 1000), so
+    // it never 429s here; only the per-route principal throttle can.
+    let client = TestApp::new()
+        .routes(routes![
+            principal_session_throttled,
+            throttle_login_alice,
+            throttle_login_bob
+        ])
+        .config(base_config())
+        .build();
+
+    // Establish two authenticated sessions (user_id = alice / bob) and capture
+    // each session cookie. TestClient has no cookie jar, so sessions stay
+    // isolated and we replay the exact cookie we want on each request.
+    let session_cookie = |set_cookie: &str| -> String {
+        set_cookie
+            .split(';')
+            .next()
+            .expect("set-cookie should start with a cookie pair")
+            .to_owned()
+    };
+
+    let alice_login = client.get("/throttle-login-alice").send().await;
+    alice_login.assert_status(200);
+    let alice_cookie = session_cookie(
+        alice_login
+            .header("set-cookie")
+            .expect("login must set a session cookie"),
+    );
+
+    let bob_login = client.get("/throttle-login-bob").send().await;
+    bob_login.assert_status(200);
+    let bob_cookie = session_cookie(
+        bob_login
+            .header("set-cookie")
+            .expect("login must set a session cookie"),
+    );
+
+    // Both principals share ONE source IP; only the derived principal should
+    // differentiate their per-route buckets.
+    let ip = "198.51.100.88";
+
+    // Principal "alice": first allowed…
+    client
+        .get("/principal-session")
+        .header("Cookie", &alice_cookie)
+        .header("X-Forwarded-For", ip)
+        .send()
+        .await
+        .assert_status(200);
+    // …second throttled (limit = 1), proving the principal was derived from the
+    // session even without the global principal middleware.
+    client
+        .get("/principal-session")
+        .header("Cookie", &alice_cookie)
+        .header("X-Forwarded-For", ip)
+        .send()
+        .await
+        .assert_status(429);
+
+    // Principal "bob" shares alice's source IP but is a distinct principal, so it
+    // gets its OWN bucket and still passes — impossible under silent IP fallback.
+    client
+        .get("/principal-session")
+        .header("Cookie", &bob_cookie)
+        .header("X-Forwarded-For", ip)
+        .send()
+        .await
+        .assert_status(200);
+}
+
+/// Regression (Codex P2, PR #1662): a plain user handler that returns its OWN 429
+/// (no rate-limit headers) DID consume a global token, so the global limiter's
+/// allowed path must still attach its informational `x-ratelimit-*` quota
+/// headers. The earlier fix skipped header insertion for ANY inner 429, which was
+/// too broad and stripped quota metadata from legitimate user 429s. The corrected
+/// logic only avoids OVERWRITING headers the inner response already set (a
+/// per-route throttle's 429), so a header-less user 429 still gets the globals.
+#[tokio::test]
+async fn user_handler_429_receives_global_ratelimit_headers() {
+    let client = TestApp::new()
+        .routes(routes![user_429])
+        .config(base_config())
+        .build();
+
+    let resp = client
+        .get("/user-429")
+        .header("X-Forwarded-For", "198.51.100.77")
+        .send()
+        .await;
+    resp.assert_status(429);
+
+    // The global limiter allowed this request through (consuming a token) before
+    // the handler returned its own 429, so the global quota headers are present
+    // even though the handler set none.
+    assert!(
+        resp.header("x-ratelimit-limit").is_some(),
+        "global x-ratelimit-limit must be present on a header-less user 429"
+    );
+    assert!(
+        resp.header("x-ratelimit-remaining").is_some(),
+        "global x-ratelimit-remaining must be present on a header-less user 429"
+    );
 }
 
 /// Bug #1350: `#[throttle(key = "ip")]` must resolve the client IP via the same
