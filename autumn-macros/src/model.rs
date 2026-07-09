@@ -978,7 +978,15 @@ fn field_already_skips_serialization(field: &Field) -> bool {
                 skips = true;
             }
             if let Ok(value) = meta.value() {
+                // `name = value` form — consume the value literal.
                 let _: syn::Result<syn::Lit> = value.parse();
+            } else if meta.input.peek(syn::token::Paren) {
+                // Nested-list form, e.g. `bound(serialize = "...")`. Consume the
+                // parenthesized tokens so `parse_nested_meta` can continue to the
+                // next item in the same `#[serde(...)]` (otherwise the loop errors
+                // out early and a later `skip_serializing` is missed, producing a
+                // duplicate injected attribute).
+                let _ = meta.parse_nested_meta(|_| Ok(()));
             }
             Ok(())
         });
@@ -4518,6 +4526,22 @@ mod tests {
         };
         let err = validate_encrypted_field(&field).unwrap_err();
         assert!(err.to_string().contains("searchable"));
+    }
+
+    #[test]
+    fn already_skips_serialization_with_nested_list_before_skip() {
+        // Regression: a nested-list item (`bound(serialize = ...)`, which has no
+        // `= value`) previously errored out `parse_nested_meta` mid-attribute, so
+        // a later `skip_serializing` in the SAME `#[serde(...)]` was never seen and
+        // the macro injected a duplicate `#[serde(skip_serializing)]`.
+        let field: syn::Field = syn::parse_quote! {
+            #[serde(bound(serialize = "T: Clone"), skip_serializing)]
+            pub secret: String
+        };
+        assert!(
+            field_already_skips_serialization(&field),
+            "a nested list before `skip_serializing` must not hide the skip"
+        );
     }
 
     // ── #1374: `#[private]` hides a column from JSON serialization ─────────

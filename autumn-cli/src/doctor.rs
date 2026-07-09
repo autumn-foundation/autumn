@@ -3264,7 +3264,9 @@ fn scan_source_for_unprivate_sensitive_columns(
         let mut field_is_private = false;
         while k < lines.len() {
             let t = lines[k].trim();
-            if t == "}" {
+            if t.starts_with('}') {
+                // Closing brace terminates the struct even when followed by a
+                // trailing comment (`} // User`) or a semicolon (`};`).
                 break;
             }
             if t.starts_with("#[private") || t.starts_with("#[encrypted") {
@@ -3360,6 +3362,27 @@ pub struct User {
         );
         assert_eq!(found[0].model, "User");
         assert_eq!(found[0].column, "password_hash");
+    }
+
+    #[test]
+    fn scan_terminates_struct_on_brace_with_trailing_tokens() {
+        // The closing brace may be followed by a trailing comment (`} // User`)
+        // or a semicolon (`};`); the scan must still stop at the struct end and
+        // not swallow following declarations.
+        for closing in ["} // User", "};", "}  // trailing"] {
+            let src = format!(
+                "#[model]\npub struct User {{\n    #[id]\n    pub id: i64,\n    pub password_hash: String,\n{closing}\npub struct Other {{\n    pub api_secret: String,\n}}\n"
+            );
+            let mut found = Vec::new();
+            scan_source_for_unprivate_sensitive_columns(&src, &mut found);
+            assert_eq!(
+                found.len(),
+                1,
+                "closing line `{closing}` must terminate the struct: {found:?}"
+            );
+            assert_eq!(found[0].model, "User");
+            assert_eq!(found[0].column, "password_hash");
+        }
     }
 
     #[test]

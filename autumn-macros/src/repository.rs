@@ -10318,14 +10318,18 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 // #1379: normalize `#[normalize]` columns on the insert path,
                 // before the `before_create` hook and the DB write, so
                 // validators and the database observe the canonical value.
-                // Dispatches through the autoref-specialization probe: a no-op
-                // for models with no `#[normalize]` columns and for hand-written
-                // `New*` types that don't implement `Normalize`.
+                // Dispatches through the autoref-specialization probe: the `Yes`
+                // arm clones and canonicalizes only for models whose `New*`
+                // implements `Normalize`; the `No` arm hands back the caller's
+                // borrow unchanged, so models with no `#[normalize]` columns (and
+                // hand-written `New*` types that don't implement `Normalize`) pay
+                // no clone. `Borrow` unifies the owned/borrowed arms to `&#new_name`.
                 #[allow(unused_imports)]
                 use ::autumn_web::normalize::{SpezNormalizeNo as _, SpezNormalizeYes as _};
-                let mut __autumn_new = ::core::clone::Clone::clone(new);
-                ::autumn_web::normalize::SpezNormalize(&mut __autumn_new).spez_normalize();
-                let new = &__autumn_new;
+                #[allow(unused_imports)]
+                use ::std::borrow::Borrow as _;
+                let __autumn_normalized = ::autumn_web::normalize::SpezNormalize(new).spez_normalize();
+                let new: &#new_name = __autumn_normalized.borrow();
                 #save_body
             }
 
@@ -10358,18 +10362,16 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
             async fn save_many(&self, new: &[#new_name]) -> ::autumn_web::AutumnResult<Vec<#model_name>> {
                 // #1379: normalize each `#[normalize]` column before the bulk
-                // insert path (mirrors `save`). No-op without `#[normalize]`.
+                // insert path (mirrors `save`). The `Yes` arm clones+canonicalizes
+                // only for `Normalize` `New*` types; the `No` arm hands back the
+                // caller's slice unchanged (no clone) for everything else.
+                // `Borrow` unifies the owned `Vec`/borrowed slice arms.
                 #[allow(unused_imports)]
-                use ::autumn_web::normalize::{SpezNormalizeNo as _, SpezNormalizeYes as _};
-                let __autumn_new: ::std::vec::Vec<#new_name> = new
-                    .iter()
-                    .map(|__n| {
-                        let mut __n = ::core::clone::Clone::clone(__n);
-                        ::autumn_web::normalize::SpezNormalize(&mut __n).spez_normalize();
-                        __n
-                    })
-                    .collect();
-                let new = &__autumn_new[..];
+                use ::autumn_web::normalize::{SpezNormalizeManyNo as _, SpezNormalizeManyYes as _};
+                #[allow(unused_imports)]
+                use ::std::borrow::Borrow as _;
+                let __autumn_normalized = ::autumn_web::normalize::SpezNormalize(new).spez_normalize_many();
+                let new: &[#new_name] = __autumn_normalized.borrow();
                 #save_many_body
             }
 
@@ -11922,8 +11924,12 @@ mod tests {
         let generated =
             repository_macro(quote! { User }, quote! { pub trait UserRepository {} }).to_string();
         assert!(
-            generated.contains("SpezNormalize (& mut __autumn_new) . spez_normalize"),
+            generated.contains("SpezNormalize (new) . spez_normalize ()"),
             "save must normalize the New input before persisting: {generated}"
+        );
+        assert!(
+            generated.contains("SpezNormalize (new) . spez_normalize_many ()"),
+            "save_many must normalize each New input before persisting: {generated}"
         );
     }
 

@@ -97,28 +97,69 @@ pub fn normalize_lookup_value<M: NormalizedModel>(column: &str, value: &str) -> 
 // **not** work through a generic boundary, which is why the wrappers are
 // constructed in the generated code rather than behind a generic helper.
 
-/// Probe wrapper for in-place normalization on the write path.
+/// Probe wrapper for write-path normalization.
+///
+/// Holds an immutable borrow of the caller's input. The specialized `Yes` impl
+/// (selected only when the concrete type is `Normalize + Clone`) clones and
+/// canonicalizes, returning the owned value; the `No` fallback returns the
+/// borrow untouched — so a model with no `#[normalize]` columns (or a
+/// hand-written `New*` that doesn't implement `Normalize`) pays no clone on the
+/// save path. The generated code unifies the two arms with `Borrow` (see
+/// `#[repository]` `save`/`save_many`).
 #[doc(hidden)]
-pub struct SpezNormalize<T>(pub T);
+pub struct SpezNormalize<'a, T: ?Sized>(pub &'a T);
 
 #[doc(hidden)]
-pub trait SpezNormalizeYes {
-    fn spez_normalize(self);
+pub trait SpezNormalizeYes<'a, T> {
+    fn spez_normalize(self) -> T;
 }
-impl<T: Normalize> SpezNormalizeYes for SpezNormalize<&mut T> {
+impl<'a, T: Normalize + Clone> SpezNormalizeYes<'a, T> for SpezNormalize<'a, T> {
     #[inline]
-    fn spez_normalize(self) {
-        self.0.normalize();
+    fn spez_normalize(self) -> T {
+        let mut owned = self.0.clone();
+        owned.normalize();
+        owned
     }
 }
 
 #[doc(hidden)]
-pub trait SpezNormalizeNo {
-    fn spez_normalize(self);
+pub trait SpezNormalizeNo<'a, T: ?Sized> {
+    fn spez_normalize(self) -> &'a T;
 }
-impl<T> SpezNormalizeNo for &SpezNormalize<&mut T> {
+impl<'a, T: ?Sized> SpezNormalizeNo<'a, T> for &SpezNormalize<'a, T> {
     #[inline]
-    fn spez_normalize(self) {}
+    fn spez_normalize(self) -> &'a T {
+        self.0
+    }
+}
+
+#[doc(hidden)]
+pub trait SpezNormalizeManyYes<'a, T> {
+    fn spez_normalize_many(self) -> Vec<T>;
+}
+impl<'a, T: Normalize + Clone> SpezNormalizeManyYes<'a, T> for SpezNormalize<'a, [T]> {
+    #[inline]
+    fn spez_normalize_many(self) -> Vec<T> {
+        self.0
+            .iter()
+            .map(|item| {
+                let mut owned = item.clone();
+                owned.normalize();
+                owned
+            })
+            .collect()
+    }
+}
+
+#[doc(hidden)]
+pub trait SpezNormalizeManyNo<'a, T> {
+    fn spez_normalize_many(self) -> &'a [T];
+}
+impl<'a, T> SpezNormalizeManyNo<'a, T> for &SpezNormalize<'a, [T]> {
+    #[inline]
+    fn spez_normalize_many(self) -> &'a [T] {
+        self.0
+    }
 }
 
 /// Probe wrapper for finder-argument normalization on lookups.
@@ -204,6 +245,7 @@ mod tests {
 
     // ── Autoref specialization dispatch (repository call sites) ────────────
 
+    #[derive(Clone)]
     struct Norms(String);
     impl Normalize for Norms {
         fn normalize(&mut self) {
@@ -215,16 +257,24 @@ mod tests {
     #[test]
     fn spez_normalize_runs_for_normalize_types_and_noops_otherwise() {
         use super::{SpezNormalizeNo as _, SpezNormalizeYes as _};
+        use std::borrow::Borrow as _;
 
-        let mut n = Norms("  Foo ".into());
-        SpezNormalize(&mut n).spez_normalize();
-        assert_eq!(n.0, "foo", "Normalize type must be canonicalized");
+        // A `Normalize + Clone` type is cloned and canonicalized; the borrow
+        // unifies both arms to `&T`.
+        let n = Norms("  Foo ".into());
+        let normalized = SpezNormalize(&n).spez_normalize();
+        let n_ref: &Norms = normalized.borrow();
+        assert_eq!(n_ref.0, "foo", "Normalize type must be canonicalized");
+        // The original input is untouched (the probe borrows immutably).
+        assert_eq!(n.0, "  Foo ", "input must not be mutated in place");
 
-        // A type that does NOT implement Normalize compiles and is left as-is
-        // (mirrors a hand-written `New*` used with `#[repository]`).
-        let mut p = Plain("  Foo ".into());
-        SpezNormalize(&mut p).spez_normalize();
-        assert_eq!(p.0, "  Foo ", "non-Normalize type must be untouched");
+        // A type that does NOT implement Normalize compiles and is returned
+        // untouched by reference (mirrors a hand-written `New*` used with
+        // `#[repository]`) — no clone is performed. The `No` arm yields `&Plain`
+        // directly (the generated code's `.borrow()` is a no-op in this case).
+        let p = Plain("  Foo ".into());
+        let p_ref: &Plain = SpezNormalize(&p).spez_normalize();
+        assert_eq!(p_ref.0, "  Foo ", "non-Normalize type must be untouched");
     }
 
     #[test]
