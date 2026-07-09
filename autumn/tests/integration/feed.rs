@@ -51,6 +51,23 @@ fn atom_feed_has_valid_shape() {
 }
 
 #[test]
+fn atom_defaults_feed_author_to_title_when_unset() {
+    let feed = Feed::atom(
+        "My Blog",
+        "https://example.com/",
+        "https://example.com/feed.xml",
+    )
+    .entry(
+        FeedEntry::new("https://example.com/x", "Post", "https://example.com/x")
+            .summary("body")
+            .published(Utc.with_ymd_and_hms(2026, 5, 1, 12, 0, 0).unwrap()),
+    );
+    let xml = feed.render();
+    assert!(xml.contains("<author>"));
+    assert!(xml.contains("<name>My Blog</name>"));
+}
+
+#[test]
 fn rss_feed_has_valid_shape() {
     let xml = sample_feed(FeedFormat::Rss).render();
     assert!(xml.contains("<rss version=\"2.0\""));

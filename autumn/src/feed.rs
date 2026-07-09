@@ -144,6 +144,10 @@ impl Feed {
     }
 
     /// Set the feed author (Atom `<author><name>`; RSS `<dc:creator>`).
+    ///
+    /// For Atom the feed title is used as the feed-level author when none is
+    /// set, since Atom 1.0 requires a feed-level author unless every entry
+    /// carries its own.
     #[must_use]
     pub fn author(mut self, author: impl Into<String>) -> Self {
         self.author = Some(author.into());
@@ -253,11 +257,12 @@ impl Feed {
         )
         .unwrap();
         writeln!(s, "  <updated>{}</updated>", rfc3339(updated)).unwrap();
-        if let Some(author) = &self.author {
-            s.push_str("  <author>\n");
-            writeln!(s, "    <name>{}</name>", escape(author)).unwrap();
-            s.push_str("  </author>\n");
-        }
+        // Atom requires a feed-level author unless every entry has one; default
+        // to the feed title so the feed is always valid.
+        let author = self.author.as_deref().unwrap_or(&self.title);
+        s.push_str("  <author>\n");
+        writeln!(s, "    <name>{}</name>", escape(author)).unwrap();
+        s.push_str("  </author>\n");
         for e in &self.entries {
             s.push_str("  <entry>\n");
             writeln!(s, "    <title>{}</title>", escape(&e.title)).unwrap();
