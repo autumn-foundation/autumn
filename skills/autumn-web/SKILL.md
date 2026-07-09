@@ -217,6 +217,7 @@ Use `.one_off_tasks(one_off_tasks![...])` for `#[task]` handlers invoked by
 | `.with_blob_store(store)` | Install a file storage backend |
 | `.with_cache_backend(cache)` | Install a cache backend |
 | `.with_mail_delivery_queue(queue)` | Install durable deferred mail |
+| `.with_mail_suppression_store(store)` | Install a durable bounce/complaint suppression backend (unreleased; in-memory default auto-wired otherwise) |
 | `.with_audit_sink(sink)` | Install structured audit sink |
 | `.listeners(listeners![...])` | Register `#[listener]` event listeners (unreleased) |
 | `.static_gate(layer)` | Middleware that also guards `#[static_get]` pre-render (unreleased; `has_static_gate::<L>()`, `get_static_gate_types()`, `TestApp::static_gate` mirror it) |
@@ -557,6 +558,92 @@ key_prefix = "myapp:webhooks:replay"
 ```
 
 Read `docs/guide/signed-webhooks.md` and `examples/signed-webhooks/`.
+
+## Mail suppression — stop emailing bounced addresses (unreleased — trunk-dev)
+
+Autumn *detects* delivery failure (inbound bounce/complaint webhooks) **and**
+acts on it: `Mailer::send()` consults a bounce/complaint suppression list
+**before** transport and skips addresses that hard-bounced or complained. This
+protects sender reputation (re-sending to a hard bounce is what gets a domain
+throttled by Gmail/Microsoft/SES). Distinct from recipient-initiated
+List-Unsubscribe (`#[mailer(list_unsubscribe)]`): that is a user opt-out;
+this is *provider-reported* failure.
+
+- **Zero-config:** an in-memory `SuppressionStore` is auto-wired; the loop works
+  out of the box on a single instance. For multi-instance deploys register the
+  durable Postgres backend (shared across replicas):
+
+  ```rust
+  use autumn_web::mail::suppression::PgSuppressionStore;
+  App::builder().with_mail_suppression_store(PgSuppressionStore::new(pool))
+  ```
+
+  > **You must create the `mail_suppressions` table yourself** —
+  > `PgSuppressionStore` ships no migration (same convention as the
+  > List-Unsubscribe `mail_unsubscribes` store, whose table is written by
+  > `autumn generate mailer --list-unsubscribe`). Add a migration with:
+  > ```sql
+  > CREATE TABLE mail_suppressions (
+  >     address       TEXT PRIMARY KEY,
+  >     reason        TEXT NOT NULL,
+  >     suppressed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  > );
+  > ```
+  > Without it, every send errors on the suppression lookup.
+
+- **Close the loop** — receive provider bounce webhook → suppress → later send
+  is skipped. The inbound handler and the `Mailer` must consult the **same**
+  store. `with_mail_suppression_store` takes a store *by value* and wraps it in
+  a fresh handle internally, so build **one** `InMemorySuppressionStore` and
+  hand out `.clone()`s of it — the clone shares the same `Arc<Mutex<…>>` state
+  (inbound handlers are plain `fn` pointers, so stash a handle in a `OnceLock`):
+
+  ```rust
+  use std::sync::OnceLock;
+  use autumn_web::mail::suppression::{
+      record_inbound, InMemorySuppressionStore, SuppressionStoreHandle,
+  };
+
+  static SUPPRESSION: OnceLock<SuppressionStoreHandle> = OnceLock::new();
+
+  // ONE store; clones share the same underlying state.
+  let store = InMemorySuppressionStore::new();
+  SUPPRESSION
+      .set(SuppressionStoreHandle::new(store.clone())) // inbound side
+      .ok();
+  let app = App::builder().with_mail_suppression_store(store); // Mailer side — same state
+
+  // Inbound router: the provided handler records the bounce.
+  InboundMailRouter::new()
+      .endpoint(InboundMailEndpointConfig::mailgun("/mail/inbound", signing_key))
+      .on_bounce(|email| Box::pin(async move {
+          record_inbound(SUPPRESSION.get().unwrap().inner().as_ref(), &email).await?;
+          Ok(())
+      }));
+  ```
+
+  A bounce suppresses the provider-reported `email.bounced_address`
+  (`SuppressionReason::HardBounce`). Afterwards `mailer.send(mail_to("a@x.com"))`
+  returns `Err(MailError::AllRecipientsSuppressed)` (zero transport calls) while
+  `b@x.com` still delivers.
+
+  > **`on_spam` is an inbound spam *verdict*, not an outbound complaint.**
+  > autumn's `on_spam` fires on a provider-side inbound spam flag
+  > (`X-Mailgun-Sflag: Yes`) — it carries no outbound complainant address, and
+  > `email.to` there is *your app's own inbound address*. So `record_inbound`
+  > deliberately suppresses **nothing** for a bare spam verdict (it logs
+  > instead), and never suppresses `email.to`. Only a genuine FBL complaint
+  > that populates `InboundEmail::complained_address` suppresses that
+  > complainant (`SuppressionReason::Complaint`). Wire a real feedback-loop
+  > source to that field before routing complaints here.
+
+- **Observability:** every skip logs `outcome = "skipped_suppressed"` and bumps
+  `suppression::suppressed_skips()` — a suppressed drop is never silent.
+- **Critical mail bypass:** `Mail::builder().….ignore_suppression()` delivers
+  even to a suppressed address (password resets, MFA codes, security alerts).
+- **Escape hatch:** `store.unsuppress(addr)` removes an address (e.g. the
+  recipient fixed their mailbox); `store.suppress(addr, SuppressionReason::Manual)`
+  adds one by hand.
 
 ## Background work
 

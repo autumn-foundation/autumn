@@ -85,6 +85,8 @@ mod mail_macro;
 #[cfg(feature = "mail")]
 mod mail_recorder_integration;
 #[cfg(feature = "mail")]
+mod mail_suppression;
+#[cfg(feature = "mail")]
 mod mail_unsubscribe;
 #[cfg(feature = "maud")]
 mod maud_render;

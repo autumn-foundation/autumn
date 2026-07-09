@@ -444,6 +444,13 @@ pub struct Mail {
     /// Files attached to this message, in declared order.
     #[serde(default)]
     pub attachments: Vec<MailAttachment>,
+    /// When `true`, [`Mailer::send`] delivers this message even to addresses on
+    /// the bounce/complaint [`suppression`] list. Set via
+    /// [`MailBuilder::ignore_suppression`] for genuinely critical mail
+    /// (password resets, MFA codes, security alerts) that must reach the
+    /// recipient regardless of prior delivery failures. `false` by default.
+    #[serde(default)]
+    pub ignore_suppression: bool,
 }
 
 /// Stable root path for the dev mail preview UI.
@@ -591,6 +598,7 @@ pub struct MailBuilder {
     list_unsubscribe: Option<String>,
     extra_headers: Vec<(String, String)>,
     attachments: Vec<MailAttachment>,
+    ignore_suppression: bool,
 }
 
 impl MailBuilder {
@@ -645,6 +653,19 @@ impl MailBuilder {
     #[must_use]
     pub fn list_unsubscribe(mut self, scope: impl Into<String>) -> Self {
         self.list_unsubscribe = Some(scope.into());
+        self
+    }
+
+    /// Bypass the bounce/complaint [`suppression`] list for this message.
+    ///
+    /// [`Mailer::send`] normally skips recipients that have hard-bounced or
+    /// filed a spam complaint. Call this for genuinely critical mail —
+    /// password resets, MFA codes, security alerts — that must be delivered
+    /// even to a suppressed address. Use sparingly: repeatedly sending to a
+    /// hard-bounced address is exactly what damages sender reputation.
+    #[must_use]
+    pub const fn ignore_suppression(mut self) -> Self {
+        self.ignore_suppression = true;
         self
     }
 
@@ -762,6 +783,7 @@ impl MailBuilder {
             list_unsubscribe: self.list_unsubscribe,
             extra_headers: self.extra_headers,
             attachments: self.attachments,
+            ignore_suppression: self.ignore_suppression,
         })
     }
 }
@@ -792,6 +814,12 @@ pub enum MailError {
     /// File transport failed.
     #[error("file mail transport failed: {0}")]
     Io(#[from] std::io::Error),
+    /// Every recipient of the message is on the bounce/complaint
+    /// [`suppression`] list, so nothing was delivered. Distinct from success:
+    /// callers can distinguish "sent" from "intentionally dropped". Bypass with
+    /// [`MailBuilder::ignore_suppression`] for critical mail.
+    #[error("all recipients are on the mail suppression list; nothing was sent")]
+    AllRecipientsSuppressed,
 }
 
 /// Escape hatch for custom transports.
@@ -1287,6 +1315,10 @@ pub struct Mailer {
     transport: Arc<dyn MailTransport>,
     delivery_queue: Option<Arc<dyn MailDeliveryQueue>>,
     unsubscribe: Option<Arc<UnsubscribeRuntime>>,
+    /// Bounce/complaint suppression list consulted before transport. See
+    /// [`suppression`]. `None` disables the check (suppression is opt-in on a
+    /// hand-built [`Mailer`]; the framework wires a default in-memory store).
+    suppression: Option<Arc<dyn suppression::SuppressionStore>>,
 }
 
 impl Mailer {
@@ -1335,6 +1367,7 @@ impl Mailer {
             transport: Arc::new(transport),
             delivery_queue: None,
             unsubscribe: None,
+            suppression: None,
         }
     }
 
@@ -1350,6 +1383,16 @@ impl Mailer {
     #[must_use]
     pub fn with_unsubscribe(mut self, runtime: Arc<UnsubscribeRuntime>) -> Self {
         self.unsubscribe = Some(runtime);
+        self
+    }
+
+    /// Attach the bounce/complaint [`suppression`] list consulted before
+    /// transport. Recipients on the list are skipped (and the skip is logged +
+    /// counted) unless the message opts out via
+    /// [`MailBuilder::ignore_suppression`].
+    #[must_use]
+    pub fn with_suppression(mut self, store: suppression::SuppressionStoreHandle) -> Self {
+        self.suppression = Some(store.into_inner());
         self
     }
 
@@ -1371,6 +1414,15 @@ impl Mailer {
 
     /// Send mail immediately.
     ///
+    /// Before transport, recipients on the bounce/complaint [`suppression`] list
+    /// (hard bounce or complaint) are skipped — each skip emits a structured
+    /// `outcome = "skipped_suppressed"` log line and increments
+    /// [`suppression::suppressed_skips`]. When **every** recipient is suppressed,
+    /// returns [`MailError::AllRecipientsSuppressed`] rather than reporting a
+    /// phantom success. A message built with
+    /// [`Mail::ignore_suppression`](MailBuilder::ignore_suppression) bypasses
+    /// this check entirely (critical mail).
+    ///
     /// When the message carries a [`list_unsubscribe`](Mail::list_unsubscribe)
     /// scope and a [`UnsubscribeRuntime`] is attached, recipients with a
     /// matching suppression row are skipped (with a structured log event) and
@@ -1381,10 +1433,36 @@ impl Mailer {
     ///
     /// # Errors
     ///
-    /// Returns an error from the selected transport, or from the suppression
+    /// Returns [`MailError::AllRecipientsSuppressed`] when every recipient is
+    /// suppressed, an error from the selected transport, or from the suppression
     /// store when a suppression check fails.
     pub async fn send(&self, mail: Mail) -> Result<(), MailError> {
-        let mail = mail.with_defaults(&self.defaults);
+        let mut mail = mail.with_defaults(&self.defaults);
+
+        // Consult the bounce/complaint suppression list *before* transport.
+        // Suppressed recipients are dropped from `to` (skipped, not an error)
+        // unless the message opts out via `Mail::ignore_suppression`. When every
+        // recipient is suppressed we return `AllRecipientsSuppressed` rather than
+        // reporting a phantom success.
+        if !mail.ignore_suppression
+            && let Some(store) = self.suppression.as_ref()
+            && !mail.to.is_empty()
+        {
+            let mut kept: Vec<String> = Vec::with_capacity(mail.to.len());
+            for recipient in &mail.to {
+                let canonical = canonical_subscriber(recipient);
+                if store.is_suppressed(&canonical).await? {
+                    suppression::note_skip(&canonical);
+                } else {
+                    kept.push(recipient.clone());
+                }
+            }
+            if kept.is_empty() {
+                return Err(MailError::AllRecipientsSuppressed);
+            }
+            mail.to = kept;
+        }
+
         if let Some(list_id) = mail.list_unsubscribe.clone() {
             if let Some(runtime) = self.unsubscribe.clone() {
                 return self.send_list_mail(mail, list_id, &runtime).await;
@@ -1742,6 +1820,7 @@ impl MailerBuilder {
             transport,
             delivery_queue: self.delivery_queue,
             unsubscribe: None,
+            suppression: None,
         })
     }
 }
@@ -3099,6 +3178,33 @@ pub(crate) fn install_mailer(
         }
     }
 
+    // ── Bounce/complaint suppression wiring (issue #1247) ────────────────────
+    // Zero-config: default to an in-memory store so the detect→suppress loop
+    // works out of the box on a single instance. An explicitly registered
+    // handle (e.g. a Postgres-backed `PgSuppressionStore` via
+    // `AppBuilder::with_mail_suppression_store`) wins. Unlike List-Unsubscribe
+    // suppression, no db-backed store is auto-wired: `send()` consults this on
+    // *every* message, so silently pointing it at a table that may not exist
+    // would break all outbound mail — durable backends are opt-in.
+    //
+    // The resolved handle is registered on `AppState` so inbound bounce/complaint
+    // handlers can share the exact store the `Mailer` consults.
+    if transport_sends_mail {
+        let handle = state
+            .extension::<suppression::SuppressionStoreHandle>()
+            .map_or_else(
+                || {
+                    let handle = suppression::SuppressionStoreHandle::new(
+                        suppression::InMemorySuppressionStore::new(),
+                    );
+                    state.insert_extension(handle.clone());
+                    handle
+                },
+                |arc| (*arc).clone(),
+            );
+        mailer.suppression = Some(Arc::clone(handle.inner()));
+    }
+
     state.insert_extension(mailer);
     Ok(())
 }
@@ -3289,6 +3395,438 @@ fn unsubscribe_error_html(detail: &str) -> String {
          <body><h1>Unsubscribe link is not valid</h1><p>{}</p></body></html>",
         escape_html(detail),
     )
+}
+
+/// Bounce/complaint mail suppression list (issue #1247).
+///
+/// Autumn already *detects* delivery failure: [`inbound_mail`] parses provider
+/// bounce signals and spam complaints. This module closes the loop — it records
+/// the addresses that hard-bounced or complained and has [`Mailer::send`] skip
+/// them before transport, so a sending domain's reputation survives contact
+/// with real recipients.
+///
+/// This is distinct from the recipient-initiated List-Unsubscribe suppression
+/// in [`crate::mail::unsubscribe`] (issue #838): that keys on
+/// `(subscriber, list_id)` and is driven by a user clicking "unsubscribe";
+/// this keys on a bare address and is driven by a *provider-reported* failure.
+///
+/// # Backends
+///
+/// [`InMemorySuppressionStore`] is the zero-config default (process-local,
+/// lost on restart — perfect for a single instance, tests, and review apps).
+/// [`PgSuppressionStore`] (feature `db`) persists to a `mail_suppressions`
+/// table for multi-instance deploys, mirroring the memory/durable split used
+/// by sessions and jobs. That table is **not** auto-created — provision it
+/// yourself (see [`PgSuppressionStore`]).
+///
+/// # Closing the loop
+///
+/// Wire the provided [`record_inbound`] handler into the inbound router's
+/// `on_bounce` hook (or call [`SuppressionStore::suppress`] yourself) to turn a
+/// parsed provider bounce into a suppression entry. autumn's `on_spam` signal
+/// is an *inbound spam verdict*, not an outbound FBL complaint — see
+/// [`record_inbound`] for why routing it here is a safe no-op rather than
+/// suppressing the wrong address.
+pub mod suppression {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::{MailError, canonical_subscriber};
+
+    /// Why an address is on the suppression list.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum SuppressionReason {
+        /// A permanent delivery failure (5xx SMTP / DSN hard bounce).
+        HardBounce,
+        /// A spam complaint / feedback-loop (FBL) report.
+        Complaint,
+        /// Added by an operator, not by a provider signal.
+        Manual,
+    }
+
+    impl SuppressionReason {
+        /// Stable lowercase token used in storage rows and log lines.
+        #[must_use]
+        pub const fn as_str(self) -> &'static str {
+            match self {
+                Self::HardBounce => "hard_bounce",
+                Self::Complaint => "complaint",
+                Self::Manual => "manual",
+            }
+        }
+    }
+
+    impl std::fmt::Display for SuppressionReason {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.as_str())
+        }
+    }
+
+    /// Persistent set of addresses that must not receive mail because they
+    /// hard-bounced or filed a spam complaint.
+    ///
+    /// All three methods canonicalize the address (strip any display name and
+    /// lowercase) so a suppression recorded as `Bounced@X.com` matches a later
+    /// send to `Ada <bounced@x.com>`.
+    pub trait SuppressionStore: Send + Sync {
+        /// Returns `true` when `address` must not be delivered to.
+        fn is_suppressed<'a>(
+            &'a self,
+            address: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<bool, MailError>> + Send + 'a>>;
+
+        /// Record `address` on the suppression list (idempotent). A repeat call
+        /// with a different `reason` updates the recorded reason.
+        fn suppress<'a>(
+            &'a self,
+            address: &'a str,
+            reason: SuppressionReason,
+        ) -> Pin<Box<dyn Future<Output = Result<(), MailError>> + Send + 'a>>;
+
+        /// Remove `address` from the suppression list — the manual escape hatch
+        /// (e.g. a recipient fixed their mailbox). No-op when absent.
+        fn unsuppress<'a>(
+            &'a self,
+            address: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<(), MailError>> + Send + 'a>>;
+    }
+
+    /// Cloneable handle to a [`SuppressionStore`] for storage on `AppState` and
+    /// attachment to a [`Mailer`].
+    #[derive(Clone)]
+    pub struct SuppressionStoreHandle(Arc<dyn SuppressionStore>);
+
+    impl SuppressionStoreHandle {
+        /// Wrap a store implementation.
+        #[must_use]
+        pub fn new(store: impl SuppressionStore + 'static) -> Self {
+            Self(Arc::new(store))
+        }
+
+        /// Wrap an already-shared store implementation.
+        #[must_use]
+        pub fn from_arc(store: Arc<dyn SuppressionStore>) -> Self {
+            Self(store)
+        }
+
+        /// Borrow the inner store.
+        #[must_use]
+        pub fn inner(&self) -> &Arc<dyn SuppressionStore> {
+            &self.0
+        }
+
+        /// Consume the handle, yielding the shared store.
+        #[must_use]
+        pub fn into_inner(self) -> Arc<dyn SuppressionStore> {
+            self.0
+        }
+    }
+
+    impl std::fmt::Debug for SuppressionStoreHandle {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("SuppressionStoreHandle")
+                .finish_non_exhaustive()
+        }
+    }
+
+    /// In-memory [`SuppressionStore`] — the zero-config default.
+    ///
+    /// State is process-local and lost on restart; use [`PgSuppressionStore`]
+    /// for multi-instance deploys that must share suppression across replicas.
+    #[derive(Debug, Default, Clone)]
+    pub struct InMemorySuppressionStore {
+        entries: Arc<std::sync::Mutex<std::collections::HashMap<String, SuppressionReason>>>,
+    }
+
+    impl InMemorySuppressionStore {
+        /// Create an empty in-memory store.
+        #[must_use]
+        pub fn new() -> Self {
+            Self::default()
+        }
+    }
+
+    impl SuppressionStore for InMemorySuppressionStore {
+        fn is_suppressed<'a>(
+            &'a self,
+            address: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<bool, MailError>> + Send + 'a>> {
+            Box::pin(async move {
+                let key = canonical_subscriber(address);
+                Ok(self
+                    .entries
+                    .lock()
+                    .expect("suppression lock")
+                    .contains_key(&key))
+            })
+        }
+
+        fn suppress<'a>(
+            &'a self,
+            address: &'a str,
+            reason: SuppressionReason,
+        ) -> Pin<Box<dyn Future<Output = Result<(), MailError>> + Send + 'a>> {
+            Box::pin(async move {
+                let key = canonical_subscriber(address);
+                self.entries
+                    .lock()
+                    .expect("suppression lock")
+                    .insert(key, reason);
+                Ok(())
+            })
+        }
+
+        fn unsuppress<'a>(
+            &'a self,
+            address: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<(), MailError>> + Send + 'a>> {
+            Box::pin(async move {
+                let key = canonical_subscriber(address);
+                self.entries.lock().expect("suppression lock").remove(&key);
+                Ok(())
+            })
+        }
+    }
+
+    // ── Observability: a suppressed drop is never truly silent ───────────────
+    static SUPPRESSED_SKIPS: AtomicU64 = AtomicU64::new(0);
+
+    /// Recipients [`Mailer::send`] has skipped as suppressed, process-wide.
+    ///
+    /// Counted since startup. Pair with the structured `outcome =
+    /// "skipped_suppressed"` log line emitted per skip.
+    #[must_use]
+    pub fn suppressed_skips() -> u64 {
+        SUPPRESSED_SKIPS.load(Ordering::Relaxed)
+    }
+
+    /// Record and log a skip. Internal to the `send` path.
+    pub(crate) fn note_skip(canonical_address: &str) {
+        SUPPRESSED_SKIPS.fetch_add(1, Ordering::Relaxed);
+        tracing::info!(
+            target: "mail",
+            outcome = "skipped_suppressed",
+            address = %canonical_address,
+            "skipping suppressed recipient (hard bounce or complaint); \
+             pass Mail::ignore_suppression() to override for critical mail"
+        );
+    }
+
+    /// Provided inbound handler: turn a parsed provider bounce/complaint webhook
+    /// into a suppression entry, closing the detect→suppress loop in one call.
+    ///
+    /// It only ever suppresses the *provider-reported failed/complaining
+    /// address*, never `email.to` — on an inbound webhook `to` is the app's own
+    /// inbound address, so suppressing it would let anyone who can POST to the
+    /// endpoint knock arbitrary recipients off future sends.
+    ///
+    /// - A bounce (`email.is_bounce`) suppresses the provider-reported
+    ///   [`bounced_address`](crate::inbound_mail::InboundEmail::bounced_address)
+    ///   with [`SuppressionReason::HardBounce`]. A bounce flagged with no
+    ///   address is logged and dropped (nothing suppressed).
+    /// - A complaint suppresses
+    ///   [`complained_address`](crate::inbound_mail::InboundEmail::complained_address)
+    ///   with [`SuppressionReason::Complaint`] — populated only by parsers that
+    ///   surface a genuine FBL complainant. autumn's built-in `on_spam` signal
+    ///   is an *inbound spam verdict* (`X-Mailgun-Sflag`), not an outbound FBL
+    ///   complaint, and carries no complainant address, so wiring `on_spam`
+    ///   here is a safe no-op (logged) rather than suppressing the wrong party.
+    ///
+    /// Wire it into the inbound router (see the crate `suppression` module docs
+    /// for the full shared-store example):
+    ///
+    /// ```rust,ignore
+    /// InboundMailRouter::new()
+    ///     .endpoint(InboundMailEndpointConfig::mailgun("/mail/inbound", key))
+    ///     .on_bounce(|email| Box::pin(async move {
+    ///         record_inbound(SUPPRESSION.get().unwrap().inner().as_ref(), &email).await?;
+    ///         Ok(())
+    ///     }));
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Propagates any [`MailError`] returned by the store while recording the
+    /// suppression (e.g. a database backend being unavailable).
+    #[cfg(feature = "inbound-mail")]
+    pub async fn record_inbound(
+        store: &dyn SuppressionStore,
+        email: &crate::inbound_mail::InboundEmail,
+    ) -> Result<(), MailError> {
+        if email.is_bounce {
+            // Only the provider-reported bounced address is the failed
+            // recipient; `email.to` on a bounce webhook is the app's own
+            // inbound address, so never suppress that.
+            if let Some(addr) = email.bounced_address.as_deref() {
+                store.suppress(addr, SuppressionReason::HardBounce).await?;
+            } else {
+                tracing::warn!(
+                    target: "mail",
+                    "inbound bounce webhook set is_bounce with no bounced_address; nothing suppressed"
+                );
+            }
+            return Ok(());
+        }
+        // Complaint / FBL: suppress the genuine complainant only. Never fall
+        // back to `email.to`. autumn's `on_spam` is an inbound spam verdict, not
+        // an outbound complaint, so `complained_address` is `None` there and we
+        // log rather than suppress the wrong address.
+        if let Some(addr) = email.complained_address.as_deref() {
+            store.suppress(addr, SuppressionReason::Complaint).await?;
+        } else if email
+            .spam_report
+            .as_ref()
+            .and_then(|r| r.verdict.as_deref())
+            .is_some_and(|v| v.eq_ignore_ascii_case("yes"))
+        {
+            tracing::warn!(
+                target: "mail",
+                "inbound spam verdict carries no outbound complainant address; \
+                 nothing suppressed (wire a real FBL/complaint source that \
+                 populates InboundEmail::complained_address)"
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "db")]
+    pub use pg::PgSuppressionStore;
+
+    #[cfg(feature = "db")]
+    mod pg {
+        use std::future::Future;
+        use std::pin::Pin;
+
+        use diesel::prelude::*;
+        use diesel_async::AsyncPgConnection;
+        use diesel_async::RunQueryDsl;
+        use diesel_async::pooled_connection::deadpool::Pool;
+
+        use super::super::canonical_subscriber;
+        use super::{MailError, SuppressionReason, SuppressionStore};
+
+        diesel::table! {
+            mail_suppressions (address) {
+                address -> Text,
+                reason -> Text,
+                suppressed_at -> Timestamptz,
+            }
+        }
+
+        #[derive(Insertable)]
+        #[diesel(table_name = mail_suppressions)]
+        struct NewSuppression<'a> {
+            address: &'a str,
+            reason: &'a str,
+        }
+
+        /// Postgres-backed bounce/complaint [`SuppressionStore`].
+        ///
+        /// Suppression is shared across every instance that points at the same
+        /// database.
+        ///
+        /// # Required table (no migration is shipped)
+        ///
+        /// This store does **not** create or migrate its table — provision it
+        /// yourself (same convention as the List-Unsubscribe `mail_unsubscribes`
+        /// store). Every `send` errors on the suppression lookup until it
+        /// exists:
+        ///
+        /// ```sql
+        /// CREATE TABLE mail_suppressions (
+        ///     address       TEXT PRIMARY KEY,
+        ///     reason        TEXT NOT NULL,
+        ///     suppressed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        /// );
+        /// ```
+        #[derive(Clone)]
+        pub struct PgSuppressionStore {
+            pool: Pool<AsyncPgConnection>,
+        }
+
+        impl PgSuppressionStore {
+            /// Create a store backed by `pool`.
+            #[must_use]
+            pub const fn new(pool: Pool<AsyncPgConnection>) -> Self {
+                Self { pool }
+            }
+        }
+
+        impl SuppressionStore for PgSuppressionStore {
+            fn is_suppressed<'a>(
+                &'a self,
+                address: &'a str,
+            ) -> Pin<Box<dyn Future<Output = Result<bool, MailError>> + Send + 'a>> {
+                Box::pin(async move {
+                    let key = canonical_subscriber(address);
+                    let mut conn = self.pool.get().await.map_err(|e| {
+                        MailError::RuntimeUnavailable(format!("suppression pool: {e}"))
+                    })?;
+                    let count: i64 = mail_suppressions::table
+                        .filter(mail_suppressions::address.eq(&key))
+                        .count()
+                        .get_result(&mut conn)
+                        .await
+                        .map_err(|e| {
+                            MailError::RuntimeUnavailable(format!("suppression query: {e}"))
+                        })?;
+                    Ok(count > 0)
+                })
+            }
+
+            fn suppress<'a>(
+                &'a self,
+                address: &'a str,
+                reason: SuppressionReason,
+            ) -> Pin<Box<dyn Future<Output = Result<(), MailError>> + Send + 'a>> {
+                Box::pin(async move {
+                    let key = canonical_subscriber(address);
+                    let reason_str = reason.as_str();
+                    let mut conn = self.pool.get().await.map_err(|e| {
+                        MailError::RuntimeUnavailable(format!("suppression pool: {e}"))
+                    })?;
+                    diesel::insert_into(mail_suppressions::table)
+                        .values(NewSuppression {
+                            address: &key,
+                            reason: reason_str,
+                        })
+                        .on_conflict(mail_suppressions::address)
+                        .do_update()
+                        .set(mail_suppressions::reason.eq(reason_str))
+                        .execute(&mut conn)
+                        .await
+                        .map_err(|e| {
+                            MailError::RuntimeUnavailable(format!("suppression insert: {e}"))
+                        })?;
+                    Ok(())
+                })
+            }
+
+            fn unsuppress<'a>(
+                &'a self,
+                address: &'a str,
+            ) -> Pin<Box<dyn Future<Output = Result<(), MailError>> + Send + 'a>> {
+                Box::pin(async move {
+                    let key = canonical_subscriber(address);
+                    let mut conn = self.pool.get().await.map_err(|e| {
+                        MailError::RuntimeUnavailable(format!("suppression pool: {e}"))
+                    })?;
+                    diesel::delete(
+                        mail_suppressions::table.filter(mail_suppressions::address.eq(&key)),
+                    )
+                    .execute(&mut conn)
+                    .await
+                    .map_err(|e| {
+                        MailError::RuntimeUnavailable(format!("suppression delete: {e}"))
+                    })?;
+                    Ok(())
+                })
+            }
+        }
+    }
 }
 
 /// Diesel-backed [`SuppressionStore`].
@@ -3800,6 +4338,7 @@ mod tests {
                 content_type: "application/pdf".to_owned(),
                 bytes: b"x".to_vec(),
             }],
+            ignore_suppression: false,
         };
         let eml = render_eml(&mail);
         assert!(
@@ -3828,6 +4367,7 @@ mod tests {
                 "1\r\nX-Value-Injected: 1".to_owned(),
             )],
             attachments: Vec::new(),
+            ignore_suppression: false,
         };
         let eml = render_eml(&mail);
         assert!(
@@ -3861,6 +4401,7 @@ mod tests {
                 content_type: "not a mime type".to_owned(),
                 bytes: b"x".to_vec(),
             }],
+            ignore_suppression: false,
         };
         let eml = render_eml(&mail);
         assert!(eml.contains("Content-Type: application/octet-stream"));
@@ -3883,6 +4424,7 @@ mod tests {
                 content_type: "application/pdf".to_owned(),
                 bytes: b"x".to_vec(),
             }],
+            ignore_suppression: false,
         };
         let eml = render_eml(&mail);
         assert!(eml.contains("filename*=UTF-8''"));
@@ -4030,6 +4572,7 @@ mod tests {
                     content_type: "application/pdf".to_owned(),
                     bytes: b"x".to_vec(),
                 }],
+                ignore_suppression: false,
             };
             let message = lettre_message(&mail).expect("lettre message should build");
             let formatted = String::from_utf8_lossy(&message.formatted()).into_owned();
@@ -4064,6 +4607,7 @@ mod tests {
                 content_type: "not a mime type".to_owned(),
                 bytes: b"x".to_vec(),
             }],
+            ignore_suppression: false,
         };
         let err = lettre_message(&mail).expect_err("invalid content type should error");
         assert!(matches!(err, MailError::InvalidMessage(_)));

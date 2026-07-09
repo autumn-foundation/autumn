@@ -21,6 +21,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `BlobStore::get_stream` without buffering the whole object in memory, so it
   serves large private files behind a `#[secured]` handler with no public
   presigned URL (#1141).
+- **mail:** bounce/complaint suppression list (issue #1247) — closes the
+  detect→suppress loop so a sending domain's reputation survives contact with
+  real recipients. New `autumn_web::mail::suppression` module ships a
+  `SuppressionStore` trait (`is_suppressed(addr)`, `suppress(addr, reason)`,
+  `unsuppress(addr)`) with a `SuppressionReason` enum (`HardBounce`,
+  `Complaint`, `Manual`), an `InMemorySuppressionStore` zero-config default,
+  and a `db`-feature `PgSuppressionStore` (a `mail_suppressions` table) for
+  multi-instance deploys — mirroring the memory/durable split used by sessions
+  and jobs. `Mailer::send()` now consults the store **before** transport:
+  suppressed recipients are skipped (not an error), each skip emits a
+  structured `outcome = "skipped_suppressed"` log line and bumps the
+  process-wide `suppression::suppressed_skips()` counter, and when *every*
+  recipient is suppressed `send()` returns the new
+  `MailError::AllRecipientsSuppressed` rather than a phantom success. Critical
+  mail opts out per message with `Mail::builder().ignore_suppression()`
+  (password resets, MFA codes, security alerts). The provided
+  `suppression::record_inbound` handler turns a parsed provider bounce into a
+  suppression entry in one call from the inbound router's `on_bounce` hook,
+  using the provider-reported `InboundEmail::bounced_address` (never `email.to`,
+  the app's own inbound address). It suppresses a complaint only from a genuine
+  FBL complainant in the new `InboundEmail::complained_address`; autumn's
+  `on_spam` is an inbound spam *verdict* (not an outbound complaint) and is a
+  logged no-op there, so an attacker cannot POST the inbound endpoint to force
+  addresses onto the outbound suppression list. Register a durable backend with
+  `AppBuilder::with_mail_suppression_store(...)`; the in-memory default is
+  auto-wired otherwise. **`PgSuppressionStore` ships no migration — you must
+  create the `mail_suppressions` table** (`address TEXT PRIMARY KEY, reason TEXT
+  NOT NULL, suppressed_at TIMESTAMPTZ NOT NULL DEFAULT now()`), matching the
+  List-Unsubscribe store convention. See `skills/autumn-web/SKILL.md`.
 - **ci:** README-quickstart gate against the published crates (issue #1586) —
   `.github/workflows/quickstart-gate.yml` + `scripts/check-quickstart.sh`
   install the README-pinned `autumn-cli` from crates.io (never the local
