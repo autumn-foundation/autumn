@@ -208,11 +208,17 @@ fn scan_stream(stream: &TokenStream, file: &str, result: &mut ScanResult) {
         if let TokenTree::Ident(ident) = &trees[i] {
             let name = ident.to_string();
 
-            // Macro form: `t ! ( <locale>, "key" [, args] )`.
+            // Macro form: `t ! ( <locale>, "key" [, args] )`. `t!` is a proc
+            // macro, so every Rust macro delimiter — `t!(...)`, `t!{...}`,
+            // `t![...]` — compiles and carries the same token stream; accept
+            // all three (but not `Delimiter::None` implicit groups).
             if name == "t"
                 && matches!(trees.get(i + 1), Some(TokenTree::Punct(p)) if p.as_char() == '!')
                 && let Some(TokenTree::Group(group)) = trees.get(i + 2)
-                && group.delimiter() == Delimiter::Parenthesis
+                && matches!(
+                    group.delimiter(),
+                    Delimiter::Parenthesis | Delimiter::Brace | Delimiter::Bracket
+                )
             {
                 record_key_at(&group.stream(), 1, file, result);
                 i += 3;
@@ -220,25 +226,40 @@ fn scan_stream(stream: &TokenStream, file: &str, result: &mut ScanResult) {
             }
 
             // Call form: `(t|t_with) ( <args> )`, not a macro invocation.
+            // Only a METHOD (`receiver.t(...)`) or ASSOCIATED (`Type::t(...)`)
+            // call is an Autumn translation site — the sole `t`/`t_with` entry
+            // points are the `Locale::t` / `Locale::t_with` methods. A bare
+            // free-function `t("...")` (some project's own helper/fixture) is
+            // NOT a translation reference and must be left alone; the
+            // free-standing translation form is the `t!` macro handled above.
             if (name == "t" || name == "t_with")
                 && let Some(TokenTree::Group(group)) = trees.get(i + 1)
                 && group.delimiter() == Delimiter::Parenthesis
             {
-                // A method call `receiver.t("key")` is preceded by `.` and puts
-                // the key first. A free/associated call `Locale::t(&loc, "key")`
-                // places the receiver first, so the key is the first *literal*
-                // argument. Either way, taking the first string-literal argument
-                // recovers the key (a `t_with` call's later `("name","val")`
-                // args never precede the key).
-                let preceded_by_dot =
-                    i > 0 && matches!(&trees[i - 1], TokenTree::Punct(p) if p.as_char() == '.');
-                if preceded_by_dot {
-                    record_key_at(&group.stream(), 0, file, result);
-                } else {
-                    record_first_literal_key(&group.stream(), file, result);
+                let prev_punct = i.checked_sub(1).and_then(|j| match &trees[j] {
+                    TokenTree::Punct(p) => Some(p.as_char()),
+                    _ => None,
+                });
+                match prev_punct {
+                    // Method call `receiver.t("key")`: preceded by `.`, key is
+                    // the first argument.
+                    Some('.') => {
+                        record_key_at(&group.stream(), 0, file, result);
+                        i += 2;
+                        continue;
+                    }
+                    // Associated call `Locale::t(&loc, "key")`: the `::` path
+                    // separator tokenizes as two `:` puncts, so the token before
+                    // `t` is `:`. The receiver comes first, so the key is the
+                    // first string-literal argument.
+                    Some(':') => {
+                        record_first_literal_key(&group.stream(), file, result);
+                        i += 2;
+                        continue;
+                    }
+                    // Bare free-function `t(...)` — not a translation call.
+                    _ => {}
                 }
-                i += 2;
-                continue;
             }
         }
 
@@ -814,6 +835,53 @@ mod tests {
                 "nav.brand",
                 "nav.home",
             ])
+        );
+        assert!(result.dynamic.is_empty());
+    }
+
+    #[test]
+    fn free_function_t_is_not_a_translation_reference() {
+        // A bare `t("...")` free function (e.g. a project's own helper or a test
+        // fixture accessor) is NOT an Autumn translation call — only the `t!`
+        // macro, the `.t(...)`/`.t_with(...)` methods, and the `Type::t(...)`
+        // associated form are. A free `t(...)` must not pollute referenced keys.
+        let src = r#"
+            fn t(name: &str) -> Fixture {
+                Fixture::load(name)
+            }
+            fn view(locale: &Locale) {
+                let _ = t("fixture-name");
+                let _ = locale.t("nav.home");
+                let _ = Locale::t(&locale, "nav.title");
+                let _ = t!(locale, "nav.macro");
+            }
+        "#;
+        let mut result = ScanResult::default();
+        scan_source(src, "view.rs", &mut result);
+        assert_eq!(
+            result.referenced,
+            keys(&["nav.home", "nav.macro", "nav.title"]),
+            "the bare free `t(\"fixture-name\")` call must be ignored"
+        );
+        assert!(result.dynamic.is_empty());
+    }
+
+    #[test]
+    fn macro_accepts_all_delimiters() {
+        // `t!` is a proc macro, so brace/bracket invocations compile just like
+        // the parenthesized form and carry the same key; all three must record.
+        let src = r#"
+            fn view(locale: &Locale) {
+                let _ = t!(locale, "nav.paren");
+                let _ = t!{ locale, "nav.home" };
+                let _ = t![locale, "nav.brace"];
+            }
+        "#;
+        let mut result = ScanResult::default();
+        scan_source(src, "view.rs", &mut result);
+        assert_eq!(
+            result.referenced,
+            keys(&["nav.brace", "nav.home", "nav.paren"])
         );
         assert!(result.dynamic.is_empty());
     }
