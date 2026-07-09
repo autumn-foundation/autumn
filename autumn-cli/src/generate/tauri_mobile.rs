@@ -687,13 +687,18 @@ fn autumn_web_patch_entry(dir: &Path) -> Option<(String, toml::Value)> {
 /// - the app itself when its manifest declares `[workspace]` (own root) or
 ///   no enclosing workspace exists (standalone),
 /// - the target of an explicit `package.workspace = "…"` pointer,
-/// - otherwise the nearest ancestor manifest declaring `[workspace]` —
-///   unless that ancestor's `workspace.exclude` covers the app's directory
-///   (exact relative path OR any ancestor directory of it, matched by
-///   whole path components — Cargo treats exclude entries as directory
-///   prefixes, so `exclude = ["examples"]` excludes `examples/mobile` but
-///   never `examples-extra/mobile`; glob patterns are not expanded — the
-///   cheap rule), in which case the app is standalone.
+/// - otherwise the nearest ancestor manifest declaring `[workspace]` whose
+///   `workspace.exclude` does NOT cover the app's directory (exact relative
+///   path OR any ancestor directory of it, matched by whole path
+///   components — Cargo treats exclude entries as directory prefixes, so
+///   `exclude = ["examples"]` excludes `examples/mobile` but never
+///   `examples-extra/mobile`; glob patterns are not expanded — the cheap
+///   rule). An EXCLUDING ancestor does not stop the walk: exclusion at one
+///   level only removes the app from THAT workspace, not from an outer
+///   workspace's membership, so the walk continues upward (Cargo reports
+///   the outer root as `workspace_root` for e.g. repo-root
+///   `members = ["mid/app"]` with `mid` excluding `app`). Only when no
+///   non-excluding ancestor root exists is the app standalone.
 ///
 /// Full `members` glob verification is deliberately skipped: a nearest
 /// ancestor root that does not include the member is a broken workspace
@@ -738,13 +743,14 @@ pub fn effective_workspace_root(project_root: &Path) -> std::path::PathBuf {
                             .is_some_and(|relative| relative.starts_with(Path::new(entry)))
                     })
                 });
-            return if excluded {
-                // Excluded members are standalone: their own manifest's
-                // patch table is the effective one.
-                project_root.to_path_buf()
-            } else {
-                d.to_path_buf()
-            };
+            if !excluded {
+                return d.to_path_buf();
+            }
+            // An excluding ancestor doesn't make the app standalone:
+            // exclusion only removes the app from THIS workspace, not from
+            // an outer workspace's membership. Keep walking — an outer root
+            // (e.g. repo root with `members = ["mid/app"]` while `mid`
+            // excludes `app`) is the one Cargo binds the app to.
         }
         dir = d.parent();
     }
@@ -3441,6 +3447,92 @@ mod tests {
             "the member-local patch skip must warn, got {:?}",
             plan.warnings
         );
+    }
+
+    #[test]
+    fn offline_exclusion_by_an_intermediate_ancestor_walks_to_the_outer_root() {
+        // Repo root `members = ["mid/app"]` while `mid` declares its own
+        // `[workspace]` excluding `app`: exclusion at the intermediate level
+        // only removes the app from MID's workspace, not from the repo
+        // root's membership — Cargo reports the repo root as
+        // `workspace_root`, so the ROOT's patch table is the effective one.
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"mid/app\"]\n\n\
+             [patch.crates-io]\nautumn-web = { path = \"/src/outer/autumn\" }\n",
+        )
+        .unwrap();
+        let mid = tmp.path().join("mid");
+        std::fs::create_dir_all(&mid).unwrap();
+        std::fs::write(
+            mid.join("Cargo.toml"),
+            "[workspace]\nmembers = []\nexclude = [\"app\"]\n\n\
+             [patch.crates-io]\nautumn-web = { path = \"/src/intermediate/autumn\" }\n",
+        )
+        .unwrap();
+        let app = mid.join("app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(
+            app.join("Cargo.toml"),
+            "[package]\nname = \"my-app\"\nversion = \"0.2.3\"\n\n\
+             [dependencies]\nautumn-web = \"0.9.1\"\n",
+        )
+        .unwrap();
+        let mut plan = Plan::new(&app);
+        let dep = shell_autumn_web_dep(&app, &mut plan);
+        let patch = dep
+            .patch_entry
+            .expect("the OUTER root's patch must be mirrored past the excluding mid");
+        assert!(
+            patch.contains(r#"autumn-web = { path = "/src/outer/autumn" }"#),
+            "got: {patch}"
+        );
+        assert!(
+            !patch.contains("/src/intermediate/autumn"),
+            "the excluding intermediate's patch must not leak in: {patch}"
+        );
+        assert!(plan.warnings.is_empty(), "got {:?}", plan.warnings);
+    }
+
+    #[test]
+    fn offline_exclusion_with_no_outer_workspace_is_still_standalone() {
+        // Regression for the continue-the-walk fix: when the excluding
+        // ancestor is the ONLY workspace above the app, the walk finds no
+        // outer root and the app remains standalone — its own patch table
+        // stays the effective one (the pre-existing behavior).
+        let tmp = TempDir::new().unwrap();
+        let mid = tmp.path().join("mid");
+        std::fs::create_dir_all(&mid).unwrap();
+        std::fs::write(
+            mid.join("Cargo.toml"),
+            "[workspace]\nmembers = []\nexclude = [\"app\"]\n\n\
+             [patch.crates-io]\nautumn-web = { path = \"/src/intermediate/autumn\" }\n",
+        )
+        .unwrap();
+        let app = mid.join("app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(
+            app.join("Cargo.toml"),
+            "[package]\nname = \"my-app\"\nversion = \"0.2.3\"\n\n\
+             [dependencies]\nautumn-web = \"0.9.1\"\n\n\
+             [patch.crates-io]\nautumn-web = { path = \"/src/standalone/autumn\" }\n",
+        )
+        .unwrap();
+        let mut plan = Plan::new(&app);
+        let dep = shell_autumn_web_dep(&app, &mut plan);
+        let patch = dep
+            .patch_entry
+            .expect("the excluded (standalone) app's own patch must be mirrored");
+        assert!(
+            patch.contains(r#"autumn-web = { path = "/src/standalone/autumn" }"#),
+            "got: {patch}"
+        );
+        assert!(
+            !patch.contains("/src/intermediate/autumn"),
+            "the excluding ancestor's patch must not leak in: {patch}"
+        );
+        assert!(plan.warnings.is_empty(), "got {:?}", plan.warnings);
     }
 
     #[test]
