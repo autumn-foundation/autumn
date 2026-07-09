@@ -53,8 +53,11 @@
 //! a group whose values are all `NULL` yields `None`, and an empty result set
 //! is an empty `Vec`.
 //!
-//! The **group (key) column must be `NOT NULL`**: a nullable group key
-//! (`K = Option<T>`) is unsupported and rejected at compile time. Nullable
+//! A nullable group-key **type** (`K = Option<T>`) is unsupported and rejected
+//! at compile time. A nullable group-key **column** is safe, however: rows with
+//! a `NULL` group key are silently **excluded** from the results (the generated
+//! SQL guards the group column with `IS NOT NULL`), so a `NULL` group is simply
+//! omitted rather than deserialized into the non-nullable `K`. Nullable
 //! **value** columns are fine — an all-`NULL` group yields `(key, None)`.
 //!
 //! ## Scoping

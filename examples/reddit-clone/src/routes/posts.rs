@@ -73,6 +73,12 @@ pub async fn front_page(
     // *read*, so it is replica-eligible (routes through the repository's read
     // route). The score-maintenance path in `routes::votes` stays an atomic
     // primary-side WRITE — see the note there.
+    //
+    // `votes.post_id` is nullable (comment votes carry a NULL `post_id`), and
+    // the grouped-aggregate codegen guards the group column with `IS NOT NULL`,
+    // so the NULL group is excluded — this leaderboard counts only
+    // post-directed votes (comment votes are correctly omitted), no per-call
+    // filter needed.
     let top_by_votes: Vec<(i64, Option<i64>)> = votes_repo
         .sum_value_grouped_by_post_id()
         .order_by_aggregate_desc()

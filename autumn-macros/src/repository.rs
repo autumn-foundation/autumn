@@ -8531,6 +8531,16 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 let mut __n: i32 = 0;
                                 #soft_delete_cond
                                 #tenant_cond
+                                // A non-nullable declared key type cannot represent a
+                                // NULL group (and `Option<K>` is rejected at compile
+                                // time), so exclude rows whose raw group column is NULL —
+                                // otherwise `GROUP BY` would emit a NULL-key group that
+                                // fails to deserialize at runtime (#1364). Guarding the
+                                // raw column also drops null-timestamp rows under
+                                // `.bucket()` (date_trunc of NULL is NULL). No bind param,
+                                // so the `$n` numbering below is unaffected. Harmless
+                                // no-op when the column is already NOT NULL.
+                                __conds.push(format!("{col} IS NOT NULL", col = #group_col_q));
                                 let __eq_n = { __n += 1; __n };
                                 __conds.push(format!("(${n} IS NULL OR {col} = ${n})", n = __eq_n, col = #group_col_q));
                                 let __low_n = { __n += 1; __n };
@@ -12084,6 +12094,34 @@ mod tests {
         assert!(
             generated.contains("CURRENT_TENANT"),
             "tenant-scoped aggregate must resolve the active tenant: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_grouped_aggregate_excludes_null_group_keys() {
+        // §1364: because the declared key type is non-nullable (and `Option<K>`
+        // is a compile error), a NULL group would fail to deserialize at
+        // runtime. The generated SQL must always guard the raw group column
+        // with `IS NOT NULL` so NULL-key rows are silently excluded — safe even
+        // when the column is already NOT NULL (the planner drops the predicate).
+        let generated = repository_macro(
+            quote! { Vote, table = "votes" },
+            quote! {
+                pub trait VoteRepository {
+                    fn sum_value_grouped_by_post_id() -> Vec<(i64, Option<i64>)>;
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("pub fn sum_value_grouped_by_post_id"),
+            "grouped-aggregate method must be generated: {generated}"
+        );
+        assert_eq!(
+            generated.matches("IS NOT NULL").count(),
+            1,
+            "grouped aggregate must emit exactly one `IS NOT NULL` group-key guard: {generated}"
         );
     }
 

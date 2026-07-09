@@ -316,9 +316,12 @@ The trait method **must** declare its pair return type; the macro reads `K` and
 timestamp's type). `sum`/`min`/`max`/`avg` are **null-safe**: a group whose
 values are all `NULL` yields `None`, and an empty result set is an empty `Vec`.
 
-The **group (key) column must be `NOT NULL`**. A nullable group key
-(`K = Option<T>`) is unsupported and rejected at compile time. Nullable **value**
-columns are fine — an all-`NULL` group simply yields `(key, None)`.
+A nullable group-key **type** (`K = Option<T>`) is unsupported and rejected at
+compile time. A nullable group-key **column** is safe: rows whose group key is
+`NULL` are silently **excluded** from the results (the generated query guards the
+group column with `IS NOT NULL`), so the `NULL` group is omitted rather than
+deserialized into the non-nullable `K`. Nullable **value** columns are fine — an
+all-`NULL` group simply yields `(key, None)`.
 
 ### Builder chain
 
