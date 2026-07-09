@@ -285,7 +285,15 @@ fn scan_stream(stream: &TokenStream, file: &str, result: &mut ScanResult) {
                     // records the KEY argument's `status.` prefix instead of
                     // mistaking the receiver for a fully-dynamic (empty-prefix)
                     // key and suppressing every Unused warning project-wide.
-                    Some(':') => {
+                    //
+                    // Require a *real* `::` — TWO consecutive `:` puncts (the
+                    // second, immediately before `t`, joined to the first with
+                    // `Spacing::Joint`). A SINGLE `:` is a struct field value
+                    // (`Widget { label: t(loc, "k") }`), a type annotation, a
+                    // match arm, etc. — there the `t`/`t_with` is a bare free
+                    // function, NOT `Locale::t`, and must be left alone (same as
+                    // any other free function named `t`).
+                    Some(':') if has_double_colon_before(&trees, i) => {
                         record_key_at(&group.stream(), 1, file, result);
                         // Recurse into the arg group so a nested translation
                         // call in the args is scanned too. The key slot cannot
@@ -308,6 +316,25 @@ fn scan_stream(stream: &TokenStream, file: &str, result: &mut ScanResult) {
     }
 }
 
+/// Whether the identifier at `trees[i]` is preceded by a real `::` path
+/// separator — two consecutive `:` [`Punct`](TokenTree::Punct) tokens, the
+/// first (`trees[i - 2]`) joined to the second with [`Spacing::Joint`], which is
+/// how `::` tokenizes.
+///
+/// The caller has already confirmed `trees[i - 1]` is a `:` punct. A lone `:`
+/// (struct field value, type annotation, match arm, closure return type) is not
+/// a path separator, so a `t`/`t_with` call after it is a bare free function
+/// rather than an associated `Locale::t` call.
+fn has_double_colon_before(trees: &[TokenTree], i: usize) -> bool {
+    let Some(j) = i.checked_sub(2) else {
+        return false;
+    };
+    matches!(
+        &trees[j],
+        TokenTree::Punct(p) if p.as_char() == ':' && p.spacing() == proc_macro2::Spacing::Joint
+    )
+}
+
 /// Split a call/macro argument [`TokenStream`] on its **top-level** commas.
 ///
 /// Nested commas (inside `(...)`, `[...]`, `{...}`) live within a single
@@ -317,15 +344,36 @@ fn scan_stream(stream: &TokenStream, file: &str, result: &mut ScanResult) {
 /// non-`Expr` token) in *another* argument position cannot discard a literal
 /// key — e.g. `t!($locale, "nav.home")` or `.t_with("nav.home", &[("n", $n)])`
 /// written inside a `macro_rules!` transcriber still records `nav.home`.
+///
+/// Angle-bracket generics and turbofish — `locale_for::<A, B>()`, `Vec<A, B>` —
+/// are NOT wrapped in a [`TokenTree::Group`] the way `()`/`[]`/`{}` are, so a
+/// comma inside `<...>` would otherwise be mistaken for an argument separator
+/// and shift the literal key out of its slot. This is the fallback path (the
+/// grammar-aware [`split_call_args`] parse having failed, e.g. on a macro body
+/// with a `$metavariable`), so we can't lean on `syn`. Instead we do a
+/// best-effort angle balance: track nesting depth by counting `<` / `>` puncts
+/// and treat a comma as a separator only at depth 0. proc-macro2 yields joined
+/// `<<` / `>>` as two individual `<`/`>` puncts, so counting each punct balances
+/// `Vec<Vec<T>>`; the saturating decrement keeps a stray `>` at depth 0 from
+/// underflowing. A stray comparison operator is very unlikely in a translation
+/// call's argument list, so this heuristic is safe here.
 fn split_top_level_args(args: &TokenStream) -> Vec<TokenStream> {
     let mut segments = Vec::new();
     let mut current: Vec<TokenTree> = Vec::new();
+    let mut angle_depth: u32 = 0;
     for tt in args.clone() {
-        if matches!(&tt, TokenTree::Punct(p) if p.as_char() == ',') {
-            segments.push(std::mem::take(&mut current).into_iter().collect());
-        } else {
-            current.push(tt);
+        match &tt {
+            TokenTree::Punct(p) if p.as_char() == '<' => angle_depth += 1,
+            TokenTree::Punct(p) if p.as_char() == '>' => {
+                angle_depth = angle_depth.saturating_sub(1);
+            }
+            TokenTree::Punct(p) if p.as_char() == ',' && angle_depth == 0 => {
+                segments.push(std::mem::take(&mut current).into_iter().collect());
+                continue;
+            }
+            _ => {}
         }
+        current.push(tt);
     }
     if !current.is_empty() {
         segments.push(current.into_iter().collect());
@@ -1221,6 +1269,59 @@ mod tests {
     }
 
     #[test]
+    fn single_colon_field_value_t_call_is_not_an_associated_call() {
+        // A `t`/`t_with` free function used as a struct field value is preceded
+        // by the FIELD colon — a SINGLE `:` punct, not the `::` path separator of
+        // an associated `Locale::t` call. Treating a lone `:` as `::` would record
+        // unrelated literals as referenced keys and turn `t_with(.., &[])` into an
+        // empty-prefix dynamic site that suppresses `--strict` unused checks. A
+        // real `::` (two joined colons) is required, so these bare calls are
+        // ignored just like any other free function named `t`.
+        let src = r#"
+            fn view(locale: &Locale) {
+                let _ = Widget { label: t(locale, "fixture") };
+                let _ = Config { args: t_with("fixture", &[]) };
+            }
+        "#;
+        let mut result = ScanResult::default();
+        scan_source(src, "view.rs", &mut result);
+        assert!(
+            result.referenced.is_empty(),
+            "a single-colon field-value `t(...)`/`t_with(...)` must not be recorded \
+             as a referenced key: {:?}",
+            result.referenced
+        );
+        assert!(
+            result.dynamic.is_empty(),
+            "a single-colon field-value call must not create a dynamic site \
+             (which would suppress unused checks): {:?}",
+            result.dynamic
+        );
+    }
+
+    #[test]
+    fn real_associated_call_with_two_colons_still_records_key() {
+        // The genuine associated form `Locale::t(&loc, "key")` /
+        // `Locale::t_with(&loc, "key", &[])` carries a real `::` (two joined `:`
+        // puncts) before the fn name and must still record its key at slot 1.
+        let src = r#"
+            fn view(loc: &Locale) {
+                let _ = Locale::t(&loc, "nav.home");
+                let _ = Locale::t_with(&loc, "nav.count", &[]);
+            }
+        "#;
+        let mut result = ScanResult::default();
+        scan_source(src, "view.rs", &mut result);
+        assert_eq!(
+            result.referenced,
+            keys(&["nav.count", "nav.home"]),
+            "a real `::` associated call must still record its key: {:?}",
+            result.referenced
+        );
+        assert!(result.dynamic.is_empty());
+    }
+
+    #[test]
     fn macro_accepts_all_delimiters() {
         // `t!` is a proc macro, so brace/bracket invocations compile just like
         // the parenthesized form and carry the same key; all three must record.
@@ -1382,6 +1483,38 @@ mod tests {
         assert!(
             result.dynamic.is_empty(),
             "metavariables in non-key positions must not create dynamic sites: {:?}",
+            result.dynamic
+        );
+    }
+
+    #[test]
+    fn metavariable_with_generic_in_earlier_arg_keeps_key_slot() {
+        // A `macro_rules!` transcriber can combine a `$metavariable` argument
+        // with a turbofish carrying more than one type parameter in an EARLIER
+        // argument: `t!(locale_for::<A, B>(), "nav.home", name = $name)`. The `$`
+        // token makes the grammar-aware `syn` split fail, so the fallback token
+        // splitter runs — and it must be angle-bracket aware, or the comma in
+        // `<A, B>` shifts the key out of slot 1 (slot 1 becomes `B>()`) and the
+        // literal key is silently lost, letting a deleted key pass the check.
+        let src = r#"
+            macro_rules! nav {
+                ($name:expr) => {
+                    let _ = t!(locale_for::<A, B>(), "nav.home", name = $name);
+                };
+            }
+        "#;
+        let mut result = ScanResult::default();
+        scan_source(src, "macros.rs", &mut result);
+        assert_eq!(
+            result.referenced,
+            keys(&["nav.home"]),
+            "the literal key must stay in slot 1 despite the multi-param generic \
+             in an earlier argument on the metavariable fallback path: {:?}",
+            result.referenced
+        );
+        assert!(
+            result.dynamic.is_empty(),
+            "no bogus dynamic site from a `B>()` fragment on the fallback path: {:?}",
             result.dynamic
         );
     }
