@@ -397,7 +397,10 @@ impl LogLevelsInner {
     /// per-target override, e.g. `"info,my_app::module=trace"`. Targets are
     /// sorted for deterministic output.
     fn build_directive(&self) -> String {
-        let mut parts = vec![self.current_level.clone()];
+        let mut parts = Vec::new();
+        if !self.current_level.is_empty() {
+            parts.push(self.current_level.clone());
+        }
         let mut targets: Vec<String> = self
             .logger_overrides
             .iter()
@@ -410,14 +413,49 @@ impl LogLevelsInner {
     }
 }
 
+/// Split a startup `log.level` value — which may be a full `EnvFilter`
+/// directive such as `"info,tower_http=warn,my_app=debug"` — into a bare
+/// global level plus per-target overrides.
+///
+/// Seeding the overrides map at construction ensures that a later
+/// `PUT /actuator/loggers/root` (which replaces only the global level) does
+/// not silently drop the module-specific directives configured at startup.
+/// Segments containing `=` become per-target overrides (keyed on the part
+/// before the final `=`, so span-field directives round-trip); a bare segment
+/// sets the global level, last one winning to match `EnvFilter` precedence.
+fn parse_initial_directive(directive: &str) -> (String, HashMap<String, String>) {
+    let mut global = String::new();
+    let mut overrides = HashMap::new();
+    for segment in directive.split(',') {
+        let segment = segment.trim();
+        if segment.is_empty() {
+            continue;
+        }
+        if let Some((target, level)) = segment.rsplit_once('=') {
+            let target = target.trim();
+            let level = level.trim();
+            // `root=<level>` / `=<level>` are just the global level in disguise.
+            if target.is_empty() || target == "root" {
+                global = level.to_string();
+            } else {
+                overrides.insert(target.to_string(), level.to_string());
+            }
+        } else {
+            global = segment.to_string();
+        }
+    }
+    (global, overrides)
+}
+
 impl LogLevels {
     /// Create a new `LogLevels` with the given initial level.
     #[must_use]
     pub fn new(initial_level: &str) -> Self {
+        let (current_level, logger_overrides) = parse_initial_directive(initial_level);
         Self {
             inner: Arc::new(RwLock::new(LogLevelsInner {
-                current_level: initial_level.to_string(),
-                logger_overrides: HashMap::new(),
+                current_level,
+                logger_overrides,
                 reload_handle: None,
             })),
         }
@@ -458,6 +496,16 @@ impl LogLevels {
         self.inner
             .read()
             .map(|guard| guard.logger_overrides.clone())
+            .unwrap_or_default()
+    }
+
+    /// The combined `EnvFilter` directive currently pushed to the live
+    /// subscriber (global level plus per-target overrides). Test-only.
+    #[cfg(test)]
+    fn rebuilt_directive_for_test(&self) -> String {
+        self.inner
+            .read()
+            .map(|guard| guard.build_directive())
             .unwrap_or_default()
     }
 
@@ -4771,6 +4819,50 @@ mod tests {
         let change = levels.set_logger_level("root", "trace");
         assert_eq!(change.previous(), Some("info"));
         assert_eq!(levels.current_level(), "trace");
+    }
+
+    #[test]
+    fn root_level_change_preserves_startup_per_target_directives() {
+        // Regression: an app configured with a full `EnvFilter` directive at
+        // startup must not lose its per-target directives when
+        // `PUT /actuator/loggers/root` replaces only the global level.
+        let levels = LogLevels::new("info,tower_http=warn,my_app=debug");
+        levels.attach_reload_handle(crate::telemetry::FilterReloadHandle::accept_all_for_test());
+
+        // The startup per-target directives are seeded as overrides, leaving
+        // only the bare global level in `current_level`.
+        let seeded = levels.logger_overrides();
+        assert_eq!(seeded.get("tower_http").map(String::as_str), Some("warn"));
+        assert_eq!(seeded.get("my_app").map(String::as_str), Some("debug"));
+        assert_eq!(levels.current_level(), "info");
+
+        // Raising the root level must NOT wipe the module-specific directives.
+        let change = levels.set_logger_level("root", "warn");
+        assert!(matches!(change, LogLevelChange::Applied { .. }));
+        assert_eq!(levels.current_level(), "warn");
+
+        let overrides = levels.logger_overrides();
+        assert_eq!(
+            overrides.get("tower_http").map(String::as_str),
+            Some("warn"),
+            "tower_http directive must survive a root-level change"
+        );
+        assert_eq!(
+            overrides.get("my_app").map(String::as_str),
+            Some("debug"),
+            "my_app directive must survive a root-level change"
+        );
+
+        // The rebuilt live directive still carries both per-target directives.
+        let directive = levels.rebuilt_directive_for_test();
+        assert!(
+            directive.contains("tower_http=warn"),
+            "rebuilt directive dropped tower_http: {directive}"
+        );
+        assert!(
+            directive.contains("my_app=debug"),
+            "rebuilt directive dropped my_app: {directive}"
+        );
     }
 
     // ── Prometheus endpoint tests ──────────────────────────────

@@ -33,7 +33,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   response reports `"applied": true` / `"status":"ok"` only when the change
   actually reached a reload-capable subscriber, and `"status":"recorded"` /
   `"applied": false` otherwise — no silent false-positive. Invalid levels still
-  return `400`.
+  return `400`. A startup `log.level` that is a full `EnvFilter` directive
+  (e.g. `"info,tower_http=warn,my_app=debug"`) now seeds its per-target
+  segments into the override map at construction, so changing the `root` level
+  at runtime no longer drops the module-specific directives configured at
+  startup.
 - **actuator:** `GET /actuator/info` now exposes build + git provenance for
   deploy/rollback verification (issue #1242): a `build` object with the app
   version, an ISO-8601 UTC build timestamp, and a `git` sub-object (full +
