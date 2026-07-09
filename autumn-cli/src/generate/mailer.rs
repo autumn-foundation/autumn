@@ -346,6 +346,10 @@ impl {struct_name} {{
             .subject("{struct_name}")
             .html(include_str!("../../../templates/mailers/{snake_name}.html"))
             .text(include_str!("../../../templates/mailers/{snake_name}.txt")){layout_call}
+            // Match the production mailer's opt-in so the preview renders the
+            // `<style>` rules inlined regardless of the app's `mail.inline_css`
+            // config default. See issue #1254.
+            .inline_css(true)
             .build()
             .expect("valid preview mail")
     }}
@@ -1083,6 +1087,28 @@ async fn main() {
         assert!(
             mailer.contains(".inline_css(true)"),
             "generated mailer must enable CSS inlining: {mailer}"
+        );
+    }
+
+    #[test]
+    fn generated_preview_enables_css_inlining() {
+        // AC6 (issue #1254): the generated preview fixture must carry the same
+        // `.inline_css(true)` opt-in the production mailer has, so a scaffolded
+        // mailer's preview is inlined regardless of the app's `mail.inline_css`
+        // config default (the preview route resolves per-message-override-or-
+        // config-default, so without the override a `false` default would show
+        // RAW `<style>` CSS even though a real send is inlined).
+        let tmp = project_with_main(default_main());
+        plan_mailer(tmp.path(), "Welcome", None, false)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+
+        let preview =
+            fs::read_to_string(tmp.path().join("src/mailers/previews/welcome.rs")).unwrap();
+        assert!(
+            preview.contains(".inline_css(true)"),
+            "generated preview fixture must enable CSS inlining to match the mailer: {preview}"
         );
     }
 
