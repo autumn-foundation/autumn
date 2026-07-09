@@ -21,6 +21,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `BlobStore::get_stream` without buffering the whole object in memory, so it
   serves large private files behind a `#[secured]` handler with no public
   presigned URL (#1141).
+- **repository:** race-safe get-or-insert (#1382) — declaring
+  `fn find_or_create_by_<field>[_and_<field>...](...)` in a `#[repository]`
+  trait generates an inherent
+  `find_or_create_by_<field>(&self, <field>: <Ty>, ..., new: &NewModel) ->
+  AutumnResult<(Model, bool)>` that returns the model plus a `created` flag. It
+  looks the row up on the read path first (replica-eligible, honoring tenant
+  scoping and soft-delete); if absent it inserts on the primary with
+  `ON CONFLICT DO NOTHING`, so under concurrent callers exactly one row is
+  created, exactly one caller observes `created == true`, and no
+  unique-violation (`23505`) is ever surfaced — a concurrent loser re-reads its
+  own write on the primary and returns `(row, false)`. `before_create` /
+  `after_create` and the durable commit-hook queue fire only on the created
+  path, and — unlike `upsert_many` — the method is generated even on hooked
+  repositories. Race-safety requires a unique constraint covering the lookup
+  column(s); `_or_` is rejected because it would span constraints. See the
+  "Race-safe get-or-insert" section of the repositories guide.
 - **ci:** README-quickstart gate against the published crates (issue #1586) —
   `.github/workflows/quickstart-gate.yml` + `scripts/check-quickstart.sh`
   install the README-pinned `autumn-cli` from crates.io (never the local
