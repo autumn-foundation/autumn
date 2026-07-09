@@ -61,6 +61,7 @@ the framework almost certainly already generates or ships it:
 | Hand-rolled pager markup (page-number windows, prev/next links) | `pagination_nav(&page, &PagerOptions::new("/posts"))` / `cursor_pagination_nav` (unreleased) |
 | Hand-rolled cross-module notifications (calling every reaction inline) | `#[event]` + `#[listener]` typed event bus, `.listeners(listeners![...])` (unreleased) |
 | Hand-rolled cards, tabs, modals, delete-confirm dialogs, method-override links | `autumn_web::widgets`: `card`/`stat_card`, `tabs`, `modal`/`confirm_action`, `link_to`/`button_to` + `ui::WIDGETS_CSS_PATH` stylesheet (unreleased) |
+| Hand-built file-download responses (manual `Content-Disposition`/`Content-Type`/`Content-Length` headers, byte-buffered blob reads) | `autumn_web::download::Download` — `from_bytes` / `from_stream` / `from_async_read` / `from_blob(&store, key).await?` + `.filename(...)` / `.content_type(...)` / `.inline()`; RFC 5987 filenames, injection-safe, streams blobs without buffering (unreleased) |
 
 When none of these fit, dropping to raw Axum (`.merge()`/`.nest()`/`.layer()`)
 or raw Diesel (`&mut *db` with `diesel_async`) is supported and fine — but only

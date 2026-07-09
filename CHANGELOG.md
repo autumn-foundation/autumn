@@ -10,6 +10,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **generator:** `autumn generate controller <name> <action>...` scaffolds a handler-only module (named actions, wired routes, Maud stub views) for non-CRUD pages/endpoints — no model, migration, or DB; `--api` emits JSON actions. (issue #1050)
+- **download:** typed `Download` `IntoResponse` (`autumn_web::download::Download`)
+  for serving files from a handler without hand-rolling headers. Construct it
+  from owned bytes, an async byte stream, an `AsyncRead`, or a stored blob
+  (`Download::from_blob(&store, key).await?`), then chain `.filename(...)`,
+  `.content_type(...)`, and `.inline()`. It sets `Content-Disposition`
+  (RFC 5987-encoded for non-ASCII names, sanitized against header injection),
+  infers `Content-Type` from the filename extension (or blob metadata, falling
+  back to `application/octet-stream`), and sets `Content-Length` when the size
+  is known. The blob-backed path streams via the new
+  `BlobStore::get_stream` without buffering the whole object in memory, so it
+  serves large private files behind a `#[secured]` handler with no public
+  presigned URL (#1141).
 - **ci:** README-quickstart gate against the published crates (issue #1586) —
   `.github/workflows/quickstart-gate.yml` + `scripts/check-quickstart.sh`
   install the README-pinned `autumn-cli` from crates.io (never the local

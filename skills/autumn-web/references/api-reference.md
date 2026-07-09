@@ -198,6 +198,29 @@ Free functions rendering changeset-aware, accessible inputs:
 GetOrComputeOptions, CacheFillError, jittered_ttl}` — single-flight fills,
 optional `.distributed_fill_lock(true)` / `.stale_while_revalidate(grace)`.
 
+## Downloads (unreleased)
+
+`autumn_web::download::Download` — a typed file-download `IntoResponse`.
+
+- Constructors: `Download::from_bytes(impl Into<Bytes>)` (sets
+  `Content-Length`), `Download::from_stream(stream)` (an async
+  `Stream<Item = Result<Bytes, std::io::Error>>`), `Download::from_async_read(reader)`
+  (any `tokio::io::AsyncRead`), and `Download::from_blob(&store, key).await?`
+  (streams a stored blob via `BlobStore::get_stream` without buffering; sets
+  `Content-Length` and a default content-type from blob metadata; requires the
+  `storage` feature).
+- Setters (chained, `#[must_use]`): `.filename(name)`, `.content_type(ct)`,
+  `.inline()` (defaults to `attachment`).
+- Sets `Content-Disposition` (RFC 5987 `filename*=UTF-8''…` for non-ASCII
+  names, sanitized against header injection), resolves `Content-Type` in the
+  order explicit `.content_type()` → filename extension → blob metadata →
+  `application/octet-stream`, and sets `Content-Length` when known.
+- One-expression example (behind `#[secured]`):
+  `Ok(Download::from_blob(&store, key).await?.filename("report.pdf"))`.
+- Additive `BlobStore::get_stream(key) -> ByteStream<'static>` streams an
+  object's bytes; `LocalBlobStore` overrides it to stream from disk, other
+  backends inherit a buffering default.
+
 ## Jobs additions
 
 - Published 0.5.0 `#[job]` keys: `name`, `max_attempts`, `backoff_ms`,
