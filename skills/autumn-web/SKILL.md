@@ -52,6 +52,7 @@ the framework almost certainly already generates or ships it:
 | Raw Diesel queries for CRUD, lookups, pagination, or bulk writes | `#[repository]`-generated methods: `find_by_id`, `find_all`, `save`, `update`, `delete_by_id`, derived `find_by_*`, `page(&PageRequest)`, `cursor_page(&CursorRequest)`, bulk `save_many`/`update_many`/`delete_many`/`upsert_many`. See `docs/guide/repositories.md`, `docs/guide/pagination.md` |
 | Manual per-item queries in a loop (N+1) or hand-written JOINs to fetch associations | `#[belongs_to]`/`#[has_many]`/`#[has_one]` + `repo.preload(records, Model::preload()...)` (unreleased) |
 | Hand-rolled auth, session, or token checks in handler bodies | `#[secured]` / `#[secured("role")]`, `#[authorize]`, repository `policy =`/`scope =`; `#[secured(scopes = [...])]` for service tokens (unreleased) |
+| A punishingly low global rate limit to protect one abuse-prone endpoint (login, search, export) | `#[throttle(limit = 5, per = "1m", key = "ip")]` sits alongside `#[get]`/`#[post]`; `#[throttle("login")]` reads `[security.rate_limit.named.login]` from config (unreleased — issue #1350, see `docs/guide/rate-limiting.md`) |
 | Hand-assembled `<form>` markup with manual value re-fill and error display | `autumn_web::form::form_for(&changeset, action, method)` + the `#[model]`-derived `FormModel` (unreleased — trunk-dev, not in published 0.5.0) renders the whole form — CSRF, `_method` override, one pre-filled control per column, inline errors, submit — in one call; see "Whole-form rendering" below. Compose the per-field helpers only when its escape hatches don't fit: `form_tag`, `method_input`, `text_input` (published); `number_input`, `datetime_input`, `date_input`, `checkbox_input`, `select_input` + `Changeset` 422 re-render (unreleased) |
 | `find_all()` + a loop (or raw Diesel `LIMIT`/`OFFSET` paging) to sweep a whole table in a task/job/backfill | `repo.find_in_batches(n)` / `repo.find_each(n)` (unreleased — trunk-dev) — bounded-memory primary-key keyset iteration. See "Generated repository surface" below and `docs/guide/pagination.md` |
 | Ad-hoc `tokio::spawn` / background threads for deferred work | `#[job]` (+ retries, backends, uniqueness/concurrency caps), `#[scheduled]` for recurring, `#[task]` for operator CLI work |
@@ -62,6 +63,7 @@ the framework almost certainly already generates or ships it:
 | Hand-rolled cross-module notifications (calling every reaction inline) | `#[event]` + `#[listener]` typed event bus, `.listeners(listeners![...])` (unreleased) |
 | Hand-rolled cards, tabs, modals, delete-confirm dialogs, method-override links | `autumn_web::widgets`: `card`/`stat_card`, `tabs`, `modal`/`confirm_action`, `link_to`/`button_to` + `ui::WIDGETS_CSS_PATH` stylesheet (unreleased) |
 | Hand-built file-download responses (manual `Content-Disposition`/`Content-Type`/`Content-Length` headers, byte-buffered blob reads) | `autumn_web::download::Download` — `from_bytes` / `from_stream` / `from_async_read` / `from_blob(&store, key).await?` + `.filename(...)` / `.content_type(...)` / `.inline()`; RFC 5987 filenames, injection-safe, streams blobs without buffering (unreleased) |
+| Hand-written RSS/Atom XML strings for a `/feed.xml` or podcast/blog feed | `feed::Feed::atom(..)` / `feed::Feed::rss(..)` + `feed::FeedEntry` — builds the XML, implements `IntoResponse` with the right `application/atom+xml`/`application/rss+xml` type, XML-escapes text, and `Feed::conditional(&headers)` reuses the `etag` layer for `304`s (unreleased). See `docs/guide/conditional-get.md` |
 
 When none of these fit, dropping to raw Axum (`.merge()`/`.nest()`/`.layer()`)
 or raw Diesel (`&mut *db` with `diesel_async`) is supported and fine — but only
@@ -265,6 +267,17 @@ async fn ws() -> impl autumn_web::ws::WsHandler {
 Route functions are collected with `routes![...]`. Static routes also need
 `static_routes![...]` so `autumn build` can pre-render them.
 
+**Duplicate-route preflight (issue #1012, unreleased — trunk-dev):** two
+handlers that resolve to the same `(method, path)` after `.scoped(...)` prefix
+resolution — including `#[repository]`-generated API routes — fail app build
+with `RouterBuildError::DuplicateUserRoute { method, path, existing, incoming }`
+BEFORE any router mounts, instead of the previous `axum::MethodRouter::merge`
+startup panic. Distinct methods on the same path (`GET /admin` + `POST /admin`)
+still merge cleanly. Opaque `.merge(...)`/`.nest(...)` routers can't be
+introspected — a non-empty opaque table emits a `tracing::warn!`
+("check skipped") rather than a false pass. See
+`docs/guide/getting-started.md` "Route collision diagnostics".
+
 ## Models and repositories
 
 Autumn uses Diesel + diesel-async for Postgres. Primary keys are `i64` /
@@ -419,6 +432,7 @@ raw Diesel:
 | `hooks = MyHooks` (attr) | `before_/after_create/update/delete` + `after_*_commit` lifecycle hooks with `MutationContext` |
 | `from_shard(&ShardedDb)`, `with_pool_untracked(pool)` | **(unreleased)** shard-scoped construction; `with_pool_untracked` is new on trunk-dev — published 0.5.0 repositories have **no** pool constructor at all |
 | `find_in_batches(batch_size)`, `find_each(batch_size)` | **(unreleased)** Bounded-memory whole-table iteration via a primary-key keyset cursor (`WHERE id > last ORDER BY id ASC LIMIT batch_size` — never `LIMIT`/`OFFSET`), generated on every repository. `find_in_batches` returns a `FindInBatches` handle — drive with `while let Some(chunk) = b.next_batch().await?`; `find_each` returns `FindEach` yielding one model per `next().await?`. Inherits soft-delete filtering, tenant scoping, and read routing like `find_all`; errors are retryable (cursor advances only on success; `Ok(None)` always means completion); `batch_size == 0` errors instead of spinning; `batch_size` is **not** clamped to `MAX_PAGE_SIZE`; sharded repos reject cross-shard `across_tenants()` iteration (iterate per shard via `from_shard`). Handle types: `autumn_web::batches::{FindInBatches, FindEach, BatchSource}` (not in the prelude). See "Batched iteration" in `docs/guide/pagination.md` |
+| `find_or_create_by_<field>[_and_<field>...](<field>, &new)` | **(unreleased)** Race-safe get-or-insert; declare `fn find_or_create_by_slug(slug: String);` (lookup fields only) to generate an inherent `find_or_create_by_slug(&self, slug: String, new: &NewModel) -> AutumnResult<(Model, bool)>`. Reads on the read path first (tenant/soft-delete aware), else inserts on the primary with `ON CONFLICT DO NOTHING` — under concurrency exactly one row is created, exactly one caller sees `created == true`, and no `23505` escapes. `before_/after_create` + commit hooks fire only on the created path; works on hooked repos (unlike `upsert_many`). **Requires a unique constraint on the lookup column(s)** (`_or_` is rejected). See "Race-safe get-or-insert" in `docs/guide/repositories.md` |
 
 Read routing: with `database.replica_url` set, all generated reads use the
 replica automatically; writes always hit the primary. See
@@ -739,6 +753,10 @@ for the common cases:
 | `card(&body, &CardConfig::new().title("..."))` / `stat_card(label, value, link)` | Titled panels and metric tiles (`autumn_web::widgets`, prelude re-export) |
 | `tabs(id, &[(id, label, markup)])` | No-JS CSS-only tab switcher (`docs/guide/tabs.md`) |
 | `modal(id, title, &body, &ModalConfig)` / `confirm_action(...)` | Native `<dialog>` confirm for destructive actions — replaces `hx-confirm`/`window.confirm()` |
+| `badge(label, BadgeVariant::for_label(status))` / `status_tag(label)` | Semantic status pill; `BadgeVariant` = `Neutral`/`Info`/`Success`/`Warning`/`Danger`, `for_label` picks a deterministic color; `badge_with`/`BadgeConfig` set `title`/`aria-label`. Composes inside a `data_table` cell |
+| `avatar(name, &AvatarConfig::new().image(url).size(AvatarSize::Small))` | Person chip: `<img>` (lazy, square, name `alt`) or a deterministic colored-initials fallback — never a broken image, no JS, no external call |
+| `alert(AlertVariant::Info, body)` / `alert_with(..., &AlertConfig::new().title("...").icon(true).dismissible(true))` | Inline callout / empty-state / error box; `role` per variant, optional title + inline-SVG icon + no-JS dismiss. `error_summary(&changeset)` renders an `Error` alert of all field errors (or `None` when valid) |
+| `flash_messages(&flash.consume().await)` (`autumn_web::flash`) | Accessible flash banners: per-severity `role`/`aria-live`, `autumn-flash--<level>` classes, empty slice renders nothing; `flash_messages_with` adds a no-JS dismiss |
 | `pagination_nav(&page, &PagerOptions::new("/posts"))` / `cursor_pagination_nav` | Accessible, filter-preserving, htmx-opt-in pager from a `Page`/`CursorPage` (prelude re-export) |
 | `autumn_web::ui::WIDGETS_CSS` / `WIDGETS_CSS_PATH` | One shipped stylesheet backing every `autumn-*` widget class — link `href=(WIDGETS_CSS_PATH)` instead of copying widget CSS into `input.css`. Accent now follows `var(--primary)` (violet), not the old hardcoded indigo (`docs/guide/widget-styling.md`) |
 
@@ -824,6 +842,86 @@ Published 0.5.0 behavior:
   (prelude re-export).
 - `actuator.prometheus` exposes the Prometheus scrape endpoint independently
   of sensitive actuator mode.
+
+### Runtime log levels (unreleased — trunk-dev)
+
+`PUT /actuator/loggers/{name}` now changes the **live** `tracing` subscriber,
+not just an in-memory map — raise/lower verbosity in production without a
+redeploy. The default telemetry init installs a `tracing_subscriber` reload
+layer and hands the handle to `LogLevels`, so a level change rebuilds the
+combined `EnvFilter` directive (global level + per-target overrides) and pushes
+it to the running subscriber on the next event. Examples (sensitive actuator
+mode required):
+
+```bash
+curl -X PUT .../actuator/loggers/root -d '{"level":"debug"}'          # global
+curl -X PUT .../actuator/loggers/my_app::orders -d '{"level":"trace"}' # per-target
+curl -X PUT .../actuator/loggers/root -d '{"level":"info"}'            # revert
+```
+
+The response now carries `"applied": true` and `"status":"ok"` only when the
+change actually reached a reload-capable subscriber; otherwise it reports
+`"status":"recorded"` / `"applied": false` rather than a false-positive `ok`.
+Overrides stay ephemeral — a restart resets to the configured `log.level`.
+Invalid levels still return `400`. `GET /actuator/loggers` keeps reporting
+`current_level` + overrides, now matching real emission.
+
+### Build & git provenance on `/actuator/info` (unreleased — trunk-dev)
+
+`GET /actuator/info` now reports which commit/build is running, for
+deploy/rollback verification. Apps scaffolded by `autumn new` get this with
+**zero action**: the generated `build.rs` bakes `AUTUMN_BUILD_*` values and
+`#[autumn_web::main]` reads them (plus the app's own `CARGO_PKG_NAME` /
+`CARGO_PKG_VERSION`) at the app's compile time. That also fixes the old
+`app.version = "unknown"` regression — the value is now baked in, correct even
+in a `--release` binary with the cargo env unset at runtime. Sample payload:
+
+```json
+{
+  "app":     { "name": "my_app", "version": "1.4.2" },
+  "autumn":  { "version": "0.6.0", "profile": "prod" },
+  "runtime": { "uptime": "3h 12m" },
+  "build": {
+    "version": "1.4.2",
+    "timestamp": "2026-07-09T12:34:56Z",
+    "git": {
+      "commit": "9f3c1a7e…",
+      "commit_short": "9f3c1a7",
+      "branch": "main",
+      "dirty": false
+    }
+  }
+}
+```
+
+Outside a git checkout (tarball / CI cache) the `git.*` fields degrade to
+`null` while `build.timestamp` + `version` stay present. The block exposes only
+commit / branch / time / version / dirty — never remote URLs or an env dump.
+Hand-rolled apps opt in by adding the generated `build.rs` provenance stanza
+and using `#[autumn_web::main]`.
+
+**Known limitation:** apps built from the scaffolded Dockerfile currently report
+null git provenance because the Docker build context excludes `.git` (tracked in
+#1676).
+Unreleased (trunk-dev) — `Server-Timing` response header:
+
+- Opt-in via `[observability] server_timing = true` (or
+  `AUTUMN_OBSERVABILITY__SERVER_TIMING=true`). Defaults **on in `dev` /
+  `development`** profiles, **off everywhere else** — so prod never leaks
+  timings to anonymous clients without explicit opt-in.
+- Emits `total;dur=…` (whole-request wall time, same clock as access-log
+  `duration_ms`) and, when at least one instrumented query ran,
+  `db;dur=…;desc="N queries"` for N+1 visibility.
+- SSE responses (`text/event-stream`) get `total`-only; header is
+  best-effort — never turns absent timing data into an error.
+- The `db` metric installs autumn's own Diesel connection instrumentation on
+  measured checkouts only (nothing is installed when `server_timing` is off, so
+  an app's `diesel::connection::set_default_instrumentation` is untouched).
+  While enabled, autumn's timer replaces an app-provided default rather than
+  composing with it — documented limitation; keep `server_timing` off where you
+  rely on your own instrumentation.
+- Doc + browser DevTools walk-through:
+  `docs/guide/observability/server-timing.md`.
 
 ## Resilience: load shedding (unreleased — trunk-dev)
 
@@ -961,7 +1059,68 @@ autumn generate scaffold Post title:String --live --live-validation
 autumn generate tauri            # desktop sidecar project (cargo tauri build)
 autumn generate plugin my-plugin # installable/conformant plugin crate
 autumn token issue service:ci --name ci --scope posts:write   # scoped tokens; also list, rotate
+autumn i18n check                # compare t!/t(...) keys vs i18n/*.ftl; --strict, --format json
 ```
+
+`autumn i18n check` scans `**/*.rs` for string-literal keys passed to
+`t!(...)`, `.t(...)`, and `.t_with(...)`, loads every `i18n/<locale>.ftl` via
+the runtime `Bundle` loader, and reports per locale: **Missing** (referenced in
+code but absent from that locale's resolved fallback chain — the correctness
+failure, non-zero exit), **Untranslated** (present in the default locale but
+not a non-default one), and **Unused** (defined in a `.ftl` with no call site).
+Untranslated/Unused are warnings unless `--strict`. `--format json` feeds CI.
+Runtime-built keys like `t(&format!(...))` are listed as "dynamic — not
+checked" rather than flagged.
+
+**Known heuristic limits.** The scanner is a best-effort token/grammar
+heuristic over source text, not a type-resolved AST. Any key it cannot
+statically resolve to a string literal is treated as *dynamic — not checked*,
+so unsupported shapes are never falsely flagged as Missing/Unused and cannot
+break CI:
+
+- Only whole-key string literals (optionally in leading borrows/parens spanning
+  the entire key argument) are checked precisely. A literal transformed by a
+  chained method or operator (`t(" nav.home ".trim())`, `t("a" + b)`) is treated
+  as dynamic, not as the literal.
+- Dynamic keys are reported as "dynamic — not checked". A whole-key
+  `format!("status.{state}")` contributes its static `"status."` prefix so
+  matching `.ftl` keys aren't marked Unused; a fully-dynamic key (bare variable,
+  `format!("{x}")`) suppresses Unused reporting entirely.
+- Keys built through concatenation, helper functions, non-`format!` macros, or
+  deeper transformations are treated as dynamic and not validated — such `.ftl`
+  entries aren't checked for Missing/Unused.
+- No type resolution: it can't distinguish an unrelated local helper named
+  `t`/`t_with` from the real translation API beyond its syntactic
+  `t!(...)` / `receiver.t(...)` / `Type::t(...)` (real `::` path) checks; a bare
+  free-function `t("...")` is left alone.
+autumn migrate baseline          # record content hashes for legacy applied migrations (issue #1203)
+autumn migrate baseline --force <version>  # escape hatch: overwrite one version's stored hash (WARN-logged)
+```
+
+### Migration content checksums (issue #1203)
+
+The framework hashes every migration's `up.sql` (SHA-256, with `\r\n`/`\r`
+→ `\n` normalisation and `trim_end()`) into `autumn_migration_checksums`
+the first time it's applied, and re-validates the hash before every
+subsequent `autumn migrate` run and startup auto-migrate. Editing an
+already-applied migration flips its state to `changed` and the next
+`autumn migrate` refuses to run:
+
+```
+migration <version> checksum mismatch: recorded <hex-a> but on-disk
+content hashes to <hex-b>. Migrations must never be edited after being
+applied — add a new migration instead, or run the documented re-baseline
+command if this change was deliberate.
+```
+
+Rule of thumb: **never edit an applied migration.** Add a new one. If the
+user asks you to edit an applied migration, push back with this rule and
+propose a follow-up migration. `autumn migrate status` reports each
+applied migration's state as `ok`, `changed`, or `unrecorded`. Use
+`autumn migrate baseline` (additive, idempotent) to record hashes for
+legacy migrations applied before the checksum feature existed; use
+`autumn migrate baseline --force <version>` only when a deliberate edit
+is intended and the fork risk is accepted.
 
 `autumn destroy` mirrors `autumn generate` argument-for-argument and never
 touches a database — it only reverses generated files/migrations.

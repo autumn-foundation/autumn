@@ -36,6 +36,23 @@ pub fn main_macro(item: TokenStream) -> TokenStream {
                 cfg!(debug_assertions),
             );
 
+            // Bake the app's compile-time build + git provenance into the
+            // process so `/actuator/info` can report exactly which commit/build
+            // is running. `env!`/`option_env!` are evaluated *here*, in the
+            // app crate's compile context, so CARGO_PKG_* reflect the app (not
+            // autumn-web) and the AUTUMN_BUILD_* vars come from the app's
+            // build.rs. All are optional — a build with no git checkout or no
+            // build.rs stanza degrades gracefully. See issue #1242.
+            ::autumn_web::build_info::__set_build_context(
+                env!("CARGO_PKG_NAME"),
+                env!("CARGO_PKG_VERSION"),
+                option_env!("AUTUMN_BUILD_GIT_SHA"),
+                option_env!("AUTUMN_BUILD_GIT_SHA_SHORT"),
+                option_env!("AUTUMN_BUILD_GIT_BRANCH"),
+                option_env!("AUTUMN_BUILD_GIT_DIRTY"),
+                option_env!("AUTUMN_BUILD_TIMESTAMP"),
+            );
+
             ::autumn_web::reexports::tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()

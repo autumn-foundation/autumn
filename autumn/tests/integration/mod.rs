@@ -9,6 +9,8 @@ mod authorization_integration;
 mod auto_broadcast;
 mod bot_protection_pipeline;
 mod boundary_hooks_integration;
+#[cfg(feature = "ws")]
+mod broadcast_recorder;
 #[cfg(feature = "cache-moka")]
 mod cache_stampede;
 #[cfg(feature = "ws")]
@@ -41,6 +43,7 @@ mod db_telemetry_tests;
 #[cfg(feature = "db")]
 mod directory_shard_router;
 mod download;
+mod duplicate_route_detection;
 #[cfg(all(feature = "embed-assets", feature = "i18n"))]
 mod embed_assets_integration;
 #[cfg(feature = "db")]
@@ -54,6 +57,7 @@ mod experiments_pg_integration;
 mod extractors;
 mod factory_integration;
 mod feature_flags_integration;
+mod feed;
 mod form_for_derive;
 mod form_search_widgets;
 #[cfg(all(feature = "maud", feature = "cache-moka"))]
@@ -100,6 +104,8 @@ mod mcp_repository;
 mod mcp_streaming;
 mod middleware_introspection;
 mod middleware_pipeline;
+#[cfg(feature = "db")]
+mod model_field_attrs;
 #[cfg(feature = "offline-sync")]
 mod offline_sync_conformance;
 #[cfg(feature = "offline-sync")]
@@ -131,6 +137,8 @@ mod repository_bulk_operations;
 #[cfg(feature = "db")]
 mod repository_find_in_batches;
 #[cfg(feature = "db")]
+mod repository_find_or_create_by;
+#[cfg(feature = "db")]
 mod repository_from_shard;
 #[cfg(all(feature = "db", feature = "openapi"))]
 mod repository_openapi;
@@ -148,6 +156,7 @@ mod schema_drift_guard;
 mod scoped_tokens;
 mod security;
 mod seo;
+mod server_timing;
 #[cfg(feature = "db")]
 mod shard_map_guard;
 #[cfg(feature = "db")]
@@ -168,12 +177,19 @@ mod tenancy;
 mod tenancy_unit;
 mod test_app_integration;
 mod test_db_integration;
+mod throttle_route;
 mod time_zone_integration;
 mod transactional_test_integration;
 mod tx_isolation_retry_integration;
 mod webhook_outbound;
 #[cfg(feature = "maud")]
 mod widget_css_coverage;
+#[cfg(feature = "maud")]
+mod widgets_alert;
+#[cfg(feature = "maud")]
+mod widgets_avatar;
+#[cfg(feature = "maud")]
+mod widgets_badge;
 mod widgets_modal;
 mod widgets_tabs;
 #[cfg(feature = "ws")]

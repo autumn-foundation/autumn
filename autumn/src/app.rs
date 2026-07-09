@@ -2834,6 +2834,12 @@ impl AppBuilder {
         if let Some(buf) = telemetry_guard.log_buffer.clone() {
             state.insert_extension(buf);
         }
+        // Wire the live-subscriber reload handle into the loggers actuator so
+        // `PUT /actuator/loggers/{name}` affects the running subscriber, not
+        // just an in-memory map (issue #1044).
+        if let Some(handle) = telemetry_guard.filter_reload.clone() {
+            state.log_levels().attach_reload_handle(handle);
+        }
 
         // Instantiate MaintenanceState, load flag synchronously at startup, insert as extension, and start background poller task
         let maintenance_state = crate::maintenance::MaintenanceState::new();
@@ -3864,6 +3870,12 @@ impl AppBuilder {
         if let Some(buf) = telemetry_guard.log_buffer.clone() {
             state.insert_extension(buf);
         }
+        // Wire the live-subscriber reload handle into the loggers actuator so
+        // `PUT /actuator/loggers/{name}` affects the running subscriber, not
+        // just an in-memory map (issue #1044).
+        if let Some(handle) = telemetry_guard.filter_reload.clone() {
+            state.log_levels().attach_reload_handle(handle);
+        }
         state.insert_extension(RegisteredApiVersions(api_versions.clone()));
         #[cfg(feature = "mail")]
         if let Some(interceptor) = mail_interceptor {
@@ -4379,6 +4391,12 @@ impl AppBuilder {
         );
         if let Some(buf) = telemetry_guard.log_buffer.clone() {
             state.insert_extension(buf);
+        }
+        // Wire the live-subscriber reload handle into the loggers actuator so
+        // `PUT /actuator/loggers/{name}` affects the running subscriber, not
+        // just an in-memory map (issue #1044).
+        if let Some(handle) = telemetry_guard.filter_reload.clone() {
+            state.log_levels().attach_reload_handle(handle);
         }
         #[cfg(feature = "mail")]
         if let Some(interceptor) = mail_interceptor {
@@ -7337,6 +7355,7 @@ fn build_state(
         auth_session_key: config.auth.session_key.clone(),
         shared_cache: None,
         clock: std::sync::Arc::new(crate::time::SystemClock),
+        app_id: AppState::next_app_id(),
     };
     #[cfg(feature = "db")]
     if state.replica_pool.is_some() {
@@ -7661,6 +7680,7 @@ mod tests {
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
+            app_id: AppState::next_app_id(),
         };
         crate::router::build_router(routes, &config, state)
     }
@@ -8893,6 +8913,7 @@ mod tests {
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
+            app_id: AppState::next_app_id(),
         };
         let router =
             crate::router::build_router(vec![test_get_route("/dummy", "dummy")], &config, state);
@@ -9005,6 +9026,7 @@ mod tests {
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
+            app_id: AppState::next_app_id(),
         };
         let router = crate::router::build_router(post_routes, &config, state);
 
@@ -9357,6 +9379,7 @@ mod tests {
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
+            app_id: AppState::next_app_id(),
         };
         let router = crate::router::build_router_with_static(
             vec![test_get_route("/other", "other_page")],
@@ -9674,6 +9697,7 @@ mod tests {
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
+            app_id: AppState::next_app_id(),
         };
         crate::router::build_router(routes, config, state)
     }
@@ -9827,6 +9851,7 @@ mod tests {
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
+            app_id: AppState::next_app_id(),
         };
         let router = crate::router::build_router_with_static(
             vec![test_get_route("/test", "test")],
@@ -9878,6 +9903,7 @@ mod tests {
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
+            app_id: AppState::next_app_id(),
         };
         let router = crate::router::build_router_with_static(
             vec![test_get_route("/test", "test")],
@@ -10135,6 +10161,7 @@ mod tests {
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
+            app_id: AppState::next_app_id(),
             metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
             health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
         };
@@ -10210,6 +10237,7 @@ mod tests {
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
+            app_id: AppState::next_app_id(),
             metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
             health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
         };
