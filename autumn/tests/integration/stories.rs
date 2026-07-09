@@ -230,12 +230,14 @@ const EXPECTED_STORY_SLUGS: &[&str] = &[
     "confirm-action",
     "data-table",
     "hero",
+    "infinite-feed",
     "modal",
     "nav-bar",
     "nav-link",
     "property-list",
     "stat-card",
     "tabs",
+    "toast",
 ];
 
 #[test]

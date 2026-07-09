@@ -17,6 +17,13 @@
 //! | `nav_link` | Navigation anchor, auto-marked active + `aria-current` |
 //! | `nav_bar` | Top-bar/sidebar `<nav>` landmark: brand, links, dropdowns, responsive toggle |
 //! | `tabs` | No-JS `tablist`/`tab`/`tabpanel` switcher with `:target` deep-linking |
+//! | `infinite_feed` | htmx infinite-scroll / "Load more" feed from a `CursorPage` |
+//!
+//! # Feedback widgets
+//!
+//! | Widget | Use |
+//! |--------|-----|
+//! | `toast` / `toast_region` | Transient, auto-dismissing htmx action feedback, appended out-of-band |
 //!
 //! # Interactive / search widgets
 //!
@@ -3443,6 +3450,508 @@ pub fn error_summary<T>(changeset: &crate::form::Changeset<T>) -> Option<maud::M
             .title("Please fix the following errors")
             .icon(true),
     ))
+}
+
+// ── toast / toast_region (#1320) ────────────────────────────────────────────
+
+/// The default id for the [`toast_region`] container, and the OOB target
+/// [`toast`] appends into.
+///
+/// Drop `toast_region(DEFAULT_TOAST_REGION_ID)` once in your base layout;
+/// `toast(msg, variant)` then appends into it out-of-band.
+pub const DEFAULT_TOAST_REGION_ID: &str = "toast-region";
+
+/// Render the persistent, fixed-position live region that toasts append into.
+///
+/// Drop this **once** into your base layout (typically just before `</body>`)
+/// and leave it in place: it is an **empty, persistent `aria-live="polite"`
+/// region**. Appending a toast into an already-in-DOM live region is announced
+/// reliably by screen readers, whereas inserting an already-populated
+/// `aria-live` element is not — which is why the politeness lives here, on the
+/// region, rather than on each non-error toast. `aria-atomic="false"` (and no
+/// `role="status"`, which would imply `aria-atomic="true"`) means only the
+/// newly-appended toast is announced, not every toast still on screen. Position
+/// and stacking come from the shipped `.autumn-toast-region` rule — no inline
+/// styles.
+///
+/// Non-error toasts inherit this region's politeness; error toasts announce
+/// assertively on their own via `role="alert"`. Use [`DEFAULT_TOAST_REGION_ID`]
+/// unless you need more than one region; a custom id must be paired with
+/// [`toast_in`] so the OOB target matches.
+///
+/// # CSS hooks
+///
+/// | Selector | Element |
+/// |---|---|
+/// | `.autumn-toast-region` | Fixed-position, persistent polite live region |
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_web::widgets::{toast_region, DEFAULT_TOAST_REGION_ID};
+///
+/// let html = toast_region(DEFAULT_TOAST_REGION_ID).into_string();
+/// assert!(html.contains(r#"id="toast-region""#));
+/// assert!(html.contains(r#"class="autumn-toast-region""#));
+/// assert!(html.contains(r#"aria-live="polite""#));   // persistent live region
+/// assert!(html.contains(r#"aria-atomic="false""#));  // announce only new toasts
+/// assert!(!html.contains(r#"role="status""#));       // role=status implies atomic
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn toast_region(id: &str) -> maud::Markup {
+    // Accept either a bare id or a `#selector` (a natural caller slip); strip a
+    // leading `#` so the element id is always bare, matching the id that
+    // `toast_in`'s `beforeend:#…` OOB target points at.
+    let id = selector_to_id(id);
+    // The region is a PERSISTENT polite live region: a `role="status"`/
+    // `aria-live="polite"` element inserted already-populated is not reliably
+    // announced, so instead this empty region lives in the layout and toasts are
+    // appended into it (screen readers announce the mutation). `aria-atomic` is
+    // explicitly `false` so only the newly-appended toast is read, not every
+    // toast currently in the region — and `role="status"` is deliberately NOT
+    // used because it implies `aria-atomic="true"`, which would re-announce all
+    // of them. Non-error toasts inherit this politeness (they carry no own
+    // `aria-live`); error toasts announce assertively on their own.
+    maud::html! {
+        div id=(id) class="autumn-toast-region" aria-live="polite" aria-atomic="false" {}
+    }
+}
+
+/// Render a single transient toast that appends into the default toast region
+/// out-of-band, for htmx action feedback.
+///
+/// This is the common case: it targets [`DEFAULT_TOAST_REGION_ID`]. Drop
+/// [`toast_region`] once in your layout, then return this alongside your normal
+/// swapped fragment from an htmx handler; htmx appends it into the region via
+/// `hx-swap-oob="beforeend:#toast-region"` — no full page reload, no
+/// JavaScript. Auto-dismiss is CSS-only (a `@keyframes` fade in the shipped
+/// stylesheet); the widget emits **no `<script>`**.
+///
+/// `variant` reuses the shared [`AlertVariant`] semantic enum (the alert/badge
+/// color lane) — no new color vocabulary. **Accessibility:** `Error` toasts
+/// announce assertively on their own (`role="alert"`, `aria-live="assertive"`),
+/// which is reliably read on insertion; all other variants carry **no own
+/// `role`/`aria-live`** and instead inherit the persistent
+/// `aria-live="polite"` of the [`toast_region`] they're appended into (an
+/// already-populated polite element inserted fresh is otherwise not reliably
+/// announced). Every toast carries `aria-atomic="true"` so its message is read
+/// as one unit. The message is HTML-escaped by Maud.
+///
+/// Use [`toast_in`] instead when you rendered [`toast_region`] with a custom id.
+///
+/// # CSS hooks
+///
+/// | Selector | Element |
+/// |---|---|
+/// | `.autumn-toast` | Root toast (carries the auto-dismiss animation) |
+/// | `.autumn-toast--<variant>` | Per-variant accent (`success`/`info`/`warning`/`error`) |
+/// | `.autumn-toast__message` | The message text |
+///
+/// # Example: end-to-end htmx recipe
+///
+/// ```rust
+/// use autumn_web::widgets::{toast, toast_region, AlertVariant, DEFAULT_TOAST_REGION_ID};
+/// use maud::html;
+///
+/// // 1. Once, in your base layout (before `</body>`) — the persistent live region:
+/// //    (toast_region(DEFAULT_TOAST_REGION_ID))
+/// let layout = toast_region(DEFAULT_TOAST_REGION_ID).into_string();
+/// assert!(layout.contains(r#"id="toast-region""#));
+/// assert!(layout.contains(r#"aria-live="polite""#));  // politeness lives here
+///
+/// // 2. From an htmx create/update/delete handler, return the toast next to
+/// //    your swapped fragment — htmx appends it into the region OOB:
+/// let response = html! {
+///     (toast("Saved", AlertVariant::Success))   // hx-swap-oob append
+///     tr id="row-42" { td { "…updated row…" } } // your normal swap
+/// };
+/// let out = response.into_string();
+/// assert!(out.contains(r##"hx-swap-oob="beforeend:#toast-region""##));
+/// // A non-error toast inherits the region's politeness: no own role/aria-live,
+/// // but it is atomic so its message is announced as one unit.
+/// assert!(out.contains(r#"aria-atomic="true""#));
+/// assert!(!out.contains(r#"role="status""#));
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn toast(message: &str, variant: AlertVariant) -> maud::Markup {
+    toast_in(DEFAULT_TOAST_REGION_ID, message, variant)
+}
+
+/// Like [`toast`], but appends into a region with a caller-chosen id.
+///
+/// Use this when your layout renders [`toast_region`] with an id other than
+/// [`DEFAULT_TOAST_REGION_ID`] (e.g. separate top/bottom regions). The emitted
+/// `hx-swap-oob="beforeend:#<region_id>"` targets that region. `region_id` is
+/// HTML-escaped in the attribute like every other caller value.
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_web::widgets::{toast_in, AlertVariant};
+///
+/// let out = toast_in("top-toasts", "Uploaded", AlertVariant::Info).into_string();
+/// assert!(out.contains(r##"hx-swap-oob="beforeend:#top-toasts""##));
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn toast_in(region_id: &str, message: &str, variant: AlertVariant) -> maud::Markup {
+    // Error toasts announce assertively on their own — `role="alert"` elements
+    // ARE reliably announced on insertion, so they don't depend on the
+    // persistent region. Non-error toasts carry NO `role`/`aria-live`: they
+    // inherit the `aria-live="polite"` of the `toast_region` they're appended
+    // into (a freshly-inserted, already-populated polite element is otherwise
+    // not reliably announced). Every toast keeps `aria-atomic="true"` so its
+    // message is read as one unit.
+    let (role, live): (Option<&str>, Option<&str>) = match variant {
+        AlertVariant::Error => (Some("alert"), Some("assertive")),
+        AlertVariant::Info | AlertVariant::Success | AlertVariant::Warning => (None, None),
+    };
+    let class = format!("autumn-toast autumn-toast--{}", variant.as_str());
+    // Accept a bare id or a `#selector`; strip one leading `#` so a caller
+    // passing `"#toast-region"` doesn't produce an invalid `beforeend:##…`.
+    let region_id = selector_to_id(region_id);
+    let oob = format!("beforeend:#{region_id}");
+    // For a POSITIONAL OOB swap (`beforeend:#…`) htmx inserts the carrier's
+    // *children* into the target and discards the carrier itself, so the carrier
+    // must be a plain, discardable `<div>` — NOT a `<template>`.
+    //
+    // Authority — vendored htmx 2.0.4 (`vendor/htmx.min.js`):
+    //   * `oobSwap` (minified `He`): for a non-outerHTML style it swaps
+    //     `f(clone)`, i.e. the *carrier element* (`f` returns the element as-is),
+    //     then `_e("beforeend", …)` → `Be` → `a`, whose insert loop is
+    //     `while(n.childNodes.length>0)` — it iterates the carrier's `childNodes`.
+    //   * The response OOB scan `ze` matches a top-level `<template hx-swap-oob=…>`
+    //     (`parentElement===null`), so the template is processed as the carrier
+    //     itself, not unwrapped. A `<template>` keeps its children in `.content`,
+    //     so `template.childNodes` is EMPTY → htmx appends nothing and the toast
+    //     never shows. (The template-content rescan only helps when `hx-swap-oob`
+    //     sits on a CHILD *inside* `.content`, which is not this positional case.)
+    //
+    // This mirrors the repo's own tested SSE convention in `channels.rs` (see the
+    // passing `broadcast_publish_oob_custom_strategy` test →
+    // `<div hx-swap-oob="beforeend:#badge"><span>3</span></div>`). The styled/ARIA
+    // `.autumn-toast` element stays the carrier's CHILD; putting `hx-swap-oob`
+    // directly on it would throw the wrapper away and append only the inner
+    // `<span>`.
+    maud::html! {
+        div hx-swap-oob=(oob) {
+            div class=(class) role=[role] aria-live=[live] aria-atomic="true" {
+                span class="autumn-toast__message" { (message) }
+            }
+        }
+    }
+}
+
+// ── infinite_feed (#1372) ───────────────────────────────────────────────────
+
+/// How the continuation control of an [`infinite_feed`] loads the next page.
+///
+/// Both modes replace the sentinel with the next page's fragment (its items
+/// plus a fresh sentinel), so appends never duplicate already-rendered rows.
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FeedMode {
+    /// Auto-load when the sentinel scrolls into view, and also on a manual
+    /// click of the visible link (`hx-trigger="revealed, click"`). The classic
+    /// infinite scroll. This is the default.
+    #[default]
+    Reveal,
+    /// Require an explicit click on the keyboard-focusable "Load more" control
+    /// (htmx's default `click` trigger); nothing loads until the user asks.
+    Button,
+}
+
+/// Configuration for [`infinite_feed`] / [`feed_page`].
+///
+/// Build with [`FeedConfig::new`] and chain setters. `url` is the partial
+/// handler that returns the next page fragment; the next cursor is appended to
+/// it as a query parameter (`?cursor=…` by default).
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_web::widgets::{FeedConfig, FeedMode};
+///
+/// let config = FeedConfig::new("/posts/feed")
+///     .mode(FeedMode::Button)
+///     .load_more_label("Show more posts");
+/// assert_eq!(config.cursor_param, "cursor");
+/// ```
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone)]
+pub struct FeedConfig<'a> {
+    /// URL of the partial handler that returns the next page fragment.
+    pub url: &'a str,
+    /// How the continuation control loads (default [`FeedMode::Reveal`]).
+    pub mode: FeedMode,
+    /// Query-parameter name carrying the cursor token (default `"cursor"`).
+    pub cursor_param: &'a str,
+    /// Visible label / accessible name of the continuation control
+    /// (default `"Load more"`).
+    pub load_more_label: &'a str,
+}
+
+#[cfg(feature = "maud")]
+impl<'a> FeedConfig<'a> {
+    /// Start a config for the partial handler at `url` with sensible defaults
+    /// (reveal mode, `cursor` param, "Load more" label).
+    #[must_use]
+    pub const fn new(url: &'a str) -> Self {
+        Self {
+            url,
+            mode: FeedMode::Reveal,
+            cursor_param: "cursor",
+            load_more_label: "Load more",
+        }
+    }
+
+    /// Set the load [`FeedMode`].
+    #[must_use]
+    pub const fn mode(mut self, mode: FeedMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    /// Shorthand for `.mode(FeedMode::Button)`.
+    #[must_use]
+    pub const fn button(mut self) -> Self {
+        self.mode = FeedMode::Button;
+        self
+    }
+
+    /// Override the cursor query-parameter name (default `"cursor"`).
+    #[must_use]
+    pub const fn cursor_param(mut self, param: &'a str) -> Self {
+        self.cursor_param = param;
+        self
+    }
+
+    /// Override the continuation control's label (default `"Load more"`).
+    #[must_use]
+    pub const fn load_more_label(mut self, label: &'a str) -> Self {
+        self.load_more_label = label;
+        self
+    }
+}
+
+/// Percent-encode a query-string component (param name or value).
+///
+/// Cursor tokens produced by [`CursorPage`](crate::pagination::CursorPage) are
+/// URL-safe base64 (signed cursors add a `.`-delimited signature, also
+/// URL-safe), but [`infinite_feed`]/[`feed_page`] accept an arbitrary
+/// `Option<&str>`, so a token containing `&`, `#`, `=`, `+`, or a space must be
+/// encoded to avoid corrupting the query string or injecting extra params. The
+/// unreserved set (`A–Z a–z 0–9 - _ . ~`) — which covers every real cursor —
+/// passes through unchanged.
+#[cfg(feature = "maud")]
+fn encode_query_component(value: &str) -> String {
+    use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
+    // Everything outside the RFC 3986 unreserved set.
+    const QUERY_COMPONENT: &AsciiSet = &CONTROLS
+        .add(b' ')
+        .add(b'"')
+        .add(b'#')
+        .add(b'%')
+        .add(b'&')
+        .add(b'+')
+        .add(b'/')
+        .add(b';')
+        .add(b'=')
+        .add(b'?')
+        .add(b'@')
+        .add(b'[')
+        .add(b'\\')
+        .add(b']')
+        .add(b'^')
+        .add(b'`')
+        .add(b'{')
+        .add(b'|')
+        .add(b'}')
+        .add(b'<')
+        .add(b'>');
+    utf8_percent_encode(value, QUERY_COMPONENT).to_string()
+}
+
+/// Build the next-page URL by appending `?<cursor_param>=<cursor>` to the config
+/// URL (using `&` if it already has a query string), with both the param name
+/// and the cursor percent-encoded via [`encode_query_component`]. Any existing
+/// `#fragment` is preserved after the query (the query must precede it). Maud
+/// additionally HTML-escapes the whole value in the attribute.
+#[cfg(feature = "maud")]
+fn feed_next_url(config: &FeedConfig<'_>, cursor: &str) -> String {
+    // The query must go before any `#fragment`.
+    let (base, fragment) = match config.url.split_once('#') {
+        Some((base, frag)) => (base, Some(frag)),
+        None => (config.url, None),
+    };
+    let sep = if base.contains('?') { '&' } else { '?' };
+    let param = encode_query_component(config.cursor_param);
+    let value = encode_query_component(cursor);
+    let mut url = format!("{base}{sep}{param}={value}");
+    if let Some(frag) = fragment {
+        url.push('#');
+        url.push_str(frag);
+    }
+    url
+}
+
+/// Render the continuation sentinel for a `next_cursor`.
+///
+/// A single control that is BOTH a progressive-enhancement `<a href>` to the
+/// next-cursor URL (works with htmx/JS unavailable) AND htmx-wired to fetch
+/// that URL and replace the whole sentinel (`hx-swap="outerHTML"`, targeting
+/// the closest `.autumn-feed__sentinel`) with the returned fragment. In
+/// [`FeedMode::Reveal`] it fires on `revealed, click` — auto-loading when
+/// scrolled into view, but also swapping in place (rather than navigating to
+/// the bare partial) if a user activates the visible link first; in
+/// [`FeedMode::Button`] it uses htmx's default `click` trigger. htmx
+/// `preventDefault`s the anchor navigation whenever it handles the trigger, so
+/// the `<a href>` stays a pure no-JS fallback.
+#[cfg(feature = "maud")]
+fn feed_sentinel(next_cursor: &str, config: &FeedConfig<'_>) -> maud::Markup {
+    let next_url = feed_next_url(config, next_cursor);
+    let trigger = match config.mode {
+        // Include `click` so a user activating the visible "Load more" link
+        // before `revealed` fires swaps in place instead of following `href`.
+        FeedMode::Reveal => Some("revealed, click"),
+        FeedMode::Button => None,
+    };
+    maud::html! {
+        div class="autumn-feed__sentinel" {
+            a class="autumn-feed__more" href=(next_url)
+                hx-get=(next_url) hx-target="closest .autumn-feed__sentinel"
+                hx-swap="outerHTML" hx-trigger=[trigger] {
+                (config.load_more_label)
+            }
+        }
+    }
+}
+
+/// Render just the next-page fragment: the already-rendered `items` followed by
+/// a fresh sentinel (only when `next_cursor` is `Some`).
+///
+/// This is the companion helper a handler returns for **each append** — and it
+/// is exactly what [`infinite_feed`] wraps for the initial view, so one partial
+/// serves both. Because the sentinel swaps itself via `outerHTML`, returning
+/// `items + new sentinel` inserts the new rows where the old sentinel was and
+/// re-arms the loop; when `next_cursor` is `None` no sentinel is emitted, so no
+/// further request fires (the feed terminates cleanly).
+///
+/// `items` is caller-rendered [`Markup`](maud::Markup) (already escaped by your
+/// own Maud); pass the cursor from
+/// [`CursorPage::next_cursor`](crate::pagination::CursorPage) via `.as_deref()`.
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_web::widgets::{feed_page, FeedConfig};
+/// use maud::html;
+///
+/// let items = html! { article { "row 1" } article { "row 2" } };
+/// let config = FeedConfig::new("/feed");
+/// // Middle page: has a next cursor → emits a sentinel.
+/// let more = feed_page(items, Some("eyJpZCI6Mn0"), &config).into_string();
+/// assert!(more.contains("autumn-feed__sentinel"));
+/// assert!(more.contains(r##"hx-get="/feed?cursor=eyJpZCI6Mn0""##));
+///
+/// // Last page: no next cursor → no sentinel, no further request.
+/// let last = feed_page(html! { article { "row 3" } }, None, &config).into_string();
+/// assert!(!last.contains("autumn-feed__sentinel"));
+/// ```
+// `items` is taken by value to keep `feed_page(html! { .. }, ..)` ergonomic (no
+// `&` at the call site, matching `alert`); Maud renders it by reference, hence
+// the allow.
+#[cfg(feature = "maud")]
+#[must_use]
+#[allow(clippy::needless_pass_by_value)]
+pub fn feed_page(
+    items: maud::Markup,
+    next_cursor: Option<&str>,
+    config: &FeedConfig<'_>,
+) -> maud::Markup {
+    maud::html! {
+        (items)
+        @if let Some(cursor) = next_cursor {
+            (feed_sentinel(cursor, config))
+        }
+    }
+}
+
+/// Render an htmx infinite-scroll / "Load more" feed for a cursor-paginated
+/// list: a `.autumn-feed` container holding the rendered `items` and, when
+/// there is a next page, a continuation sentinel.
+///
+/// Driven by a [`CursorPage`](crate::pagination::CursorPage): pass your rendered
+/// items and `page.next_cursor.as_deref()`. When the cursor is `Some`, the
+/// sentinel issues a single `hx-get` to `config.url` carrying the cursor and
+/// appends the returned fragment in place — no full-page reload, no duplicated
+/// rows (keyset cursors are stable under concurrent inserts). When it is `None`
+/// (`has_next == false`) no sentinel is emitted, so no terminal request fires.
+///
+/// Two modes ([`FeedMode`]): auto-load on reveal, or an explicit,
+/// keyboard-focusable "Load more" control. Either way the control is a real
+/// `<a href>` to the next-cursor URL, so the next page is reachable with
+/// htmx/JS unavailable. The append fragment is produced by [`feed_page`], which
+/// a handler returns for every subsequent page.
+///
+/// # CSS hooks
+///
+/// | Selector | Element |
+/// |---|---|
+/// | `.autumn-feed` | Feed container |
+/// | `.autumn-feed__sentinel` | Continuation sentinel (swapped out on load) |
+/// | `.autumn-feed__more` | The `<a>`/"Load more" control |
+///
+/// # Progressive enhancement caveat
+///
+/// The `<a href>` fallback points at your partial handler (`config.url`), which
+/// normally returns just the next-page *fragment*. With JavaScript off, clicking
+/// it therefore lands on that bare fragment unless the handler detects a
+/// non-htmx request (no `HX-Request` header) and renders a full page for it.
+///
+/// # Example: initial view + append handler
+///
+/// ```rust
+/// use autumn_web::widgets::{infinite_feed, feed_page, FeedConfig, FeedMode};
+/// use autumn_web::pagination::CursorPage;
+/// use maud::html;
+///
+/// // Render each item however you like (this is caller-owned Markup):
+/// fn render(rows: &[&str]) -> maud::Markup {
+///     html! { @for r in rows { article class="post" { (r) } } }
+/// }
+///
+/// // Page 1 (has a next page):
+/// let page = CursorPage { content: vec!["a", "b"], size: 2,
+///     next_cursor: Some("eyJpZCI6Mn0".into()), has_next: true };
+/// let config = FeedConfig::new("/posts/feed").mode(FeedMode::Reveal);
+/// let view = infinite_feed(render(&page.content), page.next_cursor.as_deref(), &config)
+///     .into_string();
+/// assert!(view.contains(r#"class="autumn-feed""#));
+/// assert!(view.contains(r#"hx-trigger="revealed, click""#));
+/// assert!(view.contains(r##"hx-get="/posts/feed?cursor=eyJpZCI6Mn0""##));
+///
+/// // Your `GET /posts/feed?cursor=…` handler returns ONE partial for each
+/// // append — the same fragment shape as above, minus the outer container:
+/// let last = CursorPage::<&str> { content: vec![], size: 2, next_cursor: None, has_next: false };
+/// let append = feed_page(render(&last.content), last.next_cursor.as_deref(), &config)
+///     .into_string();
+/// assert!(!append.contains("autumn-feed__sentinel")); // last page → loop stops
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn infinite_feed(
+    items: maud::Markup,
+    next_cursor: Option<&str>,
+    config: &FeedConfig<'_>,
+) -> maud::Markup {
+    maud::html! {
+        div class="autumn-feed" {
+            (feed_page(items, next_cursor, config))
+        }
+    }
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────
