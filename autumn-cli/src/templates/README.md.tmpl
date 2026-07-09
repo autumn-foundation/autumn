@@ -32,16 +32,42 @@ Run these steps top-to-bottom on a clean checkout to get a route serving.
   running database configured. Install it with your package manager (e.g.
   `libpq-dev` on Debian/Ubuntu, `libpq` via Homebrew on macOS).
 
-### 2. Apply migrations
+### 2. Configure the database
+
+The base scaffold ships with the `[database]` block in `autumn.toml` **commented
+out**. `autumn migrate` needs a resolved connection URL, so enable the database
+before running it — open `autumn.toml`, uncomment the `[database]` block, and set
+`url` to a reachable Postgres:
+
+```toml
+[database]
+url = "postgres://postgres:postgres@localhost:5432/{{crate_name}}"
+```
+
+Don't have a Postgres to point at? Generate a containerized one (plus the rest of
+the deployment assets) and start it:
+
+```sh
+autumn release init --target docker-compose
+```
+
+Then create the database on its server (idempotent — safe to re-run):
+
+```sh
+autumn db create
+```
+
+### 3. Apply migrations
 
 ```sh
 autumn migrate
 ```
 
-Applies any pending database migrations. (With no `[database]` configured this
-is a no-op, so it's safe to run on the base app.)
+Applies every pending migration to the database you configured above. This
+requires a resolved database URL — run step 2 first, or `autumn migrate` exits
+with `✗ No database URL found.`
 
-### 3. Run the dev server
+### 4. Run the dev server
 
 ```sh
 autumn dev

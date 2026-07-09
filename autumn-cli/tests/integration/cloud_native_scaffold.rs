@@ -43,6 +43,20 @@ fn cloud_native_scaffold_generates_readme_golden_path() {
         readme.contains("autumn dev"),
         "README.md must document `autumn dev`, got:\n{readme}"
     );
+    // The golden path must configure the database BEFORE `autumn migrate` —
+    // migrate needs a resolved URL and errors ("No database URL found") on the
+    // base scaffold, where the `[database]` block ships commented out. The
+    // README must tell the user to enable it. Assert on stable substrings so
+    // minor wording changes don't break the test.
+    assert!(
+        readme.contains("[database]"),
+        "README.md must tell the user to enable the `[database]` block before \
+         `autumn migrate`, got:\n{readme}"
+    );
+    assert!(
+        readme.contains("autumn.toml"),
+        "README.md must reference `autumn.toml` for enabling the database, got:\n{readme}"
+    );
     // The project name must be substituted everywhere (AC #5) — no leftover
     // template tokens.
     assert!(

@@ -11,8 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **generator:** `autumn new` now generates a `README.md` at the project root
   (listed in the "Created …" output) with explicit prerequisites and a
-  golden-path quickstart — `autumn migrate` → `autumn dev` to a `200` on the
-  default route — plus one-line descriptions of the most useful CLI verbs
+  golden-path quickstart — configure the `[database]` block in `autumn.toml`
+  (the base scaffold ships it commented out, so `autumn migrate` would otherwise
+  exit with "No database URL found"), then `autumn migrate` → `autumn dev` to a
+  `200` on the default route — plus one-line descriptions of the most useful CLI verbs
   (`dev`, `migrate`, `doctor`, `routes`, `generate scaffold`, `release init`).
   The README is flag-aware: `--with-i18n` and `--with-seed` add sections for the
   extra steps they introduce (issue #1052).
