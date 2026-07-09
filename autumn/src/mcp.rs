@@ -934,13 +934,6 @@ struct ReplayContext<'a> {
     headers: &'a HeaderMap,
     identity: Option<&'a crate::security::ResolvedClientIdentity>,
     peer: Option<std::net::SocketAddr>,
-    /// The outer `/mcp` request's [`ServerTimingEmitted`] sentinel, planted by
-    /// the fallback `ServerTimingLayer` when `server_timing` is enabled. Used
-    /// by [`serve_tools_call`] to suppress the fallback's duplicate `total`
-    /// once it forwards the dispatch clone's `Server-Timing` header.
-    ///
-    /// [`ServerTimingEmitted`]: crate::middleware::ServerTimingEmitted
-    server_timing_sentinel: Option<&'a crate::middleware::ServerTimingEmitted>,
 }
 
 /// Reject an untrusted `Host`/`:authority` or a disallowed browser `Origin`
@@ -1019,17 +1012,10 @@ async fn serve_mcp(
     connect_info: Option<
         axum::extract::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>,
     >,
-    // The fallback `ServerTimingLayer` (applied in `apply_startup_barrier`)
-    // plants this sentinel in the request extensions when `server_timing` is
-    // enabled; absent otherwise. Threaded into `serve_tools_call` so it can
-    // suppress the fallback's duplicate `total` after forwarding the dispatch
-    // clone's `Server-Timing` header.
-    server_timing: Option<axum::extract::Extension<crate::middleware::ServerTimingEmitted>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     let identity = identity.as_ref().map(|ext| &ext.0);
-    let server_timing_sentinel = server_timing.as_ref().map(|ext| &ext.0);
 
     // Capture the request `Origin` (if any) so the actual JSON-RPC response can
     // carry the matching CORS grant, mirroring the `OPTIONS` preflight.
@@ -1059,7 +1045,6 @@ async fn serve_mcp(
         headers: &headers,
         identity,
         peer: connect_info.map(|ext| (ext.0).0),
-        server_timing_sentinel,
     };
 
     let mut response = match parsed {
@@ -1372,13 +1357,16 @@ async fn serve_tools_call(
         return stream_tool_result(id, &params, response, cookies);
     }
 
-    // Forward the dispatch clone's `Server-Timing` header (#1348) onto the
-    // rebuilt response. The clone runs the primary `ServerTimingLayer`, which
-    // builds the full metric set — including `db;dur;desc="N queries"` for a
-    // DB-backed tool — but that inner response is discarded when the JSON-RPC
-    // envelope is rebuilt below. Without this, a DB-backed `tools/call` would
-    // expose only the outer fallback's total-only header, losing the query
-    // count. Captured before the body is consumed, like `Set-Cookie` above.
+    // Capture the dispatch clone's `Server-Timing` header (#1348) so its
+    // non-`total` metrics can be forwarded onto the rebuilt response. The clone
+    // runs the primary `ServerTimingLayer`, which builds the full metric set —
+    // including `db;dur;desc="N queries"` for a DB-backed tool — but that inner
+    // response is discarded when the JSON-RPC envelope is rebuilt below. Without
+    // forwarding, a DB-backed `tools/call` would lose the query count. Only the
+    // non-`total` metrics are forwarded (see the append below); the inner
+    // `total` measured the dispatch clone alone and is dropped in favour of the
+    // outer fallback's real `/mcp` `total`. Captured before the body is
+    // consumed, like `Set-Cookie` above.
     let mut server_timings: Vec<HeaderValue> = Vec::new();
     for value in response.headers().get_all(&SERVER_TIMING) {
         server_timings.push(value.clone());
@@ -1411,20 +1399,52 @@ async fn serve_tools_call(
     for cookie in cookies {
         resp.headers_mut().append(header::SET_COOKIE, cookie);
     }
-    if !server_timings.is_empty() {
-        for timing in server_timings {
-            resp.headers_mut().append(SERVER_TIMING.clone(), timing);
-        }
-        // Now that the inner `Server-Timing` is on the response, flip the outer
-        // sentinel so the fallback `ServerTimingLayer` does not append its own
-        // total-only header — a duplicate `total`. The dispatch replay ran on a
-        // fresh request that never carried this sentinel, so the primary inside
-        // it could not flip it; do it here explicitly.
-        if let Some(sentinel) = ctx.server_timing_sentinel {
-            sentinel.mark();
+    // Forward only the inner dispatch's non-`total` `Server-Timing` metrics
+    // (e.g. `db;dur=…;desc="N queries"`) onto the rebuilt response, dropping the
+    // inner `total`. That inner `total` measured only the dispatch clone; it was
+    // captured before this endpoint buffered the body (`to_bytes`), collapsed an
+    // SSE body for a non-SSE client, and repackaged the JSON-RPC envelope, so it
+    // under-reports `/mcp` latency. By NOT marking the outer `ServerTimingEmitted`
+    // sentinel, the fallback `ServerTimingLayer` appends the real `/mcp` `total`
+    // (which brackets that buffering/serialization). Net result on a DB-backed
+    // call: the fallback's true `total` plus the inner `db` metric, with exactly
+    // one `total`. A non-DB call forwards nothing and the fallback emits
+    // total-only.
+    for timing in server_timings {
+        if let Ok(value) = timing.to_str()
+            && let Some(kept) = strip_total_metric(value)
+            && let Ok(hv) = HeaderValue::from_str(&kept)
+        {
+            resp.headers_mut().append(SERVER_TIMING.clone(), hv);
         }
     }
     resp
+}
+
+/// Strip the `total` metric from a `Server-Timing` header value, returning the
+/// remaining comma-separated metrics (e.g. `db;dur=…;desc="N queries"`), or
+/// `None` when only `total` (or nothing usable) was present.
+///
+/// A `Server-Timing` value is a comma-separated list of metrics, each of the
+/// form `name` optionally followed by `;`-separated parameters (`dur`, `desc`).
+/// The metric name is the token before the first `;` or `=`. This keeps the
+/// output W3C-valid and preserves any future non-`total` metrics the inner
+/// pipeline emits.
+fn strip_total_metric(value: &str) -> Option<String> {
+    let kept: Vec<&str> = value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .filter(|entry| {
+            let name = entry.split([';', '=']).next().unwrap_or("").trim();
+            !name.eq_ignore_ascii_case("total")
+        })
+        .collect();
+    if kept.is_empty() {
+        None
+    } else {
+        Some(kept.join(", "))
+    }
 }
 
 /// Package a buffered handler response as the JSON-RPC tool result.
@@ -2004,6 +2024,29 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn strip_total_metric_drops_only_total() {
+        // Inner `total` is dropped; the `db` metric (with a comma-free quoted
+        // desc) is preserved so the outer fallback's real `/mcp` `total` is the
+        // only one on the response.
+        assert_eq!(
+            strip_total_metric("total;dur=5.000, db;dur=1.250;desc=\"2 queries\""),
+            Some("db;dur=1.250;desc=\"2 queries\"".to_owned())
+        );
+        // Metric order and a leading non-total entry are preserved.
+        assert_eq!(
+            strip_total_metric("app;dur=1.500, total;dur=42.000"),
+            Some("app;dur=1.500".to_owned())
+        );
+        // A total-only header forwards nothing.
+        assert_eq!(strip_total_metric("total;dur=9.000"), None);
+        // The metric-name token is matched case-insensitively before `;`/`=`,
+        // so a bare `total` (no params) is also dropped.
+        assert_eq!(strip_total_metric("Total"), None);
+        // Empty / whitespace-only input yields nothing.
+        assert_eq!(strip_total_metric("  "), None);
     }
 
     #[test]

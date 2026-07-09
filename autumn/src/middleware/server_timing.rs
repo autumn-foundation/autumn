@@ -141,12 +141,11 @@ pub struct ServerTimingEmitted(Arc<AtomicBool>);
 impl ServerTimingEmitted {
     /// Flip the sentinel so the outermost fallback layer stays silent.
     ///
-    /// The primary layer calls this when it appends its header. The MCP
-    /// endpoint (`crate::mcp`) also calls it after forwarding the dispatch
-    /// clone's `Server-Timing` header onto the rebuilt JSON-RPC response, so
-    /// the fallback does not append a duplicate `total` — the inner dispatch
-    /// runs on a fresh request that never carried this outer sentinel, so the
-    /// primary inside it could not flip it.
+    /// The primary layer calls this when it appends its header, so a request
+    /// that flows through both layers carries a single `total` metric. The MCP
+    /// endpoint deliberately does *not* call this: it forwards only the inner
+    /// dispatch's non-`total` metrics and lets the fallback append the real
+    /// `/mcp` `total` (which brackets the endpoint's body buffering).
     pub(crate) fn mark(&self) {
         self.0.store(true, Ordering::Release);
     }

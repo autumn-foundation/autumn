@@ -31,9 +31,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   anonymous clients without explicit opt-in. `total` uses the identical
   clock formula as the access-log `duration_ms`; SSE
   (`text/event-stream`) responses receive `total`-only. MCP `tools/call`
-  responses forward the dispatched handler's `Server-Timing` (including
-  `db;dur`) onto the `/mcp` response instead of exposing only the fallback's
-  `total`, so DB-backed tool calls surface their query count too. See
+  responses forward the dispatched handler's non-`total` `Server-Timing`
+  metrics (including `db;dur;desc="N queries"`) onto the `/mcp` response, so
+  DB-backed tool calls surface their query count — while the inner-dispatch
+  `total` is dropped in favour of the outer fallback's real `/mcp` `total`,
+  which brackets the endpoint's body buffering/JSON-RPC repackaging (the inner
+  `total`, captured before that work, would under-report `/mcp` latency). See
   `docs/guide/observability/server-timing.md`.
 - **ci:** README-quickstart gate against the published crates (issue #1586) —
   `.github/workflows/quickstart-gate.yml` + `scripts/check-quickstart.sh`

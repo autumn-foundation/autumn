@@ -140,9 +140,13 @@ async fn add_test_cookie(
 // Appends a distinctive `Server-Timing` metric to every response in the
 // pipeline. In production the primary `ServerTimingLayer` inside the dispatch
 // clone adds the real `db;dur;desc="N queries"` metric the same way (via
-// `HeaderMap::append`); this stand-in lets a DB-free test assert that a
-// `tools/call` forwards the inner pipeline's `Server-Timing` onto the outer
-// `/mcp` response instead of discarding it.
+// `HeaderMap::append`); the `app;dur=1.500` stand-in lets a DB-free test assert
+// that a `tools/call` forwards the inner pipeline's non-`total` `Server-Timing`
+// metric onto the outer `/mcp` response instead of discarding it. The
+// distinctive `total;dur=424242.000` stands in for the inner-dispatch `total`
+// that must be *dropped* (the outer fallback emits the real `/mcp` `total`),
+// and shares one header value with the kept metric so the endpoint's
+// comma-split stripping is exercised.
 async fn add_test_server_timing(
     req: axum::extract::Request,
     next: axum::middleware::Next,
@@ -150,7 +154,7 @@ async fn add_test_server_timing(
     let mut resp = next.run(req).await;
     resp.headers_mut().append(
         axum::http::HeaderName::from_static("server-timing"),
-        axum::http::HeaderValue::from_static("app;dur=1.500"),
+        axum::http::HeaderValue::from_static("app;dur=1.500, total;dur=424242.000"),
     );
     resp
 }
@@ -476,8 +480,10 @@ async fn single_tools_call_forwards_server_timing() {
     // carries the primary `ServerTimingLayer`. That inner layer builds the full
     // metric set (in production, including `db;dur;desc="N queries"`) on the
     // dispatched response — but the JSON-RPC envelope is rebuilt, so the inner
-    // header used to be discarded, leaving only the fallback's total-only header
-    // on `/mcp`. The endpoint must forward the inner `Server-Timing` instead.
+    // header would be discarded. The endpoint forwards the inner *non-`total`*
+    // metrics while dropping the inner `total`, so the outer fallback emits the
+    // real `/mcp` `total` (which includes the endpoint's body buffering) rather
+    // than exposing the inner-dispatch `total` that under-reports latency.
     let client = TestApp::new()
         .config(config_with_server_timing())
         .routes(routes![get_todo])
@@ -495,8 +501,6 @@ async fn single_tools_call_forwards_server_timing() {
         .await;
     resp.assert_ok();
 
-    // The distinctive inner metric (stand-in for the real `db;dur`) must reach
-    // the outer response rather than being dropped when the envelope is rebuilt.
     let joined = resp
         .headers
         .iter()
@@ -504,25 +508,33 @@ async fn single_tools_call_forwards_server_timing() {
         .map(|(_, v)| v.as_str())
         .collect::<Vec<_>>()
         .join(", ");
+    // The distinctive inner non-`total` metric (stand-in for the real `db;dur`)
+    // must reach the outer response rather than being dropped with the envelope.
     assert!(
         joined.contains("app;dur=1.500"),
-        "inner pipeline `Server-Timing` metric must be forwarded onto `/mcp`: {joined:?}"
+        "inner pipeline non-`total` `Server-Timing` metric must be forwarded onto `/mcp`: {joined:?}"
     );
-    // The primary inside the dispatch clone always emits `total`; it must appear
-    // exactly once — the outer fallback must not append a duplicate now that the
-    // inner header is forwarded.
+    // The inner-dispatch `total` must be dropped, NOT forwarded: the distinctive
+    // inner value never appears on `/mcp`.
+    assert!(
+        !joined.contains("424242"),
+        "inner-dispatch `total` must be dropped, not forwarded onto `/mcp`: {joined:?}"
+    );
+    // Exactly one `total` remains — the outer fallback's real `/mcp` total. No
+    // duplicate `total` from forwarding the inner header alongside the fallback.
     assert_eq!(
         joined.matches("total;dur=").count(),
         1,
-        "forwarded inner header + fallback must not double-emit `total`: {joined:?}"
+        "exactly one `total` (the outer fallback's) expected on `/mcp`: {joined:?}"
     );
 }
 
 #[tokio::test]
 async fn tools_call_server_timing_no_duplicate_total() {
-    // Even without any handler-emitted metric, the forwarded inner header must
-    // suppress the outer fallback so the `/mcp` response carries a single
-    // `Server-Timing` line with exactly one `total`.
+    // Without any inner non-`total` metric to forward (no DB queries, no handler
+    // metric), the endpoint forwards nothing and the outer fallback emits the
+    // real `/mcp` `total`, so the response carries a single `Server-Timing` line
+    // with exactly one `total`.
     let client = TestApp::new()
         .config(config_with_server_timing())
         .routes(routes![get_todo])
@@ -547,7 +559,7 @@ async fn tools_call_server_timing_no_duplicate_total() {
     );
     let header = resp
         .header("server-timing")
-        .expect("forwarded inner Server-Timing should be present");
+        .expect("outer fallback Server-Timing should be present");
     assert_eq!(
         header.matches("total;dur=").count(),
         1,
