@@ -22,6 +22,86 @@ fn scaffold(project_name: &str) -> tempfile::TempDir {
 }
 
 #[test]
+fn cloud_native_scaffold_generates_readme_golden_path() {
+    let temp_dir = scaffold("readme-app");
+    let project_dir = temp_dir.path().join("readme-app");
+
+    let readme_path = project_dir.join("README.md");
+    assert!(
+        readme_path.is_file(),
+        "autumn new must write a README.md at the project root"
+    );
+
+    let readme = fs::read_to_string(&readme_path).unwrap();
+    // Golden-path commands (AC #6): the README must document the two commands
+    // that take a clean checkout to a serving route.
+    assert!(
+        readme.contains("autumn migrate"),
+        "README.md must document `autumn migrate`, got:\n{readme}"
+    );
+    assert!(
+        readme.contains("autumn dev"),
+        "README.md must document `autumn dev`, got:\n{readme}"
+    );
+    // The project name must be substituted everywhere (AC #5) — no leftover
+    // template tokens.
+    assert!(
+        readme.contains("readme-app"),
+        "README.md must substitute the project name, got:\n{readme}"
+    );
+    assert!(
+        !readme.contains("{{"),
+        "README.md must not contain unsubstituted template placeholders, got:\n{readme}"
+    );
+}
+
+#[test]
+fn cloud_native_scaffold_readme_is_flag_aware_for_i18n_and_seed() {
+    // AC #7: with `--with-i18n --with-seed`, the generated README must document
+    // the extra steps those flags introduce (a seed section and an i18n
+    // section) while still substituting every template token.
+    let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
+    let autumn_bin = env!("CARGO_BIN_EXE_autumn");
+
+    let output = Command::new(autumn_bin)
+        .args(["new", "flagged-app", "--with-i18n", "--with-seed"])
+        .current_dir(temp_dir.path())
+        .output()
+        .expect("failed to run `autumn new`");
+
+    assert!(
+        output.status.success(),
+        "autumn new failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let readme_path = temp_dir.path().join("flagged-app").join("README.md");
+    let readme = fs::read_to_string(&readme_path).unwrap();
+
+    // Seed section (`--with-seed`): must point at `autumn seed`.
+    assert!(
+        readme.contains("autumn seed"),
+        "flag-aware README must document `autumn seed`, got:\n{readme}"
+    );
+    // i18n section (`--with-i18n`): must reference the `t!(` macro and the
+    // scaffolded locale bundle.
+    assert!(
+        readme.contains("t!("),
+        "flag-aware README must reference the `t!(` macro, got:\n{readme}"
+    );
+    assert!(
+        readme.contains("i18n/en.ftl"),
+        "flag-aware README must reference the i18n/en.ftl bundle, got:\n{readme}"
+    );
+    // Appended flag sections must not reintroduce template tokens.
+    assert!(
+        !readme.contains("{{"),
+        "flag-aware README must not contain unsubstituted placeholders, got:\n{readme}"
+    );
+}
+
+#[test]
 fn cloud_native_scaffold_emits_container_artifacts() {
     let temp_dir = scaffold("cloudy-app");
     let project_dir = temp_dir.path().join("cloudy-app");

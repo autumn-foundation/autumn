@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **generator:** `autumn new` now generates a `README.md` at the project root
+  (listed in the "Created …" output) with explicit prerequisites and a
+  golden-path quickstart — `autumn migrate` → `autumn dev` to a `200` on the
+  default route — plus one-line descriptions of the most useful CLI verbs
+  (`dev`, `migrate`, `doctor`, `routes`, `generate scaffold`, `release init`).
+  The README is flag-aware: `--with-i18n` and `--with-seed` add sections for the
+  extra steps they introduce (issue #1052).
 - **ci:** README-quickstart gate against the published crates (issue #1586) —
   `.github/workflows/quickstart-gate.yml` + `scripts/check-quickstart.sh`
   install the README-pinned `autumn-cli` from crates.io (never the local

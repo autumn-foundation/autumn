@@ -10,6 +10,7 @@ use autumn_web::credentials::{MasterKey, encrypt};
 
 mod templates {
     pub const CARGO_TOML: &str = include_str!("templates/Cargo.toml.tmpl");
+    pub const README: &str = include_str!("templates/README.md.tmpl");
     pub const MAIN_RS: &str = include_str!("templates/main.rs.tmpl");
     pub const AUTUMN_TOML: &str = include_str!("templates/autumn.toml.tmpl");
     pub const DOCKERFILE: &str = include_str!("templates/Dockerfile.tmpl");
@@ -214,6 +215,11 @@ fn generate_inner(
     );
     fs::write(project_dir.join("Cargo.toml"), cargo_toml)?;
 
+    fs::write(
+        project_dir.join("README.md"),
+        render_readme(render(templates::README), opts),
+    )?;
+
     let mut main_rs = if opts.with_i18n {
         inject_i18n(&render(templates::MAIN_RS))
     } else {
@@ -389,6 +395,7 @@ fn scaffold_credentials(project_dir: &Path, name: &str) -> Result<(), NewError> 
 fn print_scaffold_summary(name: &str, opts: GenerateOptions) {
     println!("  Created {name}/");
     println!("  Created {name}/Cargo.toml");
+    println!("  Created {name}/README.md");
     println!("  Created {name}/autumn.toml");
     println!("  Created {name}/Dockerfile");
     println!("  Created {name}/.dockerignore");
@@ -512,6 +519,44 @@ const DAEMON_NO_DB_FEATURES: &[&str] = &[
     "http-client",
     "reporting",
 ];
+
+/// Render the project README, appending flag-specific sections.
+///
+/// `render_template` only substitutes the four fixed `{{…}}` tokens, so the
+/// flag-aware quickstart notes (`--with-i18n`, `--with-seed`) are appended here
+/// in Rust rather than gated inside the template. The appended text must not
+/// introduce any new `{{…}}` token — `no_unsubstituted_placeholders` walks the
+/// generated tree and would flag it.
+fn render_readme(rendered: String, opts: GenerateOptions) -> String {
+    let mut readme = rendered;
+    if opts.with_i18n {
+        readme.push_str(
+            "\n## Internationalization (i18n)\n\
+             \n\
+             This project was generated with `--with-i18n`. Fluent translations\n\
+             live in `i18n/en.ftl`; add more locales by dropping additional files\n\
+             like `i18n/es.ftl`. Reach translations from your handlers by taking a\n\
+             `Locale` extractor and passing it to the `t!()` macro — e.g.\n\
+             `t!(locale, \"welcome.title\")` — and use the `[i18n]` block in\n\
+             `autumn.toml` to set the default and supported locales. See\n\
+             `docs/guide/i18n.md` for the full guide.\n",
+        );
+    }
+    if opts.with_seed {
+        readme.push_str(
+            "\n## Seed data\n\
+             \n\
+             This project was generated with `--with-seed`. Edit `src/bin/seed.rs`\n\
+             to insert representative data, then seed the database (after applying\n\
+             migrations):\n\
+             \n\
+             ```sh\n\
+             autumn migrate && autumn seed\n\
+             ```\n",
+        );
+    }
+    readme
+}
 
 fn render_cargo_toml(
     opts: GenerateOptions,
@@ -718,6 +763,7 @@ mod tests {
 
         let p = tmp.path().join("test-app");
         assert!(p.join("Cargo.toml").is_file());
+        assert!(p.join("README.md").is_file());
         assert!(p.join("src/main.rs").is_file());
         assert!(p.join("autumn.toml").is_file());
         assert!(p.join("Dockerfile").is_file());

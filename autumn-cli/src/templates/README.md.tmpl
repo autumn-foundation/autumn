@@ -1,0 +1,74 @@
+# {{project_name}}
+
+An [Autumn](https://crates.io/crates/autumn-web) web application.
+
+## Quickstart
+
+Run these steps top-to-bottom on a clean checkout to get a route serving.
+
+### 1. Prerequisites
+
+- **Rust {{rust_version}}+** (edition 2024) — https://rustup.rs
+- **The `autumn` CLI:**
+  ```sh
+  cargo install autumn-cli --version {{autumn_version}}
+  ```
+- **The Tailwind binary** (downloaded by `autumn setup`):
+  ```sh
+  autumn setup
+  ```
+- **A reachable Postgres** for database features. Don't have one? Generate a
+  containerized database (and the rest of the deployment assets) with:
+  ```sh
+  autumn release init --target docker-compose
+  ```
+- **Diesel CLI** for the database path:
+  ```sh
+  cargo install diesel_cli --no-default-features --features postgres
+  ```
+- **The PostgreSQL client library (`libpq`).** The default scaffold keeps the
+  `db` feature, so the base app links `libpq` at build time — it must be
+  installed for `cargo build` / `autumn dev` to succeed, even before you have a
+  running database configured. Install it with your package manager (e.g.
+  `libpq-dev` on Debian/Ubuntu, `libpq` via Homebrew on macOS).
+
+### 2. Apply migrations
+
+```sh
+autumn migrate
+```
+
+Applies any pending database migrations. (With no `[database]` configured this
+is a no-op, so it's safe to run on the base app.)
+
+### 3. Run the dev server
+
+```sh
+autumn dev
+```
+
+Then visit **http://localhost:3000** — you should get a `200` with
+"Welcome to {{project_name}}!". Health endpoints are auto-mounted at
+`/health` and `/actuator/health`.
+
+## CLI reference
+
+The most useful `autumn` verbs for day-to-day work:
+
+| Command | What it does |
+|---|---|
+| `autumn dev` | Run the dev server with file watching + live reload. |
+| `autumn migrate` | Apply pending database migrations. |
+| `autumn doctor` | Preflight your environment / diagnose setup problems. |
+| `autumn routes` | List all mounted routes. |
+| `autumn generate scaffold <Name> field:Type …` | Scaffold a CRUD resource — model, migration, routes, and views. |
+| `autumn release init --target docker-compose` | Generate deployment assets (e.g. a docker-compose with Postgres). |
+
+## Project layout
+
+| Path | Purpose |
+|---|---|
+| `autumn.toml` | Base config (server, database, session, security, logging). |
+| `src/main.rs` | AppBuilder setup — register routes, tasks, jobs, migrations here. |
+| `migrations/` | Diesel migrations — one directory per migration. |
+| `static/` | Static assets served under `/static/`. |
