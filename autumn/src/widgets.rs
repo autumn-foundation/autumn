@@ -3580,13 +3580,29 @@ pub fn toast_in(region_id: &str, message: &str, variant: AlertVariant) -> maud::
     let region_id = selector_to_id(region_id);
     let oob = format!("beforeend:#{region_id}");
     // For a POSITIONAL OOB swap (`beforeend:#…`) htmx inserts the carrier's
-    // *children* and discards the carrier itself. On an HTTP response the swap
-    // pipeline unwraps `<template>` (see `channels.rs` / `htmx::HtmxFragments`),
-    // so the styled/ARIA `.autumn-toast` element must be the carrier's CHILD —
-    // putting `hx-swap-oob` directly on it would throw the wrapper away and
-    // append only the inner `<span>`.
+    // *children* into the target and discards the carrier itself, so the carrier
+    // must be a plain, discardable `<div>` — NOT a `<template>`.
+    //
+    // Authority — vendored htmx 2.0.4 (`vendor/htmx.min.js`):
+    //   * `oobSwap` (minified `He`): for a non-outerHTML style it swaps
+    //     `f(clone)`, i.e. the *carrier element* (`f` returns the element as-is),
+    //     then `_e("beforeend", …)` → `Be` → `a`, whose insert loop is
+    //     `while(n.childNodes.length>0)` — it iterates the carrier's `childNodes`.
+    //   * The response OOB scan `ze` matches a top-level `<template hx-swap-oob=…>`
+    //     (`parentElement===null`), so the template is processed as the carrier
+    //     itself, not unwrapped. A `<template>` keeps its children in `.content`,
+    //     so `template.childNodes` is EMPTY → htmx appends nothing and the toast
+    //     never shows. (The template-content rescan only helps when `hx-swap-oob`
+    //     sits on a CHILD *inside* `.content`, which is not this positional case.)
+    //
+    // This mirrors the repo's own tested SSE convention in `channels.rs` (see the
+    // passing `broadcast_publish_oob_custom_strategy` test →
+    // `<div hx-swap-oob="beforeend:#badge"><span>3</span></div>`). The styled/ARIA
+    // `.autumn-toast` element stays the carrier's CHILD; putting `hx-swap-oob`
+    // directly on it would throw the wrapper away and append only the inner
+    // `<span>`.
     maud::html! {
-        template hx-swap-oob=(oob) {
+        div hx-swap-oob=(oob) {
             div class=(class) role=(role) aria-live=(live) aria-atomic="true" {
                 span class="autumn-toast__message" { (message) }
             }

@@ -63,40 +63,44 @@ fn toast_region_normalizes_a_leading_hash_in_id() {
 }
 
 #[test]
-fn oob_swap_is_on_a_discardable_template_carrier_not_the_toast() {
-    // For a positional (`beforeend:#…`) OOB swap htmx inserts the carrier's
-    // CHILDREN and discards the carrier itself. The carrier must therefore be a
-    // `<template>` (unwrapped by htmx's HTTP swap pipeline), and the styled/ARIA
-    // `.autumn-toast` element must be its CHILD — never the OOB-attributed one.
+fn oob_swap_is_on_a_discardable_div_carrier_not_the_toast() {
+    // For a positional (`beforeend:#…`) OOB swap the vendored htmx 2.0.4 inserts
+    // the carrier's CHILDREN and discards the carrier itself (`vendor/htmx.min.js`
+    // `oobSwap`/`He`: a non-outerHTML style swaps the carrier element, then
+    // `Be`→`a` runs `while(n.childNodes.length>0)`, iterating its `childNodes`).
+    // The carrier must therefore be a plain `<div>`, NOT a `<template>`: a
+    // `<template>` keeps its children in `.content`, so `template.childNodes` is
+    // empty and htmx would append nothing. This mirrors the repo's tested SSE
+    // convention in `channels.rs` (`broadcast_publish_oob_custom_strategy`). The
+    // styled/ARIA `.autumn-toast` element must be the carrier's CHILD — never the
+    // OOB-attributed one.
     let out = toast("Saved", AlertVariant::Success).into_string();
     assert!(
-        out.starts_with("<template "),
-        "carrier must be a <template>: {out}"
+        out.starts_with(r#"<div hx-swap-oob="beforeend:#toast-region">"#),
+        "carrier must be a discardable <div hx-swap-oob>: {out}"
     );
+    assert!(!out.contains("<template"), "no <template> carrier: {out}");
+    // The styled `.autumn-toast` div's own opening tag must NOT carry hx-swap-oob.
+    let toast_div = out.find(r#"<div class="autumn-toast"#).expect("toast div");
+    let toast_tag_end = out[toast_div..].find('>').expect("div tag close") + toast_div;
     assert!(
-        out.contains(r#"<template hx-swap-oob="beforeend:#toast-region">"#),
-        "{out}"
-    );
-    // The toast div's own opening tag must NOT carry hx-swap-oob.
-    let div_start = out.find("<div").expect("toast div");
-    let div_tag_end = out[div_start..].find('>').expect("div tag close") + div_start;
-    assert!(
-        !out[div_start..=div_tag_end].contains("hx-swap-oob"),
+        !out[toast_div..=toast_tag_end].contains("hx-swap-oob"),
         "the .autumn-toast div must not carry hx-swap-oob: {out}"
     );
 }
 
 #[test]
 fn htmx_children_extraction_preserves_the_styled_toast() {
-    // Model htmx's positional-OOB behavior: strip the `<template>` carrier and
-    // keep only its children (what actually gets inserted into the region).
-    // The styled, ARIA-annotated toast must survive that extraction — a
-    // regression to `hx-swap-oob` on the div would leave only the bare <span>.
+    // Model htmx's positional-OOB behavior: strip the `<div hx-swap-oob>` carrier
+    // and keep only its children (what vendored htmx 2.0.4 actually inserts into
+    // the region — `oobSwap` iterates the carrier's `childNodes`). The styled,
+    // ARIA-annotated toast must survive that extraction — a regression to
+    // `hx-swap-oob` on the toast div would leave only the bare <span>.
     let out = toast("Boom", AlertVariant::Error).into_string();
-    let open_end = out.find('>').expect("template open tag") + 1;
+    let open_end = out.find('>').expect("carrier open tag") + 1;
     let inner = out[open_end..]
-        .strip_suffix("</template>")
-        .expect("template wrapper");
+        .strip_suffix("</div>")
+        .expect("carrier wrapper");
     assert!(
         inner.contains(r#"class="autumn-toast autumn-toast--error""#),
         "{inner}"
