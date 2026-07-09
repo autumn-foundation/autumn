@@ -34,6 +34,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::str::FromStr as _;
 
+use autumn_web::config::{AutumnConfig, Env, OsEnv};
 use autumn_web::i18n::{Bundle, I18nConfig};
 use proc_macro2::{Delimiter, TokenStream, TokenTree};
 use quote::ToTokens as _;
@@ -461,9 +462,48 @@ struct ProjectToml {
     i18n: I18nConfig,
 }
 
-/// Read the `[i18n]` section from `autumn.toml` in `root`, falling back to
-/// [`I18nConfig::default`] when the file or section is absent.
-fn load_i18n_config(root: &Path) -> I18nConfig {
+/// An [`Env`] that reports `root` as the manifest directory so the layered
+/// config loader reads `autumn.toml`, inline `[profile.<env>.i18n]` overlays,
+/// and `autumn-<env>.toml` from the project being checked, while every other
+/// variable (notably `AUTUMN_ENV`) is read from the underlying environment.
+struct RootedEnv<'a> {
+    root: &'a Path,
+    inner: &'a dyn Env,
+}
+
+impl Env for RootedEnv<'_> {
+    fn var(&self, key: &str) -> Result<String, std::env::VarError> {
+        if key == "AUTUMN_MANIFEST_DIR" {
+            return Ok(self.root.to_string_lossy().into_owned());
+        }
+        self.inner.var(key)
+    }
+}
+
+/// Resolve the effective `[i18n]` config for `root`, honoring `AUTUMN_ENV` and
+/// the same profile-overlay layering the runtime applies at startup
+/// ([`AutumnConfig::load_with_env`]): base `autumn.toml` ← `[profile.<env>.i18n]`
+/// ← `autumn-<env>.toml`. This ensures `i18n check` inspects the *same* locale
+/// directory and supported-locale set the app will serve under the active
+/// profile — e.g. under `AUTUMN_ENV=prod` a production overlay's
+/// `dir`/`supported_locales` are checked instead of the base defaults, so
+/// missing production translations are no longer silently passed.
+///
+/// Falls back to a base-only parse of `autumn.toml` if the layered load fails
+/// (e.g. an unrelated prod validation error), so the check never regresses to
+/// "no config" when a base `[i18n]` block is present.
+fn load_i18n_config(root: &Path, env: &dyn Env) -> I18nConfig {
+    let rooted = RootedEnv { root, inner: env };
+    if let Ok(config) = AutumnConfig::load_with_env(&rooted) {
+        return config.i18n;
+    }
+    load_i18n_config_base_only(root)
+}
+
+/// Read only the base `[i18n]` section from `autumn.toml` in `root`, falling
+/// back to [`I18nConfig::default`] when the file or section is absent. Used as
+/// a safety net when the full layered load fails.
+fn load_i18n_config_base_only(root: &Path) -> I18nConfig {
     let path = root.join("autumn.toml");
     let Ok(raw) = std::fs::read_to_string(&path) else {
         return I18nConfig::default();
@@ -478,15 +518,16 @@ fn load_i18n_config(root: &Path) -> I18nConfig {
 /// Run `autumn i18n check` against the current working directory and exit with
 /// the appropriate CI status code.
 pub fn run(opts: I18nCheckOptions) -> ! {
-    let code = run_in(Path::new("."), opts);
+    let code = run_in(Path::new("."), &OsEnv, opts);
     std::process::exit(code);
 }
 
 /// Testable core: run the check against `root`, print a report, and return the
-/// exit code without terminating the process.
+/// exit code without terminating the process. `env` supplies `AUTUMN_ENV`
+/// (and other variables) for profile-aware i18n config resolution.
 #[must_use]
-pub fn run_in(root: &Path, opts: I18nCheckOptions) -> i32 {
-    let config = load_i18n_config(root);
+pub fn run_in(root: &Path, env: &dyn Env, opts: I18nCheckOptions) -> i32 {
+    let config = load_i18n_config(root, env);
     let dir = root.join(&config.dir);
 
     if !dir.exists() {

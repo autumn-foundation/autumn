@@ -22,7 +22,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are warnings that become errors under `--strict`. `--format json` emits a
   machine-readable report for `autumn check`/CI to consume. Dynamically-built
   keys (e.g. `t(&format!(...))`) are listed as "dynamic — not checked" rather
-  than silently ignored or falsely flagged. See `autumn-cli/src/i18n.rs`.
+  than silently ignored or falsely flagged. The i18n config is resolved through
+  the same profile-aware loader the runtime uses (`AutumnConfig::load_with_env`),
+  so `AUTUMN_ENV` and `[profile.<env>.i18n]` / `autumn-<env>.toml` overlays are
+  honored — under `AUTUMN_ENV=prod` the check inspects the production locale
+  directory and `supported_locales` instead of the base defaults, so missing
+  production translations are no longer silently passed. See
+  `autumn-cli/src/i18n.rs`.
 - **download:** typed `Download` `IntoResponse` (`autumn_web::download::Download`)
   for serving files from a handler without hand-rolling headers. Construct it
   from owned bytes, an async byte stream, an `AsyncRead`, or a stored blob

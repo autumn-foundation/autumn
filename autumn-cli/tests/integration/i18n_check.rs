@@ -36,6 +36,21 @@ fn run_check(root: &Path, args: &[&str]) -> Output {
         .expect("failed to run autumn i18n check")
 }
 
+/// Run `autumn i18n check [args...]` inside `root` with `AUTUMN_ENV` set, so
+/// profile overlays (`[profile.<env>.i18n]` / `autumn-<env>.toml`) are applied.
+/// `AUTUMN_ENV` is scoped to the spawned child process, so no test-process
+/// global env is mutated.
+fn run_check_with_env(root: &Path, autumn_env: &str, args: &[&str]) -> Output {
+    Command::new(autumn_bin())
+        .arg("i18n")
+        .arg("check")
+        .args(args)
+        .current_dir(root)
+        .env("AUTUMN_ENV", autumn_env)
+        .output()
+        .expect("failed to run autumn i18n check")
+}
+
 const AUTUMN_TOML: &str = "\
 [i18n]
 default_locale = \"en\"
@@ -210,6 +225,66 @@ fn json_format_emits_machine_readable_report() {
         .flat_map(|l| l["missing"].as_array().cloned().unwrap_or_default())
         .any(|k| k == "nav.about");
     assert!(missing_anywhere, "nav.about should be missing\n{stdout}");
+}
+
+#[test]
+fn profile_overlay_selects_prod_locale_dir_under_autumn_env() {
+    // The base `[i18n]` block points at `i18n/`, whose `en.ftl` has every
+    // referenced key (so the default/dev check PASSes). A `[profile.prod.i18n]`
+    // overlay redirects the check at `i18n-prod/`, whose `en.ftl` is *missing*
+    // `nav.about` — proving that under `AUTUMN_ENV=prod` the command honors the
+    // production overlay (locale dir + config) instead of the base defaults.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "autumn.toml",
+        "\
+[i18n]
+default_locale = \"en\"
+supported_locales = [\"en\"]
+dir = \"i18n\"
+
+[profile.prod.i18n]
+default_locale = \"en\"
+supported_locales = [\"en\"]
+dir = \"i18n-prod\"
+",
+    );
+    write(root, "src/main.rs", CALL_SITES);
+    // Base locale dir: complete.
+    write(root, "i18n/en.ftl", "nav.home = Home\nnav.about = About\n");
+    // Prod locale dir: `nav.about` is genuinely missing.
+    write(root, "i18n-prod/en.ftl", "nav.home = Home\n");
+
+    // Without AUTUMN_ENV: base `i18n/` is inspected → all keys present → PASS.
+    let base = run_check(root, &[]);
+    let base_stdout = String::from_utf8_lossy(&base.stdout);
+    assert!(
+        base.status.success(),
+        "base (dev) check should PASS using i18n/\nstdout:\n{base_stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&base.stderr)
+    );
+    assert!(base_stdout.contains("PASS"), "stdout:\n{base_stdout}");
+
+    // With AUTUMN_ENV=prod: the `[profile.prod.i18n]` overlay redirects the
+    // check at `i18n-prod/`, where `nav.about` is missing → FAIL.
+    let prod = run_check_with_env(root, "prod", &[]);
+    let prod_stdout = String::from_utf8_lossy(&prod.stdout);
+    assert!(
+        !prod.status.success(),
+        "prod overlay should FAIL: i18n-prod/ is missing nav.about\nstdout:\n{prod_stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&prod.stderr)
+    );
+    assert!(
+        prod_stdout.contains("nav.about"),
+        "should name the key missing from the prod locale dir\n{prod_stdout}"
+    );
+    assert!(
+        prod_stdout.contains("Missing"),
+        "should label it Missing under the prod overlay\n{prod_stdout}"
+    );
+    assert!(prod_stdout.contains("FAIL"), "stdout:\n{prod_stdout}");
 }
 
 #[test]
