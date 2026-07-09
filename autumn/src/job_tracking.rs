@@ -1,6 +1,6 @@
 //! Tracked job handles: unguessable-token status polling for `#[job]`.
 //!
-//! [`enqueue_tracked`](crate::job::enqueue_tracked) hands the caller a
+//! [`enqueue_tracked`] hands the caller a
 //! [`TrackedJobHandle`] carrying a public, unguessable token distinct from the
 //! internal job id. Inside the job handler, [`JobContext::current`] exposes
 //! progress reporting (`set_progress`) and lets the handler record a terminal

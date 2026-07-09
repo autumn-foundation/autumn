@@ -527,8 +527,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Accept-Encoding` accepts them, instead of relying solely on the
   general-purpose compression middleware to redo that work on every request.
 
+### Fixed
+
+- **views:** vendored the full Idiomorph 0.3.0 morphing script (replacing a
+  minimal stub) so live `hx-ext="morph"` updates actually DOM-morph, and
+  patched its htmx extension so non-morph out-of-band swaps (e.g.
+  `beforeend`/`delete`) no longer throw a caught console error. Served the
+  idiomorph script with a revalidating cache policy (a weak content-derived
+  `ETag` plus `Cache-Control: public, max-age=0, must-revalidate`) instead of a
+  year-long `immutable` cache, so clients that had cached the old stub pick up
+  the real script on their next revalidation rather than running stale code for
+  up to a year. (The idiomorph URL is not content-fingerprinted; adding
+  fingerprinted asset URLs so it can safely go back to `immutable` caching is a
+  possible future follow-up.)
+
 ### Changed
 
+- **security:** `TenancyConfig::jwt_secret` is now stored as a
+  `secrecy::SecretString` instead of a plain `String`, so the JWT signing
+  secret is redacted from `Debug` output (and any logs that format the
+  config) and zeroized on drop. Config-file deserialization is unchanged —
+  a plain TOML string still works. Breaking for code that read or set the
+  field directly: set it with `Some(value.into())` and read it via
+  `secrecy::ExposeSecret::expose_secret()` (supersedes #1304). [no-plugin]
+- **deps(security):** dependency-vulnerability upgrades (supersedes PR #1557;
+  `diesel-async` was already handled separately). `aws-sdk-s3` floored at
+  1.122 (1.119.0 → 1.122.0, the last MSRV-1.88 release) with
+  `default-features = false` to drop the deprecated legacy hyper 0.14 /
+  rustls 0.21 connector stack — this removes `rustls-webpki` 0.101.7
+  (RUSTSEC-2026-0104 / GHSA-82j2-j2ch-gfr8 high, RUSTSEC-2026-0098 /
+  GHSA-965h-392x-2mh5 and RUSTSEC-2026-0099 / GHSA-xgp8-3hg3-c2mh low),
+  `rustls` 0.21.12, `hyper` 0.14.32, and `h2` 0.3.27 from `Cargo.lock`
+  entirely (the modern hyper 1.x / rustls 0.23 `default-https-client` stack,
+  which is what the SDK actually uses at runtime, stays enabled); transitive
+  `lru` 0.12.5 → 0.16.4 (RUSTSEC-2026-0002 / GHSA-rhfx-m35p-ff5j);
+  `opentelemetry_sdk` 0.31.0 → 0.32.1 (CVE-2026-48504 / GHSA-w9wp-h8wv-79jx,
+  unbounded memory allocation in W3C Baggage propagation) together with the
+  matching `opentelemetry` / `opentelemetry-otlp` 0.32.0 and
+  `tracing-opentelemetry` 0.33.0 (with the `tls-aws-lc`, `tls-roots`, and
+  `reqwest-rustls` features enabled on `opentelemetry-otlp`, since 0.32
+  rejects `https://` gRPC collector endpoints at exporter build time unless
+  a TLS provider feature is on, the provider alone ships an empty trust-root
+  store — `tls-roots` loads the platform's native roots, which the gRPC
+  exporter now enables explicitly via `with_enabled_roots()` for `https`
+  endpoints — and its new reqwest 0.13 HTTP client ships without TLS under
+  `reqwest-client` alone — reqwest 0.12 feature unification no longer
+  covers it).
+  `rsa` 0.9.10 (RUSTSEC-2023-0071, Marvin
+  attack) remains: no fixed release exists on its 0.9.x line. [no-plugin]
 - **deps:** bumped `diesel-async` from 0.8 to 0.9 (resolving 0.9.2, with
   `diesel` at 2.3.10) and `libsqlite3-sys` from 0.36 to 0.37 — 0.37 is the
   newest release line diesel 2.3 accepts (`<0.38`). diesel-async 0.9 changed
@@ -553,6 +599,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `MailError::InvalidMessage` text; the error now reports a static reason
   ("environment variable is not set" / "contains non-unicode data") alongside
   the variable *name* only, never its value. Supersedes PR #887.
+- **circuit_breaker:** the breaker and its registry now recover from a
+  poisoned mutex (`lock().unwrap_or_else(PoisonError::into_inner)`) instead
+  of panicking on every subsequent call once a single lock holder has
+  panicked; breaker state is a self-correcting sliding window, so the
+  recovered data is safe to keep using. Supersedes #1207. [no-plugin]
+- **docs:** repaired the broken intra-doc links in the `reporting` module
+  overview (`ErrorEvent`, `ErrorReporter`, `LogReporter`, `ReportingLayer`
+  rendered as dead links on docs.rs because shorthand references don't resolve
+  when a module carries both outer and inner doc comments — they now use
+  explicit `crate::reporting::…` paths) and dropped a redundant explicit link
+  target in the `job_tracking` module docs. Supersedes the salvageable parts
+  of PR #1555.
+- **jobs:** fixed a first-initialization race in the process-global job
+  client (supersedes #1491): `init_global_job_client` /
+  `clear_global_job_client` used a get-then-set pattern on the backing
+  `OnceLock`, so two threads racing the very first install/clear could have
+  one side's `OnceLock::set` lose and be silently dropped — leaving a job
+  runtime that had just installed its client invisible to `global_job_client()`
+  (free-function `enqueue` and `#[job]` handlers would see no runtime). Both
+  functions now use `OnceLock::get_or_init` so the slot is created exactly
+  once and every install/clear lands through the `RwLock`. Both functions now
+  also recover from a poisoned lock (`PoisonError::into_inner`) instead of
+  silently skipping the write, and a loom model-check
+  (`chaos_job_client_loom`) exercises the first-init race across all
+  interleavings.
 
 ## [0.6.0] - 2026-06-30
 
@@ -729,6 +800,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Previously the pool hardcoded `NoTls`, so `sslmode=require` failed every
   connection with "no TLS implementation configured" and cleartext was the
   only working configuration (issue #1507). [no-plugin]
+
+- **offline-sync (new feature):** offline-first local storage plus a sync
+  engine for occasionally-connected apps such as the in-process Tauri mobile
+  shell (issue #1508). `autumn_web::sync` ships a local SQLite `SyncStore`
+  (JSON rows per collection, write-through change journal in the same
+  transaction, tombstoned deletes), a client `SyncEngine` (push pending →
+  pull versions past the cursor; at-least-once with server-side dedup,
+  exponential-backoff background task, transparent full resync that
+  preserves and replays pending changes), and a mountable server router
+  (`POST /sync/push` + `GET /sync/pull` via `AppBuilder::nest`) over
+  Postgres shadow tables with idempotent DDL (`PgSyncBackend`) or an
+  in-memory backend for tests. Conflicts are settled server-side by a
+  pluggable `ConflictResolver` (default: last-write-wins on the conflicting
+  writes' `updated_at`; exact ties break to the lexicographically greater
+  device id); resolved rows get a new version so every device converges.
+  Postgres pushes serialize under an advisory lock (in-order version
+  visibility for pulls; concurrent first-inserts of one pk engage the
+  resolver), pull sessions carry a session-start cursor so multi-page
+  catch-ups survive tombstone GC, completed catch-ups land the cursor at
+  the GC horizon and prune GC'd local tombstones, `already_applied` acks
+  return the originally assigned version, push/pull request sizes are
+  bounded server-side, dedup records are GC-able via
+  `SyncBackend::gc_applied`, and `SyncConfig::bearer_token` authenticates
+  the engine against an auth-guarded `/sync` mount. Zero new
+  dependencies — builds on the `db` and `http-client` features already in
+  the graph. [no-plugin]
+- **generator:** `autumn generate tauri-mobile --offline-sync` (issue #1508)
+  wires the offline-sync engine into the mobile scaffold: the shell opens a
+  `SyncStore`-backed SQLite database in the app sandbox (exported as
+  `AUTUMN_SYNC__DB_PATH`), runs a background `SyncEngine` against
+  `AUTUMN_SYNC__REMOTE_URL` (30 s interval, exponential backoff while
+  offline, plus an immediate pass on `RunEvent::Resumed` when the app
+  returns to the foreground), and the app crate gains a default
+  `offline-sync` feature and a `/sync` router mounted in the extracted
+  `serve()` — only when the app's resolved config has a database URL (e.g.
+  `AUTUMN_DATABASE__URL`), and with log-and-continue schema DDL, so the
+  same binary boots fully offline on a device (no database at all) and
+  serves sync on the server. Without the flag the emitted scaffold is
+  byte-identical to before (pinned by a golden snapshot test). Docs:
+  architecture, change tracking, tombstoning/GC, conflict resolution, and
+  an airplane-mode walkthrough in
+  [docs/guide/tauri-mobile-offline-sync.md](docs/guide/tauri-mobile-offline-sync.md).
+  [no-plugin]
 
 ### Documentation
 
