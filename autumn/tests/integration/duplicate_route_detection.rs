@@ -39,6 +39,16 @@ async fn user_by_slug() -> &'static str {
     "slug"
 }
 
+#[get("/cmd/{tool}/{sub}")]
+async fn cmd_sub() -> &'static str {
+    "sub"
+}
+
+#[post("/cmd/{*path}")]
+async fn cmd_all() -> &'static str {
+    "all"
+}
+
 // ── PROBE handlers: distinct methods, same path, same scope ──────────────────
 #[get("/posts")]
 async fn scoped_posts_get() -> &'static str {
@@ -250,6 +260,43 @@ async fn cross_method_shape_conflict_returns_structured_error_without_axum_panic
     );
     assert!(
         message.contains("/users/{id}") && message.contains("/users/{slug}"),
+        "error must name both original path templates: {message}"
+    );
+    // A leaked axum/matchit panic would carry these tokens instead.
+    assert!(
+        !message.contains("Insertion failed") && !message.contains("Overlapping method route"),
+        "no raw axum matchit panic should escape: {message}"
+    );
+}
+
+/// New #1012 finding (matchit oracle, this branch): a catch-all conflicts with
+/// a dynamic DESCENDANT — `GET /cmd/{tool}/{sub}` + `POST /cmd/{*path}`. The old
+/// hand-rolled shape normalizer collapsed captures position-by-position and let
+/// this pair through, so axum's matchit still PANICKED at mount. Delegating the
+/// shape check to matchit (the engine axum uses) catches it as a structured
+/// `ConflictingRouteShape` BEFORE axum ever sees the overlap. This end-to-end
+/// test proves no raw matchit/axum panic escapes `TestApp::build`.
+#[tokio::test]
+async fn catch_all_vs_dynamic_descendant_returns_structured_error_without_axum_panic() {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = TestApp::new().routes(routes![cmd_sub, cmd_all]).build();
+    }));
+
+    let payload = result.expect_err(
+        "catch-all vs dynamic-descendant conflict must fail the build; instead it succeeded",
+    );
+    let message = panic_message(payload.as_ref());
+
+    assert!(
+        message.contains("ConflictingRouteShape"),
+        "expected structured ConflictingRouteShape preflight error, got: {message}"
+    );
+    assert!(
+        message.contains("cmd_sub") && message.contains("cmd_all"),
+        "error must name both handlers: {message}"
+    );
+    assert!(
+        message.contains("/cmd/{tool}/{sub}") && message.contains("/cmd/{*path}"),
         "error must name both original path templates: {message}"
     );
     // A leaked axum/matchit panic would carry these tokens instead.

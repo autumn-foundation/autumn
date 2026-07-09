@@ -488,6 +488,7 @@ dependencies = [
  "libsqlite3-sys",
  "loom",
  "lru 0.18.0",
+ "matchit",
  "maud",
  "moka",
  "nix 0.31.3",

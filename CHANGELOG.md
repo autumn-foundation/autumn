@@ -29,16 +29,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   error names BOTH handlers, the HTTP method, and the resolved path. The
   synthetic `WS` method a `#[ws]` handler mounts as `GET` is normalized before
   keying, so `#[get("/live")]` + `#[ws("/live")]` is caught too. Two routes
-  whose templates normalize to the same axum path *shape* but use **different**
-  templates — capture names differ (`/users/{id}` vs `/users/{slug}`) or a
-  normal capture meets a catch-all (`/u/{id}` vs `/u/{*rest}`) — are a matchit
+  whose **different** templates resolve to overlapping path shapes are a matchit
   route conflict *regardless of HTTP method* (so `GET /users/{id}` +
   `POST /users/{slug}` clashes) and now fail with a dedicated
   `RouterBuildError::ConflictingRouteShape` that names BOTH handlers and BOTH
-  original templates, instead of leaking an axum matchit panic. Shape
-  normalization is char-level and honors escaped literal braces (`{{`/`}}`), so
-  static paths like `/{{foo}}` vs `/{{bar}}` and mixed segments like
-  `/file.{ext}` vs `/file.json` are NOT falsely rejected. Distinct methods on
+  original templates, instead of leaking an axum matchit panic. Path-shape
+  conflict detection is delegated to **matchit** — the exact engine axum 0.8
+  routes through — instead of a hand-rolled normalizer, so it mirrors axum's
+  accept/reject behavior precisely on every edge case: capture-name diffs
+  (`/users/{id}` vs `/users/{slug}`), catch-all vs sibling capture (`/u/{id}`
+  vs `/u/{*rest}`), catch-all vs dynamic *descendant* (`/cmd/{tool}/{sub}` vs
+  `/cmd/{*path}`, which the old normalizer missed), and mixed literal+capture
+  segments (`/file.{ext}` vs `/file.{kind}`). Because the check *is* matchit it
+  never over-flags what axum accepts: static-vs-capture (`/users/me` vs
+  `/users/{id}`), escaped literal braces (`/{{foo}}` vs `/{{bar}}`), and mixed
+  segments like `/file.{ext}` vs `/file.json` build cleanly. A permanent parity
+  test pins matchit's verdicts to axum 0.8.9's so a future axum bump cannot let
+  the oracle drift silently. Distinct methods on
   the *same exact path* (`GET /admin` + `POST /admin`, `GET /users/{id}` +
   `POST /users/{id}`) and genuinely different shapes (`/users/{id}` vs
   `/users/{id}/posts`) are unaffected;

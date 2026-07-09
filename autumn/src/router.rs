@@ -1425,77 +1425,24 @@ fn effective_mount_method(method: &http::Method) -> http::Method {
     }
 }
 
-/// Canonicalize a route path into the "shape" axum's matcher keys a conflict on,
-/// so the duplicate preflight collides exactly when `Router::route` would panic.
-///
-/// Verified against axum 0.8 (matchit) by building `axum::Router` directly:
-/// * capture NAMES are irrelevant — `/u/{id}` conflicts with `/u/{slug}`;
-/// * a normal capture and a catch-all at the same position ALSO conflict —
-///   `/u/{id}` conflicts with `/u/{*rest}`;
-/// * but a static segment stays distinct from a capture — `/u/{id}` does NOT
-///   conflict with `/u/foo`, and `/u/{id}` does NOT conflict with `/u/{id}/x`.
-///
-/// So every genuine capture run (normal `{name}` or catch-all `{*name}`)
-/// collapses to a single placeholder, and everything else — static text AND
-/// escaped literal braces — is preserved verbatim. Only the KEY is normalized;
-/// the error still reports the original template for readability.
-///
-/// # Escaped braces
-///
-/// axum/matchit treat `{{` and `}}` as ESCAPED literal braces, not captures —
-/// `/{{foo}}` is the static literal segment `{foo}`. Verified against axum
-/// 0.8.9 by building `axum::Router` directly: `/{{foo}}` and `/{{bar}}` build
-/// as two distinct static routes, and `/{{id}}` (literal `{id}`) does NOT
-/// conflict with the real capture `/{id}`. Collapsing every brace run — as a
-/// naive whole-segment or greedy scan would — falsely rejects those valid apps
-/// (a #1012 regression). So this scans char-by-char and only collapses
-/// UNESCAPED `{…}` capture runs, copying `{{` / `}}` through as literals. That
-/// also keeps mixed segments correct: `/file.{ext}` → `/file.{\0}` (literal
-/// prefix preserved, only the capture collapsed) and `/{{lit}}-{id}` →
-/// `/{{lit}}-{\0}`.
-fn normalize_route_shape(path: &str) -> String {
-    // Placeholder for a collapsed capture run: `{` + NUL + `}`. A NUL byte can
-    // never appear in a real path template, so a collapsed capture can never be
-    // confused with static text or an escaped literal brace.
-    const PLACEHOLDER: &str = "{\u{0}}";
-    let mut out = String::with_capacity(path.len());
-    let bytes = path.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'{' if bytes.get(i + 1) == Some(&b'{') => {
-                // Escaped literal `{{` — preserve verbatim, skip both bytes.
-                out.push_str("{{");
-                i += 2;
-            }
-            b'}' if bytes.get(i + 1) == Some(&b'}') => {
-                // Escaped literal `}}` — preserve verbatim, skip both bytes.
-                out.push_str("}}");
-                i += 2;
-            }
-            b'{' => {
-                // Start of a genuine unescaped capture run. Capture names never
-                // contain braces, so it ends at the next `}`. Collapse the whole
-                // `{…}` run (normal or `{*catch-all}`) to a single placeholder.
-                out.push_str(PLACEHOLDER);
-                i += 1;
-                while i < bytes.len() && bytes[i] != b'}' {
-                    i += 1;
-                }
-                if i < bytes.len() {
-                    // Skip the closing `}`.
-                    i += 1;
-                }
-            }
-            _ => {
-                // Copy one full UTF-8 char so multibyte static text survives.
-                let ch = path[i..].chars().next().unwrap();
-                out.push(ch);
-                i += ch.len_utf8();
-            }
-        }
+/// Probe whether two path templates conflict under matchit — the SAME engine
+/// axum 0.8 routes through — by inserting both into a throwaway router. axum's
+/// `Router::route` forwards each template to matchit verbatim (brace syntax:
+/// `{param}` / `{*wild}`), so a matchit `Conflict` here is exactly the mount
+/// panic `reject_duplicate_user_routes` is preventing. Used only on the error
+/// path to name the specific prior template a conflicting insert collided with.
+fn paths_conflict_under_matchit(existing: &str, incoming: &str) -> bool {
+    let mut probe: matchit::Router<()> = matchit::Router::new();
+    // If `existing` is itself malformed its insert fails; then it isn't in the
+    // tree and can't be the conflict partner — return false so the caller keeps
+    // scanning earlier templates.
+    if probe.insert(existing, ()).is_err() {
+        return false;
     }
-    out
+    matches!(
+        probe.insert(incoming, ()),
+        Err(matchit::InsertError::Conflict { .. })
+    )
 }
 
 /// Fail-fast preflight for issue #1012: reject two user- or plugin-registered
@@ -1544,36 +1491,68 @@ fn reject_duplicate_user_routes(
     let mut claimed: std::collections::HashMap<(String, String), String> =
         std::collections::HashMap::new();
 
-    // `shapes` keys on the normalized path SHAPE (capture names collapsed,
-    // catch-all/normal captures unified) and records the FIRST exact path
-    // template + handler seen for that shape. axum's matchit router rejects two
-    // DIFFERENT exact templates that share a shape (`/users/{id}` vs
-    // `/users/{slug}`, `/u/{id}` vs `/u/{*rest}`) as a route conflict BEFORE any
-    // method merging — so that clash is illegal regardless of method and is
-    // surfaced as `ConflictingRouteShape`. Two registrations of the SAME exact
-    // template share both the shape and the exact string, so they fall through
-    // to the method-keyed `claimed` check (duplicate vs legal cross-method).
-    let mut shapes: std::collections::HashMap<String, (String, String)> =
-        std::collections::HashMap::new();
+    // Method-independent path-shape conflicts are delegated to matchit — the
+    // SAME engine axum 0.8 routes through — instead of a hand-rolled shape
+    // normalizer. Every DISTINCT exact template is inserted into a throwaway
+    // `matchit::Router`; an `InsertError::Conflict` means the two templates
+    // resolve to overlapping shapes that axum's `Router::route` would reject
+    // with a mount panic BEFORE any method merging (`/users/{id}` vs
+    // `/users/{slug}`, `/u/{id}` vs `/u/{*rest}`, `/cmd/{tool}/{sub}` vs
+    // `/cmd/{*path}`, `/file.{ext}` vs `/file.{kind}`). Delegating to matchit
+    // converges every capture-name / escaped-brace / catch-all-vs-dynamic edge
+    // case on axum's own semantics — see `matchit_agrees_with_axum_route_conflicts`
+    // for the parity guard that fails loudly if matchit ever drifts from axum.
+    //
+    // IMPORTANT: exact-duplicate templates legitimately MERGE across distinct
+    // methods (AC #4: `GET /users/{id}` + `POST /users/{id}`), so identical
+    // strings are deduplicated BEFORE insertion — re-inserting the same string
+    // would falsely self-conflict. Those fall through to the method-keyed
+    // `claimed` check, which alone distinguishes a real duplicate from a legal
+    // cross-method registration.
+    let mut shape_router: matchit::Router<String> = matchit::Router::new();
+    // DISTINCT exact templates inserted into `shape_router`, in insertion order,
+    // paired with their handler name. matchit's `InsertError::Conflict { with }`
+    // reports the conflicting route as an unescaped/merged node string that need
+    // not equal any template we registered, so we recover the conflict partner
+    // ourselves by re-probing this list (first prior template that conflicts
+    // under matchit wins, matching the "first-seen is `existing`" convention).
+    let mut inserted_shapes: Vec<(String, String)> = Vec::new();
 
     let mut record =
         |method: &http::Method, path: String, name: &str| -> Result<(), RouterBuildError> {
             let effective_method = effective_mount_method(method).to_string();
-            let shape = normalize_route_shape(&path);
 
-            // Shape conflict (method-independent): a different exact template
-            // already claimed this shape → axum matchit would panic on mount.
-            if let Some((existing_path, existing_name)) = shapes.get(&shape) {
-                if existing_path != &path {
-                    return Err(RouterBuildError::ConflictingRouteShape {
-                        existing: existing_name.clone(),
-                        existing_path: existing_path.clone(),
-                        incoming: name.to_owned(),
-                        incoming_path: path,
-                    });
+            // Shape conflict (method-independent) via the matchit oracle. Skip
+            // templates whose EXACT string was already inserted: an identical
+            // string is a legal cross-method merge, not a shape conflict, and
+            // re-inserting it would self-conflict.
+            let already_inserted = inserted_shapes.iter().any(|(p, _)| p == &path);
+            if !already_inserted {
+                match shape_router.insert(&path, name.to_owned()) {
+                    Ok(()) => inserted_shapes.push((path.clone(), name.to_owned())),
+                    Err(matchit::InsertError::Conflict { .. }) => {
+                        // Name the specific prior template this one collides with.
+                        let (existing_path, existing_name) = inserted_shapes
+                            .iter()
+                            .find(|(prior, _)| paths_conflict_under_matchit(prior, &path))
+                            .cloned()
+                            // Defensive fallback (a full-tree conflict with no
+                            // single pairwise partner is not expected for real
+                            // route templates): attribute to the first insert.
+                            .unwrap_or_else(|| inserted_shapes[0].clone());
+                        return Err(RouterBuildError::ConflictingRouteShape {
+                            existing: existing_name,
+                            existing_path,
+                            incoming: name.to_owned(),
+                            incoming_path: path,
+                        });
+                    }
+                    // Any other `InsertError` (malformed param/catch-all syntax)
+                    // is a single-template validity problem, not a cross-route
+                    // conflict; leave it to the existing path-validation seams
+                    // and axum itself rather than mislabeling it a shape clash.
+                    Err(_) => {}
                 }
-            } else {
-                shapes.insert(shape, (path.clone(), name.to_owned()));
             }
 
             // Exact-duplicate check: same effective method AND same exact path
@@ -6530,9 +6509,9 @@ enabled = true
 
     /// Finding B (round 2): axum/matchit treat `{{`/`}}` as ESCAPED literal
     /// braces, so `/{{foo}}` and `/{{bar}}` are two DISTINCT static routes.
-    /// Verified against axum 0.8.9: both build cleanly. `normalize_route_shape`
-    /// must preserve escaped braces as literals (not collapse them to the
-    /// capture placeholder) so this valid app is not falsely rejected.
+    /// Verified against axum 0.8.9: both build cleanly. The matchit oracle
+    /// treats escaped braces as literals (not captures), so this valid app is
+    /// not falsely rejected.
     #[tokio::test]
     async fn try_build_router_allows_escaped_brace_literals() {
         let config = AutumnConfig::default();
@@ -6615,6 +6594,125 @@ enabled = true
                     if existing_path == "/u/{id}" && incoming_path == "/u/{*rest}"
             ),
             "expected ConflictingRouteShape naming both templates, got {err:?}"
+        );
+    }
+
+    /// New #1012 finding (matchit oracle): a catch-all conflicts with a dynamic
+    /// DESCENDANT, not just a sibling capture. `GET /cmd/{tool}/{sub}` +
+    /// `POST /cmd/{*path}` slipped past the old hand-rolled shape normalizer
+    /// (which only unified captures position-by-position) and axum still panicked
+    /// at mount. Delegating to matchit — the engine axum uses — catches it:
+    /// verified against axum 0.8.9 that this pair PANICS. The preflight surfaces
+    /// it as `ConflictingRouteShape` naming both handlers + both templates; no
+    /// axum/matchit panic escapes.
+    #[tokio::test]
+    async fn try_build_router_rejects_catch_all_vs_dynamic_descendant() {
+        let config = AutumnConfig::default();
+        let a = duplicate_test_route(http::Method::GET, "/cmd/{tool}/{sub}", "cmd_sub");
+        let b = duplicate_test_route(http::Method::POST, "/cmd/{*path}", "cmd_all");
+        let err =
+            super::try_build_router_inner(vec![a, b], &config, test_state(), duplicate_test_ctx())
+                .expect_err("catch-all vs dynamic descendant must be rejected before mount");
+        match err {
+            RouterBuildError::ConflictingRouteShape {
+                ref existing,
+                ref existing_path,
+                ref incoming,
+                ref incoming_path,
+            } => {
+                assert_eq!(existing, "cmd_sub");
+                assert_eq!(existing_path, "/cmd/{tool}/{sub}");
+                assert_eq!(incoming, "cmd_all");
+                assert_eq!(incoming_path, "/cmd/{*path}");
+            }
+            other => panic!("expected ConflictingRouteShape, got {other:?}"),
+        }
+        let display = err.to_string();
+        assert!(
+            display.contains("/cmd/{tool}/{sub}") && display.contains("/cmd/{*path}"),
+            "error must name both original templates; got: {display}"
+        );
+    }
+
+    /// Negative regression guard for the matchit oracle: a STATIC segment and a
+    /// dynamic capture at the same position (`/users/me` + `/users/{id}`) do NOT
+    /// conflict — matchit (and thus axum 0.8.9) accepts both, matching static
+    /// before dynamic. The oracle must NOT raise a false positive here. Confirmed
+    /// by `matchit_agrees_with_axum_route_conflicts`.
+    #[tokio::test]
+    async fn try_build_router_allows_static_vs_dynamic_segment() {
+        let config = AutumnConfig::default();
+        let a = duplicate_test_route(http::Method::GET, "/users/me", "me");
+        let b = duplicate_test_route(http::Method::GET, "/users/{id}", "by_id");
+        let _router =
+            super::try_build_router_inner(vec![a, b], &config, test_state(), duplicate_test_ctx())
+                .expect("a static segment and a dynamic capture must not be flagged as a conflict");
+    }
+
+    /// Parity guard for the #1012 matchit oracle: matchit's `insert` Ok/Err MUST
+    /// agree with axum 0.8.9's `Router::route` accept/panic on every case of the
+    /// conflict matrix. axum wraps matchit, so they should always agree — this
+    /// test fails LOUDLY if a future axum bump (or a `matchit` version that
+    /// drifts out of lockstep with the `=0.8.4` pin) changes conflict semantics,
+    /// catching silent oracle divergence before it can introduce false
+    /// positives/negatives at mount. Deterministic and fast (no async, no I/O).
+    #[test]
+    fn matchit_agrees_with_axum_route_conflicts() {
+        // (template_a, template_b, expect_conflict)
+        let matrix: &[(&str, &str, bool)] = &[
+            ("/users/{id}", "/users/{slug}", true),
+            ("/users/{id}", "/users/{id}/posts", false),
+            ("/cmd/{tool}/{sub}", "/cmd/{*path}", true),
+            ("/users/me", "/users/{id}", false),
+            ("/{{foo}}", "/{{bar}}", false),
+            ("/file.{ext}", "/file.{kind}", true),
+            ("/file.{ext}", "/file.json", false),
+            ("/u/{id}", "/u/{*rest}", true),
+        ];
+
+        // Silence axum/matchit's panic backtrace noise while we intentionally
+        // trip conflicts under catch_unwind; restore the hook afterwards.
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+
+        let mut rows = Vec::new();
+        let mut mismatches = Vec::new();
+        for &(a, b, expect_conflict) in matrix {
+            // axum: does registering BOTH templates panic inside `route()`?
+            let axum_panics = std::panic::catch_unwind(|| {
+                let _ = axum::Router::<()>::new()
+                    .route(a, axum::routing::get(|| async { "a" }))
+                    .route(b, axum::routing::get(|| async { "b" }));
+            })
+            .is_err();
+
+            // matchit: does inserting BOTH templates report a conflict?
+            let mut r: matchit::Router<()> = matchit::Router::new();
+            r.insert(a, ()).expect("first template must insert cleanly");
+            let matchit_conflicts =
+                matches!(r.insert(b, ()), Err(matchit::InsertError::Conflict { .. }));
+
+            rows.push(format!(
+                "{a:<20} vs {b:<20} axum={} matchit={} expected={}",
+                if axum_panics { "PANIC" } else { "ok" },
+                if matchit_conflicts { "Err" } else { "Ok" },
+                if expect_conflict { "conflict" } else { "ok" },
+            ));
+
+            if axum_panics != matchit_conflicts || axum_panics != expect_conflict {
+                mismatches.push(rows.last().unwrap().clone());
+            }
+        }
+
+        std::panic::set_hook(prev_hook);
+
+        assert!(
+            mismatches.is_empty(),
+            "matchit must agree with axum 0.8.9 AND the expected outcome on every \
+             case (oracle divergence => false positives/negatives at mount).\n\
+             full matrix:\n{}\nmismatches:\n{}",
+            rows.join("\n"),
+            mismatches.join("\n"),
         );
     }
 
