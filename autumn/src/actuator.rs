@@ -2640,9 +2640,11 @@ pub(crate) struct SetLoggerRequest {
 
 /// Whether `name` is a valid `tracing` directive target.
 ///
-/// A directive target is a module path: ASCII alphanumerics plus `_` and `:`
-/// (e.g. `my_app::module`). `root` (and the empty string, treated as root) are
-/// special-cased. Anything carrying an `EnvFilter` metacharacter — `=`, `,`,
+/// A directive target is a module path: ASCII alphanumerics plus `_`, `:`, `.`
+/// and `-` (e.g. `my_app::module`, `tower-http`, `my.custom.target`). `root`
+/// (and the empty string, treated as root) are special-cased. `.` and `-` are
+/// valid inside a `tracing` target and are *not* `EnvFilter` directive
+/// metacharacters. Anything carrying an `EnvFilter` metacharacter — `=`, `,`,
 /// whitespace, `[`, `]`, `{`, `}` — is rejected so a malformed target never
 /// reaches the subscriber and the endpoint cannot lie about applying it
 /// (issue #1044).
@@ -2651,7 +2653,7 @@ fn is_valid_logger_name(name: &str) -> bool {
         return true;
     }
     name.chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == ':')
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == ':' || ch == '.' || ch == '-')
 }
 
 /// `PUT <actuator-prefix>/loggers/{name}` -- change a logger's level at runtime.
@@ -2686,7 +2688,7 @@ pub(crate) async fn loggers_put<S: ProvideActuatorState + Send + Sync + 'static>
                 "status": "error",
                 "message": format!(
                     "Invalid logger name '{name}'. Names may contain only \
-                     alphanumerics, '_' and ':' (or 'root')."
+                     alphanumerics, '_', ':', '.' and '-' (or 'root')."
                 ),
             })),
         );
@@ -4632,6 +4634,71 @@ mod tests {
             loggers.is_empty(),
             "no bogus override should be recorded, got {loggers:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn actuator_loggers_put_accepts_dotted_and_hyphenated_names() {
+        // Real-world `tracing` targets from third-party crates and custom
+        // targets carry `.` and `-` (e.g. `tower-http`, `my.custom.target`,
+        // `h2::proto`). These are valid inside a target and are *not*
+        // `EnvFilter` directive metacharacters, so a PUT to such a name must
+        // NOT be rejected as invalid (400) — it reaches the normal
+        // apply/record path (200) and is recorded as an override.
+        let state = test_state();
+        for name in ["tower-http", "my.custom.target", "h2::proto"] {
+            let app = actuator_router(true).with_state(state.clone());
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri(format!("/actuator/loggers/{name}"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(r#"{"level": "debug"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "logger name {name:?} should be accepted, not rejected as invalid"
+            );
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            // No live subscriber is attached in `test_state()`, so a valid name
+            // takes the "recorded" path — the point is it is not the invalid
+            // "error" path.
+            assert_ne!(
+                json["status"], "error",
+                "valid name {name:?} must not hit the invalid-name error path"
+            );
+        }
+
+        // GET /loggers must now list the accepted overrides.
+        let app = actuator_router(true).with_state(state.clone());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/loggers")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let loggers = json["loggers"].as_object().unwrap();
+        for name in ["tower-http", "my.custom.target", "h2::proto"] {
+            assert!(
+                loggers.contains_key(name),
+                "accepted override {name:?} should be recorded, got {loggers:?}"
+            );
+        }
     }
 
     #[tokio::test]
