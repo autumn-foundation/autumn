@@ -46,10 +46,13 @@ fn page_one_emits_feed_container_and_cursored_sentinel() {
 }
 
 #[test]
-fn reveal_mode_auto_loads_on_reveal() {
+fn reveal_mode_auto_loads_on_reveal_and_on_click() {
     let config = FeedConfig::new("/feed").mode(FeedMode::Reveal);
     let out = feed_page(items(&["a"]), Some("cur1"), &config).into_string();
-    assert!(out.contains(r#"hx-trigger="revealed""#), "{out}");
+    // `click` is included alongside `revealed` so activating the visible link
+    // before it scrolls into view swaps in place instead of navigating to the
+    // bare partial handler.
+    assert!(out.contains(r#"hx-trigger="revealed, click""#), "{out}");
 }
 
 #[test]

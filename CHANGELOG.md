@@ -29,7 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `feed_page(items, next_cursor, &FeedConfig)` render an htmx infinite-scroll /
   "Load more" feed driven by a `CursorPage`: a single `hx-get` sentinel carries
   the cursor and appends the next page in place (no reload, no duplicate rows),
-  in reveal (`hx-trigger="revealed"`) or explicit-button mode, with a
+  in reveal (`hx-trigger="revealed, click"`) or explicit-button mode, with a
   progressive `<a href>` fallback (issue #1372). `tabs(id, panels)` completes
   the trio as the no-JS `tablist`/`tabpanel` switcher (issue #1316). Semantic
   `.autumn-toast*` / `.autumn-feed*` classes backed by the shipped `WIDGETS_CSS`

@@ -3603,8 +3603,9 @@ pub fn toast_in(region_id: &str, message: &str, variant: AlertVariant) -> maud::
 #[cfg(feature = "maud")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FeedMode {
-    /// Auto-load when the sentinel scrolls into view (`hx-trigger="revealed"`).
-    /// The classic infinite scroll. This is the default.
+    /// Auto-load when the sentinel scrolls into view, and also on a manual
+    /// click of the visible link (`hx-trigger="revealed, click"`). The classic
+    /// infinite scroll. This is the default.
     #[default]
     Reveal,
     /// Require an explicit click on the keyboard-focusable "Load more" control
@@ -3752,13 +3753,19 @@ fn feed_next_url(config: &FeedConfig<'_>, cursor: &str) -> String {
 /// next-cursor URL (works with htmx/JS unavailable) AND htmx-wired to fetch
 /// that URL and replace the whole sentinel (`hx-swap="outerHTML"`, targeting
 /// the closest `.autumn-feed__sentinel`) with the returned fragment. In
-/// [`FeedMode::Reveal`] it fires on `revealed`; in [`FeedMode::Button`] it uses
-/// htmx's default `click` trigger.
+/// [`FeedMode::Reveal`] it fires on `revealed, click` — auto-loading when
+/// scrolled into view, but also swapping in place (rather than navigating to
+/// the bare partial) if a user activates the visible link first; in
+/// [`FeedMode::Button`] it uses htmx's default `click` trigger. htmx
+/// `preventDefault`s the anchor navigation whenever it handles the trigger, so
+/// the `<a href>` stays a pure no-JS fallback.
 #[cfg(feature = "maud")]
 fn feed_sentinel(next_cursor: &str, config: &FeedConfig<'_>) -> maud::Markup {
     let next_url = feed_next_url(config, next_cursor);
     let trigger = match config.mode {
-        FeedMode::Reveal => Some("revealed"),
+        // Include `click` so a user activating the visible "Load more" link
+        // before `revealed` fires swaps in place instead of following `href`.
+        FeedMode::Reveal => Some("revealed, click"),
         FeedMode::Button => None,
     };
     maud::html! {
@@ -3873,7 +3880,7 @@ pub fn feed_page(
 /// let view = infinite_feed(render(&page.content), page.next_cursor.as_deref(), &config)
 ///     .into_string();
 /// assert!(view.contains(r#"class="autumn-feed""#));
-/// assert!(view.contains(r#"hx-trigger="revealed""#));
+/// assert!(view.contains(r#"hx-trigger="revealed, click""#));
 /// assert!(view.contains(r##"hx-get="/posts/feed?cursor=eyJpZCI6Mn0""##));
 ///
 /// // Your `GET /posts/feed?cursor=…` handler returns ONE partial for each
