@@ -170,6 +170,8 @@ mod sharding_commit_hooks;
 #[cfg(feature = "db")]
 mod sharding_integration;
 mod signed_webhooks;
+#[cfg(feature = "ws")]
+mod sse_replay;
 mod static_serving;
 #[cfg(feature = "storage")]
 mod storage_local_integration;
