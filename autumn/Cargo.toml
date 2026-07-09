@@ -173,7 +173,7 @@ serde_json = "1"
 thiserror.workspace = true
 tokio.workspace = true
 tokio-stream = { workspace = true, optional = true }
-tokio-util.workspace = true
+tokio-util = { workspace = true, features = ["io"] }
 toml.workspace = true
 tower.workspace = true
 tower-http.workspace = true
