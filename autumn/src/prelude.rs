@@ -142,6 +142,8 @@ pub use http::Method;
 pub use http::StatusCode;
 
 // ── Conditional GET / ETag ───────────────────────────────────────
+/// Declarative `Cache-Control` freshness builder — attach via a tuple or `.wrap(..)`.
+pub use crate::etag::CacheControl;
 /// `ETag` type for conditional-GET responses.
 pub use crate::etag::ETag;
 /// Tower middleware that auto-derives weak `ETag`s from response bodies.
@@ -150,6 +152,8 @@ pub use crate::etag::EtagLayer;
 pub use crate::etag::FreshWhen;
 /// Conversion trait — implemented for `String`, `&str`, `i64`, `(NaiveDateTime, i64)`, `ETag`.
 pub use crate::etag::IntoETag;
+/// Start a `Cache-Control` freshness directive (`max-age`); defaults to `private`.
+pub use crate::etag::cache_for;
 /// One-liner conditional-GET helper; returns a [`FreshWhen`] resolved with `.or(response)`.
 pub use crate::etag::fresh_when;
 /// Derive a weak `ETag` from any [`Hash`] value.
@@ -191,12 +195,13 @@ pub use crate::form::{Changeset, ChangesetForm, IntoChangeset};
 pub use crate::widgets::{
     ActiveSearchConfig, AlertConfig, AlertVariant, AutocompleteConfig, AvatarConfig, AvatarSize,
     BadgeConfig, BadgeVariant, CardConfig, Column, ConfirmActionConfig, Crumb, Cta, CtaStyle,
-    DataTableConfig, HeadingLevel, HeroConfig, ModalConfig, NavBarConfig, NavBarLayout, NavItem,
-    NavLinkMatch, NavMenu, SearchMethod, SortDir, active_search, active_search_empty_state,
-    active_search_input, active_search_results, alert, alert_with, autocomplete_empty_state,
-    autocomplete_input, autocomplete_option, avatar, badge, badge_with, breadcrumb, card,
-    confirm_action, data_table, error_summary, hero, modal, modal_close_button, modal_trigger,
-    nav_bar, nav_link, nav_link_matched, property_list, stat_card, status_tag, tabs,
+    DEFAULT_TOAST_REGION_ID, DataTableConfig, FeedConfig, FeedMode, HeadingLevel, HeroConfig,
+    ModalConfig, NavBarConfig, NavBarLayout, NavItem, NavLinkMatch, NavMenu, SearchMethod, SortDir,
+    active_search, active_search_empty_state, active_search_input, active_search_results, alert,
+    alert_with, autocomplete_empty_state, autocomplete_input, autocomplete_option, avatar, badge,
+    badge_with, breadcrumb, card, confirm_action, data_table, error_summary, feed_page, hero,
+    infinite_feed, modal, modal_close_button, modal_trigger, nav_bar, nav_link, nav_link_matched,
+    property_list, stat_card, status_tag, tabs, toast, toast_in, toast_region,
 };
 
 // ── Widget stories ───────────────────────────────────────────────

@@ -8,7 +8,9 @@
 //!
 //! The blob-backed constructor streams bytes straight from the store without
 //! buffering the whole object in memory, so it works for large files behind
-//! authorization (no public presigned URL required).
+//! authorization (no public presigned URL required). The byte stream is opened
+//! lazily when the response is built, so a `Range` request fetches only the
+//! requested slice rather than reading the whole object.
 //!
 //! # Serving a private stored file behind auth
 //!
@@ -44,8 +46,11 @@ use axum::body::Body;
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use futures::Stream;
-use http::HeaderValue;
-use http::header::{CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE};
+use http::header::{CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE, ETAG, LAST_MODIFIED};
+use http::{HeaderMap, HeaderValue};
+
+use crate::etag::{ETag, IntoETag};
+use crate::range::{self, Validator};
 
 /// A boxed `'static` byte stream used as a download body.
 type BoxByteStream =
@@ -62,10 +67,43 @@ enum Disposition {
 
 /// The payload backing a [`Download`].
 enum DownloadBody {
-    /// Fully-buffered bytes with a known length.
+    /// Fully-buffered bytes with a known length. **Range-capable**: a slice is
+    /// served from memory.
     Bytes(Bytes),
-    /// A streaming body of unknown or externally-tracked length.
+    /// An opaque streaming body of unknown or externally-tracked length.
+    /// **Not range-capable**: the source cannot be re-seeked, so it is always
+    /// served in full and never advertises `Accept-Ranges`.
     Stream(BoxByteStream),
+    /// A stored blob, retaining only the state needed to open the byte stream
+    /// lazily (store handle + key + size) — never a pre-opened stream.
+    /// **Range-capable**: the byte stream is opened only when the response is
+    /// built, and a ranged request asks the store for only the requested slice
+    /// via [`BlobStore::get_range`](crate::storage::BlobStore::get_range),
+    /// never buffering the whole object for a seek. The non-ranged path opens
+    /// the whole-object stream lazily via
+    /// [`BlobStore::get_stream`](crate::storage::BlobStore::get_stream).
+    #[cfg(feature = "storage")]
+    Blob {
+        /// Store handle used to open the object stream or a byte slice.
+        store: crate::storage::SharedBlobStore,
+        /// Object key within the store.
+        key: String,
+        /// Total object size in bytes.
+        size: u64,
+    },
+}
+
+impl DownloadBody {
+    /// Whether this body can serve HTTP `Range` requests. Opaque streams
+    /// cannot be re-seeked, so they are never range-capable.
+    const fn is_range_capable(&self) -> bool {
+        match self {
+            Self::Bytes(_) => true,
+            Self::Stream(_) => false,
+            #[cfg(feature = "storage")]
+            Self::Blob { .. } => true,
+        }
+    }
 }
 
 /// A typed file download.
@@ -89,6 +127,13 @@ pub struct Download {
     default_content_type: Option<String>,
     disposition: Disposition,
     content_length: Option<u64>,
+    /// Strong `ETag` used as an `If-Range` validator and emitted on the
+    /// response, when set via [`etag`](Download::etag).
+    etag: Option<ETag>,
+    /// `Last-Modified` HTTP-date string used as an `If-Range` validator and
+    /// emitted on the response, when set via
+    /// [`last_modified`](Download::last_modified).
+    last_modified: Option<String>,
 }
 
 impl std::fmt::Debug for Download {
@@ -96,6 +141,8 @@ impl std::fmt::Debug for Download {
         let body = match &self.body {
             DownloadBody::Bytes(b) => format!("Bytes({} bytes)", b.len()),
             DownloadBody::Stream(_) => "Stream(..)".to_owned(),
+            #[cfg(feature = "storage")]
+            DownloadBody::Blob { key, size, .. } => format!("Blob(key={key:?}, {size} bytes)"),
         };
         f.debug_struct("Download")
             .field("body", &body)
@@ -104,6 +151,8 @@ impl std::fmt::Debug for Download {
             .field("default_content_type", &self.default_content_type)
             .field("disposition", &self.disposition)
             .field("content_length", &self.content_length)
+            .field("etag", &self.etag)
+            .field("last_modified", &self.last_modified)
             .finish()
     }
 }
@@ -122,6 +171,8 @@ impl Download {
             default_content_type: None,
             disposition: Disposition::Attachment,
             content_length,
+            etag: None,
+            last_modified: None,
         }
     }
 
@@ -140,6 +191,8 @@ impl Download {
             default_content_type: None,
             disposition: Disposition::Attachment,
             content_length: None,
+            etag: None,
+            last_modified: None,
         }
     }
 
@@ -157,46 +210,53 @@ impl Download {
     /// Build a download that streams a stored blob's bytes.
     ///
     /// Reads the blob's metadata ([`head`](crate::storage::BlobStore::head))
-    /// for the `Content-Length` and a default `Content-Type`, and opens a
-    /// streaming body ([`get_stream`](crate::storage::BlobStore::get_stream))
-    /// that does **not** buffer the whole object in memory. This keeps the
-    /// bytes flowing through your own authorized handler — no public presigned
-    /// URL is issued.
+    /// for the `Content-Length` and a default `Content-Type`, then retains the
+    /// store handle + key so the byte stream can be opened **lazily** when the
+    /// response is built. It does **not** open (or buffer) the object here, so
+    /// a later `Range` request fetches only the requested slice via
+    /// [`get_range`](crate::storage::BlobStore::get_range) rather than reading
+    /// the whole object. This keeps the bytes flowing through your own
+    /// authorized handler — no public presigned URL is issued.
     ///
     /// The `Content-Length` is taken from the [`head`](crate::storage::BlobStore::head)
-    /// metadata read before the body stream is opened. There is a small
-    /// time-of-check/time-of-use window: if the blob is overwritten with a
-    /// different size between the `head` and the `get_stream` (a local-backend
-    /// edge case; overwrites are otherwise atomic), the advertised length may
-    /// disagree with the streamed bytes.
+    /// metadata read here. There is a small time-of-check/time-of-use window:
+    /// if the blob is overwritten with a different size between this `head` and
+    /// the later stream open (a local-backend edge case; overwrites are
+    /// otherwise atomic), the advertised length may disagree with the streamed
+    /// bytes.
     ///
     /// # Errors
     ///
     /// Returns a [`BlobStoreError`](crate::storage::BlobStoreError) if the blob
-    /// does not exist or the store cannot be read.
+    /// does not exist or its metadata cannot be read.
     #[cfg(feature = "storage")]
     pub async fn from_blob(
         store: &crate::storage::SharedBlobStore,
         key: impl Into<String>,
     ) -> Result<Self, crate::storage::BlobStoreError> {
-        use futures::StreamExt as _;
-
         let key = key.into();
         let meta = store
             .head(&key)
             .await?
             .ok_or_else(|| crate::storage::BlobStoreError::NotFound(key.clone()))?;
-        // `get_stream` yields a `'static` stream, so the download detaches
-        // cleanly from the borrow of `store`.
-        let stream = store.get_stream(&key).await?;
-        let stream = stream.map(|chunk| chunk.map_err(std::io::Error::other));
+        // Only metadata is read here; the byte stream is opened lazily when the
+        // response is built. The retained store handle + key + size let the
+        // non-ranged path open the whole-object stream and a ranged request
+        // fetch only the requested slice — the full object is never buffered
+        // for a seek.
         Ok(Self {
-            body: DownloadBody::Stream(Box::pin(stream)),
+            body: DownloadBody::Blob {
+                store: std::sync::Arc::clone(store),
+                key,
+                size: meta.byte_size,
+            },
             filename: None,
             content_type: None,
             default_content_type: Some(meta.content_type),
             disposition: Disposition::Attachment,
             content_length: Some(meta.byte_size),
+            etag: None,
+            last_modified: None,
         })
     }
 
@@ -228,6 +288,30 @@ impl Download {
         self
     }
 
+    /// Attach a strong `ETag` for the download.
+    ///
+    /// The tag is emitted as an `ETag` header and used as the `If-Range`
+    /// validator by [`into_response_ranged`](Download::into_response_ranged):
+    /// when a client's `If-Range` tag no longer matches, the whole
+    /// representation is served instead of a stale partial slice.
+    #[must_use = "builder setters return a new Download; use the returned value"]
+    pub fn etag(mut self, etag: impl IntoETag) -> Self {
+        self.etag = Some(etag.into_etag());
+        self
+    }
+
+    /// Attach a `Last-Modified` HTTP-date string for the download.
+    ///
+    /// Emitted as a `Last-Modified` header and used as the `If-Range` validator
+    /// (date form) by [`into_response_ranged`](Download::into_response_ranged).
+    /// The value must already be a formatted HTTP-date
+    /// (e.g. `Wed, 21 Oct 2015 07:28:00 GMT`).
+    #[must_use = "builder setters return a new Download; use the returned value"]
+    pub fn last_modified(mut self, http_date: impl Into<String>) -> Self {
+        self.last_modified = Some(http_date.into());
+        self
+    }
+
     /// Resolve the effective content type.
     ///
     /// Order: explicit `.content_type()` → inferred from the filename
@@ -246,19 +330,12 @@ impl Download {
     }
 }
 
-impl IntoResponse for Download {
-    fn into_response(self) -> Response {
+impl Download {
+    /// Apply the `Content-Type`, `Content-Disposition`, and (when set) `ETag` /
+    /// `Last-Modified` headers this download carries onto `headers`.
+    fn apply_metadata_headers(&self, headers: &mut HeaderMap) {
         let content_type = self.resolve_content_type();
         let disposition = build_content_disposition(self.disposition, self.filename.as_deref());
-        let content_length = self.content_length;
-
-        let body = match self.body {
-            DownloadBody::Bytes(bytes) => Body::from(bytes),
-            DownloadBody::Stream(stream) => Body::from_stream(stream),
-        };
-
-        let mut response = body.into_response();
-        let headers = response.headers_mut();
         headers.insert(
             CONTENT_TYPE,
             HeaderValue::from_str(&content_type)
@@ -271,9 +348,197 @@ impl IntoResponse for Download {
             HeaderValue::from_str(&disposition)
                 .unwrap_or_else(|_| HeaderValue::from_static("attachment")),
         );
+        if let Some(etag) = &self.etag {
+            headers.insert(ETAG, etag.header_value());
+        }
+        if let Some(lm) = &self.last_modified
+            && let Ok(v) = HeaderValue::from_str(lm)
+        {
+            headers.insert(LAST_MODIFIED, v);
+        }
+    }
+
+    /// Build the `If-Range` validator from any attached `ETag` / `Last-Modified`.
+    fn range_validator(&self) -> Option<Validator<'_>> {
+        if self.etag.is_none() && self.last_modified.is_none() {
+            return None;
+        }
+        let mut v = Validator::new();
+        if let Some(etag) = &self.etag {
+            v = v.with_etag(etag);
+        }
+        if let Some(lm) = &self.last_modified {
+            v = v.with_last_modified(lm);
+        }
+        Some(v)
+    }
+
+    /// Serve the download honouring the request's `Range` header.
+    ///
+    /// Unlike the plain [`IntoResponse`] conversion (which cannot see the
+    /// request), this reads `Range` / `If-Range` from `req_headers` and can
+    /// answer with `206 Partial Content`:
+    ///
+    /// - **Range-capable body** ([`from_bytes`](Download::from_bytes),
+    ///   [`from_blob`](Download::from_blob)): a satisfiable range yields a `206`
+    ///   with `Content-Range` and the sliced body — for a blob, only the
+    ///   requested slice is fetched from the store
+    ///   ([`BlobStore::get_range`](crate::storage::BlobStore::get_range)). An
+    ///   unsatisfiable range yields `416`. No/invalid range yields the full
+    ///   `200` with `Accept-Ranges: bytes`.
+    /// - **Opaque stream** ([`from_stream`](Download::from_stream) /
+    ///   [`from_async_read`](Download::from_async_read)): not seekable, so this
+    ///   always serves the full `200` and does not advertise `Accept-Ranges`.
+    ///
+    /// This is the documented path to a seekable media response; see the
+    /// [`range`](crate::range) module docs for a `#[secured]` video example.
+    // The method is `async` for the blob path (which awaits a ranged store
+    // read); without the `storage` feature that arm is compiled out, leaving no
+    // `.await`, but the signature stays stable across feature sets.
+    #[cfg_attr(not(feature = "storage"), allow(clippy::unused_async))]
+    pub async fn into_response_ranged(self, req_headers: &HeaderMap) -> Response {
+        // Opaque streams cannot be re-seeked: serve the full body exactly as
+        // the plain `IntoResponse` conversion would.
+        if !self.body.is_range_capable() {
+            return self.into_response();
+        }
+
+        let total = self.content_length.unwrap_or(0);
+        let resolution = range::resolve(req_headers, total, self.range_validator());
+
+        // Precompute the metadata headers while `self` is still whole, then
+        // move the body out below.
+        let mut meta = HeaderMap::new();
+        self.apply_metadata_headers(&mut meta);
+
+        match self.body {
+            DownloadBody::Bytes(bytes) => {
+                let mut response = range::partial_bytes_response(&resolution, bytes);
+                // `partial_bytes_response` already set status, Accept-Ranges,
+                // Content-Range, and Content-Length; layer the download's own
+                // Content-Type / Content-Disposition / validators on top.
+                merge_headers(response.headers_mut(), &meta);
+                response
+            }
+            #[cfg(feature = "storage")]
+            DownloadBody::Blob { store, key, size } => {
+                blob_ranged_response(&resolution, &store, &key, size, &meta).await
+            }
+            // Not range-capable — handled by the early return above.
+            DownloadBody::Stream(_) => unreachable!("opaque streams return early"),
+        }
+    }
+}
+
+/// Copy every (single-valued) header from `src` into `dst`, overwriting.
+fn merge_headers(dst: &mut HeaderMap, src: &HeaderMap) {
+    for (name, value) in src {
+        dst.insert(name, value.clone());
+    }
+}
+
+/// Build the ranged response for a stored blob, fetching only the requested
+/// slice from the store for a `206`.
+#[cfg(feature = "storage")]
+async fn blob_ranged_response(
+    resolution: &range::RangeResolution,
+    store: &crate::storage::SharedBlobStore,
+    key: &str,
+    size: u64,
+    meta: &HeaderMap,
+) -> Response {
+    use futures::StreamExt as _;
+
+    match *resolution {
+        range::RangeResolution::Full => {
+            // Open the whole-object stream only now (never up-front), so a
+            // non-ranged request streams without buffering the object.
+            let stream = match store.get_stream(key).await {
+                Ok(stream) => stream,
+                Err(err) => return err.into_autumn_error().into_response(),
+            };
+            let stream = stream.map(|chunk| chunk.map_err(std::io::Error::other));
+            let mut response = Body::from_stream(stream).into_response();
+            let headers = response.headers_mut();
+            range::set_accept_ranges(headers);
+            headers.insert(CONTENT_LENGTH, HeaderValue::from(size));
+            merge_headers(headers, meta);
+            response
+        }
+        range::RangeResolution::Partial { start, end, total } => {
+            let stream = match store.get_range(key, start, end).await {
+                Ok(stream) => stream,
+                Err(err) => return err.into_autumn_error().into_response(),
+            };
+            let stream = stream.map(|chunk| chunk.map_err(std::io::Error::other));
+            let mut response = Body::from_stream(stream).into_response();
+            *response.status_mut() = http::StatusCode::PARTIAL_CONTENT;
+            let headers = response.headers_mut();
+            range::set_accept_ranges(headers);
+            if let Ok(v) = HeaderValue::from_str(&range::content_range_value(start, end, total)) {
+                headers.insert(http::header::CONTENT_RANGE, v);
+            }
+            let len = end.saturating_sub(start).saturating_add(1);
+            headers.insert(CONTENT_LENGTH, HeaderValue::from(len));
+            merge_headers(headers, meta);
+            response
+        }
+        range::RangeResolution::Unsatisfiable { .. } => {
+            let mut response = range::partial_bytes_response(resolution, Bytes::new());
+            merge_headers(response.headers_mut(), meta);
+            response
+        }
+    }
+}
+
+/// Build a whole-object stream for the plain [`IntoResponse`] path, which
+/// cannot `.await` the store up front. The store's byte stream is opened
+/// lazily on first poll (never buffering the object here); an open error
+/// surfaces as a stream error mid-body.
+#[cfg(feature = "storage")]
+fn lazy_blob_stream(store: crate::storage::SharedBlobStore, key: String) -> BoxByteStream {
+    use futures::TryStreamExt as _;
+
+    let opened = futures::stream::once(async move {
+        store
+            .get_stream(&key)
+            .await
+            .map(|stream| stream.map_err(std::io::Error::other))
+            .map_err(std::io::Error::other)
+    })
+    .try_flatten();
+    Box::pin(opened)
+}
+
+impl IntoResponse for Download {
+    fn into_response(self) -> Response {
+        let content_length = self.content_length;
+
+        // Compute metadata before moving the body out of `self`.
+        let mut header_scratch = HeaderMap::new();
+        self.apply_metadata_headers(&mut header_scratch);
+
+        let body = match self.body {
+            DownloadBody::Bytes(bytes) => Body::from(bytes),
+            DownloadBody::Stream(stream) => Body::from_stream(stream),
+            #[cfg(feature = "storage")]
+            DownloadBody::Blob { store, key, .. } => {
+                Body::from_stream(lazy_blob_stream(store, key))
+            }
+        };
+
+        let mut response = body.into_response();
+        let headers = response.headers_mut();
+        for (name, value) in &header_scratch {
+            headers.insert(name, value.clone());
+        }
         if let Some(len) = content_length {
             headers.insert(CONTENT_LENGTH, HeaderValue::from(len));
         }
+        // This plain conversion cannot inspect the request's `Range` header and
+        // always returns the full body, so it deliberately does **not**
+        // advertise `Accept-Ranges` — that promise is honored only by
+        // `into_response_ranged`, which can actually answer with `206`/`416`.
         response
     }
 }

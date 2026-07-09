@@ -55,6 +55,42 @@ together (`0.5.0` published; `0.6.0` on trunk-dev, unpublished).
   `broadcasts_on(topic)` / `assert_broadcast(topic, predicate)` /
   `assert_broadcast_count(topic, n)` / `assert_no_broadcasts(topic)`
   (`RecordedBroadcast` exposes `.topic()` / `.payload()`)
+- Resumable SSE **(unreleased — trunk-dev, issue #1356)**:
+  `sse::stream_resumable(&state, topic, last_event_id: Option<u64>)` — automatic
+  monotonic per-topic event ids + `Last-Event-ID` replay from a bounded
+  per-topic ring buffer, with a `gap` sentinel (`event: gap`,
+  `data: {"gap":true}`) on buffer overflow; `sse::last_event_id(&headers)` and
+  the `sse::LastEventId(Option<u64>)` extractor read the inbound header;
+  `Channels::resume(topic, last_event_id) -> ResumeHandle` (fields
+  `subscriber`, `replay: Vec<SequencedMessage { id, message }>`, `gap`,
+  `next_live_id`, `resumable`); `ChannelsBackend::resume` has a live-only
+  default (Redis) overridden by `LocalChannelsBackend`;
+  `LocalChannelsBackend::with_replay_capacity(capacity, replay_capacity)`.
+  Retention is `channels.replay_buffer` (default `256`). The existing id-less
+  `sse::stream` / `sse::stream_authorized` / `sse::from_subscriber` are
+  unchanged.
+- `TestClient` auth helpers: it carries a cookie jar that persists each
+  response's `Set-Cookie` and replays it on later requests, so a real
+  `POST /login` → `GET /dashboard` flow needs no manual header threading.
+  `client.acting_as(user_id).await` (alias `login_as`) mints an authenticated
+  session directly — writing the configured `auth.session_key` (default
+  `user_id`) — so a `#[secured]` / `Auth` route returns its real success status
+  without hitting the login endpoint; it sets identity only, so roles/scopes
+  still run. `client.log_out()` clears the session cookie so secured routes
+  reject again. Requires `TestApp::build()` with the default in-memory session
+  backend; panics for `from_router` clients.
+- `TestClient` job recorder: on by default for every `TestApp::build()` client
+  (no `with_job_interceptor` opt-in), it captures every enqueue — across
+  `enqueue`, `enqueue_after_commit`, and `enqueue_in_tx` — as a `RecordedJob`
+  (`.name()` / `.payload()`). Read them with `client.enqueued_jobs()` and assert
+  with `assert_job_enqueued(name)` / `assert_job_enqueued_with(name, payload)` /
+  `assert_no_jobs_enqueued()`. `client.perform_enqueued_jobs().await` drains the
+  queue and dispatches each captured job through its registered handler,
+  returning a `PerformedJobs` report (`.assert_all_succeeded()`, `.failures()`,
+  `.outcomes()`) that surfaces per-job handler errors — including payloads that
+  fail the real deserialization round-trip — rather than swallowing them. The
+  recorder is per-`TestApp` and composes ahead of any `with_job_interceptor`;
+  `enqueued_jobs` / `perform_enqueued_jobs` panic for `from_router` clients.
 - `Locale`, `t!` (`i18n`)
 - OAuth2/OIDC config, provider presets, callback helpers, and identity values
   (`oauth2`)
@@ -244,6 +280,19 @@ Free functions rendering changeset-aware, accessible inputs:
   colored-initials fallback); `alert(AlertVariant, body)` / `alert_with(...,
   &AlertConfig)` with `AlertVariant::{Info,Success,Warning,Error}` and
   `error_summary(&Changeset) -> Option<Markup>`. All prelude re-exported.
+- `autumn_web::widgets` feedback atoms: `toast(message, AlertVariant)` /
+  `toast_in(region_id, message, AlertVariant)` / `toast_region(id)` +
+  `DEFAULT_TOAST_REGION_ID` — transient htmx toast appended out-of-band
+  (`hx-swap-oob="beforeend:#<region-id>"`), CSS-only auto-dismiss (no JS).
+  `toast_region` is a persistent `aria-live="polite"` region; non-error toasts
+  inherit its politeness (no own `role`/`aria-live`) while `Error` announces
+  assertively via its own `role="alert"` (reuses the `AlertVariant` color
+  lane). `infinite_feed(items, next_cursor, &FeedConfig)` /
+  `feed_page(items, next_cursor, &FeedConfig)` with `FeedMode::{Reveal,Button}`
+  — htmx infinite-scroll / "Load more" feed from a `CursorPage`: one cursored
+  `hx-get` sentinel appends the next page in place (no reload, no duplicate
+  rows), progressive `<a href>` fallback; `feed_page` is the per-page append
+  fragment. All prelude re-exported.
 - `autumn_web::flash::{flash_messages, flash_messages_with,
   FlashMessagesConfig}` — accessible flash-banner renderer (per-severity
   `role`/`aria-live`, `autumn-flash--<level>` classes, empty renders nothing,
@@ -283,6 +332,39 @@ optional `.distributed_fill_lock(true)` / `.stale_while_revalidate(grace)`.
 - Additive `BlobStore::get_stream(key) -> ByteStream<'static>` streams an
   object's bytes; `LocalBlobStore` overrides it to stream from disk, other
   backends inherit a buffering default.
+
+### Range / 206 Partial Content (unreleased)
+
+`autumn_web::range` — reusable HTTP `Range` (RFC 7233) parsing + response
+building, wired into `Download` and the embedded static-asset path.
+
+- `range::resolve(&HeaderMap, total, Option<Validator>) -> RangeResolution`
+  parses `Range: bytes=N-` / `N-M` / `-N` against a known `total`, returning
+  `RangeResolution::{Full, Partial{start,end,total}, Unsatisfiable{total}}`
+  (`start`/`end` inclusive). Invalid/unparseable ranges and non-`bytes` units
+  return `Full` (serve the whole representation with `200`).
+- `range::partial_bytes_response(&RangeResolution, Bytes)` builds the response:
+  `206` + `Content-Range: bytes start-end/total` + `Content-Length` for a
+  partial, `200` + `Accept-Ranges: bytes` for full, `416` +
+  `Content-Range: bytes */total` for unsatisfiable. Helpers:
+  `content_range_value`, `unsatisfied_content_range`, `set_accept_ranges`.
+- **Multi-range** (`bytes=0-50,100-150`) is collapsed deterministically to the
+  first satisfiable sub-range as a well-formed single-range `206` (no
+  `multipart/byteranges`).
+- **`If-Range`** (strong `ETag` or `Last-Modified` HTTP-date) via `Validator`:
+  a stale/absent validator falls back to the full `200`.
+- `Download::into_response_ranged(&headers).await` is the request-aware entry
+  point that returns `206`/`416` and advertises `Accept-Ranges: bytes` on the
+  `200`/`206`/`416` for range-capable bodies. The plain `IntoResponse` cannot
+  see the request, always serves the full `200`, and therefore does **not**
+  advertise `Accept-Ranges` (only `into_response_ranged` can honor a `Range`).
+  Add `.etag(..)` / `.last_modified(..)` to supply the `If-Range` validator.
+  Opaque `from_stream`/`from_async_read` bodies are not seekable: always full
+  `200`, never `Accept-Ranges`.
+- Blob range path fetches only the requested slice via the additive
+  `BlobStore::get_range(key, start, end) -> ByteStream<'static>`
+  (`LocalBlobStore` seeks + takes off disk; other backends inherit a buffering
+  default) — a seek in a large video never buffers the whole object.
 
 ## Jobs additions
 
@@ -540,6 +622,39 @@ Endpoint builders:
   full `200` feed. See `docs/guide/conditional-get.md`. The `blog` example
   wires a `/feed.xml` route this way.
 
+## Cache-Control freshness (`etag::cache_for` / `CacheControl`)
+
+Declarative per-handler `Cache-Control` header (unreleased — issue #1344).
+While `fresh_when` handles *revalidation* (is a cached copy still valid?),
+`cache_for` handles *freshness* (how long may a copy be reused before
+revalidating?). Both are re-exported from the prelude.
+
+- `etag::cache_for(ttl: Duration) -> CacheControl` — starts a directive with
+  `max-age=ttl`, defaulting to `private`.
+- Attach it two ways: as a tuple with any body via `IntoResponseParts` —
+  `(cache_for(dur).public(), html!{ … })` — or `CacheControl::wrap(response)`
+  for a single expression. Either way the header is **inserted** (replacing any
+  prior value), so exactly one `Cache-Control` is emitted.
+- Chainable directives: `public()` / `private()`, `max_age(d)`, `s_maxage(d)`,
+  `stale_while_revalidate(d)`, `no_store()`, `no_cache()`, `must_revalidate()`,
+  `immutable()`. Durations render as whole seconds.
+- `CacheControl::header_value() -> String` renders the deterministic,
+  byte-for-byte value. Ordering: `no-store` alone if set, otherwise visibility,
+  `no-cache`, `max-age`, `s-maxage`, `stale-while-revalidate`,
+  `must-revalidate`, `immutable`.
+- **`max-age` vs `s-maxage`**: `max-age` applies to every cache (browser
+  included); `s-maxage` overrides it for **shared** caches (CDN/proxy) only.
+- **`Vary`**: only mark a personalized page `public` alongside a matching
+  `Vary` (e.g. `Vary: Cookie`) so a shared cache never serves one user's page
+  to another — otherwise keep it `private`/`no_store`.
+- **Default-private safety**: `public` is an explicit opt-in, so dropping
+  `cache_for(..)` onto a secured/authenticated handler can't silently publish
+  it to a shared cache.
+- Composes with `fresh_when`:
+  `fresh_when(&headers, etag).or(cache_for(dur).public().wrap(markup))` — the
+  freshness directives ride the `200` and the preserved `304`. See
+  `docs/guide/conditional-get.md`.
+
 ## Config layering and env keys
 
 Layering order, lowest to highest:
@@ -569,6 +684,7 @@ Frequently used env keys:
 | `AUTUMN_SESSION__BACKEND` | `session.backend` |
 | `AUTUMN_SESSION__REDIS__URL` | `session.redis.url` |
 | `AUTUMN_CHANNELS__BACKEND` | `channels.backend` |
+| `AUTUMN_CHANNELS__REPLAY_BUFFER` | `channels.replay_buffer` (unreleased — trunk-dev) |
 | `AUTUMN_JOBS__BACKEND` | `jobs.backend` |
 | `AUTUMN_JOBS__REDIS__URL` | `jobs.redis.url` |
 | `AUTUMN_SCHEDULER__BACKEND` | `scheduler.backend` |

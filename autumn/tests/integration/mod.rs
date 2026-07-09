@@ -1,4 +1,5 @@
 mod access_log;
+mod acting_as_integration;
 mod after_commit_integration;
 mod api_versioning_integration;
 #[cfg(feature = "openapi")]
@@ -77,6 +78,7 @@ mod inbound_mail_integration;
 mod inline_broadcast_prefetch;
 mod inspector_integration;
 mod isr_coordination;
+mod job_recorder_integration;
 mod job_tracking_route;
 mod job_tracking_stores_integration;
 #[cfg(all(feature = "ws", feature = "maud", feature = "htmx", feature = "db"))]
@@ -125,6 +127,7 @@ mod pg_tls;
 #[cfg(feature = "db")]
 mod preload_scoping;
 mod problem_details;
+mod range;
 mod rate_limit_pipeline;
 mod rate_limit_principal;
 #[cfg(feature = "redis")]
@@ -167,6 +170,8 @@ mod sharding_commit_hooks;
 #[cfg(feature = "db")]
 mod sharding_integration;
 mod signed_webhooks;
+#[cfg(feature = "ws")]
+mod sse_replay;
 mod static_serving;
 #[cfg(feature = "storage")]
 mod storage_local_integration;
@@ -192,7 +197,11 @@ mod widgets_alert;
 mod widgets_avatar;
 #[cfg(feature = "maud")]
 mod widgets_badge;
+#[cfg(feature = "maud")]
+mod widgets_infinite_feed;
 mod widgets_modal;
 mod widgets_tabs;
+#[cfg(feature = "maud")]
+mod widgets_toast;
 #[cfg(feature = "ws")]
 mod ws_integration;

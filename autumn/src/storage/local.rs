@@ -404,6 +404,38 @@ impl BlobStore for LocalBlobStore {
         })
     }
 
+    fn get_range<'a>(
+        &'a self,
+        key: &'a str,
+        start: u64,
+        end: u64,
+    ) -> BlobFuture<'a, ByteStream<'static>> {
+        Box::pin(async move {
+            use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
+
+            let path = self.safe_path_for_key(key).await?;
+            let mut file = match tokio::fs::File::open(&path).await {
+                Ok(file) => file,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(BlobStoreError::NotFound(key.to_owned()));
+                }
+                Err(err) => return Err(BlobStoreError::io(err)),
+            };
+            // Seek to the start offset and cap the read at the inclusive slice
+            // length so only `[start, end]` is read off disk — a slice of a
+            // large file never buffers the whole object in memory.
+            file.seek(std::io::SeekFrom::Start(start))
+                .await
+                .map_err(BlobStoreError::io)?;
+            let len = end.saturating_sub(start).saturating_add(1);
+            let limited = file.take(len);
+            let stream = tokio_util::io::ReaderStream::new(limited)
+                .map(|chunk| chunk.map_err(BlobStoreError::io));
+            let boxed: ByteStream<'static> = Box::pin(stream);
+            Ok(boxed)
+        })
+    }
+
     fn delete<'a>(&'a self, key: &'a str) -> BlobFuture<'a, ()> {
         Box::pin(async move {
             let path = self.safe_path_for_key(key).await?;

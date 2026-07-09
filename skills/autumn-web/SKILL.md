@@ -63,7 +63,9 @@ the framework almost certainly already generates or ships it:
 | Hand-rolled cross-module notifications (calling every reaction inline) | `#[event]` + `#[listener]` typed event bus, `.listeners(listeners![...])` (unreleased) |
 | Hand-rolled cards, tabs, modals, delete-confirm dialogs, method-override links | `autumn_web::widgets`: `card`/`stat_card`, `tabs`, `modal`/`confirm_action`, `link_to`/`button_to` + `ui::WIDGETS_CSS_PATH` stylesheet (unreleased) |
 | Hand-built file-download responses (manual `Content-Disposition`/`Content-Type`/`Content-Length` headers, byte-buffered blob reads) | `autumn_web::download::Download` — `from_bytes` / `from_stream` / `from_async_read` / `from_blob(&store, key).await?` + `.filename(...)` / `.content_type(...)` / `.inline()`; RFC 5987 filenames, injection-safe, streams blobs without buffering (unreleased) |
+| Hand-parsed `Range` headers / manual `206 Partial Content` / `Content-Range` / `416` for seekable media or resumable downloads | `autumn_web::range` (`resolve` + `partial_bytes_response`) and `Download::into_response_ranged(&headers).await` — RFC 7233 single-range parsing, multi-range single-range collapse, `If-Range` via `.etag(..)`/`.last_modified(..)`, blob slices via `BlobStore::get_range` (no whole-object buffering) (unreleased) |
 | Hand-written RSS/Atom XML strings for a `/feed.xml` or podcast/blog feed | `feed::Feed::atom(..)` / `feed::Feed::rss(..)` + `feed::FeedEntry` — builds the XML, implements `IntoResponse` with the right `application/atom+xml`/`application/rss+xml` type, XML-escapes text, and `Feed::conditional(&headers)` reuses the `etag` layer for `304`s (unreleased). See `docs/guide/conditional-get.md` |
+| Hand-assembled `Cache-Control` header strings on a handler | `etag::cache_for(Duration)` → `CacheControl`; attach as a tuple `(cache_for(dur).public(), html!{…})` or `.wrap(resp)`. Chain `public`/`private`, `max_age`, `s_maxage`, `stale_while_revalidate`, `no_store`, `no_cache`, `must_revalidate`, `immutable`; `header_value()` renders a deterministic value. Defaults to `private` (a secured page can't be silently made public); composes with `fresh_when` — the directives ride the `200` and the preserved `304` (unreleased — issue #1344). See `docs/guide/conditional-get.md` |
 
 When none of these fit, dropping to raw Axum (`.merge()`/`.nest()`/`.layer()`)
 or raw Diesel (`&mut *db` with `diesel_async`) is supported and fine — but only
@@ -789,6 +791,8 @@ for the common cases:
 | `alert(AlertVariant::Info, body)` / `alert_with(..., &AlertConfig::new().title("...").icon(true).dismissible(true))` | Inline callout / empty-state / error box; `role` per variant, optional title + inline-SVG icon + no-JS dismiss. `error_summary(&changeset)` renders an `Error` alert of all field errors (or `None` when valid) |
 | `flash_messages(&flash.consume().await)` (`autumn_web::flash`) | Accessible flash banners: per-severity `role`/`aria-live`, `autumn-flash--<level>` classes, empty slice renders nothing; `flash_messages_with` adds a no-JS dismiss |
 | `pagination_nav(&page, &PagerOptions::new("/posts"))` / `cursor_pagination_nav` | Accessible, filter-preserving, htmx-opt-in pager from a `Page`/`CursorPage` (prelude re-export) |
+| `toast(message, variant)` / `toast_region(DEFAULT_TOAST_REGION_ID)` / `toast_in(region_id, ...)` | Transient htmx action feedback: drop `toast_region` once in the layout, then return `toast(...)` next to your swapped fragment — it appends into the region OOB (`hx-swap-oob="beforeend:#toast-region"`). CSS-only auto-dismiss (no `<script>`); `variant` reuses `AlertVariant`. `toast_region` is a persistent `aria-live="polite"` region — non-error toasts inherit its politeness (no own `role`/`aria-live`); `Error` announces assertively via its own `role="alert"` |
+| `infinite_feed(items, next_cursor, &FeedConfig)` / `feed_page(items, next_cursor, &FeedConfig)` | htmx infinite-scroll / "Load more" feed from a `CursorPage`: single `hx-get` sentinel carries the cursor and appends the next page in place (no reload, no duplicate rows). `FeedMode::{Reveal,Button}`; progressive `<a href>` fallback. `feed_page` is the append fragment a handler returns for each page (`page.next_cursor.as_deref()`) |
 | `autumn_web::ui::WIDGETS_CSS` / `WIDGETS_CSS_PATH` | One shipped stylesheet backing every `autumn-*` widget class — link `href=(WIDGETS_CSS_PATH)` instead of copying widget CSS into `input.css`. Accent now follows `var(--primary)` (violet), not the old hardcoded indigo (`docs/guide/widget-styling.md`) |
 
 ### Whole-form rendering — `form_for` (unreleased — trunk-dev, not in published 0.5.0)
@@ -837,6 +841,86 @@ RFC 3339 JSON bodies). Serde-renamed columns pre-fill correctly via
 `autumn generate scaffold` views render through a single shared
 `{snake}_form_for` helper built on this (except `--live-validation`, which
 keeps per-field htmx emission).
+
+## Resumable SSE streams (unreleased — trunk-dev, issue #1356)
+
+Don't hand-roll `Last-Event-ID` bookkeeping or a manual replay buffer for
+server-sent events. On trunk-dev the `ws`-gated channels backend keeps a
+**bounded per-topic replay ring buffer** and assigns every event an
+**epoch-tagged per-topic `id` automatically** (wire format `epoch.seq`, opaque
+to clients) — no manual `.id(...)` in handler code.
+
+- `autumn_web::sse::stream_resumable(&state, topic, last_event_id)` is the route
+  primitive. It reads the client's `Last-Event-ID`, replays the buffered events
+  the client missed in order, then continues live — no duplicated or skipped
+  events at the seam (publish assigns seqs and broadcasts under one lock; resume
+  subscribes under that same lock and snapshots the buffer). Within one epoch it
+  replays entries with `seq > last_event_id.seq`; across an epoch boundary it
+  gaps and replays the full retained current epoch (see Limitations).
+- Read the inbound header with `autumn_web::sse::last_event_id(&headers)` →
+  `Option<EventId>` (`EventId { epoch: u64, seq: u64 }`, exported as
+  `autumn_web::sse::EventId` and re-exported `autumn_web::channels::EventId`), or
+  the `autumn_web::sse::LastEventId(pub Option<EventId>)` extractor (never fails;
+  absent/malformed/legacy-bare-integer → `None` → treated as a cold connection).
+- **Cold connection** (`None`) behaves exactly like `sse::stream`: no replay,
+  just live events, dense seqs preserved.
+- **Gap sentinel:** when the requested id has aged out of the retained window
+  (the buffer overflowed) **or belongs to a different epoch**, the stream emits
+  one `gap` event (`event: gap`, `data: {"gap":true}`, no `id`) *before* the
+  replay so clients can detect missed events rather than silently receiving a
+  hole. A live broadcast lag surfaces the same `gap` sentinel and advances the
+  seq counter.
+- The existing non-resumable helpers — `sse::stream`, `sse::stream_authorized`,
+  `sse::from_subscriber`, `Channels::sse_stream` — are **unchanged and remain
+  id-less**; `stream_resumable` is purely additive.
+- Only the in-process local backend retains a replay buffer; the Redis fan-out
+  backend degrades gracefully to a live-only `ResumeHandle`
+  (`Channels::resume(topic, last_event_id) -> ResumeHandle` is available on any
+  backend).
+
+```rust
+use autumn_web::prelude::*;
+use autumn_web::sse::LastEventId;
+
+#[get("/events")]
+async fn events(State(state): State<AppState>, LastEventId(last): LastEventId) -> impl IntoResponse {
+    autumn_web::sse::stream_resumable(&state, "feed", last)
+}
+```
+
+Retention is configurable via `channels.replay_buffer` (`N`, default `256`;
+env `AUTUMN_CHANNELS__REPLAY_BUFFER`). Memory is `O(N)` per topic regardless of
+throughput. This is distinct from `channels.capacity`, which sizes the live
+broadcast fan-out ring.
+
+**Limitations** (in-process best-effort scope, per issue #1356's "Out of
+Scope") — the replay buffer is a same-process convenience, not a durable log:
+
+- The replay buffer lives in the topic's in-memory state, which is dropped when
+  the topic is garbage-collected (a topic is retained only while it has a live
+  receiver or an outstanding `Sender`). A topic with only transient SSE
+  subscribers can lose its buffer during the disconnect window. The recreated
+  topic gets a **new epoch**, so a reconnect across the gap is not silently
+  corrupted: the epoch mismatch is signalled as a `gap` sentinel plus a full
+  replay of the current epoch (the old epoch's events themselves are gone).
+- On process restart (or any topic GC/recreation) the per-topic `seq` counter
+  resets to `1` under a fresh `epoch`. The epoch tag means a stale `Last-Event-ID`
+  from a previous epoch — even one whose `seq` the new epoch has already passed —
+  is always distinguishable from a current-epoch id, so the reconnect yields a
+  `gap` sentinel followed by a full replay of the current epoch rather than
+  silently dropping the new epoch's early events (the pre-epoch-tag hole, issue
+  #1356). The buffered history from before the restart is still gone (persist it
+  yourself for durability), but the client is never fed a corrupted partial.
+- Publishing through `channels.publish()` / `broadcast().publish()` /
+  `channels.sender().send()` is safe on resumable topics: all three route
+  through the backend's `publish`, assigning a seq and appending to the replay
+  buffer. Only calling `.send()` directly on the raw `broadcast::Sender`
+  (obtained from `channels.sender().keepalive` or the `ensure_topic` trait
+  method) broadcasts without assigning an id or appending to the replay buffer,
+  which breaks resumability for that topic.
+
+For cross-restart / multi-replica durability, back the stream with a durable log
+(e.g. a database table or a Redis stream) instead of the in-process buffer.
 
 ## Configuration
 

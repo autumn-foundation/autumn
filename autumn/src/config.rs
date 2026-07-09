@@ -95,6 +95,7 @@
 //! | `AUTUMN_SESSION__REDIS__KEY_PREFIX` | `session.redis.key_prefix` | `String` |
 //! | `AUTUMN_CHANNELS__BACKEND` | `channels.backend` | `in_process` / `redis` |
 //! | `AUTUMN_CHANNELS__CAPACITY` | `channels.capacity` | `usize` |
+//! | `AUTUMN_CHANNELS__REPLAY_BUFFER` | `channels.replay_buffer` | `usize` |
 //! | `AUTUMN_CHANNELS__REDIS__URL` | `channels.redis.url` | `String` |
 //! | `AUTUMN_CHANNELS__REDIS__KEY_PREFIX` | `channels.redis.key_prefix` | `String` |
 //! | `AUTUMN_JOBS__BACKEND` | `jobs.backend` | `local` / `postgres` / `redis` |
@@ -1385,6 +1386,13 @@ pub struct ChannelConfig {
     /// Per-topic broadcast ring buffer capacity.
     #[serde(default = "default_channel_capacity")]
     pub capacity: usize,
+    /// Per-topic replay ring buffer capacity (`N`).
+    ///
+    /// Number of most-recent events retained per topic for `Last-Event-ID`
+    /// replay via [`crate::sse::stream_resumable`]. Memory is `O(N)` per topic
+    /// regardless of throughput.
+    #[serde(default = "default_channel_replay_buffer")]
+    pub replay_buffer: usize,
     /// Redis backend options.
     #[serde(default)]
     pub redis: ChannelRedisConfig,
@@ -1395,6 +1403,7 @@ impl Default for ChannelConfig {
         Self {
             backend: ChannelBackend::default(),
             capacity: default_channel_capacity(),
+            replay_buffer: default_channel_replay_buffer(),
             redis: ChannelRedisConfig::default(),
         }
     }
@@ -1422,6 +1431,10 @@ impl Default for ChannelRedisConfig {
 
 const fn default_channel_capacity() -> usize {
     32
+}
+
+const fn default_channel_replay_buffer() -> usize {
+    256
 }
 
 fn default_channels_redis_prefix() -> String {
@@ -3087,6 +3100,11 @@ impl AutumnConfig {
             env,
             "AUTUMN_CHANNELS__CAPACITY",
             &mut self.channels.capacity,
+        );
+        parse_env(
+            env,
+            "AUTUMN_CHANNELS__REPLAY_BUFFER",
+            &mut self.channels.replay_buffer,
         );
         parse_env_option_string(
             env,
@@ -7407,6 +7425,7 @@ path = "/healthz"
 
         assert_eq!(config.channels.backend, ChannelBackend::InProcess);
         assert_eq!(config.channels.capacity, 32);
+        assert_eq!(config.channels.replay_buffer, 256);
         assert_eq!(config.channels.redis.key_prefix, "autumn:channels");
         assert!(config.channels.redis.url.is_none());
     }
@@ -7416,6 +7435,7 @@ path = "/healthz"
         let env = MockEnv::new()
             .with("AUTUMN_CHANNELS__BACKEND", "redis")
             .with("AUTUMN_CHANNELS__CAPACITY", "128")
+            .with("AUTUMN_CHANNELS__REPLAY_BUFFER", "512")
             .with("AUTUMN_CHANNELS__REDIS__URL", "redis://channels:6379/4")
             .with("AUTUMN_CHANNELS__REDIS__KEY_PREFIX", "myapp:channels");
         let mut config = AutumnConfig::default();
@@ -7424,6 +7444,7 @@ path = "/healthz"
 
         assert_eq!(config.channels.backend, ChannelBackend::Redis);
         assert_eq!(config.channels.capacity, 128);
+        assert_eq!(config.channels.replay_buffer, 512);
         assert_eq!(
             config.channels.redis.url.as_deref(),
             Some("redis://channels:6379/4")
