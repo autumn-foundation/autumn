@@ -50,7 +50,11 @@ together (`0.5.0` published; `0.6.0` on trunk-dev, unpublished).
 - `Multipart` (`multipart`)
 - `Flash`, `FlashLevel`, `FlashMessage` (`flash`)
 - `Broadcast`, `Channels`, `ChannelsBackend`, `LocalChannelsBackend`,
-  `ChannelMessage`, `ChannelStats` (`ws`)
+  `ChannelMessage`, `ChannelStats` (`ws`) — in tests, opt in with
+  `TestApp::record_broadcasts()` and assert with `TestClient::broadcasts()` /
+  `broadcasts_on(topic)` / `assert_broadcast(topic, predicate)` /
+  `assert_broadcast_count(topic, n)` / `assert_no_broadcasts(topic)`
+  (`RecordedBroadcast` exposes `.topic()` / `.payload()`)
 - `Locale`, `t!` (`i18n`)
 - OAuth2/OIDC config, provider presets, callback helpers, and identity values
   (`oauth2`)
