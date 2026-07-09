@@ -170,6 +170,15 @@ never delete or rename an applied migration; add a new migration instead.
 > skipped rather than failing); authoritative enforcement is `autumn migrate
 > run` / `autumn migrate status` in CI or your deploy job, which check against
 > an explicit migrations directory.
+>
+> Startup auto-migrate only **validates** on-disk content against recorded
+> hashes; it does **not** record new checksums. It applies the embedded SQL
+> compiled into the binary, which may differ from the on-disk files, so
+> recording those disk bytes could store a hash for content that was never
+> applied. Authoritative recording happens via `autumn migrate run` and `autumn
+> migrate baseline`, where the applied bytes are exactly the on-disk `up.sql`.
+> An app that only ever startup-auto-migrates will therefore leave its
+> migrations `unrecorded` until one of those CLI commands runs.
 
 Line-ending and trailing-whitespace differences are normalised before hashing
 (CRLF/CR/LF all collapse to LF, then `trim_end()`), so a Windows checkout and

@@ -1764,15 +1764,23 @@ pub fn run_pending_locked(
 ///    its current on-disk `up.sql` (fail fast on `Changed`/`Missing`). This is
 ///    the authoritative, race-free drift guard.
 /// 3. **Apply** pending migrations.
-/// 4. **Record** checksums for the newly-applied versions.
-/// 5. **Re-validate** after apply — belt-and-suspenders for the interleaving
+/// 4. **Re-validate** after apply — belt-and-suspenders for the interleaving
 ///    where a sibling replica applied and recorded THIS version's *original*
 ///    content between our step 2 and our apply: the now-recorded hash is
 ///    compared against our edited on-disk `up.sql` so the mismatch is caught
 ///    before boot.
-/// 6. Release the lock.
+/// 5. Release the lock.
 ///
-/// Holding the lock across steps 2–5 on one session is what closes the TOCTOU
+/// This path deliberately does **not** record checksums for the freshly-applied
+/// versions. It applies the EMBEDDED migration set compiled into the binary,
+/// whereas `up_sql_by_version` is read from the on-disk `./migrations/` dir; the
+/// two can diverge (files edited/mounted after the build). Recording the disk
+/// bytes here would store a hash for content that was never applied, so recording
+/// is deferred to the CLI/baseline paths (`autumn migrate run` /
+/// `autumn migrate baseline`), where the applied bytes ARE the on-disk bytes
+/// (issue #1203 review). See the inline comment at step (4) for detail.
+///
+/// Holding the lock across steps 2–4 on one session is what closes the TOCTOU
 /// race a naive pre-lock check leaves open under a concurrent rolling deploy:
 /// with the check outside the lock, replica A (holding an edited `up.sql` for
 /// an as-yet-unapplied version) can validate successfully, then a sibling
@@ -1818,11 +1826,31 @@ fn run_pending_locked_inner(
                     .map_err(|e| MigrationError::Migration(e.to_string()))?
             };
 
-            // (4) Record checksums for the freshly-applied versions and
-            // (5) re-validate — still under the lock, on the same session.
+            // (5) Post-apply re-validation — still under the lock, on the same
+            //     session. This deliberately does NOT record checksums for the
+            //     freshly-applied versions.
+            //
+            //     This path applies the EMBEDDED migration set compiled into the
+            //     binary, but `up_sql_by_version` is read from the on-disk
+            //     `./migrations/` dir. When the dir is not byte-identical to the
+            //     embedded set (files edited or mounted after the binary was
+            //     built), recording the disk bytes here would store a hash for
+            //     content that was never applied — the DB actually holds the
+            //     embedded schema — silently making the edited file canonical and
+            //     defeating later drift checks. Diesel's `Migration` API does not
+            //     expose each embedded migration's raw `up.sql` bytes, so we
+            //     cannot hash what was actually applied. We therefore VALIDATE
+            //     only and defer authoritative recording to the CLI/baseline
+            //     paths (`autumn migrate run` / `autumn migrate baseline`), where
+            //     the applied bytes ARE the on-disk bytes (issue #1203 review).
+            //
+            //     Re-validating catches the interleaving where a sibling replica
+            //     applied and recorded THIS version's *original* content between
+            //     our step 2 and our apply: that now-recorded hash is compared
+            //     against our edited on-disk `up.sql` so the mismatch still fails
+            //     fast before boot.
             if let Some(up) = up_sql_by_version {
                 let applied_versions = load_applied_versions_lenient(conn)?;
-                record_checksums(conn, &applied_versions, up)?;
                 let recorded = recorded_checksums(conn)?;
                 validate_checksums(&applied_versions, up, &recorded)?;
             }
@@ -1975,11 +2003,17 @@ pub(crate) fn auto_migrate(
         // `./migrations/` directory is present, read every migration's on-disk
         // `up.sql` so the locked apply path can, under the advisory lock and on
         // the same Postgres session, validate already-applied versions against
-        // their recorded checksums (fail fast on drift), then record and
-        // re-validate the freshly-applied versions. Running the compare *inside*
-        // the lock — rather than in a pre-lock check — is what makes the guard
-        // race-free under a concurrent rolling deploy (see
-        // [`run_pending_locked_inner`]).
+        // their recorded checksums (fail fast on drift), then re-validate after
+        // applying. Running the compare *inside* the lock — rather than in a
+        // pre-lock check — is what makes the guard race-free under a concurrent
+        // rolling deploy (see [`run_pending_locked_inner`]).
+        //
+        // This startup path VALIDATES only; it does NOT record new checksums.
+        // It applies the EMBEDDED migration set, which may not be byte-identical
+        // to the on-disk `up.sql` read here, so recording the disk bytes would
+        // store a hash for content that was never applied. Authoritative
+        // recording happens on the CLI/baseline paths (`autumn migrate run` /
+        // `autumn migrate baseline`), where applied bytes == on-disk bytes.
         //
         // Best-effort read: production binaries typically ship without the
         // source tree, so an absent `./migrations/` is not an error (the map is
@@ -2536,6 +2570,44 @@ mod tests {
         );
         validate_checksums(&applied, &edited_by_version, &recorded)
             .expect("edited content validates Ok after rollback + fresh re-apply");
+
+        // ── Step 10: the startup path VALIDATES but does NOT record ─────────
+        // The startup auto-migrate path (`run_pending_locked_inner` with a disk
+        // map) applies the EMBEDDED migration set, which may differ from the
+        // on-disk `up.sql` read into the map, so it must never record disk bytes
+        // for versions it "applies" (issue #1203 review). Authoritative
+        // recording is deferred to the CLI/baseline paths where applied == disk.
+        //
+        // Simulate a freshly-applied-but-unrecorded version exactly as the
+        // startup path would see it: present in `__diesel_schema_migrations` and
+        // in the disk map, but with NO recorded checksum. Running the locked path
+        // must leave it Unrecorded — it must NOT write a checksum row from the
+        // disk bytes.
+        let startup_version = "20990103000000".to_string();
+        let startup_sql = "CREATE TABLE checksum_startup (id BIGINT PRIMARY KEY);";
+        diesel::sql_query("INSERT INTO __diesel_schema_migrations (version) VALUES ($1)")
+            .bind::<diesel::sql_types::Text, _>(&startup_version)
+            .execute(&mut conn)
+            .expect("simulate startup-applied version");
+        let mut startup_by_version: HashMap<String, String> = HashMap::new();
+        startup_by_version.insert(startup_version.clone(), startup_sql.to_string());
+        assert!(
+            !recorded_checksums(&mut conn)
+                .expect("read recorded checksums")
+                .contains_key(&startup_version),
+            "precondition: the startup version must have no recorded checksum yet"
+        );
+        // FRAMEWORK_MIGRATIONS are all applied, so nothing pending; the map is
+        // used for validation only. Unrecorded → Ok, so this must succeed.
+        run_pending_locked_inner(url, FRAMEWORK_MIGRATIONS, None, Some(&startup_by_version))
+            .expect("startup path validates an Unrecorded version as Ok");
+        assert!(
+            !recorded_checksums(&mut conn)
+                .expect("read recorded checksums")
+                .contains_key(&startup_version),
+            "the startup auto-migrate path must NOT record checksums from disk bytes; \
+             recording is deferred to the CLI/baseline paths"
+        );
     }
 
     // ── Existing tests ─────────────────────────────────────────────────────

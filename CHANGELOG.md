@@ -24,10 +24,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **migrations:** content checksums for applied migrations (issue #1203) —
   the framework now records a SHA-256 of every migration's `up.sql` in a
   new `autumn_migration_checksums` table (created by the framework
-  migration `20260709000000_create_migration_checksums`) the first time
-  the migration is applied. Before every subsequent `autumn migrate` run
-  and before startup auto-migrate, each applied migration's on-disk
-  `up.sql` is re-hashed and compared against the recorded value; a
+  migration `20260709000000_create_migration_checksums`) when it is
+  applied via `autumn migrate run` or backfilled by `autumn migrate
+  baseline`. Startup auto-migrate **validates** but does not record: it
+  applies the embedded SQL compiled into the binary (which may differ
+  from the on-disk files), so recording those disk bytes could store a
+  hash for content that was never applied — recording is deferred to the
+  CLI/baseline paths where applied bytes == on-disk bytes. Before every
+  subsequent `autumn migrate` run and before startup auto-migrate, each
+  applied migration's on-disk `up.sql` is re-hashed and compared against
+  the recorded value; a
   mismatch fails fast with a message that names the version and both
   hashes: `migration <version> checksum mismatch: recorded <hex-a> but
   on-disk content hashes to <hex-b>. Migrations must never be edited
