@@ -333,6 +333,21 @@ impl PageForm {
     }
 }
 
+pub(crate) fn generate_update_summary(
+    old_status: &str,
+    new_status: &str,
+    old_title: &str,
+    new_title: &str,
+) -> Option<String> {
+    if new_status != old_status {
+        Some(format!("Status changed: {} → {}", old_status, new_status))
+    } else if new_title != old_title {
+        Some(format!("Title changed: {} → {}", old_title, new_title))
+    } else {
+        None
+    }
+}
+
 #[post("/pages/{slug}")]
 pub async fn update(
     Path(slug): Path<String>,
@@ -344,16 +359,8 @@ pub async fn update(
     let update_page = form.0.into_update();
     let updated = repo.update(page.id, &update_page).await?;
 
-    let summary = if updated.status != page.status {
-        Some(format!(
-            "Status changed: {} → {}",
-            page.status, updated.status
-        ))
-    } else if updated.title != page.title {
-        Some(format!("Title changed: {} → {}", page.title, updated.title))
-    } else {
-        None
-    };
+    let summary =
+        generate_update_summary(&page.status, &updated.status, &page.title, &updated.title);
 
     diesel::insert_into(revisions::table)
         .values(&NewRevision {
