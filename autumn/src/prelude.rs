@@ -33,7 +33,7 @@ pub use autumn_macros::ws;
 pub use autumn_macros::{
     api_doc, authorize, cached, delete, event, feature_flag, get, job, jobs, listener, listeners,
     main, oauth2_callback, one_off_tasks, patch, paths, post, put, routes, scheduled, secured,
-    service, static_get, static_routes, step_up, task, tasks,
+    service, static_get, static_routes, step_up, task, tasks, throttle,
 };
 #[cfg(feature = "mail")]
 pub use autumn_macros::{mail_previews, mailer, mailer_preview};
@@ -57,6 +57,9 @@ pub use crate::canary::CanaryRoute;
 /// Database connection extractor.
 #[cfg(feature = "db")]
 pub use crate::db::Db;
+/// Transaction isolation levels and retry options for [`crate::db::Db::tx_with`].
+#[cfg(feature = "db")]
+pub use crate::db::{IsolationLevel, TxOptions};
 /// Typed domain event bus publisher extractor. The `Event` trait it works with
 /// lives at [`crate::events::Event`] (kept out of the prelude to avoid clashing
 /// with [`crate::sse::Event`]).
@@ -77,6 +80,9 @@ pub use crate::extract::Query;
 /// Flash message extractor.
 #[cfg(feature = "flash")]
 pub use crate::flash::{Flash, FlashLevel, FlashMessage};
+/// Accessible flash-banner renderer.
+#[cfg(all(feature = "flash", feature = "maud"))]
+pub use crate::flash::{FlashMessagesConfig, flash_messages, flash_messages_with};
 /// Extension trait for adding htmx response headers.
 #[cfg(feature = "htmx")]
 pub use crate::htmx::HxResponseExt;
@@ -91,6 +97,9 @@ pub use crate::htmx::{HtmxFragments, OobSwap};
 /// Trait for live-broadcasting model fragments via `#[repository(Model, broadcasts = "topic")]`.
 #[cfg(all(feature = "htmx", feature = "maud"))]
 pub use crate::live::LiveFragment;
+/// Named, cluster-wide distributed lock for run-once-across-replicas work.
+#[cfg(feature = "db")]
+pub use crate::lock::{Lock, LockError, LockGuard};
 /// Transactional email types and extractor.
 #[cfg(feature = "mail")]
 pub use crate::mail::{
@@ -133,6 +142,8 @@ pub use http::Method;
 pub use http::StatusCode;
 
 // ── Conditional GET / ETag ───────────────────────────────────────
+/// Declarative `Cache-Control` freshness builder — attach via a tuple or `.wrap(..)`.
+pub use crate::etag::CacheControl;
 /// `ETag` type for conditional-GET responses.
 pub use crate::etag::ETag;
 /// Tower middleware that auto-derives weak `ETag`s from response bodies.
@@ -141,6 +152,8 @@ pub use crate::etag::EtagLayer;
 pub use crate::etag::FreshWhen;
 /// Conversion trait — implemented for `String`, `&str`, `i64`, `(NaiveDateTime, i64)`, `ETag`.
 pub use crate::etag::IntoETag;
+/// Start a `Cache-Control` freshness directive (`max-age`); defaults to `private`.
+pub use crate::etag::cache_for;
 /// One-liner conditional-GET helper; returns a [`FreshWhen`] resolved with `.or(response)`.
 pub use crate::etag::fresh_when;
 /// Derive a weak `ETag` from any [`Hash`] value.
@@ -180,14 +193,27 @@ pub use crate::form::{Changeset, ChangesetForm, IntoChangeset};
 /// See [`crate::widgets`] for the full API.
 #[cfg(feature = "maud")]
 pub use crate::widgets::{
-    ActiveSearchConfig, AutocompleteConfig, CardConfig, Column, ConfirmActionConfig, Crumb, Cta,
-    CtaStyle, DataTableConfig, HeadingLevel, HeroConfig, ModalConfig, NavBarConfig, NavBarLayout,
-    NavItem, NavLinkMatch, NavMenu, SearchMethod, SortDir, active_search,
-    active_search_empty_state, active_search_input, active_search_results,
-    autocomplete_empty_state, autocomplete_input, autocomplete_option, breadcrumb, card,
-    confirm_action, data_table, hero, modal, modal_close_button, modal_trigger, nav_bar, nav_link,
-    nav_link_matched, property_list, stat_card, tabs,
+    ActiveSearchConfig, AlertConfig, AlertVariant, AutocompleteConfig, AvatarConfig, AvatarSize,
+    BadgeConfig, BadgeVariant, CardConfig, Column, ConfirmActionConfig, Crumb, Cta, CtaStyle,
+    DEFAULT_TOAST_REGION_ID, DataTableConfig, FeedConfig, FeedMode, HeadingLevel, HeroConfig,
+    ModalConfig, NavBarConfig, NavBarLayout, NavItem, NavLinkMatch, NavMenu, SearchMethod, SortDir,
+    active_search, active_search_empty_state, active_search_input, active_search_results, alert,
+    alert_with, autocomplete_empty_state, autocomplete_input, autocomplete_option, avatar, badge,
+    badge_with, breadcrumb, card, confirm_action, data_table, error_summary, feed_page, hero,
+    infinite_feed, modal, modal_close_button, modal_trigger, nav_bar, nav_link, nav_link_matched,
+    property_list, stat_card, status_tag, tabs, toast, toast_in, toast_region,
 };
+
+// ── Widget stories ───────────────────────────────────────────────
+/// Widget story macro for the `/_stories` gallery: `story!{ "Group", "Name", { ... } }`.
+#[cfg(feature = "maud")]
+pub use crate::stories::story;
+/// Widget story gallery types (registered via `AppBuilder::with_story_gallery`)
+/// and the error returned by `Story::render`.
+///
+/// See [`crate::stories`] for the full API.
+#[cfg(feature = "maud")]
+pub use crate::stories::{Story, StoryGallery, StoryRegistry, StoryRenderError};
 
 // ── Link helpers ─────────────────────────────────────────────────
 /// Safe, method-aware `<a>`/`<form>` link helpers: [`crate::links::link_to`]
@@ -395,6 +421,7 @@ mod tests {
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
+            app_id: AppState::next_app_id(),
         };
         #[cfg(not(feature = "db"))]
         let _state = AppState {
@@ -423,6 +450,7 @@ mod tests {
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
+            app_id: AppState::next_app_id(),
         };
         let _err: AutumnResult<()> = Ok(());
     }

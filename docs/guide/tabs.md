@@ -63,7 +63,8 @@ Each tuple is `(panel_id, label, body)`, in display order. `panel_id` and
   panel ids per widget instance (e.g. `"post-overview"`,
   `"related-overview"`) if more than one `tabs()` appears on a page.
 - **Nesting a `tabs()` widget inside another `tabs()` panel:** panel
-  *visibility* handles this — `input.css` reveals the whole ancestor chain
+  *visibility* handles this — the shared widget stylesheet
+  (`autumn_web::ui::WIDGETS_CSS_PATH`) reveals the whole ancestor chain
   down to a deep-linked inner panel, so nested content is reachable no
   matter which outer panel it lives in. The outer widget's *active-tab
   highlight* can only sync when the shown outer panel is itself the direct
@@ -101,11 +102,12 @@ Each tuple is `(panel_id, label, body)`, in display order. `panel_id` and
 
 ## No-JavaScript switching
 
-Each tab is a plain `<a href="#panel-id">`. The framework's `input.css`
-targets `.autumn-tabs__panel:target` to show the panel matching the URL
-fragment, with a `:has()`-based fallback that shows the first (`--active`)
-panel when no fragment targets any panel in the widget. No `<script>`,
-inline event handler, or `hx-*` attribute is emitted or required.
+Each tab is a plain `<a href="#panel-id">`. The framework's shared widget
+stylesheet (`autumn_web::ui::WIDGETS_CSS_PATH`) targets
+`.autumn-tabs__panel:target` to show the panel matching the URL fragment,
+with a `:has()`-based fallback that shows the first (`--active`) panel when
+no fragment targets any panel in the widget. No `<script>`, inline event
+handler, or `hx-*` attribute is emitted or required.
 
 The active-tab *visual highlight* also tracks whichever panel is actually
 `:target`-ed, using position-based `:has()`/`:nth-child()` CSS (ids are

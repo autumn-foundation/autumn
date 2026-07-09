@@ -1,4 +1,5 @@
 mod access_log;
+mod acting_as_integration;
 mod after_commit_integration;
 mod api_versioning_integration;
 #[cfg(feature = "openapi")]
@@ -9,6 +10,8 @@ mod authorization_integration;
 mod auto_broadcast;
 mod bot_protection_pipeline;
 mod boundary_hooks_integration;
+#[cfg(feature = "ws")]
+mod broadcast_recorder;
 #[cfg(feature = "cache-moka")]
 mod cache_stampede;
 #[cfg(feature = "ws")]
@@ -21,6 +24,7 @@ mod chaos_channels_loom;
 mod chaos_channels_proptest;
 #[cfg(feature = "ws")]
 mod chaos_channels_subscribe_loom;
+mod chaos_job_client_loom;
 mod chaos_metrics_compute_percentiles_proptest;
 mod chaos_metrics_leak;
 mod chaos_metrics_leak_loom;
@@ -39,6 +43,10 @@ mod custom_layer;
 mod db_telemetry_tests;
 #[cfg(feature = "db")]
 mod directory_shard_router;
+#[cfg(feature = "db")]
+mod distributed_lock;
+mod download;
+mod duplicate_route_detection;
 #[cfg(all(feature = "embed-assets", feature = "i18n"))]
 mod embed_assets_integration;
 #[cfg(feature = "db")]
@@ -52,6 +60,8 @@ mod experiments_pg_integration;
 mod extractors;
 mod factory_integration;
 mod feature_flags_integration;
+mod feed;
+mod form_for_derive;
 mod form_search_widgets;
 #[cfg(all(feature = "maud", feature = "cache-moka"))]
 mod fragment_cache_integration;
@@ -68,10 +78,12 @@ mod inbound_mail_integration;
 mod inline_broadcast_prefetch;
 mod inspector_integration;
 mod isr_coordination;
+mod job_recorder_integration;
 mod job_tracking_route;
 mod job_tracking_stores_integration;
 #[cfg(all(feature = "ws", feature = "maud", feature = "htmx", feature = "db"))]
 mod live_broadcast;
+mod load_shed;
 #[cfg(feature = "mail")]
 mod mail;
 #[cfg(feature = "mail")]
@@ -80,6 +92,8 @@ mod mail_layout;
 mod mail_macro;
 #[cfg(feature = "mail")]
 mod mail_recorder_integration;
+#[cfg(feature = "mail")]
+mod mail_suppression;
 #[cfg(feature = "mail")]
 mod mail_unsubscribe;
 #[cfg(feature = "maud")]
@@ -94,13 +108,26 @@ mod mcp_repository;
 mod mcp_streaming;
 mod middleware_introspection;
 mod middleware_pipeline;
+#[cfg(feature = "db")]
+mod model_field_attrs;
+#[cfg(feature = "offline-sync")]
+mod offline_sync_conformance;
+#[cfg(feature = "offline-sync")]
+mod offline_sync_engine;
+#[cfg(feature = "offline-sync")]
+mod offline_sync_pg;
+#[cfg(feature = "offline-sync")]
+mod offline_sync_store;
 #[cfg(feature = "openapi")]
 mod openapi;
 mod pagination;
 mod path_helpers;
 #[cfg(feature = "db")]
+mod pg_tls;
+#[cfg(feature = "db")]
 mod preload_scoping;
 mod problem_details;
+mod range;
 mod rate_limit_pipeline;
 mod rate_limit_principal;
 #[cfg(feature = "redis")]
@@ -112,6 +139,10 @@ mod read_your_writes_routing;
 mod repository_authorization;
 #[cfg(feature = "db")]
 mod repository_bulk_operations;
+#[cfg(feature = "db")]
+mod repository_find_in_batches;
+#[cfg(feature = "db")]
+mod repository_find_or_create_by;
 #[cfg(feature = "db")]
 mod repository_from_shard;
 #[cfg(all(feature = "db", feature = "openapi"))]
@@ -130,6 +161,7 @@ mod schema_drift_guard;
 mod scoped_tokens;
 mod security;
 mod seo;
+mod server_timing;
 #[cfg(feature = "db")]
 mod shard_map_guard;
 #[cfg(feature = "db")]
@@ -138,9 +170,13 @@ mod sharding_commit_hooks;
 #[cfg(feature = "db")]
 mod sharding_integration;
 mod signed_webhooks;
+#[cfg(feature = "ws")]
+mod sse_replay;
 mod static_serving;
 #[cfg(feature = "storage")]
 mod storage_local_integration;
+#[cfg(feature = "maud")]
+mod stories;
 #[cfg(feature = "system-tests")]
 mod system_test_api;
 #[cfg(feature = "db")]
@@ -148,10 +184,24 @@ mod tenancy;
 mod tenancy_unit;
 mod test_app_integration;
 mod test_db_integration;
+mod throttle_route;
 mod time_zone_integration;
 mod transactional_test_integration;
+mod tx_isolation_retry_integration;
 mod webhook_outbound;
+#[cfg(feature = "maud")]
+mod widget_css_coverage;
+#[cfg(feature = "maud")]
+mod widgets_alert;
+#[cfg(feature = "maud")]
+mod widgets_avatar;
+#[cfg(feature = "maud")]
+mod widgets_badge;
+#[cfg(feature = "maud")]
+mod widgets_infinite_feed;
 mod widgets_modal;
 mod widgets_tabs;
+#[cfg(feature = "maud")]
+mod widgets_toast;
 #[cfg(feature = "ws")]
 mod ws_integration;

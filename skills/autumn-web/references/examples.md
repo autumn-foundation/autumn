@@ -1,7 +1,51 @@
-# autumn-web 0.5.0 Example Reference
+# autumn-web Example Reference (published 0.5.0)
 
 Use these patterns when generating or reviewing Autumn apps. The official
 examples live under `examples/`; prefer current source when exact code matters.
+Everything here works on the published 0.5.0 crates unless marked otherwise.
+
+## Status field with a state machine (replaces hand-rolled hook validation)
+
+Do NOT write status-transition `match` blocks in `before_create`/
+`before_update` hooks or handlers — declare the graph on the model instead:
+
+```rust
+#[autumn_web::model]
+pub struct Page {
+    #[id]
+    pub id: i64,
+    pub title: String,
+    pub body: String,
+    #[state_machine(transitions(
+        draft -> published: "can_publish",
+        published -> archived,
+    ))]
+    pub status: String,
+}
+
+impl Page {
+    fn can_publish(&self) -> bool {
+        !self.title.is_empty() && !self.body.is_empty()
+    }
+}
+
+// In PageHooks::before_update — the only transition code you write:
+async fn before_update(
+    &self,
+    _ctx: &mut MutationContext,
+    draft: &mut UpdateDraft<Page>,
+) -> AutumnResult<()> {
+    if draft.after.status != draft.before.status {
+        let mut proposed = draft.after.clone();
+        proposed.status = draft.before.status.clone();
+        proposed.transition_status_to(&draft.after.status)?; // 400 on bad edge/guard
+    }
+    Ok(())
+}
+```
+
+See `examples/wiki/src/models.rs` + `examples/wiki/src/hooks.rs` and
+`docs/guide/state-machines.md`.
 
 ## Minimal app
 
@@ -377,6 +421,41 @@ async fn main() {
 
 `autumn-web` keeps the `BlobStore` trait and local backend. S3 lives in
 `autumn-storage-s3`.
+
+## Seekable video from a stored blob (Range / 206)
+
+Serve a private stored video behind a policy so a browser `<video>` element can
+seek. `into_response_ranged` reads the request's `Range` header and answers with
+`206 Partial Content`, fetching only the requested byte slice from the store
+(never buffering the whole object). A non-ranged request gets `200` with
+`Accept-Ranges: bytes`; an unsatisfiable range gets `416`.
+
+```rust
+use autumn_web::download::Download;
+use autumn_web::storage::SharedBlobStore;
+use autumn_web::{secured, AutumnError};
+use http::HeaderMap;
+
+#[secured(policy = "media.watch")]
+async fn watch(
+    store: SharedBlobStore,
+    key: String,
+    headers: HeaderMap,
+) -> Result<axum::response::Response, AutumnError> {
+    Ok(Download::from_blob(&store, key)
+        .await?
+        .content_type("video/mp4")
+        .inline()
+        // `.etag(..)` / `.last_modified(..)` make If-Range meaningful so a
+        // resumed download resyncs when the object changed underneath it.
+        .into_response_ranged(&headers)
+        .await)
+}
+```
+
+Under the hood the response goes through `autumn_web::range` (single-range
+parsing, multi-range single-range collapse, `If-Range`) and the blob slice is
+read via `BlobStore::get_range` (the local backend seeks + takes off disk).
 
 ## Testing helpers
 

@@ -41,10 +41,23 @@ db = [
     "dep:pq-sys",
     "dep:scoped-futures",
     "dep:tokio-postgres",
+    "dep:tokio-postgres-rustls",
+    "dep:rustls",
+    "dep:rustls-pki-types",
+    "dep:webpki-roots",
     "diesel/postgres",
     "diesel/chrono",
     "diesel/serde_json",
 ]
+# Offline-first local store + background sync engine for occasionally-
+# connected apps (e.g. Tauri mobile, issue #1508). Local state lives in an
+# in-process SQLite database (`sync::SyncStore`, change-tracked with
+# tombstones); a `sync::SyncEngine` pushes/pulls changes to a remote Autumn
+# app that mounts `sync::server::router()` over Postgres shadow tables.
+# Builds entirely on dependencies the `db` + `http-client` features already
+# compile (diesel's sqlite backend and the bundled libsqlite3-sys are
+# already in the graph) — zero new dependencies.
+offline-sync = ["db", "http-client"]
 test-support = ["dep:testcontainers", "dep:testcontainers-modules"]
 telemetry-otlp = [
     "dep:opentelemetry",
@@ -120,6 +133,11 @@ axum.workspace = true
 bytes = "1"
 http-body = "1"
 http-body-util = "0.1"
+# Both already resolved transitively via tower-http's compression-gzip/
+# compression-br features (used to precompute static CSS encodings once
+# instead of recompressing on every request — see `static_css_response`).
+flate2 = "1"
+brotli = "8"
 bcrypt.workspace = true
 deadpool = { version = "0.13", default-features = false, features = ["managed", "rt_tokio_1"], optional = true }
 diesel = { workspace = true, optional = true }
@@ -128,6 +146,15 @@ diesel-async = { workspace = true, optional = true }
 diesel_migrations = { workspace = true, optional = true }
 scoped-futures = { version = "0.1.4", optional = true }
 tokio-postgres = { version = "0.7", optional = true }
+# TLS to Postgres (`sslmode=require`/`verify-full` in the database URL):
+# rustls-backed connector plugged into diesel-async's pool via a custom
+# setup callback. `ring` (not the aws-lc default) keeps cross-compilation
+# to mobile targets working; `webpki-roots` provides a deterministic root
+# store on platforms without an accessible native one.
+tokio-postgres-rustls = { version = "0.13", optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"], optional = true }
+rustls-pki-types = { version = "1", features = ["std"], optional = true }
+webpki-roots = { version = "1", optional = true }
 postgresql_embedded = { version = "0.19", optional = true, default-features = false, features = [
     "tokio",
     "theseus",
@@ -138,6 +165,14 @@ http.workspace = true
 indexmap.workspace = true
 inventory.workspace = true
 libsqlite3-sys = { workspace = true, optional = true }
+# Conflict oracle for the #1012 duplicate-route preflight. axum 0.8 routes
+# through matchit, so we delegate path-shape conflict detection to the SAME
+# engine axum uses. This version MUST stay pinned to whatever axum resolves in
+# Cargo.lock (currently axum 0.8.9 → matchit 0.8.4); moving axum without moving
+# this in lockstep risks the oracle silently diverging from axum's real accept/
+# panic behavior. The `matchit_agrees_with_axum_route_conflicts` parity test in
+# `router.rs` is the guard — it fails loudly if the two ever disagree.
+matchit = "=0.8.4"
 maud = { workspace = true, optional = true }
 moka = { workspace = true, optional = true }
 pin-project-lite = "0.2"
@@ -146,7 +181,7 @@ serde_json = "1"
 thiserror.workspace = true
 tokio.workspace = true
 tokio-stream = { workspace = true, optional = true }
-tokio-util.workspace = true
+tokio-util = { workspace = true, features = ["io"] }
 toml.workspace = true
 tower.workspace = true
 tower-http.workspace = true
@@ -177,6 +212,7 @@ percent-encoding = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
 webauthn-rs = { version = "0.5", features = ["danger-allow-state-serialisation"], optional = true }
 jsonwebtoken = { version = "10.1.0", default-features = false, features = ["rust_crypto"] }
+secrecy = { version = "0.10.3", features = ["serde"] }
 lru = "0.18.0"
 hmac = "0.12"
 sha2 = "0.10"
@@ -217,6 +253,10 @@ loom = "0.7.2"
 temp-env = { version = "0.3.6", features = ["async_closure"] }
 rustversion = "1"
 rusty-fork = "0.3.1"
+# TLS stub server for the Postgres sslmode integration tests (already in the
+# dependency graph via the db feature — no new crates).
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+rustls-pki-types = { version = "1", features = ["std"] }
 
 # docs.rs feature posture: include all features except those that require
 # system libraries unavailable in the docs.rs sandbox.
@@ -227,7 +267,7 @@ features = [
   "maud", "htmx", "tailwind", "db", "cache-moka",
   "ws", "flash", "multipart", "http-client", "oauth2", "openapi", "mcp",
   "redis", "i18n", "storage", "variants", "mail", "seed", "system-info", "markdown",
-  "reporting", "csv", "embed-assets",
+  "reporting", "csv", "embed-assets", "offline-sync",
 ]
 rustdoc-args = ["--cfg", "docsrs"]
 
@@ -246,6 +286,12 @@ harness = false
 [[test]]
 name = "integration_tests"
 path = "tests/integration_tests.rs"
+
+# Isolated: installs the process-global tracing subscriber (issue #1044), a
+# process-wide side-effect that cannot share the consolidated binary.
+[[test]]
+name = "actuator_live_logger_reload"
+path = "tests/actuator_live_logger_reload.rs"
 
 [[test]]
 name = "db_hooks_lifecycle"

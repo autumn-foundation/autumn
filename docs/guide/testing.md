@@ -15,7 +15,7 @@ test suite fast.
 | Type | Purpose | Spring Boot analogy |
 |------|---------|---------------------|
 | [`TestApp`] | Boot a fully-wired Autumn app in-process | `@SpringBootTest` |
-| [`TestClient`] | Fluent HTTP request builder | `MockMvc` / `WebTestClient` |
+| [`TestClient`] | Fluent HTTP request builder (with a cookie jar + `acting_as` / `log_out` auth helpers) | `MockMvc` / `WebTestClient` |
 | [`TestResponse`] | Response with chainable assertion helpers | `MvcResult` |
 | [`TestDb`] | Shared Postgres testcontainer | `@DataJpaTest` |
 
@@ -99,6 +99,163 @@ resp
         assert_eq!(val.name, "Alice");
     });
 ```
+
+### Asserting channel broadcasts
+
+When a handler publishes to a channel (`ws` feature), opt in with
+`TestApp::record_broadcasts()` to capture every publication a request makes —
+no hand-written spy or `Arc<Mutex>`. The recorder installs through the existing
+`ChannelsInterceptor` seam, is scoped to the `TestClient` (parallel tests never
+leak into one another), and is zero-cost when you don't call it — production
+`Channels` behavior is untouched. Both raw `publish` text and `publish_html`
+HTML/OOB payloads are recorded.
+
+```rust
+#[post("/notes")]
+async fn create_note(State(state): State<AppState>) -> &'static str {
+    state.broadcast().publish("notes", "created").unwrap();
+    "ok"
+}
+
+#[tokio::test]
+async fn publishing_broadcasts_on_create() {
+    let client = TestApp::new()
+        .routes(routes![create_note])
+        .record_broadcasts()          // opt in
+        .build();
+
+    client.post("/notes").send().await.assert_ok();
+
+    client
+        .assert_broadcast_count("notes", 1)                       // exactly one publish
+        .assert_broadcast("notes", |b| b.payload() == "created")  // a matching payload
+        .assert_no_broadcasts("audit");                           // nothing elsewhere
+}
+```
+
+| Method | Checks |
+|--------|--------|
+| `record_broadcasts()` | builder — opt in to recording (on `TestApp`) |
+| `broadcasts()` | every recorded publication, in publish order |
+| `broadcasts_on(topic)` | recorded publications on `topic`, in order |
+| `assert_broadcast(topic, predicate)` | at least one publish on `topic` matches |
+| `assert_broadcast_count(topic, n)` | exactly `n` publishes on `topic` |
+| `assert_no_broadcasts(topic)` | nothing was published to `topic` |
+
+Each `RecordedBroadcast` exposes `.topic()` and `.payload()`. On failure the
+`assert_broadcast*` helpers self-diagnose: they list what *was* published to the
+topic and, grouped, to every other topic. Reading or asserting without
+`record_broadcasts()` panics with a message pointing you at the builder.
+
+---
+
+### Testing background jobs
+
+When a handler enqueues a `#[job]`, the built-in **job recorder** captures every
+enqueue — across `enqueue`, `enqueue_after_commit`, and `enqueue_in_tx` — with
+no opt-in and no hand-written interceptor. It is on by default for every
+`TestApp::build` client, scoped to that `TestApp` (parallel tests never leak
+into one another), and composes ahead of any `with_job_interceptor` you add
+(yours still runs). Each captured enqueue is a `RecordedJob` with public `name`
+and `payload` fields (the exact serialized args).
+
+```rust
+#[post("/signup/{id}")]
+async fn signup(Path(id): Path<i64>) -> &'static str {
+    SendWelcomeJob::enqueue(WelcomeArgs { user_id: id }).await.unwrap();
+    "ok"
+}
+
+#[tokio::test]
+async fn signup_enqueues_and_runs_welcome() {
+    let client = TestApp::new()
+        .plugin(MyJobs)                 // registers the #[job]s
+        .routes(routes![signup])
+        .build();
+
+    client.post("/signup/7").send().await.assert_ok();
+
+    // Assert the enqueue (name only, or name + exact payload):
+    client.assert_job_enqueued_with("send_welcome", json!({ "user_id": 7 }));
+
+    // Drain the captured queue and run each handler synchronously; the report
+    // surfaces per-job errors instead of swallowing them.
+    client.perform_enqueued_jobs().await.assert_all_succeeded();
+}
+```
+
+| Method | Checks |
+|--------|--------|
+| `enqueued_jobs()` | every captured enqueue (`RecordedJob`), in enqueue order |
+| `assert_job_enqueued(name)` | at least one job with `name` was enqueued |
+| `assert_job_enqueued_with(name, payload)` | a job matched both `name` and exact `payload` |
+| `assert_no_jobs_enqueued()` | nothing was enqueued at all |
+| `perform_enqueued_jobs().await` | drain the queue, dispatch each handler, return a `PerformedJobs` report |
+
+`perform_enqueued_jobs` runs each captured payload through the same handler the
+runtime would, so the real serialization round-trip is exercised — a payload
+that fails to deserialize into the job's args surfaces as a per-job failure on
+the returned `PerformedJobs`, not a silent miss. Inspect `report.failures()` or
+fail the test with `report.assert_all_succeeded()`. The `assert_job_*` helpers
+self-diagnose: on failure they list what *was* enqueued. Reading or asserting on
+a client built via `TestApp::from_router` panics with a message pointing you at
+the builder.
+
+> **Note:** `TestApp::build` starts the in-process job worker by default, and
+> that worker *also* drains and runs the enqueued jobs. Calling
+> `perform_enqueued_jobs` therefore runs a job's side effect an **additional**
+> time, on top of the worker's own run. Use it to assert a job runs to
+> completion (surfacing handler/deserialization errors), not to count side
+> effects — any assertion on a side effect's *count* must account for the
+> worker's run as well (settle the worker's run first, then attribute the next
+> change to `perform_enqueued_jobs`).
+
+---
+
+## Testing authenticated routes
+
+`TestClient` keeps a **cookie jar**. Every response's `Set-Cookie` is stored and
+replayed on subsequent requests from the same client — so a real login flow
+works with no manual header threading, exactly like a browser:
+
+```rust
+// POST /login writes the session; GET /dashboard reuses the cookie automatically.
+client.post("/login").form("email=alice@example.com&password=secret").send().await.assert_ok();
+client.get("/dashboard").send().await.assert_ok();
+```
+
+When you only need an authenticated *identity* — not the login endpoint under
+test — `acting_as` mints the session directly, so a `#[secured]` route is
+testable in ≤2 lines of setup:
+
+```rust
+let client = TestApp::new().routes(routes![dashboard]).build();
+client.acting_as(42).await;                       // authenticated as user 42
+client.get("/dashboard").send().await.assert_ok();
+```
+
+`acting_as` writes the app's configured `auth.session_key` (default `user_id`,
+so a non-default key set via `config` is honored) and sets **identity only** —
+authorization still runs. A user it acts as who lacks a required role or scope is
+still denied. `log_out()` clears the session cookie, reverting the client to an
+unauthenticated state:
+
+```rust
+client.acting_as(42).await;
+client.get("/admin").send().await.assert_status(403); // has no `admin` role
+client.log_out();
+client.get("/dashboard").send().await.assert_status(401); // session gone
+```
+
+| Method | Checks |
+|--------|--------|
+| `acting_as(id).await` | authenticate the client's session as `id` without hitting `/login` |
+| `login_as(id).await` | alias for `acting_as` |
+| `log_out()` | clear the session cookie; secured routes reject again |
+
+These mirror Laravel's `actingAs`, Rails' `sign_in`, Django's `force_login`, and
+Phoenix's `log_in_user`. `acting_as` requires a client built via `TestApp::build()`
+with the default in-memory session backend; it panics for `from_router` clients.
 
 ---
 
@@ -447,6 +604,7 @@ let comment = Comment::factory().post_id(post.id).body("Nice!").create(&pool).aw
 | Custom config | `.config(AutumnConfig { … })` or `.profile("staging")` |
 | With database | `.with_db(TestDb::shared().await.pool())` |
 | Authorization | `.policy(MyPolicy).scope(MyScope)` |
+| Authenticated request | `client.acting_as(user_id).await` (then `client.log_out()`) |
 | Custom middleware | `.layer(MyLayer)` |
 | Raw router | `TestApp::from_router(my_router)` |
 | Build model in-memory | `MyModel::factory().field(val).build()` |

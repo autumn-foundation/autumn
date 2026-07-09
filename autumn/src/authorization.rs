@@ -60,6 +60,21 @@ use http::StatusCode;
 
 use crate::session::Session;
 
+/// Provides the specific application state needed by the authorization subsystem.
+///
+/// This trait severs the dependency from the `authorization` module back to the
+/// `state` module, breaking a circular dependency (`state` -> `authorization` -> `session` -> `state`).
+pub trait ProvideAuthorizationState: Send + Sync {
+    fn policy_registry(&self) -> &PolicyRegistry;
+    fn auth_session_key(&self) -> &str;
+    fn forbidden_response(&self) -> &ForbiddenResponse;
+
+    #[cfg(feature = "db")]
+    fn pool(
+        &self,
+    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>;
+}
+
 /// Boxed future returned by [`Policy`] and [`Scope`] methods so the
 /// traits remain object-safe (`dyn Policy<R>` works regardless of
 /// rust edition).
@@ -135,10 +150,10 @@ impl PolicyContext {
         }
     }
 
-    /// Build a fully-populated [`PolicyContext`] from `AppState` +
+    /// Build a fully-populated [`PolicyContext`] from state +
     /// `Session`. Used by the `#[authorize]` macro and
     /// `#[repository(policy = ...)]`-generated handlers.
-    pub async fn from_request(state: &crate::AppState, session: &Session) -> Self {
+    pub async fn from_request(state: &impl ProvideAuthorizationState, session: &Session) -> Self {
         let mut ctx = Self::from_session(session, state.auth_session_key()).await;
         ctx.policy_registry = state.policy_registry().clone();
         #[cfg(feature = "db")]
@@ -463,9 +478,9 @@ impl<T: Send + Sync + 'static> Scoped for T {}
 /// Process-wide registry of resource → policy and resource →
 /// scope bindings.
 ///
-/// Stored on [`AppState`](crate::AppState) so handlers and
+/// Stored on application state so handlers and
 /// `#[repository]`-generated endpoints can resolve a policy by
-/// resource type via [`AppState::policy::<R>`](crate::AppState::policy).
+/// resource type.
 #[derive(Clone, Default)]
 pub struct PolicyRegistry {
     inner: Arc<RwLock<RegistryInner>>,
@@ -688,7 +703,7 @@ impl<'de> serde::Deserialize<'de> for ForbiddenResponse {
 /// }
 /// ```
 pub async fn authorize<R>(
-    state: &crate::AppState,
+    state: &impl ProvideAuthorizationState,
     session: &Session,
     action: &str,
     resource: &R,
@@ -757,7 +772,7 @@ where
 /// the public API** — call [`authorize`] from user code.
 #[doc(hidden)]
 pub async fn __check_policy<R>(
-    state: &crate::AppState,
+    state: &impl ProvideAuthorizationState,
     session: &Session,
     action: &str,
     resource: &R,
@@ -799,7 +814,7 @@ where
 /// alias for older macro output.
 #[doc(hidden)]
 pub async fn __check_policy_create<R>(
-    state: &crate::AppState,
+    state: &impl ProvideAuthorizationState,
     session: &Session,
 ) -> crate::AutumnResult<()>
 where
@@ -818,7 +833,7 @@ where
 /// only `autumn-web` is upgraded.
 #[doc(hidden)]
 pub async fn __check_policy_create_payload<R>(
-    state: &crate::AppState,
+    state: &impl ProvideAuthorizationState,
     session: &Session,
     payload: &serde_json::Value,
 ) -> crate::AutumnResult<()>
@@ -870,7 +885,7 @@ where
 /// Returns the configured deny response when the policy denies.
 /// Returns `500` when no policy is registered for `R`.
 pub async fn authorize_create<R>(
-    state: &crate::AppState,
+    state: &impl ProvideAuthorizationState,
     session: &Session,
 ) -> crate::AutumnResult<()>
 where
@@ -906,7 +921,7 @@ where
 /// Returns the configured deny response when the policy denies.
 /// Returns `500` when no policy is registered for `R`.
 pub async fn authorize_create_payload<R>(
-    state: &crate::AppState,
+    state: &impl ProvideAuthorizationState,
     session: &Session,
     payload: &serde_json::Value,
 ) -> crate::AutumnResult<()>
@@ -1240,13 +1255,54 @@ mod tests {
         assert!(dbg.contains("scopes"));
     }
 
-    fn detached_state_with(
-        _registry: PolicyRegistry,
-        forbidden: ForbiddenResponse,
-    ) -> crate::AppState {
-        crate::AppState::detached()
-            .with_forbidden_response(forbidden)
-            .with_auth_session_key("user_id")
+    #[derive(Clone)]
+    struct MockState {
+        policy_registry: PolicyRegistry,
+        forbidden_response: ForbiddenResponse,
+        auth_session_key: String,
+    }
+
+    impl ProvideAuthorizationState for MockState {
+        fn policy_registry(&self) -> &PolicyRegistry {
+            &self.policy_registry
+        }
+
+        fn auth_session_key(&self) -> &str {
+            &self.auth_session_key
+        }
+
+        fn forbidden_response(&self) -> &ForbiddenResponse {
+            &self.forbidden_response
+        }
+
+        #[cfg(feature = "db")]
+        fn pool(
+            &self,
+        ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>
+        {
+            None
+        }
+    }
+
+    impl MockState {
+        fn with_forbidden_response(mut self, forbidden: ForbiddenResponse) -> Self {
+            self.forbidden_response = forbidden;
+            self
+        }
+    }
+
+    fn detached_state() -> MockState {
+        MockState {
+            policy_registry: PolicyRegistry::default(),
+            forbidden_response: ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
+        }
+    }
+
+    fn detached_state_with(registry: PolicyRegistry, forbidden: ForbiddenResponse) -> MockState {
+        let mut state = detached_state().with_forbidden_response(forbidden);
+        state.policy_registry = registry;
+        state
     }
 
     fn session_with(user_id: Option<&str>, role: Option<&str>) -> Session {
@@ -1276,11 +1332,7 @@ mod tests {
         let registry = PolicyRegistry::default();
         registry.register_policy::<Note, _>(AdminOrOwnerPolicy);
         let state = detached_state_with(registry.clone(), ForbiddenResponse::Forbidden403);
-        // Inject the registry into the live state's registry.
-        let live = state.policy_registry();
-        // Move registrations from `registry` into the state's registry.
-        // (`detached()` starts with an empty registry; we copy in.)
-        live.register_policy::<Note, _>(AdminOrOwnerPolicy);
+        // `state` already has the registry we passed in via `detached_state_with`.
 
         let session = session_with(Some("99"), None); // not the owner, no role
         let n = Note { author_id: 42 };
@@ -1292,7 +1344,7 @@ mod tests {
 
     #[tokio::test]
     async fn authorize_returns_ok_when_policy_allows() {
-        let state = crate::AppState::detached();
+        let state = detached_state();
         state
             .policy_registry()
             .register_policy::<Note, _>(AdminOrOwnerPolicy);
@@ -1305,7 +1357,7 @@ mod tests {
 
     #[tokio::test]
     async fn authorize_create_returns_500_when_no_policy_registered() {
-        let state = crate::AppState::detached();
+        let state = detached_state();
         let session = session_with(Some("42"), None);
         let err = authorize_create::<Note>(&state, &session)
             .await
@@ -1322,8 +1374,7 @@ mod tests {
             }
         }
 
-        let state =
-            crate::AppState::detached().with_forbidden_response(ForbiddenResponse::Forbidden403);
+        let state = detached_state().with_forbidden_response(ForbiddenResponse::Forbidden403);
         state
             .policy_registry()
             .register_policy::<Note, _>(AuthOnlyCreatePolicy);
@@ -1354,8 +1405,7 @@ mod tests {
             }
         }
 
-        let state =
-            crate::AppState::detached().with_forbidden_response(ForbiddenResponse::Forbidden403);
+        let state = detached_state().with_forbidden_response(ForbiddenResponse::Forbidden403);
         state
             .policy_registry()
             .register_policy::<Note, _>(OwnerPayloadPolicy);
@@ -1382,8 +1432,7 @@ mod tests {
             }
         }
 
-        let state =
-            crate::AppState::detached().with_forbidden_response(ForbiddenResponse::Forbidden403);
+        let state = detached_state().with_forbidden_response(ForbiddenResponse::Forbidden403);
         state
             .policy_registry()
             .register_policy::<Note, _>(AuthOnlyCreatePolicy);
@@ -1416,8 +1465,7 @@ mod tests {
             }
         }
 
-        let state =
-            crate::AppState::detached().with_forbidden_response(ForbiddenResponse::Forbidden403);
+        let state = detached_state().with_forbidden_response(ForbiddenResponse::Forbidden403);
         state
             .policy_registry()
             .register_policy::<Note, _>(OwnerPayloadPolicy);
@@ -1431,7 +1479,7 @@ mod tests {
 
     #[tokio::test]
     async fn check_policy_alias_round_trips() {
-        let state = crate::AppState::detached();
+        let state = detached_state();
         state
             .policy_registry()
             .register_policy::<Note, _>(AdminOrOwnerPolicy);
@@ -1446,7 +1494,7 @@ mod tests {
 
     #[tokio::test]
     async fn from_request_clones_pool_and_registry_from_state() {
-        let state = crate::AppState::detached();
+        let state = detached_state();
         state
             .policy_registry()
             .register_policy::<Note, _>(AdminOrOwnerPolicy);
@@ -1460,7 +1508,7 @@ mod tests {
 
     #[tokio::test]
     async fn scoped_blanket_trait_constructible_without_registered_scope() {
-        let state = crate::AppState::detached();
+        let state = detached_state();
         let session = session_with(Some("1"), None);
         let ctx = PolicyContext::from_request(&state, &session).await;
         // No scope registered for `Note`.

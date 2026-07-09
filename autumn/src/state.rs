@@ -154,6 +154,43 @@ pub struct AppState {
     /// Injected wall-clock. Defaults to [`SystemClock`] (real time).
     /// Tests override via [`crate::test::TestApp::with_clock`].
     pub(crate) clock: Arc<dyn ClockSource>,
+
+    /// Process-unique identity assigned once per real `AppState` construction
+    /// and preserved verbatim across `.clone()` (it is `Copy`).
+    ///
+    /// Two independently built apps that happen to share identical rate-limit
+    /// config would otherwise collide in the process-global `#[throttle]`
+    /// limiter registry (keyed only by route/name + config fingerprint), so
+    /// traffic in one app would drain the other's per-route bucket. Folding
+    /// this id into the registry key gives each app its own buckets. Sourced
+    /// from a monotonic `AtomicU64` — never reused, unlike a pointer address.
+    pub(crate) app_id: u64,
+}
+
+/// Monotonic source for [`AppState::app_id`]. Starts at 1 so `0` can never be a
+/// live app id.
+static NEXT_APP_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+impl crate::authorization::ProvideAuthorizationState for AppState {
+    fn policy_registry(&self) -> &crate::authorization::PolicyRegistry {
+        &self.policy_registry
+    }
+
+    fn auth_session_key(&self) -> &str {
+        &self.auth_session_key
+    }
+
+    fn forbidden_response(&self) -> &crate::authorization::ForbiddenResponse {
+        &self.forbidden_response
+    }
+
+    #[cfg(feature = "db")]
+    fn pool(
+        &self,
+    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>
+    {
+        self.pool.as_ref()
+    }
 }
 
 impl AppState {
@@ -311,6 +348,25 @@ impl AppState {
     pub fn config(&self) -> crate::config::AutumnConfig {
         self.extension::<crate::config::AutumnConfig>()
             .map_or_else(crate::config::AutumnConfig::default, |arc| (*arc).clone())
+    }
+
+    /// Allocate the next process-unique app id.
+    ///
+    /// Called exactly once per genuine `AppState` construction; clones copy the
+    /// resulting `u64` verbatim, so a cloned state (what `State<AppState>` hands
+    /// a handler) reports the same id as its origin while a separately built
+    /// state gets a fresh one.
+    pub(crate) fn next_app_id() -> u64 {
+        NEXT_APP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Process-unique identity of this app, stable across clones.
+    ///
+    /// Used to scope per-route `#[throttle]` limiters so two independently
+    /// built apps with identical config never share a token bucket.
+    #[must_use]
+    pub(crate) const fn app_id(&self) -> u64 {
+        self.app_id
     }
 
     /// Returns the shared probe lifecycle state.
@@ -612,6 +668,7 @@ impl AppState {
             auth_session_key: "user_id".to_owned(),
             shared_cache: None,
             clock: Arc::new(SystemClock),
+            app_id: Self::next_app_id(),
         }
     }
 
