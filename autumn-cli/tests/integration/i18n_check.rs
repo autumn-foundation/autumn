@@ -353,6 +353,53 @@ fn view(locale: &Locale) -> String {
 }
 
 #[test]
+fn generic_arg_before_key_keeps_key_in_slot_so_deleting_it_is_missing() {
+    // When an earlier argument carries a turbofish with more than one type
+    // parameter — `t!(locale_for::<A, B>(), "nav.about")` — the comma inside
+    // `<A, B>` is not wrapped in a group. A naive comma splitter would shift the
+    // literal key out of its slot and never record it, letting a genuinely
+    // missing translation pass. The grammar-aware split keeps the key in slot,
+    // so deleting it from every locale surfaces as Missing (non-zero exit).
+    let dir = clean_project();
+    write(
+        dir.path(),
+        "src/main.rs",
+        r#"
+fn view(locale: &Locale) -> String {
+    let a = t!(locale, "nav.home");
+    let b = t!(locale_for::<A, B>(), "nav.about");
+    format!("{a}{b}")
+}
+"#,
+    );
+    // Drop `nav.about` from every locale so the referenced key is genuinely
+    // missing across the fallback chain.
+    write(dir.path(), "i18n/en.ftl", "nav.home = Home\n");
+    write(dir.path(), "i18n/es.ftl", "nav.home = Inicio\n");
+
+    let output = run_check(dir.path(), &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !output.status.success(),
+        "a key behind a multi-param generic argument must still be checked \
+         (Missing), not shifted out of its slot\nstdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("nav.about"),
+        "should name the key kept in its slot despite the generic\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Missing"),
+        "should label it Missing\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("dynamic (not checked): 1"),
+        "the `<A, B>` fragment must not create a bogus dynamic site\n{stdout}"
+    );
+    assert!(stdout.contains("FAIL"), "stdout:\n{stdout}");
+}
+
+#[test]
 fn wrapped_literal_with_trailing_tokens_is_dynamic_not_a_false_missing() {
     // A parenthesized literal that CONTINUES after the group —
     // `locale.t((" nav.home ").trim())` — is a derived expression, not a literal

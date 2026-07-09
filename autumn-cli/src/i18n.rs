@@ -333,11 +333,39 @@ fn split_top_level_args(args: &TokenStream) -> Vec<TokenStream> {
     segments
 }
 
+/// Split a call/macro argument [`TokenStream`] into its top-level arguments,
+/// preferring a grammar-aware parse and falling back to [`split_top_level_args`].
+///
+/// The raw token splitter cuts on *every* top-level comma, but a comma inside an
+/// angle-bracket generic or turbofish — `locale_for::<A, B>()`, `get::<A, B>()`,
+/// `Vec<A, B>` — is NOT wrapped in a [`TokenTree::Group`] (unlike `()`/`[]`/`{}`),
+/// so the splitter mistakes it for an argument separator and shifts the literal
+/// key out of its slot. [`syn`] understands generics, turbofish, and comparison
+/// operators, so parsing the list as a comma-punctuated sequence of
+/// [`syn::Expr`] groups those commas correctly and keeps the key in its slot.
+///
+/// The parse fails when an argument is not a valid `syn::Expr` — most notably a
+/// `$metavariable` inside a `macro_rules!` transcriber, or any other non-`Expr`
+/// token. In that case we fall back to the raw token splitter, preserving the
+/// metavariable handling: `t!($locale, "nav.home")` still records `nav.home`.
+fn split_call_args(args: &TokenStream) -> Vec<TokenStream> {
+    use syn::parse::Parser as _;
+
+    let parser = syn::punctuated::Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated;
+    if let Ok(parsed) = parser.parse2(args.clone()) {
+        return parsed
+            .into_iter()
+            .map(quote::ToTokens::into_token_stream)
+            .collect();
+    }
+    split_top_level_args(args)
+}
+
 /// Extract the argument at `index` from a call/macro argument list and classify
 /// just that key slot. Tokens in the remaining positions are never inspected,
 /// so metavariables elsewhere do not discard a literal key.
 fn record_key_at(args: &TokenStream, index: usize, file: &str, result: &mut ScanResult) {
-    if let Some(segment) = split_top_level_args(args).get(index) {
+    if let Some(segment) = split_call_args(args).get(index) {
         record_key_segment(segment, file, result);
     }
 }
@@ -1109,6 +1137,57 @@ mod tests {
             result.referenced,
             keys(&["a", "b", "c", "d", "e", "f"]),
             "every nested key must be recorded exactly once: {:?}",
+            result.referenced
+        );
+        assert!(result.dynamic.is_empty());
+    }
+
+    #[test]
+    fn generic_arg_before_key_does_not_shift_key_out_of_slot() {
+        // When an earlier argument carries a turbofish / generic with more than
+        // one type parameter — `locale_for::<A, B>()`, `&get::<A, B>()` — the
+        // comma inside `<A, B>` is NOT wrapped in a `TokenTree::Group`, so the
+        // raw token splitter would miscount it as an argument separator and shift
+        // the literal key out of slot 1. The grammar-aware `syn` split keeps the
+        // key in its slot for both the macro and the associated call form.
+        let src = r#"
+            fn view(locale: &Locale) {
+                let _ = t!(locale_for::<A, B>(), "nav.home");
+                let _ = Locale::t(&get::<A, B>(), "nav.about");
+            }
+        "#;
+        let mut result = ScanResult::default();
+        scan_source(src, "view.rs", &mut result);
+        assert_eq!(
+            result.referenced,
+            keys(&["nav.about", "nav.home"]),
+            "the literal key must stay in its slot despite the multi-param \
+             generic in an earlier argument: {:?}",
+            result.referenced
+        );
+        assert!(
+            result.dynamic.is_empty(),
+            "no bogus dynamic site from a partial `<A` / `B>()` fragment: {:?}",
+            result.dynamic
+        );
+    }
+
+    #[test]
+    fn generic_arg_in_non_key_position_of_method_form_is_recorded() {
+        // The method form `x.t_with("nav.count", &make::<A, B>())` puts the key
+        // at slot 0 and a multi-param generic in slot 1. The `<A, B>` comma must
+        // not fragment the argument list in a way that loses the key.
+        let src = r#"
+            fn view(locale: &Locale) {
+                let _ = locale.t_with("nav.count", &make::<A, B>());
+            }
+        "#;
+        let mut result = ScanResult::default();
+        scan_source(src, "view.rs", &mut result);
+        assert_eq!(
+            result.referenced,
+            keys(&["nav.count"]),
+            "the key at slot 0 must be recorded even with a generic in slot 1: {:?}",
             result.referenced
         );
         assert!(result.dynamic.is_empty());
