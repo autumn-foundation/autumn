@@ -230,7 +230,10 @@ mod tests {
             map(&ctx(Some("abc"), Some("true"), None)).git.dirty,
             Some(true)
         );
-        assert_eq!(map(&ctx(Some("abc"), Some("1"), None)).git.dirty, Some(true));
+        assert_eq!(
+            map(&ctx(Some("abc"), Some("1"), None)).git.dirty,
+            Some(true)
+        );
         assert_eq!(
             map(&ctx(Some("abc"), Some("nonsense"), None)).git.dirty,
             None
