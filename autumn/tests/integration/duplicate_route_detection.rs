@@ -39,6 +39,131 @@ async fn user_by_slug() -> &'static str {
     "slug"
 }
 
+// ── PROBE handlers: distinct methods, same path, same scope ──────────────────
+#[get("/posts")]
+async fn scoped_posts_get() -> &'static str {
+    "get-posts"
+}
+
+#[post("/posts")]
+async fn scoped_posts_post() -> &'static str {
+    "post-posts"
+}
+
+#[autumn_web::delete("/posts")]
+async fn scoped_posts_delete() -> &'static str {
+    "delete-posts"
+}
+
+#[derive(Clone)]
+struct NoopScopeLayer;
+impl<S> tower::Layer<S> for NoopScopeLayer {
+    type Service = S;
+    fn layer(&self, inner: S) -> Self::Service {
+        inner
+    }
+}
+
+/// PROBE (issue #1012 review round 3): a single scoped group with distinct
+/// methods on the SAME path (`GET /posts` + `POST /posts`) must mount cleanly
+/// and serve both verbs. `mount_scoped_groups` calls `sub_router.route()`
+/// once per scoped route; this asserts axum 0.8 merges repeated `.route()`
+/// calls for distinct methods rather than panicking on an overlap.
+#[tokio::test]
+async fn scoped_group_distinct_methods_same_path_mounts_and_serves_both() {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        TestApp::new()
+            .scoped(
+                "/api",
+                NoopScopeLayer,
+                routes![scoped_posts_get, scoped_posts_post],
+            )
+            .build()
+    }));
+
+    let app = match result {
+        Ok(app) => app,
+        Err(payload) => {
+            panic!(
+                "scoped GET+POST /posts must mount cleanly, but the build panicked: {}",
+                panic_message(payload.as_ref())
+            );
+        }
+    };
+
+    let resp = app.get("/api/posts").send().await;
+    resp.assert_status(200);
+    assert_eq!(resp.text(), "get-posts");
+
+    let resp = app.post("/api/posts").send().await;
+    resp.assert_status(200);
+    assert_eq!(resp.text(), "post-posts");
+}
+
+/// PROBE 3-method variant: `GET` + `POST` + `DELETE` on the same scoped path.
+#[tokio::test]
+async fn scoped_group_three_methods_same_path_mounts_and_serves_all() {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        TestApp::new()
+            .scoped(
+                "/api",
+                NoopScopeLayer,
+                routes![scoped_posts_get, scoped_posts_post, scoped_posts_delete],
+            )
+            .build()
+    }));
+
+    let app = match result {
+        Ok(app) => app,
+        Err(payload) => {
+            panic!(
+                "scoped GET+POST+DELETE /posts must mount cleanly, but the build panicked: {}",
+                panic_message(payload.as_ref())
+            );
+        }
+    };
+
+    app.get("/api/posts").send().await.assert_status(200);
+    app.post("/api/posts").send().await.assert_status(200);
+    app.delete("/api/posts").send().await.assert_status(200);
+}
+
+/// Convergence audit (issue #1012, review round 3): two SEPARATE scoped groups
+/// sharing the same `/api` prefix, one contributing `GET /posts` and the other
+/// `POST /posts`. Each group is mounted with its own `.nest("/api", …)` call,
+/// yet axum flattens nested routers into the parent match table and merges the
+/// method routers — so distinct methods on the same resolved path serve
+/// cleanly. The preflight blesses this as legal (distinct method+path); this
+/// proves the mount agrees.
+#[tokio::test]
+async fn distinct_methods_across_two_scoped_groups_same_prefix_serve_both() {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        TestApp::new()
+            .scoped("/api", NoopScopeLayer, routes![scoped_posts_get])
+            .scoped("/api", NoopScopeLayer, routes![scoped_posts_post])
+            .build()
+    }));
+
+    let app = match result {
+        Ok(app) => app,
+        Err(payload) => {
+            panic!(
+                "distinct methods across two `/api` scoped groups must mount cleanly, \
+                 but the build panicked: {}",
+                panic_message(payload.as_ref())
+            );
+        }
+    };
+
+    let resp = app.get("/api/posts").send().await;
+    resp.assert_status(200);
+    assert_eq!(resp.text(), "get-posts");
+
+    let resp = app.post("/api/posts").send().await;
+    resp.assert_status(200);
+    assert_eq!(resp.text(), "post-posts");
+}
+
 fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(s) = payload.downcast_ref::<String>() {
         return s.clone();
