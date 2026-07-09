@@ -185,6 +185,18 @@ Free functions rendering changeset-aware, accessible inputs:
   `stat_card(label, value, link)`, `tabs(id, &[(id, label, markup)])`,
   `modal(id, title, &body, &ModalConfig)`, `modal_trigger`,
   `modal_close_button`, `confirm_action(...)`.
+- `autumn_web::widgets` display atoms: `badge(label, BadgeVariant)` /
+  `badge_with(..., &BadgeConfig)` / `status_tag(label)` with
+  `BadgeVariant::{Neutral,Info,Success,Warning,Danger}` and
+  `BadgeVariant::for_label(&str)` (deterministic color); `avatar(name,
+  &AvatarConfig)` with `AvatarSize::{Small,Medium,Large}` (image or
+  colored-initials fallback); `alert(AlertVariant, body)` / `alert_with(...,
+  &AlertConfig)` with `AlertVariant::{Info,Success,Warning,Error}` and
+  `error_summary(&Changeset) -> Option<Markup>`. All prelude re-exported.
+- `autumn_web::flash::{flash_messages, flash_messages_with,
+  FlashMessagesConfig}` — accessible flash-banner renderer (per-severity
+  `role`/`aria-live`, `autumn-flash--<level>` classes, empty renders nothing,
+  optional no-JS dismiss). Prelude re-exported.
 - `autumn_web::links`: `link_to`, `link_to_with`, `button_to(label, href,
   Method, csrf_token)`, `button_to_with(..., &ButtonToOptions)`.
 - `autumn_web::ui::pagination`: `pagination_nav(&Page, &PagerOptions)`,
