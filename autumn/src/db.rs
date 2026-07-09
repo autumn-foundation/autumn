@@ -137,7 +137,7 @@ impl RequestQueryTimer {
     /// Record the start of a statement. Extracted from the event handler so
     /// the start/finish accounting is unit-testable without constructing a
     /// (non-exhaustive, unstable-to-build) `InstrumentationEvent`.
-    fn on_start(&mut self, now: std::time::Instant) {
+    const fn on_start(&mut self, now: std::time::Instant) {
         self.started_at = Some(now);
     }
 
