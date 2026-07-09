@@ -115,6 +115,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `BlobStore::get_stream` without buffering the whole object in memory, so it
   serves large private files behind a `#[secured]` handler with no public
   presigned URL (#1141).
+- **observability:** `Server-Timing` response header (issue #1348) —
+  standards-conformant W3C `total;dur=…` plus
+  `db;dur=…;desc="N queries"` roll-up so N+1s show up directly in the
+  browser DevTools Network → Timing pane. Opt-in via
+  `[observability] server_timing = true` (or
+  `AUTUMN_OBSERVABILITY__SERVER_TIMING=true`); defaults on in
+  `dev`/`development`, off everywhere else so prod never leaks timings to
+  anonymous clients without explicit opt-in. `total` uses the identical
+  clock formula as the access-log `duration_ms`; SSE
+  (`text/event-stream`) responses receive `total`-only. MCP `tools/call`
+  responses forward the dispatched handler's non-`total` `Server-Timing`
+  metrics (including `db;dur;desc="N queries"`) onto the `/mcp` response, so
+  DB-backed tool calls surface their query count — while the inner-dispatch
+  `total` is dropped in favour of the outer fallback's real `/mcp` `total`,
+  which brackets the endpoint's body buffering/JSON-RPC repackaging (the inner
+  `total`, captured before that work, would under-report `/mcp` latency). See
+  `docs/guide/observability/server-timing.md`.
 - **Atom/RSS feed renderer** (`feed::Feed` / `feed::FeedEntry`): build an Atom 1.0 or RSS 2.0 feed from channel metadata plus an iterator of entries and return it directly from a `#[get]` handler — it implements `IntoResponse` with the correct `application/atom+xml`/`application/rss+xml` content type, XML-escapes every text field, and `Feed::conditional(&headers)` reuses the `etag` layer so feed pollers get a `304 Not Modified` on unchanged content. The `blog` example gains a `/feed.xml` route. (#1045)
 - **router:** duplicate-route preflight (issue #1012) — two user- or
   plugin-registered handlers that resolve to the same `(method, path)` after
@@ -778,6 +795,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **observability:** `Server-Timing` no longer miscounts pooled-connection reuse
+  in the `db` metric. Connections are pooled and diesel-async's deadpool manager
+  never resets a connection's instrumentation on recycle, so a connection that
+  served a prior measured request kept its stale `RequestQueryTimer` installed.
+  On the next checkout the housekeeping `SET statement_timeout` ran while that
+  stale timer was active — adding a bogus `+1 query` (and its latency) to the
+  next request before any application SQL — and a reused connection kept paying
+  per-query `DebugQuery` formatting even on later opted-out requests. `Db::checkout`
+  now installs a fresh timer on every measured checkout (before the `SET`), the
+  timer's `on_start` probes the request scope before formatting or recording
+  anything (a cheap no-op for any stale timer left on a reused connection), and
+  the checkout `SET statement_timeout` is classified as an uncounted
+  housekeeping statement alongside transaction-control SQL (issue #1348).
+- **observability:** `Server-Timing` no longer clobbers an application's own
+  Diesel instrumentation. `Db::checkout` installs its `RequestQueryTimer` via
+  diesel-async's `set_instrumentation`, which *wholesale replaces* a
+  connection's instrumentation — so an unconditional install would overwrite
+  any global hook an app registered with
+  `diesel::connection::set_default_instrumentation` (query logging, tracing,
+  metrics) on the first checkout and never restore it, silently disabling it
+  even when `[observability] server_timing` is off. `Db::checkout` now installs
+  the timer only when a `Server-Timing` request scope is active
+  (`request_db_timing_active`), so an opted-out app keeps its own
+  instrumentation intact. Composing autumn's timer with an app-provided default
+  instrumentation is a documented limitation while `server_timing` is enabled —
+  see `docs/guide/observability/server-timing.md` (issue #1348).
+- **observability:** `Server-Timing` no longer installs the per-request DB
+  query timer on checked-out connections when `[observability] server_timing`
+  is disabled (the production default). Previously every checked-out connection
+  received the instrumentation unconditionally, so each query paid a full
+  `DebugQuery` SQL formatting/allocation on its `StartQuery` event before the
+  no-op accumulator write discovered no request scope was active. `Db::checkout`
+  now probes the request-scoped task-local (`request_db_timing_active`) and
+  installs the timer only when the `Server-Timing` layer has scoped the request,
+  so opted-out requests carry zero per-query instrumentation overhead. When
+  enabled, behaviour (`db;dur`/query count) is unchanged (issue #1348).
 - **generator:** the generated `README.md` now orders the `libpq` prerequisite
   before the `cargo install diesel_cli --features postgres` command, since that
   command's `postgres` feature (and the base `cargo build`, which links the `db`

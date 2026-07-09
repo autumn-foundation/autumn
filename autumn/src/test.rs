@@ -1672,6 +1672,19 @@ impl TestApp {
         } else {
             router
         };
+        // Mirror production's outermost Server-Timing fallback (#1348): in
+        // production it is applied in `apply_startup_barrier`, outside the
+        // primary `ServerTimingLayer` and the late `/mcp` merge, and appends a
+        // `total` only for responses the primary never saw — short-circuits and
+        // the late-merged `/mcp` envelope. Without mirroring it here a
+        // `tools/call` would carry no outer `total` in tests, unlike production,
+        // so tests would not observe the real `/mcp` timing an operator sees.
+        // Applied outer to the access-log fallback, matching production order.
+        let router = if crate::config::server_timing_enabled(&self.config) {
+            router.layer(crate::middleware::ServerTimingLayer::fallback(true))
+        } else {
+            router
+        };
         TestClient {
             router,
             probes,

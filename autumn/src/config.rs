@@ -131,6 +131,7 @@
 //! | `AUTUMN_DEV__INSPECTOR_PATH` | `dev.inspector_path` | `String` |
 //! | `AUTUMN_DEV__INSPECTOR_CAPACITY` | `dev.inspector_capacity` | `usize` |
 //! | `AUTUMN_DEV__INSPECTOR_N_PLUS_ONE_THRESHOLD` | `dev.inspector_n_plus_one_threshold` | `usize` |
+//! | `AUTUMN_OBSERVABILITY__SERVER_TIMING` | `observability.server_timing` | `bool` |
 //! | `AUTUMN_COMPRESSION__ENABLED` | `compression.enabled` | `bool` |
 //! | `AUTUMN_STORIES__ENABLED` | `stories.enabled` | `bool` |
 //! | `AUTUMN_AUTH__LOCKOUT__ENABLED` | `auth.lockout.enabled` | `bool` |
@@ -1036,6 +1037,71 @@ pub struct AutumnConfig {
     /// ```
     #[serde(default)]
     pub seo: SeoConfig,
+
+    /// Observability settings (`[observability]` section in `autumn.toml`).
+    ///
+    /// Controls opt-in framework-emitted telemetry that supplements the
+    /// access log — currently the `Server-Timing` response header. See
+    /// [`ObservabilityConfig`] and `docs/guide/observability/server-timing.md`.
+    #[serde(default)]
+    pub observability: ObservabilityConfig,
+}
+
+/// Observability configuration (`[observability]` section in `autumn.toml`).
+///
+/// Controls opt-in telemetry that supplements the default access log.
+///
+/// # Server-Timing header
+///
+/// When `server_timing = true`, Autumn emits a W3C-conformant
+/// [`Server-Timing`](https://www.w3.org/TR/server-timing/) header on every
+/// non-streaming response with at minimum a `total` metric (whole-request
+/// wall time, matching the access-log `duration_ms`) and a `db` metric
+/// summarising cumulative query time plus a query count (`db;dur=…;desc="N queries"`)
+/// when at least one query ran during the request.
+///
+/// The default is **off in production** and **on in the `dev` profile**;
+/// leave the field unset for that behavior, or pin it to `true` / `false`
+/// explicitly. Requires opt-in in prod because timings can leak
+/// infrastructure detail to anonymous clients.
+///
+/// # Example
+///
+/// ```toml
+/// # Force on in a staging profile where dev-team browsers inspect timings.
+/// [observability]
+/// server_timing = true
+/// ```
+///
+/// ```toml
+/// # Force off during a dev-profile perf comparison against production.
+/// [observability]
+/// server_timing = false
+/// ```
+#[derive(Debug, Clone, Default, Deserialize, serde::Serialize)]
+pub struct ObservabilityConfig {
+    /// Emit the `Server-Timing` response header on served requests.
+    ///
+    /// `None` (unset) means the effective value follows the profile default:
+    /// on in `dev`/`development`, off everywhere else. `Some(true)` or
+    /// `Some(false)` pin the choice explicitly.
+    #[serde(default)]
+    pub server_timing: Option<bool>,
+}
+
+/// Resolve the effective value of `[observability] server_timing` for a
+/// given [`AutumnConfig`].
+///
+/// The rules are:
+/// - Explicit `Some(true)` / `Some(false)` in config or env → returned as-is.
+/// - `None` (unset) → `true` iff the active profile is `"dev"` or
+///   `"development"`, otherwise `false`. This keeps production off by
+///   default so timings never leak to anonymous clients without opt-in.
+pub(crate) fn server_timing_enabled(cfg: &AutumnConfig) -> bool {
+    if let Some(explicit) = cfg.observability.server_timing {
+        return explicit;
+    }
+    matches!(cfg.profile.as_deref(), Some("dev" | "development"))
 }
 
 /// SEO configuration (`[seo]` section in `autumn.toml`).
@@ -2552,6 +2618,7 @@ impl AutumnConfig {
         self.apply_bot_protection_env_overrides_with_env(env);
         self.apply_idempotency_env_overrides_with_env(env);
         self.apply_dev_env_overrides_with_env(env);
+        self.apply_observability_env_overrides_with_env(env);
         self.apply_compression_env_overrides_with_env(env);
         self.apply_actuator_env_overrides_with_env(env);
         #[cfg(feature = "reporting")]
@@ -2611,6 +2678,14 @@ impl AutumnConfig {
             env,
             "AUTUMN_COMPRESSION__ENABLED",
             &mut self.compression.enabled,
+        );
+    }
+
+    fn apply_observability_env_overrides_with_env(&mut self, env: &dyn Env) {
+        parse_env_option_bool(
+            env,
+            "AUTUMN_OBSERVABILITY__SERVER_TIMING",
+            &mut self.observability.server_timing,
         );
     }
 
@@ -7436,6 +7511,65 @@ path = "/healthz"
         let mut target = "old".to_string();
         parse_env_string(&env, "SOME_STR", &mut target);
         assert_eq!(target, "val");
+    }
+
+    // ── server_timing_enabled resolver tests ────────────────────
+
+    fn cfg_with_profile(profile: Option<&str>) -> AutumnConfig {
+        AutumnConfig {
+            profile: profile.map(str::to_owned),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn server_timing_defaults_on_in_dev_profile() {
+        let cfg = cfg_with_profile(Some("dev"));
+        assert!(server_timing_enabled(&cfg));
+
+        let cfg = cfg_with_profile(Some("development"));
+        assert!(server_timing_enabled(&cfg));
+    }
+
+    #[test]
+    fn server_timing_defaults_off_in_prod_and_test_profiles() {
+        let cfg = cfg_with_profile(Some("prod"));
+        assert!(!server_timing_enabled(&cfg));
+
+        let cfg = cfg_with_profile(Some("production"));
+        assert!(!server_timing_enabled(&cfg));
+
+        let cfg = cfg_with_profile(Some("test"));
+        assert!(!server_timing_enabled(&cfg));
+
+        let cfg = cfg_with_profile(None);
+        assert!(!server_timing_enabled(&cfg));
+    }
+
+    #[test]
+    fn server_timing_explicit_config_overrides_profile_default() {
+        let mut cfg = cfg_with_profile(Some("prod"));
+        cfg.observability.server_timing = Some(true);
+        assert!(server_timing_enabled(&cfg));
+
+        let mut cfg = cfg_with_profile(Some("dev"));
+        cfg.observability.server_timing = Some(false);
+        assert!(!server_timing_enabled(&cfg));
+    }
+
+    #[test]
+    fn server_timing_env_override_wires_into_dispatcher() {
+        let env = MockEnv::new().with("AUTUMN_OBSERVABILITY__SERVER_TIMING", "true");
+        let mut config = cfg_with_profile(Some("prod"));
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.observability.server_timing, Some(true));
+        assert!(server_timing_enabled(&config));
+
+        let env = MockEnv::new().with("AUTUMN_OBSERVABILITY__SERVER_TIMING", "false");
+        let mut config = cfg_with_profile(Some("dev"));
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.observability.server_timing, Some(false));
+        assert!(!server_timing_enabled(&config));
     }
 
     #[test]
