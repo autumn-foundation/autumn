@@ -1652,26 +1652,89 @@ pub fn run_pending_locked(
     migrations: impl diesel::migration::MigrationSource<diesel::pg::Pg>,
     wait_timeout: Option<std::time::Duration>,
 ) -> Result<MigrationResult, MigrationError> {
+    run_pending_locked_inner(database_url, migrations, wait_timeout, None)
+}
+
+/// Shared engine for [`run_pending_locked`] that additionally performs
+/// content-checksum validation **inside** the advisory-locked critical section
+/// when `up_sql_by_version` is `Some` (issue #1203).
+///
+/// Passing the on-disk `up.sql` map runs, on the *same* Postgres session that
+/// holds the advisory lock and in this order:
+///
+/// 1. Acquire the advisory lock.
+/// 2. **Validate** every already-applied version's recorded checksum against
+///    its current on-disk `up.sql` (fail fast on `Changed`/`Missing`). This is
+///    the authoritative, race-free drift guard.
+/// 3. **Apply** pending migrations.
+/// 4. **Record** checksums for the newly-applied versions.
+/// 5. **Re-validate** after apply — belt-and-suspenders for the interleaving
+///    where a sibling replica applied and recorded THIS version's *original*
+///    content between our step 2 and our apply: the now-recorded hash is
+///    compared against our edited on-disk `up.sql` so the mismatch is caught
+///    before boot.
+/// 6. Release the lock.
+///
+/// Holding the lock across steps 2–5 on one session is what closes the TOCTOU
+/// race a naive pre-lock check leaves open under a concurrent rolling deploy:
+/// with the check outside the lock, replica A (holding an edited `up.sql` for
+/// an as-yet-unapplied version) can validate successfully, then a sibling
+/// applies and records the original checksum, and A later finds nothing pending
+/// and boots without ever comparing its edited content. Running the compare
+/// under the lock removes every such interleaving.
+///
+/// `up_sql_by_version` is pre-read by the caller (best-effort), so a missing or
+/// unreadable migrations dir simply yields `None` and disables the checksum
+/// steps rather than failing the migration run.
+fn run_pending_locked_inner(
+    database_url: &str,
+    migrations: impl diesel::migration::MigrationSource<diesel::pg::Pg>,
+    wait_timeout: Option<std::time::Duration>,
+    up_sql_by_version: Option<&HashMap<String, String>>,
+) -> Result<MigrationResult, MigrationError> {
     let timeout = wait_timeout.unwrap_or(DEFAULT_LOCK_WAIT_TIMEOUT);
 
     with_migration_connection!(database_url, |conn| {
         acquire_migration_lock_on(conn, timeout)?;
 
-        // Collect migration names eagerly so the harness borrow on `conn` is
-        // dropped before we call release_migration_lock on the same connection.
-        let migration_result: Result<Vec<String>, MigrationError> = {
-            let mut harness = HarnessWithOutput::write_to_stdout(&mut *conn);
-            harness
-                .run_pending_migrations(migrations)
-                .map(|applied| applied.iter().map(|m| format!("{m}")).collect())
-                .map_err(|e| MigrationError::Migration(e.to_string()))
-        };
+        // Everything from here runs under the advisory lock on THIS session, so
+        // no concurrent runner can interleave between the validate, apply,
+        // record, and re-validate steps. Compute the outcome, then always
+        // release the lock (the immediately-invoked closure drops its borrow of
+        // `conn` before the release below).
+        let outcome: Result<MigrationResult, MigrationError> = (|| {
+            // (2) Authoritative pre-apply validation: every already-applied
+            //     version's recorded checksum vs its current on-disk up.sql.
+            if let Some(up) = up_sql_by_version {
+                let recorded = recorded_checksums(conn)?;
+                let applied = load_applied_versions_lenient(conn)?;
+                validate_checksums(&applied, up, &recorded)?;
+            }
+
+            // (3) Apply pending migrations. Collect names eagerly so the harness
+            //     borrow on `conn` is dropped before the checksum steps reuse it.
+            let applied: Vec<String> = {
+                let mut harness = HarnessWithOutput::write_to_stdout(&mut *conn);
+                harness
+                    .run_pending_migrations(migrations)
+                    .map(|applied| applied.iter().map(|m| format!("{m}")).collect())
+                    .map_err(|e| MigrationError::Migration(e.to_string()))?
+            };
+
+            // (4) Record checksums for the freshly-applied versions and
+            // (5) re-validate — still under the lock, on the same session.
+            if let Some(up) = up_sql_by_version {
+                let applied_versions = load_applied_versions_lenient(conn)?;
+                record_checksums(conn, &applied_versions, up)?;
+                let recorded = recorded_checksums(conn)?;
+                validate_checksums(&applied_versions, up, &recorded)?;
+            }
+
+            Ok(MigrationResult { applied })
+        })();
 
         release_migration_lock_on(conn);
-
-        Ok(MigrationResult {
-            applied: migration_result?,
-        })
+        outcome
     })
 }
 
@@ -1811,45 +1874,41 @@ pub(crate) fn auto_migrate(
             );
         }
 
-        // Fail-fast checksum guard (issue #1203): if the local `./migrations/`
-        // directory is present, validate every already-applied migration's
-        // recorded checksum against its current on-disk `up.sql` BEFORE
-        // applying anything. A mismatch means an already-applied migration was
-        // edited after the fact and the deployed schema silently forks from
-        // what a fresh build would produce — refuse to compound the drift.
+        // Content-checksum drift guard (issue #1203). If the local
+        // `./migrations/` directory is present, read every migration's on-disk
+        // `up.sql` so the locked apply path can, under the advisory lock and on
+        // the same Postgres session, validate already-applied versions against
+        // their recorded checksums (fail fast on drift), then record and
+        // re-validate the freshly-applied versions. Running the compare *inside*
+        // the lock — rather than in a pre-lock check — is what makes the guard
+        // race-free under a concurrent rolling deploy (see
+        // [`run_pending_locked_inner`]).
         //
-        // Best-effort: production binaries typically ship without the source
-        // tree, so an absent `./migrations/` is not an error — the CLI
-        // (`autumn migrate`, which is the canonical apply path in prod) does
-        // the strict check against its explicit migrations dir. Dir-read
-        // failures fall through silently for the same reason.
+        // Best-effort read: production binaries typically ship without the
+        // source tree, so an absent `./migrations/` is not an error (the map is
+        // `None` and the checksum steps are skipped — the CLI `autumn migrate`
+        // is the canonical strict apply path in prod). A present-but-unreadable
+        // dir likewise degrades to `None` with a warning rather than blocking
+        // boot; genuine drift on a readable dir still hard-fails, under the lock.
         let migrations_dir = std::path::Path::new("migrations");
-        if migrations_dir.is_dir() {
-            match validate_recorded_checksums_against_dir(database_url, migrations_dir) {
-                Ok(()) => {}
-                // Hard-fail on genuine drift: an applied migration was either
-                // edited ("checksum mismatch") or deleted/renamed ("up.sql is
-                // missing from the source tree") after being applied. Both mean
-                // the deployed schema silently forks from a fresh build. Any
-                // other error (dir unreadable, transient DB failure) stays
-                // best-effort so a prod binary without the source tree still
-                // boots.
-                Err(MigrationError::Migration(msg))
-                    if msg.contains("checksum mismatch")
-                        || msg.contains("up.sql is missing from the source tree") =>
-                {
-                    tracing::error!(error = %msg, target = %target, "Applied migration has drifted from the source tree since it was applied");
-                    #[cfg(feature = "managed-pg")]
-                    crate::managed_pg::emergency_stop();
-                    std::process::exit(1);
-                }
+        let up_by_version = if migrations_dir.is_dir() {
+            match read_up_sql_by_version(migrations_dir) {
+                Ok(map) => Some(map),
                 Err(e) => {
-                    tracing::warn!(error = %e, target = %target, "Could not validate migration checksums; continuing");
+                    tracing::warn!(error = %e, target = %target, "Could not read migrations dir for checksum validation; continuing without the drift guard");
+                    None
                 }
             }
-        }
+        } else {
+            None
+        };
 
-        match run_pending_locked(database_url, EmbeddedMigrationsRef(migrations), None) {
+        match run_pending_locked_inner(
+            database_url,
+            EmbeddedMigrationsRef(migrations),
+            None,
+            up_by_version.as_ref(),
+        ) {
             Ok(result) if result.applied.is_empty() => {
                 tracing::info!(target = %target, "No pending migrations");
             }
@@ -1862,16 +1921,21 @@ pub(crate) fn auto_migrate(
                     target = %target,
                     "All pending migrations applied"
                 );
-
-                // Post-apply: record checksums for newly-applied migrations so
-                // any future edit is caught. Best-effort — silent if the local
-                // `migrations/` dir isn't available (e.g. framework-internal
-                // sets whose SQL lives under `autumn/`).
-                if migrations_dir.is_dir()
-                    && let Err(e) = record_checksums_from_dir(database_url, migrations_dir)
-                {
-                    tracing::warn!(error = %e, target = %target, "Failed to record migration checksums; validation for these versions will be Unrecorded until re-baselined");
-                }
+            }
+            // Hard-fail on genuine drift: an applied migration was either edited
+            // ("checksum mismatch") or deleted/renamed ("up.sql is missing from
+            // the source tree") after being applied. Both mean the deployed
+            // schema silently forks from a fresh build. The validation now runs
+            // under the advisory lock, so this is caught even in the rolling
+            // deploy race a pre-lock check would miss.
+            Err(MigrationError::Migration(msg))
+                if msg.contains("checksum mismatch")
+                    || msg.contains("up.sql is missing from the source tree") =>
+            {
+                tracing::error!(error = %msg, target = %target, "Applied migration has drifted from the source tree since it was applied");
+                #[cfg(feature = "managed-pg")]
+                crate::managed_pg::emergency_stop();
+                std::process::exit(1);
             }
             Err(e) => {
                 tracing::error!(error = %e, target = %target, "Failed to run migrations");
@@ -2004,6 +2068,24 @@ mod tests {
         assert!(
             matches!(result.unwrap_err(), MigrationError::Connection(_)),
             "unreachable host must produce Connection error, not LockTimeout"
+        );
+    }
+
+    #[test]
+    fn run_pending_locked_inner_with_checksum_map_still_errors_on_bad_url() {
+        // The checksum-carrying locked path (the one `auto_migrate` uses) must
+        // reach the connection stage and surface a Connection error on an
+        // unreachable host — the under-lock validation never runs before the
+        // session exists, so the map does not change the failure mode.
+        const MIGRATIONS: EmbeddedMigrations =
+            diesel_migrations::embed_migrations!("../examples/todo-app/migrations");
+        let url = "postgres://invalid_user:invalid_password@0.0.0.0:1/invalid_db";
+        let mut up_by_version: HashMap<String, String> = HashMap::new();
+        up_by_version.insert("20260101000000".to_string(), "SELECT 1;".to_string());
+        let result = run_pending_locked_inner(url, MIGRATIONS, None, Some(&up_by_version));
+        assert!(
+            matches!(result.unwrap_err(), MigrationError::Connection(_)),
+            "unreachable host must produce Connection error even with a checksum map"
         );
     }
 
@@ -2278,6 +2360,28 @@ mod tests {
         );
         validate_checksums(&applied, &edited_by_version, &recorded)
             .expect("edited content must validate Ok after re-baseline");
+
+        // ── Step 8: the drift guard runs UNDER the advisory lock ────────────
+        // Prove `run_pending_locked_inner` performs the checksum comparison
+        // *inside* its locked critical section — not only in the pre-lock
+        // caller. At this point `version` is recorded as `actual_hash` (step 6
+        // re-baseline), but `up_by_version[version]` still holds the ORIGINAL
+        // `up_sql` (hashing to `recorded_hash`), so the on-disk content and the
+        // recorded checksum disagree. Feeding that map to the locked apply path
+        // must fail fast with a "checksum mismatch" before any migration is
+        // applied. The framework migrations passed here are already applied, so
+        // the only way this errors is the under-lock validation firing.
+        assert_ne!(
+            migration_checksum(up_sql),
+            actual_hash,
+            "sanity: original up.sql must not match the re-baselined checksum"
+        );
+        let drift = run_pending_locked_inner(url, FRAMEWORK_MIGRATIONS, None, Some(&up_by_version))
+            .expect_err("under-lock validation must reject an applied migration that drifted");
+        assert!(
+            matches!(&drift, MigrationError::Migration(m) if m.contains("checksum mismatch") && m.contains(&version)),
+            "run_pending_locked_inner must validate checksums inside the locked section: {drift:?}"
+        );
     }
 
     // ── Existing tests ─────────────────────────────────────────────────────
