@@ -42,10 +42,8 @@
 use std::fmt::Write as _;
 use std::future::Future;
 use std::pin::Pin;
-#[cfg(feature = "db")]
 use std::sync::Arc;
-#[cfg(feature = "db")]
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use std::time::Instant;
 
@@ -127,6 +125,29 @@ const fn read_db_snapshot(_timings: &DbTimings) -> (Option<f64>, usize) {
 /// Header name for the `Server-Timing` response header.
 static SERVER_TIMING: HeaderName = HeaderName::from_static("server-timing");
 
+/// Shared sentinel coordinating the primary and fallback `Server-Timing`
+/// layers, mirroring [`AccessLogEmitted`](crate::middleware::access_log).
+///
+/// The fallback inserts it into the **request** extensions on the way in, and
+/// the primary flips it once it appends its header, so the outermost fallback
+/// only stamps responses that short-circuited before the primary ran. It
+/// rides the request (not the response) because error-page / exception
+/// filters may rebuild the response entirely, which would drop a
+/// response-side marker — and because appending the header twice would emit a
+/// duplicate `total` metric.
+#[derive(Clone, Debug, Default)]
+pub struct ServerTimingEmitted(Arc<AtomicBool>);
+
+impl ServerTimingEmitted {
+    fn mark(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    fn is_marked(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
 /// Tower [`Layer`] that stamps a `Server-Timing` response header on every
 /// served response.
 ///
@@ -136,15 +157,35 @@ static SERVER_TIMING: HeaderName = HeaderName::from_static("server-timing");
 #[derive(Clone, Debug)]
 pub struct ServerTimingLayer {
     enabled: bool,
+    fallback: bool,
 }
 
 impl ServerTimingLayer {
-    /// Create a new layer. Pass `enabled = false` to make the layer a
+    /// Create the primary layer. Pass `enabled = false` to make the layer a
     /// pass-through no-op — used in tests and by the router when the
-    /// feature is turned off.
+    /// feature is turned off. When it appends its header it flips the
+    /// [`ServerTimingEmitted`] sentinel the fallback planted, keeping the
+    /// fallback silent for that request.
     #[must_use]
     pub const fn new(enabled: bool) -> Self {
-        Self { enabled }
+        Self {
+            enabled,
+            fallback: false,
+        }
+    }
+
+    /// Create the outermost fallback layer: it appends the `Server-Timing`
+    /// header only for responses that do **not** already carry the
+    /// [`ServerTimingEmitted`] marker — i.e. requests that short-circuited
+    /// (startup 503, pre-built static page hit, session-store outage,
+    /// late `/mcp` merge) before the primary layer ran. Emits `total` only;
+    /// short-circuit paths run no instrumented DB queries.
+    #[must_use]
+    pub const fn fallback(enabled: bool) -> Self {
+        Self {
+            enabled,
+            fallback: true,
+        }
     }
 }
 
@@ -155,6 +196,7 @@ impl<S> Layer<S> for ServerTimingLayer {
         ServerTimingService {
             inner,
             enabled: self.enabled,
+            fallback: self.fallback,
         }
     }
 }
@@ -165,6 +207,7 @@ impl<S> Layer<S> for ServerTimingLayer {
 pub struct ServerTimingService<S> {
     inner: S,
     enabled: bool,
+    fallback: bool,
 }
 
 impl<S, ReqBody, ResBody> Service<Request<ReqBody>> for ServerTimingService<S>
@@ -185,11 +228,25 @@ where
                 inner: self.inner.call(req),
             };
         }
+        let mut req = req;
+        // Coordinate the primary and fallback layers via the shared sentinel,
+        // mirroring the access-log fallback: the fallback plants it for the
+        // primary to flip; the primary picks it up when present (it is absent
+        // in bare setups that apply only the primary layer).
+        let sentinel = if self.fallback {
+            let sentinel = ServerTimingEmitted::default();
+            req.extensions_mut().insert(sentinel.clone());
+            Some(sentinel)
+        } else {
+            req.extensions().get::<ServerTimingEmitted>().cloned()
+        };
         let (timings, inner) = scope_inner(self.inner.call(req));
         ServerTimingFuture::Enabled {
             start: Instant::now(),
             timings,
             inner,
+            fallback: self.fallback,
+            sentinel,
         }
     }
 }
@@ -209,6 +266,13 @@ pin_project! {
             start: Instant,
             timings: DbTimings,
             #[pin] inner: ScopedInner<F>,
+            // `true` for the outermost fallback layer, which must skip
+            // emission when the primary already stamped the header.
+            fallback: bool,
+            // Shared marker: flipped by the primary on emit, checked by the
+            // fallback to avoid a duplicate `total` metric. `None` in bare
+            // primary-only setups (no fallback planted it).
+            sentinel: Option<ServerTimingEmitted>,
         },
     }
 }
@@ -226,18 +290,36 @@ where
                 start,
                 timings,
                 inner,
+                fallback,
+                sentinel,
             } => match inner.poll(cx) {
                 Poll::Ready(Ok(mut response)) => {
-                    let total_ms = start.elapsed().as_secs_f64() * 1000.0;
-                    let (db_ms, query_count) = read_db_snapshot(timings);
-                    let streaming = is_streaming_response(&response);
-                    let value = build_header_value(total_ms, db_ms, query_count, streaming);
-                    if let Ok(hv) = HeaderValue::from_str(&value) {
-                        // Append rather than insert so any `Server-Timing`
-                        // metrics a handler already emitted are preserved —
-                        // the W3C spec allows multiple comma-joined metrics
-                        // across repeated header lines.
-                        response.headers_mut().append(SERVER_TIMING.clone(), hv);
+                    // The fallback stays silent when the primary already
+                    // stamped the header, so a request flowing through both
+                    // layers carries a single `total` metric. Short-circuit
+                    // responses never ran the primary, so the marker is unset
+                    // and the fallback emits.
+                    let already_emitted = *fallback
+                        && sentinel
+                            .as_ref()
+                            .is_some_and(ServerTimingEmitted::is_marked);
+                    if !already_emitted {
+                        let total_ms = start.elapsed().as_secs_f64() * 1000.0;
+                        let (db_ms, query_count) = read_db_snapshot(timings);
+                        let streaming = is_streaming_response(&response);
+                        let value = build_header_value(total_ms, db_ms, query_count, streaming);
+                        if let Ok(hv) = HeaderValue::from_str(&value) {
+                            // Append rather than insert so any `Server-Timing`
+                            // metrics a handler already emitted are preserved —
+                            // the W3C spec allows multiple comma-joined metrics
+                            // across repeated header lines.
+                            response.headers_mut().append(SERVER_TIMING.clone(), hv);
+                        }
+                        // Primary flips the sentinel so the outer fallback
+                        // knows not to append a duplicate `total`.
+                        if !*fallback && let Some(sentinel) = sentinel.as_ref() {
+                            sentinel.mark();
+                        }
                     }
                     Poll::Ready(Ok(response))
                 }

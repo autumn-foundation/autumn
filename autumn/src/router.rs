@@ -3213,6 +3213,19 @@ fn apply_startup_barrier(
     } else {
         router
     };
+    // Server-Timing fallback (#1348), applied OUTSIDE the startup barrier, the
+    // static-first (SSG/ISR) middleware, the session layer, and the late MCP
+    // merge — exactly the short-circuit paths the primary ServerTimingLayer in
+    // `apply_middleware` never sees. Gated on the same `server_timing_enabled`
+    // resolver as the primary. It appends only for responses missing the
+    // `ServerTimingEmitted` marker, so requests that reach the primary carry a
+    // single `total`; short-circuits (startup 503, pre-built static hits) get a
+    // `total` here.
+    let router = if crate::config::server_timing_enabled(config) {
+        router.layer(crate::middleware::ServerTimingLayer::fallback(true))
+    } else {
+        router
+    };
     // W3C Trace Context propagation wraps the startup barrier (and the
     // static-first middleware above it) so short-circuit responses —
     // startup 503s and pre-built static file hits — still extract the
@@ -4207,6 +4220,52 @@ mod tests {
         assert!(
             !events[0].contains_key("request_id"),
             "barrier short-circuits before RequestIdLayer, so no request id"
+        );
+    }
+
+    /// Pins the Server-Timing fallback wiring (#1348): the fallback layer is
+    /// applied in `apply_startup_barrier`, outside the barrier itself, so a
+    /// request rejected with 503 before the app router (and its primary
+    /// `ServerTimingLayer`) runs still carries a `Server-Timing` header. Without
+    /// the fallback the header is silently dropped on these short-circuits.
+    #[tokio::test]
+    async fn startup_barrier_503s_carry_server_timing_header() {
+        // Startup incomplete → the barrier 503s non-probe requests before the
+        // app router (and the primary ServerTimingLayer) ever run.
+        let state = AppState::for_test()
+            .with_profile("test")
+            .with_startup_complete(false);
+        let mut config = AutumnConfig::default();
+        config.observability.server_timing = Some(true);
+
+        let app = build_router(Vec::new(), &config, state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/not-a-probe")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let header = response
+            .headers()
+            .get("server-timing")
+            .expect("startup 503 short-circuit should still carry Server-Timing via the fallback")
+            .to_str()
+            .expect("server-timing header should be valid ASCII");
+        assert!(
+            header.starts_with("total;dur="),
+            "fallback should emit a `total` metric, got {header:?}"
+        );
+        // Exactly one metric on the short-circuit path — the primary never ran,
+        // so there is no second `total`.
+        assert_eq!(
+            header.matches("total;dur=").count(),
+            1,
+            "short-circuit response must carry a single total metric: {header:?}"
         );
     }
 

@@ -46,6 +46,6 @@ pub use method_override::{
 };
 pub use metrics::{MetricsCollector, MetricsLayer};
 pub use request_id::{RequestId, RequestIdLayer};
-pub use server_timing::{ServerTimingLayer, ServerTimingService};
+pub use server_timing::{ServerTimingEmitted, ServerTimingLayer, ServerTimingService};
 #[cfg(feature = "telemetry-otlp")]
 pub use trace_context::{TraceContextLayer, TraceContextService};

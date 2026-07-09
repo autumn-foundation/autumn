@@ -159,6 +159,31 @@ async fn sse_response_total_only() {
     );
 }
 
+/// A normal request flows through BOTH the primary `ServerTimingLayer`
+/// (`apply_middleware`) and the outermost fallback (`apply_startup_barrier`).
+/// The `ServerTimingEmitted` marker must keep the fallback silent so the
+/// response carries exactly one `total` metric — no duplicate from the
+/// fallback re-appending.
+#[tokio::test]
+async fn primary_and_fallback_do_not_duplicate_total() {
+    let client = TestApp::new()
+        .config(test_config_with_server_timing(Some(true)))
+        .routes(routes![html_handler])
+        .build();
+
+    let response = client.get("/html").send().await;
+    response.assert_ok();
+
+    let header = response
+        .header("server-timing")
+        .expect("server-timing header should be present");
+    assert_eq!(
+        header.matches("total;dur=").count(),
+        1,
+        "primary+fallback must not double-emit `total`: {header:?}"
+    );
+}
+
 #[tokio::test]
 async fn zero_queries_omits_db() {
     let client = TestApp::new()
