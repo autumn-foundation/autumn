@@ -21,6 +21,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `BlobStore::get_stream` without buffering the whole object in memory, so it
   serves large private files behind a `#[secured]` handler with no public
   presigned URL (#1141).
+- **router:** duplicate-route preflight (issue #1012) — two user- or
+  plugin-registered handlers that resolve to the same `(method, path)` after
+  `.scoped(prefix, …)` prefix resolution now fail app build with a structured
+  `RouterBuildError::DuplicateUserRoute` **before any router is mounted**,
+  instead of an `axum::routing::MethodRouter::merge` panic at startup. The
+  error names BOTH handlers, the HTTP method, and the resolved path. Distinct
+  methods on the same path (`GET /admin` + `POST /admin`) are unaffected;
+  `#[repository]`-generated API routes are covered because they land in the
+  normal `Route` list. Opaque `AppBuilder::merge` and `AppBuilder::nest`
+  routers cannot be introspected — a non-empty opaque table emits a
+  `tracing::warn!` ("check skipped") mirroring the existing OpenAPI/MCP
+  merge-router warnings. See `docs/guide/getting-started.md`
+  ("Route collision diagnostics").
 - **ci:** README-quickstart gate against the published crates (issue #1586) —
   `.github/workflows/quickstart-gate.yml` + `scripts/check-quickstart.sh`
   install the README-pinned `autumn-cli` from crates.io (never the local

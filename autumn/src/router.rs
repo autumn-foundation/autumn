@@ -111,6 +111,37 @@ pub enum RouterBuildError {
         /// The HTTP method of the existing route at that path.
         method: String,
     },
+    /// Two user- or plugin-registered routes resolve to the same
+    /// `(method, path)` after scope-prefix resolution. Mounting both would
+    /// panic inside `axum::routing::MethodRouter::merge` at startup on
+    /// overlapping method routes (issue #1012), so the collision preflight
+    /// surfaces it as a recoverable [`RouterBuildError`] BEFORE any router
+    /// is mounted and names both handlers so the offending call sites are
+    /// obvious in the log.
+    ///
+    /// Opaque routers registered via
+    /// [`AppBuilder::merge`](crate::app::AppBuilder::merge) or
+    /// [`AppBuilder::nest`](crate::app::AppBuilder::nest) are NOT introspectable
+    /// through axum's public API, so a collision that involves one of those
+    /// routers cannot be detected up front and will still surface as an axum
+    /// startup panic — the preflight emits a `tracing::warn!` in that case so
+    /// operators know the check was skipped (mirrors the existing OpenAPI/MCP
+    /// merge-router warnings).
+    #[error(
+        "duplicate user route: {existing:?} and {incoming:?} both resolve to {method} {path:?}; \
+         choose a different path for one of them or remove the duplicate registration"
+    )]
+    DuplicateUserRoute {
+        /// The HTTP method both handlers registered.
+        method: String,
+        /// The URL path both handlers registered (post scope-prefix resolution).
+        path: String,
+        /// The `route.name` of the first (already-seen) handler.
+        existing: String,
+        /// The `route.name` of the second (duplicate) handler that triggered
+        /// the collision.
+        incoming: String,
+    },
 }
 
 /// Build the fully-configured Axum router from routes, config, and state.
@@ -367,6 +398,21 @@ fn build_router_pre_state(
             check_route_version(route)?;
         }
     }
+
+    // Fail-fast if two user- or plugin-registered routes resolve to the same
+    // `(method, path)` — `group_and_mount_routes` below would otherwise hand
+    // overlapping method routes to `axum::routing::MethodRouter::merge`,
+    // which panics inside `Router::route` at startup (issue #1012). Runs
+    // BEFORE the OpenAPI/MCP preflights so a duplicate user route surfaces
+    // as `DuplicateUserRoute` regardless of which optional subsystem is
+    // configured, and BEFORE any router is mounted so the failure is
+    // structured rather than an axum panic.
+    reject_duplicate_user_routes(
+        &route_list,
+        &ctx.scoped_groups,
+        &ctx.merge_routers,
+        &ctx.nest_routers,
+    )?;
 
     // Fail-fast if an OpenAPI mount path collides with a user or
     // framework GET route — axum panics on overlapping method routes,
@@ -1328,6 +1374,97 @@ fn check_openapi_path_against(
             });
         }
     }
+    Ok(())
+}
+
+/// Fail-fast preflight for issue #1012: reject two user- or plugin-registered
+/// routes that resolve to the same `(method, path)` before
+/// [`group_and_mount_routes`] hands overlapping method routes to
+/// [`axum::routing::MethodRouter::merge`] (which panics inside
+/// `Router::route` at startup).
+///
+/// **Coverage** — mirrors `collect_route_infos`'s scope-prefix resolution so
+/// duplicates across the same source, across sources (top-level +
+/// scoped/plugin, plugin + plugin), and across `.scoped(...)` groups are
+/// caught uniformly. `#[repository]`-generated API routes land in
+/// `route_list` like any other route macro output, so they are covered
+/// for free.
+///
+/// **Not covered — opaque routers**:
+/// * [`AppBuilder::merge`](crate::app::AppBuilder::merge) — axum does not
+///   expose the merged router's route table.
+/// * [`AppBuilder::nest`](crate::app::AppBuilder::nest) — same limitation.
+///
+/// A non-empty opaque table emits a `tracing::warn!` (same pattern as the
+/// existing `OpenAPI` and MCP merge-router warnings) so operators know the
+/// preflight cannot see inside — an overlap involving one of those routers
+/// will still surface as an axum startup panic.
+///
+/// The first pairwise collision wins: `existing` names the handler that
+/// registered the path first (in the iteration order used by the actual
+/// mount step), `incoming` names the duplicate that triggered the error.
+fn reject_duplicate_user_routes(
+    route_list: &[Route],
+    scoped_groups: &[ScopedGroup],
+    merge_routers: &[axum::Router<AppState>],
+    nest_routers: &[(String, axum::Router<AppState>)],
+) -> Result<(), RouterBuildError> {
+    // Key on `(method, resolved_path)`; the value is the first-seen handler
+    // name so the error can point at BOTH sides of the collision (AC #2).
+    // Iterate in the same order the mount pass will: top-level routes first
+    // (`group_and_mount_routes`), then scoped groups (`mount_scoped_groups`).
+    let mut claimed: std::collections::HashMap<(String, String), String> =
+        std::collections::HashMap::new();
+
+    let mut record = |method: String, path: String, name: &str| -> Result<(), RouterBuildError> {
+        let key = (method.clone(), path.clone());
+        if let Some(existing) = claimed.get(&key) {
+            return Err(RouterBuildError::DuplicateUserRoute {
+                method,
+                path,
+                existing: existing.clone(),
+                incoming: name.to_owned(),
+            });
+        }
+        claimed.insert(key, name.to_owned());
+        Ok(())
+    };
+
+    for route in route_list {
+        record(route.method.to_string(), route.path.to_owned(), route.name)?;
+    }
+    for group in scoped_groups {
+        for route in &group.routes {
+            record(
+                route.method.to_string(),
+                join_nested_path(&group.prefix, route.path),
+                route.name,
+            )?;
+        }
+    }
+
+    // Raw merged / nested routers are opaque — axum does not expose their
+    // route tables. Warn so operators know the check does not cover those
+    // code paths (mirrors the OpenAPI and MCP merge-router warnings).
+    if !merge_routers.is_empty() {
+        tracing::warn!(
+            merged_routers = merge_routers.len(),
+            "duplicate-route preflight (#1012) skipped for AppBuilder::merge routers: \
+             axum does not expose their route table, so an overlapping handler on a \
+             method+path Autumn already owns will still panic at startup. Keep merged \
+             routers on disjoint paths from your `.routes()`/`.scoped()` registrations."
+        );
+    }
+    if !nest_routers.is_empty() {
+        tracing::warn!(
+            nested_routers = nest_routers.len(),
+            "duplicate-route preflight (#1012) skipped for AppBuilder::nest routers: \
+             axum does not expose their route table, so an overlapping handler on a \
+             method+path Autumn already owns will still panic at startup. Keep nested \
+             routers on disjoint prefixes from your `.routes()`/`.scoped()` registrations."
+        );
+    }
+
     Ok(())
 }
 
@@ -5780,6 +5917,233 @@ enabled = true
                 ));
             },
         );
+    }
+
+    // --- Duplicate user-route detection tests (issue #1012) ---
+
+    async fn duplicate_route_handler() -> &'static str {
+        "ok"
+    }
+
+    /// Build a lightweight [`Route`] for the duplicate-detection tests. The
+    /// `MethodRouter` is built with the same HTTP method as `method` so
+    /// scenarios that intentionally exercise `GET`+`POST` on the same path
+    /// (AC #4) actually merge cleanly at axum level; the caller sees the
+    /// duplicate-preflight decision, not an axum method-router-merge panic.
+    fn duplicate_test_route(method: http::Method, path: &'static str, name: &'static str) -> Route {
+        let handler = match method {
+            http::Method::POST => axum::routing::post(duplicate_route_handler),
+            http::Method::PUT => axum::routing::put(duplicate_route_handler),
+            http::Method::PATCH => axum::routing::patch(duplicate_route_handler),
+            http::Method::DELETE => axum::routing::delete(duplicate_route_handler),
+            _ => axum::routing::get(duplicate_route_handler),
+        };
+        let method_str = if method == http::Method::POST {
+            "POST"
+        } else if method == http::Method::PUT {
+            "PUT"
+        } else if method == http::Method::PATCH {
+            "PATCH"
+        } else if method == http::Method::DELETE {
+            "DELETE"
+        } else {
+            "GET"
+        };
+        Route {
+            method,
+            path,
+            handler,
+            name,
+            api_doc: crate::openapi::ApiDoc {
+                method: method_str,
+                path,
+                operation_id: name,
+                success_status: 200,
+                ..Default::default()
+            },
+            repository: None,
+            idempotency: crate::route::RouteIdempotency::Direct,
+            timeout: crate::route::RouteTimeout::Inherit,
+            api_version: None,
+            sunset_opt_out: false,
+        }
+    }
+
+    fn duplicate_test_ctx() -> RouterContext {
+        RouterContext {
+            exception_filters: Vec::new(),
+            scoped_groups: Vec::new(),
+            merge_routers: Vec::new(),
+            nest_routers: Vec::new(),
+            custom_layers: Vec::new(),
+            static_gate_layers: Vec::new(),
+            #[cfg(feature = "maud")]
+            error_page_renderer: None,
+            session_store: None,
+            #[cfg(feature = "openapi")]
+            openapi: None,
+            #[cfg(feature = "mcp")]
+            mcp: None,
+        }
+    }
+
+    /// AC #1, #2, #6: two routes registered on the same (method, path) fail
+    /// the build with a structured [`RouterBuildError::DuplicateUserRoute`]
+    /// that names both handlers and the offending method + path — no axum
+    /// panic escapes.
+    #[tokio::test]
+    async fn try_build_router_rejects_duplicate_user_route_paths() {
+        let config = AutumnConfig::default();
+        let a = duplicate_test_route(http::Method::GET, "/", "root_a");
+        let b = duplicate_test_route(http::Method::GET, "/", "root_b");
+        let err =
+            super::try_build_router_inner(vec![a, b], &config, test_state(), duplicate_test_ctx())
+                .expect_err("two GET / routes should be rejected before mount");
+        let display = err.to_string();
+        match err {
+            RouterBuildError::DuplicateUserRoute {
+                ref method,
+                ref path,
+                ref existing,
+                ref incoming,
+            } => {
+                assert_eq!(method, "GET");
+                assert_eq!(path, "/");
+                assert_eq!(existing, "root_a");
+                assert_eq!(incoming, "root_b");
+            }
+            other => panic!("expected DuplicateUserRoute, got {other:?}"),
+        }
+        assert!(
+            display.contains("root_a"),
+            "error message must name first handler; got: {display}"
+        );
+        assert!(
+            display.contains("root_b"),
+            "error message must name second handler; got: {display}"
+        );
+        assert!(
+            display.contains("GET"),
+            "error message must name the HTTP method; got: {display}"
+        );
+        assert!(
+            display.contains('/'),
+            "error message must contain the path; got: {display}"
+        );
+    }
+
+    /// AC #4: distinct methods on the same path (`GET /admin` + `POST /admin`)
+    /// must NOT be flagged — axum merges them cleanly into a single
+    /// `MethodRouter`.
+    #[tokio::test]
+    async fn try_build_router_allows_distinct_methods_on_same_path() {
+        let config = AutumnConfig::default();
+        let get = duplicate_test_route(http::Method::GET, "/admin", "admin_index");
+        let post = duplicate_test_route(http::Method::POST, "/admin", "admin_create");
+        let _router = super::try_build_router_inner(
+            vec![get, post],
+            &config,
+            test_state(),
+            duplicate_test_ctx(),
+        )
+        .expect("GET + POST on the same path should build cleanly");
+    }
+
+    /// AC #3: duplicates that span a top-level route and a scoped group
+    /// (once the scope prefix is applied) are detected using the same
+    /// preflight — the introspection reuses `RouteInfo`'s scope resolution.
+    #[tokio::test]
+    async fn try_build_router_rejects_duplicate_across_scoped_group() {
+        let config = AutumnConfig::default();
+        let top = duplicate_test_route(http::Method::GET, "/api/posts", "top_posts");
+        let scoped_child = duplicate_test_route(http::Method::GET, "/posts", "scoped_posts");
+        let group = crate::app::ScopedGroup {
+            prefix: "/api".to_owned(),
+            routes: vec![scoped_child],
+            source: crate::route_listing::RouteSource::User,
+            apply_layer: Box::new(|r| r),
+        };
+        let mut ctx = duplicate_test_ctx();
+        ctx.scoped_groups.push(group);
+        let err = super::try_build_router_inner(vec![top], &config, test_state(), ctx)
+            .expect_err("top-level + scoped resolving to same path should be rejected");
+        match err {
+            RouterBuildError::DuplicateUserRoute {
+                ref method,
+                ref path,
+                ..
+            } => {
+                assert_eq!(method, "GET");
+                assert_eq!(path, "/api/posts");
+            }
+            other => panic!("expected DuplicateUserRoute, got {other:?}"),
+        }
+    }
+
+    /// AC #3: two scoped groups whose resolved paths collide are also
+    /// caught (a plugin re-registering the same route class as user code).
+    #[tokio::test]
+    async fn try_build_router_rejects_duplicate_within_scoped_groups() {
+        let config = AutumnConfig::default();
+        let a = crate::app::ScopedGroup {
+            prefix: "/api".to_owned(),
+            routes: vec![duplicate_test_route(
+                http::Method::GET,
+                "/posts",
+                "user_posts",
+            )],
+            source: crate::route_listing::RouteSource::User,
+            apply_layer: Box::new(|r| r),
+        };
+        let b = crate::app::ScopedGroup {
+            prefix: "/api".to_owned(),
+            routes: vec![duplicate_test_route(
+                http::Method::GET,
+                "/posts",
+                "plugin_posts",
+            )],
+            source: crate::route_listing::RouteSource::Plugin("blog".to_owned()),
+            apply_layer: Box::new(|r| r),
+        };
+        let mut ctx = duplicate_test_ctx();
+        ctx.scoped_groups.push(a);
+        ctx.scoped_groups.push(b);
+        let err = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx)
+            .expect_err("two scoped groups colliding on /api/posts should be rejected");
+        assert!(matches!(
+            err,
+            RouterBuildError::DuplicateUserRoute { ref existing, ref incoming, .. }
+                if existing == "user_posts" && incoming == "plugin_posts"
+        ));
+    }
+
+    /// AC #5: an opaque `AppBuilder::merge` router coexisting with a clean
+    /// route table must not cause a false-pass failure — the check is
+    /// skipped (with the existing "check skipped" warning) and the build
+    /// continues. Regression guard for the collision preflight.
+    #[tokio::test]
+    async fn try_build_router_skips_duplicate_check_for_opaque_merge_router() {
+        let config = AutumnConfig::default();
+        let ok_route = duplicate_test_route(http::Method::GET, "/hello", "hello");
+        let raw = axum::Router::<AppState>::new()
+            .route("/raw", axum::routing::get(duplicate_route_handler));
+        let mut ctx = duplicate_test_ctx();
+        ctx.merge_routers.push(raw);
+        let _router = super::try_build_router_inner(vec![ok_route], &config, test_state(), ctx)
+            .expect("opaque merge routers must not fail the duplicate preflight");
+    }
+
+    /// AC #5: same regression guard for opaque `AppBuilder::nest` routers.
+    #[tokio::test]
+    async fn try_build_router_skips_duplicate_check_for_opaque_nest_router() {
+        let config = AutumnConfig::default();
+        let ok_route = duplicate_test_route(http::Method::GET, "/hello", "hello");
+        let nested = axum::Router::<AppState>::new()
+            .route("/child", axum::routing::get(duplicate_route_handler));
+        let mut ctx = duplicate_test_ctx();
+        ctx.nest_routers.push(("/plugin".to_owned(), nested));
+        let _router = super::try_build_router_inner(vec![ok_route], &config, test_state(), ctx)
+            .expect("opaque nest routers must not fail the duplicate preflight");
     }
 
     // --- Static file serving (SSG/ISG) tests ---
