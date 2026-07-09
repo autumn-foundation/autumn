@@ -691,9 +691,13 @@ where
         // Webhook/API paths that cannot carry a CAPTCHA token are exempt.
         // Require an exact match or a path-segment boundary (trailing `/`) so
         // that exempting `/inbound/mailgun` does not accidentally exempt
-        // `/inbound/mailgun-settings` or other adjacent routes.
+        // `/inbound/mailgun-settings` or other adjacent routes. Match against
+        // the normalized path so dot-segment tricks like
+        // `/inbound/mailgun/../other` cannot satisfy an exemption prefix
+        // while targeting another route.
+        let clean = crate::security::path::clean_path(req.uri().path());
         if self.settings.exempt_paths.iter().any(|ep| {
-            let path = req.uri().path();
+            let path = clean.as_str();
             let e = ep.as_str();
             path == e
                 || path.starts_with(e)
@@ -1106,6 +1110,39 @@ mod tests {
             StatusCode::BAD_REQUEST,
             "adjacent route must not be exempt"
         );
+    }
+
+    #[tokio::test]
+    async fn dot_segment_path_does_not_match_exemption() {
+        // `/webhook/../protected` normalizes to `/protected`, which is not
+        // exempt, so the CAPTCHA check must still run (and reject the request
+        // because no token is present). Same for percent-encoded dot-segments.
+        let layer = BotProtectionLayer::new(Arc::new(TestCaptchaProvider::new("required")))
+            .with_exempt_paths(vec!["/webhook/".to_string()]);
+        let app = Router::new()
+            .route("/webhook/inbound", post(ok_handler))
+            .route("/protected", post(ok_handler))
+            .layer(layer);
+
+        for uri in ["/webhook/../protected", "/webhook/%2e%2e/protected"] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("Content-Type", "application/x-www-form-urlencoded")
+                        .body(Body::from("field=value"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "dot-segment path {uri} must not be treated as exempt"
+            );
+        }
     }
 
     #[tokio::test]

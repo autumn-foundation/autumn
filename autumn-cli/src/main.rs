@@ -20,6 +20,7 @@ mod export;
 mod flags;
 mod generate;
 mod http;
+mod i18n;
 mod maintenance;
 mod migrate;
 mod monitor;
@@ -52,6 +53,22 @@ pub enum CheckSubcommands {
         /// Binary target to check (for packages with multiple bin targets)
         #[arg(long, value_name = "BIN")]
         bin: Option<String>,
+    },
+}
+
+/// Subcommands for `autumn i18n`.
+#[derive(Subcommand, Clone, Debug, PartialEq, Eq)]
+pub enum I18nSubcommands {
+    /// Compare translation keys referenced in code against each `i18n/*.ftl`
+    /// locale, reporting missing, untranslated, and unused keys. Exits
+    /// non-zero when any locale is missing a referenced key (CI-friendly).
+    Check {
+        /// Output format: `text` (default) or `json`.
+        #[arg(long, default_value = "text", value_name = "FORMAT")]
+        format: String,
+        /// Treat untranslated/unused warnings as failures (exit non-zero).
+        #[arg(long)]
+        strict: bool,
     },
 }
 
@@ -320,6 +337,33 @@ enum Commands {
     #[command(subcommand, verbatim_doc_comment)]
     Generate(GenerateCommands),
 
+    /// Cleanly reverse a matching `autumn generate` invocation (issue #1048).
+    ///
+    /// Deletes every file that invocation would have created (refusing when
+    /// a targeted file's content has diverged from what `generate` would
+    /// produce, unless `--force`), removes exactly the lines it inserted
+    /// into shared files (`mod` declarations, `routes![]` entries,
+    /// `Cargo.toml` deps/features, `schema.rs` table blocks), and prunes any
+    /// now-empty generated directories.
+    ///
+    /// Takes the same subcommand and positional arguments as the matching
+    /// `autumn generate` call — pass the identical resource name, fields,
+    /// and flags (`--api`, `--live`, `--id`, `--soft-delete`, ...) so the
+    /// recomputed plan matches what was originally generated.
+    ///
+    /// A migration directory is matched by resource-name suffix (a fresh
+    /// timestamp won't match the original) and removed only when it is not
+    /// yet applied to a configured database — `destroy` never touches the
+    /// database itself.
+    ///
+    /// # Examples
+    ///
+    ///   autumn generate scaffold Post title:String
+    ///   autumn destroy scaffold Post title:String
+    ///   autumn destroy model Post title:String --dry-run
+    #[command(subcommand, verbatim_doc_comment)]
+    Destroy(GenerateCommands),
+
     /// Scaffold production deployment artifacts (Dockerfile, .dockerignore,
     /// runtime config template, and optional target-specific files).
     ///
@@ -439,6 +483,12 @@ enum Commands {
         /// Treat warnings as failures (exit 1 on any ⚠️).
         #[arg(long)]
         strict: bool,
+    },
+
+    /// Inspect the project's Fluent i18n translations.
+    I18n {
+        #[command(subcommand)]
+        action: I18nSubcommands,
     },
 
     /// Run conformance checks against a plugin's route contributions.
@@ -940,6 +990,33 @@ enum MigrateCommands {
         /// before touching the database.
         #[arg(long)]
         yes_i_mean_prod: bool,
+    },
+    /// Record content hashes for applied migrations (issue #1203).
+    ///
+    /// Content hashes (SHA-256 of each migration's `up.sql`) live in the
+    /// `autumn_migration_checksums` table and are validated before every
+    /// `autumn migrate` run so a migration that was edited after being
+    /// applied fails loudly instead of silently forking the schema.
+    ///
+    /// # Examples
+    ///
+    ///   # Backfill hashes for legacy migrations applied before the checksum
+    ///   # table existed. Idempotent — safe to re-run.
+    ///   autumn migrate baseline
+    ///
+    ///   # Escape hatch: overwrite one version's stored hash with the current
+    ///   # on-disk hash. Use ONLY when you deliberately edited an applied
+    ///   # migration and accept that other environments running the previous
+    ///   # content will now report a mismatch.
+    ///   autumn migrate baseline --force 20260101000000
+    #[command(verbatim_doc_comment)]
+    Baseline {
+        /// Re-baseline the checksum for a single applied version, overwriting
+        /// whatever hash is currently recorded. The escape hatch for a
+        /// deliberate edit. Without this flag, `baseline` only records
+        /// hashes for applied migrations that don't already have one.
+        #[arg(long = "force", value_name = "VERSION")]
+        force: Option<String>,
     },
 }
 
@@ -1780,12 +1857,69 @@ enum GenerateCommands {
     ///   - `src-tauri/stage-sidecar.sh` — build + stage the sidecar (Unix)
     ///   - `src-tauri/stage-sidecar.ps1`— build + stage the sidecar (Windows)
     ///
+    /// With `--remote-url <URL>` the generator instead scaffolds a **mobile
+    /// thin client** (issue #1506): no sidecar — the webview loads the given
+    /// remote HTTPS Autumn server directly, and a `capabilities/remote-app.json`
+    /// grants that origin access to the notification/biometric/store plugins.
+    ///
     /// Example:
     ///
     ///   autumn generate tauri
     ///   autumn generate tauri --dry-run
+    ///   autumn generate tauri --remote-url https://app.example.com
+    #[allow(clippy::doc_markdown)]
     #[command(verbatim_doc_comment)]
     Tauri {
+        /// Print the file plan and exit without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Overwrite existing files instead of erroring on collision.
+        #[arg(long)]
+        force: bool,
+        /// Scaffold a mobile thin client whose webview loads this remote HTTPS
+        /// URL instead of a local sidecar (plain http allowed for localhost dev).
+        #[arg(long, value_name = "URL")]
+        remote_url: Option<String>,
+    },
+    /// Scaffold a Tauri mobile shell (iOS/Android) that runs the autumn server in-process.
+    ///
+    /// Uses the **in-process model** (issue #1507, Option B): mobile sandboxes forbid
+    /// spawning child processes, so — unlike the desktop sidecar of `generate tauri` —
+    /// the Autumn Axum server runs on a background thread inside the app process
+    /// itself, connecting to a REMOTE Postgres database over the device network.
+    ///
+    /// Also extracts your app's `src/main.rs` into `src/lib.rs::serve()` (only when
+    /// the stock scaffold layout is detected; skipped with a warning otherwise) so
+    /// the shell crate can call the server as a library.
+    ///
+    /// Creates:
+    ///   - `src-tauri/`                 — standalone Tauri mobile shell crate
+    ///     (staticlib/cdylib; no externalBin, no sidecar, no staging scripts)
+    ///   - `src-tauri/src/lib.rs`       — spawns the server thread inside
+    ///     `tauri::Builder::default().setup(...)`, polls /health, then opens the
+    ///     webview at `http://127.0.0.1:<port>`
+    ///   - `src-tauri/icons/`           — placeholder icons for immediate buildability
+    ///
+    /// See docs/guide/tauri-mobile-in-process.md for mobile sandboxing restrictions,
+    /// remote-Postgres pool tuning for flaky networks, and App Store compliance.
+    ///
+    /// Example:
+    ///
+    ///   autumn generate tauri-mobile
+    ///   autumn generate tauri-mobile --offline-sync
+    ///   autumn generate tauri-mobile --dry-run
+    #[command(verbatim_doc_comment)]
+    TauriMobile {
+        /// Wire offline-first local storage + background sync (issue #1508):
+        /// app data lives in a `SyncStore`-backed `SQLite` file inside the app
+        /// sandbox and a background `SyncEngine` syncs it with the remote
+        /// deployment's `/sync` endpoints whenever the network allows. Adds
+        /// the `offline-sync` feature (on `autumn-web`) to the app crate and
+        /// mounts the server-side sync router in the extracted `serve()`.
+        /// See docs/guide/tauri-mobile-offline-sync.md. Pass the same flag to
+        /// `autumn destroy tauri-mobile` so the recomputed plan matches.
+        #[arg(long)]
+        offline_sync: bool,
         /// Print the file plan and exit without writing anything.
         #[arg(long)]
         dry_run: bool,
@@ -1808,6 +1942,41 @@ enum GenerateCommands {
         name: String,
         /// Ordered list of step names (`snake_case`, e.g. `shipping payment review`).
         steps: Vec<String>,
+        /// Print the file plan and exit without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Overwrite existing files instead of erroring on collision.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Generate a handler-only, non-CRUD route module (no model, migration, or
+    /// database).
+    ///
+    /// Each action maps to `/<controller>/<action>`, except an action literally
+    /// named `index`, which maps to `/<controller>`. Under `--api` the prefix is
+    /// `/api/<controller>[/<action>]`.
+    ///
+    /// Actions default to GET; request another method with `action:method`
+    /// (method ∈ get, post, put, patch, delete), e.g. `submit:post`.
+    ///
+    /// HTML mode (default) emits Maud stub views returning HTTP 200; `--api`
+    /// emits JSON actions with no view stubs. Re-running against an existing
+    /// controller fails without `--force`.
+    ///
+    /// Example:
+    ///
+    ///   autumn generate controller pages home about contact
+    #[command(verbatim_doc_comment)]
+    Controller {
+        /// Controller name (`snake_case` or `PascalCase`, e.g. `pages`).
+        name: String,
+        /// Action names, each optionally suffixed with `:method`
+        /// (e.g. `home`, `submit:post`, `index`).
+        #[arg(required = true)]
+        actions: Vec<String>,
+        /// Emit JSON actions (no HTML/Maud views).
+        #[arg(long)]
+        api: bool,
         /// Print the file plan and exit without writing anything.
         #[arg(long)]
         dry_run: bool,
@@ -1996,6 +2165,11 @@ fn run_command(command: Commands) {
                     to,
                     yes_i_mean_prod,
                 }),
+                Some(MigrateCommands::Baseline { force }) => {
+                    migrate::MigrateAction::Baseline(migrate::BaselineArgs {
+                        force_version: force,
+                    })
+                }
                 None => migrate::MigrateAction::Run,
             };
             let target = match (shard, control_only) {
@@ -2290,6 +2464,21 @@ fn run_command(command: Commands) {
         Commands::Doctor { json, strict } => {
             doctor::run(doctor::DoctorOptions { json, strict });
         }
+        Commands::I18n { action } => match action {
+            I18nSubcommands::Check { format, strict } => {
+                let format = match format.as_str() {
+                    "json" => i18n::OutputFormat::Json,
+                    "text" => i18n::OutputFormat::Text,
+                    other => {
+                        eprintln!(
+                            "autumn i18n check: unknown --format `{other}` (expected `text` or `json`)"
+                        );
+                        std::process::exit(2);
+                    }
+                };
+                i18n::run(i18n::I18nCheckOptions { format, strict });
+            }
+        },
         Commands::PluginCheck {
             package,
             bin,
@@ -2307,7 +2496,8 @@ fn run_command(command: Commands) {
                 &format,
             );
         }
-        Commands::Generate(cmd) => run_generate_command(cmd),
+        Commands::Generate(cmd) => run_generate_command(cmd, ApplyMode::Generate),
+        Commands::Destroy(cmd) => run_generate_command(cmd, ApplyMode::Destroy),
         Commands::Credentials(cmd) => match cmd {
             CredentialsCommands::Edit { env } => {
                 if let Err(e) = credentials::run_edit(&credentials::EditOptions { env }) {
@@ -2638,7 +2828,50 @@ fn run_release_command(cmd: ReleaseCommands) {
 }
 
 #[allow(clippy::too_many_lines)]
-fn run_generate_command(cmd: GenerateCommands) {
+/// Whether a [`GenerateCommands`] invocation should apply its plan forward
+/// (`autumn generate`) or in reverse (`autumn destroy`, issue #1048). Both
+/// subcommands share the same argument parsing and plan-building code —
+/// `destroy` recomputes the identical [`generate::emit::Plan`] a matching
+/// `generate` call would have built, then interprets it in reverse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApplyMode {
+    Generate,
+    Destroy,
+}
+
+/// Resolve the current working directory, or print an error and exit(1).
+fn resolve_cwd() -> std::path::PathBuf {
+    std::env::current_dir().unwrap_or_else(|e| {
+        eprintln!("Error: cannot determine current directory: {e}");
+        std::process::exit(1);
+    })
+}
+
+/// Execute or revert `plan` depending on `mode`, printing `Error: ...` and
+/// exiting non-zero on failure — the shared tail every `generate`/`destroy`
+/// subcommand arm ends with.
+fn apply_plan(
+    plan: Result<generate::emit::Plan, generate::GenerateError>,
+    flags: generate::Flags,
+    mode: ApplyMode,
+) {
+    let result = plan.and_then(|p| match mode {
+        ApplyMode::Generate => p.execute(flags),
+        ApplyMode::Destroy => p.revert(flags),
+    });
+    if let Err(e) = result {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "one match arm per GenerateCommands variant, each a short, independent \
+              plan-then-apply dispatch — splitting the match itself would not make any \
+              single arm clearer"
+)]
+fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
     match cmd {
         GenerateCommands::Model {
             name,
@@ -2685,21 +2918,14 @@ fn run_generate_command(cmd: GenerateCommands) {
                 ..Default::default()
             };
             let timestamp = generate::timestamp_now();
-            match generate::model::plan_model_with_options(
+            let plan = generate::model::plan_model_with_options(
                 &std::env::current_dir().unwrap_or_default(),
                 &name,
                 &fields,
                 &timestamp,
                 &options,
-            )
-            .and_then(|p| p.execute(generate::Flags { dry_run, force }))
-            {
-                Ok(()) => {}
-                Err(e) => {
-                    eprintln!("Error: {e}");
-                    std::process::exit(1);
-                }
-            }
+            );
+            apply_plan(plan, generate::Flags { dry_run, force }, mode);
         }
         GenerateCommands::Migration {
             name,
@@ -2707,30 +2933,68 @@ fn run_generate_command(cmd: GenerateCommands) {
             unique,
             dry_run,
             force,
-        } => generate::migration::run(&name, &fields, &unique, generate::Flags { dry_run, force }),
+        } => {
+            let timestamp = generate::timestamp_now();
+            let project_root = resolve_cwd();
+            let plan = generate::migration::plan_migration_with_options(
+                &project_root,
+                &name,
+                &fields,
+                &timestamp,
+                &unique,
+            );
+            // `plan_migration_with_options` needs the model's `#[searchable]`
+            // config to render `AddSearchTo<Table>`'s SQL — meaningless (and
+            // an error) once the model is already gone. A common cleanup
+            // order like `destroy model Post` then `destroy migration
+            // AddSearchToPosts` would otherwise strand the migration
+            // directory, since the failure happens before `Plan::revert`
+            // ever sees `--force` (issue #1048 PR review). Fall back to a
+            // suffix-only removal plan in destroy mode when the real plan
+            // can't be built.
+            let plan = if mode == ApplyMode::Destroy && plan.is_err() {
+                generate::migration::plan_migration_destroy_fallback(
+                    &project_root,
+                    &name,
+                    &timestamp,
+                )
+            } else {
+                plan
+            };
+            apply_plan(plan, generate::Flags { dry_run, force }, mode);
+        }
         GenerateCommands::Task {
             name,
             dry_run,
             force,
-        } => generate::task::run(&name, generate::Flags { dry_run, force }),
+        } => {
+            let plan = generate::task::plan_task(&resolve_cwd(), &name);
+            apply_plan(plan, generate::Flags { dry_run, force }, mode);
+        }
         GenerateCommands::Job {
             name,
             fields,
             dry_run,
             force,
-        } => generate::job::run(&name, &fields, generate::Flags { dry_run, force }),
+        } => {
+            let plan = generate::job::plan_job(&resolve_cwd(), &name, &fields);
+            apply_plan(plan, generate::Flags { dry_run, force }, mode);
+        }
         GenerateCommands::Mailer {
             name,
             list_unsubscribe,
             no_layout,
             dry_run,
             force,
-        } => generate::mailer::run(
-            &name,
-            list_unsubscribe.as_deref(),
-            no_layout,
-            generate::Flags { dry_run, force },
-        ),
+        } => {
+            let plan = generate::mailer::plan_mailer(
+                &resolve_cwd(),
+                &name,
+                list_unsubscribe.as_deref(),
+                no_layout,
+            );
+            apply_plan(plan, generate::Flags { dry_run, force }, mode);
+        }
         GenerateCommands::Channel {
             name,
             sse: _,
@@ -2743,23 +3007,132 @@ fn run_generate_command(cmd: GenerateCommands) {
             } else {
                 generate::channel::Transport::Sse
             };
-            generate::channel::run(&name, transport, generate::Flags { dry_run, force });
+            let plan = generate::channel::plan_channel(&resolve_cwd(), &name, transport);
+            apply_plan(plan, generate::Flags { dry_run, force }, mode);
         }
         GenerateCommands::InboundMail {
             name,
             dry_run,
             force,
-        } => generate::inbound_mail::run(&name, generate::Flags { dry_run, force }),
+        } => {
+            let plan = generate::inbound_mail::plan_inbound_mail(&resolve_cwd(), &name);
+            apply_plan(plan, generate::Flags { dry_run, force }, mode);
+        }
         GenerateCommands::SystemTest {
             name,
             dry_run,
             force,
-        } => generate::system_test::run(&name, generate::Flags { dry_run, force }),
-        GenerateCommands::Pwa { dry_run, force } => {
-            generate::pwa::run(generate::Flags { dry_run, force });
+        } => {
+            let plan = generate::system_test::plan_system_test(&resolve_cwd(), &name);
+            apply_plan(plan, generate::Flags { dry_run, force }, mode);
         }
-        GenerateCommands::Tauri { dry_run, force } => {
-            generate::tauri::run(generate::Flags { dry_run, force });
+        GenerateCommands::Pwa { dry_run, force } => {
+            let project_root = resolve_cwd();
+            // `plan_pwa` validates `src/main.rs`'s `layout()` arity — needed
+            // so a fresh generate never emits a call with the wrong shape,
+            // but irrelevant to destroy (which never consults that arity)
+            // and can wrongly block cleanup if `main.rs` no longer matches
+            // (issue #1048 PR review). Always use the destroy-only fallback
+            // for `ApplyMode::Destroy`; it produces the identical plan for
+            // every other case.
+            let plan = match mode {
+                ApplyMode::Generate => generate::pwa::plan_pwa(&project_root),
+                ApplyMode::Destroy => generate::pwa::plan_pwa_destroy_fallback(&project_root),
+            };
+            apply_plan(plan, generate::Flags { dry_run, force }, mode);
+        }
+        GenerateCommands::Tauri {
+            dry_run,
+            force,
+            remote_url,
+        } => {
+            let flags = generate::Flags { dry_run, force };
+            let project_root = resolve_cwd();
+            // Mixed-mode guard (issue #1506): generating one Tauri mode over
+            // the other's files is rejected outright, even with --force —
+            // --force means "overwrite within the same mode", and the other
+            // mode's leftovers would actively break the new scaffold's build
+            // (stale capability files fail tauri-build validation on desktop;
+            // stale per-OS overlays keep running the sidecar staging scripts
+            // for a thin client). Destroy is exempt: `autumn destroy tauri
+            // [--remote-url <URL>]` is the documented remedy and must keep
+            // working on a mixed tree.
+            let guard = if mode == ApplyMode::Generate {
+                generate::tauri::ensure_no_opposite_mode_scaffold(
+                    &project_root,
+                    remote_url.is_some(),
+                )
+            } else {
+                Ok(())
+            };
+            let plan = guard.and_then(|()| {
+                remote_url.as_ref().map_or_else(
+                    || generate::tauri::plan_tauri(&project_root),
+                    |url| generate::tauri::plan_tauri_thin_client(&project_root, url),
+                )
+            });
+            let result = plan.and_then(|p| match mode {
+                ApplyMode::Generate => p.execute(flags),
+                ApplyMode::Destroy => p.revert(flags),
+            });
+            match result {
+                Ok(()) => {
+                    if mode == ApplyMode::Generate && !dry_run {
+                        match &remote_url {
+                            Some(url) => println!(
+                                "\n{}",
+                                generate::tauri::render_thin_client_prerequisites(url)
+                            ),
+                            None => println!("\n{}", generate::tauri::render_prerequisites()),
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        GenerateCommands::TauriMobile {
+            offline_sync,
+            dry_run,
+            force,
+        } => {
+            let flags = generate::Flags { dry_run, force };
+            let opts = generate::tauri_mobile::TauriMobileOptions { offline_sync };
+            let project_root = resolve_cwd();
+            // Mixed-mode guard (mirrors the `tauri` arm above): generating
+            // the mobile in-process shell over a desktop-sidecar or
+            // thin-client src-tauri/ is rejected outright, even with --force
+            // — the other mode's leftovers (per-OS overlay confs, staging
+            // scripts, capability files) actively break the mobile build.
+            // Destroy is exempt: it is the documented remedy and must keep
+            // working on a mixed tree.
+            let guard = if mode == ApplyMode::Generate {
+                generate::tauri_mobile::ensure_no_other_mode_scaffold(&project_root)
+            } else {
+                Ok(())
+            };
+            let plan =
+                guard.and_then(|()| generate::tauri_mobile::plan_tauri_mobile(&project_root, opts));
+            let result = plan.and_then(|p| match mode {
+                ApplyMode::Generate => p.execute(flags),
+                ApplyMode::Destroy => p.revert(flags),
+            });
+            match result {
+                Ok(()) => {
+                    if mode == ApplyMode::Generate && !dry_run {
+                        println!(
+                            "\n{}",
+                            generate::tauri_mobile::render_mobile_prerequisites(opts)
+                        );
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+            }
         }
         GenerateCommands::Auth {
             name,
@@ -2770,13 +3143,16 @@ fn run_generate_command(cmd: GenerateCommands) {
             force,
         } => {
             let oauth_options = generate::auth::AuthOAuthOptions { providers: oauth };
-            generate::auth::run_with_options(
+            let timestamp = generate::timestamp_now();
+            let plan = generate::auth::plan_auth_full_ex(
+                &resolve_cwd(),
                 &name,
-                generate::Flags { dry_run, force },
+                &timestamp,
                 &oauth_options,
                 totp,
                 passkeys,
             );
+            apply_plan(plan, generate::Flags { dry_run, force }, mode);
         }
         GenerateCommands::Admin {
             name,
@@ -2802,7 +3178,26 @@ fn run_generate_command(cmd: GenerateCommands) {
                 // Encrypted-column flags are auto-detected from the model source.
                 ..Default::default()
             };
-            generate::admin::run(&name, &fields, generate::Flags { dry_run, force }, &options);
+            let project_root = resolve_cwd();
+            // `plan_admin_with_options` reads `src/models/<name>.rs` to
+            // detect fields/encrypted columns for rendering — meaningless
+            // (and an error) once the model is gone. A common cleanup order
+            // like `destroy model Post` then `destroy admin Post` would
+            // otherwise fail before ever reaching `Plan::revert`, stranding
+            // `src/admin/post.rs` (issue #1048 PR review). Fall back to a
+            // model-independent plan in that specific case.
+            let model_missing = mode == ApplyMode::Destroy
+                && !project_root
+                    .join("src")
+                    .join("models")
+                    .join(format!("{}.rs", generate::naming::snake(&name)))
+                    .exists();
+            let plan = if model_missing {
+                generate::admin::plan_admin_destroy_fallback(&project_root, &name)
+            } else {
+                generate::admin::plan_admin_with_options(&project_root, &name, &fields, &options)
+            };
+            apply_plan(plan, generate::Flags { dry_run, force }, mode);
         }
         GenerateCommands::Wizard {
             name,
@@ -2810,7 +3205,18 @@ fn run_generate_command(cmd: GenerateCommands) {
             dry_run,
             force,
         } => {
-            generate::wizard::run(&name, &steps, generate::Flags { dry_run, force });
+            let plan = generate::wizard::plan_wizard(&resolve_cwd(), &name, &steps);
+            apply_plan(plan, generate::Flags { dry_run, force }, mode);
+        }
+        GenerateCommands::Controller {
+            name,
+            actions,
+            api,
+            dry_run,
+            force,
+        } => {
+            let plan = generate::controller::plan_controller(&resolve_cwd(), &name, &actions, api);
+            apply_plan(plan, generate::Flags { dry_run, force }, mode);
         }
         GenerateCommands::Scaffold {
             name,
@@ -2891,7 +3297,15 @@ fn run_generate_command(cmd: GenerateCommands) {
                     std::process::exit(1);
                 }
             };
-            generate::scaffold::run(&name, &fields, generate::Flags { dry_run, force }, &options);
+            let timestamp = generate::timestamp_now();
+            let plan = generate::scaffold::plan_scaffold_with_options(
+                &resolve_cwd(),
+                &name,
+                &fields,
+                &timestamp,
+                &options,
+            );
+            apply_plan(plan, generate::Flags { dry_run, force }, mode);
         }
         GenerateCommands::Plugin {
             name,
@@ -2899,23 +3313,37 @@ fn run_generate_command(cmd: GenerateCommands) {
             dry_run,
             force,
         } => {
-            let cwd = match std::env::current_dir() {
-                Ok(d) => d,
-                Err(e) => {
-                    eprintln!("Error: cannot determine current directory: {e}");
-                    std::process::exit(1);
-                }
+            let cwd = resolve_cwd();
+            let flags = generate::Flags { dry_run, force };
+            // `plan_plugin` refuses a non-empty target directory unless
+            // `--force` — a generate-time collision guard that makes no
+            // sense in destroy mode, where the directory legitimately
+            // exists (holding the files this destroy is about to remove).
+            // Always bypass it when building the plan for destroy, while
+            // still passing the user's real `flags` to `revert` below so
+            // its own, per-file content-divergence check still applies
+            // (issue #1048 PR review).
+            let plan_flags = match mode {
+                ApplyMode::Generate => flags,
+                ApplyMode::Destroy => generate::Flags {
+                    force: true,
+                    ..flags
+                },
             };
             match generate::plugin::plan_plugin(
                 &cwd,
                 &name,
                 path.as_deref().map(std::path::Path::new),
-                generate::Flags { dry_run, force },
+                plan_flags,
             ) {
                 Ok(plugin_plan) => {
-                    match plugin_plan.plan.execute(generate::Flags { dry_run, force }) {
+                    let result = match mode {
+                        ApplyMode::Generate => plugin_plan.plan.execute(flags),
+                        ApplyMode::Destroy => plugin_plan.plan.revert(flags),
+                    };
+                    match result {
                         Ok(()) => {
-                            if !dry_run {
+                            if mode == ApplyMode::Generate && !dry_run {
                                 println!("\nNext steps:");
                                 println!(
                                     "  1. Add the plugin to your workspace members in `Cargo.toml`:"
@@ -4233,6 +4661,37 @@ mod tests {
                 json: true,
                 strict: true
             }
+        ));
+    }
+
+    // ── autumn i18n tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn parse_i18n_check_defaults() {
+        let cli = Cli::try_parse_from(["autumn", "i18n", "check"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::I18n {
+                action: I18nSubcommands::Check {
+                    ref format,
+                    strict: false,
+                }
+            } if format == "text"
+        ));
+    }
+
+    #[test]
+    fn parse_i18n_check_json_and_strict() {
+        let cli = Cli::try_parse_from(["autumn", "i18n", "check", "--format", "json", "--strict"])
+            .unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::I18n {
+                action: I18nSubcommands::Check {
+                    ref format,
+                    strict: true,
+                }
+            } if format == "json"
         ));
     }
 
@@ -5815,7 +6274,8 @@ mod tests {
             cli.command,
             Commands::Generate(GenerateCommands::Tauri {
                 dry_run: false,
-                force: false
+                force: false,
+                remote_url: None
             })
         ));
     }
@@ -5823,20 +6283,155 @@ mod tests {
     #[test]
     fn parse_generate_tauri_dry_run() {
         let cli = Cli::try_parse_from(["autumn", "generate", "tauri", "--dry-run"]).unwrap();
-        let Commands::Generate(GenerateCommands::Tauri { dry_run, force }) = cli.command else {
+        let Commands::Generate(GenerateCommands::Tauri {
+            dry_run,
+            force,
+            remote_url,
+        }) = cli.command
+        else {
             panic!("expected Tauri variant");
         };
         assert!(dry_run);
         assert!(!force);
+        assert!(remote_url.is_none());
     }
 
     #[test]
     fn parse_generate_tauri_force() {
         let cli = Cli::try_parse_from(["autumn", "generate", "tauri", "--force"]).unwrap();
-        let Commands::Generate(GenerateCommands::Tauri { dry_run, force }) = cli.command else {
+        let Commands::Generate(GenerateCommands::Tauri {
+            dry_run,
+            force,
+            remote_url,
+        }) = cli.command
+        else {
             panic!("expected Tauri variant");
         };
         assert!(!dry_run);
+        assert!(force);
+        assert!(remote_url.is_none());
+    }
+
+    #[test]
+    fn parse_generate_tauri_remote_url() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "generate",
+            "tauri",
+            "--remote-url",
+            "https://app.example.com",
+        ])
+        .unwrap();
+        let Commands::Generate(GenerateCommands::Tauri {
+            dry_run,
+            force,
+            remote_url,
+        }) = cli.command
+        else {
+            panic!("expected Tauri variant");
+        };
+        assert!(!dry_run);
+        assert!(!force);
+        assert_eq!(remote_url.as_deref(), Some("https://app.example.com"));
+    }
+
+    #[test]
+    fn parse_generate_tauri_remote_url_defaults_none() {
+        let cli = Cli::try_parse_from(["autumn", "generate", "tauri"]).unwrap();
+        let Commands::Generate(GenerateCommands::Tauri { remote_url, .. }) = cli.command else {
+            panic!("expected Tauri variant");
+        };
+        assert!(
+            remote_url.is_none(),
+            "--remote-url must default to None so the desktop sidecar path stays the default"
+        );
+    }
+
+    // ── autumn generate tauri-mobile ───────────────────────────────────────
+
+    #[test]
+    fn parse_generate_tauri_mobile() {
+        let cli = Cli::try_parse_from(["autumn", "generate", "tauri-mobile"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Generate(GenerateCommands::TauriMobile {
+                offline_sync: false,
+                dry_run: false,
+                force: false
+            })
+        ));
+    }
+
+    #[test]
+    fn parse_generate_tauri_mobile_dry_run() {
+        let cli = Cli::try_parse_from(["autumn", "generate", "tauri-mobile", "--dry-run"]).unwrap();
+        let Commands::Generate(GenerateCommands::TauriMobile {
+            offline_sync,
+            dry_run,
+            force,
+        }) = cli.command
+        else {
+            panic!("expected TauriMobile variant");
+        };
+        assert!(!offline_sync);
+        assert!(dry_run);
+        assert!(!force);
+    }
+
+    #[test]
+    fn parse_generate_tauri_mobile_force() {
+        let cli = Cli::try_parse_from(["autumn", "generate", "tauri-mobile", "--force"]).unwrap();
+        let Commands::Generate(GenerateCommands::TauriMobile {
+            offline_sync,
+            dry_run,
+            force,
+        }) = cli.command
+        else {
+            panic!("expected TauriMobile variant");
+        };
+        assert!(!offline_sync);
+        assert!(!dry_run);
+        assert!(force);
+    }
+
+    #[test]
+    fn parse_generate_tauri_mobile_offline_sync() {
+        let cli =
+            Cli::try_parse_from(["autumn", "generate", "tauri-mobile", "--offline-sync"]).unwrap();
+        let Commands::Generate(GenerateCommands::TauriMobile {
+            offline_sync,
+            dry_run,
+            force,
+        }) = cli.command
+        else {
+            panic!("expected TauriMobile variant");
+        };
+        assert!(offline_sync);
+        assert!(!dry_run);
+        assert!(!force);
+    }
+
+    #[test]
+    fn parse_generate_tauri_mobile_offline_sync_composes_with_flags() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "generate",
+            "tauri-mobile",
+            "--offline-sync",
+            "--dry-run",
+            "--force",
+        ])
+        .unwrap();
+        let Commands::Generate(GenerateCommands::TauriMobile {
+            offline_sync,
+            dry_run,
+            force,
+        }) = cli.command
+        else {
+            panic!("expected TauriMobile variant");
+        };
+        assert!(offline_sync);
+        assert!(dry_run);
         assert!(force);
     }
 

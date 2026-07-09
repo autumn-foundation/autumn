@@ -1,0 +1,757 @@
+# Offline Sync for Tauri Mobile: Local SQLite + Background Sync (`autumn generate tauri-mobile --offline-sync`)
+
+`autumn generate tauri-mobile --offline-sync` layers **local-first storage**
+onto the in-process mobile scaffold from
+[docs/guide/tauri-mobile-in-process.md](tauri-mobile-in-process.md): app data
+lives in a SQLite file inside the app sandbox (`autumn_web::sync::SyncStore`),
+and a background `SyncEngine` pushes and pulls changes to your **remote
+Autumn deployment's `/sync` endpoints** whenever the network allows. The app
+functions fully offline **for its `SyncStore`-backed data** — reads, writes,
+deletes — and converges with the remote PostgreSQL database in the
+background when connection is restored (issue #1508, "Option C"). Data that
+still lives in diesel repositories keeps needing the remote database — see
+§8.
+
+This is a different network model than the plain `tauri-mobile` scaffold:
+
+| | `tauri-mobile` (default) | `tauri-mobile --offline-sync` |
+| --- | --- | --- |
+| Device data | remote Postgres, per query | local SQLite (`SyncStore`) |
+| Network needed | for every DB-backed request | only to sync, in the background |
+| Device DB credentials | Postgres URL in the shell | **none** — HTTPS to `/sync` |
+| Remote deployment | any Postgres | the same app, serving `/sync` |
+
+This page covers:
+
+1. the architecture (what runs where),
+2. the data model and change tracking (write-through journal),
+3. sync semantics (server-authoritative versions, push/pull, idempotency),
+4. conflict resolution (default last-write-wins, custom `ConflictResolver`),
+5. tombstones, garbage collection, and full resync,
+6. what the generator emits (drift-checked against the real templates),
+7. the offline showcase walkthrough (airplane-mode checklist),
+8. failure modes and limitations.
+
+The sync engine itself lives in the `autumn-web` crate behind the
+**`offline-sync`** cargo feature (`autumn_web::sync`); everything below also
+applies to non-Tauri occasionally-connected clients.
+
+## 1. Architecture
+
+```text
+┌─────────────────── mobile app process ───────────────────┐
+│  webview ⇄ http://127.0.0.1:<port>                        │
+│     │                                                     │
+│  in-process Axum server (your routes)                     │
+│     │  reads/writes                                       │
+│  SyncStore  ──  sync.db (SQLite, app sandbox, WAL)        │
+│     ▲                                                     │
+│     │ push pending / pull since cursor                    │
+│  SyncEngine (background task, 30 s + backoff)             │
+└─────┼─────────────────────────────────────────────────────┘
+      │  HTTPS  AUTUMN_SYNC__REMOTE_URL = https://…/sync
+      ▼
+┌──────────── remote Autumn deployment (same app) ──────────┐
+│  AppBuilder::nest("/sync", sync::server::router(…))       │
+│     POST /sync/push      GET /sync/pull?cursor=N          │
+│     │                                                     │
+│  PgSyncBackend → PostgreSQL shadow tables                 │
+│     autumn_sync_rows / autumn_sync_applied /              │
+│     autumn_sync_horizons (+ seq autumn_sync_version_seq)  │
+└───────────────────────────────────────────────────────────┘
+```
+
+The **same generated app codebase** plays both roles. Deployed on a server
+whose resolved config has a database URL (config file, profile, or
+`AUTUMN_DATABASE__URL`) — and with `SYNC_TOKEN` set, since the mount fails
+closed without auth (§6) — `serve()` mounts the `/sync` router backed by
+Postgres shadow tables. Running in-process on a device with no database
+configured, the mounting is skipped and the app is a sync **client**:
+routes talk to the local `SyncStore`, and the shell's background engine
+reconciles it with the remote.
+
+**Ordering is server-authoritative.** Every accepted change is assigned a
+monotonically increasing version — a change sequence number (CSN) — from one
+global Postgres sequence. Clients pull "rows with `version > my cursor`";
+device wall clocks never order the change feed (they are consulted only
+inside the conflict resolver, between the two conflicting writes — see §4).
+
+## 2. Data model and change tracking
+
+`SyncStore` is a document-flavored store: rows are JSON payloads keyed by
+`(collection, pk)`. Any `serde::Serialize`/`DeserializeOwned` type works:
+
+```rust
+use autumn_web::sync::SyncStore;
+
+let store = SyncStore::open(std::env::var("AUTUMN_SYNC__DB_PATH")?)?;
+
+store.put("notes", "6b3f2c1e-…", &note)?;           // insert or update
+let note: Option<Note> = store.get("notes", "6b3f2c1e-…")?;
+let all: Vec<(String, Note)> = store.list("notes")?; // pk-ordered, no tombstones
+store.delete("notes", "6b3f2c1e-…")?;                // tombstone + journal
+let pending = store.pending_count()?;                // journaled, unsynced changes
+```
+
+Two rules make the model sync-safe:
+
+- **Client-generated primary keys** — always UUIDs (or similarly unique
+  strings), never serial integers. Two offline devices must be able to
+  create rows concurrently without colliding.
+- **Additive schema evolution** — payloads are JSON; give new fields
+  `#[serde(default)]`-compatible semantics so old rows (and rows written by
+  not-yet-updated devices) still deserialize.
+
+**Change tracking is write-through, not trigger-based.** Every `put`/`delete`
+writes the row *and* appends an entry to a pending-change **journal in the
+same SQLite transaction** — a crash can never lose a journal entry or record
+a change that didn't happen. Journal entries per `(collection, pk)` are
+coalesced (the latest state wins) but keep the **original** `base_version`,
+so a conflict with a remote write is still detected even after ten local
+edits. The store also persists a stable per-install `device_id` (UUID v4)
+and the pull `cursor`.
+
+The SQLite file uses WAL mode with a busy timeout, and every write runs in
+an immediate (write-locking) transaction. Within one `SyncStore` instance,
+all clones share one serialized connection — **open the store once and
+clone it** (clones are cheap; see the `OnceLock` pattern in §7). Separate
+`SyncStore::open` calls on the same file are also safe — cross-connection
+writers queue on the busy timeout — but each `open` pays connection and
+schema setup, so don't open per request.
+
+## 3. Sync semantics: push, pull, idempotency
+
+One `SyncEngine::sync_once()` pass does:
+
+1. **Push** — send journaled changes in batches
+   (`POST /sync/push`, body `{device_id, changes: [...]}`). The server
+   applies each batch **atomically** (one Postgres transaction, serialized
+   across devices by an advisory lock so versions become visible in order)
+   and answers per change: `applied {version}`, `already_applied {version}`,
+   or `resolved {row}` (a conflict was settled — see §4). Confirmed entries
+   are cleared from the journal; a resolved row is applied locally so the
+   device converges immediately.
+2. **Pull** — page through `GET /sync/pull?cursor=N&limit=M&session=S`
+   (`S` is the cursor the catch-up started from, so a multi-page first
+   sync is never mistaken for a stale client — see §5) and apply every row
+   newer than the local cursor, then advance the cursor. Rows with a
+   *pending local change* are skipped — local edits win locally until the
+   push settles them (the server remains the authority on the final state).
+
+Delivery is **at-least-once**: every journal entry carries a
+client-generated `change_id`, and the server dedups per
+`(scope, device_id, change_id)` in `autumn_sync_applied`. A retry after a lost
+response returns `already_applied` with the originally assigned version
+(so the client can record the ack it never received) and never
+double-applies. `SyncBackend::gc_applied(older_than)` prunes old dedup
+records; keep its retention longer than any device's plausible offline
+retry horizon. Batches are bounded server-side (at most 1000 changes per
+push, pull pages clamped to 1000 rows).
+
+The background loop (`spawn_background(interval)`) runs `sync_once` every
+30 s (as generated), backing off exponentially — 1 s doubling to a 5 min
+ceiling — while the server is unreachable. A transport error leaves local
+state and the journal untouched; the app keeps working offline and the next
+successful pass converges. The generated shell additionally triggers an
+immediate pass when the app returns to the foreground (§6).
+
+## 4. Conflict resolution
+
+A conflict is detected at push time by **base-version mismatch**: the change
+says "I was based on version 7" but the server row is at version 9. The
+resolver runs **server-side** — one authority, no distributed convergence
+protocol:
+
+```rust
+pub trait ConflictResolver: Send + Sync {
+    fn resolve(&self, client_device_id: &str, client: &Change, server: &RemoteRow) -> Resolution;
+}
+
+pub enum Resolution {
+    KeepServer,                  // client's write loses
+    TakeClient,                  // client's write wins
+    Merge(serde_json::Value),    // synthesize a merged payload
+}
+```
+
+The default `LwwResolver` is **last-write-wins** on the two writes'
+`updated_at`, with the device id as a deterministic tiebreak: on an exact
+timestamp tie, the write from the **lexicographically greater** device id
+wins. The clock
+caveat is confined and explicit: wall clocks compare only the *two
+conflicting writes* (a device with a wrong clock can win one conflict, not
+reorder the world), and you can replace the policy entirely. A field-merge
+example:
+
+```rust
+use autumn_web::sync::{Change, ConflictResolver, RemoteRow, Resolution};
+
+/// Field-level merge: keep the server row, overlay the client's fields.
+struct FieldMergeResolver;
+
+impl ConflictResolver for FieldMergeResolver {
+    fn resolve(&self, _device: &str, client: &Change, server: &RemoteRow) -> Resolution {
+        let (Some(client_payload), Some(server_payload)) = (&client.payload, &server.payload)
+        else {
+            return Resolution::KeepServer; // a delete is involved
+        };
+        let mut merged = server_payload.clone();
+        if let (Some(merged_map), Some(client_map)) =
+            (merged.as_object_mut(), client_payload.as_object())
+        {
+            for (key, value) in client_map {
+                merged_map.insert(key.clone(), value.clone());
+            }
+        }
+        Resolution::Merge(merged)
+    }
+}
+```
+
+Pass it where the generated `serve()` builds the router:
+`server::router(backend, Arc::new(FieldMergeResolver))`.
+
+**Convergence guarantee:** every resolution — even `KeepServer` — assigns
+the row a **new** version, so all devices (including the conflict loser)
+receive the settled state on their next pull.
+
+## 5. Tombstones, GC, and full resync
+
+Deletes never physically remove a synced row on the server: they write a
+**tombstone** (`deleted = true`), which is just another versioned row in the
+change feed — that is how a delete on one device propagates to every other
+device instead of silently resurrecting on the next push.
+
+Tombstones accumulate. `SyncBackend::gc_tombstones(up_to)` physically drops
+tombstones with `version <= up_to` and advances each affected scope's
+**`tombstone_horizon`** in `autumn_sync_horizons` to the highest tombstone
+version actually dropped in that scope. Horizons are **per scope**, so one
+tenant's GC never forces another tenant's resyncs or overrides its conflict
+resolution — and the per-scope value never runs ahead of the change feed (a
+dropped row is a committed row; GC also serializes with pushes via the same
+advisory lock), so a maintenance job may pass an arbitrarily large `up_to`
+(e.g. `i64::MAX`) to mean "everything so far" without pushing client
+cursors past rows they have not seen. GC is an explicit server-side
+operation (a job or admin task you schedule); it is **off by default**.
+
+The horizon exists to keep long-offline clients correct: a client whose
+sync session *started* behind the horizon might have missed a tombstone
+that no longer exists, so the server answers its pull with
+**`FullResyncRequired`** instead of a page of rows. The engine handles this
+transparently — and safely: it first fetches the **complete** from-zero
+snapshot, and only then reconciles local state against it in one
+transaction (**pending local changes are preserved** and replayed; synced
+rows absent from the snapshot are dropped). Nothing local is touched until
+the snapshot has fully arrived, so a connection lost mid-resync leaves the
+device's data intact and the resync re-triggers on the next pass. Pick a
+GC cadence that makes this rare — e.g. GC tombstones older than 30 days if
+your fleet syncs at least monthly.
+
+Two details make the horizon check safe in the corner cases:
+
+- The staleness decision keys on the **session-start cursor** (the
+  `session=` query parameter every page of one catch-up repeats), never on
+  intermediate page cursors — a fresh device paging its first sync through
+  rows below the horizon is *not* stale and completes normally.
+- After a completed catch-up the engine persists
+  `max(next_cursor, tombstone_horizon)`, so a horizon that sits above the
+  newest surviving row (normal when the last change before GC was a
+  delete) cannot re-trigger a resync on every pass. At the same point the
+  engine prunes local tombstones the server has already GC'd.
+
+Pair `gc_tombstones` with `gc_applied` (see §3) so the dedup table is
+bounded too.
+
+One more corner the horizon guards: a device offline past a GC can still
+**push** an edit based on the deleted row's old version (pushes run before
+the pull that would demand a resync). The row is gone and its tombstone
+GC'd, but the pre-horizon `base_version` claim dates the edit — the server
+answers with a **deterministic server-winning tombstone** instead of
+silently recreating the row. The conflict resolver is deliberately
+**bypassed** for this shape: the deleted row's payload and deletion time
+were GC'd, so any resolver input would be fabricated — and a clock-based
+policy could be gamed by a device with a fast clock. The pusher converges
+on the delete via its `Resolved` outcome. Genuinely new inserts
+(`base_version = 0`) are unaffected — re-creating the row deliberately is
+done with a fresh insert.
+
+## 6. What the generator emits
+
+Run it on an app that already has (or alongside) the mobile scaffold:
+
+```bash
+autumn generate tauri-mobile --offline-sync    # or --dry-run to preview
+```
+
+On top of the base scaffold (see
+[tauri-mobile-in-process.md](tauri-mobile-in-process.md)) the flag makes
+four template changes. Every snippet below is drift-checked against the real
+generator output by `autumn-cli`'s test suite.
+
+### Environment variables
+
+| Variable | Set by | Meaning |
+| --- | --- | --- |
+| `AUTUMN_SYNC__DB_PATH` | the shell, in `setup()` | absolute path of the local SQLite sync database (app sandbox); your routes read it to open the same `SyncStore` (once — see §7) |
+| `AUTUMN_SYNC__REMOTE_URL` | **you**, in `src-tauri/src/lib.rs` | base URL of the remote `/sync` mount (no trailing slash); if unset the app runs offline-only. **Always `https://` in production** — pushes carry your data and pulls return everyone's |
+| `AUTUMN_SYNC__TOKEN` | **you**, in `src-tauri/src/lib.rs` (from your login/auth flow — never hard-coded) | the device's sync credential, sent as `Authorization: Bearer …`; must equal the deployment's `SYNC_TOKEN`. If unset the engine syncs uncredentialed and the fail-closed server mount answers `401` |
+| `SYNC_TOKEN` | your **server** deployment only | shared secret guarding the generated `/sync` mount. **Fail closed:** when unset, `serve()` refuses to mount `/sync` at all (a startup warning explains) instead of exposing it open |
+| `AUTUMN_DATABASE__URL` | your **server** deployment only | one way to give the server a database. `serve()` mounts `/sync` when its **resolved config** has a database URL (config files, profiles, or this env var); keep the device's config database-free |
+
+These are template/deployment conventions — the engine itself takes plain
+constructor arguments, so non-Tauri clients can wire it however they like.
+
+### The app crate: feature + server-side `/sync` mounting
+
+`Cargo.toml` gains an `offline-sync` feature
+(`offline-sync = ["autumn-web/offline-sync"]`), included in `default` so a
+plain `cargo run` server deployment serves `/sync`. The extracted
+`src/lib.rs::serve()` mounts the router just before `.run()`:
+
+<!-- drift:src/lib.rs -->
+```rust
+    #[cfg(feature = "offline-sync")]
+    let app = mount_offline_sync(app).await;
+```
+
+backed by this generated helper — note the three load-bearing decisions:
+the **database guard** (no database in the app's resolved config → sync
+client, `/sync` not mounted), the **fail-closed auth gate** (no
+`SYNC_TOKEN` → `/sync` not mounted, never exposed open — see §6), and
+**startup tolerance** (an unreachable database logs a warning instead of
+aborting the boot):
+
+<!-- drift:src/lib.rs -->
+```rust
+#[cfg(feature = "offline-sync")]
+async fn mount_offline_sync(app: autumn_web::app::AppBuilder) -> autumn_web::app::AppBuilder {
+    use std::sync::Arc;
+
+    use autumn_web::reexports::{axum, tokio};
+    use autumn_web::sync::{LwwResolver, PgSyncBackend, server};
+
+    // Diagnostics below use stderr: this helper runs BEFORE AppBuilder::run()
+    // installs the tracing subscriber, so tracing events here would be lost.
+    //
+    // The database URL is resolved through the SAME layered configuration
+    // the app itself boots with (autumn.toml, profile files, and the
+    // AUTUMN_DATABASE__URL / AUTUMN_DATABASE__PRIMARY_URL env overrides) —
+    // not from one raw env var. Caveat: a custom loader installed via
+    // `with_config_loader` is NOT consulted here; deployments that must
+    // serve /sync need their database URL visible to AutumnConfig::load().
+    let database_url = match autumn_web::config::AutumnConfig::load() {
+        Ok(config) => config.database.effective_primary_url().map(str::to_owned),
+        Err(e) => {
+            eprintln!("offline-sync: config load failed ({e}); /sync not mounted");
+            return app;
+        }
+    };
+    let Some(database_url) = database_url else {
+        eprintln!(
+            "offline-sync: no database is configured — running as a \
+             sync client only; the remote deployment serves /sync"
+        );
+        return app;
+    };
+    // FAIL CLOSED: a database is configured, so this process is the sync
+    // SERVER — but without a shared secret the endpoints would be open to
+    // anyone who can reach them. Refuse to mount rather than expose them.
+    if !std::env::var("SYNC_TOKEN").is_ok_and(|token| !token.is_empty()) {
+        // ... eprintln! warning: /sync NOT mounted — set SYNC_TOKEN ...
+        // ... (devices send the same secret via AUTUMN_SYNC__TOKEN) ...
+        return app;
+    }
+    let backend = Arc::new(PgSyncBackend::new(database_url));
+    // Idempotent DDL for the sync shadow tables. A temporarily unreachable
+    // database must not prevent the app from starting: log and continue —
+    // /sync requests fail until the schema exists (restart once the database
+    // is reachable, or run the DDL from a deploy step).
+    let schema_backend = Arc::clone(&backend);
+    match tokio::task::spawn_blocking(move || schema_backend.ensure_schema()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            eprintln!("offline-sync: could not ensure the sync schema (/sync will fail): {e}");
+        }
+        Err(e) => eprintln!("offline-sync: sync schema task failed: {e}"),
+    }
+    app.nest(
+        "/sync",
+        server::router(backend, Arc::new(LwwResolver))
+            .layer(axum::middleware::from_fn(require_sync_auth)),
+    )
+}
+```
+
+`ensure_schema()` creates the shadow tables (`autumn_sync_rows`,
+`autumn_sync_applied`, `autumn_sync_horizons`) idempotently. They are
+deliberately **not** part of autumn's framework migrations — apps without
+offline sync see zero schema churn. Rows and push-dedup records carry a
+`scope` column partitioning data per tenant — the single-tenant mount
+above stores everything under the constant `"global"` scope (see "Scope
+data per user" below).
+
+### Authentication on `/sync` is built in and fail closed
+
+The `/sync` endpoints trust `device_id` as sent, and **anyone who can
+reach them can read and write every synced row** — so unlike a page route,
+the generated mount refuses to run open. `mount_offline_sync` above only
+nests `/sync` when the deployment sets `SYNC_TOKEN` (a long random
+secret), and it wraps the router in this generated middleware — a
+bearer-token check with two fail-closed properties: an unset/empty
+expected token rejects with `500` rather than matching an empty
+`Authorization: Bearer ` header, and the comparison is constant-time
+(`autumn_web::sync::server::constant_time_token_eq`, built on the same
+`subtle` primitive autumn's webhook signature checks use) so response
+timing cannot leak the secret byte by byte:
+
+<!-- drift:src/lib.rs -->
+```rust
+#[cfg(feature = "offline-sync")]
+async fn require_sync_auth(
+    request: autumn_web::reexports::axum::extract::Request,
+    next: autumn_web::reexports::axum::middleware::Next,
+) -> Result<
+    autumn_web::reexports::axum::response::Response,
+    autumn_web::reexports::axum::http::StatusCode,
+> {
+    use autumn_web::reexports::axum::http;
+
+    // Fail CLOSED when the server is misconfigured: with an unset/empty
+    // SYNC_TOKEN the expected value would be "" and a bare
+    // `Authorization: Bearer ` header would authenticate.
+    let expected = std::env::var("SYNC_TOKEN").unwrap_or_default();
+    if expected.is_empty() {
+        return Err(http::StatusCode::INTERNAL_SERVER_ERROR);
+    }
+    let authorized = request
+        .headers()
+        .get(http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .is_some_and(|token| autumn_web::sync::server::constant_time_token_eq(token, &expected));
+    if authorized {
+        Ok(next.run(request).await)
+    } else {
+        Err(http::StatusCode::UNAUTHORIZED)
+    }
+}
+```
+
+A shared token authenticates the *deployment's devices*, not individual
+users — the generated single-tenant default. Apps with real accounts
+should swap the token check inside `require_sync_auth` for their own
+session/token validation (the router is a plain `axum::Router`, so any
+tower/axum middleware works; `AppBuilder::nest` also applies your
+app-level global middleware to the nested router). Whatever you swap in,
+**keep it fail closed**: reject when the check cannot be performed, never
+fall through to allowing the request. And serve `/sync` over HTTPS only —
+the bearer token and every synced row travel in these requests.
+
+On the device side, the generated shell sends the matching credential
+automatically: `start_background_sync` (next section) reads
+`AUTUMN_SYNC__TOKEN` and sets `SyncConfig::bearer_token`, which the engine
+sends as `Authorization: Bearer …`. Non-Tauri clients wire it directly:
+
+```rust
+let mut config = autumn_web::sync::SyncConfig::new(remote_url);
+config.bearer_token = Some(load_user_token()); // sent as Authorization: Bearer …
+let engine = autumn_web::sync::SyncEngine::new(store, config);
+```
+
+This end-to-end wiring — guarded router rejects a token-less engine,
+accepts a configured one — is pinned by the
+`bearer_token_authenticates_against_a_guarded_router` integration test.
+
+### Scope data per user (multi-user apps)
+
+> **Warning — the default mount is single-tenant.** `server::router`
+> stores every synced row in one shared `"global"` scope: **any**
+> authenticated user reads and writes **all** synced data. That is correct
+> for a single-user/local deployment (one person's devices sharing one
+> data set) and wrong for anything with accounts. Authentication alone
+> does not partition data — `device_id` identifies an installation, not
+> an account, and the server trusts it as sent.
+
+Multi-user deployments mount `server::scoped_router` instead and derive a
+**scope** — the key partitioning rows, tombstones, and push-dedup records
+— from the authenticated principal. The scope is **never client-supplied**
+(the wire protocol carries no scope field, so a client cannot name another
+user's partition): auth middleware inserts an
+`autumn_web::sync::SyncScope` request extension once the credential has
+been verified. Extending `require_sync_auth` from above:
+
+```rust
+use autumn_web::sync::SyncScope;
+
+async fn require_sync_auth(
+    mut request: axum::extract::Request,
+    next: Next,
+) -> Result<axum::response::Response, StatusCode> {
+    // ... the fail-closed token validation from the previous section,
+    //     yielding the authenticated user ...
+    let user_id = authenticated_user_id.ok_or(StatusCode::UNAUTHORIZED)?;
+    // Attach the scope of the user the CREDENTIAL proved — never a value
+    // taken from the request body or query.
+    request
+        .extensions_mut()
+        .insert(SyncScope::new(format!("user:{user_id}")));
+    Ok(next.run(request).await)
+}
+
+// In serve(), swap the single-tenant constructor for the scoped one:
+//     app.nest(
+//         "/sync",
+//         server::scoped_router(backend, Arc::new(LwwResolver))
+//             .layer(middleware::from_fn(require_sync_auth)),
+//     )
+```
+
+Under a scoped mount, the same `(collection, pk)` written by two users is
+two independent rows: pulls return only the requesting user's rows,
+pushes can never read or modify another user's data, and retried pushes
+dedup within their own scope. `scoped_router` keeps the same fail-closed
+posture as the token check: a request that reaches it without a
+`SyncScope` extension (misconfigured middleware) is rejected with `500`
+and touches nothing — falling back to a shared scope would silently merge
+users' data. This wiring is pinned end-to-end by the
+`scoped_router_partitions_data_by_authenticated_principal` integration
+test.
+
+**Client side — one installation, many accounts.** The local `SyncStore`
+is one SQLite file per installation. When the same device can
+re-authenticate as a different account (logout/login, token rotation),
+bind the store to the signed-in account and reset on change:
+
+```rust
+// On every login — and, to wipe eagerly at logout, with a sentinel:
+store.set_identity(&format!("user:{user_id}"))?;
+```
+
+`set_identity` compares against the identity persisted in the store and,
+when it changed, drops the cached rows, local tombstones, pending outbox,
+and cursor in one transaction — so the next account starts from a clean
+first sync instead of (1) reading the previous account's cached rows
+before ever pulling, or (2) inheriting a cursor that silently skips its
+own lower-versioned rows (versions come from one global sequence across
+scopes). Pending edits belong to the outgoing account and are
+deliberately dropped — sync before switching if they must survive. The
+identity is your auth layer's client-side key; it does not need to equal
+the server-side scope string (which is derived from auth on the server
+and never client-supplied), it only has to change whenever the account
+does. Never calling `set_identity` keeps today's single-user behavior.
+
+### The shell: local store + background engine
+
+`src-tauri/Cargo.toml` gains a direct `autumn-web` dependency with the
+`offline-sync` feature, **mirroring the app's own dependency source** so
+cargo unifies both edges into one crate instance: a registry version stays
+a version (with any `[patch.crates-io]` override of `autumn-web` from the
+app's manifest — or its workspace root — copied into the shell manifest,
+since the shell declares its own `[workspace]` and would otherwise ignore
+the patch), a `path` dependency is recomputed relative to `src-tauri/`, and
+a `git` dependency keeps its `rev`/`branch`/`tag`. When the source cannot
+be represented, the generator warns and falls back to the registry — edit
+the `autumn-web` entry in `src-tauri/Cargo.toml` by hand in that case.
+`setup()` places the sync database in the app sandbox
+and exports its path for your routes:
+
+<!-- drift:src-tauri/src/lib.rs -->
+```rust
+    let sync_db = data_root.join("sync.db");
+    std::env::set_var("AUTUMN_SYNC__DB_PATH", sync_db.to_string_lossy().as_ref());
+```
+
+The server thread starts the engine before parking on `serve()`:
+
+<!-- drift:src-tauri/src/lib.rs -->
+```rust
+fn start_background_sync(runtime: &tokio::runtime::Runtime, sync_db: std::path::PathBuf) {
+    let store = match autumn_web::sync::SyncStore::open(&sync_db) {
+        Ok(store) => store,
+        Err(e) => {
+            // ... log and return — the app still runs, without sync ...
+            return;
+        }
+    };
+    let Ok(remote_url) = std::env::var("AUTUMN_SYNC__REMOTE_URL") else {
+        // ... log: offline-only mode (local SyncStore, no background sync) ...
+        return;
+    };
+    let mut config = autumn_web::sync::SyncConfig::new(remote_url);
+    match std::env::var("AUTUMN_SYNC__TOKEN") {
+        Ok(token) if !token.is_empty() => config.bearer_token = Some(token),
+        _ => // ... warn: uncredentialed — the fail-closed server mount answers 401 ...
+    }
+    let engine = autumn_web::sync::SyncEngine::new(store, config);
+    // spawn_background must be entered from inside the runtime; the returned
+    // JoinHandle detaches on drop (dropping never cancels the task).
+    let _sync_task =
+        runtime.block_on(async { engine.spawn_background(std::time::Duration::from_secs(30)) });
+    let _ = SYNC_KICK.set((runtime.handle().clone(), engine));
+}
+```
+
+And the tauri run loop gains a **connectivity-regain trigger**: mobile OSes
+freeze the process (and its timers) in the background, and connectivity
+usually returns together with the foreground — so an app resume kicks one
+immediate sync pass instead of waiting out the interval/backoff:
+
+<!-- drift:src-tauri/src/lib.rs -->
+```rust
+            if let tauri::RunEvent::Resumed = event {
+                if let Some((handle, engine)) = SYNC_KICK.get() {
+                    let engine = engine.clone();
+                    handle.spawn(async move {
+                        if let Err(e) = engine.sync_once().await {
+                            // ... log; the background loop retries anyway ...
+                        }
+                    });
+                }
+            }
+```
+
+### Offline startup, by construction
+
+The offline requirement — *"the app functions fully offline"* (for
+`SyncStore` data) — is met by **not giving the device a database at all**.
+With no database in the resolved config (on a device there are no config
+files and `AUTUMN_DATABASE__URL` is unset), autumn's boot takes the
+"Database not configured" path: no pool, no
+startup migrations, nothing to time out. Every piece of the sync wiring
+degrades instead of aborting: a missing remote URL means offline-only mode,
+an unreachable remote is a retried transport error, and the (server-side)
+schema DDL failure logs and continues. Contrast this with the default
+`tauri-mobile` model, where a dev-profile build with an unreachable
+database exits during startup migrations — under `--offline-sync` that path
+is never armed on the device. If you *do* set a database URL on the device
+(hybrid: some direct-Postgres routes plus offline collections), you have
+reintroduced that startup dependency knowingly.
+
+## 7. Offline showcase: a notes flow, verified in airplane mode
+
+The scaffold wires the plumbing; here is the complete pattern for an
+offline-capable feature. Routes talk to the `SyncStore` — reads and writes
+work with the radio off:
+
+```rust
+use std::sync::OnceLock;
+
+use autumn_web::prelude::*;
+use autumn_web::sync::SyncStore;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Note {
+    title: String,
+    body: String,
+}
+
+/// The app's one `SyncStore`, opened lazily at the path the mobile shell
+/// exported. Open ONCE and clone per use — clones share one connection;
+/// opening per request would create a new connection (and pay schema
+/// setup) every time.
+fn notes_store() -> SyncStore {
+    static STORE: OnceLock<SyncStore> = OnceLock::new();
+    STORE
+        .get_or_init(|| {
+            let path = std::env::var("AUTUMN_SYNC__DB_PATH")
+                .unwrap_or_else(|_| "tmp/sync.db".to_owned());
+            SyncStore::open(path).expect("failed to open the offline sync store")
+        })
+        .clone()
+}
+
+#[get("/notes")]
+async fn notes_index() -> maud::Markup {
+    let notes: Vec<(String, Note)> = notes_store().list("notes").unwrap_or_default();
+    maud::html! {
+        h1 { "Notes (" (notes.len()) ")" }
+        ul {
+            @for (pk, note) in &notes {
+                li { b { (note.title) } " — " (note.body) " [" (pk) "]" }
+            }
+        }
+    }
+}
+
+#[post("/notes")]
+async fn notes_create(form: Form<Note>) -> Redirect {
+    // Client-generated pk — NEVER a serial id: offline devices must be able
+    // to create rows concurrently without colliding.
+    let pk = uuid::Uuid::new_v4().to_string();
+    notes_store().put("notes", &pk, &*form).expect("local write failed");
+    Redirect::to("/notes")
+}
+```
+
+(Register both in `routes![...]`, and add `uuid = { version = "1",
+features = ["v4"] }` to your app's dependencies — any collision-free
+string scheme works for `pk`.)
+
+**Airplane-mode checklist** (simulator or device):
+
+1. Deploy the app to a server with `AUTUMN_DATABASE__URL` **and**
+   `SYNC_TOKEN` (a long random secret) set — without the token the
+   fail-closed mount skips `/sync` entirely. Confirm
+   `GET https://your-host/sync/pull?cursor=0` answers `401` bare and JSON
+   with `-H "Authorization: Bearer $SYNC_TOKEN"`.
+2. Set `AUTUMN_SYNC__REMOTE_URL` and `AUTUMN_SYNC__TOKEN` (the same
+   secret) in `src-tauri/src/lib.rs`, then
+   `cd src-tauri && cargo tauri ios dev` (or `android dev`).
+3. Create a few notes — they appear instantly (local SQLite writes).
+4. **Enable airplane mode.** Create, edit, and delete notes: everything
+   keeps working — reads and writes never touch the network. Relaunch the
+   app in airplane mode: the data is still there (it is on disk, not in a
+   cache). The console shows the engine backing off with transport errors.
+5. **Disable airplane mode.** Within the sync interval (or immediately, on
+   an app resume) the journal drains: verify on the server with
+   `SELECT collection, pk, payload, deleted FROM autumn_sync_rows` — your
+   offline creations are rows, your offline deletes are tombstones.
+6. Run the app on a second device/simulator: it pulls the first device's
+   notes; edits converge both ways, conflicts settle per §4.
+
+In-repo, the same end-to-end behavior is pinned by
+`autumn`'s `offline_writes_replay_to_server_on_sync` integration test
+(offline writes → server starts → one sync → converged backend, drained
+journal) — run
+`cargo test -p autumn-web --features offline-sync --test integration_tests offline_sync`.
+
+## 8. Failure modes and limitations
+
+- **Only `SyncStore` data is offline.** Existing diesel `#[repository]`
+  repositories and `Db`-extractor queries still need the remote database and
+  will fail without it — the honest scope of this feature is "data you put
+  in the store", not transparent offline for the whole ORM. Design the
+  offline surface of your app around collections.
+- **At-least-once, not exactly-once side effects.** Change *application* is
+  deduplicated, but if you attach server-side hooks to sync data, make them
+  idempotent.
+- **Schema evolution is your contract.** Payloads are JSON: evolve models
+  additively with serde defaults. There is no payload migration machinery.
+- **Long-offline clients** past the GC horizon get a transparent full
+  resync (§5) — correct, but bandwidth-shaped like a first sync.
+- **Auth is required, not optional**: the `/sync` endpoints trust
+  `device_id` as sent — unguarded they expose read/write access to every
+  synced row. The generated mount therefore **fails closed**: without
+  `SYNC_TOKEN` it does not mount `/sync` at all, and with it every request
+  must present the matching bearer token (§6; devices send
+  `AUTUMN_SYNC__TOKEN`). Don't weaken that posture when you swap in your
+  own auth, and never expose the endpoints without TLS.
+  **Multi-user apps must also partition data per user**:
+  the generated mount is single-tenant (one shared scope) — swap it for
+  `server::scoped_router` with a `SyncScope` derived from the
+  authenticated user (§6, "Scope data per user").
+- **Clock skew** only influences the default LWW resolver's choice between
+  two conflicting writes; feed ordering is immune. If that is still too
+  much trust, ship a custom resolver.
+- **Storage**: sync.db lives in the app sandbox and is not size-managed by
+  the framework. Local tombstones are pruned automatically once the
+  server's tombstone GC passes them (until you run `gc_tombstones` they
+  are retained — small rows, but yours to bound). While the device is
+  offline the pending journal grows with the number of **distinct rows
+  touched** (entries per `(collection, pk)` coalesce, so a thousand edits
+  of one note stay one journal entry) and drains on the first successful
+  sync. On the server, pair `gc_tombstones` with `gc_applied` so the
+  dedup table stays bounded too.
+- `autumn destroy tauri-mobile --offline-sync` removes the shell; the app
+  crate's `offline-sync` feature and the sync code in `src/lib.rs` are left
+  in place (like the `serve()` extraction, they remain valid app code).

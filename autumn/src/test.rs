@@ -168,6 +168,94 @@
 //!         .assert_status(201);
 //! }
 //! ```
+//!
+//! # Asserting channel broadcasts
+//!
+//! Opt in with `TestApp::record_broadcasts` to capture every channel
+//! publication a request makes — no hand-written spy needed — then assert on
+//! it with `TestClient::assert_broadcast`,
+//! `TestClient::assert_broadcast_count`,
+//! `TestClient::assert_no_broadcasts`, or read them back in order with
+//! `TestClient::broadcasts` / `TestClient::broadcasts_on`. Both raw
+//! `publish` text and `publish_html` HTML/OOB payloads are recorded. The
+//! recorder is scoped to the client, so parallel tests never leak into one
+//! another, and nothing is installed unless you call it.
+//!
+//! ```rust
+//! # #[cfg(feature = "ws")]
+//! # mod broadcast_example {
+//! use autumn_web::prelude::*;
+//! use autumn_web::test::TestApp;
+//!
+//! #[post("/notes")]
+//! async fn create_note(State(state): State<AppState>) -> &'static str {
+//!     state.broadcast().publish("notes", "created").unwrap();
+//!     "ok"
+//! }
+//!
+//! pub fn run() {
+//!     tokio::runtime::Runtime::new().unwrap().block_on(async {
+//!         let client = TestApp::new()
+//!             .routes(routes![create_note])
+//!             .record_broadcasts()
+//!             .build();
+//!
+//!         client.post("/notes").send().await.assert_ok();
+//!
+//!         client
+//!             .assert_broadcast_count("notes", 1)
+//!             .assert_broadcast("notes", |b| b.payload() == "created");
+//!     });
+//! }
+//! # }
+//! # #[cfg(feature = "ws")]
+//! # broadcast_example::run();
+//! ```
+//!
+//! # Testing authenticated routes
+//!
+//! [`TestClient`] carries a **cookie jar**: every response's `Set-Cookie` is
+//! stored and replayed on later requests from the same client, so a real
+//! `POST /login` → `GET /dashboard` flow works with zero manual header
+//! threading — exactly like a browser session.
+//!
+//! When you only need an authenticated *identity* (not the login endpoint
+//! under test), [`TestClient::acting_as`] mints the session directly, so a
+//! secured route can be tested in ≤2 lines of setup:
+//!
+//! ```rust
+//! # mod acting_as_example {
+//! use autumn_web::prelude::*;
+//! use autumn_web::test::TestApp;
+//!
+//! #[get("/dashboard")]
+//! #[secured]
+//! async fn dashboard() -> &'static str {
+//!     "welcome"
+//! }
+//!
+//! pub fn run() {
+//!     tokio::runtime::Runtime::new().unwrap().block_on(async {
+//!         let client = TestApp::new().routes(routes![dashboard]).build();
+//!         client.acting_as(42).await; // ← authenticated as user 42
+//!
+//!         client.get("/dashboard").send().await.assert_ok();
+//!     });
+//! }
+//! # }
+//! # acting_as_example::run();
+//! ```
+//!
+//! `acting_as` sets **identity only** — authorization still runs, so a user it
+//! acts as who lacks a required role or scope is still denied.
+//! [`TestClient::log_out`] clears the session cookie, reverting the client to
+//! an unauthenticated state. These helpers mirror the auth-testing story in
+//! other frameworks:
+//!
+//! | Autumn | Laravel | Rails | Django | Phoenix |
+//! |--------|---------|-------|--------|---------|
+//! | [`acting_as`](TestClient::acting_as) / [`login_as`](TestClient::login_as) | `actingAs` | `sign_in` | `force_login` | `log_in_user` |
+//! | [`log_out`](TestClient::log_out) | `Auth::logout` | `sign_out` | `logout` | `log_out_user` |
 
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
@@ -307,6 +395,287 @@ impl crate::interceptor::MailInterceptor for ChainedMailInterceptor {
     }
 }
 
+/// A single background-job enqueue captured by the built-in test job recorder.
+///
+/// Available on [`TestClient`] via [`TestClient::enqueued_jobs`]. The recorder
+/// is always on for [`TestApp`]-built clients — no `.with_job_interceptor()`
+/// boilerplate is required. Both the registered job `name` and the fully
+/// serialized `payload` (the exact `serde_json::Value` handed to the backend)
+/// are captured, so assertions can match on name alone or name-and-payload.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use autumn_web::test::TestApp;
+/// use serde_json::json;
+///
+/// let client = TestApp::new().plugin(MyJobs).routes(routes![signup]).build();
+/// client.post("/signup").json(&body).send().await.assert_ok();
+///
+/// client.assert_job_enqueued_with("send_welcome", json!({ "user_id": 7 }));
+/// ```
+#[derive(Clone, Debug)]
+pub struct RecordedJob {
+    /// The registered name of the enqueued job.
+    pub name: String,
+    /// The JSON payload the job was enqueued with (the real serialized args).
+    pub payload: serde_json::Value,
+}
+
+/// Built-in per-`TestApp` recording job interceptor.
+///
+/// Auto-installed by [`TestApp::build`] — no `.with_job_interceptor()` needed.
+/// Composes with any user-supplied interceptor (the user's interceptor still
+/// runs, after the recorder). Records every enqueue — across `enqueue`,
+/// `enqueue_after_commit`, and `enqueue_in_tx`, which all funnel through the
+/// same enqueue interceptor seam — in the order they were enqueued.
+#[derive(Clone, Default)]
+struct JobRecorder {
+    jobs: std::sync::Arc<std::sync::Mutex<Vec<RecordedJob>>>,
+}
+
+impl JobRecorder {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn recorded(&self) -> Vec<RecordedJob> {
+        self.jobs.lock().unwrap().clone()
+    }
+
+    /// Take the captured jobs, leaving the recorder empty — used by
+    /// [`TestClient::perform_enqueued_jobs`] to drain the queue exactly once.
+    fn drain(&self) -> Vec<RecordedJob> {
+        std::mem::take(&mut *self.jobs.lock().unwrap())
+    }
+}
+
+impl crate::interceptor::JobInterceptor for JobRecorder {
+    fn intercept_enqueue<'a>(
+        &'a self,
+        name: &'a str,
+        payload: &'a serde_json::Value,
+        next: std::pin::Pin<
+            Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send + 'a>,
+        >,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send + 'a>>
+    {
+        let record = RecordedJob {
+            name: name.to_string(),
+            payload: payload.clone(),
+        };
+        let jobs = std::sync::Arc::clone(&self.jobs);
+        Box::pin(async move {
+            // Record the enqueue intent up front, then let delivery proceed so
+            // the app's real backend/worker still sees the job (mirroring how
+            // the mail recorder does not suppress the underlying transport).
+            jobs.lock().unwrap().push(record);
+            next.await
+        })
+    }
+
+    fn intercept_execute<'a>(
+        &'a self,
+        _name: &'a str,
+        _payload: &'a serde_json::Value,
+        next: std::pin::Pin<
+            Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send + 'a>,
+        >,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send + 'a>>
+    {
+        // The recorder only observes enqueues; execution passes straight through.
+        next
+    }
+}
+
+/// Chains two [`JobInterceptor`](crate::interceptor::JobInterceptor)s so that
+/// `first` runs before `second`, both before the actual enqueue/execute.
+struct ChainedJobInterceptor {
+    first: std::sync::Arc<dyn crate::interceptor::JobInterceptor>,
+    second: std::sync::Arc<dyn crate::interceptor::JobInterceptor>,
+}
+
+impl crate::interceptor::JobInterceptor for ChainedJobInterceptor {
+    fn intercept_enqueue<'a>(
+        &'a self,
+        name: &'a str,
+        payload: &'a serde_json::Value,
+        next: std::pin::Pin<
+            Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send + 'a>,
+        >,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send + 'a>>
+    {
+        let second_next = self.second.intercept_enqueue(name, payload, next);
+        self.first.intercept_enqueue(name, payload, second_next)
+    }
+
+    fn intercept_execute<'a>(
+        &'a self,
+        name: &'a str,
+        payload: &'a serde_json::Value,
+        next: std::pin::Pin<
+            Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send + 'a>,
+        >,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send + 'a>>
+    {
+        let second_next = self.second.intercept_execute(name, payload, next);
+        self.first.intercept_execute(name, payload, second_next)
+    }
+}
+
+/// Outcome report returned by [`TestClient::perform_enqueued_jobs`].
+///
+/// Holds one `(job name, result)` entry per drained job, in the order the jobs
+/// were enqueued. Per-job handler errors are surfaced here rather than
+/// swallowed: inspect them with [`Self::failures`], or fail the test outright
+/// with [`Self::assert_all_succeeded`]. A captured job whose name has no
+/// registered handler is reported as a failure too — never silently skipped.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let report = client.perform_enqueued_jobs().await;
+/// report.assert_all_succeeded();
+/// ```
+#[derive(Debug)]
+pub struct PerformedJobs {
+    outcomes: Vec<(String, crate::AutumnResult<()>)>,
+}
+
+impl PerformedJobs {
+    /// Every performed job's `(name, result)`, in the order they were enqueued.
+    pub fn outcomes(&self) -> &[(String, crate::AutumnResult<()>)] {
+        &self.outcomes
+    }
+
+    /// The number of jobs that were drained and performed.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.outcomes.len()
+    }
+
+    /// Whether no jobs were performed (the queue was empty).
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.outcomes.is_empty()
+    }
+
+    /// The `(name, error)` pairs for every job whose handler returned `Err`
+    /// (or that had no registered handler).
+    #[must_use]
+    pub fn failures(&self) -> Vec<(&str, &crate::AutumnError)> {
+        self.outcomes
+            .iter()
+            .filter_map(|(name, result)| result.as_ref().err().map(|e| (name.as_str(), e)))
+            .collect()
+    }
+
+    /// Assert every performed job succeeded.
+    ///
+    /// # Panics
+    ///
+    /// Panics, listing each failing job's name and error, if any performed job
+    /// returned an error or had no registered handler.
+    pub fn assert_all_succeeded(&self) -> &Self {
+        let failures = self.failures();
+        assert!(
+            failures.is_empty(),
+            "expected all performed jobs to succeed, but {} failed:\n{}",
+            failures.len(),
+            failures
+                .iter()
+                .map(|(name, err)| format!("  - {name}: {err:?}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        self
+    }
+}
+
+/// Render a captured-job list for self-diagnosing assertion failures.
+fn format_recorded_jobs(jobs: &[RecordedJob]) -> String {
+    if jobs.is_empty() {
+        return "  (no jobs were enqueued)".to_string();
+    }
+    jobs.iter()
+        .map(|j| format!("  - {} {}", j.name, j.payload))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// A single channel publication captured by the broadcast recorder.
+///
+/// Recorded by [`TestApp::record_broadcasts`] through the channels
+/// interceptor seam. Both raw `publish` text and `publish_html` HTML/OOB
+/// payloads are captured (they funnel through the same `ChannelMessage`).
+#[cfg(feature = "ws")]
+#[derive(Clone, Debug)]
+pub struct RecordedBroadcast {
+    /// The topic the message was published to.
+    pub topic: String,
+    /// The UTF-8 payload of the published `ChannelMessage`.
+    pub payload: String,
+}
+
+#[cfg(feature = "ws")]
+impl RecordedBroadcast {
+    /// The topic the message was published to.
+    #[must_use]
+    pub fn topic(&self) -> &str {
+        &self.topic
+    }
+
+    /// The UTF-8 payload of the published message.
+    #[must_use]
+    pub fn payload(&self) -> &str {
+        &self.payload
+    }
+}
+
+/// Built-in per-`TestClient` recording channels interceptor.
+///
+/// Opt-in via [`TestApp::record_broadcasts`] — no interceptor is installed
+/// unless the builder is called (zero-cost when unused). Records every
+/// publication in order, including publishes to zero subscribers.
+#[cfg(feature = "ws")]
+#[derive(Clone, Default)]
+struct BroadcastRecorder {
+    events: std::sync::Arc<std::sync::Mutex<Vec<RecordedBroadcast>>>,
+}
+
+#[cfg(feature = "ws")]
+impl BroadcastRecorder {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn recorded(&self) -> Vec<RecordedBroadcast> {
+        self.events.lock().unwrap().clone()
+    }
+}
+
+#[cfg(feature = "ws")]
+impl crate::interceptor::ChannelsInterceptor for BroadcastRecorder {
+    fn intercept_publish(
+        &self,
+        topic: &str,
+        msg: &crate::channels::ChannelMessage,
+        next: &dyn Fn(
+            &str,
+            &crate::channels::ChannelMessage,
+        ) -> Result<usize, crate::channels::ChannelPublishError>,
+    ) -> Result<usize, crate::channels::ChannelPublishError> {
+        let result = next(topic, msg);
+        // Record the publication even when it reached zero subscribers — the
+        // publish still happened and tests assert on intent, not delivery.
+        self.events.lock().unwrap().push(RecordedBroadcast {
+            topic: topic.into(),
+            payload: msg.as_str().into(),
+        });
+        result
+    }
+}
+
 // ── TestApp ────────────────────────────────────────────────────
 
 /// Builder for constructing a fully-configured Autumn application in tests.
@@ -365,10 +734,17 @@ pub struct TestApp {
     #[cfg(feature = "mail")]
     mail_recorder: MailRecorder,
     job_interceptor: Option<std::sync::Arc<dyn crate::interceptor::JobInterceptor>>,
+    /// Always-on job recorder capturing every enqueue. Composed ahead of any
+    /// user-supplied [`with_job_interceptor`](Self::with_job_interceptor).
+    job_recorder: JobRecorder,
     #[cfg(feature = "db")]
     db_interceptor: Option<std::sync::Arc<dyn crate::interceptor::DbConnectionInterceptor>>,
     #[cfg(feature = "ws")]
     channels_interceptor: Option<std::sync::Arc<dyn crate::interceptor::ChannelsInterceptor>>,
+    /// Opt-in broadcast recorder, installed only when
+    /// [`record_broadcasts`](Self::record_broadcasts) is called.
+    #[cfg(feature = "ws")]
+    broadcast_recorder: Option<BroadcastRecorder>,
     #[cfg(feature = "oauth2")]
     http_interceptor: Option<std::sync::Arc<dyn crate::interceptor::HttpInterceptor>>,
     /// Shared mock registry installed into `AppState` during [`build`](Self::build)
@@ -382,6 +758,8 @@ pub struct TestApp {
     exception_filters: Vec<std::sync::Arc<dyn crate::middleware::ExceptionFilter>>,
     #[cfg(feature = "mail")]
     suppression_store: Option<crate::mail::SuppressionStoreHandle>,
+    #[cfg(feature = "mail")]
+    mail_suppression_store: Option<crate::mail::suppression::SuppressionStoreHandle>,
     registered_plugins: std::collections::HashSet<String>,
     extensions: std::collections::HashMap<std::any::TypeId, Box<dyn std::any::Any + Send>>,
     /// Injected clock; `None` means use [`crate::time::SystemClock`].
@@ -441,10 +819,13 @@ impl TestApp {
             #[cfg(feature = "mail")]
             mail_recorder: MailRecorder::new(),
             job_interceptor: None,
+            job_recorder: JobRecorder::new(),
             #[cfg(feature = "db")]
             db_interceptor: None,
             #[cfg(feature = "ws")]
             channels_interceptor: None,
+            #[cfg(feature = "ws")]
+            broadcast_recorder: None,
             #[cfg(feature = "oauth2")]
             http_interceptor: None,
             #[cfg(feature = "http-client")]
@@ -455,6 +836,8 @@ impl TestApp {
             exception_filters: Vec::new(),
             #[cfg(feature = "mail")]
             suppression_store: None,
+            #[cfg(feature = "mail")]
+            mail_suppression_store: None,
             registered_plugins: std::collections::HashSet::new(),
             extensions: std::collections::HashMap::new(),
             clock: None,
@@ -721,6 +1104,15 @@ impl TestApp {
     /// to get recording support.
     #[must_use]
     pub fn from_router(router: axum::Router, state: AppState) -> TestClient {
+        let auth_session_key = state.auth_session_key().to_owned();
+        // Resolve the session cookie name from the router's config (installed in
+        // state extensions by `build()`), falling back to the framework default
+        // when it isn't present — so `log_out` clears the right cookie even when
+        // the app configured a custom `session.cookie_name`.
+        let session_cookie_name = state.extension::<AutumnConfig>().map_or_else(
+            || crate::session::SessionConfig::default().cookie_name,
+            |cfg| cfg.session.cookie_name.clone(),
+        );
         TestClient {
             router,
             probes: crate::probe::ProbeState::ready_for_test(),
@@ -729,6 +1121,22 @@ impl TestApp {
             clock_as_any: None,
             #[cfg(feature = "mail")]
             mail_recorder: None,
+            #[cfg(feature = "ws")]
+            broadcast_recorder: None,
+            job_recorder: None,
+            jobs: Vec::new(),
+            cookie_jar: std::sync::Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
+            // `from_router` receives an already-built router, so we have no
+            // handle to whatever session store (if any) it installed. The jar
+            // still works — cookies from real requests round-trip — but
+            // `acting_as` cannot mint a session and panics, mirroring how
+            // `sent_mail()` degrades for `from_router` clients.
+            session_store: None,
+            session_cookie_name,
+            auth_session_key,
+            session_signing_keys: None,
         }
     }
 
@@ -816,6 +1224,16 @@ impl TestApp {
             self.suppression_store = Some(handle);
         }
 
+        // Carry a plugin-registered bounce/complaint suppression store (issue
+        // #1247) into the test app so send-time suppression is consulted under
+        // TestApp exactly as under AppBuilder::run — otherwise a plugin/app that
+        // wired a PgSuppressionStore would silently test against the in-memory
+        // default and hide production failures (e.g. a missing table).
+        #[cfg(feature = "mail")]
+        if let Some(handle) = app_builder.mail_suppression_store {
+            self.mail_suppression_store = Some(handle);
+        }
+
         // Carry a plugin's `mount_unsubscribe_endpoint()` opt-in: production copies
         // this builder flag into config.mail before router assembly, so a plugin
         // that mounts the default unsubscribe endpoint must mount it under TestApp
@@ -895,6 +1313,23 @@ impl TestApp {
         self
     }
 
+    /// Register a bounce/complaint
+    /// [`SuppressionStore`](crate::mail::suppression::SuppressionStore) so
+    /// [`Mailer::send`](crate::mail::Mailer::send) skips hard-bounced/complained
+    /// addresses under `TestApp` exactly as it does under `AppBuilder::run`.
+    /// Mirrors
+    /// [`AppBuilder::with_mail_suppression_store`](crate::app::AppBuilder::with_mail_suppression_store).
+    #[cfg(feature = "mail")]
+    #[must_use]
+    pub fn with_mail_suppression_store(
+        mut self,
+        store: impl crate::mail::suppression::SuppressionStore + 'static,
+    ) -> Self {
+        self.mail_suppression_store =
+            Some(crate::mail::suppression::SuppressionStoreHandle::new(store));
+        self
+    }
+
     /// Mount the framework's default one-click unsubscribe endpoint (opt-in).
     /// Mirrors
     /// [`AppBuilder::mount_unsubscribe_endpoint`](crate::app::AppBuilder::mount_unsubscribe_endpoint).
@@ -943,6 +1378,21 @@ impl TestApp {
         interceptor: impl crate::interceptor::ChannelsInterceptor,
     ) -> Self {
         self.channels_interceptor = Some(std::sync::Arc::new(interceptor));
+        self
+    }
+
+    /// Opt in to recording every channel broadcast published while requests
+    /// run, enabling [`TestClient::broadcasts`],
+    /// [`TestClient::broadcasts_on`], and the `assert_broadcast*` helpers.
+    ///
+    /// No interceptor is installed — and channel publishing is untouched —
+    /// unless this is called. Composes with a user-supplied
+    /// [`with_channels_interceptor`](Self::with_channels_interceptor): the
+    /// recorder runs first, then the user's interceptor.
+    #[cfg(feature = "ws")]
+    #[must_use]
+    pub fn record_broadcasts(mut self) -> Self {
+        self.broadcast_recorder = Some(BroadcastRecorder::new());
         self
     }
 
@@ -1294,6 +1744,7 @@ impl TestApp {
             clock: self
                 .clock
                 .unwrap_or_else(|| std::sync::Arc::new(crate::time::SystemClock)),
+            app_id: crate::state::AppState::next_app_id(),
         };
 
         for register in self.policy_registrations {
@@ -1322,27 +1773,66 @@ impl TestApp {
             state.insert_extension(effective);
             recorder_for_client
         };
-        if let Some(interceptor) = self.job_interceptor {
-            state.insert_extension(interceptor);
-        }
+        // Always install the job recorder so `enqueued_jobs`/`assert_job_*` and
+        // `perform_enqueued_jobs` work with no opt-in. The recorder runs first
+        // and composes with any user-supplied `with_job_interceptor` (which
+        // still runs, after the recorder). A single `Arc<dyn JobInterceptor>`
+        // extension is what the job runtime reads, so we chain rather than
+        // install two.
+        let job_recorder_for_client = {
+            let recorder_for_client = self.job_recorder.clone();
+            let recorder: std::sync::Arc<dyn crate::interceptor::JobInterceptor> =
+                std::sync::Arc::new(self.job_recorder);
+            let effective: std::sync::Arc<dyn crate::interceptor::JobInterceptor> =
+                if let Some(user) = self.job_interceptor {
+                    std::sync::Arc::new(ChainedJobInterceptor {
+                        first: recorder,
+                        second: user,
+                    })
+                } else {
+                    recorder
+                };
+            state.insert_extension(effective);
+            recorder_for_client
+        };
         #[cfg(feature = "db")]
         if let Some(interceptor) = db_interceptor {
             state.insert_extension(interceptor);
         }
         #[cfg(feature = "ws")]
-        if let Some(interceptor) = self.channels_interceptor {
-            state.insert_extension(interceptor.clone());
-            state.channels = crate::channels::Channels::with_shared_backend(std::sync::Arc::new(
-                crate::channels::InterceptedChannelsBackend::new(
-                    state.channels.backend().clone(),
-                    vec![interceptor],
-                ),
-            ));
-            #[cfg(feature = "presence")]
-            {
-                state.presence = crate::presence::Presence::new(state.channels.clone());
+        let broadcast_recorder_for_client = {
+            let mut interceptors: Vec<std::sync::Arc<dyn crate::interceptor::ChannelsInterceptor>> =
+                Vec::new();
+
+            // Recorder runs first so it observes every publish before any
+            // user-supplied interceptor can short-circuit the chain.
+            let recorder_for_client = self.broadcast_recorder.clone();
+            if let Some(recorder) = self.broadcast_recorder {
+                interceptors.push(std::sync::Arc::new(recorder));
             }
-        }
+            if let Some(interceptor) = self.channels_interceptor {
+                // Preserve the existing `insert_extension` behavior so the
+                // user's interceptor is discoverable from state.
+                state.insert_extension(interceptor.clone());
+                interceptors.push(interceptor);
+            }
+
+            // AC6: install nothing (and leave production `Channels` untouched)
+            // unless at least one interceptor was requested.
+            if !interceptors.is_empty() {
+                state.channels = crate::channels::Channels::with_shared_backend(
+                    std::sync::Arc::new(crate::channels::InterceptedChannelsBackend::new(
+                        state.channels.backend().clone(),
+                        interceptors,
+                    )),
+                );
+                #[cfg(feature = "presence")]
+                {
+                    state.presence = crate::presence::Presence::new(state.channels.clone());
+                }
+            }
+            recorder_for_client
+        };
         #[cfg(feature = "oauth2")]
         if let Some(interceptor) = self.http_interceptor {
             state.insert_extension(interceptor);
@@ -1351,6 +1841,12 @@ impl TestApp {
         #[cfg(feature = "mail")]
         {
             if let Some(handle) = self.suppression_store.clone() {
+                state.insert_extension(handle);
+            }
+            // Mirror AppBuilder::run: register the bounce/complaint suppression
+            // handle before install_mailer so the test mailer actually consults
+            // it (install_mailer reads it back via the extension).
+            if let Some(handle) = self.mail_suppression_store.clone() {
                 state.insert_extension(handle);
             }
             crate::mail::install_mailer(&state, &self.config.mail, false)
@@ -1434,6 +1930,10 @@ impl TestApp {
             Some(TestJobRuntime { shutdown })
         };
 
+        // Retain the registered job metadata so `perform_enqueued_jobs` can look
+        // up each captured job's handler by name and dispatch it directly.
+        let jobs_for_client = self.jobs.clone();
+
         #[cfg_attr(not(feature = "inbound-mail"), allow(unused_mut))]
         let mut merge_routers = self.merge_routers;
         #[cfg(feature = "inbound-mail")]
@@ -1479,6 +1979,40 @@ impl TestApp {
             }
         }
 
+        // Explicitly build the session store the router's `SessionLayer` will
+        // use, so the client keeps a handle for `acting_as` to mint sessions
+        // (#1359). For the default in-memory backend we install a `MemoryStore`
+        // and pass it as the custom store; for other backends we leave it to
+        // config-driven selection (`None`) and the client's `session_store`
+        // handle stays `None`, so `acting_as` panics with a clear message.
+        let session_backed_by_memory = matches!(
+            self.config.session.backend,
+            crate::session::SessionBackend::Memory
+        );
+        let test_session_store: Option<std::sync::Arc<dyn crate::session::BoxedSessionStore>> =
+            if session_backed_by_memory {
+                Some(std::sync::Arc::new(crate::session::MemoryStore::new()))
+            } else {
+                None
+            };
+        let session_cookie_name = self.config.session.cookie_name.clone();
+        let auth_session_key = self.config.auth.session_key.clone();
+        // Mirror the router's session-cookie signing decision (router.rs): only
+        // thread signing keys when a secret is configured or in production.
+        let session_signing_keys = {
+            let is_production =
+                matches!(self.config.profile.as_deref(), Some("prod" | "production"));
+            if self.config.security.signing_secret.secret.is_some() || is_production {
+                Some(std::sync::Arc::new(
+                    crate::security::config::resolve_signing_keys(
+                        &self.config.security.signing_secret,
+                    ),
+                ))
+            } else {
+                None
+            }
+        };
+
         let router = crate::router::try_build_router_inner(
             self.routes,
             &self.config,
@@ -1492,7 +2026,7 @@ impl TestApp {
                 static_gate_layers: self.static_gate_layers,
                 #[cfg(feature = "maud")]
                 error_page_renderer: None,
-                session_store: None,
+                session_store: test_session_store.clone(),
                 #[cfg(feature = "openapi")]
                 openapi: self.openapi,
                 #[cfg(feature = "mcp")]
@@ -1513,6 +2047,19 @@ impl TestApp {
         } else {
             router
         };
+        // Mirror production's outermost Server-Timing fallback (#1348): in
+        // production it is applied in `apply_startup_barrier`, outside the
+        // primary `ServerTimingLayer` and the late `/mcp` merge, and appends a
+        // `total` only for responses the primary never saw — short-circuits and
+        // the late-merged `/mcp` envelope. Without mirroring it here a
+        // `tools/call` would carry no outer `total` in tests, unlike production,
+        // so tests would not observe the real `/mcp` timing an operator sees.
+        // Applied outer to the access-log fallback, matching production order.
+        let router = if crate::config::server_timing_enabled(&self.config) {
+            router.layer(crate::middleware::ServerTimingLayer::fallback(true))
+        } else {
+            router
+        };
         TestClient {
             router,
             probes,
@@ -1521,6 +2068,17 @@ impl TestApp {
             clock_as_any: self.clock_as_any,
             #[cfg(feature = "mail")]
             mail_recorder: Some(mail_recorder_for_client),
+            #[cfg(feature = "ws")]
+            broadcast_recorder: broadcast_recorder_for_client,
+            job_recorder: Some(job_recorder_for_client),
+            jobs: jobs_for_client,
+            cookie_jar: std::sync::Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
+            session_store: test_session_store,
+            session_cookie_name,
+            auth_session_key,
+            session_signing_keys,
         }
     }
 }
@@ -1573,7 +2131,56 @@ pub struct TestClient {
     /// wiring. `Some` for all clients produced by [`TestApp::build`].
     #[cfg(feature = "mail")]
     mail_recorder: Option<MailRecorder>,
+    /// `Some` only when [`TestApp::record_broadcasts`] opted in; otherwise
+    /// `None` (also for clients built via [`TestApp::from_router`]).
+    #[cfg(feature = "ws")]
+    broadcast_recorder: Option<BroadcastRecorder>,
+    /// Built-in job recorder. `None` for clients built via
+    /// [`TestApp::from_router`], which bypasses recorder wiring; `Some` for all
+    /// clients produced by [`TestApp::build`].
+    job_recorder: Option<JobRecorder>,
+    /// Registered job metadata, retained so [`TestClient::perform_enqueued_jobs`]
+    /// can dispatch each captured job through its handler. Empty for
+    /// [`TestApp::from_router`] clients.
+    jobs: Vec<crate::job::JobInfo>,
+    /// Per-client cookie jar (`name → value + optional expiry`). Every
+    /// response's `Set-Cookie` is folded in here, its `Max-Age`/`Expires`
+    /// recorded, and it is replayed on subsequent requests until it expires
+    /// against the client's clock, so a real
+    /// `POST /login` → `GET /dashboard` flow works with no manual header
+    /// threading. Shared with each [`RequestBuilder`] via a cloned `Arc`.
+    cookie_jar: CookieJar,
+    /// Handle to the session store the router's `SessionLayer` reads, so
+    /// [`TestClient::acting_as`] can mint an authenticated session directly.
+    /// `None` for clients built via [`TestApp::from_router`] or configured
+    /// with a non-memory session backend; `acting_as` panics for those.
+    session_store: Option<std::sync::Arc<dyn crate::session::BoxedSessionStore>>,
+    /// Name of the session cookie (`session.cookie_name`, default
+    /// `"autumn.sid"`); the cookie `acting_as` seeds and `log_out` clears.
+    session_cookie_name: String,
+    /// Session key the auth stack reads for identity (`auth.session_key`,
+    /// default `"user_id"`); the key `acting_as` writes.
+    auth_session_key: String,
+    /// Session cookie signing keys when `security.signing_secret` is set (or
+    /// in production), mirroring how the router signs session cookies. When
+    /// present, `acting_as` signs the seeded cookie so the `SessionLayer`
+    /// accepts it.
+    session_signing_keys: Option<std::sync::Arc<crate::security::config::ResolvedSigningKeys>>,
 }
+
+/// A cookie stored in the jar: its value plus an optional absolute expiry.
+///
+/// `expires_at: None` is a session cookie that never client-expires; `Some(t)`
+/// records the instant (from `Max-Age`/`Expires`) past which the cookie must no
+/// longer be replayed, evaluated against the client's (possibly virtual) clock.
+#[derive(Clone)]
+struct StoredCookie {
+    value: String,
+    expires_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Shared per-client cookie store: cookie name → stored cookie (value + expiry).
+type CookieJar = std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, StoredCookie>>>;
 
 struct TestJobRuntime {
     shutdown: tokio_util::sync::CancellationToken,
@@ -1750,40 +2357,536 @@ impl TestClient {
         self
     }
 
+    // ── Broadcast recorder accessors & assertions (issue #1043) ──────────
+
+    /// Every recorded channel publication, in publish order.
+    ///
+    /// Requires opting in with [`TestApp::record_broadcasts`]. Captures both
+    /// raw `publish` text and `publish_html` HTML/OOB payloads.
+    ///
+    /// # Panics
+    ///
+    /// Panics if [`TestApp::record_broadcasts`] was not called.
+    #[cfg(feature = "ws")]
+    #[must_use]
+    pub fn broadcasts(&self) -> Vec<RecordedBroadcast> {
+        self.broadcast_recorder
+            .as_ref()
+            .expect(
+                "broadcasts() requires opting in via TestApp::record_broadcasts() before build()",
+            )
+            .recorded()
+    }
+
+    /// Recorded publications on `topic`, in publish order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if [`TestApp::record_broadcasts`] was not called.
+    #[cfg(feature = "ws")]
+    #[must_use]
+    pub fn broadcasts_on(&self, topic: &str) -> Vec<RecordedBroadcast> {
+        self.broadcasts()
+            .into_iter()
+            .filter(|b| b.topic == topic)
+            .collect()
+    }
+
+    /// Builds a self-diagnosing failure message listing what was actually
+    /// published to `topic` and, grouped, to every other topic.
+    #[cfg(feature = "ws")]
+    fn broadcast_failure_message(&self, topic: &str, headline: &str) -> String {
+        use std::collections::BTreeMap;
+        use std::fmt::Write as _;
+        let all = self.broadcasts();
+        let on_topic: Vec<&str> = all
+            .iter()
+            .filter(|b| b.topic == topic)
+            .map(|b| b.payload.as_str())
+            .collect();
+
+        let mut others: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        for b in &all {
+            if b.topic != topic {
+                others
+                    .entry(b.topic.as_str())
+                    .or_default()
+                    .push(b.payload.as_str());
+            }
+        }
+
+        let mut msg = format!("{headline}\n");
+        let _ = writeln!(
+            msg,
+            "published to {topic:?} ({} total): {on_topic:#?}",
+            on_topic.len(),
+        );
+        if others.is_empty() {
+            msg.push_str("no publications on any other topic");
+        } else {
+            let _ = write!(msg, "other topics published: {others:#?}");
+        }
+        msg
+    }
+
+    /// Asserts that at least one publication on `topic` satisfies `predicate`.
+    ///
+    /// Returns `&Self` for chaining.
+    ///
+    /// # Panics
+    ///
+    /// Panics when no matching publication is found, dumping what *was*
+    /// published to `topic` and nearby topics.
+    #[cfg(feature = "ws")]
+    pub fn assert_broadcast(
+        &self,
+        topic: &str,
+        predicate: impl Fn(&RecordedBroadcast) -> bool,
+    ) -> &Self {
+        let matched = self.broadcasts_on(topic).iter().any(predicate);
+        assert!(
+            matched,
+            "{}",
+            self.broadcast_failure_message(
+                topic,
+                &format!("no broadcast on {topic:?} matched the predicate;"),
+            )
+        );
+        self
+    }
+
+    /// Asserts that exactly `n` publications were made to `topic`.
+    ///
+    /// Returns `&Self` for chaining.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the count does not match, dumping what *was* published to
+    /// `topic` and nearby topics.
+    #[cfg(feature = "ws")]
+    pub fn assert_broadcast_count(&self, topic: &str, n: usize) -> &Self {
+        let count = self.broadcasts_on(topic).len();
+        assert!(
+            count == n,
+            "{}",
+            self.broadcast_failure_message(
+                topic,
+                &format!("expected {n} broadcast(s) on {topic:?}, got {count};"),
+            )
+        );
+        self
+    }
+
+    /// Asserts that nothing was published to `topic`.
+    ///
+    /// Returns `&Self` for chaining.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any publication was made to `topic`, dumping what *was*
+    /// published to `topic` and nearby topics.
+    #[cfg(feature = "ws")]
+    pub fn assert_no_broadcasts(&self, topic: &str) -> &Self {
+        self.assert_broadcast_count(topic, 0)
+    }
+
+    // ── Background-job recorder ────────────────────────────────────
+
+    /// Every background-job enqueue captured by the built-in recorder, in the
+    /// order they were enqueued (across `enqueue`, `enqueue_after_commit`, and
+    /// `enqueue_in_tx`).
+    ///
+    /// The recorder is always on for [`TestApp::build`] clients — no opt-in.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called on a [`TestClient`] built via [`TestApp::from_router`],
+    /// which bypasses recorder wiring.
+    #[must_use]
+    pub fn enqueued_jobs(&self) -> Vec<RecordedJob> {
+        self.job_recorder
+            .as_ref()
+            .expect(
+                "enqueued_jobs() is not available on a TestClient built via from_router(); use TestApp::new().merge(router).build() instead",
+            )
+            .recorded()
+    }
+
+    /// Assert at least one job with the given registered `name` was enqueued.
+    ///
+    /// # Panics
+    ///
+    /// Panics, listing every job that *was* enqueued, if no enqueue with that
+    /// name was captured.
+    pub fn assert_job_enqueued(&self, name: &str) -> &Self {
+        let jobs = self.enqueued_jobs();
+        assert!(
+            jobs.iter().any(|j| j.name == name),
+            "expected a job named '{name}' to have been enqueued, but it was not.\nEnqueued jobs:\n{}",
+            format_recorded_jobs(&jobs)
+        );
+        self
+    }
+
+    /// Assert at least one job was enqueued with **both** the given registered
+    /// `name` and an exactly-equal JSON `payload`.
+    ///
+    /// # Panics
+    ///
+    /// Panics, listing every job that *was* enqueued, if no enqueue matched
+    /// both the name and payload.
+    // Takes the payload by value for call-site ergonomics — `json!({..})`
+    // reads cleanly without a leading `&`, mirroring the acceptance criteria.
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn assert_job_enqueued_with(&self, name: &str, payload: serde_json::Value) -> &Self {
+        let jobs = self.enqueued_jobs();
+        assert!(
+            jobs.iter().any(|j| j.name == name && j.payload == payload),
+            "expected a job named '{name}' enqueued with payload {payload}, but no match was found.\nEnqueued jobs:\n{}",
+            format_recorded_jobs(&jobs)
+        );
+        self
+    }
+
+    /// Assert no jobs were enqueued at all.
+    ///
+    /// # Panics
+    ///
+    /// Panics, listing every captured enqueue, if any job was enqueued.
+    pub fn assert_no_jobs_enqueued(&self) -> &Self {
+        let jobs = self.enqueued_jobs();
+        assert!(
+            jobs.is_empty(),
+            "expected no jobs to have been enqueued, but {} were:\n{}",
+            jobs.len(),
+            format_recorded_jobs(&jobs)
+        );
+        self
+    }
+
+    /// Drain every captured job and dispatch it through its registered handler,
+    /// awaiting each in enqueue order, so a test can assert the resulting side
+    /// effects synchronously.
+    ///
+    /// Each captured payload is handed to the same handler the runtime would
+    /// invoke, so the real deserialization path runs: a payload that cannot be
+    /// deserialized into the job's args surfaces as a per-job failure (not a
+    /// silent miss). The queue is emptied — a second call performs nothing
+    /// until more jobs are enqueued.
+    ///
+    /// Returns a [`PerformedJobs`] report carrying each job's `(name, result)`;
+    /// per-job handler errors (and captured jobs with no registered handler)
+    /// are surfaced there rather than swallowed. See
+    /// [`PerformedJobs::assert_all_succeeded`].
+    ///
+    /// # Note
+    ///
+    /// [`TestApp::build`] starts the in-process job worker by default, and that
+    /// worker *also* drains and runs the same enqueued jobs. Calling this method
+    /// therefore executes a job's side effect an **additional** time, on top of
+    /// the worker's own run. It is primarily for asserting that a job runs to
+    /// completion — surfacing handler/deserialization errors synchronously — not
+    /// for counting side effects. Any assertion on a side effect's *count* must
+    /// account for the worker's run as well (as the job-recorder integration
+    /// tests do: they settle the worker's run first, then attribute the next
+    /// increment to this call).
+    ///
+    /// The helper invokes each job's registered handler directly and does *not*
+    /// run it through a user-installed
+    /// [`JobInterceptor::intercept_execute`](crate::interceptor::JobInterceptor::intercept_execute),
+    /// so
+    /// execution-interceptor effects (context injection, metrics, error
+    /// injection) are exercised by the in-process worker path, not by this
+    /// helper.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called on a [`TestClient`] built via [`TestApp::from_router`].
+    pub async fn perform_enqueued_jobs(&self) -> PerformedJobs {
+        let recorder = self.job_recorder.as_ref().expect(
+            "perform_enqueued_jobs() is not available on a TestClient built via from_router(); use TestApp::new().merge(router).build() instead",
+        );
+        let drained = recorder.drain();
+        let mut outcomes = Vec::with_capacity(drained.len());
+        for job in drained {
+            let handler = self
+                .jobs
+                .iter()
+                .find(|info| info.name == job.name)
+                .map(|info| info.handler);
+            let result = match handler {
+                Some(handler) => (handler)(self.state.clone(), job.payload).await,
+                None => Err(crate::AutumnError::internal_server_error(
+                    std::io::Error::other(format!(
+                        "no registered handler for enqueued job '{}'; register it via AppBuilder::jobs()",
+                        job.name
+                    )),
+                )),
+            };
+            outcomes.push((job.name, result));
+        }
+        PerformedJobs { outcomes }
+    }
+
     /// Start building a GET request.
     #[must_use]
     pub fn get(&self, uri: &str) -> RequestBuilder {
-        RequestBuilder::new(self.router.clone(), Method::GET, uri)
+        RequestBuilder::new(
+            self.router.clone(),
+            Method::GET,
+            uri,
+            self.cookie_jar.clone(),
+            Some(self.state.clock.clone()),
+        )
     }
 
     /// Start building a POST request.
     #[must_use]
     pub fn post(&self, uri: &str) -> RequestBuilder {
-        RequestBuilder::new(self.router.clone(), Method::POST, uri)
+        RequestBuilder::new(
+            self.router.clone(),
+            Method::POST,
+            uri,
+            self.cookie_jar.clone(),
+            Some(self.state.clock.clone()),
+        )
     }
 
     /// Start building a PUT request.
     #[must_use]
     pub fn put(&self, uri: &str) -> RequestBuilder {
-        RequestBuilder::new(self.router.clone(), Method::PUT, uri)
+        RequestBuilder::new(
+            self.router.clone(),
+            Method::PUT,
+            uri,
+            self.cookie_jar.clone(),
+            Some(self.state.clock.clone()),
+        )
     }
 
     /// Start building a DELETE request.
     #[must_use]
     pub fn delete(&self, uri: &str) -> RequestBuilder {
-        RequestBuilder::new(self.router.clone(), Method::DELETE, uri)
+        RequestBuilder::new(
+            self.router.clone(),
+            Method::DELETE,
+            uri,
+            self.cookie_jar.clone(),
+            Some(self.state.clock.clone()),
+        )
     }
 
     /// Start building a PATCH request.
     #[must_use]
     pub fn patch(&self, uri: &str) -> RequestBuilder {
-        RequestBuilder::new(self.router.clone(), Method::PATCH, uri)
+        RequestBuilder::new(
+            self.router.clone(),
+            Method::PATCH,
+            uri,
+            self.cookie_jar.clone(),
+            Some(self.state.clock.clone()),
+        )
     }
 
     /// Start building an OPTIONS request (e.g. a CORS preflight).
     #[must_use]
     pub fn options(&self, uri: &str) -> RequestBuilder {
-        RequestBuilder::new(self.router.clone(), Method::OPTIONS, uri)
+        RequestBuilder::new(
+            self.router.clone(),
+            Method::OPTIONS,
+            uri,
+            self.cookie_jar.clone(),
+            Some(self.state.clock.clone()),
+        )
+    }
+
+    // ── Authentication helpers (#1359) ─────────────────────────
+
+    /// Establish an authenticated session for `user_id` *without* calling the
+    /// login endpoint, then return `&Self` for chaining.
+    ///
+    /// Mints a fresh session containing the app's configured
+    /// `auth.session_key` (default `"user_id"`) set to `user_id`, saves it to
+    /// the session store the router reads, and seeds the cookie jar with the
+    /// session cookie. A subsequent request to a `#[secured]` / [`Auth`]-gated
+    /// route then extracts the same identity a real login would produce.
+    ///
+    /// This sets **identity only** — authorization still runs. A user acted-as
+    /// here who lacks a required role or scope is still denied.
+    ///
+    /// Analogous to Laravel's `actingAs`, Rails' `sign_in`, Django's
+    /// `force_login`, and Phoenix's `log_in_user`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the client has no handle to a session store — i.e. it was
+    /// built via [`TestApp::from_router`], or configured with a non-memory
+    /// session backend. Use [`TestApp::build`] with the default (memory)
+    /// session backend for `acting_as` support.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// let client = TestApp::new().routes(routes![dashboard]).build();
+    /// client.acting_as(42).await;
+    /// client.get("/dashboard").send().await.assert_ok();
+    /// ```
+    pub async fn acting_as(&self, user_id: impl std::fmt::Display) -> &Self {
+        let store = self.session_store.as_ref().unwrap_or_else(|| {
+            panic!(
+                "acting_as requires a session store handle, which is only available on clients \
+                 built via `TestApp::build()` with the default in-memory session backend. \
+                 Clients from `TestApp::from_router` or configured with a non-memory backend \
+                 cannot mint sessions this way."
+            )
+        });
+
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let mut data = std::collections::HashMap::new();
+        data.insert(self.auth_session_key.clone(), user_id.to_string());
+        store
+            .boxed_save(&session_id, data)
+            .await
+            .expect("failed to save acting_as session to the test session store");
+
+        // Match the router's cookie encoding: sign the id when signing keys
+        // are active, otherwise store the raw id.
+        let cookie_value = self.session_signing_keys.as_ref().map_or_else(
+            || session_id.clone(),
+            |keys| format!("{session_id}.{}", keys.sign(session_id.as_bytes())),
+        );
+        self.cookie_jar
+            .lock()
+            .expect("cookie jar mutex poisoned")
+            .insert(
+                self.session_cookie_name.clone(),
+                StoredCookie {
+                    value: cookie_value,
+                    expires_at: None,
+                },
+            );
+
+        self
+    }
+
+    /// Alias for [`acting_as`](Self::acting_as).
+    ///
+    /// Provided for readers coming from frameworks whose helper is spelled
+    /// `login_as` / `sign_in`.
+    ///
+    /// # Panics
+    ///
+    /// See [`acting_as`](Self::acting_as).
+    pub async fn login_as(&self, user_id: impl std::fmt::Display) -> &Self {
+        self.acting_as(user_id).await
+    }
+
+    /// Clear the session cookie from the jar, reverting the client to an
+    /// unauthenticated state, then return `&Self` for chaining.
+    ///
+    /// After `log_out`, a request to a secured route returns its
+    /// unauthenticated status (401 / redirect) again. The corresponding
+    /// server-side session (if any) is left to expire naturally.
+    ///
+    /// Analogous to Laravel's `Auth::logout`, Rails' `sign_out`, and Django's
+    /// `logout`.
+    pub fn log_out(&self) -> &Self {
+        self.cookie_jar
+            .lock()
+            .expect("cookie jar mutex poisoned")
+            .remove(&self.session_cookie_name);
+        self
+    }
+}
+
+/// Fold a single `Set-Cookie` header value into the cookie jar.
+///
+/// Stores `name=value` along with any absolute expiry parsed from the header's
+/// `Max-Age`/`Expires` attributes (so a live cookie stops being replayed once
+/// the clock passes it), or removes the cookie when the header marks it for
+/// immediate deletion (`Max-Age=0`, a non-positive `Max-Age`, or an `Expires`
+/// in the past — the encodings the session layer and CSRF layer use to clear
+/// cookies).
+///
+/// When both `Max-Age` and `Expires` are present, `Max-Age` wins (per
+/// RFC 6265). A live cookie with no expiry attributes is stored as a session
+/// cookie (`expires_at: None`) that never client-expires.
+///
+/// `now` is the reference instant for evaluating `Max-Age`/`Expires`; callers
+/// pass the framework's (possibly virtual) clock so a test that pins or
+/// advances time sees deterministic expiry.
+fn apply_set_cookie(
+    jar: &mut std::collections::HashMap<String, StoredCookie>,
+    header: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    let mut parts = header.split(';');
+    let Some(pair) = parts.next() else {
+        return;
+    };
+    let Some((name, value)) = pair.split_once('=') else {
+        return;
+    };
+    let name = name.trim();
+    let value = value.trim();
+    if name.is_empty() {
+        return;
+    }
+
+    // The jar reliably recognizes Autumn's own cookie-clear encodings: an empty
+    // value (handled below) and a non-positive `Max-Age`, which the session and
+    // CSRF layers use to delete cookies. Third-party `Expires`-based deletions
+    // are only best-effort — an RFC 2822 timestamp in the past is honored, but
+    // other date encodings a foreign server might send are not fully parsed.
+    let mut deletes = false;
+    // Absolute expiry parsed from a positive `Max-Age`/future `Expires`. When
+    // both are present, `Max-Age` wins (RFC 6265), so track them separately and
+    // resolve at the end.
+    let mut max_age_expiry: Option<chrono::DateTime<chrono::Utc>> = None;
+    let mut expires_expiry: Option<chrono::DateTime<chrono::Utc>> = None;
+    let mut saw_max_age = false;
+    for attr in parts {
+        let attr = attr.trim();
+        // Both `Max-Age=` and `Expires=` are 8-byte ASCII prefixes; match them
+        // case-insensitively (`EXPIRES=` etc. are equally valid per RFC 6265).
+        let prefix = attr.get(..8);
+        if prefix.is_some_and(|p| p.eq_ignore_ascii_case("Max-Age=")) {
+            if let Ok(secs) = attr[8..].trim().parse::<i64>() {
+                saw_max_age = true;
+                if secs <= 0 {
+                    deletes = true;
+                } else {
+                    max_age_expiry = now.checked_add_signed(chrono::Duration::seconds(secs));
+                }
+            }
+        } else if prefix.is_some_and(|p| p.eq_ignore_ascii_case("Expires="))
+            && let Ok(when) = chrono::DateTime::parse_from_rfc2822(attr[8..].trim())
+        {
+            let when = when.with_timezone(&chrono::Utc);
+            if when <= now {
+                deletes = true;
+            } else {
+                expires_expiry = Some(when);
+            }
+        }
+    }
+
+    if deletes || value.is_empty() {
+        jar.remove(name);
+    } else {
+        // `Max-Age` takes precedence over `Expires` when both are present.
+        let expires_at = if saw_max_age {
+            max_age_expiry
+        } else {
+            expires_expiry
+        };
+        jar.insert(
+            name.to_owned(),
+            StoredCookie {
+                value: value.to_owned(),
+                expires_at,
+            },
+        );
     }
 }
 
@@ -1800,16 +2903,32 @@ pub struct RequestBuilder {
     uri: String,
     headers: Vec<(String, String)>,
     body: Body,
+    /// Shared with the originating [`TestClient`]: cookies are read from here
+    /// to compose the request `Cookie` header, and `Set-Cookie` from the
+    /// response is folded back in. `None` when the builder was constructed
+    /// without a client (not reachable through the public API today).
+    cookie_jar: Option<CookieJar>,
+    /// The originating client's clock, used to evaluate `Expires` when folding
+    /// `Set-Cookie` back into the jar. `None` falls back to [`chrono::Utc::now`].
+    clock: Option<std::sync::Arc<dyn crate::time::ClockSource>>,
 }
 
 impl RequestBuilder {
-    fn new(router: axum::Router, method: Method, uri: &str) -> Self {
+    fn new(
+        router: axum::Router,
+        method: Method,
+        uri: &str,
+        cookie_jar: CookieJar,
+        clock: Option<std::sync::Arc<dyn crate::time::ClockSource>>,
+    ) -> Self {
         Self {
             router,
             method,
             uri: uri.to_owned(),
             headers: Vec::new(),
             body: Body::empty(),
+            cookie_jar: Some(cookie_jar),
+            clock,
         }
     }
 
@@ -1862,6 +2981,35 @@ impl RequestBuilder {
     pub async fn send(self) -> TestResponse {
         let mut builder = Request::builder().method(self.method).uri(&self.uri);
 
+        // Replay the cookie jar: compose a `Cookie` header from stored cookies
+        // unless the caller already set one explicitly (an explicit header
+        // wins, so tests can still exercise raw cookie behavior).
+        let caller_set_cookie = self
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("cookie"));
+        if !caller_set_cookie && let Some(jar) = &self.cookie_jar {
+            // Evaluate expiry against the same clock the jar folds `Set-Cookie`
+            // with, so a virtual-clock test sees cookies stop replaying once it
+            // advances past their `Max-Age`/`Expires`. Prune expired entries in
+            // passing so they don't linger.
+            let now = self
+                .clock
+                .as_ref()
+                .map_or_else(chrono::Utc::now, |c| c.now());
+            let cookie_header = {
+                let mut jar = jar.lock().expect("cookie jar mutex poisoned");
+                jar.retain(|_, cookie| cookie.expires_at.is_none_or(|t| t > now));
+                jar.iter()
+                    .map(|(name, cookie)| format!("{name}={}", cookie.value))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            };
+            if !cookie_header.is_empty() {
+                builder = builder.header(http::header::COOKIE, cookie_header);
+            }
+        }
+
         for (name, value) in &self.headers {
             builder = builder.header(name.as_str(), value.as_str());
         }
@@ -1883,6 +3031,24 @@ impl RequestBuilder {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_owned()))
             .collect();
+
+        // Fold every `Set-Cookie` from the response back into the jar so the
+        // next request from the same client replays it. Cookies whose
+        // attributes mark them for deletion (`Max-Age=0` or a past `Expires`)
+        // are removed instead of stored.
+        if let Some(jar) = &self.cookie_jar {
+            let now = self
+                .clock
+                .as_ref()
+                .map_or_else(chrono::Utc::now, |c| c.now());
+            let mut jar = jar.lock().expect("cookie jar mutex poisoned");
+            for (name, value) in &headers {
+                if name.eq_ignore_ascii_case("set-cookie") {
+                    apply_set_cookie(&mut jar, value, now);
+                }
+            }
+        }
+
         let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("failed to read response body");

@@ -31,6 +31,7 @@ idempotency
 jobs
 log
 mail
+observability
 openapi
 reporting
 resilience
@@ -49,6 +50,7 @@ server.timeouts.request_timeout_ms
 server.unix_socket
 session
 storage
+stories
 telemetry
 tenancy
 time_zone

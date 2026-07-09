@@ -73,6 +73,7 @@ async fn two_replicas_share_global_budget() {
         on_backend_failure: RateLimitBackendFailure::FailOpen,
         key_strategy: KeyStrategy::default(),
         tiers: std::collections::HashMap::new(),
+        named: std::collections::HashMap::new(),
     };
     let app_a = app_from_config(&config);
     let app_b = app_from_config(&config);
@@ -122,6 +123,7 @@ async fn memory_replicas_have_independent_budgets() {
         on_backend_failure: RateLimitBackendFailure::FailOpen,
         key_strategy: KeyStrategy::default(),
         tiers: std::collections::HashMap::new(),
+        named: std::collections::HashMap::new(),
     };
     let app_a = app_from_config(&config);
     let app_b = app_from_config(&config);
@@ -168,6 +170,7 @@ async fn fail_open_allows_requests_when_redis_unavailable() {
         on_backend_failure: RateLimitBackendFailure::FailOpen,
         key_strategy: KeyStrategy::default(),
         tiers: std::collections::HashMap::new(),
+        named: std::collections::HashMap::new(),
     };
     let app = app_from_config(&config);
 
@@ -202,6 +205,7 @@ async fn fail_closed_blocks_requests_when_redis_unavailable() {
         on_backend_failure: RateLimitBackendFailure::FailClosed,
         key_strategy: KeyStrategy::default(),
         tiers: std::collections::HashMap::new(),
+        named: std::collections::HashMap::new(),
     };
     let app = app_from_config(&config);
 

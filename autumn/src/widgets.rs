@@ -17,6 +17,13 @@
 //! | `nav_link` | Navigation anchor, auto-marked active + `aria-current` |
 //! | `nav_bar` | Top-bar/sidebar `<nav>` landmark: brand, links, dropdowns, responsive toggle |
 //! | `tabs` | No-JS `tablist`/`tab`/`tabpanel` switcher with `:target` deep-linking |
+//! | `infinite_feed` | htmx infinite-scroll / "Load more" feed from a `CursorPage` |
+//!
+//! # Feedback widgets
+//!
+//! | Widget | Use |
+//! |--------|-----|
+//! | `toast` / `toast_region` | Transient, auto-dismissing htmx action feedback, appended out-of-band |
 //!
 //! # Interactive / search widgets
 //!
@@ -2790,6 +2797,1159 @@ pub fn tabs(id: &str, panels: &[(&str, &str, maud::Markup)]) -> maud::Markup {
                     (body)
                 }
             }
+        }
+    }
+}
+
+// ── Deterministic hashing (badge/avatar colors) ────────────────────────────
+
+/// FNV-1a 64-bit hash of `s`. Deterministic across processes and platforms
+/// (unlike `std`'s `DefaultHasher`), so the same input always maps to the same
+/// badge variant / avatar color on every render and every machine.
+#[cfg(feature = "maud")]
+fn fnv1a_hash(s: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in s.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+// ── badge / status_tag (#1259) ──────────────────────────────────────────────
+
+/// Semantic color for a [`badge`] / [`status_tag`].
+///
+/// Each variant emits a stable, documented class (`badge--<variant>`) so the
+/// framework stylesheet themes it; there are no inline styles. Color is never
+/// the *only* signal — the badge's text label always communicates the state.
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BadgeVariant {
+    /// Grey, no strong connotation — the default (e.g. "archived", "draft").
+    #[default]
+    Neutral,
+    /// Blue, informational (e.g. "new", "open").
+    Info,
+    /// Green, positive (e.g. "published", "active", "paid").
+    Success,
+    /// Amber, needs attention (e.g. "pending review", "trial").
+    Warning,
+    /// Red, negative (e.g. "failed", "rejected", "overdue").
+    Danger,
+}
+
+#[cfg(feature = "maud")]
+impl BadgeVariant {
+    /// The variant name as a lowercase string (matches the CSS class suffix).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Neutral => "neutral",
+            Self::Info => "info",
+            Self::Success => "success",
+            Self::Warning => "warning",
+            Self::Danger => "danger",
+        }
+    }
+
+    /// Map an arbitrary status string to a deterministic variant.
+    ///
+    /// Common status vocabularies (`published`, `active`, `failed`, …) map to
+    /// their natural color; any other string is hashed to one of the colored
+    /// variants so an enum/status column gets a **stable** color per value
+    /// without the author enumerating every case. The mapping is
+    /// case-insensitive and whitespace-trimmed, and is guaranteed
+    /// deterministic: the same input always yields the same variant.
+    #[must_use]
+    pub fn for_label(label: &str) -> Self {
+        match label.trim().to_ascii_lowercase().as_str() {
+            "success" | "active" | "published" | "done" | "complete" | "completed" | "approved"
+            | "enabled" | "online" | "paid" | "live" | "ok" | "passed" | "ready" => Self::Success,
+            "info" | "new" | "open" | "in_progress" | "in progress" | "processing" | "queued"
+            | "running" | "scheduled" => Self::Info,
+            "warning" | "warn" | "draft" | "pending" | "pending_review" | "review" | "paused"
+            | "trial" | "expiring" | "on_hold" => Self::Warning,
+            "danger" | "error" | "failed" | "failure" | "rejected" | "cancelled" | "canceled"
+            | "disabled" | "offline" | "overdue" | "banned" | "deleted" | "blocked" => Self::Danger,
+            "" | "neutral" | "inactive" | "unknown" | "archived" | "closed" | "none" => {
+                Self::Neutral
+            }
+            other => {
+                // Deterministic fallback over the colored (non-neutral) set.
+                const SET: [BadgeVariant; 4] = [
+                    BadgeVariant::Info,
+                    BadgeVariant::Success,
+                    BadgeVariant::Warning,
+                    BadgeVariant::Danger,
+                ];
+                SET[(fnv1a_hash(other) % 4) as usize]
+            }
+        }
+    }
+}
+
+/// Rendering options for [`badge_with`].
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone, Default)]
+pub struct BadgeConfig<'a> {
+    title: Option<&'a str>,
+    aria_label: Option<&'a str>,
+    class: Option<&'a str>,
+}
+
+#[cfg(feature = "maud")]
+impl<'a> BadgeConfig<'a> {
+    /// A default config: no `title`, no `aria-label`, no extra class.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set a `title` (tooltip) — useful when the visible label is abbreviated.
+    #[must_use]
+    pub const fn title(mut self, title: &'a str) -> Self {
+        self.title = Some(title);
+        self
+    }
+
+    /// Set an `aria-label` — the accessible name announced for an abbreviated
+    /// or icon-only label.
+    #[must_use]
+    pub const fn aria_label(mut self, label: &'a str) -> Self {
+        self.aria_label = Some(label);
+        self
+    }
+
+    /// Append an extra class to the root `<span>`.
+    #[must_use]
+    pub const fn class(mut self, class: &'a str) -> Self {
+        self.class = Some(class);
+        self
+    }
+}
+
+/// Render a small semantic status pill.
+///
+/// Emits `<span class="badge badge--<variant>">label</span>`. The label is
+/// text content (screen-reader legible) and HTML-escaped by Maud; color is
+/// never the sole signal. Style the `.badge` / `.badge--*` classes via the
+/// framework stylesheet — no inline styles are emitted.
+///
+/// For a tooltip / accessible name on an abbreviated label, use
+/// [`badge_with`] with [`BadgeConfig::title`] / [`BadgeConfig::aria_label`].
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_web::widgets::{badge, BadgeVariant, Column, DataTableConfig, data_table};
+/// use maud::html;
+///
+/// // Inline in a template — color chosen deterministically from the value:
+/// let pill = badge("published", BadgeVariant::for_label("published"));
+/// assert!(pill.into_string().contains(r#"class="badge badge--success""#));
+///
+/// // Inside a `data_table` cell:
+/// struct Post { title: String, status: String }
+/// let posts = vec![Post { title: "Hi".into(), status: "draft".into() }];
+/// let cols: Vec<Column<Post>> = vec![
+///     Column::new("Title",  |p: &Post| html! { (p.title.as_str()) }),
+///     Column::new("Status", |p: &Post| badge(&p.status, BadgeVariant::for_label(&p.status))),
+/// ];
+/// let table = data_table(&posts, &cols, &DataTableConfig::new("No posts.")).into_string();
+/// assert!(table.contains("badge--warning")); // "draft" → Warning
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn badge(label: &str, variant: BadgeVariant) -> maud::Markup {
+    badge_with(label, variant, &BadgeConfig::new())
+}
+
+/// Render a status pill with a [`BadgeConfig`] (tooltip / `aria-label` / extra
+/// class). See [`badge`] for the common case.
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn badge_with(label: &str, variant: BadgeVariant, config: &BadgeConfig<'_>) -> maud::Markup {
+    let root = merge_class(&format!("badge badge--{}", variant.as_str()), config.class);
+    maud::html! {
+        span class=(root) title=[config.title] aria-label=[config.aria_label] { (label) }
+    }
+}
+
+/// Render a neutral status pill in one call — shorthand for the common
+/// "just show this value as a badge" case.
+///
+/// Equivalent to `badge(label, BadgeVariant::Neutral)`. For a color chosen from
+/// the value, use `badge(label, BadgeVariant::for_label(label))`.
+///
+/// The admin plugin's hand-rolled `badge badge-{op}` audit-log spans are the
+/// migration target for this helper; the `.badge` class contract here is a
+/// superset that can replace them.
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn status_tag(label: &str) -> maud::Markup {
+    badge(label, BadgeVariant::Neutral)
+}
+
+// ── avatar (#1263) ──────────────────────────────────────────────────────────
+
+/// Named avatar size. Each maps to a fixed, square pixel dimension.
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AvatarSize {
+    /// 24×24 — inline with text, dense lists.
+    Small,
+    /// 40×40 — the default, member rows and nav bars.
+    #[default]
+    Medium,
+    /// 64×64 — profile headers.
+    Large,
+}
+
+#[cfg(feature = "maud")]
+impl AvatarSize {
+    /// The square edge length in CSS pixels.
+    #[must_use]
+    pub const fn px(self) -> u32 {
+        match self {
+            Self::Small => 24,
+            Self::Medium => 40,
+            Self::Large => 64,
+        }
+    }
+
+    /// The size modifier class.
+    const fn class(self) -> &'static str {
+        match self {
+            Self::Small => "autumn-avatar--sm",
+            Self::Medium => "autumn-avatar--md",
+            Self::Large => "autumn-avatar--lg",
+        }
+    }
+}
+
+/// Rendering options for [`avatar`].
+///
+/// Build with [`AvatarConfig::new`] and chain the setters. With no image URL,
+/// [`avatar`] renders a deterministic colored-initials badge instead.
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone, Default)]
+pub struct AvatarConfig<'a> {
+    image_url: Option<&'a str>,
+    size: AvatarSize,
+    class: Option<&'a str>,
+}
+
+#[cfg(feature = "maud")]
+impl<'a> AvatarConfig<'a> {
+    /// A default config: no image (initials fallback), [`AvatarSize::Medium`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the image URL. An empty/whitespace-only URL is treated as absent
+    /// (falls back to initials), so a `Some("")` from the database never
+    /// renders a broken image.
+    #[must_use]
+    pub const fn image(mut self, url: &'a str) -> Self {
+        self.image_url = Some(url);
+        self
+    }
+
+    /// Set the avatar size (default [`AvatarSize::Medium`]).
+    #[must_use]
+    pub const fn size(mut self, size: AvatarSize) -> Self {
+        self.size = size;
+        self
+    }
+
+    /// Append an extra class to the root element.
+    #[must_use]
+    pub const fn class(mut self, class: &'a str) -> Self {
+        self.class = Some(class);
+        self
+    }
+}
+
+/// Derive 1–2 uppercase initials from a display name.
+///
+/// `"Ada Lovelace"` → `"AL"`, `"cher"` → `"C"`, `"  José  "` → `"J"`. Unicode
+/// safe (uppercases the first *character*, not byte) and never panics: an
+/// empty or whitespace-only name yields a neutral placeholder glyph.
+#[cfg(feature = "maud")]
+fn avatar_initials(name: &str) -> String {
+    let words: Vec<&str> = name.split_whitespace().collect();
+    let first_char = |w: &str| w.chars().next();
+    match words.as_slice() {
+        [] => "?".to_string(),
+        [only] => {
+            first_char(only).map_or_else(|| "?".to_string(), |c| c.to_uppercase().to_string())
+        }
+        [first, .., last] => match (first_char(first), first_char(last)) {
+            (Some(a), Some(b)) => format!("{}{}", a.to_uppercase(), b.to_uppercase()),
+            _ => "?".to_string(),
+        },
+    }
+}
+
+/// The deterministic avatar background-color palette. Each entry is a CSS class
+/// (backed by a rule in the widget stylesheet) rather than an inline color, so
+/// the per-name color survives a nonce-based Content-Security-Policy — which
+/// forbids inline `style` attributes (`style-src` gains a nonce and drops
+/// `'unsafe-inline'`; nonces cover `<style>` elements, not attribute styles).
+#[cfg(feature = "maud")]
+const AVATAR_PALETTE: [&str; 12] = [
+    "autumn-avatar--c0",
+    "autumn-avatar--c1",
+    "autumn-avatar--c2",
+    "autumn-avatar--c3",
+    "autumn-avatar--c4",
+    "autumn-avatar--c5",
+    "autumn-avatar--c6",
+    "autumn-avatar--c7",
+    "autumn-avatar--c8",
+    "autumn-avatar--c9",
+    "autumn-avatar--c10",
+    "autumn-avatar--c11",
+];
+
+/// Deterministic background-color class for a name's initials badge. The same
+/// name always yields the same class across renders/machines, and the color is
+/// applied via the stylesheet (no inline `style` attribute) so it is not
+/// stripped by a nonce-based CSP.
+#[cfg(feature = "maud")]
+fn avatar_palette_class(name: &str) -> &'static str {
+    // `% 12` (a literal) keeps the index in range without a truncating `usize`
+    // cast; the assertion keeps the literal in sync with the palette length.
+    const _: () = assert!(AVATAR_PALETTE.len() == 12);
+    AVATAR_PALETTE[(fnv1a_hash(name.trim()) % 12) as usize]
+}
+
+/// Render a person's avatar: an image when one is supplied, or a deterministic
+/// colored-initials badge when it isn't.
+///
+/// * **Image branch** — `<img>` with the given `src`, a non-empty `alt` derived
+///   from `name`, `loading="lazy"`, and square `width`/`height` for the chosen
+///   size (no layout shift).
+/// * **Initials branch** — a square badge with 1–2 uppercase initials and a
+///   background color chosen deterministically from `name` (via a stable
+///   `autumn-avatar--cN` palette class), so the same person always gets the
+///   same color and there is never a broken-image request.
+///
+/// Both `name` and the image URL are HTML-escaped by Maud (no XSS via a crafted
+/// display name). All output carries `autumn-avatar*` classes backed by the
+/// framework stylesheet and emits **no inline `style` attribute** — the per-name
+/// color is a palette class, so it survives a nonce-based Content-Security-Policy
+/// that forbids inline styles.
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_web::widgets::{avatar, AvatarConfig, AvatarSize};
+/// use maud::html;
+///
+/// // A member row: avatar + name.
+/// let row = html! {
+///     div class="member" {
+///         (avatar("Ada Lovelace", &AvatarConfig::new().size(AvatarSize::Small)))
+///         span { "Ada Lovelace" }
+///     }
+/// };
+/// let out = row.into_string();
+/// assert!(out.contains("autumn-avatar--initials")); // no image → initials
+/// assert!(out.contains(">AL<"));                      // deterministic initials
+///
+/// // With an image:
+/// let img = avatar("Ada", &AvatarConfig::new().image("/u/ada.png")).into_string();
+/// assert!(img.contains(r#"loading="lazy""#));
+/// assert!(img.contains(r#"alt="Ada""#));
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn avatar(name: &str, config: &AvatarConfig<'_>) -> maud::Markup {
+    let px = config.size.px();
+    let size_class = config.size.class();
+    let alt = if name.trim().is_empty() {
+        "avatar".to_string()
+    } else {
+        name.to_string()
+    };
+    match config.image_url {
+        Some(url) if !url.trim().is_empty() => {
+            let root = merge_class(
+                &format!("autumn-avatar autumn-avatar--image {size_class}"),
+                config.class,
+            );
+            maud::html! {
+                img class=(root) src=(url) alt=(alt)
+                    loading="lazy" width=(px) height=(px);
+            }
+        }
+        _ => {
+            let palette = avatar_palette_class(name);
+            let root = merge_class(
+                &format!("autumn-avatar autumn-avatar--initials {size_class} {palette}"),
+                config.class,
+            );
+            maud::html! {
+                span class=(root) role="img" aria-label=(alt) title=(alt) {
+                    span class="autumn-avatar__initials" aria-hidden="true" { (avatar_initials(name)) }
+                }
+            }
+        }
+    }
+}
+
+// ── alert / callout (#1314) ─────────────────────────────────────────────────
+
+/// Semantic variant for an [`alert`] / [`error_summary`] callout.
+///
+/// Names match the flash levels (`info`/`success`/`warning`/`error`) so both
+/// share one stylesheet. `Error`/`Warning` render `role="alert"`;
+/// `Info`/`Success` render `role="status"`.
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AlertVariant {
+    /// Neutral information (blue). The default.
+    #[default]
+    Info,
+    /// Positive confirmation (green).
+    Success,
+    /// Something needs attention (amber).
+    Warning,
+    /// Something went wrong (red).
+    Error,
+}
+
+#[cfg(feature = "maud")]
+impl AlertVariant {
+    /// The variant name as a lowercase string (matches the CSS class suffix and
+    /// the flash-level names).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Info => "info",
+            Self::Success => "success",
+            Self::Warning => "warning",
+            Self::Error => "error",
+        }
+    }
+
+    /// The ARIA live-region role: `alert` for error/warning (assertive),
+    /// `status` for info/success (polite).
+    const fn role(self) -> &'static str {
+        match self {
+            Self::Error | Self::Warning => "alert",
+            Self::Info | Self::Success => "status",
+        }
+    }
+
+    /// A decorative inline-SVG icon for this variant (no icon-font dependency).
+    fn icon(self) -> maud::Markup {
+        let glyph = match self {
+            Self::Info => "i",
+            Self::Success => "✓",
+            Self::Warning => "!",
+            Self::Error => "×",
+        };
+        maud::html! {
+            svg class="alert__icon-svg" viewBox="0 0 20 20" width="20" height="20"
+                aria-hidden="true" focusable="false" {
+                circle cx="10" cy="10" r="10" fill="currentColor" {}
+                text x="10" y="15" text-anchor="middle" font-size="13"
+                    font-family="sans-serif" fill="#fff" { (glyph) }
+            }
+        }
+    }
+}
+
+/// Builder options for [`alert_with`].
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone, Default)]
+pub struct AlertConfig<'a> {
+    title: Option<&'a str>,
+    icon: bool,
+    dismissible: bool,
+    class: Option<&'a str>,
+}
+
+#[cfg(feature = "maud")]
+impl<'a> AlertConfig<'a> {
+    /// A default config: no title, no icon, not dismissible.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set a heading rendered above the body (an `<h2 class="alert__title">`).
+    #[must_use]
+    pub const fn title(mut self, title: &'a str) -> Self {
+        self.title = Some(title);
+        self
+    }
+
+    /// Render the variant's leading inline-SVG icon.
+    #[must_use]
+    pub const fn icon(mut self, show: bool) -> Self {
+        self.icon = show;
+        self
+    }
+
+    /// Render a no-JavaScript dismiss control (a `<label>`-wrapped hidden
+    /// checkbox; the stylesheet's `:has()` rule hides the alert when checked).
+    /// When omitted, no close control and no JS are emitted.
+    #[must_use]
+    pub const fn dismissible(mut self, yes: bool) -> Self {
+        self.dismissible = yes;
+        self
+    }
+
+    /// Append an extra class to the root element.
+    #[must_use]
+    pub const fn class(mut self, class: &'a str) -> Self {
+        self.class = Some(class);
+        self
+    }
+}
+
+/// Render an inline, block-level contextual message box.
+///
+/// Emits `<div class="alert alert-<variant>" role="...">` wrapping `body`.
+/// `role` is `alert` for `Error`/`Warning`, `status` for `Info`/`Success`. All
+/// caller-supplied markup is escaped by Maud. No inline `style=` is emitted and
+/// no JavaScript is required. For a title, icon, or dismiss control use
+/// [`alert_with`].
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_web::widgets::{alert, AlertVariant};
+/// use maud::html;
+///
+/// let box_ = alert(AlertVariant::Info, html! { "No posts yet — create your first one." });
+/// let out = box_.into_string();
+/// assert!(out.contains(r#"class="alert alert-info""#));
+/// assert!(out.contains(r#"role="status""#));
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn alert(variant: AlertVariant, body: maud::Markup) -> maud::Markup {
+    alert_with(variant, body, &AlertConfig::new())
+}
+
+/// Render an alert with a [`AlertConfig`] (title, icon, dismiss control).
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_web::widgets::{alert_with, AlertConfig, AlertVariant};
+/// use maud::html;
+///
+/// let out = alert_with(
+///     AlertVariant::Error,
+///     html! { "Your card was declined." },
+///     &AlertConfig::new().title("Payment failed").icon(true).dismissible(true),
+/// )
+/// .into_string();
+/// assert!(out.contains(r#"role="alert""#));
+/// assert!(out.contains(r#"<h2 class="alert__title">Payment failed</h2>"#));
+/// assert!(out.contains("alert__dismiss"));
+/// assert!(!out.contains("<script")); // no JS
+/// ```
+// `body` is taken by value to match the issue's `alert(variant, body: Markup)`
+// signature and keep `alert(v, html! { .. })` ergonomic (no `&` at the call
+// site); Maud renders it by reference, hence the allow.
+#[cfg(feature = "maud")]
+#[must_use]
+#[allow(clippy::needless_pass_by_value)]
+pub fn alert_with(
+    variant: AlertVariant,
+    body: maud::Markup,
+    config: &AlertConfig<'_>,
+) -> maud::Markup {
+    let root = merge_class(&format!("alert alert-{}", variant.as_str()), config.class);
+    maud::html! {
+        div class=(root) role=(variant.role()) {
+            @if config.icon {
+                span class="alert__icon" { (variant.icon()) }
+            }
+            div class="alert__content" {
+                @if let Some(title) = config.title {
+                    (heading(HeadingLevel::H2, None, "alert__title", &maud::html! { (title) }))
+                }
+                div class="alert__body" { (body) }
+            }
+            @if config.dismissible {
+                // The checkbox stays in tab order (visually hidden but focusable
+                // via `.alert__dismiss-toggle`, never `hidden`/`display:none`) so
+                // keyboard and screen-reader users can dismiss; the accessible
+                // name is on the control itself.
+                label class="alert__dismiss" {
+                    input type="checkbox" class="alert__dismiss-toggle"
+                        aria-label="Dismiss this message";
+                    span aria-hidden="true" { "×" }
+                }
+            }
+        }
+    }
+}
+
+/// Render an [`AlertVariant::Error`] alert summarizing every field error in a
+/// [`Changeset`](crate::form::Changeset), or `None` when the changeset is valid.
+///
+/// The messages are listed in a `<ul>` in a stable (sorted) order — directly
+/// usable at the top of a re-rendered form. Each message is HTML-escaped.
+///
+/// # Example
+///
+/// ```rust
+/// use std::collections::HashMap;
+/// use autumn_web::form::Changeset;
+/// use autumn_web::widgets::error_summary;
+///
+/// let valid = Changeset::new(());
+/// assert!(error_summary(&valid).is_none());
+///
+/// let mut errs = HashMap::new();
+/// errs.insert("email".to_string(), vec!["is invalid".to_string()]);
+/// errs.insert("name".to_string(), vec!["must be <set>".to_string()]);
+/// let invalid = Changeset::from_errors((), errs);
+/// let out = error_summary(&invalid).unwrap().into_string();
+/// assert!(out.contains(r#"class="alert alert-error""#));
+/// assert!(out.contains("<ul"));
+/// assert!(out.contains("is invalid"));
+/// assert!(out.contains("must be &lt;set&gt;")); // caller text escaped
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn error_summary<T>(changeset: &crate::form::Changeset<T>) -> Option<maud::Markup> {
+    if changeset.is_valid() {
+        return None;
+    }
+    // Stable order: sort by (field, message) so the summary is deterministic.
+    let mut messages: Vec<&str> = Vec::new();
+    let mut fields: Vec<&String> = changeset.all_errors().keys().collect();
+    fields.sort();
+    for field in fields {
+        for msg in &changeset.all_errors()[field] {
+            messages.push(msg.as_str());
+        }
+    }
+    let body = maud::html! {
+        ul class="alert__errors" {
+            @for msg in &messages {
+                li { (msg) }
+            }
+        }
+    };
+    Some(alert_with(
+        AlertVariant::Error,
+        body,
+        &AlertConfig::new()
+            .title("Please fix the following errors")
+            .icon(true),
+    ))
+}
+
+// ── toast / toast_region (#1320) ────────────────────────────────────────────
+
+/// The default id for the [`toast_region`] container, and the OOB target
+/// [`toast`] appends into.
+///
+/// Drop `toast_region(DEFAULT_TOAST_REGION_ID)` once in your base layout;
+/// `toast(msg, variant)` then appends into it out-of-band.
+pub const DEFAULT_TOAST_REGION_ID: &str = "toast-region";
+
+/// Render the persistent, fixed-position live region that toasts append into.
+///
+/// Drop this **once** into your base layout (typically just before `</body>`)
+/// and leave it in place: it is an **empty, persistent `aria-live="polite"`
+/// region**. Appending a toast into an already-in-DOM live region is announced
+/// reliably by screen readers, whereas inserting an already-populated
+/// `aria-live` element is not — which is why the politeness lives here, on the
+/// region, rather than on each non-error toast. `aria-atomic="false"` (and no
+/// `role="status"`, which would imply `aria-atomic="true"`) means only the
+/// newly-appended toast is announced, not every toast still on screen. Position
+/// and stacking come from the shipped `.autumn-toast-region` rule — no inline
+/// styles.
+///
+/// Non-error toasts inherit this region's politeness; error toasts announce
+/// assertively on their own via `role="alert"`. Use [`DEFAULT_TOAST_REGION_ID`]
+/// unless you need more than one region; a custom id must be paired with
+/// [`toast_in`] so the OOB target matches.
+///
+/// # CSS hooks
+///
+/// | Selector | Element |
+/// |---|---|
+/// | `.autumn-toast-region` | Fixed-position, persistent polite live region |
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_web::widgets::{toast_region, DEFAULT_TOAST_REGION_ID};
+///
+/// let html = toast_region(DEFAULT_TOAST_REGION_ID).into_string();
+/// assert!(html.contains(r#"id="toast-region""#));
+/// assert!(html.contains(r#"class="autumn-toast-region""#));
+/// assert!(html.contains(r#"aria-live="polite""#));   // persistent live region
+/// assert!(html.contains(r#"aria-atomic="false""#));  // announce only new toasts
+/// assert!(!html.contains(r#"role="status""#));       // role=status implies atomic
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn toast_region(id: &str) -> maud::Markup {
+    // Accept either a bare id or a `#selector` (a natural caller slip); strip a
+    // leading `#` so the element id is always bare, matching the id that
+    // `toast_in`'s `beforeend:#…` OOB target points at.
+    let id = selector_to_id(id);
+    // The region is a PERSISTENT polite live region: a `role="status"`/
+    // `aria-live="polite"` element inserted already-populated is not reliably
+    // announced, so instead this empty region lives in the layout and toasts are
+    // appended into it (screen readers announce the mutation). `aria-atomic` is
+    // explicitly `false` so only the newly-appended toast is read, not every
+    // toast currently in the region — and `role="status"` is deliberately NOT
+    // used because it implies `aria-atomic="true"`, which would re-announce all
+    // of them. Non-error toasts inherit this politeness (they carry no own
+    // `aria-live`); error toasts announce assertively on their own.
+    maud::html! {
+        div id=(id) class="autumn-toast-region" aria-live="polite" aria-atomic="false" {}
+    }
+}
+
+/// Render a single transient toast that appends into the default toast region
+/// out-of-band, for htmx action feedback.
+///
+/// This is the common case: it targets [`DEFAULT_TOAST_REGION_ID`]. Drop
+/// [`toast_region`] once in your layout, then return this alongside your normal
+/// swapped fragment from an htmx handler; htmx appends it into the region via
+/// `hx-swap-oob="beforeend:#toast-region"` — no full page reload, no
+/// JavaScript. Auto-dismiss is CSS-only (a `@keyframes` fade in the shipped
+/// stylesheet); the widget emits **no `<script>`**.
+///
+/// `variant` reuses the shared [`AlertVariant`] semantic enum (the alert/badge
+/// color lane) — no new color vocabulary. **Accessibility:** `Error` toasts
+/// announce assertively on their own (`role="alert"`, `aria-live="assertive"`),
+/// which is reliably read on insertion; all other variants carry **no own
+/// `role`/`aria-live`** and instead inherit the persistent
+/// `aria-live="polite"` of the [`toast_region`] they're appended into (an
+/// already-populated polite element inserted fresh is otherwise not reliably
+/// announced). Every toast carries `aria-atomic="true"` so its message is read
+/// as one unit. The message is HTML-escaped by Maud.
+///
+/// Use [`toast_in`] instead when you rendered [`toast_region`] with a custom id.
+///
+/// # CSS hooks
+///
+/// | Selector | Element |
+/// |---|---|
+/// | `.autumn-toast` | Root toast (carries the auto-dismiss animation) |
+/// | `.autumn-toast--<variant>` | Per-variant accent (`success`/`info`/`warning`/`error`) |
+/// | `.autumn-toast__message` | The message text |
+///
+/// # Example: end-to-end htmx recipe
+///
+/// ```rust
+/// use autumn_web::widgets::{toast, toast_region, AlertVariant, DEFAULT_TOAST_REGION_ID};
+/// use maud::html;
+///
+/// // 1. Once, in your base layout (before `</body>`) — the persistent live region:
+/// //    (toast_region(DEFAULT_TOAST_REGION_ID))
+/// let layout = toast_region(DEFAULT_TOAST_REGION_ID).into_string();
+/// assert!(layout.contains(r#"id="toast-region""#));
+/// assert!(layout.contains(r#"aria-live="polite""#));  // politeness lives here
+///
+/// // 2. From an htmx create/update/delete handler, return the toast next to
+/// //    your swapped fragment — htmx appends it into the region OOB:
+/// let response = html! {
+///     (toast("Saved", AlertVariant::Success))   // hx-swap-oob append
+///     tr id="row-42" { td { "…updated row…" } } // your normal swap
+/// };
+/// let out = response.into_string();
+/// assert!(out.contains(r##"hx-swap-oob="beforeend:#toast-region""##));
+/// // A non-error toast inherits the region's politeness: no own role/aria-live,
+/// // but it is atomic so its message is announced as one unit.
+/// assert!(out.contains(r#"aria-atomic="true""#));
+/// assert!(!out.contains(r#"role="status""#));
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn toast(message: &str, variant: AlertVariant) -> maud::Markup {
+    toast_in(DEFAULT_TOAST_REGION_ID, message, variant)
+}
+
+/// Like [`toast`], but appends into a region with a caller-chosen id.
+///
+/// Use this when your layout renders [`toast_region`] with an id other than
+/// [`DEFAULT_TOAST_REGION_ID`] (e.g. separate top/bottom regions). The emitted
+/// `hx-swap-oob="beforeend:#<region_id>"` targets that region. `region_id` is
+/// HTML-escaped in the attribute like every other caller value.
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_web::widgets::{toast_in, AlertVariant};
+///
+/// let out = toast_in("top-toasts", "Uploaded", AlertVariant::Info).into_string();
+/// assert!(out.contains(r##"hx-swap-oob="beforeend:#top-toasts""##));
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn toast_in(region_id: &str, message: &str, variant: AlertVariant) -> maud::Markup {
+    // Error toasts announce assertively on their own — `role="alert"` elements
+    // ARE reliably announced on insertion, so they don't depend on the
+    // persistent region. Non-error toasts carry NO `role`/`aria-live`: they
+    // inherit the `aria-live="polite"` of the `toast_region` they're appended
+    // into (a freshly-inserted, already-populated polite element is otherwise
+    // not reliably announced). Every toast keeps `aria-atomic="true"` so its
+    // message is read as one unit.
+    let (role, live): (Option<&str>, Option<&str>) = match variant {
+        AlertVariant::Error => (Some("alert"), Some("assertive")),
+        AlertVariant::Info | AlertVariant::Success | AlertVariant::Warning => (None, None),
+    };
+    let class = format!("autumn-toast autumn-toast--{}", variant.as_str());
+    // Accept a bare id or a `#selector`; strip one leading `#` so a caller
+    // passing `"#toast-region"` doesn't produce an invalid `beforeend:##…`.
+    let region_id = selector_to_id(region_id);
+    let oob = format!("beforeend:#{region_id}");
+    // For a POSITIONAL OOB swap (`beforeend:#…`) htmx inserts the carrier's
+    // *children* into the target and discards the carrier itself, so the carrier
+    // must be a plain, discardable `<div>` — NOT a `<template>`.
+    //
+    // Authority — vendored htmx 2.0.4 (`vendor/htmx.min.js`):
+    //   * `oobSwap` (minified `He`): for a non-outerHTML style it swaps
+    //     `f(clone)`, i.e. the *carrier element* (`f` returns the element as-is),
+    //     then `_e("beforeend", …)` → `Be` → `a`, whose insert loop is
+    //     `while(n.childNodes.length>0)` — it iterates the carrier's `childNodes`.
+    //   * The response OOB scan `ze` matches a top-level `<template hx-swap-oob=…>`
+    //     (`parentElement===null`), so the template is processed as the carrier
+    //     itself, not unwrapped. A `<template>` keeps its children in `.content`,
+    //     so `template.childNodes` is EMPTY → htmx appends nothing and the toast
+    //     never shows. (The template-content rescan only helps when `hx-swap-oob`
+    //     sits on a CHILD *inside* `.content`, which is not this positional case.)
+    //
+    // This mirrors the repo's own tested SSE convention in `channels.rs` (see the
+    // passing `broadcast_publish_oob_custom_strategy` test →
+    // `<div hx-swap-oob="beforeend:#badge"><span>3</span></div>`). The styled/ARIA
+    // `.autumn-toast` element stays the carrier's CHILD; putting `hx-swap-oob`
+    // directly on it would throw the wrapper away and append only the inner
+    // `<span>`.
+    maud::html! {
+        div hx-swap-oob=(oob) {
+            div class=(class) role=[role] aria-live=[live] aria-atomic="true" {
+                span class="autumn-toast__message" { (message) }
+            }
+        }
+    }
+}
+
+// ── infinite_feed (#1372) ───────────────────────────────────────────────────
+
+/// How the continuation control of an [`infinite_feed`] loads the next page.
+///
+/// Both modes replace the sentinel with the next page's fragment (its items
+/// plus a fresh sentinel), so appends never duplicate already-rendered rows.
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FeedMode {
+    /// Auto-load when the sentinel scrolls into view, and also on a manual
+    /// click of the visible link (`hx-trigger="revealed, click"`). The classic
+    /// infinite scroll. This is the default.
+    #[default]
+    Reveal,
+    /// Require an explicit click on the keyboard-focusable "Load more" control
+    /// (htmx's default `click` trigger); nothing loads until the user asks.
+    Button,
+}
+
+/// Configuration for [`infinite_feed`] / [`feed_page`].
+///
+/// Build with [`FeedConfig::new`] and chain setters. `url` is the partial
+/// handler that returns the next page fragment; the next cursor is appended to
+/// it as a query parameter (`?cursor=…` by default).
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_web::widgets::{FeedConfig, FeedMode};
+///
+/// let config = FeedConfig::new("/posts/feed")
+///     .mode(FeedMode::Button)
+///     .load_more_label("Show more posts");
+/// assert_eq!(config.cursor_param, "cursor");
+/// ```
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone)]
+pub struct FeedConfig<'a> {
+    /// URL of the partial handler that returns the next page fragment.
+    pub url: &'a str,
+    /// How the continuation control loads (default [`FeedMode::Reveal`]).
+    pub mode: FeedMode,
+    /// Query-parameter name carrying the cursor token (default `"cursor"`).
+    pub cursor_param: &'a str,
+    /// Visible label / accessible name of the continuation control
+    /// (default `"Load more"`).
+    pub load_more_label: &'a str,
+}
+
+#[cfg(feature = "maud")]
+impl<'a> FeedConfig<'a> {
+    /// Start a config for the partial handler at `url` with sensible defaults
+    /// (reveal mode, `cursor` param, "Load more" label).
+    #[must_use]
+    pub const fn new(url: &'a str) -> Self {
+        Self {
+            url,
+            mode: FeedMode::Reveal,
+            cursor_param: "cursor",
+            load_more_label: "Load more",
+        }
+    }
+
+    /// Set the load [`FeedMode`].
+    #[must_use]
+    pub const fn mode(mut self, mode: FeedMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    /// Shorthand for `.mode(FeedMode::Button)`.
+    #[must_use]
+    pub const fn button(mut self) -> Self {
+        self.mode = FeedMode::Button;
+        self
+    }
+
+    /// Override the cursor query-parameter name (default `"cursor"`).
+    #[must_use]
+    pub const fn cursor_param(mut self, param: &'a str) -> Self {
+        self.cursor_param = param;
+        self
+    }
+
+    /// Override the continuation control's label (default `"Load more"`).
+    #[must_use]
+    pub const fn load_more_label(mut self, label: &'a str) -> Self {
+        self.load_more_label = label;
+        self
+    }
+}
+
+/// Percent-encode a query-string component (param name or value).
+///
+/// Cursor tokens produced by [`CursorPage`](crate::pagination::CursorPage) are
+/// URL-safe base64 (signed cursors add a `.`-delimited signature, also
+/// URL-safe), but [`infinite_feed`]/[`feed_page`] accept an arbitrary
+/// `Option<&str>`, so a token containing `&`, `#`, `=`, `+`, or a space must be
+/// encoded to avoid corrupting the query string or injecting extra params. The
+/// unreserved set (`A–Z a–z 0–9 - _ . ~`) — which covers every real cursor —
+/// passes through unchanged.
+#[cfg(feature = "maud")]
+fn encode_query_component(value: &str) -> String {
+    use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
+    // Everything outside the RFC 3986 unreserved set.
+    const QUERY_COMPONENT: &AsciiSet = &CONTROLS
+        .add(b' ')
+        .add(b'"')
+        .add(b'#')
+        .add(b'%')
+        .add(b'&')
+        .add(b'+')
+        .add(b'/')
+        .add(b';')
+        .add(b'=')
+        .add(b'?')
+        .add(b'@')
+        .add(b'[')
+        .add(b'\\')
+        .add(b']')
+        .add(b'^')
+        .add(b'`')
+        .add(b'{')
+        .add(b'|')
+        .add(b'}')
+        .add(b'<')
+        .add(b'>');
+    utf8_percent_encode(value, QUERY_COMPONENT).to_string()
+}
+
+/// Build the next-page URL by appending `?<cursor_param>=<cursor>` to the config
+/// URL (using `&` if it already has a query string), with both the param name
+/// and the cursor percent-encoded via [`encode_query_component`]. Any existing
+/// `#fragment` is preserved after the query (the query must precede it). Maud
+/// additionally HTML-escapes the whole value in the attribute.
+#[cfg(feature = "maud")]
+fn feed_next_url(config: &FeedConfig<'_>, cursor: &str) -> String {
+    // The query must go before any `#fragment`.
+    let (base, fragment) = match config.url.split_once('#') {
+        Some((base, frag)) => (base, Some(frag)),
+        None => (config.url, None),
+    };
+    let sep = if base.contains('?') { '&' } else { '?' };
+    let param = encode_query_component(config.cursor_param);
+    let value = encode_query_component(cursor);
+    let mut url = format!("{base}{sep}{param}={value}");
+    if let Some(frag) = fragment {
+        url.push('#');
+        url.push_str(frag);
+    }
+    url
+}
+
+/// Render the continuation sentinel for a `next_cursor`.
+///
+/// A single control that is BOTH a progressive-enhancement `<a href>` to the
+/// next-cursor URL (works with htmx/JS unavailable) AND htmx-wired to fetch
+/// that URL and replace the whole sentinel (`hx-swap="outerHTML"`, targeting
+/// the closest `.autumn-feed__sentinel`) with the returned fragment. In
+/// [`FeedMode::Reveal`] it fires on `revealed, click` — auto-loading when
+/// scrolled into view, but also swapping in place (rather than navigating to
+/// the bare partial) if a user activates the visible link first; in
+/// [`FeedMode::Button`] it uses htmx's default `click` trigger. htmx
+/// `preventDefault`s the anchor navigation whenever it handles the trigger, so
+/// the `<a href>` stays a pure no-JS fallback.
+#[cfg(feature = "maud")]
+fn feed_sentinel(next_cursor: &str, config: &FeedConfig<'_>) -> maud::Markup {
+    let next_url = feed_next_url(config, next_cursor);
+    let trigger = match config.mode {
+        // Include `click` so a user activating the visible "Load more" link
+        // before `revealed` fires swaps in place instead of following `href`.
+        FeedMode::Reveal => Some("revealed, click"),
+        FeedMode::Button => None,
+    };
+    maud::html! {
+        div class="autumn-feed__sentinel" {
+            a class="autumn-feed__more" href=(next_url)
+                hx-get=(next_url) hx-target="closest .autumn-feed__sentinel"
+                hx-swap="outerHTML" hx-trigger=[trigger] {
+                (config.load_more_label)
+            }
+        }
+    }
+}
+
+/// Render just the next-page fragment: the already-rendered `items` followed by
+/// a fresh sentinel (only when `next_cursor` is `Some`).
+///
+/// This is the companion helper a handler returns for **each append** — and it
+/// is exactly what [`infinite_feed`] wraps for the initial view, so one partial
+/// serves both. Because the sentinel swaps itself via `outerHTML`, returning
+/// `items + new sentinel` inserts the new rows where the old sentinel was and
+/// re-arms the loop; when `next_cursor` is `None` no sentinel is emitted, so no
+/// further request fires (the feed terminates cleanly).
+///
+/// `items` is caller-rendered [`Markup`](maud::Markup) (already escaped by your
+/// own Maud); pass the cursor from
+/// [`CursorPage::next_cursor`](crate::pagination::CursorPage) via `.as_deref()`.
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_web::widgets::{feed_page, FeedConfig};
+/// use maud::html;
+///
+/// let items = html! { article { "row 1" } article { "row 2" } };
+/// let config = FeedConfig::new("/feed");
+/// // Middle page: has a next cursor → emits a sentinel.
+/// let more = feed_page(items, Some("eyJpZCI6Mn0"), &config).into_string();
+/// assert!(more.contains("autumn-feed__sentinel"));
+/// assert!(more.contains(r##"hx-get="/feed?cursor=eyJpZCI6Mn0""##));
+///
+/// // Last page: no next cursor → no sentinel, no further request.
+/// let last = feed_page(html! { article { "row 3" } }, None, &config).into_string();
+/// assert!(!last.contains("autumn-feed__sentinel"));
+/// ```
+// `items` is taken by value to keep `feed_page(html! { .. }, ..)` ergonomic (no
+// `&` at the call site, matching `alert`); Maud renders it by reference, hence
+// the allow.
+#[cfg(feature = "maud")]
+#[must_use]
+#[allow(clippy::needless_pass_by_value)]
+pub fn feed_page(
+    items: maud::Markup,
+    next_cursor: Option<&str>,
+    config: &FeedConfig<'_>,
+) -> maud::Markup {
+    maud::html! {
+        (items)
+        @if let Some(cursor) = next_cursor {
+            (feed_sentinel(cursor, config))
+        }
+    }
+}
+
+/// Render an htmx infinite-scroll / "Load more" feed for a cursor-paginated
+/// list: a `.autumn-feed` container holding the rendered `items` and, when
+/// there is a next page, a continuation sentinel.
+///
+/// Driven by a [`CursorPage`](crate::pagination::CursorPage): pass your rendered
+/// items and `page.next_cursor.as_deref()`. When the cursor is `Some`, the
+/// sentinel issues a single `hx-get` to `config.url` carrying the cursor and
+/// appends the returned fragment in place — no full-page reload, no duplicated
+/// rows (keyset cursors are stable under concurrent inserts). When it is `None`
+/// (`has_next == false`) no sentinel is emitted, so no terminal request fires.
+///
+/// Two modes ([`FeedMode`]): auto-load on reveal, or an explicit,
+/// keyboard-focusable "Load more" control. Either way the control is a real
+/// `<a href>` to the next-cursor URL, so the next page is reachable with
+/// htmx/JS unavailable. The append fragment is produced by [`feed_page`], which
+/// a handler returns for every subsequent page.
+///
+/// # CSS hooks
+///
+/// | Selector | Element |
+/// |---|---|
+/// | `.autumn-feed` | Feed container |
+/// | `.autumn-feed__sentinel` | Continuation sentinel (swapped out on load) |
+/// | `.autumn-feed__more` | The `<a>`/"Load more" control |
+///
+/// # Progressive enhancement caveat
+///
+/// The `<a href>` fallback points at your partial handler (`config.url`), which
+/// normally returns just the next-page *fragment*. With JavaScript off, clicking
+/// it therefore lands on that bare fragment unless the handler detects a
+/// non-htmx request (no `HX-Request` header) and renders a full page for it.
+///
+/// # Example: initial view + append handler
+///
+/// ```rust
+/// use autumn_web::widgets::{infinite_feed, feed_page, FeedConfig, FeedMode};
+/// use autumn_web::pagination::CursorPage;
+/// use maud::html;
+///
+/// // Render each item however you like (this is caller-owned Markup):
+/// fn render(rows: &[&str]) -> maud::Markup {
+///     html! { @for r in rows { article class="post" { (r) } } }
+/// }
+///
+/// // Page 1 (has a next page):
+/// let page = CursorPage { content: vec!["a", "b"], size: 2,
+///     next_cursor: Some("eyJpZCI6Mn0".into()), has_next: true };
+/// let config = FeedConfig::new("/posts/feed").mode(FeedMode::Reveal);
+/// let view = infinite_feed(render(&page.content), page.next_cursor.as_deref(), &config)
+///     .into_string();
+/// assert!(view.contains(r#"class="autumn-feed""#));
+/// assert!(view.contains(r#"hx-trigger="revealed, click""#));
+/// assert!(view.contains(r##"hx-get="/posts/feed?cursor=eyJpZCI6Mn0""##));
+///
+/// // Your `GET /posts/feed?cursor=…` handler returns ONE partial for each
+/// // append — the same fragment shape as above, minus the outer container:
+/// let last = CursorPage::<&str> { content: vec![], size: 2, next_cursor: None, has_next: false };
+/// let append = feed_page(render(&last.content), last.next_cursor.as_deref(), &config)
+///     .into_string();
+/// assert!(!append.contains("autumn-feed__sentinel")); // last page → loop stops
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn infinite_feed(
+    items: maud::Markup,
+    next_cursor: Option<&str>,
+    config: &FeedConfig<'_>,
+) -> maud::Markup {
+    maud::html! {
+        div class="autumn-feed" {
+            (feed_page(items, next_cursor, config))
         }
     }
 }

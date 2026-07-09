@@ -16,7 +16,7 @@ use super::emit::Plan;
 use super::model::validate_resource_name;
 use super::naming::{pascal, snake};
 use super::schema_edit::{add_mod_declaration, ensure_autumn_web_feature, update_main_rs};
-use super::{Flags, GenerateError, ensure_project_root, read_or_empty};
+use super::{GenerateError, ensure_project_root, read_or_empty};
 
 /// Compute the file actions for `autumn generate inbound_mail <name>`.
 ///
@@ -54,6 +54,10 @@ pub fn plan_inbound_mail(project_root: &Path, name: &str) -> Result<Plan, Genera
         mod_path.clone(),
         add_mod_declaration(&read_or_empty(&mod_path), &snake_name),
     );
+    plan.push_revert(crate::generate::emit::Revert::ModDecl {
+        path: mod_path,
+        name: snake_name.clone(),
+    });
 
     // ── tests/<snake>_inbound_mail.rs ──────────────────────────────────────
     plan.create(
@@ -73,15 +77,30 @@ pub fn plan_inbound_mail(project_root: &Path, name: &str) -> Result<Plan, Genera
     })?;
     let with_mods = update_main_rs(&main_existing, &["inbound_mailers"], &[]);
     let updated_main = add_inbound_mail_router_to_app(&with_mods, &module_path);
-    plan.modify(main_path, updated_main);
+    plan.modify(main_path.clone(), updated_main);
+    // `mod inbound_mailers;` is shared infrastructure (see
+    // `emit::SHARED_MAIN_MODULE_NAMES`) — only this handler's own router
+    // registration is reverted here.
+    plan.push_revert(crate::generate::emit::Revert::InboundMailHandler {
+        path: main_path,
+        handler_module_path: module_path,
+    });
 
     // ── Cargo.toml — ensure autumn-web has the "inbound-mailgun" feature ───
     let cargo_path = project_root.join("Cargo.toml");
     let cargo_existing = read_or_empty(&cargo_path);
     let updated_cargo = ensure_autumn_web_feature(&cargo_existing, "inbound-mailgun");
     if updated_cargo != cargo_existing {
-        plan.modify(cargo_path, updated_cargo);
+        plan.modify(cargo_path.clone(), updated_cargo);
     }
+    // Pushed unconditionally — see `plan_cargo_deps`'s matching comment in
+    // model.rs: destroy recomputes this plan against the already-generated
+    // Cargo.toml, where the feature is by definition already present.
+    plan.push_revert(crate::generate::emit::Revert::CargoAutumnWebFeature {
+        path: cargo_path,
+        feature: "inbound-mailgun".to_owned(),
+        owner_dir: Some(project_root.join("src").join("inbound_mailers")),
+    });
 
     Ok(plan)
 }
@@ -330,22 +349,82 @@ fn find_after_routes_call(src: &str) -> Option<usize> {
     None
 }
 
-/// CLI entry point for `autumn generate inbound_mail <name>`.
-pub fn run(name: &str, flags: Flags) {
-    let cwd = match std::env::current_dir() {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("Error: cannot determine current directory: {e}");
-            std::process::exit(1);
-        }
-    };
-    match plan_inbound_mail(&cwd, name).and_then(|p| p.execute(flags)) {
-        Ok(()) => {}
-        Err(e) => {
-            eprintln!("Error: {e}");
-            std::process::exit(1);
-        }
+/// Inverse of the chaining performed by [`add_inbound_mail_router_to_app`]
+/// (`autumn destroy`, issue #1048).
+///
+/// `generate` always inserts the `.inbound_mail_router(...)` call (and any
+/// chained `.handler(...)` calls) on one unbroken text line, but a project
+/// that runs `rustfmt` afterward commonly wraps this particular call across
+/// several lines — it's long, carrying an `.endpoint(...)` config with a
+/// path and an env-var lookup. Line-based removal would then strip only the
+/// line holding `.handler(...)`, leaving the rest of the (now handler-less)
+/// `.inbound_mail_router(...)` call behind (issue #1048 PR review). So this
+/// locates the WHOLE call by balanced-paren scan — regardless of how many
+/// lines it spans — and removes exactly `.handler(<handler_module_path>())`
+/// from within it; if other `.handler(...)` calls remain chained on, the
+/// shortened call is spliced back in place, otherwise this was the only
+/// handler and every full line the call spans is removed.
+///
+/// A no-op if `handler_module_path` isn't currently registered.
+pub(super) fn remove_inbound_mail_handler(existing: &str, handler_module_path: &str) -> String {
+    const ROUTER_CALL: &str = ".inbound_mail_router(";
+    let handler_snippet = format!(".handler({handler_module_path}())");
+    if !existing.contains(&handler_snippet) {
+        return existing.to_owned();
     }
+    let Some(router_pos) = existing.find(ROUTER_CALL) else {
+        return existing.to_owned();
+    };
+    let Some(call_end) = find_balanced_close_paren(existing, router_pos + ROUTER_CALL.len()) else {
+        return existing.to_owned();
+    };
+    let call_text = &existing[router_pos..call_end];
+    if !call_text.contains(&handler_snippet) {
+        return existing.to_owned();
+    }
+    let without_handler = call_text.replacen(handler_snippet.as_str(), "", 1);
+    if without_handler.contains(".handler(") {
+        let mut out = String::with_capacity(existing.len());
+        out.push_str(&existing[..router_pos]);
+        out.push_str(&without_handler);
+        out.push_str(&existing[call_end..]);
+        return out;
+    }
+
+    // No handlers left — remove every full line the call spans, whether
+    // `generate` left it on one line or `rustfmt` later wrapped it.
+    let start_line = existing[..router_pos].rfind('\n').map_or(0, |i| i + 1);
+    let end_line = existing[call_end..]
+        .find('\n')
+        .map_or(existing.len(), |i| call_end + i + 1);
+    let mut out = String::with_capacity(existing.len());
+    out.push_str(&existing[..start_line]);
+    out.push_str(&existing[end_line..]);
+    out
+}
+
+/// Scan forward from `start` (the byte position just after an already-open
+/// `(`, i.e. depth 1) for the matching closing paren, returning the index
+/// just past it. `None` if the parens never balance (malformed/truncated
+/// input — destroy never guesses).
+fn find_balanced_close_paren(src: &str, start: usize) -> Option<usize> {
+    let bytes = src.as_bytes();
+    let mut depth = 1usize;
+    let mut i = start;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 #[cfg(test)]
@@ -380,6 +459,69 @@ async fn main() {
         .await;
 }
 "#
+    }
+
+    #[test]
+    fn generate_then_destroy_round_trips_to_original_project_state() {
+        use crate::generate::Flags;
+
+        let tmp = project_with_main(default_main());
+        let cargo_path = tmp.path().join("Cargo.toml");
+        let main_path = tmp.path().join("src/main.rs");
+        let original_cargo = fs::read_to_string(&cargo_path).unwrap();
+        let original_main = fs::read_to_string(&main_path).unwrap();
+
+        let plan = plan_inbound_mail(tmp.path(), "Replies").unwrap();
+        plan.execute(Flags::default()).unwrap();
+        assert!(tmp.path().join("src/inbound_mailers/replies.rs").exists());
+        assert!(
+            fs::read_to_string(&main_path)
+                .unwrap()
+                .contains(".inbound_mail_router(")
+        );
+        assert!(
+            fs::read_to_string(&cargo_path)
+                .unwrap()
+                .contains("inbound-mailgun")
+        );
+
+        let destroy_plan = plan_inbound_mail(tmp.path(), "Replies").unwrap();
+        destroy_plan.revert(Flags::default()).unwrap();
+
+        assert!(!tmp.path().join("src/inbound_mailers").exists());
+        assert_eq!(fs::read_to_string(&main_path).unwrap(), original_main);
+        assert_eq!(fs::read_to_string(&cargo_path).unwrap(), original_cargo);
+    }
+
+    #[test]
+    fn destroying_one_of_two_inbound_mail_handlers_keeps_the_other_registered() {
+        use crate::generate::Flags;
+
+        let tmp = project_with_main(default_main());
+        let first = plan_inbound_mail(tmp.path(), "Replies").unwrap();
+        first.execute(Flags::default()).unwrap();
+        let second = plan_inbound_mail(tmp.path(), "Bounces").unwrap();
+        second.execute(Flags::default()).unwrap();
+        let main_path = tmp.path().join("src/main.rs");
+        let main_with_both = fs::read_to_string(&main_path).unwrap();
+        assert!(main_with_both.contains("inbound_mailers::replies::replies_handler_info"));
+        assert!(main_with_both.contains("inbound_mailers::bounces::bounces_handler_info"));
+
+        let destroy_replies = plan_inbound_mail(tmp.path(), "Replies").unwrap();
+        destroy_replies.revert(Flags::default()).unwrap();
+
+        assert!(!tmp.path().join("src/inbound_mailers/replies.rs").exists());
+        assert!(tmp.path().join("src/inbound_mailers/bounces.rs").exists());
+        let main_after = fs::read_to_string(&main_path).unwrap();
+        assert!(
+            !main_after.contains("replies_handler_info"),
+            "the destroyed handler's registration must be gone"
+        );
+        assert!(
+            main_after.contains("inbound_mailers::bounces::bounces_handler_info"),
+            "the surviving handler must remain registered — must not remove the whole router"
+        );
+        assert!(main_after.contains(".inbound_mail_router("));
     }
 
     // ── RED: file plan assertions ─────────────────────────────────────────
@@ -549,6 +691,49 @@ async fn main() {
         assert!(
             updated.contains("support_handler_info()"),
             "must chain new handler, got:\n{updated}"
+        );
+    }
+
+    #[test]
+    fn remove_inbound_mail_handler_removes_a_rustfmt_wrapped_router_call() {
+        // rustfmt commonly wraps this call across several lines (it's long:
+        // an .endpoint(...) config with a path and an env-var lookup).
+        // Line-based removal would strip only the `.handler(...)` line and
+        // leave the rest of the (now handler-less) call behind — issue
+        // #1048 PR review.
+        let src = "fn main() {\n    App::new()\n        .routes(routes![index])\n        .inbound_mail_router(\n            ::autumn_web::inbound_mail::InboundMailRouter::new()\n                .endpoint(::autumn_web::inbound_mail::InboundMailEndpointConfig::mailgun(\n                    \"/inbound/mailgun\",\n                    std::env::var(\"MAILGUN_SIGNING_KEY\").unwrap_or_default(),\n                ))\n                .handler(inbound_mailers::replies::replies_handler_info()),\n        )\n        .run()\n}\n";
+        let updated =
+            remove_inbound_mail_handler(src, "inbound_mailers::replies::replies_handler_info");
+        assert!(
+            !updated.contains(".inbound_mail_router("),
+            "the whole call must be removed once its only handler is gone, got:\n{updated}"
+        );
+        assert!(
+            !updated.contains(".handler("),
+            "no dangling .handler( fragment may remain, got:\n{updated}"
+        );
+        assert_eq!(
+            updated,
+            "fn main() {\n    App::new()\n        .routes(routes![index])\n        .run()\n}\n"
+        );
+    }
+
+    #[test]
+    fn remove_inbound_mail_handler_keeps_other_handler_in_a_rustfmt_wrapped_call() {
+        let src = "fn main() {\n    App::new()\n        .inbound_mail_router(\n            ::autumn_web::inbound_mail::InboundMailRouter::new()\n                .endpoint(::autumn_web::inbound_mail::InboundMailEndpointConfig::mailgun(\n                    \"/inbound/mailgun\",\n                    std::env::var(\"MAILGUN_SIGNING_KEY\").unwrap_or_default(),\n                ))\n                .handler(inbound_mailers::replies::replies_handler_info())\n                .handler(inbound_mailers::bounces::bounces_handler_info()),\n        )\n        .run()\n}\n";
+        let updated =
+            remove_inbound_mail_handler(src, "inbound_mailers::replies::replies_handler_info");
+        assert!(
+            updated.contains(".inbound_mail_router("),
+            "the router call must survive while another handler remains, got:\n{updated}"
+        );
+        assert!(
+            updated.contains("bounces_handler_info"),
+            "the other handler must survive, got:\n{updated}"
+        );
+        assert!(
+            !updated.contains("replies_handler_info"),
+            "the destroyed handler must be gone, got:\n{updated}"
         );
     }
 

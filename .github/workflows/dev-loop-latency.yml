@@ -53,7 +53,7 @@ jobs:
     name: Budget table (dry-run)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2.7.8
 
@@ -71,7 +71,7 @@ jobs:
     name: Measurement unit tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2.7.8
 
@@ -89,7 +89,7 @@ jobs:
     # Only run live measurement on schedule or manual dispatch, not on PRs.
     if: github.event_name != 'pull_request'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2.7.8
 
