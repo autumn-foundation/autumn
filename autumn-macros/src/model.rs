@@ -1197,7 +1197,14 @@ fn parse_field_normalize(field: &syn::Field) -> syn::Result<Vec<Normalizer>> {
         if !attr.path().is_ident("normalize") {
             continue;
         }
-        if matches!(attr.meta, syn::Meta::Path(_)) {
+        // Bare `#[normalize]` and empty `#[normalize()]` are both errors: each
+        // would otherwise register an identity no-op that silently does nothing.
+        let is_empty = match &attr.meta {
+            syn::Meta::Path(_) => true,
+            syn::Meta::List(list) => list.tokens.is_empty(),
+            syn::Meta::NameValue(_) => false,
+        };
+        if is_empty {
             return Err(syn::Error::new_spanned(
                 attr,
                 "`#[normalize]` requires at least one normalizer, e.g. \
@@ -2412,10 +2419,13 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 
     // Collect `#[normalize]` columns (validated to be non-null `String`).
-    // Each entry: (field ident, serialized column key, normalizer chain).
-    // Uses the serde-serialized key so `normalize_lookup` matches the column
-    // name a derived finder filters on. (#1379)
-    let normalize_rename_rule = serde_rename_all_serialize_rule(outer_attrs);
+    // Each entry: (field ident, lookup key, normalizer chain).
+    // The lookup key is the *Rust* field name (the diesel column), because the
+    // derived `#[repository]` `find_by_`/`count_by_` finder passes the Rust
+    // field name to `normalize_lookup` (mirroring how `#[encrypted]` keys its
+    // registry off the field ident). Keying on the serde-serialized name would
+    // desync the arm from the finder and silently skip normalization for a
+    // renamed column. (#1379)
     let mut normalized_columns: Vec<(&syn::Ident, String, Vec<Normalizer>)> = Vec::new();
     for f in &all_fields {
         if let Err(err) = validate_normalize_field(f) {
@@ -2425,16 +2435,9 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             continue;
         }
         let ident = f.ident.as_ref().unwrap();
-        let field_name = ident.to_string();
-        let serialized = field_serde_serialize_rename(f)
-            .or_else(|| {
-                normalize_rename_rule
-                    .as_deref()
-                    .and_then(|rule| apply_serde_rename_all_rule(rule, &field_name))
-            })
-            .unwrap_or_else(|| field_name.clone());
+        let lookup_key = ident.to_string();
         match parse_field_normalize(f) {
-            Ok(ops) => normalized_columns.push((ident, serialized, ops)),
+            Ok(ops) => normalized_columns.push((ident, lookup_key, ops)),
             Err(err) => return err.to_compile_error(),
         }
     }
@@ -3673,9 +3676,9 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         .collect();
     let normalize_lookup_arms: Vec<TokenStream> = normalized_columns
         .iter()
-        .map(|(_, serialized, ops)| {
+        .map(|(_, lookup_key, ops)| {
             let expr = emit_normalize_expr(ops, &quote! { value.to_owned() });
-            quote! { #serialized => ::core::option::Option::Some(#expr), }
+            quote! { #lookup_key => ::core::option::Option::Some(#expr), }
         })
         .collect();
     let normalize_impls = quote! {
@@ -4701,6 +4704,37 @@ mod tests {
     }
 
     #[test]
+    fn normalize_without_normalizers_is_rejected() {
+        // `Vec<Normalizer>` isn't `Debug`, so `unwrap_err` won't compile; assert
+        // on the error message via an explicit match instead.
+        let err_msg = |field: &syn::Field| match parse_field_normalize(field) {
+            Ok(_) => panic!("expected `#[normalize]` to error"),
+            Err(e) => e.to_string(),
+        };
+
+        // Bare `#[normalize]` must error rather than register a no-op.
+        let bare: syn::Field = syn::parse_quote! {
+            #[normalize]
+            pub email: String
+        };
+        assert!(
+            err_msg(&bare).contains("requires at least one normalizer"),
+            "bare `#[normalize]` must error"
+        );
+
+        // Empty `#[normalize()]` is likewise a silent identity no-op — reject it
+        // with the same diagnostic instead of registering a do-nothing chain.
+        let empty: syn::Field = syn::parse_quote! {
+            #[normalize()]
+            pub email: String
+        };
+        assert!(
+            err_msg(&empty).contains("requires at least one normalizer"),
+            "empty `#[normalize()]` must error"
+        );
+    }
+
+    #[test]
     fn normalize_non_string_field_is_rejected() {
         // AC7: clear compile error on non-String, mirroring `#[encrypted]`.
         let field: syn::Field = syn::parse_quote! {
@@ -4799,6 +4833,43 @@ mod tests {
         assert!(
             generated.contains("impl :: autumn_web :: normalize :: NormalizedModel for Widget"),
             "every model must impl NormalizedModel: {generated}"
+        );
+    }
+
+    #[test]
+    fn normalize_lookup_keys_on_rust_field_name_not_serde_rename() {
+        // #1379 regression: the derived `#[repository]` finder passes the Rust
+        // field name (the diesel column) to `normalize_lookup`, so the match
+        // arms must be keyed by that Rust name — not the serde-serialized name.
+        // Under a struct-level `#[serde(rename_all = "camelCase")]` a multi-word
+        // column (`display_name`) serializes to `displayName`; keying the arm on
+        // the serde name would make the finder's Rust-name lookup fall through to
+        // `None` and silently skip normalization of the argument.
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                #[serde(rename_all = "camelCase")]
+                pub struct User {
+                    #[id]
+                    pub id: i64,
+                    #[normalize(trim, downcase)]
+                    pub display_name: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+        let fp = generated
+            .find("fn normalize_lookup")
+            .expect("normalize_lookup must be generated");
+        let end = (fp + 600).min(generated.len());
+        let section = &generated[fp..end];
+        assert!(
+            section.contains("\"display_name\""),
+            "normalize_lookup arm must key on the Rust field name `display_name`: {section}"
+        );
+        assert!(
+            !section.contains("\"displayName\""),
+            "normalize_lookup arm must NOT key on the serde-renamed name `displayName`: {section}"
         );
     }
 

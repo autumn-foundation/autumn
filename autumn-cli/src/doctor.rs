@@ -3210,6 +3210,22 @@ fn resolve_unprivate_sensitive_columns() -> Vec<UnprivateSensitiveColumn> {
 /// `#[private]` (or `#[encrypted]`, which is private-in-JSON by default)
 /// attribute. Deliberately lightweight (no full parse) — consistent with the
 /// other `autumn doctor` source heuristics.
+/// Whether an attribute line applies the `#[model]` macro, including the
+/// path-qualified forms `#[autumn_web::model(...)]` and `#[macros::model]`.
+/// Matches when the attribute path's last `::`-segment is `model`.
+fn attr_line_is_model(line: &str) -> bool {
+    let Some(rest) = line.trim_start().strip_prefix("#[") else {
+        return false;
+    };
+    // The attribute path runs up to the first argument list, close bracket,
+    // whitespace, or comma (e.g. `autumn_web::model` in `#[autumn_web::model(...)]`).
+    let path = rest
+        .split(|c: char| c == '(' || c == ']' || c == ',' || c.is_whitespace())
+        .next()
+        .unwrap_or("");
+    !path.is_empty() && path.rsplit("::").next() == Some("model")
+}
+
 fn scan_source_for_unprivate_sensitive_columns(
     content: &str,
     found: &mut Vec<UnprivateSensitiveColumn>,
@@ -3217,7 +3233,7 @@ fn scan_source_for_unprivate_sensitive_columns(
     let lines: Vec<&str> = content.lines().collect();
     let mut i = 0;
     while i < lines.len() {
-        if !lines[i].trim_start().starts_with("#[model") {
+        if !attr_line_is_model(lines[i]) {
             i += 1;
             continue;
         }
@@ -3363,6 +3379,38 @@ pub struct Vault {
             found.is_empty(),
             "encrypted columns are private-in-JSON: {found:?}"
         );
+    }
+
+    #[test]
+    fn scan_matches_path_qualified_model_attributes() {
+        // Path-qualified forms (`#[autumn_web::model]`, `#[macros::model]`) must
+        // be scanned like the bare `#[model]` — otherwise the privacy heuristic
+        // silently does nothing for files that use them.
+        for attr in [
+            "#[autumn_web::model]",
+            "#[macros::model]",
+            "#[model(table = \"users\")]",
+        ] {
+            let src = format!(
+                "{attr}\npub struct User {{\n    #[id]\n    pub id: i64,\n    pub password_hash: String,\n}}\n"
+            );
+            let mut found = Vec::new();
+            scan_source_for_unprivate_sensitive_columns(&src, &mut found);
+            assert_eq!(
+                found.len(),
+                1,
+                "path-qualified `{attr}` must be scanned and flag password_hash: {found:?}"
+            );
+            assert_eq!(found[0].column, "password_hash");
+        }
+
+        // A helper self-check: only attributes whose last segment is `model`.
+        assert!(attr_line_is_model("#[autumn_web::model(table = \"x\")]"));
+        assert!(attr_line_is_model("  #[macros::model]"));
+        assert!(attr_line_is_model("#[model]"));
+        assert!(!attr_line_is_model("#[models]"));
+        assert!(!attr_line_is_model("#[model_config]"));
+        assert!(!attr_line_is_model("pub struct User {"));
     }
 
     #[test]
