@@ -382,6 +382,8 @@ pub struct TestApp {
     exception_filters: Vec<std::sync::Arc<dyn crate::middleware::ExceptionFilter>>,
     #[cfg(feature = "mail")]
     suppression_store: Option<crate::mail::SuppressionStoreHandle>,
+    #[cfg(feature = "mail")]
+    mail_suppression_store: Option<crate::mail::suppression::SuppressionStoreHandle>,
     registered_plugins: std::collections::HashSet<String>,
     extensions: std::collections::HashMap<std::any::TypeId, Box<dyn std::any::Any + Send>>,
     /// Injected clock; `None` means use [`crate::time::SystemClock`].
@@ -455,6 +457,8 @@ impl TestApp {
             exception_filters: Vec::new(),
             #[cfg(feature = "mail")]
             suppression_store: None,
+            #[cfg(feature = "mail")]
+            mail_suppression_store: None,
             registered_plugins: std::collections::HashSet::new(),
             extensions: std::collections::HashMap::new(),
             clock: None,
@@ -816,6 +820,16 @@ impl TestApp {
             self.suppression_store = Some(handle);
         }
 
+        // Carry a plugin-registered bounce/complaint suppression store (issue
+        // #1247) into the test app so send-time suppression is consulted under
+        // TestApp exactly as under AppBuilder::run — otherwise a plugin/app that
+        // wired a PgSuppressionStore would silently test against the in-memory
+        // default and hide production failures (e.g. a missing table).
+        #[cfg(feature = "mail")]
+        if let Some(handle) = app_builder.mail_suppression_store {
+            self.mail_suppression_store = Some(handle);
+        }
+
         // Carry a plugin's `mount_unsubscribe_endpoint()` opt-in: production copies
         // this builder flag into config.mail before router assembly, so a plugin
         // that mounts the default unsubscribe endpoint must mount it under TestApp
@@ -892,6 +906,23 @@ impl TestApp {
         store: impl crate::mail::SuppressionStore + 'static,
     ) -> Self {
         self.suppression_store = Some(crate::mail::SuppressionStoreHandle::new(store));
+        self
+    }
+
+    /// Register a bounce/complaint
+    /// [`SuppressionStore`](crate::mail::suppression::SuppressionStore) so
+    /// [`Mailer::send`](crate::mail::Mailer::send) skips hard-bounced/complained
+    /// addresses under `TestApp` exactly as it does under `AppBuilder::run`.
+    /// Mirrors
+    /// [`AppBuilder::with_mail_suppression_store`](crate::app::AppBuilder::with_mail_suppression_store).
+    #[cfg(feature = "mail")]
+    #[must_use]
+    pub fn with_mail_suppression_store(
+        mut self,
+        store: impl crate::mail::suppression::SuppressionStore + 'static,
+    ) -> Self {
+        self.mail_suppression_store =
+            Some(crate::mail::suppression::SuppressionStoreHandle::new(store));
         self
     }
 
@@ -1351,6 +1382,12 @@ impl TestApp {
         #[cfg(feature = "mail")]
         {
             if let Some(handle) = self.suppression_store.clone() {
+                state.insert_extension(handle);
+            }
+            // Mirror AppBuilder::run: register the bounce/complaint suppression
+            // handle before install_mailer so the test mailer actually consults
+            // it (install_mailer reads it back via the extension).
+            if let Some(handle) = self.mail_suppression_store.clone() {
                 state.insert_extension(handle);
             }
             crate::mail::install_mailer(&state, &self.config.mail, false)

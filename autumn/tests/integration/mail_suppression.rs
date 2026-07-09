@@ -8,11 +8,14 @@
 
 use std::sync::{Arc, Mutex};
 
+use autumn_web::config::AutumnConfig;
 use autumn_web::mail::suppression::{
     InMemorySuppressionStore, SuppressionReason, SuppressionStore, SuppressionStoreHandle,
     suppressed_skips,
 };
 use autumn_web::mail::{Mail, MailError, MailTransport, Mailer};
+use autumn_web::prelude::*;
+use autumn_web::test::TestApp;
 
 /// Transport double that records every recipient it is asked to deliver to, so
 /// tests can assert on the exact set of addresses that reached the wire.
@@ -284,5 +287,101 @@ async fn inbound_bounce_closes_the_loop() {
             .await
             .expect("query"),
         "complaint must never suppress email.to"
+    );
+}
+
+// ── TestApp harness carries the custom suppression store (issue #1247) ─────────
+// Regression guard: a bounce/complaint store registered on the builder must be
+// consulted by the mailer that TestApp builds — otherwise apps/plugins wiring a
+// PgSuppressionStore would silently test against the in-memory default and hide
+// production failures.
+
+fn count_emls(dir: &std::path::Path) -> usize {
+    std::fs::read_dir(dir).map_or(0, |rd| {
+        rd.filter_map(Result::ok)
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("eml"))
+            .count()
+    })
+}
+
+#[get("/send-blocked")]
+async fn send_to_suppressed(mailer: Mailer) -> &'static str {
+    let mail = Mail::builder()
+        .to("blocked@example.com")
+        .subject("Hi")
+        .text("Body")
+        .build()
+        .expect("valid mail");
+    match mailer.send(mail).await {
+        Err(MailError::AllRecipientsSuppressed) => "suppressed",
+        Ok(()) => "delivered",
+        Err(_) => "error",
+    }
+}
+
+#[get("/send-ok")]
+async fn send_to_deliverable(mailer: Mailer) -> &'static str {
+    let mail = Mail::builder()
+        .to("ok@example.com")
+        .subject("Hi")
+        .text("Body")
+        .build()
+        .expect("valid mail");
+    match mailer.send(mail).await {
+        Ok(()) => "delivered",
+        Err(MailError::AllRecipientsSuppressed) => "suppressed",
+        Err(_) => "error",
+    }
+}
+
+#[tokio::test]
+async fn custom_mail_suppression_store_is_consulted_under_testapp() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // A store with a pre-suppressed address, registered on the builder.
+    let store = InMemorySuppressionStore::new();
+    store
+        .suppress("blocked@example.com", SuppressionReason::HardBounce)
+        .await
+        .expect("suppress");
+
+    let mut config = AutumnConfig {
+        profile: Some("dev".to_owned()),
+        ..AutumnConfig::default()
+    };
+    config.mail.transport = autumn_web::mail::Transport::File;
+    config.mail.file_dir = dir.path().to_path_buf();
+    config.mail.from = Some("Autumn <noreply@example.com>".to_owned());
+
+    let client = TestApp::new()
+        .config(config)
+        .with_mail_suppression_store(store)
+        .routes(routes![send_to_suppressed, send_to_deliverable])
+        .build();
+
+    // Suppressed recipient: the TestApp-built mailer must skip it (no .eml).
+    client
+        .get("/send-blocked")
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("suppressed");
+    assert_eq!(
+        count_emls(dir.path()),
+        0,
+        "custom suppression store on the builder must be consulted under TestApp"
+    );
+
+    // A non-suppressed recipient still delivers through the same mailer.
+    client
+        .get("/send-ok")
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("delivered");
+    assert_eq!(
+        count_emls(dir.path()),
+        1,
+        "deliverable recipient is written"
     );
 }
