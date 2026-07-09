@@ -838,6 +838,70 @@ RFC 3339 JSON bodies). Serde-renamed columns pre-fill correctly via
 `{snake}_form_for` helper built on this (except `--live-validation`, which
 keeps per-field htmx emission).
 
+## Resumable SSE streams (unreleased — trunk-dev, issue #1356)
+
+Don't hand-roll `Last-Event-ID` bookkeeping or a manual replay buffer for
+server-sent events. On trunk-dev the `ws`-gated channels backend keeps a
+**bounded per-topic replay ring buffer** and assigns every event a **monotonic
+per-topic `id` automatically** — no manual `.id(...)` in handler code.
+
+- `autumn_web::sse::stream_resumable(&state, topic, last_event_id)` is the route
+  primitive. It reads the client's `Last-Event-ID`, replays buffered events with
+  `id > last_event_id` in order, then continues live — no duplicated or skipped
+  events at the seam (publish assigns ids and broadcasts under one lock; resume
+  subscribes under that same lock and snapshots the buffer).
+- Read the inbound header with `autumn_web::sse::last_event_id(&headers)` →
+  `Option<u64>`, or the `autumn_web::sse::LastEventId(pub Option<u64>)` extractor
+  (never fails; absent/unparseable → `None`).
+- **Cold connection** (`None`) behaves exactly like `sse::stream`: no replay,
+  just live events, dense ids preserved.
+- **Gap sentinel:** when the requested id has aged out of the retained window
+  (the buffer overflowed), the stream emits one `gap` event
+  (`event: gap`, `data: {"gap":true}`, no `id`) *before* the partial replay so
+  clients can detect missed events rather than silently receiving a hole. A live
+  broadcast lag surfaces the same `gap` sentinel and advances the id counter.
+- The existing non-resumable helpers — `sse::stream`, `sse::stream_authorized`,
+  `sse::from_subscriber`, `Channels::sse_stream` — are **unchanged and remain
+  id-less**; `stream_resumable` is purely additive.
+- Only the in-process local backend retains a replay buffer; the Redis fan-out
+  backend degrades gracefully to a live-only `ResumeHandle`
+  (`Channels::resume(topic, last_event_id) -> ResumeHandle` is available on any
+  backend).
+
+```rust
+use autumn_web::prelude::*;
+use autumn_web::sse::LastEventId;
+
+#[get("/events")]
+async fn events(State(state): State<AppState>, LastEventId(last): LastEventId) -> impl IntoResponse {
+    autumn_web::sse::stream_resumable(&state, "feed", last)
+}
+```
+
+Retention is configurable via `channels.replay_buffer` (`N`, default `256`;
+env `AUTUMN_CHANNELS__REPLAY_BUFFER`). Memory is `O(N)` per topic regardless of
+throughput. This is distinct from `channels.capacity`, which sizes the live
+broadcast fan-out ring.
+
+**Limitations** (in-process best-effort scope, per issue #1356's "Out of
+Scope") — the replay buffer is a same-process convenience, not a durable log:
+
+- The replay buffer lives in the topic's in-memory state, which is dropped when
+  the topic is garbage-collected (a topic is retained only while it has a live
+  receiver or an outstanding `Sender`). A topic with only transient SSE
+  subscribers can lose its buffer during the disconnect window, so a reconnect
+  may find nothing to replay.
+- On process restart the per-topic id counter resets to `1`, so a client
+  reconnecting with a stale-large `Last-Event-ID` gets an empty replay and no
+  gap sentinel.
+- Publish through `channels.publish()` / `broadcast().publish()` on resumable
+  topics. Calling `.send()` directly on a `Sender` obtained from
+  `channels.sender()` broadcasts without assigning an id or appending to the
+  replay buffer, which breaks resumability for that topic.
+
+For cross-restart / multi-replica durability, back the stream with a durable log
+(e.g. a database table or a Redis stream) instead of the in-process buffer.
+
 ## Configuration
 
 Config layering, lowest to highest:

@@ -55,6 +55,20 @@ together (`0.5.0` published; `0.6.0` on trunk-dev, unpublished).
   `broadcasts_on(topic)` / `assert_broadcast(topic, predicate)` /
   `assert_broadcast_count(topic, n)` / `assert_no_broadcasts(topic)`
   (`RecordedBroadcast` exposes `.topic()` / `.payload()`)
+- Resumable SSE **(unreleased — trunk-dev, issue #1356)**:
+  `sse::stream_resumable(&state, topic, last_event_id: Option<u64>)` — automatic
+  monotonic per-topic event ids + `Last-Event-ID` replay from a bounded
+  per-topic ring buffer, with a `gap` sentinel (`event: gap`,
+  `data: {"gap":true}`) on buffer overflow; `sse::last_event_id(&headers)` and
+  the `sse::LastEventId(Option<u64>)` extractor read the inbound header;
+  `Channels::resume(topic, last_event_id) -> ResumeHandle` (fields
+  `subscriber`, `replay: Vec<SequencedMessage { id, message }>`, `gap`,
+  `next_live_id`, `resumable`); `ChannelsBackend::resume` has a live-only
+  default (Redis) overridden by `LocalChannelsBackend`;
+  `LocalChannelsBackend::with_replay_capacity(capacity, replay_capacity)`.
+  Retention is `channels.replay_buffer` (default `256`). The existing id-less
+  `sse::stream` / `sse::stream_authorized` / `sse::from_subscriber` are
+  unchanged.
 - `Locale`, `t!` (`i18n`)
 - OAuth2/OIDC config, provider presets, callback helpers, and identity values
   (`oauth2`)
@@ -569,6 +583,7 @@ Frequently used env keys:
 | `AUTUMN_SESSION__BACKEND` | `session.backend` |
 | `AUTUMN_SESSION__REDIS__URL` | `session.redis.url` |
 | `AUTUMN_CHANNELS__BACKEND` | `channels.backend` |
+| `AUTUMN_CHANNELS__REPLAY_BUFFER` | `channels.replay_buffer` (unreleased — trunk-dev) |
 | `AUTUMN_JOBS__BACKEND` | `jobs.backend` |
 | `AUTUMN_JOBS__REDIS__URL` | `jobs.redis.url` |
 | `AUTUMN_SCHEDULER__BACKEND` | `scheduler.backend` |

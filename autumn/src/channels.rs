@@ -17,7 +17,7 @@
 //! # // In async context: let msg = rx.recv().await.expect("should receive");
 //! ```
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 
@@ -50,6 +50,23 @@ pub trait ChannelsBackend: Send + Sync + 'static {
     /// Subscribe to future messages on a topic.
     fn subscribe(&self, topic: &str) -> Subscriber;
 
+    /// Resume a subscription, replaying buffered events newer than
+    /// `last_event_id` before continuing live.
+    ///
+    /// The default implementation is live-only: it returns a fresh subscriber
+    /// with no replay and no history, so backends without a replay buffer (such
+    /// as the Redis fan-out backend) degrade gracefully to today's behaviour.
+    fn resume(&self, topic: &str, last_event_id: Option<u64>) -> ResumeHandle {
+        let _ = last_event_id;
+        ResumeHandle {
+            subscriber: self.subscribe(topic),
+            replay: Vec::new(),
+            gap: false,
+            next_live_id: 1,
+            resumable: false,
+        }
+    }
+
     /// Return the number of topics known to this backend.
     fn channel_count(&self) -> usize;
 
@@ -68,8 +85,64 @@ pub struct LocalChannelsBackend {
 
 struct LocalChannelsInner {
     capacity: usize,
-    registry: Mutex<HashMap<String, Arc<broadcast::Sender<ChannelMessage>>>>,
+    replay_capacity: usize,
+    registry: Mutex<HashMap<String, Arc<TopicState>>>,
     metrics: Arc<ChannelMetrics>,
+}
+
+/// Default per-topic replay ring buffer capacity when none is configured.
+const DEFAULT_REPLAY_CAPACITY: usize = 256;
+
+/// Per-topic state shared by the publish and resume paths.
+///
+/// The `sender` (a broadcast fan-out handle) and the `replay` ring buffer live
+/// behind the same [`Arc`] so that a publish can assign the next monotonic id,
+/// append to the buffer, and broadcast — all under one lock — while a
+/// concurrent [`ChannelsBackend::resume`] can subscribe under that same lock
+/// and snapshot the buffer for a gapless seam.
+struct TopicState {
+    sender: Arc<broadcast::Sender<ChannelMessage>>,
+    replay: Mutex<ReplayBuffer>,
+}
+
+/// Bounded per-topic ring buffer of recently published messages.
+struct ReplayBuffer {
+    /// Id to assign to the next published message (starts at 1).
+    next_id: u64,
+    /// Retention capacity, `N` (always `>= 1`).
+    cap: usize,
+    /// Retained `(id, message)` pairs in ascending id order.
+    buf: VecDeque<(u64, ChannelMessage)>,
+}
+
+/// A replayed message paired with its monotonic per-topic id.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SequencedMessage {
+    /// Monotonic per-topic event id.
+    pub id: u64,
+    /// The buffered message payload.
+    pub message: ChannelMessage,
+}
+
+/// Outcome of a [`ChannelsBackend::resume`] request.
+///
+/// Combines the buffered events a client missed (`replay`), a live
+/// `subscriber` for everything published afterwards, and the id bookkeeping the
+/// SSE layer needs to keep event ids monotonic across the replay/live seam.
+pub struct ResumeHandle {
+    /// Live subscriber for messages published after the resume point.
+    pub subscriber: Subscriber,
+    /// Buffered events with `id > last_event_id`, in ascending id order.
+    pub replay: Vec<SequencedMessage>,
+    /// `true` when the requested resume point predates the oldest retained id
+    /// (the buffer overflowed), signalling missed events the replay cannot
+    /// recover.
+    pub gap: bool,
+    /// Id to assign to the first live message read from `subscriber`.
+    pub next_live_id: u64,
+    /// `true` only for the in-process local backend, which actually retains a
+    /// replay buffer. Other backends return a live-only handle.
+    pub resumable: bool,
 }
 
 /// A message sent through a broadcast channel.
@@ -514,28 +587,55 @@ impl Subscriber {
 
 impl LocalChannelsBackend {
     /// Create a local backend with the given per-topic buffer capacity.
+    ///
+    /// The replay ring buffer defaults to [`DEFAULT_REPLAY_CAPACITY`]. Use
+    /// [`LocalChannelsBackend::with_replay_capacity`] to override it.
     #[must_use]
     pub fn new(capacity: usize) -> Self {
+        Self::with_replay_capacity(capacity, DEFAULT_REPLAY_CAPACITY)
+    }
+
+    /// Create a local backend with explicit broadcast and replay capacities.
+    ///
+    /// `capacity` sizes the live [`tokio::sync::broadcast`] ring; `replay_capacity`
+    /// (`N`) is the number of most-recent events retained per topic for
+    /// `Last-Event-ID` replay. Memory is `O(N)` per topic regardless of
+    /// throughput.
+    #[must_use]
+    pub fn with_replay_capacity(capacity: usize, replay_capacity: usize) -> Self {
         Self {
             inner: Arc::new(LocalChannelsInner {
                 capacity: capacity.clamp(1, 16_384),
+                replay_capacity: replay_capacity.clamp(1, 1_048_576),
                 registry: Mutex::new(HashMap::new()),
                 metrics: Arc::new(ChannelMetrics::default()),
             }),
         }
     }
 
-    fn get_or_create_sender(&self, topic: &str) -> Arc<broadcast::Sender<ChannelMessage>> {
+    fn get_or_create_topic(&self, topic: &str) -> Arc<TopicState> {
         let mut registry = self.inner.registry.lock().expect("channels lock poisoned");
 
         #[allow(clippy::option_if_let_else)]
-        if let Some(tx) = registry.get(topic) {
-            Arc::clone(tx)
+        if let Some(state) = registry.get(topic) {
+            Arc::clone(state)
         } else {
-            let tx = Arc::new(broadcast::channel(self.inner.capacity).0);
-            registry.insert(topic.to_owned(), Arc::clone(&tx));
-            tx
+            let sender = Arc::new(broadcast::channel(self.inner.capacity).0);
+            let state = Arc::new(TopicState {
+                sender,
+                replay: Mutex::new(ReplayBuffer {
+                    next_id: 1,
+                    cap: self.inner.replay_capacity.max(1),
+                    buf: VecDeque::new(),
+                }),
+            });
+            registry.insert(topic.to_owned(), Arc::clone(&state));
+            state
         }
+    }
+
+    fn get_or_create_sender(&self, topic: &str) -> Arc<broadcast::Sender<ChannelMessage>> {
+        Arc::clone(&self.get_or_create_topic(topic).sender)
     }
 
     fn publish_local(&self, topic: &str, msg: ChannelMessage) -> usize {
@@ -547,13 +647,79 @@ impl LocalChannelsBackend {
     }
 
     fn send_without_publish_metric(&self, topic: &str, msg: ChannelMessage) -> usize {
-        let tx = self.get_or_create_sender(topic);
-        match tx.send(msg) {
+        let state = self.get_or_create_topic(topic);
+        // Assign the id, append to the replay buffer, and broadcast — all while
+        // holding the replay lock. `resume` subscribes under this same lock, so
+        // every message a resumed subscriber receives is published strictly
+        // after its snapshot, keeping the replay/live seam gapless. The id is
+        // assigned even when there are zero receivers so ids stay dense.
+        let mut replay = state.replay.lock().expect("channel replay lock poisoned");
+        let id = replay.next_id;
+        replay.next_id = replay.next_id.saturating_add(1);
+        replay.buf.push_back((id, msg.clone()));
+        while replay.buf.len() > replay.cap {
+            replay.buf.pop_front();
+        }
+        let result = state.sender.send(msg);
+        drop(replay);
+
+        match result {
             Ok(count) => count,
             Err(_error) => {
                 self.inner.metrics.record_dropped(topic, 1);
                 0
             }
+        }
+    }
+
+    fn resume_local(&self, topic: &str, last_event_id: Option<u64>) -> ResumeHandle {
+        let state = self.get_or_create_topic(topic);
+        self.inner.metrics.ensure_topic(topic);
+
+        // Subscribe and snapshot under the replay lock so the seam is clean:
+        // publish holds this same lock while assigning ids and broadcasting, so
+        // `rx` can only ever observe messages published strictly after this
+        // point (ids `start_id + 1, start_id + 2, ...`), none of which are in
+        // the snapshot below.
+        let replay_guard = state.replay.lock().expect("channel replay lock poisoned");
+        let rx = state.sender.subscribe();
+        let start_id = replay_guard.next_id.saturating_sub(1);
+        let oldest = replay_guard.buf.front().map(|(id, _)| *id);
+
+        let (replay, gap) = last_event_id.map_or_else(
+            // Cold connection: no replay, just live events.
+            || (Vec::new(), false),
+            |last| {
+                let replay: Vec<SequencedMessage> = replay_guard
+                    .buf
+                    .iter()
+                    .filter(|(id, _)| *id > last)
+                    .map(|(id, message)| SequencedMessage {
+                        id: *id,
+                        message: message.clone(),
+                    })
+                    .collect();
+                // Gap when the requested resume point precedes the oldest
+                // retained id: the client's next-expected id (`last + 1`) aged
+                // out of the window, so the replay would be partial.
+                let gap = oldest.is_some_and(|oldest| oldest > last.saturating_add(1));
+                (replay, gap)
+            },
+        );
+        drop(replay_guard);
+
+        let subscriber = Subscriber {
+            topic: topic.to_owned(),
+            inner: rx,
+            metrics: Arc::clone(&self.inner.metrics),
+        };
+
+        ResumeHandle {
+            subscriber,
+            replay,
+            gap,
+            next_live_id: start_id.saturating_add(1),
+            resumable: true,
         }
     }
 }
@@ -564,6 +730,10 @@ impl ChannelsBackend for LocalChannelsBackend {
     }
 
     fn ensure_topic(&self, topic: &str) -> Arc<broadcast::Sender<ChannelMessage>> {
+        // NOTE: sending directly on the returned `Sender` bypasses replay-id
+        // assignment and the replay buffer — publish via `Channels::publish` /
+        // `Broadcast` to keep resumable topics resumable (see the resumable-SSE
+        // limitations in docs/guide/realtime.md, issue #1356).
         self.inner.metrics.ensure_topic(topic);
         self.get_or_create_sender(topic)
     }
@@ -577,16 +747,27 @@ impl ChannelsBackend for LocalChannelsBackend {
         }
     }
 
+    fn resume(&self, topic: &str, last_event_id: Option<u64>) -> ResumeHandle {
+        self.resume_local(topic, last_event_id)
+    }
+
     fn channel_count(&self) -> usize {
         let registry = self.inner.registry.lock().expect("channels lock poisoned");
         registry.len()
     }
 
     fn gc(&self) {
+        // NOTE: removing a topic here drops its replay buffer with it, so a
+        // topic kept alive only by transient SSE subscribers can lose its
+        // replay history during a disconnect window (resumable-SSE is in-process
+        // best-effort — see docs/guide/realtime.md, issue #1356).
         let mut registry = self.inner.registry.lock().expect("channels lock poisoned");
         let mut removed_topics = HashSet::new();
-        registry.retain(|topic, tx| {
-            let keep = tx.receiver_count() > 0 || Arc::strong_count(tx) > 1;
+        registry.retain(|topic, state| {
+            // Keep topics with live receivers, or with outstanding keepalive
+            // `Sender` handles (which hold clones of `state.sender`, bumping its
+            // strong count above the single reference held by `state`).
+            let keep = state.sender.receiver_count() > 0 || Arc::strong_count(&state.sender) > 1;
             if !keep {
                 removed_topics.insert(topic.clone());
             }
@@ -605,7 +786,7 @@ impl ChannelsBackend for LocalChannelsBackend {
             let registry = self.inner.registry.lock().expect("channels lock poisoned");
             registry
                 .iter()
-                .map(|(topic, sender)| (topic.clone(), sender.receiver_count()))
+                .map(|(topic, state)| (topic.clone(), state.sender.receiver_count()))
                 .collect()
         };
         let metric_counters = self.inner.metrics.snapshot();
@@ -683,7 +864,8 @@ impl RedisChannelsBackend {
             .ok_or(ChannelBackendConfigError::MissingRedisUrl)?;
         let client = redis::Client::open(url)
             .map_err(|error| ChannelBackendConfigError::InvalidRedisUrl(error.to_string()))?;
-        let local = LocalChannelsBackend::new(config.capacity);
+        let local =
+            LocalChannelsBackend::with_replay_capacity(config.capacity, config.replay_buffer);
         let (publisher, receiver) = tokio::sync::mpsc::channel(REDIS_PUBLISH_QUEUE_CAPACITY);
         let origin_id = uuid::Uuid::new_v4().to_string();
         let backend = Self {
@@ -961,6 +1143,10 @@ impl ChannelsBackend for InterceptedChannelsBackend {
         self.inner.subscribe(topic)
     }
 
+    fn resume(&self, topic: &str, last_event_id: Option<u64>) -> ResumeHandle {
+        self.inner.resume(topic, last_event_id)
+    }
+
     fn channel_count(&self) -> usize {
         self.inner.channel_count()
     }
@@ -1012,7 +1198,9 @@ impl Channels {
         shutdown: tokio_util::sync::CancellationToken,
     ) -> Result<Self, ChannelBackendConfigError> {
         match config.backend {
-            crate::config::ChannelBackend::InProcess => Ok(Self::new(config.capacity)),
+            crate::config::ChannelBackend::InProcess => Ok(Self::with_backend(
+                LocalChannelsBackend::with_replay_capacity(config.capacity, config.replay_buffer),
+            )),
             crate::config::ChannelBackend::Redis => Self::redis_from_config(config, shutdown),
         }
     }
@@ -1069,6 +1257,17 @@ impl Channels {
     #[must_use]
     pub fn subscribe(&self, name: &str) -> Subscriber {
         self.backend.subscribe(name)
+    }
+
+    /// Resume a subscription, replaying buffered events newer than
+    /// `last_event_id` before continuing live.
+    ///
+    /// Only the in-process local backend retains a replay buffer; other
+    /// backends return a live-only [`ResumeHandle`]. Prefer
+    /// [`crate::sse::stream_resumable`] for the SSE route primitive.
+    #[must_use]
+    pub fn resume(&self, topic: &str, last_event_id: Option<u64>) -> ResumeHandle {
+        self.backend.resume(topic, last_event_id)
     }
 
     /// Authorize a channel subscription before allocating the subscriber.
@@ -1818,6 +2017,144 @@ mod tests {
             "catch-all must wrap in div: {result}"
         );
         assert!(result.contains("beforeend:#list"), "got: {result}");
+    }
+
+    // ── replay buffer / resume ──────────────────────────────────────────────
+
+    #[test]
+    fn replay_buffer_is_bounded_and_ids_are_monotonic() {
+        let backend = LocalChannelsBackend::with_replay_capacity(16, 4);
+        for i in 0..10 {
+            backend.publish_local("topic", ChannelMessage::from(format!("m{i}")));
+        }
+        let state = backend.get_or_create_topic("topic");
+        let (len, ids, next_id) = {
+            let replay = state.replay.lock().expect("replay lock");
+            let ids: Vec<u64> = replay.buf.iter().map(|(id, _)| *id).collect();
+            (replay.buf.len(), ids, replay.next_id)
+        };
+        // Buffer never exceeds N.
+        assert_eq!(len, 4);
+        // Retains the most recent N (ids 7..=10), ascending.
+        assert_eq!(ids, vec![7, 8, 9, 10]);
+        // Next id keeps climbing densely.
+        assert_eq!(next_id, 11);
+    }
+
+    #[test]
+    fn resume_cold_connection_has_no_replay_or_gap() {
+        let backend = LocalChannelsBackend::with_replay_capacity(16, 8);
+        backend.publish_local("t", ChannelMessage::from("a"));
+        backend.publish_local("t", ChannelMessage::from("b"));
+
+        let handle = backend.resume("t", None);
+        assert!(handle.replay.is_empty(), "cold connect must not replay");
+        assert!(!handle.gap);
+        assert!(handle.resumable);
+        // Two messages published → next live id is 3.
+        assert_eq!(handle.next_live_id, 3);
+    }
+
+    #[test]
+    fn resume_replays_only_newer_than_last_event_id() {
+        let backend = LocalChannelsBackend::with_replay_capacity(16, 8);
+        for i in 1..=5 {
+            backend.publish_local("t", ChannelMessage::from(format!("m{i}")));
+        }
+        let handle = backend.resume("t", Some(2));
+        let ids: Vec<u64> = handle.replay.iter().map(|s| s.id).collect();
+        assert_eq!(ids, vec![3, 4, 5]);
+        assert!(!handle.gap, "everything since id 2 is retained");
+        assert_eq!(handle.next_live_id, 6);
+    }
+
+    #[test]
+    fn resume_signals_gap_when_last_event_id_aged_out() {
+        // cap 3: after publishing 5, retained ids are 3,4,5.
+        let backend = LocalChannelsBackend::with_replay_capacity(16, 3);
+        for i in 1..=5 {
+            backend.publish_local("t", ChannelMessage::from(format!("m{i}")));
+        }
+        // Client last saw id 1; id 2 has aged out → gap, replay starts at oldest.
+        let handle = backend.resume("t", Some(1));
+        assert!(handle.gap, "aged-out resume point must signal a gap");
+        let ids: Vec<u64> = handle.replay.iter().map(|s| s.id).collect();
+        assert_eq!(ids, vec![3, 4, 5]);
+    }
+
+    #[test]
+    fn resume_no_gap_when_last_event_id_is_current_tail() {
+        let backend = LocalChannelsBackend::with_replay_capacity(16, 3);
+        for i in 1..=5 {
+            backend.publish_local("t", ChannelMessage::from(format!("m{i}")));
+        }
+        // Client already saw the latest id (5): nothing to replay, no gap.
+        let handle = backend.resume("t", Some(5));
+        assert!(handle.replay.is_empty());
+        assert!(!handle.gap);
+        assert_eq!(handle.next_live_id, 6);
+    }
+
+    #[cfg(feature = "ws")]
+    #[tokio::test]
+    async fn resume_seam_delivers_replay_then_live_without_gap()
+    -> Result<(), broadcast::error::RecvError> {
+        let backend = LocalChannelsBackend::with_replay_capacity(16, 8);
+        for i in 1..=3 {
+            backend.publish_local("t", ChannelMessage::from(format!("m{i}")));
+        }
+        // Resume from id 1: replay 2,3 then live 4,5.
+        let mut handle = backend.resume("t", Some(1));
+        assert_eq!(
+            handle.replay.iter().map(|s| s.id).collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        assert_eq!(handle.next_live_id, 4);
+
+        backend.publish_local("t", ChannelMessage::from("m4"));
+        backend.publish_local("t", ChannelMessage::from("m5"));
+
+        assert_eq!(handle.subscriber.recv().await?.as_str(), "m4");
+        assert_eq!(handle.subscriber.recv().await?.as_str(), "m5");
+        Ok(())
+    }
+
+    #[test]
+    fn resume_via_default_backend_is_live_only() {
+        // The trait default (used by Redis) is live-only, non-resumable.
+        struct LiveOnly(LocalChannelsBackend);
+        impl ChannelsBackend for LiveOnly {
+            fn publish(
+                &self,
+                topic: &str,
+                msg: ChannelMessage,
+            ) -> Result<usize, ChannelPublishError> {
+                self.0.publish(topic, msg)
+            }
+            fn ensure_topic(&self, topic: &str) -> Arc<broadcast::Sender<ChannelMessage>> {
+                self.0.ensure_topic(topic)
+            }
+            fn subscribe(&self, topic: &str) -> Subscriber {
+                self.0.subscribe(topic)
+            }
+            fn channel_count(&self) -> usize {
+                self.0.channel_count()
+            }
+            fn gc(&self) {
+                self.0.gc();
+            }
+            fn snapshot(&self) -> HashMap<String, ChannelStats> {
+                self.0.snapshot()
+            }
+        }
+
+        let backend = LiveOnly(LocalChannelsBackend::new(16));
+        backend.publish("t", ChannelMessage::from("a")).unwrap();
+        let handle = backend.resume("t", Some(0));
+        assert!(handle.replay.is_empty());
+        assert!(!handle.gap);
+        assert!(!handle.resumable, "default resume is live-only");
+        assert_eq!(handle.next_live_id, 1);
     }
 
     #[cfg(feature = "maud")]

@@ -80,6 +80,66 @@ async fn private_events(
 }
 ```
 
+## Resumable SSE with `Last-Event-ID` (unreleased — trunk-dev, issue #1356)
+
+`sse::stream_resumable` is a drop-in upgrade to `sse::stream` that survives a
+brief client disconnect. Every event carries an automatic monotonic per-topic
+`id`, and Autumn keeps a bounded per-topic replay ring buffer. When the browser
+reconnects it echoes back the last id it saw in the `Last-Event-ID` header (the
+SSE spec does this automatically); Autumn replays the events that arrived while
+the client was gone, then continues live — with no duplicated or skipped events
+at the seam.
+
+```rust,no_run
+use autumn_web::prelude::*;
+use autumn_web::sse::LastEventId;
+
+#[get("/events")]
+async fn events(State(state): State<AppState>, LastEventId(last): LastEventId) -> impl IntoResponse {
+    autumn_web::sse::stream_resumable(&state, "tasks", last)
+}
+```
+
+- A first connection (no `Last-Event-ID`) behaves exactly like `sse::stream`:
+  no replay, just live events.
+- If the requested id has aged out of the retained window (the buffer
+  overflowed while the client was away), the stream emits a single `gap`
+  sentinel event (`event: gap`, `data: {"gap":true}`, no `id`) before the
+  partial replay so the client can recover — for example by refetching the full
+  list — instead of silently missing events.
+- The existing id-less helpers (`sse::stream`, `sse::stream_authorized`,
+  `sse::from_subscriber`) are unchanged; `stream_resumable` is additive.
+
+Retention is configured with `channels.replay_buffer` (number of most-recent
+events kept per topic; default `256`, env `AUTUMN_CHANNELS__REPLAY_BUFFER`).
+Memory is `O(N)` per topic regardless of publish throughput. Only the in-process
+backend retains a replay buffer; the Redis fan-out backend degrades gracefully
+to live-only.
+
+If you need the raw pieces (for a custom transport), `Channels::resume(topic,
+last_event_id)` returns a `ResumeHandle { subscriber, replay, gap, next_live_id,
+resumable }`.
+
+### Limitations
+
+The replay buffer is an in-process, best-effort convenience (the in-process
+scope of issue #1356, matching its "Out of Scope") — not a durable event log:
+
+- The buffer lives in the topic's in-memory state and is dropped when the topic
+  is garbage-collected. A topic is kept only while it has a live receiver or an
+  outstanding `Sender`, so a topic with only transient SSE subscribers can lose
+  its buffer during the disconnect window and have nothing to replay on
+  reconnect.
+- On process restart the per-topic id counter resets to `1`, so a client
+  reconnecting with a stale-large `Last-Event-ID` gets an empty replay and no
+  gap sentinel.
+- Publish via `channels.publish()` / `broadcast().publish()` on resumable
+  topics. Calling `.send()` directly on a `Sender` from `channels.sender()`
+  bypasses id assignment and the replay buffer, breaking resumability.
+
+For durability across restarts or replicas, persist events yourself (a database
+table or a Redis stream) rather than relying on this buffer.
+
 ## Direct Channels
 
 `AppState::channels()` remains the low-level primitive for WebSocket loops and
