@@ -88,6 +88,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the trio as the no-JS `tablist`/`tabpanel` switcher (issue #1316). Semantic
   `.autumn-toast*` / `.autumn-feed*` classes backed by the shipped `WIDGETS_CSS`
   stylesheet; all caller input HTML-escaped by Maud.
+- **fuzzing:** coverage-guided fuzz harness (cargo-fuzz / libFuzzer) over the
+  untrusted request-path parsing surface — idempotency-key, routing, headers,
+  session-cookie, and body decoders — wired into CI as a per-PR crash gate
+  (`fuzz.yml`, 30s/target seeded from the committed corpus) plus a nightly
+  corpus-persisting long-run (`fuzz-nightly.yml`, 300s/target); crash
+  reproducers upload as artifacts and the triage contract is documented in
+  `CONTRIBUTING.md`. Developer tooling with no agent-facing framework surface
+  (Closes #1637). [no-plugin]
+- **testing:** property-based (proptest) invariant tests for the parser/codec
+  surfaces, asserting round-trip and well-formedness invariants alongside the
+  fuzz harness. Test-only, no public API change. [no-plugin]
 - **generator:** `autumn new` now generates a `README.md` at the project root
   (listed in the "Created …" output) with explicit prerequisites and a
   golden-path quickstart — configure the `[database]` block in `autumn.toml`
@@ -982,6 +993,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **idempotency:** the in-memory idempotency store no longer panics on extreme
+  TTL values. `Instant::now() + ttl` panics when the sum is not representable by
+  the platform clock, so a pathological configured or attacker-influenced TTL
+  (e.g. `Duration::MAX` / `Duration::from_secs(u64::MAX)`) could crash the
+  process; deadlines are now computed with a saturating helper that clamps to a
+  far-but-representable future.
 - **observability:** `Server-Timing` no longer miscounts pooled-connection reuse
   in the `db` metric. Connections are pooled and diesel-async's deadpool manager
   never resets a connection's instrumentation on recycle, so a connection that

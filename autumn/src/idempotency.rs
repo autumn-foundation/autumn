@@ -444,6 +444,29 @@ struct MemoryInFlightLock {
     expires_at: Instant,
 }
 
+/// Clamp horizon (~10 years) used when a caller-supplied TTL would overflow
+/// `Instant + Duration`. This constant is itself always representable when
+/// added to a fresh `Instant`, so it can never re-trigger the overflow.
+const SATURATING_DEADLINE_HORIZON_SECS: u64 = 10 * 365 * 24 * 3600;
+
+/// Compute an expiry `Instant` for `ttl`, saturating instead of panicking on
+/// overflow.
+///
+/// `Instant::now() + ttl` panics when the sum is not representable by the
+/// platform clock — a pathological `ttl` such as `Duration::MAX` or
+/// `Duration::from_secs(u64::MAX)` (which is entirely attacker-influenceable
+/// via configured TTLs) triggers this. Instead of panicking we clamp the
+/// deadline to ~10 years out (far enough that the entry is effectively
+/// non-expiring), falling back to `now` only in the astronomically unlikely
+/// event that even the clamped horizon is not representable.
+fn saturating_deadline(ttl: Duration) -> Instant {
+    let now = Instant::now();
+    now.checked_add(ttl).unwrap_or_else(|| {
+        now.checked_add(Duration::from_secs(SATURATING_DEADLINE_HORIZON_SECS))
+            .unwrap_or(now)
+    })
+}
+
 impl MemoryIdempotencyStore {
     #[must_use]
     pub fn new(default_ttl: Duration) -> Self {
@@ -467,7 +490,7 @@ impl IdempotencyStore for MemoryIdempotencyStore {
         let entry = IdempotencyEntry {
             record,
             body_hash,
-            expires_at: Instant::now() + ttl,
+            expires_at: saturating_deadline(ttl),
         };
         let mut entries = self.entries.write().unwrap();
         entries.insert(key.to_owned(), entry);
@@ -504,7 +527,7 @@ impl IdempotencyStore for MemoryIdempotencyStore {
             key.to_owned(),
             MemoryInFlightLock {
                 owner: owner.to_owned(),
-                expires_at: now + ttl,
+                expires_at: saturating_deadline(ttl),
             },
         );
         true
@@ -533,10 +556,13 @@ impl IdempotencyStore for MemoryIdempotencyStore {
 
 #[cfg(feature = "redis")]
 mod redis_store {
-    use super::{IdempotencyEntry, IdempotencyRecord, IdempotencyStore, IdempotencyStoreError};
+    use super::{
+        IdempotencyEntry, IdempotencyRecord, IdempotencyStore, IdempotencyStoreError,
+        saturating_deadline,
+    };
     use redis::{AsyncCommands, Client, aio::ConnectionManager, aio::ConnectionManagerConfig};
     use serde::{Deserialize, Serialize};
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     #[derive(Serialize, Deserialize)]
     struct StoredEntry {
@@ -631,7 +657,9 @@ mod redis_store {
                                     body_hash: e.body_hash,
                                     // Redis manages TTL natively. Use a fixed 24 h offset
                                     // so the in-process expiry check never fires early.
-                                    expires_at: Instant::now() + Duration::from_secs(86_400),
+                                    // Routed through the saturating helper so this can
+                                    // never panic on an exotic platform clock either.
+                                    expires_at: saturating_deadline(Duration::from_secs(86_400)),
                                 }
                             })
                             .map_err(|e| {
@@ -1940,6 +1968,37 @@ mod tests {
             store.try_lock_owned("key", "owner-b", Duration::from_secs(60)),
             "an explicitly unlocked guard must release the in-flight lock"
         );
+    }
+
+    #[test]
+    fn set_with_extreme_ttl_does_not_panic() {
+        // Regression: `Instant::now() + ttl` panics when the sum is not
+        // representable. A pathological TTL (configured or attacker-influenced)
+        // must clamp rather than crash the process. See saturating_deadline.
+        let store = MemoryIdempotencyStore::new(Duration::from_secs(60));
+        let record = IdempotencyRecord {
+            status: 200,
+            headers: Vec::new(),
+            body: Vec::new(),
+            metadata: Vec::new(),
+        };
+
+        // Both of these overflow `Instant + Duration` on the underlying clock.
+        for extreme in [Duration::from_secs(u64::MAX), Duration::MAX] {
+            store.set("extreme-ttl-key", record.clone(), Vec::new(), extreme);
+            // Entry must be retrievable and (far-future) unexpired.
+            assert!(
+                store.get("extreme-ttl-key").is_some(),
+                "entry stored with an extreme TTL should be present and unexpired"
+            );
+        }
+
+        // The in-flight lock path uses the same arithmetic and must not panic.
+        assert!(store.try_lock_owned("lock-key", "owner", Duration::MAX));
+
+        // saturating_deadline itself clamps to a representable far future.
+        let deadline = saturating_deadline(Duration::MAX);
+        assert!(deadline > Instant::now());
     }
 
     #[tokio::test]

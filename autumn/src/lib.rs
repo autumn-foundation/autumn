@@ -245,6 +245,48 @@ pub use version_history::{
 /// that will handle incoming HTTP requests.
 pub(crate) mod router;
 
+/// Fuzzing-only re-export surface.
+///
+/// Compiled only when the crate is built with `--cfg fuzzing` (as cargo-fuzz
+/// does for the workspace-root `fuzz/` crate). It re-exports otherwise-private
+/// or `pub(crate)` request-path parsing seams so the fuzz targets can drive
+/// them over raw untrusted bytes. Everything here is guarded by `#[cfg(fuzzing)]`
+/// so normal builds — and `cargo package` output — are byte-identical.
+///
+/// Not part of the public API; no stability guarantees.
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub mod __fuzz {
+    // Routing / path-parameter extraction (functions are `pub` inside the
+    // `pub(crate)` `router` module).
+    pub use crate::router::{
+        extract_host_without_port, join_nested_path, path_matches_route_prefix,
+    };
+    // `extract_path_params` only exists under the `openapi` feature (it backs
+    // spec-URL generation); the `fuzz/` crate enables `openapi` so this routing
+    // seam is present when fuzzing.
+    #[cfg(feature = "openapi")]
+    pub use crate::router::extract_path_params;
+
+    // Trusted-proxy / `X-Forwarded-*` header parsing.
+    pub use crate::security::trusted_proxies::{
+        __fuzz_parse_forwarded_ip as parse_forwarded_ip,
+        __fuzz_parse_trusted_proxy as parse_trusted_proxy,
+        __fuzz_resolve_forwarded as resolve_forwarded,
+    };
+
+    // Cookie / signed-session decode.
+    pub use crate::session::__fuzz_decode_cookie as decode_cookie;
+
+    // Body handling: form-urlencoded (always) + inbound-mail MIME (feature-gated).
+    pub use crate::form::__fuzz_decode_urlencoded as decode_urlencoded_form;
+    #[cfg(feature = "inbound-mail")]
+    pub use crate::inbound_mail::{
+        __fuzz_parse_address_list as parse_address_list, __fuzz_parse_generic as parse_generic,
+        __fuzz_parse_ses as parse_ses,
+    };
+}
+
 #[cfg(feature = "db")]
 pub use hooks::{
     DraftField, FieldDiff, MutationContext, MutationHooks, MutationOp, NoHooks, Patch, UpdateDraft,

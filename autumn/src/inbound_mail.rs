@@ -1150,6 +1150,31 @@ pub(crate) fn parse_generic(
     Ok(parse_rfc5322(raw_body))
 }
 
+// ── Fuzzing seams ───────────────────────────────────────────────────────────
+// `#[cfg(fuzzing)]` wrappers exposing the inbound-mail parsing surface to the
+// `fuzz/` crate: SNS/SES JSON parsing, the RFC 5322 / MIME body parser (via the
+// unsigned `parse_generic` path), and address-list parsing. Compiled out of all
+// normal builds. See `fuzz/fuzz_targets/body.rs`.
+
+/// Fuzzing seam: parse an SES-via-SNS notification body.
+#[cfg(fuzzing)]
+pub fn __fuzz_parse_ses(body: &[u8]) {
+    let _ = parse_ses(&Bytes::copy_from_slice(body));
+}
+
+/// Fuzzing seam: parse a generic RFC 5322 / MIME raw body (no signature check),
+/// exercising `parse_rfc5322` including its multi-part MIME handling.
+#[cfg(fuzzing)]
+pub fn __fuzz_parse_generic(body: &[u8]) {
+    let _ = parse_generic(Bytes::copy_from_slice(body), None, &HeaderMap::new());
+}
+
+/// Fuzzing seam: parse an RFC 5322 address list.
+#[cfg(fuzzing)]
+pub fn __fuzz_parse_address_list(value: &str) {
+    let _ = parse_address_list(value);
+}
+
 /// Minimal RFC 5322 parser.
 ///
 /// Handles folded headers, plain-text and HTML bodies (single-part only).
