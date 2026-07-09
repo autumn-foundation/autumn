@@ -21,6 +21,7 @@ mod chaos_channels_loom;
 mod chaos_channels_proptest;
 #[cfg(feature = "ws")]
 mod chaos_channels_subscribe_loom;
+mod chaos_job_client_loom;
 mod chaos_metrics_compute_percentiles_proptest;
 mod chaos_metrics_leak;
 mod chaos_metrics_leak_loom;
@@ -39,6 +40,7 @@ mod custom_layer;
 mod db_telemetry_tests;
 #[cfg(feature = "db")]
 mod directory_shard_router;
+mod download;
 #[cfg(all(feature = "embed-assets", feature = "i18n"))]
 mod embed_assets_integration;
 #[cfg(feature = "db")]

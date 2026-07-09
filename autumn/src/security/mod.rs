@@ -141,6 +141,7 @@ pub mod captcha;
 pub(crate) mod config;
 pub(crate) mod csrf;
 pub(crate) mod headers;
+pub(crate) mod path;
 pub mod proxy;
 pub mod rate_limit;
 pub(crate) mod trusted_proxies;

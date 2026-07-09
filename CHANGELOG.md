@@ -28,6 +28,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   steps; `--bundled-pg` embeds and manages its own Postgres, so its README runs
   via `autumn serve --bundled-pg` and notes migrations apply automatically rather
   than telling users to configure an external `[database]`.
+- **download:** typed `Download` `IntoResponse` (`autumn_web::download::Download`)
+  for serving files from a handler without hand-rolling headers. Construct it
+  from owned bytes, an async byte stream, an `AsyncRead`, or a stored blob
+  (`Download::from_blob(&store, key).await?`), then chain `.filename(...)`,
+  `.content_type(...)`, and `.inline()`. It sets `Content-Disposition`
+  (RFC 5987-encoded for non-ASCII names, sanitized against header injection),
+  infers `Content-Type` from the filename extension (or blob metadata, falling
+  back to `application/octet-stream`), and sets `Content-Length` when the size
+  is known. The blob-backed path streams via the new
+  `BlobStore::get_stream` without buffering the whole object in memory, so it
+  serves large private files behind a `#[secured]` handler with no public
+  presigned URL (#1141).
 - **ci:** README-quickstart gate against the published crates (issue #1586) —
   `.github/workflows/quickstart-gate.yml` + `scripts/check-quickstart.sh`
   install the README-pinned `autumn-cli` from crates.io (never the local
@@ -557,9 +569,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   feature the daemon scaffold disables, so following it would leave the app
   non-compiling. `--bundled-pg` keeps the `db` feature and retains
   `generate scaffold` (issue #1052).
+- **views:** vendored the full Idiomorph 0.3.0 morphing script (replacing a
+  minimal stub) so live `hx-ext="morph"` updates actually DOM-morph, and
+  patched its htmx extension so non-morph out-of-band swaps (e.g.
+  `beforeend`/`delete`) no longer throw a caught console error. Served the
+  idiomorph script with a revalidating cache policy (a weak content-derived
+  `ETag` plus `Cache-Control: public, max-age=0, must-revalidate`) instead of a
+  year-long `immutable` cache, so clients that had cached the old stub pick up
+  the real script on their next revalidation rather than running stale code for
+  up to a year. (The idiomorph URL is not content-fingerprinted; adding
+  fingerprinted asset URLs so it can safely go back to `immutable` caching is a
+  possible future follow-up.)
 
 ### Changed
 
+- **security:** `TenancyConfig::jwt_secret` is now stored as a
+  `secrecy::SecretString` instead of a plain `String`, so the JWT signing
+  secret is redacted from `Debug` output (and any logs that format the
+  config) and zeroized on drop. Config-file deserialization is unchanged —
+  a plain TOML string still works. Breaking for code that read or set the
+  field directly: set it with `Some(value.into())` and read it via
+  `secrecy::ExposeSecret::expose_secret()` (supersedes #1304). [no-plugin]
+- **deps(security):** dependency-vulnerability upgrades (supersedes PR #1557;
+  `diesel-async` was already handled separately). `aws-sdk-s3` floored at
+  1.122 (1.119.0 → 1.122.0, the last MSRV-1.88 release) with
+  `default-features = false` to drop the deprecated legacy hyper 0.14 /
+  rustls 0.21 connector stack — this removes `rustls-webpki` 0.101.7
+  (RUSTSEC-2026-0104 / GHSA-82j2-j2ch-gfr8 high, RUSTSEC-2026-0098 /
+  GHSA-965h-392x-2mh5 and RUSTSEC-2026-0099 / GHSA-xgp8-3hg3-c2mh low),
+  `rustls` 0.21.12, `hyper` 0.14.32, and `h2` 0.3.27 from `Cargo.lock`
+  entirely (the modern hyper 1.x / rustls 0.23 `default-https-client` stack,
+  which is what the SDK actually uses at runtime, stays enabled); transitive
+  `lru` 0.12.5 → 0.16.4 (RUSTSEC-2026-0002 / GHSA-rhfx-m35p-ff5j);
+  `opentelemetry_sdk` 0.31.0 → 0.32.1 (CVE-2026-48504 / GHSA-w9wp-h8wv-79jx,
+  unbounded memory allocation in W3C Baggage propagation) together with the
+  matching `opentelemetry` / `opentelemetry-otlp` 0.32.0 and
+  `tracing-opentelemetry` 0.33.0 (with the `tls-aws-lc`, `tls-roots`, and
+  `reqwest-rustls` features enabled on `opentelemetry-otlp`, since 0.32
+  rejects `https://` gRPC collector endpoints at exporter build time unless
+  a TLS provider feature is on, the provider alone ships an empty trust-root
+  store — `tls-roots` loads the platform's native roots, which the gRPC
+  exporter now enables explicitly via `with_enabled_roots()` for `https`
+  endpoints — and its new reqwest 0.13 HTTP client ships without TLS under
+  `reqwest-client` alone — reqwest 0.12 feature unification no longer
+  covers it).
+  `rsa` 0.9.10 (RUSTSEC-2023-0071, Marvin
+  attack) remains: no fixed release exists on its 0.9.x line. [no-plugin]
 - **deps:** bumped `diesel-async` from 0.8 to 0.9 (resolving 0.9.2, with
   `diesel` at 2.3.10) and `libsqlite3-sys` from 0.36 to 0.37 — 0.37 is the
   newest release line diesel 2.3 accepts (`<0.38`). diesel-async 0.9 changed
@@ -574,6 +629,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **workspace:** `Cargo.lock` is now committed to the repository (it was
   previously gitignored) so builds are reproducible and dependency updates
   are reviewable.
+
+### Fixed
+
+- **security:** CSRF and CAPTCHA exempt-path matching now normalizes the
+  request path (resolving `.`/`..` dot-segments — including percent-encoded
+  `%2e` forms — treating percent-encoded slashes (`%2f`) as segment
+  separators, and collapsing duplicate slashes) before comparing it against
+  exemption prefixes, so a request like `POST /api/../submit` or
+  `POST /api/%2e%2e%2fsubmit` can no longer satisfy an `/api/` exemption
+  while targeting a protected route through a downstream component that
+  percent-decodes or resolves dot-segments (supersedes #1229).
+- **mail:** the SMTP password can no longer leak into startup error messages.
+  When `mail.smtp.password_env` names an environment variable whose contents
+  are not valid unicode, the raw `std::env::VarError::NotUnicode` value (which
+  carries the password itself) was formatted into the
+  `MailError::InvalidMessage` text; the error now reports a static reason
+  ("environment variable is not set" / "contains non-unicode data") alongside
+  the variable *name* only, never its value. Supersedes PR #887.
+- **circuit_breaker:** the breaker and its registry now recover from a
+  poisoned mutex (`lock().unwrap_or_else(PoisonError::into_inner)`) instead
+  of panicking on every subsequent call once a single lock holder has
+  panicked; breaker state is a self-correcting sliding window, so the
+  recovered data is safe to keep using. Supersedes #1207. [no-plugin]
+- **docs:** repaired the broken intra-doc links in the `reporting` module
+  overview (`ErrorEvent`, `ErrorReporter`, `LogReporter`, `ReportingLayer`
+  rendered as dead links on docs.rs because shorthand references don't resolve
+  when a module carries both outer and inner doc comments — they now use
+  explicit `crate::reporting::…` paths) and dropped a redundant explicit link
+  target in the `job_tracking` module docs. Supersedes the salvageable parts
+  of PR #1555.
+- **jobs:** fixed a first-initialization race in the process-global job
+  client (supersedes #1491): `init_global_job_client` /
+  `clear_global_job_client` used a get-then-set pattern on the backing
+  `OnceLock`, so two threads racing the very first install/clear could have
+  one side's `OnceLock::set` lose and be silently dropped — leaving a job
+  runtime that had just installed its client invisible to `global_job_client()`
+  (free-function `enqueue` and `#[job]` handlers would see no runtime). Both
+  functions now use `OnceLock::get_or_init` so the slot is created exactly
+  once and every install/clear lands through the `RwLock`. Both functions now
+  also recover from a poisoned lock (`PoisonError::into_inner`) instead of
+  silently skipping the write, and a loom model-check
+  (`chaos_job_client_loom`) exercises the first-init race across all
+  interleavings.
 
 ## [0.6.0] - 2026-06-30
 
