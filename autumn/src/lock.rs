@@ -415,6 +415,12 @@ mod db_impl {
         /// whole wait avoids per-poll connection churn; on timeout the
         /// connection recycles back to the pool.
         ///
+        /// The deadline is rechecked before every poll, so no poll is issued
+        /// past `timeout`. The wait is bounded to the deadline plus at most one
+        /// in-flight poll round-trip — a poll already running when the deadline
+        /// passes may still complete (and, if it grants the lock, succeed)
+        /// before the next iteration observes the expiry.
+        ///
         /// # Errors
         ///
         /// Returns [`LockError::Timeout`] if the lock is not acquired within
@@ -440,6 +446,23 @@ mod db_impl {
             // of recycling a lock-bearing connection to the pool.
             let mut ac = AcquireConn::new(checked_out);
             loop {
+                // Recheck the deadline before every poll so the bounded acquire
+                // is actually bounded. The final sleep below only ever consumes
+                // the remaining budget, so without this top-of-loop check the
+                // loop would issue one more `pg_try_advisory_lock` past the
+                // deadline and could return `Ok` after `timeout` had already
+                // elapsed. On a normal positive `timeout` the first iteration's
+                // elapsed is ~0, so at least one poll always runs.
+                let elapsed = start.elapsed();
+                if elapsed >= timeout {
+                    // Timed out: recycle the healthy `Object` back to the pool
+                    // (the lock was never acquired on it).
+                    ac.recycle();
+                    return Err(LockError::Timeout {
+                        name: self.name.clone(),
+                        waited: elapsed,
+                    });
+                }
                 let acquired = diesel::sql_query("SELECT pg_try_advisory_lock($1) AS acquired")
                     .bind::<diesel::sql_types::BigInt, _>(self.key)
                     .get_result::<AcquiredRow>(ac.as_mut())
@@ -453,17 +476,7 @@ mod db_impl {
                     let conn = ac.into_pooled();
                     return Ok(LockGuard::new(conn, self.key, self.name.clone()));
                 }
-                let elapsed = start.elapsed();
-                if elapsed >= timeout {
-                    // Timed out: recycle the healthy `Object` back to the pool
-                    // (the lock was never acquired on it).
-                    ac.recycle();
-                    return Err(LockError::Timeout {
-                        name: self.name.clone(),
-                        waited: elapsed,
-                    });
-                }
-                let remaining = timeout.saturating_sub(elapsed);
+                let remaining = timeout.saturating_sub(start.elapsed());
                 // Clamp the effective poll interval to a small minimum so a
                 // zero (or sub-millisecond) interval cannot busy-spin, but never
                 // sleep past the remaining budget.
