@@ -71,10 +71,12 @@ tokio::task_local! {
 /// installed at [`Db::checkout`], which fires on every diesel-async
 /// query (including the raw `.load()`/`.execute()` calls generated
 /// repositories run), whenever the task-local [`REQUEST_DB_TIMINGS`] is
-/// set (i.e. when the `ServerTimingLayer` has scoped the request).
-/// [`run_instrumented`] also records into it for the code paths that use
-/// it. Absent otherwise — every write site uses `try_with`, so DB code
-/// paths are unaffected when the middleware is disabled.
+/// set (i.e. when the `ServerTimingLayer` has scoped the request). The
+/// connection instrumentation is the sole writer during a request — helpers
+/// like [`run_instrumented`] deliberately do *not* record here, to avoid
+/// double-counting the same statement. Absent otherwise — every write site
+/// uses `try_with`, so DB code paths are unaffected when the middleware is
+/// disabled.
 #[derive(Default, Debug)]
 pub(crate) struct RequestDbTimings {
     /// Total elapsed time across all DB queries for this request, in
@@ -630,9 +632,11 @@ where
     let verb = sql.split_whitespace().next().unwrap_or("?");
     let metric_key = format!("{route_key} {verb}");
     metrics.record_db_query(&metric_key, elapsed_ms);
-    // Additionally, record into the per-request Server-Timing accumulator
-    // if the middleware has scoped this task. No-op otherwise.
-    record_request_db_query(elapsed);
+    // NOTE: deliberately *not* recorded into the per-request Server-Timing
+    // accumulator. The connection-level `RequestQueryTimer` instrumentation
+    // (installed at `Db::checkout`) already brackets every executed statement
+    // — including any query run through this helper — so recording here too
+    // would double-count it in `db;dur` and `desc="N queries"`.
 
     // Log slow queries with scrubbed SQL
     if elapsed >= slow_threshold {

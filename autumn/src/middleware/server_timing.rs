@@ -407,10 +407,11 @@ mod tests {
 
     /// End-to-end coverage of the db-metric path without a live database:
     /// enter the `REQUEST_DB_TIMINGS` task-local scope the middleware sets,
-    /// record two queries through the same crate-internal hook `db.rs`'s
-    /// `run_instrumented` calls, snapshot the accumulator, then feed it into
-    /// [`build_header_value`] and assert the emitted `db;dur=…;desc="N
-    /// queries"` metric. This mirrors what a real DB request produces.
+    /// record two queries through the same crate-internal hook the connection
+    /// instrumentation uses (`db.rs`'s `record_request_db_query`), snapshot the
+    /// accumulator, then feed it into [`build_header_value`] and assert the
+    /// emitted `db;dur=…;desc="N queries"` metric. This mirrors what a real DB
+    /// request produces.
     #[cfg(feature = "db")]
     #[tokio::test]
     async fn db_accumulator_feeds_header_value() {
