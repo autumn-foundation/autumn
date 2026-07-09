@@ -43,13 +43,19 @@ public API: `autumn_web::lock::Lock`.
   (`try_lock`, returns `None` immediately when another node holds it).
 - `with` / `with_timeout` / `try_with` wrap a closure and auto-release the lock
   when the guarded section ends — normal return, early `?`, or panic.
-- The lock-bearing connection is **detached from the pool** (`Object::take`) for
-  the lifetime of the `LockGuard`. Explicit `release` issues
-  `pg_advisory_unlock` and then closes the session; an implicit drop (early
-  return or panic unwind) closes the session, which Postgres treats as releasing
-  every session-scoped advisory lock it held. Either way the connection is never
-  returned to the shared pool while the lock is held, so the leak the example
-  warned about cannot occur in application code.
+- While the lock is held, the acquiring connection stays a **checked-out pooled
+  connection** owned by the `LockGuard` — counted against
+  `database.pool.max_size` and never returned to the shared pool while held, so
+  holding N locks can never open more than `max_size` sessions. Explicit
+  `release` issues `pg_advisory_unlock` and then **recycles** the healthy
+  connection back to the pool; only the panic/cancel/unlock-error paths
+  force-close the session (`Object::take` + drop the raw connection), which
+  Postgres treats as releasing every session-scoped advisory lock it held.
+  Either way a lock-bearing connection is never recycled while the lock is held,
+  so the leak the example warned about cannot occur in application code. The
+  bounded `lock_timeout` also covers the initial pool checkout in its deadline,
+  so a small timeout returns `LockError::Timeout` on time even under pool
+  pressure rather than blocking on deadpool's own wait.
 
 Acquisition happens on the primary connection so all replicas contend on the
 same server; under sharded repositories the lock lives on whichever primary the
@@ -75,10 +81,12 @@ This is a **coordination** lock, not a durable mutual-exclusion queue:
 - The `bookmarks-distributed` link-checker is rewritten onto the primitive,
   deleting its raw-SQL advisory-lock code; zero
   `diesel::sql_query("...advisory_lock...")` calls remain in `examples/**`.
-- Each held lock consumes one physical connection for its duration (closed on
-  release). This is the conservative, correct trade the example already made;
-  short critical sections make it a non-issue, and it removes any chance of
-  recycling a lock-bearing connection.
+- Each held lock occupies one checked-out pooled connection for its duration —
+  counted against `database.pool.max_size` and recycled to the pool on clean
+  release — so the number of concurrently held locks is bounded by the pool, not
+  unbounded. Keep critical sections short and size the pool for the locks you
+  hold at once; the design caps total sessions while still removing any chance
+  of recycling a lock-bearing connection.
 - The internal scheduler/migration/ISR call sites are unchanged for now; the
   shared key-namespacing convention leaves room to converge them onto the public
   core path in a later slice.

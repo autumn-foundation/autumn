@@ -81,16 +81,23 @@ for shard in shard_ids() {
 
 The lock is released when the guarded section ends, no matter how:
 
-- **Normal return** and **early `?`** — the guard is dropped at end of scope and
-  its session closed.
-- **Panic** — as the stack unwinds, the guard's `Drop` closes the lock-bearing
-  session, which Postgres treats as releasing every session-scoped advisory lock
-  it held. No leaked lock.
+- **Normal return** and **early `?`** — the closure wrappers (`with` /
+  `with_timeout` / `try_with`) run `pg_advisory_unlock` and recycle the
+  connection back to the pool; a `LockGuard` you drop yourself force-closes its
+  session instead.
+- **Panic** — as the stack unwinds, the guard's `Drop` force-closes the
+  lock-bearing session, which Postgres treats as releasing every session-scoped
+  advisory lock it held. No leaked lock.
 
-The lock-bearing connection is detached from the pool for the lifetime of the
-guard and its session is closed on release, so a recycled lock-bearing
-connection can never silently leak the lock — the footgun you would face
-hand-rolling `pg_try_advisory_lock` / `pg_advisory_unlock` yourself.
+While the lock is held its connection stays checked out of the pool — counted
+against `database.pool.max_size` and never returned to the shared pool while
+held. A clean `release` runs `pg_advisory_unlock` and recycles that connection
+back to the pool for reuse; a panic, cancelled future, or unlock error instead
+force-closes the session. Either way a lock-bearing connection can never
+silently leak the lock — the footgun you would face hand-rolling
+`pg_try_advisory_lock` / `pg_advisory_unlock` yourself. Because a held lock
+occupies a pool slot for its whole duration, keep critical sections short and
+size the pool for the number of locks you hold concurrently.
 
 If you need manual control, `try_lock` / `lock` return a `LockGuard`; call
 `guard.release().await` to release explicitly (it surfaces a typed error on

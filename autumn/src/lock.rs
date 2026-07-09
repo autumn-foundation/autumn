@@ -30,21 +30,27 @@
 //!
 //! # Semantics
 //!
-//! The lock is a `PostgreSQL` **session-scoped** advisory lock. The connection
-//! that acquires it is detached from the pool for the lifetime of the guard and
-//! is never returned to the shared pool while the lock is held — releasing the
-//! lock (or, on panic, simply closing that session) is handled internally, so
-//! the "recycled a lock-bearing connection and leaked the lock" footgun cannot
-//! occur in application code.
+//! The lock is a `PostgreSQL` **session-scoped** advisory lock. While the lock
+//! is held, its [`LockGuard`] keeps the acquiring connection as a
+//! **checked-out pooled connection** — counted against `database.pool.max_size`
+//! and unavailable to other callers, but never handed back to the shared pool
+//! while the lock is held, so the "recycled a lock-bearing connection and
+//! leaked the lock" footgun cannot occur in application code. A clean release
+//! runs `pg_advisory_unlock` and then **recycles** that connection back to the
+//! pool for reuse; only the panic/cancel/unlock-error paths force-close the
+//! session. Because a held lock occupies a pool slot for its whole duration,
+//! holding N locks concurrently can never open more than `max_size` sessions —
+//! keep critical sections short and size the pool for the locks you hold at
+//! once.
 //!
 //! Acquisition is also **cancellation-safe**: the connection is held by an
 //! internal guard across the acquire query, so if the acquiring future is
 //! dropped mid-`await` (e.g. a surrounding request/task timeout) after
-//! `PostgreSQL` granted the lock but before the session was detached, the guard
-//! force-closes that session on drop — releasing the just-granted lock rather
-//! than recycling a lock-bearing connection back into the pool. Only a
+//! `PostgreSQL` granted the lock but before the guard took ownership, that
+//! guard force-closes the session on drop — releasing the just-granted lock
+//! rather than recycling a lock-bearing connection back into the pool. A
 //! *definitive* miss (`try_lock` lost the race, or `lock_timeout` expired)
-//! recycles the healthy connection.
+//! recycles the healthy connection with no churn.
 //!
 //! # Non-goals
 //!
@@ -187,8 +193,9 @@ mod db_impl {
     /// On a definitive *not-acquired* result the caller calls
     /// [`recycle`](Self::recycle), disarming the guard so the healthy `Object`
     /// returns to the pool (no connection churn on a clean miss). On success the
-    /// caller calls [`into_detached`](Self::into_detached), disarming the guard
-    /// and handing the detached raw connection to the [`LockGuard`].
+    /// caller calls [`into_pooled`](Self::into_pooled), disarming the guard and
+    /// handing the still-pooled `Object` to the [`LockGuard`], which holds it
+    /// (counted against pool capacity) until the lock is released.
     struct AcquireConn {
         conn: Option<Object<AsyncPgConnection>>,
         armed: bool,
@@ -219,11 +226,14 @@ mod db_impl {
             // returning the connection to the pool.
         }
 
-        /// Success: disarm and detach the raw session out of the pool so the
-        /// lock-bearing connection can never be recycled while the lock is held.
-        fn into_detached(mut self) -> AsyncPgConnection {
+        /// Success: disarm and hand the still-pooled `Object` to the
+        /// [`LockGuard`]. The guard holds it as a checked-out connection
+        /// (counted against pool capacity) for the lock's lifetime and recycles
+        /// it to the pool on clean release; it is *not* detached from the pool
+        /// on the success path.
+        fn into_pooled(mut self) -> Object<AsyncPgConnection> {
             self.armed = false;
-            Object::take(self.conn.take().expect("AcquireConn detached twice"))
+            self.conn.take().expect("AcquireConn taken twice")
         }
     }
 
@@ -321,8 +331,9 @@ mod db_impl {
         /// The connection is returned as a pooled [`Object`], **not** detached.
         /// Callers wrap it in an [`AcquireConn`] guard for the duration of the
         /// acquire: on a clean miss the guard recycles the healthy `Object`
-        /// back to the pool; on success it detaches the lock-bearing session so
-        /// it can never be recycled while the lock is held; and if the acquire
+        /// back to the pool; on success it hands the still-pooled `Object` to
+        /// the [`LockGuard`], which holds it as a checked-out connection
+        /// (counted against pool capacity) until release; and if the acquire
         /// future is cancelled (or the query errors) the guard force-closes the
         /// session so `PostgreSQL` releases any lock it had already granted.
         async fn checkout(&self) -> Result<Object<AsyncPgConnection>, LockError> {
@@ -355,9 +366,10 @@ mod db_impl {
                 .map_err(|e| LockError::Database(e.to_string()))?
                 .acquired;
             if acquired {
-                // Acquired: detach the session from the pool so the
-                // lock-bearing connection can never be recycled while held.
-                let conn = ac.into_detached();
+                // Acquired: hand the still-pooled connection to the guard, which
+                // holds it (counted against pool capacity) and recycles it to
+                // the pool on clean release.
+                let conn = ac.into_pooled();
                 Ok(Some(LockGuard::new(conn, self.key, self.name.clone())))
             } else {
                 // Not acquired: recycle the healthy `Object` back to the pool
@@ -388,9 +400,10 @@ mod db_impl {
                 .execute(ac.as_mut())
                 .await
                 .map_err(|e| LockError::Database(e.to_string()))?;
-            // Acquired: detach the session from the pool so the lock-bearing
-            // connection can never be recycled while held.
-            let conn = ac.into_detached();
+            // Acquired: hand the still-pooled connection to the guard, which
+            // holds it (counted against pool capacity) and recycles it to the
+            // pool on clean release.
+            let conn = ac.into_pooled();
             Ok(LockGuard::new(conn, self.key, self.name.clone()))
         }
 
@@ -408,12 +421,24 @@ mod db_impl {
         /// `timeout`, or another [`LockError`] on connection/query failure.
         pub async fn lock_timeout(&self, timeout: Duration) -> Result<LockGuard, LockError> {
             let start = Instant::now();
-            // Check out one connection and hold it (via one `AcquireConn`) for
-            // every poll iteration — no per-poll churn. The guard also makes the
-            // whole wait cancel-safe: dropping this future during a poll query or
-            // the sleep force-closes the session, releasing any just-granted
-            // lock instead of recycling a lock-bearing connection to the pool.
-            let mut ac = AcquireConn::new(self.checkout().await?);
+            // Bound the initial pool checkout by the same deadline: under pool
+            // pressure deadpool's own wait could otherwise block far past
+            // `timeout`, returning `PoolUnavailable` instead of honoring the
+            // requested budget. Checkout time is debited from the deadline, so a
+            // small `lock_timeout` returns `Timeout` on time even when the pool
+            // is exhausted.
+            let checked_out = tokio::time::timeout(timeout, self.checkout())
+                .await
+                .map_err(|_| LockError::Timeout {
+                    name: self.name.clone(),
+                    waited: start.elapsed(),
+                })??;
+            // Hold that one connection (via one `AcquireConn`) for every poll
+            // iteration — no per-poll churn. The guard also makes the whole wait
+            // cancel-safe: dropping this future during a poll query or the sleep
+            // force-closes the session, releasing any just-granted lock instead
+            // of recycling a lock-bearing connection to the pool.
+            let mut ac = AcquireConn::new(checked_out);
             loop {
                 let acquired = diesel::sql_query("SELECT pg_try_advisory_lock($1) AS acquired")
                     .bind::<diesel::sql_types::BigInt, _>(self.key)
@@ -422,9 +447,10 @@ mod db_impl {
                     .map_err(|e| LockError::Database(e.to_string()))?
                     .acquired;
                 if acquired {
-                    // Acquired: detach the session from the pool so the
-                    // lock-bearing connection can never be recycled while held.
-                    let conn = ac.into_detached();
+                    // Acquired: hand the still-pooled connection to the guard,
+                    // which holds it (counted against pool capacity) and
+                    // recycles it to the pool on clean release.
+                    let conn = ac.into_pooled();
                     return Ok(LockGuard::new(conn, self.key, self.name.clone()));
                 }
                 let elapsed = start.elapsed();
@@ -523,19 +549,25 @@ mod db_impl {
 
     /// An acquired distributed lock. Releases automatically on drop.
     ///
-    /// Prefer [`LockGuard::release`] to release explicitly (it issues
-    /// `pg_advisory_unlock` and returns a typed error on failure). If the guard
-    /// is simply dropped — including while unwinding from a panic — the lock is
-    /// released by closing the underlying session, which `PostgreSQL` treats as
-    /// releasing every session-scoped advisory lock it held.
+    /// Holds the acquiring connection as a **checked-out pooled [`Object`]** for
+    /// the lock's lifetime — counted against `database.pool.max_size` and never
+    /// returned to the shared pool while the lock is held. Prefer
+    /// [`LockGuard::release`] to release explicitly: it issues
+    /// `pg_advisory_unlock`, then recycles the healthy connection back to the
+    /// pool (returning a typed error on unlock failure, in which case the
+    /// possibly-still-locked session is force-closed instead of recycled). If
+    /// the guard is simply dropped — including while unwinding from a panic or a
+    /// cancelled future — the lock is released by force-closing the underlying
+    /// session, which `PostgreSQL` treats as releasing every session-scoped
+    /// advisory lock it held.
     pub struct LockGuard {
-        conn: Option<AsyncPgConnection>,
+        conn: Option<Object<AsyncPgConnection>>,
         key: i64,
         name: String,
     }
 
     impl LockGuard {
-        const fn new(conn: AsyncPgConnection, key: i64, name: String) -> Self {
+        const fn new(conn: Object<AsyncPgConnection>, key: i64, name: String) -> Self {
             Self {
                 conn: Some(conn),
                 key,
@@ -557,26 +589,33 @@ mod db_impl {
 
         /// Explicitly release the lock, issuing `pg_advisory_unlock`.
         ///
-        /// The lock-bearing session is closed afterwards (the connection is
-        /// never returned to the pool).
+        /// On success the healthy connection is **recycled back to the pool**
+        /// for reuse. If the unlock query errors the session is force-closed
+        /// (detached from the pool and dropped) instead, so a
+        /// possibly-still-locked connection never returns to the shared pool.
         ///
         /// # Errors
         ///
         /// Returns [`LockError::Database`] if the unlock query failed. The lock
-        /// is still released regardless, because the session is closed.
+        /// is still released regardless, because the session is force-closed.
         pub async fn release(mut self) -> Result<(), LockError> {
             let Some(mut conn) = self.conn.take() else {
                 return Ok(());
             };
             let result = diesel::sql_query("SELECT pg_advisory_unlock($1) AS released")
                 .bind::<diesel::sql_types::BigInt, _>(self.key)
-                .get_result::<ReleasedRow>(&mut conn)
+                .get_result::<ReleasedRow>(&mut *conn)
                 .await;
-            // Closing the session releases the lock server-side no matter what.
-            drop(conn);
             match result {
-                Ok(row) if row.released => Ok(()),
+                Ok(row) if row.released => {
+                    // Clean release: recycle the healthy pooled connection.
+                    drop(conn);
+                    Ok(())
+                }
                 Ok(_) => {
+                    // Unlock returned false: the lock was not held, so the
+                    // session is clean — recycle it back to the pool.
+                    drop(conn);
                     tracing::warn!(
                         lock_name = %self.name,
                         lock_key = self.key,
@@ -584,7 +623,14 @@ mod db_impl {
                     );
                     Ok(())
                 }
-                Err(e) => Err(LockError::Database(e.to_string())),
+                Err(e) => {
+                    // Unlock errored: we cannot prove the session no longer
+                    // holds the lock, so force-close it (detach from the pool
+                    // and drop the raw connection) rather than recycle a
+                    // possibly-lock-bearing connection.
+                    let _ = Object::take(conn);
+                    Err(LockError::Database(e.to_string()))
+                }
             }
         }
     }
@@ -602,15 +648,18 @@ mod db_impl {
     impl Drop for LockGuard {
         fn drop(&mut self) {
             if let Some(conn) = self.conn.take() {
-                // Released implicitly (early return without `release`, or panic
-                // unwind): we cannot run the async `pg_advisory_unlock` here, so
-                // drop the detached connection. Closing the session releases
-                // every session-scoped advisory lock PostgreSQL held for it.
-                drop(conn);
+                // Released implicitly (early return without `release`, panic
+                // unwind, or a cancelled future): we cannot run the async
+                // `pg_advisory_unlock` here, so force-close the session — detach
+                // it from the pool and drop the raw connection so the socket
+                // closes and PostgreSQL releases every session-scoped advisory
+                // lock it held. Never recycle a still-lock-bearing connection
+                // back into the shared pool.
+                let _ = Object::take(conn);
                 tracing::debug!(
                     lock_name = %self.name,
                     lock_key = self.key,
-                    "distributed lock released by closing its session on drop"
+                    "distributed lock released by force-closing its session on drop"
                 );
             }
         }

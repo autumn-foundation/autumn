@@ -32,10 +32,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (typed `LockError::Timeout` on expiry) and a non-blocking `try_lock`
   (returns `None` immediately when another node holds it), plus `with` /
   `with_timeout` / `try_with` closure wrappers that auto-release the lock when
-  the guarded section ends — on normal return, an early `?`, or a panic. The
-  lock-bearing connection is detached from the pool while held and its session
-  is closed on release, so a recycled lock-bearing connection can never leak
-  the lock. The `bookmarks-distributed` link-checker was rewritten onto the
+  the guarded section ends — on normal return, an early `?`, or a panic. While
+  held, the lock keeps its connection as a checked-out pooled connection
+  (counted against `database.pool.max_size`, never returned to the shared pool
+  while held); a clean release runs `pg_advisory_unlock` and recycles it, while
+  panic/cancel/unlock-error paths force-close the session — so holding many
+  locks stays bounded by the pool and a recycled lock-bearing connection can
+  never leak the lock. `lock_timeout` also bounds the initial pool checkout by
+  the deadline, so a small timeout returns `Timeout` on time under pool
+  pressure. The `bookmarks-distributed` link-checker was rewritten onto the
   primitive, deleting its hand-rolled `pg_try_advisory_lock` /
   `pg_advisory_unlock` raw SQL. `Lock`, `LockGuard`, and `LockError` are
   re-exported from the prelude. See `docs/guide/distributed-locks.md` and
