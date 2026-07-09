@@ -13,12 +13,17 @@
 //! use autumn_web::lock::Lock;
 //!
 //! let lock = Lock::new(pool, "nightly-cleanup");
-//! // Runs the closure on exactly one replica; the lock auto-releases when the
-//! // section ends (normal return, early `?`, or panic).
-//! lock.with(|| async {
-//!     // ... critical section ...
-//! })
-//! .await?;
+//! // Runs the closure on exactly one replica; the others observe `None` and
+//! // skip. The lock auto-releases when the section ends (normal return, early
+//! // `?`, or panic).
+//! let ran = lock
+//!     .try_with(|| async {
+//!         // ... critical section that must not run twice ...
+//!     })
+//!     .await?;
+//! if ran.is_none() {
+//!     // Another replica holds the lock right now — nothing to do here.
+//! }
 //! # Ok(())
 //! # }
 //! ```

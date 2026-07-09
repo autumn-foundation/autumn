@@ -241,7 +241,10 @@ optional `.distributed_fill_lock(true)` / `.stale_while_revalidate(grace)`.
   i64` (namespaced under `DISTRIBUTED_LOCK_DOMAIN = "autumn:lock:v1"`).
 - Acquire: `try_lock() -> Option<LockGuard>`, `lock()`, `lock_timeout(dur)`
   (`LockError::Timeout`). Closures: `with(f)`, `with_timeout(dur, f)`,
-  `try_with(f) -> Option<T>`. Auto-releases on scope end / `?` / panic;
+  `try_with(f) -> Option<T>`. For run-once (must-not-run-twice) work use
+  `try_with`/`try_lock` and skip on `None`; blocking `with`/`with_timeout`
+  *serialize* — every waiter eventually runs, so they are not run-once.
+  Auto-releases on scope end / `?` / panic;
   `LockGuard::release().await` releases explicitly. `LockError::PoolUnavailable`
   / `Timeout` map to `503`.
 - Non-goals: not fair, not a lease, not row-level (`with_lock`), Postgres only.

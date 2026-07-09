@@ -19,17 +19,32 @@ use autumn_web::prelude::*;
 async fn nightly_cleanup(state: AppState) -> AutumnResult<()> {
     let lock = Lock::from_state(&state, "nightly-cleanup")?;
 
-    // Runs on exactly one replica; the lock auto-releases when the section
-    // ends — normal return, early `?`, or panic.
-    lock.with(|| async {
-        // ... expensive cleanup that must not run twice ...
-        Ok::<(), AutumnError>(())
-    })
-    .await??;
+    // Runs on exactly one replica; the rest observe `None` and skip. The lock
+    // auto-releases when the section ends — normal return, early `?`, or panic.
+    let ran = lock
+        .try_with(|| async {
+            // ... expensive cleanup that must not run twice ...
+            Ok::<(), AutumnError>(())
+        })
+        .await?;
+
+    match ran {
+        // We held the lock and ran the cleanup — propagate its result.
+        Some(result) => result?,
+        // Another replica already holds the lock and is doing the work — skip.
+        None => {}
+    }
 
     Ok(())
 }
 ```
+
+Use `try_with` (or `try_lock`) whenever the work **must not run twice**: the
+replica that wins the lock runs the closure, and every other replica sees `None`
+and skips. Reach for the blocking `with` / `with_timeout` only to *serialize* a
+mutually-exclusive section where every waiter should eventually run — those
+variants block until the current holder releases and then run the closure, so
+they are **not** a run-once primitive.
 
 `Lock::from_state` builds a lock from any state's **primary** pool. If you hold
 a pool directly, use `Lock::new(pool, "name")`.

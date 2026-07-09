@@ -616,10 +616,15 @@ that already gates migrations, `#[scheduled]` leader election, and ISR.
 - Acquire: `try_lock()` → `Option<LockGuard>` (non-blocking, `None` when held
   elsewhere); `lock()` blocks; `lock_timeout(dur)` blocks with a typed
   `LockError::Timeout`.
-- Run-and-release closures: `with(f)` / `with_timeout(dur, f)` (blocking) and
-  `try_with(f)` → `Option<T>` (skips when held). The lock auto-releases when the
-  section ends — normal return, early `?`, or panic — and the lock-bearing
-  connection is never recycled to the pool while held, so it cannot leak.
+- Run-and-release closures: for **run-once-across-replicas** work (must not run
+  twice) use `try_with(f)` → `Option<T>` — the winner runs the closure, every
+  other replica gets `None` and skips (check `ran.is_none()`). The blocking
+  `with(f)` / `with_timeout(dur, f)` instead *serialize* a mutually-exclusive
+  section: they block until the holder releases and then run the closure, so
+  every waiter eventually runs — they are **not** a run-once primitive. The lock
+  auto-releases when the section ends — normal return, early `?`, or panic — and
+  the lock-bearing connection is never recycled to the pool while held, so it
+  cannot leak.
 - Non-goals: not fair (no FIFO), not a lease (no heartbeat — use the scheduler
   for long-lived leader election), not row-level (use `with_lock`), Postgres
   only.
