@@ -67,7 +67,7 @@ impl ExploreState {
         }
     }
 
-    fn next(&mut self) {
+    const fn next(&mut self) {
         if self.filtered_routes.is_empty() {
             return;
         }
@@ -84,7 +84,7 @@ impl ExploreState {
         self.table_state.select(Some(i));
     }
 
-    fn previous(&mut self) {
+    const fn previous(&mut self) {
         if self.filtered_routes.is_empty() {
             return;
         }
@@ -160,24 +160,23 @@ fn run_loop(
     loop {
         terminal.draw(|frame| draw(frame, state))?;
 
-        if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
-                    match key.code {
-                        KeyCode::Esc => return Ok(()),
-                        KeyCode::Down => state.next(),
-                        KeyCode::Up => state.previous(),
-                        KeyCode::Backspace => {
-                            state.search_query.pop();
-                            state.apply_filter();
-                        }
-                        KeyCode::Char(c) => {
-                            state.search_query.push(c);
-                            state.apply_filter();
-                        }
-                        _ => {}
-                    }
+        if event::poll(Duration::from_millis(100))?
+            && let Event::Key(key) = event::read()?
+            && key.kind == KeyEventKind::Press
+        {
+            match key.code {
+                KeyCode::Esc => return Ok(()),
+                KeyCode::Down => state.next(),
+                KeyCode::Up => state.previous(),
+                KeyCode::Backspace => {
+                    state.search_query.pop();
+                    state.apply_filter();
                 }
+                KeyCode::Char(c) => {
+                    state.search_query.push(c);
+                    state.apply_filter();
+                }
+                _ => {}
             }
         }
     }
@@ -363,13 +362,11 @@ pub fn build_detail_lines(route: &RouteInfo) -> Vec<Line<'static>> {
             Span::styled(status.clone(), Style::default().fg(status_color)),
         ]));
 
-        if let Some(opt_out) = route.sunset_opt_out {
-            if opt_out {
-                lines.push(Line::from(vec![
-                    Span::styled("Sunset Opt-Out: ", Style::default().fg(Color::DarkGray)),
-                    Span::styled("true", Style::default().fg(Color::Green)),
-                ]));
-            }
+        if route.sunset_opt_out == Some(true) {
+            lines.push(Line::from(vec![
+                Span::styled("Sunset Opt-Out: ", Style::default().fg(Color::DarkGray)),
+                Span::styled("true", Style::default().fg(Color::Green)),
+            ]));
         }
     }
 
