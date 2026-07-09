@@ -614,6 +614,52 @@ mod tests {
     }
 
     #[test]
+    fn route_macro_suppresses_replay_layer_when_throttle_attribute_present() {
+        // Ordering A: `#[post]` outermost, `#[throttle]` still an attribute below
+        // it. The route macro detects the attribute (`has_throttle_guard`) and
+        // must NOT add the outer IdempotencyReplayLayer — replay handling moves
+        // into the (later-expanded) throttle body, after the throttle check.
+        let generated = route_macro(
+            "POST",
+            "post",
+            quote! { "/items" },
+            quote! {
+                #[throttle(limit = 1, per = "60s", key = "ip")]
+                async fn create_item() -> &'static str { "created" }
+            },
+        )
+        .to_string();
+
+        assert!(
+            !generated.contains("IdempotencyReplayLayer"),
+            "throttled route (route outermost) must not add the outer replay layer: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_suppresses_replay_layer_for_expanded_throttle_prologue() {
+        // Ordering B: `#[throttle]` written ABOVE `#[post]`, so the throttle macro
+        // expands FIRST — it removes its own attribute and injects the throttle
+        // prologue into the body. The route macro no longer sees a `#[throttle]`
+        // attribute and must instead recognize the generated throttle prologue in
+        // the body to suppress the outer IdempotencyReplayLayer; otherwise a
+        // cached replay would be served before the in-body throttle check.
+        let throttled = crate::throttle::throttle_macro(
+            quote! { limit = 1, per = "60s", key = "ip" },
+            quote! {
+                async fn create_item() -> &'static str { "created" }
+            },
+        );
+        let generated = route_macro("POST", "post", quote! { "/items" }, throttled).to_string();
+
+        assert!(
+            !generated.contains("IdempotencyReplayLayer"),
+            "throttled route (throttle expanded first) must not add the outer replay layer: \
+             {generated}"
+        );
+    }
+
+    #[test]
     fn route_macro_parses_api_version_and_sunset_opt_out() {
         let generated = route_macro(
             "GET",

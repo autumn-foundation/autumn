@@ -166,6 +166,20 @@ async fn throttled_idempotent() -> &'static str {
     "throttled-idempotent-ok"
 }
 
+// Same idempotent-throttle guarantee as `throttled_idempotent`, but with the
+// attributes in the OPPOSITE order: `#[throttle]` ABOVE `#[post]`. Here the
+// throttle macro expands FIRST and removes its own attribute, so the route macro
+// no longer sees a `#[throttle]` attribute — it must recognize the generated
+// throttle prologue in the body to suppress the outer `IdempotencyReplayLayer`.
+// Otherwise a cached replay would be served before the in-body throttle check and
+// bypass the per-route bucket forever, exactly the bug the in-body
+// throttle-then-replay ordering closes for the other attribute order.
+#[throttle(limit = 1, per = "60s", key = "ip")]
+#[post("/throttled-idempotent-throttle-first")]
+async fn throttled_idempotent_throttle_first() -> &'static str {
+    "throttled-idempotent-throttle-first-ok"
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 fn base_config() -> AutumnConfig {
@@ -314,6 +328,42 @@ async fn throttled_idempotent_replay_still_consumes_bucket_and_429s() {
         .post("/throttled-idempotent")
         .header("X-Forwarded-For", "198.51.100.210")
         .header("idempotency-key", "throttle-idem-key")
+        .send()
+        .await;
+    second.assert_status(429);
+    assert_eq!(second.header("x-idempotent-replayed"), None);
+}
+
+#[tokio::test]
+async fn throttled_idempotent_replay_consumes_bucket_with_throttle_attribute_first() {
+    // Same guarantee as `throttled_idempotent_replay_still_consumes_bucket_and_429s`
+    // but the handler is written with `#[throttle]` ABOVE `#[post]` (throttle
+    // expands first, then the route macro). A replay reusing the same
+    // Idempotency-Key must still 429, proving the route macro recognizes the
+    // expanded throttle prologue and suppresses the outer replay layer under BOTH
+    // attribute orderings — not just when the route attribute is outermost.
+    let client = TestApp::new()
+        .routes(routes![throttled_idempotent_throttle_first])
+        .config(base_config())
+        .idempotent()
+        .build();
+
+    let first = client
+        .post("/throttled-idempotent-throttle-first")
+        .header("X-Forwarded-For", "198.51.100.211")
+        .header("idempotency-key", "throttle-first-idem-key")
+        .send()
+        .await;
+    first.assert_status(200);
+    // First request is not a replay.
+    assert_eq!(first.header("x-idempotent-replayed"), None);
+
+    // Second request reuses the same key but the throttle bucket is exhausted:
+    // it must 429 rather than replay the cached success.
+    let second = client
+        .post("/throttled-idempotent-throttle-first")
+        .header("X-Forwarded-For", "198.51.100.211")
+        .header("idempotency-key", "throttle-first-idem-key")
         .send()
         .await;
     second.assert_status(429);
