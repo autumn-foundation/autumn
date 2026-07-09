@@ -70,6 +70,18 @@ impl FilterReloadHandle {
         let filter = EnvFilter::try_new(directive).map_err(|error| error.to_string())?;
         (self.reload)(filter)
     }
+
+    /// Test-only handle that accepts any directive `EnvFilter::try_new` parses,
+    /// standing in for a live subscriber without installing the process-global
+    /// tracing subscriber. Lets HTTP-level tests exercise the `applied: true`
+    /// path (issue #1044 AC7).
+    #[cfg(test)]
+    #[must_use]
+    pub fn accept_all_for_test() -> Self {
+        Self {
+            reload: Arc::new(|_filter| Ok(())),
+        }
+    }
 }
 
 /// Concrete log formatting chosen for the running process.

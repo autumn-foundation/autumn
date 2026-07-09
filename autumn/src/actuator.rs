@@ -461,50 +461,116 @@ impl LogLevels {
             .unwrap_or_default()
     }
 
-    /// Set the level for a specific logger. Returns the previous level if any.
+    /// Set the level for a specific logger.
     ///
     /// When a reload-capable subscriber is installed (see
     /// [`Self::attach_reload_handle`]), the rebuilt filter directive is pushed
     /// to the live `tracing` subscriber so the change takes effect immediately
     /// on the next event (issue #1044). Overrides remain ephemeral — they live
     /// only in this in-memory state and reset on process restart.
-    #[must_use]
-    pub fn set_logger_level(&self, name: &str, level: &str) -> Option<String> {
-        let (returned, directive, handle) = {
-            let Ok(mut guard) = self.inner.write() else {
-                return None;
+    ///
+    /// The returned [`LogLevelChange`] reflects the **actual** outcome, not
+    /// merely handle presence:
+    /// - [`LogLevelChange::Applied`] — pushed to a live subscriber.
+    /// - [`LogLevelChange::Recorded`] — stored, but no reload-capable subscriber
+    ///   is installed (bare state / tests).
+    /// - [`LogLevelChange::Rejected`] — the map is at capacity, or the directive
+    ///   failed to apply and the override was **rolled back** so the map never
+    ///   claims a live override that isn't (issue #1044).
+    ///
+    /// The directive is applied while the write lock is held so that concurrent
+    /// callers apply directives in the same order they mutate the map — the live
+    /// subscriber can never disagree with `GET /loggers` (issue #1044 AC4).
+    /// `reload`/`apply` never re-enters `LogLevels`, so this is deadlock-free.
+    pub fn set_logger_level(&self, name: &str, level: &str) -> LogLevelChange {
+        let Ok(mut guard) = self.inner.write() else {
+            return LogLevelChange::Rejected {
+                reason: "log level state lock poisoned".to_string(),
             };
-            // Prevent unbounded memory growth from arbitrary logger names
-            if guard.logger_overrides.len() >= 1000 && !guard.logger_overrides.contains_key(name) {
-                return None;
-            }
-
-            let previous = guard.logger_overrides.get(name).cloned();
-            guard
-                .logger_overrides
-                .insert(name.to_string(), level.to_string());
-            // If setting the root level, update current_level too
-            let returned = if name == "root" || name.is_empty() {
-                let prev = Some(guard.current_level.clone());
-                guard.current_level = level.to_string();
-                prev
-            } else {
-                previous
-            };
-            let directive = guard.build_directive();
-            let handle = guard.reload_handle.clone();
-            (returned, directive, handle)
         };
-
-        // Apply outside the lock: pushing the new directive rebuilds the
-        // tracing interest cache and must not hold our RwLock.
-        if let Some(handle) = handle
-            && let Err(error) = handle.apply_directive(&directive)
-        {
-            eprintln!("Warning: failed to apply log level change to live subscriber: {error}");
+        // Prevent unbounded memory growth from arbitrary logger names
+        if guard.logger_overrides.len() >= 1000 && !guard.logger_overrides.contains_key(name) {
+            return LogLevelChange::Rejected {
+                reason: "too many logger overrides".to_string(),
+            };
         }
 
-        returned
+        let is_root = name == "root" || name.is_empty();
+        let previous_override = guard.logger_overrides.get(name).cloned();
+        let previous_current = guard.current_level.clone();
+
+        guard
+            .logger_overrides
+            .insert(name.to_string(), level.to_string());
+        // If setting the root level, update current_level too.
+        let returned = if is_root {
+            guard.current_level = level.to_string();
+            Some(previous_current.clone())
+        } else {
+            previous_override.clone()
+        };
+
+        let directive = guard.build_directive();
+        // Clone the handle out so the rollback path below can mutate `guard`
+        // without holding a borrow of `guard.reload_handle`.
+        let Some(handle) = guard.reload_handle.clone() else {
+            return LogLevelChange::Recorded { previous: returned };
+        };
+
+        match handle.apply_directive(&directive) {
+            Ok(()) => LogLevelChange::Applied { previous: returned },
+            Err(error) => {
+                // Roll back so `GET /loggers` never advertises an override that
+                // failed to reach the live subscriber.
+                match previous_override {
+                    Some(prev) => {
+                        guard.logger_overrides.insert(name.to_string(), prev);
+                    }
+                    None => {
+                        guard.logger_overrides.remove(name);
+                    }
+                }
+                if is_root {
+                    guard.current_level = previous_current;
+                }
+                LogLevelChange::Rejected { reason: error }
+            }
+        }
+    }
+}
+
+/// Outcome of [`LogLevels::set_logger_level`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
+pub enum LogLevelChange {
+    /// The change was pushed to a live, reload-capable subscriber. Carries the
+    /// previous level for that target, if any.
+    Applied {
+        /// Previous level for the target, if it had one.
+        previous: Option<String>,
+    },
+    /// The change was stored in the in-memory map, but no reload-capable
+    /// subscriber is installed, so it does not affect emission.
+    Recorded {
+        /// Previous level for the target, if it had one.
+        previous: Option<String>,
+    },
+    /// The change was not stored: the map was at capacity, or applying the
+    /// directive to the live subscriber failed and the override was rolled back.
+    Rejected {
+        /// Human-readable reason.
+        reason: String,
+    },
+}
+
+impl LogLevelChange {
+    /// The previous level for the target, if the change was stored.
+    #[must_use]
+    pub fn previous(&self) -> Option<&str> {
+        match self {
+            Self::Applied { previous } | Self::Recorded { previous } => previous.as_deref(),
+            Self::Rejected { .. } => None,
+        }
     }
 }
 
@@ -2572,6 +2638,22 @@ pub(crate) struct SetLoggerRequest {
     level: String,
 }
 
+/// Whether `name` is a valid `tracing` directive target.
+///
+/// A directive target is a module path: ASCII alphanumerics plus `_` and `:`
+/// (e.g. `my_app::module`). `root` (and the empty string, treated as root) are
+/// special-cased. Anything carrying an `EnvFilter` metacharacter — `=`, `,`,
+/// whitespace, `[`, `]`, `{`, `}` — is rejected so a malformed target never
+/// reaches the subscriber and the endpoint cannot lie about applying it
+/// (issue #1044).
+fn is_valid_logger_name(name: &str) -> bool {
+    if name.is_empty() || name == "root" {
+        return true;
+    }
+    name.chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == ':')
+}
+
 /// `PUT <actuator-prefix>/loggers/{name}` -- change a logger's level at runtime.
 pub(crate) async fn loggers_put<S: ProvideActuatorState + Send + Sync + 'static>(
     State(state): State<S>,
@@ -2595,36 +2677,53 @@ pub(crate) async fn loggers_put<S: ProvideActuatorState + Send + Sync + 'static>
         );
     }
 
-    let previous = state.log_levels().set_logger_level(&name, &level);
-    let applied = state.log_levels().reload_available();
+    // Validate the target name the same way, so a name carrying an `EnvFilter`
+    // metacharacter is rejected before it can reach the subscriber (issue #1044).
+    if !is_valid_logger_name(&name) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "status": "error",
+                "message": format!(
+                    "Invalid logger name '{name}'. Names may contain only \
+                     alphanumerics, '_' and ':' (or 'root')."
+                ),
+            })),
+        );
+    }
 
-    // Never claim `ok` for a change we could not push to the live subscriber.
-    // In a normally-booted app the reload layer is always installed, so
-    // `applied` is true; `false` only arises where no reload-capable subscriber
-    // exists (issue #1044).
-    if applied {
-        (
+    // Base the response on the *actual* apply outcome, never on handle presence:
+    // a change that failed to reach the live subscriber must not report `ok`
+    // (issue #1044).
+    match state.log_levels().set_logger_level(&name, &level) {
+        LogLevelChange::Applied { previous } => (
             StatusCode::OK,
             Json(serde_json::json!({
                 "status": "ok",
-                "message": format!("Logger '{}' set to '{}'", name, level),
+                "message": format!("Logger '{name}' set to '{level}'"),
                 "previous": previous,
                 "applied": true,
             })),
-        )
-    } else {
-        (
+        ),
+        LogLevelChange::Recorded { previous } => (
             StatusCode::OK,
             Json(serde_json::json!({
                 "status": "recorded",
                 "message": format!(
-                    "Logger '{}' recorded as '{}' but not applied: no reload-capable subscriber is installed",
-                    name, level
+                    "Logger '{name}' recorded as '{level}' but not applied: no reload-capable subscriber is installed"
                 ),
                 "previous": previous,
                 "applied": false,
             })),
-        )
+        ),
+        LogLevelChange::Rejected { reason } => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "status": "error",
+                "message": format!("Logger '{name}' could not be set to '{level}': {reason}"),
+                "applied": false,
+            })),
+        ),
     }
 }
 
@@ -4479,6 +4578,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn actuator_loggers_put_rejects_invalid_name() {
+        // A logger name carrying an `EnvFilter` metacharacter (`=`) must be
+        // rejected up front (400) — never applied, never recorded — so the
+        // endpoint cannot claim success for a directive the subscriber would
+        // reject (issue #1044). Other metacharacters (`,`, whitespace) too.
+        // `has%20space` is percent-encoded whitespace: axum's `Path` extractor
+        // decodes it back to a space, which the validator must still reject.
+        let state = test_state();
+        for bogus in ["a=b", "a,b", "has%20space", "a::b=trace"] {
+            let app = actuator_router(true).with_state(state.clone());
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri(format!("/actuator/loggers/{bogus}"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(r#"{"level": "debug"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "logger name {bogus:?} should be rejected"
+            );
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["status"], "error");
+        }
+
+        // And GET /loggers must NOT then list any of the bogus overrides.
+        let app = actuator_router(true).with_state(state.clone());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/loggers")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let loggers = json["loggers"].as_object().unwrap();
+        assert!(
+            loggers.is_empty(),
+            "no bogus override should be recorded, got {loggers:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn actuator_loggers_put_applied_ok_with_live_subscriber() {
+        // Positive path: with a reload-capable subscriber installed, a valid
+        // change reports `{"status":"ok","applied":true}` end-to-end (issue
+        // #1044 AC7). Uses a no-op reload handle that accepts any valid
+        // directive, standing in for a live subscriber.
+        let state = test_state();
+        state
+            .log_levels()
+            .attach_reload_handle(crate::telemetry::FilterReloadHandle::accept_all_for_test());
+
+        let app = actuator_router(true).with_state(state.clone());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/actuator/loggers/autumn_web")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"level": "debug"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "ok");
+        assert_eq!(json["applied"], true);
+
+        let overrides = state.log_levels().logger_overrides();
+        assert_eq!(
+            overrides.get("autumn_web").map(String::as_str),
+            Some("debug")
+        );
+    }
+
+    #[tokio::test]
     async fn actuator_loggers_hidden_in_nonsensitive_mode() {
         let app = actuator_router(false).with_state(test_state());
         let resp = app
@@ -4506,8 +4701,8 @@ mod tests {
     #[test]
     fn log_levels_root_updates_current() {
         let levels = LogLevels::new("info");
-        let prev = levels.set_logger_level("root", "trace");
-        assert_eq!(prev, Some("info".to_string()));
+        let change = levels.set_logger_level("root", "trace");
+        assert_eq!(change.previous(), Some("info"));
         assert_eq!(levels.current_level(), "trace");
     }
 
@@ -4979,7 +5174,7 @@ mod tests {
 
         // Try to add a new key, should be rejected
         let result = levels.set_logger_level("logger_1000", "warn");
-        assert_eq!(result, None);
+        assert!(matches!(result, LogLevelChange::Rejected { .. }));
         assert_eq!(levels.logger_overrides().len(), 1000);
         assert_eq!(levels.logger_overrides().get("logger_1000"), None);
     }
@@ -4993,8 +5188,8 @@ mod tests {
         }
 
         // Try to update an existing key, should succeed
-        let prev = levels.set_logger_level("logger_999", "warn");
-        assert_eq!(prev.as_deref(), Some("debug"));
+        let change = levels.set_logger_level("logger_999", "warn");
+        assert_eq!(change.previous(), Some("debug"));
         assert_eq!(levels.logger_overrides().len(), 1000);
         assert_eq!(
             levels

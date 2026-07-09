@@ -577,6 +577,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   up to a year. (The idiomorph URL is not content-fingerprinted; adding
   fingerprinted asset URLs so it can safely go back to `immutable` caching is a
   possible future follow-up.)
+- **actuator:** `PUT /actuator/loggers/{name}` no longer reports a false
+  `{"status":"ok","applied":true}` for a change that did not actually reach the
+  live subscriber (issue #1044). Logger names are now validated up front like
+  levels — a name carrying an `EnvFilter` metacharacter (`=`, `,`, whitespace,
+  …) is rejected with `400` instead of being stored as a bogus override — and
+  the response is driven by the real apply outcome: if the directive fails to
+  apply the override is rolled back so `GET /actuator/loggers` never advertises
+  a level that isn't live. The directive is now applied while the state lock is
+  held so concurrent updates apply in the same order they mutate the map,
+  keeping `GET /actuator/loggers` consistent with live emission under
+  concurrency (AC4).
+- **cli:** the generated `build.rs` git-provenance rerun triggers are more
+  reliable (issue #1242): it now also watches `.git/logs/HEAD` (which moves on
+  every commit, `--amend`, and `reset --soft`, so the baked SHA/`dirty` flag no
+  longer goes stale after an amend), resolves the real gitdir when `.git` is a
+  *file* (git worktrees / submodules) instead of assuming the `.git/` directory
+  layout, and honors `SOURCE_DATE_EPOCH` for a deterministic build timestamp on
+  reproducible builds. Non-git builds still degrade gracefully (fields `null`,
+  build never fails).
 
 ### Changed
 

@@ -40,14 +40,17 @@ fn main() {
 /// Emit `AUTUMN_BUILD_*` compile-time env vars consumed by
 /// `#[autumn_web::main]` and surfaced on `/actuator/info`.
 ///
-/// The build timestamp is always emitted. Git fields are best-effort: outside a
-/// git checkout (tarball / CI cache) they are simply omitted and the framework
-/// reports them as `null` rather than failing the build.
+/// The build timestamp is always emitted (honoring `SOURCE_DATE_EPOCH` for
+/// reproducible builds). Git fields are best-effort: outside a git checkout
+/// (tarball / CI cache) they are simply omitted and the framework reports them
+/// as `null` rather than failing the build.
+///
+/// Note: the `dirty` flag is a best-effort snapshot taken when this script last
+/// re-ran. Cargo only re-runs it on the declared `rerun-if-changed` inputs, so
+/// after an edit that doesn't touch a watched path the baked flag may lag until
+/// the next rebuild of a watched input.
 fn emit_build_provenance() {
-    println!(
-        "cargo:rustc-env=AUTUMN_BUILD_TIMESTAMP={}",
-        iso8601_utc_now()
-    );
+    println!("cargo:rustc-env=AUTUMN_BUILD_TIMESTAMP={}", build_timestamp());
 
     if let Some(sha) = git(&["rev-parse", "HEAD"]) {
         let short = git(&["rev-parse", "--short", "HEAD"])
@@ -60,12 +63,43 @@ fn emit_build_provenance() {
         println!("cargo:rustc-env=AUTUMN_BUILD_GIT_DIRTY={dirty}");
     }
 
-    // Rebuild when HEAD or the index moves so the baked SHA / dirty flag stay
-    // fresh across commits and staging changes.
-    for path in [".git/HEAD", ".git/index"] {
-        if std::path::Path::new(path).exists() {
-            println!("cargo:rerun-if-changed={path}");
+    // Re-run when the ref is checked out (HEAD), the index changes (staging /
+    // index), or HEAD *moves* — commit, `--amend`, `reset --soft` all rewrite
+    // `logs/HEAD` even when `HEAD` itself is untouched. Resolving the real
+    // gitdir first means this also works in git worktrees and submodules, where
+    // `.git` is a *file* pointing elsewhere rather than a directory.
+    if let Some(git_dir) = resolve_git_dir() {
+        for rel in ["HEAD", "index", "logs/HEAD"] {
+            let path = git_dir.join(rel);
+            if path.exists() {
+                println!("cargo:rerun-if-changed={}", path.display());
+            }
         }
+    }
+
+    // Reproducible builds: re-run if the source date is pinned or changed.
+    println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
+}
+
+/// Resolve the real git directory. Normally `.git` is a directory; in a git
+/// worktree or submodule it is a *file* containing `gitdir: <path>`. Returns
+/// `None` when there is no `.git` at all (non-git build).
+fn resolve_git_dir() -> Option<std::path::PathBuf> {
+    let dot_git = std::path::Path::new(".git");
+    let meta = std::fs::metadata(dot_git).ok()?;
+    if meta.is_dir() {
+        return Some(dot_git.to_path_buf());
+    }
+    // `.git` is a file: "gitdir: <path>" (path may be relative to the package
+    // root, which is where this build script runs).
+    let contents = std::fs::read_to_string(dot_git).ok()?;
+    let target = contents.lines().find_map(|line| {
+        line.strip_prefix("gitdir:").map(|rest| rest.trim().to_string())
+    })?;
+    if target.is_empty() {
+        None
+    } else {
+        Some(std::path::PathBuf::from(target))
     }
 }
 
@@ -79,13 +113,28 @@ fn git(args: &[&str]) -> Option<String> {
     if text.is_empty() { None } else { Some(text) }
 }
 
-/// Current UTC time formatted as ISO-8601 (`YYYY-MM-DDTHH:MM:SSZ`), computed
-/// with no external crates via the civil-from-days algorithm.
-fn iso8601_utc_now() -> String {
-    let secs = std::time::SystemTime::now()
+/// Build timestamp as ISO-8601 UTC. Honors `SOURCE_DATE_EPOCH` (a Unix seconds
+/// count) when set so reproducible builds get a deterministic timestamp;
+/// otherwise falls back to the current wall-clock time.
+fn build_timestamp() -> String {
+    let secs = std::env::var("SOURCE_DATE_EPOCH")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or_else(unix_now_secs);
+    iso8601_utc(secs)
+}
+
+/// Current time as whole Unix seconds (0 if the clock predates the epoch).
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .unwrap_or(0)
+}
+
+/// Format Unix `secs` as ISO-8601 UTC (`YYYY-MM-DDTHH:MM:SSZ`), computed with
+/// no external crates via the civil-from-days algorithm.
+fn iso8601_utc(secs: u64) -> String {
     let days = (secs / 86_400) as i64;
     let rem = secs % 86_400;
     let (hh, mm, ss) = (rem / 3600, (rem % 3600) / 60, rem % 60);
