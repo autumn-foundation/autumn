@@ -2801,7 +2801,8 @@ pub fn check_compression_impl(compression_enabled: bool, is_production: bool) ->
 ///
 /// Returns `(has_env_example, has_env, env_gitignored)`. A `.env` is treated as
 /// gitignored when any trimmed `.gitignore` line equals `.env` or is a glob
-/// that covers it (`.env*` / `.env.*`).
+/// that covers it (`.env*` / `*.env`). Note that `.env.*` does NOT cover the
+/// root `.env` (it only matches `.env.local` etc.), so it is not counted.
 fn resolve_dotenv_state() -> (bool, bool, bool) {
     let has_env_example = std::path::Path::new(".env.example").exists();
     let has_env = std::path::Path::new(".env").exists();
@@ -2818,10 +2819,9 @@ fn gitignore_covers_dotenv(contents: &str) -> bool {
         if entry.starts_with('#') || entry.is_empty() {
             return false;
         }
-        matches!(entry, ".env" | ".env*" | ".env.*" | "/.env" | "*.env")
+        matches!(entry, ".env" | ".env*" | "/.env" | "*.env")
             || entry.ends_with("/.env")
             || entry.ends_with("/.env*")
-            || entry.ends_with("/.env.*")
             || entry.ends_with("/*.env")
     })
 }
@@ -5038,13 +5038,16 @@ redirect_uri = "http://localhost/callback"
     fn gitignore_covers_dotenv_matches_common_globs() {
         assert!(gitignore_covers_dotenv("/target\n.env\n"));
         assert!(gitignore_covers_dotenv(".env*\n"));
-        assert!(gitignore_covers_dotenv("  .env.*  \n"));
+        assert!(gitignore_covers_dotenv("*.env\n"));
+        assert!(gitignore_covers_dotenv("/.env\n"));
+        // `.env.*` matches `.env.local` etc. but NOT the root `.env`, so a
+        // gitignore that only lists `.env.*` must count as NOT covering `.env`.
+        assert!(!gitignore_covers_dotenv("  .env.*  \n"));
         assert!(!gitignore_covers_dotenv("/target\n.env.example\n"));
         assert!(!gitignore_covers_dotenv(""));
         // Recursive-glob style entries must also count as coverage.
         assert!(gitignore_covers_dotenv("**/.env\n"));
         assert!(gitignore_covers_dotenv("**/.env*\n"));
-        assert!(gitignore_covers_dotenv("**/.env.*\n"));
         // A bare `.env.example` line still does not cover `.env`.
         assert!(!gitignore_covers_dotenv(".env.example\n"));
         // Comment and blank lines are ignored.

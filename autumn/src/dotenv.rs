@@ -12,9 +12,10 @@
 //! earlier files (and any real environment variable) win: a later file only
 //! fills keys that are still unset.
 //!
-//! Auto-loading happens in the `dev` and `test` profiles. It is skipped in
-//! `prod` unless `AUTUMN_DOTENV=1` (or `true`) is set; conversely it can be
-//! disabled anywhere with `AUTUMN_DOTENV=0` (or `false`).
+//! Auto-loading happens only in the `dev` and `test` profiles. Every other
+//! profile (`prod`, `staging`, and any custom profile) skips it unless
+//! `AUTUMN_DOTENV=1` (or `true`) is set; conversely it can be disabled anywhere
+//! with `AUTUMN_DOTENV=0` (or `false`).
 //!
 //! There is intentionally **no** `${VAR}` interpolation: values are treated
 //! as literal strings (with optional surrounding single or double quotes
@@ -64,7 +65,9 @@ fn candidate_files(profile: &str) -> Vec<String> {
 /// Decide whether `.env` auto-loading should run for `profile`.
 ///
 /// `AUTUMN_DOTENV=1`/`true` forces loading on; `AUTUMN_DOTENV=0`/`false`
-/// forces it off. Absent that override, every profile except `prod` loads.
+/// forces it off. Absent that override, only the `dev` and `test` profiles
+/// auto-load; every other profile (`prod`, `staging`, and any custom profile)
+/// requires `AUTUMN_DOTENV=1`.
 fn should_load(profile: &str, env: &dyn Env) -> bool {
     if let Ok(raw) = env.var("AUTUMN_DOTENV") {
         match raw.trim() {
@@ -73,7 +76,7 @@ fn should_load(profile: &str, env: &dyn Env) -> bool {
             _ => {}
         }
     }
-    profile != "prod"
+    matches!(profile, "dev" | "test")
 }
 
 /// Parse the contents of a single `.env` file into ordered key/value pairs.
@@ -550,6 +553,38 @@ export BAZ=qux
         let env = MockEnv::new().with("AUTUMN_DOTENV", "0");
         let out = resolve_dotenv_vars(dir.path(), "dev", &env).unwrap();
         assert!(out.is_empty(), "AUTUMN_DOTENV=0 must disable loading");
+    }
+
+    #[test]
+    fn gating_test_profile_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".env"), "FOO=bar\n").unwrap();
+        let env = MockEnv::new();
+        let out = resolve_dotenv_vars(dir.path(), "test", &env).unwrap();
+        assert_eq!(out, vec![("FOO".to_owned(), "bar".to_owned())]);
+    }
+
+    #[test]
+    fn gating_custom_profile_does_not_load_by_default() {
+        // A non-prod custom profile such as `staging` must NOT auto-load `.env`
+        // without the explicit opt-in — only `dev`/`test` auto-load.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".env"), "FOO=bar\n").unwrap();
+        let env = MockEnv::new();
+        let out = resolve_dotenv_vars(dir.path(), "staging", &env).unwrap();
+        assert!(
+            out.is_empty(),
+            "a custom profile must not auto-load .env by default"
+        );
+    }
+
+    #[test]
+    fn gating_custom_profile_loads_with_opt_in() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".env"), "FOO=bar\n").unwrap();
+        let env = MockEnv::new().with("AUTUMN_DOTENV", "1");
+        let out = resolve_dotenv_vars(dir.path(), "staging", &env).unwrap();
+        assert_eq!(out, vec![("FOO".to_owned(), "bar".to_owned())]);
     }
 
     #[test]
