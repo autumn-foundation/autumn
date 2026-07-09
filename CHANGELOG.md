@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **generator:** `autumn new` now generates a `README.md` at the project root
+  (listed in the "Created …" output) with explicit prerequisites and a
+  golden-path quickstart — configure the `[database]` block in `autumn.toml`
+  (the base scaffold ships it commented out, so `autumn migrate` would otherwise
+  exit with "No database URL found"), then `autumn migrate` → `autumn dev` to a
+  `200` on the default route — plus one-line descriptions of the most useful CLI verbs
+  (`dev`, `migrate`, `doctor`, `routes`, `generate scaffold`, `release init`).
+  The README is flag-aware: `--with-i18n` and `--with-seed` add sections for the
+  extra steps they introduce (issue #1052). The DB-bootstrap step bootstraps a
+  throwaway local Postgres with a copy-paste `docker run … postgres:16` one-liner
+  that matches the generated `url`; this runnable helper lives in exactly one
+  place (the "Configure the database" step), with the prerequisites section
+  cross-referencing it instead of repeating the command — a top-to-bottom reader
+  no longer starts the `…-pg` container twice and dead-ends on a
+  container-name-in-use error (the earlier `autumn release init --target
+  docker-compose` pointer file-errored on a fresh scaffold, which already ships a
+  `Dockerfile`/`.dockerignore`, before any compose file was written; that pointer
+  is retained for generating deployment/compose assets). After the `docker run`
+  the README now waits for Postgres to accept connections
+  (`until docker exec …-pg pg_isready …; do sleep 1; done`) before `autumn db
+  create`/`autumn migrate`, since first-time container initialization takes a few
+  seconds and those commands connect immediately without retrying. The golden path is also
+  tailored to the generated app shape: `--daemon` scaffolds a database-free
+  `autumn serve` app, so its README drops the Postgres/`libpq`/`autumn migrate`
+  steps; `--bundled-pg` embeds and manages its own Postgres, so its README runs
+  via `autumn serve --bundled-pg` and notes migrations apply automatically rather
+  than telling users to configure an external `[database]`.
 - **test:** opt-in channel broadcast recorder for integration tests (issue
   #1043) — `TestApp::record_broadcasts()` installs a recorder through the
   existing `ChannelsInterceptor` seam (no hand-written spy or `Arc<Mutex>`).
@@ -751,6 +778,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **generator:** the generated `README.md` now orders the `libpq` prerequisite
+  before the `cargo install diesel_cli --features postgres` command, since that
+  command's `postgres` feature (and the base `cargo build`, which links the `db`
+  feature) needs the PostgreSQL client library. The DB-free `--daemon` README no
+  longer advertises `autumn generate scaffold` or the `migrations/` layout row:
+  that generator emits Diesel models/repositories/migrations requiring the `db`
+  feature the daemon scaffold disables, so following it would leave the app
+  non-compiling. `--bundled-pg` keeps the `db` feature and retains
+  `generate scaffold` (issue #1052).
+- **generator:** the `--daemon` and `--bundled-pg` READMEs now document
+  `autumn dev` as the browser-reachable local run (it binds TCP on
+  `127.0.0.1:3000`), matching the default README. The background daemon start
+  (`autumn serve --daemon` / `autumn serve --bundled-pg`) is reframed as the
+  production mode that binds a private Unix domain socket — not reachable at
+  `http://localhost:3000` — with a pointer to `autumn serve status` for the
+  socket address and `docs/guide/daemon.md` for details, so following the README
+  no longer leaves the route unreachable in a browser (issue #1052).
 - **views:** vendored the full Idiomorph 0.3.0 morphing script (replacing a
   minimal stub) so live `hx-ext="morph"` updates actually DOM-morph, and
   patched its htmx extension so non-morph out-of-band swaps (e.g.
