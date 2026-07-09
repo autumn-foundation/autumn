@@ -2349,7 +2349,7 @@ mod tests {
                 // Checkout housekeeping `SET` — must not be counted.
                 let t0 = std::time::Instant::now();
                 timer.on_start(t0, || "SET statement_timeout = 5000".to_string());
-                timer.on_finish(t0 + Duration::from_micros(3_000));
+                timer.on_finish(t0 + Duration::from_millis(3));
 
                 assert_eq!(
                     timings.query_count.load(Ordering::Relaxed),
@@ -2438,7 +2438,7 @@ mod tests {
                 // leaked into the total).
                 let t0 = std::time::Instant::now();
                 timer.on_start(t0, || "BEGIN".to_string());
-                timer.on_finish(t0 + Duration::from_micros(10_000));
+                timer.on_finish(t0 + Duration::from_millis(10));
 
                 // The single real query: 700µs.
                 let t1 = std::time::Instant::now();
@@ -2448,7 +2448,7 @@ mod tests {
                 // COMMIT — must not be counted.
                 let t2 = std::time::Instant::now();
                 timer.on_start(t2, || "COMMIT".to_string());
-                timer.on_finish(t2 + Duration::from_micros(10_000));
+                timer.on_finish(t2 + Duration::from_millis(10));
             })
             .await;
 
