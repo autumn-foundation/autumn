@@ -1868,9 +1868,15 @@ impl Drop for Db {
             // Record DB query metric
             let metric_key = format!("{route_key} SELECT");
             metrics.record_db_query(&metric_key, elapsed_ms);
-            // Also record into the Server-Timing per-request accumulator
-            // if scoped by the middleware. No-op otherwise.
-            record_request_db_query(elapsed);
+            // NOTE: deliberately *not* recorded into the Server-Timing
+            // per-request accumulator. `elapsed` here is the whole
+            // connection checkout-to-release window (see `start_time` /
+            // the `span` doc above), not a single query's wall time. Every
+            // request that extracts `Db` would otherwise add its entire
+            // connection-hold time as one bogus "query", inflating both
+            // `db;dur` and the `desc="N queries"` count (and double-counting
+            // against real queries recorded by `run_instrumented`). The
+            // accumulator must reflect only genuine instrumented queries.
 
             // Log slow query if it exceeds the threshold
             if elapsed >= self.slow_query_threshold {
