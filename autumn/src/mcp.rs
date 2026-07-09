@@ -53,7 +53,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use axum::body::{Body, Bytes};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use futures::{Stream, StreamExt as _};
 use serde_json::{Value, json};
@@ -926,6 +926,10 @@ async fn serve_mcp_get() -> Response {
 /// dispatch sees the same client identity a direct HTTP request would: the
 /// caller's headers, the proxy-resolved client identity, and the connection
 /// peer address (for the IP-keyed rate limiter).
+/// Header name for the `Server-Timing` response header (#1348), forwarded from
+/// the dispatch clone onto the rebuilt JSON-RPC response.
+static SERVER_TIMING: HeaderName = HeaderName::from_static("server-timing");
+
 struct ReplayContext<'a> {
     headers: &'a HeaderMap,
     identity: Option<&'a crate::security::ResolvedClientIdentity>,
@@ -1293,12 +1297,14 @@ async fn serve_tools_call(
             .insert(axum::extract::ConnectInfo(peer));
     }
     // When the `/mcp` envelope is itself rate-limited, this call was already
-    // counted there; mark the replay exempt so the dispatch pipeline's own
-    // limiter doesn't charge a second token for the same tool call.
+    // counted there; mark the replay envelope-counted so the framework-default
+    // limiter (which shares the envelope bucket) doesn't charge a second token
+    // for the same tool call. User/per-route limiters (path overrides,
+    // `#[throttle]`) don't share that bucket and still charge the replay.
     if server.envelope_rate_limited {
         request
             .extensions_mut()
-            .insert(crate::security::RateLimitExempt);
+            .insert(crate::security::RateLimitEnvelopeCounted);
     }
     // Likewise for load shedding: the envelope and the dispatch pipeline
     // share the SAME `LoadShedLayer` instance (same `Arc` in-flight
@@ -1353,6 +1359,21 @@ async fn serve_tools_call(
         return stream_tool_result(id, &params, response, cookies);
     }
 
+    // Capture the dispatch clone's `Server-Timing` header (#1348) so its
+    // non-`total` metrics can be forwarded onto the rebuilt response. The clone
+    // runs the primary `ServerTimingLayer`, which builds the full metric set —
+    // including `db;dur;desc="N queries"` for a DB-backed tool — but that inner
+    // response is discarded when the JSON-RPC envelope is rebuilt below. Without
+    // forwarding, a DB-backed `tools/call` would lose the query count. Only the
+    // non-`total` metrics are forwarded (see the append below); the inner
+    // `total` measured the dispatch clone alone and is dropped in favour of the
+    // outer fallback's real `/mcp` `total`. Captured before the body is
+    // consumed, like `Set-Cookie` above.
+    let mut server_timings: Vec<HeaderValue> = Vec::new();
+    for value in response.headers().get_all(&SERVER_TIMING) {
+        server_timings.push(value.clone());
+    }
+
     // Unlike a normal HTTP response (streamed straight to the socket), the MCP
     // path buffers the whole body to repackage it as a tool result. Cap that
     // buffer so a runaway handler can't OOM the process; report an overflow as
@@ -1380,7 +1401,52 @@ async fn serve_tools_call(
     for cookie in cookies {
         resp.headers_mut().append(header::SET_COOKIE, cookie);
     }
+    // Forward only the inner dispatch's non-`total` `Server-Timing` metrics
+    // (e.g. `db;dur=…;desc="N queries"`) onto the rebuilt response, dropping the
+    // inner `total`. That inner `total` measured only the dispatch clone; it was
+    // captured before this endpoint buffered the body (`to_bytes`), collapsed an
+    // SSE body for a non-SSE client, and repackaged the JSON-RPC envelope, so it
+    // under-reports `/mcp` latency. By NOT marking the outer `ServerTimingEmitted`
+    // sentinel, the fallback `ServerTimingLayer` appends the real `/mcp` `total`
+    // (which brackets that buffering/serialization). Net result on a DB-backed
+    // call: the fallback's true `total` plus the inner `db` metric, with exactly
+    // one `total`. A non-DB call forwards nothing and the fallback emits
+    // total-only.
+    for timing in server_timings {
+        if let Ok(value) = timing.to_str()
+            && let Some(kept) = strip_total_metric(value)
+            && let Ok(hv) = HeaderValue::from_str(&kept)
+        {
+            resp.headers_mut().append(SERVER_TIMING.clone(), hv);
+        }
+    }
     resp
+}
+
+/// Strip the `total` metric from a `Server-Timing` header value, returning the
+/// remaining comma-separated metrics (e.g. `db;dur=…;desc="N queries"`), or
+/// `None` when only `total` (or nothing usable) was present.
+///
+/// A `Server-Timing` value is a comma-separated list of metrics, each of the
+/// form `name` optionally followed by `;`-separated parameters (`dur`, `desc`).
+/// The metric name is the token before the first `;` or `=`. This keeps the
+/// output W3C-valid and preserves any future non-`total` metrics the inner
+/// pipeline emits.
+fn strip_total_metric(value: &str) -> Option<String> {
+    let kept: Vec<&str> = value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .filter(|entry| {
+            let name = entry.split([';', '=']).next().unwrap_or("").trim();
+            !name.eq_ignore_ascii_case("total")
+        })
+        .collect();
+    if kept.is_empty() {
+        None
+    } else {
+        Some(kept.join(", "))
+    }
 }
 
 /// Package a buffered handler response as the JSON-RPC tool result.
@@ -1960,6 +2026,29 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn strip_total_metric_drops_only_total() {
+        // Inner `total` is dropped; the `db` metric (with a comma-free quoted
+        // desc) is preserved so the outer fallback's real `/mcp` `total` is the
+        // only one on the response.
+        assert_eq!(
+            strip_total_metric("total;dur=5.000, db;dur=1.250;desc=\"2 queries\""),
+            Some("db;dur=1.250;desc=\"2 queries\"".to_owned())
+        );
+        // Metric order and a leading non-total entry are preserved.
+        assert_eq!(
+            strip_total_metric("app;dur=1.500, total;dur=42.000"),
+            Some("app;dur=1.500".to_owned())
+        );
+        // A total-only header forwards nothing.
+        assert_eq!(strip_total_metric("total;dur=9.000"), None);
+        // The metric-name token is matched case-insensitively before `;`/`=`,
+        // so a bare `total` (no params) is also dropped.
+        assert_eq!(strip_total_metric("Total"), None);
+        // Empty / whitespace-only input yields nothing.
+        assert_eq!(strip_total_metric("  "), None);
     }
 
     #[test]

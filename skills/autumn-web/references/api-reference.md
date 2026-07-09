@@ -50,7 +50,11 @@ together (`0.5.0` published; `0.6.0` on trunk-dev, unpublished).
 - `Multipart` (`multipart`)
 - `Flash`, `FlashLevel`, `FlashMessage` (`flash`)
 - `Broadcast`, `Channels`, `ChannelsBackend`, `LocalChannelsBackend`,
-  `ChannelMessage`, `ChannelStats` (`ws`)
+  `ChannelMessage`, `ChannelStats` (`ws`) — in tests, opt in with
+  `TestApp::record_broadcasts()` and assert with `TestClient::broadcasts()` /
+  `broadcasts_on(topic)` / `assert_broadcast(topic, predicate)` /
+  `assert_broadcast_count(topic, n)` / `assert_no_broadcasts(topic)`
+  (`RecordedBroadcast` exposes `.topic()` / `.payload()`)
 - `Locale`, `t!` (`i18n`)
 - OAuth2/OIDC config, provider presets, callback helpers, and identity values
   (`oauth2`)
@@ -81,6 +85,7 @@ together (`0.5.0` published; `0.6.0` on trunk-dev, unpublished).
 | `#[feature_flag]` | Feature-flag definition |
 | `#[inbound_mail]` | Inbound mail handler |
 | `#[step_up]` | Step-up authentication guard |
+| `#[throttle]` | Per-route rate limit — inline (`limit`/`per`/`key`) or named (`#[throttle("login")]`) (**unreleased**) |
 | `#[event]`, `#[listener]`, `listeners![...]` | Typed domain event bus (**unreleased**) — publish via the `Events` extractor, register with `.listeners(...)` |
 
 `#[model]` also recognizes `#[belongs_to]` / `#[has_many]` / `#[has_one]`
@@ -100,6 +105,36 @@ from -> to: "guard", ...))]` field attribute on `String` fields, generating
 `transition_{field}_to(&self, &str) -> AutumnResult<String>`, and a
 `__AUTUMN_SM_{FIELD}_TRANSITIONS` edge-list constant. See
 `docs/guide/state-machines.md`.
+
+`#[model]` field attributes for column privacy and canonicalization
+(**unreleased** — trunk-dev, not in published 0.5.0):
+
+- `#[private]` (issue #1374) — excludes the column from the model's `Serialize`
+  impl so it never appears in `Json` output, the auto-generated `--api`
+  list/show endpoints, or any `serde_json::to_value(&model)`. The field stays a
+  normal, queryable column and the **write** path is unaffected — `NewX` /
+  `UpdateX` / `Changeset` still bind it, so a client can *set* a password but
+  never read the hash back. `#[encrypted]` columns are `#[private]` in JSON by
+  default (ciphertext/plaintext must not leak); opt back in with the existing
+  `#[encrypted(admin_visible)]` knob. `#[private]` affects only serialization —
+  the column still appears in `FormModel::form_fields()` (you must be able to
+  *set* it). `autumn doctor` warns (`model_private_columns`) when a
+  sensitively-named column (`password`, `token`, `secret`, `*_hash`) is not
+  marked `#[private]`.
+- `#[normalize(trim, downcase, upcase, squish, with = path::to::fn)]` (issue
+  #1379) — canonicalizes a `String` column, composing normalizers
+  left-to-right. Built-ins live in `autumn_web::normalize`
+  (`trim`/`downcase`/`upcase`/`squish`); `with = path` calls a user
+  `fn(&str) -> String`. Runs on the **write** path (`save`/`save_many` insert;
+  `update` via `UpdateDraft::from_patch`) *before* the `before_create` /
+  `before_update` hooks and the DB write, and on derived `#[repository]`
+  `find_by_`/`count_by_` lookups (so `find_by_email("  FOO@X.com ")` matches the
+  stored `foo@x.com` row). Built-ins are idempotent; composing
+  `#[normalize(downcase)]` with a `unique` column yields case-insensitive
+  uniqueness. Non-`String` fields are a compile error (mirrors `#[encrypted]`).
+  Generated hooks: `impl autumn_web::normalize::Normalize` on the model and
+  `NewX`; `impl autumn_web::normalize::NormalizedModel` (`normalize_lookup`) on
+  every model.
 
 ## Repository-generated methods (`#[repository]`)
 
@@ -127,6 +162,22 @@ always means completion); `batch_size == 0` is an error; `batch_size` is not
 clamped to `MAX_PAGE_SIZE`; sharded repositories reject cross-shard
 `across_tenants()` iteration like `cursor_page`. See "Batched iteration" in
 `docs/guide/pagination.md`.
+
+**(unreleased)** — `find_or_create_by_<field>[_and_<field>...]`: declare
+`fn find_or_create_by_slug(slug: String);` (lookup fields only) in the
+`#[repository]` trait to generate an inherent
+`find_or_create_by_slug(&self, slug: String, new: &NewModel) ->
+AutumnResult<(Model, bool)>` — a race-safe get-or-insert returning the model
+plus a `created` flag (#1382). Looks up on the read path first (replica-eligible,
+tenant/soft-delete aware); if absent, inserts on the primary with `ON CONFLICT DO
+NOTHING`, so under concurrency exactly one row is created, exactly one caller
+sees `created == true`, and no `23505` unique-violation escapes (the loser
+re-reads its own write and returns `(row, false)`). `before_create` /
+`after_create` and the durable commit-hook queue fire only on the created path,
+and — unlike `upsert_many` — the method IS generated on hooked repositories.
+Requires a unique constraint covering the lookup column(s); `_or_` is rejected
+(it would span constraints). See "Race-safe get-or-insert" in
+`docs/guide/repositories.md`.
 
 ## Db transactions
 
@@ -185,6 +236,18 @@ Free functions rendering changeset-aware, accessible inputs:
   `stat_card(label, value, link)`, `tabs(id, &[(id, label, markup)])`,
   `modal(id, title, &body, &ModalConfig)`, `modal_trigger`,
   `modal_close_button`, `confirm_action(...)`.
+- `autumn_web::widgets` display atoms: `badge(label, BadgeVariant)` /
+  `badge_with(..., &BadgeConfig)` / `status_tag(label)` with
+  `BadgeVariant::{Neutral,Info,Success,Warning,Danger}` and
+  `BadgeVariant::for_label(&str)` (deterministic color); `avatar(name,
+  &AvatarConfig)` with `AvatarSize::{Small,Medium,Large}` (image or
+  colored-initials fallback); `alert(AlertVariant, body)` / `alert_with(...,
+  &AlertConfig)` with `AlertVariant::{Info,Success,Warning,Error}` and
+  `error_summary(&Changeset) -> Option<Markup>`. All prelude re-exported.
+- `autumn_web::flash::{flash_messages, flash_messages_with,
+  FlashMessagesConfig}` — accessible flash-banner renderer (per-severity
+  `role`/`aria-live`, `autumn-flash--<level>` classes, empty renders nothing,
+  optional no-JS dismiss). Prelude re-exported.
 - `autumn_web::links`: `link_to`, `link_to_with`, `button_to(label, href,
   Method, csrf_token)`, `button_to_with(..., &ButtonToOptions)`.
 - `autumn_web::ui::pagination`: `pagination_nav(&Page, &PagerOptions)`,
@@ -456,6 +519,27 @@ Endpoint builders:
 - `raw_body() -> &[u8]`
 - `json<T>() -> Result<T, serde_json::Error>`
 
+## Feeds (Atom/RSS)
+
+`autumn_web::feed` renders syndication feeds and returns them straight from a
+`#[get]` handler:
+
+- `feed::Feed` — channel builder. `Feed::atom(title, site_link, self_link)` and
+  `Feed::rss(title, site_link, self_link)` (same signature) pick the format;
+  chain `.author(..)`, `.description(..)`, `.updated(DateTime<Utc>)`,
+  `.entry(FeedEntry)`, `.entries(iter)`.
+- `feed::FeedEntry` — per-item builder. `FeedEntry::new(id, title, link)` plus
+  `.summary(..)`, `.content(..)`, `.published(DateTime<Utc>)`,
+  `.updated(DateTime<Utc>)`.
+- `Feed` implements `IntoResponse`, setting `Content-Type: application/atom+xml`
+  (Atom) or `application/rss+xml` (RSS), UTF-8, and XML-escaping every text
+  field. `Feed::render() -> String` returns the raw XML.
+- `Feed::conditional(&headers) -> Response` reuses the `etag` module: it
+  computes the feed's ETag (also available via `Feed::etag()`) and returns a
+  `304 Not Modified` when the request's `If-None-Match` matches, otherwise the
+  full `200` feed. See `docs/guide/conditional-get.md`. The `blog` example
+  wires a `/feed.xml` route this way.
+
 ## Config layering and env keys
 
 Layering order, lowest to highest:
@@ -495,6 +579,7 @@ Frequently used env keys:
 | `AUTUMN_MAIL__ALLOW_IN_PROCESS_DELIVER_LATER_IN_PRODUCTION` | `mail.allow_in_process_deliver_later_in_production` |
 | `AUTUMN_STORAGE__BACKEND` | `storage.backend` |
 | `AUTUMN_CACHE__BACKEND` | `cache.backend` |
+| `AUTUMN_OBSERVABILITY__SERVER_TIMING` | `observability.server_timing` (unreleased — trunk-dev) — bool; `Server-Timing` response header opt-in. Defaults on in `dev`/`development`, off elsewhere. See `docs/guide/observability/server-timing.md`. |
 
 ## reexports module
 

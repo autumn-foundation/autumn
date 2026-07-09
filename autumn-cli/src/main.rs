@@ -19,6 +19,7 @@ mod export;
 mod flags;
 mod generate;
 mod http;
+mod i18n;
 mod maintenance;
 mod migrate;
 mod monitor;
@@ -51,6 +52,22 @@ pub enum CheckSubcommands {
         /// Binary target to check (for packages with multiple bin targets)
         #[arg(long, value_name = "BIN")]
         bin: Option<String>,
+    },
+}
+
+/// Subcommands for `autumn i18n`.
+#[derive(Subcommand, Clone, Debug, PartialEq, Eq)]
+pub enum I18nSubcommands {
+    /// Compare translation keys referenced in code against each `i18n/*.ftl`
+    /// locale, reporting missing, untranslated, and unused keys. Exits
+    /// non-zero when any locale is missing a referenced key (CI-friendly).
+    Check {
+        /// Output format: `text` (default) or `json`.
+        #[arg(long, default_value = "text", value_name = "FORMAT")]
+        format: String,
+        /// Treat untranslated/unused warnings as failures (exit non-zero).
+        #[arg(long)]
+        strict: bool,
     },
 }
 
@@ -465,6 +482,12 @@ enum Commands {
         /// Treat warnings as failures (exit 1 on any ⚠️).
         #[arg(long)]
         strict: bool,
+    },
+
+    /// Inspect the project's Fluent i18n translations.
+    I18n {
+        #[command(subcommand)]
+        action: I18nSubcommands,
     },
 
     /// Run conformance checks against a plugin's route contributions.
@@ -951,6 +974,33 @@ enum MigrateCommands {
         /// before touching the database.
         #[arg(long)]
         yes_i_mean_prod: bool,
+    },
+    /// Record content hashes for applied migrations (issue #1203).
+    ///
+    /// Content hashes (SHA-256 of each migration's `up.sql`) live in the
+    /// `autumn_migration_checksums` table and are validated before every
+    /// `autumn migrate` run so a migration that was edited after being
+    /// applied fails loudly instead of silently forking the schema.
+    ///
+    /// # Examples
+    ///
+    ///   # Backfill hashes for legacy migrations applied before the checksum
+    ///   # table existed. Idempotent — safe to re-run.
+    ///   autumn migrate baseline
+    ///
+    ///   # Escape hatch: overwrite one version's stored hash with the current
+    ///   # on-disk hash. Use ONLY when you deliberately edited an applied
+    ///   # migration and accept that other environments running the previous
+    ///   # content will now report a mismatch.
+    ///   autumn migrate baseline --force 20260101000000
+    #[command(verbatim_doc_comment)]
+    Baseline {
+        /// Re-baseline the checksum for a single applied version, overwriting
+        /// whatever hash is currently recorded. The escape hatch for a
+        /// deliberate edit. Without this flag, `baseline` only records
+        /// hashes for applied migrations that don't already have one.
+        #[arg(long = "force", value_name = "VERSION")]
+        force: Option<String>,
     },
 }
 
@@ -1883,6 +1933,41 @@ enum GenerateCommands {
         #[arg(long)]
         force: bool,
     },
+    /// Generate a handler-only, non-CRUD route module (no model, migration, or
+    /// database).
+    ///
+    /// Each action maps to `/<controller>/<action>`, except an action literally
+    /// named `index`, which maps to `/<controller>`. Under `--api` the prefix is
+    /// `/api/<controller>[/<action>]`.
+    ///
+    /// Actions default to GET; request another method with `action:method`
+    /// (method ∈ get, post, put, patch, delete), e.g. `submit:post`.
+    ///
+    /// HTML mode (default) emits Maud stub views returning HTTP 200; `--api`
+    /// emits JSON actions with no view stubs. Re-running against an existing
+    /// controller fails without `--force`.
+    ///
+    /// Example:
+    ///
+    ///   autumn generate controller pages home about contact
+    #[command(verbatim_doc_comment)]
+    Controller {
+        /// Controller name (`snake_case` or `PascalCase`, e.g. `pages`).
+        name: String,
+        /// Action names, each optionally suffixed with `:method`
+        /// (e.g. `home`, `submit:post`, `index`).
+        #[arg(required = true)]
+        actions: Vec<String>,
+        /// Emit JSON actions (no HTML/Maud views).
+        #[arg(long)]
+        api: bool,
+        /// Print the file plan and exit without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Overwrite existing files instead of erroring on collision.
+        #[arg(long)]
+        force: bool,
+    },
     /// Generate model, migration, repository, HTML routes, smoke test, and
     /// register the new routes in `src/main.rs`.
     ///
@@ -2064,6 +2149,11 @@ fn run_command(command: Commands) {
                     to,
                     yes_i_mean_prod,
                 }),
+                Some(MigrateCommands::Baseline { force }) => {
+                    migrate::MigrateAction::Baseline(migrate::BaselineArgs {
+                        force_version: force,
+                    })
+                }
                 None => migrate::MigrateAction::Run,
             };
             let target = match (shard, control_only) {
@@ -2348,6 +2438,21 @@ fn run_command(command: Commands) {
         Commands::Doctor { json, strict } => {
             doctor::run(doctor::DoctorOptions { json, strict });
         }
+        Commands::I18n { action } => match action {
+            I18nSubcommands::Check { format, strict } => {
+                let format = match format.as_str() {
+                    "json" => i18n::OutputFormat::Json,
+                    "text" => i18n::OutputFormat::Text,
+                    other => {
+                        eprintln!(
+                            "autumn i18n check: unknown --format `{other}` (expected `text` or `json`)"
+                        );
+                        std::process::exit(2);
+                    }
+                };
+                i18n::run(i18n::I18nCheckOptions { format, strict });
+            }
+        },
         Commands::PluginCheck {
             package,
             bin,
@@ -3075,6 +3180,16 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
             force,
         } => {
             let plan = generate::wizard::plan_wizard(&resolve_cwd(), &name, &steps);
+            apply_plan(plan, generate::Flags { dry_run, force }, mode);
+        }
+        GenerateCommands::Controller {
+            name,
+            actions,
+            api,
+            dry_run,
+            force,
+        } => {
+            let plan = generate::controller::plan_controller(&resolve_cwd(), &name, &actions, api);
             apply_plan(plan, generate::Flags { dry_run, force }, mode);
         }
         GenerateCommands::Scaffold {
@@ -4520,6 +4635,37 @@ mod tests {
                 json: true,
                 strict: true
             }
+        ));
+    }
+
+    // ── autumn i18n tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn parse_i18n_check_defaults() {
+        let cli = Cli::try_parse_from(["autumn", "i18n", "check"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::I18n {
+                action: I18nSubcommands::Check {
+                    ref format,
+                    strict: false,
+                }
+            } if format == "text"
+        ));
+    }
+
+    #[test]
+    fn parse_i18n_check_json_and_strict() {
+        let cli = Cli::try_parse_from(["autumn", "i18n", "check", "--format", "json", "--strict"])
+            .unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::I18n {
+                action: I18nSubcommands::Check {
+                    ref format,
+                    strict: true,
+                }
+            } if format == "json"
         ));
     }
 

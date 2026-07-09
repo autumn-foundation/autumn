@@ -165,6 +165,14 @@ http.workspace = true
 indexmap.workspace = true
 inventory.workspace = true
 libsqlite3-sys = { workspace = true, optional = true }
+# Conflict oracle for the #1012 duplicate-route preflight. axum 0.8 routes
+# through matchit, so we delegate path-shape conflict detection to the SAME
+# engine axum uses. This version MUST stay pinned to whatever axum resolves in
+# Cargo.lock (currently axum 0.8.9 → matchit 0.8.4); moving axum without moving
+# this in lockstep risks the oracle silently diverging from axum's real accept/
+# panic behavior. The `matchit_agrees_with_axum_route_conflicts` parity test in
+# `router.rs` is the guard — it fails loudly if the two ever disagree.
+matchit = "=0.8.4"
 maud = { workspace = true, optional = true }
 moka = { workspace = true, optional = true }
 pin-project-lite = "0.2"
@@ -278,6 +286,12 @@ harness = false
 [[test]]
 name = "integration_tests"
 path = "tests/integration_tests.rs"
+
+# Isolated: installs the process-global tracing subscriber (issue #1044), a
+# process-wide side-effect that cannot share the consolidated binary.
+[[test]]
+name = "actuator_live_logger_reload"
+path = "tests/actuator_live_logger_reload.rs"
 
 [[test]]
 name = "db_hooks_lifecycle"
