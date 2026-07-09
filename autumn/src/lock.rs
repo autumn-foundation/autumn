@@ -145,6 +145,12 @@ mod db_impl {
 
     use super::{DEFAULT_LOCK_POLL_INTERVAL, LockError, distributed_lock_key};
 
+    /// Lower bound on the effective [`Lock::lock_timeout`] poll interval.
+    ///
+    /// Clamps a zero (or sub-millisecond) poll interval up to 1ms so the poll
+    /// loop yields to the runtime instead of busy-spinning.
+    const MIN_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(1);
+
     #[derive(diesel::QueryableByName)]
     struct AcquiredRow {
         #[diesel(sql_type = diesel::sql_types::Bool)]
@@ -227,16 +233,18 @@ mod db_impl {
             self
         }
 
-        /// Check out a connection detached from the pool, ready to hold a lock.
-        async fn checkout(&self) -> Result<AsyncPgConnection, LockError> {
-            let conn = self
-                .pool
+        /// Check out a pooled connection to attempt an acquire on.
+        ///
+        /// The connection is returned as a pooled [`Object`], **not** detached:
+        /// if the acquire fails the caller simply drops it and it recycles back
+        /// to the pool. Only on a *successful* acquire does the caller
+        /// [`Object::take`] it, permanently detaching the lock-bearing session
+        /// so it can never be recycled while the lock is held.
+        async fn checkout(&self) -> Result<Object<AsyncPgConnection>, LockError> {
+            self.pool
                 .get()
                 .await
-                .map_err(|e| LockError::PoolUnavailable(e.to_string()))?;
-            // Detach from the pool so a lock-bearing connection can never be
-            // recycled while the lock is held.
-            Ok(Object::take(conn))
+                .map_err(|e| LockError::PoolUnavailable(e.to_string()))
         }
 
         /// Try to acquire the lock without blocking.
@@ -252,14 +260,19 @@ mod db_impl {
             let mut conn = self.checkout().await?;
             let acquired = diesel::sql_query("SELECT pg_try_advisory_lock($1) AS acquired")
                 .bind::<diesel::sql_types::BigInt, _>(self.key)
-                .get_result::<AcquiredRow>(&mut conn)
+                .get_result::<AcquiredRow>(&mut *conn)
                 .await
                 .map_err(|e| LockError::Database(e.to_string()))?
                 .acquired;
             if acquired {
+                // Acquired: detach the session from the pool so the
+                // lock-bearing connection can never be recycled while held.
+                let conn = Object::take(conn);
                 Ok(Some(LockGuard::new(conn, self.key, self.name.clone())))
             } else {
-                // Not acquired: close this session instead of recycling it.
+                // Not acquired: drop the pooled `Object` so it recycles back to
+                // the pool (do not close it — we lost the race, not the
+                // connection).
                 drop(conn);
                 Ok(None)
             }
@@ -279,16 +292,22 @@ mod db_impl {
             let mut conn = self.checkout().await?;
             diesel::sql_query("SELECT pg_advisory_lock($1)")
                 .bind::<diesel::sql_types::BigInt, _>(self.key)
-                .execute(&mut conn)
+                .execute(&mut *conn)
                 .await
                 .map_err(|e| LockError::Database(e.to_string()))?;
+            // Acquired: detach the session from the pool so the lock-bearing
+            // connection can never be recycled while held.
+            let conn = Object::take(conn);
             Ok(LockGuard::new(conn, self.key, self.name.clone()))
         }
 
         /// Acquire the lock, blocking up to `timeout`.
         ///
-        /// Polls [`Lock::try_lock`] at the configured poll interval until the
-        /// lock is acquired or `timeout` elapses.
+        /// Checks out a single connection and polls `pg_try_advisory_lock` on
+        /// that same held connection at the configured poll interval until the
+        /// lock is acquired or `timeout` elapses. Holding one connection for the
+        /// whole wait avoids per-poll connection churn; on timeout the
+        /// connection recycles back to the pool.
         ///
         /// # Errors
         ///
@@ -296,19 +315,40 @@ mod db_impl {
         /// `timeout`, or another [`LockError`] on connection/query failure.
         pub async fn lock_timeout(&self, timeout: Duration) -> Result<LockGuard, LockError> {
             let start = Instant::now();
+            // Check out one connection and reuse it for every poll iteration.
+            let mut conn = self.checkout().await?;
             loop {
-                if let Some(guard) = self.try_lock().await? {
-                    return Ok(guard);
+                let acquired = diesel::sql_query("SELECT pg_try_advisory_lock($1) AS acquired")
+                    .bind::<diesel::sql_types::BigInt, _>(self.key)
+                    .get_result::<AcquiredRow>(&mut *conn)
+                    .await
+                    .map_err(|e| LockError::Database(e.to_string()))?
+                    .acquired;
+                if acquired {
+                    // Acquired: detach the session from the pool so the
+                    // lock-bearing connection can never be recycled while held.
+                    let conn = Object::take(conn);
+                    return Ok(LockGuard::new(conn, self.key, self.name.clone()));
                 }
                 let elapsed = start.elapsed();
                 if elapsed >= timeout {
+                    // Timed out: drop the pooled `Object` so it recycles back to
+                    // the pool (the lock was never acquired on it).
+                    drop(conn);
                     return Err(LockError::Timeout {
                         name: self.name.clone(),
                         waited: elapsed,
                     });
                 }
                 let remaining = timeout.saturating_sub(elapsed);
-                tokio::time::sleep(self.poll_interval.min(remaining)).await;
+                // Clamp the effective poll interval to a small minimum so a
+                // zero (or sub-millisecond) interval cannot busy-spin, but never
+                // sleep past the remaining budget.
+                let poll = self
+                    .poll_interval
+                    .max(MIN_LOCK_POLL_INTERVAL)
+                    .min(remaining);
+                tokio::time::sleep(poll).await;
             }
         }
 
@@ -480,7 +520,11 @@ mod db_impl {
     }
 }
 
-#[cfg(test)]
+// Gated on `db`: several assertions reference `db`-only namespacing helpers
+// (`crate::migrate::MIGRATION_ADVISORY_LOCK_KEY`,
+// `crate::repository::repository_upsert_advisory_lock_key`), so this module must
+// not compile with the `db` feature off.
+#[cfg(all(test, feature = "db"))]
 mod tests {
     use super::*;
 
