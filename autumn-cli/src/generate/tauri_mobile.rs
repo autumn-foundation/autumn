@@ -30,7 +30,10 @@
 //! feature and a `/sync` router mounted in the extracted `serve()` — only
 //! when the app's resolved config has a database URL (e.g.
 //! `AUTUMN_DATABASE__URL`), so the same binary boots fully offline on a
-//! device and serves sync on the server. Without the flag the emitted
+//! device and serves sync on the server, and only when `SYNC_TOKEN` is set
+//! (fail closed: the mount is wrapped in a generated bearer-token check the
+//! device matches via `AUTUMN_SYNC__TOKEN`; without the secret `/sync`
+//! stays unmounted instead of open). Without the flag the emitted
 //! scaffold is byte-identical to the plain #1507 output.
 //! See `docs/guide/tauri-mobile-offline-sync.md`.
 //!
@@ -237,7 +240,9 @@ pub fn render_mobile_prerequisites(opts: TauriMobileOptions) -> String {
          edit src-tauri/src/lib.rs and set AUTUMN_SYNC__REMOTE_URL to the\n\
          /sync mount of your deployed app (see the commented block in run()).\n\
          Deploy the SAME app with AUTUMN_DATABASE__URL set so it serves the\n\
-         /sync endpoints — and mount them behind auth before shipping. The\n\
+         /sync endpoints. They are mounted FAIL CLOSED: set SYNC_TOKEN on the\n\
+         deployment (a long random secret) and deliver the same secret to\n\
+         devices as AUTUMN_SYNC__TOKEN, or /sync stays unmounted. The\n\
          device itself needs no database connection; read\n\
          docs/guide/tauri-mobile-offline-sync.md for the offline walkthrough.\n"
     } else {
@@ -1129,16 +1134,27 @@ const SYNC_MOUNT_CALL: &str = r#"    // Offline sync (issue #1508): mount the /s
 const SYNC_MOUNT_HELPER: &str = r#"
 /// Mount the offline-sync server endpoints (`POST /sync/push`, `GET /sync/pull`).
 ///
-/// Added by `autumn generate tauri-mobile --offline-sync`. The endpoints are
-/// mounted only when the app's resolved configuration has a database URL:
-/// the REMOTE deployment of this app (the one with Postgres) serves `/sync`
-/// for every device, while the same code running in-process on a phone has
-/// no database and syncs as a client instead (see `src-tauri/src/lib.rs`).
+/// Added by `autumn generate tauri-mobile --offline-sync`. The endpoints
+/// trust `device_id` as sent, and anyone who can reach them can read and
+/// write every synced row — so the mount FAILS CLOSED: `/sync` is mounted
+/// only when BOTH hold:
 ///
-/// REQUIRED before shipping: put these endpoints behind authentication and
-/// serve them over HTTPS only. They trust `device_id` as sent, and anyone
-/// who can reach them can read and write every synced row — see the
-/// middleware example in docs/guide/tauri-mobile-offline-sync.md.
+/// - the app's resolved configuration has a database URL: the REMOTE
+///   deployment of this app (the one with Postgres) serves `/sync` for
+///   every device, while the same code running in-process on a phone has
+///   no database and syncs as a client instead (see
+///   `src-tauri/src/lib.rs`);
+/// - `SYNC_TOKEN` is set to a non-empty secret: `/sync` is then wrapped in
+///   the bearer-token check in `require_sync_auth` below (devices send the
+///   matching secret via `AUTUMN_SYNC__TOKEN` — see
+///   `src-tauri/src/lib.rs`). Without it the endpoints are NOT mounted —
+///   never exposed open — and a startup warning explains how to enable
+///   them. Apps with their own authentication can swap the token check in
+///   `require_sync_auth` for it; keep the replacement fail closed.
+///
+/// REQUIRED before shipping: serve these endpoints over HTTPS only — the
+/// bearer token and every synced row travel in these requests. See
+/// docs/guide/tauri-mobile-offline-sync.md.
 ///
 /// MULTI-USER apps additionally need per-user data partitioning: the
 /// `server::router` call below is SINGLE-TENANT — every authenticated
@@ -1151,7 +1167,7 @@ const SYNC_MOUNT_HELPER: &str = r#"
 async fn mount_offline_sync(app: autumn_web::app::AppBuilder) -> autumn_web::app::AppBuilder {
     use std::sync::Arc;
 
-    use autumn_web::reexports::tokio;
+    use autumn_web::reexports::{axum, tokio};
     use autumn_web::sync::{LwwResolver, PgSyncBackend, server};
 
     // Diagnostics below use stderr: this helper runs BEFORE AppBuilder::run()
@@ -1177,6 +1193,20 @@ async fn mount_offline_sync(app: autumn_web::app::AppBuilder) -> autumn_web::app
         );
         return app;
     };
+    // FAIL CLOSED: a database is configured, so this process is the sync
+    // SERVER — but without a shared secret the endpoints would be open to
+    // anyone who can reach them. Refuse to mount rather than expose them.
+    if !std::env::var("SYNC_TOKEN").is_ok_and(|token| !token.is_empty()) {
+        eprintln!(
+            "offline-sync: SYNC_TOKEN is not set — /sync NOT mounted (fail \
+             closed). Set SYNC_TOKEN to a long random secret to serve /sync \
+             behind the generated bearer-token check (devices send the same \
+             secret via AUTUMN_SYNC__TOKEN), or replace the token check in \
+             require_sync_auth with your app's real authentication — see \
+             docs/guide/tauri-mobile-offline-sync.md."
+        );
+        return app;
+    }
     let backend = Arc::new(PgSyncBackend::new(database_url));
     // Idempotent DDL for the sync shadow tables. A temporarily unreachable
     // database must not prevent the app from starting: log and continue —
@@ -1190,7 +1220,51 @@ async fn mount_offline_sync(app: autumn_web::app::AppBuilder) -> autumn_web::app
         }
         Err(e) => eprintln!("offline-sync: sync schema task failed: {e}"),
     }
-    app.nest("/sync", server::router(backend, Arc::new(LwwResolver)))
+    app.nest(
+        "/sync",
+        server::router(backend, Arc::new(LwwResolver))
+            .layer(axum::middleware::from_fn(require_sync_auth)),
+    )
+}
+
+/// Reject `/sync` requests that don't carry the expected bearer token
+/// (`Authorization: Bearer <SYNC_TOKEN>`) — the generated single-tenant
+/// default: every device of this deployment shares one secret. Swap the
+/// token check for your app's real session/token validation if you have
+/// one, and keep the replacement FAIL CLOSED (reject when the check cannot
+/// be performed, never fall through to allowing the request).
+#[cfg(feature = "offline-sync")]
+async fn require_sync_auth(
+    request: autumn_web::reexports::axum::extract::Request,
+    next: autumn_web::reexports::axum::middleware::Next,
+) -> Result<
+    autumn_web::reexports::axum::response::Response,
+    autumn_web::reexports::axum::http::StatusCode,
+> {
+    use autumn_web::reexports::axum::http;
+
+    // Fail CLOSED when the server is misconfigured: with an unset/empty
+    // SYNC_TOKEN the expected value would be "" and a bare
+    // `Authorization: Bearer ` header would authenticate.
+    // (mount_offline_sync refuses to mount /sync in that case; this guard
+    // keeps the middleware safe even if it is reused elsewhere.)
+    let expected = std::env::var("SYNC_TOKEN").unwrap_or_default();
+    if expected.is_empty() {
+        return Err(http::StatusCode::INTERNAL_SERVER_ERROR);
+    }
+    let authorized = request
+        .headers()
+        .get(http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        // Constant-time comparison: a plain `==` short-circuits on the
+        // first differing byte and leaks the secret through timing.
+        .is_some_and(|token| autumn_web::sync::server::constant_time_token_eq(token, &expected));
+    if authorized {
+        Ok(next.run(request).await)
+    } else {
+        Err(http::StatusCode::UNAUTHORIZED)
+    }
 }
 "#;
 
@@ -1464,6 +1538,11 @@ const SYNC_ENV_BLOCK: &str = r#"    // ── Offline sync (issue #1508) ──�
     //     "AUTUMN_SYNC__REMOTE_URL",
     //     "https://app.example.com/sync",
     // );
+    // ... and give it the deployment's SYNC_TOKEN so requests authenticate
+    // (sent as `Authorization: Bearer …`; the generated server mount serves
+    // /sync ONLY behind that check). Never hard-code a real secret in
+    // source — deliver it at runtime from your login/auth flow:
+    // std::env::set_var("AUTUMN_SYNC__TOKEN", sync_token);
     // With offline sync the device needs NO direct database connection: leave
     // AUTUMN_DATABASE__URL unset and the in-process server boots without
     // Postgres — the app works fully offline and converges with the remote in
@@ -1572,8 +1651,20 @@ fn start_background_sync(runtime: &tokio::runtime::Runtime, sync_db: std::path::
         );
         return;
     }};
-    let engine =
-        autumn_web::sync::SyncEngine::new(store, autumn_web::sync::SyncConfig::new(remote_url));
+    let mut config = autumn_web::sync::SyncConfig::new(remote_url);
+    // The generated server mount serves /sync only behind its SYNC_TOKEN
+    // bearer check — send the matching secret (set in run(), ideally
+    // delivered by your login/auth flow rather than hard-coded).
+    match std::env::var("AUTUMN_SYNC__TOKEN") {{
+        Ok(token) if !token.is_empty() => config.bearer_token = Some(token),
+        _ => eprintln!(
+            "[{package_name}] AUTUMN_SYNC__TOKEN is not set — syncing without \
+             credentials. The generated server mount requires its SYNC_TOKEN \
+             and will answer 401 until the matching secret is set here (or \
+             until you wire your own auth end to end)."
+        ),
+    }}
+    let engine = autumn_web::sync::SyncEngine::new(store, config);
     // spawn_background must be entered from inside the runtime; the returned
     // JoinHandle detaches on drop (dropping never cancels the task).
     let _sync_task =
@@ -3939,6 +4030,25 @@ mod tests {
         assert!(!lib.contains("\n    std::env::set_var(\"AUTUMN_DATABASE__URL\""));
     }
 
+    #[test]
+    fn offline_lib_rs_sends_the_sync_bearer_token() {
+        // Client half of the fail-closed server mount (#1612 review): the
+        // engine sends AUTUMN_SYNC__TOKEN as its bearer token, matching the
+        // deployment's SYNC_TOKEN — and warns (without aborting: local-first
+        // still works) when it is missing.
+        let lib = render_mobile_lib_rs("my-app", "my_app", true);
+        assert!(lib.contains(r#"std::env::var("AUTUMN_SYNC__TOKEN")"#));
+        assert!(lib.contains("config.bearer_token = Some(token)"));
+        assert!(
+            lib.contains("AUTUMN_SYNC__TOKEN is not set"),
+            "a missing client token must be called out at startup"
+        );
+        // The commented env block documents the pairing without shipping a
+        // hard-coded secret.
+        assert!(lib.contains(r#"// std::env::set_var("AUTUMN_SYNC__TOKEN", sync_token);"#));
+        assert!(!render_mobile_lib_rs("my-app", "my_app", false).contains("AUTUMN_SYNC__TOKEN"));
+    }
+
     /// The CHANGELOG promises the no-flag emission is byte-identical to the
     /// pre-#1508 scaffold; `render_mobile_lib_rs` now assembles the file
     /// from conditionals, so pin the default output byte-for-byte.
@@ -4049,12 +4159,53 @@ mod tests {
         assert!(contents.contains("PgSyncBackend::new(database_url)"));
         assert!(contents.contains("ensure_schema()"));
         assert!(
-            contents.contains(r#".nest("/sync", server::router(backend, Arc::new(LwwResolver)))"#)
+            contents.contains(".layer(axum::middleware::from_fn(require_sync_auth)),"),
+            "the sync router must be mounted behind the generated auth middleware"
         );
         // The mount call must precede the final run().
         let mount = contents.find("mount_offline_sync(app)").unwrap();
         let run = contents.find(".run()").unwrap();
         assert!(mount < run, "sync mounting must happen before .run()");
+    }
+
+    #[test]
+    fn offline_extraction_mounts_sync_fail_closed_behind_sync_token() {
+        // Review hardening (#1612): a fresh scaffold must never expose an
+        // UNAUTHENTICATED /sync — the endpoints trust `device_id` as sent,
+        // so an open mount lets any network client read and overwrite every
+        // synced row. The generated helper fails closed instead.
+        let tmp = stock_app_dir("my-app");
+        std::fs::write(tmp.path().join("src/main.rs"), stock_main_rs()).unwrap();
+
+        let plan = plan_tauri_mobile(tmp.path(), OFFLINE).unwrap();
+        let lib_action =
+            app_src_action(&plan, "lib.rs").expect("plan must create the app src/lib.rs");
+        let Action::CreateIfAbsent { contents, .. } = lib_action else {
+            panic!("app lib.rs must be a CreateIfAbsent action, got {lib_action:?}");
+        };
+        // Startup gate: no SYNC_TOKEN → /sync not mounted, with a warning.
+        assert!(
+            contents.contains(r#"std::env::var("SYNC_TOKEN")"#),
+            "the mount must be gated on SYNC_TOKEN"
+        );
+        assert!(
+            contents.contains("/sync NOT mounted"),
+            "the skipped mount must be explained loudly at startup"
+        );
+        // Per-request guard: the generated middleware fails closed on an
+        // empty expected token and compares in constant time.
+        assert!(contents.contains("async fn require_sync_auth"));
+        assert!(contents.contains("StatusCode::INTERNAL_SERVER_ERROR"));
+        assert!(contents.contains("StatusCode::UNAUTHORIZED"));
+        assert!(
+            contents.contains("autumn_web::sync::server::constant_time_token_eq"),
+            "the token comparison must be constant-time"
+        );
+        // The old unauthenticated one-liner mount must be gone.
+        assert!(
+            !contents.contains(r#".nest("/sync", server::router(backend, Arc::new(LwwResolver)))"#),
+            "an unauthenticated /sync mount must not be emitted"
+        );
     }
 
     #[test]

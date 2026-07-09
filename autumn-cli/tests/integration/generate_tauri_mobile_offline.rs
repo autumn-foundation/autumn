@@ -71,6 +71,18 @@ fn offline_sync_shell_wires_syncstore_engine_and_resume_trigger() {
     assert!(lib_rs.contains("autumn_web::sync::SyncEngine::new("));
     assert!(lib_rs.contains("autumn_web::sync::SyncConfig::new(remote_url)"));
 
+    // The engine authenticates against the fail-closed server mount: the
+    // device sends AUTUMN_SYNC__TOKEN (the deployment's SYNC_TOKEN) as its
+    // bearer token, and a missing token is called out at startup.
+    assert!(
+        lib_rs.contains(r#"std::env::var("AUTUMN_SYNC__TOKEN")"#),
+        "the engine must read AUTUMN_SYNC__TOKEN at runtime"
+    );
+    assert!(
+        lib_rs.contains("config.bearer_token = Some(token)"),
+        "the token must be wired into SyncConfig::bearer_token"
+    );
+
     // Background sync: spawned on the server runtime, 30 s interval
     // (exponential backoff while offline lives inside the engine).
     assert!(
@@ -366,15 +378,39 @@ fn offline_sync_app_lib_mounts_sync_router_behind_db_guard() {
     assert!(lib_rs.contains("PgSyncBackend::new(database_url)"));
     assert!(
         lib_rs.contains("REQUIRED before shipping"),
-        "the generated helper must present /sync authentication as a requirement"
+        "the generated helper must present HTTPS-only serving as a requirement"
     );
     assert!(
         lib_rs.contains("ensure_schema()"),
         "the sync shadow-table DDL must run at startup"
     );
     assert!(
-        lib_rs.contains(r#".nest("/sync", server::router(backend, Arc::new(LwwResolver)))"#),
+        lib_rs.contains("app.nest(") && lib_rs.contains(r#""/sync","#),
         "serve() must nest the sync router at /sync"
+    );
+
+    // Fail closed (#1612 review): a fresh scaffold must never expose an
+    // unauthenticated /sync. The mount is gated on SYNC_TOKEN and wrapped
+    // in the generated constant-time bearer-token middleware.
+    assert!(
+        lib_rs.contains(r#"std::env::var("SYNC_TOKEN")"#),
+        "the mount must be gated on SYNC_TOKEN"
+    );
+    assert!(
+        lib_rs.contains("/sync NOT mounted"),
+        "a missing SYNC_TOKEN must skip the mount with a loud warning"
+    );
+    assert!(
+        lib_rs.contains(".layer(axum::middleware::from_fn(require_sync_auth)),"),
+        "the mounted router must be wrapped in the auth middleware"
+    );
+    assert!(
+        lib_rs.contains("autumn_web::sync::server::constant_time_token_eq"),
+        "the bearer-token comparison must be constant-time"
+    );
+    assert!(
+        !lib_rs.contains(r#".nest("/sync", server::router(backend, Arc::new(LwwResolver)))"#),
+        "the old unauthenticated one-liner mount must not be emitted"
     );
 
     // Startup tolerance: an unreachable database must not abort the boot —
@@ -429,6 +465,10 @@ fn offline_sync_prerequisites_mention_sync_setup() {
     assert!(
         stdout.contains("AUTUMN_SYNC__REMOTE_URL"),
         "prerequisites must tell the user to point the engine at the remote /sync"
+    );
+    assert!(
+        stdout.contains("SYNC_TOKEN"),
+        "prerequisites must explain the fail-closed SYNC_TOKEN pairing"
     );
     assert!(
         stdout.contains("tauri-mobile-offline-sync"),

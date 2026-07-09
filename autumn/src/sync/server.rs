@@ -1423,6 +1423,24 @@ where
     build_router(backend, resolver, true)
 }
 
+/// Constant-time string equality for bearer-token checks in the auth
+/// middleware mounted in front of [`router`] / [`scoped_router`].
+///
+/// A plain `==` short-circuits on the first differing byte, so response
+/// timing leaks how much of a guessed token matched — this compares every
+/// byte unconditionally (via `subtle`, the same primitive autumn's webhook
+/// signature and CSRF checks use). Only the *length* of the expected token
+/// is observable, which is not secret-dependent per guess.
+///
+/// This is pure equality: callers must still fail closed on an
+/// unset/empty expected token *before* comparing (an empty expected value
+/// would otherwise equal an empty presented one).
+#[must_use]
+pub fn constant_time_token_eq(presented: &str, expected: &str) -> bool {
+    use subtle::ConstantTimeEq;
+    presented.as_bytes().ct_eq(expected.as_bytes()).into()
+}
+
 /// Resolve the request's scope: the extension when present, else the
 /// GLOBAL default ([`router`]) or a fail-closed rejection
 /// ([`scoped_router`]).
@@ -1525,5 +1543,20 @@ fn respond<T: serde::Serialize>(
             tracing::error!(error = %err, "sync request panicked");
             (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn constant_time_token_eq_is_plain_equality() {
+        assert!(super::constant_time_token_eq("sync-secret", "sync-secret"));
+        assert!(!super::constant_time_token_eq("sync-secret", "sync-secreT"));
+        assert!(!super::constant_time_token_eq("sync", "sync-secret"));
+        assert!(!super::constant_time_token_eq("", "sync-secret"));
+        // Pure equality: an empty expected token DOES equal an empty
+        // presented one — callers must reject empty expected values before
+        // comparing (the routers' documented fail-closed requirement).
+        assert!(super::constant_time_token_eq("", ""));
     }
 }
