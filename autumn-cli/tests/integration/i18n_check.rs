@@ -301,3 +301,92 @@ fn no_i18n_directory_is_a_noop_pass() {
     );
     assert!(stdout.contains("nothing to check"), "stdout:\n{stdout}");
 }
+
+#[test]
+fn configured_i18n_with_missing_directory_fails() {
+    // The project explicitly configures `[i18n]` but the resolved directory is
+    // absent. This is a misconfiguration: at startup `.i18n_auto()` would call
+    // `Bundle::load_from_dir`, which reports `MissingDefaultLocale`. The check
+    // must mirror that (non-zero exit), NOT skip to a false CI pass.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "autumn.toml",
+        "\
+[i18n]
+default_locale = \"en\"
+supported_locales = [\"en\"]
+dir = \"i18n\"
+",
+    );
+    write(root, "src/main.rs", "fn main() {}\n");
+    // Note: no `i18n/` directory is created.
+
+    let output = run_check(root, &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "a configured but missing i18n directory must fail, not skip\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stdout.contains("nothing to check"),
+        "must not report the no-op skip when i18n is configured\nstdout:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("default locale") && stderr.contains("missing"),
+        "should surface the missing-default-locale bundle error\nstderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn profile_overlay_with_missing_directory_fails_under_autumn_env() {
+    // No base `[i18n]`, so under dev the project is a genuine no-op (PASS). A
+    // `[profile.prod.i18n]` overlay points at a directory that does not exist,
+    // so under `AUTUMN_ENV=prod` the check must fail exactly as the prod app
+    // would at startup — the missing-directory skip must not mask it.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "autumn.toml",
+        "\
+[server]
+
+[profile.prod.i18n]
+default_locale = \"en\"
+supported_locales = [\"en\"]
+dir = \"i18n-prod\"
+",
+    );
+    write(root, "src/main.rs", "fn main() {}\n");
+    // Neither `i18n/` nor `i18n-prod/` exists.
+
+    // Dev: no i18n config in scope → genuine no-op PASS.
+    let dev = run_check(root, &[]);
+    let dev_stdout = String::from_utf8_lossy(&dev.stdout);
+    assert!(
+        dev.status.success(),
+        "dev has no i18n config in scope and should skip-PASS\nstdout:\n{dev_stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&dev.stderr)
+    );
+    assert!(
+        dev_stdout.contains("nothing to check"),
+        "dev should report the no-op skip\nstdout:\n{dev_stdout}"
+    );
+
+    // Prod: the `[profile.prod.i18n]` overlay configures i18n but `i18n-prod/`
+    // is absent → fail with the bundle loader's error.
+    let prod = run_check_with_env(root, "prod", &[]);
+    let prod_stderr = String::from_utf8_lossy(&prod.stderr);
+    assert!(
+        !prod.status.success(),
+        "prod overlay configures i18n but the dir is missing → must fail\nstdout:\n{}\nstderr:\n{prod_stderr}",
+        String::from_utf8_lossy(&prod.stdout)
+    );
+    assert!(
+        prod_stderr.contains("default locale") && prod_stderr.contains("missing"),
+        "should surface the missing-default-locale bundle error under prod\nstderr:\n{prod_stderr}"
+    );
+}

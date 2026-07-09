@@ -492,12 +492,83 @@ impl Env for RootedEnv<'_> {
 /// Falls back to a base-only parse of `autumn.toml` if the layered load fails
 /// (e.g. an unrelated prod validation error), so the check never regresses to
 /// "no config" when a base `[i18n]` block is present.
-fn load_i18n_config(root: &Path, env: &dyn Env) -> I18nConfig {
+///
+/// Also returns the active profile name (e.g. `"dev"`, `"prod"`, or a custom
+/// profile) so callers can inspect the matching `[profile.<env>.i18n]` /
+/// `autumn-<env>.toml` overlays; it is `None` only when the layered load failed
+/// and we fell back to a base-only parse.
+fn load_i18n_config(root: &Path, env: &dyn Env) -> (I18nConfig, Option<String>) {
     let rooted = RootedEnv { root, inner: env };
     if let Ok(config) = AutumnConfig::load_with_env(&rooted) {
-        return config.i18n;
+        let profile = config.profile_name().map(str::to_owned);
+        return (config.i18n, profile);
     }
-    load_i18n_config_base_only(root)
+    (load_i18n_config_base_only(root), None)
+}
+
+/// Returns `true` when the project *explicitly* configures i18n in any layer
+/// the runtime config loader reads — a base `autumn.toml` `[i18n]` table, a
+/// `[profile.<env>.i18n]` inline overlay for the active profile, or an
+/// `autumn-<env>.toml` overlay's `[i18n]` table.
+///
+/// This distinguishes a project that genuinely has *no* i18n (where a missing
+/// locale directory is a legitimate no-op) from one that configures i18n but
+/// whose resolved directory is absent (a misconfiguration that the runtime
+/// would hit via `.i18n_auto()` → [`Bundle::load_from_dir`] →
+/// `MissingDefaultLocale` at startup). In the latter case the check must *not*
+/// skip: it lets the bundle loader surface the same startup error.
+fn i18n_is_configured(root: &Path, profile: Option<&str>) -> bool {
+    // Base `autumn.toml`: a top-level `[i18n]` table, or a
+    // `[profile.<env>.i18n]` inline overlay for the active profile.
+    if let Some(base) = read_config_table(&root.join("autumn.toml")) {
+        if base.contains_key("i18n") {
+            return true;
+        }
+        if let Some(profile) = profile
+            && let Some(profiles) = base.get("profile").and_then(toml::Value::as_table)
+        {
+            for name in profile_lookup_names(profile) {
+                if profiles
+                    .get(name)
+                    .and_then(toml::Value::as_table)
+                    .is_some_and(|t| t.contains_key("i18n"))
+                {
+                    return true;
+                }
+            }
+        }
+    }
+
+    // `autumn-<env>.toml` overlay: a top-level `[i18n]` table.
+    if let Some(profile) = profile {
+        for name in profile_lookup_names(profile) {
+            if read_config_table(&root.join(format!("autumn-{name}.toml")))
+                .is_some_and(|t| t.contains_key("i18n"))
+            {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+/// Parse a TOML file into its top-level table, returning `None` when the file
+/// is absent or unparseable.
+fn read_config_table(path: &Path) -> Option<toml::Table> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    toml::from_str::<toml::Table>(&raw).ok()
+}
+
+/// The active profile plus its legacy aliases, mirroring the runtime config
+/// loader's `profile_lookup_names` so a `[profile.production.i18n]` overlay (or
+/// `autumn-production.toml`) is detected under `AUTUMN_ENV=prod` and vice versa.
+fn profile_lookup_names(profile: &str) -> Vec<&str> {
+    match profile {
+        "prod" => vec!["production", "prod"],
+        "dev" => vec!["development", "dev"],
+        other => vec![other],
+    }
 }
 
 /// Read only the base `[i18n]` section from `autumn.toml` in `root`, falling
@@ -527,10 +598,15 @@ pub fn run(opts: I18nCheckOptions) -> ! {
 /// (and other variables) for profile-aware i18n config resolution.
 #[must_use]
 pub fn run_in(root: &Path, env: &dyn Env, opts: I18nCheckOptions) -> i32 {
-    let config = load_i18n_config(root, env);
+    let (config, profile) = load_i18n_config(root, env);
     let dir = root.join(&config.dir);
 
-    if !dir.exists() {
+    // Skip (exit 0) *only* when the project has no i18n configuration at all.
+    // When i18n is configured but the resolved directory is absent, fall
+    // through to `Bundle::load_from_dir` so the missing directory surfaces the
+    // same `MissingDefaultLocale` error the app would fail with at startup —
+    // rather than a false CI pass.
+    if !dir.exists() && !i18n_is_configured(root, profile.as_deref()) {
         if opts.format == OutputFormat::Json {
             println!(
                 "{{\"status\":\"skipped\",\"reason\":\"no i18n directory\",\"dir\":{}}}",

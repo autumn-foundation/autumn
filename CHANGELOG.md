@@ -27,8 +27,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so `AUTUMN_ENV` and `[profile.<env>.i18n]` / `autumn-<env>.toml` overlays are
   honored — under `AUTUMN_ENV=prod` the check inspects the production locale
   directory and `supported_locales` instead of the base defaults, so missing
-  production translations are no longer silently passed. See
-  `autumn-cli/src/i18n.rs`.
+  production translations are no longer silently passed. A missing locale
+  directory only skips (exit 0) when the project has *no* i18n configuration at
+  all; when i18n *is* configured (a base `[i18n]` table or a
+  `[profile.<env>.i18n]` / `autumn-<env>.toml` overlay for the active profile)
+  but the resolved directory is absent, the check loads through
+  `Bundle::load_from_dir` and fails with the same `MissingDefaultLocale` error
+  the app would hit at startup, so CI no longer passes an app that cannot start.
+  See `autumn-cli/src/i18n.rs`.
 - **download:** typed `Download` `IntoResponse` (`autumn_web::download::Download`)
   for serving files from a handler without hand-rolling headers. Construct it
   from owned bytes, an async byte stream, an `AsyncRead`, or a stored blob
