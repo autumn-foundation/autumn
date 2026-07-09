@@ -31,7 +31,7 @@ use std::path::Path;
 
 use super::emit::{Plan, Revert};
 use super::naming::{humanize_label, snake};
-use super::schema_edit::{add_mod_declaration, update_main_rs};
+use super::schema_edit::{add_mod_declaration, remove_routes_entries_with_prefix, update_main_rs};
 use super::{GenerateError, ensure_project_root, read_or_empty};
 
 /// HTTP methods a controller action may bind to.
@@ -298,9 +298,19 @@ pub fn plan_controller(
             entries.join(", ")
         ));
     }
+    // On a `--force` regeneration with a changed action set, the overwritten
+    // handler file no longer defines the old actions, so any stale
+    // `routes::<controller>::*` entries left in `routes![...]` would reference
+    // functions that no longer exist and break compilation. Strip every
+    // existing entry for THIS controller first, then add the fresh set. A
+    // no-op on first generation (nothing matches the prefix), and scoped to
+    // this controller's `routes::<snake>::` prefix so other controllers' and
+    // unrelated routes are untouched.
+    let pruned =
+        remove_routes_entries_with_prefix(&main_existing, &format!("routes::{controller}::"));
     plan.modify(
         main_path.clone(),
-        update_main_rs(&main_existing, &["routes"], &entries),
+        update_main_rs(&pruned, &["routes"], &entries),
     );
     plan.push_revert(Revert::RoutesEntries {
         path: main_path,
@@ -492,5 +502,46 @@ mod tests {
         run(&tmp, "pages", &["layout"], true, false).unwrap();
         let file = fs::read_to_string(tmp.path().join("src/routes/pages.rs")).unwrap();
         assert!(file.contains("pub async fn layout"), "{file}");
+    }
+
+    #[test]
+    fn force_regeneration_prunes_stale_route_entries() {
+        let tmp = project_with_main();
+        // Seed an unrelated controller's entry so we can prove it survives the
+        // prune-and-rewrite of `pages`.
+        let main_path = tmp.path().join("src/main.rs");
+        let seeded = fs::read_to_string(&main_path)
+            .unwrap()
+            .replace("routes![index]", "routes![index, routes::other::index]");
+        fs::write(&main_path, seeded).unwrap();
+
+        run(&tmp, "pages", &["home", "about"], false, false).unwrap();
+        let after_first = fs::read_to_string(&main_path).unwrap();
+        assert!(after_first.contains("routes::pages::home"), "{after_first}");
+        assert!(
+            after_first.contains("routes::pages::about"),
+            "{after_first}"
+        );
+
+        // Regenerate with a changed action set (`about` dropped, `contact`
+        // added) using --force.
+        run(&tmp, "pages", &["home", "contact"], false, true).unwrap();
+        let after_force = fs::read_to_string(&main_path).unwrap();
+        assert!(after_force.contains("routes::pages::home"), "{after_force}");
+        assert!(
+            after_force.contains("routes::pages::contact"),
+            "{after_force}"
+        );
+        // The stale entry for the now-removed `about` action must be gone.
+        assert!(
+            !after_force.contains("routes::pages::about"),
+            "stale routes::pages::about should have been pruned:\n{after_force}"
+        );
+        // Unrelated entries must be untouched.
+        assert!(
+            after_force.contains("routes::other::index"),
+            "unrelated route entry must survive:\n{after_force}"
+        );
+        assert!(after_force.contains("index"), "{after_force}");
     }
 }

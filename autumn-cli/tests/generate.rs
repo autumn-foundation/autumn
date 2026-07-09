@@ -6483,6 +6483,48 @@ fn controller_generates_compiles_and_lists_routes() {
             "autumn routes must list {path}:\n{stdout}"
         );
     }
+
+    // --force regeneration with a CHANGED action set must prune the stale
+    // route entries (`about`) from main.rs, not just append the new one
+    // (`services`) — otherwise `routes::pages::about` would reference a
+    // handler the overwritten file no longer defines and break the build.
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "controller",
+            "pages",
+            "home",
+            "contact",
+            "services",
+            "--force",
+        ],
+    );
+
+    let rebuild = Command::new("cargo")
+        .args(["build"])
+        .current_dir(&project)
+        .output()
+        .expect("failed to run cargo build after --force regen");
+    assert!(
+        rebuild.status.success(),
+        "cargo build failed after --force regen (stale route entry not pruned?):\n\
+         stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&rebuild.stdout),
+        String::from_utf8_lossy(&rebuild.stderr),
+    );
+
+    let (stdout2, _stderr2) = run_autumn(&project, &["routes"]);
+    for path in ["/pages/home", "/pages/contact", "/pages/services"] {
+        assert!(
+            stdout2.contains(path),
+            "autumn routes must list {path} after regen:\n{stdout2}"
+        );
+    }
+    assert!(
+        !stdout2.contains("/pages/about"),
+        "the dropped action /pages/about must no longer be listed:\n{stdout2}"
+    );
 }
 
 /// Slow end-to-end check: `generate controller --api` must compile and list its
