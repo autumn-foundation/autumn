@@ -647,8 +647,7 @@ pub fn __fuzz_decode_cookie(
         headers.append(COOKIE, value);
     }
     let raw = get_cookie(&headers, cookie_name)?;
-    let keys =
-        crate::security::config::ResolvedSigningKeys::new(secret.to_vec(), Vec::new());
+    let keys = crate::security::config::ResolvedSigningKeys::new(secret.to_vec(), Vec::new());
     let (id, sig) = raw.split_once('.')?;
     keys.verify(id.as_bytes(), sig).then(|| id.to_owned())
 }

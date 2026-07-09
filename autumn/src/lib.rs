@@ -282,8 +282,8 @@ pub mod __fuzz {
     pub use crate::form::__fuzz_decode_urlencoded as decode_urlencoded_form;
     #[cfg(feature = "inbound-mail")]
     pub use crate::inbound_mail::{
-        __fuzz_parse_address_list as parse_address_list,
-        __fuzz_parse_generic as parse_generic, __fuzz_parse_ses as parse_ses,
+        __fuzz_parse_address_list as parse_address_list, __fuzz_parse_generic as parse_generic,
+        __fuzz_parse_ses as parse_ses,
     };
 }
 
