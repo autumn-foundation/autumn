@@ -217,7 +217,7 @@ fn generate_inner(
 
     fs::write(
         project_dir.join("README.md"),
-        render_readme(render(templates::README), opts),
+        render_readme(render(templates::README), opts, &vars),
     )?;
 
     let mut main_rs = if opts.with_i18n {
@@ -520,15 +520,47 @@ const DAEMON_NO_DB_FEATURES: &[&str] = &[
     "reporting",
 ];
 
-/// Render the project README, appending flag-specific sections.
+/// Anchor: first line of the DB-specific prerequisites/steps block in
+/// `README.md.tmpl` (the `- **A reachable Postgres**` bullet). Everything from
+/// here up to [`README_TAIL_ANCHOR`] is the default DB-first golden path and is
+/// swapped out for daemon / bundled-Postgres app shapes.
+const README_DB_BODY_ANCHOR: &str = "- **A reachable Postgres**";
+/// Anchor: start of the shared CLI-reference tail in `README.md.tmpl`.
+const README_TAIL_ANCHOR: &str = "## CLI reference";
+/// The CLI-reference row documenting `autumn migrate`, stripped from the daemon
+/// / bundled-Postgres READMEs (a DB-free daemon has no migrations to apply, and
+/// a bundled-Postgres daemon applies them automatically inside the process).
+const README_MIGRATE_ROW: &str = "| `autumn migrate` | Apply pending database migrations. |\n";
+
+/// Render the project README, tailoring the golden path to the app shape and
+/// appending flag-specific sections.
+///
+/// The template body is the default **DB-first** golden path (configure
+/// `[database]`, `autumn migrate`, `autumn dev`). For the daemon app shapes the
+/// DB-bootstrap block is swapped for prose that matches what the scaffold
+/// actually produces:
+///
+/// * `--daemon` builds with **no** database (the `db` feature is off and
+///   migrations are stripped), so it must not tell users to install `libpq`,
+///   configure Postgres, or run `autumn migrate` — it runs via `autumn serve`.
+/// * `--bundled-pg` embeds and manages its own Postgres, so there is no external
+///   server to configure and migrations apply automatically — it runs via
+///   `autumn serve --bundled-pg`.
 ///
 /// `render_template` only substitutes the four fixed `{{…}}` tokens, so the
-/// flag-aware quickstart notes (`--with-i18n`, `--with-seed`) are appended here
-/// in Rust rather than gated inside the template. The appended text must not
-/// introduce any new `{{…}}` token — `no_unsubstituted_placeholders` walks the
-/// generated tree and would flag it.
-fn render_readme(rendered: String, opts: GenerateOptions) -> String {
-    let mut readme = rendered;
+/// flag-aware quickstart notes are built here in Rust rather than gated inside
+/// the template. Text produced here must not introduce any new `{{…}}` token —
+/// `no_unsubstituted_placeholders` walks the generated tree and would flag it
+/// (crate/project names are interpolated from `vars`, not left as tokens).
+fn render_readme(rendered: String, opts: GenerateOptions, vars: &TemplateVars<'_>) -> String {
+    // `--bundled-pg` implies `with_daemon`, so test it first.
+    let mut readme = if opts.with_bundled_pg {
+        rewrite_readme_body(&rendered, &bundled_pg_readme_body(vars))
+    } else if opts.with_daemon {
+        rewrite_readme_body(&rendered, &daemon_readme_body(vars))
+    } else {
+        rendered
+    };
     if opts.with_i18n {
         readme.push_str(
             "\n## Internationalization (i18n)\n\
@@ -556,6 +588,91 @@ fn render_readme(rendered: String, opts: GenerateOptions) -> String {
         );
     }
     readme
+}
+
+/// Replace the default DB-first golden-path block (from
+/// [`README_DB_BODY_ANCHOR`] up to [`README_TAIL_ANCHOR`]) with `new_body`, then
+/// drop the CLI-reference `autumn migrate` row — neither daemon shape runs it by
+/// hand. `new_body` supplies the app-shape-specific prerequisites and run steps.
+fn rewrite_readme_body(rendered: &str, new_body: &str) -> String {
+    let start = rendered.find(README_DB_BODY_ANCHOR).unwrap_or_else(|| {
+        panic!(
+            "README.md.tmpl anchor not found: {README_DB_BODY_ANCHOR:?} — the template and \
+             render_readme have drifted out of sync"
+        )
+    });
+    let tail = rendered.find(README_TAIL_ANCHOR).unwrap_or_else(|| {
+        panic!(
+            "README.md.tmpl anchor not found: {README_TAIL_ANCHOR:?} — the template and \
+             render_readme have drifted out of sync"
+        )
+    });
+    let spliced = format!("{}{}{}", &rendered[..start], new_body, &rendered[tail..]);
+    // The daemon shapes have no hand-run migration step; drop the reference row
+    // so the CLI table stays consistent with the golden path above it.
+    spliced.replace(README_MIGRATE_ROW, "")
+}
+
+/// DB-free daemon (`--daemon`) golden-path body: no Postgres, no `libpq`, no
+/// migrations — the app runs via `autumn serve`.
+fn daemon_readme_body(vars: &TemplateVars<'_>) -> String {
+    format!(
+        "\n### 2. Run the server\n\
+         \n\
+         This project was generated with `--daemon`: it builds with **no** database — the\n\
+         `db` feature is off and there are no migrations — so there is no Postgres to\n\
+         install, no database client library to link, and nothing in `autumn.toml` to\n\
+         configure. Just build and run it:\n\
+         \n\
+         ```sh\n\
+         autumn serve\n\
+         ```\n\
+         \n\
+         Then visit **http://localhost:3000** — you should get a `200` with\n\
+         \"Welcome to {project}!\". Health endpoints are auto-mounted at `/health`\n\
+         and `/actuator/health`.\n\
+         \n\
+         Run it in the background as a managed daemon with `autumn serve --daemon`\n\
+         (`autumn serve status`, `autumn serve stop`, and `autumn serve restart` manage\n\
+         the background process).\n\
+         \n\
+         ",
+        project = vars.project_name,
+    )
+}
+
+/// Bundled/managed-Postgres daemon (`--bundled-pg`) golden-path body: the app
+/// owns its Postgres and auto-applies migrations, so there is no external server
+/// to configure — it runs via `autumn serve --bundled-pg`. It keeps the `db`
+/// feature, so `libpq` is still linked at build time.
+fn bundled_pg_readme_body(vars: &TemplateVars<'_>) -> String {
+    format!(
+        "- **The PostgreSQL client library (`libpq`).** This starter keeps the `db`\n\
+         \x20 feature, so the binary links `libpq` at build time — install it with your\n\
+         \x20 package manager (e.g. `libpq-dev` on Debian/Ubuntu, `libpq` via Homebrew on\n\
+         \x20 macOS).\n\
+         \n\
+         ### 2. Run the server\n\
+         \n\
+         This project was generated with `--bundled-pg`: it embeds and manages its own\n\
+         Postgres. You do **not** install a server, edit the `[database]` block, or run\n\
+         migrations by hand — the daemon provisions the cluster on startup and applies the\n\
+         embedded migrations automatically (see the `[database]` note in `autumn.toml`).\n\
+         Build and run it:\n\
+         \n\
+         ```sh\n\
+         autumn serve --bundled-pg\n\
+         ```\n\
+         \n\
+         Then visit **http://localhost:3000** — you should get a `200` with\n\
+         \"Welcome to {project}!\". Health endpoints are auto-mounted at `/health`\n\
+         and `/actuator/health`.\n\
+         \n\
+         Run it in the background with `autumn serve --bundled-pg --daemon`.\n\
+         \n\
+         ",
+        project = vars.project_name,
+    )
 }
 
 fn render_cargo_toml(
@@ -1013,6 +1130,69 @@ mod tests {
                 entry.display()
             );
         }
+    }
+
+    #[test]
+    fn daemon_readme_has_no_unsubstituted_placeholders() {
+        // The daemon / bundled-pg README bodies are built in Rust (not the
+        // template), so guard them against reintroducing `{{…}}` tokens.
+        for opts in [daemon_opts(), bundled_pg_opts()] {
+            let tmp = TempDir::new().unwrap();
+            generate_with("ph-daemon-app", tmp.path(), opts).unwrap();
+            let readme = fs::read_to_string(tmp.path().join("ph-daemon-app/README.md")).unwrap();
+            assert!(
+                !readme.contains("{{"),
+                "unsubstituted placeholder in daemon/bundled README (opts {opts:?}):\n{readme}"
+            );
+        }
+    }
+
+    #[test]
+    fn daemon_readme_drops_db_bootstrap() {
+        // A DB-free daemon must not tell users to run migrations or configure a
+        // database; it runs via `autumn serve`.
+        let tmp = TempDir::new().unwrap();
+        generate_with("daemon-readme", tmp.path(), daemon_opts()).unwrap();
+        let readme = fs::read_to_string(tmp.path().join("daemon-readme/README.md")).unwrap();
+        assert!(!readme.contains("autumn migrate"), "got:\n{readme}");
+        assert!(!readme.contains("libpq"), "got:\n{readme}");
+        assert!(readme.contains("autumn serve"), "got:\n{readme}");
+        // Project name still substituted.
+        assert!(readme.contains("daemon-readme"), "got:\n{readme}");
+    }
+
+    #[test]
+    fn bundled_pg_readme_documents_managed_db() {
+        // A bundled-pg daemon manages its own Postgres and auto-applies
+        // migrations; it runs via `autumn serve --bundled-pg`.
+        let tmp = TempDir::new().unwrap();
+        generate_with("bundled-readme", tmp.path(), bundled_pg_opts()).unwrap();
+        let readme = fs::read_to_string(tmp.path().join("bundled-readme/README.md")).unwrap();
+        assert!(!readme.contains("autumn migrate"), "got:\n{readme}");
+        assert!(
+            readme.contains("autumn serve --bundled-pg"),
+            "got:\n{readme}"
+        );
+    }
+
+    #[test]
+    fn default_readme_db_bootstrap_does_not_dead_end_on_release_init() {
+        // Finding 1: the default golden path must bootstrap a local Postgres
+        // with `docker run` (which always works), not lead with
+        // `release init --target docker-compose` (which file-errors on a fresh
+        // scaffold). The AC-required pointer is still present for deployment.
+        let tmp = TempDir::new().unwrap();
+        generate("dockerrun-app", tmp.path()).unwrap();
+        let readme = fs::read_to_string(tmp.path().join("dockerrun-app/README.md")).unwrap();
+        assert!(
+            readme.contains("docker run") && readme.contains("postgres:16"),
+            "default README must offer a `docker run … postgres:16` DB bootstrap, got:\n{readme}"
+        );
+        assert!(
+            readme.contains("autumn release init --target docker-compose"),
+            "default README must still point at `release init --target docker-compose`, \
+             got:\n{readme}"
+        );
     }
 
     #[test]

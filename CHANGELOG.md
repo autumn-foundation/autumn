@@ -17,7 +17,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `200` on the default route — plus one-line descriptions of the most useful CLI verbs
   (`dev`, `migrate`, `doctor`, `routes`, `generate scaffold`, `release init`).
   The README is flag-aware: `--with-i18n` and `--with-seed` add sections for the
-  extra steps they introduce (issue #1052).
+  extra steps they introduce (issue #1052). The DB-bootstrap step bootstraps a
+  throwaway local Postgres with a copy-paste `docker run … postgres:16` one-liner
+  that matches the generated `url` (the earlier `autumn release init --target
+  docker-compose` pointer file-errored on a fresh scaffold, which already ships a
+  `Dockerfile`/`.dockerignore`, before any compose file was written; that pointer
+  is retained for generating deployment/compose assets). The golden path is also
+  tailored to the generated app shape: `--daemon` scaffolds a database-free
+  `autumn serve` app, so its README drops the Postgres/`libpq`/`autumn migrate`
+  steps; `--bundled-pg` embeds and manages its own Postgres, so its README runs
+  via `autumn serve --bundled-pg` and notes migrations apply automatically rather
+  than telling users to configure an external `[database]`.
 - **ci:** README-quickstart gate against the published crates (issue #1586) —
   `.github/workflows/quickstart-gate.yml` + `scripts/check-quickstart.sh`
   install the README-pinned `autumn-cli` from crates.io (never the local

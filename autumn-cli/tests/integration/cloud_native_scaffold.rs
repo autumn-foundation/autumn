@@ -2,11 +2,17 @@ use std::fs;
 use std::process::Command;
 
 fn scaffold(project_name: &str) -> tempfile::TempDir {
+    scaffold_with_flags(project_name, &[])
+}
+
+fn scaffold_with_flags(project_name: &str, flags: &[&str]) -> tempfile::TempDir {
     let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
     let autumn_bin = env!("CARGO_BIN_EXE_autumn");
 
+    let mut args = vec!["new", project_name];
+    args.extend_from_slice(flags);
     let output = Command::new(autumn_bin)
-        .args(["new", project_name])
+        .args(&args)
         .current_dir(temp_dir.path())
         .output()
         .expect("failed to run `autumn new`");
@@ -56,6 +62,24 @@ fn cloud_native_scaffold_generates_readme_golden_path() {
     assert!(
         readme.contains("autumn.toml"),
         "README.md must reference `autumn.toml` for enabling the database, got:\n{readme}"
+    );
+    // Finding 1: the DB-bootstrap step must NOT dead-end on a `release init`
+    // file-exists error. `autumn new` already wrote Dockerfile/.dockerignore, so
+    // `autumn release init --target docker-compose` aborts before emitting the
+    // compose file unless --force (which would clobber the scaffold's Dockerfile).
+    // The golden path bootstraps a throwaway local Postgres with `docker run`
+    // instead, matching the `url` in the `[database]` block.
+    assert!(
+        readme.contains("docker run") && readme.contains("postgres:16"),
+        "README.md DB-bootstrap must offer a working `docker run … postgres:16` one-liner \
+         (not dead-end on `release init`), got:\n{readme}"
+    );
+    // AC #3's pointer to `release init --target docker-compose` is still present
+    // (reframed as a deployment-asset generator, not the local DB path).
+    assert!(
+        readme.contains("autumn release init --target docker-compose"),
+        "README.md must still point at `autumn release init --target docker-compose` for \
+         deployment assets, got:\n{readme}"
     );
     // The project name must be substituted everywhere (AC #5) — no leftover
     // template tokens.
@@ -112,6 +136,78 @@ fn cloud_native_scaffold_readme_is_flag_aware_for_i18n_and_seed() {
     assert!(
         !readme.contains("{{"),
         "flag-aware README must not contain unsubstituted placeholders, got:\n{readme}"
+    );
+}
+
+#[test]
+fn cloud_native_scaffold_daemon_readme_is_db_free() {
+    // Finding 2: `--daemon` scaffolds a DB-free app (no `db` feature, no
+    // migrations) that runs via `autumn serve`. The README must reflect that
+    // shape — not the DB-first golden path (install libpq, configure Postgres,
+    // `autumn migrate`).
+    let temp_dir = scaffold_with_flags("daemon-readme-app", &["--daemon"]);
+    let readme_path = temp_dir.path().join("daemon-readme-app").join("README.md");
+    let readme = fs::read_to_string(&readme_path).unwrap();
+
+    // The DB-first steps must be gone.
+    assert!(
+        !readme.contains("autumn migrate"),
+        "daemon README must not tell users to run `autumn migrate` (no DB / no migrations), \
+         got:\n{readme}"
+    );
+    assert!(
+        !readme.contains("Configure the database"),
+        "daemon README must not have a `Configure the database` step, got:\n{readme}"
+    );
+    assert!(
+        !readme.contains("libpq"),
+        "daemon README must not tell users to install libpq (the db feature is off), got:\n{readme}"
+    );
+    // The real run path must be documented.
+    assert!(
+        readme.contains("autumn serve"),
+        "daemon README must document `autumn serve`, got:\n{readme}"
+    );
+    assert!(
+        readme.contains("--daemon"),
+        "daemon README must mention the `--daemon` shape it was generated with, got:\n{readme}"
+    );
+    // Project name substituted; no leftover template tokens.
+    assert!(
+        readme.contains("daemon-readme-app"),
+        "daemon README must substitute the project name, got:\n{readme}"
+    );
+    assert!(
+        !readme.contains("{{"),
+        "daemon README must not contain unsubstituted template placeholders, got:\n{readme}"
+    );
+}
+
+#[test]
+fn cloud_native_scaffold_bundled_pg_readme_auto_provisions_db() {
+    // Finding 2: `--bundled-pg` embeds and manages its own Postgres, so the
+    // README must not tell users to configure an external `[database]` or run
+    // migrations by hand — it runs via `autumn serve --bundled-pg`.
+    let temp_dir = scaffold_with_flags("bundled-readme-app", &["--bundled-pg"]);
+    let readme_path = temp_dir.path().join("bundled-readme-app").join("README.md");
+    let readme = fs::read_to_string(&readme_path).unwrap();
+
+    assert!(
+        !readme.contains("autumn migrate"),
+        "bundled-pg README must not tell users to run `autumn migrate` (auto-applied), \
+         got:\n{readme}"
+    );
+    assert!(
+        !readme.contains("Configure the database"),
+        "bundled-pg README must not have a `Configure the database` step, got:\n{readme}"
+    );
+    assert!(
+        readme.contains("autumn serve --bundled-pg"),
+        "bundled-pg README must document `autumn serve --bundled-pg`, got:\n{readme}"
+    );
+    assert!(
+        !readme.contains("{{"),
+        "bundled-pg README must not contain unsubstituted template placeholders, got:\n{readme}"
     );
 }
 

@@ -17,11 +17,14 @@ Run these steps top-to-bottom on a clean checkout to get a route serving.
   ```sh
   autumn setup
   ```
-- **A reachable Postgres** for database features. Don't have one? Generate a
-  containerized database (and the rest of the deployment assets) with:
+- **A reachable Postgres** for database features. Don't have one? Start a
+  throwaway local instance with Docker (matches the `url` in step 2 below):
   ```sh
-  autumn release init --target docker-compose
+  docker run --rm --name {{crate_name}}-pg -e POSTGRES_PASSWORD=postgres \
+    -e POSTGRES_DB={{crate_name}} -p 5432:5432 postgres:16
   ```
+  To generate a full deployment/compose stack instead, see
+  `autumn release init --target docker-compose` in the CLI reference below.
 - **Diesel CLI** for the database path:
   ```sh
   cargo install diesel_cli --no-default-features --features postgres
@@ -44,18 +47,28 @@ before running it — open `autumn.toml`, uncomment the `[database]` block, and 
 url = "postgres://postgres:postgres@localhost:5432/{{crate_name}}"
 ```
 
-Don't have a Postgres to point at? Generate a containerized one (plus the rest of
-the deployment assets) and start it:
+Don't have a Postgres to point at? Start a throwaway local instance with Docker.
+This matches the `url` above (user and password `postgres`, database
+`{{crate_name}}`), so the two line up with no extra edits:
 
 ```sh
-autumn release init --target docker-compose
+docker run --rm --name {{crate_name}}-pg -e POSTGRES_PASSWORD=postgres \
+  -e POSTGRES_DB={{crate_name}} -p 5432:5432 postgres:16
 ```
 
-Then create the database on its server (idempotent — safe to re-run):
+Then create the database on its server (idempotent — safe to re-run; harmless if
+the container above already created it):
 
 ```sh
 autumn db create
 ```
+
+> Need containerized **deployment** assets (a production Dockerfile plus a
+> `docker-compose.yml` wiring app + Postgres + a one-shot migration)? Run
+> `autumn release init --target docker-compose`. That is a separate,
+> production-oriented stack — it overwrites the scaffold's `Dockerfile` and
+> `.dockerignore` (pass `--force`, since `autumn new` already wrote them), so
+> reach for it when you're packaging for deploy, not for the quick local DB above.
 
 ### 3. Apply migrations
 
