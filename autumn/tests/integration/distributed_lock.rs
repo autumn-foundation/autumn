@@ -208,6 +208,54 @@ async fn exactly_one_node_holds_at_a_time() {
     );
 }
 
+/// Cancellation safety (P1, issue #1387): if an acquire future is dropped
+/// *mid-acquire* — here a blocking `lock()` cancelled by a surrounding
+/// `tokio::time::timeout` while it is still contending for a held lock — the
+/// acquiring connection must be force-closed, never recycled into the pool
+/// while it could be holding (or about to hold) the advisory lock. We prove the
+/// lock did not leak by acquiring it fresh, from a new connection, after the
+/// cancelled acquire and after the original holder releases.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn cancelled_acquire_does_not_leak_lock() {
+    let (pool, _container) = setup_pool().await;
+
+    // Hold the lock so the contender below must block inside `pg_advisory_lock`.
+    let holder = Lock::new(pool.clone(), "test-cancel-safety");
+    let held = holder.lock().await.expect("holder should acquire");
+
+    // Cancel a blocking acquire while it is mid-flight (still waiting on the
+    // held lock). Dropping the timed-out future runs the internal acquire
+    // guard's `Drop`, which force-closes that session.
+    let contender = Lock::new(pool.clone(), "test-cancel-safety");
+    let timed_out = tokio::time::timeout(Duration::from_millis(75), contender.lock()).await;
+    assert!(
+        timed_out.is_err(),
+        "the contender's acquire should have been cancelled by the timeout"
+    );
+
+    // Release the original holder; the lock must now be genuinely free — the
+    // cancelled contender must not have leaked a lock-bearing connection back
+    // into the pool.
+    held.release().await.expect("holder release should succeed");
+
+    // A fresh handle (new pooled connection) must be able to acquire it,
+    // proving the session did not leak the lock into the pool.
+    let reacquired = Lock::new(pool.clone(), "test-cancel-safety")
+        .try_lock()
+        .await
+        .expect("post-cancellation try_lock should not error");
+    assert!(
+        reacquired.is_some(),
+        "a cancelled mid-acquire future must not leak the distributed lock"
+    );
+    reacquired
+        .expect("guard present")
+        .release()
+        .await
+        .expect("cleanup release");
+}
+
 /// A panicking guarded section must not leak the lock: the next contender can
 /// still acquire it.
 #[tokio::test]

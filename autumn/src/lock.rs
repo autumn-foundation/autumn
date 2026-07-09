@@ -37,6 +37,15 @@
 //! the "recycled a lock-bearing connection and leaked the lock" footgun cannot
 //! occur in application code.
 //!
+//! Acquisition is also **cancellation-safe**: the connection is held by an
+//! internal guard across the acquire query, so if the acquiring future is
+//! dropped mid-`await` (e.g. a surrounding request/task timeout) after
+//! `PostgreSQL` granted the lock but before the session was detached, the guard
+//! force-closes that session on drop — releasing the just-granted lock rather
+//! than recycling a lock-bearing connection back into the pool. Only a
+//! *definitive* miss (`try_lock` lost the race, or `lock_timeout` expired)
+//! recycles the healthy connection.
+//!
 //! # Non-goals
 //!
 //! This is a *coordination* lock, not a durable mutual-exclusion queue:
@@ -162,6 +171,75 @@ mod db_impl {
         acquired: bool,
     }
 
+    /// Cancellation-safe RAII owner of a pooled connection during an acquire.
+    ///
+    /// While *armed* (its initial state), dropping this guard — because the
+    /// acquire future was cancelled mid-`await`, or a query errored before a
+    /// definitive acquired/not-acquired result — **force-closes** the session:
+    /// it detaches the [`Object`] from the pool with [`Object::take`] and drops
+    /// the raw [`AsyncPgConnection`], closing the socket so `PostgreSQL`
+    /// releases any session advisory lock it had *already granted* on this
+    /// connection. That closes the cancellation hole in which a
+    /// granted-but-not-yet-detached lock would otherwise ride a recycled
+    /// connection straight back into the shared pool — the exact leak this API
+    /// exists to prevent.
+    ///
+    /// On a definitive *not-acquired* result the caller calls
+    /// [`recycle`](Self::recycle), disarming the guard so the healthy `Object`
+    /// returns to the pool (no connection churn on a clean miss). On success the
+    /// caller calls [`into_detached`](Self::into_detached), disarming the guard
+    /// and handing the detached raw connection to the [`LockGuard`].
+    struct AcquireConn {
+        conn: Option<Object<AsyncPgConnection>>,
+        armed: bool,
+    }
+
+    impl AcquireConn {
+        /// Take ownership of a freshly checked-out pooled connection, armed.
+        const fn new(conn: Object<AsyncPgConnection>) -> Self {
+            Self {
+                conn: Some(conn),
+                armed: true,
+            }
+        }
+
+        /// Borrow the underlying connection to run an acquire query on.
+        fn as_mut(&mut self) -> &mut AsyncPgConnection {
+            self.conn
+                .as_mut()
+                .expect("AcquireConn borrowed after detach")
+        }
+
+        /// Definitive miss: disarm and let the healthy pooled `Object` recycle
+        /// back to the pool on drop (no churn — we lost the race, not the
+        /// connection).
+        fn recycle(mut self) {
+            self.armed = false;
+            // `self.conn` (still `Some`) drops as a pooled `Object` here,
+            // returning the connection to the pool.
+        }
+
+        /// Success: disarm and detach the raw session out of the pool so the
+        /// lock-bearing connection can never be recycled while the lock is held.
+        fn into_detached(mut self) -> AsyncPgConnection {
+            self.armed = false;
+            Object::take(self.conn.take().expect("AcquireConn detached twice"))
+        }
+    }
+
+    impl Drop for AcquireConn {
+        fn drop(&mut self) {
+            if self.armed
+                && let Some(obj) = self.conn.take()
+            {
+                // Force-close: detach from the pool and drop the raw session
+                // so the socket closes and PostgreSQL releases any advisory
+                // lock it had already granted on this connection.
+                let _ = Object::take(obj);
+            }
+        }
+    }
+
     #[derive(diesel::QueryableByName)]
     struct ReleasedRow {
         #[diesel(sql_type = diesel::sql_types::Bool)]
@@ -240,11 +318,13 @@ mod db_impl {
 
         /// Check out a pooled connection to attempt an acquire on.
         ///
-        /// The connection is returned as a pooled [`Object`], **not** detached:
-        /// if the acquire fails the caller simply drops it and it recycles back
-        /// to the pool. Only on a *successful* acquire does the caller
-        /// [`Object::take`] it, permanently detaching the lock-bearing session
-        /// so it can never be recycled while the lock is held.
+        /// The connection is returned as a pooled [`Object`], **not** detached.
+        /// Callers wrap it in an [`AcquireConn`] guard for the duration of the
+        /// acquire: on a clean miss the guard recycles the healthy `Object`
+        /// back to the pool; on success it detaches the lock-bearing session so
+        /// it can never be recycled while the lock is held; and if the acquire
+        /// future is cancelled (or the query errors) the guard force-closes the
+        /// session so `PostgreSQL` releases any lock it had already granted.
         async fn checkout(&self) -> Result<Object<AsyncPgConnection>, LockError> {
             self.pool
                 .get()
@@ -262,23 +342,27 @@ mod db_impl {
         /// Returns [`LockError`] if a connection could not be obtained or the
         /// database query failed.
         pub async fn try_lock(&self) -> Result<Option<LockGuard>, LockError> {
-            let mut conn = self.checkout().await?;
+            // The `AcquireConn` guard owns the connection across the query
+            // `await`. If this future is cancelled after PostgreSQL grants the
+            // lock but before we detach — or the query errors via `?` — the
+            // guard's drop force-closes the session, releasing the lock instead
+            // of recycling a lock-bearing connection back into the pool.
+            let mut ac = AcquireConn::new(self.checkout().await?);
             let acquired = diesel::sql_query("SELECT pg_try_advisory_lock($1) AS acquired")
                 .bind::<diesel::sql_types::BigInt, _>(self.key)
-                .get_result::<AcquiredRow>(&mut *conn)
+                .get_result::<AcquiredRow>(ac.as_mut())
                 .await
                 .map_err(|e| LockError::Database(e.to_string()))?
                 .acquired;
             if acquired {
                 // Acquired: detach the session from the pool so the
                 // lock-bearing connection can never be recycled while held.
-                let conn = Object::take(conn);
+                let conn = ac.into_detached();
                 Ok(Some(LockGuard::new(conn, self.key, self.name.clone())))
             } else {
-                // Not acquired: drop the pooled `Object` so it recycles back to
-                // the pool (do not close it — we lost the race, not the
-                // connection).
-                drop(conn);
+                // Not acquired: recycle the healthy `Object` back to the pool
+                // (we lost the race, not the connection).
+                ac.recycle();
                 Ok(None)
             }
         }
@@ -294,15 +378,19 @@ mod db_impl {
         /// Returns [`LockError`] if a connection could not be obtained or the
         /// database query failed.
         pub async fn lock(&self) -> Result<LockGuard, LockError> {
-            let mut conn = self.checkout().await?;
+            // Held by an `AcquireConn` across the blocking `pg_advisory_lock`
+            // await: cancelling this future (or a query error) force-closes the
+            // session on drop, so a lock granted just before cancellation is
+            // released rather than leaked back into the pool.
+            let mut ac = AcquireConn::new(self.checkout().await?);
             diesel::sql_query("SELECT pg_advisory_lock($1)")
                 .bind::<diesel::sql_types::BigInt, _>(self.key)
-                .execute(&mut *conn)
+                .execute(ac.as_mut())
                 .await
                 .map_err(|e| LockError::Database(e.to_string()))?;
             // Acquired: detach the session from the pool so the lock-bearing
             // connection can never be recycled while held.
-            let conn = Object::take(conn);
+            let conn = ac.into_detached();
             Ok(LockGuard::new(conn, self.key, self.name.clone()))
         }
 
@@ -320,26 +408,30 @@ mod db_impl {
         /// `timeout`, or another [`LockError`] on connection/query failure.
         pub async fn lock_timeout(&self, timeout: Duration) -> Result<LockGuard, LockError> {
             let start = Instant::now();
-            // Check out one connection and reuse it for every poll iteration.
-            let mut conn = self.checkout().await?;
+            // Check out one connection and hold it (via one `AcquireConn`) for
+            // every poll iteration — no per-poll churn. The guard also makes the
+            // whole wait cancel-safe: dropping this future during a poll query or
+            // the sleep force-closes the session, releasing any just-granted
+            // lock instead of recycling a lock-bearing connection to the pool.
+            let mut ac = AcquireConn::new(self.checkout().await?);
             loop {
                 let acquired = diesel::sql_query("SELECT pg_try_advisory_lock($1) AS acquired")
                     .bind::<diesel::sql_types::BigInt, _>(self.key)
-                    .get_result::<AcquiredRow>(&mut *conn)
+                    .get_result::<AcquiredRow>(ac.as_mut())
                     .await
                     .map_err(|e| LockError::Database(e.to_string()))?
                     .acquired;
                 if acquired {
                     // Acquired: detach the session from the pool so the
                     // lock-bearing connection can never be recycled while held.
-                    let conn = Object::take(conn);
+                    let conn = ac.into_detached();
                     return Ok(LockGuard::new(conn, self.key, self.name.clone()));
                 }
                 let elapsed = start.elapsed();
                 if elapsed >= timeout {
-                    // Timed out: drop the pooled `Object` so it recycles back to
-                    // the pool (the lock was never acquired on it).
-                    drop(conn);
+                    // Timed out: recycle the healthy `Object` back to the pool
+                    // (the lock was never acquired on it).
+                    ac.recycle();
                     return Err(LockError::Timeout {
                         name: self.name.clone(),
                         waited: elapsed,
