@@ -67,11 +67,14 @@ tokio::task_local! {
 /// Per-request accumulator for database query timing, used by the
 /// `Server-Timing` middleware to surface `db;dur=…;desc="N queries"`.
 ///
-/// Populated by [`run_instrumented`] and the [`Db`] drop hook whenever the
-/// task-local [`REQUEST_DB_TIMINGS`] is set (i.e. when the
-/// `ServerTimingLayer` has scoped the request). Absent otherwise — every
-/// write site uses `try_with`, so DB code paths unaffected when the
-/// middleware is disabled.
+/// Populated by the [`RequestQueryTimer`] connection instrumentation
+/// installed at [`Db::checkout`], which fires on every diesel-async
+/// query (including the raw `.load()`/`.execute()` calls generated
+/// repositories run), whenever the task-local [`REQUEST_DB_TIMINGS`] is
+/// set (i.e. when the `ServerTimingLayer` has scoped the request).
+/// [`run_instrumented`] also records into it for the code paths that use
+/// it. Absent otherwise — every write site uses `try_with`, so DB code
+/// paths are unaffected when the middleware is disabled.
 #[derive(Default, Debug)]
 pub(crate) struct RequestDbTimings {
     /// Total elapsed time across all DB queries for this request, in
@@ -100,6 +103,66 @@ pub(crate) fn record_request_db_query(elapsed: Duration) {
         t.query_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     });
+}
+
+/// diesel-async [`Instrumentation`](diesel::connection::Instrumentation)
+/// that feeds every executed statement into the per-request
+/// [`REQUEST_DB_TIMINGS`] accumulator for the `Server-Timing` `db` metric.
+///
+/// Installed on each pooled connection at [`Db::checkout`]. Because generated
+/// repositories run raw `diesel-async` `.load()`/`.execute()` (they do not go
+/// through [`run_instrumented`]), the connection-level instrumentation is the
+/// only thing that observes those queries. It brackets each statement between
+/// the `StartQuery`/`FinishQuery` events the connection emits and records the
+/// elapsed wall time via [`record_request_db_query`], which is a no-op when no
+/// request has scoped the task-local (background jobs, or the middleware being
+/// disabled) — so it never panics off-request.
+///
+/// Only actual statement executions are timed. Connection-establish, prepared
+/// statement cache, and transaction (`BEGIN`/`COMMIT`/`ROLLBACK`) events are
+/// ignored: a transaction's inner statements each fire their own
+/// `StartQuery`/`FinishQuery` pair, so counting the transaction control
+/// statements too would double-count. Queries on a single connection are
+/// strictly sequential (`&mut conn`), so a single `Option<Instant>` slot is
+/// sufficient — there is no overlap between a start and its finish.
+#[cfg(feature = "db")]
+#[derive(Default, Debug)]
+pub(crate) struct RequestQueryTimer {
+    /// Start instant of the currently in-flight statement, if any.
+    started_at: Option<std::time::Instant>,
+}
+
+#[cfg(feature = "db")]
+impl RequestQueryTimer {
+    /// Record the start of a statement. Extracted from the event handler so
+    /// the start/finish accounting is unit-testable without constructing a
+    /// (non-exhaustive, unstable-to-build) `InstrumentationEvent`.
+    fn on_start(&mut self, now: std::time::Instant) {
+        self.started_at = Some(now);
+    }
+
+    /// Record the completion of the in-flight statement, accumulating its
+    /// elapsed time into the per-request accumulator. A `FinishQuery` without
+    /// a matching `StartQuery` is ignored.
+    fn on_finish(&mut self, now: std::time::Instant) {
+        if let Some(start) = self.started_at.take() {
+            record_request_db_query(now.saturating_duration_since(start));
+        }
+    }
+}
+
+#[cfg(feature = "db")]
+impl diesel::connection::Instrumentation for RequestQueryTimer {
+    fn on_connection_event(&mut self, event: diesel::connection::InstrumentationEvent<'_>) {
+        use diesel::connection::InstrumentationEvent;
+        match event {
+            InstrumentationEvent::StartQuery { .. } => self.on_start(std::time::Instant::now()),
+            InstrumentationEvent::FinishQuery { .. } => self.on_finish(std::time::Instant::now()),
+            // Ignore connection-establish, prepared-statement cache, and
+            // transaction control events — see the type-level docs.
+            _ => {}
+        }
+    }
 }
 
 /// Total count of after-commit callback errors since process start.
@@ -1746,6 +1809,19 @@ impl Db {
                 AutumnError::service_unavailable_msg(format!("Database initialization error: {e}"))
             })?;
 
+        // Install the per-request query timer. Done AFTER the framework's own
+        // `SET statement_timeout` above so that housekeeping statement is not
+        // counted as an application query in the `Server-Timing` `db` metric.
+        // Records into the request-scoped accumulator via a task-local, so it
+        // is a no-op unless the `ServerTimingLayer` scoped this request.
+        // Replaces any prior instrumentation on the pooled connection (the
+        // framework installs none of its own elsewhere).
+        #[cfg(feature = "db")]
+        {
+            use diesel_async::AsyncConnection as _;
+            conn.set_instrumentation(RequestQueryTimer::default());
+        }
+
         let start_time = std::time::Instant::now();
         let is_test_tx = params
             .interceptors
@@ -2030,6 +2106,62 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::time::Duration;
+
+    // ── RequestQueryTimer / Server-Timing db accumulator tests ───
+
+    /// The connection instrumentation records one query per completed
+    /// `StartQuery`/`FinishQuery` pair into the request accumulator, summing
+    /// elapsed time. Drives the extracted `on_start`/`on_finish` accounting
+    /// (the `InstrumentationEvent` itself is non-exhaustive and its
+    /// constructors are gated behind an unstable diesel feature, so it cannot
+    /// be built in a test). Deterministic: derives finish instants from the
+    /// start via `Instant + Duration`, no sleeps.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn request_query_timer_accumulates_finished_queries() {
+        let timings = Arc::new(RequestDbTimings::default());
+        REQUEST_DB_TIMINGS
+            .scope(Arc::clone(&timings), async {
+                let mut timer = RequestQueryTimer::default();
+
+                // Query 1: 1200µs.
+                let t0 = std::time::Instant::now();
+                timer.on_start(t0);
+                timer.on_finish(t0 + Duration::from_micros(1_200));
+
+                // Query 2: 800µs.
+                let t1 = std::time::Instant::now();
+                timer.on_start(t1);
+                timer.on_finish(t1 + Duration::from_micros(800));
+
+                // A stray FinishQuery with no matching StartQuery is ignored.
+                timer.on_finish(std::time::Instant::now());
+            })
+            .await;
+
+        assert_eq!(
+            timings.query_count.load(Ordering::Relaxed),
+            2,
+            "only completed StartQuery/FinishQuery pairs are counted"
+        );
+        assert_eq!(
+            timings.total_us.load(Ordering::Relaxed),
+            2_000,
+            "elapsed times accumulate (1200µs + 800µs)"
+        );
+    }
+
+    /// Outside a `REQUEST_DB_TIMINGS` scope the timer records nothing and does
+    /// not panic — the off-request / middleware-disabled path.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn request_query_timer_is_noop_off_request() {
+        let mut timer = RequestQueryTimer::default();
+        let t0 = std::time::Instant::now();
+        timer.on_start(t0);
+        // Must not panic even though no task-local accumulator is scoped.
+        timer.on_finish(t0 + Duration::from_micros(500));
+    }
 
     // ── after_commit tests ───────────────────────────────────────
 
