@@ -537,20 +537,6 @@ impl AdminModel for ExperimentAdminModel {
                 });
             };
 
-            // Audit-trail size via the typed grouped-aggregate API (#1364):
-            // COUNT(*) GROUP BY experiment, scoped to this experiment. Grouping
-            // on the filtered column yields a single `(name, count)` row (or
-            // none when the experiment has no history). Errors degrade to 0,
-            // matching the previous raw-SQL `map_or(0, …)`.
-            let count: i64 = PgExperimentChangeRepository::with_pool_untracked(pool.clone())
-                .count_grouped_by_experiment()
-                .filter_eq(name.clone())
-                .load()
-                .await
-                .ok()
-                .and_then(|rows| rows.into_iter().next())
-                .map_or(0, |(_, c)| c);
-
             let offset = (page.saturating_sub(1)) * per_page;
             let entries: Vec<crate::AdminHistoryEntry> = diesel::sql_query(
                 "SELECT id, mutation AS op, actor, changed_at \
@@ -575,6 +561,29 @@ impl AdminModel for ExperimentAdminModel {
                 recorded_at: r.changed_at,
             })
             .collect();
+
+            // Release this handler's connection before the grouped-aggregate
+            // count checks out its own. `conn` is held for the name + entries
+            // lookups above, and on a single-connection pool (max_size = 1, no
+            // read replica) a second concurrent checkout would block until the
+            // pool timeout — deadlocking the history page. The count does not
+            // depend on `entries`, so running it last, after `conn` is dropped,
+            // keeps the two checkouts from overlapping.
+            drop(conn);
+
+            // Audit-trail size via the typed grouped-aggregate API (#1364):
+            // COUNT(*) GROUP BY experiment, scoped to this experiment. Grouping
+            // on the filtered column yields a single `(name, count)` row (or
+            // none when the experiment has no history). Errors degrade to 0,
+            // matching the previous raw-SQL `map_or(0, …)`.
+            let count: i64 = PgExperimentChangeRepository::with_pool_untracked(pool.clone())
+                .count_grouped_by_experiment()
+                .filter_eq(name.clone())
+                .load()
+                .await
+                .ok()
+                .and_then(|rows| rows.into_iter().next())
+                .map_or(0, |(_, c)| c);
 
             Ok(AdminHistoryPage {
                 entries,

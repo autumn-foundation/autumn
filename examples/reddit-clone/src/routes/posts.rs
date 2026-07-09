@@ -42,6 +42,7 @@ pub async fn front_page(
     session: Session,
     csrf: CsrfToken,
     mut db: Db,
+    State(state): State<AppState>,
     repo: PgPostRepository,
     votes_repo: PgVoteRepository,
     flags: Flags,
@@ -66,6 +67,16 @@ pub async fn front_page(
         .load(&mut *db)
         .await?;
 
+    // Release the `Db` extractor's connection now, before any other pooled
+    // checkout. `Db` acquires its connection eagerly at extraction and holds it
+    // until it is dropped (not just for the duration of a `&mut *db` borrow), so
+    // on a single-connection pool (max_size = 1, no read replica) the
+    // leaderboard aggregate below — and the `preload` further down — would block
+    // forever waiting for a second connection that can never free up while `db`
+    // is still alive. Dropping `db` here lets each step below check out the one
+    // connection in turn.
+    drop(db);
+
     // "Top posts by votes" leaderboard (#1364, AC3): a single typed
     // grouped-aggregate call — `SUM(value) GROUP BY post_id`, ordered by the
     // aggregate descending, top 5 — replacing what would otherwise be a
@@ -78,7 +89,8 @@ pub async fn front_page(
     // the grouped-aggregate codegen guards the group column with `IS NOT NULL`,
     // so the NULL group is excluded — this leaderboard counts only
     // post-directed votes (comment votes are correctly omitted), no per-call
-    // filter needed.
+    // filter needed. Binding the result to an owned `Vec` releases the
+    // repository's pooled connection before the title lookup checks one out.
     let top_by_votes: Vec<(i64, Option<i64>)> = votes_repo
         .sum_value_grouped_by_post_id()
         .order_by_aggregate_desc()
@@ -93,21 +105,28 @@ pub async fn front_page(
     let top_titles: HashMap<i64, String> = if top_ids.is_empty() {
         HashMap::new()
     } else {
+        // Use a fresh, short-lived pool checkout — not the `Db` extractor, which
+        // was dropped above — so this lookup never overlaps another live
+        // connection on a single-connection pool. The `conn` guard is released
+        // at the end of this block, before `preload` checks one out.
+        let pool = state
+            .pool()
+            .ok_or_else(|| AutumnError::service_unavailable_msg("Database not configured"))?;
+        let mut conn = pool.get().await.map_err(AutumnError::from)?;
         posts::table
             .filter(posts::id.eq_any(&top_ids))
             .select((posts::id, posts::title))
-            .load::<(i64, String)>(&mut *db)
+            .load::<(i64, String)>(&mut conn)
             .await?
             .into_iter()
             .collect()
     };
 
-    // Release the base-query connection before `preload` checks one out, so the
-    // two never contend on a single-connection pool. The base rows were read
-    // from the primary via `Db`, so pin the preload to the primary too
-    // (`on_primary`) — otherwise, under replica lag, an author/subreddit just
-    // written may be missing on the replica and the post would be skipped.
-    drop(db);
+    // The base rows were read from the primary via `Db`, so pin the preload to
+    // the primary too (`on_primary`) — otherwise, under replica lag, an
+    // author/subreddit just written may be missing on the replica and the post
+    // would be skipped. `db` was already released above, so this checkout can
+    // never contend with it on a single-connection pool.
     let hot_posts = repo
         .on_primary()
         .preload(hot_posts, Post::preload().author().subreddit())
