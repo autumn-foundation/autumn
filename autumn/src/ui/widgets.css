@@ -1059,3 +1059,127 @@
     color: var(--danger);
     border-color: var(--danger);
 }
+
+/* ── Toast (autumn-toast) ──────────────────────────────────────────────────── */
+
+/* Fixed stacking context dropped once in the layout; `pointer-events: none`
+   so the empty region never blocks clicks, re-enabled on each toast below. */
+.autumn-toast-region {
+    position: fixed;
+    bottom: 1rem;
+    right: 1rem;
+    z-index: 1000;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    max-width: min(24rem, calc(100vw - 2rem));
+    pointer-events: none;
+}
+
+/* Auto-dismiss is CSS-only: a slide/fade in, then a fade+collapse out after a
+   visible dwell — no JavaScript. The element stays in the DOM (CSS cannot
+   remove nodes) but ends `visibility: hidden` with zero height, so it neither
+   shows nor occupies space. */
+.autumn-toast {
+    pointer-events: auto;
+    padding: 0.75rem 1rem;
+    border: 1px solid var(--border);
+    border-left-width: 4px;
+    border-radius: var(--radius);
+    background: var(--surface, #fff);
+    color: var(--text);
+    box-shadow: 0 4px 12px rgb(0 0 0 / 12%);
+    font-size: 0.9375rem;
+    /* Explicit starting max-height so the dismiss animation's height collapse
+       (to `max-height: 0`) transitions smoothly instead of jumping — larger
+       than any realistic single toast. */
+    max-height: 200px;
+    animation:
+        autumn-toast-in 200ms ease-out,
+        autumn-toast-out 400ms ease-in 5s forwards;
+}
+
+.autumn-toast__message {
+    display: block;
+}
+
+.autumn-toast--success {
+    border-left-color: var(--success);
+}
+
+.autumn-toast--info {
+    border-left-color: var(--info, #3b82f6);
+}
+
+.autumn-toast--warning {
+    border-left-color: var(--warning, #d97706);
+}
+
+.autumn-toast--error {
+    border-left-color: var(--danger);
+}
+
+@keyframes autumn-toast-in {
+    from {
+        opacity: 0;
+        transform: translateY(0.5rem);
+    }
+
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+@keyframes autumn-toast-out {
+    to {
+        opacity: 0;
+        visibility: hidden;
+        max-height: 0;
+        margin-top: -0.5rem;
+        padding-top: 0;
+        padding-bottom: 0;
+    }
+}
+
+/* Respect reduced-motion: skip the entrance/exit transforms but still
+   auto-hide after the dwell so toasts don't pile up. */
+@media (prefers-reduced-motion: reduce) {
+    .autumn-toast {
+        animation: autumn-toast-out 0s linear 5s forwards;
+    }
+}
+
+/* ── Infinite feed (autumn-feed) ───────────────────────────────────────────── */
+
+.autumn-feed {
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+}
+
+.autumn-feed__sentinel {
+    display: flex;
+    justify-content: center;
+    padding: 1rem 0;
+}
+
+.autumn-feed__more {
+    display: inline-block;
+    padding: 0.5rem 1.25rem;
+    color: var(--primary);
+    font-weight: 500;
+    font-size: 0.9375rem;
+    text-decoration: none;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+}
+
+.autumn-feed__more:hover {
+    border-color: var(--primary);
+}
+
+.autumn-feed__more:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: 2px;
+}

@@ -31,6 +31,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   surfaces an ungitignored secret file even when `.env.example` exists without a
   `.env`, so the copy-the-template hint can no longer hide a committable
   `.env.local`.
+- **web:** new public `ProvideAuthorizationState` trait (PR #1505) [no-plugin]
+  — the authorization layer (policy registry lookup, auth session key,
+  forbidden response, and the `db`-gated connection pool accessor) is now
+  driven through this trait instead of concrete `AppState`, decoupling
+  `authorization.rs` from `state.rs`. `AppState` implements it, so existing
+  apps are unaffected; custom state types can implement it to plug into
+  authorization.
+- **channels/sse:** Resumable SSE streams — automatic per-topic event ids, a bounded per-topic replay ring buffer, and `sse::stream_resumable` that replays events a client missed during a brief disconnect via `Last-Event-ID` (with a `gap` sentinel on buffer overflow) (issue #1356).
+
+- **test:** first-class auth helpers for the test harness (issue #1359).
+  `TestClient` now carries a cookie jar that persists each response's
+  `Set-Cookie` and replays it on later requests from the same client, so a real
+  `POST /login` → `GET /dashboard` flow works with no manual header threading.
+  `TestClient::acting_as(user_id)` (alias `login_as`) establishes an
+  authenticated session directly — writing the app's configured
+  `auth.session_key` (default `user_id`) — so a `#[secured]` / `Auth` route
+  returns its real success status without calling the login endpoint;
+  `log_out()` clears the session cookie so secured routes reject again.
+  `acting_as` sets identity only — policies/roles/scopes still run.
+- **test:** built-in background-job recorder for the test harness (issue #1380).
+  Every `TestApp::build` client now captures each enqueue — across `enqueue`,
+  `enqueue_after_commit`, and `enqueue_in_tx` — as `(name, payload)` with no
+  `with_job_interceptor` boilerplate. Assert with
+  `TestClient::assert_job_enqueued`, `assert_job_enqueued_with`,
+  `assert_no_jobs_enqueued`, or read them back in order via `enqueued_jobs()`.
+  `perform_enqueued_jobs().await` drains the captured queue and dispatches each
+  job through its registered handler, returning a `PerformedJobs` report that
+  surfaces per-job handler errors (including malformed payloads that fail the
+  real deserialization round-trip) rather than swallowing them. The recorder is
+  a per-`TestApp` instance and composes ahead of any user-supplied
+  `with_job_interceptor`.
+- HTTP `Range`/`206 Partial Content` support for `Download` responses and
+  embedded static assets (seekable media, resumable downloads) via the new
+  `autumn_web::range` helper — RFC 7233 single-range parsing with a documented
+  multi-range single-range collapse, `Accept-Ranges`/`Content-Range`/`416`
+  handling, `If-Range` (strong `ETag` or `Last-Modified`), and
+  `Download::into_response_ranged`; blob ranges fetch only the requested slice
+  on the local store (S3/other backends fall back to a buffered slice) via the
+  additive `BlobStore::get_range`.
+- **widgets:** three new server-rendered, accessible, zero-JavaScript view
+  helpers in `autumn_web::widgets` (all prelude re-exported, with `/_stories`
+  gallery entries). `toast(message, variant)` / `toast_region(id)` /
+  `toast_in(region_id, …)` render transient, CSS-auto-dismissing htmx action
+  feedback: the toast appends into a fixed, persistent `aria-live="polite"`
+  region out-of-band via `hx-swap-oob="beforeend:#<region-id>"`, reusing the
+  shared `AlertVariant` color lane (`Error` announces assertively via
+  `role="alert"`; non-error toasts inherit the region's politeness) — no
+  `<script>`, no new color vocabulary (issue #1320).
+  `infinite_feed(items, next_cursor, &FeedConfig)` + the companion
+  `feed_page(items, next_cursor, &FeedConfig)` render an htmx infinite-scroll /
+  "Load more" feed driven by a `CursorPage`: a single `hx-get` sentinel carries
+  the cursor and appends the next page in place (no reload, no duplicate rows),
+  in reveal (`hx-trigger="revealed, click"`) or explicit-button mode, with a
+  progressive `<a href>` fallback (issue #1372). `tabs(id, panels)` completes
+  the trio as the no-JS `tablist`/`tabpanel` switcher (issue #1316). Semantic
+  `.autumn-toast*` / `.autumn-feed*` classes backed by the shipped `WIDGETS_CSS`
+  stylesheet; all caller input HTML-escaped by Maud.
 - **generator:** `autumn new` now generates a `README.md` at the project root
   (listed in the "Created …" output) with explicit prerequisites and a
   golden-path quickstart — configure the `[database]` block in `autumn.toml`
@@ -248,6 +305,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   which brackets the endpoint's body buffering/JSON-RPC repackaging (the inner
   `total`, captured before that work, would under-report `/mcp` latency). See
   `docs/guide/observability/server-timing.md`.
+- **conditional-get:** declarative per-handler `Cache-Control` freshness helper
+  (issue #1344) — `cache_for(Duration)` builds a `CacheControl` that attaches
+  `Cache-Control` to any response either as a tuple
+  (`(cache_for(dur).public(), html!{…})`, via `IntoResponseParts`) or with
+  `.wrap(response)`. Chainable directives: `public`/`private`, `max_age`,
+  `s_maxage`, `stale_while_revalidate`, `no_store`, `no_cache`,
+  `must_revalidate`, `immutable`; `header_value()` renders a deterministic,
+  byte-for-byte value. Defaults to `private` so dropping it onto a
+  secured/authenticated page can't silently make it publicly cacheable —
+  `public` is an explicit opt-in. Composes with `fresh_when`
+  (`fresh_when(&headers, etag).or(cache_for(dur).public().wrap(markup))`): the
+  freshness directives ride along on both the `200` and the preserved `304`,
+  emitting exactly one `Cache-Control` header. Both re-exported from the
+  prelude. See `docs/guide/conditional-get.md`.
 - **Atom/RSS feed renderer** (`feed::Feed` / `feed::FeedEntry`): build an Atom 1.0 or RSS 2.0 feed from channel metadata plus an iterator of entries and return it directly from a `#[get]` handler — it implements `IntoResponse` with the correct `application/atom+xml`/`application/rss+xml` content type, XML-escapes every text field, and `Feed::conditional(&headers)` reuses the `etag` layer so feed pollers get a `304 Not Modified` on unchanged content. The `blog` example gains a `/feed.xml` route. (#1045)
 - **router:** duplicate-route preflight (issue #1012) — two user- or
   plugin-registered handlers that resolve to the same `(method, path)` after

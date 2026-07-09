@@ -107,6 +107,7 @@ pub mod hooks;
 #[cfg(feature = "i18n")]
 pub mod i18n;
 pub mod idempotency;
+pub mod range;
 pub mod seo;
 /// Translation lookup macro with compile-time key validation.
 ///

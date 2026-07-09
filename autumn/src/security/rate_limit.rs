@@ -2275,6 +2275,23 @@ mod tests {
     }
 
     #[test]
+    fn key_strategy_api_token_falls_back_to_ip() {
+        let config = RateLimitConfig {
+            key_strategy: KeyStrategy::ApiToken,
+            trust_forwarded_headers: true,
+            ..Default::default()
+        };
+        let limiter = Limiter::from_config(&config);
+        let req: Request<()> = Request::builder()
+            .header("X-Forwarded-For", "5.5.5.5")
+            .body(())
+            .unwrap();
+        // No Authorization header -> falls back to IP.
+        let key = limiter.extract_key(&req).unwrap();
+        assert_eq!(key, "5.5.5.5");
+    }
+
+    #[test]
     fn key_strategy_principal_uses_extension() {
         let config = RateLimitConfig {
             key_strategy: KeyStrategy::AuthenticatedPrincipal,
