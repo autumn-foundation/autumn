@@ -146,6 +146,7 @@ mod schema_drift_guard;
 mod scoped_tokens;
 mod security;
 mod seo;
+mod server_timing;
 #[cfg(feature = "db")]
 mod shard_map_guard;
 #[cfg(feature = "db")]

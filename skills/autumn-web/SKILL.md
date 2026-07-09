@@ -738,6 +738,20 @@ Published 0.5.0 behavior:
 - `actuator.prometheus` exposes the Prometheus scrape endpoint independently
   of sensitive actuator mode.
 
+Unreleased (trunk-dev) — `Server-Timing` response header:
+
+- Opt-in via `[observability] server_timing = true` (or
+  `AUTUMN_OBSERVABILITY__SERVER_TIMING=true`). Defaults **on in `dev` /
+  `development`** profiles, **off everywhere else** — so prod never leaks
+  timings to anonymous clients without explicit opt-in.
+- Emits `total;dur=…` (whole-request wall time, same clock as access-log
+  `duration_ms`) and, when at least one instrumented query ran,
+  `db;dur=…;desc="N queries"` for N+1 visibility.
+- SSE responses (`text/event-stream`) get `total`-only; header is
+  best-effort — never turns absent timing data into an error.
+- Doc + browser DevTools walk-through:
+  `docs/guide/observability/server-timing.md`.
+
 ## Resilience: load shedding (unreleased — trunk-dev)
 
 Admission control caps concurrent in-flight requests; excess is shed

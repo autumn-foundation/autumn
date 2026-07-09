@@ -64,6 +64,44 @@ tokio::task_local! {
     pub static AFTER_COMMIT_REGISTRY: Arc<Mutex<Vec<CommitCallback>>>;
 }
 
+/// Per-request accumulator for database query timing, used by the
+/// `Server-Timing` middleware to surface `db;dur=…;desc="N queries"`.
+///
+/// Populated by [`run_instrumented`] and the [`Db`] drop hook whenever the
+/// task-local [`REQUEST_DB_TIMINGS`] is set (i.e. when the
+/// `ServerTimingLayer` has scoped the request). Absent otherwise — every
+/// write site uses `try_with`, so DB code paths unaffected when the
+/// middleware is disabled.
+#[derive(Default, Debug)]
+pub(crate) struct RequestDbTimings {
+    /// Total elapsed time across all DB queries for this request, in
+    /// microseconds. Microseconds keep the header format (`f64` ms rounded
+    /// to three decimals) consistent with the access-log clock without an
+    /// f64 atomic.
+    pub(crate) total_us: AtomicU64,
+    /// Number of instrumented DB queries this request performed.
+    pub(crate) query_count: std::sync::atomic::AtomicUsize,
+}
+
+tokio::task_local! {
+    /// Task-local accumulator populated by DB instrumentation and read by
+    /// the `Server-Timing` middleware. See [`RequestDbTimings`].
+    pub(crate) static REQUEST_DB_TIMINGS: Arc<RequestDbTimings>;
+}
+
+/// Record one instrumented DB query into the current request's
+/// [`REQUEST_DB_TIMINGS`], if any. No-op when the task-local is unset —
+/// which is the case whenever the `Server-Timing` middleware is disabled
+/// or the query runs outside a request (e.g. background job).
+pub(crate) fn record_request_db_query(elapsed: Duration) {
+    let _ = REQUEST_DB_TIMINGS.try_with(|t| {
+        let micros = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+        t.total_us.fetch_add(micros, Ordering::Relaxed);
+        t.query_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    });
+}
+
 /// Total count of after-commit callback errors since process start.
 ///
 /// Incremented each time a callback registered via [`register_after_commit`]
@@ -529,6 +567,9 @@ where
     let verb = sql.split_whitespace().next().unwrap_or("?");
     let metric_key = format!("{route_key} {verb}");
     metrics.record_db_query(&metric_key, elapsed_ms);
+    // Additionally, record into the per-request Server-Timing accumulator
+    // if the middleware has scoped this task. No-op otherwise.
+    record_request_db_query(elapsed);
 
     // Log slow queries with scrubbed SQL
     if elapsed >= slow_threshold {
@@ -1827,6 +1868,9 @@ impl Drop for Db {
             // Record DB query metric
             let metric_key = format!("{route_key} SELECT");
             metrics.record_db_query(&metric_key, elapsed_ms);
+            // Also record into the Server-Timing per-request accumulator
+            // if scoped by the middleware. No-op otherwise.
+            record_request_db_query(elapsed);
 
             // Log slow query if it exceeds the threshold
             if elapsed >= self.slow_query_threshold {

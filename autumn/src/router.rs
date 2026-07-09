@@ -2590,6 +2590,17 @@ fn apply_middleware(
         ));
     }
 
+    // Server-Timing response header (#1348). Applied outer to AccessLogLayer
+    // (it is added after, so it wraps it) — its `total` metric is therefore
+    // the outermost wall-clock measure and is `>=` the access-log
+    // `duration_ms` by a few microseconds; both share the same
+    // `Instant`-based formula. Opt-in via
+    // `[observability] server_timing`; defaults on in dev, off in prod so
+    // timings never leak to anonymous prod clients without explicit opt-in.
+    if crate::config::server_timing_enabled(config) {
+        router = router.layer(crate::middleware::ServerTimingLayer::new(true));
+    }
+
     // Request-scoped log context (#1169). Established for every request, inner
     // to `RequestIdLayer` (so the request id is available to seed it) and outer
     // to tenancy, user layers, and the handler (so all of them, and every

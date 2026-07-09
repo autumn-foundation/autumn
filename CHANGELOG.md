@@ -21,6 +21,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `BlobStore::get_stream` without buffering the whole object in memory, so it
   serves large private files behind a `#[secured]` handler with no public
   presigned URL (#1141).
+- **observability:** `Server-Timing` response header (issue #1348) —
+  standards-conformant W3C `total;dur=…` plus
+  `db;dur=…;desc="N queries"` roll-up so N+1s show up directly in the
+  browser DevTools Network → Timing pane. Opt-in via
+  `[observability] server_timing = true` (or
+  `AUTUMN_OBSERVABILITY__SERVER_TIMING=true`); defaults on in
+  `dev`/`development`, off everywhere else so prod never leaks timings to
+  anonymous clients without explicit opt-in. `total` uses the identical
+  clock formula as the access-log `duration_ms`; SSE
+  (`text/event-stream`) responses receive `total`-only. See
+  `docs/guide/observability/server-timing.md`.
 - **ci:** README-quickstart gate against the published crates (issue #1586) —
   `.github/workflows/quickstart-gate.yml` + `scripts/check-quickstart.sh`
   install the README-pinned `autumn-cli` from crates.io (never the local
