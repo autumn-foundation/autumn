@@ -209,19 +209,23 @@ impl Feed {
 
     /// Wrap this feed in conditional-GET handling, reusing [`crate::etag`].
     ///
-    /// Returns `304 Not Modified` (no body) when the request's
-    /// `If-None-Match`/`If-Modified-Since` matches the feed's current `ETag` /
-    /// last-modified time; otherwise returns the full feed with `ETag` and
-    /// `Last-Modified` headers attached.
+    /// The strong `ETag` — a hash of the exact rendered body — is the sole
+    /// freshness validator: only a matching `If-None-Match` yields `304 Not
+    /// Modified`. `Last-Modified` is emitted for caches/readers, but a coarse
+    /// whole-second `If-Modified-Since` is deliberately NOT honored on its own,
+    /// so a body that changes within the same second (or via a feed-level edit
+    /// that leaves entry timestamps unchanged) can never be served stale.
     #[must_use]
     pub fn conditional(self, request_headers: &http::HeaderMap) -> Response {
-        let last_modified = self.last_updated();
         let content_type = self.content_type();
         let body = self.render();
         let etag = body.as_str().into_etag();
-        fresh_when(request_headers, etag)
+        let last_modified = self.last_updated();
+        let mut headers = request_headers.clone();
+        headers.remove(http::header::IF_MODIFIED_SINCE);
+        fresh_when(&headers, etag)
             .last_modified(last_modified)
-            .or_else(move || ([(CONTENT_TYPE, content_type)], body).into_response())
+            .or_else(move || ([(CONTENT_TYPE, content_type)], body))
             .into_response()
     }
 

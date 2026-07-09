@@ -2,7 +2,7 @@ use autumn_web::feed::{Feed, FeedEntry, FeedFormat};
 use axum::body::to_bytes;
 use axum::response::IntoResponse;
 use chrono::{TimeZone, Utc};
-use http::header::{CONTENT_TYPE, ETAG, IF_NONE_MATCH, LAST_MODIFIED};
+use http::header::{CONTENT_TYPE, ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED};
 use http::{HeaderMap, StatusCode};
 
 fn sample_feed(format: FeedFormat) -> Feed {
@@ -142,6 +142,20 @@ async fn conditional_get_200_when_etag_differs() {
     headers.insert(IF_NONE_MATCH, "\"stale-etag\"".parse().unwrap());
     let resp = feed.conditional(&headers);
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn conditional_get_ignores_if_modified_since_only() {
+    let feed = sample_feed(FeedFormat::Atom);
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        IF_MODIFIED_SINCE,
+        "Sat, 01 Jan 2050 00:00:00 GMT".parse().unwrap(),
+    );
+    let resp = feed.conditional(&headers);
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(resp.headers().get(ETAG).is_some());
+    assert!(resp.headers().get(LAST_MODIFIED).is_some());
 }
 
 #[test]
