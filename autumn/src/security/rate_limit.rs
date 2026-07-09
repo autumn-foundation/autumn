@@ -738,17 +738,39 @@ fn key_class_label(key: &str) -> &'static str {
 /// let layer = RateLimitLayer::from_config(&config.security.rate_limit)
 ///     .with_path_override("/api/free/", RateLimitOverride { burst: Some(5), requests_per_second: Some(1.0) });
 /// ```
-/// Request-extension marker that exempts a request from rate limiting.
+/// Request-extension marker that fully exempts a request from rate limiting.
 ///
-/// Set on requests that have already been counted by an upstream limiter so the
-/// pipeline's limiter doesn't double-count them. The MCP endpoint uses this:
-/// it counts a `tools/call` once at its `/mcp` envelope, then replays the
-/// request through the full dispatch pipeline (which carries its own
-/// [`RateLimitLayer`]); the marker keeps that replay from consuming a second
-/// token. It is only ever set internally — external requests cannot carry it,
-/// since extensions are not derived from headers.
+/// A request carrying this marker bypasses *every* limiter: the framework's
+/// global [`RateLimitLayer`], user-installed path-override limiters, and
+/// per-route [`__check_throttle`] `#[throttle]` buckets. It is only ever set
+/// internally — external requests cannot carry it, since extensions are not
+/// derived from headers.
+///
+/// This is deliberately broader than [`RateLimitEnvelopeCounted`]: use that
+/// narrower marker for the MCP `tools/call` replay path, where the request was
+/// already charged at the `/mcp` envelope and only the framework-default
+/// limiter (which shares the envelope bucket) should skip it while per-route
+/// throttles still charge it.
 #[derive(Clone, Copy, Debug)]
 pub struct RateLimitExempt;
+
+/// Request-extension marker for a replay that was already charged at the MCP
+/// `/mcp` envelope.
+///
+/// Inserted by the MCP dispatch path on a replayed `tools/call` that the `/mcp`
+/// envelope limiter already counted. The framework-default limiter shares that
+/// envelope's bucket, so it skips a request carrying this marker to avoid
+/// double-counting the same tool call. It is deliberately *narrower* than
+/// [`RateLimitExempt`]: user/per-route limiters — path overrides added via
+/// `AppBuilder::layer` and `#[throttle]` route buckets — do NOT share the
+/// envelope bucket and therefore STILL charge a request carrying this marker,
+/// exactly as they would a direct call. Use [`RateLimitExempt`] instead when a
+/// request must bypass *every* limiter (including per-route throttles).
+///
+/// Like [`RateLimitExempt`], it is only ever set internally — external requests
+/// cannot carry it, since extensions are not derived from headers.
+#[derive(Clone, Copy, Debug)]
+pub struct RateLimitEnvelopeCounted;
 
 #[derive(Clone, Debug)]
 pub struct RateLimitLayer {
@@ -838,9 +860,10 @@ impl RateLimitLayer {
 
     /// Mark this as the framework's default limiter, which shares a bucket with
     /// the MCP `/mcp` envelope limiter and therefore honors the
-    /// [`RateLimitExempt`] marker (so an envelope-counted `tools/call` isn't
-    /// charged a second time on replay). Framework-internal: user-built limiters
-    /// must not set this, or MCP replays would skip their per-route buckets.
+    /// [`RateLimitEnvelopeCounted`] marker (so an envelope-counted `tools/call`
+    /// isn't charged a second time on replay). Framework-internal: user-built
+    /// limiters must not set this, or MCP replays would skip their per-route
+    /// buckets.
     #[must_use]
     pub(crate) fn honoring_mcp_exempt(self) -> Self {
         let mut limiter = Arc::try_unwrap(self.limiter).unwrap_or_else(|arc| (*arc).deep_clone());
@@ -908,10 +931,13 @@ where
         // at the `/mcp` envelope and replayed through this pipeline) bypasses
         // the limiter so it isn't double-counted — but only this framework
         // default limiter, which shares the envelope's bucket, honors the
-        // marker. A user-installed limiter (e.g. a per-path override added via
-        // `AppBuilder::layer`) leaves `honors_mcp_exempt` false so the replay
-        // still consumes its route-specific bucket, exactly as a direct call.
-        if self.limiter.honors_mcp_exempt && req.extensions().get::<RateLimitExempt>().is_some() {
+        // `RateLimitEnvelopeCounted` marker. A user-installed limiter (e.g. a
+        // per-path override added via `AppBuilder::layer`) leaves
+        // `honors_mcp_exempt` false so the replay still consumes its
+        // route-specific bucket, exactly as a direct call.
+        if self.limiter.honors_mcp_exempt
+            && req.extensions().get::<RateLimitEnvelopeCounted>().is_some()
+        {
             let mut inner = self.inner.clone();
             std::mem::swap(&mut self.inner, &mut inner);
             return Box::pin(async move { inner.call(req).await });
@@ -2370,23 +2396,23 @@ mod tests {
         }
     }
 
-    // ── RateLimitExempt scoping (MCP replay) tests ─────────────────────────────
+    // ── RateLimitEnvelopeCounted scoping (MCP replay) tests ────────────────────
 
-    fn exempt_req(uri: &str) -> Request<Body> {
+    fn envelope_counted_req(uri: &str) -> Request<Body> {
         let mut req = Request::builder()
             .method("GET")
             .uri(uri)
             .header("X-Forwarded-For", "2.2.2.2")
             .body(Body::empty())
             .unwrap();
-        req.extensions_mut().insert(RateLimitExempt);
+        req.extensions_mut().insert(RateLimitEnvelopeCounted);
         req
     }
 
     #[tokio::test]
-    async fn exempt_marker_honored_only_by_framework_default_limiter() {
+    async fn envelope_counted_marker_honored_only_by_framework_default_limiter() {
         // The framework's default limiter shares the MCP envelope's bucket, so a
-        // `RateLimitExempt` replay must bypass it (no double-count).
+        // `RateLimitEnvelopeCounted` replay must bypass it (no double-count).
         let config = RateLimitConfig {
             enabled: true,
             requests_per_second: 0.1,
@@ -2399,11 +2425,11 @@ mod tests {
             .route("/api/strict", get(|| async { "ok" }))
             .layer(layer);
 
-        // Even past the burst of 1, every exempt request passes.
+        // Even past the burst of 1, every envelope-counted request passes.
         for _ in 0..3 {
             let r = app
                 .clone()
-                .oneshot(exempt_req("/api/strict"))
+                .oneshot(envelope_counted_req("/api/strict"))
                 .await
                 .unwrap();
             assert_eq!(r.status(), StatusCode::OK);
@@ -2411,7 +2437,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exempt_marker_ignored_by_user_path_override_limiter() {
+    async fn envelope_counted_marker_ignored_by_user_path_override_limiter() {
         // A user-installed per-path override limiter does NOT share the envelope's
         // bucket, so an MCP `tools/call` replay must still consume its
         // route-specific bucket — the marker is ignored.
@@ -2433,19 +2459,57 @@ mod tests {
             .route("/api/strict", get(|| async { "ok" }))
             .layer(layer);
 
-        // Override burst is 1: the first exempt replay passes, the second is
-        // denied despite carrying `RateLimitExempt`.
+        // Override burst is 1: the first envelope-counted replay passes, the
+        // second is denied despite carrying `RateLimitEnvelopeCounted`.
         let r = app
             .clone()
-            .oneshot(exempt_req("/api/strict"))
+            .oneshot(envelope_counted_req("/api/strict"))
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::OK);
         let r = app
             .clone()
-            .oneshot(exempt_req("/api/strict"))
+            .oneshot(envelope_counted_req("/api/strict"))
             .await
             .unwrap();
+        assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn genuine_exempt_marker_ignored_by_framework_default_limiter() {
+        // `RateLimitExempt` is the genuine full-bypass marker; it is NOT the
+        // envelope-dedup marker, so the framework-default limiter (which now
+        // keys its dedup skip off `RateLimitEnvelopeCounted`) must still charge
+        // a request carrying only `RateLimitExempt`. (Per-route throttles handle
+        // their own `RateLimitExempt` bypass in `__check_throttle`.)
+        let config = RateLimitConfig {
+            enabled: true,
+            requests_per_second: 0.1,
+            burst: 1,
+            trust_forwarded_headers: true,
+            ..Default::default()
+        };
+        let layer = RateLimitLayer::from_config(&config).honoring_mcp_exempt();
+        let app = Router::new()
+            .route("/api/strict", get(|| async { "ok" }))
+            .layer(layer);
+
+        let exempt_req = || {
+            let mut req = Request::builder()
+                .method("GET")
+                .uri("/api/strict")
+                .header("X-Forwarded-For", "2.2.2.2")
+                .body(Body::empty())
+                .unwrap();
+            req.extensions_mut().insert(RateLimitExempt);
+            req
+        };
+
+        // Burst is 1: first passes, second is denied — the global limiter does
+        // not honor `RateLimitExempt` for its envelope-dedup skip.
+        let r = app.clone().oneshot(exempt_req()).await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let r = app.clone().oneshot(exempt_req()).await.unwrap();
         assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 

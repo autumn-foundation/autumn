@@ -1960,8 +1960,8 @@ fn apply_rate_limit_middleware(
         let has_rate_limit_proxy_config =
             rl.trust_forwarded_headers || !rl.trusted_proxies.is_empty();
         // The framework default limiter shares its bucket with the MCP `/mcp`
-        // envelope limiter (both built here), so it honors `RateLimitExempt` to
-        // avoid double-counting an already-charged `tools/call`. User-installed
+        // envelope limiter (both built here), so it honors `RateLimitEnvelopeCounted`
+        // to avoid double-counting an already-charged `tools/call`. User-installed
         // limiters don't, so MCP replays still consume their per-route buckets.
         let mut layer = crate::security::RateLimitLayer::from_config(rl).honoring_mcp_exempt();
         if has_top_level_proxy_config && !has_rate_limit_proxy_config {

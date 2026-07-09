@@ -7,7 +7,8 @@
 
 use autumn_web::config::AutumnConfig;
 use autumn_web::security::{
-    KeyStrategy, RateLimitExempt, RateLimitNamedConfig, RateLimitPrincipal,
+    KeyStrategy, RateLimitEnvelopeCounted, RateLimitExempt, RateLimitNamedConfig,
+    RateLimitPrincipal,
 };
 use autumn_web::test::TestApp;
 use autumn_web::{get, routes, throttle};
@@ -44,6 +45,12 @@ async fn independent_ips() -> &'static str {
 #[throttle(limit = 1, per = "1s", key = "ip")]
 async fn exempt_route() -> &'static str {
     "exempt-ok"
+}
+
+#[get("/envelope-counted")]
+#[throttle(limit = 1, per = "1s", key = "ip")]
+async fn envelope_counted_route() -> &'static str {
+    "envelope-counted-ok"
 }
 
 #[get("/window")]
@@ -418,6 +425,51 @@ async fn rate_limit_exempt_bypasses_per_route_throttle() {
     };
     let resp3 = app.clone().oneshot(req).await.expect("oneshot");
     assert_eq!(resp3.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn envelope_counted_marker_still_charges_per_route_throttle() {
+    // Regression for the split-marker fix (#1350): an MCP `tools/call` replay
+    // now carries `RateLimitEnvelopeCounted` (not `RateLimitExempt`). That
+    // marker only dedups the framework-default limiter's envelope bucket — it
+    // must NOT bypass the per-route `#[throttle]` bucket, so the route still
+    // 429s after its limit, exactly as a direct call would.
+    use axum::Router;
+    use axum::body::Body;
+    use axum::extract::ConnectInfo;
+    use axum::http::{Request, StatusCode};
+    use std::net::SocketAddr;
+    use tower::ServiceExt;
+
+    let mut config = base_config();
+    config.security.rate_limit.enabled = true;
+    let app: Router = TestApp::new()
+        .routes(routes![envelope_counted_route])
+        .config(config)
+        .build()
+        .into_router();
+
+    let peer: SocketAddr = "127.0.0.1:65010".parse().expect("addr");
+
+    let build_req = || {
+        let mut r = Request::builder()
+            .method("GET")
+            .uri("/envelope-counted")
+            .body(Body::empty())
+            .expect("request builds");
+        r.extensions_mut().insert(ConnectInfo(peer));
+        // Simulate the MCP replay marker on EVERY request.
+        r.extensions_mut().insert(RateLimitEnvelopeCounted);
+        r
+    };
+
+    // limit = 1: the first envelope-counted request is allowed…
+    let resp1 = app.clone().oneshot(build_req()).await.expect("oneshot");
+    assert_eq!(resp1.status(), StatusCode::OK);
+
+    // …and the second is throttled — the marker did NOT bypass the route bucket.
+    let resp2 = app.clone().oneshot(build_req()).await.expect("oneshot");
+    assert_eq!(resp2.status(), StatusCode::TOO_MANY_REQUESTS);
 }
 
 #[tokio::test]

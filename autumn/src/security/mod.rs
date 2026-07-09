@@ -166,6 +166,7 @@ pub use proxy::TrustedProxy;
 #[doc(hidden)]
 pub use rate_limit::{__check_throttle, __throttle_registry_reset};
 pub use rate_limit::{
-    RateLimitExempt, RateLimitLayer, RateLimitOverride, RateLimitPrincipal, ThrottleSpec,
+    RateLimitEnvelopeCounted, RateLimitExempt, RateLimitLayer, RateLimitOverride,
+    RateLimitPrincipal, ThrottleSpec,
 };
 pub use trusted_proxies::{ProxyResolver, ResolvedClientIdentity, TrustedProxiesLayer};

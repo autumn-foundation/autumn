@@ -1293,12 +1293,14 @@ async fn serve_tools_call(
             .insert(axum::extract::ConnectInfo(peer));
     }
     // When the `/mcp` envelope is itself rate-limited, this call was already
-    // counted there; mark the replay exempt so the dispatch pipeline's own
-    // limiter doesn't charge a second token for the same tool call.
+    // counted there; mark the replay envelope-counted so the framework-default
+    // limiter (which shares the envelope bucket) doesn't charge a second token
+    // for the same tool call. User/per-route limiters (path overrides,
+    // `#[throttle]`) don't share that bucket and still charge the replay.
     if server.envelope_rate_limited {
         request
             .extensions_mut()
-            .insert(crate::security::RateLimitExempt);
+            .insert(crate::security::RateLimitEnvelopeCounted);
     }
     // Likewise for load shedding: the envelope and the dispatch pipeline
     // share the SAME `LoadShedLayer` instance (same `Arc` in-flight
