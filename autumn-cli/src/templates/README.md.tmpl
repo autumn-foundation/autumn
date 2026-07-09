@@ -18,9 +18,11 @@ Run these steps top-to-bottom on a clean checkout to get a route serving.
   autumn setup
   ```
 - **A reachable Postgres** for database features. Don't have one? Start a
-  throwaway local instance with Docker (matches the `url` in step 2 below):
+  throwaway local instance with Docker (matches the `url` in step 2 below). The
+  `-d` flag runs it in the background so your terminal stays free; stop it later
+  with `docker stop {{crate_name}}-pg`:
   ```sh
-  docker run --rm --name {{crate_name}}-pg -e POSTGRES_PASSWORD=postgres \
+  docker run -d --rm --name {{crate_name}}-pg -e POSTGRES_PASSWORD=postgres \
     -e POSTGRES_DB={{crate_name}} -p 5432:5432 postgres:16
   ```
   To generate a full deployment/compose stack instead, see
@@ -49,10 +51,12 @@ url = "postgres://postgres:postgres@localhost:5432/{{crate_name}}"
 
 Don't have a Postgres to point at? Start a throwaway local instance with Docker.
 This matches the `url` above (user and password `postgres`, database
-`{{crate_name}}`), so the two line up with no extra edits:
+`{{crate_name}}`), so the two line up with no extra edits. The `-d` flag runs it
+in the background so your terminal stays free for the next steps; stop it later
+with `docker stop {{crate_name}}-pg`:
 
 ```sh
-docker run --rm --name {{crate_name}}-pg -e POSTGRES_PASSWORD=postgres \
+docker run -d --rm --name {{crate_name}}-pg -e POSTGRES_PASSWORD=postgres \
   -e POSTGRES_DB={{crate_name}} -p 5432:5432 postgres:16
 ```
 
