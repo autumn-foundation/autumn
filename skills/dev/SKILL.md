@@ -22,7 +22,10 @@ Before running `autumn dev`, verify:
    if no database URL is present. Note: `autumn migrate check` analyzes
    migration SQL files only and does NOT test connectivity — to verify the
    database is reachable, attempt `autumn migrate status` or start the server
-   and watch the startup logs.
+   and watch the startup logs. `autumn dev` now auto-loads a project-root
+   `.env` file (dev/test profiles) into the `AUTUMN_*` env layer before boot,
+   so you can set `AUTUMN_DATABASE__URL` there (copy `.env.example` to `.env`);
+   real shell env vars still win, and a malformed `.env` fails loudly.
 
 2. **Tailwind binary is present** — if `autumn setup` has not been run:
    ```bash
@@ -47,6 +50,12 @@ autumn dev --show-config
 
 `autumn dev` uses the `dev` profile automatically in debug builds
 (`AUTUMN_ENV=dev` is the default).
+
+On trunk-dev (unreleased — not in the published 0.5.0 CLI) there is also
+`autumn serve` for a non-watch local daemon: `autumn serve --daemon` /
+`stop` / `status` / `restart`, `--release`, and `--bundled-pg` for a managed
+local Postgres. See `docs/guide/daemon.md`. Do not suggest it to users on the
+published 0.5.0 CLI.
 
 ## What gets served
 

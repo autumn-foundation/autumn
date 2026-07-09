@@ -738,17 +738,39 @@ fn key_class_label(key: &str) -> &'static str {
 /// let layer = RateLimitLayer::from_config(&config.security.rate_limit)
 ///     .with_path_override("/api/free/", RateLimitOverride { burst: Some(5), requests_per_second: Some(1.0) });
 /// ```
-/// Request-extension marker that exempts a request from rate limiting.
+/// Request-extension marker that fully exempts a request from rate limiting.
 ///
-/// Set on requests that have already been counted by an upstream limiter so the
-/// pipeline's limiter doesn't double-count them. The MCP endpoint uses this:
-/// it counts a `tools/call` once at its `/mcp` envelope, then replays the
-/// request through the full dispatch pipeline (which carries its own
-/// [`RateLimitLayer`]); the marker keeps that replay from consuming a second
-/// token. It is only ever set internally — external requests cannot carry it,
-/// since extensions are not derived from headers.
+/// A request carrying this marker bypasses *every* limiter: the framework's
+/// global [`RateLimitLayer`], user-installed path-override limiters, and
+/// per-route [`__check_throttle`] `#[throttle]` buckets. It is only ever set
+/// internally — external requests cannot carry it, since extensions are not
+/// derived from headers.
+///
+/// This is deliberately broader than [`RateLimitEnvelopeCounted`]: use that
+/// narrower marker for the MCP `tools/call` replay path, where the request was
+/// already charged at the `/mcp` envelope and only the framework-default
+/// limiter (which shares the envelope bucket) should skip it while per-route
+/// throttles still charge it.
 #[derive(Clone, Copy, Debug)]
 pub struct RateLimitExempt;
+
+/// Request-extension marker for a replay that was already charged at the MCP
+/// `/mcp` envelope.
+///
+/// Inserted by the MCP dispatch path on a replayed `tools/call` that the `/mcp`
+/// envelope limiter already counted. The framework-default limiter shares that
+/// envelope's bucket, so it skips a request carrying this marker to avoid
+/// double-counting the same tool call. It is deliberately *narrower* than
+/// [`RateLimitExempt`]: user/per-route limiters — path overrides added via
+/// `AppBuilder::layer` and `#[throttle]` route buckets — do NOT share the
+/// envelope bucket and therefore STILL charge a request carrying this marker,
+/// exactly as they would a direct call. Use [`RateLimitExempt`] instead when a
+/// request must bypass *every* limiter (including per-route throttles).
+///
+/// Like [`RateLimitExempt`], it is only ever set internally — external requests
+/// cannot carry it, since extensions are not derived from headers.
+#[derive(Clone, Copy, Debug)]
+pub struct RateLimitEnvelopeCounted;
 
 #[derive(Clone, Debug)]
 pub struct RateLimitLayer {
@@ -838,9 +860,10 @@ impl RateLimitLayer {
 
     /// Mark this as the framework's default limiter, which shares a bucket with
     /// the MCP `/mcp` envelope limiter and therefore honors the
-    /// [`RateLimitExempt`] marker (so an envelope-counted `tools/call` isn't
-    /// charged a second time on replay). Framework-internal: user-built limiters
-    /// must not set this, or MCP replays would skip their per-route buckets.
+    /// [`RateLimitEnvelopeCounted`] marker (so an envelope-counted `tools/call`
+    /// isn't charged a second time on replay). Framework-internal: user-built
+    /// limiters must not set this, or MCP replays would skip their per-route
+    /// buckets.
     #[must_use]
     pub(crate) fn honoring_mcp_exempt(self) -> Self {
         let mut limiter = Arc::try_unwrap(self.limiter).unwrap_or_else(|arc| (*arc).deep_clone());
@@ -904,14 +927,22 @@ where
     }
 
     fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
-        // A request already counted upstream (e.g. an MCP `tools/call` charged
-        // at the `/mcp` envelope and replayed through this pipeline) bypasses
-        // the limiter so it isn't double-counted — but only this framework
-        // default limiter, which shares the envelope's bucket, honors the
-        // marker. A user-installed limiter (e.g. a per-path override added via
-        // `AppBuilder::layer`) leaves `honors_mcp_exempt` false so the replay
-        // still consumes its route-specific bucket, exactly as a direct call.
-        if self.limiter.honors_mcp_exempt && req.extensions().get::<RateLimitExempt>().is_some() {
+        // A `RateLimitExempt` request is a genuine full bypass of *every*
+        // limiter (framework-default and user path-override alike), matching the
+        // marker's documented contract, so it is honored here unconditionally —
+        // regardless of `honors_mcp_exempt`.
+        //
+        // A `RateLimitEnvelopeCounted` request is the narrower MCP-replay marker:
+        // it was already counted at the `/mcp` envelope, so only this framework
+        // default limiter — which shares the envelope's bucket (`honors_mcp_exempt`
+        // true) — skips it to avoid double-counting. A user-installed limiter
+        // (e.g. a per-path override added via `AppBuilder::layer`) leaves
+        // `honors_mcp_exempt` false so the replay still consumes its
+        // route-specific bucket, exactly as a direct call.
+        if req.extensions().get::<RateLimitExempt>().is_some()
+            || (self.limiter.honors_mcp_exempt
+                && req.extensions().get::<RateLimitEnvelopeCounted>().is_some())
+        {
             let mut inner = self.inner.clone();
             std::mem::swap(&mut self.inner, &mut inner);
             return Box::pin(async move { inner.call(req).await });
@@ -967,10 +998,30 @@ where
                     reset_at_unix,
                 }) => {
                     let mut response = inner.call(req).await?;
+                    // The global limiter allowed this request (consuming a
+                    // token), so its informational `x-ratelimit-*` quota
+                    // headers belong on the response. But the inner service may
+                    // have set its own rate-limit headers — most notably a
+                    // per-route `#[throttle]` guard, whose 429 carries
+                    // route-specific `x-ratelimit-*`/`retry-after` values
+                    // (remaining: 0, the route's limit). Overwriting those with
+                    // the global bucket's numbers would mislead clients into
+                    // thinking quota remains. So insert each global header only
+                    // when the inner response does not already carry it: a
+                    // throttle 429 (which sets all three) keeps its own values,
+                    // while a plain user-handler response — including a user
+                    // 429 that consumed a global token but set no rate-limit
+                    // headers — still receives the global quota metadata.
                     let headers = response.headers_mut();
-                    headers.insert(X_RATELIMIT_LIMIT, burst_for_header);
-                    headers.insert(X_RATELIMIT_REMAINING, HeaderValue::from(remaining));
-                    headers.insert(X_RATELIMIT_RESET, HeaderValue::from(reset_at_unix));
+                    if !headers.contains_key(X_RATELIMIT_LIMIT) {
+                        headers.insert(X_RATELIMIT_LIMIT, burst_for_header);
+                    }
+                    if !headers.contains_key(X_RATELIMIT_REMAINING) {
+                        headers.insert(X_RATELIMIT_REMAINING, HeaderValue::from(remaining));
+                    }
+                    if !headers.contains_key(X_RATELIMIT_RESET) {
+                        headers.insert(X_RATELIMIT_RESET, HeaderValue::from(reset_at_unix));
+                    }
                     Ok(response)
                 }
                 None => inner.call(req).await,
@@ -978,6 +1029,501 @@ where
         })
     }
 }
+
+// ── Per-route throttle (#[throttle] attribute macro backend) ─────────────────
+
+/// Attribute-supplied throttle policy applied to a single handler.
+///
+/// Emitted by the `#[throttle(...)]` proc macro; instances are `const`-embedded
+/// in the generated handler body and passed to [`__check_throttle`] on each
+/// request. Users do not construct these directly.
+#[derive(Debug, Clone)]
+pub enum ThrottleSpec {
+    /// Inline `#[throttle(limit = N, per = "…", key = "…")]`.
+    Inline {
+        /// Requests allowed per `per_secs` window.
+        limit: u32,
+        /// Window length in seconds.
+        per_secs: u64,
+        /// Optional keying strategy; `None` means "match the global limiter".
+        key: Option<KeyStrategy>,
+    },
+    /// Named `#[throttle("name")]` referencing a `[security.rate_limit.named.<name>]`
+    /// entry.
+    Named(&'static str),
+}
+
+/// Per-route limiter registry shared across a process.
+///
+/// Keyed by `route:{route_id}@{matched_path}` for inline `#[throttle(...)]` forms
+/// (the runtime matched path isolates a handler mounted at multiple paths; it
+/// falls back to `route:{route_id}` when no `MatchedPath` is available) and by
+/// `"named:{name}"` for `#[throttle("name")]` forms, so distinct routes pointing
+/// at the same named limiter share a single token bucket while inline throttles
+/// get an isolated bucket per mounted route path.
+///
+/// The route/name is further qualified by a
+/// [`throttle_config_fingerprint`] so that two `AppState`s with DIFFERENT
+/// rate-limit configs sharing one process don't hand each other a limiter built
+/// from the wrong app's key strategy, proxy resolver, backend, or Redis prefix.
+#[allow(clippy::type_complexity)]
+static THROTTLE_REGISTRY: std::sync::OnceLock<
+    Mutex<std::collections::HashMap<String, Arc<Limiter>>>,
+> = std::sync::OnceLock::new();
+
+fn throttle_registry() -> &'static Mutex<std::collections::HashMap<String, Arc<Limiter>>> {
+    THROTTLE_REGISTRY.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Clear the process-wide `#[throttle]` limiter registry.
+///
+/// Only intended for tests; each integration test that uses `#[throttle]`
+/// should call this at the top of the test to avoid cross-test bucket bleed
+/// through the shared registry.
+#[doc(hidden)]
+pub fn __throttle_registry_reset() {
+    if let Some(reg) = THROTTLE_REGISTRY.get()
+        && let Ok(mut guard) = reg.lock()
+    {
+        guard.clear();
+    }
+}
+
+fn build_throttle_limiter(
+    global: &RateLimitConfig,
+    trusted_proxies: &TrustedProxiesConfig,
+    registry_key: &str,
+    limit: u32,
+    per_secs: u64,
+    key: KeyStrategy,
+) -> Arc<Limiter> {
+    // On the Redis backend every per-route limiter shares one connection and,
+    // by default, the single `redis.key_prefix`; the bucket key handed to
+    // `decide()` is only the client-derived value (ip/token/principal). Without
+    // namespacing, inline throttles, named throttles, and the global limiter for
+    // the same client all collide on one Redis bucket, breaking per-route
+    // isolation across replicas. Fold the `registry_key` (route:<id> or
+    // named:<name>) into the prefix so each route/name — and the global limiter,
+    // which keeps the bare prefix — lands in its own keyspace. The in-memory
+    // backend already isolates by allocating a fresh `MemoryStore` per `Limiter`,
+    // so `registry_key` is only consumed on the Redis path (memory keys never
+    // include the prefix).
+    #[cfg(not(feature = "redis"))]
+    let _ = registry_key;
+    #[cfg(feature = "redis")]
+    let redis = {
+        let mut redis = global.redis.clone();
+        redis.key_prefix = format!("{}:{}", redis.key_prefix, registry_key);
+        redis
+    };
+
+    // Rebuild a fresh RateLimitConfig with the same backend/failure/redis
+    // settings as the global limiter, then override the rate and burst.
+    let cfg = RateLimitConfig {
+        enabled: true,
+        requests_per_second: throttle_rps(limit, per_secs),
+        burst: limit,
+        trust_forwarded_headers: global.trust_forwarded_headers,
+        trusted_proxies: global.trusted_proxies.clone(),
+        key_strategy: key,
+        tiers: std::collections::HashMap::new(),
+        named: std::collections::HashMap::new(),
+        backend: global.backend,
+        #[cfg(feature = "redis")]
+        redis,
+        #[cfg(feature = "redis")]
+        on_backend_failure: global.on_backend_failure,
+    };
+
+    // Match the client-IP resolution the global tower layer uses (see
+    // `apply_rate_limit_middleware` in router.rs): prefer the shared top-level
+    // `[security.trusted_proxies]` resolver, but only when the legacy
+    // `security.rate_limit.*` proxy fields aren't set, so an operator's explicit
+    // legacy config still wins. Without this, `#[throttle(key = "ip")]` behind an
+    // ALB/CDN would key on the proxy peer instead of the real client.
+    let has_top_level_proxy_config = trusted_proxies.trust_forwarded_headers
+        || !trusted_proxies.ranges.is_empty()
+        || trusted_proxies.trusted_hops.is_some();
+    let has_rate_limit_proxy_config =
+        global.trust_forwarded_headers || !global.trusted_proxies.is_empty();
+    let top_level_resolver = if has_top_level_proxy_config && !has_rate_limit_proxy_config {
+        Some(ProxyResolver::from_config(trusted_proxies))
+    } else {
+        None
+    };
+
+    Arc::new(Limiter::from_config_with_resolver(&cfg, top_level_resolver))
+}
+
+/// Stable fingerprint of every config input `build_throttle_limiter` bakes into
+/// a `Limiter` at construction time.
+///
+/// The throttle registry caches `Limiter`s process-wide keyed by route/name.
+/// When two `AppState`s with DIFFERENT rate-limit configs run in the same
+/// process (multiple `TestApp`s, or one embedded server hosting several apps),
+/// keying on route/name alone would hand the FIRST app's cached limiter to
+/// every later app for the same route. The `limit`/`rate` are re-supplied to
+/// `decide()` on each call and so stay correct, but the cached limiter still
+/// carries the first app's **key strategy, trusted-proxy resolver, backend
+/// (memory vs Redis), Redis key prefix, and backend-failure posture** — so a
+/// later app would silently key on the wrong client/principal or use in-memory
+/// storage instead of its configured Redis. Folding this fingerprint into the
+/// registry key gives each distinct config its own, correctly-built limiter.
+///
+/// This must capture EXACTLY the inputs `build_throttle_limiter` reads from
+/// config (see that function) so a cached limiter can never mismatch the
+/// current app's config; `limit`/`per_secs` are deliberately excluded because
+/// they only set construction-time defaults that `decide()` overrides per call.
+///
+/// Trade-off: two apps whose construction-affecting config is byte-identical
+/// still share one bucket. That is acceptable — they build identical limiters,
+/// so shared token accounting is behaviorally indistinguishable from per-app
+/// accounting. The bug this closes is a later app getting the WRONG config's
+/// limiter, not two identical apps sharing one.
+fn throttle_config_fingerprint(
+    global: &RateLimitConfig,
+    trusted_proxies: &TrustedProxiesConfig,
+    key: KeyStrategy,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+
+    // Key strategy baked into the limiter (`KeyStrategy` is a fieldless enum but
+    // isn't `Hash`, so hash its discriminant).
+    (key as u8).hash(&mut hasher);
+
+    // Legacy `security.rate_limit.*` proxy resolver inputs.
+    global.trust_forwarded_headers.hash(&mut hasher);
+    global.trusted_proxies.hash(&mut hasher);
+
+    // Top-level `[security.trusted_proxies]` resolver inputs (the resolver
+    // `build_throttle_limiter` derives from these when legacy fields are unset).
+    trusted_proxies.trust_forwarded_headers.hash(&mut hasher);
+    trusted_proxies.ranges.hash(&mut hasher);
+    trusted_proxies.trusted_hops.hash(&mut hasher);
+
+    // Backend selection (memory vs Redis); fieldless enum, hash its discriminant.
+    (global.backend as u8).hash(&mut hasher);
+
+    // Redis connection, key prefix, and failure posture only exist under the
+    // `redis` feature and only affect construction there.
+    #[cfg(feature = "redis")]
+    {
+        global.redis.url.hash(&mut hasher);
+        global.redis.key_prefix.hash(&mut hasher);
+        (global.on_backend_failure as u8).hash(&mut hasher);
+    }
+
+    hasher.finish()
+}
+
+/// Steady-state refill rate for a throttle limiter: `limit` tokens per
+/// `per_secs` seconds. `limit` and `per_secs` come from a route attribute or a
+/// small config value, so the `f64` casts never lose meaningful precision.
+#[allow(clippy::cast_precision_loss)]
+fn throttle_rps(limit: u32, per_secs: u64) -> f64 {
+    f64::from(limit) / (per_secs as f64).max(1.0)
+}
+
+/// De-dupe set of keys for which a throttle misconfiguration warning has
+/// already been emitted. A misconfigured named limiter (missing entry or
+/// invalid `per`) fails open on *every* request, so without this the warning
+/// would be logged on every request; instead it fires once per distinct
+/// route/name.
+static THROTTLE_WARNED: std::sync::OnceLock<Mutex<std::collections::HashSet<String>>> =
+    std::sync::OnceLock::new();
+
+/// Returns `true` the first time it is called with a given `key`, and `false`
+/// on every subsequent call with the same key, so a `tracing::warn!` guarded by
+/// it fires at most once per distinct misconfiguration.
+fn warn_once(key: String) -> bool {
+    let set = THROTTLE_WARNED.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+    let mut guard = set
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard.insert(key)
+}
+
+/// Resolve the effective inline parameters for a spec, given the global config.
+///
+/// Returns `Some((limit, per_secs, key, registry_key))` when a limiter should
+/// be applied, or `None` when the named entry is missing (fail-open with warn).
+fn resolve_throttle_params(
+    route_id: &'static str,
+    matched_path: Option<&str>,
+    spec: &ThrottleSpec,
+    config: &RateLimitConfig,
+) -> Option<(u32, u64, KeyStrategy, String)> {
+    match spec {
+        ThrottleSpec::Inline {
+            limit,
+            per_secs,
+            key,
+        } => {
+            let key = key.unwrap_or(config.key_strategy);
+            // INLINE throttles isolate PER MOUNTED ROUTE PATH. The compile-time
+            // `route_id` (`module_path!()::fn_name`) is identical for a single
+            // handler mounted at more than one path — e.g. the same `routes![…]`
+            // reused under two `AppBuilder::scoped` prefixes, or versioned mounts
+            // — so keying on `route_id` alone would let traffic to one mounted
+            // path drain the other's bucket. Fold the RUNTIME matched path into
+            // the registry namespace so each mount gets its own bucket. When no
+            // `MatchedPath` is available (fallbacks / unnested routes) fall back
+            // to the bare `route_id`, preserving prior behavior.
+            //
+            // NAMED throttles do the OPPOSITE (see the `Named` arm below): a named
+            // limiter is a deliberately shared, centrally-named bucket, so it is
+            // keyed by name only and multiple routes referencing it share it.
+            let registry_key = matched_path.map_or_else(
+                || format!("route:{route_id}"),
+                |path| format!("route:{route_id}@{path}"),
+            );
+            Some((*limit, *per_secs, key, registry_key))
+        }
+        ThrottleSpec::Named(name) => {
+            let Some(entry) = config.named.get(*name) else {
+                if warn_once(format!("missing:{route_id}:{name}")) {
+                    tracing::warn!(
+                        name = %name,
+                        "#[throttle(\"{name}\")] references \
+                         [security.rate_limit.named.{name}] but no such entry exists in \
+                         config; failing open"
+                    );
+                }
+                return None;
+            };
+            let Some(duration) = crate::task::parse_duration(&entry.per) else {
+                if warn_once(format!("badper:{route_id}:{name}")) {
+                    tracing::warn!(
+                        name = %name,
+                        per = %entry.per,
+                        "[security.rate_limit.named.{name}] has invalid `per`; failing open"
+                    );
+                }
+                return None;
+            };
+            // A zero `limit` (or a zero-length `per` window) cannot be enforced as
+            // written: the downstream `limit.max(1)` / `per_secs.max(1)` clamps would
+            // silently turn a "0" quota into "1 request per window" and emit a
+            // misleading `x-ratelimit-limit: 0`. The INLINE macro rejects zero limits
+            // at compile time; keep named runtime config consistent by treating a zero
+            // quota as MISCONFIGURED and failing open (allow the request) — the same
+            // policy as the missing-entry / invalid-`per` paths above — rather than
+            // enforcing a bogus budget or hard-failing app startup.
+            if entry.limit == 0 || duration.is_zero() {
+                if warn_once(format!("zerolimit:{route_id}:{name}")) {
+                    tracing::warn!(
+                        name = %name,
+                        limit = entry.limit,
+                        per = %entry.per,
+                        "[security.rate_limit.named.{name}] has a zero `limit` or `per` \
+                         window, which cannot be enforced without silently allowing one \
+                         request per window; failing open"
+                    );
+                }
+                return None;
+            }
+            let per_secs = duration.as_secs().max(1);
+            let key = entry.key.unwrap_or(config.key_strategy);
+            // NAMED throttles are DELIBERATELY SHARED by name: the matched path is
+            // intentionally NOT folded into the key, so every route pointing at
+            // `#[throttle("<name>")]` shares one centrally-named bucket (e.g.
+            // `POST /login` and `POST /login/2fa` sharing one abuse budget). This
+            // is the deliberate counterpart to the per-path isolation the inline
+            // arm above applies.
+            Some((entry.limit, per_secs, key, format!("named:{name}")))
+        }
+    }
+}
+
+/// Extract a bucket key for a throttle check by reconstructing a minimal
+/// request from the parts an axum extractor already broke out, then reusing
+/// the shipped [`Limiter::extract_key`] so IP-via-proxy-resolver, bearer-token,
+/// and authenticated-principal keying all behave exactly as the global limiter
+/// (satisfying "no new keying scheme").
+fn extract_throttle_key(
+    limiter: &Limiter,
+    headers: &axum::http::HeaderMap,
+    peer: Option<std::net::SocketAddr>,
+    principal: Option<&RateLimitPrincipal>,
+) -> Option<String> {
+    let mut req: Request<()> = Request::new(());
+    *req.headers_mut() = headers.clone();
+    if let Some(addr) = peer {
+        req.extensions_mut()
+            .insert(axum::extract::ConnectInfo(addr));
+    }
+    if let Some(p) = principal {
+        req.extensions_mut().insert(p.clone());
+    }
+    limiter.extract_key(&req)
+}
+
+/// Build the 429 problem-details response returned by the `#[throttle]`
+/// per-route guard.
+///
+/// This mirrors the response the global tower layer emits on a denial
+/// (same status, `Retry-After`, `x-ratelimit-*` headers, and
+/// `application/problem+json` body via [`rate_limit_problem_json`]). The
+/// tower layer builds its own copy inline rather than calling this helper
+/// because `RateLimitService` is generic over the inner response body type,
+/// whereas this guard always returns an `axum` `Body`; keep the two in sync
+/// if either side changes.
+fn build_rate_limited_response(
+    key_class: &str,
+    retry_after_secs: u64,
+    limit: u32,
+    reset_at_unix: u64,
+) -> axum::response::Response {
+    use axum::body::Body;
+
+    let body_json = rate_limit_problem_json(key_class);
+    let mut response = Response::new(Body::from(body_json));
+    *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+    let hdrs = response.headers_mut();
+    hdrs.insert(RETRY_AFTER, HeaderValue::from(retry_after_secs));
+    hdrs.insert(X_RATELIMIT_LIMIT, HeaderValue::from(limit));
+    hdrs.insert(X_RATELIMIT_REMAINING, HeaderValue::from_static("0"));
+    hdrs.insert(X_RATELIMIT_RESET, HeaderValue::from(reset_at_unix));
+    hdrs.insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("application/problem+json"),
+    );
+    response
+}
+
+/// Runtime hook invoked by handlers annotated with `#[throttle(...)]`.
+///
+/// Consults the per-route limiter (lazily initialized on first call) and
+/// returns:
+///
+/// - `Ok(())` when the request is allowed to proceed, when the request carries
+///   the [`RateLimitExempt`] marker, or when a named-limiter lookup fails
+///   (fail-open) / a backend error is configured as `fail_open`.
+/// - `Err(Response)` when the token bucket denies the request or a backend
+///   error is configured as `fail_closed`. The response is a `429 Too Many
+///   Requests` with `Retry-After` and the standard `x-ratelimit-*` headers.
+///
+/// This function is `#[doc(hidden)]`-style: it is only meant to be called by
+/// the code generated by the `#[throttle]` macro. External callers should
+/// build their own `RateLimitLayer` instead.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub async fn __check_throttle(
+    state: &crate::AppState,
+    route_id: &'static str,
+    matched_path: Option<&str>,
+    spec: ThrottleSpec,
+    headers: &axum::http::HeaderMap,
+    peer: Option<std::net::SocketAddr>,
+    principal: Option<&RateLimitPrincipal>,
+    session: Option<&crate::session::Session>,
+    exempt: bool,
+) -> Result<(), axum::response::Response> {
+    // `RateLimitExempt` bypasses per-route throttles the same way it bypasses
+    // the framework's global limiter, so an MCP `tools/call` counted once at
+    // the `/mcp` envelope is not re-charged on dispatch replay.
+    if exempt {
+        return Ok(());
+    }
+
+    let config = state.config();
+    let rl_config = &config.security.rate_limit;
+    let trusted_proxies = &config.security.trusted_proxies;
+
+    let Some((limit, per_secs, key_strategy, registry_key)) =
+        resolve_throttle_params(route_id, matched_path, &spec, rl_config)
+    else {
+        // Fail-open: named entry missing or unparseable (already logged).
+        return Ok(());
+    };
+
+    // Derive the principal from the verified session when this route keys on the
+    // authenticated principal but no `RateLimitPrincipal` extension is present.
+    // The router only installs `populate_rate_limit_principal` when the GLOBAL
+    // limiter's strategy is `AuthenticatedPrincipal`; a `#[throttle(key =
+    // "principal")]` route guarded by `#[secured]` under the default (IP) global
+    // strategy would otherwise never see a principal and silently fall back to IP
+    // keying — collapsing every user behind one NAT into a shared bucket. Mirror
+    // `populate_rate_limit_principal` exactly: read the same auth session key from
+    // the same verified `Session`. An explicit extension (set by `RequireAuth` /
+    // `RequireApiToken`) still wins and is never overwritten.
+    let derived_principal =
+        if principal.is_none() && key_strategy == KeyStrategy::AuthenticatedPrincipal {
+            match session {
+                Some(session) => session
+                    .get(state.auth_session_key())
+                    .await
+                    .map(RateLimitPrincipal),
+                None => None,
+            }
+        } else {
+            None
+        };
+    let principal = principal.or(derived_principal.as_ref());
+
+    // Qualify the registry key with (1) the constructing app's process-unique
+    // id and (2) a fingerprint of every construction-affecting config input.
+    //
+    // The fingerprint alone stops a later `AppState` with a DIFFERENT config
+    // from reusing an earlier app's limiter for the same route/name. But two
+    // INDEPENDENTLY built apps with IDENTICAL rate-limit + trusted-proxy config
+    // (parallel `TestApp`s, or one process hosting two apps with the same
+    // handler) would still fingerprint-collide and share one process-global
+    // `Limiter`/`MemoryStore`, so traffic in one app would drain the other's
+    // per-route bucket. Prefixing the clone-stable `app_id` gives each app its
+    // own buckets, while a cloned `AppState` (what `State` hands the handler)
+    // keeps its origin's id and therefore its origin's bucket.
+    //
+    // The bare `registry_key` (route:<id> / named:<name>) still drives the Redis
+    // keyspace namespacing in `build_throttle_limiter`; only the in-memory cache
+    // lookup carries the app id + fingerprint.
+    let app_id = state.app_id();
+    let fingerprint = throttle_config_fingerprint(rl_config, trusted_proxies, key_strategy);
+    let cache_key = format!("{app_id}:{registry_key}@{fingerprint:016x}");
+    let limiter = {
+        let mut reg = throttle_registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Arc::clone(reg.entry(cache_key).or_insert_with(|| {
+            build_throttle_limiter(
+                rl_config,
+                trusted_proxies,
+                &registry_key,
+                limit,
+                per_secs,
+                key_strategy,
+            )
+        }))
+    };
+
+    let Some(bucket_key) = extract_throttle_key(&limiter, headers, peer, principal) else {
+        // In-process caller with no identifiable peer (SSG, tests without
+        // ConnectInfo). Bypass — matches how the tower layer handles this.
+        return Ok(());
+    };
+
+    let burst = f64::from(limit.max(1));
+    let rps = throttle_rps(limit.max(1), per_secs);
+
+    match limiter.decide(&bucket_key, burst, rps).await {
+        Some(Decision::Denied {
+            retry_after_secs,
+            reset_at_unix,
+        }) => {
+            let key_class = key_class_label(&bucket_key);
+            Err(build_rate_limited_response(
+                key_class,
+                retry_after_secs,
+                limit,
+                reset_at_unix,
+            ))
+        }
+        Some(Decision::Allowed { .. }) | None => Ok(()),
+    }
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -1729,6 +2275,23 @@ mod tests {
     }
 
     #[test]
+    fn key_strategy_api_token_falls_back_to_ip() {
+        let config = RateLimitConfig {
+            key_strategy: KeyStrategy::ApiToken,
+            trust_forwarded_headers: true,
+            ..Default::default()
+        };
+        let limiter = Limiter::from_config(&config);
+        let req: Request<()> = Request::builder()
+            .header("X-Forwarded-For", "5.5.5.5")
+            .body(())
+            .unwrap();
+        // No Authorization header -> falls back to IP.
+        let key = limiter.extract_key(&req).unwrap();
+        assert_eq!(key, "5.5.5.5");
+    }
+
+    #[test]
     fn key_strategy_principal_uses_extension() {
         let config = RateLimitConfig {
             key_strategy: KeyStrategy::AuthenticatedPrincipal,
@@ -1833,6 +2396,262 @@ mod tests {
         assert!(matches!(limiter.backend, BucketBackend::Memory(_)));
     }
 
+    // ── #[throttle] per-route limiter construction (bugs #1350) ────────────────
+
+    /// Bug 1: on the shared Redis backend the per-route bucket must be namespaced
+    /// by route/name so distinct routes — and the global limiter — never collide.
+    #[cfg(feature = "redis")]
+    #[tokio::test]
+    async fn throttle_limiter_namespaces_redis_key_prefix_by_route() {
+        // Building a lazy Redis `ConnectionManager` requires a Tokio reactor, so
+        // this runs on `#[tokio::test]` even though no request is issued — the
+        // assertions only inspect the composed `key_prefix`.
+        use super::super::config::{
+            RateLimitBackend, RateLimitBackendFailure, RateLimitRedisConfig,
+        };
+
+        fn redis_prefix(limiter: &Limiter) -> String {
+            match &limiter.backend {
+                BucketBackend::Redis(store) => store.key_prefix.clone(),
+                BucketBackend::Memory(_) => panic!("expected Redis backend"),
+            }
+        }
+
+        let global = RateLimitConfig {
+            enabled: true,
+            requests_per_second: 100.0,
+            burst: 100,
+            backend: RateLimitBackend::Redis,
+            redis: RateLimitRedisConfig {
+                // A valid URL builds a *lazy* connection manager without dialing,
+                // so we get a real RedisStore whose key_prefix we can inspect.
+                url: Some("redis://127.0.0.1/".to_owned()),
+                key_prefix: "app:rl".to_owned(),
+            },
+            on_backend_failure: RateLimitBackendFailure::FailOpen,
+            ..Default::default()
+        };
+        let tp = TrustedProxiesConfig::default();
+
+        let route_a = build_throttle_limiter(&global, &tp, "route:a", 5, 60, KeyStrategy::Ip);
+        let route_b = build_throttle_limiter(&global, &tp, "route:b", 5, 60, KeyStrategy::Ip);
+        let named = build_throttle_limiter(&global, &tp, "named:login", 5, 60, KeyStrategy::Ip);
+        let global_limiter = Limiter::from_config(&global);
+
+        // (i) two different routes for the same client → different Redis keyspace.
+        assert_ne!(redis_prefix(&route_a), redis_prefix(&route_b));
+        // (ii) a throttled route and the global limiter → different Redis keyspace.
+        assert_ne!(redis_prefix(&route_a), redis_prefix(&global_limiter));
+        assert_ne!(redis_prefix(&named), redis_prefix(&global_limiter));
+        // The route namespace is folded under the shared global prefix.
+        assert_eq!(redis_prefix(&route_a), "app:rl:route:a");
+        assert_eq!(redis_prefix(&route_b), "app:rl:route:b");
+        assert_eq!(redis_prefix(&named), "app:rl:named:login");
+        // The global limiter keeps the bare prefix.
+        assert_eq!(redis_prefix(&global_limiter), "app:rl");
+    }
+
+    /// Bug 2: when the app configures the recommended top-level
+    /// `[security.trusted_proxies]` (and no legacy `security.rate_limit.*` proxy
+    /// fields), `#[throttle(key = "ip")]` must resolve the real forwarded client
+    /// IP — the same resolver the global tower layer uses — not the proxy peer.
+    #[test]
+    fn throttle_limiter_uses_top_level_trusted_proxies_resolver() {
+        let global = RateLimitConfig {
+            enabled: true,
+            requests_per_second: 10.0,
+            burst: 5,
+            // Legacy rate-limit proxy fields intentionally unset.
+            trust_forwarded_headers: false,
+            trusted_proxies: Vec::new(),
+            ..Default::default()
+        };
+        let tp = TrustedProxiesConfig {
+            ranges: Vec::new(),
+            trusted_hops: Some(1),
+            trust_forwarded_headers: true,
+        };
+        let limiter = build_throttle_limiter(&global, &tp, "route:x", 5, 60, KeyStrategy::Ip);
+
+        // XFF: real client, then one proxy hop; the TCP peer is the load balancer.
+        let req = req_with_connect_info("1.1.1.1, 2.2.2.2", "9.9.9.9:4000");
+        // trusted_hops = 1 peels the LB, leaving the real client. Under the bug
+        // (legacy-only resolver) this would key on the peer 9.9.9.9 instead.
+        assert_eq!(limiter.extract_key(&req).as_deref(), Some("1.1.1.1"));
+    }
+
+    /// Bug 2 precedence: an explicit legacy `security.rate_limit.*` proxy config
+    /// still wins over the top-level resolver, matching the global tower layer.
+    #[test]
+    fn throttle_limiter_prefers_legacy_rate_limit_proxy_config() {
+        let global = RateLimitConfig {
+            enabled: true,
+            requests_per_second: 10.0,
+            burst: 5,
+            // Legacy field set → legacy resolver takes precedence.
+            trust_forwarded_headers: true,
+            trusted_proxies: Vec::new(),
+            ..Default::default()
+        };
+        let tp = TrustedProxiesConfig {
+            ranges: Vec::new(),
+            trusted_hops: Some(1),
+            trust_forwarded_headers: true,
+        };
+        let limiter = build_throttle_limiter(&global, &tp, "route:y", 5, 60, KeyStrategy::Ip);
+
+        let req = req_with_connect_info("1.1.1.1, 2.2.2.2", "9.9.9.9:4000");
+        // Legacy resolver (trust_forwarded_headers = true, no hops/ranges) uses
+        // the rightmost forwarded entry, not the hop-peeled top-level result.
+        assert_eq!(limiter.extract_key(&req).as_deref(), Some("2.2.2.2"));
+    }
+
+    /// Bug (#1662 / Codex P2): the process-wide throttle registry was keyed by
+    /// route/name only. The fingerprint must differ whenever any input
+    /// `build_throttle_limiter` bakes into the `Limiter` differs, and match when
+    /// they are identical, so distinct-config apps get distinct limiters while
+    /// byte-identical configs still share one bucket.
+    #[test]
+    fn throttle_config_fingerprint_separates_distinct_configs() {
+        let base = RateLimitConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let tp = TrustedProxiesConfig::default();
+
+        // Identical config + key strategy → identical fingerprint (shared bucket).
+        assert_eq!(
+            throttle_config_fingerprint(&base, &tp, KeyStrategy::Ip),
+            throttle_config_fingerprint(&base, &tp, KeyStrategy::Ip),
+        );
+
+        // Key strategy differs → fingerprint differs.
+        assert_ne!(
+            throttle_config_fingerprint(&base, &tp, KeyStrategy::Ip),
+            throttle_config_fingerprint(&base, &tp, KeyStrategy::AuthenticatedPrincipal),
+        );
+
+        // Top-level trusted-proxy resolver inputs differ → fingerprint differs.
+        let tp2 = TrustedProxiesConfig {
+            ranges: Vec::new(),
+            trusted_hops: Some(2),
+            trust_forwarded_headers: true,
+        };
+        assert_ne!(
+            throttle_config_fingerprint(&base, &tp, KeyStrategy::Ip),
+            throttle_config_fingerprint(&base, &tp2, KeyStrategy::Ip),
+        );
+
+        // Legacy `security.rate_limit.*` proxy inputs differ → fingerprint differs.
+        let legacy = RateLimitConfig {
+            trust_forwarded_headers: true,
+            ..base.clone()
+        };
+        assert_ne!(
+            throttle_config_fingerprint(&base, &tp, KeyStrategy::Ip),
+            throttle_config_fingerprint(&legacy, &tp, KeyStrategy::Ip),
+        );
+    }
+
+    /// Bug (#1662 / Codex P2): under the redis feature, backend selection, Redis
+    /// key prefix, and backend-failure posture also bake into the limiter and so
+    /// must move the fingerprint.
+    #[cfg(feature = "redis")]
+    #[test]
+    fn throttle_config_fingerprint_separates_redis_config() {
+        use super::super::config::{
+            RateLimitBackend, RateLimitBackendFailure, RateLimitRedisConfig,
+        };
+
+        let memory = RateLimitConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let tp = TrustedProxiesConfig::default();
+        let redis = RateLimitConfig {
+            backend: RateLimitBackend::Redis,
+            redis: RateLimitRedisConfig {
+                url: Some("redis://127.0.0.1/".to_owned()),
+                key_prefix: "app:rl".to_owned(),
+            },
+            ..memory.clone()
+        };
+
+        // Memory vs Redis backend → fingerprint differs.
+        assert_ne!(
+            throttle_config_fingerprint(&memory, &tp, KeyStrategy::Ip),
+            throttle_config_fingerprint(&redis, &tp, KeyStrategy::Ip),
+        );
+
+        // Different Redis key prefix → fingerprint differs.
+        let redis_other_prefix = RateLimitConfig {
+            redis: RateLimitRedisConfig {
+                url: Some("redis://127.0.0.1/".to_owned()),
+                key_prefix: "other:rl".to_owned(),
+            },
+            ..redis.clone()
+        };
+        assert_ne!(
+            throttle_config_fingerprint(&redis, &tp, KeyStrategy::Ip),
+            throttle_config_fingerprint(&redis_other_prefix, &tp, KeyStrategy::Ip),
+        );
+
+        // Different backend-failure posture → fingerprint differs.
+        let redis_fail_closed = RateLimitConfig {
+            on_backend_failure: RateLimitBackendFailure::FailClosed,
+            ..redis.clone()
+        };
+        assert_ne!(
+            throttle_config_fingerprint(&redis, &tp, KeyStrategy::Ip),
+            throttle_config_fingerprint(&redis_fail_closed, &tp, KeyStrategy::Ip),
+        );
+    }
+
+    /// Bug (#1662 / Codex P2): two `AppState`s with DIFFERENT configs sharing one
+    /// process must NOT reuse each other's cached limiter for the same route id.
+    /// Exercises the real process-wide registry exactly as `__check_throttle`
+    /// does (fingerprint-qualified cache key), using a route id unique to this
+    /// test so no sibling test can clear or collide with its entries.
+    #[test]
+    fn throttle_registry_scopes_cached_limiter_by_config_fingerprint() {
+        let route = "route:m1662_multi_app";
+        let global = RateLimitConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let tp = TrustedProxiesConfig::default();
+
+        // Mirror `__check_throttle`'s cache lookup against the shared registry,
+        // including the app-id prefix the real key carries (fixed here since this
+        // test drives the registry directly rather than through an `AppState`).
+        let app_id: u64 = 424_242;
+        let get = |key_strategy: KeyStrategy| -> Arc<Limiter> {
+            let fp = throttle_config_fingerprint(&global, &tp, key_strategy);
+            let cache_key = format!("{app_id}:{route}@{fp:016x}");
+            let mut reg = throttle_registry()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            Arc::clone(reg.entry(cache_key).or_insert_with(|| {
+                build_throttle_limiter(&global, &tp, route, 5, 60, key_strategy)
+            }))
+        };
+
+        // App A keys by IP; App B keys by authenticated principal — same route id.
+        let app_a = get(KeyStrategy::Ip);
+        let app_b = get(KeyStrategy::AuthenticatedPrincipal);
+
+        // Distinct instances: App B did NOT inherit App A's cached limiter.
+        assert!(!Arc::ptr_eq(&app_a, &app_b));
+        // Each carries its OWN key strategy (the bug: B would key on IP like A).
+        assert_eq!(app_a.key_strategy, KeyStrategy::Ip);
+        assert_eq!(app_b.key_strategy, KeyStrategy::AuthenticatedPrincipal);
+
+        // Re-requesting App A's exact config returns the SAME cached Arc, so
+        // identical configs still share one bucket (registry can't grow unbounded).
+        let app_a_again = get(KeyStrategy::Ip);
+        assert!(Arc::ptr_eq(&app_a, &app_a_again));
+    }
+
     #[test]
     fn is_trusted_proxy_returns_false_for_untrusted_ip() {
         use crate::security::config::TrustedProxiesConfig;
@@ -1913,23 +2732,23 @@ mod tests {
         }
     }
 
-    // ── RateLimitExempt scoping (MCP replay) tests ─────────────────────────────
+    // ── RateLimitEnvelopeCounted scoping (MCP replay) tests ────────────────────
 
-    fn exempt_req(uri: &str) -> Request<Body> {
+    fn envelope_counted_req(uri: &str) -> Request<Body> {
         let mut req = Request::builder()
             .method("GET")
             .uri(uri)
             .header("X-Forwarded-For", "2.2.2.2")
             .body(Body::empty())
             .unwrap();
-        req.extensions_mut().insert(RateLimitExempt);
+        req.extensions_mut().insert(RateLimitEnvelopeCounted);
         req
     }
 
     #[tokio::test]
-    async fn exempt_marker_honored_only_by_framework_default_limiter() {
+    async fn envelope_counted_marker_honored_only_by_framework_default_limiter() {
         // The framework's default limiter shares the MCP envelope's bucket, so a
-        // `RateLimitExempt` replay must bypass it (no double-count).
+        // `RateLimitEnvelopeCounted` replay must bypass it (no double-count).
         let config = RateLimitConfig {
             enabled: true,
             requests_per_second: 0.1,
@@ -1942,11 +2761,11 @@ mod tests {
             .route("/api/strict", get(|| async { "ok" }))
             .layer(layer);
 
-        // Even past the burst of 1, every exempt request passes.
+        // Even past the burst of 1, every envelope-counted request passes.
         for _ in 0..3 {
             let r = app
                 .clone()
-                .oneshot(exempt_req("/api/strict"))
+                .oneshot(envelope_counted_req("/api/strict"))
                 .await
                 .unwrap();
             assert_eq!(r.status(), StatusCode::OK);
@@ -1954,7 +2773,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exempt_marker_ignored_by_user_path_override_limiter() {
+    async fn envelope_counted_marker_ignored_by_user_path_override_limiter() {
         // A user-installed per-path override limiter does NOT share the envelope's
         // bucket, so an MCP `tools/call` replay must still consume its
         // route-specific bucket — the marker is ignored.
@@ -1976,20 +2795,97 @@ mod tests {
             .route("/api/strict", get(|| async { "ok" }))
             .layer(layer);
 
-        // Override burst is 1: the first exempt replay passes, the second is
-        // denied despite carrying `RateLimitExempt`.
+        // Override burst is 1: the first envelope-counted replay passes, the
+        // second is denied despite carrying `RateLimitEnvelopeCounted`.
         let r = app
             .clone()
-            .oneshot(exempt_req("/api/strict"))
+            .oneshot(envelope_counted_req("/api/strict"))
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::OK);
         let r = app
             .clone()
-            .oneshot(exempt_req("/api/strict"))
+            .oneshot(envelope_counted_req("/api/strict"))
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    fn exempt_req(uri: &str) -> Request<Body> {
+        let mut req = Request::builder()
+            .method("GET")
+            .uri(uri)
+            .header("X-Forwarded-For", "2.2.2.2")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(RateLimitExempt);
+        req
+    }
+
+    #[tokio::test]
+    async fn genuine_exempt_marker_bypasses_framework_default_limiter() {
+        // `RateLimitExempt` is the genuine full-bypass marker: it bypasses
+        // *every* limiter, including the framework-default one. So even past the
+        // burst, every request carrying it must pass. (This is broader than the
+        // `RateLimitEnvelopeCounted` envelope-dedup skip.)
+        let config = RateLimitConfig {
+            enabled: true,
+            requests_per_second: 0.1,
+            burst: 1,
+            trust_forwarded_headers: true,
+            ..Default::default()
+        };
+        let layer = RateLimitLayer::from_config(&config).honoring_mcp_exempt();
+        let app = Router::new()
+            .route("/api/strict", get(|| async { "ok" }))
+            .layer(layer);
+
+        // Burst is 1, yet every exempt request passes — the full-bypass marker
+        // is honored unconditionally.
+        for _ in 0..3 {
+            let r = app
+                .clone()
+                .oneshot(exempt_req("/api/strict"))
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::OK);
+        }
+    }
+
+    #[tokio::test]
+    async fn genuine_exempt_marker_bypasses_user_path_override_limiter() {
+        // `RateLimitExempt` bypasses *every* limiter per its documented
+        // contract, including a user-installed path-override limiter (which does
+        // NOT set `honors_mcp_exempt`). Unlike `RateLimitEnvelopeCounted`, which
+        // such a limiter still charges, a genuine exempt request always passes.
+        let config = RateLimitConfig {
+            enabled: true,
+            requests_per_second: 0.1,
+            burst: 5,
+            trust_forwarded_headers: true,
+            ..Default::default()
+        };
+        let layer = RateLimitLayer::from_config(&config).with_path_override(
+            "/api/strict",
+            RateLimitOverride {
+                burst: Some(1),
+                requests_per_second: None,
+            },
+        );
+        let app = Router::new()
+            .route("/api/strict", get(|| async { "ok" }))
+            .layer(layer);
+
+        // Override burst is 1, yet every exempt request passes — the full-bypass
+        // marker is honored even by a user path-override limiter.
+        for _ in 0..3 {
+            let r = app
+                .clone()
+                .oneshot(exempt_req("/api/strict"))
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::OK);
+        }
     }
 
     // ── Tier hook tests ───────────────────────────────────────────────────────
@@ -2054,5 +2950,472 @@ mod tests {
         assert_eq!(r.status(), StatusCode::OK);
         let r = app.clone().oneshot(make_req("regular_user")).await.unwrap();
         assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    // ── #[throttle] unit tests ────────────────────────────────────────────
+
+    #[test]
+    fn resolve_throttle_params_inline_uses_defaults_from_global_key_strategy() {
+        let global = RateLimitConfig {
+            key_strategy: KeyStrategy::AuthenticatedPrincipal,
+            ..Default::default()
+        };
+        let spec = ThrottleSpec::Inline {
+            limit: 5,
+            per_secs: 60,
+            key: None,
+        };
+        // No MatchedPath (fallback / unnested route): bare route_id, as before.
+        let (limit, per, key, reg_key) =
+            resolve_throttle_params("m::h", None, &spec, &global).expect("params");
+        assert_eq!(limit, 5);
+        assert_eq!(per, 60);
+        assert_eq!(key, KeyStrategy::AuthenticatedPrincipal);
+        assert_eq!(reg_key, "route:m::h");
+    }
+
+    #[test]
+    fn resolve_throttle_params_inline_folds_matched_path_into_registry_key() {
+        // An inline throttle mounted at two paths shares one compile-time
+        // route_id; folding the runtime matched path in gives each mount its
+        // own bucket namespace so their token buckets stay independent.
+        let global = RateLimitConfig::default();
+        let spec = ThrottleSpec::Inline {
+            limit: 5,
+            per_secs: 60,
+            key: None,
+        };
+        let (_, _, _, reg_key_a) =
+            resolve_throttle_params("m::h", Some("/a/thing"), &spec, &global).expect("params");
+        let (_, _, _, reg_key_b) =
+            resolve_throttle_params("m::h", Some("/b/thing"), &spec, &global).expect("params");
+        assert_eq!(reg_key_a, "route:m::h@/a/thing");
+        assert_eq!(reg_key_b, "route:m::h@/b/thing");
+        assert_ne!(
+            reg_key_a, reg_key_b,
+            "same handler at two mounted paths must get distinct registry namespaces"
+        );
+    }
+
+    #[test]
+    fn resolve_throttle_params_named_ignores_matched_path() {
+        // A NAMED limiter is a deliberately shared, centrally-named bucket, so
+        // its registry key is keyed by name only — the matched path must NOT be
+        // folded in, letting multiple routes share one bucket on purpose.
+        use super::super::config::RateLimitNamedConfig;
+        let mut named = std::collections::HashMap::new();
+        named.insert(
+            "login".to_owned(),
+            RateLimitNamedConfig {
+                limit: 3,
+                per: "30s".to_owned(),
+                key: None,
+            },
+        );
+        let global = RateLimitConfig {
+            named,
+            ..Default::default()
+        };
+        let spec = ThrottleSpec::Named("login");
+        let (_, _, _, reg_key_a) =
+            resolve_throttle_params("m::a", Some("/a/login"), &spec, &global).expect("params");
+        let (_, _, _, reg_key_b) =
+            resolve_throttle_params("m::b", Some("/b/login"), &spec, &global).expect("params");
+        assert_eq!(reg_key_a, "named:login");
+        assert_eq!(
+            reg_key_a, reg_key_b,
+            "named limiters stay shared by name regardless of mounted path"
+        );
+    }
+
+    #[test]
+    fn warn_once_dedupes_per_key() {
+        let key = "test::warn_once_dedupes_per_key:unique";
+        assert!(warn_once(key.to_owned()), "first call must return true");
+        assert!(
+            !warn_once(key.to_owned()),
+            "repeat call for same key must return false"
+        );
+        assert!(
+            warn_once(format!("{key}:other")),
+            "a distinct key must warn on its own first call"
+        );
+    }
+
+    #[test]
+    fn resolve_throttle_params_named_missing_entry_fails_open() {
+        let global = RateLimitConfig::default();
+        let spec = ThrottleSpec::Named("nonexistent");
+        assert!(resolve_throttle_params("m::h", None, &spec, &global).is_none());
+    }
+
+    #[test]
+    fn resolve_throttle_params_named_uses_config_key_when_present() {
+        use super::super::config::RateLimitNamedConfig;
+        let mut named = std::collections::HashMap::new();
+        named.insert(
+            "login".to_owned(),
+            RateLimitNamedConfig {
+                limit: 3,
+                per: "30s".to_owned(),
+                key: Some(KeyStrategy::ApiToken),
+            },
+        );
+        let global = RateLimitConfig {
+            named,
+            ..Default::default()
+        };
+        let spec = ThrottleSpec::Named("login");
+        let (limit, per, key, reg_key) =
+            resolve_throttle_params("m::h", None, &spec, &global).expect("params");
+        assert_eq!(limit, 3);
+        assert_eq!(per, 30);
+        assert_eq!(key, KeyStrategy::ApiToken);
+        assert_eq!(reg_key, "named:login");
+    }
+
+    #[test]
+    fn resolve_throttle_params_named_zero_limit_fails_open() {
+        use super::super::config::RateLimitNamedConfig;
+        // A named entry with `limit = 0` is misconfigured: enforcing it would
+        // clamp to one-request-per-window and emit a misleading
+        // `x-ratelimit-limit: 0`. Treat it like a missing entry → fail open.
+        let mut named = std::collections::HashMap::new();
+        named.insert(
+            "zero".to_owned(),
+            RateLimitNamedConfig {
+                limit: 0,
+                per: "1m".to_owned(),
+                key: None,
+            },
+        );
+        let global = RateLimitConfig {
+            named,
+            ..Default::default()
+        };
+        let spec = ThrottleSpec::Named("zero");
+        assert!(
+            resolve_throttle_params("m::h", None, &spec, &global).is_none(),
+            "a zero named `limit` must fail open, not enforce a budget of 1"
+        );
+        // A valid (limit >= 1) entry is unaffected.
+        let mut named_ok = std::collections::HashMap::new();
+        named_ok.insert(
+            "ok".to_owned(),
+            RateLimitNamedConfig {
+                limit: 1,
+                per: "1m".to_owned(),
+                key: None,
+            },
+        );
+        let global_ok = RateLimitConfig {
+            named: named_ok,
+            ..Default::default()
+        };
+        let (limit, _, _, _) =
+            resolve_throttle_params("m::h", None, &ThrottleSpec::Named("ok"), &global_ok)
+                .expect("valid entry resolves");
+        assert_eq!(limit, 1, "a limit of 1 stays enforced");
+    }
+
+    #[test]
+    fn resolve_throttle_params_named_zero_per_window_fails_open() {
+        use super::super::config::RateLimitNamedConfig;
+        // A zero-length `per` window is equally unenforceable (the `.max(1)`
+        // clamp would silently stretch it to one second); fail open too.
+        let mut named = std::collections::HashMap::new();
+        named.insert(
+            "zeroper".to_owned(),
+            RateLimitNamedConfig {
+                limit: 5,
+                per: "0s".to_owned(),
+                key: None,
+            },
+        );
+        let global = RateLimitConfig {
+            named,
+            ..Default::default()
+        };
+        assert!(
+            resolve_throttle_params("m::h", None, &ThrottleSpec::Named("zeroper"), &global)
+                .is_none(),
+            "a zero-length `per` window must fail open"
+        );
+    }
+
+    #[tokio::test]
+    async fn check_throttle_named_zero_limit_allows_requests_fail_open() {
+        use super::super::config::RateLimitNamedConfig;
+        // End-to-end: a `limit = 0` named limiter must ALLOW requests
+        // (fail-open), NOT allow one and then 429. Install a config carrying the
+        // misconfigured named entry and drive several requests through the guard.
+        let mut named = std::collections::HashMap::new();
+        named.insert(
+            "zero".to_owned(),
+            RateLimitNamedConfig {
+                limit: 0,
+                per: "1m".to_owned(),
+                key: Some(KeyStrategy::Ip),
+            },
+        );
+        let mut config = crate::config::AutumnConfig::default();
+        config.security.rate_limit.named = named;
+        let state = crate::AppState::for_test();
+        state.insert_extension(config);
+
+        let headers = axum::http::HeaderMap::new();
+        let peer = Some("127.0.0.1:1234".parse().unwrap());
+        for i in 0..3 {
+            let result = __check_throttle(
+                &state,
+                "test::check_throttle_named_zero_limit_allows_requests_fail_open",
+                None,
+                ThrottleSpec::Named("zero"),
+                &headers,
+                peer,
+                None,
+                None,
+                false,
+            )
+            .await;
+            assert!(
+                result.is_ok(),
+                "request {i} against a zero-limit named limiter must fail open (be allowed), \
+                 got {result:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn check_throttle_named_missing_entry_returns_ok_fail_open() {
+        // Fail-open path when a named limiter is referenced but not configured.
+        // Uses AppState::default() (no config installed) so lookup misses.
+        //
+        // Uses a route_id unique to this test so its registry bucket cannot
+        // collide with sibling tests running in parallel; see the module note
+        // on `__throttle_registry_reset` — clearing the shared registry mid-run
+        // races other tests, so we isolate by key instead of resetting.
+        let state = crate::AppState::for_test();
+        let headers = axum::http::HeaderMap::new();
+        let result = __check_throttle(
+            &state,
+            "test::check_throttle_named_missing_entry_returns_ok_fail_open",
+            None,
+            ThrottleSpec::Named("does_not_exist"),
+            &headers,
+            Some("127.0.0.1:1234".parse().unwrap()),
+            None,
+            None,
+            false,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "missing named limiter must fail-open, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn check_throttle_exempt_bypasses_limiter() {
+        // Unique route_id keeps this test's registry bucket isolated from
+        // siblings under parallel `cargo test`; no shared-registry reset.
+        let state = crate::AppState::for_test();
+        let headers = axum::http::HeaderMap::new();
+        // Even with an extremely tight limiter, `exempt = true` returns Ok.
+        let result = __check_throttle(
+            &state,
+            "test::check_throttle_exempt_bypasses_limiter",
+            None,
+            ThrottleSpec::Inline {
+                limit: 1,
+                per_secs: 3600,
+                key: Some(KeyStrategy::Ip),
+            },
+            &headers,
+            Some("127.0.0.1:1234".parse().unwrap()),
+            None,
+            None,
+            true,
+        )
+        .await;
+        assert!(result.is_ok(), "exempt request must bypass throttle");
+    }
+
+    #[tokio::test]
+    async fn check_throttle_inline_denies_after_burst_and_response_carries_headers() {
+        // This test depends on registry state persisting between r1 and r2, so
+        // it MUST own a route_id no other test touches: a parallel test calling
+        // the shared-registry reset between the two calls would otherwise clear
+        // the bucket and let r2 succeed (the historical flake). Isolate by a
+        // unique key rather than resetting the shared registry.
+        let state = crate::AppState::for_test();
+        let headers = axum::http::HeaderMap::new();
+        let peer: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        let spec = ThrottleSpec::Inline {
+            limit: 1,
+            per_secs: 60,
+            key: Some(KeyStrategy::Ip),
+        };
+
+        // First call consumes the only token.
+        let r1 = __check_throttle(
+            &state,
+            "test::check_throttle_inline_denies_after_burst",
+            None,
+            spec.clone(),
+            &headers,
+            Some(peer),
+            None,
+            None,
+            false,
+        )
+        .await;
+        assert!(r1.is_ok(), "first request must succeed");
+
+        // Second call denies.
+        let r2 = __check_throttle(
+            &state,
+            "test::check_throttle_inline_denies_after_burst",
+            None,
+            spec,
+            &headers,
+            Some(peer),
+            None,
+            None,
+            false,
+        )
+        .await;
+        let denied = r2.expect_err("second request must be denied");
+        assert_eq!(denied.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            denied.headers().get(RETRY_AFTER).is_some(),
+            "denied response must include Retry-After"
+        );
+        assert!(
+            denied.headers().get(X_RATELIMIT_LIMIT).is_some(),
+            "denied response must include x-ratelimit-limit"
+        );
+        assert_eq!(
+            denied
+                .headers()
+                .get(X_RATELIMIT_REMAINING)
+                .and_then(|v| v.to_str().ok()),
+            Some("0"),
+        );
+        assert!(
+            denied.headers().get(X_RATELIMIT_RESET).is_some(),
+            "denied response must include x-ratelimit-reset"
+        );
+        assert_eq!(
+            denied
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/problem+json"),
+        );
+    }
+
+    #[tokio::test]
+    async fn check_throttle_two_apps_same_route_get_independent_buckets() {
+        // Regression for the multi-app throttle bleed: two INDEPENDENTLY built
+        // `AppState`s with IDENTICAL config, hitting the SAME throttled route
+        // from the SAME client, must charge SEPARATE per-route buckets. Before
+        // scoping the registry key by the app's process-unique id, both apps
+        // fingerprint-collided onto one process-global limiter, so exhausting
+        // app A would also deny app B.
+        let app_a = crate::AppState::for_test();
+        let app_b = crate::AppState::for_test();
+        // Distinct construction => distinct clone-stable identities.
+        assert_ne!(
+            app_a.app_id(),
+            app_b.app_id(),
+            "independently built apps must have distinct ids"
+        );
+
+        let headers = axum::http::HeaderMap::new();
+        let peer: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        // Same route id + same single-token inline spec for both apps.
+        let route = "test::two_apps_same_route_independent_buckets";
+        let spec = ThrottleSpec::Inline {
+            limit: 1,
+            per_secs: 60,
+            key: Some(KeyStrategy::Ip),
+        };
+
+        // Exhaust app A: first request consumes its only token, second is denied.
+        let a1 = __check_throttle(
+            &app_a,
+            route,
+            None,
+            spec.clone(),
+            &headers,
+            Some(peer),
+            None,
+            None,
+            false,
+        )
+        .await;
+        assert!(a1.is_ok(), "app A first request must succeed");
+        let a2 = __check_throttle(
+            &app_a,
+            route,
+            None,
+            spec.clone(),
+            &headers,
+            Some(peer),
+            None,
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(
+            a2.expect_err("app A second request must be denied")
+                .status(),
+            StatusCode::TOO_MANY_REQUESTS,
+        );
+
+        // App B shares config + route + client, yet its own bucket is untouched:
+        // its first request must still succeed (proving buckets are independent).
+        let b1 = __check_throttle(
+            &app_b,
+            route,
+            None,
+            spec,
+            &headers,
+            Some(peer),
+            None,
+            None,
+            false,
+        )
+        .await;
+        assert!(
+            b1.is_ok(),
+            "app B must have an independent bucket and still succeed after app A is exhausted"
+        );
+    }
+
+    #[tokio::test]
+    async fn check_throttle_no_identifiable_peer_bypasses_limiter() {
+        // In-process caller without ConnectInfo (SSG, some tests): bypass.
+        // Unique route_id isolates this test from parallel siblings.
+        let state = crate::AppState::for_test();
+        let headers = axum::http::HeaderMap::new();
+        let result = __check_throttle(
+            &state,
+            "test::check_throttle_no_identifiable_peer",
+            None,
+            ThrottleSpec::Inline {
+                limit: 1,
+                per_secs: 60,
+                key: Some(KeyStrategy::Ip),
+            },
+            &headers,
+            None,
+            None,
+            None,
+            false,
+        )
+        .await;
+        assert!(result.is_ok());
     }
 }

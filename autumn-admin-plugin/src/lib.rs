@@ -38,6 +38,7 @@ pub mod feature_flags;
 mod registry;
 mod routes;
 mod templates;
+pub mod tokens;
 mod traits;
 
 pub use registry::AdminRegistry;

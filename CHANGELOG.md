@@ -9,6 +9,929 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **config:** Autumn now auto-loads a project-root `.env` file, feeding its
+  values into the highest (`AUTUMN_*` environment-variable) configuration layer.
+  It is not a new precedence tier: a real shell environment variable of the same
+  name always wins, so `.env` only fills keys that are still unset. Files load in
+  order `.env` → `.env.local` → `.env.{profile}` → `.env.{profile}.local`, and
+  earlier files (and real env vars) win. Auto-loading runs in the `dev` and
+  `test` profiles and is skipped in `prod` unless `AUTUMN_DOTENV=1` (conversely
+  `AUTUMN_DOTENV=0` disables it anywhere). A malformed `.env` fails loudly at
+  startup rather than being silently ignored. `autumn new` now scaffolds a
+  documented `.env.example` and gitignores `.env`, `.env.local`, and
+  `.env.*.local` (while keeping `.env.example` and committable `.env.{profile}`
+  files tracked). `autumn doctor` gained a `dotenv` check that warns when
+  `.env.example` is present without a `.env`, or when a `.env` exists but is not
+  gitignored (issue #1051). The environment/profile selectors (`AUTUMN_ENV`,
+  `AUTUMN_PROFILE`, `AUTUMN_IS_DEBUG`) are intentionally NOT read from `.env` —
+  a `.env` file must not be able to switch the active profile, so it can never
+  flip `autumn migrate down` / `autumn db drop` / `autumn db reset` onto a
+  production target after their real-env (dev) guards have already passed; set
+  those in your shell or via `--profile`. The `dotenv` doctor check also
+  surfaces an ungitignored secret file even when `.env.example` exists without a
+  `.env`, so the copy-the-template hint can no longer hide a committable
+  `.env.local`.
+- **web:** new public `ProvideAuthorizationState` trait (PR #1505) [no-plugin]
+  — the authorization layer (policy registry lookup, auth session key,
+  forbidden response, and the `db`-gated connection pool accessor) is now
+  driven through this trait instead of concrete `AppState`, decoupling
+  `authorization.rs` from `state.rs`. `AppState` implements it, so existing
+  apps are unaffected; custom state types can implement it to plug into
+  authorization.
+- **channels/sse:** Resumable SSE streams — automatic per-topic event ids, a bounded per-topic replay ring buffer, and `sse::stream_resumable` that replays events a client missed during a brief disconnect via `Last-Event-ID` (with a `gap` sentinel on buffer overflow) (issue #1356).
+
+- **test:** first-class auth helpers for the test harness (issue #1359).
+  `TestClient` now carries a cookie jar that persists each response's
+  `Set-Cookie` and replays it on later requests from the same client, so a real
+  `POST /login` → `GET /dashboard` flow works with no manual header threading.
+  `TestClient::acting_as(user_id)` (alias `login_as`) establishes an
+  authenticated session directly — writing the app's configured
+  `auth.session_key` (default `user_id`) — so a `#[secured]` / `Auth` route
+  returns its real success status without calling the login endpoint;
+  `log_out()` clears the session cookie so secured routes reject again.
+  `acting_as` sets identity only — policies/roles/scopes still run.
+- **test:** built-in background-job recorder for the test harness (issue #1380).
+  Every `TestApp::build` client now captures each enqueue — across `enqueue`,
+  `enqueue_after_commit`, and `enqueue_in_tx` — as `(name, payload)` with no
+  `with_job_interceptor` boilerplate. Assert with
+  `TestClient::assert_job_enqueued`, `assert_job_enqueued_with`,
+  `assert_no_jobs_enqueued`, or read them back in order via `enqueued_jobs()`.
+  `perform_enqueued_jobs().await` drains the captured queue and dispatches each
+  job through its registered handler, returning a `PerformedJobs` report that
+  surfaces per-job handler errors (including malformed payloads that fail the
+  real deserialization round-trip) rather than swallowing them. The recorder is
+  a per-`TestApp` instance and composes ahead of any user-supplied
+  `with_job_interceptor`.
+- HTTP `Range`/`206 Partial Content` support for `Download` responses and
+  embedded static assets (seekable media, resumable downloads) via the new
+  `autumn_web::range` helper — RFC 7233 single-range parsing with a documented
+  multi-range single-range collapse, `Accept-Ranges`/`Content-Range`/`416`
+  handling, `If-Range` (strong `ETag` or `Last-Modified`), and
+  `Download::into_response_ranged`; blob ranges fetch only the requested slice
+  on the local store (S3/other backends fall back to a buffered slice) via the
+  additive `BlobStore::get_range`.
+- **widgets:** three new server-rendered, accessible, zero-JavaScript view
+  helpers in `autumn_web::widgets` (all prelude re-exported, with `/_stories`
+  gallery entries). `toast(message, variant)` / `toast_region(id)` /
+  `toast_in(region_id, …)` render transient, CSS-auto-dismissing htmx action
+  feedback: the toast appends into a fixed, persistent `aria-live="polite"`
+  region out-of-band via `hx-swap-oob="beforeend:#<region-id>"`, reusing the
+  shared `AlertVariant` color lane (`Error` announces assertively via
+  `role="alert"`; non-error toasts inherit the region's politeness) — no
+  `<script>`, no new color vocabulary (issue #1320).
+  `infinite_feed(items, next_cursor, &FeedConfig)` + the companion
+  `feed_page(items, next_cursor, &FeedConfig)` render an htmx infinite-scroll /
+  "Load more" feed driven by a `CursorPage`: a single `hx-get` sentinel carries
+  the cursor and appends the next page in place (no reload, no duplicate rows),
+  in reveal (`hx-trigger="revealed, click"`) or explicit-button mode, with a
+  progressive `<a href>` fallback (issue #1372). `tabs(id, panels)` completes
+  the trio as the no-JS `tablist`/`tabpanel` switcher (issue #1316). Semantic
+  `.autumn-toast*` / `.autumn-feed*` classes backed by the shipped `WIDGETS_CSS`
+  stylesheet; all caller input HTML-escaped by Maud.
+- **generator:** `autumn new` now generates a `README.md` at the project root
+  (listed in the "Created …" output) with explicit prerequisites and a
+  golden-path quickstart — configure the `[database]` block in `autumn.toml`
+  (the base scaffold ships it commented out, so `autumn migrate` would otherwise
+  exit with "No database URL found"), then `autumn migrate` → `autumn dev` to a
+  `200` on the default route — plus one-line descriptions of the most useful CLI verbs
+  (`dev`, `migrate`, `doctor`, `routes`, `generate scaffold`, `release init`).
+  The README is flag-aware: `--with-i18n` and `--with-seed` add sections for the
+  extra steps they introduce (issue #1052). The DB-bootstrap step bootstraps a
+  throwaway local Postgres with a copy-paste `docker run … postgres:16` one-liner
+  that matches the generated `url`; this runnable helper lives in exactly one
+  place (the "Configure the database" step), with the prerequisites section
+  cross-referencing it instead of repeating the command — a top-to-bottom reader
+  no longer starts the `…-pg` container twice and dead-ends on a
+  container-name-in-use error (the earlier `autumn release init --target
+  docker-compose` pointer file-errored on a fresh scaffold, which already ships a
+  `Dockerfile`/`.dockerignore`, before any compose file was written; that pointer
+  is retained for generating deployment/compose assets). After the `docker run`
+  the README now waits for Postgres to accept connections
+  (`until docker exec …-pg pg_isready …; do sleep 1; done`) before `autumn db
+  create`/`autumn migrate`, since first-time container initialization takes a few
+  seconds and those commands connect immediately without retrying. The golden path is also
+  tailored to the generated app shape: `--daemon` scaffolds a database-free
+  `autumn serve` app, so its README drops the Postgres/`libpq`/`autumn migrate`
+  steps; `--bundled-pg` embeds and manages its own Postgres, so its README runs
+  via `autumn serve --bundled-pg` and notes migrations apply automatically rather
+  than telling users to configure an external `[database]`.
+- **test:** opt-in channel broadcast recorder for integration tests (issue
+  #1043) — `TestApp::record_broadcasts()` installs a recorder through the
+  existing `ChannelsInterceptor` seam (no hand-written spy or `Arc<Mutex>`).
+  After a request runs, read captured publications in order with
+  `TestClient::broadcasts()` / `broadcasts_on(topic)` (both raw `publish` text
+  and `publish_html` HTML/OOB payloads are captured), or assert on them with
+  `assert_broadcast(topic, predicate)`, `assert_broadcast_count(topic, n)`, and
+  `assert_no_broadcasts(topic)` — each failure self-diagnoses by listing what
+  *was* published to that topic and nearby topics. The recorder is in-memory,
+  ordered, thread-safe, and scoped to the `TestClient` (no global state, no
+  cross-test leak); nothing is installed and production `Channels` behavior is
+  untouched unless the builder is called.
+- **generator:** `autumn generate scaffold` now emits **write-path CRUD tests**,
+  not just a read smoke test (issue #1127). Alongside the in-process index/read
+  test, the generated `tests/<snake>.rs` gains a `<plural>_write_path_crud`
+  `#[tokio::test]` that drives create / update / delete **and** the
+  validation-failure re-render through `autumn_web::test::{TestApp, TestClient}`:
+  a valid `POST` redirects (303 See Other) and the row is observable on a
+  follow-up read, an invalid `POST` re-renders the form at 422 with the
+  submitted input preserved and an inline `role="alert"` error (and does not
+  persist), an update is observable on re-read, and a delete removes the row.
+  It runs fully in-process on the shipped `ChangesetForm`/`Changeset`
+  round-trip (issue #1124), the typed `text_input` renderer, and `Redirect`
+  against a process-local in-memory store — no database, no running server, no
+  external services, so it is a visible green (never `#[ignore]`d) with real
+  failure power (row-count assertions on each read turn a broken handler red).
+  `TestApp` disables CSRF, so the same-origin form `POST`s carry no `_csrf`
+  token — the real `form_for`-rendered forms (PR #1587) inject one for the
+  browser, which the in-process harness does not require. Emitted for HTML
+  scaffolds only (the `--api` JSON path is out of scope).
+- **cli:** `autumn i18n check` (issue #1252) — a read-only diagnostic that
+  compares the translation keys referenced in code (string literals passed to
+  `t!(...)`, `.t(...)`, and `.t_with(...)`) against the keys defined in each
+  `i18n/<locale>.ftl`, so a missing or untranslated string is caught in CI
+  instead of from a production `Bundle::miss_count()` warning. It loads the
+  bundle through the existing `Bundle::load_from_dir` loader and reports, per
+  locale, **Missing** keys (referenced in code but absent from that locale's
+  resolved fallback chain), **Untranslated** keys (defined in the default locale
+  but resolving all the way to it for this locale — neither the locale itself nor
+  any non-default locale in its fallback chain supplies them, so the user sees
+  default-language text; a key an intermediate parent locale like `pt` supplies
+  for `pt-BR` is not flagged), and **Unused** keys (defined in a `.ftl` with no call
+  site). Exit is non-zero when any locale has Missing keys; Untranslated/Unused
+  are warnings that become errors under `--strict`. `--format json` emits a
+  machine-readable report for `autumn check`/CI to consume. Dynamically-built
+  keys (e.g. `t(&format!(...))`) are listed as "dynamic — not checked" rather
+  than silently ignored or falsely flagged. The i18n config is resolved through
+  the same profile-aware loader the runtime uses (`AutumnConfig::load_with_env`),
+  so `AUTUMN_ENV` and `[profile.<env>.i18n]` / `autumn-<env>.toml` overlays are
+  honored — under `AUTUMN_ENV=prod` the check inspects the production locale
+  directory and `supported_locales` instead of the base defaults, so missing
+  production translations are no longer silently passed. A missing locale
+  directory only skips (exit 0) when the project has *no* i18n configuration at
+  all; when i18n *is* configured (a base `[i18n]` table or a
+  `[profile.<env>.i18n]` / `autumn-<env>.toml` overlay for the active profile)
+  but the resolved directory is absent, the check loads through
+  `Bundle::load_from_dir` and fails with the same `MissingDefaultLocale` error
+  the app would hit at startup, so CI no longer passes an app that cannot start.
+  A translation call nested in another call's arguments (e.g.
+  `t_with("message", &[("status", &locale.t("status.open"))])`) now has *both*
+  keys recorded — the scanner recurses into the outer call's argument group — so
+  removing the inner key from every `.ftl` is correctly reported as Missing
+  instead of slipping past with exit 0. The scanner's intentional heuristic
+  limits — the key-expression shapes treated as *dynamic — not checked* rather
+  than validated — are documented under "Known heuristic limits" in the command
+  module rustdoc and the plugin skill doc. See `autumn-cli/src/i18n.rs`.
+- **generator:** `autumn generate controller <name> <action>...` scaffolds a handler-only module (named actions, wired routes, Maud stub views) for non-CRUD pages/endpoints — no model, migration, or DB; `--api` emits JSON actions. (issue #1050)
+- **download:** typed `Download` `IntoResponse` (`autumn_web::download::Download`)
+  for serving files from a handler without hand-rolling headers. Construct it
+  from owned bytes, an async byte stream, an `AsyncRead`, or a stored blob
+  (`Download::from_blob(&store, key).await?`), then chain `.filename(...)`,
+  `.content_type(...)`, and `.inline()`. It sets `Content-Disposition`
+  (RFC 5987-encoded for non-ASCII names, sanitized against header injection),
+  infers `Content-Type` from the filename extension (or blob metadata, falling
+  back to `application/octet-stream`), and sets `Content-Length` when the size
+  is known. The blob-backed path streams via the new
+  `BlobStore::get_stream` without buffering the whole object in memory, so it
+  serves large private files behind a `#[secured]` handler with no public
+  presigned URL (#1141).
+- **lock:** app-facing distributed lock for run-once-across-replicas work
+  (issue #1387) — `autumn_web::lock::Lock` promotes the Postgres advisory-lock
+  machinery that already gates migrations, `#[scheduled]` leader election, and
+  ISR revalidation into a small, safe public API. `Lock::new(pool, "name")`
+  (or `Lock::from_state(&state, "name")`) hashes the name to a stable,
+  collision-namespaced 64-bit key (kept out of the scheduler/migration/ISR/
+  repository keyspaces via a `"autumn:lock:v1"` domain prefix, see
+  `distributed_lock_key`) and offers both a blocking `lock` / `lock_timeout`
+  (typed `LockError::Timeout` on expiry) and a non-blocking `try_lock`
+  (returns `None` immediately when another node holds it), plus `with` /
+  `with_timeout` / `try_with` closure wrappers that auto-release the lock when
+  the guarded section ends — on normal return, an early `?`, or a panic. While
+  held, the lock keeps its connection as a checked-out pooled connection
+  (counted against `database.pool.max_size`, never returned to the shared pool
+  while held); a clean release runs `pg_advisory_unlock` and recycles it, while
+  panic/cancel/unlock-error paths force-close the session — so holding many
+  locks stays bounded by the pool and a recycled lock-bearing connection can
+  never leak the lock. `lock_timeout` also bounds the initial pool checkout by
+  the deadline, so a small timeout returns `Timeout` on time under pool
+  pressure. The `bookmarks-distributed` link-checker was rewritten onto the
+  primitive, deleting its hand-rolled `pg_try_advisory_lock` /
+  `pg_advisory_unlock` raw SQL. `Lock`, `LockGuard`, and `LockError` are
+  re-exported from the prelude. See `docs/guide/distributed-locks.md` and
+  `docs/adr/0010-app-facing-distributed-lock.md`.
+- **mail:** bounce/complaint suppression list (issue #1247) — closes the
+  detect→suppress loop so a sending domain's reputation survives contact with
+  real recipients. New `autumn_web::mail::suppression` module ships a
+  `SuppressionStore` trait (`is_suppressed(addr)`, `suppress(addr, reason)`,
+  `unsuppress(addr)`) with a `SuppressionReason` enum (`HardBounce`,
+  `Complaint`, `Manual`), an `InMemorySuppressionStore` zero-config default,
+  and a `db`-feature `PgSuppressionStore` (a `mail_suppressions` table) for
+  multi-instance deploys — mirroring the memory/durable split used by sessions
+  and jobs. `Mailer::send()` now consults the store **before** transport:
+  suppressed recipients are skipped (not an error), each skip emits a
+  structured `outcome = "skipped_suppressed"` log line and bumps the
+  process-wide `suppression::suppressed_skips()` counter, and when *every*
+  recipient is suppressed `send()` returns the new
+  `MailError::AllRecipientsSuppressed` rather than a phantom success. Critical
+  mail opts out per message with `Mail::builder().ignore_suppression()`
+  (password resets, MFA codes, security alerts). The provided
+  `suppression::record_inbound` handler turns a parsed provider bounce into a
+  suppression entry in one call from the inbound router's `on_bounce` hook,
+  using the provider-reported `InboundEmail::bounced_address` (never `email.to`,
+  the app's own inbound address). It suppresses a complaint only from a genuine
+  FBL complainant in the new `InboundEmail::complained_address`; autumn's
+  `on_spam` is an inbound spam *verdict* (not an outbound complaint) and is a
+  logged no-op there, so an attacker cannot POST the inbound endpoint to force
+  addresses onto the outbound suppression list. Register a durable backend with
+  `AppBuilder::with_mail_suppression_store(...)`; the in-memory default is
+  auto-wired otherwise. **`PgSuppressionStore` ships no migration — you must
+  create the `mail_suppressions` table** (`address TEXT PRIMARY KEY, reason TEXT
+  NOT NULL, suppressed_at TIMESTAMPTZ NOT NULL DEFAULT now()`), matching the
+  List-Unsubscribe store convention. See `skills/autumn-web/SKILL.md`.
+- **actuator:** `PUT /actuator/loggers/{name}` now changes the **live**
+  `tracing` subscriber, not just an in-memory map (issue #1044). The default
+  telemetry init installs a `tracing_subscriber` reload layer and hands the
+  handle to `LogLevels`; a level change rebuilds the combined `EnvFilter`
+  directive (global level + per-target overrides) and pushes it to the running
+  subscriber, so an operator can raise/lower verbosity in production without a
+  redeploy — effective on the next event. Per-target overrides
+  (`my_app::module=trace`) raise only that target; reverting `root` to `info`
+  silences them again. Overrides stay ephemeral (reset on restart). The
+  response reports `"applied": true` / `"status":"ok"` only when the change
+  actually reached a reload-capable subscriber, and `"status":"recorded"` /
+  `"applied": false` otherwise — no silent false-positive. Invalid levels still
+  return `400`. A startup `log.level` that is a full `EnvFilter` directive
+  (e.g. `"info,tower_http=warn,my_app=debug"`) now seeds its per-target
+  segments into the override map at construction, so changing the `root` level
+  at runtime no longer drops the module-specific directives configured at
+  startup.
+- **actuator:** `GET /actuator/info` now exposes build + git provenance for
+  deploy/rollback verification (issue #1242): a `build` object with the app
+  version, an ISO-8601 UTC build timestamp, and a `git` sub-object (full +
+  short commit SHA, branch, working-tree-dirty flag). Apps created by
+  `autumn new` capture this with zero developer action — the generated
+  `build.rs` bakes `AUTUMN_BUILD_*` env vars and `#[autumn_web::main]` reads
+  them (plus the app's compile-time `CARGO_PKG_NAME` / `CARGO_PKG_VERSION`) at
+  the app's compile time. This also fixes the `app.version` / `app.name`
+  `"unknown"` regression (they were read from the cargo env at runtime, which
+  is unset in a released binary). Outside a git checkout the `git.*` fields
+  degrade to `null` while timestamp + version stay present; the block never
+  leaks remote URLs or an env dump.
+- **security:** per-route `#[throttle]` route attribute (issue #1350) —
+  drop-in stricter rate limit for abuse-prone endpoints (login, search,
+  export). `#[throttle(limit = 5, per = "1m")]` bounds requests to that
+  handler on top of the global limiter, `#[throttle(limit = N, per = "…",
+  key = "ip" | "principal" | "token")]` selects the keying strategy, and
+  `#[throttle("login")]` references a named limiter defined in
+  `[security.rate_limit.named.login]`. Reuses the shipped token-bucket
+  backend (memory + Redis), the shipped principal/IP/token keying (#794),
+  and the existing 429 `Retry-After` + `x-ratelimit-*` response shape.
+  `RateLimitExempt` still bypasses per-route throttles, and backend errors
+  honor `on_backend_failure` fail-open/fail-closed. See
+  `docs/guide/rate-limiting.md`.
+- **observability:** `Server-Timing` response header (issue #1348) —
+  standards-conformant W3C `total;dur=…` plus
+  `db;dur=…;desc="N queries"` roll-up so N+1s show up directly in the
+  browser DevTools Network → Timing pane. Opt-in via
+  `[observability] server_timing = true` (or
+  `AUTUMN_OBSERVABILITY__SERVER_TIMING=true`); defaults on in
+  `dev`/`development`, off everywhere else so prod never leaks timings to
+  anonymous clients without explicit opt-in. `total` uses the identical
+  clock formula as the access-log `duration_ms`; SSE
+  (`text/event-stream`) responses receive `total`-only. MCP `tools/call`
+  responses forward the dispatched handler's non-`total` `Server-Timing`
+  metrics (including `db;dur;desc="N queries"`) onto the `/mcp` response, so
+  DB-backed tool calls surface their query count — while the inner-dispatch
+  `total` is dropped in favour of the outer fallback's real `/mcp` `total`,
+  which brackets the endpoint's body buffering/JSON-RPC repackaging (the inner
+  `total`, captured before that work, would under-report `/mcp` latency). See
+  `docs/guide/observability/server-timing.md`.
+- **conditional-get:** declarative per-handler `Cache-Control` freshness helper
+  (issue #1344) — `cache_for(Duration)` builds a `CacheControl` that attaches
+  `Cache-Control` to any response either as a tuple
+  (`(cache_for(dur).public(), html!{…})`, via `IntoResponseParts`) or with
+  `.wrap(response)`. Chainable directives: `public`/`private`, `max_age`,
+  `s_maxage`, `stale_while_revalidate`, `no_store`, `no_cache`,
+  `must_revalidate`, `immutable`; `header_value()` renders a deterministic,
+  byte-for-byte value. Defaults to `private` so dropping it onto a
+  secured/authenticated page can't silently make it publicly cacheable —
+  `public` is an explicit opt-in. Composes with `fresh_when`
+  (`fresh_when(&headers, etag).or(cache_for(dur).public().wrap(markup))`): the
+  freshness directives ride along on both the `200` and the preserved `304`,
+  emitting exactly one `Cache-Control` header. Both re-exported from the
+  prelude. See `docs/guide/conditional-get.md`.
+- **Atom/RSS feed renderer** (`feed::Feed` / `feed::FeedEntry`): build an Atom 1.0 or RSS 2.0 feed from channel metadata plus an iterator of entries and return it directly from a `#[get]` handler — it implements `IntoResponse` with the correct `application/atom+xml`/`application/rss+xml` content type, XML-escapes every text field, and `Feed::conditional(&headers)` reuses the `etag` layer so feed pollers get a `304 Not Modified` on unchanged content. The `blog` example gains a `/feed.xml` route. (#1045)
+- **router:** duplicate-route preflight (issue #1012) — two user- or
+  plugin-registered handlers that resolve to the same `(method, path)` after
+  `.scoped(prefix, …)` prefix resolution now fail app build with a structured
+  `RouterBuildError::DuplicateUserRoute` **before any router is mounted**,
+  instead of an `axum::routing::MethodRouter::merge` panic at startup. The
+  error names BOTH handlers, the HTTP method, and the resolved path. The
+  synthetic `WS` method a `#[ws]` handler mounts as `GET` is normalized before
+  keying, so `#[get("/live")]` + `#[ws("/live")]` is caught too. Two routes
+  whose **different** templates resolve to overlapping path shapes are a matchit
+  route conflict *regardless of HTTP method* (so `GET /users/{id}` +
+  `POST /users/{slug}` clashes) and now fail with a dedicated
+  `RouterBuildError::ConflictingRouteShape` that names BOTH handlers and BOTH
+  original templates, instead of leaking an axum matchit panic. Path-shape
+  conflict detection is delegated to **matchit** — the exact engine axum 0.8
+  routes through — instead of a hand-rolled normalizer, so it mirrors axum's
+  accept/reject behavior precisely on every edge case: capture-name diffs
+  (`/users/{id}` vs `/users/{slug}`), catch-all vs sibling capture (`/u/{id}`
+  vs `/u/{*rest}`), catch-all vs dynamic *descendant* (`/cmd/{tool}/{sub}` vs
+  `/cmd/{*path}`, which the old normalizer missed), and mixed literal+capture
+  segments (`/file.{ext}` vs `/file.{kind}`). Because the check *is* matchit it
+  never over-flags what axum accepts: static-vs-capture (`/users/me` vs
+  `/users/{id}`), escaped literal braces (`/{{foo}}` vs `/{{bar}}`), and mixed
+  segments like `/file.{ext}` vs `/file.json` build cleanly. A permanent parity
+  test pins matchit's verdicts to axum 0.8.9's so a future axum bump cannot let
+  the oracle drift silently. Distinct methods on
+  the *same exact path* (`GET /admin` + `POST /admin`, `GET /users/{id}` +
+  `POST /users/{id}`) and genuinely different shapes (`/users/{id}` vs
+  `/users/{id}/posts`) are unaffected;
+  `#[repository]`-generated API routes are covered because they land in the
+  normal `Route` list. Opaque `AppBuilder::merge` and `AppBuilder::nest`
+  routers cannot be introspected — a non-empty opaque table emits a
+  `tracing::warn!` ("check skipped") mirroring the existing OpenAPI/MCP
+  merge-router warnings. See `docs/guide/getting-started.md`
+  ("Route collision diagnostics").
+- **migrations:** content checksums for applied migrations (issue #1203) —
+  the framework now records a SHA-256 of every migration's `up.sql` in a
+  new `autumn_migration_checksums` table (created by the framework
+  migration `20260709000000_create_migration_checksums`) when it is
+  applied via `autumn migrate run` or backfilled by `autumn migrate
+  baseline`. Startup auto-migrate **validates** but does not record: it
+  applies the embedded SQL compiled into the binary (which may differ
+  from the on-disk files), so recording those disk bytes could store a
+  hash for content that was never applied — recording is deferred to the
+  CLI/baseline paths where applied bytes == on-disk bytes. Before every
+  subsequent `autumn migrate` run and before startup auto-migrate, each
+  applied migration's on-disk `up.sql` is re-hashed and compared against
+  the recorded value; a
+  mismatch fails fast with a message that names the version and both
+  hashes: `migration <version> checksum mismatch: recorded <hex-a> but
+  on-disk content hashes to <hex-b>. Migrations must never be edited
+  after being applied — add a new migration instead, or run the
+  documented re-baseline command if this change was deliberate.` Hashing
+  normalises line endings (`\r\n`/`\r` → `\n`) and trims trailing
+  whitespace so a Windows checkout and a Linux one produce identical
+  checksums. `autumn migrate status` reports each applied migration's
+  state (`ok`/`changed`/`unrecorded`), excluding framework-owned migrations
+  (the same set rollback excludes) so operators are never prompted to
+  `baseline` framework versions whose `up.sql` does not live in the user dir;
+  `autumn migrate baseline` records
+  hashes for legacy applied migrations that pre-date the checksum table
+  (idempotent, additive); `autumn migrate baseline --force <version>`
+  overwrites one version's stored hash — the deliberate escape hatch,
+  WARN-logged. Both baseline paths run their applied-versions read and
+  checksum write under the same advisory migration lock as `run`/`down`, so a
+  concurrent rollback cannot revert a version between baseline's read and its
+  write. Rolling a migration back (`autumn migrate down`) now clears its
+  recorded checksum, so a reverted migration can be re-applied cleanly —
+  including with changed contents — instead of leaving a stale hash that would
+  trip the drift guard on a later run. `autumn migrate status` and the pre-apply
+  validation are read-only — they never create the checksum table, so displaying
+  or checking state needs no DDL privileges — and freshly-applied user
+  migrations are recorded immediately after they apply (before the framework
+  migration step), so a later framework failure can no longer leave them
+  unrecorded and mask a subsequent edit. See `docs/guide/migrations.md`.
+- **repository:** race-safe get-or-insert (#1382) — declaring
+  `fn find_or_create_by_<field>[_and_<field>...](...)` in a `#[repository]`
+  trait generates an inherent
+  `find_or_create_by_<field>(&self, <field>: <Ty>, ..., new: &NewModel) ->
+  AutumnResult<(Model, bool)>` that returns the model plus a `created` flag. It
+  looks the row up on the read path first (replica-eligible, honoring tenant
+  scoping and soft-delete); if absent it inserts on the primary with
+  `ON CONFLICT DO NOTHING`, so under concurrent callers exactly one row is
+  created, exactly one caller observes `created == true`, and no
+  unique-violation (`23505`) is ever surfaced — a concurrent loser re-reads its
+  own write on the primary and returns `(row, false)`. `before_create` /
+  `after_create` and the durable commit-hook queue fire only on the created
+  path, and — unlike `upsert_many` — the method is generated even on hooked
+  repositories. Race-safety requires a unique constraint covering the lookup
+  column(s); `_or_` is rejected because it would span constraints. On a
+  sharded, tenant-scoped repository the generated method is wrapped in the same
+  cross-shard write guard as `save`/`update`/`delete`, so a get-or-insert issued
+  through `across_tenants()` is rejected rather than silently writing to a single
+  shard while matching rows on other shards go unseen. See the
+  "Race-safe get-or-insert" section of the repositories guide.
+- **widgets:** `flash_messages(&[FlashMessage])` (issue #1240) — an accessible
+  renderer for consumed flash messages. Each banner is its own live region
+  whose `role`/`aria-live` is chosen by severity (`Error`/`Warning` announce
+  assertively, `Success`/`Info` politely), carries semantic
+  `autumn-flash`/`autumn-flash--<level>` classes backed by `FLASH_CSS`, and
+  escapes its text. An empty slice renders nothing; `flash_messages_with` adds
+  an opt-in, no-JavaScript dismiss control. The `flash` module doc now points
+  at the helper instead of the hand-rolled `div class=(level)` snippet.
+- **widgets:** `badge`/`status_tag` (issue #1259) — semantic status pills.
+  `badge(label, BadgeVariant)` emits a stable `badge badge--<variant>` class
+  (`Neutral`/`Info`/`Success`/`Warning`/`Danger`), `BadgeVariant::for_label`
+  maps an arbitrary status string to a deterministic color, `status_tag` is the
+  neutral one-liner, and `badge_with`/`BadgeConfig` set a `title`/`aria-label`.
+  Text is always present (color is never the sole signal); no inline styles.
+- **widgets:** `avatar(name, &AvatarConfig)` (issue #1263) — renders an `<img>`
+  (lazy-loaded, square `width`/`height`, name-derived `alt`) when an image URL
+  is present, or a deterministic colored-initials badge when it isn't (1–2
+  Unicode-safe uppercase initials, per-name background via a stable
+  `autumn-avatar--cN` palette class — no inline `style`, so it survives a
+  nonce-based CSP). Never a broken-image request; three named sizes
+  (`Small`/`Medium`/`Large`); the display name is HTML-escaped.
+- **widgets:** `alert`/`alert_with` + `error_summary` (issue #1314) — inline
+  block-level callouts with an `AlertVariant` (`Info`/`Success`/`Warning`/
+  `Error`, `role` chosen per variant), optional title, per-variant inline-SVG
+  icon, and an opt-in no-JavaScript dismiss control. `error_summary(&Changeset)`
+  renders an `Error` alert listing every field error as a `<ul>` (stable order)
+  or `None` when valid, for the form re-render path. All caller markup is
+  escaped by Maud; no inline styles.
+- **model:** `#[private]` field attribute (issue #1374) hides a `#[model]`
+  column from JSON — it is excluded from the model's `Serialize` impl so it
+  never appears in `Json` output, the auto-generated `--api` list/show
+  endpoints, or any `serde_json::to_value(&model)`, while staying a normal,
+  queryable column whose write path (`NewX`/`UpdateX`/`Changeset`) still binds
+  it (set a password, never read the hash back). `#[encrypted]` columns are now
+  `#[private]` in JSON by default (opt back in via `#[encrypted(admin_visible)]`);
+  `#[private]` still appears in `FormModel::form_fields()` (the write side). New
+  `autumn doctor` check `model_private_columns` warns when a sensitively-named
+  column (`password`/`token`/`secret`/`*_hash`) is not marked `#[private]`.
+- **model:** `#[normalize(trim, downcase, upcase, squish, with = path)]` field
+  attribute (issue #1379) canonicalizes a `String` column, composing
+  normalizers left-to-right. Runs on the write path (`save`/`save_many` insert
+  and `update` via `UpdateDraft::from_patch`) before the `before_create`/
+  `before_update` hooks and the DB write, and on derived `#[repository]`
+  `find_by_`/`count_by_` lookups (so `find_by_email("  FOO@X.com ")` matches the
+  stored `foo@x.com` row). Built-ins are idempotent, so `#[normalize(downcase)]`
+  plus a `unique` column gives case-insensitive uniqueness; non-`String` fields
+  are a compile error. Built-ins and the `Normalize` / `NormalizedModel` traits
+  live in the new `autumn_web::normalize` module.
+- **ci:** README-quickstart gate against the published crates (issue #1586) —
+  `.github/workflows/quickstart-gate.yml` + `scripts/check-quickstart.sh`
+  install the README-pinned `autumn-cli` from crates.io (never the local
+  workspace), run `autumn new` / `autumn setup` / build / serve and assert a
+  200 from `GET /`, then run the README's
+  `autumn generate scaffold Post title:String body:Text published:bool` path
+  through build, `autumn migrate`, and a 200 from `GET /posts`. Runs on every
+  push to `trunk-dev`, on a daily schedule (catches upstream dependency
+  releases), and via `workflow_dispatch` with a `cli-version` input for gating
+  a freshly published release candidate (post-publish, pre-announce — see
+  `docs/release-checklist.md`). Each phase is a named CI step that emits
+  `::error::` on failure so a red run names the broken quickstart step, and
+  the job summary records the tracked install→first-200 funnel time.
+- **generator:** `autumn generate tauri --remote-url <URL>` scaffolds a
+  **mobile thin-client** Tauri shell (issue #1506): the webview loads your
+  remote HTTPS Autumn server directly (https enforced; loopback and
+  Android-emulator hosts exempt for dev), capability files grant exactly
+  that origin access to the notification/biometric/store plugins
+  (`capabilities/remote-app.json`, plus `remote-app-mobile.json` restricting
+  the biometric grant to Android/iOS so desktop smoke-test builds still
+  pass), and `autumn destroy tauri --remote-url <URL>` reverts the
+  scaffold. Desktop `autumn generate tauri` output is unchanged. Generating
+  one Tauri mode over the other's files is rejected (even with `--force`,
+  which only overwrites within the same mode) with a pointer at the matching
+  `autumn destroy tauri [--remote-url <URL>]` to run first — mixing modes
+  would leave stale files that break the new scaffold's build. See
+  `docs/guide/tauri-mobile-thin-client.md`.
+- **views:** widget storybook (issue #1526) — a browsable gallery of every
+  built-in maud widget plus a CI anti-rot harness. `autumn_web::stories`
+  ships `Story`/`StoryRegistry`/`StoryGallery` (mirroring the mail-preview
+  registry), a `story!{ group, name, { ... } }` macro whose block is **both**
+  executed for the live render and captured byte-for-byte (comments and
+  formatting included) as the displayed snippet — so the shown code is
+  provably the code that rendered — and `stories::builtin()` with a story for
+  every gallery-visible widget. Stories are zero-arg pure `fn() -> Markup`
+  pointers: capturing a `Db` handle, `AppState`, or any local is a compile
+  error. Mount with `.with_story_gallery(StoryGallery::builtin())` — routes
+  at `GET /_stories` (grouped index) and `GET /_stories/{slug}` (live render
+  + Source + Rendered HTML tabs, dogfooding the `tabs` widget and styled by
+  the framework widget stylesheet) are **off by default** and opt in per
+  profile via `[stories] enabled = true` (e.g. `[profile.dev.stories]` for a
+  dev-only gallery, or a prod profile for a public showcase; `/_stories` is
+  404 wherever the resolved flag is false; `AUTUMN_STORIES__ENABLED`
+  overrides from the environment). Apps register their own widgets with the
+  same `story!` macro via `StoryGallery::builtin().extend(...)` or a
+  builtin-free `StoryGallery::new()`. CI renders every builtin story
+  (panic-free, non-empty, balanced HTML, unique slugs) and a two-layer
+  coverage gate fails the build when a widget in `widgets.rs` gains no story.
+  See `docs/guide/stories.md`.
+- **repository:** bounded-memory batched iteration (#1395) — every
+  `#[repository]` now generates `find_in_batches(batch_size)` (yielding
+  successive `Vec<Model>` chunks of at most `batch_size`) and
+  `find_each(batch_size)` (yielding one `Model` at a time), the read-side
+  companion to the bulk writes from #841. Iteration is primary-key keyset-based
+  (`WHERE id > last ORDER BY id ASC LIMIT batch_size`), not `LIMIT`/`OFFSET`, so
+  walking a million-row table in a `#[autumn_web::task]`, job, or sweep holds
+  `O(batch_size)` models — never `O(table)` — and stays stable under concurrent
+  inserts. Unlike a `cursor_page` request, `batch_size` is not clamped to
+  `MAX_PAGE_SIZE`. The iterators reuse the same soft-delete filter and read
+  routing as `find_all`/`cursor_page` (trashed rows are skipped; a
+  replica-routed repo iterates off the replica), an error mid-iteration surfaces
+  on the failing batch and is retryable (the keyset cursor only advances on
+  success, so a retry resumes with no duplicated or skipped rows — `Ok(None)`
+  always means completion), a
+  `batch_size` of `0` errors rather than spinning, and sharded repositories
+  reject cross-shard `across_tenants()` iteration exactly as `cursor_page` does.
+  The generic handle types live in `autumn_web::batches`
+  (`FindInBatches`, `FindEach`, `BatchSource`). See the "Batched iteration"
+  section of the pagination guide.
+- **form:** `autumn_web::form::form_for` — a model-driven form builder that
+  renders a complete form in one call (issue #1135): opening `<form>` (hidden
+  `_method` override for `PUT`/`PATCH`/`DELETE` + auto-injected CSRF, via the
+  same audited path as `form_tag`), one type-appropriate control per field with
+  values pre-filled and inline per-field errors, and a submit button. Controls
+  come from a new `#[model]`-derived `FormModel`/`FormField`/`FieldControl`
+  descriptor, reusing the #1131 typed inputs — no per-field control selection in
+  caller code. Escape hatches: `.exclude`, `.override_field`, `.override_label`,
+  `.append`, `.submit_label`, `.multipart`. Plain no-JS HTML; htmx stays opt-in.
+  A required `FieldControl::Date` field now renders via a new
+  `required_date_input` helper (`required` + `aria-required="true"`), matching
+  the other `required_*` siblings. Public API addition (minor bump); existing
+  helpers unchanged.
+  `autumn generate scaffold` now consumes it: the generated create/edit views
+  (and both 422 re-render branches) render through one shared
+  `{snake}_form_for` helper instead of hand-emitting one input per column —
+  the generated `{Model}Form` delegates `FormModel` to the `#[model]`-derived
+  descriptors, enum columns get a `.override_field(...)` `Select` with their
+  variants, decimal columns pin the browser `step` to the declared scale, and
+  attachment columns stay a hand-rolled file input (appended before the submit
+  button, so attachment fields now always render at the end of the form
+  regardless of their declared column position, and the form remains
+  URL-encoded) that renders the same inline-error/ARIA skeleton as the derived
+  controls, so changeset errors on the attachment key surface next to the
+  file input. `references` columns render as a `<select>` of the referenced
+  table's ids (AC "enum/references→select"): the generated handlers load the
+  ids via a per-column `{column}_select_options` loader and thread them into
+  the shared form helper — option labels are the raw id (which column makes a
+  human-friendly label is a display decision the generator can't know; the
+  generated loader's doc comment says where to swap one in). The select needs
+  the referenced resource's `src/schema.rs` entry, so it applies when the
+  referenced model is already in the project (generate it first — the same
+  ordering the FOREIGN KEY already imposes); when the target is missing (a
+  warning-only situation: the table is assumed to exist out-of-band), the
+  column falls back to the derived numeric id input so the generated code
+  still compiles, and the scaffold warns that generating the referenced model
+  first (or re-running the scaffold afterwards) yields the select.
+  Adding a column no longer requires any view edits.
+  `--live-validation` scaffolds keep the per-field emission (their htmx
+  inline-validation inputs have no `FieldControl` equivalent).
+  Non-nullable `bool` columns: the `#[model]`-generated `NewX` insert struct
+  now marks them `#[serde(default)]`, so an unchecked `form_for` checkbox
+  (which submits no key at all — `checkbox_input` deliberately emits no hidden
+  `false` fallback because serde_urlencoded rejects duplicate keys) decodes as
+  `false` instead of rejecting the submission with a missing-field error,
+  matching the scaffold's `{Model}Form` convention. Side effect: a JSON create
+  body that omits a non-nullable `bool` now also decodes it as `false` rather
+  than erroring.
+  Datetime columns: `form_for` renders `chrono::DateTime<Utc>` and
+  `NaiveDateTime` columns as `<input type="datetime-local">`, whose submitted
+  value carries no timezone offset (and not always seconds) — chrono's default
+  `Deserialize` for `DateTime<Utc>` would reject even an untouched pre-filled
+  value as a 400 before validation. The `#[model]`-generated `NewX` insert
+  struct now attaches `autumn_web::form::deserialize_datetime_local_utc`
+  (`_option` for nullable) to `DateTime<Utc>` columns and
+  `deserialize_naive_datetime_local` (`_option`) to `NaiveDateTime` columns:
+  the offsetless browser value is interpreted as UTC, an empty nullable value
+  decodes as `None`, and RFC 3339 JSON create bodies keep decoding — the
+  `DateTime<Utc>` helpers now also accept RFC 3339 input, honoring an explicit
+  offset by converting to UTC. These four `form` deserializer helpers,
+  previously `maud`-gated, are now available unconditionally.
+  `chrono::DateTime<Local>` columns (diesel's other `Timestamptz`-capable
+  zone) get the same treatment via new
+  `autumn_web::form::deserialize_datetime_local_local` /
+  `deserialize_datetime_local_local_option` helpers: the offsetless browser
+  value is interpreted as the server's local wall clock (a wall clock
+  repeated by a DST fall-back maps to the earlier instant; one skipped by a
+  spring-forward is a decode error), and RFC 3339 input converts the instant
+  to the local zone. `DateTime` columns with any *other* zone parameter
+  (e.g. `FixedOffset`, or a bare `DateTime` alias hiding its zone from the
+  derive) no longer render the `datetime-local` picker at all — an
+  offsetless wall clock is genuinely ambiguous there, and the picker's
+  submission used to 400 unconditionally; they fall back to a text input
+  pre-filled with the serialized RFC 3339 string, which chrono's default
+  `Deserialize` round-trips as-is. `UpdateX` is untouched: it has no `Validate` impl so no
+  `ChangesetForm`/`form_for` round-trip reaches it, and its JSON PATCH bodies
+  are RFC 3339, which already decodes. Required `NaiveDate` columns need no
+  treatment (the browser's `YYYY-MM-DD` is exactly chrono's wire shape).
+  Serde-renamed columns: a model field carrying `#[serde(rename = "...")]`
+  (or covered by a struct-level `#[serde(rename_all = "...")]`, both of which
+  pass through to the emitted model struct's `Serialize` derive) serializes
+  under a key that differs from its Rust identifier, and `form_for`'s
+  pre-fill lookup (`Changeset::field_value`) indexes serialized data — so
+  edit forms for renamed fields rendered blank/unselected values despite the
+  data being present. `FormField` now carries the serde-effective serialized
+  key separately as a new `value_name: Option<String>` field (constructor
+  defaults it to `None` = same as `name`; set via the new
+  `FormField::with_value_name`), which the `#[model]` derive resolves
+  automatically — field-level `rename`/`rename(serialize = ...)` wins over
+  struct-level `rename_all`, mirroring serde, with all eight serde field
+  casings implemented. `form_for` uses `value_name` **only** for the value
+  pre-fill; the rendered input `name`/`id`, error lookup, and
+  `.exclude`/`.override_*` matching keep the Rust identifier, which is what
+  the generated `NewX`/`UpdateX` structs (which do not propagate serde
+  renames) decode by. Hand-written `FormModel` impls over renaming data
+  types should call `.with_value_name(...)` themselves. (`FormField` gains a
+  public field; code constructing it via struct literal instead of
+  `FormField::new` needs the extra field.)
+  `FieldControl` is `#[non_exhaustive]` (new control kinds won't be
+  semver-major); duplicate `.override_field`/`.override_label` calls on the
+  same field now resolve last-wins; `FieldControl::File` renders the same
+  inline-error/ARIA/required skeleton as the other controls; and the
+  multipart render path now flows through the same audited CSRF/
+  method-override code as every other form (`enctype` is threaded, not
+  duplicated).
+
+- **generator:** `autumn generate scaffold`'s `create`/`update` handlers now
+  build a `Changeset` from the submission and re-render the `new`/`edit`
+  form on a rejected submission (issue #1124). A failed submission responds
+  **422** (not the old 400 error page) and re-renders through the shipped,
+  accessible `autumn_web::form::{text_input, number_input, datetime_input,
+  checkbox_input, select_input}` helpers — every submitted field value is
+  preserved and per-field error messages appear inline (`aria-invalid` +
+  `role="alert"`). Success behavior is unchanged: insert/update then
+  redirect. The generator promotes its internal decode struct to a public,
+  validating `{Model}Form` (derives `Serialize`/`validator::Validate`/
+  `Default`, carries any `--validate` rules, and gets a generated
+  `From<&Model>` to seed the edit form). The pre-existing `unique`-field
+  duplicate-value re-render (#1032) now goes through the same changeset
+  renderer instead of its own hand-rolled path. `examples/bookmarks`
+  demonstrates the round-trip.
+
+- **generate:** `decimal` scaffold field type (#1038) — `price:decimal`
+  (default `NUMERIC(12,2)`) or `price:decimal{10,2}` for an explicit
+  precision/scale now generates an exact-precision Postgres `NUMERIC` column,
+  a `rust_decimal::Decimal` `#[model]` field, and a `Numeric`/`Nullable<Numeric>`
+  Diesel schema token, so money-shaped fields no longer have to fall back to
+  `f64` and its binary-float rounding. Both `decimal`/`Decimal` casings are
+  accepted (consistent with `Attachment`/`attachment`), it composes with
+  `Option<…>` and `:unique`, and the generated `new`/`edit` form renders
+  through the changeset-aware `number_input` helper, sized to the column's
+  scale. The `rust_decimal` dependency (with the `db-diesel2-postgres` and
+  `serde` features) is added to the generated app's `Cargo.toml` only when a
+  `decimal` field is present.
+- **views:** `tabs` widget — a no-JavaScript panel switcher for detail and
+  settings views (#1316). `tabs(id, panels)` takes an ordered
+  `&[(id, label, maud::Markup)]` list and renders an `autumn-tabs` root with
+  a `role="tablist"` strip of `role="tab"` anchors (each linking to
+  `#panel-id`) and matching `role="tabpanel"` sections (`aria-labelledby`,
+  `tabindex="0"`). Switching is pure CSS: `input.css` shows the panel whose
+  `id` matches the URL's `:target` fragment, with a `:has()`-based fallback
+  that shows the first panel when nothing is targeted (and an
+  `@supports not selector(:has(a))` rule so browsers without `:has()`
+  degrade to "first panel always shown" instead of a blank widget), so a
+  3-tab detail/settings view needs zero hand-written JS or CSS and under 10
+  lines of Maud. The active-tab highlight also tracks whichever panel is
+  actually `:target`-ed, via position-based `:has()`/`:nth-child()` CSS
+  (covering the first 6 tabs). Tab/panel ids and labels are HTML-escaped by
+  Maud; panel bodies are pre-rendered `Markup` the caller owns, same as
+  `card`'s `body` parameter. Panel ids must be unique across the whole page
+  if more than one `tabs()` widget is rendered; `aria-selected` reflects
+  only the server's default selection, since the server never sees the URL
+  fragment. See `docs/guide/tabs.md` for a full example and these caveats.
+
+- **views:** `modal`/`confirm_action` widgets — an accessible, testable
+  confirm for destructive actions (#1233). `modal(id, title, body, config)`
+  renders a native `<dialog>` (`aria-modal="true"`, `aria-labelledby`, a body
+  slot, and an optional footer slot via `ModalConfig::footer`) with only
+  `autumn-modal*` BEM classes. `confirm_action(id, trigger_label, action,
+  method, csrf_token, config)` composes it with `link_to`/`button_to`'s
+  `button_to_with` (#1138) into a full confirm flow: a trigger button opens
+  the dialog, the cancel button closes it, and the confirm button is a real
+  `button_to_with` submit carrying the correct HTTP method (`_method`
+  override) and CSRF token, so a `TestClient` test can assert the dialog,
+  its title, and the confirm button's action/method/CSRF token — impossible
+  with the native `window.confirm()`/htmx `hx-confirm` it replaces. Opening
+  and closing require zero app-authored JavaScript: triggers use the native
+  `command`/`commandfor` HTML Invoker Commands API, with a `data-modal-open`/
+  `data-modal-close` fallback shipped in `autumn-widgets.js` for browsers
+  that don't support it yet. `showModal()` gives ESC-close, a focus trap,
+  and focus-into/-return-from the dialog for free from the browser in both
+  paths. The confirm button carries a danger semantic class
+  (`autumn-modal__confirm--danger`) by default (`ConfirmActionConfig::
+  danger(false)` to opt out), and `ConfirmActionConfig::light_dismiss`/
+  `level`/`modal_class` pass through to the underlying `ModalConfig` for
+  callers that need them. A `<noscript>` fallback renders the same confirm
+  button directly (unconfirmed, matching a plain HTML form) so the action
+  stays reachable with JavaScript disabled, since the trigger's `command`
+  attribute alone can't open the dialog before JS runs. The admin plugin's
+  detail-view delete button and bulk-action confirm are migrated to
+  `confirm_action`/`modal`, dropping their `hx-confirm`/`window.confirm()`
+  reliance entirely; the bulk-action dialog's Confirm button now closes via
+  the same `data-modal-close` mechanism as its Cancel button, and its
+  triggering form is re-queried rather than stashed on the dialog node.
+  The bulk-action confirm keeps a `window.confirm()` fallback, reached only
+  when `<dialog>.showModal` is unsupported, so a destructive action is
+  never submitted without some confirmation. Purely additive; minor
+  version bump.
+- **mcp:** plugins and repositories can now layer in MCP. Chainable route
+  toggles `Route::mcp()`, `Route::mcp_exclude()`, and `Route::mcp_stream()`
+  mirror the `#[api_doc(mcp)]` / `mcp = false` / `mcp, stream` attribute
+  forms at registration time, so a plugin can offer a fluent
+  `MyPlugin::new().expose_mcp()` switch and let the *host* decide at install
+  time whether the plugin's typed routes become MCP tools — no source
+  attributes needed on handlers the host doesn't own (the flags are inert
+  unless the host enables the `mcp` feature and calls `mount_mcp`). The
+  `#[repository]` macro gains an `mcp` key:
+  `#[repository(Model, api = "/path", mcp)]` exposes all five generated CRUD
+  routes as tools and `mcp = "read"` exposes only list/get, with the usual
+  verb-derived safety annotations (`readOnlyHint` on reads,
+  `destructiveHint` on delete); `mcp` without `api = "/path"` is a compile
+  error. Duplicate `mcp` keys are a compile error rather than silently
+  last-write-wins. To support the generated `DELETE`, routes declaring an
+  empty-body success status (`204 No Content`, `205 Reset Content`) are no
+  longer conflated with schema-less HTML routes: they are MCP-eligible under
+  an explicit opt-in, and an *untagged* read-only `204`/`205` route is now
+  also auto-included under a pre-existing `expose_all_as_mcp()` hatch —
+  hatch users can gain tools on upgrade. The result of a successful call to
+  such a tool is enforced to be empty text, so a route that mislabels its
+  status can't leak a response body to agents.
+  `McpToolInfo` gains public read accessors (`name()`, `description()`,
+  `input_schema()`, `annotations()`, `method()`, `path_template()`,
+  `streams()`) so hosts can introspect derived tools. Routes registered by
+  plugins via `routes()`/`scoped()` were already derived into tools; this is
+  now pinned by tests and documented. Raw `nest()`/`merge()` routers remain
+  MCP-invisible (documented follow-up). See the
+  [MCP guide](docs/guide/mcp.md) §9–§10.
+
+- **cli:** `unique` field-DSL marker and `--unique FIELD` flag for `autumn
+  generate model`/`scaffold`/`migration` (#1032). `email:String:unique`
+  scaffolds a `CREATE UNIQUE INDEX idx_<table>_<field>_unique` in the
+  migration — a distinct name from the plain, non-unique `--index` output, so
+  the two never collide even on the same column — restored on `RemoveXFromY`
+  rollback (same precedent as `references`'/`enum`'s constraint restoration).
+  `--unique FIELD` is the flag-based equivalent, mirroring `--index`'s
+  ergonomics; both converge on the same `Field::unique` bit. A scaffolded
+  unique field also gets a derived `find_by_<field>` repository lookup for
+  free (no `--query` needed), and the generated HTML `create`/`update`
+  handlers catch a duplicate submission — mapped once, in `autumn-web`, from
+  Postgres SQLSTATE `23505` via the new `autumn_web::error::
+  unique_violation_field` — and re-render the form with an inline
+  "already exists" field error and `422`, instead of a generic `500`. The
+  auth generator's hand-rolled `email … UNIQUE` column now goes through the
+  same shared `unique_index_sql` primitive rather than a parallel raw-SQL
+  path. `--dry-run` lists the migration file in the plan and `--help`
+  documents the new token; single-column only (composite `UNIQUE(a, b)`,
+  case-insensitive uniqueness, and the `--api` JSON conflict response are out
+  of scope for this slice). The generated unique index name is disambiguated
+  against Postgres's 63-byte identifier limit and against a coincidentally
+  same-named plain index, including one added by an earlier, separate
+  `generate` invocation (via `src/schema.rs`) — but not against a *plain*
+  index whose own long name Postgres silently truncates to the same stored
+  identifier, since plain index names carry no truncation handling of their
+  own here (a broader, pre-existing gap, not specific to `unique`).
+
+- **model:** many-to-many associations via `#[has_many(Target, through =
+  join_table)]` (#1324). Extends the `belongs_to`/`has_many`/`has_one`
+  associations from #835 with a join-table variant: join columns default to
+  `{source}_id` / `{target}_id` (overridable with `fk = ...` / `target_fk =
+  ...`), and `#[model]` emits the join table's `diesel::table!` itself — no
+  hand-written `schema.rs` entry needed, only a migration creating the join
+  table with a composite primary key on both columns. Participates in the
+  existing `{Model}Preload` builder and `Preloadable` machinery: `preload(&[
+  ...])` issues one batched `INNER JOIN` query per association level (fixed
+  query count regardless of result-set size), and un-preloaded access yields
+  the typed `NotLoaded` state. Nested preload paths work through a join
+  (`Post::preload().tags_with(Tag::preload().posts())`). The generated
+  `#[repository]` gets three mutation helpers per association —
+  `add_{singular}`, `remove_{singular}`, `set_{plural}` (replace-all) — each
+  idempotent (`add`/`set` use `ON CONFLICT DO NOTHING`) and, for `set_*`,
+  wrapped in a single transaction. `examples/reddit-clone` demonstrates a
+  real Post↔Tag many-to-many with preload and mutation usage in
+  `src/routes/posts.rs`. Purely additive extension of the `#[has_many]`
+  syntax; existing `belongs_to`/`has_many`/`has_one` usage is unaffected;
+  minor version bump.
+- **cache:** read-through fills with single-flight cache stampede protection
+  (#1204). `cache::get_or_compute(cache, key, ttl, fill)` computes a missing
+  value once per process for concurrent callers — the first miss becomes the
+  "leader" and runs `fill`; every other concurrent caller for the same key
+  awaits that one fill via a process-global in-flight registry instead of
+  recomputing it. `cache::get_or_compute_with(cache, key, options, fill)`
+  adds opt-in cross-replica protection: `GetOrComputeOptions::
+  distributed_fill_lock(true)` acquires a Redis `SET NX PX` lock (with a Lua
+  compare-and-delete release) so N replicas don't refill the same key N
+  times, and `GetOrComputeOptions::stale_while_revalidate(grace)` serves the
+  last-known value immediately while at most one background refresh runs. A
+  failing fill never poisons the key: the leader gets a typed
+  `CacheFillError::Fill`, waiters get a rendered `CacheFillError::FillFailed`,
+  nothing is written to the cache, and the next caller retries; the
+  distributed lock's TTL bounds the damage from a crashed filler.
+  `cache::jittered_ttl(base, fraction)` de-synchronizes mass expiry of keys
+  written together. New `autumn_cache_read_through_*` and
+  `autumn_cache_fill_lock_*` counters are exposed on both
+  `/actuator/metrics` and `/actuator/prometheus`. Additive: the `Cache` trait
+  gains two default methods (`try_acquire_fill_lock`/`release_fill_lock`,
+  default `Unsupported`/no-op) so existing backends keep working unchanged.
+  See the new [Cache Stampede Protection guide](docs/guide/cache-stampede.md).
+  Hardening from review: SWR freshness checks now correctly distinguish a
+  stale envelope from a completed refresh in the lock-poll path, `ttl: None`
+  combined with `stale_while_revalidate` no longer serves as permanently
+  stale, the lock-poll loop backs off exponentially instead of polling at a
+  fixed cadence, background refreshes are capped at 64 concurrent across all
+  keys, the Redis fill-lock key lives in its own namespace instead of one
+  that could collide with an ordinary cache key, and SWR freshness is now
+  evaluated through the same injectable `ClockSource` used elsewhere in the
+  framework rather than a hard-coded `SystemTime::now()`.
+- **views:** `link_to`/`button_to` view helpers for safe, method-aware links
+  (#1138). `link_to`/`link_to_with` render an HTML-escaped GET `<a>` anchor
+  with optional `class`/`target`/`rel`/extra attributes (e.g. htmx `hx-*`),
+  automatically adding `rel="noopener"` when `target="_blank"` is set.
+  `button_to`/`button_to_with` render a single-button `<form>` for
+  state-changing actions: the CSRF token is a **required** argument, so a
+  `button_to` call cannot compile without one in scope. For any method other
+  than `GET`, the form posts and carries a hidden `_method` override (reusing
+  `form::method_input`) plus the hidden CSRF field; `Method::GET` renders a
+  plain GET form with neither. Both helpers accept extra attributes on an
+  options struct, so `button_to_with("Delete", path, Method::DELETE, token,
+  &ButtonToOptions::new().attrs(&[("hx-delete", path)]))` upgrades to an
+  htmx interaction without hand-rolling the form. The admin plugin's
+  hand-rolled delete button now uses `button_to_with` (honoring a
+  customized `security.csrf.form_field` via `.csrf_field(...)`), gaining a
+  working no-JS fallback (POST + `_method=DELETE` + CSRF) for free. `attrs`
+  entries that collide with a named option (`href`/`class`/`target`/`rel`
+  for `link_to`, `type`/`class` for `button_to`) panic rather than silently
+  emitting duplicate-attribute markup, and `target="_blank"`/`rel="noopener"`
+  handling is ASCII-case-insensitive. Purely additive; minor version bump.
+
+- **jobs:** tracked job handles with progress reporting and a built-in
+  pollable status route (#1373). `job::enqueue_tracked`/`enqueue_tracked_for`
+  (and the generated `{Job}::enqueue_tracked`/`enqueue_tracked_for`
+  companions) return a `TrackedJobHandle` carrying a public, unguessable
+  token distinct from the internal job id. `#[job]` accepts an optional third
+  `JobContext` argument (`async fn(AppState, Args, JobContext)`) so a handler
+  can call `ctx.set_progress(pct, message)`, `ctx.set_result(json)`, and
+  `ctx.set_user_error(message)`; only the final failed attempt (or a panic)
+  settles the tracked record, so progress survives retries. A new
+  `GET /_autumn/jobs/{token}` route (on by default; opt out via
+  `jobs.tracking.route_enabled = false`) returns the status as JSON for API
+  clients or a self-polling htmx fragment (`hx-trigger="every 2s"`) for
+  browsers, dropping the poll trigger once the job reaches a terminal state.
+  Tokens can be bound to a session/user via `TrackedJobOwner`/
+  `TrackedJobOwner::from_session`; a mismatched or unknown token gets an
+  identical 404 (no enumeration/ownership oracle). Records expire after a
+  configurable TTL (`jobs.tracking.ttl_secs`, default 24h) and are persisted
+  by whichever job backend is already configured — in-memory (`local`),
+  Redis (`redis`), or the new `autumn_job_tracking` table (`postgres`, via a
+  bundled framework migration) — so tracked jobs need no separate setup.
+  Purely additive: existing `#[job]` handlers and `enqueue` calls are
+  unaffected; minor version bump.
+
+- **cli:** `references` field type for `autumn generate model`/`scaffold`
+  (#1026). `post:references` (or `references:`, either casing) scaffolds a
+  foreign key: the field name resolves to `post_id`, the referenced table is
+  derived via the existing `naming::pluralize` (`Post` -> `posts`), and the
+  migration emits `post_id BIGINT NOT NULL REFERENCES posts(id)` plus an
+  automatic index (`idx_<table>_post_id`) — no `--index` flag needed. Append
+  `?` for a nullable FK (`post:references?` -> `post_id: Option<i64>`). The
+  generated `#[model]` field is `post_id: i64` (`Int8` in `schema.rs`), and
+  `down.sql` reverses cleanly (`DROP TABLE`, or an implicit column-owned
+  index/constraint drop for the `ALTER TABLE ADD COLUMN` migration shape). An
+  unknown referenced model (no `src/models/<base>.rs` or matching
+  `src/models.rs` entry) still scaffolds, with a warning that the table is
+  assumed to already exist; a referenced model that *is* found but declares a
+  UUID primary key fails fast with a clear error instead of emitting a
+  `BIGINT`-vs-`UUID` foreign key that would break at `autumn migrate` time.
+  `generate migration Add…To…` gets the same warning/error behavior as
+  `generate model`/`scaffold` for consistency. `references` is listed in
+  `SUPPORTED_TYPES` / `--help`, and the generated scaffold smoke test creates
+  a minimal stand-in for the referenced table (skipping self-referential FKs,
+  which target the table already being created) so it stays runnable
+  standalone.
+- **cli:** `enum{a,b,c}` field type for `autumn generate model`/`scaffold`/
+  `migration` (#1030). `status:enum{draft,published,archived}` scaffolds a
+  closed-set column end to end: a generated `PascalCase` Rust enum (`Status`)
+  wired for Diesel `TEXT` storage (manual `ToSql`/`FromSql` over
+  `AsExpression`/`FromSqlRow`) and `serde`; a `CHECK (status IN (...))`
+  constraint in the migration so an out-of-set `INSERT` fails at the database
+  layer (restored on `RemoveXFromY` rollback, matching the `references`
+  field's FK-restoration precedent); a `<select>` form widget matching the
+  admin generator's `--select` output (auto-derived for `generate admin` too,
+  unless an explicit `--select` overrides it); and request-boundary
+  validation that rejects an out-of-set form value with a 400 naming the
+  field rather than a 500 or silent coercion. `--default field=variant` sets
+  both the SQL `DEFAULT` and the enum's `#[default]` variant; an unknown
+  variant errors at generate time, as does a non-identifier or keyword
+  variant (`enum{2fa}`). Nullable (`Option<enum{...}>`) is supported. The
+  generated scaffold smoke test asserts an out-of-set value is rejected at
+  both the database layer (raw `INSERT` fails, zero rows written) and the
+  request boundary (400). Not supported by `generate job` (no model file to
+  declare the type in) or `--query` (no import path for it yet). Quote the
+  token in bash/zsh — an unquoted `enum{a,b}` is brace-expanded by the shell
+  before `autumn` ever sees it; the parser detects this and suggests
+  quoting.
+- **auth:** scoped service tokens whose scopes flow into policy checks (#1158).
+  Mint named, optionally-expiring API tokens carrying a set of flat scopes
+  (e.g. `posts:read`) via `IssueTokenSpec` + `issue_scoped_api_token`; tokens
+  stay hashed at rest. The `ApiTokenStore` trait gains additive,
+  default-implemented `issue_scoped` / `verify_scoped` / `list` / `rotate`
+  methods (existing impls keep compiling), and the built-in `InMemoryApiTokenStore`
+  / `DbApiTokenStore` record `last_used_at` and reject expired tokens (401).
+  `PolicyContext` gains `has_scope` / `has_any_scope` / `has_all_scopes`
+  mirroring the role accessors, populated from the authenticating token via the
+  new `ApiTokenScopes` request extension and `authorize_with_scopes` /
+  `PolicyContext::from_request_parts`. `#[secured(scopes = ["posts:write"])]`
+  gates a handler on token scopes (default-deny, `403` when missing) and works
+  for pure service principals with no session; `#[secured("admin", scopes = […])]`
+  requires both. Management surface: helper API, `autumn token`
+  (`issue --name/--scope/--expires-at`, `list`, `rotate`), and an
+  `autumn-admin-plugin` `TokenAdminModel` panel. Additive `api_tokens` columns
+  (`name`, `scopes` JSONB, `expires_at`, `last_used_at`) via a new framework
+  migration; minor version bump, no breaking change to `autumn-web`.
 - **cli:** `autumn generate tauri` — scaffolds a complete `src-tauri/` sidecar
   project so any existing autumn app ships as a native desktop installer with a
   single additional command (`cargo tauri build`). Uses the Tauri v2 sidecar
@@ -32,11 +955,244 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   plus curated real-world combos (`db`, `mail`, `maud,htmx`, `storage,db`,
   `telemetry-otlp`) — so downstream apps building with a trimmed feature set
   can't silently break between releases (#982).
+- **ui:** Framework-owned widget stylesheet (issue #1215) — every semantic
+  `autumn-*` class emitted by form fields, the submit button, active
+  search/autocomplete, the nav bar, breadcrumbs, hero banners, modals, tabs,
+  pagination, property lists, direct-to-storage upload, and job status is now
+  backed by one shipped, token-themeable stylesheet (`autumn_web::ui::WIDGETS_CSS`,
+  served at `autumn_web::ui::WIDGETS_CSS_PATH`) instead of a ~264-line block
+  copy-pasted into every app's `input.css`. Plain CSS (no Tailwind build
+  required), embeddable in single-binary release builds (#1004), and
+  re-themed by overriding the existing `ui::tokens` design tokens rather than
+  forking the component CSS. The `autumn new` template and every example's
+  `input.css` no longer inline the widget CSS; a coverage test
+  (`widget_css_coverage`) fails the build if a widget ever emits an `autumn-*`
+  class with no backing rule. Additive API surface. **Visual change:** the
+  previous per-app copy hardcoded an indigo accent (`#4f46e5`) independent of
+  `ui::tokens`; the shipped stylesheet instead references `var(--primary)`,
+  so widgets now pick up the framework's existing brand token (violet,
+  `#7c3aed`) by default. Apps that want the old accent back can set
+  `--primary: #4f46e5;` (and friends) on `:root` in their own stylesheet,
+  loaded after the widget one. See [Widget styling](docs/guide/widget-styling.md).
+  The framework CSS routes (`autumn_web::flash::FLASH_CSS_PATH`,
+  `autumn_web::ui::WIDGETS_CSS_PATH`) also serve pre-compressed gzip/brotli
+  bodies (computed once per process, not per request) when the client's
+  `Accept-Encoding` accepts them, instead of relying solely on the
+  general-purpose compression middleware to redo that work on every request.
+
+### Fixed
+
+- **observability:** `Server-Timing` no longer miscounts pooled-connection reuse
+  in the `db` metric. Connections are pooled and diesel-async's deadpool manager
+  never resets a connection's instrumentation on recycle, so a connection that
+  served a prior measured request kept its stale `RequestQueryTimer` installed.
+  On the next checkout the housekeeping `SET statement_timeout` ran while that
+  stale timer was active — adding a bogus `+1 query` (and its latency) to the
+  next request before any application SQL — and a reused connection kept paying
+  per-query `DebugQuery` formatting even on later opted-out requests. `Db::checkout`
+  now installs a fresh timer on every measured checkout (before the `SET`), the
+  timer's `on_start` probes the request scope before formatting or recording
+  anything (a cheap no-op for any stale timer left on a reused connection), and
+  the checkout `SET statement_timeout` is classified as an uncounted
+  housekeeping statement alongside transaction-control SQL (issue #1348).
+- **observability:** `Server-Timing` no longer clobbers an application's own
+  Diesel instrumentation. `Db::checkout` installs its `RequestQueryTimer` via
+  diesel-async's `set_instrumentation`, which *wholesale replaces* a
+  connection's instrumentation — so an unconditional install would overwrite
+  any global hook an app registered with
+  `diesel::connection::set_default_instrumentation` (query logging, tracing,
+  metrics) on the first checkout and never restore it, silently disabling it
+  even when `[observability] server_timing` is off. `Db::checkout` now installs
+  the timer only when a `Server-Timing` request scope is active
+  (`request_db_timing_active`), so an opted-out app keeps its own
+  instrumentation intact. Composing autumn's timer with an app-provided default
+  instrumentation is a documented limitation while `server_timing` is enabled —
+  see `docs/guide/observability/server-timing.md` (issue #1348).
+- **observability:** `Server-Timing` no longer installs the per-request DB
+  query timer on checked-out connections when `[observability] server_timing`
+  is disabled (the production default). Previously every checked-out connection
+  received the instrumentation unconditionally, so each query paid a full
+  `DebugQuery` SQL formatting/allocation on its `StartQuery` event before the
+  no-op accumulator write discovered no request scope was active. `Db::checkout`
+  now probes the request-scoped task-local (`request_db_timing_active`) and
+  installs the timer only when the `Server-Timing` layer has scoped the request,
+  so opted-out requests carry zero per-query instrumentation overhead. When
+  enabled, behaviour (`db;dur`/query count) is unchanged (issue #1348).
+- **generator:** the generated `README.md` now orders the `libpq` prerequisite
+  before the `cargo install diesel_cli --features postgres` command, since that
+  command's `postgres` feature (and the base `cargo build`, which links the `db`
+  feature) needs the PostgreSQL client library. The DB-free `--daemon` README no
+  longer advertises `autumn generate scaffold` or the `migrations/` layout row:
+  that generator emits Diesel models/repositories/migrations requiring the `db`
+  feature the daemon scaffold disables, so following it would leave the app
+  non-compiling. `--bundled-pg` keeps the `db` feature and retains
+  `generate scaffold` (issue #1052).
+- **generator:** the `--daemon` and `--bundled-pg` READMEs now document
+  `autumn dev` as the browser-reachable local run (it binds TCP on
+  `127.0.0.1:3000`), matching the default README. The background daemon start
+  (`autumn serve --daemon` / `autumn serve --bundled-pg`) is reframed as the
+  production mode that binds a private Unix domain socket — not reachable at
+  `http://localhost:3000` — with a pointer to `autumn serve status` for the
+  socket address and `docs/guide/daemon.md` for details, so following the README
+  no longer leaves the route unreachable in a browser (issue #1052).
+- **views:** vendored the full Idiomorph 0.3.0 morphing script (replacing a
+  minimal stub) so live `hx-ext="morph"` updates actually DOM-morph, and
+  patched its htmx extension so non-morph out-of-band swaps (e.g.
+  `beforeend`/`delete`) no longer throw a caught console error. Served the
+  idiomorph script with a revalidating cache policy (a weak content-derived
+  `ETag` plus `Cache-Control: public, max-age=0, must-revalidate`) instead of a
+  year-long `immutable` cache, so clients that had cached the old stub pick up
+  the real script on their next revalidation rather than running stale code for
+  up to a year. (The idiomorph URL is not content-fingerprinted; adding
+  fingerprinted asset URLs so it can safely go back to `immutable` caching is a
+  possible future follow-up.)
+- **actuator:** `PUT /actuator/loggers/{name}` no longer reports a false
+  `{"status":"ok","applied":true}` for a change that did not actually reach the
+  live subscriber (issue #1044). Logger names are now validated up front like
+  levels — a name carrying an `EnvFilter` metacharacter (`=`, `,`, whitespace,
+  …) is rejected with `400` instead of being stored as a bogus override — and
+  the response is driven by the real apply outcome: if the directive fails to
+  apply the override is rolled back so `GET /actuator/loggers` never advertises
+  a level that isn't live. The directive is now applied while the state lock is
+  held so concurrent updates apply in the same order they mutate the map,
+  keeping `GET /actuator/loggers` consistent with live emission under
+  concurrency (AC4).
+- **cli:** the generated `build.rs` git-provenance rerun triggers are more
+  reliable (issue #1242): it now also watches `.git/logs/HEAD` (which moves on
+  every commit, `--amend`, and `reset --soft`, so the baked SHA/`dirty` flag no
+  longer goes stale after an amend), resolves the real gitdir when `.git` is a
+  *file* (git worktrees / submodules) instead of assuming the `.git/` directory
+  layout, and honors `SOURCE_DATE_EPOCH` for a deterministic build timestamp on
+  reproducible builds. Non-git builds still degrade gracefully (fields `null`,
+  build never fails).
+
+### Changed
+
+- **generator:** scaffolded `create`/`update`/`destroy` handlers now redirect
+  with `autumn_web::Redirect::to(...)` — a real **303 See Other** with a
+  `Location` header — instead of the hand-rolled 200 meta-refresh HTML page,
+  matching the `Redirect` primitive `docs/guide/path-helpers.md` already
+  recommends (and which the new #1127 write-path test asserts). `create` and
+  `destroy` redirect to the index route; `update` redirects to the show route.
+- **security:** `TenancyConfig::jwt_secret` is now stored as a
+  `secrecy::SecretString` instead of a plain `String`, so the JWT signing
+  secret is redacted from `Debug` output (and any logs that format the
+  config) and zeroized on drop. Config-file deserialization is unchanged —
+  a plain TOML string still works. Breaking for code that read or set the
+  field directly: set it with `Some(value.into())` and read it via
+  `secrecy::ExposeSecret::expose_secret()` (supersedes #1304). [no-plugin]
+- **deps(security):** dependency-vulnerability upgrades (supersedes PR #1557;
+  `diesel-async` was already handled separately). `aws-sdk-s3` floored at
+  1.122 (1.119.0 → 1.122.0, the last MSRV-1.88 release) with
+  `default-features = false` to drop the deprecated legacy hyper 0.14 /
+  rustls 0.21 connector stack — this removes `rustls-webpki` 0.101.7
+  (RUSTSEC-2026-0104 / GHSA-82j2-j2ch-gfr8 high, RUSTSEC-2026-0098 /
+  GHSA-965h-392x-2mh5 and RUSTSEC-2026-0099 / GHSA-xgp8-3hg3-c2mh low),
+  `rustls` 0.21.12, `hyper` 0.14.32, and `h2` 0.3.27 from `Cargo.lock`
+  entirely (the modern hyper 1.x / rustls 0.23 `default-https-client` stack,
+  which is what the SDK actually uses at runtime, stays enabled); transitive
+  `lru` 0.12.5 → 0.16.4 (RUSTSEC-2026-0002 / GHSA-rhfx-m35p-ff5j);
+  `opentelemetry_sdk` 0.31.0 → 0.32.1 (CVE-2026-48504 / GHSA-w9wp-h8wv-79jx,
+  unbounded memory allocation in W3C Baggage propagation) together with the
+  matching `opentelemetry` / `opentelemetry-otlp` 0.32.0 and
+  `tracing-opentelemetry` 0.33.0 (with the `tls-aws-lc`, `tls-roots`, and
+  `reqwest-rustls` features enabled on `opentelemetry-otlp`, since 0.32
+  rejects `https://` gRPC collector endpoints at exporter build time unless
+  a TLS provider feature is on, the provider alone ships an empty trust-root
+  store — `tls-roots` loads the platform's native roots, which the gRPC
+  exporter now enables explicitly via `with_enabled_roots()` for `https`
+  endpoints — and its new reqwest 0.13 HTTP client ships without TLS under
+  `reqwest-client` alone — reqwest 0.12 feature unification no longer
+  covers it).
+  `rsa` 0.9.10 (RUSTSEC-2023-0071, Marvin
+  attack) remains: no fixed release exists on its 0.9.x line. [no-plugin]
+- **deps:** bumped `diesel-async` from 0.8 to 0.9 (resolving 0.9.2, with
+  `diesel` at 2.3.10) and `libsqlite3-sys` from 0.36 to 0.37 — 0.37 is the
+  newest release line diesel 2.3 accepts (`<0.38`). diesel-async 0.9 changed
+  `AsyncConnection::transaction` to take `AsyncFnOnce` closures instead of
+  `ScopedBoxFuture` callbacks; internal call sites and macro-generated code
+  were ported via a new semver-exempt `scoped_transaction` adapter, so the
+  public `Db::tx` / `Db::tx_with` / `savepoint` closure API (including
+  `.scope_boxed()` usage in app code) is unchanged. The CLI generators now
+  pin `diesel-async = "0.9"` in generated/starter `Cargo.toml`s and the
+  auth generator emits `async move |conn|` transaction closures instead of
+  `ScopedBoxFuture`-style `Box::pin` callbacks. [no-plugin]
+- **workspace:** `Cargo.lock` is now committed to the repository (it was
+  previously gitignored) so builds are reproducible and dependency updates
+  are reviewable.
+
+### Fixed
+
+- **security:** CSRF and CAPTCHA exempt-path matching now normalizes the
+  request path (resolving `.`/`..` dot-segments — including percent-encoded
+  `%2e` forms — treating percent-encoded slashes (`%2f`) as segment
+  separators, and collapsing duplicate slashes) before comparing it against
+  exemption prefixes, so a request like `POST /api/../submit` or
+  `POST /api/%2e%2e%2fsubmit` can no longer satisfy an `/api/` exemption
+  while targeting a protected route through a downstream component that
+  percent-decodes or resolves dot-segments (supersedes #1229).
+- **mail:** the SMTP password can no longer leak into startup error messages.
+  When `mail.smtp.password_env` names an environment variable whose contents
+  are not valid unicode, the raw `std::env::VarError::NotUnicode` value (which
+  carries the password itself) was formatted into the
+  `MailError::InvalidMessage` text; the error now reports a static reason
+  ("environment variable is not set" / "contains non-unicode data") alongside
+  the variable *name* only, never its value. Supersedes PR #887.
+- **circuit_breaker:** the breaker and its registry now recover from a
+  poisoned mutex (`lock().unwrap_or_else(PoisonError::into_inner)`) instead
+  of panicking on every subsequent call once a single lock holder has
+  panicked; breaker state is a self-correcting sliding window, so the
+  recovered data is safe to keep using. Supersedes #1207. [no-plugin]
+- **docs:** repaired the broken intra-doc links in the `reporting` module
+  overview (`ErrorEvent`, `ErrorReporter`, `LogReporter`, `ReportingLayer`
+  rendered as dead links on docs.rs because shorthand references don't resolve
+  when a module carries both outer and inner doc comments — they now use
+  explicit `crate::reporting::…` paths) and dropped a redundant explicit link
+  target in the `job_tracking` module docs. Supersedes the salvageable parts
+  of PR #1555.
+- **jobs:** fixed a first-initialization race in the process-global job
+  client (supersedes #1491): `init_global_job_client` /
+  `clear_global_job_client` used a get-then-set pattern on the backing
+  `OnceLock`, so two threads racing the very first install/clear could have
+  one side's `OnceLock::set` lose and be silently dropped — leaving a job
+  runtime that had just installed its client invisible to `global_job_client()`
+  (free-function `enqueue` and `#[job]` handlers would see no runtime). Both
+  functions now use `OnceLock::get_or_init` so the slot is created exactly
+  once and every install/clear lands through the `RwLock`. Both functions now
+  also recover from a poisoned lock (`PoisonError::into_inner`) instead of
+  silently skipping the write, and a loom model-check
+  (`chaos_job_client_loom`) exercises the first-init race across all
+  interleavings.
+
+## [0.6.0] - 2026-06-30
+
+### Added
+
+- **ui:** reusable `card` and `stat_card` Maud widget helpers in
+  `autumn_web::widgets`, re-exported from the prelude. `card()` renders a
+  titled content panel with an optional header-action slot, footer, and
+  configurable heading level (`HeadingLevel::H1`–`H6`, default `H2`);
+  `stat_card()` renders a metric tile with label, value, and optional link.
+  Both are CSP-safe and HTML-escape caller-supplied text via Maud.
+  `CardConfig` uses a builder pattern with `const fn` and private fields
+  so the `title()` / `title_html()` escape path cannot be bypassed.
+  The admin plugin's 12 hand-rolled card blocks and dashboard stat tiles are
+  migrated to the new helpers, removing the duplication (#1122).
 
 ## [0.5.0] - 2026-06-16
 
 ### Added
 
+- **ci:** plugin freshness gate (`scripts/check-plugin-freshness.sh` +
+  `.github/workflows/plugin-freshness.yml`) — a PR that adds entries to this
+  changelog's Unreleased `Added`/`Changed` sections without touching the
+  Claude plugin (`skills/`, `agents/`, `.claude-plugin/`) fails a fast,
+  toolchain-free check; exempt individual bullets with a bracketed
+  `no-plugin` marker, or the whole PR via the same marker in the PR body or
+  the `plugin-exempt` label. The same job sanity-checks that
+  `plugin.json` parses and that every `docs/guide/*.md` path referenced from
+  the plugin exists. Run `scripts/check-plugin-freshness.sh --self-test`
+  locally.
 
 - **daemon:** `autumn serve` — run an app as a production (non-watch) local
   daemon, with an optional managed local Postgres (#1119)
@@ -155,6 +1311,122 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     unsharded control role — enforced at config validation. New
     `examples/bookmarks-sharded` Docker Compose stack and
     `docs/guide/sharding.md`.
+
+- **generate:** `autumn generate tauri-mobile` — Tauri v2 **mobile** scaffold
+  (iOS/Android) that runs the Autumn Axum server **in-process** on a
+  background thread against a remote Postgres database (issue #1507,
+  Option B). Mobile sandboxes forbid sidecar processes, so the shell crate
+  builds as staticlib/cdylib, links the app crate directly, spawns the server
+  from `tauri::Builder::default().setup(...)`, health-polls `/health`, and
+  opens the webview at `http://127.0.0.1:<port>`; a small pool
+  (`AUTUMN_DATABASE__POOL_SIZE=2`) is pinned for flaky mobile networks (and
+  `AUTUMN_DATABASE__CONNECT_TIMEOUT_SECS=5`, matching the framework default,
+  is pinned explicitly). The generator also extracts the stock
+  `src/main.rs` into `src/lib.rs::serve()` (anchored; skipped with a warning
+  when customised). Docs: mobile sandboxing restrictions, flaky-network pool
+  behavior, the loopback security model, and App Store / Google Play
+  guideline compliance in
+  [docs/guide/tauri-mobile-in-process.md](docs/guide/tauri-mobile-in-process.md).
+  [no-plugin]
+
+- **db:** TLS to Postgres. The connection pool now honors `sslmode` in the
+  database URL via a rustls-backed connector: `sslmode=require` encrypts the
+  connection (libpq parity — no certificate-identity check, so self-signed
+  and private-CA servers work), and `sslmode=verify-full` additionally
+  verifies the certificate chain and hostname against the Mozilla root store
+  (plus an `sslrootcert=<PEM file>` when given). URLs without `sslmode` (or
+  with `disable`/`prefer`) keep the previous plaintext behavior unchanged.
+  Previously the pool hardcoded `NoTls`, so `sslmode=require` failed every
+  connection with "no TLS implementation configured" and cleartext was the
+  only working configuration (issue #1507). [no-plugin]
+
+- **offline-sync (new feature):** offline-first local storage plus a sync
+  engine for occasionally-connected apps such as the in-process Tauri mobile
+  shell (issue #1508). `autumn_web::sync` ships a local SQLite `SyncStore`
+  (JSON rows per collection, write-through change journal in the same
+  transaction, tombstoned deletes), a client `SyncEngine` (push pending →
+  pull versions past the cursor; at-least-once with server-side dedup,
+  exponential-backoff background task, transparent full resync that
+  preserves and replays pending changes), and a mountable server router
+  (`POST /sync/push` + `GET /sync/pull` via `AppBuilder::nest`) over
+  Postgres shadow tables with idempotent DDL (`PgSyncBackend`) or an
+  in-memory backend for tests. Conflicts are settled server-side by a
+  pluggable `ConflictResolver` (default: last-write-wins on the conflicting
+  writes' `updated_at`; exact ties break to the lexicographically greater
+  device id); resolved rows get a new version so every device converges.
+  Postgres pushes serialize under an advisory lock (in-order version
+  visibility for pulls; concurrent first-inserts of one pk engage the
+  resolver), pull sessions carry a session-start cursor so multi-page
+  catch-ups survive tombstone GC, completed catch-ups land the cursor at
+  the GC horizon and prune GC'd local tombstones, `already_applied` acks
+  return the originally assigned version, push/pull request sizes are
+  bounded server-side, dedup records are GC-able via
+  `SyncBackend::gc_applied`, and `SyncConfig::bearer_token` authenticates
+  the engine against an auth-guarded `/sync` mount. Zero new
+  dependencies — builds on the `db` and `http-client` features already in
+  the graph. [no-plugin]
+- **generator:** `autumn generate tauri-mobile --offline-sync` (issue #1508)
+  wires the offline-sync engine into the mobile scaffold: the shell opens a
+  `SyncStore`-backed SQLite database in the app sandbox (exported as
+  `AUTUMN_SYNC__DB_PATH`), runs a background `SyncEngine` against
+  `AUTUMN_SYNC__REMOTE_URL` (30 s interval, exponential backoff while
+  offline, plus an immediate pass on `RunEvent::Resumed` when the app
+  returns to the foreground), and the app crate gains a default
+  `offline-sync` feature and a `/sync` router mounted in the extracted
+  `serve()` — only when the app's resolved config has a database URL (e.g.
+  `AUTUMN_DATABASE__URL`), and with log-and-continue schema DDL, so the
+  same binary boots fully offline on a device (no database at all) and
+  serves sync on the server. Without the flag the emitted scaffold is
+  byte-identical to before (pinned by a golden snapshot test). Docs:
+  architecture, change tracking, tombstoning/GC, conflict resolution, and
+  an airplane-mode walkthrough in
+  [docs/guide/tauri-mobile-offline-sync.md](docs/guide/tauri-mobile-offline-sync.md).
+  [no-plugin]
+
+### Documentation
+
+- **plugin:** refresh the Claude plugin to current framework state. Adds
+  prominent `#[state_machine]` coverage (attribute syntax, generated
+  `can_transition_{field}_to` / `transition_{field}_to`, guards, and a
+  `before_update` example replacing hand-rolled status validation), a
+  "Prefer framework idioms over raw Diesel/Axum" steering table, the
+  generated-repository method surface (pagination, bulk ops, read routing,
+  hooks), `Db::tx_with`/`TxOptions`, jobs additions (uniqueness/concurrency,
+  named queues, tracked jobs), events/listeners, cache stampede protection,
+  view widgets + `WIDGETS_CSS`, sharding, `autumn serve`, `autumn destroy`,
+  the `references`/`enum{...}`/`decimal`/`:unique` generator DSL, scoped
+  tokens, observability defaults, and load shedding. Features merged on
+  trunk-dev but absent from the published 0.5.0 crates are explicitly marked
+  "(unreleased)". Follow-up: once #1587 (`form_for`) and #1592
+  (`find_in_batches`) merged, their in-flight/do-not-use flags were replaced
+  with real coverage — `form_for`/`FormModel`/`FieldControl` (builder methods,
+  derived control mapping, checkbox/datetime/serde-rename decode contracts,
+  scaffold `{snake}_form_for` emission) and
+  `find_in_batches`/`find_each`/`autumn_web::batches` (keyset semantics,
+  retryable errors, scoping/routing inheritance, sharding limits) — each
+  marked "(unreleased)". Fixes stale claims (foreign keys/unique "not in the DSL", the
+  removed `--test repo_hygiene` target) and documents that published 0.5.0
+  repositories have no pool constructor (`with_pool_untracked` is
+  trunk-dev-only).
+
+## [0.6.0] - 2026-06-30
+
+### Added
+
+- **ui:** reusable `card` and `stat_card` Maud widget helpers in
+  `autumn_web::widgets`, re-exported from the prelude. `card()` renders a
+  titled content panel with an optional header-action slot, footer, and
+  configurable heading level (`HeadingLevel::H1`–`H6`, default `H2`);
+  `stat_card()` renders a metric tile with label, value, and optional link.
+  Both are CSP-safe and HTML-escape caller-supplied text via Maud.
+  `CardConfig` uses a builder pattern with `const fn` and private fields
+  so the `title()` / `title_html()` escape path cannot be bypassed.
+  The admin plugin's 12 hand-rolled card blocks and dashboard stat tiles are
+  migrated to the new helpers, removing the duplication (#1122).
+
+## [0.5.0] - 2026-06-16
+
+### Added
 
 - **auth:** Active session management with device list and revocation in the auth starter (#819)
   - `autumn generate auth` now persists a `{user}_sessions` row per login

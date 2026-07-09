@@ -1,0 +1,36 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Reddit Clone",
+  "version": "0.5.0",
+  "identifier": "com.example.reddit-clone",
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.png",
+      "icons/icon.ico",
+      "icons/icon.icns"
+    ],
+    "externalBin": [
+      "binaries/reddit-clone"
+    ],
+    "resources": {
+      "../autumn.toml": "autumn.toml",
+      "configs/autumn-prod.toml": "autumn-prod.toml",
+      "configs/autumn-production.toml": "autumn-production.toml",
+      "configs/autumn-dev.toml": "autumn-dev.toml",
+      "configs/autumn-development.toml": "autumn-development.toml",
+      "configs/autumn-staging.toml": "autumn-staging.toml",
+      "configs/autumn-test.toml": "autumn-test.toml",
+      "configs/credentials": "config/credentials"
+    }
+  },
+  "app": {
+    "security": {
+      "csp": null
+    }
+  }
+}

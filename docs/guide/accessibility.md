@@ -27,8 +27,9 @@ Import the helpers you need:
 
 ```rust
 use autumn_web::form::{
-    text_input, password_input, textarea_input,
-    required_text_input, aria_live_region, skip_link,
+    text_input, password_input, textarea_input, required_text_input,
+    checkbox_input, number_input, date_input, datetime_input, select_input,
+    aria_live_region, skip_link,
 };
 ```
 
@@ -85,6 +86,92 @@ Renders a labelled `<textarea>` with the same error-linking pattern.
 ```rust
 html! {
     (textarea_input(&changeset, "body", "Post body"))
+}
+```
+
+### `checkbox_input`
+
+Renders a labelled `<input type="checkbox">` for a `bool` field. Unchecked
+checkboxes are omitted from submitted form data by the browser, so the
+target field must be marked with `#[serde(default)]` to decode as `false`
+when absent (rather than pairing it with a hidden input sibling, which
+would cause duplicate-key errors on checked submissions).
+
+```rust
+html! {
+    (checkbox_input(&changeset, "published", "Published"))
+}
+```
+
+### `number_input`
+
+Renders a labelled `<input type="number">` for `i32`/`i64`/`f32`/`f64`
+fields. Pass `step` to control the HTML `step` attribute — `Some("1")` for
+integers, `Some("0.01")` or `Some("any")` for floats, `None` for the browser
+default.
+
+```rust
+html! {
+    (number_input(&changeset, "quantity", "Quantity", Some("1")))
+    (number_input(&changeset, "price", "Price", Some("0.01")))
+}
+```
+
+### `date_input` / `datetime_input`
+
+Render `<input type="date">` and `<input type="datetime-local">`
+respectively. The current value is normalized to the shape each control
+requires (`YYYY-MM-DD` / `YYYY-MM-DDTHH:MM[:SS[.f]]`, preserving
+seconds/fractional seconds when present), regardless of whether the
+underlying field serializes as a bare date or a full RFC 3339 timestamp.
+
+```rust
+html! {
+    (date_input(&changeset, "birthday", "Birthday"))
+    (datetime_input(&changeset, "starts_at", "Starts at"))
+}
+```
+
+`<input type="datetime-local">` has no timezone concept, so a
+`chrono::DateTime<Utc>` field's rendered value never carries an offset —
+chrono's default `Deserialize` for `DateTime<Utc>` requires one and rejects
+the submission. Attach `deserialize_datetime_local_utc` (or
+`deserialize_datetime_local_utc_option` for `Option<DateTime<Utc>>`):
+
+```rust
+#[derive(serde::Deserialize)]
+struct EventForm {
+    #[serde(deserialize_with = "autumn_web::form::deserialize_datetime_local_utc")]
+    starts_at: chrono::DateTime<chrono::Utc>,
+}
+```
+
+`chrono::NaiveDateTime` fields don't hit that offset problem, but a value
+the user actively edits through the browser's native picker isn't
+guaranteed to include seconds (unlike the always-seconds-inclusive
+pre-filled value), which chrono's default `Deserialize` also rejects.
+Attach `deserialize_naive_datetime_local` (or
+`deserialize_naive_datetime_local_option` for `Option<NaiveDateTime>`) as a
+defensive measure:
+
+```rust
+#[derive(serde::Deserialize)]
+struct EventForm {
+    #[serde(deserialize_with = "autumn_web::form::deserialize_naive_datetime_local")]
+    starts_at: chrono::NaiveDateTime,
+}
+```
+
+### `select_input`
+
+Renders a labelled `<select>` from `(value, label)` option pairs, marking the
+option matching the changeset's current value as `selected`. This is the
+control closed-set fields (enums, references) target.
+
+```rust
+let statuses = [("draft", "Draft"), ("published", "Published")];
+html! {
+    (select_input(&changeset, "status", "Status", &statuses))
 }
 ```
 

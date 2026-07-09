@@ -571,7 +571,24 @@ fn start_server(
     show_config: bool,
 ) -> Option<Child> {
     eprintln!("  Starting server...\n");
+
+    // Resolve `.env` fresh right before each spawn so a hot-reload restart
+    // picks up an edited `.env`. Values are injected explicitly into the child
+    // process (rather than mutating this process's environment); the child also
+    // self-loads via the config overlay, so this is belt-and-suspenders and
+    // makes a bare `DATABASE_URL` visible to the child. A malformed `.env`
+    // fails loudly. Applied BEFORE the explicit `.env(...)` calls below so those
+    // win on any key overlap.
+    let dotenv_vars = match autumn_web::dotenv::resolve_process_dotenv() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("  \u{274C} .env: {e}");
+            std::process::exit(1);
+        }
+    };
+
     let mut command = Command::new(binary);
+    command.envs(dotenv_vars);
     // Inherit stdio so tracing output (including --show-config) is visible.
     // Previously used Stdio::null(), but server logs are valuable during dev.
     command.stdout(Stdio::inherit()).stderr(Stdio::inherit());
@@ -636,7 +653,20 @@ fn classify_change(
     kind: DebouncedEventKind,
     custom_watch_dirs: &[CustomWatchDir],
 ) -> ChangeEffect {
-    if !matches!(kind, DebouncedEventKind::Any) || should_ignore_path(path) {
+    if !matches!(kind, DebouncedEventKind::Any) {
+        return ChangeEffect::Ignore;
+    }
+
+    // A root-level dotenv file the config loader reads (`.env`, `.env.local`,
+    // `.env.<profile>`, `.env.<profile>.local`) must restart the server so an
+    // edited `.env` takes effect — even though `should_ignore_path` would
+    // otherwise discard it as a dotfile. Checked before that ignore so the
+    // dotenv exception wins, while all other dotfiles stay ignored.
+    if is_watched_dotenv_file(path) {
+        return ChangeEffect::RestartOnly;
+    }
+
+    if should_ignore_path(path) {
         return ChangeEffect::Ignore;
     }
 
@@ -698,6 +728,61 @@ fn classify_change(
     }
 
     ChangeEffect::Ignore
+}
+
+/// Editor/tooling temp or backup suffixes (the final `.`-segment) that must not
+/// trigger a restart even when they decorate a dotenv filename — e.g. a vim swap
+/// file `.env.swp` or a backup `.env.tmp`. `.env.example` is a committed
+/// template the loader never reads, so it is excluded too.
+const DOTENV_NON_LOADED_SUFFIXES: &[&str] =
+    &["swp", "swo", "swx", "swpx", "tmp", "bak", "orig", "example"];
+
+/// Whether `name` is a dotenv file the config loader actually reads: `.env`,
+/// `.env.local`, `.env.<profile>`, or `.env.<profile>.local`.
+///
+/// Editor/backup decorations (`.env.swp`, `.env~`, `.env.tmp`, …) are rejected
+/// so a save-in-progress swap file does not cause a spurious restart.
+fn is_dotenv_loader_filename(name: &str) -> bool {
+    if name == ".env" {
+        return true;
+    }
+    // Must be `.env.<something>`; a bare `.env~`/`.env.swp`-style backup that
+    // lacks the `.env.` prefix is rejected here, and a trailing `~` backup
+    // (e.g. `.env.local~`) is rejected explicitly.
+    let Some(rest) = name.strip_prefix(".env.") else {
+        return false;
+    };
+    if rest.is_empty() || name.ends_with('~') {
+        return false;
+    }
+    let last_segment = rest.rsplit('.').next().unwrap_or(rest);
+    !DOTENV_NON_LOADED_SUFFIXES.contains(&last_segment)
+}
+
+/// Whether `path` is a project-root dotenv file the loader reads (see
+/// [`is_dotenv_loader_filename`]).
+///
+/// Scoped to root-level files: any dotenv-named file living under a dotted
+/// directory (e.g. `.git/.env`) or `target/` is rejected, mirroring
+/// [`should_ignore_path`] so only the genuine project-root `.env*` files are
+/// un-ignored.
+fn is_watched_dotenv_file(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    if !is_dotenv_loader_filename(name) {
+        return false;
+    }
+    path.parent().is_none_or(|parent| {
+        parent.components().all(|component| {
+            if let std::path::Component::Normal(part) = component {
+                let part = part.to_string_lossy();
+                part != "target" && !part.starts_with('.')
+            } else {
+                true
+            }
+        })
+    })
 }
 
 fn should_ignore_path(path: &Path) -> bool {
@@ -1088,6 +1173,70 @@ mod tests {
             classify_change(Path::new("autumn-dev.toml"), DebouncedEventKind::Any, &[]),
             ChangeEffect::RestartOnly
         );
+    }
+
+    #[test]
+    fn dotenv_change_requires_restart_only() {
+        for name in [".env", ".env.local", ".env.dev", ".env.production.local"] {
+            assert_eq!(
+                classify_change(Path::new(name), DebouncedEventKind::Any, &[]),
+                ChangeEffect::RestartOnly,
+                "{name} should restart the dev server",
+            );
+        }
+    }
+
+    #[test]
+    fn dotenv_editor_temp_files_are_ignored() {
+        // Editor swap/backup files must not trigger spurious restarts.
+        for name in [
+            ".env.swp",
+            ".env.swo",
+            ".env~",
+            ".env.local~",
+            ".env.tmp",
+            ".env.bak",
+        ] {
+            assert_eq!(
+                classify_change(Path::new(name), DebouncedEventKind::Any, &[]),
+                ChangeEffect::Ignore,
+                "{name} should not restart the dev server",
+            );
+        }
+    }
+
+    #[test]
+    fn dotenv_change_ignored_for_non_any_event() {
+        // A dotenv edit still only restarts on a settled `Any` event.
+        assert_eq!(
+            classify_change(Path::new(".env"), DebouncedEventKind::AnyContinuous, &[]),
+            ChangeEffect::Ignore
+        );
+    }
+
+    #[test]
+    fn nested_dotenv_under_hidden_dir_is_ignored() {
+        // Only root-level dotenv files are un-ignored; `.git/.env` stays ignored.
+        assert_eq!(
+            classify_change(Path::new(".git/.env"), DebouncedEventKind::Any, &[]),
+            ChangeEffect::Ignore
+        );
+    }
+
+    #[test]
+    fn is_watched_dotenv_file_classifies_variants() {
+        assert!(is_watched_dotenv_file(Path::new(".env")));
+        assert!(is_watched_dotenv_file(Path::new(".env.local")));
+        assert!(is_watched_dotenv_file(Path::new(".env.dev")));
+        assert!(is_watched_dotenv_file(Path::new(".env.dev.local")));
+        // Root-level file behind an absolute project path still matches.
+        assert!(is_watched_dotenv_file(Path::new("/home/alice/app/.env")));
+        // Non-loaded / decorated names do not.
+        assert!(!is_watched_dotenv_file(Path::new(".env.swp")));
+        assert!(!is_watched_dotenv_file(Path::new(".env.example")));
+        assert!(!is_watched_dotenv_file(Path::new("env")));
+        // A dotenv-named file under a dotted directory is not root-level.
+        assert!(!is_watched_dotenv_file(Path::new(".git/.env")));
     }
 
     #[test]

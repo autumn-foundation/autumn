@@ -327,6 +327,255 @@ Semantics:
   adds the nullable `unique_key`/`unique_window`/`concurrency_key`/
   `concurrency_limit` columns; rows and jobs without them behave as before.
 
+## Tracked jobs and progress polling
+
+Plain `enqueue` is fire-and-forget — there's no handle, no progress, and
+nowhere for the caller to check "is it done yet?". `enqueue_tracked` fixes
+that: it returns a handle carrying a public, unguessable token, distinct
+from the internal job id, that the browser can poll at a built-in status
+route while the job reports progress from the inside.
+
+### Enqueue a tracked job
+
+```rust,ignore
+let handle = ExportOrdersJob::enqueue_tracked(ExportArgs { account_id: 42 }).await?;
+// handle.token is the raw, unguessable token — deliver it to the caller.
+// handle.status_path() is "/_autumn/jobs/{token}".
+```
+
+By default the token is an **anonymous capability**: anyone holding it can
+poll the status. To bind status access to the caller's session/user instead,
+use `enqueue_tracked_for` with an owner derived from the current session:
+
+```rust,ignore
+use autumn_web::job::TrackedJobOwner;
+
+let owner = TrackedJobOwner::from_session(&session, &state).await;
+let handle = ExportOrdersJob::enqueue_tracked_for(args, owner).await?;
+```
+
+A request whose session doesn't match the bound owner gets the identical
+`404` an unknown token would — the route is never an existence/ownership
+oracle.
+
+`enqueue_tracked`/`enqueue_tracked_for` wrap your `Args` in an internal
+envelope under a reserved top-level field named `__autumn_tracked`. Don't
+give a job's `Args` struct a field with that exact name — `enqueue`/
+`enqueue_in`/`enqueue_at` and their `on_conn` variants reject a payload
+shaped that way with a `400` rather than risk it being misread as a tracked
+envelope.
+
+### Report progress from inside the handler
+
+Add a third `JobContext` argument to a `#[job]` handler to opt into
+progress reporting; the two-argument form keeps working unchanged:
+
+```rust,ignore
+#[job(name = "export_orders")]
+async fn export_orders(
+    state: AppState,
+    args: ExportArgs,
+    ctx: JobContext,
+) -> AutumnResult<()> {
+    ctx.set_progress(0, Some("Starting export")).await?;
+
+    // ... do the work, reporting progress as it goes ...
+    ctx.set_progress(50, Some("Rows 2500/5000")).await?;
+
+    // On success, the JSON result is whatever the caller wants back —
+    // e.g. a link to the finished file.
+    ctx.set_result(serde_json::json!({ "download_url": "/blob/orders-42.csv" }));
+    Ok(())
+}
+```
+
+If the handler returns `Err`, the job retries as usual (`max_attempts`,
+backoff); only the **final** failed attempt (or a panic, which always
+dead-letters) settles the tracked record to `failed`. Call
+`ctx.set_user_error("...")` before returning `Err` to control the message
+shown to the caller — otherwise a generic "The job failed." is recorded (the
+raw error is never leaked to the tracked-status response).
+
+### Poll the status
+
+`GET /_autumn/jobs/{token}` (mounted automatically; disable with
+`jobs.tracking.route_enabled = false`) is content-negotiated:
+
+- **API clients** (no `Accept: text/html`, no `HX-Request`) get JSON:
+
+  ```json
+  {"status": "running", "progress": 50, "message": "Rows 2500/5000", "result": null, "error": null}
+  ```
+
+- **htmx requests** (`HX-Request: true`) or a browser `Accept: text/html`
+  get a self-polling fragment. While the job is pending/running, the
+  fragment carries `hx-get={path} hx-trigger="every 2s" hx-swap="outerHTML"`,
+  so it keeps re-fetching and replacing itself with zero app-authored JS.
+  Once the job reaches a terminal state, the fragment drops every `hx-*`
+  attribute — htmx has nothing left to poll — and renders either a download
+  link (when the result carries a `download_url`) or the failure message.
+
+Embed the poll target directly in a page:
+
+```rust,ignore
+html! {
+    div hx-get=(handle.status_path()) hx-trigger="load" hx-swap="outerHTML" {
+        "Starting export…"
+    }
+}
+```
+
+### Result store TTL and backends
+
+Progress/result records expire `jobs.tracking.ttl_secs` after their last
+write (default `86400`, 24h). The record store follows whichever job
+backend is configured — `local` and `redis` use an in-memory or Redis-backed
+store respectively, `postgres` uses the `autumn_job_tracking` table (see
+[Migration notes](#migration-notes)) — so a tracked job's status composes
+with the backend an app already runs, with no extra setup. Expired records
+are invisible to reads/writes immediately on all three stores; each also
+actually frees the expired record so long-running processes don't
+accumulate one dead entry per tracked job forever: the in-memory store
+sweeps them out opportunistically (amortized across `create` calls), a
+Postgres background sweep runs every 5 minutes to `DELETE` expired rows,
+and Redis expires keys natively via `EX`.
+
+### Async CSV export, end to end
+
+The synchronous `GET /{plural}/export.csv` admin route runs inline on the
+request thread — fine for small tables, but a 50k-row export blocks the
+worker and risks tripping a proxy idle timeout. A tracked job moves that
+work off the request thread:
+
+```rust,ignore
+use autumn_web::data::csv::export_csv;
+use autumn_web::prelude::*;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExportOrdersArgs {
+    pub account_id: i64,
+}
+
+#[job(name = "export_orders")]
+async fn export_orders(
+    state: AppState,
+    args: ExportOrdersArgs,
+    ctx: JobContext,
+) -> AutumnResult<()> {
+    let repo = OrderRepository::from_state(&state);
+    let orders = repo.for_account(args.account_id).await?;
+
+    let total = orders.len();
+    let mut buffer = Vec::new();
+    for (i, chunk) in orders.chunks(500).enumerate() {
+        export_csv(chunk.iter().cloned(), &mut buffer)?;
+        let done = ((i + 1) * 500).min(total);
+        ctx.set_progress(
+            u8::try_from(done * 100 / total.max(1)).unwrap_or(100),
+            Some(&format!("Rows {done}/{total}")),
+        )
+        .await?;
+    }
+
+    let url = state.storage().put("exports/orders.csv", buffer).await?;
+    ctx.set_result(serde_json::json!({ "download_url": url }));
+    Ok(())
+}
+
+// Kick it off from a request handler and hand back a poll target — the
+// initiating request returns immediately instead of blocking on the export.
+#[post("/orders/export")]
+async fn start_export(state: AppState, session: Session) -> AutumnResult<Markup> {
+    let owner = TrackedJobOwner::from_session(&session, &state).await;
+    let handle = ExportOrdersJob::enqueue_tracked_for(
+        ExportOrdersArgs { account_id: 1 },
+        owner,
+    )
+    .await?;
+
+    Ok(html! {
+        div hx-get=(handle.status_path()) hx-trigger="load" hx-swap="outerHTML" {
+            "Export starting…"
+        }
+    })
+}
+```
+
+The browser gets a progress bar within milliseconds and a download link the
+moment the job finishes — no hand-written status table, token, or polling
+endpoint anywhere in app code.
+
+### Known limitation: tracked status vs. the durable queue record
+
+On the Redis and Postgres backends, a job's tracked status (`succeeded`/
+`failed`) is settled *before* that backend's own success/dead-letter
+acknowledgement is written. In the rare case where that ack later fails or
+is skipped (e.g. the claim changed because another worker recovered it as
+stale in between), the tracked status can briefly report a terminal state
+the durable queue record hasn't actually reached — a poller may stop
+watching a moment before the durable backend finishes catching up, which it
+does automatically on its own retry/recovery path. This window only opens
+on an ack failure, not on ordinary success/failure/retry. Treat the tracked
+status as a progress/UX signal for the caller, not as the source of truth
+for whether a job will run again — use the admin dashboard
+([Observability](#observability)) or `JobAdminBackend` for that.
+
+### Known limitation: stale progress writes on the Redis/Postgres stores
+
+`mark_running`/`set_progress` intentionally no-op once a tracked record is
+already terminal, so a stray write from an abandoned attempt can't overwrite
+a legitimate final result — but on the Redis and Postgres tracking stores
+that guard is evaluated against the value read at the *start* of that write
+(read the record, decide, write it back), not atomically at write time. If a
+worker's claim times out and it keeps running past that point while a
+replacement worker claims and completes the same job, the original worker's
+next progress write can land *after* the replacement's terminal write and
+briefly clobber it, because its in-memory guard was evaluated against the
+`running` record it read before the replacement settled. The record
+self-corrects on the next terminal write (the replacement's own retry
+path settles it, or TTL expiry clears it), so this is a transient display
+glitch, not a lost result — the queue's own durable state (visible via the
+admin dashboard) is never affected. Closing this fully means moving the
+terminal-status guard into the durable write itself (a Lua script for
+Redis, a conditional `UPDATE` for Postgres — the same compare-and-swap
+approach `JobTrackingStore::reset_for_retry` already uses to make an
+operator retry race-safe); tracked as a follow-up rather than folded into
+this change.
+
+### Known limitation: a `JobInterceptor` erroring after `next` still settles the tracked record as failed
+
+`enqueue_tracked`/`enqueue_tracked_for` treat any `Err` from the enqueue call
+as "never delivered" and settle the tracked record to `failed`. If an app
+installs a `JobInterceptor` whose `intercept_enqueue`
+successfully awaits `next` (so the job *was* delivered to the backend) and
+then its own post-`next` logic returns an error — e.g. an audit-log call
+that fails — that error is indistinguishable, from this call site alone,
+from a delivery failure: the tracked record settles to `failed` and the
+caller sees an error even though the job will still run. A caller that
+retries on that error risks enqueueing a duplicate. Closing this requires
+`JobClient::enqueue_with_outcome` to expose whether the backend write
+actually happened on its error path too (it currently tracks this
+internally via a `started` flag but only uses it to select the `Ok`
+variant), which is a signature change shared by every enqueue path — plain
+`enqueue()` has the identical gap for the same reason — not just the
+tracked ones; tracked as a follow-up. In the meantime, avoid returning an
+error from `intercept_enqueue` after `next` has resolved successfully.
+
+### Known limitation: the built-in job-status route can collide with a user route
+
+`GET /_autumn/jobs/{token}` mounts by default (`jobs.tracking.route_enabled
+= true`) for every app that registers jobs, merged after user routes are
+already mounted. If an app happens to define its own route at that exact
+path, `try_build_router_inner` panics on the resulting Axum overlapping-route
+error at startup rather than surfacing a typed, recoverable collision error
+(the framework's other reserved-but-default-on routes — the mail
+unsubscribe endpoint, mail previews — have the same gap). `/_autumn/` is a
+framework-reserved path prefix, so this should not come up in practice;
+set `jobs.tracking.route_enabled = false` if a conflict is ever hit.
+Building a general framework-route-vs-user-route collision preflight
+(mirroring the existing OpenAPI/MCP-vs-everything check) is a broader
+router-building change than this PR's scope; tracked as a follow-up.
+
 ## Observability
 
 Mount `autumn-admin-plugin` to get the built-in operator dashboard at
@@ -361,11 +610,14 @@ workers start. Run your app migrations as a one-shot `autumn migrate` job before
 scaling web and worker replicas:
 
 ```bash
-autumn migrate   # creates autumn_jobs, your domain tables, etc.
+autumn migrate   # creates autumn_jobs, autumn_job_tracking, your domain tables, etc.
 ```
 
 The migration is bundled with the framework and is applied automatically by
-`autumn migrate` as long as the `db` feature is enabled.
+`autumn migrate` as long as the `db` feature is enabled. `enqueue_tracked`
+works the same way regardless of `jobs.backend` — the framework migration
+also creates `autumn_job_tracking`, the table the Postgres-backed tracking
+store uses (see [Tracked jobs and progress polling](#tracked-jobs-and-progress-polling)).
 
 ---
 

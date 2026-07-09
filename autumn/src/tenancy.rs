@@ -6,6 +6,7 @@ use axum::{
 };
 use http_body::Body as HttpBody;
 use pin_project_lite::pin_project;
+use secrecy::ExposeSecret;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -252,7 +253,7 @@ pub async fn extract_tenant_from_parts(
 
             let token_data = ::jsonwebtoken::decode::<serde_json::Value>(
                 token,
-                &::jsonwebtoken::DecodingKey::from_secret(secret.as_bytes()),
+                &::jsonwebtoken::DecodingKey::from_secret(secret.expose_secret().as_bytes()),
                 &validation,
             )
             .map_err(|e| {

@@ -318,4 +318,57 @@ mod tests {
         assert!(map.contains_key("my_field"));
         assert_eq!(map["my_field"][0], "validation failed: custom_code");
     }
+
+    #[tokio::test]
+    async fn valid_extractor_ok() {
+        use axum::body::Body;
+
+        #[derive(serde::Deserialize, validator::Validate)]
+        struct TestInput {
+            #[validate(length(min = 1))]
+            name: String,
+        }
+
+        let req = Request::builder()
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"name": "Alice"}"#))
+            .unwrap();
+
+        let state = ();
+        let result = Valid::<axum::Json<TestInput>>::from_request(req, &state).await;
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().0.0.name, "Alice");
+    }
+
+    #[tokio::test]
+    async fn valid_extractor_err() {
+        use axum::body::Body;
+
+        #[derive(serde::Deserialize, validator::Validate)]
+        struct TestInput {
+            #[validate(length(min = 5))]
+            name: String,
+        }
+
+        let req = Request::builder()
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"name": "Bob"}"#)) // Too short
+            .unwrap();
+
+        let state = ();
+        let result = Valid::<axum::Json<TestInput>>::from_request(req, &state).await;
+
+        match result {
+            Ok(_) => panic!("Expected validation error"),
+            Err(response) => {
+                assert_eq!(
+                    response.status(),
+                    axum::http::StatusCode::UNPROCESSABLE_ENTITY
+                );
+            }
+        }
+    }
 }
