@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **generator:** `autumn generate controller <name> <action>...` scaffolds a handler-only module (named actions, wired routes, Maud stub views) for non-CRUD pages/endpoints — no model, migration, or DB; `--api` emits JSON actions. (issue #1050)
 - **ci:** README-quickstart gate against the published crates (issue #1586) —
   `.github/workflows/quickstart-gate.yml` + `scripts/check-quickstart.sh`
   install the README-pinned `autumn-cli` from crates.io (never the local

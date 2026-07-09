@@ -27,6 +27,7 @@ them; on 0.5.0 fall back to the documented manual alternative.
 | Subcommand | Example | What it creates |
 |---|---|---|
 | `scaffold` | `scaffold Post title:String body:Text` | Model + migration + routes (index/show/new/create/edit/update/delete) + views + smoke test. Also updates `src/main.rs`. |
+| `controller` **(trunk-dev)** | `controller pages home about contact` | Handler-only route module for non-CRUD pages/endpoints — one handler per named action, Maud stub views (HTTP 200), wired into `routes![...]` and `src/routes/mod.rs`. **No** model, migration, DB, schema, or `Cargo.toml` changes. `--api` emits JSON actions instead of views. |
 | `model` | `model Post title:String body:Text` | Model struct + migration |
 | `migration` | `migration add_slug_to_posts` | Empty timestamped migration file |
 | `mailer` | `mailer User` | Mailer struct + email templates (generator appends `Mailer` → produces `UserMailer`) |
@@ -118,6 +119,34 @@ Next steps:
 1. Run: autumn migrate   (the generator already updated src/main.rs)
 2. Run: autumn dev
 3. Visit: http://localhost:3000/<plural>
+```
+
+### controller (trunk-dev)
+```
+Next steps:
+1. The generator already:
+   - Created src/routes/<controller>.rs (one handler per action)
+   - Added `pub mod <controller>;` to src/routes/mod.rs
+   - Wired each action into routes![...] and added `mod routes;` in src/main.rs
+   No model, migration, database, schema, or Cargo.toml changes are made.
+
+2. Path rule: each action maps to /<controller>/<action>, except an action
+   literally named `index`, which maps to /<controller>. Under `--api` the
+   prefix is /api/<controller>[/<action>].
+
+3. Method rule: actions default to GET. Request another method with
+   `action:method` (method ∈ get, post, put, patch, delete), e.g.
+   `autumn generate controller pages home submit:post`.
+
+4. HTML mode returns a Maud stub view (HTTP 200 placeholder) per action;
+   `--api` returns AutumnResult<Json<serde_json::Value>> with a JSON stub and
+   no view. Edit the generated handlers to add real content.
+
+5. Re-running against an existing controller fails (non-destructive); pass
+   `--force` to overwrite. `autumn destroy controller <name> <action>...`
+   reverts it.
+
+6. Run: cargo check   (then `autumn routes` lists every new route)
 ```
 
 ### model
