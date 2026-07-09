@@ -114,6 +114,9 @@ pub struct ApiDoc {
     pub secured: bool,
     /// Roles required by `#[secured("role1")]`. Empty means any authenticated user.
     pub required_roles: &'static [&'static str],
+    /// Scopes required by `#[secured(scopes = ["scope"])]`. When non-empty the
+    /// route is documented as `BearerAuth` instead of `SessionAuth`.
+    pub required_scopes: &'static [&'static str],
     /// Optional runtime hook that lets a handler register any extra
     /// component schemas with the generator.
     pub register_schemas: Option<fn(&mut SchemaRegistry)>,
@@ -432,6 +435,10 @@ pub struct Operation {
     /// Declares this operation to be deprecated.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deprecated: Option<bool>,
+    /// Vendor extension: bearer-token scope strings required by this operation.
+    /// Empty for session-only or unsecured routes.
+    #[serde(rename = "x-required-scopes", skip_serializing_if = "Vec::is_empty")]
+    pub x_required_scopes: Vec<String>,
 }
 
 #[cfg(feature = "openapi")]
@@ -561,6 +568,7 @@ pub fn generate_spec_at(
         std::collections::BTreeSet::new();
 
     let mut any_secured = false;
+    let mut any_scoped = false;
 
     for api_doc in routes {
         if api_doc.hidden {
@@ -568,6 +576,9 @@ pub fn generate_spec_at(
         }
         if api_doc.secured {
             any_secured = true;
+        }
+        if !api_doc.required_scopes.is_empty() {
+            any_scoped = true;
         }
         if let Some(register) = api_doc.register_schemas {
             (register)(&mut registry);
@@ -613,7 +624,7 @@ pub fn generate_spec_at(
         }
     }
 
-    // Register the same cookie-backed session auth that `#[secured]` uses at runtime.
+    // Register auth security schemes used by secured routes.
     let mut security_schemes: BTreeMap<String, serde_json::Value> = BTreeMap::new();
     if any_secured {
         security_schemes.insert(
@@ -623,6 +634,16 @@ pub fn generate_spec_at(
                 "in": "cookie",
                 "name": config.session_cookie_name.clone(),
                 "description": "Autumn session cookie. Secured routes check the configured auth.session_key inside the server-side session.",
+            }),
+        );
+    }
+    if any_scoped {
+        security_schemes.insert(
+            "BearerAuth".to_owned(),
+            serde_json::json!({
+                "type": "http",
+                "scheme": "bearer",
+                "description": "API bearer token. Scope-secured routes require a valid token whose scopes include all required values.",
             }),
         );
     }
@@ -776,10 +797,20 @@ fn operation_for(
         });
     }
 
-    // Security requirement: `#[secured]` is backed by the Autumn session cookie.
+    // Security requirements:
+    //   - scopes-only  (#[secured(scopes=[…])])            → BearerAuth
+    //   - roles+scopes (#[secured("r", scopes=[…])])       → SessionAuth AND BearerAuth
+    //   - roles-only / bare #[secured]                     → SessionAuth
+    // Both entries in one BTreeMap object means AND per the OpenAPI spec.
+    // HTTP-bearer scheme value arrays must be empty (non-empty arrays are OAuth2 scopes).
     let security = if api_doc.secured {
         let mut req = BTreeMap::new();
-        req.insert("SessionAuth".to_owned(), Vec::new());
+        if !api_doc.required_scopes.is_empty() {
+            req.insert("BearerAuth".to_owned(), Vec::<String>::new());
+        }
+        if api_doc.required_scopes.is_empty() || !api_doc.required_roles.is_empty() {
+            req.insert("SessionAuth".to_owned(), Vec::<String>::new());
+        }
         vec![req]
     } else {
         Vec::new()
@@ -795,6 +826,11 @@ fn operation_for(
         responses,
         security,
         deprecated,
+        x_required_scopes: api_doc
+            .required_scopes
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
     }
 }
 
@@ -1518,5 +1554,91 @@ mod tests {
         );
         assert!(html.contains("/swagger-ui/swagger-ui.css?x=&lt;y&gt;"));
         assert!(html.contains("A &quot;cool&quot; &amp; fun API"));
+    }
+
+    // ── Security requirement generation (#1158) ──────────────────────────────
+
+    fn make_secured_doc(
+        secured: bool,
+        required_roles: &'static [&'static str],
+        required_scopes: &'static [&'static str],
+    ) -> ApiDoc {
+        let mut doc = make_doc();
+        doc.path = "/secured";
+        doc.operation_id = "secured_op";
+        doc.path_params = &[];
+        doc.secured = secured;
+        doc.required_roles = required_roles;
+        doc.required_scopes = required_scopes;
+        doc
+    }
+
+    #[test]
+    fn unsecured_route_has_no_security_requirement() {
+        let doc = make_secured_doc(false, &[], &[]);
+        let config = OpenApiConfig::new("Demo", "1.0.0");
+        let spec = generate_spec(&config, &[&doc]);
+        let op = spec.paths["/secured"].get.as_ref().unwrap();
+        assert!(op.security.is_empty());
+    }
+
+    #[test]
+    fn bare_secured_uses_session_auth() {
+        let doc = make_secured_doc(true, &[], &[]);
+        let config = OpenApiConfig::new("Demo", "1.0.0");
+        let spec = generate_spec(&config, &[&doc]);
+        let op = spec.paths["/secured"].get.as_ref().unwrap();
+        assert_eq!(op.security.len(), 1);
+        assert!(op.security[0].contains_key("SessionAuth"));
+        assert!(!op.security[0].contains_key("BearerAuth"));
+    }
+
+    #[test]
+    fn role_only_uses_session_auth() {
+        let doc = make_secured_doc(true, &["admin"], &[]);
+        let config = OpenApiConfig::new("Demo", "1.0.0");
+        let spec = generate_spec(&config, &[&doc]);
+        let op = spec.paths["/secured"].get.as_ref().unwrap();
+        assert_eq!(op.security.len(), 1);
+        assert!(op.security[0].contains_key("SessionAuth"));
+        assert!(!op.security[0].contains_key("BearerAuth"));
+    }
+
+    #[test]
+    fn scope_only_uses_bearer_auth_with_empty_array() {
+        let doc = make_secured_doc(true, &[], &["posts:write"]);
+        let config = OpenApiConfig::new("Demo", "1.0.0");
+        let spec = generate_spec(&config, &[&doc]);
+        let op = spec.paths["/secured"].get.as_ref().unwrap();
+        assert_eq!(op.security.len(), 1);
+        assert!(op.security[0].contains_key("BearerAuth"));
+        assert!(!op.security[0].contains_key("SessionAuth"));
+        // OpenAPI spec: HTTP bearer value array must be empty (not scope names).
+        assert!(op.security[0]["BearerAuth"].is_empty());
+        // BearerAuth scheme is registered in components.
+        let schemes = &spec.components.as_ref().unwrap().security_schemes;
+        assert!(schemes.contains_key("BearerAuth"));
+        assert_eq!(schemes["BearerAuth"]["scheme"], "bearer");
+    }
+
+    #[test]
+    fn mixed_role_and_scope_uses_both_auth_schemes() {
+        let doc = make_secured_doc(true, &["admin"], &["posts:write"]);
+        let config = OpenApiConfig::new("Demo", "1.0.0");
+        let spec = generate_spec(&config, &[&doc]);
+        let op = spec.paths["/secured"].get.as_ref().unwrap();
+        assert_eq!(op.security.len(), 1);
+        // Both in the same object = AND semantics.
+        assert!(op.security[0].contains_key("SessionAuth"));
+        assert!(op.security[0].contains_key("BearerAuth"));
+    }
+
+    #[test]
+    fn bearer_auth_scheme_registered_only_for_scoped_routes() {
+        let unscoped = make_secured_doc(true, &["admin"], &[]);
+        let config = OpenApiConfig::new("Demo", "1.0.0");
+        let spec = generate_spec(&config, &[&unscoped]);
+        let schemes = &spec.components.as_ref().unwrap().security_schemes;
+        assert!(!schemes.contains_key("BearerAuth"));
     }
 }

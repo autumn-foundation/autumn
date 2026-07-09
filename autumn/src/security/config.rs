@@ -757,9 +757,17 @@ pub enum KeyStrategy {
     #[default]
     Ip,
     /// Key on the `Authorization: Bearer` token value. Falls back to IP when absent.
+    ///
+    /// The `token` alias matches the `#[throttle(key = "token")]` macro spelling so an
+    /// operator can move an inline policy into `[security.rate_limit.named.*]` verbatim.
+    #[serde(alias = "token")]
     ApiToken,
     /// Key on the authenticated principal ID from the `RateLimitPrincipal` request
     /// extension (set by the auth middleware). Falls back to IP for unauthenticated requests.
+    ///
+    /// The `principal` alias matches the `#[throttle(key = "principal")]` macro spelling so
+    /// an operator can move an inline policy into `[security.rate_limit.named.*]` verbatim.
+    #[serde(alias = "principal")]
     AuthenticatedPrincipal,
 }
 
@@ -802,6 +810,32 @@ pub struct RateLimitTierConfig {
     pub requests_per_second: f64,
     /// Maximum burst capacity (token bucket size) for this tier.
     pub burst: u32,
+}
+
+/// Named per-route rate limit referenced from `#[throttle("name")]`.
+///
+/// Declare one entry per named limiter under `[security.rate_limit.named.<name>]`
+/// and reference it from a handler via `#[throttle("name")]` so the throttling
+/// policy lives in config, not code.
+///
+/// ```toml
+/// [security.rate_limit.named.login]
+/// limit = 5
+/// per = "1m"
+/// key = "ip"
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct RateLimitNamedConfig {
+    /// Maximum number of requests allowed in each `per` window. Also serves as
+    /// the token-bucket burst capacity.
+    pub limit: u32,
+    /// Window duration parsed by [`crate::task::parse_duration`] (e.g. `"1m"`,
+    /// `"30s"`, `"1h"`). The steady-state refill rate is `limit / per`.
+    pub per: String,
+    /// Optional keying strategy override. When `None`, the named limiter uses
+    /// the same key strategy as the global limiter (`security.rate_limit.key_strategy`).
+    #[serde(default)]
+    pub key: Option<KeyStrategy>,
 }
 
 /// Rate limiting configuration.
@@ -940,6 +974,22 @@ pub struct RateLimitConfig {
     #[serde(default)]
     pub tiers: HashMap<String, RateLimitTierConfig>,
 
+    /// Named per-route limiters referenced from `#[throttle("name")]`.
+    ///
+    /// Each entry defines a `limit` (tokens per window) and `per` (window
+    /// duration) so ops can tune per-route thresholds without a recompile.
+    /// An optional `key` overrides the default keying strategy for that
+    /// named limiter.
+    ///
+    /// ```toml
+    /// [security.rate_limit.named.login]
+    /// limit = 5
+    /// per = "1m"
+    /// key = "ip"
+    /// ```
+    #[serde(default)]
+    pub named: HashMap<String, RateLimitNamedConfig>,
+
     /// Bucket store backend. Default: `"memory"` (in-process, single-replica).
     ///
     /// Set to `"redis"` in multi-replica deployments so the configured
@@ -977,6 +1027,7 @@ impl Default for RateLimitConfig {
             trusted_proxies: Vec::new(),
             key_strategy: KeyStrategy::default(),
             tiers: HashMap::new(),
+            named: HashMap::new(),
             backend: RateLimitBackend::default(),
             #[cfg(feature = "redis")]
             redis: RateLimitRedisConfig::default(),
@@ -1601,6 +1652,87 @@ mod tests {
         assert_eq!(config.burst, 20);
         assert!(!config.trust_forwarded_headers);
         assert!(config.trusted_proxies.is_empty());
+    }
+
+    #[test]
+    fn rate_limit_named_key_accepts_short_macro_spellings() {
+        // `#[throttle(key = "principal")]` / `key = "token"` use the SHORT macro
+        // spellings; an operator moving an inline policy into config must be able
+        // to use the same words. Serde aliases bridge macro and config vocabularies.
+        let toml_str = r#"
+            [named.login]
+            limit = 5
+            per = "1m"
+            key = "principal"
+
+            [named.api]
+            limit = 10
+            per = "1s"
+            key = "token"
+        "#;
+        let config: RateLimitConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            config.named["login"].key,
+            Some(KeyStrategy::AuthenticatedPrincipal),
+            "short `principal` must deserialize to AuthenticatedPrincipal"
+        );
+        assert_eq!(
+            config.named["api"].key,
+            Some(KeyStrategy::ApiToken),
+            "short `token` must deserialize to ApiToken"
+        );
+    }
+
+    #[test]
+    fn rate_limit_named_key_still_accepts_long_config_spellings() {
+        // The canonical long spellings must keep working unchanged.
+        let toml_str = r#"
+            [named.login]
+            limit = 5
+            per = "1m"
+            key = "authenticated_principal"
+
+            [named.api]
+            limit = 10
+            per = "1s"
+            key = "api_token"
+
+            [named.byip]
+            limit = 1
+            per = "1s"
+            key = "ip"
+        "#;
+        let config: RateLimitConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            config.named["login"].key,
+            Some(KeyStrategy::AuthenticatedPrincipal)
+        );
+        assert_eq!(config.named["api"].key, Some(KeyStrategy::ApiToken));
+        assert_eq!(config.named["byip"].key, Some(KeyStrategy::Ip));
+    }
+
+    #[test]
+    fn global_key_strategy_still_accepts_existing_spellings() {
+        // The aliases live on the shared `KeyStrategy` enum, so the global
+        // `key_strategy` field also accepts them — but its existing canonical
+        // spellings must remain valid.
+        for (toml_str, expected) in [
+            (
+                "key_strategy = \"authenticated_principal\"",
+                KeyStrategy::AuthenticatedPrincipal,
+            ),
+            ("key_strategy = \"api_token\"", KeyStrategy::ApiToken),
+            ("key_strategy = \"ip\"", KeyStrategy::Ip),
+            // Aliases also work here (a beneficial side effect).
+            (
+                "key_strategy = \"principal\"",
+                KeyStrategy::AuthenticatedPrincipal,
+            ),
+            ("key_strategy = \"token\"", KeyStrategy::ApiToken),
+        ] {
+            let config: RateLimitConfig = toml::from_str(toml_str).unwrap();
+            assert_eq!(config.key_strategy, expected, "for {toml_str}");
+        }
     }
 
     #[test]

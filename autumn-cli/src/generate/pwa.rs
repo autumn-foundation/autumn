@@ -17,18 +17,16 @@ use std::path::Path;
 use super::emit::Plan;
 use super::schema_edit::update_main_rs;
 use super::system_test::patch_cargo_toml as patch_system_test_cargo_toml;
-use super::{Flags, GenerateError, ensure_project_root};
+use super::{GenerateError, ensure_project_root};
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
-/// Compute the file actions for `autumn generate pwa`.
-///
-/// # Errors
-/// Returns [`GenerateError::NotInProject`] when not at a project root, or
-/// [`GenerateError::Io`] if `src/main.rs` / `Cargo.toml` can't be read.
-pub fn plan_pwa(project_root: &Path) -> Result<Plan, GenerateError> {
-    ensure_project_root(project_root)?;
-
+/// The actions and reverts common to both `plan_pwa` and
+/// [`plan_pwa_destroy_fallback`]: every PWA-generated file is fully static
+/// (parameter-free — none of it depends on `src/main.rs`'s current shape),
+/// and the revert descriptors only need paths, not content (they read
+/// `main.rs`/`Cargo.toml` fresh off disk when `Plan::revert` runs them).
+fn plan_pwa_shared(project_root: &Path) -> Plan {
     let mut plan = Plan::new(project_root);
 
     // Static assets (served via generated route handlers + participate in fingerprinting)
@@ -56,18 +54,22 @@ pub fn plan_pwa(project_root: &Path) -> Result<Plan, GenerateError> {
         render_maskable_icon_svg(),
     );
 
-    // src/main.rs: inject PWA meta tags + route handlers (idempotent)
+    // Pushed unconditionally — see `plan_cargo_deps`'s matching comment in
+    // model.rs: destroy recomputes this plan against the already-generated
+    // main.rs, where these edits are by definition already present.
     let main_path = project_root.join("src").join("main.rs");
-    let main_existing = std::fs::read_to_string(&main_path).map_err(|_| {
-        GenerateError::Io(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("missing {}", main_path.display()),
-        ))
-    })?;
-    let updated_main = inject_pwa_into_main(&main_existing);
-    if updated_main != main_existing {
-        plan.modify(main_path, updated_main);
-    }
+    plan.push_revert(crate::generate::emit::Revert::PwaMainRsInjection {
+        path: main_path.clone(),
+    });
+    plan.push_revert(crate::generate::emit::Revert::RoutesEntries {
+        path: main_path,
+        entries: vec![
+            "pwa_manifest".to_owned(),
+            "pwa_service_worker".to_owned(),
+            "pwa_register_js".to_owned(),
+            "pwa_offline".to_owned(),
+        ],
+    });
 
     // System test
     let system_test_path = project_root
@@ -75,6 +77,56 @@ pub fn plan_pwa(project_root: &Path) -> Result<Plan, GenerateError> {
         .join("system")
         .join("pwa_smoke.rs");
     plan.create(system_test_path, render_pwa_system_test());
+
+    // Cargo.toml: add system-tests feature if absent
+    let cargo_path = project_root.join("Cargo.toml");
+    plan.push_revert(crate::generate::emit::Revert::SystemTestCargoPatch {
+        path: cargo_path,
+        snake_name: "pwa_smoke".to_owned(),
+    });
+
+    plan
+}
+
+/// Compute the file actions for `autumn generate pwa`.
+///
+/// # Errors
+/// Returns [`GenerateError::NotInProject`] when not at a project root,
+/// [`GenerateError::Io`] if `src/main.rs` / `Cargo.toml` can't be read, or
+/// [`GenerateError::Config`] when `src/main.rs`'s `layout()` doesn't accept
+/// `current_path` — the generated `pwa_offline` handler calls `layout()`
+/// with the current `nav_bar`-based scaffold's arity, so an app that
+/// hasn't migrated its own `layout()` needs to before running this.
+pub fn plan_pwa(project_root: &Path) -> Result<Plan, GenerateError> {
+    ensure_project_root(project_root)?;
+
+    // Read src/main.rs up front (rather than where it's injected below) so
+    // the layout() shape can be validated before any plan actions are built.
+    let main_path = project_root.join("src").join("main.rs");
+    let main_existing = std::fs::read_to_string(&main_path).map_err(|_| {
+        GenerateError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("missing {}", main_path.display()),
+        ))
+    })?;
+    if layout_missing_current_path(&main_existing) {
+        return Err(GenerateError::Config(format!(
+            "{}'s layout() takes fewer than 4 parameters — the current \
+             nav_bar-based scaffold needs layout(title: &str, current_path: &str, \
+             flash: Markup, content: Markup) (see autumn-cli/src/templates/main.rs.tmpl \
+             for the current shape; the path parameter's name doesn't matter) \
+             before running `autumn generate pwa`",
+            main_path.display()
+        )));
+    }
+
+    let mut plan = plan_pwa_shared(project_root);
+
+    // src/main.rs: inject PWA meta tags + route handlers (idempotent)
+    let updated_main = inject_pwa_into_main(&main_existing);
+    if updated_main != main_existing {
+        plan.modify(main_path, updated_main);
+    }
 
     // Cargo.toml: add system-tests feature if absent
     let cargo_path = project_root.join("Cargo.toml");
@@ -87,22 +139,20 @@ pub fn plan_pwa(project_root: &Path) -> Result<Plan, GenerateError> {
     Ok(plan)
 }
 
-/// CLI entry point.
-pub fn run(flags: Flags) {
-    let cwd = match std::env::current_dir() {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("Error: cannot determine current directory: {e}");
-            std::process::exit(1);
-        }
-    };
-    match plan_pwa(&cwd).and_then(|p| p.execute(flags)) {
-        Ok(()) => {}
-        Err(e) => {
-            eprintln!("Error: {e}");
-            std::process::exit(1);
-        }
-    }
+/// Destroy-only fallback (issue #1048 PR review): `plan_pwa` validates that
+/// `src/main.rs`'s `layout()` takes 4 parameters before building anything —
+/// necessary so a *fresh* generate never emits a call with the wrong arity,
+/// but that precondition is irrelevant (and can wrongly block cleanup) once
+/// `main.rs` has since been hand-edited, reverted, or otherwise no longer
+/// matches the shape `plan_pwa` expects. Every PWA-generated file is fully
+/// static, and `Plan::revert` never consults `Action::Modify` content —
+/// only `self.reverts`, which read `main.rs`/`Cargo.toml` fresh off disk at
+/// revert time — so `plan_pwa_shared` alone is already a complete, exact
+/// destroy plan; unlike the model-dependent admin/migration fallbacks, no
+/// `--force` is needed to use it.
+pub fn plan_pwa_destroy_fallback(project_root: &Path) -> Result<Plan, GenerateError> {
+    ensure_project_root(project_root)?;
+    Ok(plan_pwa_shared(project_root))
 }
 
 // ── Content renderers ─────────────────────────────────────────────────────────
@@ -411,15 +461,86 @@ fn inject_pwa_meta_into_head(source: &str) -> String {
     result
 }
 
+/// True when `source` defines a `layout()` function with fewer than 4
+/// parameters — the pre-`nav_bar` scaffold shape (`layout(title, flash,
+/// content)`) rather than the current one (`layout(title, current_path,
+/// flash, content)`). `pwa_offline`'s generated call assumes 4 positional
+/// arguments, so this gates [`plan_pwa`] with an actionable error instead
+/// of emitting code with the wrong arity.
+///
+/// Checks parameter *count*, not a specific name — Rust calls are
+/// positional, so a caller who named their path parameter `path` or
+/// `request_path` instead of `current_path` still compiles fine and must
+/// not be rejected.
+fn layout_missing_current_path(source: &str) -> bool {
+    let Some(start) = source.find("fn layout(") else {
+        return false;
+    };
+    let after_paren = &source[start + "fn layout(".len()..];
+    let Some(params) = balanced_prefix(after_paren) else {
+        return false;
+    };
+    count_params(params) < 4
+}
+
+/// Count comma-separated parameters in a (possibly multi-line, possibly
+/// trailing-comma) parameter list — the trailing comma rustfmt always adds
+/// when it wraps a signature onto separate lines doesn't itself count as an
+/// extra parameter.
+fn count_params(params: &str) -> usize {
+    let trimmed = params.trim();
+    if trimmed.is_empty() {
+        return 0;
+    }
+    let commas = count_top_level_commas(trimmed);
+    if trimmed.ends_with(',') {
+        commas
+    } else {
+        commas + 1
+    }
+}
+
+/// The prefix of `s` up to (not including) the `)` that closes the opening
+/// paren implicit in the caller's position — tracks `(`/`[` nesting (e.g. a
+/// closure-typed parameter like `Fn(i32) -> bool`) so an inner `)` doesn't
+/// end the scan early. Returns `None` if unbalanced.
+fn balanced_prefix(s: &str) -> Option<&str> {
+    let mut depth = 0i32;
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' | '[' => depth += 1,
+            ')' if depth == 0 => return Some(&s[..i]),
+            ')' | ']' => depth -= 1,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Count commas in `s` that aren't nested inside `(...)`/`[...]` — a cheap
+/// proxy for "how many parameters does this signature have" without a real
+/// parser. Doesn't track `<...>` generic nesting, so a parameter type with a
+/// top-level comma inside angle brackets (e.g. `HashMap<K, V>`) would
+/// over-count — harmless here since over-counting only makes this check
+/// *more* permissive, never a false rejection.
+fn count_top_level_commas(s: &str) -> usize {
+    let mut depth = 0i32;
+    let mut count = 0;
+    for c in s.chars() {
+        match c {
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth -= 1,
+            ',' if depth == 0 => count += 1,
+            _ => {}
+        }
+    }
+    count
+}
+
 /// Append `pwa_manifest`, `pwa_service_worker`, `pwa_register_js`, and `pwa_offline`
 /// handler functions just before `#[autumn_web::main]`.  Idempotent — skipped when
 /// `pwa_manifest` is already defined.
-fn inject_pwa_handlers(source: &str) -> String {
-    if source.contains("async fn pwa_manifest()") {
-        return source.to_owned();
-    }
-
-    let handlers = "\
+const PWA_HANDLERS_BLOCK: &str = "\
 #[get(\"/manifest.webmanifest\")]\n\
 async fn pwa_manifest() -> impl IntoResponse {\n\
     (\n\
@@ -455,9 +576,10 @@ async fn pwa_register_js() -> impl IntoResponse {\n\
 }\n\
 \n\
 #[get(\"/offline\")]\n\
-async fn pwa_offline(flash: Flash) -> maud::Markup {\n\
+async fn pwa_offline(flash: Flash, path: CurrentPath) -> maud::Markup {\n\
     layout(\n\
         \"Offline\",\n\
+        path.as_str(),\n\
         flash.render().await,\n\
         maud::html! {\n\
             h1 { \"You are offline\" }\n\
@@ -467,29 +589,118 @@ async fn pwa_offline(flash: Flash) -> maud::Markup {\n\
 }\n\
 \n";
 
-    // Insert before `#[autumn_web::main]`, or append at end as fallback.
-    source.find("#[autumn_web::main]").map_or_else(
+fn inject_pwa_handlers(source: &str) -> String {
+    if source.contains("async fn pwa_manifest()") {
+        return source.to_owned();
+    }
+
+    // Insert before the line that is exactly `#[autumn_web::main]` — a naive
+    // substring search would also match the text inside a comment that merely
+    // mentions the macro (e.g. `// routes are wired under #[autumn_web::main]`)
+    // and slice the file mid-comment. Appends at end as fallback.
+    find_main_attr_line_start(source).map_or_else(
         || {
             let mut result = source.to_owned();
             if !result.ends_with('\n') {
                 result.push('\n');
             }
             result.push('\n');
-            result.push_str(handlers);
+            result.push_str(PWA_HANDLERS_BLOCK);
             result
         },
         |pos| {
-            let mut result = String::with_capacity(source.len() + handlers.len());
+            let mut result = String::with_capacity(source.len() + PWA_HANDLERS_BLOCK.len());
             result.push_str(&source[..pos]);
-            result.push_str(handlers);
+            result.push_str(PWA_HANDLERS_BLOCK);
             result.push_str(&source[pos..]);
             result
         },
     )
 }
 
+/// Byte offset of the start of the first line whose entire content (modulo
+/// surrounding whitespace) is `#[autumn_web::main]`, or `None` when no such
+/// line exists. Line-exact matching prevents false positives on comments
+/// that mention the attribute.
+fn find_main_attr_line_start(source: &str) -> Option<usize> {
+    let mut offset = 0;
+    for line in source.split_inclusive('\n') {
+        if line.trim() == "#[autumn_web::main]" {
+            return Some(offset);
+        }
+        offset += line.len();
+    }
+    None
+}
+
 fn indent_count(line: &str) -> usize {
     line.len() - line.trim_start().len()
+}
+
+/// Inverse of [`inject_pwa_into_main`] (`autumn destroy`, issue #1048).
+///
+/// Removes the PWA `<link>`/`<meta>` tags from the `head {}` block and the
+/// `pwa_manifest`/`pwa_service_worker`/`pwa_register_js`/`pwa_offline`
+/// handler functions this generator injected. A no-op wherever its target
+/// isn't present (already destroyed, or hand-edited away).
+pub(super) fn remove_pwa_injection(existing: &str) -> String {
+    let without_handlers = remove_pwa_handlers(existing);
+    remove_pwa_meta_from_head(&without_handlers)
+}
+
+/// Inverse of [`inject_pwa_meta_into_head`]. Removes exactly the four lines
+/// that function inserts (three tag lines + the register-script line),
+/// identified by the unique `/pwa-register.js` script line together with the
+/// three lines immediately preceding it matching the known tag text
+/// (ignoring indentation) — restoring the `head {}` block byte-identically.
+///
+/// A no-op if the script line isn't present, or the three preceding lines
+/// don't match (hand-edited — never guesses at a partial match).
+fn remove_pwa_meta_from_head(existing: &str) -> String {
+    const SCRIPT_LINE: &str = "script src=\"/pwa-register.js\" {}";
+    const PRECEDING_LINES: [&str; 3] = [
+        "link rel=\"manifest\" href=\"/manifest.webmanifest\";",
+        "meta name=\"theme-color\" content=\"#ffffff\";",
+        "link rel=\"apple-touch-icon\" href=\"/static/icons/icon.svg\";",
+    ];
+    let lines: Vec<&str> = existing.lines().collect();
+    let Some(script_idx) = lines.iter().position(|l| l.trim() == SCRIPT_LINE) else {
+        return existing.to_owned();
+    };
+    if script_idx < PRECEDING_LINES.len() {
+        return existing.to_owned();
+    }
+    let start = script_idx - PRECEDING_LINES.len();
+    let matches = PRECEDING_LINES
+        .iter()
+        .enumerate()
+        .all(|(offset, expected)| lines[start + offset].trim() == *expected);
+    if !matches {
+        return existing.to_owned();
+    }
+    let mut new_lines: Vec<&str> = Vec::with_capacity(lines.len());
+    new_lines.extend_from_slice(&lines[..start]);
+    new_lines.extend_from_slice(&lines[script_idx + 1..]);
+    let mut out = new_lines.join("\n");
+    if existing.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+/// Inverse of [`inject_pwa_handlers`]. Removes the exact
+/// [`PWA_HANDLERS_BLOCK`] text that function inserts verbatim.
+///
+/// A no-op if the block isn't present (already destroyed, or hand-edited
+/// away).
+fn remove_pwa_handlers(existing: &str) -> String {
+    let Some(pos) = existing.find(PWA_HANDLERS_BLOCK) else {
+        return existing.to_owned();
+    };
+    let mut out = String::with_capacity(existing.len() - PWA_HANDLERS_BLOCK.len());
+    out.push_str(&existing[..pos]);
+    out.push_str(&existing[pos + PWA_HANDLERS_BLOCK.len()..]);
+    out
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -524,7 +735,11 @@ use autumn_web::prelude::*;
 
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
 
-pub fn layout(title: &str, flash: maud::Markup, content: maud::Markup) -> maud::Markup {
+pub fn layout(title: &str, current_path: &str, flash: maud::Markup, content: maud::Markup) -> maud::Markup {
+    let nav = NavBarConfig::new()
+        .brand(\"My App\", \"/\")
+        .aria_label(\"Main navigation\")
+        .item(NavItem::link(\"/\", \"Home\"));
     maud::html! {
         (maud::DOCTYPE)
         html lang=\"en\" {
@@ -534,13 +749,12 @@ pub fn layout(title: &str, flash: maud::Markup, content: maud::Markup) -> maud::
                 title { (title) }
                 link rel=\"stylesheet\" href=(autumn_web::flash::FLASH_CSS_PATH);
                 link rel=\"stylesheet\" href=\"/static/css/app.css\";
+                script src=(autumn_web::htmx::AUTUMN_WIDGETS_JS_PATH) defer {}
             }
             body {
                 (skip_link(\"#main-content\", \"Skip to main content\"))
                 header role=\"banner\" {
-                    nav aria-label=\"Main navigation\" {
-                        a href=\"/\" { \"My App\" }
-                    }
+                    (nav_bar(current_path, &nav))
                 }
                 main id=\"main-content\" role=\"main\" {
                     (flash)
@@ -548,6 +762,51 @@ pub fn layout(title: &str, flash: maud::Markup, content: maud::Markup) -> maud::
                 }
                 footer role=\"contentinfo\" {
                     p { \"Built with Autumn\" }
+                }
+            }
+        }
+    }
+}
+
+#[get(\"/\")]
+async fn index(flash: Flash, path: CurrentPath) -> maud::Markup {
+    layout(\"Welcome\", path.as_str(), flash.render().await, maud::html! {
+        h1 { \"Welcome!\" }
+    })
+}
+
+#[autumn_web::main]
+async fn main() {
+    autumn_web::app()
+        .routes(routes![index])
+        .migrations(MIGRATIONS)
+        .run()
+        .await;
+}
+";
+
+    /// The pre-`nav_bar` scaffold shape: `layout()` has no `current_path`
+    /// parameter. Apps generated before `nav_bar` shipped still look like this.
+    const OLD_SHAPE_MAIN: &str = "\
+use autumn_web::form::skip_link;
+use autumn_web::migrate::{EmbeddedMigrations, embed_migrations};
+use autumn_web::prelude::*;
+
+const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
+
+pub fn layout(title: &str, flash: maud::Markup, content: maud::Markup) -> maud::Markup {
+    maud::html! {
+        (maud::DOCTYPE)
+        html lang=\"en\" {
+            head {
+                meta charset=\"utf-8\";
+                title { (title) }
+            }
+            body {
+                (skip_link(\"#main-content\", \"Skip to main content\"))
+                main id=\"main-content\" role=\"main\" {
+                    (flash)
+                    (content)
                 }
             }
         }
@@ -572,6 +831,61 @@ async fn main() {
 ";
 
     // ── plan_pwa: file plan tests ─────────────────────────────────────────────
+
+    #[test]
+    fn plan_pwa_rejects_layout_missing_current_path() {
+        // nav_bar's arrival made layout() take current_path as its second
+        // argument; pwa_offline's generated call now assumes that shape.
+        // Running against an app that hasn't migrated must fail loudly with
+        // an actionable message instead of silently emitting a call that
+        // won't compile.
+        let tmp = project_with_main(OLD_SHAPE_MAIN);
+        let err = plan_pwa(tmp.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("current_path"), "{msg}");
+        assert!(msg.contains("layout"), "{msg}");
+    }
+
+    #[test]
+    fn plan_pwa_accepts_rustfmt_wrapped_layout_signature() {
+        // rustfmt wraps layout()'s ~108-char signature onto separate lines
+        // (verified: `rustfmt` puts each param on its own line at the
+        // default 100-column width) — current_path then no longer shares a
+        // physical line with `fn layout(`, so a naive single-line scan would
+        // false-positive as "missing current_path" on any formatted,
+        // up-to-date project.
+        let wrapped_main = DEFAULT_MAIN.replace(
+            "pub fn layout(title: &str, current_path: &str, flash: maud::Markup, content: maud::Markup) -> maud::Markup {",
+            "pub fn layout(\n    title: &str,\n    current_path: &str,\n    flash: maud::Markup,\n    content: maud::Markup,\n) -> maud::Markup {",
+        );
+        assert_ne!(
+            wrapped_main, DEFAULT_MAIN,
+            "replacement must actually match"
+        );
+        let tmp = project_with_main(&wrapped_main);
+        plan_pwa(tmp.path())
+            .expect("rustfmt-wrapped current_path parameter must still be detected");
+    }
+
+    #[test]
+    fn plan_pwa_accepts_layout_with_renamed_path_parameter() {
+        // Rust calls are positional — a layout() with 4 parameters compiles
+        // fine against pwa_offline's 4-arg call regardless of what the
+        // second parameter is named. Requiring the literal name
+        // "current_path" would reject valid, already-migrated apps that
+        // simply chose a different name (e.g. `path`, `request_path`).
+        let renamed_main = DEFAULT_MAIN.replace(
+            "pub fn layout(title: &str, current_path: &str, flash: maud::Markup, content: maud::Markup) -> maud::Markup {",
+            "pub fn layout(title: &str, request_path: &str, flash: maud::Markup, content: maud::Markup) -> maud::Markup {",
+        );
+        assert_ne!(
+            renamed_main, DEFAULT_MAIN,
+            "replacement must actually match"
+        );
+        let tmp = project_with_main(&renamed_main);
+        plan_pwa(tmp.path())
+            .expect("a differently-named 4th parameter must still be accepted (arity, not name)");
+    }
 
     #[test]
     fn plan_pwa_requires_project_root() {
@@ -861,6 +1175,53 @@ async fn main() {
     }
 
     #[test]
+    fn inject_handlers_ignores_main_attr_mentioned_in_comment() {
+        // A comment that merely mentions `#[autumn_web::main]` must not be
+        // treated as the insertion point — the naive substring search used to
+        // slice the file mid-comment, leaving the handlers inside the comment
+        // text and the file uncompilable.
+        let source = "\
+use autumn_web::prelude::*;
+
+// Route handlers are registered under #[autumn_web::main] via routes![].
+fn helper() {}
+
+#[autumn_web::main]
+async fn main() {
+    autumn_web::app().routes(routes![]).run().await;
+}
+";
+        let updated = inject_pwa_handlers(source);
+        assert!(
+            updated.contains(
+                "// Route handlers are registered under #[autumn_web::main] via routes![]."
+            ),
+            "comment must be untouched: {updated}"
+        );
+        let handler_pos = updated.find("async fn pwa_manifest()").unwrap();
+        let helper_pos = updated.find("fn helper()").unwrap();
+        let real_main_pos = updated.find("\n#[autumn_web::main]\n").unwrap();
+        assert!(
+            helper_pos < handler_pos && handler_pos < real_main_pos,
+            "handlers must be inserted immediately before the real attribute line: {updated}"
+        );
+    }
+
+    #[test]
+    fn inject_handlers_appends_when_only_comment_mentions_main_attr() {
+        let source = "// see #[autumn_web::main]\nfn main() {}\n";
+        let updated = inject_pwa_handlers(source);
+        assert!(
+            updated.starts_with("// see #[autumn_web::main]\nfn main() {}\n"),
+            "original source must be untouched: {updated}"
+        );
+        assert!(
+            updated.ends_with(PWA_HANDLERS_BLOCK),
+            "handlers must be appended at end as fallback: {updated}"
+        );
+    }
+
+    #[test]
     fn pwa_manifest_handler_uses_include_str() {
         let updated = inject_pwa_handlers(DEFAULT_MAIN);
         assert!(
@@ -922,6 +1283,26 @@ async fn main() {
         let twice = inject_pwa_into_main(&once);
         let handler_count = twice.matches("async fn pwa_manifest()").count();
         assert_eq!(handler_count, 1, "must not duplicate pwa_manifest handler");
+    }
+
+    #[test]
+    fn pwa_offline_handler_matches_current_layout_arity() {
+        // The scaffold's layout() takes (title, current_path, flash, content) —
+        // pwa_offline must extract CurrentPath and pass it through, or the
+        // generated src/main.rs fails to compile with an arity mismatch.
+        let updated = inject_pwa_into_main(DEFAULT_MAIN);
+        assert!(
+            updated.contains("async fn pwa_offline(flash: Flash, path: CurrentPath)"),
+            "pwa_offline must extract CurrentPath alongside Flash: {updated}"
+        );
+        let offline_fn_start = updated
+            .find("async fn pwa_offline")
+            .expect("pwa_offline handler must be present");
+        let offline_fn = &updated[offline_fn_start..offline_fn_start + 200];
+        assert!(
+            offline_fn.contains("\"Offline\"") && offline_fn.contains("path.as_str()"),
+            "pwa_offline must pass path.as_str() as layout()'s second argument: {offline_fn}"
+        );
     }
 
     // ── plan execution ────────────────────────────────────────────────────────
@@ -1018,6 +1399,81 @@ async fn main() {
         assert!(main_rs.contains("async fn pwa_service_worker()"));
         assert!(main_rs.contains("async fn pwa_register_js()"));
         assert!(main_rs.contains("async fn pwa_offline("));
+    }
+
+    #[test]
+    fn generate_then_destroy_pwa_round_trips_to_original_project_state() {
+        let tmp = project_with_main(DEFAULT_MAIN);
+        let cargo_path = tmp.path().join("Cargo.toml");
+        let main_path = tmp.path().join("src/main.rs");
+        let original_cargo = fs::read_to_string(&cargo_path).unwrap();
+        let original_main = fs::read_to_string(&main_path).unwrap();
+
+        plan_pwa(tmp.path())
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+        assert!(tmp.path().join("static/manifest.webmanifest").exists());
+        assert!(
+            fs::read_to_string(&main_path)
+                .unwrap()
+                .contains("async fn pwa_manifest()")
+        );
+        assert!(
+            fs::read_to_string(&cargo_path)
+                .unwrap()
+                .contains("system-tests")
+        );
+
+        plan_pwa(tmp.path())
+            .unwrap()
+            .revert(Flags::default())
+            .unwrap();
+
+        assert!(!tmp.path().join("static/manifest.webmanifest").exists());
+        assert!(!tmp.path().join("static").exists());
+        assert!(!tmp.path().join("tests/system/pwa_smoke.rs").exists());
+        assert_eq!(fs::read_to_string(&main_path).unwrap(), original_main);
+        assert_eq!(fs::read_to_string(&cargo_path).unwrap(), original_cargo);
+    }
+
+    #[test]
+    fn destroy_pwa_still_works_after_main_rs_reverted_to_pre_nav_bar_shape() {
+        // issue #1048 PR review: `plan_pwa` (used to recompute the plan for
+        // destroy too) rejects `main.rs` whenever `layout()` has fewer than
+        // 4 parameters. That precondition only matters for a *fresh*
+        // generate — but a common cleanup order (hand-revert `main.rs` to
+        // the pre-`nav_bar` shape, or run a competing generator that
+        // rewrites `layout()`) would otherwise strand every PWA file
+        // because `destroy pwa` fails before `Plan::revert` ever runs.
+        let tmp = project_with_main(DEFAULT_MAIN);
+        plan_pwa(tmp.path())
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+        assert!(tmp.path().join("static/manifest.webmanifest").exists());
+
+        // Simulate main.rs having been rewritten to the old, incompatible
+        // arity after PWA was generated (still contains the PWA injections,
+        // just with layout() narrowed back down).
+        let main_path = tmp.path().join("src/main.rs");
+        let with_pwa = fs::read_to_string(&main_path).unwrap();
+        let narrowed = with_pwa.replace(
+            "pub fn layout(title: &str, current_path: &str, flash: maud::Markup, content: maud::Markup) -> maud::Markup {",
+            "pub fn layout(title: &str, flash: maud::Markup, content: maud::Markup) -> maud::Markup {",
+        );
+        assert_ne!(narrowed, with_pwa, "replacement must actually match");
+        fs::write(&main_path, &narrowed).unwrap();
+        assert!(plan_pwa(tmp.path()).is_err());
+
+        plan_pwa_destroy_fallback(tmp.path())
+            .unwrap()
+            .revert(Flags::default())
+            .unwrap();
+
+        assert!(!tmp.path().join("static/manifest.webmanifest").exists());
+        assert!(!tmp.path().join("static").exists());
+        assert!(!tmp.path().join("tests/system/pwa_smoke.rs").exists());
     }
 
     #[test]

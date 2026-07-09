@@ -66,6 +66,7 @@ mod tests {
             session,
             user_id: user_id.map(str::to_owned),
             roles: role.into_iter().map(str::to_owned).collect(),
+            scopes: Vec::new(),
             pool: None,
             policy_registry: autumn_web::authorization::PolicyRegistry::default(),
         }

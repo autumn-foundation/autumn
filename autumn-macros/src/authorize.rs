@@ -227,6 +227,19 @@ pub fn authorize_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         };
         input_fn.sig.inputs.insert(0, route_version_param);
     }
+    // Inject the granted-scopes extension so the policy check can decide on
+    // `ctx.has_scope(...)` for token-authenticated principals. Guarded so
+    // stacking `#[secured(scopes = ...)]` + `#[authorize]` doesn't double-inject.
+    if !has_input_named(&input_fn, "__autumn_token_scopes") {
+        let scopes_param: syn::FnArg = parse_quote! {
+            __autumn_token_scopes: ::core::option::Option<
+                ::autumn_web::reexports::axum::extract::Extension<
+                    ::autumn_web::auth::ApiTokenScopes
+                >
+            >
+        };
+        input_fn.sig.inputs.insert(0, scopes_param);
+    }
 
     let action_lit = syn::LitStr::new(&action_str, proc_macro2::Span::call_site());
     let original_body = &input_fn.block;
@@ -266,9 +279,10 @@ pub fn authorize_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
     input_fn.block = parse_quote! {
         {
-            if let ::core::result::Result::Err(__autumn_error) = ::autumn_web::authorization::__check_policy::<#resource_ident>(
+            if let ::core::result::Result::Err(__autumn_error) = ::autumn_web::authorization::__check_policy_scoped::<#resource_ident>(
                 &__autumn_state,
                 &__autumn_session,
+                __autumn_token_scopes.as_ref().map(|__e| &__e.0),
                 #action_lit,
                 &#from_ident,
             ).await {
@@ -405,6 +419,33 @@ mod tests {
         assert!(
             generated.contains("__replay_finalized_session_response_for_anonymous"),
             "authorized handlers must let old destroyed-session retries receive cached finalized Set-Cookie responses: {generated}"
+        );
+    }
+
+    #[test]
+    fn authorize_injects_token_scopes_and_calls_scoped_policy_check() {
+        let generated = authorize_macro(
+            quote::quote! { "update", resource = Post },
+            quote::quote! {
+                async fn update_post(post: Post) -> &'static str {
+                    "ok"
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("__check_policy_scoped"),
+            "#[authorize] must call __check_policy_scoped so token scopes reach the policy: {generated}"
+        );
+        assert!(
+            generated.contains("__autumn_token_scopes"),
+            "#[authorize] must inject __autumn_token_scopes parameter: {generated}"
+        );
+        // The old 4-arg form must NOT appear — we always use the scoped variant.
+        assert!(
+            !generated.contains("__check_policy (") && !generated.contains("__check_policy("),
+            "#[authorize] must not generate the old unscoped __check_policy call: {generated}"
         );
     }
 }

@@ -10,6 +10,11 @@
     --danger: #dc2626;
     --danger-hover: #b91c1c;
     --danger-light: #fee2e2;
+    /* Alias so the shared autumn-modal__confirm--danger rule (autumn/templates/
+       static/css/input.css) tracks the admin plugin's own danger token instead
+       of drifting from it via a separately hardcoded color. */
+    --autumn-danger: var(--danger);
+    --autumn-danger-hover: var(--danger-hover);
     --success: #059669;
     --success-light: #ecfdf5;
     --warning: #d97706;

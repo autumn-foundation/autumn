@@ -270,7 +270,11 @@ const CREATE_API_TOKENS_SQL: &str = "
         token_hash TEXT NOT NULL UNIQUE,
         principal_id TEXT NOT NULL,
         created_at TIMESTAMP NOT NULL DEFAULT NOW(),
-        revoked_at TIMESTAMP
+        revoked_at TIMESTAMP,
+        name TEXT NOT NULL DEFAULT '',
+        scopes JSONB NOT NULL DEFAULT '[]'::jsonb,
+        expires_at TIMESTAMP,
+        last_used_at TIMESTAMP
     )
 ";
 

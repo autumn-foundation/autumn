@@ -46,6 +46,7 @@ pub struct SelectOption {
 /// Metadata for a single model field.
 #[derive(Debug, Clone)]
 #[allow(clippy::struct_excessive_bools)] // orthogonal flags on a plain config record
+#[non_exhaustive]
 pub struct AdminField {
     /// Column name in the database / struct field name.
     pub name: &'static str,
@@ -63,6 +64,9 @@ pub struct AdminField {
     pub required: bool,
     /// Whether this field is editable (false for IDs, timestamps, etc.).
     pub editable: bool,
+    /// Editable only on create; shown as read-only on edit (e.g. `principal_id`, `expires_at`).
+    /// `strip_meta_fields` drops these on update submissions so the model never sees them.
+    pub create_only: bool,
     /// Sort priority in list view (None = not sortable).
     pub sortable: bool,
     /// Whether this column is encrypted at rest (#805). When set, the field is
@@ -100,6 +104,7 @@ impl AdminField {
             filterable: false,
             required: true,
             editable,
+            create_only: false,
             sortable: true,
             encrypted: false,
             encrypted_visible: false,
@@ -156,6 +161,15 @@ impl AdminField {
     #[must_use]
     pub const fn readonly(mut self) -> Self {
         self.editable = false;
+        self
+    }
+
+    /// Editable on create, read-only on edit (e.g. `principal_id`, `expires_at`).
+    /// The field renders normally in the create form but as a disabled display
+    /// in the edit form; update submissions never receive its value.
+    #[must_use]
+    pub const fn create_only(mut self) -> Self {
+        self.create_only = true;
         self
     }
 

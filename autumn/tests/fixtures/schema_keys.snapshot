@@ -10,9 +10,11 @@ database.auto_migrate_in_production
 database.connect_timeout_secs
 database.directory_shard_router
 database.max_connections_warn_threshold
+database.pin_after_write_secs
 database.pool_size
 database.primary_pool_size
 database.primary_url
+database.read_your_writes
 database.replica_fallback
 database.replica_pool_size
 database.replica_url
@@ -29,6 +31,7 @@ idempotency
 jobs
 log
 mail
+observability
 openapi
 reporting
 resilience
@@ -37,6 +40,7 @@ security
 seo
 server
 server.host
+server.max_concurrent_requests
 server.port
 server.prestop_grace_secs
 server.shutdown_timeout_secs
@@ -46,6 +50,7 @@ server.timeouts.request_timeout_ms
 server.unix_socket
 session
 storage
+stories
 telemetry
 tenancy
 time_zone
