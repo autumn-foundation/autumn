@@ -58,6 +58,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `BlobStore::get_stream` without buffering the whole object in memory, so it
   serves large private files behind a `#[secured]` handler with no public
   presigned URL (#1141).
+- **router:** duplicate-route preflight (issue #1012) — two user- or
+  plugin-registered handlers that resolve to the same `(method, path)` after
+  `.scoped(prefix, …)` prefix resolution now fail app build with a structured
+  `RouterBuildError::DuplicateUserRoute` **before any router is mounted**,
+  instead of an `axum::routing::MethodRouter::merge` panic at startup. The
+  error names BOTH handlers, the HTTP method, and the resolved path. The
+  synthetic `WS` method a `#[ws]` handler mounts as `GET` is normalized before
+  keying, so `#[get("/live")]` + `#[ws("/live")]` is caught too. Two routes
+  whose **different** templates resolve to overlapping path shapes are a matchit
+  route conflict *regardless of HTTP method* (so `GET /users/{id}` +
+  `POST /users/{slug}` clashes) and now fail with a dedicated
+  `RouterBuildError::ConflictingRouteShape` that names BOTH handlers and BOTH
+  original templates, instead of leaking an axum matchit panic. Path-shape
+  conflict detection is delegated to **matchit** — the exact engine axum 0.8
+  routes through — instead of a hand-rolled normalizer, so it mirrors axum's
+  accept/reject behavior precisely on every edge case: capture-name diffs
+  (`/users/{id}` vs `/users/{slug}`), catch-all vs sibling capture (`/u/{id}`
+  vs `/u/{*rest}`), catch-all vs dynamic *descendant* (`/cmd/{tool}/{sub}` vs
+  `/cmd/{*path}`, which the old normalizer missed), and mixed literal+capture
+  segments (`/file.{ext}` vs `/file.{kind}`). Because the check *is* matchit it
+  never over-flags what axum accepts: static-vs-capture (`/users/me` vs
+  `/users/{id}`), escaped literal braces (`/{{foo}}` vs `/{{bar}}`), and mixed
+  segments like `/file.{ext}` vs `/file.json` build cleanly. A permanent parity
+  test pins matchit's verdicts to axum 0.8.9's so a future axum bump cannot let
+  the oracle drift silently. Distinct methods on
+  the *same exact path* (`GET /admin` + `POST /admin`, `GET /users/{id}` +
+  `POST /users/{id}`) and genuinely different shapes (`/users/{id}` vs
+  `/users/{id}/posts`) are unaffected;
+  `#[repository]`-generated API routes are covered because they land in the
+  normal `Route` list. Opaque `AppBuilder::merge` and `AppBuilder::nest`
+  routers cannot be introspected — a non-empty opaque table emits a
+  `tracing::warn!` ("check skipped") mirroring the existing OpenAPI/MCP
+  merge-router warnings. See `docs/guide/getting-started.md`
+  ("Route collision diagnostics").
 - **migrations:** content checksums for applied migrations (issue #1203) —
   the framework now records a SHA-256 of every migration's `up.sql` in a
   new `autumn_migration_checksums` table (created by the framework

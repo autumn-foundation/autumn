@@ -264,6 +264,17 @@ async fn ws() -> impl autumn_web::ws::WsHandler {
 Route functions are collected with `routes![...]`. Static routes also need
 `static_routes![...]` so `autumn build` can pre-render them.
 
+**Duplicate-route preflight (issue #1012, unreleased — trunk-dev):** two
+handlers that resolve to the same `(method, path)` after `.scoped(...)` prefix
+resolution — including `#[repository]`-generated API routes — fail app build
+with `RouterBuildError::DuplicateUserRoute { method, path, existing, incoming }`
+BEFORE any router mounts, instead of the previous `axum::MethodRouter::merge`
+startup panic. Distinct methods on the same path (`GET /admin` + `POST /admin`)
+still merge cleanly. Opaque `.merge(...)`/`.nest(...)` routers can't be
+introspected — a non-empty opaque table emits a `tracing::warn!`
+("check skipped") rather than a false pass. See
+`docs/guide/getting-started.md` "Route collision diagnostics".
+
 ## Models and repositories
 
 Autumn uses Diesel + diesel-async for Postgres. Primary keys are `i64` /
