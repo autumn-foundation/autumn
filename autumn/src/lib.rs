@@ -87,6 +87,7 @@ pub mod config;
 pub mod credentials;
 #[cfg(feature = "db")]
 pub mod db;
+pub mod download;
 pub mod encryption;
 pub mod error;
 #[cfg(feature = "maud")]

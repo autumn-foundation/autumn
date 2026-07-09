@@ -39,6 +39,7 @@ mod custom_layer;
 mod db_telemetry_tests;
 #[cfg(feature = "db")]
 mod directory_shard_router;
+mod download;
 #[cfg(all(feature = "embed-assets", feature = "i18n"))]
 mod embed_assets_integration;
 #[cfg(feature = "db")]
