@@ -744,12 +744,24 @@ mod tests {
     fn field_diff_option_was_set() {
         let diff = FieldDiff::new(None, Some(42));
         assert!(diff.was_set());
+        let diff2 = FieldDiff::new(Some(42), Some(42));
+        assert!(!diff2.was_set());
+        let diff3 = FieldDiff::new(None::<i32>, None);
+        assert!(!diff3.was_set());
+        let diff4 = FieldDiff::new(Some(42), None);
+        assert!(!diff4.was_set());
     }
 
     #[test]
     fn field_diff_option_was_cleared() {
         let diff = FieldDiff::new(Some(42), None);
         assert!(diff.was_cleared());
+        let diff2 = FieldDiff::new(Some(42), Some(42));
+        assert!(!diff2.was_cleared());
+        let diff3 = FieldDiff::new(None::<i32>, None);
+        assert!(!diff3.was_cleared());
+        let diff4 = FieldDiff::new(None, Some(42));
+        assert!(!diff4.was_cleared());
     }
 
     // ── MutationOp tests ────────────────────────────────────────────
@@ -1059,6 +1071,21 @@ mod tests {
         let field = DraftField::new(&before, &mut after);
         assert!(field.was_set());
         assert!(!field.was_cleared());
+
+        let before2: Option<i32> = Some(42);
+        let mut after2: Option<i32> = Some(42);
+        let field2 = DraftField::new(&before2, &mut after2);
+        assert!(!field2.was_set());
+
+        let before3: Option<i32> = None;
+        let mut after3: Option<i32> = None;
+        let field3 = DraftField::new(&before3, &mut after3);
+        assert!(!field3.was_set());
+
+        let before4: Option<i32> = Some(42);
+        let mut after4: Option<i32> = None;
+        let field4 = DraftField::new(&before4, &mut after4);
+        assert!(!field4.was_set());
     }
 
     #[test]
@@ -1068,5 +1095,20 @@ mod tests {
         let field = DraftField::new(&before, &mut after);
         assert!(field.was_cleared());
         assert!(!field.was_set());
+
+        let before2: Option<i32> = Some(42);
+        let mut after2: Option<i32> = Some(42);
+        let field2 = DraftField::new(&before2, &mut after2);
+        assert!(!field2.was_cleared());
+
+        let before3: Option<i32> = None;
+        let mut after3: Option<i32> = None;
+        let field3 = DraftField::new(&before3, &mut after3);
+        assert!(!field3.was_cleared());
+
+        let before4: Option<i32> = None;
+        let mut after4: Option<i32> = Some(42);
+        let field4 = DraftField::new(&before4, &mut after4);
+        assert!(!field4.was_cleared());
     }
 }
