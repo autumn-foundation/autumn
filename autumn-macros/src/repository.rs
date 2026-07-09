@@ -8464,9 +8464,19 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             (quote! {}, quote! {}, quote! {})
         };
 
+        // Reject cross-shard aggregates whenever the repo is (compile-time)
+        // sharded + tenant-scoped AND the runtime `across_tenants` flag is set —
+        // independent of whether a live shard set (`__autumn_shards`) is loaded.
+        // sum/avg/min/max cannot be merged across shards, and an across-tenant
+        // scan without a shard set (e.g. built via `with_pool_untracked`, where
+        // `__autumn_shards` is `None`) would bind a NULL tenant predicate and
+        // silently return a PARTIAL result over only the current pool. Gating on
+        // `__autumn_shards.is_some()` missed exactly that no-shard-set case, so
+        // the guard fires purely on the sharded config + the `across_tenants`
+        // flag (#1364).
         let cross_shard_guard = if config_sharded && config_tenant_scoped {
             quote! {
-                if __repo.across_tenants && __repo.__autumn_shards.is_some() {
+                if __repo.across_tenants {
                     return ::core::result::Result::Err(
                         ::autumn_web::AutumnError::bad_request_msg(
                             "cross-shard grouped aggregates are not supported: \
@@ -12123,6 +12133,58 @@ mod tests {
         assert!(
             generated.contains("CURRENT_TENANT"),
             "tenant-scoped aggregate must resolve the active tenant: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_grouped_aggregate_rejects_across_tenants_without_shard_set() {
+        // §1364 tenant-isolation: a sharded + tenant-scoped grouped aggregate
+        // must reject `across_tenants()` cross-shard queries (sum/avg/min/max
+        // cannot be merged across shards). The guard must fire purely on the
+        // runtime `across_tenants` flag, NOT on a live shard set being present —
+        // otherwise a repo built without shard context (e.g. `with_pool_untracked`,
+        // where `__autumn_shards` is `None`) would slip past and silently return a
+        // PARTIAL result over only the current pool.
+        let generated = repository_macro(
+            quote! { Event, table = "events", tenant_scoped, sharded },
+            quote! {
+                pub trait EventRepository {
+                    fn sum_score_grouped_by_kind() -> Vec<(String, Option<i64>)>;
+                }
+            },
+        )
+        .to_string();
+
+        // Isolate the generated aggregate method body so the assertions below
+        // target the aggregate guard specifically (not some other cross-shard
+        // surface on the same repo).
+        let pos = generated
+            .find("pub fn sum_score_grouped_by_kind")
+            .expect("sharded+tenant_scoped grouped aggregate method must be generated");
+        let section = &generated[pos..];
+
+        // The rejection guard must be present in the aggregate body.
+        assert!(
+            section.contains("cross-shard grouped aggregates are not supported"),
+            "sharded+tenant_scoped grouped aggregate must reject across_tenants: {section}"
+        );
+        // The guard must key off the runtime `across_tenants` flag.
+        assert!(
+            section.contains("across_tenants"),
+            "aggregate guard must reference the across_tenants flag: {section}"
+        );
+        // The guard condition must NOT depend on a shard set being loaded —
+        // `__autumn_shards.is_some()` gating is exactly the no-shard-set hole
+        // this fix closes. Check the tokens up to the rejection so we assert on
+        // the guard condition, not on unrelated fan-out code elsewhere.
+        let guard_end = section
+            .find("cross-shard grouped aggregates are not supported")
+            .expect("rejection message must be present");
+        let guard_cond = &section[..guard_end];
+        assert!(
+            !guard_cond.contains("__autumn_shards . is_some")
+                && !guard_cond.contains("__autumn_shards.is_some"),
+            "aggregate guard condition must not depend on __autumn_shards being Some: {guard_cond}"
         );
     }
 
