@@ -115,6 +115,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `BlobStore::get_stream` without buffering the whole object in memory, so it
   serves large private files behind a `#[secured]` handler with no public
   presigned URL (#1141).
+- **actuator:** `PUT /actuator/loggers/{name}` now changes the **live**
+  `tracing` subscriber, not just an in-memory map (issue #1044). The default
+  telemetry init installs a `tracing_subscriber` reload layer and hands the
+  handle to `LogLevels`; a level change rebuilds the combined `EnvFilter`
+  directive (global level + per-target overrides) and pushes it to the running
+  subscriber, so an operator can raise/lower verbosity in production without a
+  redeploy — effective on the next event. Per-target overrides
+  (`my_app::module=trace`) raise only that target; reverting `root` to `info`
+  silences them again. Overrides stay ephemeral (reset on restart). The
+  response reports `"applied": true` / `"status":"ok"` only when the change
+  actually reached a reload-capable subscriber, and `"status":"recorded"` /
+  `"applied": false` otherwise — no silent false-positive. Invalid levels still
+  return `400`. A startup `log.level` that is a full `EnvFilter` directive
+  (e.g. `"info,tower_http=warn,my_app=debug"`) now seeds its per-target
+  segments into the override map at construction, so changing the `root` level
+  at runtime no longer drops the module-specific directives configured at
+  startup.
+- **actuator:** `GET /actuator/info` now exposes build + git provenance for
+  deploy/rollback verification (issue #1242): a `build` object with the app
+  version, an ISO-8601 UTC build timestamp, and a `git` sub-object (full +
+  short commit SHA, branch, working-tree-dirty flag). Apps created by
+  `autumn new` capture this with zero developer action — the generated
+  `build.rs` bakes `AUTUMN_BUILD_*` env vars and `#[autumn_web::main]` reads
+  them (plus the app's compile-time `CARGO_PKG_NAME` / `CARGO_PKG_VERSION`) at
+  the app's compile time. This also fixes the `app.version` / `app.name`
+  `"unknown"` regression (they were read from the cargo env at runtime, which
+  is unset in a released binary). Outside a git checkout the `git.*` fields
+  degrade to `null` while timestamp + version stay present; the block never
+  leaks remote URLs or an env dump.
 - **security:** per-route `#[throttle]` route attribute (issue #1350) —
   drop-in stricter rate limit for abuse-prone endpoints (login, search,
   export). `#[throttle(limit = 5, per = "1m")]` bounds requests to that
@@ -871,6 +900,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   up to a year. (The idiomorph URL is not content-fingerprinted; adding
   fingerprinted asset URLs so it can safely go back to `immutable` caching is a
   possible future follow-up.)
+- **actuator:** `PUT /actuator/loggers/{name}` no longer reports a false
+  `{"status":"ok","applied":true}` for a change that did not actually reach the
+  live subscriber (issue #1044). Logger names are now validated up front like
+  levels — a name carrying an `EnvFilter` metacharacter (`=`, `,`, whitespace,
+  …) is rejected with `400` instead of being stored as a bogus override — and
+  the response is driven by the real apply outcome: if the directive fails to
+  apply the override is rolled back so `GET /actuator/loggers` never advertises
+  a level that isn't live. The directive is now applied while the state lock is
+  held so concurrent updates apply in the same order they mutate the map,
+  keeping `GET /actuator/loggers` consistent with live emission under
+  concurrency (AC4).
+- **cli:** the generated `build.rs` git-provenance rerun triggers are more
+  reliable (issue #1242): it now also watches `.git/logs/HEAD` (which moves on
+  every commit, `--amend`, and `reset --soft`, so the baked SHA/`dirty` flag no
+  longer goes stale after an amend), resolves the real gitdir when `.git` is a
+  *file* (git worktrees / submodules) instead of assuming the `.git/` directory
+  layout, and honors `SOURCE_DATE_EPOCH` for a deterministic build timestamp on
+  reproducible builds. Non-git builds still degrade gracefully (fields `null`,
+  build never fails).
 
 ### Changed
 

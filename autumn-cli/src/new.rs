@@ -1160,6 +1160,43 @@ mod tests {
     }
 
     #[test]
+    fn generated_build_rs_bakes_build_and_git_provenance() {
+        // AC #4 of issue #1242: apps created by `autumn new` capture build + git
+        // provenance with zero developer action — the generated build.rs emits
+        // the AUTUMN_BUILD_* env vars that `#[autumn_web::main]` reads.
+        let tmp = TempDir::new().unwrap();
+        generate("provenance-check", tmp.path()).unwrap();
+
+        let content = fs::read_to_string(tmp.path().join("provenance-check/build.rs")).unwrap();
+        assert!(content.contains("emit_build_provenance"));
+        assert!(content.contains("cargo:rustc-env=AUTUMN_BUILD_TIMESTAMP="));
+        assert!(content.contains("cargo:rustc-env=AUTUMN_BUILD_GIT_SHA="));
+        assert!(content.contains("cargo:rustc-env=AUTUMN_BUILD_GIT_SHA_SHORT="));
+        assert!(content.contains("cargo:rustc-env=AUTUMN_BUILD_GIT_BRANCH="));
+        assert!(content.contains("cargo:rustc-env=AUTUMN_BUILD_GIT_DIRTY="));
+        // Best-effort git: never fails the build outside a checkout.
+        assert!(content.contains("rev-parse"));
+        // Re-run when HEAD *moves* (commit/amend/reset all rewrite logs/HEAD),
+        // not only when HEAD/index files change.
+        assert!(content.contains("logs/HEAD"));
+        // Gitdir is resolved by asking git itself, so nested/monorepo apps whose
+        // package root has no `.git` still register the parent checkout's rerun
+        // triggers. `--git-common-dir` covers linked worktrees where `logs/HEAD`
+        // lives in the common dir.
+        assert!(content.contains("--git-dir"));
+        assert!(content.contains("--git-common-dir"));
+        // Linked worktrees: `--amend`/`reset` rewrites the per-worktree reflog
+        // (`<git-dir>/logs/HEAD`) but not the shared common-dir reflog, so the
+        // generated build.rs must watch the per-worktree reflog too — otherwise
+        // Cargo never re-runs after an amend in a worktree and `/actuator/info`
+        // reports a stale SHA.
+        assert!(content.contains("git_dir.join(\"logs/HEAD\")"));
+        // Reproducible builds: honor and watch SOURCE_DATE_EPOCH.
+        assert!(content.contains("SOURCE_DATE_EPOCH"));
+        assert!(content.contains("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH"));
+    }
+
+    #[test]
     fn no_unsubstituted_placeholders() {
         let tmp = TempDir::new().unwrap();
         generate("placeholder-check", tmp.path()).unwrap();

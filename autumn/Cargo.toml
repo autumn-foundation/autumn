@@ -287,6 +287,12 @@ harness = false
 name = "integration_tests"
 path = "tests/integration_tests.rs"
 
+# Isolated: installs the process-global tracing subscriber (issue #1044), a
+# process-wide side-effect that cannot share the consolidated binary.
+[[test]]
+name = "actuator_live_logger_reload"
+path = "tests/actuator_live_logger_reload.rs"
+
 [[test]]
 name = "db_hooks_lifecycle"
 path = "tests/db_hooks_lifecycle.rs"

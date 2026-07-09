@@ -756,6 +756,66 @@ Published 0.5.0 behavior:
 - `actuator.prometheus` exposes the Prometheus scrape endpoint independently
   of sensitive actuator mode.
 
+### Runtime log levels (unreleased — trunk-dev)
+
+`PUT /actuator/loggers/{name}` now changes the **live** `tracing` subscriber,
+not just an in-memory map — raise/lower verbosity in production without a
+redeploy. The default telemetry init installs a `tracing_subscriber` reload
+layer and hands the handle to `LogLevels`, so a level change rebuilds the
+combined `EnvFilter` directive (global level + per-target overrides) and pushes
+it to the running subscriber on the next event. Examples (sensitive actuator
+mode required):
+
+```bash
+curl -X PUT .../actuator/loggers/root -d '{"level":"debug"}'          # global
+curl -X PUT .../actuator/loggers/my_app::orders -d '{"level":"trace"}' # per-target
+curl -X PUT .../actuator/loggers/root -d '{"level":"info"}'            # revert
+```
+
+The response now carries `"applied": true` and `"status":"ok"` only when the
+change actually reached a reload-capable subscriber; otherwise it reports
+`"status":"recorded"` / `"applied": false` rather than a false-positive `ok`.
+Overrides stay ephemeral — a restart resets to the configured `log.level`.
+Invalid levels still return `400`. `GET /actuator/loggers` keeps reporting
+`current_level` + overrides, now matching real emission.
+
+### Build & git provenance on `/actuator/info` (unreleased — trunk-dev)
+
+`GET /actuator/info` now reports which commit/build is running, for
+deploy/rollback verification. Apps scaffolded by `autumn new` get this with
+**zero action**: the generated `build.rs` bakes `AUTUMN_BUILD_*` values and
+`#[autumn_web::main]` reads them (plus the app's own `CARGO_PKG_NAME` /
+`CARGO_PKG_VERSION`) at the app's compile time. That also fixes the old
+`app.version = "unknown"` regression — the value is now baked in, correct even
+in a `--release` binary with the cargo env unset at runtime. Sample payload:
+
+```json
+{
+  "app":     { "name": "my_app", "version": "1.4.2" },
+  "autumn":  { "version": "0.6.0", "profile": "prod" },
+  "runtime": { "uptime": "3h 12m" },
+  "build": {
+    "version": "1.4.2",
+    "timestamp": "2026-07-09T12:34:56Z",
+    "git": {
+      "commit": "9f3c1a7e…",
+      "commit_short": "9f3c1a7",
+      "branch": "main",
+      "dirty": false
+    }
+  }
+}
+```
+
+Outside a git checkout (tarball / CI cache) the `git.*` fields degrade to
+`null` while `build.timestamp` + `version` stay present. The block exposes only
+commit / branch / time / version / dirty — never remote URLs or an env dump.
+Hand-rolled apps opt in by adding the generated `build.rs` provenance stanza
+and using `#[autumn_web::main]`.
+
+**Known limitation:** apps built from the scaffolded Dockerfile currently report
+null git provenance because the Docker build context excludes `.git` (tracked in
+#1676).
 Unreleased (trunk-dev) — `Server-Timing` response header:
 
 - Opt-in via `[observability] server_timing = true` (or
