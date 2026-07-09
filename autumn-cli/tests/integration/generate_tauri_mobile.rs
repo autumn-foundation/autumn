@@ -11,7 +11,9 @@ use std::process::{Command, Output};
 
 /// Scaffold a fresh Autumn app via `autumn new` in a temp dir; returns the
 /// temp dir guard and the project directory path.
-fn fresh_project(project_name: &str) -> (tempfile::TempDir, PathBuf) {
+///
+/// Shared with `generate_tauri_mobile_offline` (the `--offline-sync` tests).
+pub fn fresh_project(project_name: &str) -> (tempfile::TempDir, PathBuf) {
     let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
     let autumn_bin = env!("CARGO_BIN_EXE_autumn");
 
@@ -41,7 +43,7 @@ fn run_autumn_raw(project_dir: &Path, args: &[&str]) -> Output {
 }
 
 /// Run the autumn CLI in `project_dir`, asserting success.
-fn run_autumn(project_dir: &Path, args: &[&str]) -> Output {
+pub fn run_autumn(project_dir: &Path, args: &[&str]) -> Output {
     let output = run_autumn_raw(project_dir, args);
     assert!(
         output.status.success(),
@@ -52,7 +54,7 @@ fn run_autumn(project_dir: &Path, args: &[&str]) -> Output {
     output
 }
 
-fn read(path: &Path) -> String {
+pub fn read(path: &Path) -> String {
     fs::read_to_string(path).unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
 }
 

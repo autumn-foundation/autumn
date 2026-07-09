@@ -555,6 +555,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before the line that is exactly `#[autumn_web::main]` rather than before
   any comment that merely mentions the macro — both used to produce
   uncompilable `main.rs` output when such comments were present.
+### Security
+
+- **auth:** OIDC `id_token` verification no longer trusts the token header's
+  `alg` to select the verification algorithm (JWT algorithm-confusion
+  defense). The accepted algorithm set is now pinned from the matched JWKS
+  key — its declared `alg` when present, otherwise the asymmetric signature
+  algorithms compatible with its key type (`kty`) — and tokens whose header
+  algorithm is not in that set are rejected before signature verification.
+  In particular, symmetric (HS256/HS384/HS512) headers are rejected when
+  verifying against asymmetric JWKS keys, closing the forgery vector where an
+  attacker HMAC-signs a token using the provider's public key material, and
+  `alg: none` tokens remain rejected at header parsing.
 
 ## [0.6.0] - 2026-06-30
 
@@ -731,6 +743,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Previously the pool hardcoded `NoTls`, so `sslmode=require` failed every
   connection with "no TLS implementation configured" and cleartext was the
   only working configuration (issue #1507). [no-plugin]
+
+- **offline-sync (new feature):** offline-first local storage plus a sync
+  engine for occasionally-connected apps such as the in-process Tauri mobile
+  shell (issue #1508). `autumn_web::sync` ships a local SQLite `SyncStore`
+  (JSON rows per collection, write-through change journal in the same
+  transaction, tombstoned deletes), a client `SyncEngine` (push pending →
+  pull versions past the cursor; at-least-once with server-side dedup,
+  exponential-backoff background task, transparent full resync that
+  preserves and replays pending changes), and a mountable server router
+  (`POST /sync/push` + `GET /sync/pull` via `AppBuilder::nest`) over
+  Postgres shadow tables with idempotent DDL (`PgSyncBackend`) or an
+  in-memory backend for tests. Conflicts are settled server-side by a
+  pluggable `ConflictResolver` (default: last-write-wins on the conflicting
+  writes' `updated_at`; exact ties break to the lexicographically greater
+  device id); resolved rows get a new version so every device converges.
+  Postgres pushes serialize under an advisory lock (in-order version
+  visibility for pulls; concurrent first-inserts of one pk engage the
+  resolver), pull sessions carry a session-start cursor so multi-page
+  catch-ups survive tombstone GC, completed catch-ups land the cursor at
+  the GC horizon and prune GC'd local tombstones, `already_applied` acks
+  return the originally assigned version, push/pull request sizes are
+  bounded server-side, dedup records are GC-able via
+  `SyncBackend::gc_applied`, and `SyncConfig::bearer_token` authenticates
+  the engine against an auth-guarded `/sync` mount. Zero new
+  dependencies — builds on the `db` and `http-client` features already in
+  the graph. [no-plugin]
+- **generator:** `autumn generate tauri-mobile --offline-sync` (issue #1508)
+  wires the offline-sync engine into the mobile scaffold: the shell opens a
+  `SyncStore`-backed SQLite database in the app sandbox (exported as
+  `AUTUMN_SYNC__DB_PATH`), runs a background `SyncEngine` against
+  `AUTUMN_SYNC__REMOTE_URL` (30 s interval, exponential backoff while
+  offline, plus an immediate pass on `RunEvent::Resumed` when the app
+  returns to the foreground), and the app crate gains a default
+  `offline-sync` feature and a `/sync` router mounted in the extracted
+  `serve()` — only when the app's resolved config has a database URL (e.g.
+  `AUTUMN_DATABASE__URL`), and with log-and-continue schema DDL, so the
+  same binary boots fully offline on a device (no database at all) and
+  serves sync on the server. Without the flag the emitted scaffold is
+  byte-identical to before (pinned by a golden snapshot test). Docs:
+  architecture, change tracking, tombstoning/GC, conflict resolution, and
+  an airplane-mode walkthrough in
+  [docs/guide/tauri-mobile-offline-sync.md](docs/guide/tauri-mobile-offline-sync.md).
+  [no-plugin]
 
 ### Documentation
 
