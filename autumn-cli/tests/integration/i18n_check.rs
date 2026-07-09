@@ -205,6 +205,108 @@ fn view(locale: &Locale, section: &str) -> String {
 }
 
 #[test]
+fn dynamic_prefix_suppresses_matching_unused_but_not_others() {
+    // A dynamic site `locale.t(&format!("status.{state}"))` records the static
+    // prefix `status.`, so the defined `status.open`/`status.closed` keys must
+    // NOT be flagged Unused (and `--strict` still passes). An unrelated
+    // `footer.legacy` (matching no prefix) IS still Unused and fails `--strict`.
+    let dir = clean_project();
+    write(
+        dir.path(),
+        "src/main.rs",
+        r#"
+fn view(locale: &Locale, state: &str) -> String {
+    let a = t!(locale, "nav.home");
+    let b = locale.t("nav.about");
+    let c = locale.t(&format!("status.{state}"));
+    format!("{a}{b}{c}")
+}
+"#,
+    );
+    write(
+        dir.path(),
+        "i18n/en.ftl",
+        "nav.home = Home\nnav.about = About\nstatus.open = Open\nstatus.closed = Closed\n",
+    );
+    write(
+        dir.path(),
+        "i18n/es.ftl",
+        "nav.home = Inicio\nnav.about = Acerca\nstatus.open = Abierto\nstatus.closed = Cerrado\n",
+    );
+
+    // status.* is covered by the dynamic prefix → no Unused → --strict passes.
+    let strict = run_check(dir.path(), &["--strict"]);
+    let strict_stdout = String::from_utf8_lossy(&strict.stdout);
+    assert!(
+        strict.status.success(),
+        "status.* keys are covered by the `status.` dynamic prefix, so --strict must pass\nstdout:\n{strict_stdout}"
+    );
+    assert!(
+        !strict_stdout.contains("status.open") && !strict_stdout.contains("status.closed"),
+        "status.* keys must not be reported Unused\n{strict_stdout}"
+    );
+
+    // Add a genuinely-unused key matching no prefix: --strict must now fail.
+    write(
+        dir.path(),
+        "i18n/en.ftl",
+        "nav.home = Home\nnav.about = About\nstatus.open = Open\nstatus.closed = Closed\nfooter.legacy = Old\n",
+    );
+    let unrelated = run_check(dir.path(), &["--strict"]);
+    let unrelated_out = String::from_utf8_lossy(&unrelated.stdout);
+    assert!(
+        !unrelated.status.success(),
+        "a key matching no dynamic prefix must still fail --strict\nstdout:\n{unrelated_out}"
+    );
+    assert!(
+        unrelated_out.contains("footer.legacy"),
+        "should list the genuinely-unused key\n{unrelated_out}"
+    );
+}
+
+#[test]
+fn fully_dynamic_site_suppresses_unused_reporting() {
+    // A bare-variable key site `locale.t(&key)` has no static prefix and could
+    // reference any key, so Unused reporting is suppressed entirely: even an
+    // otherwise-unused key must not fail `--strict`, and the output notes it.
+    let dir = clean_project();
+    write(
+        dir.path(),
+        "src/main.rs",
+        r#"
+fn view(locale: &Locale, key: &str) -> String {
+    let a = t!(locale, "nav.home");
+    let b = locale.t("nav.about");
+    let c = locale.t(&key);
+    format!("{a}{b}{c}")
+}
+"#,
+    );
+    // `footer.legacy` is defined but never statically referenced.
+    write(
+        dir.path(),
+        "i18n/en.ftl",
+        "nav.home = Home\nnav.about = About\nfooter.legacy = Old\n",
+    );
+    write(
+        dir.path(),
+        "i18n/es.ftl",
+        "nav.home = Inicio\nnav.about = Acerca\nfooter.legacy = Viejo\n",
+    );
+
+    let output = run_check(dir.path(), &["--strict"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "a fully-dynamic key site suppresses Unused, so --strict must pass\nstdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Unused checking suppressed"),
+        "output should note the suppression\n{stdout}"
+    );
+}
+
+#[test]
 fn json_format_emits_machine_readable_report() {
     let dir = clean_project();
     write(dir.path(), "i18n/en.ftl", "nav.home = Home\n");

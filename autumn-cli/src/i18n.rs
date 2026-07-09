@@ -14,7 +14,11 @@
 //! - **Untranslated** — a key present in the default locale but absent from a
 //!   non-default locale. A warning (error under `--strict`).
 //! - **Unused** — a key defined in a `.ftl` with no matching call site in
-//!   code. A warning (error under `--strict`).
+//!   code. A warning (error under `--strict`). Dynamic key sites are taken into
+//!   account: a key any dynamic site's static prefix could build (e.g.
+//!   `status.open` under a `format!("status.{state}")` site) is not flagged, and
+//!   a *fully*-dynamic site (`t(&key)`) suppresses Unused reporting entirely
+//!   (informational only) since it could reference any key.
 //!
 //! The scanner statically extracts string-literal keys from `t!(...)`,
 //! `.t(...)`, and `.t_with(...)` call sites via [`syn`]. Keys built at runtime
@@ -66,6 +70,12 @@ pub struct DynamicSite {
     pub line: usize,
     /// The offending key expression, as source text.
     pub snippet: String,
+    /// The leading *static* portion of the key expression, up to the first
+    /// dynamic interpolation — e.g. `format!("status.{state}")` → `"status."`.
+    /// Empty when no leading literal is discoverable (a bare variable,
+    /// `format!("{x}")`, …), meaning the site could reference *any* key. Used to
+    /// suppress false `Unused` reports for keys such a site could cover.
+    pub key_prefix: String,
 }
 
 /// Per-locale findings.
@@ -93,6 +103,11 @@ pub struct Report {
     pub files_scanned: usize,
     /// Call sites with non-literal keys (not analyzable).
     pub dynamic: Vec<DynamicSite>,
+    /// True when a *fully*-dynamic key site (one with an empty static prefix,
+    /// e.g. `locale.t(&key)`) was found. Such a site could reference any key, so
+    /// the **Unused** set cannot be trusted: `unused` entries are then reported
+    /// for information only and never fail `--strict`.
+    pub unused_suppressed_by_dynamic: bool,
     pub locales: Vec<LocaleReport>,
 }
 
@@ -103,12 +118,14 @@ impl Report {
         self.locales.iter().any(|l| !l.missing.is_empty())
     }
 
-    /// Any **Untranslated**/**Unused** warnings across locales.
+    /// Any **Untranslated**/**Unused** warnings across locales. When a
+    /// fully-dynamic key site suppressed Unused checking, the (informational)
+    /// `unused` lists do not count toward warnings and never fail `--strict`.
     #[must_use]
     pub fn has_warnings(&self) -> bool {
-        self.locales
-            .iter()
-            .any(|l| !l.untranslated.is_empty() || !l.unused.is_empty())
+        self.locales.iter().any(|l| !l.untranslated.is_empty())
+            || (!self.unused_suppressed_by_dynamic
+                && self.locales.iter().any(|l| !l.unused.is_empty()))
     }
 
     /// Process exit code: non-zero when any locale has Missing keys, or (under
@@ -344,7 +361,86 @@ fn record_dynamic_segment(segment: &TokenStream, file: &str, result: &mut ScanRe
         file: file.to_owned(),
         line,
         snippet: segment.to_string(),
+        key_prefix: dynamic_key_prefix(segment),
     });
+}
+
+/// Derive the leading *static* key prefix a dynamic key site could reference.
+///
+/// - `format!("status.{state}")` → `"status."`
+/// - `&format!("nav.{}", x)`     → `"nav."`
+/// - `"status.".to_owned() + s`  → `"status."`
+/// - a bare variable / `&key` / `format!("{x}")` (no leading literal) → `""`
+///
+/// An empty prefix means the site could reference *any* key, so the caller must
+/// treat the entire `Unused` set as untrustworthy.
+fn dynamic_key_prefix(segment: &TokenStream) -> String {
+    let trees: Vec<TokenTree> = segment.clone().into_iter().collect();
+
+    // Case 1: a `format!(...)` invocation anywhere in the expression (e.g. the
+    // `format!` in `&format!("nav.{}", x)`). Its first argument's format string
+    // supplies the static prefix — the text before the first `{` interpolation.
+    for i in 0..trees.len() {
+        if let TokenTree::Ident(id) = &trees[i]
+            && *id == "format"
+            && matches!(trees.get(i + 1), Some(TokenTree::Punct(p)) if p.as_char() == '!')
+            && let Some(TokenTree::Group(group)) = trees.get(i + 2)
+        {
+            return split_top_level_args(&group.stream())
+                .first()
+                .and_then(segment_str_lit)
+                .map_or_else(String::new, |fmt| format_static_prefix(&fmt));
+        }
+    }
+
+    // Case 2: a leading string literal (e.g. `"status." + s`, or the borrowed /
+    // parenthesized `&("footer.".to_owned() + s)`). A plain literal has no
+    // interpolation, so its whole value is static leading text. Only the
+    // *leading* literal counts; one in a later position must not masquerade as
+    // the key's prefix.
+    leading_str_literal(&trees).unwrap_or_default()
+}
+
+/// The value of the leading string literal of an expression, stepping over
+/// leading borrow/deref puncts (`&`/`*`) and descending into a single leading
+/// parenthesized/implicit group. `None` when the expression does not begin with
+/// a string literal (a bare variable, a metavariable, a method-call receiver…).
+fn leading_str_literal(trees: &[TokenTree]) -> Option<String> {
+    let first = trees
+        .iter()
+        .find(|tt| !matches!(tt, TokenTree::Punct(p) if matches!(p.as_char(), '&' | '*')))?;
+    match first {
+        TokenTree::Literal(_) => segment_str_lit(&TokenStream::from(first.clone())),
+        TokenTree::Group(g)
+            if matches!(g.delimiter(), Delimiter::Parenthesis | Delimiter::None) =>
+        {
+            let inner: Vec<TokenTree> = g.stream().into_iter().collect();
+            leading_str_literal(&inner)
+        }
+        _ => None,
+    }
+}
+
+/// The static leading text of a `format!` format string: everything before the
+/// first `{` interpolation, with `{{`/`}}` escapes decoded to `{`/`}`.
+fn format_static_prefix(fmt: &str) -> String {
+    let mut out = String::new();
+    let mut chars = fmt.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '{' if chars.peek() == Some(&'{') => {
+                chars.next();
+                out.push('{');
+            }
+            '{' => break, // a real interpolation begins the dynamic tail
+            '}' if chars.peek() == Some(&'}') => {
+                chars.next();
+                out.push('}');
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 // ── `.ftl` key extraction ─────────────────────────────────────────────────
@@ -424,6 +520,20 @@ pub fn build_report(
     let empty = BTreeSet::new();
     let default_keys = per_locale_keys.get(&default_locale).unwrap_or(&empty);
 
+    // Dynamic key sites make the **Unused** set imprecise: a key a dynamic site
+    // could build must not be flagged Unused. A site with a non-empty static
+    // prefix (`format!("status.{s}")` → `"status."`) suppresses only keys under
+    // that prefix; a *fully*-dynamic site (empty prefix, e.g. `t(&key)`) could
+    // reference any key, so Unused is suppressed wholesale (reported for info,
+    // never failing `--strict`).
+    let unused_suppressed_by_dynamic = scan.dynamic.iter().any(|d| d.key_prefix.is_empty());
+    let dynamic_prefixes: Vec<&str> = scan
+        .dynamic
+        .iter()
+        .map(|d| d.key_prefix.as_str())
+        .filter(|p| !p.is_empty())
+        .collect();
+
     // Seed the set of locales to report on from BOTH the `.ftl` files present on
     // disk AND the locales declared in `[i18n].supported_locales`. A configured
     // locale with no `.ftl` file must still be reported (its keys resolve to the
@@ -464,10 +574,12 @@ pub fn build_report(
             // Fluent terms (`-brand = …`) are only referenced from within other
             // messages via `{ -brand }`, never through `t!`, so they would
             // always show up as Unused. Exclude them to avoid false-positive CI
-            // noise.
+            // noise. Also exclude any key a dynamic site's static prefix could
+            // build (e.g. `status.open` under a `format!("status.{s}")` site).
             let unused: Vec<String> = keys
                 .iter()
                 .filter(|k| !k.starts_with('-') && !scan.referenced.contains(*k))
+                .filter(|k| !dynamic_prefixes.iter().any(|p| k.starts_with(p)))
                 .cloned()
                 .collect();
 
@@ -487,6 +599,7 @@ pub fn build_report(
         referenced_keys: scan.referenced.len(),
         files_scanned: scan.files_scanned,
         dynamic: scan.dynamic.clone(),
+        unused_suppressed_by_dynamic,
         locales,
     }
 }
@@ -751,6 +864,14 @@ fn print_text(report: &Report, strict: bool) {
         }
     }
 
+    if report.unused_suppressed_by_dynamic {
+        println!(
+            "  note: Unused checking suppressed — a fully-dynamic key site (no static \
+             prefix) is present; Unused entries below are informational only and do not \
+             fail --strict."
+        );
+    }
+
     for locale in &report.locales {
         let tag = if locale.is_default {
             format!("{} (default)", locale.locale)
@@ -762,7 +883,12 @@ fn print_text(report: &Report, strict: bool) {
         if !locale.is_default {
             print_key_list("Untranslated", &locale.untranslated, "⚠");
         }
-        print_key_list("Unused", &locale.unused, "·");
+        let unused_label = if report.unused_suppressed_by_dynamic {
+            "Unused (informational)"
+        } else {
+            "Unused"
+        };
+        print_key_list(unused_label, &locale.unused, "·");
     }
 
     println!();
@@ -946,6 +1072,103 @@ mod tests {
             result.referenced
         );
         assert_eq!(result.dynamic.len(), 1);
+    }
+
+    #[test]
+    fn dynamic_prefix_from_format_and_leading_literal() {
+        // The static prefix is the text before the first `{` interpolation for a
+        // `format!`, the whole leading literal for a concat, and empty when no
+        // leading literal is discoverable.
+        let src = r#"
+            fn view(locale: &Locale, state: &str, x: &str, key: &str) {
+                let _ = locale.t(&format!("status.{state}"));
+                let _ = locale.t(&format!("nav.{}", x));
+                let _ = locale.t(&format!("{x}"));
+                let _ = locale.t(&("footer.".to_owned() + x));
+                let _ = locale.t(key);
+            }
+        "#;
+        let mut result = ScanResult::default();
+        scan_source(src, "view.rs", &mut result);
+        let prefixes: Vec<&str> = result
+            .dynamic
+            .iter()
+            .map(|d| d.key_prefix.as_str())
+            .collect();
+        assert_eq!(prefixes, vec!["status.", "nav.", "", "footer.", ""]);
+    }
+
+    #[test]
+    fn format_static_prefix_decodes_escaped_braces() {
+        assert_eq!(format_static_prefix("status.{state}"), "status.");
+        assert_eq!(format_static_prefix("nav.{}"), "nav.");
+        assert_eq!(format_static_prefix("{x}"), "");
+        assert_eq!(format_static_prefix("a{{b}}.{x}"), "a{b}.");
+        assert_eq!(format_static_prefix("plain"), "plain");
+    }
+
+    #[test]
+    fn dynamic_prefix_suppresses_only_matching_unused_keys() {
+        // A dynamic site `t(&format!("status.{state}"))` records prefix
+        // `status.`, so `status.open`/`status.closed` must NOT be flagged Unused
+        // — but an unrelated `footer.legacy` (matching no prefix) still is.
+        let src = r#"
+            fn view(locale: &Locale, state: &str) {
+                let _ = locale.t("nav.home");
+                let _ = locale.t(&format!("status.{state}"));
+            }
+        "#;
+        let mut scan = ScanResult::default();
+        scan_source(src, "view.rs", &mut scan);
+
+        let mut per_locale = BTreeMap::new();
+        per_locale.insert(
+            "en".to_owned(),
+            keys(&["nav.home", "status.open", "status.closed", "footer.legacy"]),
+        );
+        let report = build_report(&scan, &cfg("en", &[]), &per_locale);
+
+        assert!(!report.unused_suppressed_by_dynamic);
+        let en = &report.locales[0];
+        assert_eq!(
+            en.unused,
+            vec!["footer.legacy".to_owned()],
+            "prefix `status.` must suppress status.* keys but keep footer.legacy"
+        );
+        // Genuinely-unused key still fails under --strict.
+        assert!(report.has_warnings());
+        assert_eq!(report.exit_code(false), 0);
+        assert_eq!(report.exit_code(true), 1);
+    }
+
+    #[test]
+    fn fully_dynamic_site_suppresses_unused_entirely() {
+        // A bare-variable key site `t(&key)` (empty prefix) could reference any
+        // key, so Unused reporting is suppressed wholesale: even otherwise-unused
+        // keys must not fail `--strict`.
+        let src = r#"
+            fn view(locale: &Locale, key: &str) {
+                let _ = locale.t("nav.home");
+                let _ = locale.t(&key);
+            }
+        "#;
+        let mut scan = ScanResult::default();
+        scan_source(src, "view.rs", &mut scan);
+        assert_eq!(scan.dynamic.len(), 1);
+        assert_eq!(scan.dynamic[0].key_prefix, "");
+
+        let mut per_locale = BTreeMap::new();
+        per_locale.insert("en".to_owned(), keys(&["nav.home", "footer.legacy"]));
+        let report = build_report(&scan, &cfg("en", &[]), &per_locale);
+
+        assert!(report.unused_suppressed_by_dynamic);
+        // The unused key is still listed (informational) …
+        let en = &report.locales[0];
+        assert_eq!(en.unused, vec!["footer.legacy".to_owned()]);
+        // … but does NOT count as a warning or fail --strict.
+        assert!(!report.has_warnings());
+        assert_eq!(report.exit_code(false), 0);
+        assert_eq!(report.exit_code(true), 0);
     }
 
     #[test]
