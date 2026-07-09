@@ -21,10 +21,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   helpers in `autumn_web::widgets` (all prelude re-exported, with `/_stories`
   gallery entries). `toast(message, variant)` / `toast_region(id)` /
   `toast_in(region_id, …)` render transient, CSS-auto-dismissing htmx action
-  feedback: the toast appends into a fixed region out-of-band via
-  `hx-swap-oob="beforeend:#<region-id>"`, reusing the shared `AlertVariant`
-  color lane (`Error` announces assertively via `role="alert"`/`aria-live`,
-  others politely) — no `<script>`, no new color vocabulary (issue #1320).
+  feedback: the toast appends into a fixed, persistent `aria-live="polite"`
+  region out-of-band via `hx-swap-oob="beforeend:#<region-id>"`, reusing the
+  shared `AlertVariant` color lane (`Error` announces assertively via
+  `role="alert"`; non-error toasts inherit the region's politeness) — no
+  `<script>`, no new color vocabulary (issue #1320).
   `infinite_feed(items, next_cursor, &FeedConfig)` + the companion
   `feed_page(items, next_cursor, &FeedConfig)` render an htmx infinite-scroll /
   "Load more" feed driven by a `CursorPage`: a single `hx-get` sentinel carries

@@ -3461,22 +3461,29 @@ pub fn error_summary<T>(changeset: &crate::form::Changeset<T>) -> Option<maud::M
 /// `toast(msg, variant)` then appends into it out-of-band.
 pub const DEFAULT_TOAST_REGION_ID: &str = "toast-region";
 
-/// Render the fixed-position container that toasts stack into.
+/// Render the persistent, fixed-position live region that toasts append into.
 ///
-/// Drop this **once** into your base layout (typically just before `</body>`).
-/// It is an empty, `aria-live`-free stacking context; each [`toast`] carries
-/// its own live-region role so screen readers announce individual toasts as
-/// they arrive rather than re-reading the whole region. Position and stacking
-/// come from the shipped `.autumn-toast-region` rule — no inline styles.
+/// Drop this **once** into your base layout (typically just before `</body>`)
+/// and leave it in place: it is an **empty, persistent `aria-live="polite"`
+/// region**. Appending a toast into an already-in-DOM live region is announced
+/// reliably by screen readers, whereas inserting an already-populated
+/// `aria-live` element is not — which is why the politeness lives here, on the
+/// region, rather than on each non-error toast. `aria-atomic="false"` (and no
+/// `role="status"`, which would imply `aria-atomic="true"`) means only the
+/// newly-appended toast is announced, not every toast still on screen. Position
+/// and stacking come from the shipped `.autumn-toast-region` rule — no inline
+/// styles.
 ///
-/// Use [`DEFAULT_TOAST_REGION_ID`] unless you need more than one region; a
-/// custom id must be paired with [`toast_in`] so the OOB target matches.
+/// Non-error toasts inherit this region's politeness; error toasts announce
+/// assertively on their own via `role="alert"`. Use [`DEFAULT_TOAST_REGION_ID`]
+/// unless you need more than one region; a custom id must be paired with
+/// [`toast_in`] so the OOB target matches.
 ///
 /// # CSS hooks
 ///
 /// | Selector | Element |
 /// |---|---|
-/// | `.autumn-toast-region` | Fixed-position stacking container |
+/// | `.autumn-toast-region` | Fixed-position, persistent polite live region |
 ///
 /// # Example
 ///
@@ -3486,6 +3493,9 @@ pub const DEFAULT_TOAST_REGION_ID: &str = "toast-region";
 /// let html = toast_region(DEFAULT_TOAST_REGION_ID).into_string();
 /// assert!(html.contains(r#"id="toast-region""#));
 /// assert!(html.contains(r#"class="autumn-toast-region""#));
+/// assert!(html.contains(r#"aria-live="polite""#));   // persistent live region
+/// assert!(html.contains(r#"aria-atomic="false""#));  // announce only new toasts
+/// assert!(!html.contains(r#"role="status""#));       // role=status implies atomic
 /// ```
 #[cfg(feature = "maud")]
 #[must_use]
@@ -3494,25 +3504,39 @@ pub fn toast_region(id: &str) -> maud::Markup {
     // leading `#` so the element id is always bare, matching the id that
     // `toast_in`'s `beforeend:#…` OOB target points at.
     let id = selector_to_id(id);
+    // The region is a PERSISTENT polite live region: a `role="status"`/
+    // `aria-live="polite"` element inserted already-populated is not reliably
+    // announced, so instead this empty region lives in the layout and toasts are
+    // appended into it (screen readers announce the mutation). `aria-atomic` is
+    // explicitly `false` so only the newly-appended toast is read, not every
+    // toast currently in the region — and `role="status"` is deliberately NOT
+    // used because it implies `aria-atomic="true"`, which would re-announce all
+    // of them. Non-error toasts inherit this politeness (they carry no own
+    // `aria-live`); error toasts announce assertively on their own.
     maud::html! {
-        div id=(id) class="autumn-toast-region" {}
+        div id=(id) class="autumn-toast-region" aria-live="polite" aria-atomic="false" {}
     }
 }
 
 /// Render a single transient toast that appends into the default toast region
 /// out-of-band, for htmx action feedback.
 ///
-/// This is the common case: it targets [`DEFAULT_TOAST_REGION_ID`]. Return it
-/// alongside your normal swapped fragment from an htmx handler and htmx appends
-/// it into the region via `hx-swap-oob="beforeend:#toast-region"` — no full
-/// page reload, no JavaScript. Auto-dismiss is CSS-only (a `@keyframes` fade in
-/// the shipped stylesheet); the widget emits **no `<script>`**.
+/// This is the common case: it targets [`DEFAULT_TOAST_REGION_ID`]. Drop
+/// [`toast_region`] once in your layout, then return this alongside your normal
+/// swapped fragment from an htmx handler; htmx appends it into the region via
+/// `hx-swap-oob="beforeend:#toast-region"` — no full page reload, no
+/// JavaScript. Auto-dismiss is CSS-only (a `@keyframes` fade in the shipped
+/// stylesheet); the widget emits **no `<script>`**.
 ///
 /// `variant` reuses the shared [`AlertVariant`] semantic enum (the alert/badge
-/// color lane) — no new color vocabulary. `Error` toasts announce assertively
-/// (`role="alert"`, `aria-live="assertive"`); all other variants announce
-/// politely (`role="status"`, `aria-live="polite"`). Every toast carries
-/// `aria-atomic="true"`. The message is HTML-escaped by Maud.
+/// color lane) — no new color vocabulary. **Accessibility:** `Error` toasts
+/// announce assertively on their own (`role="alert"`, `aria-live="assertive"`),
+/// which is reliably read on insertion; all other variants carry **no own
+/// `role`/`aria-live`** and instead inherit the persistent
+/// `aria-live="polite"` of the [`toast_region`] they're appended into (an
+/// already-populated polite element inserted fresh is otherwise not reliably
+/// announced). Every toast carries `aria-atomic="true"` so its message is read
+/// as one unit. The message is HTML-escaped by Maud.
 ///
 /// Use [`toast_in`] instead when you rendered [`toast_region`] with a custom id.
 ///
@@ -3530,10 +3554,11 @@ pub fn toast_region(id: &str) -> maud::Markup {
 /// use autumn_web::widgets::{toast, toast_region, AlertVariant, DEFAULT_TOAST_REGION_ID};
 /// use maud::html;
 ///
-/// // 1. Once, in your base layout (before `</body>`):
+/// // 1. Once, in your base layout (before `</body>`) — the persistent live region:
 /// //    (toast_region(DEFAULT_TOAST_REGION_ID))
 /// let layout = toast_region(DEFAULT_TOAST_REGION_ID).into_string();
 /// assert!(layout.contains(r#"id="toast-region""#));
+/// assert!(layout.contains(r#"aria-live="polite""#));  // politeness lives here
 ///
 /// // 2. From an htmx create/update/delete handler, return the toast next to
 /// //    your swapped fragment — htmx appends it into the region OOB:
@@ -3543,7 +3568,10 @@ pub fn toast_region(id: &str) -> maud::Markup {
 /// };
 /// let out = response.into_string();
 /// assert!(out.contains(r##"hx-swap-oob="beforeend:#toast-region""##));
-/// assert!(out.contains(r#"role="status""#));
+/// // A non-error toast inherits the region's politeness: no own role/aria-live,
+/// // but it is atomic so its message is announced as one unit.
+/// assert!(out.contains(r#"aria-atomic="true""#));
+/// assert!(!out.contains(r#"role="status""#));
 /// ```
 #[cfg(feature = "maud")]
 #[must_use]
@@ -3569,10 +3597,16 @@ pub fn toast(message: &str, variant: AlertVariant) -> maud::Markup {
 #[cfg(feature = "maud")]
 #[must_use]
 pub fn toast_in(region_id: &str, message: &str, variant: AlertVariant) -> maud::Markup {
-    // Error interrupts a screen reader (assertive); everything else is polite.
-    let (role, live) = match variant {
-        AlertVariant::Error => ("alert", "assertive"),
-        AlertVariant::Info | AlertVariant::Success | AlertVariant::Warning => ("status", "polite"),
+    // Error toasts announce assertively on their own — `role="alert"` elements
+    // ARE reliably announced on insertion, so they don't depend on the
+    // persistent region. Non-error toasts carry NO `role`/`aria-live`: they
+    // inherit the `aria-live="polite"` of the `toast_region` they're appended
+    // into (a freshly-inserted, already-populated polite element is otherwise
+    // not reliably announced). Every toast keeps `aria-atomic="true"` so its
+    // message is read as one unit.
+    let (role, live): (Option<&str>, Option<&str>) = match variant {
+        AlertVariant::Error => (Some("alert"), Some("assertive")),
+        AlertVariant::Info | AlertVariant::Success | AlertVariant::Warning => (None, None),
     };
     let class = format!("autumn-toast autumn-toast--{}", variant.as_str());
     // Accept a bare id or a `#selector`; strip one leading `#` so a caller
@@ -3603,7 +3637,7 @@ pub fn toast_in(region_id: &str, message: &str, variant: AlertVariant) -> maud::
     // `<span>`.
     maud::html! {
         div hx-swap-oob=(oob) {
-            div class=(class) role=(role) aria-live=(live) aria-atomic="true" {
+            div class=(class) role=[role] aria-live=[live] aria-atomic="true" {
                 span class="autumn-toast__message" { (message) }
             }
         }

@@ -247,9 +247,11 @@ Free functions rendering changeset-aware, accessible inputs:
 - `autumn_web::widgets` feedback atoms: `toast(message, AlertVariant)` /
   `toast_in(region_id, message, AlertVariant)` / `toast_region(id)` +
   `DEFAULT_TOAST_REGION_ID` — transient htmx toast appended out-of-band
-  (`hx-swap-oob="beforeend:#<region-id>"`), CSS-only auto-dismiss (no JS),
-  `Error` → assertive `role="alert"`, others polite `role="status"` (reuses the
-  `AlertVariant` color lane). `infinite_feed(items, next_cursor, &FeedConfig)` /
+  (`hx-swap-oob="beforeend:#<region-id>"`), CSS-only auto-dismiss (no JS).
+  `toast_region` is a persistent `aria-live="polite"` region; non-error toasts
+  inherit its politeness (no own `role`/`aria-live`) while `Error` announces
+  assertively via its own `role="alert"` (reuses the `AlertVariant` color
+  lane). `infinite_feed(items, next_cursor, &FeedConfig)` /
   `feed_page(items, next_cursor, &FeedConfig)` with `FeedMode::{Reveal,Button}`
   — htmx infinite-scroll / "Load more" feed from a `CursorPage`: one cursored
   `hx-get` sentinel appends the next page in place (no reload, no duplicate

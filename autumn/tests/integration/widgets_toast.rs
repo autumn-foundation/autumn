@@ -16,6 +16,17 @@ fn region_carries_default_id_and_class() {
 }
 
 #[test]
+fn region_is_a_persistent_polite_live_region() {
+    // The politeness lives on the persistent region (toasts are appended into
+    // it), NOT on each non-error toast. `aria-atomic="false"` + no `role="status"`
+    // (which would imply atomic) so only the newly-added toast is announced.
+    let out = toast_region(DEFAULT_TOAST_REGION_ID).into_string();
+    assert!(out.contains(r#"aria-live="polite""#), "{out}");
+    assert!(out.contains(r#"aria-atomic="false""#), "{out}");
+    assert!(!out.contains(r#"role="status""#), "{out}");
+}
+
+#[test]
 fn default_region_id_is_toast_region() {
     assert_eq!(DEFAULT_TOAST_REGION_ID, "toast-region");
 }
@@ -118,26 +129,33 @@ fn htmx_children_extraction_preserves_the_styled_toast() {
 
 #[test]
 fn error_toast_is_assertive_alert() {
+    // Error toasts announce assertively on their own — alerts ARE reliably
+    // announced on insertion, so they don't rely on the persistent region.
     let out = toast("Boom", AlertVariant::Error).into_string();
     assert!(out.contains(r#"role="alert""#), "{out}");
     assert!(out.contains(r#"aria-live="assertive""#), "{out}");
+    assert!(out.contains(r#"aria-atomic="true""#), "{out}");
 }
 
 #[test]
-fn non_error_toasts_are_polite_status() {
+fn non_error_toasts_inherit_region_politeness() {
+    // Non-error toasts carry NO own `role`/`aria-live`: politeness is inherited
+    // from the persistent `toast_region` they're appended into. They keep
+    // `aria-atomic="true"` so the message is announced as one unit.
     for variant in [
         AlertVariant::Success,
         AlertVariant::Info,
         AlertVariant::Warning,
     ] {
         let out = toast("ok", variant).into_string();
-        assert!(out.contains(r#"role="status""#), "{out}");
-        assert!(out.contains(r#"aria-live="polite""#), "{out}");
-        assert!(
-            !out.contains(r#"aria-live="assertive""#),
-            "non-error should not be assertive: {out}"
-        );
+        assert!(!out.contains("aria-live="), "no own aria-live: {out}");
+        assert!(!out.contains("role="), "no own role: {out}");
+        assert!(out.contains(r#"aria-atomic="true""#), "{out}");
     }
+
+    // End-to-end: the region wrapper the toast lands in is the polite live region.
+    let region = toast_region(DEFAULT_TOAST_REGION_ID).into_string();
+    assert!(region.contains(r#"aria-live="polite""#), "{region}");
 }
 
 #[test]
