@@ -386,8 +386,18 @@ pub fn build_report(
     let empty = BTreeSet::new();
     let default_keys = per_locale_keys.get(&default_locale).unwrap_or(&empty);
 
+    // Seed the set of locales to report on from BOTH the `.ftl` files present on
+    // disk AND the locales declared in `[i18n].supported_locales`. A configured
+    // locale with no `.ftl` file must still be reported (its keys resolve to the
+    // default via the fallback chain, so they surface as Untranslated warnings)
+    // — otherwise "added a second locale but shipped untranslated UI" slips past
+    // even `--strict`. The union deduplicates locales that are both configured
+    // and have a file.
+    let mut name_set: BTreeSet<&String> = per_locale_keys.keys().collect();
+    name_set.extend(config.supported_locales.iter());
+
     // Default locale first, then the rest alphabetically.
-    let mut names: Vec<&String> = per_locale_keys.keys().collect();
+    let mut names: Vec<&String> = name_set.into_iter().collect();
     names.sort_by_key(|n| (**n != default_locale, (*n).clone()));
 
     let locales = names
@@ -711,6 +721,50 @@ mod tests {
         assert!(es.missing.is_empty(), "fallback should supply nav.about");
         assert!(!report.has_missing());
         assert_eq!(report.exit_code(false), 0);
+    }
+
+    #[test]
+    fn configured_locale_without_ftl_file_is_untranslated() {
+        // `es` is declared in `[i18n].supported_locales` but has NO `es.ftl` on
+        // disk. Runtime negotiation can still select `es` and fall back to the
+        // default bundle, so the untranslated UI must surface: `es` appears in
+        // the report with every default key Untranslated (resolvable via the
+        // fallback chain → NOT Missing), a warning that fails only under
+        // `--strict`.
+        let scan = scan_with(&["nav.home", "nav.about"]);
+        let mut per_locale = BTreeMap::new();
+        per_locale.insert("en".to_owned(), keys(&["nav.home", "nav.about"]));
+        // Only `en` has a file; `es` is configured but its file is absent.
+        let config = I18nConfig {
+            default_locale: "en".to_owned(),
+            supported_locales: vec!["en".to_owned(), "es".to_owned()],
+            fallback_chain: Vec::new(),
+            dir: "i18n".to_owned(),
+        };
+        let report = build_report(&scan, &config, &per_locale);
+
+        // `es` is present in the report even though it has no `.ftl` file.
+        let es = report
+            .locales
+            .iter()
+            .find(|l| l.locale == "es")
+            .expect("configured `es` must appear in the report");
+        assert!(
+            es.missing.is_empty(),
+            "fallback supplies keys: {:?}",
+            es.missing
+        );
+        assert_eq!(
+            es.untranslated,
+            vec!["nav.about".to_owned(), "nav.home".to_owned()]
+        );
+        assert!(es.unused.is_empty());
+
+        // Warning by default (exit 0), failure under --strict (exit 1).
+        assert!(!report.has_missing());
+        assert!(report.has_warnings());
+        assert_eq!(report.exit_code(false), 0);
+        assert_eq!(report.exit_code(true), 1);
     }
 
     #[test]
