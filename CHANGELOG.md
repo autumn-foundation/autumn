@@ -38,7 +38,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `t_with("message", &[("status", &locale.t("status.open"))])`) now has *both*
   keys recorded — the scanner recurses into the outer call's argument group — so
   removing the inner key from every `.ftl` is correctly reported as Missing
-  instead of slipping past with exit 0. See `autumn-cli/src/i18n.rs`.
+  instead of slipping past with exit 0. The scanner's intentional heuristic
+  limits — the key-expression shapes treated as *dynamic — not checked* rather
+  than validated — are documented under "Known heuristic limits" in the command
+  module rustdoc and the plugin skill doc. See `autumn-cli/src/i18n.rs`.
 - **download:** typed `Download` `IntoResponse` (`autumn_web::download::Download`)
   for serving files from a handler without hand-rolling headers. Construct it
   from owned bytes, an async byte stream, an `AsyncRead`, or a stored blob

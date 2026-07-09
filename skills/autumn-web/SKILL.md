@@ -887,6 +887,28 @@ Untranslated/Unused are warnings unless `--strict`. `--format json` feeds CI.
 Runtime-built keys like `t(&format!(...))` are listed as "dynamic — not
 checked" rather than flagged.
 
+**Known heuristic limits.** The scanner is a best-effort token/grammar
+heuristic over source text, not a type-resolved AST. Any key it cannot
+statically resolve to a string literal is treated as *dynamic — not checked*,
+so unsupported shapes are never falsely flagged as Missing/Unused and cannot
+break CI:
+
+- Only whole-key string literals (optionally in leading borrows/parens spanning
+  the entire key argument) are checked precisely. A literal transformed by a
+  chained method or operator (`t(" nav.home ".trim())`, `t("a" + b)`) is treated
+  as dynamic, not as the literal.
+- Dynamic keys are reported as "dynamic — not checked". A whole-key
+  `format!("status.{state}")` contributes its static `"status."` prefix so
+  matching `.ftl` keys aren't marked Unused; a fully-dynamic key (bare variable,
+  `format!("{x}")`) suppresses Unused reporting entirely.
+- Keys built through concatenation, helper functions, non-`format!` macros, or
+  deeper transformations are treated as dynamic and not validated — such `.ftl`
+  entries aren't checked for Missing/Unused.
+- No type resolution: it can't distinguish an unrelated local helper named
+  `t`/`t_with` from the real translation API beyond its syntactic
+  `t!(...)` / `receiver.t(...)` / `Type::t(...)` (real `::` path) checks; a bare
+  free-function `t("...")` is left alone.
+
 `autumn destroy` mirrors `autumn generate` argument-for-argument and never
 touches a database — it only reverses generated files/migrations.
 

@@ -30,6 +30,40 @@
 //! loader, so a `.ftl` syntax error or a missing default locale fails the
 //! command exactly as it would fail the app at startup.
 //!
+//! # Known heuristic limits
+//!
+//! The scanner is a best-effort token/grammar heuristic over source *text*, not
+//! a type-resolved AST. It deliberately errs toward classifying anything it
+//! cannot statically resolve to a string literal as **dynamic — not checked**,
+//! so an unsupported or approximated key shape is never falsely flagged as
+//! `Missing`/`Unused` and cannot break CI. The following shapes are handled
+//! conservatively and are therefore *not* validated against the `.ftl` files:
+//!
+//! - **Only whole-key string literals are checked precisely.** A literal is
+//!   recognized only when it (optionally wrapped in leading borrows/derefs or
+//!   parens that span the *entire* key argument — `t(&"nav.home")`,
+//!   `t(("nav.home"))`) is a lone string token. A literal transformed by a
+//!   chained method or operator (`t(" nav.home ".trim())`, `t("a" + b)`) is the
+//!   *receiver* of a derived value, not the literal, so it is treated as dynamic
+//!   rather than as the literal text.
+//! - **Dynamic/runtime-built keys are reported as "dynamic — not checked".**
+//!   Where a whole-key `format!` has a static literal prefix
+//!   (`t(&format!("status.{state}"))` → `"status."`), that prefix is used so
+//!   matching `.ftl` keys are not falsely marked `Unused`. A fully-dynamic key
+//!   with no discoverable leading literal (a bare variable, `format!("{x}")`)
+//!   yields an empty prefix and suppresses `Unused` reporting entirely.
+//! - **More exotic key construction is treated as dynamic** — string
+//!   concatenation, helper functions, non-`format!` macros, and deeper
+//!   transformations produce no static prefix and are not validated. If a
+//!   project builds keys that way, those `.ftl` entries are not checked for
+//!   `Missing`/`Unused`.
+//! - **No type resolution.** Because the scanner reads tokens rather than a
+//!   resolved AST, it cannot distinguish an unrelated local helper named
+//!   `t`/`t_with` from the real translation API beyond the syntactic checks it
+//!   applies: a `t!(...)` macro invocation, a method call `receiver.t(...)`, or
+//!   an associated call `Type::t(...)` reached through a real `::` path. A bare
+//!   free-function `t("...")` is intentionally left alone.
+//!
 //! [`Bundle::load_from_dir`]: autumn_web::i18n::Bundle::load_from_dir
 //! [`Bundle::miss_count`]: autumn_web::i18n::Bundle::miss_count
 //! [`I18nConfig::resolved_fallback_chain`]: autumn_web::i18n::I18nConfig::resolved_fallback_chain
