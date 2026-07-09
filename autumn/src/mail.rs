@@ -524,9 +524,11 @@ pub struct Mail {
     /// `Some(true)`/`Some(false)` force inlining on/off for this message,
     /// overriding the [`Mailer`]'s configured default; `None` (the default)
     /// defers to [`MailConfig::inline_css`]. Set via
-    /// [`MailBuilder::inline_css`]. Carried through a durable
-    /// [`MailDeliveryQueue`] so deferred mail inlines consistently with
-    /// immediate sends.
+    /// [`MailBuilder::inline_css`]. On the deferred/durable path a `None` is
+    /// frozen to the originating mailer's default before the message is
+    /// persisted to a [`MailDeliveryQueue`], so the enqueued job is
+    /// self-describing and deferred mail inlines consistently with an immediate
+    /// send even when a different worker consumes the queue.
     #[serde(default)]
     pub inline_css: Option<bool>,
 }
@@ -1635,6 +1637,26 @@ impl Mailer {
         }
     }
 
+    /// Freeze this mailer's CSS-inlining default onto a message before it is
+    /// handed to a durable [`MailDeliveryQueue`] for deferred delivery (issue
+    /// #1254).
+    ///
+    /// A worker that later dequeues the persisted job resolves
+    /// [`Mail::inline_css`] against ITS OWN mailer's default via
+    /// [`apply_css_inlining`](Self::apply_css_inlining), which may differ from
+    /// (or be off by default relative to) the originating mailer. Recording the
+    /// originating decision here makes the persisted job self-describing, so
+    /// deferred mail inlines consistently with an immediate send. Only `None`
+    /// is resolved — explicit `Some(true)`/`Some(false)` per-message overrides
+    /// are preserved. The body itself is left un-inlined so the single inline
+    /// pass still happens once at the consumer's `send()`, keeping delivery
+    /// idempotent and avoiding a bloated persisted body.
+    const fn freeze_inline_css_default(&self, mail: &mut Mail) {
+        if mail.inline_css.is_none() {
+            mail.inline_css = Some(self.inline_css_default);
+        }
+    }
+
     /// Deliver a list mail recipient-by-recipient, applying suppression and
     /// per-recipient RFC 8058 headers.
     async fn send_list_mail(
@@ -1752,7 +1774,13 @@ impl Mailer {
         if self.transport.is_disabled() {
             return Ok(());
         }
-        let mail = mail.with_defaults(&self.defaults);
+        let mut mail = mail.with_defaults(&self.defaults);
+        // Resolve the CSS-inlining default onto the message once, at the top of
+        // the deferred path, so BOTH the durable-queue branch (persisted for a
+        // possibly-different worker to consume) and the in-process fallback
+        // branch carry the originating mailer's decision. Only `None` is frozen;
+        // explicit per-message overrides are preserved (issue #1254).
+        self.freeze_inline_css_default(&mut mail);
 
         // When inside a db.tx, push the spawn as an after-commit callback so
         // the mail only fires if the transaction commits successfully.
@@ -1809,7 +1837,8 @@ impl Mailer {
         if self.transport.is_disabled() {
             return Ok(());
         }
-        let mail = mail.with_defaults(&self.defaults);
+        let mut mail = mail.with_defaults(&self.defaults);
+        self.freeze_inline_css_default(&mut mail);
         self.spawn_mail_delivery(mail)
     }
 
@@ -6095,7 +6124,99 @@ mod tests {
             .expect("queue should receive within 1s")
             .expect("queue should receive the mail");
 
-        assert_eq!(received, mail);
+        // The deferred path freezes the originating mailer's CSS-inlining default
+        // onto the message before enqueue (issue #1254); this mailer defaults
+        // inlining off, so the enqueued job carries `Some(false)` where the
+        // source had `None`. Everything else (notably attachments) is untouched.
+        let mut expected = mail;
+        expected.inline_css = Some(false);
+        assert_eq!(received, expected);
+    }
+
+    #[tokio::test]
+    async fn deferred_enqueue_freezes_originating_inline_css_default() {
+        // A mailer whose config defaults CSS inlining ON must record that
+        // decision on the persisted job when the message carries no explicit
+        // override, so a worker consuming the durable queue (with a possibly
+        // different/off default) still inlines. Only the flag is frozen — the
+        // body is left un-inlined so the single inline pass happens once at the
+        // consumer's send() (issue #1254).
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Mail>();
+        let mailer = Mailer::builder()
+            .inline_css(true)
+            .delivery_queue(CapturingQueue { tx })
+            .build()
+            .expect("mailer should build");
+
+        let mail = Mail::builder()
+            .to("user@example.com")
+            .subject("Hi")
+            .html(
+                "<html><head><style>p { color: red; }</style></head><body><p>hi</p></body></html>",
+            )
+            .build()
+            .expect("mail should build");
+        assert_eq!(mail.inline_css, None, "sample relies on the mailer default");
+
+        mailer
+            .try_deliver_later(mail)
+            .expect("scheduling onto the queue should succeed");
+
+        let received = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("queue should receive within 1s")
+            .expect("queue should receive the mail");
+
+        assert_eq!(
+            received.inline_css,
+            Some(true),
+            "the originating mailer's inlining default must be frozen onto the enqueued job"
+        );
+        assert!(
+            received
+                .html
+                .as_deref()
+                .expect("html body")
+                .contains("<style>"),
+            "the body must be left un-inlined at enqueue time; inlining happens once at the consumer's send()"
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_enqueue_preserves_explicit_inline_css_override() {
+        // An explicit per-message `inline_css(false)` opt-out must survive the
+        // durable-queue handoff and never be clobbered by the mailer default.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Mail>();
+        let mailer = Mailer::builder()
+            .inline_css(true)
+            .delivery_queue(CapturingQueue { tx })
+            .build()
+            .expect("mailer should build");
+
+        let mail = Mail::builder()
+            .to("user@example.com")
+            .subject("Hi")
+            .html(
+                "<html><head><style>p { color: red; }</style></head><body><p>hi</p></body></html>",
+            )
+            .inline_css(false)
+            .build()
+            .expect("mail should build");
+
+        mailer
+            .try_deliver_later(mail)
+            .expect("scheduling onto the queue should succeed");
+
+        let received = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("queue should receive within 1s")
+            .expect("queue should receive the mail");
+
+        assert_eq!(
+            received.inline_css,
+            Some(false),
+            "an explicit per-message override must be preserved through the queue, not overwritten by the mailer default"
+        );
     }
 
     #[tokio::test]

@@ -115,7 +115,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a mailer that calls `.inline_css(true)`, demonstrating the happy path end to
   end. On inliner failure `send` fails loudly, returning a typed
   `MailError::CssInline` instead of delivering a corrupted body — the message is
-  not sent, so the body is never silently corrupted.
+  not sent, so the body is never silently corrupted. Deferred/durable-queue
+  sends (`deliver_later`) freeze the originating mailer's inlining default onto
+  the message before it is persisted, so a worker consuming the queue with a
+  different default still honors the sender's decision (explicit per-message
+  overrides are preserved).
 - **generator:** `autumn new` now generates a `README.md` at the project root
   (listed in the "Created …" output) with explicit prerequisites and a
   golden-path quickstart — configure the `[database]` block in `autumn.toml`
