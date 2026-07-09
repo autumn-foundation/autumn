@@ -222,6 +222,17 @@ async fn conditional_get_ignores_if_modified_since_only() {
 }
 
 #[test]
+fn feed_etag_is_weak() {
+    let feed = sample_feed(FeedFormat::Atom);
+    assert!(
+        feed.etag().is_weak(),
+        "feed ETag must be weak so it survives content-coding"
+    );
+    let hv = feed.etag().header_value();
+    assert!(hv.to_str().unwrap().starts_with("W/"));
+}
+
+#[test]
 fn etag_changes_when_content_changes_within_same_second() {
     let ts = Utc.with_ymd_and_hms(2026, 5, 1, 12, 0, 0).unwrap();
     let mk = |title: &str| {

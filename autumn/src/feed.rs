@@ -41,7 +41,7 @@ use axum::response::{IntoResponse, Response};
 use chrono::{DateTime, SecondsFormat, Utc};
 use http::header::CONTENT_TYPE;
 
-use crate::etag::{ETag, IntoETag, fresh_when};
+use crate::etag::{ETag, fresh_when, hash_etag};
 
 /// Wire format for a rendered [`Feed`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -202,28 +202,39 @@ impl Feed {
             .max()
     }
 
-    /// A strong [`ETag`] over the exact rendered feed bytes, suitable for
+    /// A **weak** [`ETag`] over the exact rendered feed bytes, suitable for
     /// conditional GET: it changes whenever any rendered field changes —
     /// including two edits within the same whole second, or content edits that
     /// leave timestamps untouched — and is stable otherwise.
+    ///
+    /// The tag is weak (a weak body hash) so it remains a valid validator even
+    /// when the framework applies a content-coding (gzip/br) to the response:
+    /// weak validators denote semantic equivalence across representations that
+    /// may differ only in content-coding, whereas a strong validator would be
+    /// violated by serving byte-different identity and compressed bodies under
+    /// one tag. This mirrors what [`crate::etag::EtagLayer`] does for
+    /// body-derived tags.
     #[must_use]
     pub fn etag(&self) -> ETag {
-        self.render().into_etag()
+        hash_etag(&self.render())
     }
 
     /// Wrap this feed in conditional-GET handling, reusing [`crate::etag`].
     ///
-    /// The strong `ETag` — a hash of the exact rendered body — is the sole
+    /// The weak `ETag` — a weak hash of the exact rendered body — is the sole
     /// freshness validator: only a matching `If-None-Match` yields `304 Not
-    /// Modified`. `Last-Modified` is emitted for caches/readers, but a coarse
-    /// whole-second `If-Modified-Since` is deliberately NOT honored on its own,
-    /// so a body that changes within the same second (or via a feed-level edit
-    /// that leaves entry timestamps unchanged) can never be served stale.
+    /// Modified`. The tag is weak so it stays a valid validator even when the
+    /// framework applies a content-coding (gzip/br) to the response; weak
+    /// `If-None-Match` comparison still yields `304` on match. `Last-Modified`
+    /// is emitted for caches/readers, but a coarse whole-second
+    /// `If-Modified-Since` is deliberately NOT honored on its own, so a body
+    /// that changes within the same second (or via a feed-level edit that
+    /// leaves entry timestamps unchanged) can never be served stale.
     #[must_use]
     pub fn conditional(self, request_headers: &http::HeaderMap) -> Response {
         let content_type = self.content_type();
         let body = self.render();
-        let etag = body.as_str().into_etag();
+        let etag = hash_etag(&body);
         let last_modified = self.last_updated();
         let mut headers = request_headers.clone();
         headers.remove(http::header::IF_MODIFIED_SINCE);
