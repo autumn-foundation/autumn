@@ -1282,6 +1282,27 @@ fn resolve_throttle_params(
                 }
                 return None;
             };
+            // A zero `limit` (or a zero-length `per` window) cannot be enforced as
+            // written: the downstream `limit.max(1)` / `per_secs.max(1)` clamps would
+            // silently turn a "0" quota into "1 request per window" and emit a
+            // misleading `x-ratelimit-limit: 0`. The INLINE macro rejects zero limits
+            // at compile time; keep named runtime config consistent by treating a zero
+            // quota as MISCONFIGURED and failing open (allow the request) — the same
+            // policy as the missing-entry / invalid-`per` paths above — rather than
+            // enforcing a bogus budget or hard-failing app startup.
+            if entry.limit == 0 || duration.is_zero() {
+                if warn_once(format!("zerolimit:{route_id}:{name}")) {
+                    tracing::warn!(
+                        name = %name,
+                        limit = entry.limit,
+                        per = %entry.per,
+                        "[security.rate_limit.named.{name}] has a zero `limit` or `per` \
+                         window, which cannot be enforced without silently allowing one \
+                         request per window; failing open"
+                    );
+                }
+                return None;
+            }
             let per_secs = duration.as_secs().max(1);
             let key = entry.key.unwrap_or(config.key_strategy);
             Some((entry.limit, per_secs, key, format!("named:{name}")))
@@ -2952,6 +2973,116 @@ mod tests {
         assert_eq!(per, 30);
         assert_eq!(key, KeyStrategy::ApiToken);
         assert_eq!(reg_key, "named:login");
+    }
+
+    #[test]
+    fn resolve_throttle_params_named_zero_limit_fails_open() {
+        use super::super::config::RateLimitNamedConfig;
+        // A named entry with `limit = 0` is misconfigured: enforcing it would
+        // clamp to one-request-per-window and emit a misleading
+        // `x-ratelimit-limit: 0`. Treat it like a missing entry → fail open.
+        let mut named = std::collections::HashMap::new();
+        named.insert(
+            "zero".to_owned(),
+            RateLimitNamedConfig {
+                limit: 0,
+                per: "1m".to_owned(),
+                key: None,
+            },
+        );
+        let global = RateLimitConfig {
+            named,
+            ..Default::default()
+        };
+        let spec = ThrottleSpec::Named("zero");
+        assert!(
+            resolve_throttle_params("m::h", &spec, &global).is_none(),
+            "a zero named `limit` must fail open, not enforce a budget of 1"
+        );
+        // A valid (limit >= 1) entry is unaffected.
+        let mut named_ok = std::collections::HashMap::new();
+        named_ok.insert(
+            "ok".to_owned(),
+            RateLimitNamedConfig {
+                limit: 1,
+                per: "1m".to_owned(),
+                key: None,
+            },
+        );
+        let global_ok = RateLimitConfig {
+            named: named_ok,
+            ..Default::default()
+        };
+        let (limit, _, _, _) =
+            resolve_throttle_params("m::h", &ThrottleSpec::Named("ok"), &global_ok)
+                .expect("valid entry resolves");
+        assert_eq!(limit, 1, "a limit of 1 stays enforced");
+    }
+
+    #[test]
+    fn resolve_throttle_params_named_zero_per_window_fails_open() {
+        use super::super::config::RateLimitNamedConfig;
+        // A zero-length `per` window is equally unenforceable (the `.max(1)`
+        // clamp would silently stretch it to one second); fail open too.
+        let mut named = std::collections::HashMap::new();
+        named.insert(
+            "zeroper".to_owned(),
+            RateLimitNamedConfig {
+                limit: 5,
+                per: "0s".to_owned(),
+                key: None,
+            },
+        );
+        let global = RateLimitConfig {
+            named,
+            ..Default::default()
+        };
+        assert!(
+            resolve_throttle_params("m::h", &ThrottleSpec::Named("zeroper"), &global).is_none(),
+            "a zero-length `per` window must fail open"
+        );
+    }
+
+    #[tokio::test]
+    async fn check_throttle_named_zero_limit_allows_requests_fail_open() {
+        use super::super::config::RateLimitNamedConfig;
+        // End-to-end: a `limit = 0` named limiter must ALLOW requests
+        // (fail-open), NOT allow one and then 429. Install a config carrying the
+        // misconfigured named entry and drive several requests through the guard.
+        let mut named = std::collections::HashMap::new();
+        named.insert(
+            "zero".to_owned(),
+            RateLimitNamedConfig {
+                limit: 0,
+                per: "1m".to_owned(),
+                key: Some(KeyStrategy::Ip),
+            },
+        );
+        let mut config = crate::config::AutumnConfig::default();
+        config.security.rate_limit.named = named;
+        let state = crate::AppState::for_test();
+        state.insert_extension(config);
+
+        let headers = axum::http::HeaderMap::new();
+        let peer = Some("127.0.0.1:1234".parse().unwrap());
+        for i in 0..3 {
+            let result = __check_throttle(
+                &state,
+                "test::check_throttle_named_zero_limit_allows_requests_fail_open",
+                ThrottleSpec::Named("zero"),
+                &headers,
+                peer,
+                None,
+                None,
+                false,
+            )
+            .await;
+            assert!(
+                result.is_ok(),
+                "request {i} against a zero-limit named limiter must fail open (be allowed), \
+                 got {result:?}"
+            );
+        }
     }
 
     #[tokio::test]
