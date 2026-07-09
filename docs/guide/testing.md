@@ -100,6 +100,53 @@ resp
     });
 ```
 
+### Asserting channel broadcasts
+
+When a handler publishes to a channel (`ws` feature), opt in with
+`TestApp::record_broadcasts()` to capture every publication a request makes —
+no hand-written spy or `Arc<Mutex>`. The recorder installs through the existing
+`ChannelsInterceptor` seam, is scoped to the `TestClient` (parallel tests never
+leak into one another), and is zero-cost when you don't call it — production
+`Channels` behavior is untouched. Both raw `publish` text and `publish_html`
+HTML/OOB payloads are recorded.
+
+```rust
+#[post("/notes")]
+async fn create_note(State(state): State<AppState>) -> &'static str {
+    state.broadcast().publish("notes", "created").unwrap();
+    "ok"
+}
+
+#[tokio::test]
+async fn publishing_broadcasts_on_create() {
+    let client = TestApp::new()
+        .routes(routes![create_note])
+        .record_broadcasts()          // opt in
+        .build();
+
+    client.post("/notes").send().await.assert_ok();
+
+    client
+        .assert_broadcast_count("notes", 1)                       // exactly one publish
+        .assert_broadcast("notes", |b| b.payload() == "created")  // a matching payload
+        .assert_no_broadcasts("audit");                           // nothing elsewhere
+}
+```
+
+| Method | Checks |
+|--------|--------|
+| `record_broadcasts()` | builder — opt in to recording (on `TestApp`) |
+| `broadcasts()` | every recorded publication, in publish order |
+| `broadcasts_on(topic)` | recorded publications on `topic`, in order |
+| `assert_broadcast(topic, predicate)` | at least one publish on `topic` matches |
+| `assert_broadcast_count(topic, n)` | exactly `n` publishes on `topic` |
+| `assert_no_broadcasts(topic)` | nothing was published to `topic` |
+
+Each `RecordedBroadcast` exposes `.topic()` and `.payload()`. On failure the
+`assert_broadcast*` helpers self-diagnose: they list what *was* published to the
+topic and, grouped, to every other topic. Reading or asserting without
+`record_broadcasts()` panics with a message pointing you at the builder.
+
 ---
 
 ## Structural HTML assertions

@@ -80,6 +80,9 @@ pub use crate::extract::Query;
 /// Flash message extractor.
 #[cfg(feature = "flash")]
 pub use crate::flash::{Flash, FlashLevel, FlashMessage};
+/// Accessible flash-banner renderer.
+#[cfg(all(feature = "flash", feature = "maud"))]
+pub use crate::flash::{FlashMessagesConfig, flash_messages, flash_messages_with};
 /// Extension trait for adding htmx response headers.
 #[cfg(feature = "htmx")]
 pub use crate::htmx::HxResponseExt;
@@ -183,13 +186,14 @@ pub use crate::form::{Changeset, ChangesetForm, IntoChangeset};
 /// See [`crate::widgets`] for the full API.
 #[cfg(feature = "maud")]
 pub use crate::widgets::{
-    ActiveSearchConfig, AutocompleteConfig, CardConfig, Column, ConfirmActionConfig, Crumb, Cta,
-    CtaStyle, DataTableConfig, HeadingLevel, HeroConfig, ModalConfig, NavBarConfig, NavBarLayout,
-    NavItem, NavLinkMatch, NavMenu, SearchMethod, SortDir, active_search,
-    active_search_empty_state, active_search_input, active_search_results,
-    autocomplete_empty_state, autocomplete_input, autocomplete_option, breadcrumb, card,
-    confirm_action, data_table, hero, modal, modal_close_button, modal_trigger, nav_bar, nav_link,
-    nav_link_matched, property_list, stat_card, tabs,
+    ActiveSearchConfig, AlertConfig, AlertVariant, AutocompleteConfig, AvatarConfig, AvatarSize,
+    BadgeConfig, BadgeVariant, CardConfig, Column, ConfirmActionConfig, Crumb, Cta, CtaStyle,
+    DataTableConfig, HeadingLevel, HeroConfig, ModalConfig, NavBarConfig, NavBarLayout, NavItem,
+    NavLinkMatch, NavMenu, SearchMethod, SortDir, active_search, active_search_empty_state,
+    active_search_input, active_search_results, alert, alert_with, autocomplete_empty_state,
+    autocomplete_input, autocomplete_option, avatar, badge, badge_with, breadcrumb, card,
+    confirm_action, data_table, error_summary, hero, modal, modal_close_button, modal_trigger,
+    nav_bar, nav_link, nav_link_matched, property_list, stat_card, status_tag, tabs,
 };
 
 // ── Widget stories ───────────────────────────────────────────────

@@ -31,6 +31,7 @@ idempotency
 jobs
 log
 mail
+observability
 openapi
 reporting
 resilience

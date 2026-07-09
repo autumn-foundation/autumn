@@ -168,6 +168,49 @@
 //!         .assert_status(201);
 //! }
 //! ```
+//!
+//! # Asserting channel broadcasts
+//!
+//! Opt in with `TestApp::record_broadcasts` to capture every channel
+//! publication a request makes — no hand-written spy needed — then assert on
+//! it with `TestClient::assert_broadcast`,
+//! `TestClient::assert_broadcast_count`,
+//! `TestClient::assert_no_broadcasts`, or read them back in order with
+//! `TestClient::broadcasts` / `TestClient::broadcasts_on`. Both raw
+//! `publish` text and `publish_html` HTML/OOB payloads are recorded. The
+//! recorder is scoped to the client, so parallel tests never leak into one
+//! another, and nothing is installed unless you call it.
+//!
+//! ```rust
+//! # #[cfg(feature = "ws")]
+//! # mod broadcast_example {
+//! use autumn_web::prelude::*;
+//! use autumn_web::test::TestApp;
+//!
+//! #[post("/notes")]
+//! async fn create_note(State(state): State<AppState>) -> &'static str {
+//!     state.broadcast().publish("notes", "created").unwrap();
+//!     "ok"
+//! }
+//!
+//! pub fn run() {
+//!     tokio::runtime::Runtime::new().unwrap().block_on(async {
+//!         let client = TestApp::new()
+//!             .routes(routes![create_note])
+//!             .record_broadcasts()
+//!             .build();
+//!
+//!         client.post("/notes").send().await.assert_ok();
+//!
+//!         client
+//!             .assert_broadcast_count("notes", 1)
+//!             .assert_broadcast("notes", |b| b.payload() == "created");
+//!     });
+//! }
+//! # }
+//! # #[cfg(feature = "ws")]
+//! # broadcast_example::run();
+//! ```
 
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
@@ -307,6 +350,79 @@ impl crate::interceptor::MailInterceptor for ChainedMailInterceptor {
     }
 }
 
+/// A single channel publication captured by the broadcast recorder.
+///
+/// Recorded by [`TestApp::record_broadcasts`] through the channels
+/// interceptor seam. Both raw `publish` text and `publish_html` HTML/OOB
+/// payloads are captured (they funnel through the same `ChannelMessage`).
+#[cfg(feature = "ws")]
+#[derive(Clone, Debug)]
+pub struct RecordedBroadcast {
+    /// The topic the message was published to.
+    pub topic: String,
+    /// The UTF-8 payload of the published `ChannelMessage`.
+    pub payload: String,
+}
+
+#[cfg(feature = "ws")]
+impl RecordedBroadcast {
+    /// The topic the message was published to.
+    #[must_use]
+    pub fn topic(&self) -> &str {
+        &self.topic
+    }
+
+    /// The UTF-8 payload of the published message.
+    #[must_use]
+    pub fn payload(&self) -> &str {
+        &self.payload
+    }
+}
+
+/// Built-in per-`TestClient` recording channels interceptor.
+///
+/// Opt-in via [`TestApp::record_broadcasts`] — no interceptor is installed
+/// unless the builder is called (zero-cost when unused). Records every
+/// publication in order, including publishes to zero subscribers.
+#[cfg(feature = "ws")]
+#[derive(Clone, Default)]
+struct BroadcastRecorder {
+    events: std::sync::Arc<std::sync::Mutex<Vec<RecordedBroadcast>>>,
+}
+
+#[cfg(feature = "ws")]
+impl BroadcastRecorder {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn recorded(&self) -> Vec<RecordedBroadcast> {
+        self.events.lock().unwrap().clone()
+    }
+}
+
+#[cfg(feature = "ws")]
+impl crate::interceptor::ChannelsInterceptor for BroadcastRecorder {
+    fn intercept_publish(
+        &self,
+        topic: &str,
+        msg: &crate::channels::ChannelMessage,
+        next: &dyn Fn(
+            &str,
+            &crate::channels::ChannelMessage,
+        ) -> Result<usize, crate::channels::ChannelPublishError>,
+    ) -> Result<usize, crate::channels::ChannelPublishError> {
+        let result = next(topic, msg);
+        // Record the publication even when it reached zero subscribers — the
+        // publish still happened and tests assert on intent, not delivery.
+        self.events.lock().unwrap().push(RecordedBroadcast {
+            topic: topic.into(),
+            payload: msg.as_str().into(),
+        });
+        result
+    }
+}
+
 // ── TestApp ────────────────────────────────────────────────────
 
 /// Builder for constructing a fully-configured Autumn application in tests.
@@ -369,6 +485,10 @@ pub struct TestApp {
     db_interceptor: Option<std::sync::Arc<dyn crate::interceptor::DbConnectionInterceptor>>,
     #[cfg(feature = "ws")]
     channels_interceptor: Option<std::sync::Arc<dyn crate::interceptor::ChannelsInterceptor>>,
+    /// Opt-in broadcast recorder, installed only when
+    /// [`record_broadcasts`](Self::record_broadcasts) is called.
+    #[cfg(feature = "ws")]
+    broadcast_recorder: Option<BroadcastRecorder>,
     #[cfg(feature = "oauth2")]
     http_interceptor: Option<std::sync::Arc<dyn crate::interceptor::HttpInterceptor>>,
     /// Shared mock registry installed into `AppState` during [`build`](Self::build)
@@ -445,6 +565,8 @@ impl TestApp {
             db_interceptor: None,
             #[cfg(feature = "ws")]
             channels_interceptor: None,
+            #[cfg(feature = "ws")]
+            broadcast_recorder: None,
             #[cfg(feature = "oauth2")]
             http_interceptor: None,
             #[cfg(feature = "http-client")]
@@ -729,6 +851,8 @@ impl TestApp {
             clock_as_any: None,
             #[cfg(feature = "mail")]
             mail_recorder: None,
+            #[cfg(feature = "ws")]
+            broadcast_recorder: None,
         }
     }
 
@@ -943,6 +1067,21 @@ impl TestApp {
         interceptor: impl crate::interceptor::ChannelsInterceptor,
     ) -> Self {
         self.channels_interceptor = Some(std::sync::Arc::new(interceptor));
+        self
+    }
+
+    /// Opt in to recording every channel broadcast published while requests
+    /// run, enabling [`TestClient::broadcasts`],
+    /// [`TestClient::broadcasts_on`], and the `assert_broadcast*` helpers.
+    ///
+    /// No interceptor is installed — and channel publishing is untouched —
+    /// unless this is called. Composes with a user-supplied
+    /// [`with_channels_interceptor`](Self::with_channels_interceptor): the
+    /// recorder runs first, then the user's interceptor.
+    #[cfg(feature = "ws")]
+    #[must_use]
+    pub fn record_broadcasts(mut self) -> Self {
+        self.broadcast_recorder = Some(BroadcastRecorder::new());
         self
     }
 
@@ -1331,19 +1470,39 @@ impl TestApp {
             state.insert_extension(interceptor);
         }
         #[cfg(feature = "ws")]
-        if let Some(interceptor) = self.channels_interceptor {
-            state.insert_extension(interceptor.clone());
-            state.channels = crate::channels::Channels::with_shared_backend(std::sync::Arc::new(
-                crate::channels::InterceptedChannelsBackend::new(
-                    state.channels.backend().clone(),
-                    vec![interceptor],
-                ),
-            ));
-            #[cfg(feature = "presence")]
-            {
-                state.presence = crate::presence::Presence::new(state.channels.clone());
+        let broadcast_recorder_for_client = {
+            let mut interceptors: Vec<std::sync::Arc<dyn crate::interceptor::ChannelsInterceptor>> =
+                Vec::new();
+
+            // Recorder runs first so it observes every publish before any
+            // user-supplied interceptor can short-circuit the chain.
+            let recorder_for_client = self.broadcast_recorder.clone();
+            if let Some(recorder) = self.broadcast_recorder {
+                interceptors.push(std::sync::Arc::new(recorder));
             }
-        }
+            if let Some(interceptor) = self.channels_interceptor {
+                // Preserve the existing `insert_extension` behavior so the
+                // user's interceptor is discoverable from state.
+                state.insert_extension(interceptor.clone());
+                interceptors.push(interceptor);
+            }
+
+            // AC6: install nothing (and leave production `Channels` untouched)
+            // unless at least one interceptor was requested.
+            if !interceptors.is_empty() {
+                state.channels = crate::channels::Channels::with_shared_backend(
+                    std::sync::Arc::new(crate::channels::InterceptedChannelsBackend::new(
+                        state.channels.backend().clone(),
+                        interceptors,
+                    )),
+                );
+                #[cfg(feature = "presence")]
+                {
+                    state.presence = crate::presence::Presence::new(state.channels.clone());
+                }
+            }
+            recorder_for_client
+        };
         #[cfg(feature = "oauth2")]
         if let Some(interceptor) = self.http_interceptor {
             state.insert_extension(interceptor);
@@ -1514,6 +1673,19 @@ impl TestApp {
         } else {
             router
         };
+        // Mirror production's outermost Server-Timing fallback (#1348): in
+        // production it is applied in `apply_startup_barrier`, outside the
+        // primary `ServerTimingLayer` and the late `/mcp` merge, and appends a
+        // `total` only for responses the primary never saw — short-circuits and
+        // the late-merged `/mcp` envelope. Without mirroring it here a
+        // `tools/call` would carry no outer `total` in tests, unlike production,
+        // so tests would not observe the real `/mcp` timing an operator sees.
+        // Applied outer to the access-log fallback, matching production order.
+        let router = if crate::config::server_timing_enabled(&self.config) {
+            router.layer(crate::middleware::ServerTimingLayer::fallback(true))
+        } else {
+            router
+        };
         TestClient {
             router,
             probes,
@@ -1522,6 +1694,8 @@ impl TestApp {
             clock_as_any: self.clock_as_any,
             #[cfg(feature = "mail")]
             mail_recorder: Some(mail_recorder_for_client),
+            #[cfg(feature = "ws")]
+            broadcast_recorder: broadcast_recorder_for_client,
         }
     }
 }
@@ -1574,6 +1748,10 @@ pub struct TestClient {
     /// wiring. `Some` for all clients produced by [`TestApp::build`].
     #[cfg(feature = "mail")]
     mail_recorder: Option<MailRecorder>,
+    /// `Some` only when [`TestApp::record_broadcasts`] opted in; otherwise
+    /// `None` (also for clients built via [`TestApp::from_router`]).
+    #[cfg(feature = "ws")]
+    broadcast_recorder: Option<BroadcastRecorder>,
 }
 
 struct TestJobRuntime {
@@ -1749,6 +1927,139 @@ impl TestClient {
             "no sent email matched the predicate;\nactually sent: {sent:#?}",
         );
         self
+    }
+
+    // ── Broadcast recorder accessors & assertions (issue #1043) ──────────
+
+    /// Every recorded channel publication, in publish order.
+    ///
+    /// Requires opting in with [`TestApp::record_broadcasts`]. Captures both
+    /// raw `publish` text and `publish_html` HTML/OOB payloads.
+    ///
+    /// # Panics
+    ///
+    /// Panics if [`TestApp::record_broadcasts`] was not called.
+    #[cfg(feature = "ws")]
+    #[must_use]
+    pub fn broadcasts(&self) -> Vec<RecordedBroadcast> {
+        self.broadcast_recorder
+            .as_ref()
+            .expect(
+                "broadcasts() requires opting in via TestApp::record_broadcasts() before build()",
+            )
+            .recorded()
+    }
+
+    /// Recorded publications on `topic`, in publish order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if [`TestApp::record_broadcasts`] was not called.
+    #[cfg(feature = "ws")]
+    #[must_use]
+    pub fn broadcasts_on(&self, topic: &str) -> Vec<RecordedBroadcast> {
+        self.broadcasts()
+            .into_iter()
+            .filter(|b| b.topic == topic)
+            .collect()
+    }
+
+    /// Builds a self-diagnosing failure message listing what was actually
+    /// published to `topic` and, grouped, to every other topic.
+    #[cfg(feature = "ws")]
+    fn broadcast_failure_message(&self, topic: &str, headline: &str) -> String {
+        use std::collections::BTreeMap;
+        use std::fmt::Write as _;
+        let all = self.broadcasts();
+        let on_topic: Vec<&str> = all
+            .iter()
+            .filter(|b| b.topic == topic)
+            .map(|b| b.payload.as_str())
+            .collect();
+
+        let mut others: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        for b in &all {
+            if b.topic != topic {
+                others
+                    .entry(b.topic.as_str())
+                    .or_default()
+                    .push(b.payload.as_str());
+            }
+        }
+
+        let mut msg = format!("{headline}\n");
+        let _ = writeln!(
+            msg,
+            "published to {topic:?} ({} total): {on_topic:#?}",
+            on_topic.len(),
+        );
+        if others.is_empty() {
+            msg.push_str("no publications on any other topic");
+        } else {
+            let _ = write!(msg, "other topics published: {others:#?}");
+        }
+        msg
+    }
+
+    /// Asserts that at least one publication on `topic` satisfies `predicate`.
+    ///
+    /// Returns `&Self` for chaining.
+    ///
+    /// # Panics
+    ///
+    /// Panics when no matching publication is found, dumping what *was*
+    /// published to `topic` and nearby topics.
+    #[cfg(feature = "ws")]
+    pub fn assert_broadcast(
+        &self,
+        topic: &str,
+        predicate: impl Fn(&RecordedBroadcast) -> bool,
+    ) -> &Self {
+        let matched = self.broadcasts_on(topic).iter().any(predicate);
+        assert!(
+            matched,
+            "{}",
+            self.broadcast_failure_message(
+                topic,
+                &format!("no broadcast on {topic:?} matched the predicate;"),
+            )
+        );
+        self
+    }
+
+    /// Asserts that exactly `n` publications were made to `topic`.
+    ///
+    /// Returns `&Self` for chaining.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the count does not match, dumping what *was* published to
+    /// `topic` and nearby topics.
+    #[cfg(feature = "ws")]
+    pub fn assert_broadcast_count(&self, topic: &str, n: usize) -> &Self {
+        let count = self.broadcasts_on(topic).len();
+        assert!(
+            count == n,
+            "{}",
+            self.broadcast_failure_message(
+                topic,
+                &format!("expected {n} broadcast(s) on {topic:?}, got {count};"),
+            )
+        );
+        self
+    }
+
+    /// Asserts that nothing was published to `topic`.
+    ///
+    /// Returns `&Self` for chaining.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any publication was made to `topic`, dumping what *was*
+    /// published to `topic` and nearby topics.
+    #[cfg(feature = "ws")]
+    pub fn assert_no_broadcasts(&self, topic: &str) -> &Self {
+        self.assert_broadcast_count(topic, 0)
     }
 
     /// Start building a GET request.
