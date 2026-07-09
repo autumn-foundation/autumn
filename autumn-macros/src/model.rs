@@ -939,9 +939,59 @@ fn user_attrs(field: &Field) -> Vec<&syn::Attribute> {
                 && !a.path().is_ident("lock_version")
                 && !a.path().is_ident("searchable")
                 && !a.path().is_ident("encrypted")
+                && !a.path().is_ident("private")
+                && !a.path().is_ident("normalize")
                 && !a.path().is_ident("state_machine")
         })
         .collect()
+}
+
+/// Whether a field is marked `#[private]` (issue #1374): excluded from the
+/// model's `Serialize` impl (JSON responses) while remaining a normal,
+/// queryable Rust field mapped to its DB column. The write path (`New*` /
+/// `Update*` / `Changeset`) is unaffected, so a client can still *set* the
+/// value while never *reading* it back.
+fn field_is_private(field: &Field) -> bool {
+    has_attr(field, "private")
+}
+
+/// Whether a field's serialized form should be hidden from JSON. A field is
+/// hidden when it is explicitly `#[private]`, or when it is `#[encrypted]`
+/// without opting back in via `admin_visible` — ciphertext/plaintext of an
+/// encrypted column must never leak to the public API by default (#1374 AC).
+/// Exposure re-uses the existing `admin_visible` knob rather than a second one.
+fn field_hidden_from_json(field: &Field) -> bool {
+    if field_is_private(field) {
+        return true;
+    }
+    let enc = parse_field_encrypted(field).unwrap_or(EncryptedSpec::NONE);
+    enc.is_encrypted() && !enc.admin_visible
+}
+
+/// Whether a field already carries a serde `skip`/`skip_serializing` so we do
+/// not emit a duplicate attribute (serde rejects duplicates).
+fn field_already_skips_serialization(field: &Field) -> bool {
+    let mut skips = false;
+    for attr in field.attrs.iter().filter(|a| a.path().is_ident("serde")) {
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("skip") || meta.path.is_ident("skip_serializing") {
+                skips = true;
+            }
+            if let Ok(value) = meta.value() {
+                // `name = value` form — consume the value literal.
+                let _: syn::Result<syn::Lit> = value.parse();
+            } else if meta.input.peek(syn::token::Paren) {
+                // Nested-list form, e.g. `bound(serialize = "...")`. Consume the
+                // parenthesized tokens so `parse_nested_meta` can continue to the
+                // next item in the same `#[serde(...)]` (otherwise the loop errors
+                // out early and a later `skip_serializing` is missed, producing a
+                // duplicate injected attribute).
+                let _ = meta.parse_nested_meta(|_| Ok(()));
+            }
+            Ok(())
+        });
+    }
+    skips
 }
 
 /// Encryption mode requested by an `#[encrypted]` field attribute.
@@ -1126,6 +1176,122 @@ fn validate_encrypted_field(field: &syn::Field) -> syn::Result<()> {
         ));
     }
     Ok(())
+}
+
+// ── #1379: `#[normalize(...)]` field normalization ────────────────────────
+
+/// One normalizer step from a `#[normalize(...)]` attribute, applied
+/// left-to-right in declaration order.
+#[derive(Clone)]
+enum Normalizer {
+    /// `trim` — strip leading/trailing whitespace.
+    Trim,
+    /// `downcase` — lowercase (str casing).
+    Downcase,
+    /// `upcase` — uppercase (str casing).
+    Upcase,
+    /// `squish` — trim and collapse internal whitespace runs to one space.
+    Squish,
+    /// `with = path::to::fn` — user escape hatch (`fn(&str) -> String`).
+    With(syn::Path),
+}
+
+/// Parse a field's `#[normalize(trim, downcase, upcase, squish, with = path)]`
+/// attribute into an ordered list of normalizers. Returns an empty list when
+/// the field has no `#[normalize]` attribute.
+fn parse_field_normalize(field: &syn::Field) -> syn::Result<Vec<Normalizer>> {
+    let mut ops = Vec::new();
+    for attr in &field.attrs {
+        if !attr.path().is_ident("normalize") {
+            continue;
+        }
+        // Bare `#[normalize]` and empty `#[normalize()]` are both errors: each
+        // would otherwise register an identity no-op that silently does nothing.
+        let is_empty = match &attr.meta {
+            syn::Meta::Path(_) => true,
+            syn::Meta::List(list) => list.tokens.is_empty(),
+            syn::Meta::NameValue(_) => false,
+        };
+        if is_empty {
+            return Err(syn::Error::new_spanned(
+                attr,
+                "`#[normalize]` requires at least one normalizer, e.g. \
+                 `#[normalize(trim, downcase)]`",
+            ));
+        }
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("trim") {
+                ops.push(Normalizer::Trim);
+            } else if meta.path.is_ident("downcase") {
+                ops.push(Normalizer::Downcase);
+            } else if meta.path.is_ident("upcase") {
+                ops.push(Normalizer::Upcase);
+            } else if meta.path.is_ident("squish") {
+                ops.push(Normalizer::Squish);
+            } else if meta.path.is_ident("with") {
+                let path: syn::Path = meta.value()?.parse()?;
+                ops.push(Normalizer::With(path));
+            } else {
+                return Err(meta.error(
+                    "unsupported `#[normalize]` option; expected one of \
+                     `trim`, `downcase`, `upcase`, `squish`, or `with = path`",
+                ));
+            }
+            Ok(())
+        })?;
+    }
+    Ok(ops)
+}
+
+/// Whether a field carries a `#[normalize(...)]` attribute.
+fn field_has_normalize(field: &syn::Field) -> bool {
+    has_attr(field, "normalize")
+}
+
+/// Validate that `#[normalize]` is only applied to a plain `String` field
+/// (mirrors the `#[encrypted]` non-`String` diagnostic; #1379 AC7). Also
+/// surfaces malformed-option errors early.
+fn validate_normalize_field(field: &syn::Field) -> syn::Result<()> {
+    if !field_has_normalize(field) {
+        return Ok(());
+    }
+    // Surface option-parse errors (e.g. empty `#[normalize]`, bad option).
+    parse_field_normalize(field)?;
+    let is_string = matches!(&field.ty, syn::Type::Path(p) if p.path.segments.last().is_some_and(|s| s.ident == "String"));
+    if !is_string {
+        return Err(syn::Error::new_spanned(
+            &field.ty,
+            "`#[normalize]` is only supported on non-null `String` fields \
+             (normalize a `String` column; `Option<String>` and other types are \
+             out of scope in this slice)",
+        ));
+    }
+    Ok(())
+}
+
+/// Emit an expression that normalizes `value_expr` (an owned `String`) through
+/// the field's normalizer chain, left-to-right. Each built-in is a
+/// `fn(&str) -> String` in `autumn_web::normalize`; `with = path` calls the
+/// user function with the same signature.
+fn emit_normalize_expr(ops: &[Normalizer], value_expr: &TokenStream) -> TokenStream {
+    let steps = ops.iter().map(|op| match op {
+        Normalizer::Trim => quote! { __autumn_n = ::autumn_web::normalize::trim(&__autumn_n); },
+        Normalizer::Downcase => {
+            quote! { __autumn_n = ::autumn_web::normalize::downcase(&__autumn_n); }
+        }
+        Normalizer::Upcase => {
+            quote! { __autumn_n = ::autumn_web::normalize::upcase(&__autumn_n); }
+        }
+        Normalizer::Squish => {
+            quote! { __autumn_n = ::autumn_web::normalize::squish(&__autumn_n); }
+        }
+        Normalizer::With(path) => quote! { __autumn_n = #path(&__autumn_n); },
+    });
+    quote! {{
+        let mut __autumn_n: ::std::string::String = #value_expr;
+        #(#steps)*
+        __autumn_n
+    }}
 }
 
 /// Whether any attribute is a struct-level `#[serde(rename_all = "...")]`.
@@ -2259,6 +2425,31 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             Err(err) => return err.to_compile_error(),
         }
     }
+
+    // Collect `#[normalize]` columns (validated to be non-null `String`).
+    // Each entry: (field ident, lookup key, normalizer chain).
+    // The lookup key is the *Rust* field name (the diesel column), because the
+    // derived `#[repository]` `find_by_`/`count_by_` finder passes the Rust
+    // field name to `normalize_lookup` (mirroring how `#[encrypted]` keys its
+    // registry off the field ident). Keying on the serde-serialized name would
+    // desync the arm from the finder and silently skip normalization for a
+    // renamed column. (#1379)
+    let mut normalized_columns: Vec<(&syn::Ident, String, Vec<Normalizer>)> = Vec::new();
+    for f in &all_fields {
+        if let Err(err) = validate_normalize_field(f) {
+            return err.to_compile_error();
+        }
+        if !field_has_normalize(f) {
+            continue;
+        }
+        let ident = f.ident.as_ref().unwrap();
+        let lookup_key = ident.to_string();
+        match parse_field_normalize(f) {
+            Ok(ops) => normalized_columns.push((ident, lookup_key, ops)),
+            Err(err) => return err.to_compile_error(),
+        }
+    }
+
     // A struct-level `#[serde(rename_all = ...)]` also desyncs encrypted-column
     // registration (Rust name) from the serialized key — reject it when any field
     // is encrypted (see `field_has_serde_rename` for the per-field case).
@@ -2401,7 +2592,15 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 parse_field_encrypted_mode(f).unwrap_or(EncryptedMode::None),
             )
             .map(|w| quote! { #[diesel(serialize_as = #w, deserialize_as = #w)] });
-            quote! { #(#attrs)* #enc pub #ident: #ty }
+            // #1374: a `#[private]` column (or an `#[encrypted]` column not
+            // opted back in via `admin_visible`) is excluded from the model's
+            // `Serialize` impl so it never leaks into JSON responses, while the
+            // field itself stays a normal queryable column and the write path
+            // (New*/Update*/Changeset) is unaffected. `skip_serializing` (not
+            // `skip`) keeps `Deserialize` intact.
+            let private = (field_hidden_from_json(f) && !field_already_skips_serialization(f))
+                .then(|| quote! { #[serde(skip_serializing)] });
+            quote! { #(#attrs)* #enc #private pub #ident: #ty }
         })
         .collect();
 
@@ -3449,6 +3648,71 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         serde_rename_all_serialize_rule(outer_attrs).as_deref(),
     );
 
+    // #1379: normalization codegen.
+    //
+    // `impl Normalize` canonicalizes each `#[normalize]` column in place; it is
+    // generated for the `New*` insert struct (write path) and the model itself.
+    // `impl NormalizedModel` powers derived-finder argument normalization and is
+    // generated for *every* model (empty match when no columns normalize) so the
+    // generic finder call compiles uniformly. Draft (update) normalization is
+    // woven into `from_patch` via `normalize_draft_stmts`.
+    let names_for_new: std::collections::HashSet<String> = fields_for_new
+        .iter()
+        .filter_map(|f| f.ident.as_ref().map(std::string::ToString::to_string))
+        .collect();
+    let normalize_new_stmts: Vec<TokenStream> = normalized_columns
+        .iter()
+        .filter(|(ident, _, _)| names_for_new.contains(&ident.to_string()))
+        .map(|(ident, _, ops)| {
+            let expr = emit_normalize_expr(ops, &quote! { ::core::mem::take(&mut self.#ident) });
+            quote! { self.#ident = #expr; }
+        })
+        .collect();
+    let normalize_model_stmts: Vec<TokenStream> = normalized_columns
+        .iter()
+        .map(|(ident, _, ops)| {
+            let expr = emit_normalize_expr(ops, &quote! { ::core::mem::take(&mut self.#ident) });
+            quote! { self.#ident = #expr; }
+        })
+        .collect();
+    let normalize_draft_stmts: Vec<TokenStream> = normalized_columns
+        .iter()
+        .map(|(ident, _, ops)| {
+            let expr = emit_normalize_expr(ops, &quote! { ::core::mem::take(&mut after.#ident) });
+            quote! { after.#ident = #expr; }
+        })
+        .collect();
+    let normalize_lookup_arms: Vec<TokenStream> = normalized_columns
+        .iter()
+        .map(|(_, lookup_key, ops)| {
+            let expr = emit_normalize_expr(ops, &quote! { value.to_owned() });
+            quote! { #lookup_key => ::core::option::Option::Some(#expr), }
+        })
+        .collect();
+    let normalize_impls = quote! {
+        impl ::autumn_web::normalize::Normalize for #new_name {
+            fn normalize(&mut self) {
+                #(#normalize_new_stmts)*
+            }
+        }
+        impl ::autumn_web::normalize::Normalize for #name {
+            fn normalize(&mut self) {
+                #(#normalize_model_stmts)*
+            }
+        }
+        impl ::autumn_web::normalize::NormalizedModel for #name {
+            fn normalize_lookup(
+                column: &str,
+                value: &str,
+            ) -> ::core::option::Option<::std::string::String> {
+                match column {
+                    #(#normalize_lookup_arms)*
+                    _ => ::core::option::Option::None,
+                }
+            }
+        }
+    };
+
     quote! {
         #encrypted_use
 
@@ -3462,6 +3726,8 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         #name_debug_impl
 
         #form_model_impl
+
+        #normalize_impls
 
         #[derive(#new_debug_derive Clone, ::diesel::Insertable)]
         #[derive(::serde::Serialize, ::serde::Deserialize)]
@@ -3665,6 +3931,10 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             fn from_patch(current: &#name, patch: &#update_name) -> ::autumn_web::AutumnResult<Self> {
                 let mut after = current.clone();
                 #(#merge_arms)*
+                // #1379: normalize `#[normalize]` columns on the update path
+                // (before validation / persistence), so the DB observes the
+                // canonical value. No-op when no columns normalize.
+                #(#normalize_draft_stmts)*
                 Ok(Self::new_with_changes(current.clone(), after))
             }
 
@@ -4256,6 +4526,375 @@ mod tests {
         };
         let err = validate_encrypted_field(&field).unwrap_err();
         assert!(err.to_string().contains("searchable"));
+    }
+
+    #[test]
+    fn already_skips_serialization_with_nested_list_before_skip() {
+        // Regression: a nested-list item (`bound(serialize = ...)`, which has no
+        // `= value`) previously errored out `parse_nested_meta` mid-attribute, so
+        // a later `skip_serializing` in the SAME `#[serde(...)]` was never seen and
+        // the macro injected a duplicate `#[serde(skip_serializing)]`.
+        let field: syn::Field = syn::parse_quote! {
+            #[serde(bound(serialize = "T: Clone"), skip_serializing)]
+            pub secret: String
+        };
+        assert!(
+            field_already_skips_serialization(&field),
+            "a nested list before `skip_serializing` must not hide the skip"
+        );
+    }
+
+    // ── #1374: `#[private]` hides a column from JSON serialization ─────────
+
+    #[test]
+    fn private_attr_filtered_from_user_attrs() {
+        // The raw `#[private]` marker must not leak onto the generated Diesel
+        // query struct — Diesel doesn't understand it.
+        let field: syn::Field = syn::parse_quote! {
+            #[private]
+            pub password_hash: String
+        };
+        let attrs = user_attrs(&field);
+        assert!(
+            attrs.iter().all(|a| !a.path().is_ident("private")),
+            "`#[private]` must be stripped from the query struct's attrs"
+        );
+    }
+
+    #[test]
+    fn private_field_gets_skip_serializing_in_query_struct() {
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct User {
+                    #[id]
+                    pub id: i64,
+                    pub email: String,
+                    #[private]
+                    pub password_hash: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+        // The generated model struct field for `password_hash` must carry
+        // `#[serde(skip_serializing)]` so it never appears in JSON output,
+        // while `email` (public) must not be skipped.
+        assert!(
+            generated.contains("skip_serializing"),
+            "a `#[private]` field must emit `#[serde(skip_serializing)]`: {generated}"
+        );
+        // The field is still a real, queryable Rust field on the struct.
+        assert!(
+            generated.contains("pub password_hash : String"),
+            "the `#[private]` column must remain a normal queryable field: {generated}"
+        );
+    }
+
+    #[test]
+    fn private_field_still_writable_on_new_struct() {
+        // AC: write/deserialize path unaffected — the NewUser struct must still
+        // bind `password_hash` so a client can set (but never read back) it.
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct User {
+                    #[id]
+                    pub id: i64,
+                    pub email: String,
+                    #[private]
+                    pub password_hash: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+        assert!(
+            generated.contains("struct NewUser"),
+            "NewUser must be generated: {generated}"
+        );
+        // NewUser must contain the password_hash field (write path intact) and
+        // must NOT skip it on the write struct.
+        let new_start = generated.find("struct NewUser").unwrap();
+        let new_section = &generated[new_start..new_start + 400];
+        assert!(
+            new_section.contains("password_hash"),
+            "NewUser must still bind the `#[private]` column for writes: {new_section}"
+        );
+    }
+
+    #[test]
+    fn encrypted_field_is_private_in_json_by_default() {
+        // AC: `#[encrypted]` fields are `#[private]` in JSON by default —
+        // plaintext (held in Rust) / ciphertext must never leak to the API.
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Account {
+                    #[id]
+                    pub id: i64,
+                    #[encrypted]
+                    pub ssn: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+        assert!(
+            generated.contains("skip_serializing"),
+            "an `#[encrypted]` field must be skipped from Serialize by default: {generated}"
+        );
+    }
+
+    #[test]
+    fn encrypted_admin_visible_field_is_serialized() {
+        // AC: opt-in exposure mirrors the existing `admin_visible` pattern —
+        // an `#[encrypted(admin_visible)]` field opts back into serialization.
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Account {
+                    #[id]
+                    pub id: i64,
+                    #[encrypted(admin_visible)]
+                    pub tier: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+        // With only an admin_visible encrypted field and no `#[private]` field,
+        // there must be no skip_serializing injected by our logic.
+        assert!(
+            !generated.contains("skip_serializing"),
+            "`admin_visible` encrypted field must remain serialized: {generated}"
+        );
+    }
+
+    #[test]
+    fn public_field_is_not_skipped() {
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Widget {
+                    #[id]
+                    pub id: i64,
+                    pub name: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+        assert!(
+            !generated.contains("skip_serializing"),
+            "a model with no private/encrypted fields must not skip anything: {generated}"
+        );
+    }
+
+    // ── #1379: `#[normalize]` canonicalizes String columns ────────────────
+
+    #[test]
+    fn normalize_attr_filtered_from_user_attrs() {
+        let field: syn::Field = syn::parse_quote! {
+            #[normalize(trim, downcase)]
+            pub email: String
+        };
+        let attrs = user_attrs(&field);
+        assert!(
+            attrs.iter().all(|a| !a.path().is_ident("normalize")),
+            "`#[normalize]` must be stripped from the query struct's attrs"
+        );
+    }
+
+    #[test]
+    fn parse_field_normalize_reads_builtins_left_to_right() {
+        let field: syn::Field = syn::parse_quote! {
+            #[normalize(trim, downcase, squish, upcase)]
+            pub email: String
+        };
+        let ops = parse_field_normalize(&field).unwrap();
+        assert_eq!(ops.len(), 4);
+        assert!(matches!(ops[0], Normalizer::Trim));
+        assert!(matches!(ops[1], Normalizer::Downcase));
+        assert!(matches!(ops[2], Normalizer::Squish));
+        assert!(matches!(ops[3], Normalizer::Upcase));
+    }
+
+    #[test]
+    fn parse_field_normalize_reads_with_escape_hatch() {
+        let field: syn::Field = syn::parse_quote! {
+            #[normalize(trim, with = my_crate::canonicalize)]
+            pub slug: String
+        };
+        let ops = parse_field_normalize(&field).unwrap();
+        assert_eq!(ops.len(), 2);
+        assert!(matches!(ops[0], Normalizer::Trim));
+        assert!(matches!(ops[1], Normalizer::With(_)));
+    }
+
+    #[test]
+    fn normalize_without_normalizers_is_rejected() {
+        // `Vec<Normalizer>` isn't `Debug`, so `unwrap_err` won't compile; assert
+        // on the error message via an explicit match instead.
+        let err_msg = |field: &syn::Field| match parse_field_normalize(field) {
+            Ok(_) => panic!("expected `#[normalize]` to error"),
+            Err(e) => e.to_string(),
+        };
+
+        // Bare `#[normalize]` must error rather than register a no-op.
+        let bare: syn::Field = syn::parse_quote! {
+            #[normalize]
+            pub email: String
+        };
+        assert!(
+            err_msg(&bare).contains("requires at least one normalizer"),
+            "bare `#[normalize]` must error"
+        );
+
+        // Empty `#[normalize()]` is likewise a silent identity no-op — reject it
+        // with the same diagnostic instead of registering a do-nothing chain.
+        let empty: syn::Field = syn::parse_quote! {
+            #[normalize()]
+            pub email: String
+        };
+        assert!(
+            err_msg(&empty).contains("requires at least one normalizer"),
+            "empty `#[normalize()]` must error"
+        );
+    }
+
+    #[test]
+    fn normalize_non_string_field_is_rejected() {
+        // AC7: clear compile error on non-String, mirroring `#[encrypted]`.
+        let field: syn::Field = syn::parse_quote! {
+            #[normalize(trim)]
+            pub age: i64
+        };
+        let err = validate_normalize_field(&field).unwrap_err();
+        assert!(
+            err.to_string().contains("String"),
+            "error must mention String: {err}"
+        );
+
+        // `Option<String>` is also rejected in this slice.
+        let field: syn::Field = syn::parse_quote! {
+            #[normalize(trim)]
+            pub nickname: Option<String>
+        };
+        assert!(validate_normalize_field(&field).is_err());
+    }
+
+    #[test]
+    fn normalize_generates_normalize_and_lookup_impls() {
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct User {
+                    #[id]
+                    pub id: i64,
+                    #[normalize(trim, downcase)]
+                    pub email: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+        // Normalize impl for the insert struct (write path).
+        assert!(
+            generated.contains("impl :: autumn_web :: normalize :: Normalize for NewUser"),
+            "must generate `impl Normalize for NewUser`: {generated}"
+        );
+        // NormalizedModel impl for finder-argument normalization.
+        assert!(
+            generated.contains("impl :: autumn_web :: normalize :: NormalizedModel for User"),
+            "must generate `impl NormalizedModel for User`: {generated}"
+        );
+        // The lookup match must key on the serialized column name.
+        assert!(
+            generated.contains("\"email\""),
+            "normalize_lookup must match the `email` column: {generated}"
+        );
+        // The builtin normalizers must be referenced.
+        assert!(
+            generated.contains("normalize :: trim") && generated.contains("normalize :: downcase"),
+            "must chain the trim+downcase builtins: {generated}"
+        );
+    }
+
+    #[test]
+    fn normalize_runs_in_from_patch_update_path() {
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct User {
+                    #[id]
+                    pub id: i64,
+                    #[normalize(trim, downcase)]
+                    pub email: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+        let fp = generated
+            .find("fn from_patch")
+            .expect("from_patch must be generated");
+        let section = &generated[fp..fp + 1200];
+        assert!(
+            section.contains("normalize"),
+            "from_patch (update path) must normalize the draft: {section}"
+        );
+    }
+
+    #[test]
+    fn model_without_normalize_still_impls_normalized_model() {
+        // Every model impls NormalizedModel (empty) so the generic finder call
+        // compiles uniformly.
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Widget {
+                    #[id]
+                    pub id: i64,
+                    pub name: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+        assert!(
+            generated.contains("impl :: autumn_web :: normalize :: NormalizedModel for Widget"),
+            "every model must impl NormalizedModel: {generated}"
+        );
+    }
+
+    #[test]
+    fn normalize_lookup_keys_on_rust_field_name_not_serde_rename() {
+        // #1379 regression: the derived `#[repository]` finder passes the Rust
+        // field name (the diesel column) to `normalize_lookup`, so the match
+        // arms must be keyed by that Rust name — not the serde-serialized name.
+        // Under a struct-level `#[serde(rename_all = "camelCase")]` a multi-word
+        // column (`display_name`) serializes to `displayName`; keying the arm on
+        // the serde name would make the finder's Rust-name lookup fall through to
+        // `None` and silently skip normalization of the argument.
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                #[serde(rename_all = "camelCase")]
+                pub struct User {
+                    #[id]
+                    pub id: i64,
+                    #[normalize(trim, downcase)]
+                    pub display_name: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+        let fp = generated
+            .find("fn normalize_lookup")
+            .expect("normalize_lookup must be generated");
+        let end = (fp + 600).min(generated.len());
+        let section = &generated[fp..end];
+        assert!(
+            section.contains("\"display_name\""),
+            "normalize_lookup arm must key on the Rust field name `display_name`: {section}"
+        );
+        assert!(
+            !section.contains("\"displayName\""),
+            "normalize_lookup arm must NOT key on the serde-renamed name `displayName`: {section}"
+        );
     }
 
     #[test]

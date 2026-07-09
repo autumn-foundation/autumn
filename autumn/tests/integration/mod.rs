@@ -98,6 +98,8 @@ mod mcp_repository;
 mod mcp_streaming;
 mod middleware_introspection;
 mod middleware_pipeline;
+#[cfg(feature = "db")]
+mod model_field_attrs;
 #[cfg(feature = "offline-sync")]
 mod offline_sync_conformance;
 #[cfg(feature = "offline-sync")]
@@ -128,6 +130,8 @@ mod repository_authorization;
 mod repository_bulk_operations;
 #[cfg(feature = "db")]
 mod repository_find_in_batches;
+#[cfg(feature = "db")]
+mod repository_find_or_create_by;
 #[cfg(feature = "db")]
 mod repository_from_shard;
 #[cfg(all(feature = "db", feature = "openapi"))]
@@ -172,6 +176,12 @@ mod tx_isolation_retry_integration;
 mod webhook_outbound;
 #[cfg(feature = "maud")]
 mod widget_css_coverage;
+#[cfg(feature = "maud")]
+mod widgets_alert;
+#[cfg(feature = "maud")]
+mod widgets_avatar;
+#[cfg(feature = "maud")]
+mod widgets_badge;
 mod widgets_modal;
 mod widgets_tabs;
 #[cfg(feature = "ws")]

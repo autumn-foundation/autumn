@@ -124,6 +124,127 @@ RETURNING *;
 
 ---
 
+## 6. Race-safe get-or-insert: `find_or_create_by_<field>` *(unreleased)*
+
+The classic "find it, and if it isn't there create it" pattern is a **TOCTOU
+race**: between your `find_by_slug` returning empty and your `insert` landing,
+another request can insert the same key — and one of you gets a Postgres
+`23505` unique-violation (which also aborts the surrounding transaction).
+
+Declare the lookup in the repository trait (just the lookup fields — the `new`
+value is added for you):
+
+```rust
+#[autumn_web::repository(Subreddit)]
+pub trait SubredditRepository {
+    /// Backed by `CREATE UNIQUE INDEX ... ON subreddits (slug)`.
+    fn find_or_create_by_slug(slug: String);
+}
+```
+
+This generates an inherent method on `PgSubredditRepository`:
+
+```rust
+pub async fn find_or_create_by_slug(
+    &self,
+    slug: String,
+    new: &NewSubreddit,
+) -> AutumnResult<(Subreddit, bool)>;
+```
+
+Call it and branch on the returned `created` flag if you care:
+
+```rust
+let (community, created) = repo
+    .find_or_create_by_slug(slug.clone(), &new_sub)
+    .await?;
+if created {
+    tracing::info!(%slug, "created new community");
+}
+```
+
+Composite keys use `_and_`, matching a **composite** unique index:
+
+```rust
+// UNIQUE (user_id, list_id)
+fn find_or_create_by_user_id_and_list_id(user_id: i64, list_id: i64);
+```
+
+### The `(Model, bool)` return
+
+The method returns `(model, created)`. `created == true` **only** when this call
+actually inserted the row. When a matching row already exists — or when a
+concurrent caller won the insert race — you get the existing row with
+`created == false`.
+
+### How it stays race-safe
+
+1. **Preliminary lookup** on the read path (replica-eligible, honoring tenant
+   scoping and soft-delete). A hit returns `(row, false)` immediately and fires
+   **no** hooks.
+2. Otherwise **insert on the primary** with `INSERT ... ON CONFLICT DO NOTHING`.
+   `ON CONFLICT DO NOTHING` is the crux: instead of raising `23505` (and
+   poisoning the transaction), Postgres silently skips a conflicting insert.
+   - If a row comes back, this call created it → `(row, true)`, and create/commit
+     hooks fire.
+   - If nothing comes back, a concurrent caller won → the method re-reads the
+     row **on the primary** (read-your-writes) and returns `(row, false)` with no
+     hooks.
+
+Under 10+ concurrent callers for the same key, exactly one row exists
+afterward, exactly one caller observes `created == true`, and **no
+unique-violation ever surfaces to any caller.**
+
+### Hooks and replica routing
+
+- Lifecycle hooks (`before_create` / `after_create` and the durable
+  `after_create_commit` commit-hook queue) fire **only on the created path** —
+  never when the preliminary lookup finds an existing row.
+- One caveat: `before_create` runs *before* the `ON CONFLICT DO NOTHING` insert,
+  so when a concurrent caller wins the insert race the loser's `before_create`
+  has already executed — and any DB writes it made inside the transaction still
+  commit even though that caller's row ends up *not* created (it returns
+  `created == false`). Only `after_create` and the `after_create_commit` commit
+  hooks are guaranteed to run **exclusively** on the created path. Keep
+  `before_create` side effects idempotent, or move create-only work into
+  `after_create`.
+- Unlike `upsert_many`, `find_or_create_by_*` **is** generated on repositories
+  that configure `hooks = ...`. Because the found-vs-created decision is made
+  before any hook runs, there is no hook-bypass hazard.
+- The lookup may run on a replica; the insert and the read-your-writes re-lookup
+  always run on the primary, consistent with `on_primary()` write routing.
+
+### You must have a unique constraint (AC6)
+
+**Race-safety depends entirely on a unique constraint (or unique index)
+covering the lookup column(s).** `ON CONFLICT DO NOTHING` only skips inserts
+that violate a constraint — with no matching constraint, two concurrent callers
+will each insert a row and you get duplicates. The method cannot detect a
+missing constraint at compile time, so this is on you:
+
+- Single-field `find_or_create_by_slug` → `UNIQUE (slug)`.
+- Composite `find_or_create_by_a_and_b` → `UNIQUE (a, b)`.
+- On a `tenant_scoped` repository the unique index should include `tenant_id`
+  (e.g. `UNIQUE (tenant_id, slug)`) so the constraint and the tenant-filtered
+  re-lookup agree.
+- On a `soft_delete` repository the unique constraint **must be a partial index
+  scoped `WHERE deleted_at IS NULL`** (e.g.
+  `CREATE UNIQUE INDEX ... ON subreddits (slug) WHERE deleted_at IS NULL`).
+  With a plain (non-partial) unique index, a soft-deleted row keeps occupying
+  the unique slot: the insert conflicts with it, while the `deleted_at IS NULL`
+  lookup can't see it — so the re-lookup finds nothing and the method returns
+  the internal error below. A partial index frees the slot the moment a row is
+  soft-deleted, keeping the constraint and the filtered lookup in agreement.
+
+If an insert conflicts but the follow-up re-lookup finds nothing — the tell-tale
+sign that the conflict fired on a *different* constraint than the one you're
+looking up by — the method returns a clear internal error rather than silently
+looping or lying. Only `_and_` composites are supported; `_or_` is **rejected**
+at compile time because it would span multiple constraints and defeat the
+single-constraint guarantee.
+
+---
+
 ## Read Replicas: Automatic Read Routing
 
 When `database.replica_url` is configured, every generated **read-only** method — `find_by_id`, `find_all`, `count`, `exists_by_id`, `paginate`, `cursor_page`, derived `find_by_*` / `count_by_*` / `exists_by_*` queries, and full-text `search` / `search_page` — automatically acquires its connection from the replica pool. Mutating methods (`save`, `update`, `delete_by_id`, the bulk operations, hook-driven writes, `with_lock`) always run on the primary. Provisioning a replica therefore offloads your primary with **zero application code changes**.

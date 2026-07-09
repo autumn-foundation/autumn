@@ -132,6 +132,13 @@ is a defect. Flag these and name the framework replacement:
   `LIMIT/OFFSET` pagination, per-row insert loops, or CRUD queries when the
   model has a `#[repository]`. Fix: `page`/`cursor_page`, bulk
   `save_many`/`update_many`/`delete_many`/`upsert_many`, generated CRUD.
+- **Hand-rolled find-then-create / insert-or-catch-23505** (a `find_by_x` +
+  branch-then-`insert`, or `insert_into(...).on_conflict...`/error-mapping a
+  unique violation) when the model has a `#[repository]` and a unique
+  constraint on the lookup column. Fix: declare
+  `fn find_or_create_by_<field>(...)` and call the generated race-safe
+  `find_or_create_by_<field>(field, &new) -> (Model, bool)` **(unreleased)** —
+  the manual read-then-insert is a TOCTOU race that can surface a `23505`.
 - **Raw `axum::Router` handlers for app routes**: `.route("/x", get(...))`
   instead of `#[get]`/`#[post]` + `routes![...]`. `.merge()`/`.nest()` is
   acceptable only for third-party routers.
