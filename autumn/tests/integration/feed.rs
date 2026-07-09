@@ -143,3 +143,46 @@ async fn conditional_get_200_when_etag_differs() {
     let resp = feed.conditional(&headers);
     assert_eq!(resp.status(), StatusCode::OK);
 }
+
+#[test]
+fn etag_changes_when_content_changes_within_same_second() {
+    let ts = Utc.with_ymd_and_hms(2026, 5, 1, 12, 0, 0).unwrap();
+    let mk = |title: &str| {
+        Feed::atom(
+            "Blog",
+            "https://example.com/",
+            "https://example.com/feed.xml",
+        )
+        .entry(
+            FeedEntry::new("https://example.com/x", title, "https://example.com/x")
+                .summary("body")
+                .published(ts)
+                .updated(ts),
+        )
+    };
+    let a = mk("Original title");
+    let b = mk("Edited title");
+    assert_eq!(a.last_updated(), b.last_updated()); // identical whole-second timestamp
+    assert_ne!(
+        a.etag().header_value(),
+        b.etag().header_value(),
+        "a content edit within the same second must change the ETag"
+    );
+}
+
+#[test]
+fn empty_feed_renders_deterministically() {
+    let mk = || {
+        Feed::atom(
+            "Blog",
+            "https://example.com/",
+            "https://example.com/feed.xml",
+        )
+    };
+    assert_eq!(
+        mk().render(),
+        mk().render(),
+        "empty feed body must be deterministic"
+    );
+    assert_eq!(mk().etag().header_value(), mk().etag().header_value());
+}

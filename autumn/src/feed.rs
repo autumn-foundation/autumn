@@ -198,12 +198,13 @@ impl Feed {
             .max()
     }
 
-    /// A strong [`ETag`] derived from the newest entry and the entry count,
-    /// suitable for conditional GET.
+    /// A strong [`ETag`] over the exact rendered feed bytes, suitable for
+    /// conditional GET: it changes whenever any rendered field changes —
+    /// including two edits within the same whole second, or content edits that
+    /// leave timestamps untouched — and is stable otherwise.
     #[must_use]
     pub fn etag(&self) -> ETag {
-        let ts = self.last_updated().map_or(0, |d| d.timestamp());
-        format!("feed:{ts}:{}", self.entries.len()).into_etag()
+        self.render().into_etag()
     }
 
     /// Wrap this feed in conditional-GET handling, reusing [`crate::etag`].
@@ -214,11 +215,13 @@ impl Feed {
     /// `Last-Modified` headers attached.
     #[must_use]
     pub fn conditional(self, request_headers: &http::HeaderMap) -> Response {
-        let etag = self.etag();
         let last_modified = self.last_updated();
+        let content_type = self.content_type();
+        let body = self.render();
+        let etag = body.as_str().into_etag();
         fresh_when(request_headers, etag)
             .last_modified(last_modified)
-            .or_else(move || self)
+            .or_else(move || ([(CONTENT_TYPE, content_type)], body).into_response())
             .into_response()
     }
 
@@ -232,7 +235,7 @@ impl Feed {
     }
 
     fn render_atom(&self) -> String {
-        let updated = self.last_updated().unwrap_or_else(Utc::now);
+        let updated = self.last_updated().unwrap_or_else(fallback_timestamp);
         let mut s = String::new();
         s.push_str("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n");
         s.push_str("<feed xmlns=\"http://www.w3.org/2005/Atom\">\n");
@@ -279,7 +282,7 @@ impl Feed {
     }
 
     fn render_rss(&self) -> String {
-        let updated = self.last_updated().unwrap_or_else(Utc::now);
+        let updated = self.last_updated().unwrap_or_else(fallback_timestamp);
         let description = self.description.as_deref().unwrap_or(&self.title);
         let mut s = String::new();
         s.push_str("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n");
@@ -376,6 +379,13 @@ impl IntoResponse for Feed {
         let body = self.render();
         ([(CONTENT_TYPE, content_type)], body).into_response()
     }
+}
+
+/// Deterministic fallback used for `<updated>` / `lastBuildDate` when a feed
+/// has no channel timestamp and no dated entries, so the rendered body (and the
+/// `ETag` derived from it) stays stable across renders.
+const fn fallback_timestamp() -> DateTime<Utc> {
+    DateTime::from_timestamp(0, 0).expect("unix epoch is a valid timestamp")
 }
 
 fn rfc3339(dt: DateTime<Utc>) -> String {
