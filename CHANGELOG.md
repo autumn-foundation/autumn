@@ -22,7 +22,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `.env.*.local` (while keeping `.env.example` and committable `.env.{profile}`
   files tracked). `autumn doctor` gained a `dotenv` check that warns when
   `.env.example` is present without a `.env`, or when a `.env` exists but is not
-  gitignored (issue #1051).
+  gitignored (issue #1051). The environment/profile selectors (`AUTUMN_ENV`,
+  `AUTUMN_PROFILE`, `AUTUMN_IS_DEBUG`) are intentionally NOT read from `.env` —
+  a `.env` file must not be able to switch the active profile, so it can never
+  flip `autumn migrate down` / `autumn db drop` / `autumn db reset` onto a
+  production target after their real-env (dev) guards have already passed; set
+  those in your shell or via `--profile`. The `dotenv` doctor check also
+  surfaces an ungitignored secret file even when `.env.example` exists without a
+  `.env`, so the copy-the-template hint can no longer hide a committable
+  `.env.local`.
 - **generator:** `autumn new` now generates a `README.md` at the project root
   (listed in the "Created …" output) with explicit prerequisites and a
   golden-path quickstart — configure the `[database]` block in `autumn.toml`

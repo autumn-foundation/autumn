@@ -296,6 +296,12 @@ pub(crate) fn resolve_profile(env: &dyn Env) -> String {
 }
 
 /// Resolve the raw profile selector value (before normalization).
+///
+/// The env-var keys consulted here (`AUTUMN_ENV`, `AUTUMN_PROFILE`,
+/// `AUTUMN_IS_DEBUG`) are the profile *selectors*; they are deliberately
+/// excluded from the `.env` overlay (see [`crate::dotenv`]'s
+/// `PROFILE_SELECTOR_KEYS`) so a `.env` file cannot switch the active profile.
+/// Keep the two lists in sync.
 fn resolve_profile_input(env: &dyn Env) -> String {
     // 1. Preferred env var
     if let Ok(profile) = env.var("AUTUMN_ENV") {

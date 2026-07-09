@@ -20,6 +20,12 @@
 //! There is intentionally **no** `${VAR}` interpolation: values are treated
 //! as literal strings (with optional surrounding single or double quotes
 //! stripped).
+//!
+//! The environment/profile **selector** keys (`AUTUMN_ENV`, `AUTUMN_PROFILE`,
+//! `AUTUMN_IS_DEBUG`) are intentionally **excluded** from the overlay — a
+//! `.env` file must not be able to change the active profile or bypass the
+//! prod / destructive-command guards. Set those in the real shell environment
+//! or via `--profile`. See [`PROFILE_SELECTOR_KEYS`].
 
 use std::path::{Path, PathBuf};
 
@@ -48,6 +54,30 @@ impl std::fmt::Display for DotenvError {
 }
 
 impl std::error::Error for DotenvError {}
+
+/// Environment-variable keys that select the active profile / environment and
+/// are therefore deliberately **never** honored from a `.env` file.
+///
+/// Safety: the active profile is a safety-critical bootstrapping decision — it
+/// gates the production / destructive-command confirmations in `autumn migrate
+/// down`, `autumn db drop`, and `autumn db reset`, and it picks which config
+/// overlay (and thus which database) an app targets. A `.env` file must not be
+/// able to change it. Were `.env` allowed to set `AUTUMN_ENV=prod`, it could
+/// flip a command onto a production target *after* that command's real-env
+/// (dev) guard had already passed, bypassing the confirmation flag. Profile
+/// selection therefore stays sourced only from the real shell environment and
+/// the `--profile` flag — mirroring Rails/Next, where `.env` does not set
+/// `RAILS_ENV`/`NODE_ENV`.
+///
+/// These are exactly the keys [`crate::config::resolve_profile_input`] consults
+/// to pick the profile; keep the two lists in sync.
+const PROFILE_SELECTOR_KEYS: [&str; 3] = ["AUTUMN_ENV", "AUTUMN_PROFILE", "AUTUMN_IS_DEBUG"];
+
+/// Whether `key` selects the active profile / environment and so must be
+/// dropped from the `.env` overlay (see [`PROFILE_SELECTOR_KEYS`]).
+fn is_profile_selector_key(key: &str) -> bool {
+    PROFILE_SELECTOR_KEYS.contains(&key)
+}
 
 /// The ordered list of candidate `.env` files for a given profile.
 ///
@@ -187,6 +217,12 @@ fn parse_value(raw: &str) -> String {
 /// (real env always wins), and the first file to set a key wins over later
 /// files.
 ///
+/// Profile/environment selector keys ([`PROFILE_SELECTOR_KEYS`] — `AUTUMN_ENV`,
+/// `AUTUMN_PROFILE`, `AUTUMN_IS_DEBUG`) are dropped unconditionally, even when
+/// present in `.env`: a `.env` file must not be able to change the active
+/// profile or bypass the prod / destructive-command guards. See
+/// [`PROFILE_SELECTOR_KEYS`] for the full rationale.
+///
 /// # Errors
 /// Returns a [`DotenvError`] if a candidate file exists but cannot be read, or
 /// if a present file fails to parse.
@@ -217,6 +253,11 @@ pub(crate) fn resolve_dotenv_vars(
         };
 
         for (key, value) in parse_dotenv(&path, &contents)? {
+            // Safety: `.env` must never select the active profile/environment,
+            // so drop the profile-selector keys regardless of the file.
+            if is_profile_selector_key(&key) {
+                continue;
+            }
             // Real environment variables always win.
             if env.var(&key).is_ok() {
                 continue;
@@ -674,6 +715,25 @@ export BAZ=qux
     }
 
     #[test]
+    fn dotenv_env_prod_does_not_flip_resolved_profile() {
+        // End-to-end guard: a `.env`-provided `AUTUMN_ENV=prod` must NOT change
+        // the profile the overlay resolves to. `resolve_profile` is exactly the
+        // selector `autumn migrate` / config load consult, so this proves the
+        // prod/destructive guards can't be flipped by `.env`.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".env"),
+            "AUTUMN_ENV=prod\nAUTUMN_DATABASE__URL=postgres://localhost/app\n",
+        )
+        .unwrap();
+        let base = MockEnv::new();
+        let vars = resolve_dotenv_vars(dir.path(), "dev", &base).unwrap();
+        let env = DotenvEnv::new(&base, vars);
+        // The selector is not honored from `.env`, so the profile stays `dev`.
+        assert_eq!(crate::config::resolve_profile(&env), "dev");
+    }
+
+    #[test]
     fn dotenv_resolves_into_config_via_overlay() {
         // End-to-end: a `.env` value flows into `config.database.url` through
         // the overlay `Env`, with no process-environment mutation.
@@ -692,6 +752,59 @@ export BAZ=qux
             config.database.url.as_deref(),
             Some("postgres://localhost/from-dotenv")
         );
+    }
+
+    #[test]
+    fn profile_selector_keys_are_dropped_from_dotenv() {
+        // Safety: `.env` must never select the active profile/environment.
+        // `AUTUMN_ENV`, `AUTUMN_PROFILE`, and `AUTUMN_IS_DEBUG` are dropped even
+        // when present in `.env`, while ordinary keys still flow through.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".env"),
+            "AUTUMN_ENV=prod\n\
+             AUTUMN_PROFILE=prod\n\
+             AUTUMN_IS_DEBUG=0\n\
+             AUTUMN_DATABASE__URL=postgres://localhost/app\n",
+        )
+        .unwrap();
+        let env = MockEnv::new();
+        let out = resolve_dotenv_vars(dir.path(), "dev", &env).unwrap();
+        let map: std::collections::HashMap<_, _> = out.into_iter().collect();
+        assert!(
+            !map.contains_key("AUTUMN_ENV"),
+            "AUTUMN_ENV must not be honored from .env"
+        );
+        assert!(
+            !map.contains_key("AUTUMN_PROFILE"),
+            "AUTUMN_PROFILE must not be honored from .env"
+        );
+        assert!(
+            !map.contains_key("AUTUMN_IS_DEBUG"),
+            "AUTUMN_IS_DEBUG must not be honored from .env"
+        );
+        // Non-selector keys are unaffected.
+        assert_eq!(
+            map.get("AUTUMN_DATABASE__URL").map(String::as_str),
+            Some("postgres://localhost/app")
+        );
+    }
+
+    #[test]
+    fn real_env_profile_selector_is_unaffected_by_exclusion() {
+        // Excluding the selector keys from `.env` must not touch the REAL
+        // environment: a real-env `AUTUMN_ENV` remains readable through the
+        // base env even though a `.env`-provided one is dropped.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".env"), "AUTUMN_ENV=prod\nOTHER=x\n").unwrap();
+        let env = MockEnv::new().with("AUTUMN_ENV", "dev");
+        let out = resolve_dotenv_vars(dir.path(), "dev", &env).unwrap();
+        let map: std::collections::HashMap<_, _> = out.into_iter().collect();
+        // The `.env` selector is dropped, not surfaced.
+        assert!(!map.contains_key("AUTUMN_ENV"));
+        // The real-env value is still what callers observe.
+        assert_eq!(env.var("AUTUMN_ENV").unwrap(), "dev");
+        assert_eq!(map.get("OTHER").map(String::as_str), Some("x"));
     }
 
     #[test]

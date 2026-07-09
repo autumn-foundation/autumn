@@ -2922,10 +2922,13 @@ fn glob_matches_basename(pattern: &str, text: &str) -> bool {
 
 /// Check that project-root `.env` handling is set up safely.
 ///
-/// - `.env.example` present but no `.env` → Warn (developer likely needs to
-///   copy the template).
 /// - Any always-secret dotenv file (`.env`, `.env.local`, `.env.<profile>.local`)
 ///   present but NOT gitignore-covered → Warn, naming the offending file(s).
+///   This security finding takes priority: it is surfaced even when
+///   `.env.example` exists without a root `.env` (so the copy-the-template hint
+///   can never hide an ungitignored, committable secret file).
+/// - `.env.example` present but no `.env` → Warn (developer likely needs to
+///   copy the template).
 /// - otherwise → Pass.
 ///
 /// Warn-only by design (never Fail), consistent with the skill doc.
@@ -2934,25 +2937,33 @@ pub fn check_dotenv_impl(
     has_env: bool,
     uncovered_secret_files: &[String],
 ) -> CheckResult {
+    // Security first: an ungitignored always-secret dotenv file risks committing
+    // secrets and must never be hidden behind the copy-the-template hint, so
+    // check it before the `.env.example`-without-`.env` case. When both apply,
+    // lead with the security issue and still mention copying the template.
+    if !uncovered_secret_files.is_empty() {
+        let mut detail = format!(
+            "{} present but not gitignored — you risk committing secrets",
+            uncovered_secret_files.join(", ")
+        );
+        if has_env_example && !has_env {
+            detail.push_str("; also copy `.env.example` to `.env` to get started");
+        }
+        return CheckResult {
+            name: "dotenv",
+            status: CheckStatus::Warn,
+            detail: Some(detail),
+            hint: Some(
+                "Add your local .env files to .gitignore (e.g. `.env`, `.env.local`, `.env.*.local`)",
+            ),
+        };
+    }
     if has_env_example && !has_env {
         return CheckResult {
             name: "dotenv",
             status: CheckStatus::Warn,
             detail: Some("`.env.example` is present but no `.env` exists".into()),
             hint: Some("Copy `.env.example` to `.env` and fill in local values"),
-        };
-    }
-    if !uncovered_secret_files.is_empty() {
-        return CheckResult {
-            name: "dotenv",
-            status: CheckStatus::Warn,
-            detail: Some(format!(
-                "{} present but not gitignored — you risk committing secrets",
-                uncovered_secret_files.join(", ")
-            )),
-            hint: Some(
-                "Add your local .env files to .gitignore (e.g. `.env`, `.env.local`, `.env.*.local`)",
-            ),
         };
     }
     CheckResult {
@@ -5125,6 +5136,36 @@ redirect_uri = "http://localhost/callback"
             result.detail.as_deref().unwrap().contains(".env.local"),
             "detail should name the offending file: {:?}",
             result.detail
+        );
+    }
+
+    #[test]
+    fn dotenv_uncovered_secret_takes_priority_over_missing_env() {
+        // Combined case: `.env.example` present, no root `.env`, and a present
+        // `.env.local` that is NOT gitignored. The ungitignored-secret warning
+        // must win (naming the file) rather than being hidden behind the
+        // copy-the-template hint.
+        let result = check_dotenv_impl(true, false, &[".env.local".to_owned()]);
+        assert_eq!(result.name, "dotenv");
+        assert!(
+            matches!(result.status, CheckStatus::Warn),
+            "expected Warn, got {:?}",
+            result.status
+        );
+        let detail = result.detail.as_deref().unwrap();
+        assert!(
+            detail.contains(".env.local"),
+            "detail must name the uncovered secret file: {detail:?}"
+        );
+        assert!(
+            detail.contains("not gitignored"),
+            "detail must lead with the security issue: {detail:?}"
+        );
+        // The gitignore hint is the actionable one for the security issue.
+        assert!(
+            result.hint.unwrap().contains(".gitignore"),
+            "hint should point at .gitignore: {:?}",
+            result.hint
         );
     }
 
