@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **generator:** `autumn generate controller <name> <action>...` scaffolds a handler-only module (named actions, wired routes, Maud stub views) for non-CRUD pages/endpoints — no model, migration, or DB; `--api` emits JSON actions. (issue #1050)
 - **download:** typed `Download` `IntoResponse` (`autumn_web::download::Download`)
   for serving files from a handler without hand-rolling headers. Construct it
   from owned bytes, an async byte stream, an `AsyncRead`, or a stored blob
@@ -41,6 +42,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   through `across_tenants()` is rejected rather than silently writing to a single
   shard while matching rows on other shards go unseen. See the
   "Race-safe get-or-insert" section of the repositories guide.
+- **widgets:** `flash_messages(&[FlashMessage])` (issue #1240) — an accessible
+  renderer for consumed flash messages. Each banner is its own live region
+  whose `role`/`aria-live` is chosen by severity (`Error`/`Warning` announce
+  assertively, `Success`/`Info` politely), carries semantic
+  `autumn-flash`/`autumn-flash--<level>` classes backed by `FLASH_CSS`, and
+  escapes its text. An empty slice renders nothing; `flash_messages_with` adds
+  an opt-in, no-JavaScript dismiss control. The `flash` module doc now points
+  at the helper instead of the hand-rolled `div class=(level)` snippet.
+- **widgets:** `badge`/`status_tag` (issue #1259) — semantic status pills.
+  `badge(label, BadgeVariant)` emits a stable `badge badge--<variant>` class
+  (`Neutral`/`Info`/`Success`/`Warning`/`Danger`), `BadgeVariant::for_label`
+  maps an arbitrary status string to a deterministic color, `status_tag` is the
+  neutral one-liner, and `badge_with`/`BadgeConfig` set a `title`/`aria-label`.
+  Text is always present (color is never the sole signal); no inline styles.
+- **widgets:** `avatar(name, &AvatarConfig)` (issue #1263) — renders an `<img>`
+  (lazy-loaded, square `width`/`height`, name-derived `alt`) when an image URL
+  is present, or a deterministic colored-initials badge when it isn't (1–2
+  Unicode-safe uppercase initials, per-name background via a stable
+  `autumn-avatar--cN` palette class — no inline `style`, so it survives a
+  nonce-based CSP). Never a broken-image request; three named sizes
+  (`Small`/`Medium`/`Large`); the display name is HTML-escaped.
+- **widgets:** `alert`/`alert_with` + `error_summary` (issue #1314) — inline
+  block-level callouts with an `AlertVariant` (`Info`/`Success`/`Warning`/
+  `Error`, `role` chosen per variant), optional title, per-variant inline-SVG
+  icon, and an opt-in no-JavaScript dismiss control. `error_summary(&Changeset)`
+  renders an `Error` alert listing every field error as a `<ul>` (stable order)
+  or `None` when valid, for the form re-render path. All caller markup is
+  escaped by Maud; no inline styles.
+- **model:** `#[private]` field attribute (issue #1374) hides a `#[model]`
+  column from JSON — it is excluded from the model's `Serialize` impl so it
+  never appears in `Json` output, the auto-generated `--api` list/show
+  endpoints, or any `serde_json::to_value(&model)`, while staying a normal,
+  queryable column whose write path (`NewX`/`UpdateX`/`Changeset`) still binds
+  it (set a password, never read the hash back). `#[encrypted]` columns are now
+  `#[private]` in JSON by default (opt back in via `#[encrypted(admin_visible)]`);
+  `#[private]` still appears in `FormModel::form_fields()` (the write side). New
+  `autumn doctor` check `model_private_columns` warns when a sensitively-named
+  column (`password`/`token`/`secret`/`*_hash`) is not marked `#[private]`.
+- **model:** `#[normalize(trim, downcase, upcase, squish, with = path)]` field
+  attribute (issue #1379) canonicalizes a `String` column, composing
+  normalizers left-to-right. Runs on the write path (`save`/`save_many` insert
+  and `update` via `UpdateDraft::from_patch`) before the `before_create`/
+  `before_update` hooks and the DB write, and on derived `#[repository]`
+  `find_by_`/`count_by_` lookups (so `find_by_email("  FOO@X.com ")` matches the
+  stored `foo@x.com` row). Built-ins are idempotent, so `#[normalize(downcase)]`
+  plus a `unique` column gives case-insensitive uniqueness; non-`String` fields
+  are a compile error. Built-ins and the `Normalize` / `NormalizedModel` traits
+  live in the new `autumn_web::normalize` module.
 - **ci:** README-quickstart gate against the published crates (issue #1586) —
   `.github/workflows/quickstart-gate.yml` + `scripts/check-quickstart.sh`
   install the README-pinned `autumn-cli` from crates.io (never the local

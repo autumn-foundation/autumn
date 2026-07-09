@@ -653,6 +653,10 @@ for the common cases:
 | `card(&body, &CardConfig::new().title("..."))` / `stat_card(label, value, link)` | Titled panels and metric tiles (`autumn_web::widgets`, prelude re-export) |
 | `tabs(id, &[(id, label, markup)])` | No-JS CSS-only tab switcher (`docs/guide/tabs.md`) |
 | `modal(id, title, &body, &ModalConfig)` / `confirm_action(...)` | Native `<dialog>` confirm for destructive actions — replaces `hx-confirm`/`window.confirm()` |
+| `badge(label, BadgeVariant::for_label(status))` / `status_tag(label)` | Semantic status pill; `BadgeVariant` = `Neutral`/`Info`/`Success`/`Warning`/`Danger`, `for_label` picks a deterministic color; `badge_with`/`BadgeConfig` set `title`/`aria-label`. Composes inside a `data_table` cell |
+| `avatar(name, &AvatarConfig::new().image(url).size(AvatarSize::Small))` | Person chip: `<img>` (lazy, square, name `alt`) or a deterministic colored-initials fallback — never a broken image, no JS, no external call |
+| `alert(AlertVariant::Info, body)` / `alert_with(..., &AlertConfig::new().title("...").icon(true).dismissible(true))` | Inline callout / empty-state / error box; `role` per variant, optional title + inline-SVG icon + no-JS dismiss. `error_summary(&changeset)` renders an `Error` alert of all field errors (or `None` when valid) |
+| `flash_messages(&flash.consume().await)` (`autumn_web::flash`) | Accessible flash banners: per-severity `role`/`aria-live`, `autumn-flash--<level>` classes, empty slice renders nothing; `flash_messages_with` adds a no-JS dismiss |
 | `pagination_nav(&page, &PagerOptions::new("/posts"))` / `cursor_pagination_nav` | Accessible, filter-preserving, htmx-opt-in pager from a `Page`/`CursorPage` (prelude re-export) |
 | `autumn_web::ui::WIDGETS_CSS` / `WIDGETS_CSS_PATH` | One shipped stylesheet backing every `autumn-*` widget class — link `href=(WIDGETS_CSS_PATH)` instead of copying widget CSS into `input.css`. Accent now follows `var(--primary)` (violet), not the old hardcoded indigo (`docs/guide/widget-styling.md`) |
 

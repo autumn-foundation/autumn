@@ -101,6 +101,36 @@ from -> to: "guard", ...))]` field attribute on `String` fields, generating
 `__AUTUMN_SM_{FIELD}_TRANSITIONS` edge-list constant. See
 `docs/guide/state-machines.md`.
 
+`#[model]` field attributes for column privacy and canonicalization
+(**unreleased** — trunk-dev, not in published 0.5.0):
+
+- `#[private]` (issue #1374) — excludes the column from the model's `Serialize`
+  impl so it never appears in `Json` output, the auto-generated `--api`
+  list/show endpoints, or any `serde_json::to_value(&model)`. The field stays a
+  normal, queryable column and the **write** path is unaffected — `NewX` /
+  `UpdateX` / `Changeset` still bind it, so a client can *set* a password but
+  never read the hash back. `#[encrypted]` columns are `#[private]` in JSON by
+  default (ciphertext/plaintext must not leak); opt back in with the existing
+  `#[encrypted(admin_visible)]` knob. `#[private]` affects only serialization —
+  the column still appears in `FormModel::form_fields()` (you must be able to
+  *set* it). `autumn doctor` warns (`model_private_columns`) when a
+  sensitively-named column (`password`, `token`, `secret`, `*_hash`) is not
+  marked `#[private]`.
+- `#[normalize(trim, downcase, upcase, squish, with = path::to::fn)]` (issue
+  #1379) — canonicalizes a `String` column, composing normalizers
+  left-to-right. Built-ins live in `autumn_web::normalize`
+  (`trim`/`downcase`/`upcase`/`squish`); `with = path` calls a user
+  `fn(&str) -> String`. Runs on the **write** path (`save`/`save_many` insert;
+  `update` via `UpdateDraft::from_patch`) *before* the `before_create` /
+  `before_update` hooks and the DB write, and on derived `#[repository]`
+  `find_by_`/`count_by_` lookups (so `find_by_email("  FOO@X.com ")` matches the
+  stored `foo@x.com` row). Built-ins are idempotent; composing
+  `#[normalize(downcase)]` with a `unique` column yields case-insensitive
+  uniqueness. Non-`String` fields are a compile error (mirrors `#[encrypted]`).
+  Generated hooks: `impl autumn_web::normalize::Normalize` on the model and
+  `NewX`; `impl autumn_web::normalize::NormalizedModel` (`normalize_lookup`) on
+  every model.
+
 ## Repository-generated methods (`#[repository]`)
 
 Published 0.5.0: `find_by_id`, `find_all`, `count`, `exists_by_id`, `save`,
@@ -201,6 +231,18 @@ Free functions rendering changeset-aware, accessible inputs:
   `stat_card(label, value, link)`, `tabs(id, &[(id, label, markup)])`,
   `modal(id, title, &body, &ModalConfig)`, `modal_trigger`,
   `modal_close_button`, `confirm_action(...)`.
+- `autumn_web::widgets` display atoms: `badge(label, BadgeVariant)` /
+  `badge_with(..., &BadgeConfig)` / `status_tag(label)` with
+  `BadgeVariant::{Neutral,Info,Success,Warning,Danger}` and
+  `BadgeVariant::for_label(&str)` (deterministic color); `avatar(name,
+  &AvatarConfig)` with `AvatarSize::{Small,Medium,Large}` (image or
+  colored-initials fallback); `alert(AlertVariant, body)` / `alert_with(...,
+  &AlertConfig)` with `AlertVariant::{Info,Success,Warning,Error}` and
+  `error_summary(&Changeset) -> Option<Markup>`. All prelude re-exported.
+- `autumn_web::flash::{flash_messages, flash_messages_with,
+  FlashMessagesConfig}` — accessible flash-banner renderer (per-severity
+  `role`/`aria-live`, `autumn-flash--<level>` classes, empty renders nothing,
+  optional no-JS dismiss). Prelude re-exported.
 - `autumn_web::links`: `link_to`, `link_to_with`, `button_to(label, href,
   Method, csrf_token)`, `button_to_with(..., &ButtonToOptions)`.
 - `autumn_web::ui::pagination`: `pagination_nav(&Page, &PagerOptions)`,

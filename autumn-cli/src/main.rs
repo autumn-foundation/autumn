@@ -1883,6 +1883,41 @@ enum GenerateCommands {
         #[arg(long)]
         force: bool,
     },
+    /// Generate a handler-only, non-CRUD route module (no model, migration, or
+    /// database).
+    ///
+    /// Each action maps to `/<controller>/<action>`, except an action literally
+    /// named `index`, which maps to `/<controller>`. Under `--api` the prefix is
+    /// `/api/<controller>[/<action>]`.
+    ///
+    /// Actions default to GET; request another method with `action:method`
+    /// (method ∈ get, post, put, patch, delete), e.g. `submit:post`.
+    ///
+    /// HTML mode (default) emits Maud stub views returning HTTP 200; `--api`
+    /// emits JSON actions with no view stubs. Re-running against an existing
+    /// controller fails without `--force`.
+    ///
+    /// Example:
+    ///
+    ///   autumn generate controller pages home about contact
+    #[command(verbatim_doc_comment)]
+    Controller {
+        /// Controller name (`snake_case` or `PascalCase`, e.g. `pages`).
+        name: String,
+        /// Action names, each optionally suffixed with `:method`
+        /// (e.g. `home`, `submit:post`, `index`).
+        #[arg(required = true)]
+        actions: Vec<String>,
+        /// Emit JSON actions (no HTML/Maud views).
+        #[arg(long)]
+        api: bool,
+        /// Print the file plan and exit without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Overwrite existing files instead of erroring on collision.
+        #[arg(long)]
+        force: bool,
+    },
     /// Generate model, migration, repository, HTML routes, smoke test, and
     /// register the new routes in `src/main.rs`.
     ///
@@ -3075,6 +3110,16 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
             force,
         } => {
             let plan = generate::wizard::plan_wizard(&resolve_cwd(), &name, &steps);
+            apply_plan(plan, generate::Flags { dry_run, force }, mode);
+        }
+        GenerateCommands::Controller {
+            name,
+            actions,
+            api,
+            dry_run,
+            force,
+        } => {
+            let plan = generate::controller::plan_controller(&resolve_cwd(), &name, &actions, api);
             apply_plan(plan, generate::Flags { dry_run, force }, mode);
         }
         GenerateCommands::Scaffold {
