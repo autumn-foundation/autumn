@@ -6414,3 +6414,157 @@ fn generate_tauri_reuses_pwa_icon() {
         "PWA icon must still exist"
     );
 }
+
+// ── generate controller (issue #1050) ──────────────────────────────────────
+
+/// Re-running `generate controller` against an existing controller must fail
+/// (non-zero exit) and leave the first file byte-for-byte intact. Fast — no
+/// compile needed.
+#[test]
+fn controller_rerun_without_force_fails() {
+    let (_tmp, project) = fresh_project("controller-rerun-app");
+    run_autumn(
+        &project,
+        &["generate", "controller", "pages", "home", "about"],
+    );
+    let original = fs::read_to_string(project.join("src/routes/pages.rs")).unwrap();
+
+    let (_out, _err, code) = run_autumn_failing(
+        &project,
+        &["generate", "controller", "pages", "home", "contact"],
+    );
+    assert_eq!(code, Some(1), "second run must exit non-zero");
+    let after = fs::read_to_string(project.join("src/routes/pages.rs")).unwrap();
+    assert_eq!(
+        original, after,
+        "existing controller file must be untouched"
+    );
+}
+
+/// Slow end-to-end check: a fresh project + `generate controller` (HTML) must
+/// compile with zero edits, and `autumn routes` must list every generated
+/// route.
+///
+/// Ignored by default; run with `cargo test -p autumn-cli -- --ignored`.
+#[test]
+#[ignore = "slow: cargo-builds a fresh project — run with `cargo test -p autumn-cli -- --ignored`"]
+fn controller_generates_compiles_and_lists_routes() {
+    let (_tmp, project) = fresh_project("controller-html-build");
+    patch_generated_cargo_toml(&project);
+
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "controller",
+            "pages",
+            "home",
+            "about",
+            "contact",
+        ],
+    );
+
+    let build = Command::new("cargo")
+        .args(["build"])
+        .current_dir(&project)
+        .output()
+        .expect("failed to run cargo build");
+    assert!(
+        build.status.success(),
+        "cargo build failed on generated controller:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr),
+    );
+
+    let (stdout, _stderr) = run_autumn(&project, &["routes"]);
+    for path in ["/pages/home", "/pages/about", "/pages/contact"] {
+        assert!(
+            stdout.contains(path),
+            "autumn routes must list {path}:\n{stdout}"
+        );
+    }
+
+    // --force regeneration with a CHANGED action set must prune the stale
+    // route entries (`about`) from main.rs, not just append the new one
+    // (`services`) — otherwise `routes::pages::about` would reference a
+    // handler the overwritten file no longer defines and break the build.
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "controller",
+            "pages",
+            "home",
+            "contact",
+            "services",
+            "--force",
+        ],
+    );
+
+    let rebuild = Command::new("cargo")
+        .args(["build"])
+        .current_dir(&project)
+        .output()
+        .expect("failed to run cargo build after --force regen");
+    assert!(
+        rebuild.status.success(),
+        "cargo build failed after --force regen (stale route entry not pruned?):\n\
+         stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&rebuild.stdout),
+        String::from_utf8_lossy(&rebuild.stderr),
+    );
+
+    let (stdout2, _stderr2) = run_autumn(&project, &["routes"]);
+    for path in ["/pages/home", "/pages/contact", "/pages/services"] {
+        assert!(
+            stdout2.contains(path),
+            "autumn routes must list {path} after regen:\n{stdout2}"
+        );
+    }
+    assert!(
+        !stdout2.contains("/pages/about"),
+        "the dropped action /pages/about must no longer be listed:\n{stdout2}"
+    );
+}
+
+/// Slow end-to-end check: `generate controller --api` must compile and list its
+/// JSON routes under `/api/<controller>`.
+///
+/// Ignored by default; run with `cargo test -p autumn-cli -- --ignored`.
+#[test]
+#[ignore = "slow: cargo-builds a fresh project — run with `cargo test -p autumn-cli -- --ignored`"]
+fn controller_api_generates_json() {
+    let (_tmp, project) = fresh_project("controller-api-build");
+    patch_generated_cargo_toml(&project);
+
+    run_autumn(
+        &project,
+        &["generate", "controller", "pages", "index", "stats", "--api"],
+    );
+
+    let file = fs::read_to_string(project.join("src/routes/pages.rs")).unwrap();
+    assert!(
+        file.contains("AutumnResult<Json<serde_json::Value>>"),
+        "--api controller must return JSON:\n{file}"
+    );
+
+    let build = Command::new("cargo")
+        .args(["build"])
+        .current_dir(&project)
+        .output()
+        .expect("failed to run cargo build");
+    assert!(
+        build.status.success(),
+        "cargo build failed on generated --api controller:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr),
+    );
+
+    let (stdout, _stderr) = run_autumn(&project, &["routes"]);
+    for path in ["/api/pages", "/api/pages/stats"] {
+        assert!(
+            stdout.contains(path),
+            "autumn routes must list {path}:\n{stdout}"
+        );
+    }
+}

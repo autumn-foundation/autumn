@@ -74,4 +74,69 @@ mod tests {
             panic!("Expected title to be Set");
         }
     }
+
+    #[test]
+    fn test_pages_list_snippet() {
+        use crate::models::Page;
+        let p1 = Page {
+            id: 1,
+            slug: "test-slug-1".into(),
+            title: "Test Title 1".into(),
+            body: "Test Body".into(),
+            status: "published".into(),
+            created_at: chrono::Utc::now().naive_utc(),
+            updated_at: chrono::Utc::now().naive_utc(),
+            lock_version: 1,
+        };
+        let p2 = Page {
+            id: 2,
+            slug: "test-slug-2".into(),
+            title: "Test Title 2".into(),
+            body: "Test Body".into(),
+            status: "draft".into(),
+            created_at: chrono::Utc::now().naive_utc(),
+            updated_at: chrono::Utc::now().naive_utc(),
+            lock_version: 1,
+        };
+        let pages = vec![p1, p2];
+        let markup = pages::pages_list_snippet(&pages);
+        let html_string = markup.into_string();
+
+        assert!(html_string.contains("test-slug-1"));
+        assert!(html_string.contains("Test Title 1"));
+        assert!(html_string.contains("published"));
+
+        assert!(html_string.contains("test-slug-2"));
+        assert!(html_string.contains("Test Title 2"));
+        assert!(html_string.contains("draft"));
+    }
+
+    #[test]
+    fn test_update_summary_generation() {
+        use crate::routes::pages::generate_update_summary;
+
+        // Status change takes precedence
+        assert_eq!(
+            generate_update_summary("draft", "published", "Title", "Title"),
+            Some("Status changed: draft → published".to_string())
+        );
+
+        // Title change
+        assert_eq!(
+            generate_update_summary("draft", "draft", "Old Title", "New Title"),
+            Some("Title changed: Old Title → New Title".to_string())
+        );
+
+        // Both changed (status takes precedence)
+        assert_eq!(
+            generate_update_summary("draft", "published", "Old Title", "New Title"),
+            Some("Status changed: draft → published".to_string())
+        );
+
+        // No change
+        assert_eq!(
+            generate_update_summary("draft", "draft", "Title", "Title"),
+            None
+        );
+    }
 }

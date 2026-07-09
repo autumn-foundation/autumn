@@ -98,6 +98,8 @@ mod mcp_repository;
 mod mcp_streaming;
 mod middleware_introspection;
 mod middleware_pipeline;
+#[cfg(feature = "db")]
+mod model_field_attrs;
 #[cfg(feature = "offline-sync")]
 mod offline_sync_conformance;
 #[cfg(feature = "offline-sync")]

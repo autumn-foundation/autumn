@@ -445,9 +445,26 @@ fn generate_derived_query_for_source(
             if string_fields.contains(&field.to_string()) {
                 let field_str = field.to_string();
                 let enc_ident = format_ident!("__autumn_q_{field}");
+                let norm_ident = format_ident!("__autumn_qn_{field}");
+                // #1379 AC3: canonicalize the lookup argument for `#[normalize]`
+                // columns so `find_by_email("  FOO@X.com ")` matches the stored
+                // `foo@x.com` row. Dispatches through the autoref-specialization
+                // probe, so it returns the raw value for non-normalized columns
+                // and for hand-written models that don't implement
+                // `NormalizedModel`. Runs *before* the encrypted-column encoder
+                // (a normalized + deterministic-encrypted column matches on the
+                // canonical form).
                 encode_lets.push(quote! {
+                    let #norm_ident = {
+                        #[allow(unused_imports)]
+                        use ::autumn_web::normalize::{SpezLookupNo as _, SpezLookupYes as _};
+                        ::autumn_web::normalize::SpezLookup::<#model_name>(
+                            ::core::marker::PhantomData, #field_str, &#param,
+                        )
+                        .spez_lookup()
+                    };
                     let #enc_ident = ::autumn_web::encryption::encode_derived_query_param(
-                        #table_name_str, #field_str, &#param,
+                        #table_name_str, #field_str, &#norm_ident,
                     )
                     .map_err(|__e| ::autumn_web::AutumnError::internal_server_error_msg(
                         __e.to_string(),
@@ -10298,6 +10315,21 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
 
             async fn save(&self, new: &#new_name) -> ::autumn_web::AutumnResult<#model_name> {
+                // #1379: normalize `#[normalize]` columns on the insert path,
+                // before the `before_create` hook and the DB write, so
+                // validators and the database observe the canonical value.
+                // Dispatches through the autoref-specialization probe: the `Yes`
+                // arm clones and canonicalizes only for models whose `New*`
+                // implements `Normalize`; the `No` arm hands back the caller's
+                // borrow unchanged, so models with no `#[normalize]` columns (and
+                // hand-written `New*` types that don't implement `Normalize`) pay
+                // no clone. `Borrow` unifies the owned/borrowed arms to `&#new_name`.
+                #[allow(unused_imports)]
+                use ::autumn_web::normalize::{SpezNormalizeNo as _, SpezNormalizeYes as _};
+                #[allow(unused_imports)]
+                use ::std::borrow::Borrow as _;
+                let __autumn_normalized = ::autumn_web::normalize::SpezNormalize(new).spez_normalize();
+                let new: &#new_name = __autumn_normalized.borrow();
                 #save_body
             }
 
@@ -10329,6 +10361,17 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             #soft_delete_impl_methods
 
             async fn save_many(&self, new: &[#new_name]) -> ::autumn_web::AutumnResult<Vec<#model_name>> {
+                // #1379: normalize each `#[normalize]` column before the bulk
+                // insert path (mirrors `save`). The `Yes` arm clones+canonicalizes
+                // only for `Normalize` `New*` types; the `No` arm hands back the
+                // caller's slice unchanged (no clone) for everything else.
+                // `Borrow` unifies the owned `Vec`/borrowed slice arms.
+                #[allow(unused_imports)]
+                use ::autumn_web::normalize::{SpezNormalizeManyNo as _, SpezNormalizeManyYes as _};
+                #[allow(unused_imports)]
+                use ::std::borrow::Borrow as _;
+                let __autumn_normalized = ::autumn_web::normalize::SpezNormalize(new).spez_normalize_many();
+                let new: &[#new_name] = __autumn_normalized.borrow();
                 #save_many_body
             }
 
@@ -11847,10 +11890,46 @@ mod tests {
         let impl_delete = generated
             .find("async fn delete_by_title")
             .expect("delete_by_title impl must be generated");
-        let section = &generated[impl_delete..impl_delete + 800];
+        let section = &generated[impl_delete..impl_delete + 1200];
         assert!(
             section.contains("deleted_at"),
             "derived delete_by_title must reference deleted_at in soft-delete mode: {section}"
+        );
+    }
+
+    // ── #1379: normalization wiring in the repository codegen ─────────────
+
+    #[test]
+    fn repository_macro_derived_finder_normalizes_string_lookup_arg() {
+        // AC3: a derived `find_by_email` must canonicalize its String argument
+        // through the model's `NormalizedModel` impl before filtering, so
+        // `find_by_email("FOO@X.COM")` matches the stored `foo@x.com` row.
+        let generated = repository_macro(
+            quote! { User },
+            quote! { pub trait UserRepository {
+                fn find_by_email(email: String) -> Vec<User>;
+            } },
+        )
+        .to_string();
+        assert!(
+            generated.contains("SpezLookup :: < User >"),
+            "derived finder must normalize its String lookup argument: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_save_normalizes_new_input() {
+        // AC2: the insert path (`save`/`save_many`) normalizes the `New*` input
+        // before the `before_create` hook and the DB write.
+        let generated =
+            repository_macro(quote! { User }, quote! { pub trait UserRepository {} }).to_string();
+        assert!(
+            generated.contains("SpezNormalize (new) . spez_normalize ()"),
+            "save must normalize the New input before persisting: {generated}"
+        );
+        assert!(
+            generated.contains("SpezNormalize (new) . spez_normalize_many ()"),
+            "save_many must normalize each New input before persisting: {generated}"
         );
     }
 
