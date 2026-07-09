@@ -158,6 +158,22 @@ clamped to `MAX_PAGE_SIZE`; sharded repositories reject cross-shard
 `across_tenants()` iteration like `cursor_page`. See "Batched iteration" in
 `docs/guide/pagination.md`.
 
+**(unreleased)** — `find_or_create_by_<field>[_and_<field>...]`: declare
+`fn find_or_create_by_slug(slug: String);` (lookup fields only) in the
+`#[repository]` trait to generate an inherent
+`find_or_create_by_slug(&self, slug: String, new: &NewModel) ->
+AutumnResult<(Model, bool)>` — a race-safe get-or-insert returning the model
+plus a `created` flag (#1382). Looks up on the read path first (replica-eligible,
+tenant/soft-delete aware); if absent, inserts on the primary with `ON CONFLICT DO
+NOTHING`, so under concurrency exactly one row is created, exactly one caller
+sees `created == true`, and no `23505` unique-violation escapes (the loser
+re-reads its own write and returns `(row, false)`). `before_create` /
+`after_create` and the durable commit-hook queue fire only on the created path,
+and — unlike `upsert_many` — the method IS generated on hooked repositories.
+Requires a unique constraint covering the lookup column(s); `_or_` is rejected
+(it would span constraints). See "Race-safe get-or-insert" in
+`docs/guide/repositories.md`.
+
 ## Db transactions
 
 - `Db::tx(f)` — READ COMMITTED, one attempt (published 0.5.0).
