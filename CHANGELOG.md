@@ -555,6 +555,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **observability:** `Server-Timing` no longer miscounts pooled-connection reuse
+  in the `db` metric. Connections are pooled and diesel-async's deadpool manager
+  never resets a connection's instrumentation on recycle, so a connection that
+  served a prior measured request kept its stale `RequestQueryTimer` installed.
+  On the next checkout the housekeeping `SET statement_timeout` ran while that
+  stale timer was active — adding a bogus `+1 query` (and its latency) to the
+  next request before any application SQL — and a reused connection kept paying
+  per-query `DebugQuery` formatting even on later opted-out requests. `Db::checkout`
+  now installs a fresh timer on every checkout (before the `SET`), the timer's
+  `on_start` probes the request scope before formatting or recording anything
+  (a cheap no-op when opted out, so always installing is free of per-query
+  overhead), and the checkout `SET statement_timeout` is classified as an
+  uncounted housekeeping statement alongside transaction-control SQL (issue
+  #1348).
 - **observability:** `Server-Timing` no longer installs the per-request DB
   query timer on checked-out connections when `[observability] server_timing`
   is disabled (the production default). Previously every checked-out connection
