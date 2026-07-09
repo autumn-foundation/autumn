@@ -55,6 +55,28 @@ together (`0.5.0` published; `0.6.0` on trunk-dev, unpublished).
   `broadcasts_on(topic)` / `assert_broadcast(topic, predicate)` /
   `assert_broadcast_count(topic, n)` / `assert_no_broadcasts(topic)`
   (`RecordedBroadcast` exposes `.topic()` / `.payload()`)
+- `TestClient` auth helpers: it carries a cookie jar that persists each
+  response's `Set-Cookie` and replays it on later requests, so a real
+  `POST /login` → `GET /dashboard` flow needs no manual header threading.
+  `client.acting_as(user_id).await` (alias `login_as`) mints an authenticated
+  session directly — writing the configured `auth.session_key` (default
+  `user_id`) — so a `#[secured]` / `Auth` route returns its real success status
+  without hitting the login endpoint; it sets identity only, so roles/scopes
+  still run. `client.log_out()` clears the session cookie so secured routes
+  reject again. Requires `TestApp::build()` with the default in-memory session
+  backend; panics for `from_router` clients.
+- `TestClient` job recorder: on by default for every `TestApp::build()` client
+  (no `with_job_interceptor` opt-in), it captures every enqueue — across
+  `enqueue`, `enqueue_after_commit`, and `enqueue_in_tx` — as a `RecordedJob`
+  (`.name()` / `.payload()`). Read them with `client.enqueued_jobs()` and assert
+  with `assert_job_enqueued(name)` / `assert_job_enqueued_with(name, payload)` /
+  `assert_no_jobs_enqueued()`. `client.perform_enqueued_jobs().await` drains the
+  queue and dispatches each captured job through its registered handler,
+  returning a `PerformedJobs` report (`.assert_all_succeeded()`, `.failures()`,
+  `.outcomes()`) that surfaces per-job handler errors — including payloads that
+  fail the real deserialization round-trip — rather than swallowing them. The
+  recorder is per-`TestApp` and composes ahead of any `with_job_interceptor`;
+  `enqueued_jobs` / `perform_enqueued_jobs` panic for `from_router` clients.
 - `Locale`, `t!` (`i18n`)
 - OAuth2/OIDC config, provider presets, callback helpers, and identity values
   (`oauth2`)

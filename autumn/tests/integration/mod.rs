@@ -1,4 +1,5 @@
 mod access_log;
+mod acting_as_integration;
 mod after_commit_integration;
 mod api_versioning_integration;
 #[cfg(feature = "openapi")]
@@ -77,6 +78,7 @@ mod inbound_mail_integration;
 mod inline_broadcast_prefetch;
 mod inspector_integration;
 mod isr_coordination;
+mod job_recorder_integration;
 mod job_tracking_route;
 mod job_tracking_stores_integration;
 #[cfg(all(feature = "ws", feature = "maud", feature = "htmx", feature = "db"))]

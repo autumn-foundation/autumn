@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **test:** first-class auth helpers for the test harness (issue #1359).
+  `TestClient` now carries a cookie jar that persists each response's
+  `Set-Cookie` and replays it on later requests from the same client, so a real
+  `POST /login` → `GET /dashboard` flow works with no manual header threading.
+  `TestClient::acting_as(user_id)` (alias `login_as`) establishes an
+  authenticated session directly — writing the app's configured
+  `auth.session_key` (default `user_id`) — so a `#[secured]` / `Auth` route
+  returns its real success status without calling the login endpoint;
+  `log_out()` clears the session cookie so secured routes reject again.
+  `acting_as` sets identity only — policies/roles/scopes still run.
+- **test:** built-in background-job recorder for the test harness (issue #1380).
+  Every `TestApp::build` client now captures each enqueue — across `enqueue`,
+  `enqueue_after_commit`, and `enqueue_in_tx` — as `(name, payload)` with no
+  `with_job_interceptor` boilerplate. Assert with
+  `TestClient::assert_job_enqueued`, `assert_job_enqueued_with`,
+  `assert_no_jobs_enqueued`, or read them back in order via `enqueued_jobs()`.
+  `perform_enqueued_jobs().await` drains the captured queue and dispatches each
+  job through its registered handler, returning a `PerformedJobs` report that
+  surfaces per-job handler errors (including malformed payloads that fail the
+  real deserialization round-trip) rather than swallowing them. The recorder is
+  a per-`TestApp` instance and composes ahead of any user-supplied
+  `with_job_interceptor`.
 - **generator:** `autumn new` now generates a `README.md` at the project root
   (listed in the "Created …" output) with explicit prerequisites and a
   golden-path quickstart — configure the `[database]` block in `autumn.toml`
