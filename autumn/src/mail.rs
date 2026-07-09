@@ -412,6 +412,61 @@ fn html_contains_style_block(html: &str) -> bool {
         .any(|window| window.eq_ignore_ascii_case(b"<style"))
 }
 
+/// Whether `html` looks like a full HTML *document* — it carries a `<!doctype`,
+/// `<html`, or `<body` marker — rather than a bare fragment. Autumn permits raw
+/// fragment bodies when no layout wraps them, so [`inline_css_html`] uses this to
+/// decide whether to strip the synthetic document wrappers `css-inline` adds. A
+/// user-authored `<body>` is therefore recognized as a document and its
+/// structure is left untouched. Allocation-free case-insensitive ASCII scan.
+fn html_is_full_document(html: &str) -> bool {
+    let bytes = html.as_bytes();
+    bytes.windows(5).any(|w| w.eq_ignore_ascii_case(b"<html"))
+        || bytes.windows(5).any(|w| w.eq_ignore_ascii_case(b"<body"))
+        || bytes
+            .windows(9)
+            .any(|w| w.eq_ignore_ascii_case(b"<!doctype"))
+}
+
+/// Strip the synthetic `<html>`/`<head>`/`<body>` wrappers that `css-inline`'s
+/// document mode adds around fragment input, reconstructing the fragment.
+///
+/// [`inline_css_html`] always inlines in document mode because `css-inline`'s
+/// fragment mode drops retained `@media`/at-rules (it re-homes them to `<head>`,
+/// which a fragment lacks). Document mode instead wraps a fragment body in
+/// synthetic structural tags. This is only ever called on output we produced by
+/// document-inlining a body we already determined was a *fragment*, so those
+/// wrappers are always `css-inline`'s own, never user-authored.
+///
+/// `css-inline` (via `html5ever`) serializes a document as a canonical,
+/// attribute-free `<html><head>…</head><body>…</body></html>`, so exact-literal
+/// matching is safe. The result is the `<head>` contents (the retained `<style>`
+/// block carrying un-inlinable `@media`/pseudo rules, per AC5) followed by the
+/// `<body>` contents — preserving the original fragment ordering of `<style>`
+/// before body content. If the expected shape is absent, the input is returned
+/// unchanged rather than risking corruption.
+fn unwrap_synthetic_document(doc: &str) -> String {
+    // html5ever emits these exact byte sequences, lowercased and without
+    // attributes or whitespace, for the wrappers it synthesizes.
+    let inner = doc
+        .strip_prefix("<html>")
+        .and_then(|rest| rest.strip_suffix("</html>"))
+        .unwrap_or(doc);
+    let (head, after_head) = match inner.strip_prefix("<head>") {
+        Some(rest) => match rest.split_once("</head>") {
+            Some(split) => split,
+            // Malformed/unexpected shape: don't risk corrupting the body.
+            None => return doc.to_owned(),
+        },
+        None => ("", inner),
+    };
+    let body = after_head
+        .strip_prefix("<body>")
+        .map_or(after_head, |rest| {
+            rest.strip_suffix("</body>").unwrap_or(rest)
+        });
+    format!("{head}{body}")
+}
+
 /// Inline the `<style>` rules of an HTML mail body onto matching elements as
 /// `style="…"` attributes, so the message renders styled in clients that strip
 /// `<head>`/`<style>` (Gmail, Outlook). See issue #1254.
@@ -426,6 +481,12 @@ fn html_contains_style_block(html: &str) -> bool {
 ///   this again is a no-op: inlining is idempotent.
 /// - Remote/`<link>` stylesheets are never fetched (the `css-inline` network
 ///   feature is not compiled in) — only embedded `<style>` CSS is inlined.
+/// - A raw *fragment* body (no `<html>`/`<body>`/doctype) stays a fragment.
+///   `css-inline`'s document mode wraps fragment output in synthetic
+///   `<html>`/`<head>`/`<body>` tags; those wrappers are stripped back off (see
+///   [`unwrap_synthetic_document`]) so opting into inlining never promotes a
+///   fragment MIME body into a full document. Full-document bodies keep their
+///   structure unchanged.
 ///
 /// # Errors
 ///
@@ -437,7 +498,7 @@ fn inline_css_html(html: &str) -> Result<String, MailError> {
     if !html_contains_style_block(html) {
         return Ok(html.to_owned());
     }
-    css_inline::CSSInliner::options()
+    let inliner = css_inline::CSSInliner::options()
         // Retain `<style>` so un-inlinable rules survive…
         .keep_style_tags(true)
         // …including `@media`/other at-rules (dropped by default), so responsive
@@ -448,7 +509,14 @@ fn inline_css_html(html: &str) -> Result<String, MailError> {
         .remove_inlined_selectors(true)
         // Never reach out to the network for `<link>`ed stylesheets.
         .load_remote_stylesheets(false)
-        .build()
+        .build();
+    // Inline in document mode. Its fragment mode would avoid the `<html>`/`<body>`
+    // wrapping but drops retained `@media`/at-rules (it re-homes them to `<head>`,
+    // which a fragment lacks) — breaking AC5. So document-inline unconditionally,
+    // then, for a fragment body, strip the synthetic wrappers back off so the
+    // MIME body stays a fragment. Full documents keep their structure as-is.
+    let is_fragment = !html_is_full_document(html);
+    let rendered = inliner
         .inline(html)
         // Defensive / effectively unreachable: with remote-stylesheet loading
         // disabled above and no file loader configured, `css-inline` only errors
@@ -456,7 +524,12 @@ fn inline_css_html(html: &str) -> Result<String, MailError> {
         // malformed CSS/HTML (garbage `<style>` bodies inline to an unchanged
         // fragment, never an error). We still surface the typed error rather than
         // `expect`ing, to keep the API stable if those loaders are ever enabled.
-        .map_err(|error| MailError::CssInline(error.to_string()))
+        .map_err(|error| MailError::CssInline(error.to_string()))?;
+    Ok(if is_fragment {
+        unwrap_synthetic_document(&rendered)
+    } else {
+        rendered
+    })
 }
 
 /// A file attached to a [`Mail`] message.
@@ -4235,6 +4308,95 @@ mod tests {
         assert!(
             out.contains("<a") && out.contains("style="),
             "the inlinable rule must still be inlined onto the anchor; got: {out}"
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::literal_string_with_formatting_args,
+        reason = "CSS rule braces are literal HTML, not format placeholders"
+    )]
+    fn inline_css_fragment_body_stays_a_fragment() {
+        // A no-layout FRAGMENT body must stay a fragment after inlining:
+        // opting into CSS inlining must not promote it into a full document by
+        // introducing synthetic `<html>`/`<head>`/`<body>` wrappers. The class
+        // rule is still inlined onto the element. See issue #1254 / PR #1681.
+        let html = r#"<style>.x{color:red}</style><p class="x">Hi</p>"#;
+        let out = inline_css_html(html).expect("inlining succeeds");
+        assert!(
+            !out.to_ascii_lowercase().contains("<html")
+                && !out.to_ascii_lowercase().contains("<body")
+                && !out.to_ascii_lowercase().contains("<head"),
+            "fragment body must not gain document wrappers; got: {out}"
+        );
+        let para = out
+            .split("<p")
+            .nth(1)
+            .expect("a <p> tag is present in the output");
+        let para_open = &para[..para.find('>').expect("paragraph tag closes")];
+        assert!(
+            para_open.contains("style=") && para_open.contains("red"),
+            "the class rule must be inlined onto the paragraph; got tag: {para_open}"
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::literal_string_with_formatting_args,
+        reason = "CSS rule braces are literal HTML, not format placeholders"
+    )]
+    fn inline_css_fragment_body_retains_media_query_without_wrapping() {
+        // AC5 + fragment: a FRAGMENT body with an un-inlinable `@media` rule
+        // must stay a fragment (no synthetic wrappers) yet still carry the
+        // retained `@media` block. Document-mode inlining hoists that retained
+        // `<style>` into the synthetic `<head>`; the unwrap must fold it back
+        // into the fragment rather than dropping it. See PR #1681.
+        let html = r#"<style>.btn{color:#fff}@media (max-width:600px){.btn{color:#000}}</style><a class="btn">Go</a>"#;
+        let out = inline_css_html(html).expect("inlining succeeds");
+        assert!(
+            !out.to_ascii_lowercase().contains("<html")
+                && !out.to_ascii_lowercase().contains("<body")
+                && !out.to_ascii_lowercase().contains("<head"),
+            "fragment body must not gain document wrappers; got: {out}"
+        );
+        assert!(
+            out.contains("@media") && out.contains("max-width"),
+            "the retained @media block must survive the unwrap; got: {out}"
+        );
+        let anchor = out
+            .split("<a")
+            .nth(1)
+            .expect("an <a> tag is present in the output");
+        let anchor_open = &anchor[..anchor.find('>').expect("anchor tag closes")];
+        assert!(
+            anchor_open.contains("style=") && anchor_open.contains("#fff"),
+            "the inlinable rule must still be inlined onto the anchor; got tag: {anchor_open}"
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::literal_string_with_formatting_args,
+        reason = "CSS rule braces are literal HTML, not format placeholders"
+    )]
+    fn inline_css_full_document_body_stays_a_document() {
+        // A FULL-DOCUMENT body keeps document-mode handling: its authored
+        // `<html>`/`<body>` structure survives and the class rule is inlined.
+        let html = r#"<html><head><style>.x{color:red}</style></head><body><p class="x">Hi</p></body></html>"#;
+        let out = inline_css_html(html).expect("inlining succeeds");
+        assert!(
+            out.to_ascii_lowercase().contains("<html")
+                && out.to_ascii_lowercase().contains("<body"),
+            "full-document body must retain its structure; got: {out}"
+        );
+        let para = out
+            .split("<p")
+            .nth(1)
+            .expect("a <p> tag is present in the output");
+        let para_open = &para[..para.find('>').expect("paragraph tag closes")];
+        assert!(
+            para_open.contains("style=") && para_open.contains("red"),
+            "the class rule must be inlined onto the paragraph; got tag: {para_open}"
         );
     }
 
