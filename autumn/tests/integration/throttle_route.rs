@@ -11,7 +11,7 @@ use autumn_web::security::{
     RateLimitPrincipal,
 };
 use autumn_web::test::TestApp;
-use autumn_web::{get, routes, throttle};
+use autumn_web::{get, post, routes, throttle};
 
 // ── Handlers ───────────────────────────────────────────────────────────────
 
@@ -128,6 +128,44 @@ async fn redis_route_b() -> &'static str {
     "redis-route-b-ok"
 }
 
+// Regression coverage for the primitive-output wrapper: a `#[throttle]` handler
+// returning a primitive (e.g. `u32`) must COMPILE. The route macro would
+// otherwise emit a `.to_string()` wrapper that calls the handler with only the
+// user's original args, but `#[throttle]` rewrites the handler to require hidden
+// extractors and return `Response`, so that wrapper no longer type-checks. The
+// fact this file compiles proves the wrapper is now suppressed for throttled
+// handlers; the test below also asserts runtime 200-then-429 behavior.
+#[get("/primitive-throttled")]
+#[throttle(limit = 1, per = "1s", key = "ip")]
+async fn primitive_throttled() -> u32 {
+    7
+}
+
+// A throttled handler returning `impl IntoResponse` must also still work.
+#[get("/impl-throttled")]
+#[throttle(limit = 1, per = "1s", key = "ip")]
+async fn impl_throttled() -> impl axum::response::IntoResponse {
+    "impl-throttled-ok"
+}
+
+// A throttled handler returning `Response` must also still work.
+#[get("/response-throttled")]
+#[throttle(limit = 1, per = "1s", key = "ip")]
+async fn response_throttled() -> axum::response::Response {
+    axum::response::IntoResponse::into_response("response-throttled-ok")
+}
+
+// A throttled MUTATING route that also participates in idempotency. Repeat
+// requests reusing the same `Idempotency-Key` must still consume the per-route
+// throttle bucket and 429 once the limit is exhausted, rather than replaying a
+// cached 2xx forever (the throttle check runs before the idempotency-replay
+// lookup in the generated body).
+#[post("/throttled-idempotent")]
+#[throttle(limit = 1, per = "60s", key = "ip")]
+async fn throttled_idempotent() -> &'static str {
+    "throttled-idempotent-ok"
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 fn base_config() -> AutumnConfig {
@@ -211,6 +249,75 @@ async fn throttled_route_429s_after_burst_while_sibling_route_unaffected() {
             .await
             .assert_status(200);
     }
+}
+
+#[tokio::test]
+async fn primitive_returning_throttled_handler_compiles_and_throttles() {
+    // Core proof is that `primitive_throttled` (a `#[throttle]` handler returning
+    // `u32`) compiles at all. Also verify a throttled handler returning
+    // `impl IntoResponse` and one returning `Response` compile and serve, and
+    // that each enforces its limit (200 then 429 after the burst of 1).
+    let client = TestApp::new()
+        .routes(routes![
+            primitive_throttled,
+            impl_throttled,
+            response_throttled
+        ])
+        .config(base_config())
+        .build();
+
+    for (path, ip) in [
+        ("/primitive-throttled", "198.51.100.201"),
+        ("/impl-throttled", "198.51.100.202"),
+        ("/response-throttled", "198.51.100.203"),
+    ] {
+        client
+            .get(path)
+            .header("X-Forwarded-For", ip)
+            .send()
+            .await
+            .assert_status(200);
+        client
+            .get(path)
+            .header("X-Forwarded-For", ip)
+            .send()
+            .await
+            .assert_status(429);
+    }
+}
+
+#[tokio::test]
+async fn throttled_idempotent_replay_still_consumes_bucket_and_429s() {
+    // limit = 1: the first keyed request succeeds and is cached; a second request
+    // reusing the SAME Idempotency-Key must be denied by the throttle (429), not
+    // served the cached 2xx. This proves the throttle check precedes the
+    // idempotency-replay lookup in the generated handler body.
+    let client = TestApp::new()
+        .routes(routes![throttled_idempotent])
+        .config(base_config())
+        .idempotent()
+        .build();
+
+    let first = client
+        .post("/throttled-idempotent")
+        .header("X-Forwarded-For", "198.51.100.210")
+        .header("idempotency-key", "throttle-idem-key")
+        .send()
+        .await;
+    first.assert_status(200);
+    // First request is not a replay.
+    assert_eq!(first.header("x-idempotent-replayed"), None);
+
+    // Second request reuses the same key but the throttle bucket is exhausted:
+    // it must 429 rather than replay the cached success.
+    let second = client
+        .post("/throttled-idempotent")
+        .header("X-Forwarded-For", "198.51.100.210")
+        .header("idempotency-key", "throttle-idem-key")
+        .send()
+        .await;
+    second.assert_status(429);
+    assert_eq!(second.header("x-idempotent-replayed"), None);
 }
 
 #[tokio::test]

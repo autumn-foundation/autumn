@@ -927,16 +927,21 @@ where
     }
 
     fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
-        // A request already counted upstream (e.g. an MCP `tools/call` charged
-        // at the `/mcp` envelope and replayed through this pipeline) bypasses
-        // the limiter so it isn't double-counted — but only this framework
-        // default limiter, which shares the envelope's bucket, honors the
-        // `RateLimitEnvelopeCounted` marker. A user-installed limiter (e.g. a
-        // per-path override added via `AppBuilder::layer`) leaves
+        // A `RateLimitExempt` request is a genuine full bypass of *every*
+        // limiter (framework-default and user path-override alike), matching the
+        // marker's documented contract, so it is honored here unconditionally —
+        // regardless of `honors_mcp_exempt`.
+        //
+        // A `RateLimitEnvelopeCounted` request is the narrower MCP-replay marker:
+        // it was already counted at the `/mcp` envelope, so only this framework
+        // default limiter — which shares the envelope's bucket (`honors_mcp_exempt`
+        // true) — skips it to avoid double-counting. A user-installed limiter
+        // (e.g. a per-path override added via `AppBuilder::layer`) leaves
         // `honors_mcp_exempt` false so the replay still consumes its
         // route-specific bucket, exactly as a direct call.
-        if self.limiter.honors_mcp_exempt
-            && req.extensions().get::<RateLimitEnvelopeCounted>().is_some()
+        if req.extensions().get::<RateLimitExempt>().is_some()
+            || (self.limiter.honors_mcp_exempt
+                && req.extensions().get::<RateLimitEnvelopeCounted>().is_some())
         {
             let mut inner = self.inner.clone();
             std::mem::swap(&mut self.inner, &mut inner);
@@ -2509,13 +2514,23 @@ mod tests {
         assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 
+    fn exempt_req(uri: &str) -> Request<Body> {
+        let mut req = Request::builder()
+            .method("GET")
+            .uri(uri)
+            .header("X-Forwarded-For", "2.2.2.2")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(RateLimitExempt);
+        req
+    }
+
     #[tokio::test]
-    async fn genuine_exempt_marker_ignored_by_framework_default_limiter() {
-        // `RateLimitExempt` is the genuine full-bypass marker; it is NOT the
-        // envelope-dedup marker, so the framework-default limiter (which now
-        // keys its dedup skip off `RateLimitEnvelopeCounted`) must still charge
-        // a request carrying only `RateLimitExempt`. (Per-route throttles handle
-        // their own `RateLimitExempt` bypass in `__check_throttle`.)
+    async fn genuine_exempt_marker_bypasses_framework_default_limiter() {
+        // `RateLimitExempt` is the genuine full-bypass marker: it bypasses
+        // *every* limiter, including the framework-default one. So even past the
+        // burst, every request carrying it must pass. (This is broader than the
+        // `RateLimitEnvelopeCounted` envelope-dedup skip.)
         let config = RateLimitConfig {
             enabled: true,
             requests_per_second: 0.1,
@@ -2528,23 +2543,52 @@ mod tests {
             .route("/api/strict", get(|| async { "ok" }))
             .layer(layer);
 
-        let exempt_req = || {
-            let mut req = Request::builder()
-                .method("GET")
-                .uri("/api/strict")
-                .header("X-Forwarded-For", "2.2.2.2")
-                .body(Body::empty())
+        // Burst is 1, yet every exempt request passes — the full-bypass marker
+        // is honored unconditionally.
+        for _ in 0..3 {
+            let r = app
+                .clone()
+                .oneshot(exempt_req("/api/strict"))
+                .await
                 .unwrap();
-            req.extensions_mut().insert(RateLimitExempt);
-            req
-        };
+            assert_eq!(r.status(), StatusCode::OK);
+        }
+    }
 
-        // Burst is 1: first passes, second is denied — the global limiter does
-        // not honor `RateLimitExempt` for its envelope-dedup skip.
-        let r = app.clone().oneshot(exempt_req()).await.unwrap();
-        assert_eq!(r.status(), StatusCode::OK);
-        let r = app.clone().oneshot(exempt_req()).await.unwrap();
-        assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+    #[tokio::test]
+    async fn genuine_exempt_marker_bypasses_user_path_override_limiter() {
+        // `RateLimitExempt` bypasses *every* limiter per its documented
+        // contract, including a user-installed path-override limiter (which does
+        // NOT set `honors_mcp_exempt`). Unlike `RateLimitEnvelopeCounted`, which
+        // such a limiter still charges, a genuine exempt request always passes.
+        let config = RateLimitConfig {
+            enabled: true,
+            requests_per_second: 0.1,
+            burst: 5,
+            trust_forwarded_headers: true,
+            ..Default::default()
+        };
+        let layer = RateLimitLayer::from_config(&config).with_path_override(
+            "/api/strict",
+            RateLimitOverride {
+                burst: Some(1),
+                requests_per_second: None,
+            },
+        );
+        let app = Router::new()
+            .route("/api/strict", get(|| async { "ok" }))
+            .layer(layer);
+
+        // Override burst is 1, yet every exempt request passes — the full-bypass
+        // marker is honored even by a user path-override limiter.
+        for _ in 0..3 {
+            let r = app
+                .clone()
+                .oneshot(exempt_req("/api/strict"))
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::OK);
+        }
     }
 
     // ── Tier hook tests ───────────────────────────────────────────────────────

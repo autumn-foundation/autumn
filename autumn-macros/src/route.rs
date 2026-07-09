@@ -81,7 +81,23 @@ pub fn route_macro(
             .last()
             .is_some_and(|s| s.ident == "feature_flag")
     });
-    let primitive_wrapper = if should_stringify_primitive_output(&input_fn.sig.output) {
+    // Body guards that rewrite the handler's return type to `Response` (and
+    // inject hidden extractors): #[throttle], #[step_up], #[authorize], and
+    // #[secured]. This route macro is outermost, so when one of these guards is
+    // still present as an attribute it has not expanded yet — the signature we
+    // see here still declares the original primitive return type, but the guard
+    // will lower it to `Response`. Emitting the primitive `.to_string()` wrapper
+    // (which calls the handler with only the user's original args and stringifies
+    // the result) would then fail to compile, so skip it and route through the
+    // normal `Response` path. (#[feature_flag] does NOT rewrite the return type;
+    // it propagates its gate param instead, so the primitive wrapper is kept.)
+    let has_response_rewriting_guard = has_throttle_guard(&input_fn)
+        || has_step_up_guard(&input_fn)
+        || has_secured_attr(&input_fn)
+        || has_authorize_attr(&input_fn);
+    let primitive_wrapper = if should_stringify_primitive_output(&input_fn.sig.output)
+        && !has_response_rewriting_guard
+    {
         let wrapper_name = format_ident!("__autumn_primitive_handler_{}", fn_name);
         let mut wrapper_inputs = Vec::new();
         let mut call_args = Vec::new();
@@ -274,6 +290,33 @@ fn has_throttle_guard(input_fn: &syn::ItemFn) -> bool {
     })
 }
 
+/// Whether a `#[secured]` attribute is still present on the handler (i.e. it has
+/// not expanded yet because this route macro is outermost). Used to disable the
+/// primitive-output wrapper, since `#[secured]` rewrites the return type to
+/// `Response`.
+fn has_secured_attr(input_fn: &syn::ItemFn) -> bool {
+    input_fn.attrs.iter().any(|attr| {
+        attr.path()
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == "secured")
+    })
+}
+
+/// Whether an `#[authorize]` attribute is still present on the handler. Used to
+/// disable the primitive-output wrapper, since `#[authorize]` rewrites the
+/// return type to `Response`. This is intentionally narrower than
+/// [`has_authorize_guard`], which also matches inline policy checks that do not
+/// rewrite the return type.
+fn has_authorize_attr(input_fn: &syn::ItemFn) -> bool {
+    input_fn.attrs.iter().any(|attr| {
+        attr.path()
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == "authorize")
+    })
+}
+
 fn has_policy_only(input_fn: &syn::ItemFn) -> bool {
     input_fn.attrs.iter().any(|attr| {
         attr.path()
@@ -420,7 +463,12 @@ fn positional_format_string(path: &str) -> String {
     result
 }
 
-fn should_stringify_primitive_output(output: &ReturnType) -> bool {
+/// Whether a route handler's declared return type is a bare numeric/bool
+/// primitive that Autumn serves by stringifying it (primitives do not implement
+/// axum's `IntoResponse`). Shared with the `#[throttle]` macro so a throttled
+/// primitive-returning handler stringifies its result the same way the plain
+/// primitive-output wrapper does.
+pub fn should_stringify_primitive_output(output: &ReturnType) -> bool {
     let ReturnType::Type(_, ty) = output else {
         return false;
     };

@@ -376,6 +376,21 @@ pub fn throttle_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 (async move #original_body).await
             )
         },
+        // A bare numeric/bool primitive does not implement `IntoResponse`;
+        // Autumn's plain primitive-output wrapper serves it by stringifying. The
+        // route macro suppresses that wrapper when `#[throttle]` is present (the
+        // handler is rewritten to return `Response`), so mirror the stringify
+        // here to keep primitive-returning throttled handlers compiling.
+        syn::ReturnType::Type(_, ty)
+            if crate::route::should_stringify_primitive_output(&input_fn.sig.output) =>
+        {
+            quote! {
+                let __autumn_inner: #ty = (async move #original_body).await;
+                ::autumn_web::reexports::axum::response::IntoResponse::into_response(
+                    ::std::string::ToString::to_string(&__autumn_inner)
+                )
+            }
+        }
         syn::ReturnType::Type(_, ty) => quote! {
             let __autumn_inner: #ty = (async move #original_body).await;
             ::autumn_web::reexports::axum::response::IntoResponse::into_response(__autumn_inner)
@@ -402,10 +417,18 @@ pub fn throttle_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         }
     };
+    // The throttle check must run BEFORE the idempotency-replay lookup. Because
+    // the route macro disables the outer `IdempotencyReplayLayer` for throttled
+    // routes (replay handling moves into this body), returning a cached response
+    // ahead of `__check_throttle` would let repeat requests reusing the same
+    // `Idempotency-Key` bypass the per-route bucket forever. Running the throttle
+    // check first ensures replays still consume the bucket and can 429 once the
+    // route limit is exhausted; only if the throttle check passes do we replay
+    // any cached response, then fall through to the user body.
     input_fn.block = syn::parse_quote! {
         {
-            #replay_stop
             #check_call
+            #replay_stop
             #original_response
         }
     };
