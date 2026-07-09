@@ -2807,6 +2807,12 @@ impl AppBuilder {
         if let Some(buf) = telemetry_guard.log_buffer.clone() {
             state.insert_extension(buf);
         }
+        // Wire the live-subscriber reload handle into the loggers actuator so
+        // `PUT /actuator/loggers/{name}` affects the running subscriber, not
+        // just an in-memory map (issue #1044).
+        if let Some(handle) = telemetry_guard.filter_reload.clone() {
+            state.log_levels().attach_reload_handle(handle);
+        }
 
         // Instantiate MaintenanceState, load flag synchronously at startup, insert as extension, and start background poller task
         let maintenance_state = crate::maintenance::MaintenanceState::new();
@@ -3831,6 +3837,12 @@ impl AppBuilder {
         if let Some(buf) = telemetry_guard.log_buffer.clone() {
             state.insert_extension(buf);
         }
+        // Wire the live-subscriber reload handle into the loggers actuator so
+        // `PUT /actuator/loggers/{name}` affects the running subscriber, not
+        // just an in-memory map (issue #1044).
+        if let Some(handle) = telemetry_guard.filter_reload.clone() {
+            state.log_levels().attach_reload_handle(handle);
+        }
         state.insert_extension(RegisteredApiVersions(api_versions.clone()));
         #[cfg(feature = "mail")]
         if let Some(interceptor) = mail_interceptor {
@@ -4340,6 +4352,12 @@ impl AppBuilder {
         );
         if let Some(buf) = telemetry_guard.log_buffer.clone() {
             state.insert_extension(buf);
+        }
+        // Wire the live-subscriber reload handle into the loggers actuator so
+        // `PUT /actuator/loggers/{name}` affects the running subscriber, not
+        // just an in-memory map (issue #1044).
+        if let Some(handle) = telemetry_guard.filter_reload.clone() {
+            state.log_levels().attach_reload_handle(handle);
         }
         #[cfg(feature = "mail")]
         if let Some(interceptor) = mail_interceptor {

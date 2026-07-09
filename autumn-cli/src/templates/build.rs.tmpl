@@ -7,6 +7,10 @@ fn main() {
     #[cfg(target_os = "windows")]
     println!("cargo:rerun-if-env-changed=PATHEXT");
 
+    // Bake build + git provenance into the binary so `/actuator/info` can
+    // report exactly which commit/build is running (deploy/rollback checks).
+    emit_build_provenance();
+
     if let Some(tailwind) = find_tailwind_cli() {
         let status = std::process::Command::new(&tailwind)
             .args([
@@ -31,6 +35,74 @@ fn main() {
         // As per DX audit, removing the warning or making it quieter is better,
         // we'll just not emit a warning for missing tailwind when it's optional.
     }
+}
+
+/// Emit `AUTUMN_BUILD_*` compile-time env vars consumed by
+/// `#[autumn_web::main]` and surfaced on `/actuator/info`.
+///
+/// The build timestamp is always emitted. Git fields are best-effort: outside a
+/// git checkout (tarball / CI cache) they are simply omitted and the framework
+/// reports them as `null` rather than failing the build.
+fn emit_build_provenance() {
+    println!(
+        "cargo:rustc-env=AUTUMN_BUILD_TIMESTAMP={}",
+        iso8601_utc_now()
+    );
+
+    if let Some(sha) = git(&["rev-parse", "HEAD"]) {
+        let short = git(&["rev-parse", "--short", "HEAD"])
+            .unwrap_or_else(|| sha.chars().take(7).collect());
+        let branch = git(&["rev-parse", "--abbrev-ref", "HEAD"]).unwrap_or_else(|| "unknown".into());
+        let dirty = git(&["status", "--porcelain"]).is_some_and(|out| !out.trim().is_empty());
+        println!("cargo:rustc-env=AUTUMN_BUILD_GIT_SHA={sha}");
+        println!("cargo:rustc-env=AUTUMN_BUILD_GIT_SHA_SHORT={short}");
+        println!("cargo:rustc-env=AUTUMN_BUILD_GIT_BRANCH={branch}");
+        println!("cargo:rustc-env=AUTUMN_BUILD_GIT_DIRTY={dirty}");
+    }
+
+    // Rebuild when HEAD or the index moves so the baked SHA / dirty flag stay
+    // fresh across commits and staging changes.
+    for path in [".git/HEAD", ".git/index"] {
+        if std::path::Path::new(path).exists() {
+            println!("cargo:rerun-if-changed={path}");
+        }
+    }
+}
+
+/// Run a git subcommand, returning trimmed stdout on success.
+fn git(args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new("git").args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    if text.is_empty() { None } else { Some(text) }
+}
+
+/// Current UTC time formatted as ISO-8601 (`YYYY-MM-DDTHH:MM:SSZ`), computed
+/// with no external crates via the civil-from-days algorithm.
+fn iso8601_utc_now() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let (hh, mm, ss) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+
+    // Howard Hinnant's civil_from_days, epoch 1970-01-01.
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let day = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let month = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let year = if month <= 2 { year + 1 } else { year };
+
+    format!("{year:04}-{month:02}-{day:02}T{hh:02}:{mm:02}:{ss:02}Z")
 }
 
 fn find_tailwind_cli() -> Option<std::path::PathBuf> {

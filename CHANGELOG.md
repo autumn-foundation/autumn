@@ -21,6 +21,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `BlobStore::get_stream` without buffering the whole object in memory, so it
   serves large private files behind a `#[secured]` handler with no public
   presigned URL (#1141).
+- **actuator:** `PUT /actuator/loggers/{name}` now changes the **live**
+  `tracing` subscriber, not just an in-memory map (issue #1044). The default
+  telemetry init installs a `tracing_subscriber` reload layer and hands the
+  handle to `LogLevels`; a level change rebuilds the combined `EnvFilter`
+  directive (global level + per-target overrides) and pushes it to the running
+  subscriber, so an operator can raise/lower verbosity in production without a
+  redeploy — effective on the next event. Per-target overrides
+  (`my_app::module=trace`) raise only that target; reverting `root` to `info`
+  silences them again. Overrides stay ephemeral (reset on restart). The
+  response reports `"applied": true` / `"status":"ok"` only when the change
+  actually reached a reload-capable subscriber, and `"status":"recorded"` /
+  `"applied": false` otherwise — no silent false-positive. Invalid levels still
+  return `400`.
+- **actuator:** `GET /actuator/info` now exposes build + git provenance for
+  deploy/rollback verification (issue #1242): a `build` object with the app
+  version, an ISO-8601 UTC build timestamp, and a `git` sub-object (full +
+  short commit SHA, branch, working-tree-dirty flag). Apps created by
+  `autumn new` capture this with zero developer action — the generated
+  `build.rs` bakes `AUTUMN_BUILD_*` env vars and `#[autumn_web::main]` reads
+  them (plus the app's compile-time `CARGO_PKG_NAME` / `CARGO_PKG_VERSION`) at
+  the app's compile time. This also fixes the `app.version` / `app.name`
+  `"unknown"` regression (they were read from the cargo env at runtime, which
+  is unset in a released binary). Outside a git checkout the `git.*` fields
+  degrade to `null` while timestamp + version stay present; the block never
+  leaks remote URLs or an env dump.
 - **ci:** README-quickstart gate against the published crates (issue #1586) —
   `.github/workflows/quickstart-gate.yml` + `scripts/check-quickstart.sh`
   install the README-pinned `autumn-cli` from crates.io (never the local

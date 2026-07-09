@@ -382,6 +382,32 @@ struct LogLevelsInner {
     current_level: String,
     /// Per-logger level overrides applied at runtime.
     logger_overrides: HashMap<String, String>,
+    /// Handle for pushing level changes to the live `tracing` subscriber.
+    ///
+    /// `Some` once `AppBuilder` wires in the reload handle from the telemetry
+    /// guard; `None` in bare `LogLevels` (e.g. unit tests) where no
+    /// reload-capable subscriber is installed. When `None`, a level change is
+    /// recorded but cannot affect emission — the endpoint reports this honestly
+    /// rather than returning a false-positive `ok` (issue #1044).
+    reload_handle: Option<crate::telemetry::FilterReloadHandle>,
+}
+
+impl LogLevelsInner {
+    /// Build a combined `EnvFilter` directive from the global level plus every
+    /// per-target override, e.g. `"info,my_app::module=trace"`. Targets are
+    /// sorted for deterministic output.
+    fn build_directive(&self) -> String {
+        let mut parts = vec![self.current_level.clone()];
+        let mut targets: Vec<String> = self
+            .logger_overrides
+            .iter()
+            .filter(|(name, _)| name.as_str() != "root" && !name.is_empty())
+            .map(|(name, level)| format!("{name}={level}"))
+            .collect();
+        targets.sort();
+        parts.extend(targets);
+        parts.join(",")
+    }
 }
 
 impl LogLevels {
@@ -392,8 +418,30 @@ impl LogLevels {
             inner: Arc::new(RwLock::new(LogLevelsInner {
                 current_level: initial_level.to_string(),
                 logger_overrides: HashMap::new(),
+                reload_handle: None,
             })),
         }
+    }
+
+    /// Attach the live-subscriber reload handle produced by telemetry init.
+    ///
+    /// Called once by `AppBuilder` after the tracing subscriber is installed so
+    /// subsequent [`Self::set_logger_level`] calls take effect on the running
+    /// process (issue #1044).
+    pub fn attach_reload_handle(&self, handle: crate::telemetry::FilterReloadHandle) {
+        if let Ok(mut guard) = self.inner.write() {
+            guard.reload_handle = Some(handle);
+        }
+    }
+
+    /// Returns `true` when a reload-capable subscriber is installed, i.e. level
+    /// changes made via [`Self::set_logger_level`] actually reach the live
+    /// `tracing` subscriber.
+    #[must_use]
+    pub fn reload_available(&self) -> bool {
+        self.inner
+            .read()
+            .is_ok_and(|guard| guard.reload_handle.is_some())
     }
 
     /// Get the current global log level.
@@ -414,27 +462,49 @@ impl LogLevels {
     }
 
     /// Set the level for a specific logger. Returns the previous level if any.
+    ///
+    /// When a reload-capable subscriber is installed (see
+    /// [`Self::attach_reload_handle`]), the rebuilt filter directive is pushed
+    /// to the live `tracing` subscriber so the change takes effect immediately
+    /// on the next event (issue #1044). Overrides remain ephemeral — they live
+    /// only in this in-memory state and reset on process restart.
     #[must_use]
     pub fn set_logger_level(&self, name: &str, level: &str) -> Option<String> {
-        let Ok(mut guard) = self.inner.write() else {
-            return None;
+        let (returned, directive, handle) = {
+            let Ok(mut guard) = self.inner.write() else {
+                return None;
+            };
+            // Prevent unbounded memory growth from arbitrary logger names
+            if guard.logger_overrides.len() >= 1000 && !guard.logger_overrides.contains_key(name) {
+                return None;
+            }
+
+            let previous = guard.logger_overrides.get(name).cloned();
+            guard
+                .logger_overrides
+                .insert(name.to_string(), level.to_string());
+            // If setting the root level, update current_level too
+            let returned = if name == "root" || name.is_empty() {
+                let prev = Some(guard.current_level.clone());
+                guard.current_level = level.to_string();
+                prev
+            } else {
+                previous
+            };
+            let directive = guard.build_directive();
+            let handle = guard.reload_handle.clone();
+            (returned, directive, handle)
         };
-        // Prevent unbounded memory growth from arbitrary logger names
-        if guard.logger_overrides.len() >= 1000 && !guard.logger_overrides.contains_key(name) {
-            return None;
+
+        // Apply outside the lock: pushing the new directive rebuilds the
+        // tracing interest cache and must not hold our RwLock.
+        if let Some(handle) = handle
+            && let Err(error) = handle.apply_directive(&directive)
+        {
+            eprintln!("Warning: failed to apply log level change to live subscriber: {error}");
         }
 
-        let previous = guard.logger_overrides.get(name).cloned();
-        guard
-            .logger_overrides
-            .insert(name.to_string(), level.to_string());
-        // If setting the root level, update current_level too
-        if name == "root" || name.is_empty() {
-            let prev = Some(guard.current_level.clone());
-            guard.current_level = level.to_string();
-            return prev;
-        }
-        previous
+        returned
     }
 }
 
@@ -1795,6 +1865,8 @@ pub(crate) struct ActuatorInfo {
     app: AppInfo,
     autumn: FrameworkInfo,
     runtime: RuntimeInfo,
+    /// Build + git provenance baked into the running binary (issue #1242).
+    build: crate::build_info::BuildProvenance,
 }
 
 #[derive(Serialize)]
@@ -1820,8 +1892,11 @@ pub(crate) async fn info<S: ProvideActuatorState + Send + Sync + 'static>(
 ) -> Json<ActuatorInfo> {
     Json(ActuatorInfo {
         app: AppInfo {
-            name: std::env::var("CARGO_PKG_NAME").unwrap_or_else(|_| "unknown".into()),
-            version: std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "unknown".into()),
+            // Read the consuming app's compile-time name/version (baked in by
+            // `#[autumn_web::main]`), not a runtime `std::env::var` lookup that
+            // always failed in a released binary (issue #1242).
+            name: crate::build_info::app_name(),
+            version: crate::build_info::app_version(),
         },
         autumn: FrameworkInfo {
             version: env!("CARGO_PKG_VERSION"),
@@ -1830,6 +1905,7 @@ pub(crate) async fn info<S: ProvideActuatorState + Send + Sync + 'static>(
         runtime: RuntimeInfo {
             uptime: state.uptime_display(),
         },
+        build: crate::build_info::build_provenance(),
     })
 }
 
@@ -2520,15 +2596,36 @@ pub(crate) async fn loggers_put<S: ProvideActuatorState + Send + Sync + 'static>
     }
 
     let previous = state.log_levels().set_logger_level(&name, &level);
+    let applied = state.log_levels().reload_available();
 
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "status": "ok",
-            "message": format!("Logger '{}' set to '{}'", name, level),
-            "previous": previous,
-        })),
-    )
+    // Never claim `ok` for a change we could not push to the live subscriber.
+    // In a normally-booted app the reload layer is always installed, so
+    // `applied` is true; `false` only arises where no reload-capable subscriber
+    // exists (issue #1044).
+    if applied {
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "ok",
+                "message": format!("Logger '{}' set to '{}'", name, level),
+                "previous": previous,
+                "applied": true,
+            })),
+        )
+    } else {
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "recorded",
+                "message": format!(
+                    "Logger '{}' recorded as '{}' but not applied: no reload-capable subscriber is installed",
+                    name, level
+                ),
+                "previous": previous,
+                "applied": false,
+            })),
+        )
+    }
 }
 
 // ── Logfile (sensitive) ────────────────────────────────────────
@@ -3950,6 +4047,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn actuator_info_reports_build_and_git_provenance() {
+        // This is the only test in the lib test binary that touches the
+        // process-global build context (`__set_build_context` is first-wins),
+        // so the injected values below are guaranteed to be the ones rendered.
+        fn leak(value: String) -> &'static str {
+            Box::leak(value.into_boxed_str())
+        }
+
+        // Use the repo's real HEAD so this exercises AC #2's contract: the
+        // reported commit equals `git rev-parse HEAD` of the source tree.
+        let head = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .and_then(|out| String::from_utf8(out.stdout).ok())
+            .map(|out| out.trim().to_owned())
+            .expect("git rev-parse HEAD should succeed in the repo");
+        let short: String = head.chars().take(7).collect();
+
+        crate::build_info::__set_build_context(
+            "provenance_probe_app",
+            "9.9.9",
+            Some(leak(head.clone())),
+            Some(leak(short.clone())),
+            Some("provenance-branch"),
+            Some("false"),
+            Some("2026-07-09T00:00:00Z"),
+        );
+
+        let app = actuator_router(true).with_state(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/info")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // AC #3: app.name/version reflect the consuming app's compile-time
+        // values, not "unknown".
+        assert_eq!(json["app"]["name"], "provenance_probe_app");
+        assert_eq!(json["app"]["version"], "9.9.9");
+        assert_ne!(json["app"]["version"], "unknown");
+
+        // AC #1/#2: build object carries full + short SHA, branch, dirty bool,
+        // and an ISO-8601 UTC build timestamp; commit equals real HEAD.
+        assert_eq!(json["build"]["git"]["commit"], head);
+        assert_eq!(json["build"]["git"]["commit_short"], short);
+        assert_eq!(json["build"]["git"]["branch"], "provenance-branch");
+        assert_eq!(json["build"]["git"]["dirty"], false);
+        assert_eq!(json["build"]["timestamp"], "2026-07-09T00:00:00Z");
+        assert_eq!(json["build"]["version"], "9.9.9");
+    }
+
+    #[tokio::test]
     async fn actuator_env_available_in_sensitive_mode() {
         let config = AutumnConfig {
             profile: Some("prod".into()),
@@ -4280,8 +4440,13 @@ mod tests {
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["status"], "ok");
-        assert_eq!(json["message"], "Logger 'autumn_web' set to 'debug'");
+        // `test_state()` has no reload-capable subscriber wired in, so the
+        // endpoint honestly reports the change was recorded but not applied
+        // rather than a false-positive `ok` (issue #1044). A live-subscriber
+        // integration test (`actuator_loggers_live_reload`) covers the `ok`
+        // path with a real reloadable subscriber.
+        assert_eq!(json["status"], "recorded");
+        assert_eq!(json["applied"], false);
 
         let overrides = state.log_levels().logger_overrides();
         assert_eq!(
