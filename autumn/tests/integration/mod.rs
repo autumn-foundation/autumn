@@ -142,6 +142,8 @@ mod repository_find_in_batches;
 mod repository_find_or_create_by;
 #[cfg(feature = "db")]
 mod repository_from_shard;
+#[cfg(feature = "db")]
+mod repository_grouped_aggregates;
 #[cfg(all(feature = "db", feature = "openapi"))]
 mod repository_openapi;
 #[cfg(feature = "db")]

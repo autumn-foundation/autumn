@@ -67,6 +67,7 @@
 extern crate self as autumn_web;
 
 pub mod actuator;
+pub mod aggregate;
 pub mod app;
 pub mod assets;
 pub mod audit;
