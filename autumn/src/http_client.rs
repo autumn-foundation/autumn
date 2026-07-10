@@ -46,6 +46,7 @@
 //! ```
 
 use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -73,6 +74,22 @@ pub enum ClientError {
     /// The outbound circuit breaker is open.
     #[error("outbound circuit breaker is open")]
     CircuitBreakerOpen,
+    /// A resolved connection target (or redirect target) is a blocked
+    /// (private / link-local / loopback / reserved) IP address per the built-in
+    /// SSRF policy. See [`is_blocked_ip`].
+    #[error("SSRF policy blocked address: {0}")]
+    SsrfBlocked(String),
+    /// A redirect chain exceeded the configured maximum number of hops.
+    #[error("too many redirects (max {0})")]
+    TooManyRedirects(usize),
+    /// A redirect's absolute `Location` target was rejected by the caller's
+    /// validator (or by the built-in scheme-downgrade guard).
+    #[error("redirect rejected: {0}")]
+    RedirectRejected(String),
+    /// A URL could not be parsed, was missing a host, or DNS resolution failed
+    /// while composing a custom (redirect / pin / SSRF-safe) request.
+    #[error("invalid or unresolvable URL: {0}")]
+    InvalidUrl(String),
 }
 
 // ── Response ─────────────────────────────────────────────────────────────────
@@ -81,6 +98,7 @@ pub enum ClientError {
 ///
 /// Body is consumed once — call exactly one of [`json`](Self::json),
 /// [`text`](Self::text), or [`bytes`](Self::bytes).
+#[derive(Debug)]
 pub struct Response {
     status: reqwest::StatusCode,
     headers: HeaderMap,
@@ -126,6 +144,130 @@ impl Response {
     pub fn bytes(self) -> Bytes {
         self.body
     }
+}
+
+// ── SSRF address policy ──────────────────────────────────────────────────────
+
+/// Return `true` when `ip` must **not** be connected to because it belongs to a
+/// private, loopback, link-local, CGNAT, benchmarking, documentation, multicast
+/// or otherwise reserved range.
+///
+/// This is the built-in Server-Side Request Forgery (SSRF) deny-list used by
+/// [`Client::get_ssrf_safe`]. Ranges are checked explicitly (rather than via the
+/// unstable `IpAddr::is_global` family) so the code compiles on stable Rust.
+///
+/// IPv4-mapped (`::ffff:a.b.c.d`) and the deprecated IPv4-compatible
+/// (`::a.b.c.d`) IPv6 forms are unwrapped and re-checked as IPv4, so encodings
+/// such as `::ffff:169.254.169.254` are correctly blocked.
+#[must_use]
+pub fn is_blocked_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_blocked_ipv4(v4),
+        IpAddr::V6(v6) => is_blocked_ipv6(v6),
+    }
+}
+
+/// Return `true` when `ip` is safe to connect to — the exact negation of
+/// [`is_blocked_ip`].
+#[must_use]
+pub fn is_public_ip(ip: IpAddr) -> bool {
+    !is_blocked_ip(ip)
+}
+
+fn is_blocked_ipv4(ip: Ipv4Addr) -> bool {
+    let [a, b, c, _d] = ip.octets();
+    // 0.0.0.0/8 (incl. unspecified)
+    if a == 0 {
+        return true;
+    }
+    // 10.0.0.0/8
+    if a == 10 {
+        return true;
+    }
+    // 100.64.0.0/10 (CGNAT)
+    if a == 100 && (64..=127).contains(&b) {
+        return true;
+    }
+    // 127.0.0.0/8 (loopback)
+    if a == 127 {
+        return true;
+    }
+    // 169.254.0.0/16 (link-local, incl. 169.254.169.254 cloud metadata)
+    if a == 169 && b == 254 {
+        return true;
+    }
+    // 172.16.0.0/12
+    if a == 172 && (16..=31).contains(&b) {
+        return true;
+    }
+    // 192.0.0.0/24 (IETF protocol assignments)
+    if a == 192 && b == 0 && c == 0 {
+        return true;
+    }
+    // 192.0.2.0/24 (TEST-NET-1)
+    if a == 192 && b == 0 && c == 2 {
+        return true;
+    }
+    // 192.168.0.0/16
+    if a == 192 && b == 168 {
+        return true;
+    }
+    // 198.18.0.0/15 (benchmarking)
+    if a == 198 && (18..=19).contains(&b) {
+        return true;
+    }
+    // 198.51.100.0/24 (TEST-NET-2)
+    if a == 198 && b == 51 && c == 100 {
+        return true;
+    }
+    // 203.0.113.0/24 (TEST-NET-3)
+    if a == 203 && b == 0 && c == 113 {
+        return true;
+    }
+    // 224.0.0.0/4 (multicast) and 240.0.0.0/4 (reserved, incl. 255.255.255.255)
+    if a >= 224 {
+        return true;
+    }
+    false
+}
+
+fn is_blocked_ipv6(ip: Ipv6Addr) -> bool {
+    // Unwrap IPv4-mapped (::ffff:a.b.c.d) and deprecated IPv4-compatible
+    // (::a.b.c.d) forms and re-check as IPv4. `to_ipv4` covers both, but we try
+    // the mapped form first for clarity.
+    if let Some(v4) = ip.to_ipv4_mapped() {
+        return is_blocked_ipv4(v4);
+    }
+    if let Some(v4) = ip.to_ipv4() {
+        return is_blocked_ipv4(v4);
+    }
+
+    let segs = ip.segments();
+    // :: (unspecified)
+    if ip == Ipv6Addr::UNSPECIFIED {
+        return true;
+    }
+    // ::1 (loopback)
+    if ip == Ipv6Addr::LOCALHOST {
+        return true;
+    }
+    // fc00::/7 (unique local address)
+    if segs[0] & 0xfe00 == 0xfc00 {
+        return true;
+    }
+    // fe80::/10 (link-local)
+    if segs[0] & 0xffc0 == 0xfe80 {
+        return true;
+    }
+    // ff00::/8 (multicast)
+    if segs[0] & 0xff00 == 0xff00 {
+        return true;
+    }
+    // 2001:db8::/32 (documentation)
+    if segs[0] == 0x2001 && segs[1] == 0x0db8 {
+        return true;
+    }
+    false
 }
 
 // ── RetryPolicy ──────────────────────────────────────────────────────────────
@@ -698,6 +840,9 @@ impl Client {
             alias: self.alias.clone(),
             pending_error: None,
             resilience_config: self.resilience_config.clone(),
+            redirect_mode: RedirectMode::Default,
+            pin_addr: None,
+            ssrf_safe: false,
         }
     }
 
@@ -732,6 +877,28 @@ impl Client {
     pub fn head(&self, url: impl AsRef<str>) -> RequestBuilder {
         self.build_request(Method::HEAD, url)
     }
+
+    /// Build an SSRF-safe `GET` request.
+    ///
+    /// This is the composed safe path for fetching **untrusted** URLs. Before
+    /// connecting it resolves the host **once**, validates every resolved IP
+    /// against the built-in SSRF deny-list ([`is_blocked_ip`]) and rejects the
+    /// request if *any* address is blocked. The connection is then pinned to a
+    /// validated address so reqwest cannot re-resolve the host (closing the
+    /// DNS-rebinding / TOCTOU window). Redirects are followed manually up to
+    /// [`SSRF_SAFE_MAX_REDIRECTS`] hops, re-running resolve→validate→pin on each
+    /// hop; a hop that downgrades the scheme from `https` to `http` is rejected
+    /// as defence-in-depth.
+    ///
+    /// Like the test-mock path, this custom send path bypasses the process-wide
+    /// circuit-breaker registry to avoid entangling per-URL SSRF fetches with
+    /// the shared per-host breaker state.
+    #[must_use]
+    pub fn get_ssrf_safe(&self, url: impl Into<String>) -> RequestBuilder {
+        let mut builder = self.build_request(Method::GET, url.into());
+        builder.ssrf_safe = true;
+        builder
+    }
 }
 
 impl Default for Client {
@@ -753,6 +920,30 @@ impl axum::extract::FromRequestParts<crate::AppState> for Client {
 
 // ── RequestBuilder ───────────────────────────────────────────────────────────
 
+/// Type alias for a redirect-`Location` validator.
+type RedirectValidator = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
+/// Per-request redirect handling.
+///
+/// `Default` preserves the historical behaviour exactly (the shared-client fast
+/// path with reqwest's built-in auto-follow). `None` and `Follow` route the
+/// request through the custom one-shot-client send path.
+enum RedirectMode {
+    /// Historical behaviour: shared client, reqwest auto-follows up to 10 hops.
+    Default,
+    /// Never follow: a 3xx is returned to the caller verbatim.
+    None,
+    /// Follow up to `max` hops, calling `validator` on each absolute target
+    /// before following it.
+    Follow {
+        max: usize,
+        validator: RedirectValidator,
+    },
+}
+
+/// Default hop cap for the composed [`Client::get_ssrf_safe`] safe path.
+const SSRF_SAFE_MAX_REDIRECTS: usize = 5;
+
 /// Fluent outbound request builder produced by [`Client`] methods.
 pub struct RequestBuilder {
     client: reqwest::Client,
@@ -768,6 +959,14 @@ pub struct RequestBuilder {
     pending_error: Option<ClientError>,
     /// Resilience configuration for circuit breakers.
     resilience_config: Option<Arc<crate::config::ResilienceConfig>>,
+    /// Per-request redirect handling (see [`RedirectMode`]).
+    redirect_mode: RedirectMode,
+    /// When set, connect directly to this socket, skipping DNS resolution while
+    /// preserving the original `Host` header + SNI. See [`RequestBuilder::pin_to`].
+    pin_addr: Option<SocketAddr>,
+    /// When `true`, use the composed SSRF-safe send path (resolve→validate→pin
+    /// with per-hop redirect validation). Set by [`Client::get_ssrf_safe`].
+    ssrf_safe: bool,
 }
 
 impl RequestBuilder {
@@ -847,6 +1046,60 @@ impl RequestBuilder {
         self
     }
 
+    /// Disable redirect following for this request.
+    ///
+    /// A `3xx` response is returned to the caller verbatim (status, headers and
+    /// body) rather than being followed. Routes the request through the custom
+    /// one-shot-client send path, which bypasses the process-wide circuit
+    /// breaker.
+    #[must_use]
+    pub fn no_redirect(mut self) -> Self {
+        self.redirect_mode = RedirectMode::None;
+        self
+    }
+
+    /// Follow up to `max` redirects, validating each hop before following it.
+    ///
+    /// Before following a `3xx`, the `Location` header is resolved to an
+    /// absolute URL (relative locations are joined against the current URL) and
+    /// `validator(&absolute_location)` is called. If it returns `false` the
+    /// request fails with [`ClientError::RedirectRejected`]. If the chain would
+    /// exceed `max` hops the request fails with
+    /// [`ClientError::TooManyRedirects`] (so `max == 0` turns the first `3xx`
+    /// into an error). Routes the request through the custom one-shot-client
+    /// send path, which bypasses the process-wide circuit breaker.
+    #[must_use]
+    pub fn follow_redirects<F>(mut self, max: usize, validator: F) -> Self
+    where
+        F: Fn(&str) -> bool + Send + Sync + 'static,
+    {
+        self.redirect_mode = RedirectMode::Follow {
+            max,
+            validator: Arc::new(validator),
+        };
+        self
+    }
+
+    /// Pin the connection to `addr`, skipping DNS resolution.
+    ///
+    /// The original `Host` header and TLS SNI are preserved; only the
+    /// address the socket connects to is overridden. This protects against
+    /// DNS-rebinding / TOCTOU attacks where a hostname re-resolves to a
+    /// different (private) address between validation and connection.
+    ///
+    /// Implemented via a one-shot `reqwest::ClientBuilder::resolve(host, addr)`
+    /// scoped to this request. Note that reqwest ignores the **port** in the
+    /// resolve override and connects to the port from the request URL, so
+    /// `addr.port()` is only honoured when it matches the URL's port (which it
+    /// does for addresses obtained by resolving that same URL). Routes the
+    /// request through the custom one-shot-client send path, which bypasses the
+    /// process-wide circuit breaker.
+    #[must_use]
+    pub const fn pin_to(mut self, addr: SocketAddr) -> Self {
+        self.pin_addr = Some(addr);
+        self
+    }
+
     /// Send the request, applying retries and returning a [`Response`].
     ///
     /// # Errors
@@ -869,6 +1122,16 @@ impl RequestBuilder {
         // Bypassing circuit breaker if a mock registry is present.
         if self.mock.is_some() {
             return self.send_inner(false).await;
+        }
+
+        // Custom send path: any of no_redirect / follow_redirects / pin_to /
+        // get_ssrf_safe builds one-shot reqwest client(s) with Policy::none()
+        // (+ optional .resolve()) and does manual redirect handling. Like the
+        // mock path it deliberately BYPASSES the process-global circuit breaker
+        // to avoid entangling these one-off, per-URL requests with the shared
+        // per-host breaker registry.
+        if self.needs_custom_path() {
+            return self.send_custom().await;
         }
 
         // ── Resilience / Circuit Breaker ──────────────────────────────────
@@ -1041,6 +1304,153 @@ impl RequestBuilder {
         // The retry loop always returns inside the last attempt; this is unreachable.
         unreachable!("retry loop exited without returning a result — this is a bug")
     }
+
+    /// `true` when any security-hardening option requires the custom send path.
+    const fn needs_custom_path(&self) -> bool {
+        self.ssrf_safe
+            || self.pin_addr.is_some()
+            || !matches!(self.redirect_mode, RedirectMode::Default)
+    }
+
+    /// Dispatch to the appropriate custom send path. Consumes `self`.
+    async fn send_custom(self) -> Result<Response, ClientError> {
+        let timeout = self
+            .retry_policy
+            .request_timeout
+            .unwrap_or_else(|| Duration::from_secs(30));
+
+        if self.ssrf_safe {
+            return self.send_ssrf_safe(timeout).await;
+        }
+
+        // Extract the follow parameters (ending the borrow) before moving `self`.
+        let follow = match &self.redirect_mode {
+            RedirectMode::Follow { max, validator } => Some((*max, validator.clone())),
+            RedirectMode::None | RedirectMode::Default => None,
+        };
+        if let Some((max, validator)) = follow {
+            return self.follow_loop(max, validator, timeout).await;
+        }
+
+        // `None`: single one-shot request with Policy::none() so a 3xx is
+        // returned verbatim. `Default` (pin_to only): keep reqwest's built-in
+        // auto-follow but pin the initial host's resolution.
+        let policy = match self.redirect_mode {
+            RedirectMode::None => reqwest::redirect::Policy::none(),
+            RedirectMode::Default | RedirectMode::Follow { .. } => {
+                reqwest::redirect::Policy::default()
+            }
+        };
+        let resolve = self.pin_resolve()?;
+        let client = build_oneshot_client(resolve, policy, timeout)?;
+        send_one(
+            &client,
+            &self.method,
+            &self.url,
+            &self.extra_headers,
+            self.body.as_ref(),
+            &self.retry_policy,
+        )
+        .await
+    }
+
+    /// Compute the `(host, addr)` resolve override for a pinned request, if any.
+    fn pin_resolve(&self) -> Result<Option<(String, SocketAddr)>, ClientError> {
+        match self.pin_addr {
+            Some(addr) => Ok(Some((host_of(&self.url)?, addr))),
+            None => Ok(None),
+        }
+    }
+
+    /// Manual redirect-following loop with per-hop validation (Feature #1238).
+    async fn follow_loop(
+        self,
+        max: usize,
+        validator: RedirectValidator,
+        timeout: Duration,
+    ) -> Result<Response, ClientError> {
+        let mut current = self.url.clone();
+        for hop in 0.. {
+            // Pin only applies to the first hop's original target.
+            let resolve = if hop == 0 {
+                match self.pin_addr {
+                    Some(addr) => Some((host_of(&current)?, addr)),
+                    None => None,
+                }
+            } else {
+                None
+            };
+            let client = build_oneshot_client(resolve, reqwest::redirect::Policy::none(), timeout)?;
+            // Only send the body on the first hop; a redirect drops it.
+            let body = if hop == 0 { self.body.as_ref() } else { None };
+            let resp = send_one(
+                &client,
+                &self.method,
+                &current,
+                &self.extra_headers,
+                body,
+                &self.retry_policy,
+            )
+            .await?;
+
+            let Some(next) = redirect_target(&resp, &current)? else {
+                return Ok(resp);
+            };
+            if hop >= max {
+                return Err(ClientError::TooManyRedirects(max));
+            }
+            if !validator(&next) {
+                return Err(ClientError::RedirectRejected(next));
+            }
+            current = next;
+        }
+        unreachable!("redirect loop is bounded by `max` and always returns")
+    }
+
+    /// Composed SSRF-safe send path (Features #1238 + #1239). Resolves and
+    /// validates every hop, pins the connection, and rejects scheme downgrades.
+    async fn send_ssrf_safe(self, timeout: Duration) -> Result<Response, ClientError> {
+        let mut current = self.url.clone();
+        for hop in 0.. {
+            // Resolve host → validated address (rejects if ANY resolved IP is
+            // blocked), then pin so reqwest cannot re-resolve.
+            let addr = resolve_and_validate(&current).await?;
+            let host = host_of(&current)?;
+            let client = build_oneshot_client(
+                Some((host, addr)),
+                reqwest::redirect::Policy::none(),
+                timeout,
+            )?;
+            let body = if hop == 0 { self.body.as_ref() } else { None };
+            let resp = send_one(
+                &client,
+                &self.method,
+                &current,
+                &self.extra_headers,
+                body,
+                &self.retry_policy,
+            )
+            .await?;
+
+            let Some(next) = redirect_target(&resp, &current)? else {
+                return Ok(resp);
+            };
+            if hop >= SSRF_SAFE_MAX_REDIRECTS {
+                return Err(ClientError::TooManyRedirects(SSRF_SAFE_MAX_REDIRECTS));
+            }
+            // Defence-in-depth: reject an https→http downgrade on redirect.
+            if scheme_is_https(&current)? && !scheme_is_https(&next)? {
+                return Err(ClientError::RedirectRejected(format!(
+                    "https→http scheme downgrade on redirect to {next}"
+                )));
+            }
+            current = next;
+            // The next loop iteration re-resolves + re-validates `current`
+            // before connecting, so a redirect to a blocked address is rejected
+            // there with `SsrfBlocked`.
+        }
+        unreachable!("redirect loop is bounded by SSRF_SAFE_MAX_REDIRECTS")
+    }
 }
 
 // ── Internal helpers ─────────────────────────────────────────────────────────
@@ -1054,6 +1464,192 @@ const fn is_idempotent_method(method: &Method) -> bool {
 
 const fn is_retryable_status(status: u16) -> bool {
     matches!(status, 502..=504)
+}
+
+// ── Custom send-path helpers (redirect / pin / SSRF-safe) ─────────────────────
+
+/// Build a one-shot `reqwest::Client` for the custom send path, with the given
+/// redirect policy, per-request timeout, and optional DNS `resolve` override.
+fn build_oneshot_client(
+    resolve: Option<(String, SocketAddr)>,
+    policy: reqwest::redirect::Policy,
+    timeout: Duration,
+) -> Result<reqwest::Client, ClientError> {
+    let mut builder = reqwest::ClientBuilder::new()
+        .timeout(timeout)
+        .redirect(policy);
+    if let Some((host, addr)) = resolve {
+        builder = builder.resolve(&host, addr);
+    }
+    builder.build().map_err(ClientError::Request)
+}
+
+/// Send a single request through `client` (no manual redirect following — the
+/// client's redirect policy governs that) with the same transient-error and
+/// 429/5xx retry behaviour as the shared path, and collect the [`Response`].
+async fn send_one(
+    client: &reqwest::Client,
+    method: &Method,
+    url: &str,
+    extra_headers: &HeaderMap,
+    body: Option<&Bytes>,
+    retry_policy: &RetryPolicy,
+) -> Result<Response, ClientError> {
+    let start = Instant::now();
+    let max_attempts = if is_idempotent_method(method) || !retry_policy.retry_idempotent_only {
+        retry_policy.max_retries.saturating_add(1)
+    } else {
+        1
+    };
+
+    for attempt in 0..max_attempts {
+        if attempt > 0 {
+            let exp = (attempt - 1).min(10);
+            let delay = Duration::from_millis(100 * (1_u64 << exp));
+            tokio::time::sleep(delay).await;
+        }
+
+        let mut req = client.request(method.clone(), url);
+        req = inject_trace_context(req);
+        for (name, value) in extra_headers {
+            req = req.header(name.clone(), value.clone());
+        }
+        if let Some(body) = body {
+            req = req.body(body.clone());
+        }
+
+        match req.send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                let headers = resp.headers().clone();
+                let url_used = resp.url().clone();
+
+                if status.as_u16() == 429 && attempt + 1 < max_attempts {
+                    let mut sleep_delay =
+                        parse_retry_after(&headers).unwrap_or(Duration::from_secs(1));
+                    sleep_delay = sleep_delay.min(retry_policy.max_retry_after);
+                    if let Some(req_timeout) = retry_policy.request_timeout {
+                        sleep_delay = sleep_delay.min(req_timeout);
+                    }
+                    tokio::time::sleep(sleep_delay).await;
+                    continue;
+                }
+                if is_retryable_status(status.as_u16()) && attempt + 1 < max_attempts {
+                    continue;
+                }
+
+                let body = resp
+                    .bytes()
+                    .await
+                    .map_err(|e| ClientError::Request(e.without_url()))?;
+                log_request(
+                    method.as_str(),
+                    &url_used,
+                    status.as_u16(),
+                    start.elapsed(),
+                    extra_headers,
+                );
+                return Ok(Response {
+                    status,
+                    headers,
+                    body,
+                    url: Some(url_used),
+                });
+            }
+            Err(e) if (e.is_connect() || e.is_timeout()) && attempt + 1 < max_attempts => {}
+            Err(e) => return Err(ClientError::Request(e.without_url())),
+        }
+    }
+
+    unreachable!("retry loop exited without returning a result — this is a bug")
+}
+
+/// Extract the host portion of a URL as an owned `String`.
+fn host_of(url: &str) -> Result<String, ClientError> {
+    let parsed = url::Url::parse(url).map_err(|e| ClientError::InvalidUrl(e.to_string()))?;
+    parsed
+        .host_str()
+        .map(str::to_owned)
+        .ok_or_else(|| ClientError::InvalidUrl(format!("URL has no host: {url}")))
+}
+
+/// `true` when the URL's scheme is `https` (case-insensitive).
+fn scheme_is_https(url: &str) -> Result<bool, ClientError> {
+    let parsed = url::Url::parse(url).map_err(|e| ClientError::InvalidUrl(e.to_string()))?;
+    Ok(parsed.scheme().eq_ignore_ascii_case("https"))
+}
+
+/// If `resp` is a `3xx` carrying a `Location` header, resolve it to an absolute
+/// URL (joining relative locations against `base`). Returns `Ok(None)` when the
+/// response is not a followable redirect (non-3xx, or 3xx without `Location`).
+fn redirect_target(resp: &Response, base: &str) -> Result<Option<String>, ClientError> {
+    if !resp.status().is_redirection() {
+        return Ok(None);
+    }
+    let Some(location) = resp
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return Ok(None);
+    };
+    let base_url = url::Url::parse(base).map_err(|e| ClientError::InvalidUrl(e.to_string()))?;
+    let joined = base_url
+        .join(location)
+        .map_err(|e| ClientError::InvalidUrl(e.to_string()))?;
+    Ok(Some(joined.to_string()))
+}
+
+/// Resolve `url`'s host to a single validated [`SocketAddr`], rejecting with
+/// [`ClientError::SsrfBlocked`] if the host is (or resolves to) any blocked IP.
+///
+/// IP-literal hosts (including decimal/octal/hex encodings, which the `url`
+/// crate normalises to an `Ipv4Addr` at parse time) are validated directly with
+/// no DNS lookup. Domain hosts are resolved once via `tokio::net::lookup_host`
+/// and rejected if **any** resolved address is blocked.
+async fn resolve_and_validate(url: &str) -> Result<SocketAddr, ClientError> {
+    let parsed = url::Url::parse(url).map_err(|e| ClientError::InvalidUrl(e.to_string()))?;
+    let port = parsed.port_or_known_default().ok_or_else(|| {
+        ClientError::InvalidUrl(format!("URL has no port and unknown scheme: {url}"))
+    })?;
+    let host = parsed
+        .host()
+        .ok_or_else(|| ClientError::InvalidUrl(format!("URL has no host: {url}")))?;
+
+    match host {
+        url::Host::Ipv4(v4) => {
+            let ip = IpAddr::V4(v4);
+            if is_blocked_ip(ip) {
+                return Err(ClientError::SsrfBlocked(ip.to_string()));
+            }
+            Ok(SocketAddr::new(ip, port))
+        }
+        url::Host::Ipv6(v6) => {
+            let ip = IpAddr::V6(v6);
+            if is_blocked_ip(ip) {
+                return Err(ClientError::SsrfBlocked(ip.to_string()));
+            }
+            Ok(SocketAddr::new(ip, port))
+        }
+        url::Host::Domain(name) => {
+            let addrs: Vec<SocketAddr> = tokio::net::lookup_host((name, port))
+                .await
+                .map_err(|e| ClientError::InvalidUrl(format!("DNS lookup failed for {name}: {e}")))?
+                .collect();
+            if addrs.is_empty() {
+                return Err(ClientError::InvalidUrl(format!(
+                    "DNS lookup for {name} returned no addresses"
+                )));
+            }
+            // Reject if ANY resolved address is blocked (fail closed).
+            for addr in &addrs {
+                if is_blocked_ip(addr.ip()) {
+                    return Err(ClientError::SsrfBlocked(addr.ip().to_string()));
+                }
+            }
+            Ok(addrs[0])
+        }
+    }
 }
 
 fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
@@ -2018,5 +2614,392 @@ mod tests {
         });
 
         let _client = Client::from_state(&state);
+    }
+
+    // ── Security-hardening tests (#1238 redirects, #1239 SSRF/pinning) ────────
+
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    // TEST 44: SSRF address policy — blocked ranges.
+    #[test]
+    fn ssrf_policy_blocks_private_and_reserved_ipv4() {
+        let blocked = [
+            "0.0.0.0",
+            "10.1.2.3",
+            "100.64.0.1",      // CGNAT
+            "127.0.0.1",       // loopback
+            "169.254.169.254", // cloud metadata
+            "172.16.5.4",      // private
+            "192.0.0.1",       // IETF
+            "192.0.2.5",       // TEST-NET-1
+            "192.168.1.1",     // private
+            "198.18.0.1",      // benchmarking
+            "198.51.100.7",    // TEST-NET-2
+            "203.0.113.9",     // TEST-NET-3
+            "224.0.0.1",       // multicast
+            "240.0.0.1",       // reserved
+            "255.255.255.255", // broadcast
+        ];
+        for s in blocked {
+            let ip: IpAddr = s.parse().unwrap();
+            assert!(is_blocked_ip(ip), "{s} should be blocked");
+            assert!(!is_public_ip(ip), "{s} should not be public");
+        }
+    }
+
+    // TEST 45: SSRF address policy — public IPv4 is allowed.
+    #[test]
+    fn ssrf_policy_allows_public_ipv4() {
+        for s in ["1.1.1.1", "8.8.8.8", "93.184.216.34"] {
+            let ip: IpAddr = s.parse().unwrap();
+            assert!(is_public_ip(ip), "{s} should be public");
+            assert!(!is_blocked_ip(ip), "{s} should not be blocked");
+        }
+    }
+
+    // TEST 46: SSRF address policy — IPv6 blocked ranges, mapped/compatible forms.
+    #[test]
+    fn ssrf_policy_ipv6_and_mapped_forms() {
+        let blocked = [
+            "::",                     // unspecified
+            "::1",                    // loopback
+            "fe80::1",                // link-local
+            "fc00::1",                // ULA
+            "ff02::1",                // multicast
+            "2001:db8::1",            // documentation
+            "::ffff:169.254.169.254", // IPv4-mapped metadata
+            "::ffff:127.0.0.1",       // IPv4-mapped loopback
+        ];
+        for s in blocked {
+            let ip: IpAddr = s.parse().unwrap();
+            assert!(is_blocked_ip(ip), "{s} should be blocked");
+        }
+        // IPv4-compatible ::7f00:1 == 127.0.0.1 (deprecated form) is blocked.
+        let compat = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0x7f00, 0x0001));
+        assert!(
+            is_blocked_ip(compat),
+            "::7f00:1 (127.0.0.1) should be blocked"
+        );
+
+        // A real public IPv6 (Cloudflare DNS) is allowed.
+        let public: IpAddr = "2606:4700:4700::1111".parse().unwrap();
+        assert!(
+            is_public_ip(public),
+            "2606:4700:4700::1111 should be public"
+        );
+    }
+
+    // TEST 47: the `url` crate normalises decimal/hex IP-literal hosts to Ipv4,
+    // so `http://2130706433/` (== 127.0.0.1) is recognised as a blocked IP.
+    #[test]
+    fn ssrf_policy_decimal_encoded_host_is_blocked() {
+        for raw in [
+            "http://2130706433/",
+            "http://0x7f000001/",
+            "http://127.0.0.1/",
+        ] {
+            let parsed = url::Url::parse(raw).unwrap();
+            match parsed.host() {
+                Some(url::Host::Ipv4(v4)) => {
+                    assert_eq!(
+                        v4,
+                        Ipv4Addr::LOCALHOST,
+                        "{raw} should normalise to 127.0.0.1"
+                    );
+                    assert!(
+                        is_blocked_ip(IpAddr::V4(v4)),
+                        "{raw} host should be blocked"
+                    );
+                }
+                other => panic!("{raw} did not parse to an Ipv4 host: {other:?}"),
+            }
+        }
+    }
+
+    // Small axum helper: spawn `app` on an ephemeral 127.0.0.1 port, return it.
+    async fn spawn(app: axum::Router) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        addr
+    }
+
+    fn redirect_302(location: String) -> axum::response::Response {
+        axum::response::Response::builder()
+            .status(302)
+            .header("location", location)
+            .body(axum::body::Body::empty())
+            .unwrap()
+    }
+
+    // TEST 48: no_redirect returns the 3xx verbatim without following it.
+    #[tokio::test]
+    async fn no_redirect_returns_3xx_unfollowed() {
+        use axum::{Router, routing::get};
+        let addr = spawn(Router::new().route(
+            "/start",
+            get(|| async { redirect_302("http://127.0.0.1:1/never".to_owned()) }),
+        ))
+        .await;
+
+        let resp = Client::new()
+            .get(format!("http://127.0.0.1:{}/start", addr.port()))
+            .no_redirect()
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status().as_u16(), 302);
+        assert_eq!(
+            resp.headers().get("location").and_then(|v| v.to_str().ok()),
+            Some("http://127.0.0.1:1/never")
+        );
+    }
+
+    // TEST 49: follow_redirects follows a valid chain A→B and calls the validator.
+    #[tokio::test]
+    async fn follow_redirects_valid_chain_calls_validator() {
+        use axum::{Router, routing::get};
+
+        let b_addr = spawn(Router::new().route("/final", get(|| async { "final-body" }))).await;
+        let b_port = b_addr.port();
+        let a_addr = spawn(Router::new().route(
+            "/start",
+            get(move || async move { redirect_302(format!("http://127.0.0.1:{b_port}/final")) }),
+        ))
+        .await;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls2 = calls.clone();
+        let resp = Client::new()
+            .get(format!("http://127.0.0.1:{}/start", a_addr.port()))
+            .follow_redirects(5, move |_loc| {
+                calls2.fetch_add(1, Ordering::SeqCst);
+                true
+            })
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status().as_u16(), 200);
+        assert_eq!(resp.text(), "final-body");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "validator called once per hop"
+        );
+    }
+
+    // TEST 50: follow_redirects rejects a redirect to a private/blocked target,
+    // and NEVER connects to that private address. Uses the SSRF IP policy as the
+    // validator — structurally the same guard get_ssrf_safe applies per hop.
+    #[tokio::test]
+    async fn follow_redirects_rejects_private_target() {
+        use axum::{Router, routing::get};
+        use std::sync::atomic::AtomicBool;
+
+        // A "private" server that must never be reached.
+        let touched = Arc::new(AtomicBool::new(false));
+        let touched2 = touched.clone();
+        let priv_addr = spawn(Router::new().route(
+            "/secret",
+            get(move || {
+                let t = touched2.clone();
+                async move {
+                    t.store(true, Ordering::SeqCst);
+                    "SECRET"
+                }
+            }),
+        ))
+        .await;
+        let priv_port = priv_addr.port();
+
+        // Public-ish entrypoint that 302s to the private loopback target.
+        let a_addr = spawn(Router::new().route(
+            "/start",
+            get(
+                move || async move { redirect_302(format!("http://127.0.0.1:{priv_port}/secret")) },
+            ),
+        ))
+        .await;
+
+        let validator = |u: &str| -> bool {
+            let Ok(p) = url::Url::parse(u) else {
+                return false;
+            };
+            match p.host() {
+                Some(url::Host::Ipv4(v4)) => is_public_ip(IpAddr::V4(v4)),
+                Some(url::Host::Ipv6(v6)) => is_public_ip(IpAddr::V6(v6)),
+                _ => true,
+            }
+        };
+
+        let result = Client::new()
+            .get(format!("http://127.0.0.1:{}/start", a_addr.port()))
+            .follow_redirects(5, validator)
+            .send()
+            .await;
+
+        assert!(
+            matches!(result, Err(ClientError::RedirectRejected(_))),
+            "expected RedirectRejected, got {result:?}"
+        );
+        assert!(
+            !touched.load(Ordering::SeqCst),
+            "the private target must never be connected to"
+        );
+    }
+
+    // TEST 51: follow_redirects with a chain longer than `max` → TooManyRedirects.
+    #[tokio::test]
+    async fn follow_redirects_cap_exceeded() {
+        use axum::{Router, routing::get};
+
+        // /loop always redirects back to itself → infinite chain.
+        let addr =
+            spawn(Router::new().route("/loop", get(|| async { redirect_302("/loop".to_owned()) })))
+                .await;
+
+        let result = Client::new()
+            .get(format!("http://127.0.0.1:{}/loop", addr.port()))
+            .follow_redirects(2, |_| true)
+            .send()
+            .await;
+
+        assert!(
+            matches!(result, Err(ClientError::TooManyRedirects(2))),
+            "expected TooManyRedirects(2), got {result:?}"
+        );
+    }
+
+    // TEST 52: follow_redirects(0, ..) turns the first 3xx into TooManyRedirects.
+    #[tokio::test]
+    async fn follow_redirects_zero_max_errors_on_first_3xx() {
+        use axum::{Router, routing::get};
+        let addr = spawn(Router::new().route(
+            "/start",
+            get(|| async { redirect_302("http://127.0.0.1:1/x".to_owned()) }),
+        ))
+        .await;
+
+        let result = Client::new()
+            .get(format!("http://127.0.0.1:{}/start", addr.port()))
+            .follow_redirects(0, |_| true)
+            .send()
+            .await;
+
+        assert!(matches!(result, Err(ClientError::TooManyRedirects(0))));
+    }
+
+    // TEST 53: pin_to bypasses DNS and connects to the URL's port.
+    //
+    // The host `pinned.invalid` is guaranteed non-resolvable (.invalid TLD), yet
+    // pinning to 127.0.0.1 reaches the listener — proving DNS was bypassed. The
+    // pinned SocketAddr uses port 1 (which nothing listens on) while the URL uses
+    // the real listener port; reaching the listener proves reqwest IGNORES the
+    // resolve SocketAddr's port and connects to the URL's port instead.
+    #[tokio::test]
+    async fn pin_to_bypasses_dns_and_uses_url_port() {
+        use axum::{Router, routing::get};
+        let addr = spawn(Router::new().route("/ping", get(|| async { "pong" }))).await;
+        let listener_port = addr.port();
+
+        let resp = Client::new()
+            .get(format!("http://pinned.invalid:{listener_port}/ping"))
+            // Deliberately-wrong port (1) to probe reqwest's port handling.
+            .pin_to(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1))
+            .send()
+            .await
+            .expect("pinned request should reach the loopback listener");
+
+        assert_eq!(resp.status().as_u16(), 200);
+        assert_eq!(resp.text(), "pong");
+    }
+
+    // TEST 54: get_ssrf_safe rejects a host that resolves to a blocked IP BEFORE
+    // connecting. `localhost` resolves to 127.0.0.1 (and/or ::1), both blocked.
+    // The listener's handler must never fire.
+    #[tokio::test]
+    async fn get_ssrf_safe_rejects_loopback_host_before_connecting() {
+        use axum::{Router, routing::get};
+        use std::sync::atomic::AtomicBool;
+
+        let touched = Arc::new(AtomicBool::new(false));
+        let touched2 = touched.clone();
+        let addr = spawn(Router::new().route(
+            "/x",
+            get(move || {
+                let t = touched2.clone();
+                async move {
+                    t.store(true, Ordering::SeqCst);
+                    "reached"
+                }
+            }),
+        ))
+        .await;
+
+        let result = Client::new()
+            .get_ssrf_safe(format!("http://localhost:{}/x", addr.port()))
+            .send()
+            .await;
+
+        assert!(
+            matches!(result, Err(ClientError::SsrfBlocked(_))),
+            "expected SsrfBlocked, got {result:?}"
+        );
+        assert!(
+            !touched.load(Ordering::SeqCst),
+            "SSRF guard must reject before any connection"
+        );
+    }
+
+    // TEST 55: get_ssrf_safe rejects a decimal-encoded loopback IP literal
+    // (http://2130706433/ == 127.0.0.1) with no DNS lookup.
+    #[tokio::test]
+    async fn get_ssrf_safe_rejects_decimal_encoded_loopback() {
+        let result = Client::new()
+            .get_ssrf_safe("http://2130706433/")
+            .send()
+            .await;
+        assert!(
+            matches!(result, Err(ClientError::SsrfBlocked(_))),
+            "expected SsrfBlocked, got {result:?}"
+        );
+    }
+
+    // TEST 56: resolve_and_validate — the resolve→validate core of get_ssrf_safe.
+    // A public IP literal validates (returning the URL's port); blocked literals
+    // and decimal-encoded loopback are rejected with SsrfBlocked. Exercising the
+    // actual network connect of the safe path against a public host is NOT
+    // reproducible in-sandbox (no reachable public server); it is covered
+    // structurally by the pin_to and follow_redirects tests. See the report.
+    #[tokio::test]
+    async fn resolve_and_validate_accepts_public_rejects_blocked() {
+        // Public literal with an explicit port → Ok, port preserved.
+        let ok = resolve_and_validate("http://8.8.8.8:8080/path")
+            .await
+            .unwrap();
+        assert_eq!(
+            ok,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 8080)
+        );
+
+        // https default port is inferred.
+        let ok_https = resolve_and_validate("https://1.1.1.1/").await.unwrap();
+        assert_eq!(ok_https.port(), 443);
+
+        // Blocked literals and decimal-encoded loopback → SsrfBlocked.
+        for raw in [
+            "http://127.0.0.1/",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://10.0.0.1/",
+            "http://2130706433/",
+        ] {
+            let err = resolve_and_validate(raw).await;
+            assert!(
+                matches!(err, Err(ClientError::SsrfBlocked(_))),
+                "{raw} should be SsrfBlocked, got {err:?}"
+            );
+        }
     }
 }
