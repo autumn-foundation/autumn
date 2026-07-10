@@ -1639,7 +1639,7 @@ mod tests {
         let mut last = None;
         for (i, status) in statuses.iter().enumerate() {
             last = None;
-            let now = ts(i as i64);
+            let now = ts(i64::try_from(i).unwrap());
             match classify_health_transition(*status) {
                 HealthTransition::Down => {
                     let first = *down_since.entry(name.to_owned()).or_insert(now);

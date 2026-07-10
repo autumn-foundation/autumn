@@ -88,7 +88,7 @@ async fn dead_lettered_job_delivers_alert_to_configured_channel() {
     let alerter = Alerter::new(vec![Arc::new(channel.clone())], test_settings());
 
     let client = TestApp::new()
-        .state_initializer(move |state| state.insert_extension(alerter.clone()))
+        .state_initializer(move |state| state.insert_extension(alerter))
         .build();
 
     // Induce the dead-letter signal exactly as the job runtime does.
@@ -127,7 +127,7 @@ async fn where_to_look_honors_custom_actuator_prefix() {
     );
 
     let client = TestApp::new()
-        .state_initializer(move |state| state.insert_extension(alerter.clone()))
+        .state_initializer(move |state| state.insert_extension(alerter))
         .build();
 
     autumn_web::alerts::notify_dead_lettered_job(client.state(), "reporting_job", "boom");
@@ -158,7 +158,7 @@ async fn scheduled_task_failure_delivers_alert() {
     let alerter = Alerter::new(vec![Arc::new(channel.clone())], test_settings());
 
     let client = TestApp::new()
-        .state_initializer(move |state| state.insert_extension(alerter.clone()))
+        .state_initializer(move |state| state.insert_extension(alerter))
         .build();
 
     autumn_web::alerts::notify_scheduled_task_failure(
@@ -191,7 +191,7 @@ async fn sensitive_false_alerts_point_at_mounted_endpoint() {
         settings_with_prefix_sensitive("/actuator", false),
     );
     let client = TestApp::new()
-        .state_initializer(move |state| state.insert_extension(alerter.clone()))
+        .state_initializer(move |state| state.insert_extension(alerter))
         .build();
 
     autumn_web::alerts::notify_dead_lettered_job(client.state(), "reporting_job", "boom");
@@ -231,7 +231,7 @@ async fn sensitive_false_alerts_point_at_mounted_endpoint() {
         settings_with_prefix_sensitive("/actuator", true),
     );
     let client2 = TestApp::new()
-        .state_initializer(move |state| state.insert_extension(alerter2.clone()))
+        .state_initializer(move |state| state.insert_extension(alerter2))
         .build();
 
     autumn_web::alerts::notify_dead_lettered_job(client2.state(), "reporting_job", "boom");
@@ -297,7 +297,7 @@ async fn scheduled_task_recovers_then_realerts_on_new_failure() {
     let alerter = Alerter::new(vec![Arc::new(channel.clone())], test_settings());
 
     let client = TestApp::new()
-        .state_initializer(move |state| state.insert_extension(alerter.clone()))
+        .state_initializer(move |state| state.insert_extension(alerter))
         .build();
     let state = client.state();
 
@@ -340,7 +340,7 @@ async fn scheduled_task_recovery_without_prior_failure_is_silent() {
     let alerter = Alerter::new(vec![Arc::new(channel.clone())], test_settings());
 
     let client = TestApp::new()
-        .state_initializer(move |state| state.insert_extension(alerter.clone()))
+        .state_initializer(move |state| state.insert_extension(alerter))
         .build();
 
     autumn_web::alerts::notify_scheduled_task_recovered(client.state(), "healthy_task");
@@ -835,7 +835,7 @@ async fn alert_fans_out_to_every_channel() {
     );
 
     let client = TestApp::new()
-        .state_initializer(move |state| state.insert_extension(alerter.clone()))
+        .state_initializer(move |state| state.insert_extension(alerter))
         .build();
 
     autumn_web::alerts::notify_dead_lettered_job(client.state(), "widget_job", "boom");
