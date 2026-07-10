@@ -3149,8 +3149,10 @@ fn generate_auth_in_fresh_project_creates_expected_files() {
     );
     assert_eq!(
         routes.matches("session.insert(\"user_id\"").count(),
-        3,
-        "User auth routes should only write user_id as the generated account id key"
+        4,
+        "User auth routes should only write user_id as the generated account id key \
+         (the four session-establishment points: issue_remember_cookie, login, \
+         reset_password, confirm_email)"
     );
     assert!(
         routes.contains("email.split_once('@')"),
@@ -4401,7 +4403,13 @@ fn generate_auth_confirmation_tests_cover_required_flows() {
         "confirm_with_expired_token_fails",
         "confirm_with_replayed_token_fails",
         "resend_confirmation_rate_limit",
-        "email_change_reenters_unconfirmed",
+        // The old `email_change_reenters_unconfirmed` stub was replaced by the
+        // #1396 account-flow tests: `email_change_confirm_invalid_token_fails`
+        // guards the confirm endpoint, and `password_and_email_change_end_to_end`
+        // exercises the full pending-email change (old address stays usable until
+        // the new-address token is confirmed, then the new address signs in).
+        "email_change_confirm_invalid_token_fails",
+        "password_and_email_change_end_to_end",
     ] {
         assert!(tests.contains(flow), "tests/auth.rs missing test: {flow}");
     }

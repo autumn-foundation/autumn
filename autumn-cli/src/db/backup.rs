@@ -1267,7 +1267,8 @@ fn tool_on_path(tool: &str) -> bool {
     Command::new(tool)
         .arg("--version")
         .output()
-        .is_ok_and(|o| o.status.success())
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 // ─── Manifest ───────────────────────────────────────────────────────────────
