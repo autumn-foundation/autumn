@@ -829,11 +829,18 @@ let daily = repo
     .await?;
 ```
 
-Builder methods: `.order_by_aggregate_desc()` / `.order_by_aggregate_asc()`,
-`.limit(n)`, `.filter_eq(v)`, `.filter_range(lo, hi)`, and `.bucket(bucket)`
-(`DateBucket::Day` / `Week` / `Month`). Filter values are bound (never
-interpolated). A `timestamptz` (`DateTime<Utc>`) bucket uses
-`date_trunc(.., 'UTC')` for timezone-stable buckets.
+Builder methods available on **every** aggregate builder regardless of key type:
+`.order_by_aggregate_desc()` / `.order_by_aggregate_asc()`, `.limit(n)`,
+`.filter_eq(v)`, and `.filter_range(lo, hi)`. Filter values are bound (never
+interpolated).
+
+`.bucket(bucket)` (`DateBucket::Day` / `Week` / `Month`) is **only** defined when
+the group key `K` is a timestamp type — `NaiveDateTime` or `DateTime<Utc>` — since
+it swaps the raw group column for `date_trunc('<unit>', <col>)`. Calling it on a
+non-temporal aggregate (e.g. the `String`-keyed `sum_total_grouped_by_status()`
+above) is a compile error, because the method does not exist for that key. A
+`timestamptz` (`DateTime<Utc>`) bucket uses `date_trunc(.., 'UTC')` for
+timezone-stable buckets.
 
 **Gotchas:** on a sharded, tenant-scoped repo, *every* grouped aggregate —
 `count_grouped_by_*` included, not just `sum`/`avg`/`min`/`max` — rejects
@@ -1235,8 +1242,9 @@ async fn delete_account(session: Session) -> AutumnResult<Redirect> {
 **Effect:** before the body runs, `__check_step_up_with_config` verifies the
 session authenticated within `max_age` (default 5 minutes if bare `#[step_up]`).
 On failure it returns a JSON `401`-style challenge for API clients or a redirect
-(honoring `Referer`) for browsers. `max_age` accepts `"5m"`, `"1h"`, `"30s"`,
-or a bare number of seconds.
+(honoring `Referer`) for browsers. `max_age` is always a **string literal**:
+`"5m"`, `"1h"`, `"30s"`, or raw seconds as a string (`"300"`). A bare unquoted
+number (`max_age = 300`) is a compile error.
 
 ### `#[feature_flag("key", fallback = fn)]`
 
