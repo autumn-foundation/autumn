@@ -833,7 +833,7 @@ fn cargo_build_capturing(package: Option<&str>) -> (bool, Vec<BuildDiagnostic>) 
                 // whatever we captured so far rather than panicking.
                 break;
             };
-            if let Some(rendered) = error_rendered_from_line(&line) {
+            if let Some(rendered) = compiler_message_rendered(&line) {
                 eprint!("{rendered}");
             }
             buffer.push_str(&line);
@@ -856,27 +856,28 @@ fn cargo_build_capturing(package: Option<&str>) -> (bool, Vec<BuildDiagnostic>) 
 }
 
 /// If `line` is a single `cargo build --message-format=json` record that is a
-/// `compiler-message` at `error` level, return its `rendered` text so it can be
-/// echoed to the terminal the instant it arrives. Non-JSON lines, warnings, and
-/// other message kinds yield `None`. Mirrors the filtering in
-/// [`parse_build_diagnostics`] so the live echo and the returned diagnostics
-/// stay in agreement.
-fn error_rendered_from_line(line: &str) -> Option<String> {
+/// `compiler-message` carrying a non-empty `rendered` block, return that text so
+/// it can be echoed to the terminal the instant it arrives. This deliberately
+/// echoes diagnostics at *every* level (errors, warnings, notes, help, etc.) so
+/// the live output matches what plain `cargo build` would print — the overlay
+/// payload, built separately by [`parse_build_diagnostics`], stays errors-only.
+/// Non-JSON lines and non-`compiler-message` records (artifacts, build scripts,
+/// build-finished) yield `None`, as do compiler messages with no `rendered`
+/// text.
+fn compiler_message_rendered(line: &str) -> Option<String> {
     let value = serde_json::from_str::<serde_json::Value>(line).ok()?;
     if value.get("reason").and_then(serde_json::Value::as_str) != Some("compiler-message") {
         return None;
     }
-    let message = value.get("message")?;
-    if message.get("level").and_then(serde_json::Value::as_str) != Some("error") {
+    let rendered = value
+        .get("message")?
+        .get("rendered")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if rendered.is_empty() {
         return None;
     }
-    Some(
-        message
-            .get("rendered")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .to_owned(),
-    )
+    Some(rendered.to_owned())
 }
 
 /// Run `cargo build` for the given package. Returns true on success.
@@ -2197,6 +2198,43 @@ mod tests {
         assert_eq!(diags[1].file, "src/lib.rs");
         assert_eq!(diags[1].line, 12);
         assert_eq!(diags[1].column, 9);
+    }
+
+    #[test]
+    fn compiler_message_rendered_echoes_all_levels_but_not_other_records() {
+        // Warning-level messages must be echoed live so the terminal matches
+        // plain `cargo build` output, even though they never enter the overlay.
+        let warning = r#"{"reason":"compiler-message","message":{"code":null,"level":"warning","message":"unused variable: `x`","rendered":"warning: unused variable\n"}}"#;
+        assert_eq!(
+            compiler_message_rendered(warning).as_deref(),
+            Some("warning: unused variable\n"),
+        );
+
+        // Error-level messages are echoed too.
+        let error = r#"{"reason":"compiler-message","message":{"code":{"code":"E0425"},"level":"error","message":"cannot find value `foo`","rendered":"error[E0425]: cannot find value `foo`\n"}}"#;
+        assert_eq!(
+            compiler_message_rendered(error).as_deref(),
+            Some("error[E0425]: cannot find value `foo`\n"),
+        );
+
+        // Non-JSON progress lines yield nothing.
+        assert_eq!(compiler_message_rendered("   Compiling app v0.1.0"), None);
+
+        // Non-`compiler-message` records (artifacts, build scripts, finished)
+        // are never echoed.
+        assert_eq!(
+            compiler_message_rendered(r#"{"reason":"compiler-artifact","target":{"name":"app"}}"#),
+            None,
+        );
+
+        // A compiler message with no `rendered` text yields nothing rather than
+        // an empty echo.
+        assert_eq!(
+            compiler_message_rendered(
+                r#"{"reason":"compiler-message","message":{"level":"warning","message":"x"}}"#
+            ),
+            None,
+        );
     }
 
     /// A representative single-error diagnostic list for the build-error tests.
