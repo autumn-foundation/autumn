@@ -58,6 +58,13 @@ look next** pointer.
 | **High 5xx rate** | the rolling 5xx rate crosses a threshold | `/actuator/metrics` | `error_rate_threshold` (`0.05`), `error_rate_min_requests` (`20`) |
 | **Scheduled-task failure** | a framework-scheduled task (cron or fixed-delay — e.g. backup, cert-renewal) returns an error | `/actuator/tasks` | always on |
 
+The "where to look" paths above assume the default actuator prefix. If you
+change `[actuator] prefix` (or set `AUTUMN_ACTUATOR__PREFIX`), each alert's
+`where_to_look` is rebuilt from the configured prefix — e.g. with
+`prefix = "/_ops"` a dead-lettered-job alert points at `/_ops/jobs` — so it
+always references the endpoint you actually mounted rather than a `/actuator/*`
+404.
+
 The 5xx-rate and health conditions are evaluated on a **background tick**
 (`eval_interval_secs`, default `30`) — never on the request path — so they add
 no request latency (AC #6). The 5xx rate is measured over the requests seen
@@ -140,6 +147,9 @@ The webhook payload is JSON:
   "details": { "job": "reporting_job", "error": "connection refused" }
 }
 ```
+
+`where_to_look` uses your configured actuator prefix, so under a custom
+`[actuator] prefix` (e.g. `/_ops`) it reads `/_ops/jobs` instead.
 
 Alert webhooks are **always signed**, exactly like Autumn's outbound webhooks:
 an `Autumn-Signature: t=<unix>,v1=<hmac-sha256>` header over `"<t>.<body>"` using

@@ -43,12 +43,17 @@ impl AlertChannel for CapturingChannel {
 }
 
 fn test_settings() -> AlerterSettings {
+    settings_with_prefix("/actuator")
+}
+
+fn settings_with_prefix(prefix: &str) -> AlerterSettings {
     AlerterSettings {
         dedup_window: std::time::Duration::from_secs(900),
         health_grace: std::time::Duration::from_secs(60),
         error_rate_threshold: 0.05,
         error_rate_min_requests: 20,
         eval_interval: std::time::Duration::from_secs(30),
+        actuator_prefix: prefix.to_owned(),
     }
 }
 
@@ -96,6 +101,37 @@ async fn dead_lettered_job_delivers_alert_to_configured_channel() {
     assert!(alert.title.contains("reporting_job"));
     assert!(alert.summary.contains("connection refused"));
     assert!(!alert.host.is_empty());
+}
+
+/// Finding 2: an alert's `where_to_look` must honor the configured `[actuator]
+/// prefix`. With a custom prefix, the emitted alert points operators at the real
+/// actuator endpoint (`/_ops/jobs`) instead of a hard-coded `/actuator/jobs`
+/// that would 404. The default-prefix case is covered by
+/// `dead_lettered_job_delivers_alert_to_configured_channel` above (`/actuator/jobs`).
+#[tokio::test]
+async fn where_to_look_honors_custom_actuator_prefix() {
+    let channel = CapturingChannel::default();
+    let alerter = Alerter::new(vec![Arc::new(channel.clone())], settings_with_prefix("/_ops"));
+
+    let client = TestApp::new()
+        .state_initializer(move |state| state.insert_extension(alerter.clone()))
+        .build();
+
+    autumn_web::alerts::notify_dead_lettered_job(client.state(), "reporting_job", "boom");
+
+    wait_for(&channel, 1).await;
+    let alerts = channel.alerts();
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(
+        alerts[0].where_to_look, "/_ops/jobs",
+        "where_to_look must use the configured actuator prefix, not a hard-coded /actuator"
+    );
+
+    // A scheduled-task failure uses the same prefix for its /tasks pointer.
+    autumn_web::alerts::notify_scheduled_task_failure(client.state(), "nightly_backup", "disk full");
+    wait_for(&channel, 2).await;
+    let alerts = channel.alerts();
+    assert_eq!(alerts[1].where_to_look, "/_ops/tasks");
 }
 
 /// AC #2 (condition d): a framework-scheduled task failure produces an alert.

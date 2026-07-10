@@ -98,7 +98,14 @@ impl AlertCondition {
         }
     }
 
-    /// The actuator endpoint an operator should consult for this condition.
+    /// The actuator endpoint an operator should consult for this condition,
+    /// under the **default** actuator prefix (`/actuator`).
+    ///
+    /// This is the builder default. When the app configures a custom
+    /// `[actuator] prefix`, the emitted alert's `where_to_look` is rebuilt from
+    /// the effective prefix (see [`actuator_where_to_look`]) so it points at the
+    /// real endpoint rather than a `/actuator/*` 404. Keep the suffixes here in
+    /// sync with [`Self::actuator_suffix`].
     #[must_use]
     pub const fn where_to_look(self) -> &'static str {
         match self {
@@ -108,6 +115,32 @@ impl AlertCondition {
             Self::ScheduledTaskFailure => "/actuator/tasks",
         }
     }
+
+    /// The actuator endpoint suffix (path *below* the actuator prefix) an
+    /// operator should consult for this condition. Combined with the effective
+    /// prefix by [`actuator_where_to_look`].
+    const fn actuator_suffix(self) -> &'static str {
+        match self {
+            Self::DeadLetteredJob => "/jobs",
+            Self::HealthIndicatorDown => "/health",
+            Self::HighErrorRate => "/metrics",
+            Self::ScheduledTaskFailure => "/tasks",
+        }
+    }
+}
+
+/// Build the actuator `where_to_look` pointer for `condition` under the
+/// effective actuator `prefix`.
+///
+/// Uses the same path builder as the router
+/// ([`actuator_route_path`](crate::actuator::actuator_route_path)) so the
+/// derived path matches the mounted endpoint exactly — including prefix
+/// normalization (leading slash added, trailing slash trimmed, `/` or empty
+/// treated as root) — and never yields `//` or a missing slash. With the
+/// default prefix (`/actuator`) this reproduces
+/// [`AlertCondition::where_to_look`] byte-for-byte.
+fn actuator_where_to_look(prefix: &str, condition: AlertCondition) -> String {
+    crate::actuator::actuator_route_path(prefix, condition.actuator_suffix())
 }
 
 /// Severity class of an [`Alert`]. External routers (`PagerDuty` etc.) map this
@@ -421,16 +454,22 @@ pub struct AlerterSettings {
     pub error_rate_min_requests: u64,
     /// Background evaluation cadence (conditions b and c).
     pub eval_interval: std::time::Duration,
+    /// The effective actuator URL prefix (`[actuator] prefix`, default
+    /// `/actuator`). Every alert's `where_to_look` pointer is built from this so
+    /// operators are sent to the real actuator endpoint even when the prefix is
+    /// customized. Stored raw; normalization happens in [`actuator_where_to_look`].
+    pub actuator_prefix: String,
 }
 
 impl AlerterSettings {
-    fn from_config(config: &AlertConfig) -> Self {
+    fn from_config(config: &AlertConfig, actuator_prefix: String) -> Self {
         Self {
             dedup_window: std::time::Duration::from_secs(config.dedup_window_secs.max(1)),
             health_grace: std::time::Duration::from_secs(config.health_grace_secs),
             error_rate_threshold: config.error_rate_threshold,
             error_rate_min_requests: config.error_rate_min_requests.max(1),
             eval_interval: std::time::Duration::from_secs(config.eval_interval_secs.max(1)),
+            actuator_prefix,
         }
     }
 }
@@ -574,6 +613,10 @@ pub fn notify_dead_lettered_job(state: &AppState, job_name: &str, error: &str) {
     .summary(format!(
         "Background job '{job_name}' exhausted its retries and was moved to the dead-letter queue. Last error: {error}"
     ))
+    .where_to_look(actuator_where_to_look(
+        &alerter.settings().actuator_prefix,
+        AlertCondition::DeadLetteredJob,
+    ))
     .detail("job", job_name)
     .detail("error", error)
     .build();
@@ -593,6 +636,10 @@ pub fn notify_scheduled_task_failure(state: &AppState, task_name: &str, error: &
     .title(format!("Scheduled task '{task_name}' failed"))
     .summary(format!(
         "The framework-scheduled task '{task_name}' returned an error on its last run: {error}"
+    ))
+    .where_to_look(actuator_where_to_look(
+        &alerter.settings().actuator_prefix,
+        AlertCondition::ScheduledTaskFailure,
     ))
     .detail("task", task_name)
     .detail("error", error)
@@ -619,6 +666,10 @@ pub fn notify_scheduled_task_recovered(state: &AppState, task_name: &str) {
     .title(format!("Scheduled task '{task_name}' recovered"))
     .summary(format!(
         "The framework-scheduled task '{task_name}' completed successfully after a previous failure."
+    ))
+    .where_to_look(actuator_where_to_look(
+        &alerter.settings().actuator_prefix,
+        AlertCondition::ScheduledTaskFailure,
     ))
     .detail("task", task_name)
     .build();
@@ -992,7 +1043,11 @@ pub fn install_from_config(
         return;
     }
 
-    let settings = AlerterSettings::from_config(config);
+    // Capture the effective actuator prefix so every alert's `where_to_look`
+    // points at the real actuator endpoints even under a custom `[actuator]
+    // prefix`. The full config is installed on `state` before this runs.
+    let actuator_prefix = state.config().actuator.prefix;
+    let settings = AlerterSettings::from_config(config, actuator_prefix);
     let alerter = Alerter::new(channels, settings);
     state.insert_extension(alerter.clone());
     spawn_evaluation_loop(state.clone(), alerter);
@@ -1087,6 +1142,10 @@ fn evaluate_error_rate(
                 "{err_delta} of the last {req_delta} requests returned 5xx ({pct:.1}%), \
                  crossing the {threshold_pct:.1}% threshold."
             ))
+            .where_to_look(actuator_where_to_look(
+                &settings.actuator_prefix,
+                AlertCondition::HighErrorRate,
+            ))
             .detail("rate", format!("{rate:.4}"))
             .detail("errors", err_delta.to_string())
             .detail("requests", req_delta.to_string())
@@ -1098,6 +1157,10 @@ fn evaluate_error_rate(
             .summary(format!(
                 "The 5xx error rate is back under the threshold ({pct:.1}% of {req_delta} requests).",
                 pct = rate * 100.0,
+            ))
+            .where_to_look(actuator_where_to_look(
+                &settings.actuator_prefix,
+                AlertCondition::HighErrorRate,
             ))
             .build();
         let _ = alerter.recover(alert);
@@ -1132,6 +1195,10 @@ async fn evaluate_health(
                         result.name,
                         grace_secs = settings.health_grace.as_secs(),
                     ))
+                    .where_to_look(actuator_where_to_look(
+                        &settings.actuator_prefix,
+                        AlertCondition::HealthIndicatorDown,
+                    ))
                     .detail("indicator", result.name.clone())
                     .detail("down_seconds", secs.to_string())
                     .build();
@@ -1143,6 +1210,10 @@ async fn evaluate_health(
                 .summary(format!(
                     "Health indicator '{}' is reporting healthy again.",
                     result.name
+                ))
+                .where_to_look(actuator_where_to_look(
+                    &settings.actuator_prefix,
+                    AlertCondition::HealthIndicatorDown,
                 ))
                 .detail("indicator", result.name.clone())
                 .build();
@@ -1264,6 +1335,43 @@ mod tests {
     }
 
     #[test]
+    fn actuator_where_to_look_honors_prefix() {
+        // Default prefix reproduces the const builder default byte-for-byte.
+        assert_eq!(
+            actuator_where_to_look("/actuator", AlertCondition::DeadLetteredJob),
+            "/actuator/jobs"
+        );
+        assert_eq!(
+            actuator_where_to_look("/actuator", AlertCondition::HealthIndicatorDown),
+            "/actuator/health"
+        );
+        // A custom prefix is honored for every condition.
+        assert_eq!(
+            actuator_where_to_look("/_ops", AlertCondition::DeadLetteredJob),
+            "/_ops/jobs"
+        );
+        assert_eq!(
+            actuator_where_to_look("/_ops", AlertCondition::HighErrorRate),
+            "/_ops/metrics"
+        );
+        assert_eq!(
+            actuator_where_to_look("/_ops", AlertCondition::ScheduledTaskFailure),
+            "/_ops/tasks"
+        );
+        // Normalization matches the router: a trailing slash is trimmed and a
+        // missing leading slash is added, so no `//` or missing-slash paths.
+        assert_eq!(
+            actuator_where_to_look("_ops/", AlertCondition::HealthIndicatorDown),
+            "/_ops/health"
+        );
+        // Root ("/" or empty) prefix yields the bare suffix, matching the router.
+        assert_eq!(
+            actuator_where_to_look("/", AlertCondition::DeadLetteredJob),
+            "/jobs"
+        );
+    }
+
+    #[test]
     fn stable_dedup_key_survives_trigger_and_recovery() {
         let key = "dead_lettered_job:emailer";
         let t = Alert::trigger(AlertCondition::DeadLetteredJob, key).build();
@@ -1300,6 +1408,7 @@ mod tests {
             error_rate_threshold: 0.05,
             error_rate_min_requests: 20,
             eval_interval: std::time::Duration::from_secs(30),
+            actuator_prefix: "/actuator".to_owned(),
         }
     }
 

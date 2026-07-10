@@ -2594,6 +2594,11 @@ fn resolve_alert_destination() -> (bool, bool) {
 /// Layers, highest first: env var, `[profile.{profile}.alerts]`, base
 /// `[alerts]`. Only a layer that omits the key entirely falls through.
 ///
+/// A webhook counts as configured only when BOTH `webhook_url` and
+/// `webhook_secret` resolve non-empty under this precedence — mirroring the
+/// runtime, which never registers an unsigned webhook channel — so a webhook URL
+/// with a missing or cleared secret is not a destination.
+///
 /// Split out from [`resolve_alert_destination`] so the precedence logic is unit
 /// testable without mutating process-global env/cwd state.
 fn resolve_alert_destination_from_sources<F>(
@@ -2641,7 +2646,15 @@ where
     };
 
     let email = resolve("AUTUMN_ALERTS__EMAIL", "email");
-    let webhook = resolve("AUTUMN_ALERTS__WEBHOOK_URL", "webhook_url");
+    // A webhook destination requires BOTH a URL and a signing secret to be a real
+    // destination: the runtime (`alerts::install_from_config`) refuses to register
+    // an unsigned webhook channel, so a URL with a missing/cleared secret installs
+    // NO channel. Count the webhook only when both resolve non-empty under the same
+    // per-field precedence, so doctor agrees with runtime (URL-without-secret is
+    // NOT a destination → in production with no other destination, doctor warns).
+    let webhook_url = resolve("AUTUMN_ALERTS__WEBHOOK_URL", "webhook_url");
+    let webhook_secret = resolve("AUTUMN_ALERTS__WEBHOOK_SECRET", "webhook_secret");
+    let webhook = webhook_url && webhook_secret;
     (email, webhook)
 }
 
@@ -4563,8 +4576,10 @@ pub struct Vault {
     fn resolve_alert_destination_empty_env_clears_base_email() {
         // An explicitly-empty AUTUMN_ALERTS__EMAIL is the highest-priority layer
         // and must CLEAR a base value; an unset webhook var falls through to base.
+        // The base carries BOTH a webhook_url and a webhook_secret so the webhook
+        // is a real (signed) destination.
         let table: toml::Table = toml::from_str(
-            "[alerts]\nemail = \"dev@example.com\"\nwebhook_url = \"https://hooks.example/x\"\n",
+            "[alerts]\nemail = \"dev@example.com\"\nwebhook_url = \"https://hooks.example/x\"\nwebhook_secret = \"s3cr3t\"\n",
         )
         .unwrap();
         let env = |key: &str| (key == "AUTUMN_ALERTS__EMAIL").then(String::new);
@@ -4576,12 +4591,81 @@ pub struct Vault {
 
     #[test]
     fn resolve_alert_destination_nonempty_env_wins_over_absent_toml() {
-        let env = |key: &str| {
-            (key == "AUTUMN_ALERTS__WEBHOOK_URL").then(|| "https://hooks.example/y".to_owned())
+        // Env supplies both the webhook URL and its signing secret, so the webhook
+        // resolves as a real signed destination with no TOML present.
+        let env = |key: &str| match key {
+            "AUTUMN_ALERTS__WEBHOOK_URL" => Some("https://hooks.example/y".to_owned()),
+            "AUTUMN_ALERTS__WEBHOOK_SECRET" => Some("s3cr3t".to_owned()),
+            _ => None,
         };
         let (email, webhook) = resolve_alert_destination_from_sources(env, None, "prod");
         assert!(!email);
         assert!(webhook, "env webhook should resolve as configured with no TOML");
+    }
+
+    #[test]
+    fn resolve_alert_destination_webhook_requires_secret() {
+        // (a) URL + secret both set at base → webhook is a real destination and a
+        // production run passes.
+        let table: toml::Table = toml::from_str(
+            "[alerts]\nwebhook_url = \"https://hooks.example/x\"\nwebhook_secret = \"s3cr3t\"\n",
+        )
+        .unwrap();
+        let (email, webhook) =
+            resolve_alert_destination_from_sources(no_env, Some(&table), "prod");
+        assert!(!email);
+        assert!(webhook, "webhook_url + webhook_secret must count as configured");
+        let r = check_alert_destination_impl(email, webhook, true);
+        assert!(matches!(r.status, CheckStatus::Pass));
+    }
+
+    #[test]
+    fn resolve_alert_destination_webhook_url_without_secret_is_not_configured() {
+        // (b) URL set but secret MISSING → runtime installs no (unsigned) channel,
+        // so doctor must NOT count it and must warn in production.
+        let table: toml::Table =
+            toml::from_str("[alerts]\nwebhook_url = \"https://hooks.example/x\"\n").unwrap();
+        let (email, webhook) =
+            resolve_alert_destination_from_sources(no_env, Some(&table), "prod");
+        assert!(!email);
+        assert!(
+            !webhook,
+            "a webhook_url with no signing secret is not a destination"
+        );
+        let r = check_alert_destination_impl(email, webhook, true);
+        assert!(
+            matches!(r.status, CheckStatus::Warn),
+            "URL-without-secret in production must warn"
+        );
+    }
+
+    #[test]
+    fn resolve_alert_destination_prod_profile_clears_webhook_secret() {
+        // (c) URL + secret set at base, but the prod profile CLEARS the secret with
+        // an empty string → the higher (profile) layer wins, so the webhook is not
+        // a signed destination and doctor warns in production.
+        let table: toml::Table = toml::from_str(
+            "[alerts]\nwebhook_url = \"https://hooks.example/x\"\nwebhook_secret = \"s3cr3t\"\n[profile.prod.alerts]\nwebhook_secret = \"\"\n",
+        )
+        .unwrap();
+        let (email, webhook) =
+            resolve_alert_destination_from_sources(no_env, Some(&table), "prod");
+        assert!(!email);
+        assert!(
+            !webhook,
+            "a prod-profile empty webhook_secret must clear the base secret"
+        );
+        let r = check_alert_destination_impl(email, webhook, true);
+        assert!(matches!(r.status, CheckStatus::Warn));
+
+        // And an empty AUTUMN_ALERTS__WEBHOOK_SECRET env var clears it just the same.
+        let env = |key: &str| (key == "AUTUMN_ALERTS__WEBHOOK_SECRET").then(String::new);
+        let (_email, webhook_env) =
+            resolve_alert_destination_from_sources(env, Some(&table), "prod");
+        assert!(
+            !webhook_env,
+            "an empty AUTUMN_ALERTS__WEBHOOK_SECRET must clear the secret"
+        );
     }
 
     // ── compute_summary ──────────────────────────────────────────────────────
