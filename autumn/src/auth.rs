@@ -188,8 +188,23 @@ pub async fn __check_secured_with_key(
         ));
     };
 
-    // Tag the request-scoped log context (#1169) with the authenticated user
-    // so every subsequent event automatically carries `user_id`.
+    // Publish the authenticated principal as the request's current actor
+    // (#1383) so generated repository/audit writes auto-attribute to it, and
+    // tag the request-scoped log context (#1169) with the same user so every
+    // subsequent event automatically carries `user_id`.
+    //
+    // Seed the actor only if no stronger/earlier principal is already set. This
+    // `#[secured]` role check runs inside the handler body, *inner* to the auth
+    // middleware layers (`RequireApiToken` bearer, `RequireAuth` session). On a
+    // route that combines `RequireApiToken` with `#[secured]`, the bearer
+    // middleware has already published the token principal by the time this runs;
+    // a request that *also* carries a session cookie must stay attributed to the
+    // token principal, so we must not clobber it with the session user here.
+    // (`log::context::set_user_id` for #1169 is independent and stays
+    // unconditional.)
+    if crate::current::Current::actor().is_none() {
+        crate::current::Current::set_actor(user_id.clone());
+    }
     crate::log::context::set_user_id(user_id);
 
     // Check authorization: if roles are specified, the session's "role"
@@ -392,9 +407,22 @@ where
                 // "authenticated_principal" works without an extra middleware shim.
                 req.extensions_mut()
                     .insert(crate::security::RateLimitPrincipal(user_id.clone()));
-                // Tag the request-scoped log context (#1169) so handler logs for
-                // middleware-authenticated requests carry `user_id` too, matching
-                // the `#[secured]` path.
+                // Publish the authenticated principal as the request's current
+                // actor (#1383) and tag the request-scoped log context (#1169)
+                // so handler logs for middleware-authenticated requests carry
+                // `user_id` too, matching the `#[secured]` path.
+                //
+                // Seed the actor only if no stronger/earlier principal is already
+                // set. On a normal session-auth route nothing publishes an actor
+                // before this middleware (the outer `LogContextLayer` only
+                // establishes an empty scope), so `actor().is_none()` is true and
+                // this still seeds. The guard keeps the uniform "first/outermost
+                // resolver wins" rule: if an outer bearer layer or an explicit
+                // `with_actor(...)` scope already resolved a principal, that one
+                // stays. (`set_user_id` for #1169 is independent, stays unconditional.)
+                if crate::current::Current::actor().is_none() {
+                    crate::current::Current::set_actor(user_id.clone());
+                }
                 crate::log::context::set_user_id(user_id);
                 inner.call(req).await
             } else {
@@ -2216,6 +2244,20 @@ where
                     // `#[secured(scopes = …)]` gate and `PolicyContext`
                     // scope-aware helpers read this extension.
                     req.extensions_mut().insert(ApiTokenScopes(scopes));
+                    // Publish the token's principal as the request's current
+                    // actor (#1383) so generated repository/audit writes
+                    // auto-attribute to it.
+                    //
+                    // Seed the actor only if no stronger/earlier principal is
+                    // already set. On a bearer-auth route nothing publishes an
+                    // actor before this middleware (the outer `LogContextLayer`
+                    // only establishes an empty scope), so `actor().is_none()` is
+                    // true and this still seeds. The guard keeps the uniform
+                    // "first/outermost resolver wins" rule: an explicit
+                    // `with_actor(...)` scope already in effect is preserved.
+                    if crate::current::Current::actor().is_none() {
+                        crate::current::Current::set_actor(principal_id.clone());
+                    }
                     req.extensions_mut().insert(ApiTokenPrincipal(principal_id));
                     inner.call(req).await
                 }
@@ -3346,6 +3388,47 @@ mod tests {
         let session = crate::session::Session::new_for_test("sess".into(), data);
         let result = __check_secured(&session, &["admin", "editor"]).await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn check_secured_seeds_actor_when_none_established() {
+        // On a normal single-auth `#[secured]` route nothing publishes an actor
+        // before the role check (the outer `LogContextLayer` establishes only an
+        // empty scope), so the resolved session user becomes the ambient actor
+        // and versioned writes attribute to them (#1383).
+        crate::current::scope_request(async {
+            assert_eq!(crate::current::Current::actor(), None);
+            let data = std::collections::HashMap::from([("user_id".into(), "42".into())]);
+            let session = crate::session::Session::new_for_test("sess".into(), data);
+            let result = __check_secured_with_key(&session, "user_id", &[]).await;
+            assert!(result.is_ok());
+            assert_eq!(crate::current::Current::actor(), Some("42".to_owned()));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn check_secured_preserves_already_established_actor() {
+        // The flagged clobber (#1383): a route that combines `RequireApiToken`
+        // (bearer, OUTER) with `#[secured]` and *also* carries a session cookie.
+        // The bearer middleware has already published the token principal by the
+        // time this inner role check runs; resolving the session user here must
+        // NOT overwrite the stronger, earlier principal, so versioned writes stay
+        // attributed to the token principal rather than the cookie user.
+        crate::current::scope_request(async {
+            crate::current::Current::set_actor("token-principal".to_owned());
+            let data = std::collections::HashMap::from([("user_id".into(), "42".into())]);
+            let session = crate::session::Session::new_for_test("sess".into(), data);
+            let result = __check_secured_with_key(&session, "user_id", &[]).await;
+            // The session still authenticates/authorizes normally...
+            assert!(result.is_ok());
+            // ...but the already-established principal wins as the ambient actor.
+            assert_eq!(
+                crate::current::Current::actor(),
+                Some("token-principal".to_owned())
+            );
+        })
+        .await;
     }
 
     // ── #[secured] macro integration tests ──────────────────────

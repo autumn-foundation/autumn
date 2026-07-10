@@ -87,6 +87,7 @@ pub mod canary;
 pub mod circuit_breaker;
 pub mod config;
 pub mod credentials;
+pub mod current;
 #[cfg(feature = "db")]
 pub mod db;
 pub mod dotenv;

@@ -974,7 +974,9 @@ fn is_string_param_type(ty: &syn::Type) -> bool {
 /// - `op` — `"insert"`, `"update"`, or `"delete"`
 /// - `with_ctx` — when `true` a `MutationContext` variable named `ctx`
 ///   is in scope; actor / `request_id` are taken from it.
-///   When `false` the actor is hard-coded to `"system"` and `request_id` is `NULL`.
+///   When `false` the actor is read from the ambient current-actor scope
+///   (`Current::actor()`), falling back to `SYSTEM_ACTOR`, and `request_id` is
+///   `NULL`.
 /// - `record_expr` — token stream for the record value (implements `Serialize`)
 /// - `before_expr` — token stream for the "before" record value for updates
 ///   (same type; ignored for inserts/deletes).
@@ -988,10 +990,22 @@ fn vh_insert_ts(
     conn_ident: &TokenStream,
     model_ident: &proc_macro2::Ident,
 ) -> TokenStream {
+    // Choose the version-history actor. Hooked repos read the per-record
+    // `MutationContext` (already seeded from the ambient current actor, and
+    // overridable by a `before_*` hook). Non-hooked repos have no `ctx`, so they
+    // read the ambient current actor directly. Both fall back to the canonical
+    // `SYSTEM_ACTOR` when no actor is in scope.
     let actor_ts = if with_ctx {
-        quote! { ctx.actor.as_deref().unwrap_or("system") }
+        quote! {
+            ctx.actor
+                .clone()
+                .unwrap_or_else(|| ::autumn_web::version_history::VersionEntry::SYSTEM_ACTOR.to_string())
+        }
     } else {
-        quote! { "system" }
+        quote! {
+            ::autumn_web::current::Current::actor()
+                .unwrap_or_else(|| ::autumn_web::version_history::VersionEntry::SYSTEM_ACTOR.to_string())
+        }
     };
     let request_id_ts = if with_ctx {
         quote! { ctx.request_id.as_deref() }
@@ -1047,7 +1061,7 @@ fn vh_insert_ts(
                 use ::autumn_web::version_history::VersionedRecord as _;
                 (#record_expr).version_tenant_id()
             };
-            let __vh_actor: &str = #actor_ts;
+            let __vh_actor: ::std::string::String = #actor_ts;
             let __vh_request_id: ::core::option::Option<&str> = #request_id_ts;
             ::autumn_web::reexports::diesel::sql_query(
                 "INSERT INTO _autumn_version_history \
@@ -13907,7 +13921,7 @@ mod tests {
             "hooked versioned save_many must record history for each inserted record before moving chunk results: {section}"
         );
         assert!(
-            section.contains("ctx . actor . as_deref"),
+            section.contains("ctx . actor . clone"),
             "hooked versioned save_many history should use the per-record MutationContext: {section}"
         );
     }
