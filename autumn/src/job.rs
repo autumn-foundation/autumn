@@ -1258,6 +1258,7 @@ fn is_final_attempt<T: PartialOrd>(attempt: &T, max_attempts: &T) -> bool {
 /// stable hash of the full canonicalized payload.
 fn job_unique_key(uniqueness: &JobUniqueness, payload: &Value) -> String {
     let (_, payload) = crate::job_tracking::split_tracked_payload(payload);
+    let (_, payload) = crate::payload_version::split_version(payload);
     if uniqueness.by.is_empty() {
         let mut canonical = String::new();
         write_canonical_json(payload, &mut canonical);
@@ -1283,6 +1284,7 @@ fn job_unique_key(uniqueness: &JobUniqueness, payload: &Value) -> String {
 /// payloads lacking the field share one scope.
 fn job_concurrency_scope(concurrency: &JobConcurrency, payload: &Value) -> Option<String> {
     let (_, payload) = crate::job_tracking::split_tracked_payload(payload);
+    let (_, payload) = crate::payload_version::split_version(payload);
     concurrency.key.as_ref().map(|field| {
         let mut scope = String::new();
         write_canonical_json(payload.get(field).unwrap_or(&Value::Null), &mut scope);
@@ -1292,6 +1294,7 @@ fn job_concurrency_scope(concurrency: &JobConcurrency, payload: &Value) -> Optio
 
 fn job_payload_identity(payload: &Value) -> (Option<String>, Option<String>) {
     let (_, payload) = crate::job_tracking::split_tracked_payload(payload);
+    let (_, payload) = crate::payload_version::split_version(payload);
     let principal = first_payload_string(payload, &["principal_id", "principal", "user_id"]);
     let correlation = first_payload_string(payload, &["correlation_id", "request_id"]);
     (principal, correlation)
@@ -11494,6 +11497,54 @@ mod tests {
 
         let (principal, _) = job_payload_identity(&wrapped);
         assert_eq!(principal.as_deref(), Some("user:7"));
+    }
+
+    #[test]
+    fn job_unique_key_and_identity_strip_the_version_envelope() {
+        // A v1 job (raw args) and its versioned re-encoding must hash
+        // identically so dedup still coalesces across a deploy that starts
+        // wrapping payloads.
+        let inner = serde_json::json!({"account_id": 42, "principal_id": "user:7"});
+        let versioned = crate::payload_version::wrap(2, inner.clone());
+
+        let uniqueness = JobUniqueness {
+            by: Vec::new(),
+            window: JobUniquenessWindow::Running,
+        };
+        assert_eq!(
+            job_unique_key(&uniqueness, &versioned),
+            job_unique_key(&uniqueness, &inner),
+            "the version envelope must not change the derived unique key"
+        );
+
+        let by_field = JobUniqueness {
+            by: vec!["account_id".to_string()],
+            window: JobUniquenessWindow::Running,
+        };
+        assert_eq!(
+            job_unique_key(&by_field, &versioned),
+            job_unique_key(&by_field, &inner)
+        );
+
+        let concurrency = JobConcurrency {
+            limit: 1,
+            key: Some("account_id".to_string()),
+        };
+        assert_eq!(
+            job_concurrency_scope(&concurrency, &versioned),
+            job_concurrency_scope(&concurrency, &inner)
+        );
+
+        let (principal, _) = job_payload_identity(&versioned);
+        assert_eq!(principal.as_deref(), Some("user:7"));
+
+        // Composition: a tracked + versioned payload strips both envelopes.
+        let tracked_versioned = crate::job_tracking::wrap_tracked_payload("h", &versioned);
+        assert_eq!(
+            job_unique_key(&uniqueness, &tracked_versioned),
+            job_unique_key(&uniqueness, &inner),
+            "tracked + versioned must strip both envelopes for key derivation"
+        );
     }
 
     #[tokio::test]

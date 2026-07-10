@@ -2540,8 +2540,12 @@ impl TestClient {
     #[allow(clippy::needless_pass_by_value)]
     pub fn assert_job_enqueued_with(&self, name: &str, payload: serde_json::Value) -> &Self {
         let jobs = self.enqueued_jobs();
+        // Strip the opt-in schema-version envelope (issue #1205) so payload
+        // assertions stay on clean args even for `#[job(version = N)]` jobs
+        // whose stored payload is wrapped as `{__autumn_schema_version, args}`.
         assert!(
-            jobs.iter().any(|j| j.name == name && j.payload == payload),
+            jobs.iter().any(|j| j.name == name
+                && *crate::payload_version::split_version(&j.payload).1 == payload),
             "expected a job named '{name}' enqueued with payload {payload}, but no match was found.\nEnqueued jobs:\n{}",
             format_recorded_jobs(&jobs)
         );

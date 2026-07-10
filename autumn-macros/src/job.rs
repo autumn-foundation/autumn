@@ -19,6 +19,11 @@ struct JobAttrs {
     unique_for_ms: Option<u64>,
     concurrency: Option<u32>,
     concurrency_key: Option<String>,
+    /// Declared schema version for this job's payload (issue #1205).
+    /// `None` = version 1 (un-versioned).
+    version: Option<u32>,
+    /// Optional payload-upgrade hook `fn(u32, Value) -> Result<Value, E>`.
+    upgrade: Option<syn::Path>,
 }
 
 fn parse_basic_arg(
@@ -48,6 +53,16 @@ fn parse_basic_arg(
             ));
         }
         result.queue = Some(queue);
+    } else if meta.path.is_ident("version") {
+        let value: LitInt = meta.value()?.parse()?;
+        let version = value.base10_parse::<u32>()?;
+        if version == 0 {
+            return Err(meta.error("version must be greater than zero"));
+        }
+        result.version = Some(version);
+    } else if meta.path.is_ident("upgrade") {
+        let value: syn::Path = meta.value()?.parse()?;
+        result.upgrade = Some(value);
     } else {
         return Ok(false);
     }
@@ -169,6 +184,8 @@ fn parse_job_args(attr: TokenStream) -> syn::Result<JobAttrs> {
         unique_for_ms: None,
         concurrency: None,
         concurrency_key: None,
+        version: None,
+        upgrade: None,
     };
 
     syn::meta::parser(|meta| {
@@ -180,7 +197,8 @@ fn parse_job_args(attr: TokenStream) -> syn::Result<JobAttrs> {
         } else {
             Err(meta.error(
                 "unsupported attribute: expected name, max_attempts, backoff_ms, queue, unique, \
-                 unique_by, unique_window, unique_for_ms, concurrency, or concurrency_key",
+                 unique_by, unique_window, unique_for_ms, concurrency, concurrency_key, version, \
+                 or upgrade",
             ))
         }
     })
@@ -300,6 +318,24 @@ pub fn job_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let uniqueness = uniqueness_tokens(&attrs);
     let concurrency = concurrency_tokens(&attrs);
 
+    // ── Versioned payloads (issue #1205) ─────────────────────────────────────
+    // Wrap args in the schema-version envelope only when the job opts in
+    // (declares version > 1 or an upgrade hook); otherwise store raw args so
+    // un-versioned jobs are byte-identical to pre-#1205 behavior.
+    let version = attrs.version.unwrap_or(1);
+    let should_wrap = version > 1 || attrs.upgrade.is_some();
+    let wrap_payload = if should_wrap {
+        quote! { let payload = ::autumn_web::payload_version::wrap(#version, payload); }
+    } else {
+        quote! {}
+    };
+    let upgrade_opt = attrs.upgrade.as_ref().map_or_else(
+        || quote! { ::core::option::Option::None },
+        |path| {
+            quote! { ::core::option::Option::Some(#path as ::autumn_web::payload_version::UpgradeFn) }
+        },
+    );
+
     let handler_call = if takes_context {
         quote! { #fn_name(state, args, ::autumn_web::job::JobContext::current()).await }
     } else {
@@ -318,6 +354,7 @@ pub fn job_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             pub async fn enqueue(args: #args_type) -> ::autumn_web::AutumnResult<()> {
                 let payload = ::autumn_web::reexports::serde_json::to_value(&args)
                     .map_err(|e| ::autumn_web::AutumnError::internal_server_error(::std::io::Error::other(format!("job args serialization failed: {e}"))))?;
+                #wrap_payload
                 ::autumn_web::job::enqueue(#job_name, payload).await
             }
 
@@ -325,6 +362,7 @@ pub fn job_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             pub async fn enqueue_in(args: #args_type, delay: ::core::time::Duration) -> ::autumn_web::AutumnResult<()> {
                 let payload = ::autumn_web::reexports::serde_json::to_value(&args)
                     .map_err(|e| ::autumn_web::AutumnError::internal_server_error(::std::io::Error::other(format!("job args serialization failed: {e}"))))?;
+                #wrap_payload
                 ::autumn_web::job::enqueue_in(#job_name, payload, delay).await
             }
 
@@ -335,6 +373,7 @@ pub fn job_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             ) -> ::autumn_web::AutumnResult<()> {
                 let payload = ::autumn_web::reexports::serde_json::to_value(&args)
                     .map_err(|e| ::autumn_web::AutumnError::internal_server_error(::std::io::Error::other(format!("job args serialization failed: {e}"))))?;
+                #wrap_payload
                 ::autumn_web::job::enqueue_at(#job_name, payload, when).await
             }
 
@@ -344,6 +383,7 @@ pub fn job_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             pub async fn enqueue_tracked(args: #args_type) -> ::autumn_web::AutumnResult<::autumn_web::job::TrackedJobHandle> {
                 let payload = ::autumn_web::reexports::serde_json::to_value(&args)
                     .map_err(|e| ::autumn_web::AutumnError::internal_server_error(::std::io::Error::other(format!("job args serialization failed: {e}"))))?;
+                #wrap_payload
                 ::autumn_web::job::enqueue_tracked(#job_name, payload).await
             }
 
@@ -356,6 +396,7 @@ pub fn job_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             ) -> ::autumn_web::AutumnResult<::autumn_web::job::TrackedJobHandle> {
                 let payload = ::autumn_web::reexports::serde_json::to_value(&args)
                     .map_err(|e| ::autumn_web::AutumnError::internal_server_error(::std::io::Error::other(format!("job args serialization failed: {e}"))))?;
+                #wrap_payload
                 ::autumn_web::job::enqueue_tracked_for(#job_name, payload, owner).await
             }
         }
@@ -371,8 +412,21 @@ pub fn job_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 concurrency: #concurrency,
                 handler: |state: ::autumn_web::AppState, payload: ::autumn_web::reexports::serde_json::Value| {
                     Box::pin(async move {
-                        let args: #args_type = ::autumn_web::reexports::serde_json::from_value(payload)
-                            .map_err(|e| ::autumn_web::AutumnError::internal_server_error(::std::io::Error::other(format!("job args deserialization failed: {e}"))))?;
+                        // Version-aware decode (issue #1205): reads the stored
+                        // schema version (missing marker → 1), applies the
+                        // declared upgrade chain, then deserializes. A
+                        // version/shape mismatch surfaces the precise
+                        // `JobPayloadVersionError` (naming job type + versions)
+                        // rather than a generic serde error, so the dead-letter
+                        // record is self-diagnosing.
+                        let __autumn_upgrade: ::core::option::Option<::autumn_web::payload_version::UpgradeFn> = #upgrade_opt;
+                        let args: #args_type = ::autumn_web::payload_version::decode_versioned(
+                            #job_name,
+                            #version,
+                            __autumn_upgrade,
+                            payload,
+                        )
+                            .map_err(|e| ::autumn_web::AutumnError::internal_server_error(::std::io::Error::other(e.to_string())))?;
                         #handler_call
                     })
                 },
@@ -399,6 +453,23 @@ mod tests {
         assert_eq!(attrs.backoff_ms, Some(10));
         assert_eq!(attrs.unique, None);
         assert!(attrs.concurrency.is_none());
+    }
+
+    #[test]
+    fn parses_version_and_upgrade_attrs() {
+        let attrs = parse(quote! { version = 2, upgrade = crate::jobs::upgrade_welcome })
+            .expect("parse");
+        assert_eq!(attrs.version, Some(2));
+        let upgrade = attrs.upgrade.expect("upgrade path parsed");
+        assert!(quote!(#upgrade).to_string().contains("upgrade_welcome"));
+    }
+
+    #[test]
+    fn version_defaults_to_none_and_zero_is_rejected() {
+        let attrs = parse(quote! { name = "j" }).expect("parse");
+        assert_eq!(attrs.version, None);
+        assert!(attrs.upgrade.is_none());
+        assert!(parse(quote! { version = 0 }).is_err(), "zero version rejected");
     }
 
     #[test]
