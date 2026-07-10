@@ -4151,7 +4151,21 @@ fn chart_desc(points: &[(&str, f64)], config: &ChartConfig<'_>) -> String {
     if points.is_empty() {
         return "No data".to_string();
     }
-    let (min, max) = resolve_bounds(points, config);
+    // Report the actual data range from the finite point values, independent of
+    // any `config.min`/`config.max` axis override (which controls plotting only).
+    let mut min = f64::INFINITY;
+    let mut max = f64::NEG_INFINITY;
+    for (_, v) in points {
+        if v.is_finite() {
+            min = min.min(*v);
+            max = max.max(*v);
+        }
+    }
+    if !min.is_finite() {
+        // No finite data points: fall back to a unit range, matching axis bounds.
+        min = 0.0;
+        max = 1.0;
+    }
     format!(
         "{} data points, ranging from {} to {}.",
         points.len(),
@@ -6122,6 +6136,25 @@ mod tests {
         // (the auto-scaled chart puts the middle datum at y=15 instead).
         assert!(overridden.contains("50,26.7"), "{overridden}");
         assert!(auto.contains("50,15"), "{auto}");
+    }
+
+    #[test]
+    fn desc_reports_data_range_not_axis_override() {
+        // Caller pins the axis to 0..100 but leaves `desc` unset. The accessible
+        // `<desc>` must announce the actual data range (0..10), not the override.
+        let html = sparkline_with(
+            &[("a", 0.0), ("b", 5.0), ("c", 10.0)],
+            &ChartConfig::new().max(100.0),
+        )
+        .into_string();
+        assert!(
+            html.contains("<desc>3 data points, ranging from 0 to 10.</desc>"),
+            "{html}"
+        );
+        assert!(
+            !html.contains("ranging from 0 to 100"),
+            "must not leak axis override into desc: {html}"
+        );
     }
 
     #[test]
