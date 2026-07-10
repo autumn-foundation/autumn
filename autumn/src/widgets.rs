@@ -4084,6 +4084,39 @@ fn resolve_bounds(points: &[(&str, f64)], config: &ChartConfig<'_>) -> (f64, f64
     (min, max)
 }
 
+/// Resolve the `(min, max)` axis bounds for a **bar** chart. Identical to
+/// [`resolve_bounds`] except that an *automatic* bound (one the caller did not
+/// pin via [`ChartConfig::min`] / [`ChartConfig::max`]) is anchored at zero:
+/// the automatic lower bound is `min(0.0, data_min)` and the automatic upper
+/// bound is `max(0.0, data_max)`. This is the standard bar convention — bars
+/// measure magnitude from a zero baseline, so the smallest bar of an
+/// all-positive series (e.g. data whose minimum is well above zero) still
+/// renders with a visible, proportional height instead of collapsing to zero.
+/// An explicit caller override is respected unchanged on the side it pins (no
+/// zero is injected there).
+#[cfg(feature = "maud")]
+fn resolve_bar_bounds(points: &[(&str, f64)], config: &ChartConfig<'_>) -> (f64, f64) {
+    let mut data_min = f64::INFINITY;
+    let mut data_max = f64::NEG_INFINITY;
+    for (_, v) in points {
+        if v.is_finite() {
+            data_min = data_min.min(*v);
+            data_max = data_max.max(*v);
+        }
+    }
+    if !data_min.is_finite() {
+        // No finite data points: fall back to a unit range.
+        data_min = 0.0;
+        data_max = 1.0;
+    }
+    let mut min = config.min.unwrap_or_else(|| data_min.min(0.0));
+    let mut max = config.max.unwrap_or_else(|| data_max.max(0.0));
+    if max < min {
+        std::mem::swap(&mut min, &mut max);
+    }
+    (min, max)
+}
+
 /// Map a value to a `0.0..=1.0` fraction of the axis. Returns `0.5` when the
 /// span is zero (single point, all-equal values, or `min == max` override),
 /// avoiding a divide-by-zero and placing the datum at mid-height.
@@ -4331,7 +4364,7 @@ pub fn bar_chart_with(series: &[(&str, f64)], config: &ChartConfig<'_>) -> maud:
     const W: f64 = 100.0;
     const H: f64 = 40.0;
     const PAD: f64 = 2.0;
-    let (min, max) = resolve_bounds(series, config);
+    let (min, max) = resolve_bar_bounds(series, config);
     let usable_h = H - 2.0 * PAD;
     let n = series.len();
     let body = maud::html! {
@@ -6145,6 +6178,70 @@ mod tests {
             !html.contains(r#"height="18""#),
             "no half-height bars: {html}"
         );
+    }
+
+    /// Extract every `<rect>` `height="…"` value, in document (series) order.
+    #[cfg(test)]
+    fn bar_heights(html: &str) -> Vec<f64> {
+        html.match_indices(r#"height=""#)
+            .map(|(i, m)| {
+                let rest = &html[i + m.len()..];
+                let end = rest.find('"').unwrap();
+                rest[..end].parse::<f64>().unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn bar_auto_baseline_includes_zero_so_min_positive_bar_is_visible() {
+        // All-positive series whose minimum (7) sits well above zero. With the
+        // automatic baseline anchored at zero, the smallest bar must still get a
+        // proportional, POSITIVE height — not collapse to zero because the data
+        // minimum was treated as the axis floor.
+        let html = bar_chart(&[("Q1", 12.0), ("Q2", 19.0), ("Q3", 7.0)]).into_string();
+        assert!(!html.contains("NaN"), "{html}");
+        let heights = bar_heights(&html);
+        assert_eq!(heights.len(), 3, "{html}");
+        let (q1, q2, q3) = (heights[0], heights[1], heights[2]);
+        // Q3 (the smallest bar) is visible: strictly positive height.
+        assert!(q3 > 0.0, "smallest bar must be visible, got {q3}: {html}");
+        assert!(
+            !html.contains(r#"height="0""#),
+            "no zero-height bar: {html}"
+        );
+        // Bars are ordered by magnitude from a zero baseline.
+        assert!(q2 > q3, "tallest (Q2=19) taller than Q3=7: {q2} vs {q3}");
+        assert!(q2 > q1 && q1 > q3, "12 between 7 and 19: {q1}");
+        // Q2 is the max, so it fills the usable height (H - 2*PAD = 36).
+        assert!((q2 - 36.0).abs() < 1e-6, "max bar is full height: {q2}");
+        // Q3 = 7/19 of full height (~13.26).
+        let expected_q3 = 7.0 / 19.0 * 36.0;
+        assert!(
+            (q3 - expected_q3).abs() < 1e-3,
+            "Q3 scaled from zero baseline: {q3}"
+        );
+    }
+
+    #[test]
+    fn explicit_bar_min_override_wins_over_zero_baseline() {
+        // When the caller pins `min`, that override is respected unchanged — no
+        // zero is injected. Pinning min to the data minimum (7) puts the smallest
+        // bar back at zero height, exactly as the caller asked.
+        let html = bar_chart_with(
+            &[("Q1", 12.0), ("Q2", 19.0), ("Q3", 7.0)],
+            &ChartConfig::new().min(7.0),
+        )
+        .into_string();
+        assert!(!html.contains("NaN"), "{html}");
+        let heights = bar_heights(&html);
+        assert_eq!(heights.len(), 3, "{html}");
+        // Q3 == the pinned min, so it renders at zero height (caller override wins).
+        assert!(
+            (heights[2] - 0.0).abs() < 1e-9,
+            "explicit min pins Q3 to zero: {}",
+            heights[2]
+        );
+        assert!(html.contains(r#"height="0""#), "{html}");
     }
 
     #[test]
