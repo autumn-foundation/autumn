@@ -525,6 +525,7 @@ pub fn plan_auth_with_providers(
     user_field_tokens.push("confirm_token_digest:Option<String>");
     user_field_tokens.push("confirm_token_expires_at:Option<NaiveDateTime>");
     user_field_tokens.push("email_confirmed_at:Option<NaiveDateTime>");
+    user_field_tokens.push("pending_email:Option<String>");
     user_field_tokens.push("export_requested_at:Option<NaiveDateTime>");
     user_field_tokens.push("delete_requested_at:Option<NaiveDateTime>");
     user_field_tokens.push("delete_scheduled_at:Option<NaiveDateTime>");
@@ -1623,6 +1624,7 @@ fn render_migration_up(snake_name: &str, table: &str, totp: bool) -> String {
          \x20   confirm_token_digest TEXT NULL,\n\
          \x20   confirm_token_expires_at TIMESTAMP NULL,\n\
          \x20   email_confirmed_at TIMESTAMP NULL,\n\
+         \x20   pending_email TEXT NULL,\n\
          \x20   export_requested_at TIMESTAMP NULL,\n\
          \x20   delete_requested_at TIMESTAMP NULL,\n\
          \x20   delete_scheduled_at TIMESTAMP NULL,\n\
@@ -1761,6 +1763,11 @@ pub struct {pascal_name} {{
     pub confirm_token_expires_at: Option<chrono::NaiveDateTime>,
     #[default]
     pub email_confirmed_at: Option<chrono::NaiveDateTime>,
+    // Pending email-change target (issue #1396). Nullable: set when a change is
+    // requested, cleared when the new-address token is confirmed. The old
+    // `email` stays valid for sign-in until confirmation swaps it.
+    #[default]
+    pub pending_email: Option<String>,
     #[default]
     pub export_requested_at: Option<chrono::NaiveDateTime>,
     #[default]
@@ -3742,6 +3749,8 @@ pub async fn account(session: Session, State(state): State<AppState>, mut db: Db
             @if let Some(ref csrf) = csrf {{ input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
             button type="submit" {{ "Log Out" }}
         }}
+        p {{ a href="/account/password" {{ "Change password" }} }}
+        p {{ a href="/account/email" {{ "Change email address" }} }}
         p {{ a href="/account/sessions" {{ "Manage active sessions" }} }}
         p {{
             a href="/account/delete" {{ "Delete my account" }}
@@ -3776,6 +3785,490 @@ pub async fn account_destroy(
 
     session.destroy().await;
     Ok(redirect_to("/").into_response())
+}}
+
+// ── Change Password (issue #1396) ─────────────────────────────────────────────
+
+/// Wrap a re-rendered form in a `422 Unprocessable Entity` response.
+///
+/// The account settings forms re-render themselves on a rejected submission
+/// (wrong current password, weak/ mismatched new password, invalid address) with
+/// a `422` status so the failure is machine-detectable and never mistaken for a
+/// success — while still returning the human-readable form body.
+fn form_unprocessable(body: Markup) -> Response {{
+    let mut response = body.into_response();
+    *response.status_mut() = axum::http::StatusCode::UNPROCESSABLE_ENTITY;
+    response
+}}
+
+/// Render the authenticated change-password form, optionally with an error.
+fn render_change_password_form(
+    error: Option<&str>,
+    csrf: Option<&CsrfToken>,
+    csrf_field: Option<&CsrfFormField>,
+) -> Markup {{
+    layout("Change Password", html! {{
+        h1 {{ "Change Password" }}
+        @if let Some(error) = error {{
+            p role="alert" {{ (error) }}
+        }}
+        form action="/account/password" method="post" {{
+            @if let Some(csrf) = csrf {{ input type="hidden" name=(csrf_field.map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
+            div {{
+                label {{ "Current password" }}
+                input type="password" name="current_password" autocomplete="current-password" required;
+            }}
+            div {{
+                label {{ "New password" }}
+                input type="password" name="new_password" autocomplete="new-password" required;
+            }}
+            div {{
+                label {{ "Confirm new password" }}
+                input type="password" name="new_password_confirmation" autocomplete="new-password" required;
+            }}
+            button type="submit" {{ "Change Password" }}
+        }}
+        p {{ a href="/account" {{ "← Back to account" }} }}
+    }})
+}}
+
+/// `GET /account/password` — render the change-password form. Requires auth.
+#[secured]
+#[get("/account/password")]
+pub async fn change_password_form(
+    session: Session,
+    State(state): State<AppState>,
+    mut db: Db,
+    csrf: Option<CsrfToken>,
+    csrf_field: Option<CsrfFormField>,
+) -> AutumnResult<Response> {{
+    // Validates the tracked session row (401s immediately if revoked).
+    let _ = require_tracked_session(&session, &mut db, &state).await?;
+    Ok(render_change_password_form(None, csrf.as_ref(), csrf_field.as_ref()).into_response())
+}}
+
+#[derive(Deserialize)]
+pub struct ChangePasswordForm {{
+    pub current_password: String,
+    pub new_password: String,
+    pub new_password_confirmation: String,
+}}
+
+/// `POST /account/password` — verify the current password and set a new one.
+///
+/// Requires a valid session (`#[secured]`) and a fresh step-up claim
+/// (`#[step_up]`). On success the password policy is applied, the new password
+/// is hashed with `hash_password`, the session id is rotated (fixation defence
+/// on a credential change), every OTHER tracked session and remember-me chain is
+/// revoked, and the step-up claim is re-stamped. The current device stays signed
+/// in. A wrong current password re-renders the form with a `422` and never
+/// partially updates. The response never reveals whether any address exists.
+#[secured]
+#[step_up]
+#[post("/account/password")]
+pub async fn change_password(
+    session: Session,
+    State(state): State<AppState>,
+    mut db: Db,
+    flash: Flash,
+    csrf: Option<CsrfToken>,
+    csrf_field: Option<CsrfFormField>,
+    Form(form): Form<ChangePasswordForm>,
+) -> AutumnResult<Response> {{
+    let {snake_name} = require_tracked_session(&session, &mut db, &state).await?;
+
+    // Verify the CURRENT password before anything else. A wrong current password
+    // re-renders the form at 422 and makes no change (AC2).
+    let current_ok = verify_password(&form.current_password, &{snake_name}.password_digest)
+        .await
+        .unwrap_or(false);
+    if !current_ok {{
+        return Ok(form_unprocessable(render_change_password_form(
+            Some("Current password is incorrect."),
+            csrf.as_ref(),
+            csrf_field.as_ref(),
+        )));
+    }}
+
+    // The confirmation field must match so a typo cannot lock the user out.
+    if form.new_password != form.new_password_confirmation {{
+        return Ok(form_unprocessable(render_change_password_form(
+            Some("New password and confirmation do not match."),
+            csrf.as_ref(),
+            csrf_field.as_ref(),
+        )));
+    }}
+
+    // Enforce the configured password policy, passing the account email as
+    // similarity context (matches the signup path).
+    let password_cfg = state.config().auth.password;
+    let mut policy = password_cfg.policy();
+    if password_cfg.breach_check != autumn_web::auth::BreachCheck::Off {{
+        policy = policy.with_client(autumn_web::http_client::Client::new());
+    }}
+    let ctx = [{snake_name}.email.as_str()];
+    let validation = autumn_web::auth::validate_password(&form.new_password, &policy, &ctx).await;
+    if !validation.is_valid() {{
+        let messages = validation.messages();
+        let message = if messages.is_empty() {{
+            "Invalid password.".to_owned()
+        }} else {{
+            messages.join("\n")
+        }};
+        return Ok(form_unprocessable(render_change_password_form(
+            Some(&message),
+            csrf.as_ref(),
+            csrf_field.as_ref(),
+        )));
+    }}
+
+    let new_digest = hash_password(&form.new_password).await?;
+
+    // Rotate the session id (fixation defence on a credential change), then
+    // atomically: persist the new digest, revoke every OTHER tracked session,
+    // rebind the CURRENT device's row onto the rotated id so it stays signed in,
+    // and revoke every persistent remember-me chain (the old password is now
+    // suspect). If any step fails the whole change rolls back.
+    let pre_rotation_digest = session_token_digest(&session).await;
+    session.rotate_id().await;
+    let post_rotation_digest = session_token_digest(&session).await;
+    let {snake_name}_id = {snake_name}.id;
+    (*db)
+        .transaction::<_, diesel::result::Error, _>(async move |conn| {{
+            diesel::update({table}::table.find({snake_name}_id))
+                .set({table}::password_digest.eq(&new_digest))
+                .execute(conn)
+                .await?;
+            // Revoke every OTHER session (all rows whose digest is not this
+            // device's pre-rotation digest), then rebind this device.
+            diesel::delete(
+                {sess_table}::table
+                    .filter({sess_table}::user_id.eq({snake_name}_id))
+                    .filter({sess_table}::token_digest.ne(&pre_rotation_digest)),
+            )
+            .execute(conn)
+            .await?;
+            diesel::update(
+                {sess_table}::table.filter({sess_table}::token_digest.eq(&pre_rotation_digest)),
+            )
+            .set({sess_table}::token_digest.eq(&post_rotation_digest))
+            .execute(conn)
+            .await?;
+            diesel::delete(
+                {rem_table}::table.filter({rem_table}::user_id.eq({snake_name}_id)),
+            )
+            .execute(conn)
+            .await?;
+            Ok(())
+        }})
+        .await
+        .map_err(|e| {{
+            AutumnError::internal_server_error_msg(format!("Failed to change password: {{e}}"))
+        }})?;
+
+    // Re-stamp the step-up claim so the freshly rotated session keeps sudo-mode
+    // freshness (consistent with reauth / reset-password).
+    autumn_web::step_up::set_last_strong_auth_at(&session).await;
+    flash.success("Your password has been changed.").await;
+    Ok(redirect_to("/account"))
+}}
+
+// ── Change Email (issue #1396) ────────────────────────────────────────────────
+
+/// Render the authenticated change-email form, optionally with an error.
+fn render_change_email_form(
+    error: Option<&str>,
+    csrf: Option<&CsrfToken>,
+    csrf_field: Option<&CsrfFormField>,
+) -> Markup {{
+    layout("Change Email Address", html! {{
+        h1 {{ "Change Email Address" }}
+        p {{ "We'll send a confirmation link to the new address. Your current \
+              address keeps working until you confirm the change." }}
+        @if let Some(error) = error {{
+            p role="alert" {{ (error) }}
+        }}
+        form action="/account/email" method="post" {{
+            @if let Some(csrf) = csrf {{ input type="hidden" name=(csrf_field.map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
+            div {{
+                label {{ "New email address" }}
+                input type="email" name="new_email" autocomplete="email" required;
+            }}
+            div {{
+                label {{ "Current password" }}
+                input type="password" name="current_password" autocomplete="current-password" required;
+            }}
+            button type="submit" {{ "Send Confirmation Link" }}
+        }}
+        p {{ a href="/account" {{ "← Back to account" }} }}
+    }})
+}}
+
+/// `GET /account/email` — render the change-email form. Requires auth.
+#[secured]
+#[get("/account/email")]
+pub async fn change_email_form(
+    session: Session,
+    State(state): State<AppState>,
+    mut db: Db,
+    csrf: Option<CsrfToken>,
+    csrf_field: Option<CsrfFormField>,
+) -> AutumnResult<Response> {{
+    // Validates the tracked session row (401s immediately if revoked).
+    let _ = require_tracked_session(&session, &mut db, &state).await?;
+    Ok(render_change_email_form(None, csrf.as_ref(), csrf_field.as_ref()).into_response())
+}}
+
+#[derive(Deserialize)]
+pub struct ChangeEmailForm {{
+    pub new_email: String,
+    pub current_password: String,
+}}
+
+/// `POST /account/email` — start an email-address change.
+///
+/// Requires a valid session (`#[secured]`) and a fresh step-up claim
+/// (`#[step_up]`). Verifies the current password, then stores the new address as
+/// `pending_email` (re-using the `confirm_token_digest` machinery) and sends a
+/// confirmation link to the NEW address plus a change-notice to the OLD address.
+/// The OLD address stays valid for sign-in until the new-address token is
+/// confirmed. A second request supersedes the prior pending token. Mail must be
+/// configured; the disabled-transport guard runs first.
+#[secured]
+#[step_up]
+#[post("/account/email")]
+pub async fn change_email(
+    session: Session,
+    State(state): State<AppState>,
+    mut db: Db,
+    mailer: Mailer,
+    flash: Flash,
+    csrf: Option<CsrfToken>,
+    csrf_field: Option<CsrfFormField>,
+    Form(form): Form<ChangeEmailForm>,
+) -> AutumnResult<Response> {{
+    // Guard disabled mail FIRST — the flow is unusable without a confirmation
+    // email, so fail loudly rather than store a pending change no one can confirm.
+    if mailer.is_disabled() {{
+        return Err(AutumnError::internal_server_error_msg(
+            "Changing your email requires mail to be configured. \
+             Set [mail] transport in autumn.toml (e.g. transport = \"log\" for dev). \
+             The change-email feature is unavailable until mail is set up.",
+        ));
+    }}
+
+    let {snake_name} = require_tracked_session(&session, &mut db, &state).await?;
+
+    // Verify the current password before accepting the change (AC3). A wrong
+    // password re-renders the form at 422 and makes no change.
+    let current_ok = verify_password(&form.current_password, &{snake_name}.password_digest)
+        .await
+        .unwrap_or(false);
+    if !current_ok {{
+        return Ok(form_unprocessable(render_change_email_form(
+            Some("Current password is incorrect."),
+            csrf.as_ref(),
+            csrf_field.as_ref(),
+        )));
+    }}
+
+    let new_email = form.new_email.trim().to_lowercase();
+    // Basic format check, mirroring signup. Same message for every rejection so
+    // the endpoint never reveals whether the address is already registered.
+    let invalid = || {{
+        Ok(form_unprocessable(render_change_email_form(
+            Some("Please enter a valid email address."),
+            csrf.as_ref(),
+            csrf_field.as_ref(),
+        )))
+    }};
+    match new_email.split_once('@') {{
+        Some((_, domain)) if domain.contains('.') => {{}}
+        _ => return invalid(),
+    }}
+    if new_email == {snake_name}.email {{
+        return invalid();
+    }}
+
+    // Mint a fresh single-use token; only the SHA-256 digest is stored. A second
+    // change request overwrites `pending_email` and re-mints the token, so the
+    // prior pending change is superseded (AC4).
+    let raw_token = generate_confirmation_token();
+    let confirm_digest = sha256_hex(&raw_token);
+    let confirm_expires_at = chrono::Utc::now().naive_utc() + chrono::Duration::hours(24);
+
+    // Send the confirmation link to the NEW address first; only persist the
+    // pending change on success, so a transient mail failure leaves the account
+    // untouched (the old address keeps working, no stale pending token).
+    send_email_change_confirmation(&mailer, &new_email, &raw_token).await?;
+
+    diesel::update({table}::table.find({snake_name}.id))
+        .set((
+            {table}::pending_email.eq(Some(&new_email)),
+            {table}::confirm_token_digest.eq(Some(&confirm_digest)),
+            {table}::confirm_token_expires_at.eq(Some(confirm_expires_at)),
+        ))
+        .execute(&mut *db)
+        .await
+        .map_err(|e| {{
+            AutumnError::internal_server_error_msg(format!("Failed to record email change: {{e}}"))
+        }})?;
+
+    // Notify the OLD address so the account owner is alerted to the change even
+    // if it was initiated by someone else. Best-effort: a failure here must not
+    // roll back the (already-confirmed-deliverable) pending change.
+    if let Err(e) = send_email_change_notice(&mailer, &{snake_name}.email, &new_email).await {{
+        tracing::warn!("email-change notice to old address failed: {{e}}");
+    }}
+
+    flash
+        .info("Check your new email address for a confirmation link.")
+        .await;
+    Ok(redirect_to("/account"))
+}}
+
+/// `GET /account/email/confirm/{{token}}` — confirm a pending email change.
+///
+/// On a valid unexpired token whose account still has a `pending_email`: swaps
+/// `email` to the pending address, clears `pending_email` and the token, and
+/// stamps `email_confirmed_at`. Single-use — the token is consumed atomically so
+/// a replay matches zero rows. Any invalid/expired/unknown/already-consumed
+/// token returns the SAME non-revealing 422 (no oracle). Only the SHA-256 digest
+/// is ever stored; the raw token lives only in the emailed URL.
+#[get("/account/email/confirm/{{token}}")]
+pub async fn confirm_email_change(
+    mut db: Db,
+    Path(params): Path<ConfirmEmailPath>,
+) -> AutumnResult<Response> {{
+    let token_digest = sha256_hex(&params.token);
+    let now = chrono::Utc::now().naive_utc();
+    let generic = || {{
+        AutumnError::unprocessable_msg(
+            "This email-change link is invalid or has expired. \
+             Please request a new email change from your account settings.",
+        )
+    }};
+
+    // Load the pending row by token digest. `pending_email IS NOT NULL` keeps
+    // this path from colliding with the signup email-confirmation flow, which
+    // shares the `confirm_token_digest` column but never sets `pending_email`.
+    let {snake_name}: {pascal_name} = {table}::table
+        .filter({table}::confirm_token_digest.eq(Some(&token_digest)))
+        .filter({table}::confirm_token_expires_at.gt(now))
+        .filter({table}::pending_email.is_not_null())
+        .select({pascal_name}::as_select())
+        .first(&mut *db)
+        .await
+        .map_err(|_| generic())?;
+
+    let Some(new_email) = {snake_name}.pending_email.clone() else {{
+        return Err(generic());
+    }};
+
+    // Consume atomically: the UPDATE re-filters on the digest so two concurrent
+    // requests with the same token cannot both apply (the second matches zero
+    // rows). Swapping the address here also enforces email uniqueness — a
+    // collision surfaces as the same generic error, revealing nothing.
+    let rows = diesel::update(
+        {table}::table
+            .find({snake_name}.id)
+            .filter({table}::confirm_token_digest.eq(Some(&token_digest))),
+    )
+    .set((
+        {table}::email.eq(&new_email),
+        {table}::pending_email.eq(None::<String>),
+        {table}::confirm_token_digest.eq(None::<String>),
+        {table}::confirm_token_expires_at.eq(None::<chrono::NaiveDateTime>),
+        {table}::email_confirmed_at.eq(Some(now)),
+    ))
+    .execute(&mut *db)
+    .await
+    .map_err(|_| generic())?;
+    if rows == 0 {{
+        return Err(generic());
+    }}
+
+    Ok(layout("Email Address Updated", html! {{
+        h1 {{ "Email Address Updated" }}
+        p {{ "Your email address has been changed to " (new_email) "." }}
+        p {{ a href="/account" {{ "← Back to account" }} }}
+    }})
+    .into_response())
+}}
+
+/// Send the email-change confirmation link to the NEW address.
+async fn send_email_change_confirmation(
+    mailer: &Mailer,
+    to: &str,
+    token: &str,
+) -> AutumnResult<()> {{
+    if mailer.is_disabled() {{
+        return Err(AutumnError::internal_server_error_msg(
+            "Changing your email requires mail to be configured.",
+        ));
+    }}
+    let base_url = std::env::var("APP_BASE_URL")
+        .unwrap_or_else(|_| "http://localhost:3000".to_owned());
+    let confirm_url = format!("{{base_url}}/account/email/confirm/{{token}}");
+    let mail = Mail::builder()
+        .to(to.to_owned())
+        .subject("Confirm your new email address")
+        .html(html! {{
+            p {{ "Click the link below to confirm this as the new email address for your account." }}
+            p {{ "This link expires in 24 hours." }}
+            p {{ a href=(&confirm_url) {{ "Confirm New Email Address" }} }}
+            p {{ "If you did not request this change, you can safely ignore this email." }}
+        }})
+        .text(format!(
+            "Confirm your new email address: {{confirm_url}}\n\
+             This link expires in 24 hours.\n\
+             If you did not request this change, you can safely ignore this email."
+        ))
+        .build()
+        .map_err(|e| {{
+            AutumnError::internal_server_error_msg(format!(
+                "Failed to build email-change confirmation: {{e}}"
+            ))
+        }})?;
+    mailer.send(mail).await.map_err(|e| {{
+        AutumnError::internal_server_error_msg(format!(
+            "Failed to send email-change confirmation: {{e}}"
+        ))
+    }})
+}}
+
+/// Send a change-notice to the OLD address so the owner is alerted.
+async fn send_email_change_notice(
+    mailer: &Mailer,
+    to: &str,
+    new_email: &str,
+) -> AutumnResult<()> {{
+    let mail = Mail::builder()
+        .to(to.to_owned())
+        .subject("Email address change requested")
+        .html(html! {{
+            p {{ "Someone requested changing the email address on your account to " (new_email) "." }}
+            p {{ "The change only takes effect once the new address is confirmed. \
+                  Your current address stays active until then." }}
+            p {{ "If you did not request this, change your password immediately — \
+                  your account may be compromised." }}
+        }})
+        .text(format!(
+            "Someone requested changing the email address on your account to {{new_email}}.\n\
+             The change only takes effect once the new address is confirmed.\n\
+             If you did not request this, change your password immediately."
+        ))
+        .build()
+        .map_err(|e| {{
+            AutumnError::internal_server_error_msg(format!(
+                "Failed to build email-change notice: {{e}}"
+            ))
+        }})?;
+    mailer.send(mail).await.map_err(|e| {{
+        AutumnError::internal_server_error_msg(format!(
+            "Failed to send email-change notice: {{e}}"
+        ))
+    }})
 }}
 
 // ── Step-Up Reauth ────────────────────────────────────────────────────────────
@@ -5408,26 +5901,88 @@ fn resend_confirmation_rate_limit() {{
     );
 }}
 
-/// AC9 — changing an email address on an existing account re-enters the
-/// unconfirmed state for the new address and keeps the old address valid for
-/// sign-in until the new address is confirmed.
-///
-/// This test documents the contract; the email-change flow is scaffolded via
-/// the account settings page. See docs/guide/authentication.md for the
-/// customization point documentation.
+// ── Change password / change email (issue #1396) ──────────────────────────────
+
+/// The authenticated change-password page is `#[secured]`, so an anonymous
+/// request must be rejected (401) or redirected to sign in.
 #[test]
-fn email_change_reenters_unconfirmed() {{
+fn change_password_page_requires_auth() {{
     let Some(base) = base_url() else {{
         eprintln!("skipping: AUTUMN_TEST_BASE_URL not set");
         return;
     }};
-    // Verify the resend endpoint accepts POST and returns a sensible response
-    // (full email-change flow requires an authenticated session and SMTP).
-    let resp = get(&base, "/auth/confirm/resend");
+    let resp = get(&base, "/account/password");
+    let rejected = resp.contains("HTTP/1.1 401")
+        || resp.contains("HTTP/1.0 401")
+        || resp.contains("HTTP/1.1 30")
+        || resp.contains("HTTP/1.0 30");
+    assert!(rejected, "GET /account/password must reject anonymous requests:\n{{resp}}");
+}}
+
+/// The authenticated change-email page is `#[secured]`, so an anonymous request
+/// must be rejected (401) or redirected to sign in.
+#[test]
+fn change_email_page_requires_auth() {{
+    let Some(base) = base_url() else {{
+        eprintln!("skipping: AUTUMN_TEST_BASE_URL not set");
+        return;
+    }};
+    let resp = get(&base, "/account/email");
+    let rejected = resp.contains("HTTP/1.1 401")
+        || resp.contains("HTTP/1.0 401")
+        || resp.contains("HTTP/1.1 30")
+        || resp.contains("HTTP/1.0 30");
+    assert!(rejected, "GET /account/email must reject anonymous requests:\n{{resp}}");
+}}
+
+/// AC4 — an invalid/expired/unknown email-change token returns the same
+/// non-revealing 422 (no oracle).
+#[test]
+fn email_change_confirm_invalid_token_fails() {{
+    let Some(base) = base_url() else {{
+        eprintln!("skipping: AUTUMN_TEST_BASE_URL not set");
+        return;
+    }};
+    let resp = get(&base, "/account/email/confirm/this-token-does-not-exist");
     assert!(
-        resp.contains("HTTP/1.1 200") || resp.contains("HTTP/1.0 200"),
-        "GET /auth/confirm/resend must return 200:\n{{resp}}"
+        resp.contains("HTTP/1.1 422") || resp.contains("HTTP/1.0 422"),
+        "invalid email-change token must return 422:\n{{resp}}"
     );
+}}
+
+/// AC — end-to-end behaviour that requires a live database (start the app
+/// against Postgres, set `AUTUMN_TEST_BASE_URL`, and a mail transport that
+/// captures messages such as `transport = "log"` or `"file"`). Ignored by
+/// default so `cargo test` is green out of the box; run with `-- --ignored`.
+///
+/// Full coverage of issue #1396's acceptance criteria:
+///   1. Sign up + confirm + sign in on two browsers (two session cookies).
+///   2. POST /account/password with the correct current password + a strong new
+///      password (through /reauth for the step-up claim). Assert the OTHER
+///      browser's session is now revoked (its next request 401s / redirects),
+///      while the acting browser stays signed in.
+///   3. POST /account/password with a WRONG current password → 422, and the
+///      password is unchanged (the old one still signs in).
+///   4. POST /account/email with a new address → the OLD address still signs in;
+///      GET the confirmation link from the captured mail; after confirming, the
+///      NEW address signs in and the old one no longer does.
+///
+/// See docs/guide/authentication.md for a full walkthrough.
+#[test]
+#[ignore = "requires a live database and a capturing mail transport"]
+fn password_and_email_change_end_to_end() {{
+    let Some(base) = base_url() else {{
+        eprintln!("skipping: AUTUMN_TEST_BASE_URL not set");
+        return;
+    }};
+    let _ = base;
+    todo!(
+        "implement password_and_email_change_end_to_end against a live DB: \
+         (1) password change revokes other sessions, \
+         (2) wrong current password → 422 with no change, \
+         (3) pending email keeps the old address usable until the new-address \
+         token is confirmed"
+    )
 }}
 "#
     )
@@ -6290,6 +6845,11 @@ fn auth_route_entries(totp: bool) -> Vec<String> {
         "routes::auth::unlock_account".to_owned(),
         "routes::auth::account".to_owned(),
         "routes::auth::account_destroy".to_owned(),
+        "routes::auth::change_password_form".to_owned(),
+        "routes::auth::change_password".to_owned(),
+        "routes::auth::change_email_form".to_owned(),
+        "routes::auth::change_email".to_owned(),
+        "routes::auth::confirm_email_change".to_owned(),
         "routes::auth::sessions_page".to_owned(),
         "routes::auth::sessions_revoke".to_owned(),
         "routes::auth::sessions_revoke_remember".to_owned(),
@@ -9724,6 +10284,308 @@ mod tests {
             disabled_pos < maybe_user_pos,
             "is_disabled guard must come before the DB lookup in forgot_password"
         );
+    }
+
+    // ── Change password / change email (issue #1396) ─────────────────────────
+
+    /// Slice out a single handler body from the rendered routes file: from
+    /// `pub async fn <name>(` up to the next handler declaration.
+    fn handler_body<'a>(routes: &'a str, name: &str) -> &'a str {
+        let needle = format!("pub async fn {name}(");
+        let start = routes
+            .find(&needle)
+            .unwrap_or_else(|| panic!("handler {name} missing from routes"));
+        let after = &routes[start..];
+        let next = after[1..]
+            .find("\npub async fn ")
+            .map_or(after.len(), |p| p + 1);
+        &after[..next]
+    }
+
+    #[test]
+    fn routes_file_has_change_password_and_email_handlers() {
+        let routes = render_routes_file("User", "user", "users", &[], false);
+        for needle in [
+            "pub async fn change_password_form(",
+            "pub async fn change_password(",
+            "pub async fn change_email_form(",
+            "pub async fn change_email(",
+            "pub async fn confirm_email_change(",
+        ] {
+            assert!(routes.contains(needle), "routes missing handler: {needle}");
+        }
+        // Both POST forms carry the documented field names.
+        assert!(
+            routes.contains("current_password"),
+            "missing current_password field"
+        );
+        assert!(
+            routes.contains("new_password_confirmation"),
+            "missing confirmation field"
+        );
+        assert!(routes.contains("new_email"), "missing new_email field");
+        assert!(
+            routes.contains(r#"action="/account/password""#),
+            "change-password form must post to /account/password"
+        );
+        assert!(
+            routes.contains(r#"action="/account/email""#),
+            "change-email form must post to /account/email"
+        );
+    }
+
+    #[test]
+    fn change_password_post_carries_secured_and_step_up() {
+        let routes = render_routes_file("User", "user", "users", &[], false);
+        let pos = routes
+            .find("pub async fn change_password(")
+            .expect("change_password handler missing");
+        let before = &routes[..pos];
+        // The attributes immediately preceding the handler must be, in order,
+        // #[secured] then #[step_up] then #[post(...)] — matching account_destroy.
+        let secured = before
+            .rfind("#[secured]")
+            .expect("change_password needs #[secured]");
+        let step_up = before
+            .rfind("#[step_up]")
+            .expect("change_password needs #[step_up]");
+        let post = before
+            .rfind(r#"#[post("/account/password")]"#)
+            .expect("change_password needs its #[post] route");
+        assert!(
+            secured < step_up && step_up < post,
+            "attribute order must be secured, step_up, post"
+        );
+    }
+
+    #[test]
+    fn change_email_post_carries_secured_and_step_up() {
+        let routes = render_routes_file("User", "user", "users", &[], false);
+        let pos = routes
+            .find("pub async fn change_email(")
+            .expect("change_email handler missing");
+        let before = &routes[..pos];
+        let secured = before
+            .rfind("#[secured]")
+            .expect("change_email needs #[secured]");
+        let step_up = before
+            .rfind("#[step_up]")
+            .expect("change_email needs #[step_up]");
+        let post = before
+            .rfind(r#"#[post("/account/email")]"#)
+            .expect("change_email needs its #[post] route");
+        assert!(
+            secured < step_up && step_up < post,
+            "attribute order must be secured, step_up, post"
+        );
+    }
+
+    #[test]
+    fn change_password_verifies_current_rotates_and_revokes_others() {
+        let routes = render_routes_file("User", "user", "users", &[], false);
+        let body = handler_body(&routes, "change_password");
+        assert!(
+            body.contains("verify_password("),
+            "must verify the current password"
+        );
+        assert!(
+            body.contains("validate_password("),
+            "must apply the password policy"
+        );
+        assert!(
+            body.contains("hash_password("),
+            "must hash the new password"
+        );
+        assert!(
+            body.contains("session.rotate_id()"),
+            "must rotate the session id"
+        );
+        assert!(
+            body.contains("set_last_strong_auth_at"),
+            "must re-stamp the step-up claim on success"
+        );
+        // Revokes OTHER tracked sessions (delete where digest != current) and the
+        // remember chains.
+        assert!(
+            body.contains("user_sessions::token_digest.ne"),
+            "must revoke other tracked sessions"
+        );
+        assert!(
+            body.contains("user_remember_tokens::table"),
+            "must revoke persistent remember-me chains"
+        );
+    }
+
+    #[test]
+    fn change_password_wrong_current_returns_422_and_no_update() {
+        let routes = render_routes_file("User", "user", "users", &[], false);
+        let body = handler_body(&routes, "change_password");
+        // Wrong current password re-renders the form via form_unprocessable (422)
+        // and returns BEFORE any password_digest update.
+        let wrong_pos = body
+            .find("Current password is incorrect.")
+            .expect("must show a clear wrong-password error");
+        let update_pos = body
+            .find("password_digest.eq")
+            .expect("must update the password digest on success");
+        assert!(
+            wrong_pos < update_pos,
+            "wrong-password branch must return before any update"
+        );
+        assert!(
+            routes.contains("StatusCode::UNPROCESSABLE_ENTITY"),
+            "rejected form submissions must carry a 422 status"
+        );
+    }
+
+    #[test]
+    fn change_email_guards_disabled_mail_first_and_stores_pending() {
+        let routes = render_routes_file("User", "user", "users", &[], false);
+        let body = handler_body(&routes, "change_email");
+        // Disabled-mail guard must come before the DB session lookup, mirroring
+        // forgot_password — so it fires unconditionally.
+        let disabled = body
+            .find("mailer.is_disabled()")
+            .expect("must guard disabled mail");
+        let lookup = body
+            .find("require_tracked_session")
+            .expect("must load the session");
+        assert!(
+            disabled < lookup,
+            "is_disabled guard must precede the session lookup"
+        );
+        assert!(
+            body.contains("verify_password("),
+            "must verify the current password"
+        );
+        assert!(
+            body.contains("pending_email.eq"),
+            "must store the new address as pending"
+        );
+        assert!(
+            body.contains("send_email_change_confirmation"),
+            "must send a confirmation link to the new address"
+        );
+        assert!(
+            body.contains("send_email_change_notice"),
+            "must send a change-notice to the old address"
+        );
+        // Old address stays valid: the handler must NOT touch users::email here.
+        assert!(
+            !body.contains("users::email.eq"),
+            "change_email request must NOT swap the active address"
+        );
+    }
+
+    #[test]
+    fn confirm_email_change_swaps_address_and_stamps_confirmed() {
+        let routes = render_routes_file("User", "user", "users", &[], false);
+        let body = handler_body(&routes, "confirm_email_change");
+        assert!(
+            body.contains("pending_email.is_not_null()"),
+            "must target a pending change only"
+        );
+        assert!(
+            body.contains("users::email.eq(&new_email)"),
+            "must swap the active address"
+        );
+        assert!(
+            body.contains("pending_email.eq(None::<String>)"),
+            "must clear pending_email on confirm"
+        );
+        assert!(
+            body.contains("email_confirmed_at.eq(Some(now))"),
+            "must stamp email_confirmed_at on confirm"
+        );
+        // Single generic error (no oracle): the not-found / expired / consumed
+        // paths all return the same message.
+        assert!(
+            body.contains("This email-change link is invalid or has expired."),
+            "must return a single non-revealing error"
+        );
+        assert!(
+            routes.contains(r#"#[get("/account/email/confirm/{token}")]"#),
+            "confirm route must be registered under /account/email/confirm/{{token}}"
+        );
+    }
+
+    #[test]
+    fn account_page_links_to_change_password_and_email() {
+        let routes = render_routes_file("User", "user", "users", &[], false);
+        let body = handler_body(&routes, "account");
+        assert!(
+            body.contains(r#"href="/account/password""#),
+            "account page must link to change-password"
+        );
+        assert!(
+            body.contains(r#"href="/account/email""#),
+            "account page must link to change-email"
+        );
+    }
+
+    #[test]
+    fn change_email_confirm_uses_secured_only_on_get_forms() {
+        let routes = render_routes_file("User", "user", "users", &[], false);
+        // The GET form pages are #[secured] but NOT #[step_up].
+        for form_fn in ["change_password_form", "change_email_form"] {
+            let pos = routes
+                .find(&format!("pub async fn {form_fn}("))
+                .unwrap_or_else(|| panic!("{form_fn} missing"));
+            // Look at the attribute block immediately preceding this handler
+            // (bounded by the previous handler) so a #[step_up] on some later
+            // handler cannot satisfy the check.
+            let before = &routes[..pos];
+            let prev_fn = before.rfind("pub async fn ").unwrap_or(0);
+            let attrs = &before[prev_fn..];
+            assert!(attrs.contains("#[secured]"), "{form_fn} must be #[secured]");
+            assert!(
+                !attrs.contains("#[step_up]"),
+                "{form_fn} GET form must NOT be #[step_up]"
+            );
+        }
+    }
+
+    #[test]
+    fn migration_and_model_and_schema_have_pending_email() {
+        let tmp = project_with_main();
+        let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let up = fs::read_to_string(
+            tmp.path()
+                .join("migrations/20260508000000_create_users/up.sql"),
+        )
+        .unwrap();
+        assert!(
+            up.contains("pending_email TEXT NULL"),
+            "migration missing pending_email: {up}"
+        );
+        let model = fs::read_to_string(tmp.path().join("src/models/user.rs")).unwrap();
+        assert!(
+            model.contains("pub pending_email: Option<String>"),
+            "model missing pending_email: {model}"
+        );
+        let schema = fs::read_to_string(tmp.path().join("src/schema.rs")).unwrap();
+        assert!(
+            schema.contains("pending_email"),
+            "schema missing pending_email: {schema}"
+        );
+    }
+
+    #[test]
+    fn main_rs_registers_change_password_and_email_routes() {
+        let tmp = project_with_main();
+        let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let main = fs::read_to_string(tmp.path().join("src/main.rs")).unwrap();
+        for entry in [
+            "routes::auth::change_password_form",
+            "routes::auth::change_password",
+            "routes::auth::change_email_form",
+            "routes::auth::change_email",
+            "routes::auth::confirm_email_change",
+        ] {
+            assert!(main.contains(entry), "main.rs missing route entry: {entry}");
+        }
     }
 
     // ── Generated tests ─────────────────────────────────────────────────────
