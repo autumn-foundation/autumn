@@ -40,7 +40,12 @@ AUTUMN_ALERTS__WEBHOOK_SECRET=…       # HMAC signing secret for the webhook
 ```
 
 `autumn doctor` warns (in production mode) when no destination is configured, so
-a deploy never runs silently blind to its own failures.
+a deploy never runs silently blind to its own failures. An `email` destination
+only counts when a usable `[mail] transport` is configured: the mailer defaults
+to `disabled` outside dev, and a disabled mailer installs no email alert channel
+(it silently drops mail), so doctor warns for an email paired with a disabled
+transport just as it does for a missing destination. Set `[mail] transport` to a
+real backend (`smtp`/`log`/`file`) or use a signed webhook.
 
 ---
 
