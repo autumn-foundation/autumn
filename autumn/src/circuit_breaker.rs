@@ -1,3 +1,53 @@
+//! A self-correcting software circuit breaker that prevents cascading failures
+//! by failing fast when an external service or dependency is unhealthy.
+//!
+//! Think of this module as a protective fuse between your application and an unstable system.
+//! When a dependency starts returning errors or timing out, the circuit "opens", instantly failing
+//! subsequent requests to protect both your application (from thread exhaustion) and the
+//! downstream system (from being overwhelmed while trying to recover).
+//!
+//! # The "Hero's Journey"
+//!
+//! ```
+//! use autumn_web::circuit_breaker::{CircuitBreaker, CircuitBreakerPolicy, CircuitBreakerError};
+//! use std::time::Duration;
+//!
+//! # async fn example() -> Result<(), CircuitBreakerError<std::io::Error>> {
+//! // Create a policy that trips if 50% of the last 10 requests fail
+//! let policy = CircuitBreakerPolicy {
+//!     failure_ratio_threshold: 0.5,
+//!     minimum_sample_count: 10,
+//!     ..CircuitBreakerPolicy::default()
+//! };
+//!
+//! let breaker = CircuitBreaker::new("payment_gateway", policy);
+//!
+//! // The breaker monitors this future's Result.
+//! // If it's Ok(_), the success is recorded.
+//! // If it's Err(_), the failure is recorded.
+//! let result = breaker.run(async {
+//!     // Simulating an external API call
+//!     Ok::<_, std::io::Error>("Payment successful")
+//! }).await;
+//!
+//! assert_eq!(result.unwrap(), "Payment successful");
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # The Three States of a Circuit
+//!
+//! - [`CircuitState::Closed`]: The normal state. Traffic flows freely. Failures are counted.
+//! - [`CircuitState::Open`]: The tripped state. Requests fail immediately with
+//!   [`CircuitBreakerError::Open`] without executing the underlying code.
+//! - [`CircuitState::HalfOpen`]: The testing state. After `open_duration` has passed,
+//!   a few requests are let through to see if the downstream system has recovered.
+//!
+//! # Integration with `tower`
+//!
+//! You can wrap any `tower::Service` (like an HTTP client) with a [`CircuitBreakerLayer`]
+//! to automatically trip the circuit based on the service's `Result`.
+
 #![allow(
     clippy::missing_panics_doc,
     clippy::missing_errors_doc,
@@ -15,15 +65,35 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
+/// Represents the current operational state of a circuit breaker.
+///
+/// The state machine transitions as follows:
+/// `Closed` -> (failures exceed threshold) -> `Open` -> (timeout expires) -> `HalfOpen` -> (successes/failures) -> `Closed` or `Open`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum CircuitState {
+    /// Normal operation. Requests are passed through to the downstream system,
+    /// and their success or failure is recorded in a sliding window.
     Closed,
+    /// Failing operation. The failure threshold has been exceeded.
+    /// Requests are rejected immediately without being passed through.
     Open,
+    /// Testing operation. A cooling off period has passed since opening.
+    /// A limited number of requests are passed through to probe if the downstream
+    /// system has recovered.
     HalfOpen,
 }
 
 impl CircuitState {
+    /// Returns the string representation of the state.
+    ///
+    /// ## Examples
+    ///
+    /// ```
+    /// use autumn_web::circuit_breaker::CircuitState;
+    ///
+    /// assert_eq!(CircuitState::HalfOpen.as_str(), "HALF_OPEN");
+    /// ```
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Closed => "CLOSED",
@@ -33,12 +103,27 @@ impl CircuitState {
     }
 }
 
+/// Configuration parameters for a [`CircuitBreaker`].
+///
+/// Dictates how the circuit measures failure, when it trips, and how long
+/// it waits before attempting to recover.
 #[derive(Debug, Clone)]
 pub struct CircuitBreakerPolicy {
+    /// The percentage of requests (expressed as a float between 0.0 and 1.0)
+    /// that must fail to trip the circuit. For example, `0.5` means 50%.
     pub failure_ratio_threshold: f64,
+    /// The sliding time window over which failures are evaluated.
+    /// Older results are discarded.
     pub sample_window: Duration,
+    /// The minimum number of requests that must be recorded within the
+    /// `sample_window` before the failure ratio is evaluated. This prevents
+    /// the circuit from tripping due to a single failure when traffic is low.
     pub minimum_sample_count: u64,
+    /// How long the circuit stays in the [`CircuitState::Open`] state before
+    /// transitioning to [`CircuitState::HalfOpen`] to test recovery.
     pub open_duration: Duration,
+    /// The number of probe requests permitted when in the [`CircuitState::HalfOpen`] state.
+    /// If these succeed, the circuit closes. If any fail, the circuit re-opens.
     pub half_open_trial_count: u64,
 }
 
@@ -55,6 +140,10 @@ impl Default for CircuitBreakerPolicy {
 }
 
 impl CircuitBreakerPolicy {
+    /// Creates a policy from the global resilience configuration.
+    ///
+    /// It applies global defaults first, then overrides them with any
+    /// host-specific configuration matching the given `name`.
     pub fn from_config(rc: &crate::config::ResilienceConfig, name: &str) -> Self {
         let mut policy = Self::default();
         let defs = &rc.circuit_breaker.defaults;
@@ -95,14 +184,28 @@ impl CircuitBreakerPolicy {
     }
 }
 
+/// Represents an error resulting from a circuit breaker operation.
 #[derive(Debug, Error)]
 pub enum CircuitBreakerError<E> {
+    /// The circuit is currently in the [`CircuitState::Open`] state.
+    /// The request was rejected without executing the underlying code.
     #[error("circuit breaker is open")]
     Open,
+    /// The circuit allowed the request to execute, but the underlying
+    /// operation failed and returned an error.
     #[error("execution failed: {0}")]
     Execution(E),
 }
 
+/// A software circuit breaker that monitors the success and failure of operations
+/// to protect fragile external dependencies and prevent cascading system failures.
+///
+/// It uses a sliding window to track failures and will automatically transition
+/// into an [`CircuitState::Open`] state to reject traffic when the failure ratio
+/// threshold is crossed. It will eventually transition to [`CircuitState::HalfOpen`]
+/// to test recovery.
+///
+/// To use it, wrap an asynchronous operation with [`CircuitBreaker::run`].
 #[derive(Clone)]
 pub struct CircuitBreaker {
     name: String,
@@ -157,6 +260,19 @@ impl CircuitBreakerInner {
 }
 
 impl CircuitBreaker {
+    /// Creates a new circuit breaker with the given name and policy.
+    ///
+    /// The `failure_ratio_threshold` is automatically clamped between `0.0001` and `1.0`.
+    ///
+    /// ## Examples
+    ///
+    /// ```
+    /// use autumn_web::circuit_breaker::{CircuitBreaker, CircuitBreakerPolicy};
+    ///
+    /// let policy = CircuitBreakerPolicy::default();
+    /// let breaker = CircuitBreaker::new("payment_gateway", policy);
+    /// assert_eq!(breaker.name(), "payment_gateway");
+    /// ```
     pub fn new(name: impl Into<String>, mut config: CircuitBreakerPolicy) -> Self {
         config.failure_ratio_threshold = config.failure_ratio_threshold.clamp(0.000_1, 1.0);
         Self {
@@ -173,6 +289,7 @@ impl CircuitBreaker {
         }
     }
 
+    /// The configured name identifying this specific circuit instance.
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -187,6 +304,19 @@ impl CircuitBreaker {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Evaluates the current operational mode of the breaker.
+    ///
+    /// This method is also responsible for checking if an `Open` circuit
+    /// has passed its cooling-off period and should transition to `HalfOpen`.
+    ///
+    /// ## Examples
+    ///
+    /// ```
+    /// use autumn_web::circuit_breaker::{CircuitBreaker, CircuitBreakerPolicy, CircuitState};
+    ///
+    /// let breaker = CircuitBreaker::new("test", CircuitBreakerPolicy::default());
+    /// assert_eq!(breaker.state(), CircuitState::Closed);
+    /// ```
     pub fn state(&self) -> CircuitState {
         let mut inner = self.lock_inner();
         let now = Instant::now();
@@ -204,17 +334,46 @@ impl CircuitBreaker {
         inner.state
     }
 
+    /// The active rule set governing failure thresholds and recovery delays.
     pub fn config(&self) -> CircuitBreakerPolicy {
         let inner = self.lock_inner();
         inner.config.clone()
     }
 
+    /// Updates the policy configuration of the circuit breaker dynamically.
+    ///
+    /// The `failure_ratio_threshold` is automatically clamped between `0.0001` and `1.0`.
+    ///
+    /// ## Examples
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use autumn_web::circuit_breaker::{CircuitBreaker, CircuitBreakerPolicy};
+    ///
+    /// let breaker = CircuitBreaker::new("test", CircuitBreakerPolicy::default());
+    /// let mut new_policy = CircuitBreakerPolicy::default();
+    /// new_policy.open_duration = Duration::from_secs(120);
+    /// breaker.update_config(new_policy);
+    /// ```
     pub fn update_config(&self, mut config: CircuitBreakerPolicy) {
         config.failure_ratio_threshold = config.failure_ratio_threshold.clamp(0.000_1, 1.0);
         let mut inner = self.lock_inner();
         inner.config = config;
     }
 
+    /// Calculates the current percentage of failed requests in the sliding window.
+    ///
+    /// The ratio is a float between `0.0` and `1.0`. Old entries in the sliding window
+    /// are cleaned up before calculation.
+    ///
+    /// ## Examples
+    ///
+    /// ```
+    /// use autumn_web::circuit_breaker::{CircuitBreaker, CircuitBreakerPolicy};
+    ///
+    /// let breaker = CircuitBreaker::new("test", CircuitBreakerPolicy::default());
+    /// assert_eq!(breaker.failure_ratio(), 0.0);
+    /// ```
     pub fn failure_ratio(&self) -> f64 {
         let mut inner = self.lock_inner();
         let window = inner.config.sample_window;
@@ -299,6 +458,23 @@ impl CircuitBreaker {
         }
     }
 
+    /// Executes an asynchronous operation, monitoring its `Result` to update
+    /// the circuit's state.
+    ///
+    /// If the circuit is currently `Open`, this method immediately returns
+    /// `Err(CircuitBreakerError::Open)` without executing the future.
+    ///
+    /// ## Examples
+    ///
+    /// ```
+    /// use autumn_web::circuit_breaker::{CircuitBreaker, CircuitBreakerPolicy};
+    ///
+    /// # async fn example() {
+    /// let breaker = CircuitBreaker::new("test", CircuitBreakerPolicy::default());
+    /// let result = breaker.run(async { Ok::<_, ()>("Success") }).await;
+    /// assert_eq!(result.unwrap(), "Success");
+    /// # }
+    /// ```
     pub async fn run<F, T, E>(&self, fut: F) -> Result<T, CircuitBreakerError<E>>
     where
         F: Future<Output = Result<T, E>>,
@@ -316,6 +492,28 @@ impl CircuitBreaker {
         res.map_err(CircuitBreakerError::Execution)
     }
 
+    /// Executes an asynchronous operation, providing a fallback function
+    /// that is called if the circuit is `Open` or the execution fails.
+    ///
+    /// This is useful for providing a default value or alternative action
+    /// when the primary system is unavailable.
+    ///
+    /// ## Examples
+    ///
+    /// ```
+    /// use autumn_web::circuit_breaker::{CircuitBreaker, CircuitBreakerPolicy, CircuitBreakerError};
+    ///
+    /// # async fn example() {
+    /// let breaker = CircuitBreaker::new("test", CircuitBreakerPolicy::default());
+    ///
+    /// let result = breaker.run_with_fallback(
+    ///     async { Err::<&str, &str>("Failed") },
+    ///     |_err| Ok("Fallback value")
+    /// ).await;
+    ///
+    /// assert_eq!(result.unwrap(), "Fallback value");
+    /// # }
+    /// ```
     pub async fn run_with_fallback<F, T, E, FB>(&self, fut: F, fallback: FB) -> Result<T, E>
     where
         F: Future<Output = Result<T, E>>,
@@ -328,12 +526,18 @@ impl CircuitBreaker {
     }
 }
 
+/// A guard object tracking an in-flight operation.
+///
+/// It must be explicitly marked as a success or failure by calling
+/// [`CircuitBreakerGuard::success`] or [`CircuitBreakerGuard::failure`].
+/// If it is dropped without being marked, it is treated as a failure.
 pub struct CircuitBreakerGuard {
     breaker: CircuitBreaker,
     completed: bool,
 }
 
 impl CircuitBreakerGuard {
+    /// Creates a new guard for an in-flight request.
     pub fn new(breaker: CircuitBreaker) -> Self {
         Self {
             breaker,
@@ -341,11 +545,13 @@ impl CircuitBreakerGuard {
         }
     }
 
+    /// Marks the guarded operation as successful.
     pub fn success(mut self) {
         self.completed = true;
         self.breaker.after_call(true);
     }
 
+    /// Marks the guarded operation as a failure.
     pub fn failure(mut self) {
         self.completed = true;
         self.breaker.after_call(false);
@@ -365,11 +571,24 @@ impl Drop for CircuitBreakerGuard {
     }
 }
 
+/// A thread-safe registry for managing multiple named circuit breakers.
+///
+/// Ensures that multiple parts of the application can share and refer to
+/// the same `CircuitBreaker` instance by name.
 pub struct CircuitBreakerRegistry {
     breakers: Mutex<HashMap<String, CircuitBreaker>>,
 }
 
 impl CircuitBreakerRegistry {
+    /// Creates a new, empty registry.
+    ///
+    /// ## Examples
+    ///
+    /// ```
+    /// use autumn_web::circuit_breaker::CircuitBreakerRegistry;
+    ///
+    /// let registry = CircuitBreakerRegistry::new();
+    /// ```
     pub fn new() -> Self {
         Self {
             breakers: Mutex::new(HashMap::new()),
@@ -385,6 +604,19 @@ impl CircuitBreakerRegistry {
         self.breakers.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Gets an existing circuit breaker by name, or creates a new one
+    /// with the provided `config` if it doesn't exist.
+    ///
+    /// ## Examples
+    ///
+    /// ```
+    /// use autumn_web::circuit_breaker::{CircuitBreakerRegistry, CircuitBreakerPolicy};
+    ///
+    /// let registry = CircuitBreakerRegistry::new();
+    /// let policy = CircuitBreakerPolicy::default();
+    /// let breaker = registry.get_or_create("service_a", policy);
+    /// assert_eq!(breaker.name(), "service_a");
+    /// ```
     pub fn get_or_create(&self, name: &str, config: CircuitBreakerPolicy) -> CircuitBreaker {
         let mut breakers = self.lock_breakers();
         breakers
@@ -393,6 +625,21 @@ impl CircuitBreakerRegistry {
             .clone()
     }
 
+    /// Gets an existing circuit breaker by name and updates its config, or
+    /// creates a new one with the provided `config` if it doesn't exist.
+    ///
+    /// ## Examples
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use autumn_web::circuit_breaker::{CircuitBreakerRegistry, CircuitBreakerPolicy};
+    ///
+    /// let registry = CircuitBreakerRegistry::new();
+    /// let mut policy = CircuitBreakerPolicy::default();
+    /// policy.failure_ratio_threshold = 0.9;
+    /// let breaker = registry.get_or_create_with_config("service_b", policy);
+    /// assert_eq!(breaker.config().failure_ratio_threshold, 0.9);
+    /// ```
     pub fn get_or_create_with_config(
         &self,
         name: &str,
@@ -424,18 +671,37 @@ impl CircuitBreakerRegistry {
 
 static REGISTRY: std::sync::OnceLock<CircuitBreakerRegistry> = std::sync::OnceLock::new();
 
+/// Returns a reference to the global `CircuitBreakerRegistry` singleton.
+///
+/// This provides a convenient way to share circuit breakers across the application
+/// without passing a registry instance around.
 pub fn global_registry() -> &'static CircuitBreakerRegistry {
     REGISTRY.get_or_init(CircuitBreakerRegistry::new)
 }
 
+/// A global lock to prevent tests that manipulate time or the global registry
+/// from interfering with each other.
 pub static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// A `tower::Layer` that wraps a service with a [`CircuitBreaker`].
+///
+/// It will trip the circuit if the inner service's `Future` resolves to an `Err`.
 #[derive(Clone)]
 pub struct CircuitBreakerLayer {
     breaker: CircuitBreaker,
 }
 
 impl CircuitBreakerLayer {
+    /// Creates a new layer that applies the given `CircuitBreaker` to a service.
+    ///
+    /// ## Examples
+    ///
+    /// ```
+    /// use autumn_web::circuit_breaker::{CircuitBreakerLayer, CircuitBreaker, CircuitBreakerPolicy};
+    ///
+    /// let breaker = CircuitBreaker::new("layer_test", CircuitBreakerPolicy::default());
+    /// let layer = CircuitBreakerLayer::new(breaker);
+    /// ```
     #[must_use]
     pub const fn new(breaker: CircuitBreaker) -> Self {
         Self { breaker }
@@ -453,6 +719,7 @@ impl<S> tower::Layer<S> for CircuitBreakerLayer {
     }
 }
 
+/// A `tower::Service` wrapper that applies a [`CircuitBreaker`] to an inner service.
 #[derive(Clone)]
 pub struct CircuitBreakerService<S> {
     inner: S,
@@ -460,13 +727,16 @@ pub struct CircuitBreakerService<S> {
 }
 
 pin_project_lite::pin_project! {
+    /// The future returned by [`CircuitBreakerService`].
     #[project = CircuitBreakerServiceFutureProj]
     pub enum CircuitBreakerServiceFuture<F> {
+        #[allow(missing_docs)]
         Executing {
             #[pin]
             fut: F,
             guard: Option<CircuitBreakerGuard>,
         },
+        #[allow(missing_docs)]
         Open,
     }
 }
