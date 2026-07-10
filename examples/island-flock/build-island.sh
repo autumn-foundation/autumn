@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the Yew "literary boids" island into the hello example's static/islands/ dir.
+# Build the Yew "literary boids" island into the flock example's static/islands/ dir.
 #
 # Pipeline (see docs/guide/wasm-islands.md):
 #   1. cargo build --target wasm32-unknown-unknown --release   (raw .wasm)
@@ -17,7 +17,7 @@ set -euo pipefail
 
 CRATE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$CRATE_DIR"
-OUT_DIR="../hello/static/islands"
+OUT_DIR="../flock/static/islands"
 CRATE_NAME="autumn_island_flock"
 # Honor CARGO_TARGET_DIR when set (e.g. a shared /workspace/target); otherwise
 # cargo writes to ./target.

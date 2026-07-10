@@ -1,7 +1,7 @@
-# Minimal config for the `hello` example.
+# Minimal config for the `flock` example.
 #
 # Everything else uses framework defaults. The only opt-in here is a custom
-# Content-Security-Policy for the Yew WASM island served at GET /flock.
+# Content-Security-Policy for the Yew WASM island served at GET /.
 #
 # This is the framework's DEFAULT policy (see
 # `autumn::security::config::default_content_security_policy`) with a single

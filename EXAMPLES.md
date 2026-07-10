@@ -37,6 +37,24 @@ blocks publishing `autumn-web` or `autumn-cli`.
 
 ---
 
+### `examples/flock` — WASM Island (Yew CSR)
+
+<!-- catalog:example name=flock tier=supported -->
+
+| Field | Value |
+|-------|-------|
+| **Persona** | Developer who needs one heavy, client-side interactive widget inside an otherwise server-rendered Autumn page |
+| **Journey** | WASM island: server-render a maud page whose home route mounts a Yew CSR component compiled to `wasm32-unknown-unknown`, with a custom app-level CSP |
+| **Key capabilities** | maud-owned page, `data-*` island mount point, ES-module loader, `asset_url` static serving, custom `content_security_policy` with `'wasm-unsafe-eval'` |
+| **Prerequisites** | Rust 1.88.0+ (committed wasm artifacts run without a toolchain; rebuilding needs the `wasm32-unknown-unknown` target + `wasm-bindgen-cli`) |
+| **Run command** | `cargo run -p flock` |
+| **Success proof** | `curl -sD - -o /dev/null http://127.0.0.1:3000/ \| grep -i content-security-policy` shows `script-src 'self' 'wasm-unsafe-eval'`; the browser page animates the flocking canvas |
+
+The island crate that produces the wasm lives in `examples/island-flock`
+(cataloged as excluded). See `docs/guide/wasm-islands.md` for the design notes.
+
+---
+
 ### `examples/todo-app` — Classic CRUD App
 
 <!-- catalog:example name=todo-app tier=supported -->
@@ -194,6 +212,7 @@ can pick the closest starting point without overlap.
 | Journey | Example | One-line summary |
 |---------|---------|-----------------|
 | First route | `hello` | Simplest possible Autumn app — three routes, no database |
+| WASM island | `flock` | Server-rendered maud page that mounts a Yew CSR "literary boids" wasm widget on `GET /` |
 | CRUD + MCP | `todo-app` | Full-stack todo list with Diesel, Maud, htmx, bearer-token API, and MCP tool projection |
 | Admin / static rendering | `blog` | Blog engine with admin UI and `#[static_get]` pre-rendering |
 | Profiles / tasks | `bookmarks` | Repository macro, profile layering, actuator, hourly scheduled task |

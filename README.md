@@ -173,6 +173,7 @@ See [EXAMPLES.md](EXAMPLES.md) for the full catalog with personas, journeys, pre
 | Example | Description |
 |---------|-------------|
 | [`examples/hello`](examples/hello) | Minimal hello-world app with route macros and no database |
+| [`examples/flock`](examples/flock) | WASM island spike: a server-rendered maud page whose home route mounts a Yew CSR "literary boids" widget compiled to `wasm32-unknown-unknown`, with a custom `'wasm-unsafe-eval'` CSP |
 | [`examples/todo-app`](examples/todo-app) | Full-stack CRUD app with Diesel, Maud, htmx, Tailwind, JSON API, bearer-token auth, and MCP tool projection |
 | [`examples/blog`](examples/blog) | Blog engine with admin UI, validation, and pre-rendering pages to static HTML via `#[static_get]` |
 | [`examples/bookmarks`](examples/bookmarks) | Repository macro, generated CRUD API, profiles, scheduled tasks, and actuator endpoints |

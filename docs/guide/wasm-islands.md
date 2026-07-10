@@ -16,8 +16,8 @@ glyph-agent becomes the last character of **Autumn's own source code** it eats.
 > `autumn generate island`, no `IslandCx`, no build-pipeline integration. You
 > wire the pieces by hand. That is deliberate. A complete, working copy of
 > everything here lives in `examples/island-flock/` +
-> `examples/hello/src/main.rs` (the `/flock` route). The crate is a peer of the
-> `hello` example and builds its wasm into `examples/hello/static/islands/`.
+> `examples/flock/src/main.rs` (the `GET /` route). The crate is a peer of the
+> `flock` example and builds its wasm into `examples/flock/static/islands/`.
 
 ## Why a WASM island (and not htmx)
 
@@ -59,7 +59,7 @@ collide** — a concern that turns out to be a non-issue in this architecture.
 
 ```
 ┌────────────────────────── server (native, autumn-web) ───────────────────────────┐
-│  #[get("/flock")] async fn flock() -> Markup {                                     │
+│  #[get("/")] async fn index() -> Markup {                                          │
 │      html! { div id="flock" data-autumn-island="flock" data-count="120" {}        │
 │              script type="module" src=(asset_url("islands/flock-boot.js")) defer;} │
 │  }                                                                                 │
@@ -227,7 +227,7 @@ which wraps the three steps:
 ```bash
 cd examples/island-flock && ./build-island.sh
 # 1. cargo build --target wasm32-unknown-unknown --release
-# 2. wasm-bindgen --target web --no-typescript --out-dir ../hello/static/islands <crate>.wasm
+# 2. wasm-bindgen --target web --no-typescript --out-dir ../flock/static/islands <crate>.wasm
 # 3. wasm-opt -Oz (optional, only if wasm-opt is on PATH)
 ```
 
@@ -247,7 +247,7 @@ For the flock these are ~29 KB of JS glue and ~212 KB of wasm before `wasm-opt`
 ## The loader
 
 An **external** ES module — no inline script, so it works under `script-src
-'self'` with no nonce (`examples/hello/static/islands/flock-boot.js`):
+'self'` with no nonce (`examples/flock/static/islands/flock-boot.js`):
 
 ```js
 import init, { mount } from './autumn_island_flock.js';
@@ -294,12 +294,12 @@ set it to an explicit string, Autumn emits that string **verbatim** as the
 `autumn::security::headers`, an explicit policy automatically opts out of nonce
 injection — you own the policy end to end).
 
-The hello example sets its policy to the framework default **plus** the single
+The flock example sets its policy to the framework default **plus** the single
 `'wasm-unsafe-eval'` token in `script-src` — every other directive is
 byte-for-byte the default (`autumn::security::config::default_content_security_policy`):
 
 ```toml
-# examples/hello/autumn.toml
+# examples/flock/autumn.toml
 [security.headers]
 content_security_policy = "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'wasm-unsafe-eval'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'self'"
 ```
@@ -307,7 +307,7 @@ content_security_policy = "default-src 'self'; img-src 'self' data:; style-src '
 You can confirm it at runtime:
 
 ```bash
-curl -sD - -o /dev/null http://127.0.0.1:3000/flock | grep -i content-security-policy
+curl -sD - -o /dev/null http://127.0.0.1:3000/ | grep -i content-security-policy
 # content-security-policy: default-src 'self'; … script-src 'self' 'wasm-unsafe-eval'; …
 ```
 
@@ -357,14 +357,14 @@ serves `static/` at `/static/` out of the box, so no route wiring is required.
 3. Write your component + a `#[wasm_bindgen] pub fn mount(el: web_sys::Element, /* props */)`.
 4. Copy `build-island.sh`, update `CRATE_NAME`, and also point `OUT_DIR` at
    your own app's `static/islands` (e.g. `OUT_DIR="../<their-app>/static/islands"`)
-   — it defaults to the hello example's dir and is relative to the island
+   — it defaults to the flock example's dir and is relative to the island
    crate dir. Then run it; the artifacts land in that `OUT_DIR`.
 5. Copy `flock-boot.js` → `my-island-boot.js`; update the import filename and
    the `data-autumn-island` selector.
 6. In a maud handler, render the empty mount div + the module script
    (`asset_url("islands/my-island-boot.js")`).
 7. In `autumn.toml`, set an explicit `content_security_policy` = *default* +
-   `'wasm-unsafe-eval'` in `script-src` (copy the hello example's string).
+   `'wasm-unsafe-eval'` in `script-src` (copy the flock example's string).
 8. `cargo run`, open the page, confirm the widget mounts.
 
 ## Limitations & honest caveats

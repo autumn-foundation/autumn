@@ -1,0 +1,14 @@
+[package]
+name = "flock"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+autumn-web = { path = "../../autumn" }
+# The maud `html!` macro expands to `::maud::` paths, so any crate that calls it
+# needs `maud` as a direct dependency (used by the `/` WASM-island page).
+maud = { version = "0.27", features = ["axum"] }
+
+[lints.rust]
+unsafe_code = "forbid"
