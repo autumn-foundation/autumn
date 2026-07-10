@@ -137,6 +137,25 @@ impl PolicyContext {
     /// instead.
     pub async fn from_session(session: &Session, auth_session_key: &str) -> Self {
         let user_id = session.get(auth_session_key).await;
+
+        // Seed the ambient current actor (#1383) with the authenticated session
+        // user, mirroring how `auth.rs` publishes the principal next to
+        // `log::context::set_user_id`. This is the single seam that covers every
+        // `#[repository(policy = ...)]` route which gates on a
+        // session-authenticated policy check but is NOT also wrapped by
+        // `RequireAuth`/`#[secured]`/an API-token bearer (the three existing
+        // `set_actor` sites) — without this, such a route's versioned writes
+        // would fall back to `SYSTEM_ACTOR` even though a real user is in scope.
+        //
+        // Only an *ambient* seed: it never overrides an explicit `AuditEvent`
+        // actor or a `before_*` hook's `ctx.actor`. `set_actor` is a no-op
+        // outside an established request scope, so this stays panic-safe for
+        // non-request callers (e.g. hand-rolled policy unit tests), and it never
+        // publishes for an anonymous session (guarded on `Some`).
+        if let Some(user_id) = &user_id {
+            crate::current::Current::set_actor(user_id.clone());
+        }
+
         let role = session.get("role").await;
         let roles = role.into_iter().collect();
         Self {
@@ -1136,6 +1155,37 @@ mod tests {
         let c = PolicyContext::from_session(&session, "user_id").await;
         assert!(c.scopes.is_empty());
         assert!(!c.has_scope("posts:read"));
+    }
+
+    #[tokio::test]
+    async fn from_session_seeds_current_actor_for_authenticated_user() {
+        // Mirrors the request path: the log-context middleware establishes an
+        // empty current-actor scope, then a session-authenticated policy check
+        // resolves the user via `from_session`. Even without RequireAuth /
+        // #[secured] / an API-token bearer having fired, the resolved user must
+        // become the ambient actor so versioned writes attribute to them rather
+        // than falling back to SYSTEM_ACTOR (#1383).
+        crate::current::scope_request(async {
+            assert_eq!(crate::current::Current::actor(), None);
+            let session = session_with(Some("42"), Some("editor"));
+            let c = PolicyContext::from_session(&session, "user_id").await;
+            assert_eq!(c.user_id.as_deref(), Some("42"));
+            assert_eq!(crate::current::Current::actor(), Some("42".to_owned()));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn from_session_leaves_current_actor_none_for_anonymous() {
+        // An anonymous session must never publish an actor, so unauthenticated
+        // requests behave exactly as before this feature existed.
+        crate::current::scope_request(async {
+            let session = session_with(None, None);
+            let c = PolicyContext::from_session(&session, "user_id").await;
+            assert!(c.user_id.is_none());
+            assert_eq!(crate::current::Current::actor(), None);
+        })
+        .await;
     }
 
     #[test]
