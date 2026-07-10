@@ -1975,8 +1975,16 @@ fn list_run_files(run_dir: &Path) -> Result<Vec<String>, BackupError> {
     Ok(files)
 }
 
-/// Prune remote runs for a profile, keeping the newest `keep` and NEVER deleting
-/// the just-uploaded `keep_run_id`. Independent of the local `--keep`.
+/// Prune remote runs for a profile, keeping the newest `keep` COMPLETE runs and
+/// NEVER deleting the just-uploaded `keep_run_id`. Independent of the local
+/// `--keep`.
+///
+/// Retention is based ONLY on complete runs (those with a remote `manifest.json`,
+/// the same completeness source `resolve_latest_run` uses), so a partial/failed
+/// upload can't consume a keep slot and cause an older *complete* backup to be
+/// pruned. Incomplete/partial prefixes are left untouched here — deleting them
+/// could race a concurrent in-progress upload; GC of stale partial prefixes is a
+/// possible follow-up, out of scope for this change.
 fn prune_remote(
     offsite: &ResolvedOffsite,
     client: &S3Client,
@@ -1988,7 +1996,7 @@ fn prune_remote(
     let objects = client
         .list_objects_v2(&list_prefix)
         .map_err(|e| e.to_string())?;
-    let run_ids = remote_run_ids(&objects, &list_prefix);
+    let run_ids = complete_remote_run_ids(&objects, &list_prefix);
     let to_remove = plan_remote_pruning(&run_ids, keep, keep_run_id);
     for run_id in &to_remove {
         let run_prefix = offsite_run_prefix(&offsite.prefix, profile, run_id);
@@ -2004,7 +2012,10 @@ fn prune_remote(
 }
 
 /// Extract the unique, sorted run-id (timestamp) segments from listed object
-/// keys under `list_prefix` (`{list_prefix}{run_id}/{file}`).
+/// keys under `list_prefix` (`{list_prefix}{run_id}/{file}`). Test-only: the
+/// live paths (`latest` resolution and retention) use the manifest-gated
+/// [`complete_remote_run_ids`] so partial runs never count.
+#[cfg(test)]
 fn remote_run_ids(objects: &[s3::S3Object], list_prefix: &str) -> Vec<String> {
     let mut ids: Vec<String> = objects
         .iter()
@@ -3238,6 +3249,67 @@ mod tests {
             complete.into_iter().next_back().as_deref(),
             Some("20260709T010101Z")
         );
+    }
+
+    #[test]
+    fn remote_retention_counts_only_complete_runs() {
+        // P2 #3 (Codex scenario): keep=2 with complete runs A/B, a NEWER partial
+        // run C (no manifest), and the just-uploaded complete run D. Retention
+        // must count only complete runs — keep the newest 2 complete (D, B),
+        // prune the older complete A, and NEVER touch the partial C or D.
+        let list_prefix = "db/prod/";
+        let a = "20260701T000000Z"; // complete, oldest
+        let b = "20260702T000000Z"; // complete
+        let c = "20260703T000000Z"; // PARTIAL (no manifest), newer than B
+        let d = "20260704T000000Z"; // complete, just uploaded (newest)
+        let objects = vec![
+            s3::S3Object {
+                key: format!("{list_prefix}{a}/control.dump"),
+                size: 1,
+            },
+            s3::S3Object {
+                key: format!("{list_prefix}{a}/manifest.json"),
+                size: 1,
+            },
+            s3::S3Object {
+                key: format!("{list_prefix}{b}/control.dump"),
+                size: 1,
+            },
+            s3::S3Object {
+                key: format!("{list_prefix}{b}/manifest.json"),
+                size: 1,
+            },
+            // Partial C: artifact only, no manifest.
+            s3::S3Object {
+                key: format!("{list_prefix}{c}/control.dump"),
+                size: 1,
+            },
+            s3::S3Object {
+                key: format!("{list_prefix}{d}/control.dump"),
+                size: 1,
+            },
+            s3::S3Object {
+                key: format!("{list_prefix}{d}/manifest.json"),
+                size: 1,
+            },
+        ];
+
+        // Retention input = complete runs only (A, B, D) — the partial C is absent.
+        let complete = complete_remote_run_ids(&objects, list_prefix);
+        assert_eq!(
+            complete,
+            vec![a.to_owned(), b.to_owned(), d.to_owned()],
+            "partial run C must not count as a retention slot"
+        );
+
+        // keep=2, just-uploaded=D => prune only the oldest complete run A.
+        let to_remove = plan_remote_pruning(&complete, 2, d);
+        assert_eq!(to_remove, vec![a.to_owned()]);
+        // The partial C is NOT pruned (never a candidate), and D is never pruned.
+        assert!(!to_remove.contains(&c.to_owned()));
+        assert!(!to_remove.contains(&d.to_owned()));
+        // B survives (it's within the newest-2 complete).
+        assert!(!to_remove.contains(&b.to_owned()));
     }
 
     #[test]
