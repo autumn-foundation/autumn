@@ -1735,11 +1735,9 @@ fn rewrite_after_redirect(
             }
             *body = None;
         }
-        301 | 302 => {
-            if *method == Method::POST {
-                *method = Method::GET;
-                *body = None;
-            }
+        301 | 302 if *method == Method::POST => {
+            *method = Method::GET;
+            *body = None;
         }
         _ => {}
     }
