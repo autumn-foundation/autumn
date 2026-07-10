@@ -515,6 +515,12 @@ fn inline_css_html(html: &str) -> Result<String, MailError> {
         // tags in the body (dropped by default) so the linked CSS still reaches
         // clients rather than being silently discarded from the delivered body.
         .keep_link_tags(true)
+        // Also emit the presentational HTML `width`/`height` attributes (from the
+        // inlined CSS dimensions) on `table`/`td`/`th`/`img` — both default off.
+        // Outlook-family clients ignore CSS `width`/`height`, so without these
+        // attributes those elements lose their intended sizing there.
+        .apply_width_attributes(true)
+        .apply_height_attributes(true)
         .build();
     // Inline in document mode. Its fragment mode would avoid the `<html>`/`<body>`
     // wrapping but drops retained `@media`/at-rules (it re-homes them to `<head>`,
@@ -4272,6 +4278,52 @@ mod tests {
         assert!(
             table_open.contains("style=") && table_open.contains("600px"),
             "table must carry an inline style with the width rule; got tag: {table_open}"
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::literal_string_with_formatting_args,
+        reason = "CSS rule braces are literal HTML, not format placeholders"
+    )]
+    fn inline_css_emits_outlook_width_height_attributes() {
+        // Outlook-family clients ignore CSS `width`/`height`, so the inliner must
+        // also emit the presentational HTML `width`/`height` attributes on the
+        // supported elements (`table`/`td`/`th`/`img`) — not only the CSS `style=`.
+        let html = r#"<style>table{width:600px}img{height:40px}</style><table><tr><td><img src="/x.png"></td></tr></table>"#;
+        let out = inline_css_html(html).expect("inlining succeeds");
+
+        let table_open = {
+            let table = out
+                .split("<table")
+                .nth(1)
+                .expect("a <table> tag is present in the output");
+            &table[..table.find('>').expect("table tag closes")]
+        };
+        // Discriminating: the CSS style must be present AND the HTML attribute too.
+        assert!(
+            table_open.contains("style=") && table_open.contains("600px"),
+            "table must still carry the inline CSS width; got tag: {table_open}"
+        );
+        assert!(
+            table_open.contains(r#"width="600""#),
+            "table must gain the presentational HTML width attribute Outlook needs; got tag: {table_open}"
+        );
+
+        let img_open = {
+            let img = out
+                .split("<img")
+                .nth(1)
+                .expect("an <img> tag is present in the output");
+            &img[..img.find('>').expect("img tag closes")]
+        };
+        assert!(
+            img_open.contains("style=") && img_open.contains("40px"),
+            "img must still carry the inline CSS height; got tag: {img_open}"
+        );
+        assert!(
+            img_open.contains(r#"height="40""#),
+            "img must gain the presentational HTML height attribute Outlook needs; got tag: {img_open}"
         );
     }
 
