@@ -366,6 +366,7 @@ consumed; nothing is left on the function.
 | `status` | integer | Success HTTP status code (defaults to `200`) |
 | `hidden` | flag / bool | Exclude the route from the generated spec |
 | `mcp` | flag / bool | Expose this endpoint as an MCP tool (`mcp = false` force-excludes it). Requires the `mcp` feature and a `mount_mcp` call. |
+| `stream` | flag / bool | Mark an `Sse`-returning MCP tool as streaming (`#[api_doc(mcp, stream)]`). A streaming route has no JSON response schema, so without this flag an `mcp`-exposed `Sse` route is skipped as schema-less; `stream` exempts it from that gate and advertises it as a streaming tool. |
 
 - **Ordering is flexible — with one exception:** `#[api_doc]` works whether it
   sits *above* or *below* the built-in route macros. Rust expands attribute
@@ -655,6 +656,22 @@ pub trait PostRepository {
 **Generates:**
 
 ```rust
+// The macro re-emits your trait, augmenting it with built-in CRUD alongside
+// your derived queries, then implements the whole thing for a generated
+// `Pg*` struct. The CRUD methods are trait methods (bring `PostRepository`
+// into scope to call them), not inherent methods on `PgPostRepository`.
+pub trait PostRepository: Send + Sync {
+    // Built-in CRUD (always added to the trait)
+    async fn find_by_id(&self, id: i64) -> AutumnResult<Option<Post>>;
+    async fn find_all(&self) -> AutumnResult<Vec<Post>>;
+    async fn save(&self, new: &NewPost) -> AutumnResult<Post>;
+    async fn update(&self, id: i64, changes: &UpdatePost) -> AutumnResult<Post>;
+    async fn delete_by_id(&self, id: i64) -> AutumnResult<()>;
+    async fn count(&self) -> AutumnResult<i64>;
+    async fn exists_by_id(&self, id: i64) -> AutumnResult<bool>;
+    // ...plus your declared derived queries (find_by_published, count_by_author_id)
+}
+
 // Concrete struct with a connection pool
 #[derive(Clone)]
 pub struct PgPostRepository {
@@ -664,19 +681,13 @@ pub struct PgPostRepository {
 // Axum extractor -- use `repo: PgPostRepository` in handler signatures
 impl FromRequestParts<AppState> for PgPostRepository { ... }
 
-// Built-in CRUD (always generated)
-impl PgPostRepository {
-    pub async fn find_by_id(&self, id: i64) -> AutumnResult<Post> { ... }
-    pub async fn find_all(&self) -> AutumnResult<Vec<Post>> { ... }
-    pub async fn save(&self, new: &NewPost) -> AutumnResult<Post> { ... }
-    pub async fn update(&self, id: i64, changes: &UpdatePost) -> AutumnResult<Post> { ... }
-    pub async fn delete_by_id(&self, id: i64) -> AutumnResult<()> { ... }
-    pub async fn count(&self) -> AutumnResult<i64> { ... }
-    pub async fn exists_by_id(&self, id: i64) -> AutumnResult<bool> { ... }
-}
-
-// Derived queries (parsed from trait method names)
+// One impl block carries the built-in CRUD and your derived queries
 impl PostRepository for PgPostRepository {
+    // Built-in CRUD (always generated)
+    async fn find_by_id(&self, id: i64) -> AutumnResult<Option<Post>> { ... }
+    // ...find_all / save / update / delete_by_id / count / exists_by_id...
+
+    // Derived queries (parsed from trait method names)
     async fn find_by_published(&self, published: bool) -> AutumnResult<Vec<Post>> {
         let mut conn = self.pool.get().await?;
         posts::table
@@ -704,7 +715,7 @@ impl PostRepository for PgPostRepository {
 |-----------------|------------------------------------------|
 | `find_by_`      | `.filter(col.eq(val)).load()`            |
 | `count_by_`     | `.filter(col.eq(val)).count()`           |
-| `exists_by_`    | `.filter(col.eq(val)).count() > 0`       |
+| `exists_by_`    | `select(exists(...filter(col.eq(val))))` |
 | `delete_by_`    | `diesel::delete(...).filter(col.eq(val))`|
 | `_and_`         | Joins multiple `.filter()` clauses       |
 
@@ -1313,9 +1324,12 @@ protection, combine with the global limiter layer under `[security.rate_limit]`.
 **Runtime detail — `RateLimitEnvelopeCounted`:** this is **not** a macro. It's
 an internal marker struct (`autumn_web::security::rate_limit::RateLimitEnvelopeCounted`)
 set only on the MCP `tools/call` replay path to avoid double-charging a request
-whose enclosing `/mcp` envelope was already counted. Per-route `#[throttle]`
-buckets and the global layer still charge a request carrying it (use
-`RateLimitExempt` to bypass every limiter). It's mentioned here only because it
+whose enclosing `/mcp` envelope was already counted. Only the framework-default
+`[security.rate_limit]` limiter — which shares that envelope's bucket — skips a
+request carrying it; per-route `#[throttle]` buckets and user-installed
+path-override limiters (added via `AppBuilder::layer`) do **not** share the
+envelope bucket and **still** charge it, exactly as a direct call (use
+`RateLimitExempt` to bypass *every* limiter). It's mentioned here only because it
 lives next to the throttle machinery. See [Rate Limiting](./rate-limiting.md).
 
 ---
