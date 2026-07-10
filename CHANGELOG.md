@@ -425,6 +425,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   through `across_tenants()` is rejected rather than silently writing to a single
   shard while matching rows on other shards go unseen. See the
   "Race-safe get-or-insert" section of the repositories guide.
+- **repository:** typed grouped aggregate queries (#1364) — declarative
+  `GROUP BY` roll-ups on a `#[repository]` trait. **Before:** dashboard
+  aggregates (a post's vote tally, an experiment's audit-trail size) were
+  hand-written raw `diesel::sql_query("SELECT … SUM/COUNT … GROUP BY …")`
+  strings that bypassed the repository's replica routing, tenant scoping, and
+  soft-delete filters and had to be re-typed for every widening cast.
+  **After:** declare the aggregate by method name with its pair return type —
+  `count_grouped_by_<col>() -> Vec<(K, i64)>` or
+  `sum_/avg_/min_/max_<num_col>_grouped_by_<col>() -> Vec<(K, Option<T>)>`
+  (`avg` rolls up to `Option<f64>`) — and the macro generates an inherent
+  method returning a lazy `GroupedAggregate<'_, K, V>` builder that yields one
+  `(group, aggregate)` pair per group. Chain `.order_by_aggregate_desc()` /
+  `.limit(n)` for top-N, `.filter_eq(v)` / `.filter_range(lo, hi)` to scope the
+  group column *before* aggregating, or `.bucket(DateBucket::{Day,Week,Month})`
+  for a `date_trunc` time series, then `.load().await`. Filter values are bound
+  as parameters (never interpolated); the query composes the same soft-delete +
+  tenant predicates as `count` and acquires its connection through the read
+  route, so replica routing and multi-tenancy come for free.
+  `sum`/`avg`/`min`/`max` are null-safe (an all-`NULL` group yields `None`, an
+  empty table an empty `Vec`) and are rejected on a sharded, tenant-scoped
+  repository used via `across_tenants()` rather than returning a
+  per-shard-partial answer. The reddit-clone vote tally and the admin
+  experiment-history count now use this instead of raw `SUM`/`COUNT` SQL.
+  Closes #1364. See "Grouped aggregate queries" in
+  `docs/guide/repositories.md`.
 - **widgets:** `flash_messages(&[FlashMessage])` (issue #1240) — an accessible
   renderer for consumed flash messages. Each banner is its own live region
   whose `role`/`aria-live` is chosen by severity (`Error`/`Warning` announce

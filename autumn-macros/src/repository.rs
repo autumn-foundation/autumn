@@ -9,7 +9,7 @@
 //! Uses `diesel-async` `RunQueryDsl` for async queries - no sync `interact()`.
 
 use proc_macro2::TokenStream;
-use quote::{format_ident, quote};
+use quote::{ToTokens, format_ident, quote};
 use syn::parse::Parser as _;
 use syn::{Ident, ItemTrait, LitStr, TraitItem};
 
@@ -417,6 +417,216 @@ fn parse_query_name(name: &str) -> Option<DerivedQuery> {
     })
 }
 
+/// The aggregate function a grouped-aggregate method computes (#1364).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AggKind {
+    Count,
+    Sum,
+    Avg,
+    Min,
+    Max,
+}
+
+impl AggKind {
+    /// The bare aggregate keyword for diagnostics (`"count"`, `"sum"`, …).
+    const fn keyword(self) -> &'static str {
+        match self {
+            Self::Count => "count",
+            Self::Sum => "sum",
+            Self::Avg => "avg",
+            Self::Min => "min",
+            Self::Max => "max",
+        }
+    }
+}
+
+/// Parse a grouped-aggregate method name into `(kind, numeric_col, group_col)`.
+///
+/// Recognized shapes (issue #1364):
+/// - `count_grouped_by_<group_col>` → `(Count, None, group_col)`
+/// - `sum_<col>_grouped_by_<group_col>` → `(Sum, Some(col), group_col)`
+/// - `avg_<col>_grouped_by_<group_col>` → likewise for avg/min/max
+///
+/// Returns `None` when the name has no `_grouped_by_` segment at all (so the
+/// caller can fall through to the ordinary derived-query surface). A name that
+/// *does* contain `_grouped_by_` but is otherwise malformed returns
+/// `Some((_, _, group_col))` only when well formed; malformedness is reported
+/// separately by the caller via [`parse_grouped_aggregate_name`]'s companion
+/// error path.
+fn parse_grouped_aggregate_name(name: &str) -> Option<(AggKind, Option<String>, String)> {
+    let (left, group_col) = name.split_once("_grouped_by_")?;
+    if group_col.is_empty() || group_col.contains("_grouped_by_") {
+        return None;
+    }
+    if left == "count" {
+        return Some((AggKind::Count, None, group_col.to_string()));
+    }
+    for (prefix, kind) in [
+        ("sum_", AggKind::Sum),
+        ("avg_", AggKind::Avg),
+        ("min_", AggKind::Min),
+        ("max_", AggKind::Max),
+    ] {
+        if let Some(col) = left.strip_prefix(prefix)
+            && !col.is_empty()
+        {
+            return Some((kind, Some(col.to_string()), group_col.to_string()));
+        }
+    }
+    None
+}
+
+/// Extract `(K, V)` from a declared `Vec<(K, V)>` return type.
+fn parse_vec_pair_type(ty: &syn::Type) -> Option<(syn::Type, syn::Type)> {
+    let syn::Type::Path(p) = ty else { return None };
+    let seg = p.path.segments.last()?;
+    if seg.ident != "Vec" {
+        return None;
+    }
+    let syn::PathArguments::AngleBracketed(args) = &seg.arguments else {
+        return None;
+    };
+    let syn::GenericArgument::Type(syn::Type::Tuple(tuple)) = args.args.first()? else {
+        return None;
+    };
+    if tuple.elems.len() != 2 {
+        return None;
+    }
+    let mut it = tuple.elems.iter();
+    let k = it.next()?.clone();
+    let v = it.next()?.clone();
+    Some((k, v))
+}
+
+/// If `ty` is `Option<T>`, return the inner `T`.
+fn option_inner_type(ty: &syn::Type) -> Option<&syn::Type> {
+    let syn::Type::Path(p) = ty else { return None };
+    let seg = p.path.segments.last()?;
+    if seg.ident != "Option" {
+        return None;
+    }
+    let syn::PathArguments::AngleBracketed(args) = &seg.arguments else {
+        return None;
+    };
+    match args.args.first()? {
+        syn::GenericArgument::Type(inner) => Some(inner),
+        _ => None,
+    }
+}
+
+/// True if `ty` is exactly the bare path identifier `ident` (e.g. `i64`), with
+/// no generic arguments — used to enforce the exact width a `count`/`avg`
+/// aggregate deserializes into (#1364 review).
+fn type_is_bare_ident(ty: &syn::Type, ident: &str) -> bool {
+    let syn::Type::Path(p) = ty else { return false };
+    if p.qself.is_some() {
+        return false;
+    }
+    p.path
+        .segments
+        .last()
+        .is_some_and(|s| s.ident == ident && s.arguments.is_empty())
+}
+
+/// True if `ty` is exactly `Option<inner>` where `inner` is the bare ident
+/// `inner_ident` (e.g. `Option<f64>`).
+fn type_is_option_of(ty: &syn::Type, inner_ident: &str) -> bool {
+    option_inner_type(ty).is_some_and(|inner| type_is_bare_ident(inner, inner_ident))
+}
+
+/// True if `ty`'s final path segment identifier is `ident`, ignoring any
+/// generic arguments — so it matches both `DateTime` and `DateTime<Utc>`. Used
+/// to detect a `timestamptz` group key (`DateTime<Utc>`) so `.bucket()`
+/// truncation can be pinned to UTC (#1364).
+fn type_last_segment_is(ty: &syn::Type, ident: &str) -> bool {
+    let syn::Type::Path(p) = ty else {
+        return false;
+    };
+    p.path.segments.last().is_some_and(|s| s.ident == ident)
+}
+
+/// Map a supported Rust type to its diesel `sql_types` path token, threading
+/// `Option<T>` to `Nullable<…>`. Returns `None` for unsupported types.
+fn diesel_sql_type_for(ty: &syn::Type) -> Option<TokenStream> {
+    match ty {
+        syn::Type::Reference(r) => diesel_sql_type_for(&r.elem),
+        syn::Type::Path(p) => {
+            let seg = p.path.segments.last()?;
+            let name = seg.ident.to_string();
+            let d = quote! { ::autumn_web::reexports::diesel::sql_types };
+            if name == "Option" {
+                let inner = option_inner_type(ty)?;
+                let inner_st = diesel_sql_type_for(inner)?;
+                return Some(quote! { #d::Nullable<#inner_st> });
+            }
+            let st = match name.as_str() {
+                "i16" => quote! { #d::SmallInt },
+                "i32" => quote! { #d::Integer },
+                "i64" => quote! { #d::BigInt },
+                "f32" => quote! { #d::Float },
+                "f64" => quote! { #d::Double },
+                "bool" => quote! { #d::Bool },
+                "String" | "str" => quote! { #d::Text },
+                "Uuid" => quote! { #d::Uuid },
+                "NaiveDate" => quote! { #d::Date },
+                "NaiveDateTime" => quote! { #d::Timestamp },
+                "NaiveTime" => quote! { #d::Time },
+                "DateTime" => quote! { #d::Timestamptz },
+                _ => return None,
+            };
+            Some(st)
+        }
+        _ => None,
+    }
+}
+
+/// Map a supported numeric Rust type to the Postgres type name used to `CAST`
+/// an aggregate result so it deserializes back into the declared value type
+/// (Postgres widens `SUM`/`AVG`, so an explicit cast keeps the round-trip
+/// exact). Returns `None` for unsupported types.
+fn pg_cast_type_for(ty: &syn::Type) -> Option<&'static str> {
+    let syn::Type::Path(p) = ty else { return None };
+    let name = p.path.segments.last()?.ident.to_string();
+    let pg = match name.as_str() {
+        "i16" => "smallint",
+        "i32" => "integer",
+        "i64" => "bigint",
+        "f32" => "real",
+        "f64" => "double precision",
+        _ => return None,
+    };
+    Some(pg)
+}
+
+/// A parsed grouped-aggregate declaration (#1364).
+///
+/// Like [`FindOrCreateSpec`], this is emitted as an inherent method on the
+/// `Pg*` struct — it returns a lazy `GroupedAggregate<'_, K, V>` builder rather
+/// than a trait finder — so it lives in its own spec list.
+struct GroupedAggregateSpec {
+    /// The declared method identifier, e.g. `sum_amount_grouped_by_user_id`.
+    fn_ident: Ident,
+    /// The declared key type `K` (the group column's Rust type).
+    key_type: syn::Type,
+    /// The declared value type `V`.
+    value_type: syn::Type,
+    /// Diesel `sql_type` for the group-column key.
+    key_sql_type: TokenStream,
+    /// Diesel `sql_type` for the aggregated value.
+    value_sql_type: TokenStream,
+    /// The SQL aggregate expression, e.g. `COUNT(*)` or
+    /// `CAST(SUM("amount") AS bigint)`.
+    agg_sql_expr: String,
+    /// The group column name (quoted-identifier-safe bare name).
+    group_col: String,
+    /// The aggregated numeric column name, if any (`None` for `count`). Guarded
+    /// against at-rest encryption alongside the group column (#1364).
+    value_col: Option<String>,
+    /// When set, generation emits a `compile_error!` with this message instead
+    /// of a method.
+    error: Option<String>,
+}
+
 /// A parsed `find_or_create_by_<field>[_and_<field>...]` declaration (#1382).
 ///
 /// Unlike the [`DerivedQuery`] finders, this is emitted as an inherent async
@@ -802,6 +1012,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // codegen'd near the batch-feature bindings (once `tenant_query_filter`
     // is in scope), then spliced into the inherent `impl Pg*` block.
     let mut find_or_create_specs: Vec<FindOrCreateSpec> = Vec::new();
+    // §1364: typed grouped aggregate declarations. Collected here and codegen'd
+    // near the batch-feature bindings (once `tenant_query_filter` is in scope),
+    // then spliced into the inherent `impl Pg*` block as lazy builder methods.
+    let mut grouped_aggregate_specs: Vec<GroupedAggregateSpec> = Vec::new();
     // §1d: per-shard helpers for derived read methods that fan out under
     // across_tenants. Emitted into the inherent impl (a trait impl cannot hold
     // non-trait members), so kept in a separate list.
@@ -829,6 +1043,205 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     for item in &trait_def.items {
         if let TraitItem::Fn(method) = item {
             let method_name = method.sig.ident.to_string();
+
+            // §1364: `<agg>_[<col>_]grouped_by_<group_col>`. Parsed and
+            // codegen'd separately as an inherent method returning a lazy
+            // `GroupedAggregate<'_, K, V>` builder (like find_or_create_by, not
+            // a trait finder). Intercepted before the derived-query surface so
+            // `count_grouped_by_x` is never mistaken for a `count_by_` finder.
+            if method_name.contains("_grouped_by_") {
+                let fn_ident = method.sig.ident.clone();
+
+                // Every grouped-aggregate method must declare its pair type as
+                // the return type so the macro can bake concrete SQL types.
+                let declared_pair = match &method.sig.output {
+                    syn::ReturnType::Type(_, ty) => parse_vec_pair_type(ty),
+                    syn::ReturnType::Default => None,
+                };
+                let parsed = parse_grouped_aggregate_name(&method_name);
+
+                // Sensible fallbacks used only on the error path (so the spec is
+                // still well-formed for `compile_error!` emission).
+                let unit_ty: syn::Type = syn::parse_quote!(());
+                let mut error: Option<String>;
+                let mut key_type = unit_ty.clone();
+                let mut value_type = unit_ty.clone();
+                let mut key_sql_type = quote! { () };
+                let mut value_sql_type = quote! { () };
+                let mut agg_sql_expr = String::new();
+                let mut group_col = String::new();
+                let mut value_col: Option<String> = None;
+
+                match (parsed, declared_pair) {
+                    (None, _) => {
+                        error = Some(format!(
+                            "`{method_name}` is not a valid grouped-aggregate name: use \
+                             `count_grouped_by_<group_col>` or \
+                             `<sum|avg|min|max>_<num_col>_grouped_by_<group_col>`"
+                        ));
+                    }
+                    (Some(_), None) => {
+                        error = Some(format!(
+                            "`{method_name}` must declare its result type as `-> Vec<(K, V)>` \
+                             so the aggregate's key/value SQL types are known, e.g. \
+                             `fn {method_name}() -> Vec<(i64, Option<i64>)>;`"
+                        ));
+                    }
+                    (Some((kind, num_col, gcol)), Some((k, v))) => {
+                        group_col = gcol;
+                        value_col.clone_from(&num_col);
+                        let value_inner = option_inner_type(&v).unwrap_or(&v).clone();
+
+                        // Numeric-column presence must match the aggregate, and
+                        // sum/min/max/avg need a numeric value type to cast to.
+                        error = match (kind, &num_col) {
+                            (AggKind::Count, Some(_)) => Some(format!(
+                                "`{method_name}`: count takes no numeric column — use \
+                                 `count_grouped_by_<group_col>`"
+                            )),
+                            (_, None) if !matches!(kind, AggKind::Count) => Some(format!(
+                                "`{method_name}`: {kw} needs a numeric column — use \
+                                 `{kw}_<num_col>_grouped_by_<group_col>`",
+                                kw = kind.keyword()
+                            )),
+                            _ => None,
+                        };
+
+                        // Nullable group keys are unsupported (#1364 review): a
+                        // `K = Option<T>` makes `key_sql_type` `Nullable<T>`, and
+                        // then filter binds wrap it again into
+                        // `Nullable<Nullable<T>>`, producing an opaque diesel
+                        // type error. The group column must be NOT NULL.
+                        if error.is_none() && option_inner_type(&k).is_some() {
+                            error = Some(format!(
+                                "`{method_name}`: nullable group keys are unsupported — \
+                                 the group column must be NOT NULL, so declare `K` as `T`, \
+                                 not `Option<T>`"
+                            ));
+                        }
+
+                        // The declared value type must EXACTLY match the type the
+                        // aggregate casts to (#1364 review). `count` always
+                        // produces `bigint` (i64) and `avg` always produces
+                        // `double precision` (f64); QueryableByName does not check
+                        // column OIDs, so a mismatched width silently reinterprets
+                        // the raw bytes as garbage (e.g. float bytes read as i64).
+                        if error.is_none() {
+                            match kind {
+                                AggKind::Count if !type_is_bare_ident(&v, "i64") => {
+                                    error = Some(format!(
+                                        "`{method_name}`: count must declare its value type as \
+                                         `i64` (it produces `COUNT(*)` → bigint); a different \
+                                         width silently misreads the result, e.g. \
+                                         `fn {method_name}() -> Vec<(K, i64)>;`"
+                                    ));
+                                }
+                                AggKind::Avg if !type_is_option_of(&v, "f64") => {
+                                    error = Some(format!(
+                                        "`{method_name}`: avg must declare its value type as \
+                                         `Option<f64>` (it always casts to double precision); a \
+                                         different width silently reinterprets the float bytes as \
+                                         garbage, e.g. `fn {method_name}() -> Vec<(K, Option<f64>)>;`"
+                                    ));
+                                }
+                                AggKind::Sum | AggKind::Min | AggKind::Max
+                                    if option_inner_type(&v).is_none() =>
+                                {
+                                    // SUM/MIN/MAX over an empty or all-NULL group
+                                    // returns SQL NULL, which QueryableByName
+                                    // cannot deserialize into a non-nullable
+                                    // value — it would fail at runtime. Force the
+                                    // declaration to be nullable (#1364 review).
+                                    error = Some(format!(
+                                        "`{method_name}`: {kw} must declare its value type as \
+                                         `Option<T>` for a numeric `T` (it returns SQL NULL over \
+                                         an empty or all-NULL group), e.g. \
+                                         `fn {method_name}() -> Vec<(K, Option<T>)>;`",
+                                        kw = kind.keyword()
+                                    ));
+                                }
+                                _ => {}
+                            }
+                        }
+
+                        // Build the aggregate SQL, casting so the result
+                        // deserializes back into the declared value type
+                        // (Postgres widens SUM/AVG).
+                        if error.is_none() {
+                            agg_sql_expr = match kind {
+                                AggKind::Count => "COUNT(*)".to_string(),
+                                AggKind::Avg => {
+                                    format!(
+                                        "CAST(AVG(\"{}\") AS double precision)",
+                                        num_col.as_ref().unwrap()
+                                    )
+                                }
+                                AggKind::Sum | AggKind::Min | AggKind::Max => {
+                                    if let Some(pg) = pg_cast_type_for(&value_inner) {
+                                        let f = match kind {
+                                            AggKind::Sum => "SUM",
+                                            AggKind::Min => "MIN",
+                                            _ => "MAX",
+                                        };
+                                        format!(
+                                            "CAST({f}(\"{}\") AS {pg})",
+                                            num_col.as_ref().unwrap()
+                                        )
+                                    } else {
+                                        error = Some(format!(
+                                            "`{method_name}`: unsupported {kw} value type — \
+                                             the value must be `Option<T>` for a numeric `T` \
+                                             (i16/i32/i64/f32/f64)",
+                                            kw = kind.keyword()
+                                        ));
+                                        String::new()
+                                    }
+                                }
+                            };
+                        }
+
+                        // Resolve concrete diesel SQL types for key + value.
+                        if error.is_none() {
+                            match diesel_sql_type_for(&k) {
+                                Some(st) => key_sql_type = st,
+                                None => {
+                                    error = Some(format!(
+                                        "`{method_name}`: unsupported group-column key type `{}`",
+                                        k.to_token_stream()
+                                    ));
+                                }
+                            }
+                        }
+                        if error.is_none() {
+                            match diesel_sql_type_for(&v) {
+                                Some(st) => value_sql_type = st,
+                                None => {
+                                    error = Some(format!(
+                                        "`{method_name}`: unsupported aggregate value type `{}`",
+                                        v.to_token_stream()
+                                    ));
+                                }
+                            }
+                        }
+
+                        key_type = k;
+                        value_type = v;
+                    }
+                }
+
+                grouped_aggregate_specs.push(GroupedAggregateSpec {
+                    fn_ident,
+                    key_type,
+                    value_type,
+                    key_sql_type,
+                    value_sql_type,
+                    agg_sql_expr,
+                    group_col,
+                    value_col,
+                    error,
+                });
+                continue;
+            }
 
             // §1382: `find_or_create_by_<field>[_and_<field>...]`. Parsed and
             // codegen'd separately from the `find_by`/`count`/… derived-query
@@ -8002,6 +8415,297 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
+    // ── Typed grouped aggregate queries (issue #1364) ───────────────────────
+    //
+    // Emitted as inherent methods on the Pg* struct (parallel to
+    // find_in_batches / find_or_create_by): each returns a lazy
+    // `GroupedAggregate<'_, K, V>` builder. Under the hood a parameterized
+    // `diesel::sql_query` with a QueryableByName row (concrete SQL types baked
+    // from the declared `Vec<(K, V)>`), routed through the read-role helper and
+    // composing the same soft-delete + tenant predicates as `count`. Filter
+    // values are bound (never interpolated). sum/avg/min/max cannot be merged
+    // across shards, so across_tenants() on a sharded repo is rejected.
+    let grouped_aggregate_methods = {
+        // Baked literals shared by every generated method.
+        let table_q = format!("\"{table_name}\"");
+        let config_soft_delete = config.soft_delete;
+        let config_tenant_scoped = config.tenant_scoped;
+        let config_sharded = config.sharded;
+
+        let soft_delete_cond = if config_soft_delete {
+            quote! { __conds.push(::std::string::String::from("deleted_at IS NULL")); }
+        } else {
+            quote! {}
+        };
+
+        let (tenant_resolve, tenant_cond, tenant_bind) = if config_tenant_scoped {
+            (
+                quote! {
+                    let __tenant: ::core::option::Option<::std::string::String> =
+                        if __repo.across_tenants {
+                            ::core::option::Option::None
+                        } else {
+                            ::core::option::Option::Some(
+                                ::autumn_web::tenancy::CURRENT_TENANT
+                                    .try_with(|t| t.clone())
+                                    .ok()
+                                    .flatten()
+                                    .ok_or_else(|| ::autumn_web::AutumnError::internal_server_error_msg(
+                                        "Query scoped to tenant, but no tenant context was established"
+                                    ))?,
+                            )
+                        };
+                },
+                quote! {
+                    let __tenant_n = { __n += 1; __n };
+                    __conds.push(format!("(${n} IS NULL OR tenant_id = ${n})", n = __tenant_n));
+                },
+                quote! {
+                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<
+                        ::autumn_web::reexports::diesel::sql_types::Text
+                    >, _>(__tenant)
+                },
+            )
+        } else {
+            (quote! {}, quote! {}, quote! {})
+        };
+
+        // Reject cross-shard aggregates whenever the repo is (compile-time)
+        // sharded + tenant-scoped AND the runtime `across_tenants` flag is set —
+        // independent of whether a live shard set (`__autumn_shards`) is loaded.
+        // sum/avg/min/max cannot be merged across shards, and an across-tenant
+        // scan without a shard set (e.g. built via `with_pool_untracked`, where
+        // `__autumn_shards` is `None`) would bind a NULL tenant predicate and
+        // silently return a PARTIAL result over only the current pool. Gating on
+        // `__autumn_shards.is_some()` missed exactly that no-shard-set case, so
+        // the guard fires purely on the sharded config + the `across_tenants`
+        // flag (#1364).
+        let cross_shard_guard = if config_sharded && config_tenant_scoped {
+            quote! {
+                if __repo.across_tenants {
+                    return ::core::result::Result::Err(
+                        ::autumn_web::AutumnError::bad_request_msg(
+                            "cross-shard grouped aggregates are not supported: \
+                             sum/avg/min/max cannot be merged across shards; run the \
+                             aggregate per shard via from_shard(...) instead"
+                        )
+                    );
+                }
+            }
+        } else {
+            quote! {}
+        };
+
+        let mut __methods: Vec<TokenStream> = Vec::new();
+        for spec in &grouped_aggregate_specs {
+            let fn_ident = &spec.fn_ident;
+            if let Some(msg) = &spec.error {
+                __methods.push(quote! { ::core::compile_error!(#msg); });
+                continue;
+            }
+
+            let key_type = &spec.key_type;
+            let value_type = &spec.value_type;
+            let key_sql_type = &spec.key_sql_type;
+            let value_sql_type = &spec.value_sql_type;
+            let agg_expr = &spec.agg_sql_expr;
+            let group_col_q = format!("\"{}\"", spec.group_col);
+
+            // #1364 encryption correctness: grouped aggregates cannot operate on
+            // an at-rest `#[encrypted(...)]` column. The stored value is
+            // ciphertext, so grouping would return ciphertext keys deserialized
+            // into the declared key type, and `.filter_eq(plaintext)` would bind
+            // plaintext against a ciphertext column and match nothing (the
+            // `find_by` path avoids this by routing string params through the
+            // registry encoder; this raw-SQL path cannot). Whether a column is
+            // encrypted is only known at runtime — the mode is declared on the
+            // model, which the repository macro cannot see (see
+            // `encode_derived_query_param`) — so this is a runtime guard against
+            // the SAME registry the `find_by` surface consults, not a
+            // `compile_error!`. It rejects only columns that are actually
+            // encrypted, so non-encrypted grouping (e.g. `count_grouped_by_kind`
+            // on a plain `String`) is unchanged. The escape hatch is a raw query.
+            let enc_guard = {
+                let fn_name_str = spec.fn_ident.to_string();
+                let group_col_raw = spec.group_col.as_str();
+                let mut checks: Vec<TokenStream> = vec![quote! {
+                    if ::autumn_web::encryption::is_encrypted_column(#table_name, #group_col_raw) {
+                        return ::core::result::Result::Err(
+                            ::autumn_web::AutumnError::internal_server_error_msg(
+                                ::std::format!(
+                                    "`{m}`: grouped aggregates are not supported on the encrypted \
+                                     column `{c}` (its stored value is ciphertext; grouping/filtering \
+                                     would compare or return ciphertext). Use a raw query, or group on \
+                                     a non-encrypted column.",
+                                    m = #fn_name_str, c = #group_col_raw,
+                                )
+                            )
+                        );
+                    }
+                }];
+                if let Some(value_col_raw) = spec.value_col.as_deref() {
+                    checks.push(quote! {
+                        if ::autumn_web::encryption::is_encrypted_column(#table_name, #value_col_raw) {
+                            return ::core::result::Result::Err(
+                                ::autumn_web::AutumnError::internal_server_error_msg(
+                                    ::std::format!(
+                                        "`{m}`: grouped aggregates are not supported on the encrypted \
+                                         column `{c}` (its stored value is ciphertext; grouping/filtering \
+                                         would compare or return ciphertext). Use a raw query, or group on \
+                                         a non-encrypted column.",
+                                        m = #fn_name_str, c = #value_col_raw,
+                                    )
+                                )
+                            );
+                        }
+                    });
+                }
+                quote! { #(#checks)* }
+            };
+            // #1364 timezone correctness: only a `timestamptz` (`DateTime<Utc>`)
+            // bucket key gets the UTC-pinning 3-arg `date_trunc` zone argument.
+            // A `NaiveDateTime` (`timestamp`) key keeps the plain 2-arg form
+            // (deterministic field truncation, session-tz independent).
+            let bucket_zone_arg: &str = if type_last_segment_is(key_type, "DateTime") {
+                ", 'UTC'"
+            } else {
+                ""
+            };
+            let doc = format!(
+                "Grouped aggregate `{fn_ident}` → lazy `GroupedAggregate<'_, K, V>` builder (issue #1364).\n\n\
+                 Chain `.order_by_aggregate_desc()`/`.limit(n)` for top-N, \
+                 `.filter_eq(..)`/`.filter_range(lo, hi)` to scope before grouping, \
+                 or `.bucket(DateBucket::Day)` for a time series, then `.load().await`."
+            );
+
+            __methods.push(quote! {
+                #[doc = #doc]
+                #[must_use]
+                pub fn #fn_ident<'__agg>(
+                    &'__agg self,
+                ) -> ::autumn_web::aggregate::GroupedAggregate<'__agg, #key_type, #value_type> {
+                    let __repo = self;
+                    ::autumn_web::aggregate::GroupedAggregate::new(::std::boxed::Box::new(
+                        move |__opts: ::autumn_web::aggregate::AggregateOptions<#key_type>| {
+                            ::std::boxed::Box::pin(async move {
+                                use ::autumn_web::reexports::diesel::prelude::*;
+                                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+
+                                #enc_guard
+                                #cross_shard_guard
+                                #tenant_resolve
+
+                                #[derive(::autumn_web::reexports::diesel::QueryableByName)]
+                                struct __AutumnAggRow {
+                                    #[diesel(sql_type = #key_sql_type)]
+                                    agg_key: #key_type,
+                                    #[diesel(sql_type = #value_sql_type)]
+                                    agg_val: #value_type,
+                                }
+
+                                // Group expression: bucketed (date_trunc) or the raw column.
+                                // For a `timestamptz` (`DateTime<Utc>`) key, `#bucket_zone_arg`
+                                // is `, 'UTC'` so the 3-arg `date_trunc('unit', col, 'UTC')`
+                                // (Postgres 12+) truncates in UTC — otherwise the 2-arg form
+                                // would truncate in the DB session `TimeZone`, drifting bucket
+                                // boundaries across deployments (#1364). For a `NaiveDateTime`
+                                // (`timestamp`) key it is empty, keeping the deterministic
+                                // 2-arg field truncation. SELECT and GROUP BY reuse this same
+                                // string, so the bucket expression always matches exactly.
+                                let __group_expr: ::std::string::String = match __opts.bucket {
+                                    ::core::option::Option::Some(__b) => format!(
+                                        "date_trunc('{unit}', {col}{zone})",
+                                        unit = __b.as_trunc_unit(),
+                                        col = #group_col_q,
+                                        zone = #bucket_zone_arg,
+                                    ),
+                                    ::core::option::Option::None => ::std::string::String::from(#group_col_q),
+                                };
+
+                                // Fixed bind layout — [tenant?], eq, range_low, range_high —
+                                // all bound Nullable so an unset filter is a NULL no-op and the
+                                // bind chain stays constant regardless of which filters are set.
+                                let mut __conds: ::std::vec::Vec<::std::string::String> = ::std::vec::Vec::new();
+                                let mut __n: i32 = 0;
+                                #soft_delete_cond
+                                #tenant_cond
+                                // A non-nullable declared key type cannot represent a
+                                // NULL group (and `Option<K>` is rejected at compile
+                                // time), so exclude rows whose raw group column is NULL —
+                                // otherwise `GROUP BY` would emit a NULL-key group that
+                                // fails to deserialize at runtime (#1364). Guarding the
+                                // raw column also drops null-timestamp rows under
+                                // `.bucket()` (date_trunc of NULL is NULL). No bind param,
+                                // so the `$n` numbering below is unaffected. Harmless
+                                // no-op when the column is already NOT NULL.
+                                __conds.push(format!("{col} IS NOT NULL", col = #group_col_q));
+                                let __eq_n = { __n += 1; __n };
+                                __conds.push(format!("(${n} IS NULL OR {col} = ${n})", n = __eq_n, col = #group_col_q));
+                                let __low_n = { __n += 1; __n };
+                                __conds.push(format!("(${n} IS NULL OR {col} >= ${n})", n = __low_n, col = #group_col_q));
+                                let __high_n = { __n += 1; __n };
+                                __conds.push(format!("(${n} IS NULL OR {col} <= ${n})", n = __high_n, col = #group_col_q));
+
+                                let mut __sql = format!(
+                                    "SELECT {ge} AS agg_key, {ae} AS agg_val FROM {tbl}",
+                                    ge = __group_expr, ae = #agg_expr, tbl = #table_q,
+                                );
+                                __sql.push_str(" WHERE ");
+                                __sql.push_str(&__conds.join(" AND "));
+                                __sql.push_str(&format!(" GROUP BY {}", __group_expr));
+                                match __opts.order {
+                                    ::autumn_web::aggregate::AggregateOrder::Desc =>
+                                        __sql.push_str(" ORDER BY agg_val DESC NULLS LAST, agg_key ASC"),
+                                    ::autumn_web::aggregate::AggregateOrder::Asc =>
+                                        __sql.push_str(" ORDER BY agg_val ASC NULLS LAST, agg_key ASC"),
+                                    ::autumn_web::aggregate::AggregateOrder::Unordered => {}
+                                }
+                                if let ::core::option::Option::Some(__lim) = __opts.limit {
+                                    __sql.push_str(&format!(" LIMIT {}", __lim));
+                                }
+
+                                let (__low, __high) = match __opts.range {
+                                    ::core::option::Option::Some((__l, __h)) => (
+                                        ::core::option::Option::Some(__l),
+                                        ::core::option::Option::Some(__h),
+                                    ),
+                                    ::core::option::Option::None => (
+                                        ::core::option::Option::None,
+                                        ::core::option::Option::None,
+                                    ),
+                                };
+                                let __eq = __opts.eq;
+
+                                let mut __conn = __repo.__autumn_acquire_read_conn().await?;
+                                let __rows: ::std::vec::Vec<__AutumnAggRow> =
+                                    ::autumn_web::reexports::diesel::sql_query(__sql)
+                                        #tenant_bind
+                                        .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<#key_sql_type>, _>(__eq)
+                                        .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<#key_sql_type>, _>(__low)
+                                        .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<#key_sql_type>, _>(__high)
+                                        .load::<__AutumnAggRow>(&mut __conn)
+                                        .await
+                                        .map_err(::autumn_web::AutumnError::from)?;
+
+                                ::core::result::Result::Ok(
+                                    __rows
+                                        .into_iter()
+                                        .map(|__r| (__r.agg_key, __r.agg_val))
+                                        .collect::<::std::vec::Vec<(#key_type, #value_type)>>(),
+                                )
+                            }) as ::std::pin::Pin<::std::boxed::Box<
+                                dyn ::std::future::Future<
+                                    Output = ::autumn_web::AutumnResult<::std::vec::Vec<(#key_type, #value_type)>>,
+                                > + ::core::marker::Send + '__agg,
+                            >>
+                        },
+                    ))
+                }
+            });
+        }
+        quote! { #(#__methods)* }
+    };
+
     // ── Race-safe get-or-insert (find_or_create_by_*, issue #1382) ──────────
     //
     // Emitted as inherent async methods on the Pg* struct (parallel to
@@ -10991,6 +11695,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
             #find_in_batches_methods
 
+            // Typed grouped aggregate queries (issue #1364).
+            #grouped_aggregate_methods
+
             // Race-safe get-or-insert (find_or_create_by_*, issue #1382).
             #find_or_create_by_methods
 
@@ -11391,6 +12098,437 @@ mod tests {
             err.to_string().contains("requires hooks"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn repository_macro_generates_grouped_sum_method() {
+        // §1364: a `sum_<col>_grouped_by_<group>` declaration becomes an
+        // inherent method returning a lazy `GroupedAggregate` builder, backed
+        // by a parameterized `sql_query` with a `QueryableByName` row. Postgres
+        // widens `SUM`, so the aggregate is `CAST` to the declared value type
+        // (`Option<i64>` → `bigint`) to keep the round-trip exact.
+        let generated = repository_macro(
+            quote! { Event, table = "events" },
+            quote! {
+                pub trait EventRepository {
+                    fn sum_score_grouped_by_post_id() -> Vec<(i64, Option<i64>)>;
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("pub fn sum_score_grouped_by_post_id"),
+            "grouped-aggregate method must be generated: {generated}"
+        );
+        assert!(
+            generated.contains(":: autumn_web :: aggregate :: GroupedAggregate"),
+            "method must return the runtime GroupedAggregate builder: {generated}"
+        );
+        assert!(
+            generated.contains("QueryableByName"),
+            "aggregate must load through a typed QueryableByName row: {generated}"
+        );
+        assert!(
+            generated.contains("AS bigint"),
+            "SUM must be CAST to the declared value type (bigint): {generated}"
+        );
+        // Filter values are bound as Nullable parameters, never interpolated.
+        assert!(
+            generated.contains("Nullable"),
+            "filter/tenant values must be bound as Nullable parameters: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_grouped_avg_casts_to_double_precision() {
+        // AVG rolls up to `Option<f64>` via an explicit double-precision cast.
+        let generated = repository_macro(
+            quote! { Event, table = "events" },
+            quote! {
+                pub trait EventRepository {
+                    fn avg_score_grouped_by_post_id() -> Vec<(i64, Option<f64>)>;
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("pub fn avg_score_grouped_by_post_id"),
+            "avg grouped-aggregate method must be generated: {generated}"
+        );
+        assert!(
+            generated.contains("AS double precision"),
+            "AVG must be cast to double precision: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_grouped_count_tenant_scoped_predicate() {
+        // A tenant-scoped grouped COUNT composes the same `tenant_id` predicate
+        // as `count`, resolving the active tenant before the query.
+        let generated = repository_macro(
+            quote! { Event, table = "events", tenant_scoped },
+            quote! {
+                pub trait EventRepository {
+                    fn count_grouped_by_kind() -> Vec<(String, i64)>;
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("pub fn count_grouped_by_kind"),
+            "count grouped-aggregate method must be generated: {generated}"
+        );
+        assert!(
+            generated.contains("COUNT(*)"),
+            "count aggregate must use COUNT(*): {generated}"
+        );
+        assert!(
+            generated.contains("tenant_id ="),
+            "tenant-scoped aggregate must filter by tenant_id: {generated}"
+        );
+        assert!(
+            generated.contains("CURRENT_TENANT"),
+            "tenant-scoped aggregate must resolve the active tenant: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_grouped_aggregate_rejects_across_tenants_without_shard_set() {
+        // §1364 tenant-isolation: a sharded + tenant-scoped grouped aggregate
+        // must reject `across_tenants()` cross-shard queries (sum/avg/min/max
+        // cannot be merged across shards). The guard must fire purely on the
+        // runtime `across_tenants` flag, NOT on a live shard set being present —
+        // otherwise a repo built without shard context (e.g. `with_pool_untracked`,
+        // where `__autumn_shards` is `None`) would slip past and silently return a
+        // PARTIAL result over only the current pool.
+        let generated = repository_macro(
+            quote! { Event, table = "events", tenant_scoped, sharded },
+            quote! {
+                pub trait EventRepository {
+                    fn sum_score_grouped_by_kind() -> Vec<(String, Option<i64>)>;
+                }
+            },
+        )
+        .to_string();
+
+        // Isolate the generated aggregate method body so the assertions below
+        // target the aggregate guard specifically (not some other cross-shard
+        // surface on the same repo).
+        let pos = generated
+            .find("pub fn sum_score_grouped_by_kind")
+            .expect("sharded+tenant_scoped grouped aggregate method must be generated");
+        let section = &generated[pos..];
+
+        // The rejection guard must be present in the aggregate body.
+        assert!(
+            section.contains("cross-shard grouped aggregates are not supported"),
+            "sharded+tenant_scoped grouped aggregate must reject across_tenants: {section}"
+        );
+        // The guard must key off the runtime `across_tenants` flag.
+        assert!(
+            section.contains("across_tenants"),
+            "aggregate guard must reference the across_tenants flag: {section}"
+        );
+        // The guard condition must NOT depend on a shard set being loaded —
+        // `__autumn_shards.is_some()` gating is exactly the no-shard-set hole
+        // this fix closes. Check the tokens up to the rejection so we assert on
+        // the guard condition, not on unrelated fan-out code elsewhere.
+        let guard_end = section
+            .find("cross-shard grouped aggregates are not supported")
+            .expect("rejection message must be present");
+        let guard_cond = &section[..guard_end];
+        assert!(
+            !guard_cond.contains("__autumn_shards . is_some")
+                && !guard_cond.contains("__autumn_shards.is_some"),
+            "aggregate guard condition must not depend on __autumn_shards being Some: {guard_cond}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_grouped_aggregate_excludes_null_group_keys() {
+        // §1364: because the declared key type is non-nullable (and `Option<K>`
+        // is a compile error), a NULL group would fail to deserialize at
+        // runtime. The generated SQL must always guard the raw group column
+        // with `IS NOT NULL` so NULL-key rows are silently excluded — safe even
+        // when the column is already NOT NULL (the planner drops the predicate).
+        let generated = repository_macro(
+            quote! { Vote, table = "votes" },
+            quote! {
+                pub trait VoteRepository {
+                    fn sum_value_grouped_by_post_id() -> Vec<(i64, Option<i64>)>;
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("pub fn sum_value_grouped_by_post_id"),
+            "grouped-aggregate method must be generated: {generated}"
+        );
+        assert_eq!(
+            generated.matches("IS NOT NULL").count(),
+            1,
+            "grouped aggregate must emit exactly one `IS NOT NULL` group-key guard: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_grouped_bucket_timestamptz_key_truncates_in_utc() {
+        // §1364 timezone correctness: a `DateTime<Utc>` (Postgres `timestamptz`)
+        // bucket key must truncate in an explicit UTC zone via the 3-arg
+        // `date_trunc('unit', col, 'UTC')` form (Postgres 12+). The 2-arg form
+        // would truncate in the DB session `TimeZone`, drifting bucket
+        // boundaries across deployments even though the API exposes UTC.
+        let generated = repository_macro(
+            quote! { Event, table = "events" },
+            quote! {
+                pub trait EventRepository {
+                    fn count_grouped_by_created_at() -> Vec<(::chrono::DateTime<::chrono::Utc>, i64)>;
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("pub fn count_grouped_by_created_at"),
+            "grouped-aggregate method must be generated: {generated}"
+        );
+        // The emitted bucket expression pins truncation to UTC.
+        assert!(
+            generated.contains("date_trunc('{unit}', {col}{zone})"),
+            "bucket expression must be built from the parameterized template: {generated}"
+        );
+        assert!(
+            generated.contains("\", 'UTC'\""),
+            "timestamptz bucket key must supply the UTC zone argument so \
+             date_trunc truncates in UTC (#1364): {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_grouped_bucket_timestamp_key_has_no_zone() {
+        // A `NaiveDateTime` (Postgres `timestamp WITHOUT time zone`) bucket key
+        // is a deterministic field truncation, so it keeps the plain 2-arg
+        // `date_trunc('unit', col)` with an EMPTY zone argument — no `'UTC'`.
+        let generated = repository_macro(
+            quote! { Event, table = "events" },
+            quote! {
+                pub trait EventRepository {
+                    fn count_grouped_by_created_at() -> Vec<(::chrono::NaiveDateTime, i64)>;
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("pub fn count_grouped_by_created_at"),
+            "grouped-aggregate method must be generated: {generated}"
+        );
+        // Still built from the same parameterized bucket template …
+        assert!(
+            generated.contains("date_trunc('{unit}', {col}{zone})"),
+            "bucket expression must be built from the parameterized template: {generated}"
+        );
+        // … but with an empty zone argument, so no `'UTC'` is ever added.
+        assert!(
+            !generated.contains("'UTC'"),
+            "timestamp bucket key must NOT pin truncation to UTC — it is a \
+             deterministic field truncation (#1364): {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_grouped_aggregate_requires_return_type() {
+        // Omitting the `-> Vec<(K, V)>` return type is a compile error with a
+        // helpful message (the macro can't infer the key/value SQL types).
+        let generated = repository_macro(
+            quote! { Event, table = "events" },
+            quote! {
+                pub trait EventRepository {
+                    fn count_grouped_by_post_id();
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "missing return type must emit a compile_error: {generated}"
+        );
+        assert!(
+            generated.contains("must declare its result type"),
+            "compile_error must explain the missing `-> Vec<(K, V)>`: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_grouped_avg_wrong_value_type_is_error() {
+        // §1364 review: `avg` always casts to double precision, so declaring a
+        // non-`Option<f64>` value type must be a compile error (QueryableByName
+        // would otherwise silently reinterpret the float bytes).
+        let generated = repository_macro(
+            quote! { Event, table = "events" },
+            quote! {
+                pub trait EventRepository {
+                    fn avg_score_grouped_by_post_id() -> Vec<(i64, Option<i64>)>;
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "avg with a non-Option<f64> value must emit a compile_error: {generated}"
+        );
+        assert!(
+            generated.contains("avg must declare its value type as"),
+            "compile_error must name the avg value-type rule: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_grouped_count_wrong_value_type_is_error() {
+        // §1364 review: `count` always produces bigint (i64); a mis-declared
+        // width is a compile error rather than a runtime width mismatch.
+        let generated = repository_macro(
+            quote! { Event, table = "events" },
+            quote! {
+                pub trait EventRepository {
+                    fn count_grouped_by_kind() -> Vec<(String, i32)>;
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "count with a non-i64 value must emit a compile_error: {generated}"
+        );
+        assert!(
+            generated.contains("count must declare its value type as"),
+            "compile_error must name the count value-type rule: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_grouped_sum_wrong_value_type_is_error() {
+        // §1364 review: `sum`/`min`/`max` return SQL NULL over an empty or
+        // all-NULL group, so a non-`Option<T>` value type must be a compile
+        // error (QueryableByName cannot deserialize NULL into a non-nullable
+        // value — it would fail at runtime).
+        let generated = repository_macro(
+            quote! { Event, table = "events" },
+            quote! {
+                pub trait EventRepository {
+                    fn sum_value_grouped_by_post_id() -> Vec<(i64, i64)>;
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "sum with a non-Option value must emit a compile_error: {generated}"
+        );
+        assert!(
+            generated.contains("must declare its value type as"),
+            "compile_error must name the sum value-type rule: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_grouped_nullable_key_is_error() {
+        // §1364 review: a nullable group key (`K = Option<T>`) is unsupported —
+        // it would nest into `Nullable<Nullable<T>>` on filter binds.
+        let generated = repository_macro(
+            quote! { Event, table = "events" },
+            quote! {
+                pub trait EventRepository {
+                    fn count_grouped_by_post_id() -> Vec<(Option<i64>, i64)>;
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "nullable group key must emit a compile_error: {generated}"
+        );
+        assert!(
+            generated.contains("nullable group keys are unsupported"),
+            "compile_error must explain nullable group keys are unsupported: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_grouped_aggregate_guards_encrypted_columns() {
+        // §1364 encryption correctness: whether a column is `#[encrypted(...)]`
+        // is declared on the model and is only known at runtime (the repository
+        // macro sees the trait, not the model's fields — see
+        // `encode_derived_query_param`), so a `compile_error!` cannot name the
+        // encrypted column. Instead the generated grouped-aggregate method emits
+        // a runtime guard against the SAME `is_encrypted_column` registry the
+        // `find_by` surface consults, rejecting both the group column and the
+        // aggregated numeric column before running any SQL. It fires only for
+        // columns that are actually encrypted, so non-encrypted grouping is
+        // unchanged (asserted separately by the other grouped-aggregate tests,
+        // whose generated bodies never early-return).
+        let generated = repository_macro(
+            quote! { Event, table = "events" },
+            quote! {
+                pub trait EventRepository {
+                    fn sum_secret_grouped_by_email() -> Vec<(String, Option<i64>)>;
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("is_encrypted_column"),
+            "grouped aggregate must guard against encrypted columns at runtime: {generated}"
+        );
+        // Both the group column and the aggregated value column are guarded.
+        assert!(
+            generated.contains("\"email\""),
+            "guard must check the group column `email`: {generated}"
+        );
+        assert!(
+            generated.contains("\"secret\""),
+            "guard must check the aggregated value column `secret`: {generated}"
+        );
+        assert!(
+            generated.contains("not supported on the encrypted"),
+            "guard message must name the encrypted-column restriction: {generated}"
+        );
+        assert!(
+            generated.contains("Use a raw query"),
+            "guard message must point to the raw-SQL escape hatch: {generated}"
+        );
+    }
+
+    #[test]
+    fn parse_grouped_aggregate_name_shapes() {
+        assert_eq!(
+            parse_grouped_aggregate_name("count_grouped_by_post_id"),
+            Some((AggKind::Count, None, "post_id".to_string()))
+        );
+        assert_eq!(
+            parse_grouped_aggregate_name("sum_amount_grouped_by_user_id"),
+            Some((
+                AggKind::Sum,
+                Some("amount".to_string()),
+                "user_id".to_string()
+            ))
+        );
+        assert_eq!(
+            parse_grouped_aggregate_name("avg_score_grouped_by_day"),
+            Some((AggKind::Avg, Some("score".to_string()), "day".to_string()))
+        );
+        // Not a grouped-aggregate name → None (falls through to derived queries).
+        assert_eq!(parse_grouped_aggregate_name("find_by_post_id"), None);
     }
 
     #[test]
