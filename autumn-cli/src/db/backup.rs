@@ -323,14 +323,21 @@ fn backup(args: &BackupArgs) -> Result<(), BackupError> {
 
     let profile = migrate::effective_profile(args.profile.as_deref());
 
-    // Offsite pre-flight (issue #1619): resolve the destination and, when an
-    // upload is requested, build/validate the client (credentials present,
-    // destination distinct from app storage) BEFORE dumping — so a misconfigured
-    // offsite fails fast instead of after a full dump.
-    let offsite = load_offsite(&profile)?;
-    let should_upload = args.upload || offsite.as_ref().is_some_and(|o| o.auto_upload);
+    // Offsite pre-flight (issue #1619): read the offsite section LENIENTLY (no
+    // bucket/cred validation) just to learn `auto_upload`. Only when an upload is
+    // actually requested do we STRICTLY validate (bucket required, creds env
+    // resolved, distinct destination) and build the client — BEFORE dumping — so
+    // a misconfigured offsite fails fast, while a plain local backup with an
+    // incomplete `[backup.offsite]` section is never blocked.
+    let loaded_offsite = load_offsite(&profile)?;
+    let should_upload = args.upload
+        || loaded_offsite
+            .as_ref()
+            .is_some_and(LoadedOffsite::auto_upload);
     let upload_ctx = if should_upload {
-        let offsite = offsite.ok_or(BackupError::OffsiteNotConfigured)?;
+        let offsite = loaded_offsite
+            .ok_or(BackupError::OffsiteNotConfigured)?
+            .resolve()?;
         let client = offsite.build_client()?;
         Some((offsite, client))
     } else {
@@ -1615,7 +1622,6 @@ struct ResolvedOffsite {
     s3: S3Config,
     prefix: String,
     keep: Option<usize>,
-    auto_upload: bool,
     allow_shared_bucket: bool,
     access_key_id_env: Option<String>,
     secret_access_key_env: Option<String>,
@@ -1698,10 +1704,82 @@ impl autumn_web::config::Env for ProfileForcedEnv<'_> {
     }
 }
 
-/// Load and resolve the `[backup.offsite]` destination for `profile`, applying
-/// the profile overlay and `AUTUMN_*` env overrides via the runtime config
-/// loader. `Ok(None)` when no offsite section is configured.
-fn load_offsite(profile: &str) -> Result<Option<ResolvedOffsite>, BackupError> {
+/// A leniently-loaded `[backup.offsite]` section: enough to learn `auto_upload`
+/// WITHOUT validating the bucket/credentials, so a plain local `autumn db backup`
+/// (no `--upload`, no `auto_upload`) never fails just because an incomplete
+/// offsite section exists. Call [`LoadedOffsite::resolve`] — only when an upload
+/// is actually requested — to get the validated, ready-to-use destination.
+struct LoadedOffsite {
+    offsite: autumn_web::config::OffsiteBackupConfig,
+    app_storage_bucket: Option<String>,
+    app_storage_endpoint: Option<String>,
+}
+
+impl LoadedOffsite {
+    /// The configured-default upload flag, readable without validating anything.
+    const fn auto_upload(&self) -> bool {
+        self.offsite.auto_upload
+    }
+
+    /// Validate and resolve into a ready-to-use [`ResolvedOffsite`]. This is the
+    /// STRICT step — bucket is required here — and must only run when uploading.
+    fn resolve(self) -> Result<ResolvedOffsite, BackupError> {
+        let Self {
+            offsite,
+            app_storage_bucket,
+            app_storage_endpoint,
+        } = self;
+        let bucket = offsite
+            .s3
+            .bucket
+            .as_deref()
+            .map(str::trim)
+            .filter(|b| !b.is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| BackupError::OffsiteConfig {
+                detail: "backup.offsite.s3.bucket is required".to_owned(),
+            })?;
+        // Region is only meaningful for AWS + SigV4 scope; many S3-compatible
+        // endpoints ignore it. Default to us-east-1 when unset.
+        let region = offsite
+            .s3
+            .region
+            .as_deref()
+            .map(str::trim)
+            .filter(|r| !r.is_empty())
+            .unwrap_or("us-east-1")
+            .to_owned();
+        let s3 = S3Config {
+            bucket,
+            region,
+            endpoint: offsite
+                .s3
+                .endpoint
+                .as_deref()
+                .map(str::trim)
+                .filter(|e| !e.is_empty())
+                .map(str::to_owned),
+            force_path_style: offsite.s3.force_path_style,
+        };
+        Ok(ResolvedOffsite {
+            s3,
+            prefix: normalize_offsite_prefix(offsite.prefix.as_deref()),
+            keep: offsite.keep,
+            allow_shared_bucket: offsite.allow_shared_bucket,
+            access_key_id_env: offsite.s3.access_key_id_env,
+            secret_access_key_env: offsite.s3.secret_access_key_env,
+            app_storage_bucket,
+            app_storage_endpoint,
+        })
+    }
+}
+
+/// Leniently load the `[backup.offsite]` section for `profile`, applying the
+/// profile overlay and `AUTUMN_*` env overrides via the runtime config loader.
+/// `Ok(None)` when no offsite section is configured. Performs NO bucket/cred
+/// validation — that is deferred to [`LoadedOffsite::resolve`] so a local-only
+/// backup is never blocked by an incomplete offsite section.
+fn load_offsite(profile: &str) -> Result<Option<LoadedOffsite>, BackupError> {
     let base = dotenv_env();
     let forced = ProfileForcedEnv {
         inner: &base,
@@ -1716,48 +1794,8 @@ fn load_offsite(profile: &str) -> Result<Option<ResolvedOffsite>, BackupError> {
     let Some(offsite) = cfg.backup.offsite else {
         return Ok(None);
     };
-    // Unbox once so the field moves/reads below are identical to an owned value.
-    let offsite = *offsite;
-    let bucket = offsite
-        .s3
-        .bucket
-        .as_deref()
-        .map(str::trim)
-        .filter(|b| !b.is_empty())
-        .map(str::to_owned)
-        .ok_or_else(|| BackupError::OffsiteConfig {
-            detail: "backup.offsite.s3.bucket is required".to_owned(),
-        })?;
-    // Region is only meaningful for AWS + SigV4 scope; many S3-compatible
-    // endpoints ignore it. Default to us-east-1 when unset.
-    let region = offsite
-        .s3
-        .region
-        .as_deref()
-        .map(str::trim)
-        .filter(|r| !r.is_empty())
-        .unwrap_or("us-east-1")
-        .to_owned();
-    let s3 = S3Config {
-        bucket,
-        region,
-        endpoint: offsite
-            .s3
-            .endpoint
-            .as_deref()
-            .map(str::trim)
-            .filter(|e| !e.is_empty())
-            .map(str::to_owned),
-        force_path_style: offsite.s3.force_path_style,
-    };
-    Ok(Some(ResolvedOffsite {
-        s3,
-        prefix: normalize_offsite_prefix(offsite.prefix.as_deref()),
-        keep: offsite.keep,
-        auto_upload: offsite.auto_upload,
-        allow_shared_bucket: offsite.allow_shared_bucket,
-        access_key_id_env: offsite.s3.access_key_id_env.clone(),
-        secret_access_key_env: offsite.s3.secret_access_key_env,
+    Ok(Some(LoadedOffsite {
+        offsite: *offsite,
         app_storage_bucket: cfg
             .storage
             .s3
@@ -1885,6 +1923,11 @@ fn upload_run(
     eprintln!("\u{2500}\u{2500} offsite upload \u{2500}\u{2500}");
     let mut files = list_run_files(run_dir).map_err(|e| e.to_string())?;
     files.sort();
+    // Upload `manifest.json` LAST so the presence of a verified remote manifest
+    // implies the whole run uploaded (completeness marker for `latest`
+    // resolution). A stable sort keeps the artifact files in alphabetical order
+    // and moves the single manifest to the end.
+    files.sort_by_key(|f| f.as_str() == MANIFEST_FILE);
     if files.is_empty() {
         return Err("the completed run directory contains no files to upload".to_owned());
     }
@@ -1975,6 +2018,30 @@ fn remote_run_ids(objects: &[s3::S3Object], list_prefix: &str) -> Vec<String> {
     ids
 }
 
+/// The unique, sorted run ids under `list_prefix` that have a remote
+/// `manifest.json` — i.e. COMPLETE runs. Because [`upload_run`] uploads the
+/// manifest last, a `--upload` that died partway leaves artifacts but no
+/// manifest, so its run id is excluded here. This keeps a partial failed upload
+/// from shadowing the last good backup when resolving `latest`.
+fn complete_remote_run_ids(objects: &[s3::S3Object], list_prefix: &str) -> Vec<String> {
+    let mut ids: Vec<String> = objects
+        .iter()
+        .filter_map(|o| o.key.strip_prefix(list_prefix))
+        .filter_map(|rest| {
+            let mut parts = rest.splitn(2, '/');
+            match (parts.next(), parts.next()) {
+                (Some(run_id), Some(file)) if !run_id.is_empty() && file == MANIFEST_FILE => {
+                    Some(run_id.to_owned())
+                }
+                _ => None,
+            }
+        })
+        .collect();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
 /// Pure remote-retention rule: given run ids sorted ascending, keep the newest
 /// `keep` and return the older ones to delete — but ALWAYS exclude
 /// `keep_run_id` (the just-uploaded run) from deletion, even if retention math
@@ -2006,7 +2073,9 @@ pub fn run_offsite_list(profile: Option<&str>) {
 
 fn offsite_list(profile: Option<&str>) -> Result<(), BackupError> {
     let profile = migrate::effective_profile(profile);
-    let offsite = load_offsite(&profile)?.ok_or(BackupError::OffsiteNotConfigured)?;
+    let offsite = load_offsite(&profile)?
+        .ok_or(BackupError::OffsiteNotConfigured)?
+        .resolve()?;
     let client = offsite.build_client()?;
     let list_prefix = offsite_profile_prefix(&offsite.prefix, &profile);
     let objects = client
@@ -2030,10 +2099,14 @@ struct OffsiteRun {
     run_id: String,
     files: Vec<(String, u64)>,
     total: u64,
+    /// Whether the run has a remote `manifest.json` (a complete upload). A run
+    /// missing it is a partial/failed upload and is flagged in the listing.
+    complete: bool,
 }
 
 /// Group listed objects (`{list_prefix}{run_id}/{file}`) into runs, sorted by
-/// run id ascending. Pure for unit testing.
+/// run id ascending. A run is `complete` iff it has a `manifest.json` object.
+/// Pure for unit testing.
 fn group_offsite_objects(objects: &[s3::S3Object], list_prefix: &str) -> Vec<OffsiteRun> {
     let mut map: std::collections::BTreeMap<String, OffsiteRun> = std::collections::BTreeMap::new();
     for obj in objects {
@@ -2051,14 +2124,20 @@ fn group_offsite_objects(objects: &[s3::S3Object], list_prefix: &str) -> Vec<Off
             run_id: run_id.to_owned(),
             files: Vec::new(),
             total: 0,
+            complete: false,
         });
         run.files.push((file.to_owned(), obj.size));
         run.total += obj.size;
+        if file == MANIFEST_FILE {
+            run.complete = true;
+        }
     }
     map.into_values().collect()
 }
 
-/// Render a run listing as a human table: timestamp, files (labels), size. Pure.
+/// Render a run listing as a human table: timestamp, files (labels), size. An
+/// incomplete run (no remote manifest) is flagged so a partial failed upload is
+/// never mistaken for a restorable backup. Pure.
 fn format_offsite_listing(runs: &[OffsiteRun]) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
@@ -2066,12 +2145,16 @@ fn format_offsite_listing(runs: &[OffsiteRun]) -> String {
     for run in runs {
         let mut labels: Vec<&str> = run.files.iter().map(|(f, _)| f.as_str()).collect();
         labels.sort_unstable();
+        let mut files = labels.join(", ");
+        if !run.complete {
+            files.push_str("  (INCOMPLETE — no manifest, not restorable)");
+        }
         let _ = writeln!(
             out,
             "{:<20}  {:>10}  {}",
             run.run_id,
             human_size(run.total),
-            labels.join(", "),
+            files,
         );
     }
     out
@@ -2146,7 +2229,9 @@ fn parse_offsite_ref(s: &str) -> Option<OffsiteRef> {
 /// via the identical [`RestorePlan::discover`] path (AC #4). The temp dir is
 /// removed when the guard drops (after the restore completes or fails).
 fn restore_from_offsite(args: &RestoreArgs, oref: &OffsiteRef) -> Result<(), BackupError> {
-    let offsite = load_offsite(&oref.profile)?.ok_or(BackupError::OffsiteNotConfigured)?;
+    let offsite = load_offsite(&oref.profile)?
+        .ok_or(BackupError::OffsiteNotConfigured)?
+        .resolve()?;
     let client = offsite.build_client()?;
 
     let run_id = match &oref.selector {
@@ -2219,11 +2304,13 @@ fn resolve_latest_run(
             op: "list",
             detail: e.to_string(),
         })?;
-    remote_run_ids(&objects, &list_prefix)
+    // Only consider COMPLETE runs (those with a remote manifest.json), so a
+    // partial/failed upload never shadows the last good backup.
+    complete_remote_run_ids(&objects, &list_prefix)
         .into_iter()
-        .next_back() // sorted ascending; newest is last
+        .next_back() // sorted ascending; newest complete run is last
         .ok_or_else(|| BackupError::BadArtifact {
-            detail: format!("no offsite backups found for profile {profile:?}"),
+            detail: format!("no complete offsite backups found for profile {profile:?}"),
         })
 }
 
@@ -3092,6 +3179,101 @@ mod tests {
             remote_run_ids(&objects, list_prefix),
             vec!["20260709T010101Z".to_owned(), "20260710T010101Z".to_owned()]
         );
+    }
+
+    #[test]
+    fn local_backup_does_not_validate_incomplete_offsite() {
+        // P2 #1: an incomplete [backup.offsite] (no bucket) with auto_upload off
+        // must NOT block a plain local `autumn db backup`. Reading auto_upload
+        // never validates; the strict bucket check lives in resolve(), which the
+        // backup path only calls when an upload is actually requested.
+        let offsite = autumn_web::config::OffsiteBackupConfig::default();
+        assert!(offsite.s3.bucket.is_none(), "precondition: no bucket set");
+        let loaded = LoadedOffsite {
+            offsite,
+            app_storage_bucket: None,
+            app_storage_endpoint: None,
+        };
+        // The decision a local backup makes (args.upload = false): no upload.
+        assert!(!loaded.auto_upload());
+        // And the strict validation is deferred to resolve() (only reached when
+        // uploading) — proving a local-only backup never hits it.
+        assert!(matches!(
+            loaded.resolve(),
+            Err(BackupError::OffsiteConfig { .. })
+        ));
+    }
+
+    #[test]
+    fn complete_remote_run_ids_only_counts_runs_with_a_manifest() {
+        // P2 #2: a newer PARTIAL run (artifacts but no manifest.json) and an
+        // older COMPLETE run. `latest` must pick the older complete run.
+        let list_prefix = "db/prod/";
+        let objects = vec![
+            // Older, complete run.
+            s3::S3Object {
+                key: "db/prod/20260709T010101Z/control.dump".to_owned(),
+                size: 10,
+            },
+            s3::S3Object {
+                key: "db/prod/20260709T010101Z/manifest.json".to_owned(),
+                size: 1,
+            },
+            // Newer, partial run — died before uploading the (last) manifest.
+            s3::S3Object {
+                key: "db/prod/20260710T010101Z/control.dump".to_owned(),
+                size: 10,
+            },
+        ];
+        // The raw run ids include the partial newer run...
+        assert_eq!(
+            remote_run_ids(&objects, list_prefix),
+            vec!["20260709T010101Z".to_owned(), "20260710T010101Z".to_owned()]
+        );
+        // ...but only the complete (older) run is a candidate.
+        let complete = complete_remote_run_ids(&objects, list_prefix);
+        assert_eq!(complete, vec!["20260709T010101Z".to_owned()]);
+        // `latest` = newest COMPLETE run = the older run, not the partial newer one.
+        assert_eq!(
+            complete.into_iter().next_back().as_deref(),
+            Some("20260709T010101Z")
+        );
+    }
+
+    #[test]
+    fn upload_orders_manifest_last() {
+        // P2 #2(a): the manifest must upload last so its remote presence marks a
+        // complete run. Mirror upload_run's ordering.
+        let mut files = vec![
+            "manifest.json".to_owned(),
+            "shard-east.dump".to_owned(),
+            "control.dump".to_owned(),
+        ];
+        files.sort();
+        files.sort_by_key(|f| f.as_str() == MANIFEST_FILE);
+        assert_eq!(
+            files,
+            vec![
+                "control.dump".to_owned(),
+                "shard-east.dump".to_owned(),
+                "manifest.json".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn offsite_listing_flags_incomplete_runs() {
+        // P2 #2: an incomplete run (no manifest) is flagged in `db offsite list`.
+        let list_prefix = "db/prod/";
+        let objects = vec![s3::S3Object {
+            key: "db/prod/20260710T010101Z/control.dump".to_owned(),
+            size: 10,
+        }];
+        let runs = group_offsite_objects(&objects, list_prefix);
+        assert_eq!(runs.len(), 1);
+        assert!(!runs[0].complete);
+        let table = format_offsite_listing(&runs);
+        assert!(table.contains("INCOMPLETE"), "table was: {table}");
     }
 
     #[test]
