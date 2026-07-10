@@ -407,7 +407,12 @@ pub async fn remember_me_middleware(session: Session, request: Request, next: Ne
     let record = match find_remember_token(&mut conn, &series).await {
         Ok(record) => record,
         // A transient DB error must not authenticate — proceed unauthenticated.
-        Err(_) => return next.run(request).await,
+        // Release the checked-out connection first so a downstream `Db` route
+        // can't self-starve a small/exhausted pool while `next.run` awaits.
+        Err(_) => {
+            drop(conn);
+            return next.run(request).await;
+        }
     };
 
     let now = chrono::Utc::now();

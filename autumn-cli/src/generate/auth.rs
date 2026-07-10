@@ -2348,25 +2348,40 @@ fn redirect_to(url: &str) -> Response {{
 struct RememberMiddlewareState {{
     pool: diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
     config: RememberConfig,
+    // The configured `[auth].session_key` (default `"user_id"`), captured at
+    // startup so a remember-me restore writes the SAME identity key that
+    // `#[secured]` / `#[authorize]` authenticate against — the middleware has
+    // no `AppState` to call `state.auth_session_key()` on at request time.
+    auth_session_key: String,
 }}
 
 static REMEMBER_STATE: std::sync::OnceLock<RememberMiddlewareState> = std::sync::OnceLock::new();
 
-/// Install the shared pool and resolved config the remember middleware uses.
-/// Idempotent — a second call is ignored. Called by `remember_me_startup`.
+/// Install the shared pool, resolved config, and configured auth session key the
+/// remember middleware uses. Idempotent — a second call is ignored. Called by
+/// `remember_me_startup`.
 pub fn init_remember_pool(
     pool: diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
     config: RememberConfig,
+    auth_session_key: String,
 ) {{
-    let _ = REMEMBER_STATE.set(RememberMiddlewareState {{ pool, config }});
+    let _ = REMEMBER_STATE.set(RememberMiddlewareState {{
+        pool,
+        config,
+        auth_session_key,
+    }});
 }}
 
 /// Startup hook (auto-wired into `main` via `.on_startup(...)`) that hands the
-/// remember middleware the shared pool and the resolved `[auth.remember]`
-/// config.
+/// remember middleware the shared pool, the resolved `[auth.remember]` config,
+/// and the configured `[auth].session_key`.
 pub async fn remember_me_startup(state: AppState) -> AutumnResult<()> {{
     if let Some(pool) = state.pool() {{
-        init_remember_pool(pool.clone(), state.config().auth.remember.clone());
+        init_remember_pool(
+            pool.clone(),
+            state.config().auth.remember.clone(),
+            state.auth_session_key().to_string(),
+        );
     }}
     Ok(())
 }}
@@ -2485,12 +2500,19 @@ fn to_remember_record(r: &{pascal_name}RememberToken) -> RememberRecord {{
 async fn establish_remember_login(
     session: &Session,
     pool: &diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+    auth_session_key: &str,
     {snake_name}_id: i64,
     ip: std::net::IpAddr,
     headers: &axum::http::HeaderMap,
 ) {{
     session.rotate_id().await;
+    // A remembered request must be fully authenticated for protected routes:
+    // write the SAME identity keys login writes. `{snake_name}_id` powers the
+    // identity extractors / tracked-session lookup, and the configured
+    // `auth_session_key` is the key `#[secured]` / `#[authorize]` check — without
+    // it a remember-cookie restore would rotate the token but still 401.
     session.insert("{snake_name}_id", {snake_name}_id.to_string()).await;
+    session.insert(auth_session_key, {snake_name}_id.to_string()).await;
     autumn_web::step_up::set_last_strong_auth_at(session).await;
     if let Ok(mut db) = pool.get().await {{
         let session_row = build_session_row(session, {snake_name}_id, ip, headers).await;
@@ -2537,7 +2559,12 @@ pub async fn remember_me(
     let record = match find_remember_token(&mut *conn, &series).await {{
         Ok(record) => record,
         // A transient DB error must not authenticate — proceed unauthenticated.
-        Err(_) => return next.run(request).await,
+        // Release the checked-out connection first so a downstream `Db` route
+        // can't self-starve a small/exhausted pool while `next.run` awaits.
+        Err(_) => {{
+            drop(conn);
+            return next.run(request).await;
+        }}
     }};
 
     let now = chrono::Utc::now();
@@ -2572,13 +2599,18 @@ pub async fn remember_me(
             .await
             {{
                 Ok(n) => n,
-                // A transient DB error must not authenticate.
-                Err(_) => return next.run(request).await,
+                // A transient DB error must not authenticate. Release the
+                // connection before yielding so a downstream `Db` route can't
+                // self-starve a small/exhausted pool while `next.run` awaits.
+                Err(_) => {{
+                    drop(conn);
+                    return next.run(request).await;
+                }}
             }};
 
             if affected == 1 {{
                 drop(conn);
-                establish_remember_login(&session, &mw_state.pool, row.user_id, ip, request.headers())
+                establish_remember_login(&session, &mw_state.pool, &mw_state.auth_session_key, row.user_id, ip, request.headers())
                     .await;
                 let mut response = next.run(request).await;
                 append_set_cookie(
@@ -2600,6 +2632,7 @@ pub async fn remember_me(
                         establish_remember_login(
                             &session,
                             &mw_state.pool,
+                            &mw_state.auth_session_key,
                             row.user_id,
                             ip,
                             request.headers(),
@@ -2629,7 +2662,7 @@ pub async fn remember_me(
             // new cookie.
             let row = record.expect("Accept is only returned for a present record");
             drop(conn);
-            establish_remember_login(&session, &mw_state.pool, row.user_id, ip, request.headers())
+            establish_remember_login(&session, &mw_state.pool, &mw_state.auth_session_key, row.user_id, ip, request.headers())
                 .await;
             next.run(request).await
         }}
