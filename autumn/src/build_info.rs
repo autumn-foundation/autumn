@@ -2,7 +2,7 @@
 //!
 //! The consuming app's `build.rs` captures git + build-time facts and bakes
 //! them into the binary as `cargo:rustc-env` variables. The
-//! [`#[autumn_web::main]`](autumn_web_macros) entry-point macro reads those
+//! [`#[autumn_web::main]`](crate::main) entry-point macro reads those
 //! (via `option_env!`) **in the app crate's compile context** — together with
 //! the app's own `CARGO_PKG_NAME` / `CARGO_PKG_VERSION` — and hands them to
 //! [`__set_build_context`] at startup. `/actuator/info` then renders them.

@@ -2727,7 +2727,7 @@ impl TestClient {
     /// Mints a fresh session containing the app's configured
     /// `auth.session_key` (default `"user_id"`) set to `user_id`, saves it to
     /// the session store the router reads, and seeds the cookie jar with the
-    /// session cookie. A subsequent request to a `#[secured]` / [`Auth`]-gated
+    /// session cookie. A subsequent request to a `#[secured]` / [`Auth`](crate::auth::Auth)-gated
     /// route then extracts the same identity a real login would produce.
     ///
     /// This sets **identity only** — authorization still runs. A user acted-as

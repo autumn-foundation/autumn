@@ -142,7 +142,7 @@ const fn read_db_snapshot(_timings: &DbTimings) -> (Option<f64>, usize) {
 static SERVER_TIMING: HeaderName = HeaderName::from_static("server-timing");
 
 /// Shared sentinel coordinating the primary and fallback `Server-Timing`
-/// layers, mirroring [`AccessLogEmitted`](crate::middleware::access_log).
+/// layers, mirroring `AccessLogEmitted`.
 ///
 /// The fallback inserts it into the **request** extensions on the way in, and
 /// the primary flips it once it appends its header, so the outermost fallback
@@ -175,7 +175,7 @@ impl ServerTimingEmitted {
 /// served response.
 ///
 /// Applied automatically by the framework router when
-/// [`server_timing_enabled`](crate::config::server_timing_enabled) resolves
+/// `server_timing_enabled` resolves
 /// to `true` for the active configuration/profile.
 #[derive(Clone, Debug)]
 pub struct ServerTimingLayer {

@@ -808,7 +808,7 @@ where
 ///
 /// The table is created lazily by the *write* helpers ([`record_checksum`],
 /// [`record_checksums`], [`rebaseline_checksum`], [`delete_checksum`],
-/// [`delete_checksums`]), each of which calls [`ensure_checksum_table`] before
+/// [`delete_checksums`]), each of which calls `ensure_checksum_table` before
 /// writing. So the "validate → apply → record" sequence on the startup
 /// auto-migrate and shard paths still works: the pre-apply validate reads an
 /// empty map (nothing to fork from yet, no error), and the subsequent
@@ -928,7 +928,7 @@ where
 /// skips versions that already have a row), leaving a stale hash that only
 /// trips a validate on some *later* migrate run.
 ///
-/// [`ensure_checksum_table`] runs first (consistent with the other helpers,
+/// `ensure_checksum_table` runs first (consistent with the other helpers,
 /// and safe/idempotent under autocommit). Idempotent: deleting an absent row
 /// is a no-op.
 ///
@@ -950,7 +950,7 @@ where
 /// Delete the recorded checksum rows for several versions at once (bulk form of
 /// [`delete_checksum`]). Returns the number of rows actually removed.
 ///
-/// [`ensure_checksum_table`] runs first; an empty `versions` slice is a no-op
+/// `ensure_checksum_table` runs first; an empty `versions` slice is a no-op
 /// that returns `0`. Idempotent — versions with no recorded row are simply not
 /// counted.
 ///

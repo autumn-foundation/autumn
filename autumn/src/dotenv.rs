@@ -3,7 +3,7 @@
 //! A `.env` file is a **local-dev feeder for the highest configuration
 //! layer** — the `AUTUMN_*` environment-variable layer. It does *not*
 //! introduce a new precedence tier: `.env`-derived values are layered *under*
-//! the real environment via an overlay [`Env`] ([`DotenvEnv`] /
+//! the real environment via an overlay [`Env`] (`DotenvEnv` /
 //! [`DotenvOsEnv`]) rather than mutating the process environment, so a real
 //! shell environment variable always wins over the same key in a `.env` file.
 //!
@@ -25,7 +25,7 @@
 //! `AUTUMN_IS_DEBUG`) are intentionally **excluded** from the overlay — a
 //! `.env` file must not be able to change the active profile or bypass the
 //! prod / destructive-command guards. Set those in the real shell environment
-//! or via `--profile`. See [`PROFILE_SELECTOR_KEYS`].
+//! or via `--profile`. See `PROFILE_SELECTOR_KEYS`.
 
 use std::path::{Path, PathBuf};
 
@@ -347,12 +347,12 @@ pub(crate) fn dotenv_base_dir(env: &dyn Env) -> PathBuf {
 /// Resolve `.env` vars for the config manifest directory using the real OS env
 /// and resolved profile.
 ///
-/// The base directory is [`dotenv_base_dir`] — `AUTUMN_MANIFEST_DIR` when set,
+/// The base directory is `dotenv_base_dir` — `AUTUMN_MANIFEST_DIR` when set,
 /// else the process working directory — so `.env` is always read from the same
 /// place as `autumn.toml`.
 ///
 /// Returns the `(key, value)` pairs to apply (empty when gating disables
-/// loading — see [`should_load`]).
+/// loading — see `should_load`).
 ///
 /// # Errors
 /// Returns a [`DotenvError`] (with a `path:line` location) on a malformed or
