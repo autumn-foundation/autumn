@@ -1457,7 +1457,16 @@ async fn generated_scaffold_serves_posts_index_and_json_api() {
         .expect("GET /api/posts failed");
     assert_eq!(response.status(), 200, "GET /api/posts status");
     let body = response.text().await.expect("GET /api/posts body");
-    assert_eq!(body.trim(), "[]", "empty JSON index body");
+    let envelope: serde_json::Value =
+        serde_json::from_str(body.trim()).expect("GET /api/posts must return a JSON Page envelope");
+    let content = envelope["content"]
+        .as_array()
+        .expect("Page envelope must carry a content array");
+    assert!(content.is_empty(), "empty JSON index body: {body}");
+    assert_eq!(
+        envelope["total_elements"], 0,
+        "empty JSON index total_elements"
+    );
 }
 
 #[test]
