@@ -20,6 +20,11 @@ use diesel::{Connection as _, PgConnection, RunQueryDsl as _, sql_query};
 
 use crate::migrate;
 
+/// `autumn db backup` / `autumn db restore` — logical dump/restore (issue #1595).
+/// A submodule so it can reuse this module's production guard
+/// ([`guard_destructive`]) verbatim.
+pub mod backup;
+
 /// The lifecycle subcommands of `autumn db`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DbCommand {

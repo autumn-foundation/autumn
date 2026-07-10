@@ -114,6 +114,105 @@ Two build modes select where the Postgres binaries come from:
   supervised `postgres` child with an on-disk data dir — it is **not** linked
   in-process like SQLite.
 
+## Database backups
+
+`autumn db backup` and `autumn db restore` take logical dumps of the databases
+your app actually uses. They resolve the connection URL(s) through the **same**
+path as `autumn migrate` and the other `autumn db` commands — control plus every
+configured shard, under the active profile/`.env` overlay — so a backup captures
+exactly what the running app reads. On a managed-Postgres daemon the bundled
+`pg_dump`/`pg_restore` are used automatically, so there are no external client
+tools to install.
+
+```sh
+# Back up control + every shard into ./backups/<profile>/<timestamp>/
+autumn db backup
+
+# Compressed by default (pg_dump custom format). Plain SQL instead:
+autumn db backup --format plain
+
+# Only the control database, or a single shard:
+autumn db backup --control-only
+autumn db backup --shard us_east
+
+# Keep only the newest 7 runs, pruning older ones after a successful backup:
+autumn db backup --keep 7 --dir /var/backups/myapp
+```
+
+Each run writes a self-describing directory containing a `manifest.json` plus
+one artifact per database. Every artifact's integrity is verified (custom dumps
+via `pg_restore --list`, plain dumps via `pg_dump`'s completion marker) **before**
+the run is reported successful; a partial or failed run is removed and never
+counted toward `--keep` retention.
+
+If `pg_dump`/`pg_restore` are not on `PATH` (and you are not on a managed-Postgres
+app that bundles them), install the PostgreSQL client tools or point
+`AUTUMN_PG_BIN_DIR` at their `bin` directory. `autumn doctor` warns when they are
+missing.
+
+### Scheduling
+
+**cron** — a nightly backup with 7-day retention:
+
+```cron
+# m h dom mon dow  command
+0 2 * * *  cd /srv/myapp && AUTUMN_ENV=prod autumn db backup --keep 7 --dir /var/backups/myapp
+```
+
+**systemd timer** — the same schedule as a service + timer pair:
+
+```ini
+# /etc/systemd/system/myapp-backup.service
+[Unit]
+Description=Nightly Autumn database backup
+
+[Service]
+Type=oneshot
+WorkingDirectory=/srv/myapp
+Environment=AUTUMN_ENV=prod
+ExecStart=/usr/local/bin/autumn db backup --keep 7 --dir /var/backups/myapp
+```
+
+```ini
+# /etc/systemd/system/myapp-backup.timer
+[Unit]
+Description=Run the Autumn database backup nightly
+
+[Timer]
+OnCalendar=*-*-* 02:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+```sh
+systemctl enable --now myapp-backup.timer   # arm it
+systemctl list-timers myapp-backup.timer     # confirm the next run
+```
+
+### Restore drill
+
+Rehearse recovery before you need it. `restore` is gated by the **same
+production guard** as `autumn db drop`: against a `prod` (or other non-`dev`/`test`)
+profile it refuses unless you pass `--force`, and it verifies every artifact's
+integrity before touching any database.
+
+```sh
+# Restore the whole run (control + shards) — safe on a dev/test profile:
+autumn db restore ./backups/dev/20260710T020000Z
+
+# Restore just one shard from a run:
+autumn db restore ./backups/dev/20260710T020000Z --shard us_east
+
+# Against production you must opt in explicitly (this overwrites data):
+AUTUMN_ENV=prod autumn db restore /var/backups/myapp/prod/20260710T020000Z --force
+```
+
+A good drill: restore the latest backup into a scratch database, run
+`autumn doctor` / your smoke tests against it, then discard it. Confirming a
+backup restores cleanly is the only way to know it is real.
+
 ## Out of scope
 
 SQLite as an app backend, in-process Postgres, and system-service installation
