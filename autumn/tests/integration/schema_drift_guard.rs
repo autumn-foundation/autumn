@@ -51,11 +51,14 @@ use std::collections::BTreeSet;
 /// `#[cfg(feature = "...")]`. Keep in sync with `config.rs`'s `AutumnConfig`
 /// struct — [`feature_gated_roots_mapping_matches_config_when_enabled`] below
 /// self-checks this list whenever a listed feature happens to be enabled.
-const fn feature_gated_roots() -> [(bool, &'static str); 6] {
+const fn feature_gated_roots() -> [(bool, &'static str); 7] {
     [
         (cfg!(feature = "i18n"), "i18n"),
         (cfg!(feature = "mail"), "mail"),
         (cfg!(feature = "storage"), "storage"),
+        // `[backup]` (issue #1619) is gated on `storage` because it reuses
+        // `StorageS3Config`; it shares that feature flag with the `storage` root.
+        (cfg!(feature = "storage"), "backup"),
         (cfg!(feature = "http-client"), "http"),
         (cfg!(feature = "reporting"), "reporting"),
         (cfg!(feature = "maud"), "stories"),

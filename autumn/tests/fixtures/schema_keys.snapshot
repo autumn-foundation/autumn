@@ -1,6 +1,7 @@
 actuator
 alerts
 auth
+backup
 bot_protection
 cache
 channels
