@@ -2571,46 +2571,77 @@ fn resolve_trusted_hosts() -> Vec<String> {
 ///
 /// Returns `(email_configured, webhook_configured)`.
 fn resolve_alert_destination() -> (bool, bool) {
-    let env_set = |name: &str| {
-        std::env::var(name)
-            .ok()
-            .is_some_and(|v| !v.trim().is_empty())
+    let table = read_autumn_toml_table();
+    let profile = std::env::var("AUTUMN_ENV")
+        .ok()
+        .or_else(|| std::env::var("AUTUMN_PROFILE").ok())
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    // `.ok()` deliberately does NOT filter empty values: a set-but-empty env
+    // var is a PRESENT higher-priority layer that CLEARS the destination,
+    // distinct from an unset var (which falls through to the TOML layers).
+    resolve_alert_destination_from_sources(|key| std::env::var(key).ok(), table.as_ref(), &profile)
+}
+
+/// Resolve whether an email and/or webhook alert destination is configured,
+/// honouring layer precedence exactly as the runtime config merge does.
+///
+/// The highest-priority layer that is PRESENT wins, and an explicitly-empty
+/// higher layer CLEARS the value rather than falling back to a lower one — so a
+/// base `[alerts] email = "…"` cleared by `[profile.prod.alerts] email = ""`
+/// (or an empty `AUTUMN_ALERTS__EMAIL`) correctly resolves as "no destination".
+/// Layers, highest first: env var, `[profile.{profile}.alerts]`, base
+/// `[alerts]`. Only a layer that omits the key entirely falls through.
+///
+/// Split out from [`resolve_alert_destination`] so the precedence logic is unit
+/// testable without mutating process-global env/cwd state.
+fn resolve_alert_destination_from_sources<F>(
+    env_var: F,
+    table: Option<&toml::Table>,
+    profile: &str,
+) -> (bool, bool)
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let profile_alerts = if profile.is_empty() {
+        None
+    } else {
+        table
+            .and_then(|t| t.get("profile"))
+            .and_then(|v| v.get(profile))
+            .and_then(toml::Value::as_table)
+            .and_then(|p| p.get("alerts"))
+            .and_then(toml::Value::as_table)
     };
-    let mut email = env_set("AUTUMN_ALERTS__EMAIL");
-    let mut webhook = env_set("AUTUMN_ALERTS__WEBHOOK_URL");
+    let base_alerts = table
+        .and_then(|t| t.get("alerts"))
+        .and_then(toml::Value::as_table);
 
-    if !(email && webhook) {
-        let table = read_autumn_toml_table().unwrap_or_default();
-        let profile = std::env::var("AUTUMN_ENV")
-            .ok()
-            .or_else(|| std::env::var("AUTUMN_PROFILE").ok())
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase();
-
-        let str_set = |root: &toml::Table, key: &str| {
-            root.get("alerts")
-                .and_then(|a| a.get(key))
-                .and_then(toml::Value::as_str)
-                .is_some_and(|s| !s.trim().is_empty())
-        };
-
-        let mut check = |root: &toml::Table| {
-            email = email || str_set(root, "email");
-            webhook = webhook || str_set(root, "webhook_url");
-        };
-
-        if !profile.is_empty()
-            && let Some(profile_table) = table
-                .get("profile")
-                .and_then(|v| v.get(&profile))
-                .and_then(toml::Value::as_table)
-        {
-            check(profile_table);
+    let resolve = |env_key: &str, key: &str| -> bool {
+        // 1. Env var — highest priority. Set-and-empty clears; unset falls through.
+        if let Some(val) = env_var(env_key) {
+            return !val.trim().is_empty();
         }
-        check(&table);
-    }
+        // 2. Profile-specific `[profile.{profile}.alerts].{key}`.
+        if let Some(v) = profile_alerts
+            .and_then(|t| t.get(key))
+            .and_then(toml::Value::as_str)
+        {
+            return !v.trim().is_empty();
+        }
+        // 3. Base `[alerts].{key}`.
+        if let Some(v) = base_alerts
+            .and_then(|t| t.get(key))
+            .and_then(toml::Value::as_str)
+        {
+            return !v.trim().is_empty();
+        }
+        false
+    };
 
+    let email = resolve("AUTUMN_ALERTS__EMAIL", "email");
+    let webhook = resolve("AUTUMN_ALERTS__WEBHOOK_URL", "webhook_url");
     (email, webhook)
 }
 
@@ -4478,6 +4509,79 @@ pub struct Vault {
     fn alert_destination_passes_in_dev_without_destination() {
         let r = check_alert_destination_impl(false, false, false);
         assert!(matches!(r.status, CheckStatus::Pass));
+    }
+
+    // ── resolve_alert_destination_from_sources precedence (issue #1610) ───────
+
+    fn no_env(_: &str) -> Option<String> {
+        None
+    }
+
+    #[test]
+    fn resolve_alert_destination_base_email_is_detected() {
+        let table: toml::Table = toml::from_str("[alerts]\nemail = \"dev@example.com\"\n").unwrap();
+        let (email, webhook) =
+            resolve_alert_destination_from_sources(no_env, Some(&table), "prod");
+        assert!(email, "base [alerts] email should resolve as configured");
+        assert!(!webhook);
+    }
+
+    #[test]
+    fn resolve_alert_destination_prod_profile_clears_base_email() {
+        // Base sets an email; the prod profile explicitly clears it with an empty
+        // string. A production run must resolve to "no destination" so doctor warns.
+        let table: toml::Table = toml::from_str(
+            "[alerts]\nemail = \"dev@example.com\"\n[profile.prod.alerts]\nemail = \"\"\n",
+        )
+        .unwrap();
+        let (email, _webhook) =
+            resolve_alert_destination_from_sources(no_env, Some(&table), "prod");
+        assert!(
+            !email,
+            "an empty prod-profile override must CLEAR the base email, not OR it back in"
+        );
+
+        // And the surfaced doctor check warns in production for this config.
+        let r = check_alert_destination_impl(email, false, true);
+        assert!(matches!(r.status, CheckStatus::Warn));
+    }
+
+    #[test]
+    fn resolve_alert_destination_dev_profile_does_not_clear_base_for_prod_run() {
+        // A dev-profile override must not affect a prod run: only the active
+        // profile's layer participates.
+        let table: toml::Table = toml::from_str(
+            "[alerts]\nemail = \"dev@example.com\"\n[profile.dev.alerts]\nemail = \"\"\n",
+        )
+        .unwrap();
+        let (email, _webhook) =
+            resolve_alert_destination_from_sources(no_env, Some(&table), "prod");
+        assert!(email, "dev-profile clear must not affect a prod run");
+    }
+
+    #[test]
+    fn resolve_alert_destination_empty_env_clears_base_email() {
+        // An explicitly-empty AUTUMN_ALERTS__EMAIL is the highest-priority layer
+        // and must CLEAR a base value; an unset webhook var falls through to base.
+        let table: toml::Table = toml::from_str(
+            "[alerts]\nemail = \"dev@example.com\"\nwebhook_url = \"https://hooks.example/x\"\n",
+        )
+        .unwrap();
+        let env = |key: &str| (key == "AUTUMN_ALERTS__EMAIL").then(String::new);
+        let (email, webhook) =
+            resolve_alert_destination_from_sources(env, Some(&table), "prod");
+        assert!(!email, "empty AUTUMN_ALERTS__EMAIL must clear the base email");
+        assert!(webhook, "unset webhook env should fall through to base");
+    }
+
+    #[test]
+    fn resolve_alert_destination_nonempty_env_wins_over_absent_toml() {
+        let env = |key: &str| {
+            (key == "AUTUMN_ALERTS__WEBHOOK_URL").then(|| "https://hooks.example/y".to_owned())
+        };
+        let (email, webhook) = resolve_alert_destination_from_sources(env, None, "prod");
+        assert!(!email);
+        assert!(webhook, "env webhook should resolve as configured with no TOML");
     }
 
     // ── compute_summary ──────────────────────────────────────────────────────

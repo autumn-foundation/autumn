@@ -887,7 +887,19 @@ pub fn install_from_config(
     #[cfg(feature = "mail")]
     if let Some(email) = config.email.as_ref().filter(|s| !s.trim().is_empty()) {
         if let Some(mailer) = state.extension::<crate::mail::Mailer>() {
-            channels.push(Arc::new(MailAlertChannel::new(mailer, email.clone())));
+            // A `Mailer` backed by the disabled (no-op) transport accepts and
+            // silently drops every message, so registering a `MailAlertChannel`
+            // here would make an email-only prod config look active while
+            // delivering nothing. Warn and skip the dead channel instead.
+            if mailer.is_disabled() {
+                tracing::warn!(
+                    "alerts: an operator email is configured but [mail] transport is disabled; \
+                     no email alerts will be delivered. Set [mail] transport to a real backend \
+                     or use a webhook destination."
+                );
+            } else {
+                channels.push(Arc::new(MailAlertChannel::new(mailer, email.clone())));
+            }
         } else {
             tracing::warn!(
                 "alerts: an operator email is configured but no mailer is installed; \

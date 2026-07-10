@@ -6708,6 +6708,8 @@ async fn pg_ack_dead_letter(
 #[derive(diesel::QueryableByName)]
 struct PgStaleRecoveryRow {
     #[diesel(sql_type = diesel::sql_types::Text)]
+    name: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
     payload: String,
     #[diesel(sql_type = diesel::sql_types::Text)]
     status: String,
@@ -6778,7 +6780,7 @@ async fn pg_recover_stale_claims(pool: &PgPool, visibility_timeout_ms: u64, stat
            FOR UPDATE SKIP LOCKED \
            LIMIT 100 \
          ) \
-         RETURNING payload::TEXT AS payload, status",
+         RETURNING name, payload::TEXT AS payload, status",
     )
     .bind::<diesel::sql_types::BigInt, _>(i64::try_from(visibility_timeout_ms).unwrap_or(i64::MAX))
     .get_results::<PgStaleRecoveryRow>(&mut *conn)
@@ -6792,6 +6794,16 @@ async fn pg_recover_stale_claims(pool: &PgPool, visibility_timeout_ms: u64, stat
     match rows {
         Ok(rows) => {
             for row in rows.into_iter().filter(|row| row.status == "failed") {
+                // A crashed worker never resumes to observe its ack returning
+                // `Ok(false)`, so `record_pg_lifecycle_after_ack` never fires
+                // the dead-letter alert for these rows. Emit it here — mirroring
+                // the other dead-letter sites — so genuine crashed-worker
+                // dead-letters still page the operator.
+                crate::alerts::notify_dead_lettered_job(
+                    state,
+                    &row.name,
+                    "visibility timeout expired",
+                );
                 let payload = serde_json::from_str::<Value>(&row.payload).unwrap_or(Value::Null);
                 crate::job_tracking::settle_tracked_payload_as_failed(
                     state,

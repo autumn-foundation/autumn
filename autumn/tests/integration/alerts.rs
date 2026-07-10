@@ -224,6 +224,93 @@ async fn mail_channel_reuses_mailer_and_bypasses_suppression() {
     );
 }
 
+/// Regression: with the `mail` feature on but the mail transport disabled
+/// (the default `DisabledTransport`, or a prod profile turning it off), an
+/// email-only alert config must NOT register a `MailAlertChannel`. That channel
+/// would report `Ok(())` while the disabled transport silently drops the
+/// message, making an email-only prod config look active while sending nothing.
+/// `install_from_config` must skip the dead channel and, with no other
+/// destination, install no alerter at all.
+#[cfg(feature = "mail")]
+#[tokio::test]
+async fn disabled_mail_transport_does_not_register_email_channel() {
+    use autumn_web::mail::{Mail, MailError, MailTransport, Mailer};
+
+    #[derive(Clone, Default)]
+    struct DisabledTestTransport;
+    impl MailTransport for DisabledTestTransport {
+        fn send<'a>(
+            &'a self,
+            _mail: Mail,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), MailError>> + Send + 'a>>
+        {
+            Box::pin(async move { Ok(()) })
+        }
+        fn is_disabled(&self) -> bool {
+            true
+        }
+    }
+
+    let mailer = Arc::new(Mailer::with_transport(DisabledTestTransport));
+    assert!(mailer.is_disabled(), "sanity: transport reports disabled");
+
+    let client = TestApp::new()
+        .state_initializer(move |state| state.insert_extension((*mailer).clone()))
+        .build();
+
+    let config = AlertConfig {
+        email: Some("oncall@example.com".to_owned()),
+        ..AlertConfig::default()
+    };
+    autumn_web::alerts::install_from_config(client.state(), &config, Vec::new());
+
+    // The only configured destination was email over a disabled transport, so
+    // no channel is registered and therefore no alerter is installed — the
+    // `notify_*` hooks stay no-ops rather than pretending to deliver.
+    assert!(
+        client.state().extension::<Alerter>().is_none(),
+        "email-only config over a disabled mail transport must not install an alerter"
+    );
+}
+
+/// Companion to the above: an ENABLED mail transport with an email destination
+/// DOES register the mail channel (proving the guard keys off `is_disabled`).
+#[cfg(feature = "mail")]
+#[tokio::test]
+async fn enabled_mail_transport_registers_email_channel() {
+    use autumn_web::mail::{Mail, MailError, MailTransport, Mailer};
+
+    #[derive(Clone, Default)]
+    struct EnabledTestTransport;
+    impl MailTransport for EnabledTestTransport {
+        fn send<'a>(
+            &'a self,
+            _mail: Mail,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), MailError>> + Send + 'a>>
+        {
+            Box::pin(async move { Ok(()) })
+        }
+    }
+
+    let mailer = Arc::new(Mailer::with_transport(EnabledTestTransport));
+    assert!(!mailer.is_disabled(), "sanity: transport reports enabled");
+
+    let client = TestApp::new()
+        .state_initializer(move |state| state.insert_extension((*mailer).clone()))
+        .build();
+
+    let config = AlertConfig {
+        email: Some("oncall@example.com".to_owned()),
+        ..AlertConfig::default()
+    };
+    autumn_web::alerts::install_from_config(client.state(), &config, Vec::new());
+
+    assert!(
+        client.state().extension::<Alerter>().is_some(),
+        "an enabled mail transport with an email destination must install the mail channel"
+    );
+}
+
 /// AC #1 (fan-out): every registered channel receives the alert.
 #[tokio::test]
 async fn alert_fans_out_to_every_channel() {
