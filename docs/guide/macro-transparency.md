@@ -465,22 +465,35 @@ the association attributes `belongs_to` / `has_many` / `has_one`.
 #### `#[private]`
 
 Excludes the field from the model's `Serialize` impl (JSON responses) while
-keeping it a normal, queryable Rust field mapped to its column. Its `Debug` is
-redacted. The write path (`New*` / `Update*` / changeset) is unaffected, so a
-client can still *set* the value while never *reading* it back.
+keeping it a normal, queryable Rust field mapped to its column. Concretely it
+adds `#[serde(skip_serializing)]` to the generated query struct (leaving
+`Deserialize` intact). The write path (`New*` / `Update*` / changeset) is
+unaffected, so a client can still *set* the value while never *reading* it back.
+
+**`#[private]` does *not* redact `Debug`.** A field that is *only* `#[private]`
+still prints verbatim in `{:?}` output, so it can leak into logs, panic
+backtraces, and framework error messages. The redacting `Debug` impl is emitted
+only for models that have at least one `#[encrypted]` field — mark a field
+`#[encrypted]` (not just `#[private]`) when it must also stay out of `Debug`
+output.
 
 ```rust
 #[model(table = "users")]
 pub struct User {
     #[id] pub id: i64,
     pub email: String,
-    #[private] pub password_hash: String, // still SELECTed & filterable, never serialized
+    // Hidden from JSON responses, but still printed by `Debug`. Fine for a
+    // non-secret internal field; for an actual secret (e.g. `password_hash`)
+    // reach for `#[encrypted]` so it is redacted from `Debug` too.
+    #[private] pub internal_notes: String, // still SELECTed & filterable, never serialized
 }
 ```
 
-**Gotcha:** `#[private]` only controls JSON serialization and `Debug`. The
-column is still selected and can be used in `find_by_*` queries — it is not a
-column-level access control.
+**Gotcha:** `#[private]` controls JSON serialization only — it emits
+`#[serde(skip_serializing)]` and nothing more. It does **not** redact `Debug`,
+and the column is still selected and can be used in `find_by_*` queries — it is
+not a column-level access control. For a value that must also stay out of
+`Debug`/log output, use `#[encrypted]`.
 
 #### `#[encrypted]` / `#[encrypted(deterministic | randomized, admin_visible, versioned_ciphertext)]`
 
