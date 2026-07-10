@@ -80,6 +80,14 @@ pub struct AppState {
     /// Active profile name (e.g., "dev", "prod", "staging").
     pub(crate) profile: Option<String>,
 
+    /// Resolved process role for this replica, after config parsing and the
+    /// `AUTUMN_ROLE` env override. This is the same value the framework uses to
+    /// gate the job runtime, scheduler, and commit-hook worker, exposed here as
+    /// a first-class accessor ([`role`](Self::role)) so `on_startup`/`on_shutdown`
+    /// hooks, plugins, and handlers can self-gate app-owned background work
+    /// without re-reading `AUTUMN_ROLE` by hand.
+    pub(crate) role: crate::config::ProcessRole,
+
     /// When the application started. Used for uptime calculation.
     pub(crate) started_at: std::time::Instant,
 
@@ -549,6 +557,32 @@ impl AppState {
         self.profile.as_deref().unwrap_or("default")
     }
 
+    /// Returns the resolved [`ProcessRole`](crate::config::ProcessRole) for this
+    /// replica.
+    ///
+    /// This is the role after config parsing and the `AUTUMN_ROLE` env override
+    /// — the exact same value the framework uses to gate the job runtime,
+    /// scheduler, and commit-hook worker. Use it from `state_initializer`,
+    /// `on_startup`/`on_shutdown` hooks, plugins, and request handlers to
+    /// self-gate app-owned background work:
+    ///
+    /// ```rust
+    /// # use autumn_web::AppState;
+    /// # fn example(state: &AppState) {
+    /// if state.role().runs_workers() {
+    ///     // start an embedded worker loop only on replicas that run workers
+    /// }
+    /// # }
+    /// ```
+    ///
+    /// [`serves_http`](crate::config::ProcessRole::serves_http) and
+    /// [`runs_workers`](crate::config::ProcessRole::runs_workers) are reachable
+    /// on the returned value.
+    #[must_use]
+    pub const fn role(&self) -> crate::config::ProcessRole {
+        self.role
+    }
+
     /// Returns how long the application has been running.
     #[must_use]
     pub fn uptime(&self) -> std::time::Duration {
@@ -647,6 +681,7 @@ impl AppState {
             #[cfg(feature = "db")]
             shards: None,
             profile: None,
+            role: crate::config::ProcessRole::Combined,
             started_at: std::time::Instant::now(),
             health_detailed: true,
             probes: probe::ProbeState::ready_for_test(),

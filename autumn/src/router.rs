@@ -4139,6 +4139,7 @@ mod tests {
             #[cfg(feature = "db")]
             shards: None,
             profile: Some("test".to_owned()),
+            role: crate::config::ProcessRole::Combined,
             started_at: std::time::Instant::now(),
             health_detailed: false,
             probes: crate::probe::ProbeState::ready_for_test(),

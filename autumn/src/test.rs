@@ -1719,6 +1719,7 @@ impl TestApp {
                     .expect("test shard pools should build from config")
             },
             profile: self.config.profile.clone(),
+            role: self.config.role,
             started_at: std::time::Instant::now(),
             health_detailed: self.config.health.detailed,
             probes: probes.clone(),
