@@ -115,6 +115,10 @@ fn compile_pass_tests() {
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/repository_policy_non_serialize_new.rs");
     #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/repository_api_validated.rs");
+    #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/repository_api_cursor.rs");
+    #[cfg(feature = "db")]
     t.pass("tests/compile-pass/repository_versioned.rs");
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/repository_tenant_scoped_versioned_optional_tenant.rs");

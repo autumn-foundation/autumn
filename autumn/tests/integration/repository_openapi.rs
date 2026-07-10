@@ -31,7 +31,9 @@ pub struct Widget {
 pub trait WidgetRepository {}
 
 #[test]
-fn list_route_returns_array_of_widget() {
+fn list_route_returns_paginated_page_envelope() {
+    // #1237: the list operation documents the `Page` envelope response and the
+    // `page`/`size` query parameters, not a bare unbounded array.
     let route = __autumn_route_info_widget_api_list();
     assert_eq!(route.api_doc.method, "GET");
     assert_eq!(route.api_doc.path, "/api/widgets");
@@ -41,12 +43,42 @@ fn list_route_returns_array_of_widget() {
         .response
         .as_ref()
         .expect("list must document its JSON response");
-    let inner = match resp.kind {
-        SchemaKind::Array(e) => e,
-        other => panic!("list should emit Array, got {other:?}"),
-    };
-    assert_eq!(inner.name, "Widget");
-    assert_eq!(inner.kind, SchemaKind::Ref);
+    assert_eq!(
+        resp.kind,
+        SchemaKind::Ref,
+        "list response is the Page envelope, referenced by name"
+    );
+    assert_eq!(resp.name, "WidgetPage");
+
+    let query = route
+        .api_doc
+        .query_schema
+        .as_ref()
+        .expect("list must document its pagination query params");
+    assert_eq!(query.name, "PageRequest");
+    assert_eq!(query.kind, SchemaKind::Ref);
+
+    // The register_schemas hook must materialize the envelope + query schemas.
+    let register = route
+        .api_doc
+        .register_schemas
+        .expect("list must register its Page/PageRequest schemas");
+    let mut registry = autumn_web::openapi::SchemaRegistry::default();
+    register(&mut registry);
+    let schemas = registry.schemas();
+    let page_schema = schemas
+        .get("WidgetPage")
+        .expect("WidgetPage envelope schema must be registered");
+    assert_eq!(page_schema["properties"]["total_pages"]["type"], "integer");
+    assert_eq!(
+        page_schema["properties"]["content"]["items"]["$ref"],
+        "#/components/schemas/Widget"
+    );
+    let query_schema = schemas
+        .get("PageRequest")
+        .expect("PageRequest query schema must be registered");
+    assert!(query_schema["properties"]["page"].is_object());
+    assert!(query_schema["properties"]["size"].is_object());
 }
 
 #[test]

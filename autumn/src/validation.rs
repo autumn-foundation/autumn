@@ -187,7 +187,9 @@ impl<T> AsValidatable for crate::extract::Query<T> {
 }
 
 /// Convert `validator::ValidationErrors` into a field → messages map.
-fn validation_errors_to_map(errors: &validator::ValidationErrors) -> HashMap<String, Vec<String>> {
+pub(crate) fn validation_errors_to_map(
+    errors: &validator::ValidationErrors,
+) -> HashMap<String, Vec<String>> {
     errors
         .field_errors()
         .into_iter()
@@ -213,6 +215,62 @@ fn validation_errors_to_map(errors: &validator::ValidationErrors) -> HashMap<Str
 /// `From<E: Error>` impl that would conflict.
 fn validation_errors_to_autumn_error(errors: &validator::ValidationErrors) -> crate::AutumnError {
     crate::AutumnError::validation(validation_errors_to_map(errors))
+}
+
+// ── Conditional validation (autoref specialization) ─────────────
+//
+// The `#[repository(api = ...)]` macro needs to validate a decoded write
+// payload *only when its type implements `validator::Validate`* — the
+// generated `NewModel` derives `Validate` solely when the model declares
+// `#[validate(...)]` rules, and a hand-written `NewModel` may not implement
+// it at all. Rust has no stable negative/​specialization reasoning, so we use
+// autoref-based specialization (Kalbertodt/dtolnay): a value that implements
+// `Validate` resolves to the real validating impl (fewer autorefs), while
+// everything else falls through to a no-op. This keeps existing repositories
+// compiling with zero migration burden.
+
+/// Wrapper carrying a reference to a candidate write payload for the autoref
+/// specialization used by the generated API write handlers.
+///
+/// Not part of the stable API — used only by macro-generated code.
+#[doc(hidden)]
+pub struct MaybeValidate<'a, T>(pub &'a T);
+
+/// Specialized branch: runs `validator::Validate` and maps failures to a
+/// `422` [`crate::AutumnError`] with the per-field `errors` map.
+#[doc(hidden)]
+pub trait MaybeValidateViaValidator {
+    /// Validate the wrapped value; `Ok(())` when it passes.
+    ///
+    /// # Errors
+    /// Returns a `422` validation error when the wrapped value fails a rule.
+    fn autumn_maybe_validate(&self) -> crate::AutumnResult<()>;
+}
+
+impl<T: validator::Validate> MaybeValidateViaValidator for MaybeValidate<'_, T> {
+    fn autumn_maybe_validate(&self) -> crate::AutumnResult<()> {
+        match validator::Validate::validate(self.0) {
+            Ok(()) => Ok(()),
+            Err(errors) => Err(validation_errors_to_autumn_error(&errors)),
+        }
+    }
+}
+
+/// Fallback branch (behind one autoref): any type that does *not* implement
+/// `Validate` is accepted without validation.
+#[doc(hidden)]
+pub trait MaybeValidateFallback {
+    /// No-op validation for types without `#[validate]` rules.
+    ///
+    /// # Errors
+    /// Never returns an error.
+    fn autumn_maybe_validate(&self) -> crate::AutumnResult<()>;
+}
+
+impl<T> MaybeValidateFallback for &MaybeValidate<'_, T> {
+    fn autumn_maybe_validate(&self) -> crate::AutumnResult<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -340,6 +398,58 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(result.unwrap().0.0.name, "Alice");
+    }
+
+    #[test]
+    // Mirrors the `(&MaybeValidate(&x)).autumn_maybe_validate()` form the
+    // repository macro emits: both traits in scope, explicit leading borrow.
+    #[allow(clippy::needless_borrow, unused_imports)]
+    fn maybe_validate_runs_for_validate_types() {
+        // Autoref specialization: a type implementing `Validate` resolves to
+        // the real validating branch and surfaces a 422 on failure.
+        use super::{MaybeValidate, MaybeValidateFallback as _, MaybeValidateViaValidator as _};
+
+        #[derive(validator::Validate)]
+        struct HasRules {
+            #[validate(length(min = 5))]
+            name: String,
+        }
+
+        let bad = HasRules {
+            name: "ab".to_string(),
+        };
+        let err = (&MaybeValidate(&bad))
+            .autumn_maybe_validate()
+            .expect_err("short name must fail validation");
+        assert_eq!(err.status(), axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+
+        let good = HasRules {
+            name: "alice".to_string(),
+        };
+        assert!(
+            (&MaybeValidate(&good)).autumn_maybe_validate().is_ok(),
+            "valid input must pass"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::needless_borrow, unused_imports)]
+    fn maybe_validate_is_noop_for_non_validate_types() {
+        // Autoref specialization: a type that does NOT implement `Validate`
+        // falls through to the no-op branch and compiles + always succeeds.
+        use super::{MaybeValidate, MaybeValidateFallback as _, MaybeValidateViaValidator as _};
+
+        struct NoRules {
+            _name: String,
+        }
+
+        let value = NoRules {
+            _name: "anything".to_string(),
+        };
+        assert!(
+            (&MaybeValidate(&value)).autumn_maybe_validate().is_ok(),
+            "types without validation rules must be accepted unchanged"
+        );
     }
 
     #[tokio::test]

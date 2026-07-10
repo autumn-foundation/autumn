@@ -2744,10 +2744,11 @@ fn render_api_smoke_test(plural: &str, id_schema_type: &str, setup_calls: &str) 
          //! The handler below is NOT the generated repository's JSON list\n\
          //! handler: a `tests/` integration binary cannot import a project's own\n\
          //! code when the project has no `src/lib.rs` (see\n\
-         //! `docs/guide/tutorial/11-testing.md`). This test only proves the\n\
-         //! database, migration, and in-process request pipeline work -- it does\n\
-         //! NOT exercise the real repository handler's serialization, filtering,\n\
-         //! or pagination logic.\n\
+         //! `docs/guide/tutorial/11-testing.md`). It reuses the same shipped\n\
+         //! `PageRequest` extractor + `Page` envelope the real generated\n\
+         //! `--api` list handler paginates with (issue #1237), so it proves the\n\
+         //! self-describing envelope shape and that pages advance -- but it does\n\
+         //! NOT exercise the real repository handler's serialization or filtering.\n\
          //!\n\
          //! `cargo test` reports this test as `ignored` (Docker is not assumed to\n\
          //! be available in every environment); run it for real with:\n\
@@ -2757,6 +2758,8 @@ fn render_api_smoke_test(plural: &str, id_schema_type: &str, setup_calls: &str) 
          use autumn_web::prelude::*;\n\
          use autumn_web::test::{{TestApp, TestClient, TestDb}};\n\
          use diesel::prelude::*;\n\
+         use diesel::dsl::sql;\n\
+         use diesel::sql_types::Text;\n\
          use diesel_async::RunQueryDsl;\n\
          \n\
          diesel::table! {{\n\
@@ -2765,26 +2768,57 @@ fn render_api_smoke_test(plural: &str, id_schema_type: &str, setup_calls: &str) 
          }}\n\
          }}\n\
          \n\
+         // Stand-in that paginates by default, exactly like the generated\n\
+         // `--api` list handler: a bounded `LIMIT/OFFSET` window wrapped in the\n\
+         // `Page` envelope, never an unbounded `find_all()`.\n\
          #[get(\"/api/{plural}\")]\n\
-         async fn api_list(mut db: Db) -> AutumnResult<Json<serde_json::Value>> {{\n\
+         async fn api_list(page: PageRequest, mut db: Db) -> AutumnResult<Page<String>> {{\n\
          let total: i64 = {plural}::table.count().get_result(&mut db).await?;\n\
-         Ok(Json(serde_json::json!({{ \"count\": total }})))\n\
+         let ids: Vec<String> = {plural}::table\n\
+         .select(sql::<Text>(\"id::text\"))\n\
+         .order({plural}::id.asc())\n\
+         .limit(page.limit())\n\
+         .offset(page.offset())\n\
+         .load(&mut db)\n\
+         .await?;\n\
+         Ok(Page::new(ids, total, &page))\n\
          }}\n\
          \n\
          #[tokio::test]\n\
          #[ignore = \"requires Docker (testcontainers) via TestDb; run `cargo test -- --ignored`\"]\n\
-         async fn {plural}_api_list_returns_ok_against_a_real_database() {{\n\
+         async fn {plural}_api_list_paginates_against_a_real_database() {{\n\
          let db = TestDb::shared().await;\n\
          {setup_calls}\
          db.execute_sql(\"TRUNCATE {plural} RESTART IDENTITY\").await;\n\
+         // Seed three rows -- more than one page at size = 2.\n\
+         db.execute_sql(\"INSERT INTO {plural} DEFAULT VALUES\").await;\n\
+         db.execute_sql(\"INSERT INTO {plural} DEFAULT VALUES\").await;\n\
+         db.execute_sql(\"INSERT INTO {plural} DEFAULT VALUES\").await;\n\
          \n\
          let client: TestClient = TestApp::new().routes(routes![api_list]).with_db(db.pool()).build();\n\
          \n\
-         client.get(\"/api/{plural}\").send().await\n\
+         // Page 1 returns the self-describing `Page` envelope, bounded to `size`.\n\
+         let page1: serde_json::Value = client\n\
+         .get(\"/api/{plural}?page=1&size=2\")\n\
+         .send()\n\
+         .await\n\
          .assert_ok()\n\
-         .assert_json::<serde_json::Value, _>(|body| {{\n\
-         assert_eq!(body[\"count\"], 0);\n\
-         }});\n\
+         .json();\n\
+         assert_eq!(page1[\"page\"], 1);\n\
+         assert_eq!(page1[\"size\"], 2);\n\
+         assert_eq!(page1[\"total_elements\"], 3);\n\
+         assert_eq!(page1[\"total_pages\"], 2);\n\
+         assert_eq!(page1[\"has_next\"], true);\n\
+         assert_eq!(page1[\"content\"].as_array().map(Vec::len), Some(2));\n\
+         \n\
+         // Page 2 holds different rows -- pagination actually advances.\n\
+         let page2: serde_json::Value = client\n\
+         .get(\"/api/{plural}?page=2&size=2\")\n\
+         .send()\n\
+         .await\n\
+         .assert_ok()\n\
+         .json();\n\
+         assert_ne!(page1[\"content\"], page2[\"content\"], \"page 2 must differ from page 1\");\n\
          }}\n"
     )
 }

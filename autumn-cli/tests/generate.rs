@@ -1136,14 +1136,23 @@ fn generate_scaffold_api_only() {
     // No HTML routes file
     assert!(!project.join("src/routes/posts.rs").is_file());
 
-    // Smoke test: real, in-process, DB-backed read test (issue #1023).
+    // Smoke test: real, in-process, DB-backed read test (issue #1023),
+    // paginated per issue #1237 — asserts the `Page` envelope + page 2 advance.
     let test = fs::read_to_string(project.join("tests/post.rs")).unwrap();
-    assert!(test.contains("posts_api_list_returns_ok_against_a_real_database"));
+    assert!(test.contains("posts_api_list_paginates_against_a_real_database"));
     assert!(test.contains("autumn_web::test::{TestApp, TestClient, TestDb}"));
     assert!(!test.contains("TcpStream"));
     assert!(!test.contains("AUTUMN_TEST_BASE_URL"));
     assert!(test.contains("#[ignore = \"requires Docker"));
     assert!(test.contains("/api/posts"));
+    assert!(
+        test.contains("PageRequest") && test.contains("Page::new"),
+        "the --api smoke test must paginate via the Page envelope: {test}"
+    );
+    assert!(
+        test.contains("page 2 must differ from page 1"),
+        "the --api smoke test must assert pages advance: {test}"
+    );
 
     // `routes![]` registration.
     let main = fs::read_to_string(project.join("src/main.rs")).unwrap();
