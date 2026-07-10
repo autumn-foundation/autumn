@@ -115,6 +115,31 @@ pub enum RepositoryError {
     },
 }
 
+/// How a parent's dependent children are handled when the parent is deleted.
+///
+/// Declared per association on the `#[repository]` macro via
+/// `dependent(ChildRepository, fk = "parent_fk", on_delete = <action>)`, and
+/// applied inside the parent's `delete_by_id` transaction so a parent delete
+/// never leaves orphaned child rows (issue #1369).
+///
+/// The cascade runs app-side (not via a DB `ON DELETE` constraint) so that
+/// soft-delete, lifecycle/commit hooks, and counter caches stay correct — a
+/// guarantee raw `ON DELETE CASCADE` cannot provide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DependentAction {
+    /// Delete each child through the child repository's delete path, honoring
+    /// the child's soft-delete mode and firing its lifecycle/commit hooks.
+    Destroy,
+    /// Bulk hard-delete every child in a single `DELETE`, skipping per-row hooks.
+    DeleteAll,
+    /// Set the child's foreign-key column to `NULL` (the child rows survive,
+    /// detached from the deleted parent).
+    Nullify,
+    /// Refuse to delete the parent while any child exists, surfacing a typed
+    /// `409 Conflict` error instead of orphaning or cascading.
+    Restrict,
+}
+
 /// Extension trait that provides a fallback `None` for model structs that do
 /// not have a `#[lock_version]` field — or that are defined manually without
 /// going through `#[model]`.

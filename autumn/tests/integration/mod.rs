@@ -143,6 +143,8 @@ mod repository_authorization;
 #[cfg(feature = "db")]
 mod repository_bulk_operations;
 #[cfg(feature = "db")]
+mod repository_dependent_destroy;
+#[cfg(feature = "db")]
 mod repository_find_in_batches;
 #[cfg(feature = "db")]
 mod repository_find_or_create_by;
