@@ -36,6 +36,33 @@ pub enum AdminFieldKind {
     Json,
 }
 
+impl AdminFieldKind {
+    /// Whether an empty submitted string on a **nullable** field of this kind
+    /// should be coerced to `NULL`.
+    ///
+    /// Text-routed columns (`String`/`Uuid`/`Enum`/`Decimal` all map to
+    /// [`AdminFieldKind::Text`]) join the numeric/date kinds here so that a
+    /// blank submission on a nullable column clears to `NULL` instead of
+    /// storing an empty string (which fails validation for nullable
+    /// Uuid/decimal columns and silently stores `""` for strings).
+    ///
+    /// `Boolean`/`Hidden`/`Password`/`Json` are excluded: their empty
+    /// submissions are handled elsewhere or are not meaningfully "blank".
+    #[must_use]
+    pub const fn blank_submission_is_null(&self) -> bool {
+        matches!(
+            self,
+            Self::Integer
+                | Self::Float
+                | Self::Date
+                | Self::DateTime
+                | Self::Text
+                | Self::TextArea
+                | Self::Select(_)
+        )
+    }
+}
+
 /// A single option in a [`AdminFieldKind::Select`] dropdown.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectOption {

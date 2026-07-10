@@ -1439,14 +1439,12 @@ fn coerce_form_fields(mut data: Value, fields: &[AdminField]) -> Value {
 }
 
 fn coerce_form_value(value: &mut Value, field: &AdminField) {
+    // On a nullable text-ish column (String/Uuid/Enum/Decimal all route to
+    // `AdminFieldKind::Text`), as well as the numeric/date kinds, an empty
+    // submission clears to NULL — matching the existing numeric/date
+    // convention. Required columns deliberately keep the empty string.
     if !field.required
-        && matches!(
-            field.kind,
-            AdminFieldKind::Integer
-                | AdminFieldKind::Float
-                | AdminFieldKind::Date
-                | AdminFieldKind::DateTime
-        )
+        && field.kind.blank_submission_is_null()
         && matches!(value, Value::String(raw) if raw.trim().is_empty())
     {
         *value = Value::Null;
@@ -1504,6 +1502,7 @@ fn parse_form_bool(raw: &str) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::traits::SelectOption;
     use autumn_web::job::{JobAdminBackendEntry, JobAdminMemoryBackend};
     use autumn_web::session::Session;
     use axum::body::Body;
@@ -1667,6 +1666,37 @@ mod tests {
         let out = coerce_form_fields(json!({"published_on": "", "starts_at": "   "}), &fields);
 
         assert_eq!(out, json!({"published_on": null, "starts_at": null}));
+    }
+
+    #[test]
+    fn coerce_form_fields_converts_blank_optional_textish_strings_to_null() {
+        // Text-routed nullable columns (String/Uuid/Enum/Decimal all map to
+        // `AdminFieldKind::Text`) clear to NULL on an empty submission, matching
+        // the numeric/date convention.
+        let fields = vec![
+            AdminField::new("token", AdminFieldKind::Text).optional(),
+            AdminField::new("notes", AdminFieldKind::TextArea).optional(),
+            AdminField::new(
+                "status",
+                AdminFieldKind::Select(vec![SelectOption {
+                    value: "a".to_owned(),
+                    label: "A".to_owned(),
+                }]),
+            )
+            .optional(),
+        ];
+        let out = coerce_form_fields(json!({"token": "", "notes": "   ", "status": ""}), &fields);
+
+        assert_eq!(out, json!({"token": null, "notes": null, "status": null}));
+    }
+
+    #[test]
+    fn coerce_form_fields_keeps_blank_required_text_as_empty_string() {
+        // Required columns keep the empty string rather than clearing to NULL.
+        let fields = vec![AdminField::new("token", AdminFieldKind::Text)];
+        let out = coerce_form_fields(json!({"token": ""}), &fields);
+
+        assert_eq!(out, json!({"token": ""}));
     }
 
     #[test]
