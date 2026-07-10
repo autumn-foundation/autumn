@@ -40,6 +40,10 @@ const AWS4_REQUEST: &str = "aws4_request";
 /// HEAD / DELETE).
 const EMPTY_PAYLOAD_SHA256: &str =
     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+/// Upper bound on `list_objects_v2` pagination. At 1000 objects/page (the S3
+/// maximum) this covers a million objects — far beyond any backup prefix — while
+/// bounding a broken endpoint that never stops returning a continuation token.
+const MAX_LIST_PAGES: usize = 1000;
 
 // ─── Credentials (never Debug/Display) ───────────────────────────────────────
 
@@ -188,6 +192,12 @@ fn aws_uri_encode(s: &str, encode_slash: bool) -> String {
 
 /// A header name/value pair for signing.
 type Header = (String, String);
+
+/// The extra signed header a HEAD carries so the endpoint echoes the object's
+/// checksum on the response (AWS requires opting in with `checksum-mode`).
+fn head_extra_headers() -> Vec<Header> {
+    vec![("x-amz-checksum-mode".to_owned(), "ENABLED".to_owned())]
+}
 
 /// The `SignedHeaders` list: sorted lowercase header names joined by `;`.
 fn signed_headers_list(headers: &[Header]) -> String {
@@ -353,9 +363,36 @@ pub struct S3Client {
     now: fn() -> chrono::DateTime<chrono::Utc>,
 }
 
+/// Reject a custom `endpoint` that carries a path prefix. `canonical_path` signs
+/// `/{bucket}/{key}` (path-style) or `/{key}` (virtual-hosted) — it does NOT
+/// know about an endpoint path segment (e.g. `https://gw.example/s3`), so the
+/// signed path and the actually-sent path would diverge and every request would
+/// 403. Fail loud at construction with clear guidance instead of at first use.
+fn validate_endpoint(endpoint: &str) -> Result<(), S3Error> {
+    let url = url::Url::parse(endpoint).map_err(|e| S3Error::Transport {
+        op: "init",
+        detail: format!("invalid endpoint {endpoint:?}: {e}"),
+    })?;
+    let path = url.path();
+    if !path.is_empty() && path != "/" {
+        return Err(S3Error::Transport {
+            op: "init",
+            detail: format!(
+                "endpoint {endpoint:?} must be scheme + host[:port] only (no path); \
+                 a path prefix like {path:?} is not supported"
+            ),
+        });
+    }
+    Ok(())
+}
+
 impl S3Client {
-    /// Build a client. Fails only if the TLS/HTTP stack can't be constructed.
+    /// Build a client. Fails if the TLS/HTTP stack can't be constructed or if a
+    /// custom `endpoint` carries a path prefix (see [`validate_endpoint`]).
     pub fn new(config: S3Config, credentials: S3Credentials) -> Result<Self, S3Error> {
+        if let Some(endpoint) = &config.endpoint {
+            validate_endpoint(endpoint)?;
+        }
         let http =
             reqwest::blocking::Client::builder()
                 .build()
@@ -535,8 +572,20 @@ impl S3Client {
     }
 
     /// HEAD `key`, returning its length and (when echoed) checksum.
+    ///
+    /// Sends a signed `x-amz-checksum-mode: ENABLED` so AWS (and compliant
+    /// endpoints) echo `x-amz-checksum-sha256` on the HEAD response, letting
+    /// [`verify_uploaded`](Self::verify_uploaded) take the cheap HEAD-only path
+    /// instead of downloading and rehashing the whole (possibly multi-GB) object.
     pub fn head_object(&self, key: &str) -> Result<RemoteObjectInfo, S3Error> {
-        let resp = self.send("head", reqwest::Method::HEAD, key, "", &[], &[])?;
+        let resp = self.send(
+            "head",
+            reqwest::Method::HEAD,
+            key,
+            "",
+            &head_extra_headers(),
+            &[],
+        )?;
         let content_length = resp
             .headers()
             .get(reqwest::header::CONTENT_LENGTH)
@@ -575,10 +624,14 @@ impl S3Client {
     }
 
     /// List every object under `prefix` (following continuation tokens).
+    ///
+    /// Bounded by [`MAX_LIST_PAGES`]: a broken endpoint that returns a repeating
+    /// continuation token can't loop forever — past the cap this errors rather
+    /// than hanging.
     pub fn list_objects_v2(&self, prefix: &str) -> Result<Vec<S3Object>, S3Error> {
         let mut out = Vec::new();
         let mut continuation: Option<String> = None;
-        loop {
+        for _page in 0..MAX_LIST_PAGES {
             // Canonical query string: keys sorted, both key and value encoded.
             let mut params: Vec<(String, String)> = vec![
                 ("list-type".to_owned(), "2".to_owned()),
@@ -603,10 +656,16 @@ impl S3Client {
             out.extend(objects);
             match next {
                 Some(token) => continuation = Some(token),
-                None => break,
+                None => return Ok(out),
             }
         }
-        Ok(out)
+        Err(S3Error::BadResponse {
+            op: "list",
+            detail: format!(
+                "exceeded {MAX_LIST_PAGES} list pages (endpoint returned an unending \
+                 continuation token?)"
+            ),
+        })
     }
 
     /// Upload `bytes` to `key` and verify the remote object matches (AC #2):
@@ -849,5 +908,63 @@ mod tests {
             sha256_base64(b""),
             "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU="
         );
+    }
+
+    #[test]
+    fn head_request_signs_checksum_mode_header() {
+        // HEAD must ask the endpoint to echo the checksum so verification can
+        // take the cheap HEAD-only path (no full GET+rehash).
+        let extra = head_extra_headers();
+        assert_eq!(
+            extra,
+            vec![("x-amz-checksum-mode".to_owned(), "ENABLED".to_owned())]
+        );
+        // The header must land in the SIGNED set: assemble the base HEAD headers
+        // exactly as `send` does, sort, and confirm it's part of SignedHeaders in
+        // its correct sorted position.
+        let mut headers: Vec<Header> = vec![
+            ("host".to_owned(), "s3.example.test".to_owned()),
+            (
+                "x-amz-content-sha256".to_owned(),
+                EMPTY_PAYLOAD_SHA256.to_owned(),
+            ),
+            ("x-amz-date".to_owned(), "20260710T000000Z".to_owned()),
+        ];
+        headers.extend(extra);
+        headers.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            signed_headers_list(&headers),
+            "host;x-amz-checksum-mode;x-amz-content-sha256;x-amz-date"
+        );
+    }
+
+    #[test]
+    fn validate_endpoint_accepts_scheme_authority_only() {
+        assert!(validate_endpoint("https://minio.example:9000").is_ok());
+        assert!(validate_endpoint("https://s3.example.test/").is_ok());
+        assert!(validate_endpoint("http://127.0.0.1:9000").is_ok());
+    }
+
+    #[test]
+    fn validate_endpoint_rejects_a_path_prefix() {
+        // A gateway path prefix would be signed differently than it's sent → 403.
+        let err = validate_endpoint("https://gw.example/s3").unwrap_err();
+        assert!(matches!(err, S3Error::Transport { .. }));
+        assert!(err.to_string().contains("no path"));
+    }
+
+    #[test]
+    fn new_rejects_endpoint_with_path() {
+        let config = S3Config {
+            bucket: "b".to_owned(),
+            region: "us-east-1".to_owned(),
+            endpoint: Some("https://gw.example/s3".to_owned()),
+            force_path_style: true,
+        };
+        let creds = S3Credentials {
+            access_key_id: "k".to_owned(),
+            secret_access_key: "s".to_owned(),
+        };
+        assert!(S3Client::new(config, creds).is_err());
     }
 }

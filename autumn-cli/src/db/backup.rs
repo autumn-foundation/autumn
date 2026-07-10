@@ -1776,8 +1776,8 @@ fn load_offsite(profile: &str) -> Result<Option<ResolvedOffsite>, BackupError> {
 }
 
 /// Whether the offsite destination collides with the app's user-facing blob
-/// storage: same bucket AND same (normalized) endpoint. Pure for unit testing
-/// the AC #3 opt-in guard.
+/// storage: same bucket AND same canonical endpoint authority. Pure for unit
+/// testing the AC #3 opt-in guard.
 fn destinations_conflict(
     offsite_bucket: &str,
     offsite_endpoint: Option<&str>,
@@ -1788,17 +1788,53 @@ fn destinations_conflict(
         return false;
     };
     app_bucket == offsite_bucket
-        && normalize_endpoint(offsite_endpoint) == normalize_endpoint(app_endpoint)
+        && canonical_authority(offsite_endpoint, offsite_bucket)
+            == canonical_authority(app_endpoint, app_bucket)
 }
 
-/// Normalize an endpoint for comparison: trim, lowercase, drop a trailing slash.
-/// `None` and empty both normalize to `""` (the AWS default endpoint).
-fn normalize_endpoint(endpoint: Option<&str>) -> String {
-    endpoint
-        .unwrap_or("")
-        .trim()
-        .trim_end_matches('/')
-        .to_ascii_lowercase()
+/// Canonicalize an endpoint to a comparable `scheme://host[:non-default-port]`
+/// authority so spellings that address the SAME S3 service compare equal:
+///
+/// * `None`/empty (the AWS default endpoint) and any explicit `*.amazonaws.com`
+///   URL both collapse to `"aws"` — S3 bucket names are globally unique, so the
+///   same bucket name is the same bucket regardless of regional endpoint.
+/// * default ports (443/https, 80/http) are dropped so `host:443` == bare host.
+/// * a virtual-hosted `{bucket}.` host prefix is stripped so it compares equal
+///   to the path-style spelling of the same endpoint.
+///
+/// This prevents a genuinely shared bucket from slipping past the AC #3 guard
+/// because one side wrote the endpoint out explicitly and the other left it None.
+fn canonical_authority(endpoint: Option<&str>, bucket: &str) -> String {
+    let raw = endpoint.unwrap_or("").trim();
+    if raw.is_empty() {
+        return "aws".to_owned();
+    }
+    let with_scheme = if raw.contains("://") {
+        raw.to_owned()
+    } else {
+        format!("https://{raw}")
+    };
+    let Ok(url) = url::Url::parse(&with_scheme) else {
+        return raw.to_ascii_lowercase();
+    };
+    let host = url.host_str().unwrap_or("").to_ascii_lowercase();
+    if host == "amazonaws.com" || host.ends_with(".amazonaws.com") {
+        return "aws".to_owned();
+    }
+    // Strip a virtual-hosted `{bucket}.` prefix so path-style and virtual-hosted
+    // spellings of the same endpoint compare equal.
+    let bucket_prefix = format!("{}.", bucket.to_ascii_lowercase());
+    let host = host.strip_prefix(&bucket_prefix).unwrap_or(&host);
+    let scheme = url.scheme().to_ascii_lowercase();
+    let default_port = match scheme.as_str() {
+        "https" => Some(443),
+        "http" => Some(80),
+        _ => None,
+    };
+    match url.port() {
+        Some(port) if Some(port) != default_port => format!("{scheme}://{host}:{port}"),
+        _ => format!("{scheme}://{host}"),
+    }
 }
 
 /// Normalize a configured key prefix: trim surrounding whitespace and slashes so
@@ -2946,6 +2982,53 @@ mod tests {
         assert!(!destinations_conflict("offsite", None, None, None));
         // Both AWS default endpoint (None) + same bucket => conflict.
         assert!(destinations_conflict("shared", None, Some("shared"), None));
+    }
+
+    #[test]
+    fn destinations_conflict_normalizes_ports_and_aws_defaults() {
+        // `:443` vs bare host on https must compare equal (default port dropped).
+        assert!(destinations_conflict(
+            "shared",
+            Some("https://minio.example:443"),
+            Some("shared"),
+            Some("https://minio.example"),
+        ));
+        // `:80` vs bare host on http likewise.
+        assert!(destinations_conflict(
+            "shared",
+            Some("http://gw:80"),
+            Some("shared"),
+            Some("http://gw"),
+        ));
+        // Offsite None (AWS default) vs app spelled as the explicit regional AWS
+        // URL, same bucket => still a shared bucket (globally-unique name).
+        assert!(destinations_conflict(
+            "shared",
+            None,
+            Some("shared"),
+            Some("https://s3.us-east-1.amazonaws.com"),
+        ));
+        // ...and the virtual-hosted AWS spelling too.
+        assert!(destinations_conflict(
+            "shared",
+            None,
+            Some("shared"),
+            Some("https://shared.s3.us-east-1.amazonaws.com"),
+        ));
+        // A non-default port genuinely differs => distinct.
+        assert!(!destinations_conflict(
+            "shared",
+            Some("https://minio.example:9000"),
+            Some("shared"),
+            Some("https://minio.example"),
+        ));
+        // Virtual-hosted `{bucket}.` prefix vs path-style same host => equal.
+        assert!(destinations_conflict(
+            "shared",
+            Some("https://shared.minio.example"),
+            Some("shared"),
+            Some("https://minio.example"),
+        ));
     }
 
     #[test]
