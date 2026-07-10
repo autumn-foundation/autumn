@@ -38,6 +38,7 @@ mod setup;
 mod shard;
 mod starters;
 mod task;
+mod test_cmd;
 mod text_width;
 mod token;
 mod webhook;
@@ -231,6 +232,52 @@ enum Commands {
     ///   autumn db reset
     #[command(subcommand, verbatim_doc_comment, name = "db")]
     Db(DbCommands),
+    /// Provision the test database, migrate it, then run `cargo test`.
+    ///
+    /// A safety-first wrapper around `cargo test` for database-backed apps.
+    /// It always runs under the test profile and exports these for the suite:
+    ///
+    ///   AUTUMN_ENV=test
+    ///   DATABASE_URL / AUTUMN_DATABASE__PRIMARY_URL = <resolved test URL>
+    ///
+    /// Lifecycle (create → migrate → run):
+    ///
+    ///   1. Resolve the test database URL with the same precedence as
+    ///      `autumn migrate` (autumn.toml → AUTUMN_DATABASE__* → DATABASE_URL),
+    ///      defaulting the database name to `*_test` when only a base URL is
+    ///      given (a bare `…/myapp` targets `…/myapp_test`).
+    ///   2. Create the database if missing (existing data is left intact).
+    ///   3. Run all pending app + framework migrations against it.
+    ///   4. Shell out to `cargo test`, forwarding trailing args to the test
+    ///      harness after `--` (like `cargo test -- <args>`), and exit with its
+    ///      exit code (a failing suite fails the command).
+    ///
+    /// `--reset` drops and recreates the database first (clean slate for schema
+    /// drift). The command refuses to run against a non-test database name.
+    ///
+    ///   autumn test
+    ///   autumn test --reset
+    ///   autumn test -- --nocapture some_test
+    // Help text is shown verbatim by clap; backticks would leak into `--help`
+    // output, so keep the identifiers bare and silence the doc-markdown lint.
+    #[allow(clippy::doc_markdown)]
+    #[command(verbatim_doc_comment)]
+    Test {
+        /// Drop and recreate the test database before migrating, for a clean
+        /// slate (otherwise the database is created only if missing and existing
+        /// data is left intact).
+        #[arg(long)]
+        reset: bool,
+        /// Arguments forwarded to the test harness after `--` (mirroring
+        /// `cargo test -- <args>`), e.g. `autumn test -- --nocapture some_test`
+        /// runs `cargo test -- --nocapture some_test`.
+        #[arg(
+            value_name = "CARGO_TEST_ARGS",
+            trailing_var_arg = true,
+            allow_hyphen_values = true
+        )]
+        cargo_args: Vec<String>,
+    },
     /// Shard operations (e.g. moving a tenant's data between shards)
     Shard(ShardCommands),
     /// Live monitoring dashboard for a running Autumn application
@@ -2182,6 +2229,7 @@ fn run_command(command: Commands) {
                 db::run(&command, profile.as_deref());
             }
         },
+        Commands::Test { reset, cargo_args } => test_cmd::run(reset, &cargo_args),
         Commands::Shard(cmd) => match cmd.command {
             ShardSubcommand::MoveSlot {
                 from,

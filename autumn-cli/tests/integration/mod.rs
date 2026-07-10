@@ -11,4 +11,5 @@ mod scaffold_form_for;
 #[cfg(unix)]
 mod serve;
 mod tauri_mobile_thin_client;
+mod test_command;
 mod webhook_sim;
