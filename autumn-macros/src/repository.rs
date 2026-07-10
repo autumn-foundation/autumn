@@ -1257,6 +1257,15 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         // pre-fetch is needed. Mirrors the inline delete broadcast the normal
         // `delete_by_id` wrapper emits (static/dynamic topic, tenant scoping,
         // custom `broadcast_render`), keyed on the destroyed child record.
+        // #1369 broadcast timing: do NOT publish the cascaded child's OOB delete
+        // mid-transaction. If a later dependent action or the parent mutation
+        // fails and the tx rolls back, a mid-tx publish can't be retracted and
+        // clients would drop a fragment for a child that still exists. Instead,
+        // accumulate (topic, dom_id) into `__ret_broadcasts` and hand them back to
+        // the parent, which publishes them only AFTER the tx commits (mirroring
+        // the normal inline delete broadcast, which effectively fires post-commit
+        // for that single op). Commit-hook children defer via the durable outbox
+        // and are unaffected (they never accumulate here — no double publish).
         let destroy_broadcast = if dep_needs_broadcast {
             let base_topic = match generate_topic_format(
                 config
@@ -1301,31 +1310,33 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 }
             };
             quote! {
-                if let ::core::option::Option::Some(__channels) =
-                    ::autumn_web::__private::get_global_channels()
                 {
                     let __broadcast_rec: &#model_name = &__record;
-                    let __del_topic = #topic_expr;
-                    let __del_id = #dom_id_expr;
-                    let __fragment = ::autumn_web::html! {};
-                    if let ::core::result::Result::Err(__err) = __channels
-                        .broadcast()
-                        .publish_oob(
-                            &__del_topic,
-                            &__del_id,
-                            &::autumn_web::htmx::OobSwap::Delete,
-                            &__fragment,
-                        )
-                    {
-                        ::autumn_web::reexports::tracing::warn!(
-                            error = %__err,
-                            "auto-broadcast dependent-destroy delete failed"
-                        );
-                    }
+                    let __del_topic: ::std::string::String =
+                        ::std::string::ToString::to_string(&#topic_expr);
+                    let __del_id: ::std::string::String =
+                        ::std::string::ToString::to_string(&#dom_id_expr);
+                    __ret_broadcasts.push((__del_topic, __del_id));
                 }
             }
         } else {
             quote! {}
+        };
+        // Declaration + return of the deferred-broadcast buffer for the Destroy
+        // arm. Only a broadcasts-only child accumulates; every other repo returns
+        // an empty buffer (zero-cost).
+        let destroy_ret_decl = if dep_needs_broadcast {
+            quote! {
+                let mut __ret_broadcasts: ::std::vec::Vec<(::std::string::String, ::std::string::String)> =
+                    ::std::vec::Vec::new();
+            }
+        } else {
+            quote! {}
+        };
+        let destroy_ret_value = if dep_needs_broadcast {
+            quote! { __ret_broadcasts }
+        } else {
+            quote! { ::std::vec::Vec::new() }
         };
         let destroy_post_mutation = if dep_needs_post {
             quote! {
@@ -1350,6 +1361,11 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             /// The `Destroy` action follows it so a soft-delete child is only
             /// soft-deleted alongside a soft-deleted parent (see below).
             ///
+            /// Returns the `(topic, dom_id)` OOB delete broadcasts accumulated for
+            /// `broadcasts = true` (non-commit-hook) children — the parent
+            /// publishes them only AFTER its transaction commits, so a rolled-back
+            /// cascade broadcasts nothing. Empty for every other configuration.
+            ///
             /// NOTE (#1369 scope / see #1702): the `Destroy` cascade is
             /// single-level — it applies this model's mutation to each child but
             /// does NOT recursively invoke the child's own `dependent(...)`
@@ -1363,7 +1379,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 __parent_id: i64,
                 __action: ::autumn_web::repository::DependentAction,
                 __parent_soft: bool,
-            ) -> ::autumn_web::AutumnResult<()> {
+            ) -> ::autumn_web::AutumnResult<
+                ::std::vec::Vec<(::std::string::String, ::std::string::String)>,
+            > {
                 use ::autumn_web::reexports::diesel::prelude::*;
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
                 #dep_hooks_use
@@ -1399,7 +1417,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 ))
                             );
                         }
-                        ::core::result::Result::Ok(())
+                        ::core::result::Result::Ok(::std::vec::Vec::new())
                     }
                     ::autumn_web::repository::DependentAction::Nullify => {
                         let __q = format!(
@@ -1411,7 +1429,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             .execute(conn)
                             .await
                             .map_err(::autumn_web::AutumnError::from)?;
-                        ::core::result::Result::Ok(())
+                        ::core::result::Result::Ok(::std::vec::Vec::new())
                     }
                     ::autumn_web::repository::DependentAction::DeleteAll => {
                         let __q = format!(
@@ -1423,7 +1441,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             .execute(conn)
                             .await
                             .map_err(::autumn_web::AutumnError::from)?;
-                        ::core::result::Result::Ok(())
+                        ::core::result::Result::Ok(::std::vec::Vec::new())
                     }
                     ::autumn_web::repository::DependentAction::Destroy => {
                         // Single-level cascade (#1369 scope; recursion tracked in
@@ -1431,6 +1449,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         // child's OWN `dependent(...)` cascade is NOT invoked, so
                         // grandchildren are not recursively destroyed/nullified.
                         #destroy_register
+                        #destroy_ret_decl
                         #[derive(::autumn_web::reexports::diesel::QueryableByName)]
                         struct __AutumnDepId {
                             #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
@@ -1461,7 +1480,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 #destroy_post_mutation
                             }
                         }
-                        ::core::result::Result::Ok(())
+                        ::core::result::Result::Ok(#destroy_ret_value)
                     }
                 }
             }
@@ -7859,15 +7878,19 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let __autumn_dep_repo = #child_repo::with_pool_untracked(
                     ::core::clone::Clone::clone(&self.pool)
                 );
-                __autumn_dep_repo
-                    .__autumn_apply_dependent_on_conn(
-                        conn,
-                        #fk,
-                        id,
-                        ::autumn_web::repository::DependentAction::#action_variant,
-                        #parent_soft_lit,
-                    )
-                    .await?;
+                // Deferred delete broadcasts accumulate here; they are published
+                // only after the tx commits (see the post-commit region below).
+                __autumn_dep_broadcasts.extend(
+                    __autumn_dep_repo
+                        .__autumn_apply_dependent_on_conn(
+                            conn,
+                            #fk,
+                            id,
+                            ::autumn_web::repository::DependentAction::#action_variant,
+                            #parent_soft_lit,
+                        )
+                        .await?
+                );
             }
         });
         let cascade_calls = quote! { #(#cascade_calls)* };
@@ -8082,35 +8105,48 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             #parent_register
             #tenant_id_setup
             let mut conn = self.__autumn_acquire_conn().await?;
-            ::autumn_web::__private::scoped_transaction::<(), ::autumn_web::AutumnError, _, _>(
-                &mut *conn,
-                |conn| {
-                    async move {
-                        #parent_ctx_decl
-                        #parent_idempotency_setup
+            // Deferred OOB delete broadcasts for broadcasts-only cascaded children
+            // (#1369). Accumulated inside the tx and returned on commit, so a
+            // rollback drops them and no spurious client deletes are published.
+            let __autumn_dep_broadcasts: ::std::vec::Vec<(::std::string::String, ::std::string::String)> =
+                ::autumn_web::__private::scoped_transaction::<
+                    ::std::vec::Vec<(::std::string::String, ::std::string::String)>,
+                    ::autumn_web::AutumnError, _, _,
+                >(
+                    &mut *conn,
+                    |conn| {
+                        async move {
+                            let mut __autumn_dep_broadcasts: ::std::vec::Vec<(::std::string::String, ::std::string::String)> =
+                                ::std::vec::Vec::new();
+                            #parent_ctx_decl
+                            #parent_idempotency_setup
 
-                        #parent_load
+                            #parent_load
 
-                        #parent_before_delete
+                            #parent_before_delete
 
-                        // Cascade to dependent children FIRST so the parent
-                        // delete never trips a foreign-key constraint and no
-                        // orphan can survive the transaction.
-                        #cascade_calls
+                            // Cascade to dependent children FIRST so the parent
+                            // delete never trips a foreign-key constraint and no
+                            // orphan can survive the transaction.
+                            #cascade_calls
 
-                        #parent_mutation
+                            #parent_mutation
 
-                        #parent_vh
+                            #parent_vh
 
-                        #parent_commit_enqueue
+                            #parent_commit_enqueue
 
-                        Ok(())
-                    }
-                    .scope_boxed()
-                },
-            )
-            .await?;
+                            Ok(__autumn_dep_broadcasts)
+                        }
+                        .scope_boxed()
+                    },
+                )
+                .await?;
             ::core::mem::drop(conn);
+            // Publish the cascaded children's OOB delete broadcasts only now that
+            // the transaction has committed (a rolled-back cascade published
+            // nothing). No-op when the buffer is empty / live channels are off.
+            ::autumn_web::repository::publish_deferred_dependent_broadcasts(__autumn_dep_broadcasts);
             // Always kick the durable commit-hook dispatcher after a dependent
             // delete: even when this parent has no commit hooks, a cascaded
             // `dependent = destroy` child may have enqueued one in the same
@@ -11455,6 +11491,15 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         fn save_many(&self, new: &[#new_name]) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<Vec<#model_name>>> + Send;
         fn save_many_skip_invalid(&self, new: &[#new_name]) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<(Vec<#model_name>, Vec<(usize, ::autumn_web::AutumnError)>)>> + Send;
         fn update_many(&self, ids: &[i64], changes: &#update_name) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<Vec<#model_name>>> + Send;
+        /// Bulk-delete the given ids in one statement.
+        ///
+        /// NOTE (#1369 scope; see #1702): `dependent(...)` cascade actions are
+        /// NOT applied on this bulk path — AC2 scopes dependent actions to the
+        /// single-record `delete_by_id`/`destroy`. On a repository that declares
+        /// `dependent(...)`, `delete_many` issues a plain bulk parent
+        /// delete/soft-delete and does not cascade, so it can FK-fail or orphan
+        /// children. Callers who need the cascade must use `delete_by_id`. Bulk
+        /// cascade is a tracked follow-up.
         fn delete_many(&self, ids: &[i64]) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<()>> + Send;
         #upsert_many_trait_method
     };
@@ -14331,37 +14376,52 @@ mod tests {
     }
 
     #[test]
-    fn repository_macro_dependent_destroy_emits_inline_broadcast_for_broadcasts_only_child() {
-        // AC4: a child declared `broadcasts = true` (without commit_hooks)
-        // publishes its OOB delete fragment inline in the normal delete path;
-        // the cascade helper must emit the SAME inline delete broadcast per
-        // cascaded child so live clients don't keep a stale fragment.
+    fn repository_macro_dependent_destroy_defers_broadcast_to_post_commit() {
+        // AC4 + broadcast timing: a `broadcasts = true` (non-commit-hook) child
+        // must NOT publish mid-transaction — a rollback couldn't retract it.
+        // Instead the cascade *accumulates* (topic, dom_id) into a buffer, and
+        // the parent publishes them only AFTER the tx closure commits.
         let generated = repository_macro(
             quote! { Comment, broadcasts = true, dependent(PgReplyRepository, fk = "comment_id", on_delete = destroy) },
             quote! { pub trait CommentRepository {} },
         )
         .to_string();
+        // Child side: the destroy arm ACCUMULATES, it does not publish mid-tx.
         let destroy_arm = dependent_destroy_arm(&generated);
         assert!(
-            destroy_arm.contains("publish_oob"),
-            "broadcasts-only child destroy must publish an inline OOB broadcast: {destroy_arm}"
+            destroy_arm.contains("__ret_broadcasts . push"),
+            "broadcasts-only child destroy must accumulate (topic, dom_id), not publish: {destroy_arm}"
         );
         assert!(
-            destroy_arm.contains("OobSwap :: Delete"),
-            "the inline cascade broadcast must be an OOB Delete: {destroy_arm}"
+            !destroy_arm.contains("publish_oob"),
+            "the child cascade must not publish an OOB broadcast mid-transaction: {destroy_arm}"
         );
-        // A broadcasts-only child does not enqueue a durable commit hook.
         assert!(
             !destroy_arm.contains("enqueue_repository_commit_hook_on_conn"),
             "a broadcasts-only child must not enqueue a durable commit hook: {destroy_arm}"
         );
+        // Parent side: the deferred broadcasts are published AFTER the tx closure
+        // (post-commit), i.e. after the connection is dropped.
+        let section = delete_by_id_section(&generated);
+        let tx_pos = section
+            .find("scoped_transaction")
+            .expect("dependent delete_by_id opens a transaction");
+        let drop_pos = section
+            .find("mem :: drop")
+            .expect("dependent delete_by_id drops the conn after the tx");
+        let publish_pos = section
+            .find("publish_deferred_dependent_broadcasts")
+            .expect("parent must publish deferred cascade broadcasts");
+        assert!(
+            tx_pos < drop_pos && drop_pos < publish_pos,
+            "deferred cascade broadcasts must be published AFTER the tx closure / conn drop (post-commit): {section}"
+        );
     }
 
     #[test]
-    fn repository_macro_dependent_destroy_commit_hooks_child_enqueues_and_does_not_inline_broadcast()
-     {
+    fn repository_macro_dependent_destroy_commit_hooks_child_enqueues_and_does_not_broadcast() {
         // A commit_hooks child enqueues the durable hook (which carries the
-        // broadcast) and must NOT also emit the inline broadcast — no double emit.
+        // broadcast) and must NOT also accumulate/publish inline — no double emit.
         let generated = repository_macro(
             quote! { Comment, hooks = CommentHooks, commit_hooks = true, broadcasts = true, dependent(PgReplyRepository, fk = "comment_id", on_delete = destroy) },
             quote! { pub trait CommentRepository {} },
@@ -14373,8 +14433,9 @@ mod tests {
             "a commit_hooks child destroy must enqueue the durable commit hook: {destroy_arm}"
         );
         assert!(
-            !destroy_arm.contains("publish_oob"),
-            "a commit_hooks child must not also emit the inline broadcast (no double emit): {destroy_arm}"
+            !destroy_arm.contains("publish_oob")
+                && !destroy_arm.contains("__ret_broadcasts . push"),
+            "a commit_hooks child must not also accumulate/publish the inline broadcast (no double emit): {destroy_arm}"
         );
     }
 

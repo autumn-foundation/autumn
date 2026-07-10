@@ -546,7 +546,7 @@ async fn destroy_soft_parent_soft_deletes_soft_children() {
 /// #1369 P1 (hard parent + soft child, incl. a PRE-soft-deleted child): a
 /// NON-soft parent that `destroy`s a `#[soft_delete]` child. Because the parent
 /// is hard-deleted, the children must be HARD-deleted too (rows gone) — even a
-/// child that was ALREADY soft-deleted (deleted_at set) whose NOT NULL FK still
+/// child that was ALREADY soft-deleted (`deleted_at` set) whose NOT NULL FK still
 /// points at the parent. The parent-soft-gated live filter is dropped for a hard
 /// parent, so the cascade selects every physically-present child. Assert zero
 /// surviving children, zero FK errors, parent gone.

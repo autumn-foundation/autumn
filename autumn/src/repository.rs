@@ -140,6 +140,49 @@ pub enum DependentAction {
     Restrict,
 }
 
+/// Publish a batch of deferred dependent-cascade OOB *delete* broadcasts,
+/// accumulated during a `dependent = destroy` cascade over `broadcasts = true`
+/// children and published **after** the parent transaction commits (#1369).
+///
+/// Each entry is `(topic, dom_id)`; the fragment is empty and the swap is
+/// [`OobSwap::Delete`](crate::htmx::OobSwap::Delete). Deferring to post-commit
+/// means a rolled-back cascade publishes nothing, so live clients are never told
+/// to remove a child that still exists. Commit-hook children defer via the
+/// durable outbox instead and are not routed through here.
+///
+/// Framework plumbing; not a public API. No-op when the live-channel /
+/// `maud` / `htmx` features are not built in (the buffer is always empty then).
+#[cfg(all(feature = "ws", feature = "maud", feature = "htmx"))]
+#[doc(hidden)]
+pub fn publish_deferred_dependent_broadcasts(broadcasts: Vec<(String, String)>) {
+    if broadcasts.is_empty() {
+        return;
+    }
+    if let Some(channels) = crate::__private::get_global_channels() {
+        let fragment = crate::html! {};
+        for (topic, dom_id) in &broadcasts {
+            if let Err(err) = channels.broadcast().publish_oob(
+                topic,
+                dom_id,
+                &crate::htmx::OobSwap::Delete,
+                &fragment,
+            ) {
+                tracing::warn!(
+                    error = %err,
+                    "auto-broadcast dependent-destroy delete failed"
+                );
+            }
+        }
+    }
+}
+
+/// No-op fallback when live broadcasting is not compiled in. The accumulation
+/// side only runs for `broadcasts = true` children (which require these
+/// features), so the buffer is always empty in this configuration.
+#[cfg(not(all(feature = "ws", feature = "maud", feature = "htmx")))]
+#[doc(hidden)]
+pub fn publish_deferred_dependent_broadcasts(_broadcasts: Vec<(String, String)>) {}
+
 /// Extension trait that provides a fallback `None` for model structs that do
 /// not have a `#[lock_version]` field — or that are defined manually without
 /// going through `#[model]`.
