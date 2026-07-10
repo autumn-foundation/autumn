@@ -1212,6 +1212,52 @@ fn check_stale_artifacts() -> CheckResult {
     }
 }
 
+/// Result of probing for the `PostgreSQL` client tools, factored out so the
+/// pass/warn logic is unit-testable without touching PATH.
+fn check_pg_client_tools_impl(missing: &[&str]) -> CheckResult {
+    if missing.is_empty() {
+        CheckResult {
+            name: "pg_client_tools",
+            status: CheckStatus::Pass,
+            detail: Some("pg_dump and pg_restore found on PATH".into()),
+            hint: None,
+        }
+    } else {
+        CheckResult {
+            name: "pg_client_tools",
+            status: CheckStatus::Warn,
+            detail: Some(format!(
+                "{} not found on PATH; `autumn db backup` / `autumn db restore` need it",
+                missing.join(", ")
+            )),
+            hint: Some(
+                "Install the PostgreSQL client tools (e.g. `postgresql-client`) or set AUTUMN_PG_BIN_DIR to their bin directory",
+            ),
+        }
+    }
+}
+
+/// Warn when the `PostgreSQL` client tools behind `autumn db backup` /
+/// `autumn db restore` aren't on PATH. Mirrors the diesel-CLI nudge in
+/// [`check_pending_migrations`]: a soft warning (managed-Postgres apps bundle
+/// these and not every project runs backups), never a hard failure.
+fn check_pg_client_tools() -> CheckResult {
+    let missing: Vec<&str> = ["pg_dump", "pg_restore"]
+        .into_iter()
+        .filter(|tool| !pg_tool_on_path(tool))
+        .collect();
+    check_pg_client_tools_impl(&missing)
+}
+
+/// Whether a pg client tool resolves on PATH (probed via `--version`).
+fn pg_tool_on_path(tool: &str) -> bool {
+    std::process::Command::new(tool)
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 /// Read the `rust-version` MSRV from the nearest workspace/package `Cargo.toml`.
 fn read_msrv() -> Option<String> {
     let content = std::fs::read_to_string("Cargo.toml").ok()?;
@@ -2560,6 +2606,9 @@ pub fn run(opts: DoctorOptions) {
         tasks.push(Box::new(check_tailwind_binary));
     }
 
+    // 7b. PostgreSQL client tools behind `autumn db backup` / `db restore`.
+    tasks.push(Box::new(check_pg_client_tools));
+
     // 8. Signing-secret readiness (warn in dev, fail in prod when missing/weak)
     tasks.push(Box::new(move || {
         check_signing_secret_impl(signing_secret.as_deref(), is_production)
@@ -3513,6 +3562,23 @@ mod tests {
     fn model_private_columns_pass_when_none_flagged() {
         let r = check_model_private_columns_impl(&[]);
         assert_eq!(r.status, CheckStatus::Pass);
+    }
+
+    #[test]
+    fn pg_client_tools_pass_when_all_present() {
+        let r = check_pg_client_tools_impl(&[]);
+        assert_eq!(r.status, CheckStatus::Pass);
+        assert!(r.hint.is_none());
+    }
+
+    #[test]
+    fn pg_client_tools_warn_lists_missing() {
+        let r = check_pg_client_tools_impl(&["pg_dump", "pg_restore"]);
+        assert_eq!(r.status, CheckStatus::Warn);
+        let detail = r.detail.unwrap();
+        assert!(detail.contains("pg_dump"));
+        assert!(detail.contains("pg_restore"));
+        assert!(r.hint.unwrap().contains("AUTUMN_PG_BIN_DIR"));
     }
 
     #[test]

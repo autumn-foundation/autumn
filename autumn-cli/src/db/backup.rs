@@ -327,6 +327,41 @@ fn backup_into(
     write_manifest(run_dir, &manifest)
 }
 
+/// Build a `Command` for a pg client tool with the connection password moved
+/// out of argv and into `PGPASSWORD`. The full URL (with password) is never
+/// passed as a command-line argument, so it can't leak via `ps` /
+/// `/proc/<pid>/cmdline` to other local users — matching this module's
+/// credential-safety stance. Returns the command plus the password-free
+/// `--dbname` value the caller should pass. libpq reads `PGPASSWORD` when the
+/// connection string omits the password.
+fn pg_command(program: &Path, url: &str) -> (Command, String) {
+    let (safe_url, password) = split_password(url);
+    let mut cmd = Command::new(program);
+    if let Some(pw) = password {
+        cmd.env("PGPASSWORD", pw);
+    }
+    (cmd, safe_url)
+}
+
+/// Split a connection URL into a `(password-free URL, password)` pair. On a
+/// URL that can't be parsed (or has no password) the URL is returned unchanged
+/// with `None`, so behavior degrades to the previous "URL on the command line"
+/// path rather than failing.
+fn split_password(url: &str) -> (String, Option<String>) {
+    url::Url::parse(url).map_or_else(
+        |_| (url.to_owned(), None),
+        |mut parsed| {
+            let password = parsed.password().map(str::to_owned);
+            if password.is_some() {
+                // Clearing the password keeps the username, host, port, db, and
+                // any query parameters intact.
+                let _ = parsed.set_password(None);
+            }
+            (parsed.to_string(), password)
+        },
+    )
+}
+
 /// Shell out to `pg_dump` for one target.
 fn run_pg_dump(
     pg_dump: &Path,
@@ -338,7 +373,8 @@ fn run_pg_dump(
     // `--no-owner`/`--no-privileges` keep the artifact portable across roles so
     // a restore into a freshly-created database works without recreating the
     // original owner/grants.
-    let status = Command::new(pg_dump)
+    let (mut cmd, safe_url) = pg_command(pg_dump, url);
+    let status = cmd
         .arg("--format")
         .arg(format.pg_dump_format_flag())
         .arg("--no-owner")
@@ -346,7 +382,7 @@ fn run_pg_dump(
         .arg("--file")
         .arg(out_path)
         .arg("--dbname")
-        .arg(url)
+        .arg(&safe_url)
         .status()
         .map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => BackupError::ToolMissing {
@@ -496,12 +532,13 @@ fn run_restore_one(
             let pg_restore = tools.require("pg_restore")?;
             // `--clean --if-exists` drops existing objects first so the restore
             // is an overwrite, not a merge; `--no-owner` matches the dump flags.
-            let status = Command::new(&pg_restore)
+            let (mut cmd, safe_url) = pg_command(&pg_restore, url);
+            let status = cmd
                 .arg("--clean")
                 .arg("--if-exists")
                 .arg("--no-owner")
                 .arg("--dbname")
-                .arg(url)
+                .arg(&safe_url)
                 .arg(artifact)
                 .status()
                 .map_err(|e| spawn_err("pg_restore", db, &e))?;
@@ -518,11 +555,12 @@ fn run_restore_one(
         }
         BackupFormat::Plain => {
             let psql = tools.require("psql")?;
-            let status = Command::new(&psql)
+            let (mut cmd, safe_url) = pg_command(&psql, url);
+            let status = cmd
                 .arg("--set")
                 .arg("ON_ERROR_STOP=1")
                 .arg("--dbname")
-                .arg(url)
+                .arg(&safe_url)
                 .arg("--file")
                 .arg(artifact)
                 .status()
@@ -636,17 +674,37 @@ impl RestorePlan {
 
 // ─── Target resolution (reuses the migrate URL-resolution path) ─────────────
 
+/// The project-root `.env`-overlaid process environment, mirroring how
+/// `autumn migrate` resolves its target URLs (issue #1684). A real env var
+/// still wins over `.env`; a malformed `.env` fails loudly (with a `path:line`
+/// location) rather than being silently ignored.
+fn dotenv_env() -> autumn_web::dotenv::DotenvOsEnv {
+    match autumn_web::dotenv::os_env_with_dotenv() {
+        Ok(env) => env,
+        Err(e) => {
+            eprintln!("  \u{274C} .env: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
 /// Resolve the databases a backup run should capture, reusing the SAME
 /// resolution `autumn migrate` uses so the set matches the running app exactly.
 fn resolve_targets(
     profile: Option<&str>,
     selector: &TargetSelector,
 ) -> Result<Vec<ResolvedTarget>, BackupError> {
-    let control = migrate::resolve_primary_url(profile);
+    use autumn_web::config::Env as _;
+
+    // Resolve control AND shards through the SAME `.env`-overlaid environment
+    // that `autumn migrate` uses (issue #1684), so a `.env`-provided shard
+    // override is honored identically. A real env var still wins over `.env`.
     let table =
         migrate::read_autumn_toml_table_with_profile(Some(&migrate::effective_profile(profile)));
-    let shards =
-        migrate::resolve_shard_database_urls_from_sources(|k| std::env::var(k), table.as_ref());
+    let env = dotenv_env();
+    let control =
+        migrate::resolve_primary_database_url_from_sources(|k| env.var(k), table.as_ref());
+    let shards = migrate::resolve_shard_database_urls_from_sources(|k| env.var(k), table.as_ref());
     build_targets(control, shards, selector)
 }
 
@@ -705,11 +763,16 @@ fn resolve_targets_for_restore(
     profile: Option<&str>,
     entries: &[ManifestTarget],
 ) -> Result<Vec<(ManifestTarget, String)>, BackupError> {
-    let control = migrate::resolve_primary_url(profile);
+    use autumn_web::config::Env as _;
+
+    // Same `.env`-overlaid resolution as `resolve_targets` / `autumn migrate`
+    // so restore writes to the exact databases a backup would have captured.
     let table =
         migrate::read_autumn_toml_table_with_profile(Some(&migrate::effective_profile(profile)));
-    let shards =
-        migrate::resolve_shard_database_urls_from_sources(|k| std::env::var(k), table.as_ref());
+    let env = dotenv_env();
+    let control =
+        migrate::resolve_primary_database_url_from_sources(|k| env.var(k), table.as_ref());
+    let shards = migrate::resolve_shard_database_urls_from_sources(|k| env.var(k), table.as_ref());
 
     let mut out = Vec::with_capacity(entries.len());
     for entry in entries {
@@ -759,7 +822,11 @@ fn prune(root: &Path, keep: usize) -> Result<(), BackupError> {
     Ok(())
 }
 
-/// List run-directory names directly under `root`. Missing root => empty.
+/// List backup run-directory names directly under `root`. Only directories that
+/// actually contain a `manifest.json` are counted, so retention pruning can
+/// never delete an unrelated directory a user may have placed alongside the
+/// backups (or a partially-written run — those are cleaned up before this runs).
+/// Missing root => empty.
 fn list_run_dirs(root: &Path) -> Result<Vec<String>, BackupError> {
     if !root.exists() {
         return Ok(Vec::new());
@@ -769,7 +836,8 @@ fn list_run_dirs(root: &Path) -> Result<Vec<String>, BackupError> {
         std::fs::read_dir(root).map_err(BackupError::io(format!("read {}", root.display())))?
     {
         let entry = entry.map_err(BackupError::io(format!("read entry in {}", root.display())))?;
-        if entry.path().is_dir() {
+        let path = entry.path();
+        if path.is_dir() && path.join(MANIFEST_FILE).is_file() {
             names.push(entry.file_name().to_string_lossy().into_owned());
         }
     }
@@ -1208,6 +1276,23 @@ mod tests {
     }
 
     #[test]
+    fn list_run_dirs_only_counts_dirs_with_a_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // A real backup run: dir with a manifest.
+        let good = root.join("20260710T040506Z");
+        std::fs::create_dir_all(&good).unwrap();
+        std::fs::write(good.join(MANIFEST_FILE), b"{}").unwrap();
+        // An unrelated directory with no manifest must be ignored by pruning.
+        std::fs::create_dir_all(root.join("notes")).unwrap();
+        // A stray file is not a directory.
+        std::fs::write(root.join("README.txt"), b"hi").unwrap();
+
+        let dirs = list_run_dirs(root).unwrap();
+        assert_eq!(dirs, vec!["20260710T040506Z".to_owned()]);
+    }
+
+    #[test]
     fn plan_pruning_never_removes_everything_on_keep_zero() {
         let runs: Vec<String> = ["a", "b"].iter().map(|s| (*s).to_owned()).collect();
         // keep 0 is clamped to 1 so a just-taken backup survives.
@@ -1295,6 +1380,27 @@ mod tests {
         // Never leaks credentials.
         assert!(!name.contains("hunter2"));
         assert_eq!(parsed_db_name("not a url"), "(database)");
+    }
+
+    #[test]
+    fn split_password_moves_secret_out_of_url() {
+        let (safe, pw) = split_password("postgres://user:hunter2@db.example.com:6543/my_app");
+        assert_eq!(pw.as_deref(), Some("hunter2"));
+        // The returned URL keeps everything but the password.
+        assert!(!safe.contains("hunter2"));
+        assert!(safe.contains("user@db.example.com"));
+        assert!(safe.contains("/my_app"));
+    }
+
+    #[test]
+    fn split_password_passthrough_when_absent_or_unparseable() {
+        let (safe, pw) = split_password("postgres://user@localhost/app");
+        assert_eq!(pw, None);
+        assert_eq!(safe, "postgres://user@localhost/app");
+        // A non-URL degrades to passing the string through unchanged.
+        let (safe, pw) = split_password("not a url");
+        assert_eq!(pw, None);
+        assert_eq!(safe, "not a url");
     }
 
     #[test]
