@@ -85,6 +85,36 @@ These routes are generated from `#[autumn_web::repository(Bookmark, api = "/api/
 | GET    | `/static/js/htmx.min.js` | Bundled htmx          |
 | GET    | `/static/css/autumn.css` | Compiled Tailwind CSS  |
 
+## Seeding fake data
+
+`src/bin/seed.rs` uses the `#[model]` factory's `.fake()` support (issue #1343)
+to fill the database with realistic rows so you can exercise pagination and
+search against a populated list.
+
+```bash
+# Populate 200 faked bookmarks in one shot (the seed binary's default body).
+# Idempotent: it only bulk-seeds when the table is empty.
+autumn seed
+```
+
+The one line that does the work in `src/bin/seed.rs`:
+
+```rust
+Bookmark::factory().fake().create_many(200, ctx.pool()).await;
+```
+
+You can also generate a specific count for any registered `#[model]` without
+editing the seed binary:
+
+```bash
+# Insert 200 faked Bookmark rows to try pagination/search on a full list.
+autumn seed --count 200 --model Bookmark
+```
+
+`autumn seed` forwards `--count`/`--model` to the seed binary, which routes them
+to `autumn_web::seed::fake_seed_model` — the model is looked up by name from a
+registry every `#[autumn_web::model]` joins automatically.
+
 ## Try the generated CRUD API
 
 ```bash

@@ -7,12 +7,35 @@
 //!
 //! Re-running this seed against an already-seeded database is safe because
 //! every insert uses `ON CONFLICT DO NOTHING` (upsert-by-natural-key).
+//!
+//! Faking rows without editing this file:
+//!
+//!   autumn seed --count 200 --model Post
+//!
+//! `autumn seed` forwards `--count`/`--model` as the `AUTUMN_SEED_COUNT` and
+//! `AUTUMN_SEED_MODEL` environment variables; `autumn_web::seed::maybe_fake_seed`
+//! (called first below) then routes to `autumn_web::seed::fake_seed_model`, which
+//! drives the model's factory `.fake().create_many(...)`. Any
+//! `#[autumn_web::model]` is registered automatically — no code change needed
+//! here. Because the dispatch lives in autumn-web, upgrading the framework picks
+//! up any fixes without re-scaffolding this file.
 use autumn_web::seed::SeedContext;
 
 #[autumn_web::main]
 async fn main() {
     let ctx = SeedContext::build()
         .expect("failed to build seed context — is the database running?");
+
+    // Fake-seed dispatch (owned by autumn-web): when invoked as
+    // `autumn seed --count N --model M`, generate faked rows for that model and
+    // return, skipping the hand-written seed body below. Returns `false` when no
+    // fake request was made, so the normal seed runs.
+    if autumn_web::seed::maybe_fake_seed(ctx.pool())
+        .await
+        .expect("fake-seed failed")
+    {
+        return;
+    }
 
     println!("Seeding database (profile: {})...", ctx.profile());
 
@@ -33,6 +56,10 @@ async fn main() {
     //       .execute(&mut db)
     //       .await
     //       .expect("seed insert failed");
+    //
+    // Or, to populate 100+ faked rows in one line (requires `#[autumn_web::model]`):
+    //
+    //   MyModel::factory().fake().create_many(200, ctx.pool()).await;
 
     drop(db);
     println!("Seed complete.");

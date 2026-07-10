@@ -331,6 +331,16 @@ enum Commands {
         /// Package to run (for workspaces)
         #[arg(short, long)]
         package: Option<String>,
+        /// Number of faked rows to generate. Requires --model.
+        ///
+        /// When both `--count` and `--model` are given, the seed binary
+        /// generates and inserts that many faked rows for the model via its
+        /// factory, instead of running its hand-written seed body.
+        #[arg(long, requires = "model")]
+        count: Option<usize>,
+        /// Model to fake rows for (e.g. `Post`). Requires --count.
+        #[arg(long, requires = "count")]
+        model: Option<String>,
     },
     /// Run or list one-off operational tasks registered by the application.
     Task {
@@ -2377,7 +2387,12 @@ fn run_command(command: Commands) {
             secret,
             payload,
         }) => webhook::run_sim(&provider, &url, &secret, &payload),
-        Commands::Seed { profile, package } => seed::run(&profile, package.as_deref()),
+        Commands::Seed {
+            profile,
+            package,
+            count,
+            model,
+        } => seed::run(&profile, package.as_deref(), count, model.as_deref()),
         Commands::Task {
             package,
             bin,
@@ -4343,9 +4358,16 @@ mod tests {
     fn parse_seed_defaults() {
         let cli = Cli::try_parse_from(["autumn", "seed"]).unwrap();
         match cli.command {
-            Commands::Seed { profile, package } => {
+            Commands::Seed {
+                profile,
+                package,
+                count,
+                model,
+            } => {
                 assert_eq!(profile, "dev");
                 assert!(package.is_none());
+                assert!(count.is_none());
+                assert!(model.is_none());
             }
             _ => panic!("expected Seed command"),
         }
@@ -4371,6 +4393,33 @@ mod tests {
             }
             _ => panic!("expected Seed command"),
         }
+    }
+
+    #[test]
+    fn parse_seed_with_count_and_model() {
+        let cli =
+            Cli::try_parse_from(["autumn", "seed", "--count", "200", "--model", "Post"]).unwrap();
+        match cli.command {
+            Commands::Seed { count, model, .. } => {
+                assert_eq!(count, Some(200));
+                assert_eq!(model.as_deref(), Some("Post"));
+            }
+            _ => panic!("expected Seed command"),
+        }
+    }
+
+    #[test]
+    fn parse_seed_with_count_only() {
+        // `--count` declares `requires = "model"`, so clap rejects it at parse
+        // time when `--model` is absent. `resolve_fake_request` remains as a
+        // secondary run-time guard for callers that bypass clap.
+        assert!(Cli::try_parse_from(["autumn", "seed", "--count", "50"]).is_err());
+    }
+
+    #[test]
+    fn parse_seed_with_model_only() {
+        // Symmetrically, `--model` requires `--count`.
+        assert!(Cli::try_parse_from(["autumn", "seed", "--model", "Post"]).is_err());
     }
 
     #[test]
