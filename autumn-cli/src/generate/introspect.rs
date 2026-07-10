@@ -1531,6 +1531,7 @@ mod tests {
                 nullable: false,
                 variants: Vec::new(),
                 unique: false,
+                constraints: Default::default(),
             },
             Field {
                 name: "body".into(),
@@ -1538,6 +1539,7 @@ mod tests {
                 nullable: false,
                 variants: Vec::new(),
                 unique: false,
+                constraints: Default::default(),
             },
             Field {
                 name: "published".into(),
@@ -1545,6 +1547,7 @@ mod tests {
                 nullable: false,
                 variants: Vec::new(),
                 unique: false,
+                constraints: Default::default(),
             },
         ];
         let greenfield = render_model_file_for_test("Post", "posts", &fields);

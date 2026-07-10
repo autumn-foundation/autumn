@@ -511,6 +511,7 @@ fn fields_with_existing_schema_columns(
                 nullable: false,
                 variants: Vec::new(),
                 unique: false,
+                constraints: Default::default(),
             });
         }
     }
@@ -935,6 +936,87 @@ pub fn remove_main_mod_declarations(existing: &str, names: &[&str]) -> String {
     let mut out = collapsed.join("\n");
     if existing.ends_with('\n') && !out.is_empty() {
         out.push('\n');
+    }
+    out
+}
+
+/// Inject the `#[path]`-qualified `mod schema;` / `mod models;` declarations
+/// that link a scaffolded app's `src/schema.rs` and `src/models/` into the
+/// standalone `src/bin/seed.rs` binary (issue #1718).
+///
+/// `autumn seed --count/--model` resolves a model by name through an
+/// `inventory` registry that each `#[autumn_web::model]` submits into. That
+/// registry is only populated with models actually **compiled into the seed
+/// binary** — but `autumn new` emits `src/bin/seed.rs` as a separate `[[bin]]`
+/// target that links neither `src/main.rs` nor `src/models/`, so a scaffolded
+/// model was never visible to it and `--model M` returned
+/// `unknown model M; available: (none)`. Declaring the models (and the
+/// `schema` module they `use crate::schema::…` from) directly in `seed.rs`
+/// pulls their `inventory::submit!`s into the seed binary.
+///
+/// The `#[path]` form is required because `src/bin/seed.rs`'s own module tree
+/// has no `models`/`schema` child relative to `src/bin/`; the attribute points
+/// each declaration at the real file under `src/`. Child modules of
+/// `models/mod.rs` (`mod post;` → `src/models/post.rs`) resolve relative to
+/// that file's directory, so no per-model edit is needed here — regenerating
+/// or adding a model just extends `src/models/mod.rs`, which this single
+/// declaration already re-exports into the seed binary.
+///
+/// Idempotent: a declaration already present (in any `mod x;` / `pub mod x;`
+/// form, with or without a preceding `#[path]` attribute) is left untouched,
+/// so repeated `generate` runs converge. No destroy-time removal is needed:
+/// `autumn destroy` only ever strips lines from `src/models/mod.rs` and
+/// `src/schema.rs` (never deletes the files themselves), so these `#[path]`
+/// targets always exist and an emptied module simply contributes nothing to
+/// the registry — exactly the pre-scaffold behavior.
+#[must_use]
+pub fn link_models_into_seed_bin(existing: &str) -> String {
+    // (module name, full declaration incl. its `#[path]` attribute)
+    let entries: [(&str, &str); 2] = [
+        ("schema", "#[path = \"../schema.rs\"]\nmod schema;"),
+        ("models", "#[path = \"../models/mod.rs\"]\nmod models;"),
+    ];
+    let needed: Vec<&str> = entries
+        .iter()
+        .filter(|(name, _)| !has_mod_declaration(existing, name))
+        .map(|(_, decl)| *decl)
+        .collect();
+    if needed.is_empty() {
+        return existing.to_owned();
+    }
+    let block = needed.join("\n");
+
+    // `mod` declarations are *items* and must follow any crate-level inner
+    // attributes (`#![…]`) and `//!` doc comments — mirror `ensure_mods`.
+    let split = existing
+        .lines()
+        .position(|l| {
+            let t = l.trim_start();
+            !t.is_empty() && !t.starts_with("//!") && !t.starts_with("#![")
+        })
+        .unwrap_or_else(|| existing.lines().count());
+
+    if split == 0 {
+        return format!("{block}\n\n{existing}");
+    }
+
+    let mut out = String::with_capacity(existing.len() + block.len() + 4);
+    let lines: Vec<&str> = existing.lines().collect();
+    for line in &lines[..split] {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push_str(&block);
+    out.push('\n');
+    if split < lines.len() {
+        out.push('\n');
+        for line in &lines[split..] {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    if !existing.ends_with('\n') && out.ends_with('\n') {
+        out.pop();
     }
     out
 }
@@ -5080,6 +5162,92 @@ async fn main() {\n\
         let original = "fn main() {}\n";
         let updated = update_main_rs(original, &[], &["foo".into()]);
         assert_eq!(updated, original);
+    }
+
+    // ── link_models_into_seed_bin (issue #1718) ───────────────────────────
+
+    /// The seed binary as `autumn new --with-seed` emits it: a `//!` doc block
+    /// followed by a `use` and the async `main`.
+    const SEED_BIN: &str = "\
+//! Database seed binary.
+//!
+//!   autumn seed --count 200 --model Post
+use autumn_web::seed::SeedContext;
+
+#[autumn_web::main]
+async fn main() {}
+";
+
+    #[test]
+    fn link_seed_bin_injects_path_qualified_schema_and_models_mods() {
+        let linked = link_models_into_seed_bin(SEED_BIN);
+        assert!(
+            linked.contains("#[path = \"../schema.rs\"]\nmod schema;"),
+            "must inject a #[path]-qualified `mod schema;`:\n{linked}"
+        );
+        assert!(
+            linked.contains("#[path = \"../models/mod.rs\"]\nmod models;"),
+            "must inject a #[path]-qualified `mod models;`:\n{linked}"
+        );
+    }
+
+    #[test]
+    fn link_seed_bin_inserts_after_inner_doc_block_not_before() {
+        // `mod` items must follow the crate-level `//!` doc block, or the file
+        // fails to parse.
+        let linked = link_models_into_seed_bin(SEED_BIN);
+        let doc_end = linked.find("use autumn_web::seed").unwrap();
+        let mods_at = linked.find("mod schema;").unwrap();
+        assert!(
+            linked.find("//! Database seed binary.").unwrap() < mods_at,
+            "mods must come after the doc comment: {linked}"
+        );
+        assert!(
+            mods_at < doc_end,
+            "mods must be inserted before the first ordinary item (`use`): {linked}"
+        );
+    }
+
+    #[test]
+    fn link_seed_bin_is_idempotent() {
+        let once = link_models_into_seed_bin(SEED_BIN);
+        let twice = link_models_into_seed_bin(&once);
+        assert_eq!(once, twice, "re-linking an already-linked seed bin is a no-op");
+    }
+
+    #[test]
+    fn link_seed_bin_preserves_existing_declarations() {
+        // A hand-written seed that already declares one module keeps that
+        // declaration untouched and only the missing one is added.
+        let existing = "\
+//! seed
+#[path = \"../models/mod.rs\"]
+mod models;
+use autumn_web::seed::SeedContext;
+";
+        let linked = link_models_into_seed_bin(existing);
+        assert_eq!(
+            linked.matches("mod models;").count(),
+            1,
+            "must not duplicate the pre-existing `mod models;`:\n{linked}"
+        );
+        assert!(
+            linked.contains("mod schema;"),
+            "must still add the missing `mod schema;`:\n{linked}"
+        );
+    }
+
+    #[test]
+    fn link_seed_bin_no_change_when_both_present() {
+        let existing = "\
+//! seed
+#[path = \"../schema.rs\"]
+mod schema;
+#[path = \"../models/mod.rs\"]
+mod models;
+use autumn_web::seed::SeedContext;
+";
+        assert_eq!(link_models_into_seed_bin(existing), existing);
     }
 
     #[test]

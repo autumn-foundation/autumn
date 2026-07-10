@@ -1326,6 +1326,21 @@ fn render_model_form(
                     | FieldKind::Decimal { .. }
                     | FieldKind::References
             )
+            // A numeric field carrying a `{min,max}` range constraint (issue
+            // #1388) must keep its NATIVE type on the form struct, not the
+            // String representation below: `validator`'s `range` rule only
+            // applies to numeric types, so `#[validate(range(...))]` on a
+            // `String` field fails to compile — and the whole point of the
+            // constraint is that the range is rejected server-side through the
+            // changeset (a 422 with an inline error), which needs the rule on
+            // the form the changeset validates. The `T::default()` pre-fill
+            // trade-off the String representation avoids is moot here: the
+            // field is `required` and range-bounded, so a deliberate value is
+            // forced anyway.
+            && !(matches!(
+                f.kind,
+                FieldKind::I32 | FieldKind::I64 | FieldKind::F32 | FieldKind::F64
+            ) && (f.constraints.min.is_some() || f.constraints.max.is_some()))
         {
             // Represented as a `String` on the form, exactly like a required
             // enum/datetime field: `T::default()` for these kinds (`0`, the nil
@@ -2562,7 +2577,45 @@ fn render_form_for_helper(
                     "\n        .override_field(\"{name}\", autumn_web::form::FieldControl::Select {{ options: {name}_select }})"
                 );
             }
-            _ => {}
+            // A `String`/`Text`/numeric field carrying DSL constraint
+            // modifiers (issue #1388) needs HTML5 attributes the derived
+            // `FieldControl` can't express (`minlength`/`maxlength`,
+            // `min`/`max`, `type="email"`/`type="url"`). Exclude it from the
+            // derived render and append an equivalent control that carries the
+            // constraints — the same `.exclude()` + `.append()` escape hatch
+            // the attachment arm uses. The value is re-filled from the
+            // changeset so the 422 re-render keeps entered input, and the
+            // inline-error/ARIA skeleton matches the derived controls.
+            _ => {
+                if let Some((input_type, constraint_attrs)) = html5_constraint_spec(f) {
+                    let label = humanize_label(name);
+                    let required_attr = if f.nullable {
+                        ""
+                    } else {
+                        " required aria-required=\"true\""
+                    };
+                    let _ = write!(builder_calls, "\n        .exclude(\"{name}\")");
+                    let _ = write!(
+                        appends,
+                        "\n        .append(html! {{\n            \
+                         @let errors = changeset.errors_for(\"{name}\");\n            \
+                         div id=\"{name}-field\" class=\"autumn-field\" {{\n                \
+                         label for=\"{name}\" class=\"autumn-field__label\" {{ \"{label}\" }}\n                \
+                         input type=\"{input_type}\" id=\"{name}\" name=\"{name}\"\n                    \
+                         value=(changeset.field_value(\"{name}\").unwrap_or_default()){constraint_attrs}{required_attr}\n                    \
+                         class=(if errors.is_empty() {{ \"autumn-field__input\" }} else {{ \"autumn-field__input autumn-field__input--invalid\" }})\n                    \
+                         aria-invalid=(if errors.is_empty() {{ \"false\" }} else {{ \"true\" }})\n                    \
+                         aria-describedby=(if errors.is_empty() {{ \"\" }} else {{ \"{name}-error\" }});\n                \
+                         @if !errors.is_empty() {{\n                    \
+                         div id=\"{name}-error\" role=\"alert\" class=\"autumn-field__errors\" {{\n                        \
+                         @for error in errors {{ p class=\"autumn-field__error\" {{ (error) }} }}\n                    \
+                         }}\n                \
+                         }}\n            \
+                         }}\n        \
+                         }})"
+                    );
+                }
+            }
         }
     }
     format!(
@@ -2799,6 +2852,54 @@ fn decimal_literal_at_scale(scale: u32, digit: u32) -> String {
 /// increment (unlike float fields, whose `step="any"` accepts any input).
 fn decimal_step(scale: u32) -> String {
     decimal_literal_at_scale(scale, 1)
+}
+
+/// The HTML5 `<input>` type and constraint-attribute string a field's DSL
+/// constraint modifiers (issue #1388) render to, or `None` when the field has
+/// no HTML5 fan-out (so the derived `FieldControl` already renders it right).
+///
+/// `String`/`Text`: `min`/`max` -> `minlength`/`maxlength`, `email` ->
+/// `type="email"`, `url` -> `type="url"`. Numeric: `min`/`max` -> `min`/`max`
+/// on a `type="number"` input. Returned attribute string is space-prefixed and
+/// ready to splice straight into the generated maud `input`.
+fn html5_constraint_spec(field: &Field) -> Option<(&'static str, String)> {
+    use std::fmt::Write as _;
+    let c = &field.constraints;
+    let mut attrs = String::new();
+    let input_type = match field.kind {
+        FieldKind::String | FieldKind::Text => {
+            if let Some(min) = &c.min {
+                let _ = write!(attrs, " minlength=\"{min}\"");
+            }
+            if let Some(max) = &c.max {
+                let _ = write!(attrs, " maxlength=\"{max}\"");
+            }
+            if c.email {
+                "email"
+            } else if c.url {
+                "url"
+            } else {
+                "text"
+            }
+        }
+        FieldKind::I32 | FieldKind::I64 | FieldKind::F32 | FieldKind::F64 => {
+            if let Some(min) = &c.min {
+                let _ = write!(attrs, " min=\"{min}\"");
+            }
+            if let Some(max) = &c.max {
+                let _ = write!(attrs, " max=\"{max}\"");
+            }
+            "number"
+        }
+        _ => return None,
+    };
+    // Nothing to add over the derived control: a plain `text`/`number` with no
+    // constraint attributes is exactly what `form_for` already renders, so
+    // don't excise-and-reappend it (which would only reorder the field).
+    if attrs.is_empty() && input_type != "email" && input_type != "url" {
+        return None;
+    }
+    Some((input_type, attrs))
 }
 
 /// Produce the cell-body expression for a `data_table` column closure.
@@ -8101,14 +8202,14 @@ async fn main() {
                 nullable: false,
                 variants: Vec::new(),
                 unique: false,
-            },
+                constraints: Default::default(),            },
             Field {
                 name: "author_id".to_string(),
                 kind: FieldKind::References,
                 nullable: true,
                 variants: Vec::new(),
                 unique: false,
-            },
+                constraints: Default::default(),            },
         ];
         assert_eq!(
             fields[0].reference_table(),
@@ -8154,14 +8255,14 @@ async fn main() {
                 nullable: false,
                 variants: Vec::new(),
                 unique: false,
-            },
+                constraints: Default::default(),            },
             Field {
                 name: "author_id".to_string(),
                 kind: FieldKind::References,
                 nullable: true,
                 variants: Vec::new(),
                 unique: false,
-            },
+                constraints: Default::default(),            },
         ];
         let sql = render_reference_stub_tables_sql(&fields, "unrelated_table");
         assert_eq!(
@@ -8262,7 +8363,7 @@ async fn main() {
             nullable: false,
             variants: vec!["a".to_string(), "b".to_string()],
             unique: false,
-        };
+            constraints: Default::default(),        };
         let weight = Field {
             name: "weight".to_string(),
             kind: FieldKind::Decimal {
@@ -8272,7 +8373,7 @@ async fn main() {
             nullable: false,
             variants: Vec::new(),
             unique: false,
-        };
+            constraints: Default::default(),        };
         let fields = vec![status.clone(), weight];
         let sql = enum_rejection_insert_sql("items", &fields, &status, &BTreeMap::new());
         assert!(

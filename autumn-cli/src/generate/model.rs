@@ -9,7 +9,7 @@ use super::emit::Plan;
 use super::naming::{pascal, pluralize, snake};
 use super::schema_edit::{
     add_mod_declaration, append_schema_table_with_id, create_table_sql_with_metadata_and_id,
-    drop_table_sql,
+    drop_table_sql, link_models_into_seed_bin,
 };
 use super::{GenerateError, ensure_project_root, read_or_empty};
 
@@ -234,7 +234,33 @@ pub fn plan_model_with_options(
         &project_root.join("src/models"),
     );
 
+    // (e) Link the new model (and the `schema` module it reads) into the
+    // standalone `src/bin/seed.rs` binary, when the project was scaffolded
+    // with one (`autumn new --with-seed`). Without this the model's
+    // `#[model]` inventory registration is never compiled into the seed
+    // binary, so `autumn seed --count N --model M` cannot resolve it
+    // (issue #1718; completes AC4 of #1343). `generate scaffold` reuses this
+    // planner, so it inherits the same wiring.
+    plan_seed_bin_linking(&mut plan, project_root);
+
     Ok(plan)
+}
+
+/// Add a `Modify` action linking `src/models/` + `src/schema.rs` into
+/// `src/bin/seed.rs` when that binary exists, unless it's already linked
+/// (see [`link_models_into_seed_bin`]). A no-op — no action queued — when the
+/// project has no seed binary or the declarations are already present, so a
+/// plain non-`--with-seed` project's plan and output are unchanged.
+fn plan_seed_bin_linking(plan: &mut Plan, project_root: &Path) {
+    let seed_path = project_root.join("src").join("bin").join("seed.rs");
+    if !seed_path.exists() {
+        return;
+    }
+    let existing = read_or_empty(&seed_path);
+    let linked = link_models_into_seed_bin(&existing);
+    if linked != existing {
+        plan.modify(seed_path, linked);
+    }
 }
 
 /// Whether resource `base`'s model can be found anywhere in the project,
@@ -370,6 +396,97 @@ fn type_is_uuid(ty: &syn::Type) -> bool {
     }
 }
 
+/// The `String`/`Text` columns of resource `base`'s `#[model]` struct, in
+/// declaration order, each paired with whether it is nullable
+/// (`Option<String>`).
+///
+/// The scaffold generator uses this to pick a human-friendly display column
+/// for a `references` field (issue #1146): a belongs_to `<select>` and the
+/// index/show views render this column's value instead of the raw foreign-key
+/// id. Returns an empty vec when the model can't be located/parsed or has no
+/// string column — the caller then falls back to rendering the id, exactly the
+/// pre-#1146 behavior.
+///
+/// Parses with `syn` (like [`model_struct_has_uuid_pk`]) so grouped
+/// attributes, doc comments, and a multi-model `src/models.rs` layout don't
+/// defeat it.
+pub(super) fn model_string_columns(project_root: &Path, base: &str) -> Vec<(String, bool)> {
+    let pascal_name = pascal(base);
+    let per_resource = project_root
+        .join("src")
+        .join("models")
+        .join(format!("{base}.rs"));
+    let content = if per_resource.exists() {
+        read_or_empty(&per_resource)
+    } else {
+        let single_file = project_root.join("src").join("models.rs");
+        if !single_file.exists() {
+            return Vec::new();
+        }
+        read_or_empty(&single_file)
+    };
+
+    let Ok(file) = syn::parse_file(&content) else {
+        return Vec::new();
+    };
+    let Some(item_struct) = file.items.iter().find_map(|item| match item {
+        syn::Item::Struct(s) if s.ident == pascal_name => Some(s),
+        _ => None,
+    }) else {
+        return Vec::new();
+    };
+    let syn::Fields::Named(fields) = &item_struct.fields else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::new();
+    for field in &fields.named {
+        let Some(ident) = field.ident.as_ref() else {
+            continue;
+        };
+        if let Some(nullable) = string_like_nullability(&field.ty) {
+            out.push((ident.to_string(), nullable));
+        }
+    }
+    out
+}
+
+/// `Some(false)` for a `String` field, `Some(true)` for `Option<String>`,
+/// `None` for any non-string type.
+fn string_like_nullability(ty: &syn::Type) -> Option<bool> {
+    if let Some(inner) = option_inner_type(ty) {
+        return type_is_string(inner).then_some(true);
+    }
+    type_is_string(ty).then_some(false)
+}
+
+/// The `T` of an `Option<T>` type, or `None` when `ty` isn't an `Option<…>`.
+fn option_inner_type(ty: &syn::Type) -> Option<&syn::Type> {
+    let syn::Type::Path(tp) = ty else {
+        return None;
+    };
+    let seg = tp.path.segments.last()?;
+    if seg.ident != "Option" {
+        return None;
+    }
+    let syn::PathArguments::AngleBracketed(args) = &seg.arguments else {
+        return None;
+    };
+    args.args.iter().find_map(|arg| match arg {
+        syn::GenericArgument::Type(t) => Some(t),
+        _ => None,
+    })
+}
+
+/// Whether `ty` is the bare `String` type (the only spelling the model
+/// generator emits for `String`/`Text` columns).
+fn type_is_string(ty: &syn::Type) -> bool {
+    let syn::Type::Path(tp) = ty else {
+        return false;
+    };
+    tp.qself.is_none() && tp.path.segments.last().is_some_and(|s| s.ident == "String")
+}
+
 /// Validate every `references` field against its target model (issue #1026):
 ///
 /// - A *self*-reference (the target table is `own_table` — the resource this
@@ -503,6 +620,7 @@ pub(super) fn augment_fields_for_soft_delete(
         nullable: true,
         variants: Vec::new(),
         unique: false,
+        constraints: Default::default(),
     });
     Ok(std::borrow::Cow::Owned(augmented))
 }
@@ -1128,6 +1246,27 @@ pub fn parse_model_metadata(
             .entry(field_name.to_owned())
             .or_default()
             .push(attr);
+    }
+
+    // DSL brace-constraint modifiers (`title:String{min=3,max=120}`,
+    // `contact:String{email}`, `age:i32{min=0,max=130}`) fan out into the
+    // same `#[validate(...)]` pipeline as the `--validate` flag (issue #1388),
+    // so the generated model rejects invalid input server-side through the
+    // existing `Validated`/changeset path (422 + per-field errors) rather than
+    // a 500 or a silent store. Deduped against any `--validate` rule already
+    // recorded for the field, so declaring a constraint both ways doesn't emit
+    // it twice. `has_validator_rules()` then pulls in the `validator` crate
+    // dependency automatically (see `plan_model_with_options`).
+    for field in fields {
+        if field.constraints.is_empty() {
+            continue;
+        }
+        for attr in field.validation_attrs() {
+            let entry = metadata.validations.entry(field.name.clone()).or_default();
+            if !entry.contains(&attr) {
+                entry.push(attr);
+            }
+        }
     }
 
     for default in &options.defaults {
