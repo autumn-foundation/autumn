@@ -208,6 +208,21 @@ endpoints like `/auth/github/callback`. It calls the exact same
 (`__autumn_route_info_{name}`) are identical to `#[get]` — the different name
 is purely to signal intent at the call site.
 
+**`#[api_doc]` ordering caveat.** The expansion matches `#[get]`, but the *name*
+`oauth2_callback` is **not** in `#[api_doc]`'s route recognizer
+(`ROUTE_ATTR_NAMES`, which lists only `get`/`post`/`put`/`delete`/`patch`/
+`static_get`/`ws`). So the [flexible `#[api_doc]` ordering](#api_doc) does **not**
+apply here: an `#[api_doc]` placed *above* `#[oauth2_callback]` is treated as
+standalone and silently stripped, and its OpenAPI metadata is lost. Place
+`#[api_doc]` **below** `#[oauth2_callback]`, where the expanded GET route
+consumes it:
+
+```rust
+#[oauth2_callback("/auth/github/callback")]
+#[api_doc(summary = "GitHub OAuth callback", tag = "auth")]
+async fn github_callback(/* ... */) { /* ... */ }
+```
+
 ### `routes![handler_a, handler_b]`
 
 Transforms a list of handler names into a `Vec<Route>` by calling each
@@ -352,10 +367,16 @@ consumed; nothing is left on the function.
 | `hidden` | flag / bool | Exclude the route from the generated spec |
 | `mcp` | flag / bool | Expose this endpoint as an MCP tool (`mcp = false` force-excludes it). Requires the `mcp` feature and a `mount_mcp` call. |
 
-- **Ordering is flexible:** `#[api_doc]` works whether it sits *above* or
-  *below* the route macro. Rust expands attribute macros outermost-first, so
-  when `#[api_doc]` runs first it detects the pending route attribute and hands
-  the metadata through rather than stripping itself.
+- **Ordering is flexible — with one exception:** `#[api_doc]` works whether it
+  sits *above* or *below* the built-in route macros. Rust expands attribute
+  macros outermost-first, so when `#[api_doc]` runs first it detects the pending
+  route attribute and hands the metadata through rather than stripping itself.
+  The recognizer (`ROUTE_ATTR_NAMES` / `is_route_attribute`) covers only
+  `get`/`post`/`put`/`delete`/`patch`/`static_get`/`ws` — **not**
+  `#[oauth2_callback]`. Because that name is unrecognized, an `#[api_doc]` placed
+  *above* `#[oauth2_callback]` is treated as standalone and silently dropped;
+  put it *below* the callback instead (see
+  [`#[oauth2_callback]`](#oauth2_callbackpath)).
 
 ### `#[autumn_web::main]`
 
@@ -459,8 +480,10 @@ Beyond `#[id]`, `#[default]`, `#[validate(...)]`, `#[indexed]`, and
 These are stripped from the emitted Diesel query struct (they'd confuse the
 derives) and instead drive extra generated code. The full recognized set is
 `id`, `indexed`, `validate`, `default`, `factory_assoc`, `lock_version`,
-`searchable`, `encrypted`, `private`, `normalize`, and `state_machine`, plus
-the association attributes `belongs_to` / `has_many` / `has_one`.
+`searchable`, `encrypted`, `private`, `normalize`, and `state_machine`. The
+association attributes `belongs_to` / `has_many` / `has_one` are **not**
+field-level — they are struct-level attributes placed *above* the struct (see
+[Associations and search keys](#associations-and-search-keys) below).
 
 #### `#[private]`
 
@@ -579,9 +602,32 @@ the stripped name (`can_transition_type_to`). See
 
 `#[belongs_to(Target, fk = ...)]`, `#[has_many(Target, fk = ..., through = join)]`,
 and `#[has_one(Target, fk = ...)]` declare relationships used by the eager-load
-and association helpers (the foreign key lives on *this* model for `belongs_to`,
-on the *target* for `has_many`/`has_one`; `through =` marks a many-to-many join
-table). `#[searchable]` marks a column for the full-text search surface. The
+and association helpers. Unlike the field attributes above, **these are
+struct-level attributes** — place them *above* the struct, next to `#[model]`,
+just like `#[shard_key]`. The macro reads them only from the model's outer
+attributes (`resolve_associations(name, outer_attrs)`); a `#[belongs_to(...)]`
+sitting *on a field* is **not** registered — no preload metadata or accessors
+are generated, and because it is not in the field-attribute allow-list it can
+leak into the emitted Diesel query struct. The foreign key lives on *this* model
+for `belongs_to`, on the *target* for `has_many`/`has_one`; `through =` marks a
+many-to-many join table.
+
+```rust
+#[model(table = "posts")]
+#[belongs_to(User, fk = author_id)]   // fk on THIS model
+#[has_many(Comment)]                  // fk (post_id) on the TARGET
+#[has_many(Tag, through = post_tags)] // many-to-many via a join table
+pub struct Post {
+    #[id] pub id: i64,
+    pub author_id: i64,
+    pub title: String,
+}
+```
+
+An association that was not preloaded returns `NotLoaded` from its accessor
+rather than issuing SQL — autumn never lazy-loads.
+
+`#[searchable]` marks a column for the full-text search surface. The
 sharding key is set with a **struct-level** `#[shard_key = "field_name"]`
 attribute placed above the struct (its value names an existing field, e.g.
 `#[shard_key = "shard_id"]`; `"id"` is always valid) — there is no field-level
