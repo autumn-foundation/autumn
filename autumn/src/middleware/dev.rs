@@ -191,7 +191,15 @@ pub async fn capture_matched_path_middleware(
 /// escaping. It renders arbitrary compiler output exclusively via `textContent`
 /// on `<pre>`/`<code>`/`<div>` nodes — never `innerHTML` — so it is XSS-safe and
 /// needs no inline scripting (CSP `script-src 'self'` compliant).
-const BUILD_ERROR_OVERLAY_JS: &str = r#"
+///
+/// All styling is applied through individual CSSOM property assignments
+/// (`element.style.<prop> = value`) rather than literal `style` attributes.
+/// Styles set via the CSSOM are NOT governed by the CSP `style-src` directive
+/// (only literal `style` attributes, `<style>` blocks, and external stylesheets
+/// are), so the overlay renders correctly even under a strict nonce-based
+/// `style-src 'self' 'nonce-...'` policy — e.g. when a dev app enables
+/// `security.headers.csp_nonce`.
+const BUILD_ERROR_OVERLAY_JS: &str = r##"
   const OVERLAY_ID = "__autumn_build_error";
 
   function removeBuildErrorOverlay() {
@@ -209,13 +217,19 @@ const BUILD_ERROR_OVERLAY_JS: &str = r#"
     if (!overlay) {
       overlay = document.createElement("div");
       overlay.id = OVERLAY_ID;
-      overlay.setAttribute(
-        "style",
-        "position:fixed;inset:0;z-index:2147483647;overflow:auto;" +
-          "background:rgba(12,12,16,0.97);color:#f5f5f5;" +
-          "font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;" +
-          "padding:32px;box-sizing:border-box;"
-      );
+      overlay.style.position = "fixed";
+      overlay.style.top = "0";
+      overlay.style.right = "0";
+      overlay.style.bottom = "0";
+      overlay.style.left = "0";
+      overlay.style.zIndex = "2147483647";
+      overlay.style.overflow = "auto";
+      overlay.style.background = "rgba(12,12,16,0.97)";
+      overlay.style.color = "#f5f5f5";
+      overlay.style.fontFamily =
+        "ui-monospace,SFMono-Regular,Menlo,Consolas,monospace";
+      overlay.style.padding = "32px";
+      overlay.style.boxSizing = "border-box";
       document.body.appendChild(overlay);
     }
     while (overlay.firstChild) {
@@ -223,15 +237,18 @@ const BUILD_ERROR_OVERLAY_JS: &str = r#"
     }
 
     const panel = document.createElement("div");
-    panel.setAttribute("style", "max-width:960px;margin:0 auto;");
+    panel.style.maxWidth = "960px";
+    panel.style.margin = "0 auto";
 
     const banner = document.createElement("div");
-    banner.setAttribute(
-      "style",
-      "border-left:4px solid #ff5f56;background:#2a1416;color:#ffb3ad;" +
-        "padding:14px 18px;border-radius:6px;margin-bottom:20px;" +
-        "font-size:15px;font-weight:600;"
-    );
+    banner.style.borderLeft = "4px solid #ff5f56";
+    banner.style.background = "#2a1416";
+    banner.style.color = "#ffb3ad";
+    banner.style.padding = "14px 18px";
+    banner.style.borderRadius = "6px";
+    banner.style.marginBottom = "20px";
+    banner.style.fontSize = "15px";
+    banner.style.fontWeight = "600";
     banner.textContent = buildError.stale
       ? "Build failed — you're viewing a stale page. Fix the errors below and save."
       : "Build failed. Fix the errors below and save.";
@@ -242,37 +259,37 @@ const BUILD_ERROR_OVERLAY_JS: &str = r#"
       : [];
     diagnostics.forEach((diag) => {
       const item = document.createElement("div");
-      item.setAttribute(
-        "style",
-        "background:#1a1a20;border:1px solid #33333c;border-radius:6px;" +
-          "padding:16px 18px;margin-bottom:16px;"
-      );
+      item.style.background = "#1a1a20";
+      item.style.border = "1px solid #33333c";
+      item.style.borderRadius = "6px";
+      item.style.padding = "16px 18px";
+      item.style.marginBottom = "16px";
 
       const heading = document.createElement("div");
-      heading.setAttribute(
-        "style",
-        "color:#ff8a80;font-size:14px;font-weight:700;margin-bottom:6px;"
-      );
+      heading.style.color = "#ff8a80";
+      heading.style.fontSize = "14px";
+      heading.style.fontWeight = "700";
+      heading.style.marginBottom = "6px";
       const codePrefix = diag.code ? "[" + diag.code + "] " : "";
       heading.textContent = codePrefix + (diag.message || "");
       item.appendChild(heading);
 
       if (diag.file) {
         const loc = document.createElement("div");
-        loc.setAttribute(
-          "style",
-          "color:#9aa0a6;font-size:12px;margin-bottom:10px;"
-        );
+        loc.style.color = "#9aa0a6";
+        loc.style.fontSize = "12px";
+        loc.style.marginBottom = "10px";
         loc.textContent = diag.file + ":" + diag.line + ":" + diag.column;
         item.appendChild(loc);
       }
 
       const pre = document.createElement("pre");
-      pre.setAttribute(
-        "style",
-        "margin:0;white-space:pre-wrap;word-break:break-word;" +
-          "font-size:13px;line-height:1.5;color:#e8e8e8;"
-      );
+      pre.style.margin = "0";
+      pre.style.whiteSpace = "pre-wrap";
+      pre.style.wordBreak = "break-word";
+      pre.style.fontSize = "13px";
+      pre.style.lineHeight = "1.5";
+      pre.style.color = "#e8e8e8";
       const code = document.createElement("code");
       code.textContent = diag.rendered || "";
       pre.appendChild(code);
@@ -283,7 +300,7 @@ const BUILD_ERROR_OVERLAY_JS: &str = r#"
 
     overlay.appendChild(panel);
   }
-"#;
+"##;
 
 fn live_reload_script_body() -> String {
     format!(
@@ -758,6 +775,30 @@ mod tests {
         assert!(
             !js.contains("innerHTML"),
             "diagnostics must not be rendered via innerHTML"
+        );
+
+        // CSP-safety: the overlay must style elements via CSSOM per-property
+        // assignments (`element.style.<prop> = value`), which are NOT governed
+        // by the CSP `style-src` directive. Literal `style` attributes,
+        // `cssText`, and `setAttribute("style", ...)` ARE blocked under a
+        // strict nonce-based `style-src 'self' 'nonce-...'` policy, so none of
+        // those may appear or the overlay renders unstyled on apps that enable
+        // `security.headers.csp_nonce`.
+        assert!(
+            !js.contains(r#"setAttribute("style""#),
+            "overlay must not set styles via a literal style attribute"
+        );
+        assert!(
+            !js.contains(".cssText"),
+            "overlay must not set styles via cssText"
+        );
+        assert!(
+            !js.contains(" style="),
+            "overlay markup must not contain an inline style= attribute"
+        );
+        assert!(
+            js.contains(".style."),
+            "overlay must apply styling via CSSOM .style.<prop> assignments"
         );
     }
 
