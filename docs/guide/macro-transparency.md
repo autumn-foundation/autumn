@@ -568,8 +568,11 @@ the stripped name (`can_transition_type_to`). See
 and `#[has_one(Target, fk = ...)]` declare relationships used by the eager-load
 and association helpers (the foreign key lives on *this* model for `belongs_to`,
 on the *target* for `has_many`/`has_one`; `through =` marks a many-to-many join
-table). `#[searchable]` marks a column for the full-text search surface, and
-`#[shard_key]` designates the sharding key on a sharded model.
+table). `#[searchable]` marks a column for the full-text search surface. The
+sharding key is set with a **struct-level** `#[shard_key = "field_name"]`
+attribute placed above the struct (its value names an existing field, e.g.
+`#[shard_key = "shard_id"]`; `"id"` is always valid) — there is no field-level
+`#[shard_key]` marker.
 
 ---
 
@@ -752,8 +755,10 @@ Builder methods: `.order_by_aggregate_desc()` / `.order_by_aggregate_asc()`,
 interpolated). A `timestamptz` (`DateTime<Utc>`) bucket uses
 `date_trunc(.., 'UTC')` for timezone-stable buckets.
 
-**Gotchas:** `sum`/`avg`/`min`/`max` can't be merged across shards, so
-`across_tenants()` on a sharded repo is rejected. Grouping/filtering on an
+**Gotchas:** on a sharded, tenant-scoped repo, *every* grouped aggregate —
+`count_grouped_by_*` included, not just `sum`/`avg`/`min`/`max` — rejects
+`across_tenants()` at runtime (partial per-shard results can't be merged); run
+the aggregate per shard via `from_shard(...)` instead. Grouping/filtering on an
 `#[encrypted]` column is rejected at runtime (the stored value is ciphertext).
 
 #### `dependent(...)` cascades
