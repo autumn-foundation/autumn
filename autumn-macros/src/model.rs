@@ -1018,7 +1018,7 @@ fn validate_attrs_for_patch(field: &Field) -> Vec<syn::Attribute> {
             .filter(|m| {
                 !m.path()
                     .get_ident()
-                    .is_some_and(|id| NON_PATCH_VALIDATORS.contains(&id.to_string().as_str()))
+                    .is_some_and(|id| NON_PATCH_VALIDATORS.iter().any(|v| id == *v))
             })
             .collect();
         if kept.is_empty() {

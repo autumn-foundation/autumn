@@ -11632,13 +11632,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             // return a PARTIAL result over only the current pool, so we reject
             // rather than fall through to the single-pool count (#1692).
             if self.across_tenants {
-                if let ::core::option::Option::Some(ref __shards) = self.__autumn_shards {
-                    let __counts = __shards.fan_out_shards(|__shard| {
-                        let __sub = self.__autumn_for_shard(__shard);
-                        async move { __sub.__autumn_count_one_shard().await }
-                    }).await?;
-                    return ::core::result::Result::Ok(__counts.into_iter().sum());
-                } else {
+                let ::core::option::Option::Some(ref __shards) = self.__autumn_shards else {
                     return ::core::result::Result::Err(
                         ::autumn_web::AutumnError::bad_request_msg(
                             "cross-shard count requires a configured shard set: \
@@ -11649,7 +11643,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                              instead"
                         )
                     );
-                }
+                };
+                let __counts = __shards.fan_out_shards(|__shard| {
+                    let __sub = self.__autumn_for_shard(__shard);
+                    async move { __sub.__autumn_count_one_shard().await }
+                }).await?;
+                return ::core::result::Result::Ok(__counts.into_iter().sum());
             }
             let mut conn = self.__autumn_acquire_read_conn().await?;
             #base
