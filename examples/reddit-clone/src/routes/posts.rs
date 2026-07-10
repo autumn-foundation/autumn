@@ -20,7 +20,7 @@ use crate::jobs::{PostPublicationArgs, PostPublicationJob};
 use crate::models::{
     Comment, CommentAssociations, NewTag, Post, PostAssociations, PostTagsMutations, Subreddit, Tag,
 };
-use crate::repositories::{PgPostRepository, PostRepository};
+use crate::repositories::{PgPostRepository, PgVoteRepository, PostRepository};
 use crate::schema::{posts, subreddits, tags};
 use crate::slugify::slugify;
 
@@ -37,11 +37,14 @@ use super::layout::{layout, time_ago, vote_controls};
 // ── Front page — hot posts across all subreddits ───────────────
 
 #[get("/")]
+#[allow(clippy::too_many_arguments)]
 pub async fn front_page(
     session: Session,
     csrf: CsrfToken,
     mut db: Db,
+    State(state): State<AppState>,
     repo: PgPostRepository,
+    votes_repo: PgVoteRepository,
     flags: Flags,
     exps: Experiments,
     flash: Flash,
@@ -63,12 +66,67 @@ pub async fn front_page(
         .select(Post::as_select())
         .load(&mut *db)
         .await?;
-    // Release the base-query connection before `preload` checks one out, so the
-    // two never contend on a single-connection pool. The base rows were read
-    // from the primary via `Db`, so pin the preload to the primary too
-    // (`on_primary`) — otherwise, under replica lag, an author/subreddit just
-    // written may be missing on the replica and the post would be skipped.
+
+    // Release the `Db` extractor's connection now, before any other pooled
+    // checkout. `Db` acquires its connection eagerly at extraction and holds it
+    // until it is dropped (not just for the duration of a `&mut *db` borrow), so
+    // on a single-connection pool (max_size = 1, no read replica) the
+    // leaderboard aggregate below — and the `preload` further down — would block
+    // forever waiting for a second connection that can never free up while `db`
+    // is still alive. Dropping `db` here lets each step below check out the one
+    // connection in turn.
     drop(db);
+
+    // "Top posts by votes" leaderboard (#1364, AC3): a single typed
+    // grouped-aggregate call — `SUM(value) GROUP BY post_id`, ordered by the
+    // aggregate descending, top 5 — replacing what would otherwise be a
+    // hand-written `SUM ... GROUP BY ... ORDER BY ... LIMIT` string. This is a
+    // *read*, so it is replica-eligible (routes through the repository's read
+    // route). The score-maintenance path in `routes::votes` stays an atomic
+    // primary-side WRITE — see the note there.
+    //
+    // `votes.post_id` is nullable (comment votes carry a NULL `post_id`), and
+    // the grouped-aggregate codegen guards the group column with `IS NOT NULL`,
+    // so the NULL group is excluded — this leaderboard counts only
+    // post-directed votes (comment votes are correctly omitted), no per-call
+    // filter needed. Binding the result to an owned `Vec` releases the
+    // repository's pooled connection before the title lookup checks one out.
+    let top_by_votes: Vec<(i64, Option<i64>)> = votes_repo
+        .sum_value_grouped_by_post_id()
+        .order_by_aggregate_desc()
+        .limit(5)
+        .load()
+        .await?;
+    // Resolve the leaderboard entries' titles in one query (order preserved via
+    // the `top_by_votes` iteration below).
+    let top_ids: Vec<i64> = top_by_votes.iter().map(|(id, _)| *id).collect();
+    // Skip the follow-up title lookup entirely when the leaderboard is empty —
+    // otherwise we'd issue a pointless `WHERE id = ANY('{}')` query.
+    let top_titles: HashMap<i64, String> = if top_ids.is_empty() {
+        HashMap::new()
+    } else {
+        // Use a fresh, short-lived pool checkout — not the `Db` extractor, which
+        // was dropped above — so this lookup never overlaps another live
+        // connection on a single-connection pool. The `conn` guard is released
+        // at the end of this block, before `preload` checks one out.
+        let pool = state
+            .pool()
+            .ok_or_else(|| AutumnError::service_unavailable_msg("Database not configured"))?;
+        let mut conn = pool.get().await.map_err(AutumnError::from)?;
+        posts::table
+            .filter(posts::id.eq_any(&top_ids))
+            .select((posts::id, posts::title))
+            .load::<(i64, String)>(&mut conn)
+            .await?
+            .into_iter()
+            .collect()
+    };
+
+    // The base rows were read from the primary via `Db`, so pin the preload to
+    // the primary too (`on_primary`) — otherwise, under replica lag, an
+    // author/subreddit just written may be missing on the replica and the post
+    // would be skipped. `db` was already released above, so this checkout can
+    // never contend with it on a single-connection pool.
     let hot_posts = repo
         .on_primary()
         .preload(hot_posts, Post::preload().author().subreddit())
@@ -100,6 +158,31 @@ pub async fn front_page(
                 }
                 a href="/?sort=new" class="text-gray-500 hover:text-orange-600 px-3 py-1.5" {
                     "New"
+                }
+            }
+
+            // Top posts by votes — rendered from the typed grouped-aggregate
+            // leaderboard read (#1364, AC3). Empty until posts have votes.
+            @if !top_by_votes.is_empty() {
+                div class="mb-4 px-4 py-3 bg-white rounded-lg shadow-sm border border-gray-200" {
+                    div class="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2" {
+                        "Top posts by votes"
+                    }
+                    ol class="space-y-1 text-sm" {
+                        @for (post_id, sum) in &top_by_votes {
+                            @if let Some(title) = top_titles.get(post_id) {
+                                li class="flex items-center gap-2" {
+                                    span class="font-semibold text-gray-500 w-8 text-right shrink-0" {
+                                        (sum.unwrap_or(0))
+                                    }
+                                    a href=(format!("/posts/{}", post_id))
+                                       class="text-gray-900 hover:text-orange-600 line-clamp-1" {
+                                        (title)
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
 

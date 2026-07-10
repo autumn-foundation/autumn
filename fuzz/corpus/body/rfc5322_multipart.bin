@@ -1,0 +1,8 @@
+From: a@b.com
+Content-Type: multipart/alternative; boundary=XYZ
+
+--XYZ
+Content-Type: text/plain
+
+text part
+--XYZ--

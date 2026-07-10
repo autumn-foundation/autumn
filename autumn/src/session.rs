@@ -630,6 +630,28 @@ pub(crate) fn get_cookie(headers: &http::HeaderMap, name: &str) -> Option<String
     found_token
 }
 
+/// Fuzzing seam: exercise the cookie-header parser plus the signed-session
+/// cookie verification path (`{session_id}.{hmac_hex}` split + HMAC verify)
+/// over arbitrary bytes. Mirrors the decode performed by `SessionLayer`.
+///
+/// Compiled only under `--cfg fuzzing`, so the published crate is unaffected.
+/// See `fuzz/fuzz_targets/session.rs`.
+#[cfg(fuzzing)]
+pub fn __fuzz_decode_cookie(
+    cookie_header: &[u8],
+    cookie_name: &str,
+    secret: &[u8],
+) -> Option<String> {
+    let mut headers = http::HeaderMap::new();
+    if let Ok(value) = http::HeaderValue::from_bytes(cookie_header) {
+        headers.append(COOKIE, value);
+    }
+    let raw = get_cookie(&headers, cookie_name)?;
+    let keys = crate::security::config::ResolvedSigningKeys::new(secret.to_vec(), Vec::new());
+    let (id, sig) = raw.split_once('.')?;
+    keys.verify(id.as_bytes(), sig).then(|| id.to_owned())
+}
+
 /// Build a Set-Cookie header value.
 fn build_set_cookie(config: &SessionConfig, session_id: &str) -> String {
     use std::fmt::Write;

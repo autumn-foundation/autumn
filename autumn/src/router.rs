@@ -5202,9 +5202,9 @@ enabled = true
     async fn custom_story_served_alongside_builtins() {
         let custom = crate::stories::story! {
             "App",
-            "Badge",
+            "Greeting",
             {
-                maud::html! { span class="app-badge" { "hi from the app" } }
+                maud::html! { span class="app-greeting" { "hi from the app" } }
             }
         };
         let state = test_state();
@@ -5216,7 +5216,7 @@ enabled = true
 
         let router = build_router(Vec::new(), &story_gallery_config(), state);
 
-        let detail = get_with_host(router.clone(), "/_stories/badge").await;
+        let detail = get_with_host(router.clone(), "/_stories/greeting").await;
         assert_eq!(detail.status(), StatusCode::OK);
         let body = response_text(detail).await;
         assert!(
@@ -5227,7 +5227,7 @@ enabled = true
         let index = get_with_host(router, "/_stories").await;
         let body = response_text(index).await;
         assert!(
-            body.contains("Badge"),
+            body.contains("Greeting"),
             "index must list the custom story: {body}"
         );
         assert!(
@@ -8563,5 +8563,85 @@ mod idiomorph_tests {
 
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert!(!body.is_empty(), "idiomorph JS body must be non-empty");
+    }
+}
+
+#[cfg(test)]
+mod proptests {
+    //! Property-based invariants for the low-level path/host string helpers.
+    //! These are `pub(crate)` (only reachable via the `cfg(fuzzing)` seam
+    //! module), so they are exercised here in-crate rather than from an
+    //! integration test.
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// Mounting the root child (`"/"` or empty) is the identity on a
+        /// non-empty prefix, and idempotent: re-mounting the root child on the
+        /// result leaves it unchanged. (An empty prefix collapses to `"/"`.)
+        #[test]
+        fn join_nested_path_root_child_is_identity(prefix in "/?[a-z0-9/]{0,20}", root in prop::sample::select(vec!["/", ""])) {
+            let once = join_nested_path(&prefix, root);
+            let expected = if prefix.is_empty() { "/".to_owned() } else { prefix };
+            prop_assert_eq!(&once, &expected);
+            let twice = join_nested_path(&once, root);
+            prop_assert_eq!(once, twice);
+        }
+
+        /// `join_nested_path` never introduces a doubled slash at the join seam
+        /// for well-formed single-segment children.
+        #[test]
+        fn join_nested_path_no_double_slash_at_seam(prefix in "/[a-z0-9]{1,8}/?", child in "/[a-z0-9]{1,8}") {
+            let joined = join_nested_path(&prefix, &child);
+            prop_assert!(!joined.contains("//"), "unexpected `//` in {joined:?}");
+        }
+
+        /// `extract_host_without_port` never panics on arbitrary input and,
+        /// when it returns something, that something is a substring of the
+        /// trimmed input (it only ever strips a port / brackets, never invents
+        /// characters).
+        #[test]
+        fn extract_host_without_port_never_panics(header in ".*") {
+            if let Some(host) = extract_host_without_port(&header) {
+                prop_assert!(header.contains(host));
+            }
+        }
+
+        /// `path_matches_route_prefix` never panics and is reflexive: a path
+        /// always matches itself as a prefix.
+        #[test]
+        fn path_matches_route_prefix_reflexive(path in ".*") {
+            prop_assert!(path_matches_route_prefix(&path, &path));
+        }
+
+        /// `path_matches_route_prefix` is consistent with its documented
+        /// contract: a match means either exact equality or a `/`-delimited
+        /// boundary immediately after the prefix.
+        #[test]
+        fn path_matches_route_prefix_boundary(path in "/?[a-z0-9/]{0,24}", prefix in "/?[a-z0-9/]{0,24}") {
+            if path_matches_route_prefix(&path, &prefix) {
+                let boundary_ok = path == prefix
+                    || path.strip_prefix(&prefix).is_some_and(|rest| rest.starts_with('/'));
+                prop_assert!(boundary_ok, "match without boundary: path={path:?} prefix={prefix:?}");
+            }
+        }
+    }
+
+    // `extract_path_params` (openapi-only) never panics on arbitrary input and
+    // only ever returns non-empty, brace-free parameter names.
+    #[cfg(feature = "openapi")]
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        #[test]
+        fn extract_path_params_never_panics(path in ".*") {
+            for name in extract_path_params(&path) {
+                prop_assert!(!name.is_empty());
+                let has_brace = name.contains('{') || name.contains('}');
+                prop_assert!(!has_brace, "param name should be brace-free: {name:?}");
+            }
+        }
     }
 }

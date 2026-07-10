@@ -46,8 +46,7 @@ fn next_topic_epoch() -> u64 {
         // value is only a per-process epoch seed, not a precise clock.
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0)
+            .map_or(0, |d| d.as_nanos() as u64)
     });
     seed.wrapping_add(COUNTER.fetch_add(1, Ordering::Relaxed))
 }
